@@ -1,4 +1,10 @@
-from .base_scraper import BaseScraper
-from .example_scraper import ExampleScraper
+from .base_scraper import BridgeScraper, ScrapedRecord
+from .registry import UnsupportedCountyError, get_scraper_class, list_supported
 
-__all__ = ['BaseScraper', 'ExampleScraper']
+__all__ = [
+    "BridgeScraper",
+    "ScrapedRecord",
+    "get_scraper_class",
+    "list_supported",
+    "UnsupportedCountyError",
+]

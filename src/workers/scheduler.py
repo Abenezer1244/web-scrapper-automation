@@ -1,0 +1,243 @@
+"""Celery beat scheduler: 4 periodic tasks."""
+
+from datetime import datetime, timezone, timedelta
+
+from celery.schedules import crontab
+
+from src.workers import app
+from src.utils.logger import setup_logger
+
+_logger = setup_logger("worker.scheduler")
+
+# ─── Beat schedule ────────────────────────────────────────────────────────────
+
+app.conf.beat_schedule = {
+    "dispatch-scheduled-jobs": {
+        "task": "src.workers.scheduler.dispatch_scheduled_jobs",
+        "schedule": 60.0,  # every 1 minute
+    },
+    "watchdog-stuck-jobs": {
+        "task": "src.workers.scheduler.watchdog_stuck_jobs",
+        "schedule": 300.0,  # every 5 minutes
+    },
+    "canary-check": {
+        "task": "src.workers.scheduler.canary_check",
+        "schedule": 3600.0,  # every 1 hour
+    },
+    "reset-monthly-usage": {
+        "task": "src.workers.scheduler.reset_monthly_usage",
+        "schedule": crontab(hour=0, minute=0, day_of_month=1),  # 1st of month, midnight UTC
+    },
+}
+
+
+# ─── Task 1: Dispatch scheduled jobs ─────────────────────────────────────────
+
+@app.task(name="src.workers.scheduler.dispatch_scheduled_jobs")
+def dispatch_scheduled_jobs() -> None:
+    """Enqueue jobs for all active scraper configs whose schedule matches now.
+
+    Runs every minute. Idempotent — checks for an existing pending/running job
+    for the same config before enqueuing to prevent duplicates.
+    """
+    from src.db.session import SyncSessionLocal
+    from src.db.models import Job, ScraperConfig
+    from src.workers.tasks import run_scrape_job
+    from sqlalchemy import select
+    import uuid
+
+    now = datetime.now(timezone.utc)
+    enqueued = 0
+
+    with SyncSessionLocal() as db:
+        configs = db.execute(
+            select(ScraperConfig).where(ScraperConfig.active == True)
+        ).scalars().all()
+
+        for config in configs:
+            schedule = config.schedule or {}
+            frequency = schedule.get("frequency", "manual")
+
+            if frequency == "manual":
+                continue
+
+            if not _should_run_now(frequency, schedule.get("time", "06:00"), now):
+                continue
+
+            # Idempotency: skip if a job is already pending or running for this config
+            active_statuses = {"pending", "queued", "probing", "scraping", "enriching"}
+            existing = db.execute(
+                select(Job).where(
+                    Job.scraper_config_id == config.id,
+                    Job.status.in_(active_statuses),
+                )
+            ).scalar_one_or_none()
+
+            if existing:
+                _logger.debug("Skipping %s — job already active (%s)", config.name, existing.status)
+                continue
+
+            job = Job(
+                id=str(uuid.uuid4()),
+                user_id=config.user_id,
+                scraper_config_id=config.id,
+                status="pending",
+                trigger="scheduled",
+            )
+            db.add(job)
+            db.flush()
+            run_scrape_job.delay(job.id)
+            enqueued += 1
+            _logger.info("Scheduled job enqueued: %s (job_id=%s)", config.name, job.id)
+
+        db.commit()
+
+    if enqueued:
+        _logger.info("dispatch_scheduled_jobs: enqueued %d jobs", enqueued)
+
+
+def _should_run_now(frequency: str, run_time_str: str, now: datetime) -> bool:
+    """Return True if this frequency + run_time combination should fire at `now`."""
+    try:
+        hour, minute = (int(x) for x in run_time_str.split(":"))
+    except (ValueError, AttributeError):
+        hour, minute = 6, 0
+
+    if now.hour != hour or now.minute != minute:
+        return False
+
+    if frequency == "daily":
+        return True
+    if frequency == "weekly":
+        return now.weekday() == 0  # Monday
+    if frequency == "monthly":
+        return now.day == 1
+    return False
+
+
+# ─── Task 2: Watchdog for stuck jobs ─────────────────────────────────────────
+
+@app.task(name="src.workers.scheduler.watchdog_stuck_jobs")
+def watchdog_stuck_jobs() -> None:
+    """Fail jobs that have been stuck in an active state for > 30 minutes.
+
+    Runs every 5 minutes. Re-queues the job for retry up to max_retries times.
+    """
+    from src.db.session import SyncSessionLocal
+    from src.db.models import Job
+    from src.workers.tasks import run_scrape_job
+    from sqlalchemy import select
+
+    stuck_cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
+    active_statuses = {"queued", "probing", "scraping", "enriching"}
+
+    with SyncSessionLocal() as db:
+        stuck_jobs = db.execute(
+            select(Job).where(
+                Job.status.in_(active_statuses),
+                Job.started_at < stuck_cutoff,
+            )
+        ).scalars().all()
+
+        for job in stuck_jobs:
+            if job.retry_count < 3:
+                stuck_minutes = (
+                    int((datetime.now(timezone.utc) - job.started_at).total_seconds() / 60)
+                    if job.started_at else "?"
+                )
+                job.retry_count += 1
+                job.status = "pending"
+                job.started_at = None
+                db.flush()
+                run_scrape_job.delay(job.id)
+                _logger.warning(
+                    "Watchdog: re-queued stuck job %s (attempt %d/3, stuck for %s min)",
+                    job.id,
+                    job.retry_count,
+                    stuck_minutes,
+                )
+            else:
+                job.status = "failed"
+                job.finished_at = datetime.now(timezone.utc)
+                job.error_message = (
+                    "This scraper run did not complete in time. "
+                    "Our team has been notified and will investigate."
+                )
+                _logger.error("Watchdog: permanently failed job %s after 3 retries", job.id)
+
+        db.commit()
+
+
+# ─── Task 3: Canary health checks ────────────────────────────────────────────
+
+@app.task(name="src.workers.scheduler.canary_check")
+def canary_check() -> None:
+    """Run a 1-page test scrape per active connector to verify portal health.
+
+    Updates county_connectors.health_status:
+      - 'healthy'  — canary returned ≥ 1 record
+      - 'degraded' — canary returned 0 records (portal reachable but empty)
+      - 'down'     — canary threw an exception
+    """
+    from src.db.session import SyncSessionLocal
+    from src.db.models import CountyConnector
+    from src.scrapers.registry import get_scraper_class, UnsupportedCountyError
+    from sqlalchemy import select
+    import asyncio
+
+    with SyncSessionLocal() as db:
+        connectors = db.execute(
+            select(CountyConnector).where(CountyConnector.active == True)
+        ).scalars().all()
+
+        for connector in connectors:
+            try:
+                scraper_class = get_scraper_class(
+                    connector.county, connector.state, connector.record_types[0]
+                )
+                # Probe a single day to minimise load on county portal
+                today = datetime.now(timezone.utc).date()
+                yesterday = today - timedelta(days=1)
+
+                records = asyncio.run(
+                    _canary_scrape(scraper_class, yesterday.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y"))
+                )
+                connector.health_status = "healthy" if records else "degraded"
+                _logger.info(
+                    "Canary %s/%s: %s (%d records)",
+                    connector.county, connector.state, connector.health_status, len(records)
+                )
+            except UnsupportedCountyError:
+                _logger.warning("Canary: no scraper for %s/%s", connector.county, connector.state)
+                connector.health_status = "down"
+            except Exception as exc:
+                _logger.error("Canary failed for %s/%s: %s", connector.county, connector.state, exc)
+                connector.health_status = "down"
+
+            connector.last_checked = datetime.now(timezone.utc)
+
+        db.commit()
+
+
+async def _canary_scrape(scraper_class, date_from: str, date_to: str) -> list:
+    async with scraper_class() as scraper:
+        return await scraper.scrape(date_from, date_to)
+
+
+# ─── Task 4: Monthly usage reset ─────────────────────────────────────────────
+
+@app.task(name="src.workers.scheduler.reset_monthly_usage")
+def reset_monthly_usage() -> None:
+    """Reset records_used to 0 for all users on the 1st of each month.
+
+    Runs at midnight UTC on the 1st. This clears the monthly quota so
+    all plans get a fresh allocation each billing cycle.
+    """
+    from src.db.session import SyncSessionLocal
+    from src.db.models import User
+    from sqlalchemy import update
+
+    with SyncSessionLocal() as db:
+        result = db.execute(update(User).values(records_used=0))
+        db.commit()
+        _logger.info("Monthly reset complete — cleared records_used for %d users", result.rowcount)

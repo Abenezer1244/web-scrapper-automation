@@ -1,0 +1,48 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    app: bridgeleads
+    environment: production
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+scrape_configs:
+  # ─── FastAPI app (via prometheus-fastapi-instrumentator) ──────────────────
+  - job_name: fastapi
+    static_configs:
+      - targets: [api:8000]
+    metrics_path: /metrics
+    scrape_interval: 15s
+
+  # ─── Celery workers (via celery-prometheus-exporter / Flower) ─────────────
+  - job_name: celery
+    static_configs:
+      - targets: [flower:5555]
+    metrics_path: /metrics
+    scrape_interval: 30s
+
+  # ─── Redis ────────────────────────────────────────────────────────────────
+  - job_name: redis
+    static_configs:
+      - targets: [redis-exporter:9121]
+    scrape_interval: 15s
+
+  # ─── PostgreSQL ───────────────────────────────────────────────────────────
+  - job_name: postgres
+    static_configs:
+      - targets: [postgres-exporter:9187]
+    scrape_interval: 30s
+
+  # ─── Node / host metrics ──────────────────────────────────────────────────
+  - job_name: node
+    static_configs:
+      - targets: [node-exporter:9100]
+    scrape_interval: 30s

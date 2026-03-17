@@ -1,0 +1,107 @@
+groups:
+  - name: bridgeleads
+    interval: 30s
+    rules:
+
+      # ─── Critical: service down ────────────────────────────────────────────
+
+      - alert: APIDown
+        expr: up{job="fastapi"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "BridgeLeads API is down"
+          description: "The FastAPI server has been unreachable for > 1 minute."
+
+      - alert: CeleryWorkersDown
+        expr: flower_workers_online == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "All Celery workers are offline"
+          description: "No Celery workers have been online for > 2 minutes. Scrape jobs will not run."
+
+      # ─── Warning: queue health ─────────────────────────────────────────────
+
+      - alert: QueueDepthHigh
+        expr: celery_queue_length{queue="celery"} > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Celery queue depth is high"
+          description: "Queue has {{ $value }} tasks pending for > 5 minutes. Consider scaling workers."
+
+      - alert: HighJobFailureRate
+        expr: >
+          rate(celery_task_failed_total[10m])
+          / (rate(celery_task_succeeded_total[10m]) + rate(celery_task_failed_total[10m]) + 0.001)
+          > 0.25
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High scrape job failure rate"
+          description: "More than 25% of jobs are failing over the last 10 minutes ({{ $value | humanizePercentage }})."
+
+      # ─── Warning: database ─────────────────────────────────────────────────
+
+      - alert: DBPoolExhausted
+        expr: pg_stat_activity_count{state="active"} > 80
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL connection pool near exhaustion"
+          description: "{{ $value }} active connections. Pool max is 100. Risk of connection refused errors."
+
+      # ─── Warning: Redis ────────────────────────────────────────────────────
+
+      - alert: RedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis memory usage above 85%"
+          description: "Redis is using {{ $value | humanizePercentage }} of max memory. Risk of eviction."
+
+      # ─── Warning: disk ─────────────────────────────────────────────────────
+
+      - alert: DiskSpaceLow
+        expr: >
+          (node_filesystem_avail_bytes{mountpoint="/", fstype!="tmpfs"}
+          / node_filesystem_size_bytes{mountpoint="/", fstype!="tmpfs"}) < 0.15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk space is below 15%"
+          description: "Only {{ $value | humanizePercentage }} of disk space remaining on /."
+
+      # ─── Warning: API latency ─────────────────────────────────────────────
+
+      - alert: APIHighLatency
+        expr: >
+          histogram_quantile(0.95,
+            rate(http_request_duration_seconds_bucket{job="fastapi"}[5m])
+          ) > 2.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API p95 latency above 2 seconds"
+          description: "95th percentile response time is {{ $value | humanizeDuration }}."
+
+      # ─── Warning: county portal health ───────────────────────────────────
+
+      - alert: CountyConnectorDown
+        expr: bridgeleads_connector_health{status="down"} > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "County connector portal is down"
+          description: "Connector {{ $labels.county }}/{{ $labels.state }} has been unreachable for > 10 minutes."

@@ -1,0 +1,65 @@
+global:
+  resolve_timeout: 5m
+  slack_api_url: "${SLACK_WEBHOOK_URL}"
+
+templates:
+  - /etc/alertmanager/templates/*.tmpl
+
+route:
+  group_by: [alertname, severity]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: slack-default
+
+  routes:
+    # Critical alerts → immediate, no grouping wait
+    - match:
+        severity: critical
+      receiver: slack-critical
+      group_wait: 0s
+      repeat_interval: 1h
+
+    # Warning alerts → standard grouping
+    - match:
+        severity: warning
+      receiver: slack-default
+      repeat_interval: 4h
+
+receivers:
+  - name: slack-critical
+    slack_configs:
+      - channel: "#bridgeleads-alerts"
+        username: "BridgeLeads Monitor"
+        icon_emoji: ":rotating_light:"
+        color: "#e54b4b"
+        title: "🚨 CRITICAL: {{ .GroupLabels.alertname }}"
+        text: >-
+          {{ range .Alerts }}
+          *Alert:* {{ .Annotations.summary }}
+          *Details:* {{ .Annotations.description }}
+          *Started:* {{ .StartsAt.Format "2006-01-02 15:04:05 UTC" }}
+          {{ end }}
+        send_resolved: true
+
+  - name: slack-default
+    slack_configs:
+      - channel: "#bridgeleads-alerts"
+        username: "BridgeLeads Monitor"
+        icon_emoji: ":warning:"
+        color: "#f5a623"
+        title: "⚠️ WARNING: {{ .GroupLabels.alertname }}"
+        text: >-
+          {{ range .Alerts }}
+          *Alert:* {{ .Annotations.summary }}
+          *Details:* {{ .Annotations.description }}
+          {{ end }}
+        send_resolved: true
+
+inhibit_rules:
+  # Suppress warnings when a critical alert for the same service fires
+  - source_match:
+      severity: critical
+    target_match:
+      severity: warning
+    equal: [alertname]

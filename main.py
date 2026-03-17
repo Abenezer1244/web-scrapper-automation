@@ -1,67 +1,51 @@
-#!/usr/bin/env python3
-"""
-Web Scraper Automation - Entry Point
+from contextlib import asynccontextmanager
 
-Usage:
-    python main.py [--scraper SCRAPER] [--format FORMAT] [--pages PAGES] [--no-headless]
-"""
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-import argparse
-import sys
-
-from src.config import Settings
-from src.utils import setup_logger, DataExporter
-from src.scrapers.example_scraper import ExampleScraper
+from src.api import auth_router, billing_router, jobs_router, scrapers_router
+from src.api.middleware import SecurityHeadersMiddleware
+from src.config import settings
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='Web Scraper Automation')
-    parser.add_argument(
-        '--scraper', default='example',
-        choices=['example'],
-        help='Scraper to run (default: example)'
-    )
-    parser.add_argument(
-        '--format', default=None,
-        choices=['csv', 'json', 'excel'],
-        help=f'Export format (default: {Settings.EXPORT_FORMAT})'
-    )
-    parser.add_argument(
-        '--pages', type=int, default=5,
-        help='Number of pages to scrape (default: 5)'
-    )
-    parser.add_argument(
-        '--no-headless', action='store_true',
-        help='Run browser in visible mode'
-    )
-    return parser.parse_args()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings.ensure_dirs()
+    yield
 
 
-def main():
-    args = parse_args()
-    logger = setup_logger('main')
+app = FastAPI(
+    title="BridgeLeads API",
+    version="1.0.0",
+    # Docs only available in debug/development mode
+    docs_url="/docs" if settings.DEBUG else None,
+    redoc_url="/redoc" if settings.DEBUG else None,
+    openapi_url="/openapi.json" if settings.DEBUG else None,
+    lifespan=lifespan,
+)
 
-    logger.info("Starting web scraper automation")
+# ─── Middleware ────────────────────────────────────────────────────────────────
 
-    headless = not args.no_headless
-    export_format = args.format or Settings.EXPORT_FORMAT
-    exporter = DataExporter()
+app.add_middleware(SecurityHeadersMiddleware)
 
-    if args.scraper == 'example':
-        logger.info(f"Running ExampleScraper (pages={args.pages}, headless={headless})")
-        with ExampleScraper(headless=headless) as scraper:
-            data = scraper.scrape_all(max_pages=args.pages)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.get_allowed_origins(),
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "X-Requested-With"],
+)
 
-        if data:
-            output_path = exporter.export(data, filename='quotes', format=export_format)
-            logger.info(f"Export complete: {output_path}")
-        else:
-            logger.warning("No data was scraped.")
-            return 1
+# ─── Routers ──────────────────────────────────────────────────────────────────
 
-    logger.info("Scraping finished successfully")
-    return 0
+app.include_router(auth_router)
+app.include_router(scrapers_router)
+app.include_router(jobs_router)
+app.include_router(billing_router)
 
 
-if __name__ == '__main__':
-    sys.exit(main())
+# ─── Health check ─────────────────────────────────────────────────────────────
+
+@app.get("/health", tags=["system"])
+async def health() -> dict:
+    return {"status": "ok", "service": "bridgeleads-api"}

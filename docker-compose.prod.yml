@@ -1,0 +1,182 @@
+version: "3.9"
+
+# BridgeLeads production stack
+# Usage: docker-compose -f docker-compose.prod.yml up -d
+
+x-api-env: &api-env
+  DATABASE_URL: ${DATABASE_URL}
+  DATABASE_URL_SYNC: ${DATABASE_URL_SYNC}
+  REDIS_URL: ${REDIS_URL}
+  SECRET_KEY: ${SECRET_KEY}
+  R2_ENDPOINT_URL: ${R2_ENDPOINT_URL}
+  R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID}
+  R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY}
+  R2_BUCKET_NAME: ${R2_BUCKET_NAME}
+  STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+  STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+  STRIPE_PRICE_PRO: ${STRIPE_PRICE_PRO}
+  STRIPE_PRICE_BUSINESS: ${STRIPE_PRICE_BUSINESS}
+  STRIPE_PRICE_AGENCY: ${STRIPE_PRICE_AGENCY}
+  RESEND_API_KEY: ${RESEND_API_KEY}
+  EMAIL_FROM: ${EMAIL_FROM}
+  FRONTEND_URL: ${FRONTEND_URL}
+  ENVIRONMENT: production
+  DEBUG: "false"
+  LOG_LEVEL: INFO
+
+services:
+  # ─── Application ─────────────────────────────────────────────────────────
+
+  api:
+    image: ghcr.io/${GITHUB_REPOSITORY}:main
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *api-env
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging: &loki-logging
+      driver: loki
+      options:
+        loki-url: "http://loki:3100/loki/api/v1/push"
+        loki-external-labels: "service=api,app=bridgeleads"
+
+  worker:
+    image: ghcr.io/${GITHUB_REPOSITORY}:main
+    restart: unless-stopped
+    command: celery -A src.workers worker --loglevel=info --concurrency=2
+    environment:
+      <<: *api-env
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging:
+      <<: *loki-logging
+      options:
+        loki-url: "http://loki:3100/loki/api/v1/push"
+        loki-external-labels: "service=worker,app=bridgeleads"
+
+  beat:
+    image: ghcr.io/${GITHUB_REPOSITORY}:main
+    restart: unless-stopped
+    command: celery -A src.workers beat --loglevel=info --scheduler celery.beat.PersistentScheduler
+    environment:
+      <<: *api-env
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging:
+      <<: *loki-logging
+      options:
+        loki-url: "http://loki:3100/loki/api/v1/push"
+        loki-external-labels: "service=beat,app=bridgeleads"
+
+  flower:
+    image: ghcr.io/${GITHUB_REPOSITORY}:main
+    restart: unless-stopped
+    command: celery -A src.workers flower --port=5555 --basic_auth=${FLOWER_USER}:${FLOWER_PASSWORD}
+    ports:
+      - "5555:5555"
+    environment:
+      <<: *api-env
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ─── Infrastructure ───────────────────────────────────────────────────────
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD} --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Monitoring ───────────────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-lifecycle
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      GF_SERVER_ROOT_URL: https://grafana.bridgeleads.io
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+  loki:
+    image: grafana/loki:2.9.7
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+
+  promtail:
+    image: grafana/promtail:2.9.7
+    restart: unless-stopped
+    volumes:
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    command: -config.file=/etc/promtail/config.yml
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.59.0
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: ${DATABASE_URL_SYNC}
+
+  node-exporter:
+    image: prom/node-exporter:v1.7.0
+    restart: unless-stopped
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+
+volumes:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  loki_data:

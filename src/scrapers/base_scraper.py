@@ -1,143 +1,189 @@
-import time
-import logging
-from typing import Optional
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
-from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.firefox import GeckoDriverManager
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.firefox.service import Service as FirefoxService
+"""Playwright-only base scraper for all BridgeLeads county connectors."""
+
+import asyncio
+import hashlib
+import json
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+import requests
 from bs4 import BeautifulSoup
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    async_playwright,
+)
 
-from src.config import Settings
+from src.api.middleware.security import validate_scraping_target
+from src.config import settings
+from src.utils.logger import setup_logger
 
-logger = logging.getLogger(__name__)
+_logger = setup_logger("scraper.base")
 
 
-class BaseScraper:
-    """Base class for web scrapers using Selenium."""
+@dataclass
+class ScrapedRecord:
+    """Normalised record extracted by any county connector."""
 
-    def __init__(self, headless: Optional[bool] = None, browser: str = 'chrome'):
-        """
-        Initialize the scraper.
+    date_recorded: str | None = None
+    party_name: str | None = None
+    heirs: str | None = None
+    legal_description: str | None = None
+    parcel_id: str | None = None
+    property_address: str | None = None
+    mailing_address: str | None = None
+    enrichment_data: dict[str, Any] = field(default_factory=dict)
+    raw_html_hash: str | None = None
 
-        Args:
-            headless: Run browser in headless mode. Defaults to Settings.HEADLESS.
-            browser: Browser to use ('chrome' or 'firefox'). Defaults to 'chrome'.
-        """
-        self.headless = headless if headless is not None else Settings.HEADLESS
-        self.browser = browser.lower()
-        self.driver = None
-        self.wait = None
-        Settings.ensure_dirs()
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "date_recorded": self.date_recorded,
+            "party_name": self.party_name,
+            "heirs": self.heirs,
+            "legal_description": self.legal_description,
+            "parcel_id": self.parcel_id,
+            "property_address": self.property_address,
+            "mailing_address": self.mailing_address,
+            "enrichment_data": self.enrichment_data,
+            "raw_html_hash": self.raw_html_hash,
+        }
 
-    def _setup_driver(self):
-        """Set up the Selenium WebDriver."""
-        if self.browser == 'chrome':
-            options = webdriver.ChromeOptions()
-            if self.headless:
-                options.add_argument('--headless')
-            options.add_argument('--no-sandbox')
-            options.add_argument('--disable-dev-shm-usage')
-            options.add_argument('--disable-blink-features=AutomationControlled')
-            options.add_experimental_option('excludeSwitches', ['enable-logging'])
 
-            service = ChromeService(ChromeDriverManager().install())
-            self.driver = webdriver.Chrome(service=service, options=options)
+class BridgeScraper:
+    """Async Playwright scraper base class.
 
-        elif self.browser == 'firefox':
-            options = webdriver.FirefoxOptions()
-            if self.headless:
-                options.add_argument('--headless')
+    All county connectors must subclass this and implement `scrape()`.
 
-            service = FirefoxService(GeckoDriverManager().install())
-            self.driver = webdriver.Firefox(service=service, options=options)
+    Usage:
+        async with BridgeScraper() as scraper:
+            records = await scraper.scrape()
 
-        else:
-            raise ValueError(f"Unsupported browser: {self.browser}")
+    The context manager handles browser lifecycle, including cleanup on error.
+    """
 
-        self.wait = WebDriverWait(self.driver, Settings.DEFAULT_TIMEOUT)
-        logger.info(f"WebDriver initialized: {self.browser} (headless={self.headless})")
+    def __init__(self) -> None:
+        self._playwright: Playwright | None = None
+        self._browser: Browser | None = None
+        self._context: BrowserContext | None = None
+        self.page: Page | None = None
 
-    def start(self):
-        """Start the browser."""
-        if self.driver is None:
-            self._setup_driver()
+    # ─── Lifecycle ────────────────────────────────────────────────────────────
 
-    def stop(self):
-        """Stop the browser and clean up."""
-        if self.driver:
-            self.driver.quit()
-            self.driver = None
-            self.wait = None
-            logger.info("WebDriver closed")
-
-    def get_page(self, url: str, retries: int = None) -> bool:
-        """
-        Navigate to a URL with retry logic.
-
-        Args:
-            url: The URL to navigate to.
-            retries: Number of retries. Defaults to Settings.MAX_RETRIES.
-
-        Returns:
-            True if successful, False otherwise.
-        """
-        if not self.driver:
-            self.start()
-
-        retries = retries if retries is not None else Settings.MAX_RETRIES
-
-        for attempt in range(retries):
-            try:
-                self.driver.get(url)
-                logger.info(f"Successfully loaded: {url}")
-                return True
-            except WebDriverException as e:
-                logger.warning(f"Attempt {attempt + 1}/{retries} failed for {url}: {e}")
-                if attempt < retries - 1:
-                    time.sleep(Settings.RETRY_DELAY)
-
-        logger.error(f"Failed to load {url} after {retries} attempts")
-        return False
-
-    def wait_for_element(self, by: By, value: str, timeout: int = None) -> Optional[any]:
-        """
-        Wait for an element to be present on the page.
-
-        Args:
-            by: Selenium By locator strategy.
-            value: The value to locate.
-            timeout: Custom timeout in seconds.
-
-        Returns:
-            The element if found, None otherwise.
-        """
-        timeout = timeout if timeout is not None else Settings.DEFAULT_TIMEOUT
-        try:
-            wait = WebDriverWait(self.driver, timeout)
-            element = wait.until(EC.presence_of_element_located((by, value)))
-            return element
-        except TimeoutException:
-            logger.warning(f"Element not found: {by}={value}")
-            return None
-
-    def get_page_source(self) -> str:
-        """Get the current page source."""
-        return self.driver.page_source if self.driver else ""
-
-    def get_soup(self) -> BeautifulSoup:
-        """Get BeautifulSoup object of current page."""
-        return BeautifulSoup(self.get_page_source(), 'lxml')
-
-    def __enter__(self):
-        """Context manager entry."""
-        self.start()
+    async def __aenter__(self) -> "BridgeScraper":
+        self._playwright = await async_playwright().start()
+        self._browser = await self._playwright.chromium.launch(
+            headless=settings.PLAYWRIGHT_HEADLESS,
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        self._context = await self._browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
+        )
+        self.page = await self._context.new_page()
+        _logger.info("Browser context started (headless=%s)", settings.PLAYWRIGHT_HEADLESS)
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
-        self.stop()
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._context:
+            await self._context.close()
+        if self._browser:
+            await self._browser.close()
+        if self._playwright:
+            await self._playwright.stop()
+        _logger.info("Browser context closed")
+
+    # ─── Core navigation ──────────────────────────────────────────────────────
+
+    async def navigate(self, url: str, wait_until: str = "networkidle") -> None:
+        """Navigate to a URL. Validates against SSRF allowlist before any request."""
+        validate_scraping_target(url)
+
+        for attempt in range(1, settings.MAX_RETRIES + 1):
+            try:
+                await self.page.goto(url, wait_until=wait_until, timeout=settings.DEFAULT_TIMEOUT * 1000)
+                _logger.info("Navigated to %s", url)
+                return
+            except Exception as exc:
+                _logger.warning("Navigate attempt %d/%d failed: %s", attempt, settings.MAX_RETRIES, exc)
+                if attempt == settings.MAX_RETRIES:
+                    raise
+                await asyncio.sleep(2 ** attempt)  # exponential backoff
+
+    def get_soup(self) -> BeautifulSoup:
+        """Return a BeautifulSoup parse of the current page content."""
+        if not self.page:
+            raise RuntimeError("BridgeScraper not started — use 'async with BridgeScraper()'")
+        content = self.page.content()
+        # page.content() is a coroutine — callers must await this helper or use get_soup_async
+        raise RuntimeError("Use await get_soup_async() instead of get_soup()")
+
+    async def get_soup_async(self) -> BeautifulSoup:
+        """Return a BeautifulSoup parse of the current page content."""
+        if not self.page:
+            raise RuntimeError("BridgeScraper not started — use 'async with BridgeScraper()'")
+        content = await self.page.content()
+        return BeautifulSoup(content, "lxml")
+
+    # ─── Render mode probe ────────────────────────────────────────────────────
+
+    @staticmethod
+    def probe(url: str) -> str:
+        """Determine if a URL requires Playwright (JS) or can be fetched statically.
+
+        Returns:
+            'static' if requests.get returns the expected content,
+            'playwright' otherwise.
+        """
+        validate_scraping_target(url)
+        try:
+            resp = requests.get(url, timeout=10, headers={"User-Agent": "BridgeLeads-Probe/1.0"})
+            if resp.status_code == 200 and len(resp.text) > 500:
+                return "static"
+        except Exception:
+            pass
+        return "playwright"
+
+    # ─── Utilities ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def make_hash(row_dict: dict[str, Any]) -> str:
+        """MD5 fingerprint of a scraped row for deduplication.
+
+        Normalises the dict to a stable JSON string before hashing so that
+        field order differences do not produce different hashes.
+        """
+        stable = json.dumps(row_dict, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.md5(stable.encode("utf-8")).hexdigest()  # noqa: S324 (dedup only, not security)
+
+    @staticmethod
+    def clean(text: str | None) -> str | None:
+        """Strip control characters and normalise whitespace in scraped text."""
+        if text is None:
+            return None
+        # Remove control chars (except normal whitespace)
+        text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+        # Collapse multiple spaces/newlines
+        text = re.sub(r"\s+", " ", text)
+        return text.strip() or None
+
+    async def polite_delay(self) -> None:
+        """Wait the configured polite delay between requests."""
+        await asyncio.sleep(settings.POLITE_DELAY_MS / 1000)
+
+    # ─── Subclass interface ───────────────────────────────────────────────────
+
+    async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
+        """Run the full scrape for a date range. Must be implemented by subclasses."""
+        raise NotImplementedError("Each county connector must implement scrape()")

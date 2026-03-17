@@ -1,0 +1,42 @@
+version: 2
+
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 5
+    groups:
+      fastapi-stack:
+        patterns:
+          - fastapi
+          - uvicorn
+          - pydantic*
+          - starlette
+      celery-stack:
+        patterns:
+          - celery
+          - redis
+          - kombu
+      aws-stack:
+        patterns:
+          - boto3
+          - botocore
+      security:
+        patterns:
+          - python-jose
+          - passlib
+          - bcrypt
+          - cryptography
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 5

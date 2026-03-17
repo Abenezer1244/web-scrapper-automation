@@ -1,38 +1,97 @@
-import os
 from pathlib import Path
-from dotenv import load_dotenv
+from typing import ClassVar
 
-# Load environment variables
-load_dotenv()
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-class Settings:
-    """Global configuration settings for the scraper."""
 
-    # Project paths
-    BASE_DIR = Path(__file__).parent.parent.parent
-    DATA_DIR = BASE_DIR / 'data'
-    EXPORTS_DIR = DATA_DIR / 'exports'
-    LOGS_DIR = BASE_DIR / 'logs'
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore",
+    )
 
-    # Browser configuration
-    HEADLESS = os.getenv('HEADLESS', 'true').lower() == 'true'
-    BROWSER = os.getenv('BROWSER', 'chrome')
+    # ─── Paths ────────────────────────────────────────────────────────────────
+    BASE_DIR: ClassVar[Path] = Path(__file__).parent.parent.parent
+    DATA_DIR: ClassVar[Path] = BASE_DIR / "data"
+    EXPORTS_DIR: ClassVar[Path] = DATA_DIR / "exports"
+    LOGS_DIR: ClassVar[Path] = BASE_DIR / "logs"
 
-    # Scraping configuration
-    DEFAULT_TIMEOUT = int(os.getenv('DEFAULT_TIMEOUT', 10))
-    MAX_RETRIES = int(os.getenv('MAX_RETRIES', 3))
-    RETRY_DELAY = int(os.getenv('RETRY_DELAY', 2))
+    # ─── Database ─────────────────────────────────────────────────────────────
+    DATABASE_URL: str
+    DATABASE_URL_SYNC: str
 
-    # Export configuration
-    EXPORT_FORMAT = os.getenv('EXPORT_FORMAT', 'csv')
-    EXPORT_DIR = os.getenv('EXPORT_DIR', 'data/exports')
+    # ─── Redis ────────────────────────────────────────────────────────────────
+    REDIS_URL: str
 
-    # Logging
-    LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
-    LOG_DIR = os.getenv('LOG_DIR', 'logs')
+    # ─── Security ─────────────────────────────────────────────────────────────
+    SECRET_KEY: str
 
+    @field_validator("SECRET_KEY")
     @classmethod
-    def ensure_dirs(cls):
-        """Create necessary directories if they don't exist."""
-        cls.EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
-        cls.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    def secret_key_must_be_strong(cls, v: str) -> str:
+        insecure = {"changeme", "secret", "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET_KEY_AT_LEAST_32_CHARS"}
+        if v in insecure or len(v) < 32:
+            raise ValueError(
+                "SECRET_KEY must be at least 32 characters and not a default value. "
+                "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+        return v
+
+    # ─── Cloudflare R2 ────────────────────────────────────────────────────────
+    R2_ENDPOINT_URL: str = ""
+    R2_ACCESS_KEY_ID: str = ""
+    R2_SECRET_ACCESS_KEY: str = ""
+    R2_BUCKET_NAME: str = "bridgeleads-exports"
+    R2_PUBLIC_URL: str = ""
+
+    # ─── Stripe ───────────────────────────────────────────────────────────────
+    STRIPE_SECRET_KEY: str = ""
+    STRIPE_WEBHOOK_SECRET: str = ""
+    STRIPE_PRICE_PRO: str = ""
+    STRIPE_PRICE_BUSINESS: str = ""
+    STRIPE_PRICE_AGENCY: str = ""
+
+    # ─── Email ────────────────────────────────────────────────────────────────
+    RESEND_API_KEY: str = ""
+    EMAIL_FROM: str = "leads@bridgeleads.io"
+
+    # ─── App ──────────────────────────────────────────────────────────────────
+    DEBUG: bool = False
+    ENVIRONMENT: str = "production"
+    FRONTEND_URL: str = "https://app.bridgeleads.io"
+    ALLOWED_ORIGINS: str = "https://app.bridgeleads.io"
+
+    # ─── Playwright ───────────────────────────────────────────────────────────
+    PLAYWRIGHT_HEADLESS: bool = True
+
+    # ─── Scraping ─────────────────────────────────────────────────────────────
+    DEFAULT_TIMEOUT: int = 30
+    MAX_RETRIES: int = 3
+    POLITE_DELAY_MS: int = 300
+
+    # ─── Logging ──────────────────────────────────────────────────────────────
+    LOG_LEVEL: str = "INFO"
+
+    # ─── Export ───────────────────────────────────────────────────────────────
+    EXPORT_FORMAT: str = "csv"
+
+    # ─── Plan limits: records per month (-1 = unlimited) ──────────────────────
+    PLAN_LIMITS: ClassVar[dict[str, int]] = {
+        "starter": 50,
+        "pro": 500,
+        "business": 5000,
+        "agency": -1,
+    }
+
+    def get_allowed_origins(self) -> list[str]:
+        return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
+
+    def ensure_dirs(self) -> None:
+        self.EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        self.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+settings = Settings()

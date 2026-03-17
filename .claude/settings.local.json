@@ -3,7 +3,10 @@
     "allow": [
       "Bash(claude mcp:*)",
       "WebFetch(domain:github.com)",
-      "Bash(uvx:*)"
+      "Bash(uvx:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(npx:*)",
+      "Bash(where npx:*)"
     ]
   }
 }

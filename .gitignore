@@ -51,3 +51,13 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Terraform
+infra/terraform/.terraform/
+infra/terraform/terraform.tfvars
+infra/terraform/terraform.tfstate
+infra/terraform/terraform.tfstate.backup
+infra/terraform/.terraform.lock.hcl
+
+# Claude worktrees
+.claude/worktrees/

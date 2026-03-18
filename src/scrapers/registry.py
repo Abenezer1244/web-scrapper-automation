@@ -7,7 +7,7 @@ and being listed in the DB.
 
 import importlib
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from src.db.models import CountyConnector
 from src.db.session import SyncSessionLocal
@@ -39,8 +39,8 @@ def get_scraper_class(county: str, state: str, record_type: str):
     with SyncSessionLocal() as db:
         result = db.execute(
             select(CountyConnector).where(
-                CountyConnector.county == county.lower(),
-                CountyConnector.state == state.upper(),
+                func.lower(CountyConnector.county) == county.lower(),
+                func.lower(CountyConnector.state) == state.lower(),
                 CountyConnector.active,
             )
         )

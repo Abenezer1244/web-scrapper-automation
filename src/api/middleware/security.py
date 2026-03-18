@@ -4,7 +4,7 @@ import ipaddress
 import re
 from urllib.parse import urlparse
 
-from fastapi import HTTPException, Request, status
+from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
@@ -44,7 +44,7 @@ _BLOCKED_HOSTNAMES: frozenset[str] = frozenset(
 
 
 def validate_scraping_target(url: str) -> None:
-    """Raise HTTP 422 if the URL is not an approved scraping target.
+    """Raise ValueError if the URL is not an approved scraping target.
 
     Blocks:
     - Non-HTTPS schemes
@@ -55,43 +55,36 @@ def validate_scraping_target(url: str) -> None:
     try:
         parsed = urlparse(url)
     except Exception:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid URL")
+        raise ValueError("Invalid URL")
 
     if parsed.scheme != "https":
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Only HTTPS scraping targets are permitted",
-        )
+        raise ValueError("Only HTTPS scraping targets are permitted")
 
     hostname = (parsed.hostname or "").lower()
 
     if not hostname:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid URL: no hostname")
+        raise ValueError("Invalid URL: no hostname")
 
     if hostname in _BLOCKED_HOSTNAMES:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Scraping target not permitted")
+        raise ValueError("Scraping target not permitted")
 
     # Block IP addresses in restricted ranges
     try:
         addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        addr = None  # hostname is a domain name, not a raw IP
+
+    if addr is not None:
         for network in _BLOCKED_NETWORKS:
             if addr in network:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="Scraping target not permitted",
-                )
-    except ValueError:
-        pass  # hostname is a domain name, not an IP — continue
+                raise ValueError("Scraping target not permitted")
 
     # Allowlist check
     if hostname not in _ALLOWED_SCRAPE_DOMAINS:
         # Also check subdomains of allowed domains
         allowed = any(hostname.endswith(f".{d}") or hostname == d for d in _ALLOWED_SCRAPE_DOMAINS)
         if not allowed:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Scraping target not in approved domain list",
-            )
+            raise ValueError("Scraping target not in approved domain list")
 
 
 def add_scrape_domain(domain: str) -> None:

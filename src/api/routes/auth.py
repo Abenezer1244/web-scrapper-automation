@@ -134,7 +134,7 @@ async def logout_all(
     audit_log(request, "logout_all", current_user.id)
 
 
-@router.post("/api-key", response_model=ApiKeyResponse)
+@router.post("/api-key", response_model=ApiKeyResponse, status_code=status.HTTP_201_CREATED)
 async def create_api_key(
     request: Request,
     current_user: Annotated[User, Depends(require_plan("business", "agency"))],

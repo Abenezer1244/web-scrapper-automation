@@ -3,8 +3,10 @@ import json
 import uuid
 
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import src.db.session as _db_session
 from src.db.models import Job, JobLog, ScraperConfig, User
 
 # ─── List jobs ────────────────────────────────────────────────────────────────
@@ -100,14 +102,16 @@ async def test_create_job_invalid_scraper_id(client: AsyncClient, starter_token:
 
 async def test_create_job_blocked_when_limit_reached(
     client: AsyncClient,
-    db: AsyncSession,
     starter_user: User,
     starter_token: str,
     scraper_config: ScraperConfig,
 ):
-    # Max out the quota
-    starter_user.records_used = starter_user.records_limit
-    await db.commit()
+    # Max out the quota using an inline session to avoid cross-loop db fixture issues
+    async with _db_session.AsyncSessionLocal() as s:
+        result = await s.execute(select(User).where(User.id == starter_user.id))
+        u = result.scalar_one()
+        u.records_used = u.records_limit
+        await s.commit()
 
     resp = await client.post(
         "/jobs",
@@ -120,13 +124,15 @@ async def test_create_job_blocked_when_limit_reached(
 
 async def test_create_job_allowed_when_under_limit(
     client: AsyncClient,
-    db: AsyncSession,
     starter_user: User,
     starter_token: str,
     scraper_config: ScraperConfig,
 ):
-    starter_user.records_used = starter_user.records_limit - 1
-    await db.commit()
+    async with _db_session.AsyncSessionLocal() as s:
+        result = await s.execute(select(User).where(User.id == starter_user.id))
+        u = result.scalar_one()
+        u.records_used = u.records_limit - 1
+        await s.commit()
 
     resp = await client.post(
         "/jobs",
@@ -138,32 +144,33 @@ async def test_create_job_allowed_when_under_limit(
 
 async def test_unlimited_plan_never_blocked(
     client: AsyncClient,
-    db: AsyncSession,
     business_user: User,
     business_token: str,
 ):
-    # Create a scraper config for the business user
-    config = ScraperConfig(
-        id=str(uuid.uuid4()),
-        user_id=business_user.id,
-        name="Business Test Config",
-        county="pierce",
-        state="WA",
-        record_type="probate",
-        fields=[],
-        enrichment=[],
-        schedule={"frequency": "manual"},
-        deliver={"format": "csv", "emails": []},
-    )
-    db.add(config)
-    # Set records_used very high — business plan (-1) should never block
-    business_user.records_limit = -1
-    business_user.records_used = 999999
-    await db.commit()
+    config_id = str(uuid.uuid4())
+    async with _db_session.AsyncSessionLocal() as s:
+        s.add(ScraperConfig(
+            id=config_id,
+            user_id=business_user.id,
+            name="Business Test Config",
+            county="pierce",
+            state="WA",
+            record_type="probate",
+            fields=[],
+            enrichment=[],
+            schedule={"frequency": "manual"},
+            deliver={"format": "csv", "emails": []},
+        ))
+        result = await s.execute(select(User).where(User.id == business_user.id))
+        u = result.scalar_one()
+        # Set records_used very high — business plan (-1) should never block
+        u.records_limit = -1
+        u.records_used = 999999
+        await s.commit()
 
     resp = await client.post(
         "/jobs",
-        json={"scraper_config_id": config.id, "trigger": "manual"},
+        json={"scraper_config_id": config_id, "trigger": "manual"},
         headers={"Authorization": f"Bearer {business_token}"},
     )
     assert resp.status_code == 201
@@ -185,23 +192,23 @@ async def test_cancel_pending_job(
 
 async def test_cancel_done_job_returns_400(
     client: AsyncClient,
-    db: AsyncSession,
     starter_user: User,
     starter_token: str,
     scraper_config: ScraperConfig,
 ):
-    done_job = Job(
-        id=str(uuid.uuid4()),
-        user_id=starter_user.id,
-        scraper_config_id=scraper_config.id,
-        status="done",
-        trigger="manual",
-    )
-    db.add(done_job)
-    await db.commit()
+    job_id = str(uuid.uuid4())
+    async with _db_session.AsyncSessionLocal() as s:
+        s.add(Job(
+            id=job_id,
+            user_id=starter_user.id,
+            scraper_config_id=scraper_config.id,
+            status="done",
+            trigger="manual",
+        ))
+        await s.commit()
 
     resp = await client.delete(
-        f"/jobs/{done_job.id}",
+        f"/jobs/{job_id}",
         headers={"Authorization": f"Bearer {starter_token}"},
     )
     assert resp.status_code == 400
@@ -210,23 +217,23 @@ async def test_cancel_done_job_returns_400(
 
 async def test_cancel_failed_job_returns_400(
     client: AsyncClient,
-    db: AsyncSession,
     starter_user: User,
     starter_token: str,
     scraper_config: ScraperConfig,
 ):
-    failed_job = Job(
-        id=str(uuid.uuid4()),
-        user_id=starter_user.id,
-        scraper_config_id=scraper_config.id,
-        status="failed",
-        trigger="manual",
-    )
-    db.add(failed_job)
-    await db.commit()
+    job_id = str(uuid.uuid4())
+    async with _db_session.AsyncSessionLocal() as s:
+        s.add(Job(
+            id=job_id,
+            user_id=starter_user.id,
+            scraper_config_id=scraper_config.id,
+            status="failed",
+            trigger="manual",
+        ))
+        await s.commit()
 
     resp = await client.delete(
-        f"/jobs/{failed_job.id}",
+        f"/jobs/{job_id}",
         headers={"Authorization": f"Bearer {starter_token}"},
     )
     assert resp.status_code == 400
@@ -236,23 +243,23 @@ async def test_cancel_failed_job_returns_400(
 
 async def test_sse_replays_existing_logs(
     client: AsyncClient,
-    db: AsyncSession,
     starter_user: User,
     starter_token: str,
     pending_job: Job,
 ):
-    # Seed two log entries for the job
-    for msg in ["Job queued — Pierce County", "Probing county portal..."]:
-        db.add(JobLog(
-            id=str(uuid.uuid4()),
-            job_id=pending_job.id,
-            level="info",
-            message=msg,
-        ))
-
-    # Mark job done so SSE terminates after replay
-    pending_job.status = "done"
-    await db.commit()
+    # Seed log entries and mark job done using an inline session
+    async with _db_session.AsyncSessionLocal() as s:
+        for msg in ["Job queued — Pierce County", "Probing county portal..."]:
+            s.add(JobLog(
+                id=str(uuid.uuid4()),
+                job_id=pending_job.id,
+                level="info",
+                message=msg,
+            ))
+        result = await s.execute(select(Job).where(Job.id == pending_job.id))
+        job = result.scalar_one()
+        job.status = "done"
+        await s.commit()
 
     resp = await client.get(
         f"/jobs/{pending_job.id}/logs",

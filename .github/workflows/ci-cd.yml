@@ -164,7 +164,7 @@ jobs:
 
   # ─── Deploy Production ────────────────────────────────────────────────────────
   deploy-production:
-    name: Deploy to Production
+    name: Run Migrations
     runs-on: ubuntu-latest
     needs: build
     if: github.ref == 'refs/heads/main'
@@ -173,48 +173,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Railway CLI
-        run: npm install -g @railway/cli
-
       - name: Run DB migrations
         env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PRODUCTION }}
           DATABASE_URL: ${{ secrets.DATABASE_URL || 'postgresql+asyncpg://unused:unused@localhost/unused' }}
           DATABASE_URL_SYNC: ${{ secrets.DATABASE_URL_SYNC }}
           REDIS_URL: ${{ secrets.REDIS_URL || 'redis://localhost:6379/0' }}
-          # SECRET_KEY is not used by alembic but Settings() validates it on import.
-          # Fall back to a placeholder so migrations can run even before the secret is set.
           SECRET_KEY: ${{ secrets.SECRET_KEY || 'migration-ci-placeholder-not-used-in-production!!' }}
         run: |
           pip install -r requirements.txt
           alembic upgrade head
-
-      - name: Deploy API to Railway
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PRODUCTION }}
-        run: |
-          for i in 1 2 3; do
-            railway up --service api --environment production --detach && break
-            echo "Attempt $i failed, retrying in 10s..."
-            sleep 10
-          done
-
-      - name: Deploy Worker to Railway
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PRODUCTION }}
-        run: |
-          for i in 1 2 3; do
-            railway up --service worker --environment production --detach && break
-            echo "Attempt $i failed, retrying in 10s..."
-            sleep 10
-          done
-
-      - name: Deploy Beat to Railway
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PRODUCTION }}
-        run: |
-          for i in 1 2 3; do
-            railway up --service beat --environment production --detach && break
-            echo "Attempt $i failed, retrying in 10s..."
-            sleep 10
-          done

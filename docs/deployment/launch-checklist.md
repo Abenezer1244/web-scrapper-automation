@@ -16,57 +16,57 @@ Complete every item in order. Do not skip steps.
 
 ## Step 1 — Supabase Database
 
-- [ ] Go to [supabase.com](https://supabase.com) → your project → **Settings → Database**
-- [ ] Copy the **Connection string (URI)** — select **Transaction** mode for `DATABASE_URL_SYNC` (psycopg2) and **Session** mode for `DATABASE_URL` (asyncpg)
-- [ ] Enable **Point-in-Time Recovery** (PITR) under **Database → Backups**
-- [ ] Set a database password — save it securely
+- [x] Go to [supabase.com](https://supabase.com) → your project → **Settings → Database**
+- [x] Copy the **Connection string (URI)** — select **Transaction** mode for `DATABASE_URL_SYNC` (psycopg2) and **Session** mode for `DATABASE_URL` (asyncpg)
+- [x] Enable **Point-in-Time Recovery** (PITR) under **Database → Backups**
+- [x] Set a database password — save it securely
 
 ---
 
 ## Step 2 — Cloudflare R2
 
-- [ ] Cloudflare dashboard → **R2** → Create bucket `bridgeleads-exports` (region: WNAM)
-- [ ] **R2 → Manage R2 API Tokens** → Create token with **Object Read & Write** on `bridgeleads-exports`
-- [ ] Copy: Account ID, Access Key ID, Secret Access Key, Endpoint URL
+- [x] Cloudflare dashboard → **R2** → Create bucket `bridgeleads-exports` (region: WNAM)
+- [x] **R2 → Manage R2 API Tokens** → Create token with **Object Read & Write** on `bridgeleads-exports`
+- [x] Copy: Account ID, Access Key ID, Secret Access Key, Endpoint URL
   Format: `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`
 
 ---
 
 ## Step 3 — Stripe
 
-- [ ] [dashboard.stripe.com](https://dashboard.stripe.com) → **Developers → API keys** → copy Secret key
-- [ ] **Products** → Create 3 products:
+- [x] [dashboard.stripe.com](https://dashboard.stripe.com) → **Developers → API keys** → copy Secret key
+- [x] **Products** → Create 3 products:
   - Pro ($99/mo) → copy Price ID → `STRIPE_PRICE_PRO`
   - Business ($299/mo) → copy Price ID → `STRIPE_PRICE_BUSINESS`
   - Agency ($799/mo) → copy Price ID → `STRIPE_PRICE_AGENCY`
-- [ ] **Webhooks** → Add endpoint: `https://api.bridgeleads.io/billing/webhook`
+- [x] **Webhooks** → Add endpoint: `https://api.bridgeleads.io/billing/webhook`
   - Events: `checkout.session.completed`, `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.payment_failed`
   - Copy Signing secret → `STRIPE_WEBHOOK_SECRET`
-- [ ] Enable **Stripe Customer Portal** → Settings → Customer portal → Activate
+- [x] Enable **Stripe Customer Portal** → Settings → Customer portal → Activate
 
 ---
 
 ## Step 4 — Resend Email
 
-- [ ] [resend.com](https://resend.com) → **API Keys** → Create key → `RESEND_API_KEY`
-- [ ] **Domains** → Add `bridgeleads.io` → verify DNS records in Cloudflare
-- [ ] Set `EMAIL_FROM=leads@bridgeleads.io`
+- [x] [resend.com](https://resend.com) → **API Keys** → Create key → `RESEND_API_KEY`
+- [x] **Domains** → Add `bridgeleads.io` → verify DNS records in Cloudflare
+- [x] Set `EMAIL_FROM=leads@bridgeleads.io`
 
 ---
 
 ## Step 5 — Upstash Redis
 
-- [ ] [upstash.com](https://upstash.com) → Create database → region: `us-west-1`
-- [ ] Copy **Redis URL** (TLS) → `REDIS_URL`
+- [x] [upstash.com](https://upstash.com) → Create database → region: `us-west-1`
+- [x] Copy **Redis URL** (TLS) → `REDIS_URL`
 
 ---
 
 ## Step 6 — Railway Setup
 
-- [ ] `railway login`
-- [ ] `railway init` → create project `bridgeleads-production`
-- [ ] Create 3 services: **api**, **worker**, **beat**
-- [ ] Set all environment variables on each service:
+- [x] `railway login`
+- [x] `railway init` → create project `bridgeleads-production`
+- [x] Create 3 services: **api**, **worker**, **beat**
+- [x] Set all environment variables on each service:
 
 ```bash
 # Run for each service: api, worker, beat
@@ -143,15 +143,15 @@ railway run --service api alembic upgrade head
 
 ## Step 10 — Vercel (Frontend)
 
-- [ ] `cd bridgeleads-web`
-- [ ] `npx vercel --prod`
-- [ ] Set environment variables in Vercel dashboard:
+- [x] `cd bridgeleads-web`
+- [x] `npx vercel --prod`
+- [x] Set environment variables in Vercel dashboard:
   ```
   NEXT_PUBLIC_API_URL=https://api.bridgeleads.io
   NEXTAUTH_URL=https://app.bridgeleads.io
   NEXTAUTH_SECRET=<min 32 char random string>
   ```
-- [ ] Add `app.bridgeleads.io` as custom domain in Vercel
+- [x] Add `app.bridgeleads.io` as custom domain in Vercel
 
 ---
 
@@ -215,22 +215,22 @@ curl -X POST https://api.bridgeleads.io/billing/checkout \
 
 ## Step 14 — Monitoring
 
-- [ ] Open Grafana: `http://YOUR_SERVER:3001` (or tunnel via Railway)
-- [ ] Default login: `admin` / `${GRAFANA_PASSWORD}`
-- [ ] Verify all 4 Prometheus targets are green: fastapi, celery, redis, postgres
-- [ ] Confirm the BridgeLeads dashboard loaded (auto-provisioned from `infra/grafana/dashboards/`)
-- [ ] Create Slack channel `#bridgeleads-alerts`
-- [ ] Set `SLACK_WEBHOOK_URL` in alertmanager environment
-- [ ] Trigger a test alert: `curl -X POST http://localhost:9093/-/reload`
+- [x] Open Grafana: `http://YOUR_SERVER:3001` (or tunnel via Railway)
+- [x] Default login: `admin` / `${GRAFANA_PASSWORD}`
+- [x] Verify all 4 Prometheus targets are green: fastapi, celery, redis, postgres
+- [x] Confirm the BridgeLeads dashboard loaded (auto-provisioned from `infra/grafana/dashboards/`)
+- [x] Create Slack channel `#bridgeleads-alerts`
+- [x] Set `SLACK_WEBHOOK_URL` in alertmanager environment
+- [x] Trigger a test alert: `curl -X POST http://localhost:9093/-/reload`
 
 ---
 
 ## Step 15 — Supabase Backups
 
-- [ ] Supabase dashboard → **Database → Backups**
-- [ ] Enable **Point-in-Time Recovery**
-- [ ] Verify daily backups are scheduled
-- [ ] Test restore procedure on staging before going live
+- [x] Supabase dashboard → **Database → Backups**
+- [x] Enable **Point-in-Time Recovery**
+- [x] Verify daily backups are scheduled
+- [x] Test restore procedure on staging before going live
 
 ---
 

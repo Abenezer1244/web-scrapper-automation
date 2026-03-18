@@ -2,8 +2,7 @@
 import pytest
 from pydantic import ValidationError
 
-from src.config import settings, Settings
-
+from src.config import Settings, settings
 
 # ─── Singleton sanity ─────────────────────────────────────────────────────────
 

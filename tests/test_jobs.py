@@ -2,12 +2,10 @@
 import json
 import uuid
 
-import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import Job, JobLog, ScraperConfig, User
-
 
 # ─── List jobs ────────────────────────────────────────────────────────────────
 

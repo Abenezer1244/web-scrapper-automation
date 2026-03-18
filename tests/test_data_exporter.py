@@ -5,8 +5,7 @@ import json
 import pytest
 
 from src.api.middleware.security import sanitize_for_csv
-from src.utils.data_exporter import DataExporter, _build_dataframe, _COLUMN_ORDER
-
+from src.utils.data_exporter import _COLUMN_ORDER, DataExporter, _build_dataframe
 
 LEAD_RECORDS = [
     {

@@ -2,7 +2,6 @@
 
 import ipaddress
 import re
-import unicodedata
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request, status

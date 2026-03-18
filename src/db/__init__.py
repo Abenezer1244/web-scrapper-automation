@@ -1,5 +1,12 @@
 from .models import Base, CountyConnector, Job, JobLog, Result, ScraperConfig, User
-from .session import AsyncSessionLocal, SyncSessionLocal, async_engine, get_db, get_sync_db, sync_engine
+from .session import (
+    AsyncSessionLocal,
+    SyncSessionLocal,
+    async_engine,
+    get_db,
+    get_sync_db,
+    sync_engine,
+)
 
 __all__ = [
     "Base",

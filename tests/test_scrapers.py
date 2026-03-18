@@ -5,7 +5,6 @@ from src.api.middleware.security import sanitize_for_csv, validate_scraping_targ
 from src.scrapers.base_scraper import BridgeScraper
 from src.scrapers.registry import UnsupportedCountyError, get_scraper_class
 
-
 # ─── validate_scraping_target — SSRF prevention ───────────────────────────────
 
 @pytest.mark.parametrize("url", [

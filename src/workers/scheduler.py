@@ -1,11 +1,11 @@
 """Celery beat scheduler: 4 periodic tasks."""
 
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
 
 from celery.schedules import crontab
 
-from src.workers import app
 from src.utils.logger import setup_logger
+from src.workers import app
 
 _logger = setup_logger("worker.scheduler")
 
@@ -40,18 +40,20 @@ def dispatch_scheduled_jobs() -> None:
     Runs every minute. Idempotent — checks for an existing pending/running job
     for the same config before enqueuing to prevent duplicates.
     """
-    from src.db.session import SyncSessionLocal
-    from src.db.models import Job, ScraperConfig
-    from src.workers.tasks import run_scrape_job
-    from sqlalchemy import select
     import uuid
 
-    now = datetime.now(timezone.utc)
+    from sqlalchemy import select
+
+    from src.db.models import Job, ScraperConfig
+    from src.db.session import SyncSessionLocal
+    from src.workers.tasks import run_scrape_job
+
+    now = datetime.now(UTC)
     enqueued = 0
 
     with SyncSessionLocal() as db:
         configs = db.execute(
-            select(ScraperConfig).where(ScraperConfig.active == True)
+            select(ScraperConfig).where(ScraperConfig.active)
         ).scalars().all()
 
         for config in configs:
@@ -123,12 +125,13 @@ def watchdog_stuck_jobs() -> None:
 
     Runs every 5 minutes. Re-queues the job for retry up to max_retries times.
     """
-    from src.db.session import SyncSessionLocal
-    from src.db.models import Job
-    from src.workers.tasks import run_scrape_job
     from sqlalchemy import select
 
-    stuck_cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
+    from src.db.models import Job
+    from src.db.session import SyncSessionLocal
+    from src.workers.tasks import run_scrape_job
+
+    stuck_cutoff = datetime.now(UTC) - timedelta(minutes=30)
     active_statuses = {"queued", "probing", "scraping", "enriching"}
 
     with SyncSessionLocal() as db:
@@ -142,7 +145,7 @@ def watchdog_stuck_jobs() -> None:
         for job in stuck_jobs:
             if job.retry_count < 3:
                 stuck_minutes = (
-                    int((datetime.now(timezone.utc) - job.started_at).total_seconds() / 60)
+                    int((datetime.now(UTC) - job.started_at).total_seconds() / 60)
                     if job.started_at else "?"
                 )
                 job.retry_count += 1
@@ -158,7 +161,7 @@ def watchdog_stuck_jobs() -> None:
                 )
             else:
                 job.status = "failed"
-                job.finished_at = datetime.now(timezone.utc)
+                job.finished_at = datetime.now(UTC)
                 job.error_message = (
                     "This scraper run did not complete in time. "
                     "Our team has been notified and will investigate."
@@ -179,15 +182,17 @@ def canary_check() -> None:
       - 'degraded' — canary returned 0 records (portal reachable but empty)
       - 'down'     — canary threw an exception
     """
-    from src.db.session import SyncSessionLocal
-    from src.db.models import CountyConnector
-    from src.scrapers.registry import get_scraper_class, UnsupportedCountyError
-    from sqlalchemy import select
     import asyncio
+
+    from sqlalchemy import select
+
+    from src.db.models import CountyConnector
+    from src.db.session import SyncSessionLocal
+    from src.scrapers.registry import UnsupportedCountyError, get_scraper_class
 
     with SyncSessionLocal() as db:
         connectors = db.execute(
-            select(CountyConnector).where(CountyConnector.active == True)
+            select(CountyConnector).where(CountyConnector.active)
         ).scalars().all()
 
         for connector in connectors:
@@ -196,7 +201,7 @@ def canary_check() -> None:
                     connector.county, connector.state, connector.record_types[0]
                 )
                 # Probe a single day to minimise load on county portal
-                today = datetime.now(timezone.utc).date()
+                today = datetime.now(UTC).date()
                 yesterday = today - timedelta(days=1)
 
                 records = asyncio.run(
@@ -214,7 +219,7 @@ def canary_check() -> None:
                 _logger.error("Canary failed for %s/%s: %s", connector.county, connector.state, exc)
                 connector.health_status = "down"
 
-            connector.last_checked = datetime.now(timezone.utc)
+            connector.last_checked = datetime.now(UTC)
 
         db.commit()
 
@@ -233,9 +238,10 @@ def reset_monthly_usage() -> None:
     Runs at midnight UTC on the 1st. This clears the monthly quota so
     all plans get a fresh allocation each billing cycle.
     """
-    from src.db.session import SyncSessionLocal
-    from src.db.models import User
     from sqlalchemy import update
+
+    from src.db.models import User
+    from src.db.session import SyncSessionLocal
 
     with SyncSessionLocal() as db:
         result = db.execute(update(User).values(records_used=0))

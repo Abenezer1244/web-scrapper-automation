@@ -8,9 +8,8 @@ stays functional if the portal reorders its columns.
 """
 
 import re
-from typing import Any
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
@@ -193,9 +192,6 @@ class PierceWAProbateScraper(BridgeScraper):
     def _map_row(self, cell_texts: list[str], headers: list[str]) -> ScrapedRecord | None:
         """Map a result row to a ScrapedRecord using header hints + heuristics."""
         record = ScrapedRecord()
-
-        # Build a combined text blob for heuristic scanning
-        all_text = " ".join(cell_texts)
 
         # ── Date: first cell matching date pattern ────────────────────────────
         for text in cell_texts:

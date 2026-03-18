@@ -41,7 +41,7 @@ def get_scraper_class(county: str, state: str, record_type: str):
             select(CountyConnector).where(
                 CountyConnector.county == county.lower(),
                 CountyConnector.state == state.upper(),
-                CountyConnector.active == True,
+                CountyConnector.active,
             )
         )
         connector = result.scalar_one_or_none()
@@ -81,7 +81,7 @@ def list_supported() -> list[dict]:
     """
     with SyncSessionLocal() as db:
         result = db.execute(
-            select(CountyConnector).where(CountyConnector.active == True)
+            select(CountyConnector).where(CountyConnector.active)
             .order_by(CountyConnector.state, CountyConnector.county)
         )
         connectors = result.scalars().all()

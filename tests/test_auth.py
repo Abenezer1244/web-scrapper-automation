@@ -1,10 +1,7 @@
 """Tests for authentication: register, login, JWT, brute-force, API keys."""
-import pytest
 from httpx import AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import User
-
 
 # ─── Register ─────────────────────────────────────────────────────────────────
 

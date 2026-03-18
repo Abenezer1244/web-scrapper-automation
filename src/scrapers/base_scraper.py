@@ -125,7 +125,6 @@ class BridgeScraper:
         """Return a BeautifulSoup parse of the current page content."""
         if not self.page:
             raise RuntimeError("BridgeScraper not started — use 'async with BridgeScraper()'")
-        content = self.page.content()
         # page.content() is a coroutine — callers must await this helper or use get_soup_async
         raise RuntimeError("Use await get_soup_async() instead of get_soup()")
 

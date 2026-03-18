@@ -3,7 +3,7 @@
 import asyncio
 import json
 import uuid
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
 
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -12,11 +12,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
+from src.api.deps import get_rls_db
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.schemas import JobCreate, JobResponse, LogLine, ResultRow, ResultsPage
 from src.config import settings
-from src.api.deps import get_rls_db
-from src.db import Job, JobLog, Result, ScraperConfig, get_db
+from src.db import Job, JobLog, Result, ScraperConfig
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -51,7 +51,7 @@ async def create_job(
         select(ScraperConfig).where(
             ScraperConfig.id == body.scraper_config_id,
             ScraperConfig.user_id == current_user.id,
-            ScraperConfig.active == True,
+            ScraperConfig.active,
         )
     )
     if config_result.scalar_one_or_none() is None:

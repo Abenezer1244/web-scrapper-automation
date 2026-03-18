@@ -1,0 +1,5 @@
+﻿cloudflare_api_token  = "AwLQdz2Fzu3uEhmkK1EAgfmzsfIjMdd-OibCtzyR"
+cloudflare_zone_id = "8218901888215bdabd0d77cbee03279a"
+cloudflare_account_id = "8f25a1f3e733636f98254a997fe6c127"
+railway_api_ip = "66.33.22.1"
+vercel_ip = "cname.vercel-dns.com"

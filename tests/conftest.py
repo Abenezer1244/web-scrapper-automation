@@ -10,15 +10,14 @@ import pytest
 import pytest_asyncio
 import redis as sync_redis
 from httpx import ASGITransport, AsyncClient
+from main import app
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from main import app
 from src.api.auth import create_secure_token, hash_password
 from src.config import settings
-from src.db.models import CountyConnector, Job, JobLog, Result, ScraperConfig, User
+from src.db.models import Job, JobLog, Result, ScraperConfig, User
 from src.db.session import AsyncSessionLocal
-
 
 # ─── Database fixture ─────────────────────────────────────────────────────────
 

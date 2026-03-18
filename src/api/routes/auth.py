@@ -5,7 +5,6 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from jose import jwt
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -75,7 +74,7 @@ async def login(
     ip = _client_ip(request)
     await BruteForceProtection.check(ip, body.email)
 
-    result = await db.execute(select(User).where(User.email == body.email, User.is_active == True))
+    result = await db.execute(select(User).where(User.email == body.email, User.is_active))
     user = result.scalar_one_or_none()
 
     # Always run verify_password — even when user not found — to prevent timing attacks.

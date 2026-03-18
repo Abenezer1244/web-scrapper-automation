@@ -1,6 +1,5 @@
 """Data exporter: CSV / Excel / JSON with CSV injection sanitization and R2 upload."""
 
-import io
 import json
 from datetime import datetime
 from pathlib import Path

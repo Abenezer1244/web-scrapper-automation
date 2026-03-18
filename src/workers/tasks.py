@@ -7,19 +7,19 @@ State machine:
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import redis as sync_redis
 
-from src.workers import app
 from src.config import settings
 from src.utils.logger import setup_logger
+from src.workers import app
 
 _logger = setup_logger("worker.task")
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _redis() -> sync_redis.Redis:
@@ -28,9 +28,10 @@ def _redis() -> sync_redis.Redis:
 
 def _publish_log(r: sync_redis.Redis, job_id: str, level: str, message: str) -> None:
     """Publish a log line to Redis Pub/Sub and persist it to the DB."""
-    from src.db.session import SyncSessionLocal
-    from src.db.models import JobLog
     import uuid
+
+    from src.db.models import JobLog
+    from src.db.session import SyncSessionLocal
 
     payload = {
         "id": str(uuid.uuid4()),
@@ -70,12 +71,13 @@ def _set_status(db, job, status: str, **kwargs) -> None:
 )
 def run_scrape_job(self, job_id: str) -> None:
     """Execute a full scrape job lifecycle for the given job_id."""
-    from src.db.session import SyncSessionLocal
+    from sqlalchemy import select
+
     from src.db.models import Job, Result, ScraperConfig, User
-    from src.scrapers.registry import get_scraper_class, UnsupportedCountyError
+    from src.db.session import SyncSessionLocal
+    from src.scrapers.registry import UnsupportedCountyError, get_scraper_class
     from src.utils.data_exporter import DataExporter
     from src.workers.delivery import deliver_job_results
-    from sqlalchemy import select
 
     r = _redis()
 
@@ -120,9 +122,9 @@ def run_scrape_job(self, job_id: str) -> None:
 
         try:
             records = asyncio.run(_run_scraper(scraper_class, date_from, date_to, r, job_id))
-        except Exception as exc:
+        except Exception:
             _logger.exception("Scraper error for job %s", job_id)
-            _fail_job(db, job, r, job_id, f"Scraper encountered an error — our team has been notified.")
+            _fail_job(db, job, r, job_id, "Scraper encountered an error — our team has been notified.")
             return
 
         _publish_log(r, job_id, "success", f"Scrape complete — {len(records)} records found")
@@ -217,7 +219,7 @@ def _resolve_date_range(schedule: dict) -> tuple[str, str]:
     """Compute date_from and date_to from a scraper's schedule config."""
     from datetime import timedelta
 
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     range_mode = schedule.get("range_mode", "rolling_90")
 
     if range_mode == "custom":

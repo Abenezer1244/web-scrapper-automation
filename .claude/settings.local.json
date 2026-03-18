@@ -6,7 +6,17 @@
       "Bash(uvx:*)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(npx:*)",
-      "Bash(where npx:*)"
+      "Bash(where npx:*)",
+      "Bash(cd:*)",
+      "Bash(pip install:*)",
+      "Bash(cat:*)",
+      "Bash(chmod:*)",
+      "Bash(python:*)",
+      "Bash(mkdir:*)",
+      "Bash(node:*)",
+      "mcp__supabase__list_projects",
+      "mcp__supabase__get_project",
+      "mcp__supabase__get_project_url"
     ]
   }
 }

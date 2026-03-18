@@ -7,8 +7,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
-from src.api.schemas import ConnectorResponse, ScraperConfigCreate, ScraperConfigResponse
 from src.api.deps import get_rls_db
+from src.api.schemas import ConnectorResponse, ScraperConfigCreate, ScraperConfigResponse
 from src.db import CountyConnector, ScraperConfig, get_db
 
 router = APIRouter(prefix="/scrapers", tags=["scrapers"])
@@ -23,7 +23,7 @@ async def list_scrapers(
 ) -> list[ScraperConfigResponse]:
     result = await db.execute(
         select(ScraperConfig)
-        .where(ScraperConfig.user_id == current_user.id, ScraperConfig.active == True)
+        .where(ScraperConfig.user_id == current_user.id, ScraperConfig.active)
         .order_by(ScraperConfig.created_at.desc())
     )
     return [ScraperConfigResponse.model_validate(s) for s in result.scalars().all()]
@@ -41,7 +41,7 @@ async def create_scraper(
         select(CountyConnector).where(
             CountyConnector.county == body.county,
             CountyConnector.state == body.state,
-            CountyConnector.active == True,
+            CountyConnector.active,
         )
     )
     connector = result.scalar_one_or_none()
@@ -96,7 +96,7 @@ async def list_connectors(
     """
     result = await db.execute(
         select(CountyConnector)
-        .where(CountyConnector.active == True)
+        .where(CountyConnector.active)
         .order_by(CountyConnector.state, CountyConnector.county)
     )
     return [ConnectorResponse.model_validate(c) for c in result.scalars().all()]

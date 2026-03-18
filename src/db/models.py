@@ -1,7 +1,7 @@
 import uuid
-from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     Column,
     DateTime,
@@ -9,7 +9,6 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
-    JSON,
     func,
 )
 from sqlalchemy.dialects.postgresql import UUID

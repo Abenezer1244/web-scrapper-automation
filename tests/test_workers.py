@@ -1,15 +1,13 @@
 """Tests for Celery workers: watchdog, monthly reset, and delivery."""
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
-import pytest
 from sqlalchemy.orm import Session
 
+from src.api.auth import hash_password
 from src.db.models import Job, ScraperConfig, User
 from src.db.session import SyncSessionLocal
-from src.utils.data_exporter import DataExporter, _build_dataframe, _COLUMN_ORDER
-from src.api.auth import hash_password
-
+from src.utils.data_exporter import _COLUMN_ORDER, DataExporter, _build_dataframe
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -52,7 +50,7 @@ def _create_stuck_job(db: Session, user_id: str, config_id: str, minutes_ago: in
         scraper_config_id=config_id,
         status="scraping",
         trigger="scheduled",
-        started_at=datetime.now(timezone.utc) - timedelta(minutes=minutes_ago),
+        started_at=datetime.now(UTC) - timedelta(minutes=minutes_ago),
     )
     db.add(job)
     db.flush()

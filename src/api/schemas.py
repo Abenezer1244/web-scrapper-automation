@@ -3,7 +3,6 @@ from typing import Any
 
 from pydantic import BaseModel, EmailStr, field_validator
 
-
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
 class UserRegister(BaseModel):

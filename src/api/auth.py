@@ -13,9 +13,9 @@ from passlib.context import CryptContext
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.middleware.auth_hardening import TokenBlacklist, constant_time_compare
 from src.config import settings
 from src.db import User, get_db
-from src.api.middleware.auth_hardening import TokenBlacklist, constant_time_compare
 
 # ─── Password hashing ─────────────────────────────────────────────────────────
 
@@ -105,7 +105,7 @@ async def get_current_user(
     if token.startswith("bl_"):
         key_hash = hash_api_key(token)
         result = await db.execute(
-            select(User).where(User.api_key_hash.isnot(None), User.is_active == True)
+            select(User).where(User.api_key_hash.isnot(None), User.is_active)
         )
         # constant-time comparison across all users with api keys
         user_match: User | None = None
@@ -140,7 +140,7 @@ async def get_current_user(
         raise _CREDENTIALS_EXCEPTION
 
     result = await db.execute(
-        select(User).where(User.id == user_id, User.is_active == True)
+        select(User).where(User.id == user_id, User.is_active)
     )
     user = result.scalar_one_or_none()
     if user is None:

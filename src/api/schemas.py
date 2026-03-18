@@ -45,17 +45,35 @@ class ApiKeyResponse(BaseModel):
 # ─── Scraper Configs ──────────────────────────────────────────────────────────
 
 class ScheduleConfig(BaseModel):
-    frequency: str = "manual"       # manual | daily | weekly | monthly
-    time: str = "06:00"             # HH:MM UTC
-    range_mode: str = "rolling_90"  # rolling_90 | custom | since_last_run
+    frequency: str = "manual"           # manual | daily | weekly | monthly
+    run_at_hour: int = 6                # 0–23 UTC
+    run_at_minute: int = 0              # 0–59
+    date_range_mode: str = "rolling_90" # rolling_90 | custom | since_last_run
     date_from: str | None = None
     date_to: str | None = None
 
 
 class DeliverConfig(BaseModel):
     emails: list[str] = []
-    format: str = "csv"             # csv | excel | json
+    formats: list[str] = ["csv"]    # csv | excel | json (one or more)
     webhook_url: str | None = None
+
+
+class FieldsConfig(BaseModel):
+    party_name: bool = True
+    parcel_id: bool = True
+    property_address: bool = True
+    mailing_address: bool = True
+    heirs: bool = True
+    legal_description: bool = False
+    date_recorded: bool = True
+
+    model_config = {"extra": "allow"}
+
+
+class EnrichmentConfig(BaseModel):
+    property_lookup: bool = True
+    skip_tracing: bool = False
 
 
 class ScraperConfigCreate(BaseModel):
@@ -63,8 +81,8 @@ class ScraperConfigCreate(BaseModel):
     county: str
     state: str
     record_type: str
-    fields: list[str] = []
-    enrichment: list[str] = []
+    fields: FieldsConfig = FieldsConfig()
+    enrichment: EnrichmentConfig = EnrichmentConfig()
     schedule: ScheduleConfig = ScheduleConfig()
     deliver: DeliverConfig = DeliverConfig()
 
@@ -86,8 +104,8 @@ class ScraperConfigResponse(BaseModel):
     county: str
     state: str
     record_type: str
-    fields: list[str]
-    enrichment: list[str]
+    fields: dict[str, Any]
+    enrichment: dict[str, Any]
     schedule: dict[str, Any]
     deliver: dict[str, Any]
     active: bool

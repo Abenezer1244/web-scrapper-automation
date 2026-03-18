@@ -63,7 +63,7 @@ async def create_scraper(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail="Webhook delivery requires a Business or Agency plan",
         )
-    if body.enrichment and "skip_tracing" in body.enrichment and current_user.plan not in _BUSINESS_PLANS:
+    if body.enrichment.skip_tracing and current_user.plan not in _BUSINESS_PLANS:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail="Skip tracing enrichment requires a Business or Agency plan",

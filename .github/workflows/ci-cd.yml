@@ -192,14 +192,29 @@ jobs:
       - name: Deploy API to Railway
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PRODUCTION }}
-        run: railway up --service api --environment production
+        run: |
+          for i in 1 2 3; do
+            railway up --service api --environment production --detach && break
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Deploy Worker to Railway
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PRODUCTION }}
-        run: railway up --service worker --environment production
+        run: |
+          for i in 1 2 3; do
+            railway up --service worker --environment production --detach && break
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Deploy Beat to Railway
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PRODUCTION }}
-        run: railway up --service beat --environment production
+        run: |
+          for i in 1 2 3; do
+            railway up --service beat --environment production --detach && break
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done

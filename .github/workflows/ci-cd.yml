@@ -179,10 +179,12 @@ jobs:
       - name: Run DB migrations
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PRODUCTION }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL || 'postgresql+asyncpg://unused:unused@localhost/unused' }}
           DATABASE_URL_SYNC: ${{ secrets.DATABASE_URL_SYNC }}
-          REDIS_URL: ${{ secrets.REDIS_URL }}
-          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          REDIS_URL: ${{ secrets.REDIS_URL || 'redis://localhost:6379/0' }}
+          # SECRET_KEY is not used by alembic but Settings() validates it on import.
+          # Fall back to a placeholder so migrations can run even before the secret is set.
+          SECRET_KEY: ${{ secrets.SECRET_KEY || 'migration-ci-placeholder-not-used-in-production!!' }}
         run: |
           pip install -r requirements.txt
           alembic upgrade head

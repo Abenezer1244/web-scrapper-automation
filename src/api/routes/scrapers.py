@@ -76,8 +76,8 @@ async def create_scraper(
         county=body.county,
         state=body.state,
         record_type=body.record_type,
-        fields=body.fields,
-        enrichment=body.enrichment,
+        fields=body.fields.model_dump(),
+        enrichment=body.enrichment.model_dump(),
         schedule=body.schedule.model_dump(),
         deliver=body.deliver.model_dump(),
     )

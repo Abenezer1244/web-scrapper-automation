@@ -1,3 +1,5 @@
+import ssl
+
 from celery import Celery
 
 from src.config import settings
@@ -8,6 +10,12 @@ app = Celery(
     backend=settings.REDIS_URL,
     include=["src.workers.tasks", "src.workers.scheduler"],
 )
+
+# Upstash Redis uses TLS (rediss://) — kombu needs explicit SSL config
+if settings.REDIS_URL.startswith("rediss://"):
+    _ssl_opts = {"ssl_cert_reqs": ssl.CERT_NONE}
+    app.conf.broker_use_ssl = _ssl_opts
+    app.conf.redis_backend_use_ssl = _ssl_opts
 
 app.conf.update(
     task_acks_late=True,

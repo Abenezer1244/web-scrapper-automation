@@ -12,10 +12,18 @@ async def test_register_creates_user(client: AsyncClient):
     })
     assert resp.status_code == 201
     data = resp.json()
-    assert data["email"] == "newuser@test.bridgeleads.io"
-    assert data["plan"] == "starter"
+    # Register returns TokenResponse (access_token + token_type)
+    assert "access_token" in data
+    assert data["token_type"] == "bearer"
     assert "password" not in data
     assert "password_hash" not in data
+
+    # Verify user was created with correct fields via /auth/me
+    me = await client.get("/auth/me", headers={"Authorization": f"Bearer {data['access_token']}"})
+    assert me.status_code == 200
+    me_data = me.json()
+    assert me_data["email"] == "newuser@test.bridgeleads.io"
+    assert me_data["plan"] == "starter"
 
 
 async def test_register_duplicate_returns_generic_error(client: AsyncClient):
@@ -119,8 +127,8 @@ async def test_logout_blacklists_token(client: AsyncClient):
     # Token works before logout
     assert (await client.get("/auth/me", headers=headers)).status_code == 200
 
-    # Logout
-    assert (await client.post("/auth/logout", headers=headers)).status_code == 200
+    # Logout (returns 204 No Content)
+    assert (await client.post("/auth/logout", headers=headers)).status_code == 204
 
     # Token rejected after logout
     resp = await client.get("/auth/me", headers=headers)

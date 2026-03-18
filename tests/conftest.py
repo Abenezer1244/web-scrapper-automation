@@ -4,6 +4,7 @@ All fixtures use real infrastructure (Postgres, Redis) — no mocks.
 The CI environment sets DATABASE_URL and DATABASE_URL_SYNC to a dedicated
 test database so production data is never touched.
 """
+import asyncio
 import uuid
 
 import pytest
@@ -19,6 +20,24 @@ import src.db.session as _db_session
 from src.api.auth import create_secure_token, hash_password
 from src.config import settings
 from src.db.models import Job, JobLog, Result, ScraperConfig, User
+
+# ─── Session-scoped event loop ────────────────────────────────────────────────
+
+@pytest.fixture(scope="session")
+def event_loop(request):  # noqa: ARG001
+    """Single event loop shared by all tests and async fixtures in the session.
+
+    Without this, pytest-asyncio creates a new event loop per test function
+    while async fixtures (db, starter_user, etc.) run in the session-scoped
+    loop set by asyncio_default_fixture_loop_scope = "session". This mismatch
+    causes 'Future attached to a different loop' errors whenever a test body
+    calls await db.commit(), and 'Event loop is closed' errors for the Redis
+    client singleton that was created in the previous test's loop.
+    """
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
+
 
 # ─── Test engine override ─────────────────────────────────────────────────────
 

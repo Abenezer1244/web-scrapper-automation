@@ -40,7 +40,7 @@ async def create_scraper(
     result = await db.execute(
         select(CountyConnector).where(
             CountyConnector.county == body.county,
-            CountyConnector.state == body.state,
+            CountyConnector.state == body.state.lower(),
             CountyConnector.active,
         )
     )

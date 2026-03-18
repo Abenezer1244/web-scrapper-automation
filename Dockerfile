@@ -43,3 +43,5 @@ RUN useradd -m -u 1000 bridge && chown -R bridge:bridge /app
 USER bridge
 
 EXPOSE 8000
+
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}

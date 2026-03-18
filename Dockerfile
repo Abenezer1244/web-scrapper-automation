@@ -39,9 +39,9 @@ RUN playwright install chromium
 COPY . .
 
 # Create non-root user
-RUN useradd -m -u 1000 bridge && chown -R bridge:bridge /app
+RUN useradd -m -u 1000 bridge && chown -R bridge:bridge /app && chmod +x /app/start.sh
 USER bridge
 
 EXPOSE 8000
 
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+CMD ["/app/start.sh"]

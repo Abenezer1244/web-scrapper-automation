@@ -12,19 +12,45 @@ import redis as sync_redis
 from httpx import ASGITransport, AsyncClient
 from main import app
 from sqlalchemy import delete
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
+import src.db.session as _db_session
 from src.api.auth import create_secure_token, hash_password
 from src.config import settings
 from src.db.models import Job, JobLog, Result, ScraperConfig, User
-from src.db.session import AsyncSessionLocal
+
+# ─── Test engine override ─────────────────────────────────────────────────────
+
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def _setup_test_engine():
+    """Replace the module-level pooled engine with NullPool for test isolation.
+
+    The production engine uses a connection pool whose connections are bound to
+    the event loop that first used them. With function-scoped async fixtures each
+    test runs in a new loop, causing 'Future attached to a different loop' errors.
+
+    NullPool creates a fresh, independent connection for every AsyncSessionLocal()
+    call and closes it immediately afterwards — zero pool state carried between
+    tests.
+    """
+    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
+    _db_session.async_engine = engine
+    _db_session.AsyncSessionLocal = async_sessionmaker(
+        engine, class_=AsyncSession, expire_on_commit=False
+    )
+    yield
+    await engine.dispose()
+
 
 # ─── Database fixture ─────────────────────────────────────────────────────────
 
 @pytest_asyncio.fixture
 async def db() -> AsyncSession:
     """Yield a real async DB session, then clean up all test rows."""
-    async with AsyncSessionLocal() as session:
+    # Use the module reference so we always pick up the NullPool sessionmaker
+    # installed by _setup_test_engine above, not the original pooled one.
+    async with _db_session.AsyncSessionLocal() as session:
         yield session
         # Clean up in FK-safe order; cascade handles children
         await session.execute(delete(JobLog))

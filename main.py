@@ -1,7 +1,9 @@
+import traceback
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from src.api import auth_router, billing_router, jobs_router, scrapers_router
 from src.api.middleware import SecurityHeadersMiddleware
@@ -42,6 +44,17 @@ app.include_router(auth_router)
 app.include_router(scrapers_router)
 app.include_router(jobs_router)
 app.include_router(billing_router)
+
+
+# ─── Debug exception handler (TEMPORARY — remove before production) ───────────
+
+@app.exception_handler(Exception)
+async def debug_exception_handler(request: Request, exc: Exception):
+    tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc), "traceback": tb[-3:]},
+    )
 
 
 # ─── Health check ─────────────────────────────────────────────────────────────

@@ -3,15 +3,16 @@ from collections.abc import AsyncGenerator
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from src.config import settings
 
 # ─── Async engine — FastAPI / async routes ────────────────────────────────────
+# NullPool: let PgBouncer handle connection pooling (prevents prepared statement
+# cache conflicts when PgBouncer resets backend sessions in transaction mode).
 async_engine = create_async_engine(
     settings.DATABASE_URL,
-    pool_size=10,
-    max_overflow=20,
-    pool_pre_ping=True,
+    poolclass=NullPool,
     echo=settings.DEBUG,
     connect_args={"statement_cache_size": 0},
 )
@@ -37,9 +38,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 # ─── Sync engine — Celery workers / Alembic ───────────────────────────────────
 sync_engine = create_engine(
     settings.DATABASE_URL_SYNC,
-    pool_size=5,
-    max_overflow=10,
-    pool_pre_ping=True,
+    poolclass=NullPool,
     echo=settings.DEBUG,
 )
 

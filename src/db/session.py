@@ -1,6 +1,6 @@
 from collections.abc import AsyncGenerator
 
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
@@ -24,15 +24,9 @@ AsyncSessionLocal = async_sessionmaker(
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI dependency: yields an async database session.
-
-    Runs DEALLOCATE ALL at session start to clear any stale prepared
-    statements left by PgBouncer's connection reuse.
-    """
+    """FastAPI dependency: yields an async database session."""
     async with AsyncSessionLocal() as session:
         try:
-            # Clear any stale prepared statements from PgBouncer
-            await session.execute(text("DEALLOCATE ALL"))
             yield session
             await session.commit()
         except Exception:
@@ -46,15 +40,6 @@ sync_engine = create_engine(
     poolclass=NullPool,
     echo=settings.DEBUG,
 )
-
-
-@event.listens_for(sync_engine, "connect")
-def _on_sync_connect(dbapi_connection, connection_record):
-    """Clear prepared statements on new sync connections (PgBouncer compat)."""
-    cursor = dbapi_connection.cursor()
-    cursor.execute("DEALLOCATE ALL")
-    cursor.close()
-
 
 SyncSessionLocal = sessionmaker(
     sync_engine,

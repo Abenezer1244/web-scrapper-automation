@@ -192,6 +192,11 @@ def run_scrape_job(self, job_id: str) -> None:
         _publish_log(r, job_id, "success", f"Job complete — {len(records)} records ready")
         r.publish(f"job_logs:{job_id}", json.dumps({"type": "done", "record_count": len(records)}))
 
+        # ── TRIGGER ENRICHMENT (separate task) ────────────────────────────────
+        # Enrichment runs in a separate Celery task to avoid running two
+        # Playwright browsers in the same worker (memory exhaustion).
+        enrich_job_results.delay(job_id)
+
         # ── EMAIL DELIVERY ─────────────────────────────────────────────────────
         emails = deliver_config.get("emails", [])
         if emails and object_key:
@@ -253,3 +258,142 @@ def _resolve_date_range(schedule: dict) -> tuple[str, str]:
         date_from = today - timedelta(days=90)
 
     return date_from.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y")
+
+
+# ─── Enrichment task (runs separately from scraping) ─────────────────────────
+
+
+@app.task(
+    name="src.workers.tasks.enrich_job_results",
+    bind=True,
+    max_retries=1,
+    default_retry_delay=60,
+    acks_late=True,
+    soft_time_limit=900,   # 15 min
+    time_limit=960,        # 16 min
+)
+def enrich_job_results(self, job_id: str) -> None:
+    """Enrich all results in a completed job with property/mailing addresses.
+
+    Runs as a separate Celery task after scraping completes.
+    Uses its own Playwright browser (no conflict with the scraper).
+    Only enriches records that have a parcel_id but no property_address.
+    """
+    from sqlalchemy import select
+
+    from src.db.models import Job, Result, ScraperConfig
+    from src.db.session import SyncSessionLocal
+
+    r = _redis()
+
+    with SyncSessionLocal() as db:
+        job = db.execute(select(Job).where(Job.id == job_id)).scalar_one_or_none()
+        if job is None or job.status != "done":
+            _logger.info("Enrichment skipped for job %s (status=%s)", job_id, job.status if job else "not found")
+            return
+
+        config = db.execute(
+            select(ScraperConfig).where(ScraperConfig.id == job.scraper_config_id)
+        ).scalar_one_or_none()
+        if config is None:
+            return
+
+        # Find results that need enrichment (have parcel_id, no address)
+        results = db.execute(
+            select(Result).where(
+                Result.job_id == job_id,
+                Result.parcel_id.isnot(None),
+                Result.parcel_id != "",
+                (Result.property_address.is_(None)) | (Result.property_address == "(enrichment unavailable)"),
+            )
+        ).scalars().all()
+
+        if not results:
+            _logger.info("No results need enrichment for job %s", job_id)
+            return
+
+        _logger.info("Enriching %d results for job %s", len(results), job_id)
+        _publish_log(r, job_id, "info", f"Enriching {len(results)} records with property addresses...")
+
+        # Run async enrichment
+        enriched_count = asyncio.run(
+            _run_enrichment(results, config.county, config.state, db, r, job_id)
+        )
+
+        _publish_log(r, job_id, "success", f"Enrichment complete — {enriched_count} addresses found")
+        _logger.info("Enrichment complete for job %s: %d/%d enriched", job_id, enriched_count, len(results))
+
+
+async def _run_enrichment(results, county: str, state: str, db, r, job_id: str) -> int:
+    """Run async enrichment for a batch of results."""
+    from src.scrapers.base_scraper import BridgeScraper
+    from src.scrapers.enrichment.captcha import solve_recaptcha
+
+    enriched = 0
+    sitekey = "6Lcv5V0qAAAAADbB5-O6mhR9xb5q294gpfvabKcT"
+    page_url = "https://atip.piercecountywa.gov/app/parcelSearch"
+
+    # Solve CAPTCHA once
+    from src.config import settings
+    if not settings.CAPTCHA_ENABLED or not settings.CAPTCHA_API_KEY:
+        _logger.warning("CAPTCHA not configured — skipping enrichment")
+        return 0
+
+    token = await solve_recaptcha(page_url, sitekey)
+    if not token:
+        _publish_log(r, job_id, "warning", "CAPTCHA solving failed — enrichment skipped")
+        return 0
+
+    # Open ONE browser for all lookups
+    async with BridgeScraper() as scraper:
+        await scraper.navigate(page_url)
+        await scraper.page.wait_for_timeout(2_000)
+
+        for i, result in enumerate(results):
+            parcel_id = result.parcel_id.strip()
+
+            # Refresh CAPTCHA token if needed (every ~25 lookups)
+            if i > 0 and i % 20 == 0:
+                token = await solve_recaptcha(page_url, sitekey)
+                if not token:
+                    _logger.warning("CAPTCHA refresh failed at record %d", i)
+                    break
+
+            # Call ATIP API from browser context
+            try:
+                api_result = await scraper.page.evaluate("""
+                    async (args) => {
+                        const [pid, tok] = args;
+                        try {
+                            const r = await fetch('/api/parcelSearch?value=' + pid, {
+                                headers: {'Accept':'application/json','recaptcha-response':tok}
+                            });
+                            if (r.status !== 200) return null;
+                            const data = await r.json();
+                            if (!data || !data.length) return null;
+                            return {
+                                address: (data[0].line1 || '').trim() || null,
+                                name: (data[0].name || '').trim() || null
+                            };
+                        } catch(e) { return null; }
+                    }
+                """, [parcel_id, token])
+
+                if api_result and api_result.get("address"):
+                    address = api_result["address"]
+                    result.property_address = address
+                    result.mailing_address = address  # Owner-occupied assumption
+                    result.enrichment_data = {"owner": api_result.get("name"), "source": "atip"}
+                    db.commit()
+                    enriched += 1
+
+                    if enriched <= 5 or enriched % 10 == 0:
+                        _publish_log(r, job_id, "info", f"  {parcel_id} → {address}")
+
+            except Exception as exc:
+                _logger.warning("Enrichment failed for %s: %s", parcel_id, str(exc)[:60])
+
+            # Polite delay
+            await scraper.polite_delay()
+
+    return enriched

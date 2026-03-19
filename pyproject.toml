@@ -56,9 +56,11 @@ omit = [
     "src/db/migrations/*",
     "alembic/*",
     "tests/*",
-    "src/scrapers/enrichment.py",          # external parcel API — no live test environment
+    "src/scrapers/enrichment/*",           # external parcel API — no live test environment
     "src/scrapers/pierce_wa_probate.py",   # Playwright scraper — requires live county portal
-    "src/workers/tasks.py",                # Celery task runner — requires Celery broker
+    "src/scrapers/ai/*",                   # AI scraper — requires Claude API key
+    "src/scrapers/ai_scraper.py",          # AI scraper — requires Claude API key
+    "src/workers/tasks.py",               # Celery task runner — requires Celery broker
 ]
 
 [tool.coverage.report]

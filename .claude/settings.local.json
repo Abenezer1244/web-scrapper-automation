@@ -16,7 +16,21 @@
       "Bash(node:*)",
       "mcp__supabase__list_projects",
       "mcp__supabase__get_project",
-      "mcp__supabase__get_project_url"
+      "mcp__supabase__get_project_url",
+      "Bash(curl:*)",
+      "Bash(echo:*)",
+      "Bash(find:*)",
+      "Bash(sleep:*)",
+      "Bash(railway logs:*)",
+      "mcp__supabase__execute_sql",
+      "Bash(railway variables:*)",
+      "Bash(celery -A src.workers worker --loglevel=info --concurrency=1)",
+      "Bash(celery -A src.workers worker --loglevel=info --concurrency=1 --pool=solo)",
+      "mcp__playwright__browser_navigate",
+      "mcp__playwright__browser_click",
+      "Bash(taskkill //F //IM celery.exe)",
+      "Bash(tasklist)",
+      "Bash(python -c \":*)"
     ]
   }
 }

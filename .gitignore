@@ -61,3 +61,5 @@ infra/terraform/.terraform.lock.hcl
 
 # Claude worktrees
 .claude/worktrees/
+tests/screenshots/
+.playwright-mcp/

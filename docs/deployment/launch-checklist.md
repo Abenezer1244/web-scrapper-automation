@@ -215,22 +215,22 @@ curl -X POST https://api.bridgeleads.io/billing/checkout \
 
 ## Step 14 — Monitoring
 
-- [x] Open Grafana: `http://YOUR_SERVER:3001` (or tunnel via Railway)
-- [x] Default login: `admin` / `${GRAFANA_PASSWORD}`
-- [x] Verify all 4 Prometheus targets are green: fastapi, celery, redis, postgres
-- [x] Confirm the BridgeLeads dashboard loaded (auto-provisioned from `infra/grafana/dashboards/`)
-- [x] Create Slack channel `#bridgeleads-alerts`
-- [x] Set `SLACK_WEBHOOK_URL` in alertmanager environment
-- [x] Trigger a test alert: `curl -X POST http://localhost:9093/-/reload`
+- [ ] Open Grafana: `http://YOUR_SERVER:3001` (or tunnel via Railway)
+- [ ] Default login: `admin` / `${GRAFANA_PASSWORD}`
+- [ ] Verify all 4 Prometheus targets are green: fastapi, celery, redis, postgres
+- [ ] Confirm the BridgeLeads dashboard loaded (auto-provisioned from `infra/grafana/dashboards/`)
+- [ ] Create Slack channel `#bridgeleads-alerts`
+- [ ] Set `SLACK_WEBHOOK_URL` in alertmanager environment
+- [ ] Trigger a test alert: `curl -X POST http://localhost:9093/-/reload`
 
 ---
 
 ## Step 15 — Supabase Backups
 
-- [x] Supabase dashboard → **Database → Backups**
-- [x] Enable **Point-in-Time Recovery**
-- [x] Verify daily backups are scheduled
-- [x] Test restore procedure on staging before going live
+- [ ] Supabase dashboard → **Database → Backups**
+- [ ] Enable **Point-in-Time Recovery**
+- [ ] Verify daily backups are scheduled
+- [ ] Test restore procedure on staging before going live
 
 ---
 

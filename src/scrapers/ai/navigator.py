@@ -32,12 +32,16 @@ Each action is an object with one of these shapes:
 
 Rules:
 - If there is a disclaimer or terms page, include actions to accept it first.
-- Use CSS selectors that are specific (IDs, unique attributes). Avoid fragile selectors.
-- For date fields that use custom JS widgets, prefer the "evaluate" action with JS to set values.
-- For checkbox lists with many items, use "evaluate" with JS to check the right box.
-- End with a click on the search/submit button.
-- Add a wait action (2000ms) after any page-changing action (disclaimer accept, form submit).
-- Keep the array as short as possible. Only include necessary actions."""
+- STRONGLY prefer "evaluate" actions with JavaScript over CSS selectors. JS is far more reliable.
+- For clicking elements, use: {"action": "evaluate", "js": "document.querySelector('...').click()"}
+- For filling inputs, use: {"action": "evaluate", "js": "document.querySelector('...').value = '...'"}
+- Only use "click" or "fill" actions for very simple, unique selectors like "#myId".
+- NEVER use CSS selectors with spaces, backslashes, or special characters.
+- For date fields, always use "evaluate" with JS to set values directly.
+- End with a submit action.
+- Add a wait action (2000ms) after any page-changing action.
+- Return at most 5-7 actions per step. I will take a new screenshot and ask for more.
+- When the search form has been submitted, return an empty array []."""
 
 
 async def ai_navigate_form(
@@ -45,52 +49,140 @@ async def ai_navigate_form(
     record_type: str,
     date_from: str,
     date_to: str,
+    max_steps: int = 5,
 ) -> dict:
-    """Use Claude to fill and submit a county search form.
+    """Use Claude to fill and submit a county search form via multi-step navigation.
+
+    Instead of planning all actions upfront, this takes a screenshot after each
+    batch of actions so Claude can see the updated page state. This handles
+    JS-heavy sites where the page changes after clicks/tab switches.
 
     Args:
         page: Playwright page currently on the search portal.
         record_type: Record type to search for (e.g. "probate").
         date_from: Start date in MM/DD/YYYY format.
         date_to: End date in MM/DD/YYYY format.
+        max_steps: Maximum number of Claude calls for navigation.
 
     Returns:
         Dict with keys: actions (list), ai_usage (dict with token/cost info)
     """
-    # Take screenshot and get accessibility snapshot
+    all_actions = []
+    total_usage = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    goal = (
+        f"Search for **{record_type.upper()}** records "
+        f"from **{date_from}** to **{date_to}**."
+    )
+
+    for step in range(max_steps):
+        # Fresh screenshot + snapshot each step
+        screenshot = await page.screenshot(type="png", full_page=True)
+        snapshot = await _get_accessibility_snapshot(page)
+
+        if step == 0:
+            user_message = (
+                f"Goal: {goal}\n\n"
+                f"Current URL: {page.url}\n\n"
+                f"Page accessibility snapshot:\n```\n{snapshot}\n```\n\n"
+                f"Return a JSON array of actions to accomplish this goal. "
+                f"Keep it short — only return the NEXT few actions needed from this page state. "
+                f"If you need to navigate to a different tab/section first, just return those actions. "
+                f"I will take a new screenshot after executing them and ask you for the next steps.\n\n"
+                f"When the search has been submitted and results are loading, "
+                f"return an empty array [] to signal you're done."
+            )
+        else:
+            user_message = (
+                f"Goal: {goal}\n\n"
+                f"I've executed the previous actions. Here is the current page state.\n"
+                f"Current URL: {page.url}\n\n"
+                f"Page accessibility snapshot:\n```\n{snapshot}\n```\n\n"
+                f"Actions executed so far: {len(all_actions)}\n\n"
+                f"Return the NEXT actions needed. If the search form has been submitted "
+                f"and results are visible (or loading), return an empty array []."
+            )
+
+        response = await ask_claude(
+            system_prompt=_SYSTEM_PROMPT,
+            user_message=user_message,
+            images=[screenshot],
+        )
+        total_usage["input_tokens"] += response["input_tokens"]
+        total_usage["output_tokens"] += response["output_tokens"]
+        total_usage["cost_usd"] += response["cost_usd"]
+
+        actions = _parse_actions(response["text"])
+        _logger.info("Step %d: Claude returned %d actions", step + 1, len(actions))
+
+        # Empty array = Claude says we're done
+        if not actions:
+            _logger.info("Claude signaled navigation complete")
+            break
+
+        # Execute this batch of actions
+        for i, action in enumerate(actions):
+            desc = action.get("description", action.get("action", "?"))
+            _logger.info("  Action %d: %s — %s", i + 1, action["action"], desc)
+            try:
+                await _execute_action(page, action)
+                all_actions.append(action)
+            except Exception as exc:
+                _logger.warning("  Action %d failed: %s — trying JS fallback", i + 1, str(exc)[:80])
+                # Quick retry: ask Claude for a single corrected action
+                retry_resp = await _retry_failed_action(page, action, desc, str(exc))
+                total_usage["input_tokens"] += retry_resp["usage"]["input_tokens"]
+                total_usage["output_tokens"] += retry_resp["usage"]["output_tokens"]
+                total_usage["cost_usd"] += retry_resp["usage"]["cost_usd"]
+                if retry_resp["action"]:
+                    all_actions.append(retry_resp["action"])
+
+    return {"actions": all_actions, "ai_usage": total_usage}
+
+
+async def _retry_failed_action(page: Page, action: dict, desc: str, error: str) -> dict:
+    """Ask Claude for a corrected action after a failure."""
     screenshot = await page.screenshot(type="png", full_page=True)
     snapshot = await _get_accessibility_snapshot(page)
 
-    user_message = (
-        f"I need to search for **{record_type.upper()}** records "
-        f"from **{date_from}** to **{date_to}**.\n\n"
-        f"Current URL: {page.url}\n\n"
-        f"Page accessibility snapshot:\n```\n{snapshot}\n```\n\n"
-        f"Return a JSON array of actions to fill and submit this search form."
+    retry_msg = (
+        f"Action failed: {error[:200]}\n"
+        f"Failed action: {json.dumps(action)}\n\n"
+        f"Current URL: {page.url}\n"
+        f"Page snapshot:\n```\n{snapshot}\n```\n\n"
+        f"Return ONE corrected action as a JSON object to accomplish: {desc}\n"
+        f"Prefer 'evaluate' with JS for reliability."
     )
-
-    response = await ask_claude(
+    resp = await ask_claude(
         system_prompt=_SYSTEM_PROMPT,
-        user_message=user_message,
+        user_message=retry_msg,
         images=[screenshot],
+        max_tokens=512,
     )
 
-    actions = _parse_actions(response["text"])
-    _logger.info("Claude returned %d navigation actions", len(actions))
+    text = resp["text"].strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        text = "\n".join(lines[1:])
+        if text.endswith("```"):
+            text = text[:-3]
 
-    # Execute each action
-    for i, action in enumerate(actions):
-        _logger.info("Action %d/%d: %s — %s", i + 1, len(actions), action["action"], action.get("description", ""))
-        await _execute_action(page, action)
+    result = {"action": None, "usage": {
+        "input_tokens": resp["input_tokens"],
+        "output_tokens": resp["output_tokens"],
+        "cost_usd": resp["cost_usd"],
+    }}
 
-    return {
-        "actions": actions,
-        "ai_usage": {
-            "input_tokens": response["input_tokens"],
-            "output_tokens": response["output_tokens"],
-            "cost_usd": response["cost_usd"],
-        },
-    }
+    try:
+        retry_action = json.loads(text)
+        if isinstance(retry_action, list) and retry_action:
+            retry_action = retry_action[0]
+        _logger.info("  Retry: %s", retry_action.get("description", retry_action.get("action")))
+        await _execute_action(page, retry_action)
+        result["action"] = retry_action
+    except Exception as exc:
+        _logger.error("  Retry also failed: %s — skipping", str(exc)[:80])
+
+    return result
 
 
 async def ai_handle_disclaimer(page: Page) -> dict | None:
@@ -143,45 +235,47 @@ async def ai_handle_disclaimer(page: Page) -> dict | None:
 
 
 async def _get_accessibility_snapshot(page: Page) -> str:
-    """Get a text representation of the page's accessibility tree.
+    """Get a DOM listing of all interactive elements with their attributes.
 
-    This gives Claude structural info about form fields, buttons, etc.
-    without needing to parse raw HTML.
+    This gives Claude the actual IDs, classes, and attributes needed to
+    write correct CSS selectors or JS code.
     """
     try:
-        snapshot = await page.accessibility.snapshot()
-        if snapshot:
-            return _flatten_a11y(snapshot, depth=0, max_depth=4)
+        dom_info = await page.evaluate("""
+            () => {
+                const elements = document.querySelectorAll(
+                    'input, select, button, a, textarea, [role="button"], [role="link"], [role="tab"], [onclick]'
+                );
+                const results = [];
+                for (const el of elements) {
+                    if (el.offsetParent === null && el.type !== 'hidden') continue; // skip hidden
+                    const info = {
+                        tag: el.tagName.toLowerCase(),
+                        id: el.id || null,
+                        name: el.name || null,
+                        type: el.type || null,
+                        class: el.className ? el.className.substring(0, 80) : null,
+                        text: (el.textContent || '').trim().substring(0, 60),
+                        value: el.value ? el.value.substring(0, 40) : null,
+                        placeholder: el.placeholder || null,
+                        href: el.href ? el.href.substring(0, 80) : null,
+                    };
+                    // Remove null values for cleaner output
+                    const clean = {};
+                    for (const [k, v] of Object.entries(info)) {
+                        if (v !== null && v !== '') clean[k] = v;
+                    }
+                    results.push(clean);
+                }
+                return JSON.stringify(results.slice(0, 80), null, 1);
+            }
+        """)
+        return dom_info
     except Exception:
         pass
-    # Fallback: return page title + visible text summary
+    # Fallback
     title = await page.title()
-    return f"Page title: {title}\n(Accessibility snapshot unavailable)"
-
-
-def _flatten_a11y(node: dict, depth: int, max_depth: int) -> str:
-    """Flatten an accessibility tree into a readable text format."""
-    if depth > max_depth:
-        return ""
-
-    indent = "  " * depth
-    role = node.get("role", "")
-    name = node.get("name", "")
-    value = node.get("value", "")
-
-    parts = [role]
-    if name:
-        parts.append(f'"{name}"')
-    if value:
-        parts.append(f'value="{value}"')
-
-    line = f"{indent}{' '.join(parts)}"
-    lines = [line]
-
-    for child in node.get("children", []):
-        lines.append(_flatten_a11y(child, depth + 1, max_depth))
-
-    return "\n".join(lines)
+    return f"Page title: {title}\n(DOM snapshot unavailable)"
 
 
 def _parse_actions(text: str) -> list[dict]:
@@ -195,13 +289,36 @@ def _parse_actions(text: str) -> list[dict]:
             text = text[:-3]
         text = text.strip()
 
+    # Try parsing as-is
     try:
         actions = json.loads(text)
         if isinstance(actions, list):
             return actions
     except json.JSONDecodeError:
-        _logger.error("Failed to parse Claude's response as JSON: %s", text[:200])
+        pass
 
+    # Try to find JSON array in the response (Claude sometimes adds extra text)
+    import re
+    match = re.search(r"\[[\s\S]*\]", text)
+    if match:
+        try:
+            actions = json.loads(match.group())
+            if isinstance(actions, list):
+                return actions
+        except json.JSONDecodeError:
+            pass
+
+    # Try fixing truncated JSON — add closing brackets
+    for suffix in ["]", "}]", "\"}]"]:
+        try:
+            actions = json.loads(text + suffix)
+            if isinstance(actions, list):
+                _logger.warning("Fixed truncated JSON by appending %r", suffix)
+                return actions
+        except json.JSONDecodeError:
+            continue
+
+    _logger.error("Failed to parse Claude's response as JSON: %s", text[:300])
     return []
 
 

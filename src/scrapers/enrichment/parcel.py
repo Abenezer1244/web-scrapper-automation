@@ -1,7 +1,8 @@
 """County-agnostic parcel enrichment pipeline.
 
 Each county connector calls enrich_parcel() with a parcel_id.
-Phase 1 implementation: Pierce County ATIP REST API with Playwright UI fallback.
+Pierce County: ATIP REST API (with circuit breaker — skips all parcels
+if the API is detected as unavailable).
 New counties plug in their own lookup while keeping the same interface.
 """
 
@@ -19,13 +20,29 @@ _logger = setup_logger("scraper.enrichment")
 # Register approved enrichment domains (SSRF allowlist)
 add_scrape_domain("atip.piercecountywa.gov")
 
+# ─── Circuit breaker: skip enrichment for the rest of the job if API is down ──
+
+_api_down: dict[str, bool] = {}
+
+
+def _is_api_down(county_key: str) -> bool:
+    return _api_down.get(county_key, False)
+
+
+def _mark_api_down(county_key: str) -> None:
+    _api_down[county_key] = True
+    _logger.warning("Enrichment API marked DOWN for %s — skipping remaining parcels", county_key)
+
+
 # ─── Pierce County ATIP ───────────────────────────────────────────────────────
 
-_ATIP_API_URL = "https://atip.piercecountywa.gov/app/v2/parcelSearch/search"
+_ATIP_API_URL = "https://atip.piercecountywa.gov/api/parcelSearch/search"
 _ATIP_HEADERS = {
     "User-Agent": "BridgeLeads-Enrichment/1.0",
     "Accept": "application/json",
 }
+
+_EMPTY = {"property_address": None, "mailing_address": None}
 
 
 def _parse_atip_response(data: dict[str, Any]) -> dict[str, str | None]:
@@ -60,62 +77,45 @@ async def _enrich_pierce_api(parcel_id: str) -> dict[str, str | None] | None:
     """Fetch parcel data from Pierce County ATIP REST API.
 
     Returns parsed address dict on success, None if the API is unavailable.
-    Applies exponential backoff on HTTP 429.
+    Uses a single attempt with fast failure — no retries on non-JSON responses.
     """
     params = {"parcelNumber": parcel_id}
 
-    for attempt in range(1, settings.MAX_RETRIES + 1):
-        try:
-            resp = requests.get(
-                _ATIP_API_URL,
-                params=params,
-                headers=_ATIP_HEADERS,
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                return _parse_atip_response(data)
-            if resp.status_code == 429:
-                wait = 2 ** attempt
-                _logger.warning("ATIP rate-limited (attempt %d). Waiting %ds.", attempt, wait)
-                await asyncio.sleep(wait)
-                continue
-            _logger.warning("ATIP API returned %d for parcel %s", resp.status_code, parcel_id)
+    try:
+        resp = requests.get(
+            _ATIP_API_URL,
+            params=params,
+            headers=_ATIP_HEADERS,
+            timeout=10,
+        )
+
+        # Check if we got HTML instead of JSON (API returns SPA page when down)
+        content_type = resp.headers.get("content-type", "")
+        if "html" in content_type:
+            _logger.warning("ATIP API returned HTML instead of JSON — API is down")
             return None
-        except Exception as exc:
-            _logger.warning("ATIP API error on attempt %d: %s", attempt, exc)
-            if attempt < settings.MAX_RETRIES:
-                await asyncio.sleep(2 ** attempt)
 
-    return None
+        if resp.status_code == 200:
+            data = resp.json()
+            return _parse_atip_response(data)
 
+        if resp.status_code == 429:
+            _logger.warning("ATIP rate-limited for parcel %s", parcel_id)
+            await asyncio.sleep(2)
+            return None
 
-async def _enrich_pierce_playwright(parcel_id: str) -> dict[str, str | None]:
-    """Playwright UI fallback for Pierce County ATIP when the API is unavailable."""
-    from src.scrapers.base_scraper import BridgeScraper
+        _logger.warning("ATIP API returned %d for parcel %s", resp.status_code, parcel_id)
+        return None
 
-    url = f"https://atip.piercecountywa.gov/app/parcelSearch?parcelNumber={parcel_id}"
-
-    async with BridgeScraper() as scraper:
-        await scraper.navigate(url)
-        soup = await scraper.get_soup_async()
-
-    property_address: str | None = None
-    mailing_address: str | None = None
-
-    # ATIP renders addresses in labeled dl/dd elements
-    for label_el in soup.select("dt, th, label"):
-        label_text = (label_el.get_text(strip=True) or "").lower()
-        sibling = label_el.find_next_sibling(["dd", "td"])
-        if not sibling:
-            continue
-        value = sibling.get_text(separator=" ", strip=True)
-        if "site" in label_text or "property" in label_text:
-            property_address = value
-        elif "mail" in label_text:
-            mailing_address = value
-
-    return {"property_address": property_address, "mailing_address": mailing_address}
+    except requests.exceptions.JSONDecodeError:
+        _logger.warning("ATIP API returned non-JSON for parcel %s", parcel_id)
+        return None
+    except requests.exceptions.Timeout:
+        _logger.warning("ATIP API timed out for parcel %s", parcel_id)
+        return None
+    except Exception as exc:
+        _logger.warning("ATIP API error for parcel %s: %s", parcel_id, exc)
+        return None
 
 
 # ─── Public interface ─────────────────────────────────────────────────────────
@@ -124,8 +124,8 @@ async def enrich_parcel(parcel_id: str, county: str, state: str) -> dict[str, st
     """Enrich a parcel record with property and mailing address data.
 
     Routes to the correct county lookup based on county + state.
-    New counties implement their own async function and are added to the
-    dispatch table below — no changes needed to the caller.
+    Uses a circuit breaker: if the first parcel fails, skips all remaining
+    parcels in the same job to avoid wasting time.
 
     Args:
         parcel_id: The county parcel identifier (e.g. '0001000001').
@@ -135,17 +135,21 @@ async def enrich_parcel(parcel_id: str, county: str, state: str) -> dict[str, st
     Returns:
         Dict with keys: property_address, mailing_address (either may be None).
     """
-    _logger.info("Enriching parcel %s (%s, %s)", parcel_id, county, state)
-
     county_key = f"{county.lower()}_{state.upper()}"
+
+    # Circuit breaker: skip if API already known to be down
+    if _is_api_down(county_key):
+        return _EMPTY
+
+    _logger.info("Enriching parcel %s (%s, %s)", parcel_id, county, state)
 
     if county_key == "pierce_WA":
         result = await _enrich_pierce_api(parcel_id)
         if result is None:
-            _logger.info("ATIP API unavailable — falling back to Playwright UI for parcel %s", parcel_id)
-            result = await _enrich_pierce_playwright(parcel_id)
+            _mark_api_down(county_key)
+            return _EMPTY
         return result
 
     # Unknown county — return empty enrichment rather than error
     _logger.warning("No enrichment handler for %s — skipping", county_key)
-    return {"property_address": None, "mailing_address": None}
+    return _EMPTY

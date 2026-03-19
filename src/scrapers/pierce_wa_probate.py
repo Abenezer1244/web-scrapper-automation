@@ -190,15 +190,21 @@ class PierceWAProbateScraper(BridgeScraper):
     def _extract_records(self, soup: BeautifulSoup) -> list[ScrapedRecord]:
         """Extract records from the ARMS results table.
 
-        Uses the second table on the page (the data table, not the header table)
-        and maps columns by known index positions.
+        The results page has two tables: a header-only table and the data table.
+        The data table has rows with exactly 9 <td> cells per row.
         """
-        # Find all tables — the results data is in the second table with many rows
+        # Find the data table: it's the table whose data rows have 9 cells
+        # (row#, image, select, instrument, date, doctype, name, legal, status)
         tables = soup.find_all("table")
         data_table = None
         for t in tables:
-            rows = t.find_all("tr")
-            if len(rows) > 5:  # Data table has 25+ rows
+            data_rows = t.find_all("tr")
+            if len(data_rows) < 3:
+                continue
+            # Check if the second row (first data row) has 9 td cells
+            sample_row = data_rows[1] if len(data_rows) > 1 else data_rows[0]
+            tds = sample_row.find_all("td")
+            if len(tds) == 9:
                 data_table = t
                 break
 
@@ -209,10 +215,10 @@ class PierceWAProbateScraper(BridgeScraper):
         rows = data_table.find_all("tr")
         records: list[ScrapedRecord] = []
 
-        # Skip header row(s)
+        # Skip header row (first row has <th> or column names)
         for row in rows[1:]:
             cells = row.find_all("td")
-            if len(cells) < 8:
+            if len(cells) != 9:
                 continue
 
             record = self._map_row(cells)

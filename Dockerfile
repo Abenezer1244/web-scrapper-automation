@@ -33,14 +33,16 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright Chromium browser only
+# Create non-root user BEFORE installing Playwright
+# so browsers are installed in the correct home directory
+RUN useradd -m -u 1000 bridge && chown -R bridge:bridge /app
+USER bridge
+
+# Install Playwright Chromium as the bridge user
 RUN playwright install chromium
 
-COPY . .
-
-# Create non-root user
-RUN useradd -m -u 1000 bridge && chown -R bridge:bridge /app && chmod +x /app/start.sh
-USER bridge
+COPY --chown=bridge:bridge . .
+RUN chmod +x /app/start.sh
 
 EXPOSE 8000
 

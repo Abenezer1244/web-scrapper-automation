@@ -19,12 +19,12 @@ def _direct_url(url: str) -> str:
     # pooler URL: aws-0-us-west-2.pooler.supabase.com:6543
     # direct URL: db.<project-ref>.supabase.co:5432
     if "pooler.supabase.com:6543" in url:
-        # Extract project ref from the username (postgres.<project-ref>)
-        m = re.search(r"postgres\.([a-z]+)@", url)
+        # Extract project ref from the username (postgres.<project-ref>:password@...)
+        m = re.search(r"postgres\.([a-z0-9]+):", url)
         if m:
             ref = m.group(1)
             url = re.sub(
-                r"@aws-0-[a-z0-9-]+\.pooler\.supabase\.com:6543",
+                r"@[a-z0-9-]+\.pooler\.supabase\.com:6543",
                 f"@db.{ref}.supabase.co:5432",
                 url,
             )

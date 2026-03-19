@@ -2,31 +2,7 @@
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
-# ─── API service ──────────────────────────────────────────────────────────────
-[[services]]
-name = "api"
+[deploy]
 startCommand = "/app/start.sh"
-
-[services.deploy]
-healthcheckPath = "/health"
-healthcheckTimeout = 30
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 3
-
-# ─── Worker service ───────────────────────────────────────────────────────────
-[[services]]
-name = "worker"
-startCommand = "celery -A src.workers worker --loglevel=info --concurrency=2"
-
-[services.deploy]
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 3
-
-# ─── Beat service ─────────────────────────────────────────────────────────────
-[[services]]
-name = "beat"
-startCommand = "celery -A src.workers beat --loglevel=info --scheduler celery.beat.PersistentScheduler"
-
-[services.deploy]
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3

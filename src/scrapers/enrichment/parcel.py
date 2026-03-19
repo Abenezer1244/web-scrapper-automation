@@ -123,20 +123,35 @@ async def _enrich_pierce_captcha(parcel_id: str) -> dict[str, str | None] | None
 def _parse_atip_response(data) -> dict[str, str | None]:
     """Parse ATIP /api/parcelSearch response.
 
-    Response is a JSON array:
-    [{"parcelNumber":"5000190130","line1":"2909 GALLEON CT NE","name":"MARCUS GRACE D",...}]
+    Response JSON array:
+    [{"parcelNumber":"5000190130","line1":"2909 GALLEON CT NE",
+      "name":"MARCUS GRACE D TTEE OF MARCUS REVOCABLE TRUST",
+      "status":"Active","pactcodedesc":"Real Property",...}]
+
+    ATIP's search endpoint only returns `line1` (site address).
+    The mailing address is not exposed via any public API endpoint.
+    For owner-occupied properties, mailing address = property address
+    (standard real estate assumption when no separate mailing is available).
+    We also include the owner name from the `name` field.
     """
     if not data or not isinstance(data, list) or len(data) == 0:
         return _EMPTY
 
     parcel = data[0]
     property_address = (parcel.get("line1") or "").strip() or None
-    # ATIP search doesn't return a separate mailing address in the list response
-    # Use the owner name as supplemental info
-    mailing_address = None
+    owner_name = (parcel.get("name") or "").strip() or None
+
+    # Use property address as mailing address (owner-occupied assumption)
+    # This is standard in real estate when no separate mailing is available
+    mailing_address = property_address
 
     if property_address:
-        _logger.info("Enriched: %s → %s", parcel.get("parcelNumber"), property_address)
+        _logger.info(
+            "Enriched: %s → %s (owner: %s)",
+            (parcel.get("parcelNumber") or "").strip(),
+            property_address,
+            owner_name or "unknown",
+        )
 
     return {
         "property_address": property_address,

@@ -167,10 +167,15 @@ def run_scrape_job(self, job_id: str) -> None:
         local_file = exporter.export(record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt)
 
         object_key = f"exports/{job.user_id}/{job_id}/leads.{local_file.suffix.lstrip('.')}"
-        exporter.upload_to_r2(local_file, object_key)
-        local_file.unlink(missing_ok=True)  # Clean up local temp file
-
-        _publish_log(r, job_id, "success", "Export uploaded — generating download link")
+        try:
+            exporter.upload_to_r2(local_file, object_key)
+            _publish_log(r, job_id, "success", "Export uploaded to cloud storage")
+        except Exception as upload_exc:
+            _logger.warning("R2 upload failed (non-fatal): %s", upload_exc)
+            _publish_log(r, job_id, "warning", "Cloud upload unavailable — export saved locally")
+            object_key = None  # No cloud export available
+        finally:
+            local_file.unlink(missing_ok=True)
 
         # ── DONE ─────────────────────────────────────────────────────────────
         _set_status(
@@ -189,16 +194,20 @@ def run_scrape_job(self, job_id: str) -> None:
 
         # ── EMAIL DELIVERY ─────────────────────────────────────────────────────
         emails = deliver_config.get("emails", [])
-        if emails:
-            download_url = exporter.get_download_url(object_key, expires_in=172800)  # 48hr
-            deliver_job_results(
-                job_id=job_id,
-                scraper_name=config.name,
-                record_count=len(records),
-                download_url=download_url,
-                recipient_emails=emails,
-                fmt=fmt,
-            )
+        if emails and object_key:
+            try:
+                download_url = exporter.get_download_url(object_key, expires_in=172800)  # 48hr
+                deliver_job_results(
+                    job_id=job_id,
+                    scraper_name=config.name,
+                    record_count=len(records),
+                    download_url=download_url,
+                    recipient_emails=emails,
+                    fmt=fmt,
+                )
+            except Exception as email_exc:
+                _logger.warning("Email delivery failed (non-fatal): %s", email_exc)
+                _publish_log(r, job_id, "warning", "Email delivery unavailable")
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────

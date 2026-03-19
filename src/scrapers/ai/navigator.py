@@ -38,10 +38,12 @@ Rules:
 - Only use "click" or "fill" actions for very simple, unique selectors like "#myId".
 - NEVER use CSS selectors with spaces, backslashes, or special characters.
 - For date fields, always use "evaluate" with JS to set values directly.
+- USE THE CURRENTLY VISIBLE FORM. Do NOT try to navigate to other tabs or pages unless the current page has no search form at all.
+- If the form already has date fields and a document type field, fill them directly.
 - End with a submit action.
 - Add a wait action (2000ms) after any page-changing action.
 - Return at most 5-7 actions per step. I will take a new screenshot and ask for more.
-- When the search form has been submitted, return an empty array []."""
+- When the search form has been submitted and results are visible (or loading), return an empty array []."""
 
 
 async def ai_navigate_form(
@@ -75,6 +77,15 @@ async def ai_navigate_form(
     )
 
     for step in range(max_steps):
+        # Check for CAPTCHA before proceeding
+        captcha_detected = await page.locator("iframe[src*='recaptcha'], iframe[title*='reCAPTCHA'], .g-recaptcha, .h-captcha").count()
+        if captcha_detected > 0:
+            _logger.error("CAPTCHA detected on page — cannot automate this site")
+            raise RuntimeError(
+                "This county website requires CAPTCHA verification and cannot be scraped automatically. "
+                "Consider using a different data source for this county."
+            )
+
         # Fresh screenshot + snapshot each step
         screenshot = await page.screenshot(type="png", full_page=True)
         snapshot = await _get_accessibility_snapshot(page)

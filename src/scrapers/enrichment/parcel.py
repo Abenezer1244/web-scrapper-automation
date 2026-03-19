@@ -1,9 +1,9 @@
 """County-agnostic parcel enrichment pipeline.
 
-Pierce County: ATIP with reCAPTCHA solving via 2Captcha + Playwright.
-Flow: solve reCAPTCHA → inject token into ATIP page → scrape rendered address.
+Pierce County: ATIP API with reCAPTCHA solving via 2Captcha + Playwright.
+Correct endpoint: GET /api/parcelSearch?value=PARCEL_ID
+with recaptcha-response header (requires browser session cookies).
 """
-
 
 import requests
 
@@ -35,84 +35,108 @@ _ATIP_PAGE_URL = "https://atip.piercecountywa.gov/app/parcelSearch"
 _EMPTY = {"property_address": None, "mailing_address": None}
 _UNAVAILABLE = {"property_address": "(enrichment unavailable)", "mailing_address": "(enrichment unavailable)"}
 
+# Shared Playwright scraper instance for batch enrichment
+_shared_scraper = None
+_shared_token = None
+
+
+async def _get_atip_session():
+    """Get or create a shared Playwright session for ATIP enrichment.
+
+    Reuses the same browser context across multiple parcel lookups
+    to avoid opening a new browser per parcel.
+    """
+    global _shared_scraper
+    if _shared_scraper is None:
+        from src.scrapers.base_scraper import BridgeScraper
+        _shared_scraper = BridgeScraper()
+        await _shared_scraper.__aenter__()
+        await _shared_scraper.navigate("https://atip.piercecountywa.gov/app/parcelSearch")
+        await _shared_scraper.page.wait_for_timeout(2_000)
+        _logger.info("ATIP Playwright session established")
+    return _shared_scraper
+
+
+async def _close_atip_session():
+    """Close the shared Playwright session."""
+    global _shared_scraper
+    if _shared_scraper:
+        await _shared_scraper.__aexit__(None, None, None)
+        _shared_scraper = None
+
 
 async def _enrich_pierce_captcha(parcel_id: str) -> dict[str, str | None] | None:
-    """Enrich via ATIP using Playwright + 2Captcha to solve reCAPTCHA.
+    """Enrich via ATIP using Playwright + 2Captcha.
 
     1. Solve reCAPTCHA via 2Captcha (cached ~100s)
-    2. Open ATIP in Playwright, inject the token
-    3. Navigate to parcel search, wait for results to render
-    4. Scrape the address from the rendered page
+    2. Use shared Playwright session with session cookies
+    3. Call /api/parcelSearch?value=PARCEL_ID from browser with token header
+    4. Parse JSON response
     """
+    global _shared_token
     from src.scrapers.enrichment.captcha import solve_recaptcha
 
-    token = await solve_recaptcha(_ATIP_PAGE_URL, _ATIP_SITEKEY)
-    if not token:
+    # Get or refresh CAPTCHA token
+    if not _shared_token:
+        _shared_token = await solve_recaptcha(_ATIP_PAGE_URL, _ATIP_SITEKEY)
+    if not _shared_token:
         return None
-
-    from src.scrapers.base_scraper import BridgeScraper
-
-    url = f"https://atip.piercecountywa.gov/app/parcelSearch?parcelNumber={parcel_id}"
 
     try:
-        async with BridgeScraper() as scraper:
-            await scraper.navigate(url)
+        scraper = await _get_atip_session()
 
-            # Inject the solved reCAPTCHA token
-            await scraper.page.evaluate(f"""
-                () => {{
-                    // Set the reCAPTCHA response in the hidden textarea
-                    const ta = document.querySelector('#g-recaptcha-response, textarea[name="g-recaptcha-response"]');
-                    if (ta) {{
-                        ta.value = '{token}';
-                    }}
-                    // Also try to call the reCAPTCHA callback if it exists
-                    if (window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {{
-                        for (const client of Object.values(window.___grecaptcha_cfg.clients)) {{
-                            const callback = client?.rr?.l?.callback;
-                            if (callback) callback('{token}');
-                        }}
-                    }}
-                }}
-            """)
+        result = await scraper.page.evaluate("""
+            async (args) => {
+                const [parcelId, captchaToken] = args;
+                try {
+                    const r = await fetch('/api/parcelSearch?value=' + parcelId, {
+                        headers: {
+                            'Accept': 'application/json',
+                            'recaptcha-response': captchaToken
+                        }
+                    });
+                    if (r.status !== 200) return {error: 'status ' + r.status};
+                    const data = await r.json();
+                    return {data: data};
+                } catch(e) {
+                    return {error: e.message};
+                }
+            }
+        """, [parcel_id, _shared_token])
 
-            # Wait for the Angular SPA to load parcel data
-            await scraper.page.wait_for_timeout(5_000)
+        if result.get("error"):
+            err = result["error"]
+            _logger.warning("ATIP API error for %s: %s", parcel_id, err)
+            # If 500/401, token might be expired — clear it for refresh
+            if "500" in str(err) or "401" in str(err):
+                _shared_token = None
+            return None
 
-            # Scrape the rendered page for address data
-            soup = await scraper.get_soup_async()
-
-        return _parse_atip_html(soup)
+        data = result.get("data", [])
+        return _parse_atip_response(data)
 
     except Exception as exc:
-        _logger.warning("Playwright enrichment failed for %s: %s", parcel_id, str(exc)[:80])
+        _logger.warning("ATIP enrichment failed for %s: %s", parcel_id, str(exc)[:80])
         return None
 
 
-def _parse_atip_html(soup) -> dict[str, str | None]:
-    """Extract addresses from the rendered ATIP page HTML."""
-    property_address = None
+def _parse_atip_response(data) -> dict[str, str | None]:
+    """Parse ATIP /api/parcelSearch response.
+
+    Response is a JSON array:
+    [{"parcelNumber":"5000190130","line1":"2909 GALLEON CT NE","name":"MARCUS GRACE D",...}]
+    """
+    if not data or not isinstance(data, list) or len(data) == 0:
+        return _EMPTY
+
+    parcel = data[0]
+    property_address = (parcel.get("line1") or "").strip() or None
+    # ATIP search doesn't return a separate mailing address in the list response
+    # Use the owner name as supplemental info
     mailing_address = None
 
-    soup.get_text(separator="\n")
-
-    # Look for address patterns in the rendered page
-    for label_el in soup.select("dt, th, label, .label, strong, b"):
-        label_text = (label_el.get_text(strip=True) or "").lower()
-        sibling = label_el.find_next_sibling()
-        if not sibling:
-            # Try next element
-            sibling = label_el.find_next()
-        if not sibling:
-            continue
-        value = sibling.get_text(separator=" ", strip=True)
-        if not value or len(value) > 200:
-            continue
-
-        if any(w in label_text for w in ["site address", "situs", "property address", "location"]):
-            property_address = value
-        elif "mailing" in label_text:
-            mailing_address = value
+    if property_address:
+        _logger.info("Enriched: %s → %s", parcel.get("parcelNumber"), property_address)
 
     return {
         "property_address": property_address,
@@ -124,25 +148,15 @@ async def _enrich_pierce_api_simple(parcel_id: str) -> dict[str, str | None] | N
     """Quick check: try the ATIP API without CAPTCHA (in case it's restored)."""
     try:
         resp = requests.get(
-            "https://atip.piercecountywa.gov/api/parcelSearch/search",
-            params={"parcelNumber": parcel_id},
+            "https://atip.piercecountywa.gov/api/parcelSearch",
+            params={"value": parcel_id},
             headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
             timeout=5,
         )
         ct = resp.headers.get("content-type", "")
         if resp.status_code == 200 and "json" in ct:
             data = resp.json()
-            parcel = data.get("parcel") or data
-            site = parcel.get("siteAddress") or {}
-            mail = parcel.get("mailingAddress") or {}
-
-            def _join(*parts):
-                return " ".join(str(p) for p in parts if p and str(p).strip()).strip() or None
-
-            return {
-                "property_address": _join(site.get("streetAddress"), site.get("city"), site.get("state"), site.get("zip")),
-                "mailing_address": _join(mail.get("streetAddress"), mail.get("city"), mail.get("state"), mail.get("zip")),
-            }
+            return _parse_atip_response(data)
     except Exception:
         pass
     return None
@@ -162,7 +176,7 @@ async def enrich_parcel(parcel_id: str, county: str, state: str) -> dict[str, st
     if county_key == "pierce_WA":
         # Try simple API first (in case CAPTCHA is removed)
         result = await _enrich_pierce_api_simple(parcel_id)
-        if result and (result.get("property_address") or result.get("mailing_address")):
+        if result and result.get("property_address"):
             return result
 
         # Try CAPTCHA-based enrichment

@@ -41,32 +41,35 @@ async def solve_recaptcha(site_url: str, sitekey: str) -> str | None:
             _logger.info("Using cached reCAPTCHA token (%.0fs remaining)", expiry - time.time())
             return token
 
-    # Solve via 2Captcha
+    # Solve via 2Captcha (with retry on UNSOLVABLE)
     _logger.info("Solving reCAPTCHA for %s (this takes ~15-30s)...", site_url)
-    try:
-        from twocaptcha import TwoCaptcha
-        solver = TwoCaptcha(settings.CAPTCHA_API_KEY)
+    from twocaptcha import TwoCaptcha
+    solver = TwoCaptcha(settings.CAPTCHA_API_KEY)
 
-        # Run the blocking solver in a thread to not block the event loop
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: solver.recaptcha(sitekey=sitekey, url=site_url),
-        )
+    for attempt in range(1, 4):
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: solver.recaptcha(sitekey=sitekey, url=site_url),
+            )
 
-        token = result.get("code", "")
-        if not token:
-            _logger.error("2Captcha returned empty token: %s", result)
-            return None
+            token = result.get("code", "")
+            if not token:
+                _logger.error("2Captcha returned empty token: %s", result)
+                continue
 
-        # Cache the token
-        _token_cache[sitekey] = (token, time.time() + _TOKEN_TTL)
-        _logger.info("reCAPTCHA solved successfully, token cached for %ds", _TOKEN_TTL)
-        return token
+            _token_cache[sitekey] = (token, time.time() + _TOKEN_TTL)
+            _logger.info("reCAPTCHA solved (attempt %d), cached for %ds", attempt, _TOKEN_TTL)
+            return token
 
-    except Exception as exc:
-        _logger.error("2Captcha solve failed: %s", exc)
-        return None
+        except Exception as exc:
+            _logger.warning("2Captcha attempt %d failed: %s", attempt, exc)
+            if attempt < 3:
+                await asyncio.sleep(2)
+
+    _logger.error("2Captcha failed after 3 attempts")
+    return None
 
 
 def invalidate_token(sitekey: str) -> None:

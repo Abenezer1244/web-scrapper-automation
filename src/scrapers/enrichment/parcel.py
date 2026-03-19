@@ -189,18 +189,15 @@ async def enrich_parcel(parcel_id: str, county: str, state: str) -> dict[str, st
     _logger.info("Enriching parcel %s (%s, %s)", parcel_id, county, state)
 
     if county_key == "pierce_WA":
-        # Try simple API first (in case CAPTCHA is removed)
+        # Try simple API first (no CAPTCHA needed)
         result = await _enrich_pierce_api_simple(parcel_id)
         if result and result.get("property_address"):
             return result
 
-        # Try CAPTCHA-based enrichment
-        from src.config import settings
-        if settings.CAPTCHA_ENABLED and settings.CAPTCHA_API_KEY:
-            result = await _enrich_pierce_captcha(parcel_id)
-            if result is not None:
-                return result
-
+        # CAPTCHA-based enrichment disabled during scraping to avoid
+        # running two Playwright browsers simultaneously (causes worker
+        # memory exhaustion). Records are saved without addresses and
+        # can be enriched in a separate post-processing step.
         _mark_api_down(county_key)
         return _UNAVAILABLE
 

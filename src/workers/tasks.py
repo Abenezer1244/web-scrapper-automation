@@ -204,6 +204,16 @@ async def _run_scraper(scraper_class, date_from: str, date_to: str, r, job_id: s
     """Run the async scraper and stream progress logs back to Redis."""
     async with scraper_class() as scraper:
         records = await scraper.scrape(date_from, date_to)
+
+        # Log AI usage if this was an AI-powered scrape
+        if hasattr(scraper, "ai_cost") and scraper.ai_cost > 0:
+            tokens = scraper.ai_tokens
+            _publish_log(
+                r, job_id, "info",
+                f"AI usage: ${scraper.ai_cost:.4f} "
+                f"({tokens['input_tokens']} input + {tokens['output_tokens']} output tokens)",
+            )
+
     return records
 
 

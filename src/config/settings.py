@@ -72,6 +72,13 @@ class Settings(BaseSettings):
     MAX_RETRIES: int = 3
     POLITE_DELAY_MS: int = 300
 
+    # ─── AI Extraction (Claude API) ───────────────────────────────────────────
+    ANTHROPIC_API_KEY: str = ""
+    AI_MODEL: str = "claude-sonnet-4-6"
+    AI_MAX_TOKENS: int = 4096
+    AI_SCRAPER_ENABLED: bool = False
+    AI_COST_ALERT_THRESHOLD: float = 10.0  # USD per day
+
     # ─── Logging ──────────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 
@@ -83,6 +90,14 @@ class Settings(BaseSettings):
         "starter": 50,
         "pro": 500,
         "business": 5000,
+        "agency": -1,
+    }
+
+    # ─── AI scrape job limits per month (-1 = unlimited) ─────────────────────
+    AI_JOB_LIMITS: ClassVar[dict[str, int]] = {
+        "starter": 5,
+        "pro": 50,
+        "business": 500,
         "agency": -1,
     }
 

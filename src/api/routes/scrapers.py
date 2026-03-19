@@ -6,9 +6,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.auth import CurrentUser
+from src.api.auth import CurrentUser, require_plan
 from src.api.deps import get_rls_db
-from src.api.schemas import ConnectorResponse, ScraperConfigCreate, ScraperConfigResponse
+from src.api.schemas import ConnectorCreate, ConnectorResponse, ScraperConfigCreate, ScraperConfigResponse
 from src.db import CountyConnector, ScraperConfig, get_db
 
 router = APIRouter(prefix="/scrapers", tags=["scrapers"])
@@ -137,3 +137,51 @@ async def delete_scraper(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
     config.active = False  # Soft delete — preserves job history
     await db.flush()
+
+
+# ─── Admin: County connector management ──────────────────────────────────────
+
+
+@router.post("/connectors", response_model=ConnectorResponse, status_code=status.HTTP_201_CREATED)
+async def create_connector(
+    body: ConnectorCreate,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ConnectorResponse:
+    """Add a new county connector. Agency plan only.
+
+    For AI-mode connectors, no Python scraper code is needed — just provide
+    the county portal URL and Claude handles the rest.
+    """
+    # Agency-only (admin feature)
+    if current_user.plan != "agency":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Adding county connectors requires an Agency plan",
+        )
+
+    # Check for duplicate
+    result = await db.execute(
+        select(CountyConnector).where(
+            CountyConnector.county == body.county,
+            CountyConnector.state == body.state.lower(),
+        )
+    )
+    if result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Connector for {body.county}, {body.state} already exists",
+        )
+
+    connector = CountyConnector(
+        id=str(uuid.uuid4()),
+        county=body.county,
+        state=body.state.lower(),
+        record_types=body.record_types,
+        scraper_class="src.scrapers.ai_scraper.AIScraper",
+        scraper_mode=body.scraper_mode,
+        base_url=body.base_url,
+    )
+    db.add(connector)
+    await db.flush()
+    return ConnectorResponse.model_validate(connector)

@@ -422,12 +422,191 @@
 > Agency tier, AI extraction, CRM integrations.
 
 - [ ] White-label / agency tier (multi-client dashboard, custom domain)
-- [ ] AI-powered extraction — Claude API for any county URL, no selector maintenance
+- [ ] **AI-powered extraction — Claude API for any county URL, no selector maintenance** ← IN PROGRESS
 - [ ] CRM integrations: Podio, HubSpot, InvestorFuse, Follow Up Boss
 - [ ] Zapier + Make.com native integrations
 - [ ] AVM (automated valuation model) enrichment
 - [ ] Lead scoring (property value × estate complexity × days since filing)
 - [ ] Series A prep: $2M+ ARR, metrics deck, investor pipeline
+
+---
+
+## Phase 12A — AI-Powered Extraction (Claude API)
+
+### The Problem
+Every county has a unique website with different:
+- URLs, disclaimers, login flows
+- Form controls (dropdowns vs checkboxes, date pickers, custom JS widgets)
+- Results table HTML structure (different column names, layouts, pagination)
+
+The current approach requires a hand-coded `{county}_{state}_{type}.py` file per county,
+which took hours of debugging just for Pierce County. This doesn't scale to 3,000+ US counties.
+
+### The Solution
+Replace per-county selector code with a **Claude-powered AI agent** that:
+1. Navigates to any county public records URL
+2. Takes a page screenshot + accessibility snapshot
+3. Asks Claude to identify the form fields and how to fill them
+4. Executes Claude's instructions via Playwright
+5. Extracts structured records from the results using Claude vision/HTML analysis
+
+### Architecture
+
+```
+Current flow:
+  county_connectors DB → get_scraper_class() → PierceWAProbateScraper (hand-coded)
+
+New flow:
+  county_connectors DB → get_scraper_class() → AIScraper (universal)
+    ├── Step 1: Navigate to base_url
+    ├── Step 2: Screenshot + snapshot → Claude "navigate" prompt
+    ├── Step 3: Execute Claude's actions (click, fill, submit)
+    ├── Step 4: Screenshot results page → Claude "extract" prompt
+    ├── Step 5: Claude returns structured JSON → ScrapedRecord[]
+    └── Step 6: Paginate (Claude identifies next page control)
+```
+
+The `county_connectors` DB table already has `base_url` and `record_types` —
+that's all Claude needs to figure out the rest.
+
+### Todo
+
+#### 12A.1 — Dependencies & Config ✅
+- [x] Add `anthropic` to `requirements.txt`
+- [x] Add `ANTHROPIC_API_KEY` to `settings.py` and `.env.example`
+- [x] Add `AI_MODEL` setting (default: `claude-sonnet-4-6`)
+- [x] Add `AI_MAX_TOKENS` setting (default: 4096)
+- [x] Add `AI_SCRAPER_ENABLED` feature flag (default: false)
+
+#### 12A.2 — Claude Client Module ✅
+- [x] Create `src/scrapers/ai/client.py`:
+  - `async def ask_claude(system_prompt, user_message, images=[]) -> dict`
+  - Sends screenshot bytes + text to Claude API
+  - Handles rate limits (429 → exponential backoff)
+  - Logs token usage for cost tracking
+  - Returns dict with text, input_tokens, output_tokens, cost_usd
+
+#### 12A.3 — AI Navigation Agent ✅
+- [x] Create `src/scrapers/ai/navigator.py`:
+  - `async def ai_navigate_form(page, base_url, record_type, date_from, date_to) -> None`
+  - **Step 1:** Navigate to `base_url`, handle disclaimers/terms
+  - **Step 2:** Take screenshot + get page accessibility snapshot
+  - **Step 3:** Send to Claude with prompt:
+    ```
+    You are a browser automation agent. The screenshot shows a county public
+    records search portal. I need to search for {record_type} records from
+    {date_from} to {date_to}.
+
+    Analyze the page and return a JSON array of actions to fill and submit
+    the search form. Each action is one of:
+    - {"action": "click", "selector": "...", "description": "..."}
+    - {"action": "fill", "selector": "...", "value": "...", "description": "..."}
+    - {"action": "check", "selector": "...", "description": "..."}
+    - {"action": "select", "selector": "...", "value": "...", "description": "..."}
+    - {"action": "wait", "ms": 1000}
+
+    Rules:
+    - Use CSS selectors or accessible roles
+    - If there's a disclaimer/terms page, include accept actions first
+    - Always end with a submit/search action
+    - Include waits after page-changing actions
+    ```
+  - **Step 4:** Parse Claude's JSON response
+  - **Step 5:** Execute each action via Playwright
+  - **Step 6:** Verify results loaded (screenshot → Claude confirmation)
+
+#### 12A.4 — AI Record Extractor ✅
+- [x] Create `src/scrapers/ai/extractor.py`:
+  - `async def ai_extract_records(page) -> list[ScrapedRecord]`
+  - Takes screenshot + full HTML of results page
+  - Sends to Claude with prompt:
+    ```
+    Extract all public records from this page as a JSON array.
+    Each record should have these fields (null if not found):
+    - date_recorded: string (MM/DD/YYYY)
+    - party_name: string
+    - heirs: string (comma-separated if multiple)
+    - legal_description: string
+    - parcel_id: string (numeric)
+    - property_address: string
+    - mailing_address: string
+
+    Return ONLY valid JSON. No markdown, no explanation.
+    ```
+  - Parses Claude's JSON → list[ScrapedRecord]
+  - Validates each record (date format, non-empty party_name or parcel_id)
+
+#### 12A.5 — AI Pagination Handler ✅
+- [x] Create `src/scrapers/ai/paginator.py`:
+  - `async def ai_has_next_page(page) -> bool`
+  - `async def ai_go_next_page(page) -> None`
+  - Screenshot → Claude: "Is there a next page button? If yes, return the selector."
+  - Executes click if found, returns False if no next page
+
+#### 12A.6 — AIScraper Class (Unified) ✅
+- [x] Create `src/scrapers/ai_scraper.py`:
+  - Extends `BridgeScraper`
+  - Implements `scrape(date_from, date_to) -> list[ScrapedRecord]`
+  - Orchestrates: navigator → extractor → paginator loop
+  - Falls back to hand-coded scraper if AI extraction fails
+  - Tracks Claude API cost per job (store in `job_logs`)
+
+#### 12A.7 — Registry Integration ✅
+- [x] Update `county_connectors` table:
+  - Add `scraper_mode` column: `"manual"` (hand-coded) | `"ai"` (Claude-powered)
+  - Default: `"ai"` for new counties, `"manual"` for existing Pierce County
+- [ ] Update `registry.py`:
+  - If `scraper_mode == "ai"`, return `AIScraper` instead of the hand-coded class
+  - Pass `base_url` and `record_types` to `AIScraper.__init__()`
+- [ ] Alembic migration for the new column
+
+#### 12A.8 — Admin: Add Any County (no code) ✅
+- [x] Create API endpoint `POST /scrapers/connectors`:
+  - Accepts: `county`, `state`, `record_types`, `base_url`
+  - Creates `county_connectors` row with `scraper_mode="ai"`
+  - No Python code needed — Claude handles the rest
+- [ ] Update `GET /scrapers/connectors` to include `scraper_mode`
+
+#### 12A.9 — Cost Controls ✅
+- [x] Track Claude API usage per job:
+  - Input tokens, output tokens, cost estimate
+  - Store in `job_logs` with level="ai_usage"
+- [ ] Add plan-based AI limits:
+  - Starter: 5 AI scrape jobs/month
+  - Pro: 50 AI scrape jobs/month
+  - Business: 500
+  - Agency: unlimited
+- [ ] Add `AI_COST_ALERT_THRESHOLD` setting (default: $10/day)
+
+#### 12A.10 — Prompt Cache / Learning ✅
+- [x] Create `src/scrapers/ai/cache.py`:
+  - After a successful AI scrape, cache the navigation actions for that `base_url`
+  - On subsequent runs, try cached actions first → only call Claude if they fail
+  - Store in Redis with TTL of 7 days
+  - This turns a ~$0.05/run Claude call into a ~$0.00/run cached replay
+  - If cached actions fail, re-run with Claude and update the cache
+
+### Build Order (strict)
+```
+1. requirements.txt + settings.py + .env.example  (12A.1)
+2. src/scrapers/ai/client.py                       (12A.2)
+3. src/scrapers/ai/navigator.py                    (12A.3)
+4. src/scrapers/ai/extractor.py                    (12A.4)
+5. src/scrapers/ai/paginator.py                    (12A.5)
+6. src/scrapers/ai_scraper.py                      (12A.6)
+7. registry.py update + migration                  (12A.7)
+8. Admin endpoint                                  (12A.8)
+9. Cost controls                                   (12A.9)
+10. Prompt cache                                   (12A.10)
+```
+
+### Cost Estimate
+- Claude Sonnet per page: ~2K input tokens (screenshot) + ~500 output tokens
+- Navigation: 1 call (~$0.01)
+- Extraction per page: 1 call (~$0.01)
+- Pagination check: 1 call per page (~$0.005)
+- **Total per job (10 pages): ~$0.15–$0.25**
+- With prompt cache: **~$0.01–$0.03** (cached navigation replays free)
 
 ---
 

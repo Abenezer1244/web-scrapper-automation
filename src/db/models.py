@@ -115,6 +115,7 @@ class CountyConnector(Base):
     state = Column(String(2), nullable=False, index=True)
     record_types = Column(JSON, nullable=False, default=list)
     scraper_class = Column(String(255), nullable=False)
+    scraper_mode = Column(String(16), nullable=False, default="ai")  # ai | manual
     render_mode = Column(String(16), nullable=False, default="playwright")  # playwright | static
     base_url = Column(String(512), nullable=False)
     health_status = Column(String(16), nullable=False, default="unknown")  # healthy | degraded | down | unknown

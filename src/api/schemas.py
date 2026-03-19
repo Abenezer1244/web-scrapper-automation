@@ -190,11 +190,30 @@ class ProgressEvent(BaseModel):
 
 # ─── County connectors ────────────────────────────────────────────────────────
 
+class ConnectorCreate(BaseModel):
+    county: str
+    state: str
+    record_types: list[str]
+    base_url: str
+    scraper_mode: str = "ai"  # ai | manual
+
+    @field_validator("state")
+    @classmethod
+    def state_uppercase(cls, v: str) -> str:
+        return v.upper()
+
+    @field_validator("county")
+    @classmethod
+    def county_lowercase(cls, v: str) -> str:
+        return v.lower().strip()
+
+
 class ConnectorResponse(BaseModel):
     id: str
     county: str
     state: str
     record_types: list[str]
+    scraper_mode: str  # ai | manual
     render_mode: str
     base_url: str
     health_status: str

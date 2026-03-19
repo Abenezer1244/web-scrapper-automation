@@ -57,7 +57,27 @@ def get_scraper_class(county: str, state: str, record_type: str):
             f"Supported: {connector.record_types}"
         )
 
-    # Dynamically import the scraper module + class
+    # AI-powered scraper: return AIScraper configured with the connector's base_url
+    scraper_mode = getattr(connector, "scraper_mode", "manual")
+    if scraper_mode == "ai":
+        from functools import partial
+
+        from src.scrapers.ai_scraper import AIScraper
+
+        _logger.info(
+            "Registry resolved %s/%s/%s → AIScraper (ai mode, base_url=%s)",
+            county, state, record_type, connector.base_url,
+        )
+        # Return a factory that creates an AIScraper with the right config
+        return partial(
+            AIScraper,
+            base_url=connector.base_url,
+            county=connector.county,
+            state=connector.state,
+            record_types=connector.record_types,
+        )
+
+    # Manual mode: dynamically import the hand-coded scraper class
     module_path, class_name = connector.scraper_class.rsplit(".", 1)
     try:
         module = importlib.import_module(module_path)
@@ -68,7 +88,7 @@ def get_scraper_class(county: str, state: str, record_type: str):
         ) from exc
 
     _logger.info(
-        "Registry resolved %s/%s/%s → %s",
+        "Registry resolved %s/%s/%s → %s (manual mode)",
         county, state, record_type, connector.scraper_class,
     )
     return scraper_class
@@ -93,6 +113,7 @@ def list_supported() -> list[dict]:
             "record_types": c.record_types,
             "health_status": c.health_status,
             "base_url": c.base_url,
+            "scraper_mode": getattr(c, "scraper_mode", "manual"),
         }
         for c in connectors
     ]

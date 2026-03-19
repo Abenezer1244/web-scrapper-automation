@@ -29,11 +29,6 @@ _logger = setup_logger("scraper.pierce_wa_probate")
 # Register approved domains for SSRF allowlist
 add_scrape_domain("armsweb.co.pierce.wa.us")
 
-# ─── Column indices in the ARMS results table ─────────────────────────────────
-_COL_DATE = 4
-_COL_NAME = 6
-_COL_LEGAL = 7
-
 # ─── Patterns ─────────────────────────────────────────────────────────────────
 _PARCEL_RE = re.compile(r"\b(\d{10,13})\b")
 
@@ -190,23 +185,22 @@ class PierceWAProbateScraper(BridgeScraper):
     def _extract_records(self, soup: BeautifulSoup) -> list[ScrapedRecord]:
         """Extract records from the ARMS results table.
 
-        The results page has two tables: a header-only table and the data table.
-        The data table has rows with exactly 9 <td> cells per row.
+        The ARMS page uses nested tables with many td cells per row (~39).
+        The data table is identified by: 20+ rows, first data row starts with
+        a numeric row number, and has many td cells.
         """
-        # Find the data table: it's the table whose data rows have 9 cells
-        # (row#, image, select, instrument, date, doctype, name, legal, status)
         tables = soup.find_all("table")
         data_table = None
         for t in tables:
             data_rows = t.find_all("tr")
-            if len(data_rows) < 3:
+            if len(data_rows) < 5:
                 continue
-            # Check if the second row (first data row) has 9 td cells
-            sample_row = data_rows[1] if len(data_rows) > 1 else data_rows[0]
-            tds = sample_row.find_all("td")
-            if len(tds) == 9:
-                data_table = t
-                break
+            # Check if the second row starts with a number (row counter)
+            if len(data_rows) > 1:
+                first_td = data_rows[1].find("td")
+                if first_td and first_td.get_text(strip=True).isdigit():
+                    data_table = t
+                    break
 
         if data_table is None:
             _logger.warning("No results data table found on page")
@@ -215,57 +209,82 @@ class PierceWAProbateScraper(BridgeScraper):
         rows = data_table.find_all("tr")
         records: list[ScrapedRecord] = []
 
-        # Skip header row (first row has <th> or column names)
+        # Skip header row
         for row in rows[1:]:
             cells = row.find_all("td")
-            if len(cells) != 9:
+            if len(cells) < 9:
                 continue
 
-            record = self._map_row(cells)
+            # First cell should be a row number
+            first_text = cells[0].get_text(strip=True)
+            if not first_text.isdigit():
+                continue
+
+            record = self._map_row_by_text(cells)
             if record:
                 records.append(record)
 
         return records
 
-    def _map_row(self, cells: list[Tag]) -> ScrapedRecord | None:
-        """Map a table row to a ScrapedRecord using known column positions.
+    def _map_row_by_text(self, cells: list[Tag]) -> ScrapedRecord | None:
+        """Map a table row by extracting text from all cells and parsing.
 
-        Column layout:
-          0: #, 1: Image, 2: Select, 3: Instrument#,
-          4: Date Recorded, 5: Document Type,
-          6: Name + Associated Name, 7: Legal Description, 8: Status
+        Since ARMS uses nested tables with varying td counts (~39 per row),
+        we extract all cell text and find fields by content patterns.
         """
-        if len(cells) < 8:
+        # Gather all cell texts
+        all_texts = []
+        for c in cells:
+            text = self.clean(c.get_text(separator=" ", strip=True))
+            if text:
+                all_texts.append(text)
+
+        if not all_texts:
             return None
 
         record = ScrapedRecord()
 
-        # ── Date Recorded (column 4) ──────────────────────────────────────────
-        record.date_recorded = self.clean(cells[_COL_DATE].get_text(strip=True))
-
-        # ── Name + Associated Name (column 6) ────────────────────────────────
-        # The cell contains: [R] ESTATE NAME \n [E] HEIR/ASSOCIATED NAME
-        # These are in separate child elements (spans/divs)
-        name_cell = cells[_COL_NAME]
-        party_name, heirs = self._parse_name_cell(name_cell)
-        record.party_name = party_name
-        record.heirs = heirs
-
-        # ── Legal Description (column 7) ──────────────────────────────────────
-        legal_text = self.clean(cells[_COL_LEGAL].get_text(separator=" ", strip=True))
-        record.legal_description = legal_text
-
-        # ── Parcel ID: extract from legal description ─────────────────────────
-        if legal_text:
-            m = _PARCEL_RE.search(legal_text)
+        # Find date (MM/DD/YYYY pattern)
+        date_re = re.compile(r"\b\d{2}/\d{2}/\d{4}\b")
+        for text in all_texts:
+            m = date_re.search(text)
             if m:
-                record.parcel_id = m.group(1)
+                record.date_recorded = m.group()
+                break
 
-        # Skip rows with no meaningful data
+        # Find the Name cell — contains [R] and/or [E] markers
+        for c in cells:
+            cell_text = c.get_text(separator="|", strip=True)
+            if "[R]" in cell_text or "[E]" in cell_text:
+                party_name, heirs = self._parse_name_cell(c)
+                record.party_name = party_name
+                record.heirs = heirs
+                break
+
+        # Find Legal Description — contains land keywords (LOT, BLK, SEC, etc.)
+        legal_re = re.compile(r"\b(LT|LOT|BLK|BLOCK|SEC|TWNSHP|RNG|ADDN|PLAT|DIV|SHORT PLAT)\b", re.IGNORECASE)
+        for text in all_texts:
+            if legal_re.search(text) and text != record.party_name:
+                record.legal_description = text
+                # Extract parcel ID from legal description
+                m = _PARCEL_RE.search(text)
+                if m:
+                    record.parcel_id = m.group(1)
+                break
+
+        # If no legal desc found, check for standalone parcel IDs
+        if not record.parcel_id:
+            for text in all_texts:
+                m = _PARCEL_RE.search(text)
+                if m and text != record.date_recorded:
+                    record.parcel_id = m.group(1)
+                    break
+
+        # Skip empty rows
         if not record.date_recorded and not record.party_name:
             return None
 
-        # Skip garbage rows (UI chrome)
+        # Skip garbage
         if record.party_name and len(record.party_name) > 200:
             return None
         junk = ["Page 1", "Sort By", "New Search", "Criteria:", "records found", "Select All"]

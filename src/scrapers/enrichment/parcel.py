@@ -43,6 +43,7 @@ _ATIP_HEADERS = {
 }
 
 _EMPTY = {"property_address": None, "mailing_address": None}
+_UNAVAILABLE = {"property_address": "(enrichment unavailable)", "mailing_address": "(enrichment unavailable)"}
 
 
 def _parse_atip_response(data: dict[str, Any]) -> dict[str, str | None]:
@@ -139,7 +140,7 @@ async def enrich_parcel(parcel_id: str, county: str, state: str) -> dict[str, st
 
     # Circuit breaker: skip if API already known to be down
     if _is_api_down(county_key):
-        return _EMPTY
+        return _UNAVAILABLE
 
     _logger.info("Enriching parcel %s (%s, %s)", parcel_id, county, state)
 
@@ -147,7 +148,7 @@ async def enrich_parcel(parcel_id: str, county: str, state: str) -> dict[str, st
         result = await _enrich_pierce_api(parcel_id)
         if result is None:
             _mark_api_down(county_key)
-            return _EMPTY
+            return _UNAVAILABLE
         return result
 
     # Unknown county — return empty enrichment rather than error

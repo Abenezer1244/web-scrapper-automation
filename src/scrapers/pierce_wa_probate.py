@@ -3,20 +3,21 @@
 Source: ARMS Web (armsweb.co.pierce.wa.us)
 Record type: probate
 
-The site requires:
-1. Accept disclaimer at the landing page
-2. Navigate to /RealEstate/SearchEntry.aspx
-3. Check the PROBATE document type checkbox
-4. Fill date range fields
-5. Click the Search button
-
-Extraction uses heuristics, not hardcoded column indices, so the scraper
-stays functional if the portal reorders its columns.
+ARMS results table columns (0-indexed):
+  0: Row #
+  1: Image link
+  2: Select checkbox
+  3: Instrument # / Book-Page
+  4: Date Recorded
+  5: Document Type
+  6: Name ([R] recording party) + Associated Name ([E] heir/executor)
+  7: Legal Description (may contain embedded parcel IDs)
+  8: Status
 """
 
 import re
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
@@ -28,11 +29,13 @@ _logger = setup_logger("scraper.pierce_wa_probate")
 # Register approved domains for SSRF allowlist
 add_scrape_domain("armsweb.co.pierce.wa.us")
 
-# ─── Heuristic patterns ───────────────────────────────────────────────────────
+# ─── Column indices in the ARMS results table ─────────────────────────────────
+_COL_DATE = 4
+_COL_NAME = 6
+_COL_LEGAL = 7
 
-_DATE_RE = re.compile(r"\b\d{1,2}/\d{1,2}/\d{4}\b")
-_PARCEL_RE = re.compile(r"\b\d{10}\b")
-_LEGAL_KEYWORDS = re.compile(r"\b(LOT|BLOCK|SEC|TWP|RNG|PLAT|TRACT|SUBDIVISION)\b", re.IGNORECASE)
+# ─── Patterns ─────────────────────────────────────────────────────────────────
+_PARCEL_RE = re.compile(r"\b(\d{10,13})\b")
 
 _ARMS_HOME = "https://armsweb.co.pierce.wa.us/"
 _ARMS_SEARCH = "https://armsweb.co.pierce.wa.us/RealEstate/SearchEntry.aspx"
@@ -42,24 +45,10 @@ class PierceWAProbateScraper(BridgeScraper):
     """Scrapes probate filings from Pierce County ARMS Web portal."""
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
-        """Run full probate scrape for the given date range.
-
-        Args:
-            date_from: Start date in MM/DD/YYYY format.
-            date_to:   End date in MM/DD/YYYY format.
-
-        Returns:
-            List of ScrapedRecord instances, deduplicated by row hash.
-        """
         _logger.info("Pierce WA Probate — scraping %s to %s", date_from, date_to)
 
-        # Step 1: Accept the disclaimer to establish a session
         await self._accept_disclaimer()
-
-        # Step 2: Navigate to the search form
         await self.navigate(_ARMS_SEARCH)
-
-        # Step 3: Fill and submit the search form
         await self._fill_search_form(date_from, date_to)
 
         all_records: list[ScrapedRecord] = []
@@ -73,14 +62,16 @@ class PierceWAProbateScraper(BridgeScraper):
             soup = await self.get_soup_async()
             page_records = self._extract_records(soup)
 
+            new_count = 0
             for record in page_records:
                 h = self.make_hash(record.to_dict())
                 if h not in seen_hashes:
                     seen_hashes.add(h)
                     record.raw_html_hash = h
                     all_records.append(record)
+                    new_count += 1
 
-            _logger.info("Page %d — %d new records (total: %d)", page_num, len(page_records), len(all_records))
+            _logger.info("Page %d — %d new records (total: %d)", page_num, new_count, len(all_records))
 
             if not await self._go_to_next_page():
                 break
@@ -107,7 +98,6 @@ class PierceWAProbateScraper(BridgeScraper):
         page = self.page
         await self.navigate(_ARMS_HOME)
 
-        # Look for the disclaimer acceptance link
         accept_link = page.locator("a:has-text('Click here to acknowledge')")
         try:
             await accept_link.wait_for(timeout=10_000)
@@ -115,27 +105,21 @@ class PierceWAProbateScraper(BridgeScraper):
             await page.wait_for_load_state("load")
             _logger.info("Disclaimer accepted")
         except Exception:
-            # Disclaimer may already be accepted (session cookie present)
             _logger.info("No disclaimer prompt found — may already be accepted")
 
     async def _fill_search_form(self, date_from: str, date_to: str) -> None:
         """Fill and submit the ARMS Web search form."""
         page = self.page
-
-        # Wait for the form to be ready
         await page.wait_for_load_state("load")
-        await page.wait_for_timeout(1_000)  # Let JS initialize
+        await page.wait_for_timeout(1_000)
 
-        # Check the PROBATE document type checkbox
-        # The document type list is a long scrollable checkbox list.
-        # Use role-based locator for reliability.
+        # Check PROBATE checkbox
         probate_cb = page.get_by_role("checkbox", name="PROBATE")
         try:
             await probate_cb.scroll_into_view_if_needed(timeout=10_000)
             await probate_cb.check(timeout=5_000)
             _logger.info("Checked PROBATE document type")
         except Exception:
-            # Fallback: evaluate JS to check the checkbox directly
             _logger.warning("Could not check PROBATE via locator, trying JS fallback")
             await page.evaluate("""
                 () => {
@@ -152,8 +136,7 @@ class PierceWAProbateScraper(BridgeScraper):
             """)
             _logger.info("Checked PROBATE via JS fallback")
 
-        # Fill date range fields via JS — Infragistics date pickers redraw on
-        # focus/change, so direct DOM manipulation is more reliable.
+        # Fill date range via JS
         await page.evaluate("""
             ([dateFrom, dateTo]) => {
                 const inputs = document.querySelectorAll('input[title="mm/dd/yyyy"]');
@@ -163,7 +146,6 @@ class PierceWAProbateScraper(BridgeScraper):
                     inputs[1].value = dateTo;
                     inputs[1].dispatchEvent(new Event('change', { bubbles: true }));
                 } else {
-                    // Fallback: find by alt attribute
                     const altInputs = document.querySelectorAll('input[alt="mm/dd/yyyy"]');
                     if (altInputs.length >= 2) {
                         altInputs[0].value = dateFrom;
@@ -176,133 +158,157 @@ class PierceWAProbateScraper(BridgeScraper):
         """, [date_from, date_to])
         _logger.info("Filled date range: %s — %s", date_from, date_to)
 
-        # Submit the form — click the Search button (use role-based locator)
+        # Submit
         search_btn = page.get_by_role("button", name="Search", exact=True).first
         await search_btn.scroll_into_view_if_needed(timeout=5_000)
         await search_btn.click(timeout=10_000)
         await page.wait_for_load_state("load")
-        await page.wait_for_timeout(3_000)  # Wait for results to render
+        await page.wait_for_timeout(3_000)
         _logger.info("Search form submitted for %s — %s", date_from, date_to)
 
     async def _go_to_next_page(self) -> bool:
-        """Click the next page control if one exists. Returns True if navigated."""
+        """Click the Next page button. Returns True if navigated."""
         page = self.page
 
-        # Look for a "Next" link or pagination button
-        next_selectors = [
-            "a:has-text('Next')",
-            "a:has-text('>')",
-            "input[value='Next']",
-            "a[id*='Next']",
-            "span[id*='Next'] a",
-        ]
-        for selector in next_selectors:
-            el = page.locator(selector).first
-            if await el.count() > 0:
-                is_disabled = await el.get_attribute("disabled")
-                css_class = (await el.get_attribute("class")) or ""
-                if is_disabled or "disabled" in css_class.lower():
-                    return False
-                await el.click()
-                await page.wait_for_load_state("load")
-                return True
-
-        return False
+        # ARMS uses <button> elements for pagination, not <a> links
+        next_btn = page.get_by_role("button", name="Next", exact=True).first
+        try:
+            if await next_btn.count() == 0:
+                return False
+            is_disabled = await next_btn.get_attribute("disabled")
+            if is_disabled:
+                return False
+            await next_btn.click(timeout=10_000)
+            await page.wait_for_load_state("load")
+            await page.wait_for_timeout(2_000)
+            _logger.info("Navigated to next page")
+            return True
+        except Exception as exc:
+            _logger.warning("Next page navigation failed: %s", exc)
+            return False
 
     def _extract_records(self, soup: BeautifulSoup) -> list[ScrapedRecord]:
-        """Extract ScrapedRecord objects from the results table HTML.
+        """Extract records from the ARMS results table.
 
-        Uses heuristics to identify columns rather than fixed indices.
+        Uses the second table on the page (the data table, not the header table)
+        and maps columns by known index positions.
         """
-        table = soup.find("table", id=re.compile(r"[Gg]rid|[Rr]esult|[Dd]ata"))
-        if table is None:
-            # Fallback: first table with > 2 columns and > 1 row
-            for t in soup.find_all("table"):
-                rows = t.find_all("tr")
-                if len(rows) > 1:
-                    cols = rows[0].find_all(["th", "td"])
-                    if len(cols) >= 3:
-                        table = t
-                        break
+        # Find all tables — the results data is in the second table with many rows
+        tables = soup.find_all("table")
+        data_table = None
+        for t in tables:
+            rows = t.find_all("tr")
+            if len(rows) > 5:  # Data table has 25+ rows
+                data_table = t
+                break
 
-        if table is None:
-            _logger.warning("No results table found on page")
+        if data_table is None:
+            _logger.warning("No results data table found on page")
             return []
 
-        rows = table.find_all("tr")
-        if not rows:
-            return []
-
-        # Detect header row to understand column layout
-        header_row = rows[0]
-        header_cells = header_row.find_all(["th", "td"])
-        headers = [self.clean(c.get_text()) or "" for c in header_cells]
-
+        rows = data_table.find_all("tr")
         records: list[ScrapedRecord] = []
 
+        # Skip header row(s)
         for row in rows[1:]:
             cells = row.find_all("td")
-            if not cells:
+            if len(cells) < 8:
                 continue
 
-            cell_texts = [self.clean(c.get_text(separator=" ")) or "" for c in cells]
-
-            if not any(cell_texts):
-                continue
-
-            record = self._map_row(cell_texts, headers)
+            record = self._map_row(cells)
             if record:
                 records.append(record)
 
         return records
 
-    def _map_row(self, cell_texts: list[str], headers: list[str]) -> ScrapedRecord | None:
-        """Map a result row to a ScrapedRecord using header hints + heuristics."""
+    def _map_row(self, cells: list[Tag]) -> ScrapedRecord | None:
+        """Map a table row to a ScrapedRecord using known column positions.
+
+        Column layout:
+          0: #, 1: Image, 2: Select, 3: Instrument#,
+          4: Date Recorded, 5: Document Type,
+          6: Name + Associated Name, 7: Legal Description, 8: Status
+        """
+        if len(cells) < 8:
+            return None
+
         record = ScrapedRecord()
 
-        # ── Date: first cell matching date pattern ────────────────────────────
-        for text in cell_texts:
-            m = _DATE_RE.search(text)
+        # ── Date Recorded (column 4) ──────────────────────────────────────────
+        record.date_recorded = self.clean(cells[_COL_DATE].get_text(strip=True))
+
+        # ── Name + Associated Name (column 6) ────────────────────────────────
+        # The cell contains: [R] ESTATE NAME \n [E] HEIR/ASSOCIATED NAME
+        # These are in separate child elements (spans/divs)
+        name_cell = cells[_COL_NAME]
+        party_name, heirs = self._parse_name_cell(name_cell)
+        record.party_name = party_name
+        record.heirs = heirs
+
+        # ── Legal Description (column 7) ──────────────────────────────────────
+        legal_text = self.clean(cells[_COL_LEGAL].get_text(separator=" ", strip=True))
+        record.legal_description = legal_text
+
+        # ── Parcel ID: extract from legal description ─────────────────────────
+        if legal_text:
+            m = _PARCEL_RE.search(legal_text)
             if m:
-                record.date_recorded = m.group()
-                break
+                record.parcel_id = m.group(1)
 
-        # ── Parcel ID: 10-digit number ────────────────────────────────────────
-        for text in cell_texts:
-            m = _PARCEL_RE.search(text)
-            if m:
-                record.parcel_id = m.group()
-                break
-
-        # ── Legal description: cell containing land survey keywords ───────────
-        for text in cell_texts:
-            if _LEGAL_KEYWORDS.search(text):
-                record.legal_description = text
-                break
-
-        # ── Party name: longest text field not already used ───────────────────
-        used = {record.date_recorded, record.parcel_id, record.legal_description}
-        remaining = [t for t in cell_texts if t and t not in used]
-        if remaining:
-            record.party_name = max(remaining, key=len)
-
-        # ── Heirs: look for header hint or secondary name fields ──────────────
-        heir_idx = next(
-            (i for i, h in enumerate(headers) if "heir" in h.lower() or "associated" in h.lower()),
-            None,
-        )
-        if heir_idx is not None and heir_idx < len(cell_texts):
-            record.heirs = cell_texts[heir_idx]
-
-        # Skip rows that produced no meaningful data
-        if not any([record.date_recorded, record.party_name, record.parcel_id]):
+        # Skip rows with no meaningful data
+        if not record.date_recorded and not record.party_name:
             return None
 
-        # Skip garbage rows: UI chrome, pagination, toolbar text
+        # Skip garbage rows (UI chrome)
         if record.party_name and len(record.party_name) > 200:
             return None
-        _JUNK_KEYWORDS = ["Page 1", "Sort By", "New Search", "Refine Search", "Criteria:", "records found"]
-        if record.party_name and any(kw in record.party_name for kw in _JUNK_KEYWORDS):
+        junk = ["Page 1", "Sort By", "New Search", "Criteria:", "records found", "Select All"]
+        if record.party_name and any(kw in record.party_name for kw in junk):
             return None
 
         return record
+
+    @staticmethod
+    def _parse_name_cell(cell: Tag) -> tuple[str | None, str | None]:
+        """Parse the Name/Associated Name cell into (party_name, heirs).
+
+        The cell structure is:
+          [R] ESTATE_NAME EST OF
+          [E] HEIR_NAME HEIRS OF
+
+        Where [R] = Recording party, [E] = Associated name (heir/executor).
+        These are in separate text nodes or child <span>/<div> elements.
+        """
+        # Get all text segments from the cell
+        text_parts = []
+        for child in cell.children:
+            if isinstance(child, Tag):
+                text_parts.append(child.get_text(strip=True))
+            elif isinstance(child, str):
+                stripped = child.strip()
+                if stripped:
+                    text_parts.append(stripped)
+
+        # Join and split by [R] and [E] markers
+        full_text = " ".join(text_parts)
+
+        party_name = None
+        heirs = None
+
+        # Extract [R] portion (recording party / estate)
+        r_match = re.search(r"\[R\]\s*(.+?)(?=\s*\[E\]|$)", full_text)
+        if r_match:
+            party_name = r_match.group(1).strip()
+
+        # Extract [E] portion (associated name / heir)
+        e_match = re.search(r"\[E\]\s*(.+?)$", full_text)
+        if e_match:
+            heirs = e_match.group(1).strip()
+
+        # Fallback: if no [R]/[E] markers, use full text as party_name
+        if not party_name and not heirs:
+            cleaned = full_text.strip()
+            if cleaned:
+                party_name = cleaned
+
+        return party_name, heirs

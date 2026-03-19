@@ -65,6 +65,12 @@ def _build_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
     extras = [c for c in df.columns if c not in _COLUMN_ORDER]
     df = df[ordered + extras]
 
+    # Sort/group by party_name (estate) then date_recorded so related
+    # records from the same estate appear together in the export
+    sort_cols = [c for c in ["party_name", "date_recorded"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols, na_position="last").reset_index(drop=True)
+
     return df
 
 

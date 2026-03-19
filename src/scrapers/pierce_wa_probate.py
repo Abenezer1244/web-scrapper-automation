@@ -30,7 +30,6 @@ _logger = setup_logger("scraper.pierce_wa_probate")
 add_scrape_domain("armsweb.co.pierce.wa.us")
 
 # ─── Patterns ─────────────────────────────────────────────────────────────────
-_PARCEL_RE = re.compile(r"\b(\d{10,13})\b")
 
 _ARMS_HOME = "https://armsweb.co.pierce.wa.us/"
 _ARMS_SEARCH = "https://armsweb.co.pierce.wa.us/RealEstate/SearchEntry.aspx"
@@ -266,19 +265,15 @@ class PierceWAProbateScraper(BridgeScraper):
         for text in all_texts:
             if legal_re.search(text) and text != record.party_name:
                 record.legal_description = text
-                # Extract parcel ID from legal description
-                m = _PARCEL_RE.search(text)
-                if m:
-                    record.parcel_id = m.group(1)
                 break
 
-        # If no legal desc found, check for standalone parcel IDs
-        if not record.parcel_id:
-            for text in all_texts:
-                m = _PARCEL_RE.search(text)
-                if m and text != record.date_recorded:
-                    record.parcel_id = m.group(1)
-                    break
+        # Extract parcel ID: exactly 10 digits (Pierce County format)
+        # Only search in legal description text to avoid matching instrument numbers
+        parcel_10_re = re.compile(r"\b(\d{10})\b")
+        if record.legal_description:
+            m = parcel_10_re.search(record.legal_description)
+            if m:
+                record.parcel_id = m.group(1)
 
         # Skip empty rows
         if not record.date_recorded and not record.party_name:

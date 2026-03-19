@@ -5,14 +5,11 @@ The ATIP API requires a `recaptcha-response` header on every call.
 We solve the reCAPTCHA once and reuse the token for ~2 minutes.
 """
 
-import asyncio
 import json
-from typing import Any
 
 import requests
 
 from src.api.middleware.security import add_scrape_domain
-from src.config import settings
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.enrichment")
@@ -94,7 +91,7 @@ async def _enrich_pierce_api(parcel_id: str) -> dict[str, str | None] | None:
     3. Parse the JSON response for addresses
     """
     # Step 1: Get reCAPTCHA token
-    from src.scrapers.enrichment.captcha import solve_recaptcha, invalidate_token
+    from src.scrapers.enrichment.captcha import invalidate_token, solve_recaptcha
 
     token = await solve_recaptcha(_ATIP_PAGE_URL, _ATIP_SITEKEY)
     if not token:

@@ -5,6 +5,7 @@ Tests the live production frontend at https://app.bridgeleads.io
 import asyncio
 import uuid
 from pathlib import Path
+
 from playwright.async_api import async_playwright, expect
 
 BASE = "https://app.bridgeleads.io"
@@ -65,7 +66,7 @@ async def run():
         except Exception as e:
             await page.screenshot(path=str(SCREENSHOTS / "03_register_error.png"))
             # Check for error message on page
-            body = await page.inner_text("body")
+            await page.inner_text("body")
             fail("Registration + auto-login", f"url={page.url} | {str(e)[:80]}")
 
         # ── 3. Dashboard renders ────────────────────────────────────────────

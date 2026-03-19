@@ -4,9 +4,9 @@ Uses API for setup, Playwright browser to monitor the live run.
 """
 import asyncio
 import uuid
-import time
-import requests
 from pathlib import Path
+
+import requests
 from playwright.async_api import async_playwright
 
 API     = "https://api.bridgeleads.io"

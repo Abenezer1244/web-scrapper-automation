@@ -30,7 +30,29 @@
       "mcp__playwright__browser_click",
       "Bash(taskkill //F //IM celery.exe)",
       "Bash(tasklist)",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(ls -la \"C:\\\\Users\\\\Windows\\\\OneDrive - Seattle Colleges\\\\Desktop\\\\bridgeleads-web\\\\app\\\\\\(dashboard\\\\\\)\")",
+      "Bash(grep -E \"\\\\.ts$|\\\\.tsx$\")",
+      "Bash(xargs -I {} railway variables --set \"DATABASE_URL={}\")",
+      "Bash(railway service:*)",
+      "Bash(railway status:*)",
+      "Bash(for svc:*)",
+      "Bash(do)",
+      "Bash(done)",
+      "Bash(railway redeploy:*)",
+      "Bash(xxd start.sh)",
+      "Bash(gh repo:*)",
+      "mcp__playwright__browser_take_screenshot",
+      "mcp__playwright__browser_fill_form",
+      "mcp__playwright__browser_wait_for",
+      "mcp__playwright__browser_snapshot",
+      "mcp__playwright__browser_close",
+      "Bash(1 railway:*)",
+      "Bash(xargs -d'\\\\n' -I {} railway variables --set \"DATABASE_URL={}\" 2)",
+      "Bash(1 echo:*)",
+      "Bash(xargs -d'\\\\n' -I {} railway variables --set \"DATABASE_URL={}\")",
+      "mcp__playwright__browser_evaluate",
+      "mcp__playwright__browser_handle_dialog"
     ]
   }
 }

@@ -6,9 +6,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.auth import CurrentUser, require_plan
+from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
-from src.api.schemas import ConnectorCreate, ConnectorResponse, ScraperConfigCreate, ScraperConfigResponse
+from src.api.schemas import (
+    ConnectorCreate,
+    ConnectorResponse,
+    ScraperConfigCreate,
+    ScraperConfigResponse,
+)
 from src.db import CountyConnector, ScraperConfig, get_db
 
 router = APIRouter(prefix="/scrapers", tags=["scrapers"])

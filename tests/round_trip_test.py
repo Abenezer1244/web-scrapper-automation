@@ -3,9 +3,10 @@ Full production round-trip test.
 Covers: register, login, auth edge cases, profile, connectors,
         scraper config CRUD, job create/get/cancel, billing, api-key, logout
 """
-import uuid
-import requests
 import sys
+import uuid
+
+import requests
 
 BASE = "https://api.bridgeleads.io"
 EMAIL = f"test_{uuid.uuid4().hex[:8]}@bridgeleads.io"

@@ -298,4 +298,11 @@ class PierceWAProbateScraper(BridgeScraper):
         if not any([record.date_recorded, record.party_name, record.parcel_id]):
             return None
 
+        # Skip garbage rows: UI chrome, pagination, toolbar text
+        if record.party_name and len(record.party_name) > 200:
+            return None
+        _JUNK_KEYWORDS = ["Page 1", "Sort By", "New Search", "Refine Search", "Criteria:", "records found"]
+        if record.party_name and any(kw in record.party_name for kw in _JUNK_KEYWORDS):
+            return None
+
         return record

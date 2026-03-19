@@ -133,20 +133,23 @@ def run_scrape_job(self, job_id: str) -> None:
         _set_status(db, job, "enriching", record_count=len(records))
         _publish_log(r, job_id, "info", "Saving records to database...")
 
-        # Bulk insert results
+        # Bulk insert results (truncate fields to fit DB column limits)
+        def _trunc(val: str | None, max_len: int) -> str | None:
+            return val[:max_len] if val and len(val) > max_len else val
+
         for record in records:
             import uuid as _uuid
             db.add(Result(
                 id=str(_uuid.uuid4()),
                 job_id=job_id,
                 user_id=job.user_id,
-                date_recorded=record.date_recorded,
-                party_name=record.party_name,
+                date_recorded=_trunc(record.date_recorded, 32),
+                party_name=_trunc(record.party_name, 512),
                 heirs=record.heirs,
                 legal_description=record.legal_description,
-                parcel_id=record.parcel_id,
-                property_address=record.property_address,
-                mailing_address=record.mailing_address,
+                parcel_id=_trunc(record.parcel_id, 64),
+                property_address=_trunc(record.property_address, 512),
+                mailing_address=_trunc(record.mailing_address, 512),
                 enrichment_data=record.enrichment_data or {},
                 raw_html_hash=record.raw_html_hash,
             ))

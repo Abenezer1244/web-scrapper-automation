@@ -1,12 +1,12 @@
 """County-agnostic parcel enrichment pipeline.
 
-Each county connector calls enrich_parcel() with a parcel_id.
-Pierce County: ATIP REST API (with circuit breaker — skips all parcels
-if the API is detected as unavailable).
-New counties plug in their own lookup while keeping the same interface.
+Pierce County: ATIP API with reCAPTCHA solving via 2Captcha.
+The ATIP API requires a `recaptcha-response` header on every call.
+We solve the reCAPTCHA once and reuse the token for ~2 minutes.
 """
 
 import asyncio
+import json
 from typing import Any
 
 import requests
@@ -17,10 +17,9 @@ from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.enrichment")
 
-# Register approved enrichment domains (SSRF allowlist)
 add_scrape_domain("atip.piercecountywa.gov")
 
-# ─── Circuit breaker: skip enrichment for the rest of the job if API is down ──
+# ─── Circuit breaker ─────────────────────────────────────────────────────────
 
 _api_down: dict[str, bool] = {}
 
@@ -36,37 +35,49 @@ def _mark_api_down(county_key: str) -> None:
 
 # ─── Pierce County ATIP ───────────────────────────────────────────────────────
 
-_ATIP_API_URL = "https://atip.piercecountywa.gov/api/parcelSearch/search"
-_ATIP_HEADERS = {
-    "User-Agent": "BridgeLeads-Enrichment/1.0",
-    "Accept": "application/json",
-}
+_ATIP_RECAPTCHA_URL = "https://atip.piercecountywa.gov/api/publicRecaptcha"
+_ATIP_SITEKEY = "6Lcv5V0qAAAAADbB5-O6mhR9xb5q294gpfvabKcT"
+_ATIP_PAGE_URL = "https://atip.piercecountywa.gov/app/parcelSearch"
 
 _EMPTY = {"property_address": None, "mailing_address": None}
 _UNAVAILABLE = {"property_address": "(enrichment unavailable)", "mailing_address": "(enrichment unavailable)"}
 
 
-def _parse_atip_response(data: dict[str, Any]) -> dict[str, str | None]:
-    """Extract property_address and mailing_address from ATIP API response."""
-    parcel = data.get("parcel") or {}
-    site = parcel.get("siteAddress") or {}
-    mail = parcel.get("mailingAddress") or {}
+def _parse_atip_response(data) -> dict[str, str | None]:
+    """Extract addresses from ATIP API response.
 
-    def _join(*parts: str | None) -> str | None:
-        joined = " ".join(p for p in parts if p and str(p).strip())
+    The response can be a list of parcels or a single parcel object.
+    """
+    # Handle list response
+    if isinstance(data, list):
+        if not data:
+            return _EMPTY
+        parcel_data = data[0]
+    elif isinstance(data, dict):
+        parcel_data = data
+    else:
+        return _EMPTY
+
+    # Navigate nested structure
+    parcel = parcel_data.get("parcel") or parcel_data
+    site = parcel.get("siteAddress") or parcel.get("situs") or {}
+    mail = parcel.get("mailingAddress") or parcel.get("mailing") or {}
+
+    def _join(*parts) -> str | None:
+        joined = " ".join(str(p) for p in parts if p and str(p).strip())
         return joined.strip() or None
 
     property_address = _join(
-        site.get("streetAddress"),
+        site.get("streetAddress") or site.get("address"),
         site.get("city"),
         site.get("state"),
-        site.get("zip"),
+        site.get("zip") or site.get("zipCode"),
     )
     mailing_address = _join(
-        mail.get("streetAddress"),
+        mail.get("streetAddress") or mail.get("address"),
         mail.get("city"),
         mail.get("state"),
-        mail.get("zip"),
+        mail.get("zip") or mail.get("zipCode"),
     )
     return {
         "property_address": property_address,
@@ -75,70 +86,95 @@ def _parse_atip_response(data: dict[str, Any]) -> dict[str, str | None]:
 
 
 async def _enrich_pierce_api(parcel_id: str) -> dict[str, str | None] | None:
-    """Fetch parcel data from Pierce County ATIP REST API.
+    """Fetch parcel data from Pierce County ATIP with reCAPTCHA solving.
 
-    Returns parsed address dict on success, None if the API is unavailable.
-    Uses a single attempt with fast failure — no retries on non-JSON responses.
+    Flow:
+    1. Get a solved reCAPTCHA token (from cache or 2Captcha)
+    2. Call ATIP publicRecaptcha endpoint with the token as header
+    3. Parse the JSON response for addresses
     """
-    params = {"parcelNumber": parcel_id}
+    # Step 1: Get reCAPTCHA token
+    from src.scrapers.enrichment.captcha import solve_recaptcha, invalidate_token
+
+    token = await solve_recaptcha(_ATIP_PAGE_URL, _ATIP_SITEKEY)
+    if not token:
+        _logger.warning("Could not solve reCAPTCHA — enrichment unavailable")
+        return None
+
+    # Step 2: Call ATIP API with token
+    filter_param = json.dumps({"criteria": [{"eq": ["parcelNumber", parcel_id]}]})
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
+        "recaptcha-response": token,
+    }
 
     try:
         resp = requests.get(
-            _ATIP_API_URL,
-            params=params,
-            headers=_ATIP_HEADERS,
-            timeout=10,
+            _ATIP_RECAPTCHA_URL,
+            params={
+                "bypass-recaptcha-interceptor": "true",
+                "filter": filter_param,
+            },
+            headers=headers,
+            timeout=15,
         )
 
-        # Check if we got HTML instead of JSON (API returns SPA page when down)
         content_type = resp.headers.get("content-type", "")
-        if "html" in content_type:
-            _logger.warning("ATIP API returned HTML instead of JSON — API is down")
-            return None
 
-        if resp.status_code == 200:
+        if resp.status_code == 200 and "json" in content_type:
             data = resp.json()
-            return _parse_atip_response(data)
+            result = _parse_atip_response(data)
+            if result.get("property_address") or result.get("mailing_address"):
+                _logger.info("Enriched parcel %s: %s", parcel_id, result.get("property_address", "N/A"))
+                return result
+            # API returned JSON but no address data
+            _logger.warning("ATIP returned no address data for parcel %s", parcel_id)
+            return _EMPTY
 
-        if resp.status_code == 429:
-            _logger.warning("ATIP rate-limited for parcel %s", parcel_id)
-            await asyncio.sleep(2)
+        if resp.status_code == 500:
+            # Token might be expired or invalid
+            _logger.warning("ATIP returned 500 — reCAPTCHA token may be expired, invalidating")
+            invalidate_token(_ATIP_SITEKEY)
+            # Retry once with a fresh token
+            token = await solve_recaptcha(_ATIP_PAGE_URL, _ATIP_SITEKEY)
+            if token:
+                headers["recaptcha-response"] = token
+                resp = requests.get(
+                    _ATIP_RECAPTCHA_URL,
+                    params={"bypass-recaptcha-interceptor": "true", "filter": filter_param},
+                    headers=headers,
+                    timeout=15,
+                )
+                if resp.status_code == 200 and "json" in resp.headers.get("content-type", ""):
+                    return _parse_atip_response(resp.json())
+
             return None
 
-        _logger.warning("ATIP API returned %d for parcel %s", resp.status_code, parcel_id)
+        if "html" in content_type:
+            _logger.warning("ATIP returned HTML — API may be down")
+            return None
+
+        _logger.warning("ATIP returned %d for parcel %s", resp.status_code, parcel_id)
         return None
 
     except requests.exceptions.JSONDecodeError:
-        _logger.warning("ATIP API returned non-JSON for parcel %s", parcel_id)
+        _logger.warning("ATIP returned non-JSON for parcel %s", parcel_id)
         return None
     except requests.exceptions.Timeout:
-        _logger.warning("ATIP API timed out for parcel %s", parcel_id)
+        _logger.warning("ATIP timed out for parcel %s", parcel_id)
         return None
     except Exception as exc:
-        _logger.warning("ATIP API error for parcel %s: %s", parcel_id, exc)
+        _logger.warning("ATIP error for parcel %s: %s", parcel_id, exc)
         return None
 
 
 # ─── Public interface ─────────────────────────────────────────────────────────
 
 async def enrich_parcel(parcel_id: str, county: str, state: str) -> dict[str, str | None]:
-    """Enrich a parcel record with property and mailing address data.
-
-    Routes to the correct county lookup based on county + state.
-    Uses a circuit breaker: if the first parcel fails, skips all remaining
-    parcels in the same job to avoid wasting time.
-
-    Args:
-        parcel_id: The county parcel identifier (e.g. '0001000001').
-        county: Lowercase county slug (e.g. 'pierce').
-        state: Uppercase state code (e.g. 'WA').
-
-    Returns:
-        Dict with keys: property_address, mailing_address (either may be None).
-    """
+    """Enrich a parcel record with property and mailing address data."""
     county_key = f"{county.lower()}_{state.upper()}"
 
-    # Circuit breaker: skip if API already known to be down
     if _is_api_down(county_key):
         return _UNAVAILABLE
 
@@ -151,6 +187,5 @@ async def enrich_parcel(parcel_id: str, county: str, state: str) -> dict[str, st
             return _UNAVAILABLE
         return result
 
-    # Unknown county — return empty enrichment rather than error
     _logger.warning("No enrichment handler for %s — skipping", county_key)
     return _EMPTY

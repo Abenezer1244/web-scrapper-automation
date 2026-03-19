@@ -79,6 +79,10 @@ class Settings(BaseSettings):
     AI_SCRAPER_ENABLED: bool = False
     AI_COST_ALERT_THRESHOLD: float = 10.0  # USD per day
 
+    # ─── CAPTCHA solving (2Captcha) ───────────────────────────────────────────
+    CAPTCHA_API_KEY: str = ""
+    CAPTCHA_ENABLED: bool = False
+
     # ─── Logging ──────────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 

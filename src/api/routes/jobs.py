@@ -16,7 +16,7 @@ from src.api.deps import get_rls_db
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.schemas import JobCreate, JobResponse, LogLine, ResultRow, ResultsPage
 from src.config import settings
-from src.db import Job, JobLog, Result, ScraperConfig
+from src.db import CountyConnector, Job, JobLog, Result, ScraperConfig
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -54,8 +54,47 @@ async def create_job(
             ScraperConfig.active,
         )
     )
-    if config_result.scalar_one_or_none() is None:
+    config = config_result.scalar_one_or_none()
+    if config is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
+
+    # Check if this is an AI-powered connector and enforce AI job limits
+    connector_result = await db.execute(
+        select(CountyConnector).where(
+            CountyConnector.county == config.county,
+            func.lower(CountyConnector.state) == config.state.lower(),
+            CountyConnector.active,
+        )
+    )
+    connector = connector_result.scalar_one_or_none()
+    if connector and getattr(connector, "scraper_mode", "manual") == "ai":
+        ai_limit = settings.AI_JOB_LIMITS.get(current_user.plan, 5)
+        if ai_limit != -1:
+            # Count AI jobs this month
+            from datetime import UTC, datetime
+            month_start = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            ai_job_count_result = await db.execute(
+                select(func.count()).select_from(Job).join(
+                    ScraperConfig, Job.scraper_config_id == ScraperConfig.id
+                ).join(
+                    CountyConnector,
+                    (func.lower(ScraperConfig.county) == func.lower(CountyConnector.county))
+                    & (func.lower(ScraperConfig.state) == func.lower(CountyConnector.state)),
+                ).where(
+                    Job.user_id == current_user.id,
+                    Job.created_at >= month_start,
+                    CountyConnector.scraper_mode == "ai",
+                )
+            )
+            ai_jobs_used = ai_job_count_result.scalar_one()
+            if ai_jobs_used >= ai_limit:
+                raise HTTPException(
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    detail=(
+                        f"Monthly AI scrape limit reached ({ai_jobs_used}/{ai_limit}). "
+                        "Upgrade your plan for more AI-powered scrapes."
+                    ),
+                )
 
     # Enforce record limit — HTTP 402 when over quota
     if (

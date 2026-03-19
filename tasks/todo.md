@@ -555,28 +555,28 @@ that's all Claude needs to figure out the rest.
 - [x] Update `county_connectors` table:
   - Add `scraper_mode` column: `"manual"` (hand-coded) | `"ai"` (Claude-powered)
   - Default: `"ai"` for new counties, `"manual"` for existing Pierce County
-- [ ] Update `registry.py`:
-  - If `scraper_mode == "ai"`, return `AIScraper` instead of the hand-coded class
-  - Pass `base_url` and `record_types` to `AIScraper.__init__()`
-- [ ] Alembic migration for the new column
+- [x] Update `registry.py`:
+  - If `scraper_mode == "ai"`, return `AIScraper` via `functools.partial` with base_url, county, state, record_types
+  - Manual mode falls through to dynamic import of hand-coded scraper class
+- [x] Alembic migration `002_add_scraper_mode.py`:
+  - Adds column with server_default="manual" (existing rows stay manual)
+  - Then changes default to "ai" for new rows
 
 #### 12A.8 — Admin: Add Any County (no code) ✅
 - [x] Create API endpoint `POST /scrapers/connectors`:
   - Accepts: `county`, `state`, `record_types`, `base_url`
   - Creates `county_connectors` row with `scraper_mode="ai"`
   - No Python code needed — Claude handles the rest
-- [ ] Update `GET /scrapers/connectors` to include `scraper_mode`
+- [x] Update `GET /scrapers/connectors` to include `scraper_mode`
 
 #### 12A.9 — Cost Controls ✅
 - [x] Track Claude API usage per job:
   - Input tokens, output tokens, cost estimate
-  - Store in `job_logs` with level="ai_usage"
-- [ ] Add plan-based AI limits:
-  - Starter: 5 AI scrape jobs/month
-  - Pro: 50 AI scrape jobs/month
-  - Business: 500
-  - Agency: unlimited
-- [ ] Add `AI_COST_ALERT_THRESHOLD` setting (default: $10/day)
+  - Logged via worker task after job completion
+- [x] Add plan-based AI limits:
+  - Starter: 5, Pro: 50, Business: 500, Agency: unlimited
+  - Enforced in `POST /jobs` — HTTP 402 when exceeded
+- [x] Add `AI_COST_ALERT_THRESHOLD` setting (default: $10/day)
 
 #### 12A.10 — Prompt Cache / Learning ✅
 - [x] Create `src/scrapers/ai/cache.py`:

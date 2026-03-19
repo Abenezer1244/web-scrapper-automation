@@ -1,44 +1,16 @@
-import re
 from collections.abc import AsyncGenerator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
 
 from src.config import settings
 
-
-def _direct_url(url: str) -> str:
-    """Convert Supabase PgBouncer pooler URL to direct connection.
-
-    Supabase pooler (port 6543) uses PgBouncer in transaction mode, which
-    does not support prepared statements. Switch to direct connection
-    (port 5432) and let SQLAlchemy NullPool handle connections.
-    """
-    # pooler URL: aws-0-us-west-2.pooler.supabase.com:6543
-    # direct URL: db.<project-ref>.supabase.co:5432
-    if "pooler.supabase.com:6543" in url:
-        # Extract project ref from the username (postgres.<project-ref>:password@...)
-        m = re.search(r"postgres\.([a-z0-9]+):", url)
-        if m:
-            ref = m.group(1)
-            url = re.sub(
-                r"@[a-z0-9-]+\.pooler\.supabase\.com:6543",
-                f"@db.{ref}.supabase.co:5432",
-                url,
-            )
-            # Remove the project ref from the username
-            url = url.replace(f"postgres.{ref}@", "postgres@")
-    return url
-
-
 # ─── Async engine — FastAPI / async routes ────────────────────────────────────
-# Use direct Supabase connection (not PgBouncer pooler) to avoid prepared
-# statement conflicts. NullPool means we create fresh connections per request.
-_async_url = _direct_url(settings.DATABASE_URL)
+# NullPool + statement_cache_size=0 for Supabase PgBouncer compatibility.
 async_engine = create_async_engine(
-    _async_url,
+    settings.DATABASE_URL,
     poolclass=NullPool,
     echo=settings.DEBUG,
     connect_args={"statement_cache_size": 0},
@@ -52,9 +24,15 @@ AsyncSessionLocal = async_sessionmaker(
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI dependency: yields an async database session."""
+    """FastAPI dependency: yields an async database session.
+
+    Runs DEALLOCATE ALL at session start to clear any stale prepared
+    statements left by PgBouncer's connection reuse.
+    """
     async with AsyncSessionLocal() as session:
         try:
+            # Clear any stale prepared statements from PgBouncer
+            await session.execute(text("DEALLOCATE ALL"))
             yield session
             await session.commit()
         except Exception:
@@ -63,12 +41,20 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 # ─── Sync engine — Celery workers / Alembic ───────────────────────────────────
-_sync_url = _direct_url(settings.DATABASE_URL_SYNC)
 sync_engine = create_engine(
-    _sync_url,
+    settings.DATABASE_URL_SYNC,
     poolclass=NullPool,
     echo=settings.DEBUG,
 )
+
+
+@event.listens_for(sync_engine, "connect")
+def _on_sync_connect(dbapi_connection, connection_record):
+    """Clear prepared statements on new sync connections (PgBouncer compat)."""
+    cursor = dbapi_connection.cursor()
+    cursor.execute("DEALLOCATE ALL")
+    cursor.close()
+
 
 SyncSessionLocal = sessionmaker(
     sync_engine,

@@ -3,6 +3,13 @@
 Source: ARMS Web (armsweb.co.pierce.wa.us)
 Record type: probate
 
+The site requires:
+1. Accept disclaimer at the landing page
+2. Navigate to /RealEstate/SearchEntry.aspx
+3. Check the PROBATE document type checkbox
+4. Fill date range fields
+5. Click the Search button
+
 Extraction uses heuristics, not hardcoded column indices, so the scraper
 stays functional if the portal reorders its columns.
 """
@@ -27,7 +34,8 @@ _DATE_RE = re.compile(r"\b\d{1,2}/\d{1,2}/\d{4}\b")
 _PARCEL_RE = re.compile(r"\b\d{10}\b")
 _LEGAL_KEYWORDS = re.compile(r"\b(LOT|BLOCK|SEC|TWP|RNG|PLAT|TRACT|SUBDIVISION)\b", re.IGNORECASE)
 
-_ARMS_URL = "https://armsweb.co.pierce.wa.us/SearchEntry.aspx"
+_ARMS_HOME = "https://armsweb.co.pierce.wa.us/"
+_ARMS_SEARCH = "https://armsweb.co.pierce.wa.us/RealEstate/SearchEntry.aspx"
 
 
 class PierceWAProbateScraper(BridgeScraper):
@@ -45,7 +53,13 @@ class PierceWAProbateScraper(BridgeScraper):
         """
         _logger.info("Pierce WA Probate — scraping %s to %s", date_from, date_to)
 
-        await self.navigate(_ARMS_URL)
+        # Step 1: Accept the disclaimer to establish a session
+        await self._accept_disclaimer()
+
+        # Step 2: Navigate to the search form
+        await self.navigate(_ARMS_SEARCH)
+
+        # Step 3: Fill and submit the search form
         await self._fill_search_form(date_from, date_to)
 
         all_records: list[ScrapedRecord] = []
@@ -88,33 +102,86 @@ class PierceWAProbateScraper(BridgeScraper):
 
     # ─── Private helpers ──────────────────────────────────────────────────────
 
+    async def _accept_disclaimer(self) -> None:
+        """Navigate to the ARMS home page and accept the terms disclaimer."""
+        page = self.page
+        await self.navigate(_ARMS_HOME)
+
+        # Look for the disclaimer acceptance link
+        accept_link = page.locator("a:has-text('Click here to acknowledge')")
+        try:
+            await accept_link.wait_for(timeout=10_000)
+            await accept_link.click()
+            await page.wait_for_load_state("load")
+            _logger.info("Disclaimer accepted")
+        except Exception:
+            # Disclaimer may already be accepted (session cookie present)
+            _logger.info("No disclaimer prompt found — may already be accepted")
+
     async def _fill_search_form(self, date_from: str, date_to: str) -> None:
         """Fill and submit the ARMS Web search form."""
         page = self.page
 
         # Wait for the form to be ready
-        await page.wait_for_load_state("networkidle")
+        await page.wait_for_load_state("load")
+        await page.wait_for_timeout(1_000)  # Let JS initialize
 
-        # Select document type = Probate
-        doc_type_selector = "select[id*='DocumentType'], select[name*='DocumentType']"
-        doc_select = page.locator(doc_type_selector).first
-        if await doc_select.count() > 0:
-            await doc_select.select_option(label="PROBATE")
-            _logger.info("Selected document type: PROBATE")
+        # Check the PROBATE document type checkbox
+        # The document type list is a long scrollable checkbox list.
+        # Use role-based locator for reliability.
+        probate_cb = page.get_by_role("checkbox", name="PROBATE")
+        try:
+            await probate_cb.scroll_into_view_if_needed(timeout=10_000)
+            await probate_cb.check(timeout=5_000)
+            _logger.info("Checked PROBATE document type")
+        except Exception:
+            # Fallback: evaluate JS to check the checkbox directly
+            _logger.warning("Could not check PROBATE via locator, trying JS fallback")
+            await page.evaluate("""
+                () => {
+                    const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+                    for (const cb of checkboxes) {
+                        const label = cb.nextSibling;
+                        if (label && label.textContent && label.textContent.trim() === 'PROBATE') {
+                            cb.checked = true;
+                            cb.dispatchEvent(new Event('change', { bubbles: true }));
+                            break;
+                        }
+                    }
+                }
+            """)
+            _logger.info("Checked PROBATE via JS fallback")
 
-        # Fill date range fields
-        for field_pattern, value in [
-            ("input[id*='DateFrom'], input[name*='DateFrom']", date_from),
-            ("input[id*='DateTo'], input[name*='DateTo']", date_to),
-        ]:
-            field_el = page.locator(field_pattern).first
-            if await field_el.count() > 0:
-                await field_el.fill(value)
+        # Fill date range fields via JS — Infragistics date pickers redraw on
+        # focus/change, so direct DOM manipulation is more reliable.
+        await page.evaluate("""
+            ([dateFrom, dateTo]) => {
+                const inputs = document.querySelectorAll('input[title="mm/dd/yyyy"]');
+                if (inputs.length >= 2) {
+                    inputs[0].value = dateFrom;
+                    inputs[0].dispatchEvent(new Event('change', { bubbles: true }));
+                    inputs[1].value = dateTo;
+                    inputs[1].dispatchEvent(new Event('change', { bubbles: true }));
+                } else {
+                    // Fallback: find by alt attribute
+                    const altInputs = document.querySelectorAll('input[alt="mm/dd/yyyy"]');
+                    if (altInputs.length >= 2) {
+                        altInputs[0].value = dateFrom;
+                        altInputs[0].dispatchEvent(new Event('change', { bubbles: true }));
+                        altInputs[1].value = dateTo;
+                        altInputs[1].dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }
+            }
+        """, [date_from, date_to])
+        _logger.info("Filled date range: %s — %s", date_from, date_to)
 
-        # Submit the form
-        submit = page.locator("input[type='submit'], button[type='submit']").first
-        await submit.click()
-        await page.wait_for_load_state("networkidle")
+        # Submit the form — click the Search button (use role-based locator)
+        search_btn = page.get_by_role("button", name="Search", exact=True).first
+        await search_btn.scroll_into_view_if_needed(timeout=5_000)
+        await search_btn.click(timeout=10_000)
+        await page.wait_for_load_state("load")
+        await page.wait_for_timeout(3_000)  # Wait for results to render
         _logger.info("Search form submitted for %s — %s", date_from, date_to)
 
     async def _go_to_next_page(self) -> bool:
@@ -137,7 +204,7 @@ class PierceWAProbateScraper(BridgeScraper):
                 if is_disabled or "disabled" in css_class.lower():
                     return False
                 await el.click()
-                await page.wait_for_load_state("networkidle")
+                await page.wait_for_load_state("load")
                 return True
 
         return False

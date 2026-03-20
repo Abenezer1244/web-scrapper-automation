@@ -72,6 +72,12 @@ class PierceWAProbateScraper(BridgeScraper):
 
             await self.polite_delay()
 
+        # ── Fetch real parcel IDs from detail pages ─────────────────────────
+        _logger.info("Fetching parcel IDs from detail pages for %d records...", len(all_records))
+        await self._fetch_parcel_ids(all_records)
+        parcels_found = sum(1 for r in all_records if r.parcel_id)
+        _logger.info("Parcel IDs found: %d/%d", parcels_found, len(all_records))
+
         # ── Enrichment pass ───────────────────────────────────────────────────
         _logger.info("Enriching %d records with parcel data", len(all_records))
         for record in all_records:
@@ -181,6 +187,86 @@ class PierceWAProbateScraper(BridgeScraper):
             _logger.warning("Next page navigation failed: %s", exc)
             return False
 
+    async def _fetch_parcel_ids(self, records: list[ScrapedRecord]) -> None:
+        """Click into each record's detail page to get the real parcel ID.
+
+        The ARMS detail page has a 'Legal Description' tab that shows the
+        actual assessor parcel ID (not visible in search results).
+
+        Uses the instrument number dropdown on the detail page to navigate
+        between records without going back to search results.
+        """
+        page = self.page
+
+        # Get records that need parcel IDs (skip ones that already have one)
+        needs_parcel = [
+            r for r in records
+            if not r.parcel_id and r.enrichment_data and r.enrichment_data.get("instrument_number")
+        ]
+
+        if not needs_parcel:
+            _logger.info("All records already have parcel IDs or no instrument numbers")
+            return
+
+        _logger.info("Fetching parcel IDs for %d records from detail pages", len(needs_parcel))
+
+        # Click the first instrument number to enter the detail view
+        first_inst = needs_parcel[0].enrichment_data["instrument_number"]
+        try:
+            inst_link = page.locator(f"text={first_inst}").first
+            await inst_link.click(timeout=10_000)
+            await page.wait_for_load_state("load")
+            await page.wait_for_timeout(1_000)
+        except Exception as exc:
+            _logger.warning("Could not click into detail page: %s", str(exc)[:60])
+            return
+
+        # Now iterate through records using the instrument dropdown
+        for i, record in enumerate(needs_parcel):
+            inst_num = record.enrichment_data["instrument_number"]
+
+            try:
+                # Select this instrument from the dropdown
+                dropdown = page.locator("select").first
+                if await dropdown.count() > 0:
+                    await dropdown.select_option(value=inst_num, timeout=5_000)
+                    await page.wait_for_load_state("load")
+                    await page.wait_for_timeout(500)
+
+                # Click "Legal Description" tab
+                legal_tab = page.locator("text=Legal Description").first
+                if await legal_tab.count() > 0:
+                    await legal_tab.click(timeout=5_000)
+                    await page.wait_for_timeout(500)
+
+                # Extract parcel ID from the detail page
+                parcel_text = await page.evaluate("""() => {
+                    const cells = document.querySelectorAll('td');
+                    for (let i = 0; i < cells.length; i++) {
+                        if (cells[i].textContent.trim() === 'Parcel Id:' && cells[i+1]) {
+                            return cells[i+1].textContent.trim();
+                        }
+                    }
+                    return null;
+                }""")
+
+                if parcel_text and parcel_text.strip():
+                    record.parcel_id = parcel_text.strip()
+                    if (i + 1) <= 5 or (i + 1) % 20 == 0:
+                        _logger.info("  %s → parcel %s", inst_num, record.parcel_id)
+
+            except Exception as exc:
+                _logger.warning("  Detail page failed for %s: %s", inst_num, str(exc)[:50])
+
+        # Navigate back to results
+        try:
+            back_link = page.locator("text=Back to Results").first
+            if await back_link.count() > 0:
+                await back_link.click(timeout=5_000)
+                await page.wait_for_load_state("load")
+        except Exception:
+            pass
+
     def _extract_records(self, soup: BeautifulSoup) -> list[ScrapedRecord]:
         """Extract records from the ARMS results table.
 
@@ -242,6 +328,15 @@ class PierceWAProbateScraper(BridgeScraper):
             return None
 
         record = ScrapedRecord()
+
+        # Find instrument number (12-digit, starts with year)
+        inst_re = re.compile(r"\b(20\d{10})\b")
+        for text in all_texts:
+            m = inst_re.search(text)
+            if m:
+                # Store in enrichment_data for later detail page lookup
+                record.enrichment_data = {"instrument_number": m.group(1)}
+                break
 
         # Find date (MM/DD/YYYY pattern)
         date_re = re.compile(r"\b\d{2}/\d{2}/\d{4}\b")

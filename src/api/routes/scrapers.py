@@ -3,7 +3,7 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
@@ -44,8 +44,8 @@ async def create_scraper(
     # county_connectors has no RLS — the rls db session can still query it
     result = await db.execute(
         select(CountyConnector).where(
-            CountyConnector.county == body.county,
-            CountyConnector.state == body.state.lower(),
+            func.lower(CountyConnector.county) == body.county.lower(),
+            func.upper(CountyConnector.state) == body.state.upper(),
             CountyConnector.active,
         )
     )

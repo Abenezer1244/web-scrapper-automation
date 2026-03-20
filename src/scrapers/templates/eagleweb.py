@@ -292,8 +292,13 @@ class EagleWebScraper(BridgeScraper):
                     return null;
                 })()
             """)
-            await self.page.wait_for_timeout(5_000)
-            _logger.info("Search submitted via %s", submitted)
+            # Wait for results page to load after form submission
+            try:
+                await self.page.wait_for_load_state("domcontentloaded", timeout=15_000)
+            except Exception:
+                pass
+            await self.page.wait_for_timeout(3_000)
+            _logger.info("Search submitted via %s, page: %s", submitted, self.page.url)
         except Exception as exc:
             _logger.warning("Could not submit search: %s", str(exc)[:60])
 

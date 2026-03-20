@@ -156,11 +156,51 @@ class EagleWebScraper(BridgeScraper):
 
         # Fill date range via JavaScript (most reliable for EagleWeb)
         try:
-            await self.page.evaluate(f"""
+            filled = await self.page.evaluate(f"""
                 (() => {{
-                    const inputs = document.querySelectorAll('input[type="text"]');
+                    // Strategy 1: Find by ID patterns (RecDateIDStart/End, StartDate, etc.)
+                    const idPatterns = [
+                        ['RecDateIDStart', 'RecDateIDEnd'],
+                        ['StartDate', 'EndDate'],
+                        ['startDate', 'endDate'],
+                        ['dateFrom', 'dateTo'],
+                    ];
+                    for (const [startId, endId] of idPatterns) {{
+                        const s = document.getElementById(startId);
+                        const e = document.getElementById(endId);
+                        if (s && e) {{
+                            s.value = '{date_from}';
+                            s.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            e.value = '{date_to}';
+                            e.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            return 'id:' + startId;
+                        }}
+                    }}
+
+                    // Strategy 2: Find by nearby "Start Date"/"End Date" labels
+                    const allInputs = document.querySelectorAll('input[type="text"]');
+                    let startInput = null, endInput = null;
+                    for (const inp of allInputs) {{
+                        const cell = inp.closest('td') || inp.parentElement;
+                        if (!cell) continue;
+                        const text = cell.textContent.toLowerCase();
+                        if (text.includes('start') && (text.includes('date') || text.includes('recording'))) {{
+                            startInput = inp;
+                        }} else if (text.includes('end') && (text.includes('date') || text.includes('recording'))) {{
+                            endInput = inp;
+                        }}
+                    }}
+                    if (startInput && endInput) {{
+                        startInput.value = '{date_from}';
+                        startInput.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        endInput.value = '{date_to}';
+                        endInput.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        return 'label';
+                    }}
+
+                    // Strategy 3: Find inputs with existing date values
                     let startSet = false;
-                    for (const inp of inputs) {{
+                    for (const inp of allInputs) {{
                         if (inp.value && inp.value.includes('/') && inp.value.length >= 8) {{
                             if (!startSet) {{
                                 inp.value = '{date_from}';
@@ -169,13 +209,14 @@ class EagleWebScraper(BridgeScraper):
                             }} else {{
                                 inp.value = '{date_to}';
                                 inp.dispatchEvent(new Event('change', {{bubbles: true}}));
-                                break;
+                                return 'value';
                             }}
                         }}
                     }}
+                    return startSet ? 'partial' : null;
                 }})()
             """)
-            _logger.info("Date range set: %s to %s", date_from, date_to)
+            _logger.info("Date range set (%s): %s to %s", filled, date_from, date_to)
         except Exception as exc:
             _logger.warning("Could not set date range: %s", str(exc)[:60])
 

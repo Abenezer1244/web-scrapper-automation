@@ -252,20 +252,30 @@ class EagleWebScraper(BridgeScraper):
                 "domcontentloaded",
             ) if hasattr(self.page, 'run_and_wait') else None
 
-            # Fallback: click and wait for URL change
-            if not hasattr(self.page, 'run_and_wait'):
-                current_url = self.page.url
-                await search_btn.click()
-                # Wait for URL to change (form submission)
-                for _ in range(30):
-                    await self.page.wait_for_timeout(500)
-                    if self.page.url != current_url:
-                        break
-                # Wait for final redirect to complete
-                for _ in range(20):
-                    await self.page.wait_for_timeout(500)
-                    if "Results" in self.page.url or "results" in self.page.url:
-                        break
+            # Click and wait for form to process
+            current_url = self.page.url
+            await search_btn.click()
+
+            # Wait for URL to change from search form
+            for _ in range(20):
+                await self.page.wait_for_timeout(500)
+                if self.page.url != current_url:
+                    break
+
+            # If stuck on docSearchPOST.jsp, manually navigate to results
+            # The POST page processes the search server-side and creates a searchId
+            for _ in range(10):
+                await self.page.wait_for_timeout(1_000)
+                url = self.page.url
+                if "Results" in url or "results" in url:
+                    break
+                if "POST" in url:
+                    # The POST page has finished — go to results
+                    base = url.split("/eagleweb/")[0] if "/eagleweb/" in url else url.rsplit("/", 1)[0]
+                    results_url = f"{base}/eagleweb/docSearchResults.jsp?searchId=0"
+                    _logger.info("POST complete, navigating to results")
+                    await self.page.goto(results_url, wait_until="domcontentloaded", timeout=10_000)
+                    break
 
             await self.page.wait_for_timeout(2_000)
             _logger.info("Search submitted, page: %s", self.page.url)

@@ -264,48 +264,37 @@ class EagleWebScraper(BridgeScraper):
         _logger.info("Selected %d doc type checkboxes for %s", selected, record_type)
 
     async def _submit_search(self) -> None:
-        """Submit the search form via JavaScript."""
+        """Submit the search form using Playwright native click."""
         try:
-            # Use JS to find and click the Search submit button
-            # EagleWeb uses <input type="submit" value="Search"> not <button>
-            submitted = await self.page.evaluate("""
-                (() => {
-                    // Try input[type=submit] first (most EagleWeb sites)
-                    const submits = document.querySelectorAll('input[type="submit"]');
-                    for (const s of submits) {
-                        if (s.value && s.value.trim().toLowerCase() === 'search') {
-                            s.click();
-                            return 'input_submit';
-                        }
-                    }
-                    // Try button elements
-                    const btns = document.querySelectorAll('button');
-                    for (const b of btns) {
-                        if (b.textContent.trim().toLowerCase() === 'search') {
-                            b.click();
-                            return 'button';
-                        }
-                    }
-                    // Try form submit
-                    const form = document.querySelector('form');
-                    if (form) { form.submit(); return 'form_submit'; }
-                    return null;
-                })()
-            """)
-            # Wait for results page — EagleWeb posts to docSearchPOST.jsp
-            # which redirects to docSearchResults.jsp
-            try:
-                await self.page.wait_for_url("**/docSearchResults*", timeout=15_000)
-            except Exception:
-                # If URL-based wait fails, wait for page load
+            # Use Playwright native click (not JS) so it tracks navigation
+            search_btn = self.page.locator("input[type='submit'][value='Search']").last
+            if await search_btn.count() == 0:
+                search_btn = self.page.locator("button:has-text('Search')").last
+            if await search_btn.count() == 0:
+                search_btn = self.page.locator("input[value='Search']").last
+
+            # Click with navigation wait
+            async with self.page.expect_navigation(timeout=15_000, wait_until="domcontentloaded"):
+                await search_btn.click()
+
+            # EagleWeb may redirect: docSearchPOST.jsp → docSearchResults.jsp
+            if "POST" in self.page.url:
                 try:
-                    await self.page.wait_for_load_state("networkidle", timeout=10_000)
+                    await self.page.wait_for_url("**/docSearchResults*", timeout=10_000)
                 except Exception:
-                    pass
+                    await self.page.wait_for_timeout(3_000)
+
             await self.page.wait_for_timeout(2_000)
-            _logger.info("Search submitted via %s, page: %s", submitted, self.page.url)
+            _logger.info("Search submitted, page: %s", self.page.url)
         except Exception as exc:
-            _logger.warning("Could not submit search: %s", str(exc)[:60])
+            _logger.warning("Could not submit search: %s — trying fallback", str(exc)[:60])
+            # Fallback: direct form submission
+            try:
+                await self.page.evaluate("document.querySelector('form')?.submit()")
+                await self.page.wait_for_timeout(5_000)
+                _logger.info("Fallback form submit, page: %s", self.page.url)
+            except Exception:
+                pass
 
     async def _extract_all_pages(self) -> list[ScrapedRecord]:
         """Extract records from all result pages."""

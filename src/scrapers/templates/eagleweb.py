@@ -24,11 +24,15 @@ _logger = setup_logger("scraper.template.eagleweb")
 # Document type keywords in EagleWeb checkbox labels
 _DOC_TYPE_MAP = {
     "probate": ["PROBATE", "LETTERS TESTAMENTARY", "LETTERS OF ADMINISTRATION",
-                "PERSONAL REPRESENTATIVE", "ESTATE", "WILL"],
+                "PERSONAL REPRESENTATIVE", "PERSONAL REP", "ESTATE", "WILL",
+                "DEATH", "AFFIDAVIT OF HEIRSHIP", "HEIR"],
     "pre_foreclosure": ["LIS PENDENS", "NOTICE OF TRUSTEE", "TRUSTEE SALE",
-                        "DEFAULT", "FORECLOSURE"],
-    "tax_delinquent": ["TAX", "DELINQUENT", "TAX LIEN", "CERTIFICATE OF DELINQUENCY"],
-    "divorce": ["DIVORCE", "DISSOLUTION"],
+                        "TRUSTEE'S SALE", "DISCONTINUANCE TRUSTEE",
+                        "SUBSTITUTION OF TRUSTEE", "DEFAULT", "FORECLOSURE",
+                        "NOTICE OF DEFAULT"],
+    "tax_delinquent": ["TAX", "DELINQUENT", "TAX LIEN", "CERTIFICATE OF DELINQUENCY",
+                       "CERTIFICATE OF SALE"],
+    "divorce": ["DIVORCE", "DISSOLUTION", "DECREE OF DISSOLUTION"],
 }
 
 
@@ -322,16 +326,20 @@ class EagleWebScraper(BridgeScraper):
 
             soup = await self.get_soup_async()
 
-            # Find results table — look for table with "Description" and "Summary" headers
-            results_table = None
+            # Find results table — EagleWeb has multiple tables with "Description"/"Summary"
+            # headers. The actual data table is the one with the MOST rows.
+            candidate_tables = []
             for table in soup.find_all("table"):
                 headers = [th.get_text(strip=True).upper() for th in table.find_all("th")]
-                # EagleWeb results have Description + Summary columns
                 if "DESCRIPTION" in headers or "SUMMARY" in headers:
-                    results_table = table
-                    break
+                    row_count = len(table.find_all("tr"))
+                    candidate_tables.append((row_count, table))
 
-            if not results_table:
+            if candidate_tables:
+                # Pick the table with the most rows (the actual data table)
+                candidate_tables.sort(reverse=True)
+                results_table = candidate_tables[0][1]
+            else:
                 # Fallback: find table with most rows that has links
                 tables_with_links = []
                 for table in soup.find_all("table"):
@@ -342,6 +350,8 @@ class EagleWebScraper(BridgeScraper):
                 if tables_with_links:
                     tables_with_links.sort(reverse=True)
                     results_table = tables_with_links[0][1]
+                else:
+                    results_table = None
 
             if not results_table:
                 _logger.warning("Could not find results table")

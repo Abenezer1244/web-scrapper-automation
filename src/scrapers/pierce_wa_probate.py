@@ -308,18 +308,18 @@ class PierceWAProbateScraper(BridgeScraper):
             except Exception:
                 pass  # Skip this record, continue with next
 
-        # Go back to search results
+        # Go back to search results (ARMS preserves pagination state)
         try:
             back_link = page.locator("text=Back to Results").first
             if await back_link.count() > 0:
                 await back_link.click(timeout=5_000)
                 await page.wait_for_load_state("load")
-                await page.wait_for_timeout(1_000)
+                await page.wait_for_timeout(2_000)  # Wait for results to fully render
+                _logger.info("  Back to results page")
         except Exception:
-            pass
+            _logger.warning("  Could not go back to results")
 
-        if found:
-            _logger.info("  Detail pages: found %d parcel IDs on this page", found)
+        _logger.info("  Detail pages: found %d parcel IDs", found)
 
     async def _fetch_parcel_ids(self, records: list[ScrapedRecord]) -> None:
         """Click into each record's detail page to get the real parcel ID.

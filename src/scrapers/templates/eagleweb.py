@@ -308,123 +308,88 @@ class EagleWebScraper(BridgeScraper):
         return all_records
 
     async def _extract_page(self) -> list[ScrapedRecord]:
-        """Extract records from the current EagleWeb results page.
+        """Extract records from the current EagleWeb results page via JavaScript.
 
-        EagleWeb results format:
-        - Column 1 (Description): Doc type + AFN number (e.g., "Deed Of Trust 7472965")
-        - Column 2 (Summary): Date + Grantor + Grantee lines
-        - Pagination: numbered links + [Next/Last]
+        Uses browser-side JS extraction instead of BeautifulSoup for reliability.
+        EagleWeb results: Description (doc type + AFN) | Summary (date + Grantor + Grantee)
         """
-        import re
-
         records: list[ScrapedRecord] = []
-        # Extract ALL record types — don't filter, return everything
-        record_type = "all"
 
         try:
-            # Check for "No documents found" or "0 items found"
-            page_text = await self.page.inner_text("body")
-            if "No documents found" in page_text or "0 items found" in page_text:
-                _logger.info("No results found on this page")
-                return []
+            # Extract directly via JavaScript — more reliable than BeautifulSoup
+            raw = await self.page.evaluate("""
+                (() => {
+                    const tables = document.querySelectorAll('table');
+                    let bestTable = null, bestRows = 0;
+                    for (const t of tables) {
+                        const ths = Array.from(t.querySelectorAll('th')).map(h => h.textContent.trim().toUpperCase());
+                        if (ths.includes('DESCRIPTION') || ths.includes('SUMMARY')) {
+                            const rows = t.querySelectorAll('tr').length;
+                            if (rows > bestRows) { bestRows = rows; bestTable = t; }
+                        }
+                    }
+                    if (!bestTable) return [];
 
-            soup = await self.get_soup_async()
+                    const results = [];
+                    const rows = bestTable.querySelectorAll('tr');
+                    for (let i = 1; i < rows.length; i++) {
+                        const cells = rows[i].querySelectorAll('td');
+                        if (cells.length < 2) continue;
+                        const desc = cells[0].textContent.trim();
+                        const summary = cells[1].textContent.trim();
+                        if (!desc || desc.length < 3) continue;
+                        results.push({desc, summary});
+                    }
+                    return results;
+                })()
+            """)
 
-            # Find results table — EagleWeb has multiple tables with "Description"/"Summary"
-            # headers. The actual data table is the one with the MOST rows.
-            candidate_tables = []
-            for table in soup.find_all("table"):
-                headers = [th.get_text(strip=True).upper() for th in table.find_all("th")]
-                if "DESCRIPTION" in headers or "SUMMARY" in headers:
-                    row_count = len(table.find_all("tr"))
-                    candidate_tables.append((row_count, table))
-
-            if candidate_tables:
-                # Pick the table with the most rows (the actual data table)
-                candidate_tables.sort(reverse=True)
-                results_table = candidate_tables[0][1]
-            else:
-                # Fallback: find table with most rows that has links
-                tables_with_links = []
-                for table in soup.find_all("table"):
-                    rows = table.find_all("tr")
-                    link_count = len(table.find_all("a"))
-                    if len(rows) > 3 and link_count > 2:
-                        tables_with_links.append((len(rows), table))
-                if tables_with_links:
-                    tables_with_links.sort(reverse=True)
-                    results_table = tables_with_links[0][1]
+            if not raw:
+                page_text = await self.page.inner_text("body")
+                if "No documents found" in page_text or "0 items found" in page_text:
+                    _logger.info("No results found on this page")
                 else:
-                    results_table = None
-
-            if not results_table:
-                _logger.warning("Could not find results table")
+                    _logger.warning("Could not find results table via JS")
                 return []
 
-            rows = results_table.find_all("tr")
-            # Doc type keywords for filtering
-            type_keywords = _DOC_TYPE_MAP.get(record_type, [])
-
-            for row in rows[1:]:  # Skip header
-                cells = row.find_all("td")
-                if len(cells) < 2:
-                    continue
-
-                # Extract Description (col 0) and Summary (col 1)
-                desc_text = cells[0].get_text(strip=True)
-                summary_text = cells[1].get_text(" ", strip=True) if len(cells) > 1 else ""
-
-                if not desc_text or len(desc_text) < 3:
-                    continue
-
-                # Filter by doc type if specified
-                if type_keywords:
-                    desc_upper = desc_text.upper()
-                    if not any(kw in desc_upper for kw in type_keywords):
-                        continue
+            import re
+            for item in raw:
+                desc = item.get("desc", "")
+                summary = item.get("summary", "")
 
                 record = ScrapedRecord()
 
-                # Parse Description: "Deed Of Trust 7472965" → doc_type + AFN
-                desc_parts = desc_text.strip()
-                # AFN is usually the last number in the description
-                afn_match = re.search(r"\b(\d{5,})\b", desc_parts)
+                # Parse AFN from description
+                afn_match = re.search(r"\b(\d{5,})\b", desc)
                 if afn_match:
                     record.instrument_number = afn_match.group(1)
 
-                # Parse Summary for date, grantor, grantee
-                # Format: "03/02/2026 08:04:48 AM\nGrantor: NAME\nGrantee: NAME"
-                date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", summary_text)
+                # Parse date
+                date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", summary)
                 if date_match:
                     record.date_recorded = date_match.group(1)
 
-                grantor_match = re.search(r"Grantor:\s*(.+?)(?:Grantee:|$)", summary_text)
+                # Parse Grantor
+                grantor_match = re.search(r"Grantor:\s*(.+?)(?:Grantee:|$)", summary, re.DOTALL)
                 if grantor_match:
                     record.party_name = grantor_match.group(1).strip().rstrip(",")
 
-                grantee_match = re.search(r"Grantee:\s*(.+?)(?:Grantor:|$)", summary_text)
+                # Parse Grantee
+                grantee_match = re.search(r"Grantee:\s*(.+?)(?:Grantor:|$)", summary, re.DOTALL)
                 if grantee_match:
-                    grantee = grantee_match.group(1).strip().rstrip(",")
+                    grantee = grantee_match.group(1).strip().rstrip(",").rstrip(".")
                     if grantee:
                         record.heirs = grantee
 
-                # Look for legal description in additional cells
-                for cell in cells[2:]:
-                    cell_text = cell.get_text(strip=True)
-                    legal_keywords = ["LOT", "BLOCK", "SEC", "TWP", "ADD", "PLAT", "SUB"]
-                    if any(kw in cell_text.upper() for kw in legal_keywords):
-                        record.legal_description = cell_text
-                        break
-
-                # Look for parcel ID
-                parcel_match = re.search(r"\b(\d{10,})\b", summary_text)
+                # Parcel ID
+                parcel_match = re.search(r"\b(\d{10,})\b", summary)
                 if parcel_match:
                     record.parcel_id = parcel_match.group(1)
 
                 if record.party_name or record.date_recorded:
                     records.append(record)
 
-            _logger.info("Extracted %d records from page (filtered by %s)", len(records), record_type)
+            _logger.info("Extracted %d records from page", len(records))
 
         except Exception as exc:
             _logger.warning("Error extracting page: %s", str(exc)[:80])

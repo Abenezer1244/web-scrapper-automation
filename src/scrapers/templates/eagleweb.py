@@ -264,14 +264,38 @@ class EagleWebScraper(BridgeScraper):
         _logger.info("Selected %d doc type checkboxes for %s", selected, record_type)
 
     async def _submit_search(self) -> None:
-        """Click the Search button."""
+        """Submit the search form via JavaScript."""
         try:
-            search_btn = self.page.locator("button:has-text('Search'), input[value='Search']").last
-            await search_btn.click()
-            await self.page.wait_for_timeout(3_000)
-            _logger.info("Search submitted")
+            # Use JS to find and click the Search submit button
+            # EagleWeb uses <input type="submit" value="Search"> not <button>
+            submitted = await self.page.evaluate("""
+                (() => {
+                    // Try input[type=submit] first (most EagleWeb sites)
+                    const submits = document.querySelectorAll('input[type="submit"]');
+                    for (const s of submits) {
+                        if (s.value && s.value.trim().toLowerCase() === 'search') {
+                            s.click();
+                            return 'input_submit';
+                        }
+                    }
+                    // Try button elements
+                    const btns = document.querySelectorAll('button');
+                    for (const b of btns) {
+                        if (b.textContent.trim().toLowerCase() === 'search') {
+                            b.click();
+                            return 'button';
+                        }
+                    }
+                    // Try form submit
+                    const form = document.querySelector('form');
+                    if (form) { form.submit(); return 'form_submit'; }
+                    return null;
+                })()
+            """)
+            await self.page.wait_for_timeout(5_000)
+            _logger.info("Search submitted via %s", submitted)
         except Exception as exc:
-            _logger.warning("Could not click Search: %s", str(exc)[:60])
+            _logger.warning("Could not submit search: %s", str(exc)[:60])
 
     async def _extract_all_pages(self) -> list[ScrapedRecord]:
         """Extract records from all result pages."""

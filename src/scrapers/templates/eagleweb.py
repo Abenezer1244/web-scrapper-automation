@@ -318,7 +318,8 @@ class EagleWebScraper(BridgeScraper):
         import re
 
         records: list[ScrapedRecord] = []
-        record_type = self.record_types[0] if self.record_types else "all"
+        # Extract ALL record types — don't filter, return everything
+        record_type = "all"
 
         try:
             # Check for "No documents found" or "0 items found"

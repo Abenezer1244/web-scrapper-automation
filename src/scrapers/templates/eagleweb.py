@@ -87,11 +87,25 @@ class EagleWebScraper(BridgeScraper):
     async def _accept_disclaimer(self) -> None:
         """Click 'I Acknowledge' disclaimer if present."""
         try:
-            btn = self.page.locator("button:has-text('I Acknowledge'), input[value*='Acknowledge']")
-            if await btn.count() > 0:
-                await btn.first.click()
+            # EagleWeb disclaimer buttons: "I Acknowledge", "Accept", "Agree"
+            clicked = await self.page.evaluate("""
+                (() => {
+                    const btns = document.querySelectorAll('button, input[type="button"], input[type="submit"], a');
+                    for (const b of btns) {
+                        const text = (b.textContent || b.value || '').trim().toLowerCase();
+                        if (text.includes('acknowledge') || text.includes('accept') || text.includes('agree')) {
+                            b.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                })()
+            """)
+            if clicked:
                 await self.page.wait_for_timeout(2_000)
                 _logger.info("Disclaimer accepted")
+            else:
+                _logger.info("No disclaimer found, continuing")
         except Exception:
             _logger.info("No disclaimer found, continuing")
 
@@ -115,73 +129,66 @@ class EagleWebScraper(BridgeScraper):
             except Exception as exc:
                 _logger.warning("Could not configure doc types: %s", str(exc)[:60])
 
-        # Fill date range
+        # Fill date range via JavaScript (most reliable for EagleWeb)
         try:
-            # EagleWeb has Start Date and End Date text inputs
-            start_inputs = self.page.locator("input[type='text']").all()
-            date_fields = []
-            for inp in await self.page.locator("input[type='text']").all():
-                val = await inp.get_attribute("value") or ""
-                # Date fields typically have date-like default values
-                if "/" in val and len(val) >= 8:
-                    date_fields.append(inp)
-
-            if len(date_fields) >= 2:
-                await date_fields[0].triple_click()
-                await date_fields[0].fill(date_from)
-                await date_fields[1].triple_click()
-                await date_fields[1].fill(date_to)
-                _logger.info("Date range set: %s to %s", date_from, date_to)
-            else:
-                # Fallback: use JavaScript to find and fill date inputs
-                await self.page.evaluate(f"""
-                    (() => {{
-                        const inputs = document.querySelectorAll('input[type="text"]');
-                        for (const inp of inputs) {{
-                            if (inp.value && inp.value.includes('/') && inp.value.length >= 8) {{
-                                if (inp.value.startsWith('01/01')) {{
-                                    inp.value = '{date_from}';
-                                    inp.dispatchEvent(new Event('change'));
-                                }} else {{
-                                    inp.value = '{date_to}';
-                                    inp.dispatchEvent(new Event('change'));
-                                }}
+            await self.page.evaluate(f"""
+                (() => {{
+                    const inputs = document.querySelectorAll('input[type="text"]');
+                    let startSet = false;
+                    for (const inp of inputs) {{
+                        if (inp.value && inp.value.includes('/') && inp.value.length >= 8) {{
+                            if (!startSet) {{
+                                inp.value = '{date_from}';
+                                inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                                startSet = true;
+                            }} else {{
+                                inp.value = '{date_to}';
+                                inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                                break;
                             }}
                         }}
-                    }})()
-                """)
-                _logger.info("Date range set via JS: %s to %s", date_from, date_to)
+                    }}
+                }})()
+            """)
+            _logger.info("Date range set: %s to %s", date_from, date_to)
         except Exception as exc:
             _logger.warning("Could not set date range: %s", str(exc)[:60])
 
     async def _select_doc_types(self, record_type: str) -> None:
-        """Select document type checkboxes matching the record type."""
+        """Select document type checkboxes matching the record type via JavaScript."""
         keywords = _DOC_TYPE_MAP.get(record_type, [])
         if not keywords:
             return
 
-        # Get all checkbox labels
-        checkboxes = await self.page.locator("input[type='checkbox']").all()
-        selected = 0
-        for cb in checkboxes:
-            label_text = ""
-            # Try to get label from parent or sibling
-            try:
-                parent = cb.locator("..")
-                label_text = (await parent.inner_text()).strip().upper()
-            except Exception:
-                pass
-
-            for keyword in keywords:
-                if keyword in label_text:
-                    if not await cb.is_checked():
-                        await cb.check()
-                        selected += 1
-                        _logger.info("Selected doc type: %s", label_text[:40])
-                    break
-
-        if selected == 0:
-            _logger.warning("No doc type checkboxes matched for %s", record_type)
+        # Use JavaScript to find and check matching checkboxes
+        # EagleWeb checkboxes have labels as sibling text nodes
+        keywords_json = str(keywords)
+        selected = await self.page.evaluate(f"""
+            (() => {{
+                const keywords = {keywords_json};
+                const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+                let count = 0;
+                for (const cb of checkboxes) {{
+                    if (cb.id === 'allTypes' || cb.name === 'allTypes') continue;
+                    const parent = cb.parentElement;
+                    if (!parent) continue;
+                    const text = parent.textContent.trim().toUpperCase();
+                    for (const kw of keywords) {{
+                        if (text.includes(kw)) {{
+                            if (!cb.checked) {{
+                                cb.checked = true;
+                                cb.dispatchEvent(new Event('change', {{bubbles: true}}));
+                                cb.dispatchEvent(new Event('click', {{bubbles: true}}));
+                                count++;
+                            }}
+                            break;
+                        }}
+                    }}
+                }}
+                return count;
+            }})()
+        """)
+        _logger.info("Selected %d doc type checkboxes for %s", selected, record_type)
 
     async def _submit_search(self) -> None:
         """Click the Search button."""

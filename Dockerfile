@@ -41,6 +41,8 @@ USER bridge
 # Install Playwright Chromium as the bridge user
 RUN playwright install chromium
 
+# Cache-bust: force fresh copy of source files on every build
+ARG CACHEBUST=1
 COPY --chown=bridge:bridge . .
 RUN chmod +x /app/start.sh
 

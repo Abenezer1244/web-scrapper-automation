@@ -54,7 +54,26 @@ class PierceWAProbateScraper(BridgeScraper):
             _logger.info("Processing page %d", page_num)
 
             soup = await self.get_soup_async()
+
+            # Capture instrument numbers via Playwright DOM (more reliable than BS4)
+            instrument_numbers = await self.page.evaluate(r"""() => {
+                const links = document.querySelectorAll('a[href*="javascript"]');
+                const nums = [];
+                for (const a of links) {
+                    const text = a.textContent.trim();
+                    if (/^\d{10,12}$/.test(text)) nums.push(text);
+                }
+                return nums;
+            }""")
+
             page_records = self._extract_records(soup)
+
+            # Assign instrument numbers to records by order
+            for idx, record in enumerate(page_records):
+                if idx < len(instrument_numbers):
+                    if not record.enrichment_data or not record.enrichment_data.get("instrument_number"):
+                        record.enrichment_data = record.enrichment_data or {}
+                        record.enrichment_data["instrument_number"] = instrument_numbers[idx]
 
             new_count = 0
             for record in page_records:

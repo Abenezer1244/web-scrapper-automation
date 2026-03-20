@@ -62,8 +62,9 @@ def get_scraper_class(county: str, state: str, record_type: str):
     if scraper_mode == "ai":
         from functools import partial
 
-        # Check for template match first (saves Claude AI tokens)
-        template_class = _detect_template(connector.base_url)
+        # Template scrapers disabled pending EagleWeb form submission fix.
+        # Fall through to AI scraper for now.
+        template_class = None  # _detect_template(connector.base_url)
         if template_class:
             _logger.info(
                 "Registry resolved %s/%s/%s → %s (template, base_url=%s)",

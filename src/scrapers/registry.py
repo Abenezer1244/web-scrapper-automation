@@ -62,6 +62,21 @@ def get_scraper_class(county: str, state: str, record_type: str):
     if scraper_mode == "ai":
         from functools import partial
 
+        # Check for template match first (saves Claude AI tokens)
+        template_class = _detect_template(connector.base_url)
+        if template_class:
+            _logger.info(
+                "Registry resolved %s/%s/%s → %s (template, base_url=%s)",
+                county, state, record_type, template_class.__name__, connector.base_url,
+            )
+            return partial(
+                template_class,
+                base_url=connector.base_url,
+                county=connector.county,
+                state=connector.state,
+                record_types=connector.record_types,
+            )
+
         from src.scrapers.ai_scraper import AIScraper
 
         _logger.info(
@@ -92,6 +107,43 @@ def get_scraper_class(county: str, state: str, record_type: str):
         county, state, record_type, connector.scraper_class,
     )
     return scraper_class
+
+
+def _detect_template(base_url: str):
+    """Detect if a URL matches a known recorder platform template.
+
+    Returns the template scraper class if matched, None otherwise.
+    This saves Claude AI tokens by using standardized navigation
+    for known platforms.
+    """
+    url_lower = base_url.lower()
+
+    # EagleWeb (Tyler Technologies) — 16+ WA counties
+    # URL patterns: /recorder/web/, /eagleweb/, tylerhost.net, countygovernmentrecords.com
+    eagleweb_patterns = [
+        "/recorder/web",
+        "/eagleweb/",
+        "tylerhost.net",
+        "countygovernmentrecords.com",
+        "selfservice.",
+    ]
+    if any(p in url_lower for p in eagleweb_patterns):
+        from src.scrapers.templates.eagleweb import EagleWebScraper
+        return EagleWebScraper
+
+    # LandmarkWeb (Hyland) — Clark, King, Snohomish
+    # URL pattern: /LandmarkWeb/
+    if "/landmarkweb" in url_lower:
+        # LandmarkWeb may have reCAPTCHA — fall through to AI scraper
+        # which has CAPTCHA detection
+        return None
+
+    # AcclaimWeb (Tyler) — Chelan, Douglas, Pend Oreille
+    if "/acclaimweb" in url_lower:
+        # Similar to EagleWeb but different interface — use AI for now
+        return None
+
+    return None
 
 
 def list_supported() -> list[dict]:

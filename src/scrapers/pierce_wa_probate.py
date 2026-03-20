@@ -83,7 +83,11 @@ class PierceWAProbateScraper(BridgeScraper):
                 enriched = await enrich_parcel(record.parcel_id, "pierce", "WA")
                 record.property_address = enriched.get("property_address") or record.property_address
                 record.mailing_address = enriched.get("mailing_address") or record.mailing_address
-                record.enrichment_data = enriched
+                # Merge enrichment data (preserve instrument_number)
+                if isinstance(record.enrichment_data, dict):
+                    record.enrichment_data.update(enriched)
+                else:
+                    record.enrichment_data = enriched
                 await self.polite_delay()
 
         _logger.info("Pierce WA Probate — complete. %d records", len(all_records))
@@ -327,14 +331,28 @@ class PierceWAProbateScraper(BridgeScraper):
 
         record = ScrapedRecord()
 
-        # Find instrument number (12-digit, starts with year)
-        inst_re = re.compile(r"\b(20\d{10})\b")
-        for text in all_texts:
-            m = inst_re.search(text)
-            if m:
-                # Store in enrichment_data for later detail page lookup
-                record.enrichment_data = {"instrument_number": m.group(1)}
+        # Find instrument number — clickable link in the results table
+        # Modern format: 12 digits starting with 20 (e.g., 202601020064)
+        # Old format: 10 digits starting with 8 or 9 (e.g., 8207220167)
+        inst_re = re.compile(r"\b(\d{10,12})\b")
+        for c in cells:
+            # Instrument numbers are in clickable <a> or <td> with cursor:pointer
+            links = c.find_all("a")
+            for link in links:
+                link_text = link.get_text(strip=True)
+                m = inst_re.match(link_text)
+                if m and len(link_text) >= 10:
+                    record.enrichment_data = {"instrument_number": m.group(1)}
+                    break
+            if record.enrichment_data and record.enrichment_data.get("instrument_number"):
                 break
+        # Fallback: search all text for instrument-like numbers
+        if not record.enrichment_data or not record.enrichment_data.get("instrument_number"):
+            for text in all_texts:
+                m = re.search(r"\b(20\d{10})\b", text)
+                if m:
+                    record.enrichment_data = {"instrument_number": m.group(1)}
+                    break
 
         # Find date (MM/DD/YYYY pattern)
         date_re = re.compile(r"\b\d{2}/\d{2}/\d{4}\b")

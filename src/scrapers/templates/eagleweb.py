@@ -65,10 +65,13 @@ class EagleWebScraper(BridgeScraper):
         Returns:
             List of ScrapedRecord instances.
         """
-        record_type = self.record_types[0] if self.record_types else "all"
+        # Extract all record types — the worker doesn't pass the specific job
+        # record_type to scrape(), so we search all and filter by keywords.
+        # "all" means no filter — return every record found.
+        record_type = "all"
         _logger.info(
-            "EagleWeb scraper — %s/%s %s — %s to %s",
-            self.county, self.state, record_type, date_from, date_to,
+            "EagleWeb scraper — %s/%s — %s to %s",
+            self.county, self.state, date_from, date_to,
         )
 
         await self.navigate(self.base_url)

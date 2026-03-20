@@ -90,21 +90,35 @@ county_connectors DB row (base_url, record_types)
 
 ---
 
-## Enrichment Architecture (National Scale)
+## Enrichment Architecture (Cost-Optimized)
 
 ```
 Parcel ID from any county
-  → Regrid API: GET /api/v2/parcels/apn?parcelnumb=APN&token=TOKEN
-  → Returns: GeoJSON with property address, mailing address, owner, assessed value
-  → Works for ALL 3,100+ US counties
-  → $0.01-0.05 per lookup
-  → No CAPTCHA, no Playwright, no per-county code
+  → 1. County GIS REST API (FREE — ArcGIS, no auth, no CAPTCHA)
+       GET .../FeatureServer/0/query?where=TaxParcelNumber='APN'&f=json
+       ~60-70% of US counties have free ArcGIS endpoints
+       $0.00 per lookup
+
+  → 2. Regrid API (paid, if enabled — $375/mo)
+       GET /api/v2/parcels/apn?parcelnumb=APN&token=TOKEN
+       Works for ALL 3,100+ US counties
+       $0.01-0.05 per lookup
+
+  → 3. AI Assessor Scraper (Claude API — ~$0.01/lookup)
+       Claude navigates county assessor website via Playwright
+       Cached after first lookup (subsequent replays free)
+
+  → 4. County-specific fallback (ATIP for Pierce, etc.)
+
+  → 5. "(enrichment unavailable)"
 ```
 
-Fallback chain:
-1. Regrid API (national, primary)
-2. County-specific API (ATIP for Pierce, etc.)
-3. "(enrichment unavailable)"
+Fallback chain (cheapest first):
+1. County GIS REST API (free, fast, no auth)
+2. Regrid API (paid, if enabled)
+3. AI assessor scraper (Claude API, cached)
+4. County-specific API (ATIP for Pierce, etc.)
+5. "(enrichment unavailable)"
 
 ---
 

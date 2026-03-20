@@ -87,6 +87,10 @@ class Settings(BaseSettings):
     REGRID_API_TOKEN: str = ""
     REGRID_ENABLED: bool = False
 
+    # ─── Free Enrichment (County GIS + AI Assessor) ───────────────────────────
+    GIS_ENRICHMENT_ENABLED: bool = True
+    AI_ENRICHMENT_ENABLED: bool = True
+
     # ─── Logging ──────────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 

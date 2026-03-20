@@ -118,6 +118,8 @@ class CountyConnector(Base):
     scraper_mode = Column(String(16), nullable=False, default="ai")  # ai | manual
     render_mode = Column(String(16), nullable=False, default="playwright")  # playwright | static
     base_url = Column(String(512), nullable=False)
+    gis_endpoint = Column(Text, nullable=True)  # Free ArcGIS REST API URL
+    assessor_url = Column(Text, nullable=True)  # County assessor website (AI fallback)
     health_status = Column(String(16), nullable=False, default="unknown")  # healthy | degraded | down | unknown
     last_checked = Column(DateTime(timezone=True), nullable=True)
     active = Column(Boolean, nullable=False, default=True)

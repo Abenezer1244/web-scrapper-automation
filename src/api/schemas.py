@@ -196,6 +196,8 @@ class ConnectorCreate(BaseModel):
     record_types: list[str]
     base_url: str
     scraper_mode: str = "ai"  # ai | manual
+    gis_endpoint: str | None = None  # Free ArcGIS REST API URL
+    assessor_url: str | None = None  # County assessor website (AI fallback)
 
     @field_validator("state")
     @classmethod
@@ -216,6 +218,8 @@ class ConnectorResponse(BaseModel):
     scraper_mode: str  # ai | manual
     render_mode: str
     base_url: str
+    gis_endpoint: str | None = None
+    assessor_url: str | None = None
     health_status: str
     last_checked: datetime | None
     active: bool

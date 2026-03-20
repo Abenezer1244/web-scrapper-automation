@@ -125,7 +125,8 @@ def _detect_template(base_url: str):
         "/eagleweb/",
         "tylerhost.net",
         "countygovernmentrecords.com",
-        "selfservice.",
+        # Note: "selfservice." excluded — Tyler Self-Service is a different
+        # interface than EagleWeb (uses /web/cart, not /eagleweb/docSearch)
     ]
     if any(p in url_lower for p in eagleweb_patterns):
         from src.scrapers.templates.eagleweb import EagleWebScraper

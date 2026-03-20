@@ -255,9 +255,18 @@ class EagleWebScraper(BridgeScraper):
                     return false;
                 })()
             """)
-            # Wait for results page to load after POST redirect
+            # Wait for results page — may go through docSearchPOST.jsp redirect
             await self.page.wait_for_load_state("domcontentloaded", timeout=15_000)
-            await self.page.wait_for_timeout(2_000)
+            await self.page.wait_for_timeout(3_000)
+
+            # If stuck on POST page, navigate to results (session is maintained)
+            if "POST" in self.page.url and "Results" not in self.page.url:
+                base = self.page.url.split("/eagleweb/")[0] if "/eagleweb/" in self.page.url else self.base_url.rstrip("/")
+                results_url = f"{base}/eagleweb/docSearchResults.jsp?searchId=0"
+                _logger.info("POST page detected, navigating to results")
+                await self.page.goto(results_url, wait_until="domcontentloaded", timeout=15_000)
+                await self.page.wait_for_timeout(2_000)
+
             _logger.info("Search submitted, page: %s", self.page.url)
         except Exception as exc:
             _logger.warning("Could not submit search: %s", str(exc)[:60])

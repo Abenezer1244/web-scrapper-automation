@@ -292,12 +292,17 @@ class EagleWebScraper(BridgeScraper):
                     return null;
                 })()
             """)
-            # Wait for results page to load after form submission
+            # Wait for results page — EagleWeb posts to docSearchPOST.jsp
+            # which redirects to docSearchResults.jsp
             try:
-                await self.page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                await self.page.wait_for_url("**/docSearchResults*", timeout=15_000)
             except Exception:
-                pass
-            await self.page.wait_for_timeout(3_000)
+                # If URL-based wait fails, wait for page load
+                try:
+                    await self.page.wait_for_load_state("networkidle", timeout=10_000)
+                except Exception:
+                    pass
+            await self.page.wait_for_timeout(2_000)
             _logger.info("Search submitted via %s, page: %s", submitted, self.page.url)
         except Exception as exc:
             _logger.warning("Could not submit search: %s", str(exc)[:60])

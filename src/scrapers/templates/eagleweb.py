@@ -238,45 +238,25 @@ class EagleWebScraper(BridgeScraper):
         _logger.info("Selected %d doc type checkboxes for %s", selected, record_type)
 
     async def _submit_search(self) -> None:
-        """Submit the search form and wait for results page."""
+        """Submit the search form using form.submit() for reliable redirect.
+
+        form.submit() follows the POST→redirect chain correctly,
+        unlike clicking the submit button which gets stuck on the
+        intermediate docSearchPOST.jsp page in headless mode.
+        """
         try:
-            # Find the search form and submit it natively
-            # This ensures the browser follows all redirects naturally
-            search_btn = self.page.locator("input[value='Search']").last
-            if await search_btn.count() == 0:
-                search_btn = self.page.locator("button:has-text('Search')").last
-
-            # Use Promise.all pattern: start waiting BEFORE clicking
-            await self.page.run_and_wait(
-                lambda: search_btn.click(),
-                "domcontentloaded",
-            ) if hasattr(self.page, 'run_and_wait') else None
-
-            # Click and wait for form to process
-            current_url = self.page.url
-            await search_btn.click()
-
-            # Wait for URL to change from search form
-            for _ in range(20):
-                await self.page.wait_for_timeout(500)
-                if self.page.url != current_url:
-                    break
-
-            # If stuck on docSearchPOST.jsp, manually navigate to results
-            # The POST page processes the search server-side and creates a searchId
-            for _ in range(10):
-                await self.page.wait_for_timeout(1_000)
-                url = self.page.url
-                if "Results" in url or "results" in url:
-                    break
-                if "POST" in url:
-                    # The POST page has finished — go to results
-                    base = url.split("/eagleweb/")[0] if "/eagleweb/" in url else url.rsplit("/", 1)[0]
-                    results_url = f"{base}/eagleweb/docSearchResults.jsp?searchId=0"
-                    _logger.info("POST complete, navigating to results")
-                    await self.page.goto(results_url, wait_until="domcontentloaded", timeout=10_000)
-                    break
-
+            await self.page.evaluate("""
+                (() => {
+                    const dateInput = document.getElementById('RecDateIDStart') ||
+                                     document.querySelector('input[name*="RecDate"]') ||
+                                     document.querySelector('input[name*="Date"]');
+                    const form = dateInput ? dateInput.closest('form') : document.querySelector('form');
+                    if (form) { form.submit(); return true; }
+                    return false;
+                })()
+            """)
+            # Wait for results page to load after POST redirect
+            await self.page.wait_for_load_state("domcontentloaded", timeout=15_000)
             await self.page.wait_for_timeout(2_000)
             _logger.info("Search submitted, page: %s", self.page.url)
         except Exception as exc:
@@ -347,6 +327,10 @@ class EagleWebScraper(BridgeScraper):
                         const desc = cells[0].textContent.trim();
                         const summary = cells[1].textContent.trim();
                         if (!desc || desc.length < 3) continue;
+                        // Skip rows that are scripts or navigation (no date pattern)
+                        if (desc.includes('function ') || desc.includes('var ')) continue;
+                        // Valid rows have a date in summary (MM/DD/YYYY)
+                        if (!/\d{1,2}\/\d{1,2}\/\d{4}/.test(summary)) continue;
                         results.push({desc, summary});
                     }
                     return results;

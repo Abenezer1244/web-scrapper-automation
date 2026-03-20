@@ -35,6 +35,27 @@ _KNOWN_GIS_ENDPOINTS: dict[str, dict] = {
     },
 }
 
+# ─── Statewide GIS endpoints (covers ALL counties in a state) ────────────────
+# WA State publishes all 39 counties in a single ArcGIS service.
+# FIPS codes map county names to their FIPS number for filtering.
+_WA_STATEWIDE_ENDPOINT = (
+    "https://services.arcgis.com/jsIt88o09Q0r1j8h"
+    "/arcgis/rest/services/Current_Parcels/FeatureServer/0/query"
+)
+
+_WA_COUNTY_FIPS: dict[str, str] = {
+    "adams": "001", "asotin": "003", "benton": "005", "chelan": "007",
+    "clallam": "009", "clark": "011", "columbia": "013", "cowlitz": "015",
+    "douglas": "017", "ferry": "019", "franklin": "021", "garfield": "023",
+    "grant": "025", "grays harbor": "027", "island": "029", "jefferson": "031",
+    "king": "033", "kitsap": "035", "kittitas": "037", "klickitat": "039",
+    "lewis": "041", "lincoln": "043", "mason": "045", "okanogan": "047",
+    "pacific": "049", "pend oreille": "051", "pierce": "053", "san juan": "055",
+    "skagit": "057", "skamania": "059", "snohomish": "061", "spokane": "063",
+    "stevens": "065", "thurston": "067", "wahkiakum": "069", "walla walla": "071",
+    "whatcom": "073", "whitman": "075", "yakima": "077",
+}
+
 
 def enrich_parcel_gis(
     parcel_id: str,
@@ -66,9 +87,23 @@ def enrich_parcel_gis(
     elif county_key in _KNOWN_GIS_ENDPOINTS:
         gis_config = _KNOWN_GIS_ENDPOINTS[county_key]
 
-    if not gis_config:
-        return _empty()
+    # Try county-specific endpoint first
+    if gis_config:
+        result = _query_gis(parcel_id, gis_config, county_key)
+        if result.get("property_address"):
+            return result
 
+    # Fallback: WA statewide parcel service (covers all 39 WA counties)
+    if state.upper() == "WA":
+        result = _query_wa_statewide(parcel_id, county)
+        if result.get("property_address"):
+            return result
+
+    return _empty()
+
+
+def _query_gis(parcel_id: str, gis_config: dict, county_key: str) -> dict[str, str | None]:
+    """Query a county-specific ArcGIS REST endpoint."""
     endpoint = gis_config["endpoint"]
     parcel_field = gis_config["parcel_field"]
     out_fields = gis_config.get("out_fields", "*")
@@ -101,6 +136,68 @@ def enrich_parcel_gis(
         return _empty()
     except Exception as exc:
         _logger.warning("GIS API error for parcel %s: %s", parcel_id, str(exc)[:80])
+        return _empty()
+
+
+def _query_wa_statewide(parcel_id: str, county: str) -> dict[str, str | None]:
+    """Query the WA statewide parcel service (covers all 39 WA counties).
+
+    Endpoint: WAGeoservices Current_Parcels FeatureServer
+    Fields: ORIG_PARCEL_ID, SITUS_ADDRESS, SITUS_CITY_NM, SITUS_ZIP_NR
+    Filter: FIPS_NR for county scoping.
+    """
+    apn_clean = parcel_id.replace("-", "").strip()
+    fips = _WA_COUNTY_FIPS.get(county.lower())
+
+    where_clause = f"ORIG_PARCEL_ID='{apn_clean}'"
+    if fips:
+        where_clause += f" AND FIPS_NR='{fips}'"
+
+    params = {
+        "where": where_clause,
+        "outFields": "ORIG_PARCEL_ID,SITUS_ADDRESS,SITUS_CITY_NM,SITUS_ZIP_NR,VALUE_LAND,VALUE_BLDG",
+        "returnGeometry": "false",
+        "f": "json",
+        "resultRecordCount": 1,
+    }
+
+    try:
+        resp = requests.get(_WA_STATEWIDE_ENDPOINT, params=params, timeout=15)
+
+        if resp.status_code != 200:
+            _logger.warning("WA statewide GIS returned %d for parcel %s", resp.status_code, parcel_id)
+            return _empty()
+
+        data = resp.json()
+        features = data.get("features") or []
+        if not features:
+            return _empty()
+
+        attrs = features[0].get("attributes") or {}
+        address = attrs.get("SITUS_ADDRESS") or None
+        city = attrs.get("SITUS_CITY_NM") or ""
+        zipcode = attrs.get("SITUS_ZIP_NR") or ""
+
+        if address:
+            address = address.strip()
+            # Build full mailing address
+            parts = [address]
+            if city:
+                parts.append(city.strip())
+            if zipcode:
+                parts.append(f"WA {str(zipcode).strip()}")
+            mailing = ", ".join(parts)
+
+            _logger.info("WA statewide GIS enriched parcel %s: %s", parcel_id, address)
+            return {"property_address": address, "mailing_address": mailing}
+
+        return _empty()
+
+    except requests.exceptions.Timeout:
+        _logger.warning("WA statewide GIS timed out for parcel %s", parcel_id)
+        return _empty()
+    except Exception as exc:
+        _logger.warning("WA statewide GIS error for parcel %s: %s", parcel_id, str(exc)[:80])
         return _empty()
 
 

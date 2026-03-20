@@ -264,37 +264,30 @@ class EagleWebScraper(BridgeScraper):
         _logger.info("Selected %d doc type checkboxes for %s", selected, record_type)
 
     async def _submit_search(self) -> None:
-        """Submit the search form using Playwright native click."""
+        """Submit the search form and navigate to results."""
         try:
-            # Use Playwright native click (not JS) so it tracks navigation
-            search_btn = self.page.locator("input[type='submit'][value='Search']").last
+            # Click search button with Playwright
+            search_btn = self.page.locator("input[value='Search']").last
             if await search_btn.count() == 0:
                 search_btn = self.page.locator("button:has-text('Search')").last
-            if await search_btn.count() == 0:
-                search_btn = self.page.locator("input[value='Search']").last
 
-            # Click with navigation wait
-            async with self.page.expect_navigation(timeout=15_000, wait_until="domcontentloaded"):
-                await search_btn.click()
+            await search_btn.click()
+            await self.page.wait_for_timeout(3_000)
 
-            # EagleWeb may redirect: docSearchPOST.jsp → docSearchResults.jsp
-            if "POST" in self.page.url:
-                try:
-                    await self.page.wait_for_url("**/docSearchResults*", timeout=10_000)
-                except Exception:
-                    await self.page.wait_for_timeout(3_000)
+            # EagleWeb redirects: docSearch.jsp → docSearchPOST.jsp → docSearchResults.jsp
+            # The redirect may not complete automatically. Force navigate to results.
+            current = self.page.url
+            if "Results" not in current:
+                # Build the results URL from the current base
+                base = current.split("/eagleweb/")[0] if "/eagleweb/" in current else current.rsplit("/", 1)[0]
+                results_url = f"{base}/eagleweb/docSearchResults.jsp?searchId=0"
+                _logger.info("Navigating to results: %s", results_url)
+                await self.page.goto(results_url, wait_until="domcontentloaded", timeout=15_000)
+                await self.page.wait_for_timeout(2_000)
 
-            await self.page.wait_for_timeout(2_000)
             _logger.info("Search submitted, page: %s", self.page.url)
         except Exception as exc:
-            _logger.warning("Could not submit search: %s — trying fallback", str(exc)[:60])
-            # Fallback: direct form submission
-            try:
-                await self.page.evaluate("document.querySelector('form')?.submit()")
-                await self.page.wait_for_timeout(5_000)
-                _logger.info("Fallback form submit, page: %s", self.page.url)
-            except Exception:
-                pass
+            _logger.warning("Could not submit search: %s", str(exc)[:60])
 
     async def _extract_all_pages(self) -> list[ScrapedRecord]:
         """Extract records from all result pages."""

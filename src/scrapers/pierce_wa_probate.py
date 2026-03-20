@@ -104,7 +104,10 @@ class PierceWAProbateScraper(BridgeScraper):
                 ]
                 if page_needs_parcel:
                     _logger.info("  Clicking into detail pages for %d records...", len(page_needs_parcel))
-                    await self._fetch_parcel_ids_inline(page_needs_parcel, instrument_numbers)
+                    await self._fetch_parcel_ids_inline(
+                        page_needs_parcel, instrument_numbers,
+                        all_page_records=page_records,
+                    )
 
             if not await self._go_to_next_page():
                 break
@@ -229,7 +232,8 @@ class PierceWAProbateScraper(BridgeScraper):
             return False
 
     async def _fetch_parcel_ids_inline(
-        self, records: list[ScrapedRecord], instrument_numbers: list[str]
+        self, records: list[ScrapedRecord], instrument_numbers: list[str],
+        all_page_records: list[ScrapedRecord] | None = None,
     ) -> None:
         """Click into detail pages within the SAME browser session to get parcel IDs.
 
@@ -274,9 +278,6 @@ class PierceWAProbateScraper(BridgeScraper):
 
         found = 0
         for inst_num in options:
-            if inst_num not in inst_map:
-                continue
-
             try:
                 # Select this instrument from dropdown
                 dropdown = page.locator("select").first
@@ -302,7 +303,17 @@ class PierceWAProbateScraper(BridgeScraper):
                 }""")
 
                 if parcel_id and parcel_id.strip():
-                    inst_map[inst_num].parcel_id = parcel_id.strip()
+                    # Find the record with this instrument number
+                    if inst_num in inst_map:
+                        inst_map[inst_num].parcel_id = parcel_id.strip()
+                    else:
+                        # Try to match against ALL page records (not just needs_parcel)
+                        search_list = all_page_records or records
+                        for rec in search_list:
+                            ed = rec.enrichment_data or {}
+                            if ed.get("instrument_number") == inst_num and not rec.parcel_id:
+                                rec.parcel_id = parcel_id.strip()
+                                break
                     found += 1
 
             except Exception:

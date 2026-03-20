@@ -238,27 +238,36 @@ class EagleWebScraper(BridgeScraper):
         _logger.info("Selected %d doc type checkboxes for %s", selected, record_type)
 
     async def _submit_search(self) -> None:
-        """Submit the search form and navigate to results."""
+        """Submit the search form and wait for results page."""
         try:
-            # Click search button with Playwright
+            # Find the search form and submit it natively
+            # This ensures the browser follows all redirects naturally
             search_btn = self.page.locator("input[value='Search']").last
             if await search_btn.count() == 0:
                 search_btn = self.page.locator("button:has-text('Search')").last
 
-            await search_btn.click()
-            await self.page.wait_for_timeout(3_000)
+            # Use Promise.all pattern: start waiting BEFORE clicking
+            await self.page.run_and_wait(
+                lambda: search_btn.click(),
+                "domcontentloaded",
+            ) if hasattr(self.page, 'run_and_wait') else None
 
-            # EagleWeb redirects: docSearch.jsp → docSearchPOST.jsp → docSearchResults.jsp
-            # The redirect may not complete automatically. Force navigate to results.
-            current = self.page.url
-            if "Results" not in current:
-                # Build the results URL from the current base
-                base = current.split("/eagleweb/")[0] if "/eagleweb/" in current else current.rsplit("/", 1)[0]
-                results_url = f"{base}/eagleweb/docSearchResults.jsp?searchId=0"
-                _logger.info("Navigating to results: %s", results_url)
-                await self.page.goto(results_url, wait_until="domcontentloaded", timeout=15_000)
-                await self.page.wait_for_timeout(2_000)
+            # Fallback: click and wait for URL change
+            if not hasattr(self.page, 'run_and_wait'):
+                current_url = self.page.url
+                await search_btn.click()
+                # Wait for URL to change (form submission)
+                for _ in range(30):
+                    await self.page.wait_for_timeout(500)
+                    if self.page.url != current_url:
+                        break
+                # Wait for final redirect to complete
+                for _ in range(20):
+                    await self.page.wait_for_timeout(500)
+                    if "Results" in self.page.url or "results" in self.page.url:
+                        break
 
+            await self.page.wait_for_timeout(2_000)
             _logger.info("Search submitted, page: %s", self.page.url)
         except Exception as exc:
             _logger.warning("Could not submit search: %s", str(exc)[:60])

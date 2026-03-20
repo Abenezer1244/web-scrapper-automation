@@ -90,44 +90,69 @@ class EagleWebScraper(BridgeScraper):
             # EagleWeb disclaimer buttons: "I Acknowledge", "Accept", "Agree"
             clicked = await self.page.evaluate("""
                 (() => {
+                    // Step 1: Try "I Acknowledge" button (most EagleWeb sites)
                     const btns = document.querySelectorAll('button, input[type="button"], input[type="submit"], a');
                     for (const b of btns) {
                         const text = (b.textContent || b.value || '').trim().toLowerCase();
                         if (text.includes('acknowledge') || text.includes('accept') || text.includes('agree')) {
                             b.click();
-                            return true;
+                            return 'acknowledge';
                         }
                     }
-                    return false;
+                    // Step 2: Try "Public Login" button (Spokane-style EagleWeb)
+                    for (const b of btns) {
+                        const text = (b.textContent || b.value || '').trim().toLowerCase();
+                        if (text === 'public login' || text.includes('public log in')) {
+                            b.click();
+                            return 'public_login';
+                        }
+                    }
+                    // Step 3: Try generic "Login" button on disclaimer page
+                    for (const b of btns) {
+                        const text = (b.textContent || b.value || '').trim().toLowerCase();
+                        if (text === 'login' || text === 'log in') {
+                            b.click();
+                            return 'login';
+                        }
+                    }
+                    return null;
                 })()
             """)
             if clicked:
                 await self.page.wait_for_timeout(2_000)
-                _logger.info("Disclaimer accepted")
+                _logger.info("Disclaimer step 1: %s", clicked)
+                # Some EagleWeb sites need a second step (Login → Public Login)
+                if clicked == 'login':
+                    clicked2 = await self.page.evaluate("""
+                        (() => {
+                            const btns = document.querySelectorAll('button, input[type="button"], input[type="submit"]');
+                            for (const b of btns) {
+                                const text = (b.textContent || b.value || '').trim().toLowerCase();
+                                if (text === 'public login' || text.includes('public log in')) {
+                                    b.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        })()
+                    """)
+                    if clicked2:
+                        await self.page.wait_for_timeout(2_000)
+                        _logger.info("Disclaimer step 2: public login")
             else:
                 _logger.info("No disclaimer found, continuing")
         except Exception:
             _logger.info("No disclaimer found, continuing")
 
     async def _configure_search(self, record_type: str, date_from: str, date_to: str) -> None:
-        """Configure EagleWeb search form."""
-        # Uncheck "Search All Types" if filtering by document type
-        if record_type != "all":
-            try:
-                all_types_cb = self.page.locator("input[type='checkbox']").filter(has_text="Search All Types")
-                if await all_types_cb.count() == 0:
-                    # Try by nearby text
-                    all_types_cb = self.page.locator("text=Search All Types >> .. >> input[type='checkbox']")
+        """Configure EagleWeb search form.
 
-                if await all_types_cb.count() > 0 and await all_types_cb.first.is_checked():
-                    await all_types_cb.first.uncheck()
-                    await self.page.wait_for_timeout(1_000)
-                    _logger.info("Unchecked 'Search All Types'")
-
-                    # Select relevant document type checkboxes
-                    await self._select_doc_types(record_type)
-            except Exception as exc:
-                _logger.warning("Could not configure doc types: %s", str(exc)[:60])
+        Strategy: Keep "Search All Types" checked and filter by doc type
+        during extraction. This is more reliable than trying to check/uncheck
+        individual type checkboxes (which vary per county).
+        """
+        # Leave "Search All Types" checked — filter by type during extraction
+        _logger.info("Searching all types, will filter '%s' during extraction", record_type)
 
         # Fill date range via JavaScript (most reliable for EagleWeb)
         try:
@@ -235,77 +260,116 @@ class EagleWebScraper(BridgeScraper):
         return all_records
 
     async def _extract_page(self) -> list[ScrapedRecord]:
-        """Extract records from the current results page."""
+        """Extract records from the current EagleWeb results page.
+
+        EagleWeb results format:
+        - Column 1 (Description): Doc type + AFN number (e.g., "Deed Of Trust 7472965")
+        - Column 2 (Summary): Date + Grantor + Grantee lines
+        - Pagination: numbered links + [Next/Last]
+        """
+        import re
+
         records: list[ScrapedRecord] = []
+        record_type = self.record_types[0] if self.record_types else "all"
 
         try:
-            # EagleWeb results are in table rows with class 'searchResultRow' or similar
+            # Check for "No documents found" or "0 items found"
+            page_text = await self.page.inner_text("body")
+            if "No documents found" in page_text or "0 items found" in page_text:
+                _logger.info("No results found on this page")
+                return []
+
             soup = await self.get_soup()
 
-            # Find the results table — EagleWeb uses tables with specific patterns
+            # Find results table — look for table with "Description" and "Summary" headers
             results_table = None
             for table in soup.find_all("table"):
-                headers = table.find_all("th")
-                header_text = " ".join(h.get_text() for h in headers).upper()
-                if "GRANTOR" in header_text or "GRANTEE" in header_text or "RECORDING" in header_text:
+                headers = [th.get_text(strip=True).upper() for th in table.find_all("th")]
+                # EagleWeb results have Description + Summary columns
+                if "DESCRIPTION" in headers or "SUMMARY" in headers:
                     results_table = table
                     break
 
             if not results_table:
-                # Try finding by result count text
-                page_text = await self.page.inner_text("body")
-                if "No documents found" in page_text or "0 documents" in page_text:
-                    _logger.info("No results found on this page")
-                    return []
+                # Fallback: find table with most rows that has links
+                tables_with_links = []
+                for table in soup.find_all("table"):
+                    rows = table.find_all("tr")
+                    link_count = len(table.find_all("a"))
+                    if len(rows) > 3 and link_count > 2:
+                        tables_with_links.append((len(rows), table))
+                if tables_with_links:
+                    tables_with_links.sort(reverse=True)
+                    results_table = tables_with_links[0][1]
+
+            if not results_table:
                 _logger.warning("Could not find results table")
                 return []
 
             rows = results_table.find_all("tr")
-            # Skip header row(s)
-            for row in rows[1:]:
+            # Doc type keywords for filtering
+            type_keywords = _DOC_TYPE_MAP.get(record_type, [])
+
+            for row in rows[1:]:  # Skip header
                 cells = row.find_all("td")
-                if len(cells) < 3:
+                if len(cells) < 2:
                     continue
 
-                cell_texts = [c.get_text(strip=True) for c in cells]
+                # Extract Description (col 0) and Summary (col 1)
+                desc_text = cells[0].get_text(strip=True)
+                summary_text = cells[1].get_text(" ", strip=True) if len(cells) > 1 else ""
 
-                # EagleWeb typical columns:
-                # Recording Date | Doc Type | Grantor | Grantee | Legal | Related Docs
-                record = ScrapedRecord()
+                if not desc_text or len(desc_text) < 3:
+                    continue
 
-                for i, text in enumerate(cell_texts):
-                    text_upper = text.upper()
-
-                    # Date detection (MM/DD/YYYY)
-                    import re
-                    date_match = re.match(r"\d{1,2}/\d{1,2}/\d{4}", text)
-                    if date_match and not record.date_recorded:
-                        record.date_recorded = date_match.group()
+                # Filter by doc type if specified
+                if type_keywords:
+                    desc_upper = desc_text.upper()
+                    if not any(kw in desc_upper for kw in type_keywords):
                         continue
 
-                    # Parcel ID detection (numeric patterns)
-                    parcel_match = re.search(r"\b\d{10,}\b", text)
-                    if parcel_match and not record.parcel_id:
-                        record.parcel_id = parcel_match.group()
+                record = ScrapedRecord()
 
-                    # Name detection (all caps, likely Grantor/Grantee)
-                    if text and text == text.upper() and len(text) > 3 and not text.isdigit():
-                        if not record.party_name:
-                            record.party_name = text
-                        elif text != record.party_name:
-                            # Could be heirs or second party
-                            if record.heirs:
-                                record.heirs += f", {text}"
-                            else:
-                                record.heirs = text
+                # Parse Description: "Deed Of Trust 7472965" → doc_type + AFN
+                desc_parts = desc_text.strip()
+                # AFN is usually the last number in the description
+                afn_match = re.search(r"\b(\d{5,})\b", desc_parts)
+                if afn_match:
+                    record.instrument_number = afn_match.group(1)
 
-                    # Legal description
+                # Parse Summary for date, grantor, grantee
+                # Format: "03/02/2026 08:04:48 AM\nGrantor: NAME\nGrantee: NAME"
+                date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", summary_text)
+                if date_match:
+                    record.date_recorded = date_match.group(1)
+
+                grantor_match = re.search(r"Grantor:\s*(.+?)(?:Grantee:|$)", summary_text)
+                if grantor_match:
+                    record.party_name = grantor_match.group(1).strip().rstrip(",")
+
+                grantee_match = re.search(r"Grantee:\s*(.+?)(?:Grantor:|$)", summary_text)
+                if grantee_match:
+                    grantee = grantee_match.group(1).strip().rstrip(",")
+                    if grantee:
+                        record.heirs = grantee
+
+                # Look for legal description in additional cells
+                for cell in cells[2:]:
+                    cell_text = cell.get_text(strip=True)
                     legal_keywords = ["LOT", "BLOCK", "SEC", "TWP", "ADD", "PLAT", "SUB"]
-                    if any(kw in text_upper for kw in legal_keywords):
-                        record.legal_description = text
+                    if any(kw in cell_text.upper() for kw in legal_keywords):
+                        record.legal_description = cell_text
+                        break
+
+                # Look for parcel ID
+                parcel_match = re.search(r"\b(\d{10,})\b", summary_text)
+                if parcel_match:
+                    record.parcel_id = parcel_match.group(1)
 
                 if record.party_name or record.date_recorded:
                     records.append(record)
+
+            _logger.info("Extracted %d records from page (filtered by %s)", len(records), record_type)
 
         except Exception as exc:
             _logger.warning("Error extracting page: %s", str(exc)[:80])

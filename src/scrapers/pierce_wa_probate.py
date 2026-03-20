@@ -55,13 +55,20 @@ class PierceWAProbateScraper(BridgeScraper):
 
             soup = await self.get_soup_async()
 
-            # Capture instrument numbers via Playwright DOM (more reliable than BS4)
+            # Capture instrument numbers via Playwright DOM
+            # ARMS uses <td> with cursor:pointer, not <a> tags
             instrument_numbers = await self.page.evaluate(r"""() => {
-                const links = document.querySelectorAll('a[href*="javascript"]');
                 const nums = [];
-                for (const a of links) {
-                    const text = a.textContent.trim();
+                const cells = document.querySelectorAll('td[style*="cursor"], td[onclick], a');
+                for (const el of cells) {
+                    const text = el.textContent.trim();
                     if (/^\d{10,12}$/.test(text)) nums.push(text);
+                }
+                if (nums.length === 0) {
+                    // Fallback: search all text nodes for 12-digit instrument numbers
+                    const body = document.body.innerText;
+                    const matches = body.match(/\b\d{12}\b/g);
+                    if (matches) return [...new Set(matches)];
                 }
                 return nums;
             }""")
@@ -248,9 +255,12 @@ class PierceWAProbateScraper(BridgeScraper):
             return
 
         try:
-            await page.locator(f"text={first_inst}").first.click(timeout=10_000)
+            # Instrument numbers are in <td class="fauxDetailLink"> cells
+            inst_cell = page.locator(f"td.fauxDetailLink:has-text('{first_inst}')").first
+            await inst_cell.click(timeout=10_000)
             await page.wait_for_load_state("load")
             await page.wait_for_timeout(500)
+            _logger.info("  Entered detail view for %s", first_inst)
         except Exception as exc:
             _logger.warning("Could not enter detail view: %s", str(exc)[:50])
             return

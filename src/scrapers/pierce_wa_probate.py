@@ -86,6 +86,17 @@ class PierceWAProbateScraper(BridgeScraper):
 
             _logger.info("Page %d — %d new records (total: %d)", page_num, new_count, len(all_records))
 
+            # ── Fetch parcel IDs from detail pages for THIS page ─────────
+            # Click into first instrument, iterate dropdown, extract parcel IDs
+            # Same browser session = ASP.NET state preserved
+            if instrument_numbers:
+                page_needs_parcel = [
+                    r for r in page_records
+                    if not r.parcel_id and r in all_records
+                ]
+                if page_needs_parcel:
+                    await self._fetch_parcel_ids_inline(page_needs_parcel, instrument_numbers)
+
             if not await self._go_to_next_page():
                 break
 
@@ -207,6 +218,96 @@ class PierceWAProbateScraper(BridgeScraper):
         except Exception as exc:
             _logger.warning("Next page navigation failed: %s", exc)
             return False
+
+    async def _fetch_parcel_ids_inline(
+        self, records: list[ScrapedRecord], instrument_numbers: list[str]
+    ) -> None:
+        """Click into detail pages within the SAME browser session to get parcel IDs.
+
+        This runs on the search results page. It clicks the first instrument,
+        iterates through the dropdown, extracts parcel IDs, then goes back.
+        Same session = ASP.NET state preserved = reliable.
+        """
+        page = self.page
+
+        # Build map: instrument_number → record
+        inst_map: dict[str, ScrapedRecord] = {}
+        for record in records:
+            inst = (record.enrichment_data or {}).get("instrument_number")
+            if inst:
+                inst_map[inst] = record
+
+        if not inst_map:
+            return
+
+        # Click the first instrument link to enter detail view
+        first_inst = instrument_numbers[0] if instrument_numbers else None
+        if not first_inst:
+            return
+
+        try:
+            await page.locator(f"text={first_inst}").first.click(timeout=10_000)
+            await page.wait_for_load_state("load")
+            await page.wait_for_timeout(500)
+        except Exception as exc:
+            _logger.warning("Could not enter detail view: %s", str(exc)[:50])
+            return
+
+        # Get all instruments from the dropdown (this page's 25)
+        options = await page.evaluate("""() => {
+            const sel = document.querySelector('select');
+            if (!sel) return [];
+            return Array.from(sel.options).map(o => o.value.trim());
+        }""")
+
+        found = 0
+        for inst_num in options:
+            if inst_num not in inst_map:
+                continue
+
+            try:
+                # Select this instrument from dropdown
+                dropdown = page.locator("select").first
+                await dropdown.select_option(value=inst_num, timeout=5_000)
+                await page.wait_for_load_state("load")
+                await page.wait_for_timeout(300)
+
+                # Click Legal Description tab
+                legal_tab = page.locator("text=Legal Description").first
+                if await legal_tab.count() > 0:
+                    await legal_tab.click(timeout=3_000)
+                    await page.wait_for_timeout(300)
+
+                # Extract Parcel Id
+                parcel_id = await page.evaluate("""() => {
+                    const cells = document.querySelectorAll('td');
+                    for (let i = 0; i < cells.length; i++) {
+                        if (cells[i].textContent.trim() === 'Parcel Id:' && cells[i+1]) {
+                            return cells[i+1].textContent.trim();
+                        }
+                    }
+                    return null;
+                }""")
+
+                if parcel_id and parcel_id.strip():
+                    inst_map[inst_num].parcel_id = parcel_id.strip()
+                    found += 1
+
+            except Exception:
+                pass  # Skip this record, continue with next
+
+        # Go back to search results
+        try:
+            back_link = page.locator("text=Back to Results").first
+            if await back_link.count() > 0:
+                await back_link.click(timeout=5_000)
+                await page.wait_for_load_state("load")
+                await page.wait_for_timeout(1_000)
+        except Exception:
+            pass
+
+        if found:
+            _logger.info("  Detail pages: found %d parcel IDs on this page", found)
 
     async def _fetch_parcel_ids(self, records: list[ScrapedRecord]) -> None:
         """Click into each record's detail page to get the real parcel ID.

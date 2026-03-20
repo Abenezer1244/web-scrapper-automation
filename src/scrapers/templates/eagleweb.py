@@ -279,7 +279,7 @@ class EagleWebScraper(BridgeScraper):
                 _logger.info("No results found on this page")
                 return []
 
-            soup = await self.get_soup()
+            soup = await self.get_soup_async()
 
             # Find results table — look for table with "Description" and "Summary" headers
             results_table = None

@@ -486,32 +486,48 @@ async def _fetch_parcel_ids_from_arms(results, db, r, job_id: str) -> int:
             if inst:
                 inst_map[inst] = res
 
-        # Click the first instrument to enter detail view
-        first_inst = next(iter(inst_map), None)
-        if not first_inst:
+        # Click the first visible instrument link on the ARMS results page
+        first_visible = await scraper.page.evaluate(r"""() => {
+            const links = document.querySelectorAll('a[href*="javascript"]');
+            for (const a of links) {
+                const text = a.textContent.trim();
+                if (/^\d{10,12}$/.test(text)) return text;
+            }
+            return null;
+        }""")
+        if not first_visible:
+            _logger.warning("No instrument links found on ARMS results page")
             return 0
 
         try:
-            await scraper.page.locator(f"text={first_inst}").first.click(timeout=10_000)
+            await scraper.page.locator(f"text={first_visible}").first.click(timeout=10_000)
             await scraper.page.wait_for_load_state("load")
             await scraper.page.wait_for_timeout(1_000)
         except Exception:
-            _logger.warning("Could not click first instrument %s", first_inst)
+            _logger.warning("Could not click first instrument %s", first_visible)
             return 0
 
-        # Get all instrument numbers from the dropdown
-        options = await scraper.page.evaluate("""() => {
-            const sel = document.querySelector('select');
-            if (!sel) return [];
-            return Array.from(sel.options).map(o => o.value.trim());
-        }""")
+        # Process ALL pages of the dropdown
+        processed_instruments = set()
+        for page_idx in range(10):  # Max 10 pages
+            options = await scraper.page.evaluate("""() => {
+                const sel = document.querySelector('select');
+                if (!sel) return [];
+                return Array.from(sel.options).map(o => o.value.trim());
+            }""")
 
-        _logger.info("Detail page dropdown has %d instruments", len(options))
+            if not options or all(o in processed_instruments for o in options):
+                break
 
-        # Process each instrument that matches our needs
-        for inst_num in options:
-            if inst_num not in inst_map:
-                continue
+            _logger.info("Detail page %d: %d instruments in dropdown", page_idx + 1, len(options))
+
+            for inst_num in options:
+                if inst_num in processed_instruments:
+                    continue
+                processed_instruments.add(inst_num)
+
+                if inst_num not in inst_map:
+                    continue
 
             try:
                 # Select this instrument
@@ -549,7 +565,44 @@ async def _fetch_parcel_ids_from_arms(results, db, r, job_id: str) -> int:
             except Exception as exc:
                 _logger.warning("Detail failed for %s: %s", inst_num, str(exc)[:40])
 
-        # Navigate through remaining pages
-        # TODO: implement multi-page detail navigation if needed
+            # Navigate to next page of results (to get more instruments in dropdown)
+            try:
+                # Go back to results list first
+                back_link = scraper.page.locator("text=Back to Results").first
+                if await back_link.count() > 0:
+                    await back_link.click(timeout=5_000)
+                    await scraper.page.wait_for_load_state("load")
+                    await scraper.page.wait_for_timeout(1_000)
+
+                # Click Next page button
+                next_btn = scraper.page.get_by_role("button", name="Next", exact=True).first
+                if await next_btn.count() > 0:
+                    is_disabled = await next_btn.get_attribute("disabled")
+                    if not is_disabled:
+                        await next_btn.click(timeout=5_000)
+                        await scraper.page.wait_for_load_state("load")
+                        await scraper.page.wait_for_timeout(1_000)
+
+                        # Click first instrument on new page to re-enter detail view
+                        first_on_page = await scraper.page.evaluate(r"""() => {
+                            const links = document.querySelectorAll('a[href*="javascript"]');
+                            for (const a of links) {
+                                const text = a.textContent.trim();
+                                if (/^\d{10,12}$/.test(text)) return text;
+                            }
+                            return null;
+                        }""")
+                        if first_on_page:
+                            await scraper.page.locator(f"text={first_on_page}").first.click(timeout=5_000)
+                            await scraper.page.wait_for_load_state("load")
+                            await scraper.page.wait_for_timeout(500)
+                        else:
+                            break
+                    else:
+                        break  # No more pages
+                else:
+                    break
+            except Exception:
+                break  # Navigation failed, stop paginating
 
     return found

@@ -67,14 +67,17 @@ class PierceWAProbateScraper(BridgeScraper):
 
             _logger.info("Page %d — %d new records (total: %d)", page_num, new_count, len(all_records))
 
+            # Fetch parcel IDs from detail pages for THIS page's records
+            page_new_records = [r for r in page_records if r in all_records and not r.parcel_id]
+            if page_new_records:
+                await self._fetch_parcel_ids(page_new_records)
+
             if not await self._go_to_next_page():
                 break
 
             await self.polite_delay()
 
-        # ── Fetch real parcel IDs from detail pages ─────────────────────────
-        _logger.info("Fetching parcel IDs from detail pages for %d records...", len(all_records))
-        await self._fetch_parcel_ids(all_records)
+        # ── Note: parcel IDs are fetched during pagination (see _scrape_page_details)
         parcels_found = sum(1 for r in all_records if r.parcel_id)
         _logger.info("Parcel IDs found: %d/%d", parcels_found, len(all_records))
 

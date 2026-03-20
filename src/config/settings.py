@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     CAPTCHA_API_KEY: str = ""
     CAPTCHA_ENABLED: bool = False
 
+    # ─── Property Data API (Regrid) ───────────────────────────────────────────
+    REGRID_API_TOKEN: str = ""
+    REGRID_ENABLED: bool = False
+
     # ─── Logging ──────────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 

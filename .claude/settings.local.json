@@ -52,7 +52,16 @@
       "Bash(1 echo:*)",
       "Bash(xargs -d'\\\\n' -I {} railway variables --set \"DATABASE_URL={}\")",
       "mcp__playwright__browser_evaluate",
-      "mcp__playwright__browser_handle_dialog"
+      "mcp__playwright__browser_handle_dialog",
+      "WebSearch",
+      "WebFetch(domain:support.regrid.com)",
+      "WebFetch(domain:api.developer.attomdata.com)",
+      "WebFetch(domain:www.oreateai.com)",
+      "WebFetch(domain:app.regrid.com)",
+      "WebFetch(domain:regrid.com)",
+      "WebFetch(domain:cloud-help.attomdata.com)",
+      "WebFetch(domain:blog.realie.ai)",
+      "WebFetch(domain:www.attomdata.com)"
     ]
   }
 }

@@ -1,205 +1,90 @@
 """County-agnostic parcel enrichment pipeline.
 
-Pierce County: ATIP API with reCAPTCHA solving via 2Captcha + Playwright.
-Correct endpoint: GET /api/parcelSearch?value=PARCEL_ID
-with recaptcha-response header (requires browser session cookies).
+Priority order:
+1. Regrid national API (works for ALL US counties, no CAPTCHA)
+2. County-specific fallback (Pierce County ATIP with CAPTCHA)
+3. Return "(enrichment unavailable)"
 """
 
-import requests
-
-from src.api.middleware.security import add_scrape_domain
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.enrichment")
 
-add_scrape_domain("atip.piercecountywa.gov")
-
-# ─── Circuit breaker ─────────────────────────────────────────────────────────
-
-_api_down: dict[str, bool] = {}
-
-
-def _is_api_down(county_key: str) -> bool:
-    return _api_down.get(county_key, False)
-
-
-def _mark_api_down(county_key: str) -> None:
-    _api_down[county_key] = True
-    _logger.warning("Enrichment marked DOWN for %s — skipping remaining parcels", county_key)
-
-
-# ─── Pierce County ATIP ───────────────────────────────────────────────────────
-
-_ATIP_SITEKEY = "6Lcv5V0qAAAAADbB5-O6mhR9xb5q294gpfvabKcT"
-_ATIP_PAGE_URL = "https://atip.piercecountywa.gov/app/parcelSearch"
 _EMPTY = {"property_address": None, "mailing_address": None}
-_UNAVAILABLE = {"property_address": "(enrichment unavailable)", "mailing_address": "(enrichment unavailable)"}
+_UNAVAILABLE = {
+    "property_address": "(enrichment unavailable)",
+    "mailing_address": "(enrichment unavailable)",
+}
 
-# Shared Playwright scraper instance for batch enrichment
-_shared_scraper = None
-_shared_token = None
+# Circuit breaker per source
+_source_down: dict[str, bool] = {}
 
-
-async def _get_atip_session():
-    """Get or create a shared Playwright session for ATIP enrichment.
-
-    Reuses the same browser context across multiple parcel lookups
-    to avoid opening a new browser per parcel.
-    """
-    global _shared_scraper
-    if _shared_scraper is None:
-        from src.scrapers.base_scraper import BridgeScraper
-        _shared_scraper = BridgeScraper()
-        await _shared_scraper.__aenter__()
-        await _shared_scraper.navigate("https://atip.piercecountywa.gov/app/parcelSearch")
-        await _shared_scraper.page.wait_for_timeout(2_000)
-        _logger.info("ATIP Playwright session established")
-    return _shared_scraper
-
-
-async def _close_atip_session():
-    """Close the shared Playwright session."""
-    global _shared_scraper
-    if _shared_scraper:
-        await _shared_scraper.__aexit__(None, None, None)
-        _shared_scraper = None
-
-
-async def _enrich_pierce_captcha(parcel_id: str) -> dict[str, str | None] | None:
-    """Enrich via ATIP using Playwright + 2Captcha.
-
-    1. Solve reCAPTCHA via 2Captcha (cached ~100s)
-    2. Use shared Playwright session with session cookies
-    3. Call /api/parcelSearch?value=PARCEL_ID from browser with token header
-    4. Parse JSON response
-    """
-    global _shared_token
-    from src.scrapers.enrichment.captcha import solve_recaptcha
-
-    # Get or refresh CAPTCHA token
-    if not _shared_token:
-        _shared_token = await solve_recaptcha(_ATIP_PAGE_URL, _ATIP_SITEKEY)
-    if not _shared_token:
-        return None
-
-    try:
-        scraper = await _get_atip_session()
-
-        result = await scraper.page.evaluate("""
-            async (args) => {
-                const [parcelId, captchaToken] = args;
-                try {
-                    const r = await fetch('/api/parcelSearch?value=' + parcelId, {
-                        headers: {
-                            'Accept': 'application/json',
-                            'recaptcha-response': captchaToken
-                        }
-                    });
-                    if (r.status !== 200) return {error: 'status ' + r.status};
-                    const data = await r.json();
-                    return {data: data};
-                } catch(e) {
-                    return {error: e.message};
-                }
-            }
-        """, [parcel_id, _shared_token])
-
-        if result.get("error"):
-            err = result["error"]
-            _logger.warning("ATIP API error for %s: %s", parcel_id, err)
-            # If 500/401, token might be expired — clear it for refresh
-            if "500" in str(err) or "401" in str(err):
-                _shared_token = None
-            return None
-
-        data = result.get("data", [])
-        return _parse_atip_response(data)
-
-    except Exception as exc:
-        _logger.warning("ATIP enrichment failed for %s: %s", parcel_id, str(exc)[:80])
-        return None
-
-
-def _parse_atip_response(data) -> dict[str, str | None]:
-    """Parse ATIP /api/parcelSearch response.
-
-    Response JSON array:
-    [{"parcelNumber":"5000190130","line1":"2909 GALLEON CT NE",
-      "name":"MARCUS GRACE D TTEE OF MARCUS REVOCABLE TRUST",
-      "status":"Active","pactcodedesc":"Real Property",...}]
-
-    ATIP's search endpoint only returns `line1` (site address).
-    The mailing address is not exposed via any public API endpoint.
-    For owner-occupied properties, mailing address = property address
-    (standard real estate assumption when no separate mailing is available).
-    We also include the owner name from the `name` field.
-    """
-    if not data or not isinstance(data, list) or len(data) == 0:
-        return _EMPTY
-
-    parcel = data[0]
-    property_address = (parcel.get("line1") or "").strip() or None
-    owner_name = (parcel.get("name") or "").strip() or None
-
-    # Use property address as mailing address (owner-occupied assumption)
-    # This is standard in real estate when no separate mailing is available
-    mailing_address = property_address
-
-    if property_address:
-        _logger.info(
-            "Enriched: %s → %s (owner: %s)",
-            (parcel.get("parcelNumber") or "").strip(),
-            property_address,
-            owner_name or "unknown",
-        )
-
-    return {
-        "property_address": property_address,
-        "mailing_address": mailing_address,
-    }
-
-
-async def _enrich_pierce_api_simple(parcel_id: str) -> dict[str, str | None] | None:
-    """Quick check: try the ATIP API without CAPTCHA (in case it's restored)."""
-    try:
-        resp = requests.get(
-            "https://atip.piercecountywa.gov/api/parcelSearch",
-            params={"value": parcel_id},
-            headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
-            timeout=5,
-        )
-        ct = resp.headers.get("content-type", "")
-        if resp.status_code == 200 and "json" in ct:
-            data = resp.json()
-            return _parse_atip_response(data)
-    except Exception:
-        pass
-    return None
-
-
-# ─── Public interface ─────────────────────────────────────────────────────────
 
 async def enrich_parcel(parcel_id: str, county: str, state: str) -> dict[str, str | None]:
-    """Enrich a parcel record with property and mailing address data."""
-    county_key = f"{county.lower()}_{state.upper()}"
+    """Enrich a parcel record with property and mailing address data.
 
-    if _is_api_down(county_key):
-        return _UNAVAILABLE
-
+    Uses Regrid national API (all US counties) as primary source.
+    Falls back to county-specific enrichment if Regrid is unavailable.
+    """
     _logger.info("Enriching parcel %s (%s, %s)", parcel_id, county, state)
 
-    if county_key == "pierce_WA":
-        # Try simple API first (no CAPTCHA needed)
-        result = await _enrich_pierce_api_simple(parcel_id)
-        if result and result.get("property_address"):
-            return result
+    # ── Primary: Regrid national API (all counties) ───────────────────────
+    from src.config import settings
 
-        # CAPTCHA-based enrichment disabled during scraping to avoid
-        # running two Playwright browsers simultaneously (causes worker
-        # memory exhaustion). Records are saved without addresses and
-        # can be enriched in a separate post-processing step.
-        _mark_api_down(county_key)
+    if settings.REGRID_ENABLED and settings.REGRID_API_TOKEN:
+        if not _source_down.get("regrid"):
+            from src.scrapers.enrichment.national import enrich_parcel_national
+
+            result = enrich_parcel_national(parcel_id, county, state)
+            if result.get("property_address"):
+                return result
+
+            # If Regrid returned nothing, don't mark as down (might just be unknown parcel)
+            _logger.info("Regrid: no data for parcel %s", parcel_id)
+
+    # ── Fallback: county-specific enrichment ──────────────────────────────
+    # Pierce County: ATIP with CAPTCHA (legacy, expensive)
+    county_key = f"{county.lower()}_{state.upper()}"
+    if county_key == "pierce_WA" and not _source_down.get(county_key):
+        if settings.CAPTCHA_ENABLED and settings.CAPTCHA_API_KEY:
+            try:
+                from src.scrapers.base_scraper import BridgeScraper
+                from src.scrapers.enrichment.captcha import solve_recaptcha
+
+                sitekey = "6Lcv5V0qAAAAADbB5-O6mhR9xb5q294gpfvabKcT"
+                token = await solve_recaptcha(
+                    "https://atip.piercecountywa.gov/app/parcelSearch",
+                    sitekey,
+                )
+                if token:
+                    async with BridgeScraper() as scraper:
+                        await scraper.navigate("https://atip.piercecountywa.gov/app/parcelSearch")
+                        await scraper.page.wait_for_timeout(2_000)
+
+                        api_result = await scraper.page.evaluate("""
+                            async (args) => {
+                                const [pid, tok] = args;
+                                try {
+                                    const r = await fetch('/api/parcelSearch?value=' + pid, {
+                                        headers: {'Accept':'application/json','recaptcha-response':tok}
+                                    });
+                                    if (r.status !== 200) return null;
+                                    const data = await r.json();
+                                    if (!data || !data.length) return null;
+                                    return {address: (data[0].line1 || '').trim(), name: (data[0].name || '').trim()};
+                                } catch(e) { return null; }
+                            }
+                        """, [parcel_id, token])
+
+                        if api_result and api_result.get("address"):
+                            return {
+                                "property_address": api_result["address"],
+                                "mailing_address": api_result["address"],
+                            }
+            except Exception as exc:
+                _logger.warning("ATIP fallback failed: %s", str(exc)[:60])
+
+        _source_down[county_key] = True
         return _UNAVAILABLE
 
-    _logger.warning("No enrichment handler for %s — skipping", county_key)
-    return _EMPTY
+    return _UNAVAILABLE

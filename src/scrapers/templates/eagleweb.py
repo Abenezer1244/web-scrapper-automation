@@ -161,69 +161,43 @@ class EagleWebScraper(BridgeScraper):
         # Leave "Search All Types" checked — filter by type during extraction
         _logger.info("Searching all types, will filter '%s' during extraction", record_type)
 
-        # Fill date range via JavaScript (most reliable for EagleWeb)
+        # Fill date range using Playwright's fill() for proper event triggering
         try:
-            filled = await self.page.evaluate(f"""
-                (() => {{
-                    // Strategy 1: Find by ID patterns (RecDateIDStart/End, StartDate, etc.)
-                    const idPatterns = [
-                        ['RecDateIDStart', 'RecDateIDEnd'],
-                        ['StartDate', 'EndDate'],
-                        ['startDate', 'endDate'],
-                        ['dateFrom', 'dateTo'],
-                    ];
-                    for (const [startId, endId] of idPatterns) {{
-                        const s = document.getElementById(startId);
-                        const e = document.getElementById(endId);
-                        if (s && e) {{
-                            s.value = '{date_from}';
-                            s.dispatchEvent(new Event('change', {{bubbles: true}}));
-                            e.value = '{date_to}';
-                            e.dispatchEvent(new Event('change', {{bubbles: true}}));
-                            return 'id:' + startId;
-                        }}
-                    }}
+            filled = False
+            # Strategy 1: Fill by input ID (most EagleWeb sites)
+            for start_id, end_id in [
+                ("RecDateIDStart", "RecDateIDEnd"),
+                ("StartDate", "EndDate"),
+            ]:
+                start_el = self.page.locator(f"#{start_id}")
+                end_el = self.page.locator(f"#{end_id}")
+                if await start_el.count() > 0 and await end_el.count() > 0:
+                    await start_el.click()
+                    await start_el.fill(date_from)
+                    await end_el.click()
+                    await end_el.fill(date_to)
+                    filled = True
+                    _logger.info("Date range set (id): %s to %s", date_from, date_to)
+                    break
 
-                    // Strategy 2: Find by nearby "Start Date"/"End Date" labels
-                    const allInputs = document.querySelectorAll('input[type="text"]');
-                    let startInput = null, endInput = null;
-                    for (const inp of allInputs) {{
-                        const cell = inp.closest('td') || inp.parentElement;
-                        if (!cell) continue;
-                        const text = cell.textContent.toLowerCase();
-                        if (text.includes('start') && (text.includes('date') || text.includes('recording'))) {{
-                            startInput = inp;
-                        }} else if (text.includes('end') && (text.includes('date') || text.includes('recording'))) {{
-                            endInput = inp;
-                        }}
-                    }}
-                    if (startInput && endInput) {{
-                        startInput.value = '{date_from}';
-                        startInput.dispatchEvent(new Event('change', {{bubbles: true}}));
-                        endInput.value = '{date_to}';
-                        endInput.dispatchEvent(new Event('change', {{bubbles: true}}));
-                        return 'label';
-                    }}
+            if not filled:
+                # Strategy 2: Find inputs with existing date values (pre-filled sites)
+                inputs = await self.page.locator("input[type='text']").all()
+                date_inputs = []
+                for inp in inputs:
+                    val = await inp.get_attribute("value") or ""
+                    if "/" in val and len(val) >= 8:
+                        date_inputs.append(inp)
+                if len(date_inputs) >= 2:
+                    await date_inputs[0].click()
+                    await date_inputs[0].fill(date_from)
+                    await date_inputs[1].click()
+                    await date_inputs[1].fill(date_to)
+                    filled = True
+                    _logger.info("Date range set (value): %s to %s", date_from, date_to)
 
-                    // Strategy 3: Find inputs with existing date values
-                    let startSet = false;
-                    for (const inp of allInputs) {{
-                        if (inp.value && inp.value.includes('/') && inp.value.length >= 8) {{
-                            if (!startSet) {{
-                                inp.value = '{date_from}';
-                                inp.dispatchEvent(new Event('change', {{bubbles: true}}));
-                                startSet = true;
-                            }} else {{
-                                inp.value = '{date_to}';
-                                inp.dispatchEvent(new Event('change', {{bubbles: true}}));
-                                return 'value';
-                            }}
-                        }}
-                    }}
-                    return startSet ? 'partial' : null;
-                }})()
-            """)
-            _logger.info("Date range set (%s): %s to %s", filled, date_from, date_to)
+            if not filled:
+                _logger.warning("Could not find date inputs to fill")
         except Exception as exc:
             _logger.warning("Could not set date range: %s", str(exc)[:60])
 

@@ -298,18 +298,37 @@ def enrich_job_results(self, job_id: str) -> None:
         if config is None:
             return
 
-        # Find results that need enrichment (have parcel_id, no address)
-        results = db.execute(
-            select(Result).where(
-                Result.job_id == job_id,
-                Result.parcel_id.isnot(None),
-                Result.parcel_id != "",
-                (Result.property_address.is_(None)) | (Result.property_address == "(enrichment unavailable)"),
-            )
+        # Step 1: Find ALL results (for parcel ID fetching from ARMS detail pages)
+        all_results = db.execute(
+            select(Result).where(Result.job_id == job_id)
         ).scalars().all()
 
+        # Step 2: Fetch parcel IDs from ARMS detail pages for records missing them
+        needs_parcel = [
+            res for res in all_results
+            if not res.parcel_id
+            and res.enrichment_data
+            and isinstance(res.enrichment_data, dict)
+            and res.enrichment_data.get("instrument_number")
+        ]
+
+        if needs_parcel:
+            _logger.info("Fetching parcel IDs from ARMS detail pages for %d records", len(needs_parcel))
+            _publish_log(r, job_id, "info", f"Fetching parcel IDs from detail pages ({len(needs_parcel)} records)...")
+            parcel_count = asyncio.run(_fetch_parcel_ids_from_arms(needs_parcel, db, r, job_id))
+            _publish_log(r, job_id, "info", f"Found {parcel_count} parcel IDs from detail pages")
+
+        # Step 3: Enrich records that have parcel_id but no address
+        results = [
+            res for res in all_results
+            if res.parcel_id
+            and res.parcel_id.strip()
+            and (not res.property_address or res.property_address == "(enrichment unavailable)")
+        ]
+
         if not results:
-            _logger.info("No results need enrichment for job %s", job_id)
+            _logger.info("No results need address enrichment for job %s", job_id)
+            _publish_log(r, job_id, "info", "No records with parcel IDs to enrich")
             return
 
         _logger.info("Enriching %d results for job %s", len(results), job_id)
@@ -397,3 +416,140 @@ async def _run_enrichment(results, county: str, state: str, db, r, job_id: str) 
             await scraper.polite_delay()
 
     return enriched
+
+
+async def _fetch_parcel_ids_from_arms(results, db, r, job_id: str) -> int:
+    """Open ARMS in a separate browser, navigate to each record's detail page,
+    and extract the real parcel ID from the Legal Description tab.
+
+    Processes records page by page using the instrument number dropdown.
+    """
+    from src.api.middleware.security import add_scrape_domain
+    from src.scrapers.base_scraper import BridgeScraper
+
+    add_scrape_domain("armsweb.co.pierce.wa.us")
+
+    found = 0
+    async with BridgeScraper() as scraper:
+        # Accept disclaimer + search for the same records
+        await scraper.navigate("https://armsweb.co.pierce.wa.us/")
+        try:
+            accept = scraper.page.locator("a:has-text('Click here to acknowledge')")
+            await accept.wait_for(timeout=5_000)
+            await accept.click()
+            await scraper.page.wait_for_load_state("load")
+        except Exception:
+            pass
+
+        await scraper.navigate("https://armsweb.co.pierce.wa.us/RealEstate/SearchEntry.aspx")
+        await scraper.page.wait_for_timeout(1_000)
+
+        # Check PROBATE + fill dates + search
+        probate_cb = scraper.page.get_by_role("checkbox", name="PROBATE")
+        try:
+            await probate_cb.scroll_into_view_if_needed(timeout=10_000)
+            await probate_cb.check(timeout=5_000)
+        except Exception:
+            await scraper.page.evaluate("""() => {
+                const cbs = document.querySelectorAll('input[type="checkbox"]');
+                for (const cb of cbs) {
+                    const sib = cb.nextSibling;
+                    if (sib && sib.textContent && sib.textContent.trim() === 'PROBATE') {
+                        cb.checked = true; cb.dispatchEvent(new Event('change', {bubbles: true})); break;
+                    }
+                }
+            }""")
+
+        from datetime import UTC, timedelta
+        today = datetime.now(UTC).date()
+        date_from = (today - timedelta(days=90)).strftime("%m/%d/%Y")
+        date_to = today.strftime("%m/%d/%Y")
+
+        await scraper.page.evaluate("""([df, dt]) => {
+            const inputs = document.querySelectorAll('input[title="mm/dd/yyyy"]');
+            if (inputs.length >= 2) {
+                inputs[0].value = df; inputs[0].dispatchEvent(new Event('change', {bubbles: true}));
+                inputs[1].value = dt; inputs[1].dispatchEvent(new Event('change', {bubbles: true}));
+            }
+        }""", [date_from, date_to])
+
+        search_btn = scraper.page.get_by_role("button", name="Search", exact=True).first
+        await search_btn.scroll_into_view_if_needed(timeout=5_000)
+        await search_btn.click(timeout=10_000)
+        await scraper.page.wait_for_load_state("load")
+        await scraper.page.wait_for_timeout(2_000)
+
+        # Build a map of instrument_number → result for quick lookup
+        inst_map = {}
+        for res in results:
+            inst = res.enrichment_data.get("instrument_number") if isinstance(res.enrichment_data, dict) else None
+            if inst:
+                inst_map[inst] = res
+
+        # Click the first instrument to enter detail view
+        first_inst = next(iter(inst_map), None)
+        if not first_inst:
+            return 0
+
+        try:
+            await scraper.page.locator(f"text={first_inst}").first.click(timeout=10_000)
+            await scraper.page.wait_for_load_state("load")
+            await scraper.page.wait_for_timeout(1_000)
+        except Exception:
+            _logger.warning("Could not click first instrument %s", first_inst)
+            return 0
+
+        # Get all instrument numbers from the dropdown
+        options = await scraper.page.evaluate("""() => {
+            const sel = document.querySelector('select');
+            if (!sel) return [];
+            return Array.from(sel.options).map(o => o.value.trim());
+        }""")
+
+        _logger.info("Detail page dropdown has %d instruments", len(options))
+
+        # Process each instrument that matches our needs
+        for inst_num in options:
+            if inst_num not in inst_map:
+                continue
+
+            try:
+                # Select this instrument
+                dropdown = scraper.page.locator("select").first
+                await dropdown.select_option(value=inst_num, timeout=5_000)
+                await scraper.page.wait_for_load_state("load")
+                await scraper.page.wait_for_timeout(500)
+
+                # Click Legal Description tab
+                legal_tab = scraper.page.locator("text=Legal Description").first
+                if await legal_tab.count() > 0:
+                    await legal_tab.click(timeout=3_000)
+                    await scraper.page.wait_for_timeout(500)
+
+                # Extract parcel ID
+                parcel_id = await scraper.page.evaluate("""() => {
+                    const cells = document.querySelectorAll('td');
+                    for (let i = 0; i < cells.length; i++) {
+                        if (cells[i].textContent.trim() === 'Parcel Id:' && cells[i+1]) {
+                            return cells[i+1].textContent.trim();
+                        }
+                    }
+                    return null;
+                }""")
+
+                if parcel_id and parcel_id.strip():
+                    result = inst_map[inst_num]
+                    result.parcel_id = parcel_id.strip()
+                    db.commit()
+                    found += 1
+
+                    if found <= 5 or found % 20 == 0:
+                        _publish_log(r, job_id, "info", f"  {inst_num} → parcel {parcel_id.strip()}")
+
+            except Exception as exc:
+                _logger.warning("Detail failed for %s: %s", inst_num, str(exc)[:40])
+
+        # Navigate through remaining pages
+        # TODO: implement multi-page detail navigation if needed
+
+    return found

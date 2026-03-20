@@ -87,14 +87,16 @@ class PierceWAProbateScraper(BridgeScraper):
             _logger.info("Page %d — %d new records (total: %d)", page_num, new_count, len(all_records))
 
             # ── Fetch parcel IDs from detail pages for THIS page ─────────
-            # Click into first instrument, iterate dropdown, extract parcel IDs
-            # Same browser session = ASP.NET state preserved
+            _logger.info("  Instruments captured: %d, records needing parcel: %d",
+                         len(instrument_numbers),
+                         sum(1 for r in page_records if not r.parcel_id and r in all_records))
             if instrument_numbers:
                 page_needs_parcel = [
                     r for r in page_records
                     if not r.parcel_id and r in all_records
                 ]
                 if page_needs_parcel:
+                    _logger.info("  Clicking into detail pages for %d records...", len(page_needs_parcel))
                     await self._fetch_parcel_ids_inline(page_needs_parcel, instrument_numbers)
 
             if not await self._go_to_next_page():

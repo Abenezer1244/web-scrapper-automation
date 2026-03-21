@@ -271,7 +271,7 @@ class EagleWebScraper(BridgeScraper):
             try:
                 async with self.page.expect_navigation(
                     url="**/docSearchResults*",
-                    timeout=30_000,
+                    timeout=120_000,  # 2 min — large date ranges take time
                     wait_until="domcontentloaded",
                 ):
                     await submit.last.click()

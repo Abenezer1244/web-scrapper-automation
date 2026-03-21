@@ -258,11 +258,24 @@ class EagleWebScraper(BridgeScraper):
             # Wait for results page (POST → redirect → docSearchResults.jsp)
             try:
                 await self.page.wait_for_url(
-                    "**/docSearchResults*", timeout=20_000
+                    "**/docSearchResults*", timeout=10_000
                 )
             except Exception:
-                # Fallback: if URL wait times out, check where we are
-                _logger.info("URL wait timed out, current page: %s", self.page.url)
+                # POST redirect didn't happen (common in headless mode).
+                # The search was processed server-side during the POST.
+                # Navigate directly to the results page — session is valid.
+                current = self.page.url
+                if "POST" in current or "Results" not in current:
+                    base = current.split("/eagleweb/")[0] if "/eagleweb/" in current else self.base_url.rstrip("/")
+                    if "/eagleweb/" not in base:
+                        # Handle URLs like /recorder/web/ → need /recorder/eagleweb/
+                        base = base.replace("/web", "").rstrip("/")
+                    results_url = f"{base}/eagleweb/docSearchResults.jsp?searchId=0"
+                    _logger.info("POST redirect failed, navigating: %s", results_url)
+                    try:
+                        await self.page.goto(results_url, wait_until="domcontentloaded", timeout=15_000)
+                    except Exception as nav_exc:
+                        _logger.warning("Results navigation failed: %s", str(nav_exc)[:60])
 
             await self.page.wait_for_timeout(2_000)
             _logger.info("Search submitted, page: %s", self.page.url)

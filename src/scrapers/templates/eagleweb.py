@@ -165,6 +165,16 @@ class EagleWebScraper(BridgeScraper):
         # This is critical — fill() doesn't trigger EagleWeb's internal JS
         # event handlers, but pressSequentially does.
         try:
+            # Wait for the search form to load (date inputs may take a moment)
+            try:
+                await self.page.wait_for_selector("#RecDateIDStart", timeout=10_000)
+            except Exception:
+                # Try alternate selector
+                try:
+                    await self.page.wait_for_selector("input[name*='RecDate']", timeout=5_000)
+                except Exception:
+                    pass
+
             filled = False
             for start_id, end_id in [
                 ("RecDateIDStart", "RecDateIDEnd"),

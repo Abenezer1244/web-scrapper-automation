@@ -258,14 +258,22 @@ class EagleWebScraper(BridgeScraper):
             # Wait for the results page URL
             try:
                 await self.page.wait_for_url(
-                    "**/docSearchResults*", timeout=20_000
+                    "**/docSearchResults*", timeout=10_000
                 )
             except Exception:
-                # Some sites redirect via JS — wait extra and check
-                await self.page.wait_for_timeout(5_000)
-                if "Results" not in self.page.url and "POST" in self.page.url:
-                    _logger.info("Stuck on POST, waiting for JS redirect...")
-                    await self.page.wait_for_timeout(10_000)
+                # Spokane-style EagleWeb: POST page shows "Recent Searches"
+                # with a link to results instead of auto-redirecting.
+                # Click the results link if present.
+                try:
+                    results_link = self.page.locator("a[href*='docSearchResults']")
+                    if await results_link.count() > 0:
+                        _logger.info("Found results link on POST page, clicking")
+                        await results_link.first.click()
+                        await self.page.wait_for_timeout(3_000)
+                    else:
+                        _logger.info("No results link found, page: %s", self.page.url)
+                except Exception:
+                    pass
 
             await self.page.wait_for_timeout(2_000)
             _logger.info("Search submitted, page: %s", self.page.url)

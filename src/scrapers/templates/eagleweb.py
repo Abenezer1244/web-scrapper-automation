@@ -97,11 +97,11 @@ class EagleWebScraper(BridgeScraper):
             # EagleWeb disclaimer buttons: "I Acknowledge", "Accept", "Agree"
             clicked = await self.page.evaluate("""
                 (() => {
-                    // Step 1: Try "I Acknowledge" button (most EagleWeb sites)
+                    // Step 1: Try disclaimer buttons (various EagleWeb labels)
                     const btns = document.querySelectorAll('button, input[type="button"], input[type="submit"], a');
                     for (const b of btns) {
                         const text = (b.textContent || b.value || '').trim().toLowerCase();
-                        if (text.includes('acknowledge') || text.includes('accept') || text.includes('agree')) {
+                        if (text.includes('acknowledge') || text.includes('accept') || text.includes('agree') || text === 'enter') {
                             b.click();
                             return 'acknowledge';
                         }
@@ -255,18 +255,16 @@ class EagleWebScraper(BridgeScraper):
                     return false;
                 })()
             """)
-            # Wait for results page — may go through docSearchPOST.jsp redirect
-            await self.page.wait_for_load_state("domcontentloaded", timeout=15_000)
-            await self.page.wait_for_timeout(3_000)
+            # Wait for results page (POST → redirect → docSearchResults.jsp)
+            try:
+                await self.page.wait_for_url(
+                    "**/docSearchResults*", timeout=20_000
+                )
+            except Exception:
+                # Fallback: if URL wait times out, check where we are
+                _logger.info("URL wait timed out, current page: %s", self.page.url)
 
-            # If stuck on POST page, navigate to results (session is maintained)
-            if "POST" in self.page.url and "Results" not in self.page.url:
-                base = self.page.url.split("/eagleweb/")[0] if "/eagleweb/" in self.page.url else self.base_url.rstrip("/")
-                results_url = f"{base}/eagleweb/docSearchResults.jsp?searchId=0"
-                _logger.info("POST page detected, navigating to results")
-                await self.page.goto(results_url, wait_until="domcontentloaded", timeout=15_000)
-                await self.page.wait_for_timeout(2_000)
-
+            await self.page.wait_for_timeout(2_000)
             _logger.info("Search submitted, page: %s", self.page.url)
         except Exception as exc:
             _logger.warning("Could not submit search: %s", str(exc)[:60])

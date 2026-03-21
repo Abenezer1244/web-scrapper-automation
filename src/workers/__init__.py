@@ -20,8 +20,8 @@ if settings.REDIS_URL.startswith("rediss://"):
 app.conf.update(
     task_acks_late=True,
     worker_prefetch_multiplier=1,
-    task_soft_time_limit=1700,   # 28 min — warn worker before hard kill
-    task_time_limit=1800,        # 30 min — hard kill
+    task_soft_time_limit=3300,   # 55 min — warn worker before hard kill
+    task_time_limit=3600,        # 60 min — hard kill (EagleWeb chunked = 15-20min scrape + 15min DB save)
     task_serializer="json",
     result_serializer="json",
     accept_content=["json"],

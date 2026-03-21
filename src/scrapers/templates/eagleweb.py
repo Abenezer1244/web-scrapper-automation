@@ -98,28 +98,38 @@ class EagleWebScraper(BridgeScraper):
 
             # Navigate back to search form for each chunk
             if chunk_start != start:
-                # Go back to search page
-                search_url = self.page.url
-                if "docSearch" not in search_url:
-                    search_url = self.base_url
-                # Click "New Search" or navigate back
+                # Try "New Search" link first (stays in session)
+                navigated = False
                 try:
-                    new_search = self.page.locator("a:has-text('New Search'), a:has-text('Modify Search')")
+                    new_search = self.page.locator(
+                        "a:has-text('New Search'), a:has-text('DOCUMENT SEARCH'), "
+                        "a:has-text('Modify Search'), a[href*='docSearch.jsp']"
+                    )
                     if await new_search.count() > 0:
                         await new_search.first.click()
                         await self.page.wait_for_timeout(2_000)
-                    else:
-                        await self.navigate(self.base_url)
-                        await self._accept_disclaimer()
+                        navigated = True
                 except Exception:
-                    await self.navigate(self.base_url)
+                    pass
+
+                if not navigated:
+                    # Build docSearch.jsp URL from current URL
+                    current = self.page.url
+                    if "/eagleweb/" in current:
+                        base = current.split("/eagleweb/")[0]
+                        search_url = f"{base}/eagleweb/docSearch.jsp"
+                    else:
+                        search_url = self.base_url
+                    await self.page.goto(search_url, wait_until="domcontentloaded", timeout=15_000)
+                    await self.page.wait_for_timeout(2_000)
+                    # Accept disclaimer if shown
                     await self._accept_disclaimer()
 
-                # Wait for search form
+                # Wait for search form to be ready
                 try:
                     await self.page.wait_for_selector("#RecDateIDStart", timeout=10_000)
                 except Exception:
-                    pass
+                    _logger.warning("Date input not found after navigation back")
 
             # Fill dates for this chunk
             await self._configure_search("all", cf, ct)

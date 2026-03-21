@@ -121,9 +121,10 @@ def _should_run_now(frequency: str, run_time_str: str, now: datetime) -> bool:
 
 @app.task(name="src.workers.scheduler.watchdog_stuck_jobs")
 def watchdog_stuck_jobs() -> None:
-    """Fail jobs that have been stuck in an active state for > 30 minutes.
+    """Fail jobs that have been stuck in an active state for > 55 minutes.
 
     Runs every 5 minutes. Re-queues the job for retry up to max_retries times.
+    EagleWeb chunked scraping can take 15-20min scrape + 15min DB save = 35min.
     """
     from sqlalchemy import select
 
@@ -131,7 +132,7 @@ def watchdog_stuck_jobs() -> None:
     from src.db.session import SyncSessionLocal
     from src.workers.tasks import run_scrape_job
 
-    stuck_cutoff = datetime.now(UTC) - timedelta(minutes=30)
+    stuck_cutoff = datetime.now(UTC) - timedelta(minutes=55)
     active_statuses = {"queued", "probing", "scraping", "enriching"}
 
     with SyncSessionLocal() as db:

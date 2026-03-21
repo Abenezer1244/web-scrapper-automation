@@ -278,11 +278,16 @@ class EagleWebScraper(BridgeScraper):
                     "**/docSearchResults*", timeout=10_000
                 )
             except Exception:
-                # Spokane-style EagleWeb: POST page shows "Recent Searches"
-                # with a link to results instead of auto-redirecting.
-                # Click the results link if present.
+                # Spokane-style EagleWeb: POST page processes search server-side,
+                # then shows "Recent Searches" with a results link.
+                # Wait for the link to appear (search processing takes time).
                 try:
                     results_link = self.page.locator("a[href*='docSearchResults']")
+                    # Wait up to 15s for the results link to appear
+                    try:
+                        await results_link.first.wait_for(timeout=15_000)
+                    except Exception:
+                        pass
                     if await results_link.count() > 0:
                         _logger.info("Found results link on POST page, clicking")
                         await results_link.first.click()

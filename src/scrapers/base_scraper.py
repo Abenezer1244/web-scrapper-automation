@@ -73,13 +73,22 @@ class BridgeScraper:
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 
     async def __aenter__(self) -> "BridgeScraper":
+        import os
+
         self._playwright = await async_playwright().start()
+
+        # Use headed mode if DISPLAY is set (Xvfb virtual display on Railway).
+        # This fixes EagleWeb sites where headless mode breaks JS redirects.
+        has_display = bool(os.environ.get("DISPLAY"))
+        use_headless = settings.PLAYWRIGHT_HEADLESS and not has_display
+
         self._browser = await self._playwright.chromium.launch(
-            headless=settings.PLAYWRIGHT_HEADLESS,
+            headless=use_headless,
             args=[
                 "--no-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
             ],
         )
         self._context = await self._browser.new_context(

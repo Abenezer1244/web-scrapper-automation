@@ -118,19 +118,18 @@ def _detect_template(base_url: str):
     """
     url_lower = base_url.lower()
 
-    # EagleWeb (Tyler Technologies) — only use template for sites with
-    # HTTP 302 redirects (Benton, Jefferson pattern). Spokane-style sites
-    # use JS redirects that fail in headless Playwright — use AI scraper.
-    #
-    # Known working template sites (HTTP 302 redirect after form.submit):
-    eagleweb_302_sites = [
-        "erecording.co.benton.wa.us",
-        "er-web.co.jefferson.wa.us",
+    # EagleWeb (Tyler Technologies) — template scraper for all EagleWeb sites.
+    # With Xvfb virtual display, Playwright runs in headed mode which fixes
+    # the JS redirect issue on docSearchPOST.jsp.
+    eagleweb_patterns = [
+        "/recorder/web",
+        "/eagleweb/",
+        "tylerhost.net",
+        "countygovernmentrecords.com",
     ]
-    for site in eagleweb_302_sites:
-        if site in url_lower:
-            from src.scrapers.templates.eagleweb import EagleWebScraper
-            return EagleWebScraper
+    if any(p in url_lower for p in eagleweb_patterns):
+        from src.scrapers.templates.eagleweb import EagleWebScraper
+        return EagleWebScraper
 
     # LandmarkWeb (Hyland) — Clark, King, Snohomish
     # URL pattern: /LandmarkWeb/

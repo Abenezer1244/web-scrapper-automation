@@ -92,6 +92,15 @@ class BridgeScraper:
             locale="en-US",
         )
         self.page = await self._context.new_page()
+
+        # Anti-headless-detection: override navigator.webdriver
+        await self.page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            window.chrome = {runtime: {}};
+        """)
+
         _logger.info("Browser context started (headless=%s)", settings.PLAYWRIGHT_HEADLESS)
         return self
 
@@ -106,7 +115,7 @@ class BridgeScraper:
 
     # ─── Core navigation ──────────────────────────────────────────────────────
 
-    async def navigate(self, url: str, wait_until: str = "networkidle") -> None:
+    async def navigate(self, url: str, wait_until: str = "domcontentloaded") -> None:
         """Navigate to a URL. Validates against SSRF allowlist before any request."""
         validate_scraping_target(url)
 

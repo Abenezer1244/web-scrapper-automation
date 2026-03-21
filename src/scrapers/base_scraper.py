@@ -110,7 +110,7 @@ class BridgeScraper:
             window.chrome = {runtime: {}};
         """)
 
-        _logger.info("Browser context started (headless=%s)", settings.PLAYWRIGHT_HEADLESS)
+        _logger.info("Browser context started (headless=%s, DISPLAY=%s)", use_headless, os.environ.get("DISPLAY", "unset"))
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:

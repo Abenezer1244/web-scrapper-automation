@@ -56,7 +56,11 @@ class EagleWebScraper(BridgeScraper):
             add_scrape_domain(domain)
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
-        """Scrape records from an EagleWeb site.
+        """Scrape records from an EagleWeb site using date chunking.
+
+        EagleWeb's POST page takes too long to redirect for large date ranges.
+        Split the range into 7-day chunks — each chunk searches, extracts,
+        then navigates back to the search form for the next chunk.
 
         Args:
             date_from: Start date in MM/DD/YYYY format.
@@ -65,28 +69,79 @@ class EagleWebScraper(BridgeScraper):
         Returns:
             List of ScrapedRecord instances.
         """
-        # Extract all record types — the worker doesn't pass the specific job
-        # record_type to scrape(), so we search all and filter by keywords.
-        # "all" means no filter — return every record found.
-        record_type = "all"
+        from datetime import datetime, timedelta
+
+        start = datetime.strptime(date_from, "%m/%d/%Y")
+        end = datetime.strptime(date_to, "%m/%d/%Y")
+        chunk_days = 7  # 7-day chunks keep result sets small
+
         _logger.info(
-            "EagleWeb scraper — %s/%s — %s to %s",
-            self.county, self.state, date_from, date_to,
+            "EagleWeb scraper — %s/%s — %s to %s (%d-day chunks)",
+            self.county, self.state, date_from, date_to, chunk_days,
         )
 
         await self.navigate(self.base_url)
 
-        # Step 1: Accept disclaimer if present
+        # Step 1: Accept disclaimer (only once)
         await self._accept_disclaimer()
 
-        # Step 2: Configure search form
-        await self._configure_search(record_type, date_from, date_to)
+        all_records: list[ScrapedRecord] = []
+        seen_hashes: set[str] = set()
+        chunk_start = start
 
-        # Step 3: Submit search
-        await self._submit_search()
+        while chunk_start < end:
+            chunk_end = min(chunk_start + timedelta(days=chunk_days), end)
+            cf = chunk_start.strftime("%m/%d/%Y")
+            ct = chunk_end.strftime("%m/%d/%Y")
 
-        # Step 4: Extract results with pagination
-        all_records = await self._extract_all_pages()
+            _logger.info("Chunk: %s to %s", cf, ct)
+
+            # Navigate back to search form for each chunk
+            if chunk_start != start:
+                # Go back to search page
+                search_url = self.page.url
+                if "docSearch" not in search_url:
+                    search_url = self.base_url
+                # Click "New Search" or navigate back
+                try:
+                    new_search = self.page.locator("a:has-text('New Search'), a:has-text('Modify Search')")
+                    if await new_search.count() > 0:
+                        await new_search.first.click()
+                        await self.page.wait_for_timeout(2_000)
+                    else:
+                        await self.navigate(self.base_url)
+                        await self._accept_disclaimer()
+                except Exception:
+                    await self.navigate(self.base_url)
+                    await self._accept_disclaimer()
+
+                # Wait for search form
+                try:
+                    await self.page.wait_for_selector("#RecDateIDStart", timeout=10_000)
+                except Exception:
+                    pass
+
+            # Fill dates for this chunk
+            await self._configure_search("all", cf, ct)
+
+            # Submit and extract
+            await self._submit_search()
+            chunk_records = await self._extract_all_pages()
+
+            # Deduplicate against all records
+            new_count = 0
+            for record in chunk_records:
+                h = self.make_hash(record.to_dict())
+                if h not in seen_hashes:
+                    seen_hashes.add(h)
+                    record.raw_html_hash = h
+                    all_records.append(record)
+                    new_count += 1
+
+            _logger.info("Chunk %s-%s: %d new records (total: %d)", cf, ct, new_count, len(all_records))
+
+            chunk_start = chunk_end
+            await self.polite_delay()
 
         _logger.info("EagleWeb scraper complete — %d records", len(all_records))
         return all_records

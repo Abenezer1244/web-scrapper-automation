@@ -18,7 +18,8 @@ if [ "$RAILWAY_SERVICE_NAME" = "worker" ]; then
   else
     echo "Xvfb not available, running in headless mode"
   fi
-  exec celery -A src.workers worker --loglevel=info --concurrency=2
+  # Concurrency=1 when using Xvfb (headed mode uses ~500MB per browser)
+  exec celery -A src.workers worker --loglevel=info --concurrency=1
 elif [ "$RAILWAY_SERVICE_NAME" = "beat" ]; then
   echo "Starting Celery beat scheduler..."
   exec celery -A src.workers beat --loglevel=info --scheduler celery.beat.PersistentScheduler

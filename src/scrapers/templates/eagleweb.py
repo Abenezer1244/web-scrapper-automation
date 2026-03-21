@@ -161,10 +161,11 @@ class EagleWebScraper(BridgeScraper):
         # Leave "Search All Types" checked — filter by type during extraction
         _logger.info("Searching all types, will filter '%s' during extraction", record_type)
 
-        # Fill date range using Playwright's fill() for proper event triggering
+        # Fill dates using pressSequentially (simulates real keystrokes).
+        # This is critical — fill() doesn't trigger EagleWeb's internal JS
+        # event handlers, but pressSequentially does.
         try:
             filled = False
-            # Strategy 1: Fill by input ID (most EagleWeb sites)
             for start_id, end_id in [
                 ("RecDateIDStart", "RecDateIDEnd"),
                 ("StartDate", "EndDate"),
@@ -172,16 +173,20 @@ class EagleWebScraper(BridgeScraper):
                 start_el = self.page.locator(f"#{start_id}")
                 end_el = self.page.locator(f"#{end_id}")
                 if await start_el.count() > 0 and await end_el.count() > 0:
+                    # Clear and type start date
                     await start_el.click()
-                    await start_el.fill(date_from)
+                    await start_el.fill("")  # clear first
+                    await start_el.press_sequentially(date_from, delay=30)
+                    # Clear and type end date
                     await end_el.click()
-                    await end_el.fill(date_to)
+                    await end_el.fill("")  # clear first
+                    await end_el.press_sequentially(date_to, delay=30)
                     filled = True
-                    _logger.info("Date range set (id): %s to %s", date_from, date_to)
+                    _logger.info("Date range typed: %s to %s", date_from, date_to)
                     break
 
             if not filled:
-                # Strategy 2: Find inputs with existing date values (pre-filled sites)
+                # Fallback: find pre-filled date inputs
                 inputs = await self.page.locator("input[type='text']").all()
                 date_inputs = []
                 for inp in inputs:
@@ -190,11 +195,13 @@ class EagleWebScraper(BridgeScraper):
                         date_inputs.append(inp)
                 if len(date_inputs) >= 2:
                     await date_inputs[0].click()
-                    await date_inputs[0].fill(date_from)
+                    await date_inputs[0].fill("")
+                    await date_inputs[0].press_sequentially(date_from, delay=30)
                     await date_inputs[1].click()
-                    await date_inputs[1].fill(date_to)
+                    await date_inputs[1].fill("")
+                    await date_inputs[1].press_sequentially(date_to, delay=30)
                     filled = True
-                    _logger.info("Date range set (value): %s to %s", date_from, date_to)
+                    _logger.info("Date range typed (fallback): %s to %s", date_from, date_to)
 
             if not filled:
                 _logger.warning("Could not find date inputs to fill")

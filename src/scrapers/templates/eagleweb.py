@@ -293,7 +293,18 @@ class EagleWebScraper(BridgeScraper):
                         await results_link.first.click()
                         await self.page.wait_for_timeout(3_000)
                     else:
-                        _logger.info("No results link found, page: %s", self.page.url)
+                        # POST page has no results link — the search may have
+                        # completed but the page doesn't show it. Try navigating
+                        # directly to searchId=0 (most recent search).
+                        current = self.page.url
+                        if "eagleweb" in current:
+                            base = current.split("/eagleweb/")[0]
+                            nav_url = f"{base}/eagleweb/docSearchResults.jsp?searchId=0"
+                            _logger.info("No results link, trying direct nav: %s", nav_url)
+                            try:
+                                await self.page.goto(nav_url, wait_until="domcontentloaded", timeout=15_000)
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 

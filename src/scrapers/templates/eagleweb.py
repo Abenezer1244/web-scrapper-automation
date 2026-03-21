@@ -262,55 +262,35 @@ class EagleWebScraper(BridgeScraper):
         intermediate docSearchPOST.jsp page in headless mode.
         """
         try:
-            # Use Playwright native click on submit button — this properly
-            # triggers form submission and follows redirects, unlike
-            # page.evaluate("form.submit()") which fails in headless mode.
             submit = self.page.locator("input[type='submit'][value='Search']")
             if await submit.count() == 0:
                 submit = self.page.locator("button:has-text('Search')")
 
-            # Click and wait for navigation to complete
-            await submit.last.click()
-
-            # Wait for the results page URL
+            # Click submit and explicitly wait for navigation to complete.
+            # Use expect_navigation to properly catch the POST→redirect chain.
             try:
-                await self.page.wait_for_url(
-                    "**/docSearchResults*", timeout=10_000
-                )
+                async with self.page.expect_navigation(
+                    url="**/docSearchResults*",
+                    timeout=30_000,
+                    wait_until="domcontentloaded",
+                ):
+                    await submit.last.click()
+                _logger.info("Search submitted via expect_navigation, page: %s", self.page.url)
             except Exception:
-                # Spokane-style EagleWeb: POST page processes search server-side,
-                # then shows "Recent Searches" with a results link.
-                # Wait for the link to appear (search processing takes time).
+                # expect_navigation timed out — try clicking the results link
+                _logger.info("Navigation timeout, checking for results link on: %s", self.page.url)
                 try:
                     results_link = self.page.locator("a[href*='docSearchResults']")
-                    # Wait up to 15s for the results link to appear
-                    try:
-                        await results_link.first.wait_for(timeout=15_000)
-                    except Exception:
-                        pass
+                    await results_link.first.wait_for(timeout=10_000)
                     if await results_link.count() > 0:
-                        _logger.info("Found results link on POST page, clicking")
+                        _logger.info("Found results link, clicking")
                         await results_link.first.click()
                         await self.page.wait_for_timeout(3_000)
-                    else:
-                        # POST page has no results link. Try reloading the page
-                        # to trigger any pending JS redirects, then check again.
-                        _logger.info("No results link, reloading POST page...")
-                        try:
-                            await self.page.reload(wait_until="domcontentloaded", timeout=15_000)
-                            await self.page.wait_for_timeout(3_000)
-                            # Check again for results link after reload
-                            if await results_link.count() > 0:
-                                _logger.info("Found results link after reload, clicking")
-                                await results_link.first.click()
-                                await self.page.wait_for_timeout(3_000)
-                        except Exception:
-                            pass
                 except Exception:
-                    pass
+                    _logger.info("No results link found either")
 
             await self.page.wait_for_timeout(2_000)
-            _logger.info("Search submitted, page: %s", self.page.url)
+            _logger.info("Final page: %s", self.page.url)
         except Exception as exc:
             _logger.warning("Could not submit search: %s", str(exc)[:60])
 

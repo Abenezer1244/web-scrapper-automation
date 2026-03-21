@@ -277,17 +277,22 @@ class EagleWebScraper(BridgeScraper):
                     await submit.last.click()
                 _logger.info("Search submitted via expect_navigation, page: %s", self.page.url)
             except Exception:
-                # expect_navigation timed out — try clicking the results link
-                _logger.info("Navigation timeout, checking for results link on: %s", self.page.url)
-                try:
+                # expect_navigation timed out on POST page.
+                # Poll for the results link or URL change (server is processing).
+                _logger.info("Navigation timeout on POST, polling for results...")
+                for poll in range(30):  # 30 x 5s = 150s max
+                    await self.page.wait_for_timeout(5_000)
+                    # Check if redirected
+                    if "Results" in self.page.url or "results" in self.page.url:
+                        _logger.info("Redirected to results after %ds", (poll+1)*5)
+                        break
+                    # Check for results link
                     results_link = self.page.locator("a[href*='docSearchResults']")
-                    await results_link.first.wait_for(timeout=10_000)
                     if await results_link.count() > 0:
-                        _logger.info("Found results link, clicking")
+                        _logger.info("Found results link after %ds, clicking", (poll+1)*5)
                         await results_link.first.click()
                         await self.page.wait_for_timeout(3_000)
-                except Exception:
-                    _logger.info("No results link found either")
+                        break
 
             await self.page.wait_for_timeout(2_000)
             _logger.info("Final page: %s", self.page.url)

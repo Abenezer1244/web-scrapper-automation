@@ -192,9 +192,14 @@ def canary_check() -> None:
     from src.scrapers.registry import UnsupportedCountyError, get_scraper_class
 
     with SyncSessionLocal() as db:
-        connectors = db.execute(
+        all_connectors = db.execute(
             select(CountyConnector).where(CountyConnector.active)
         ).scalars().all()
+
+        # Check max 5 counties per run (rotate through all over time)
+        import random
+        connectors = random.sample(all_connectors, min(5, len(all_connectors)))
+        _logger.info("Canary: checking %d/%d counties", len(connectors), len(all_connectors))
 
         for connector in connectors:
             try:

@@ -1,106 +1,89 @@
-# BridgeLeads — Master Build Plan
+# BridgeLeads — Fix 19 Failed WA Counties
 
-**Product:** Multi-tenant SaaS automating motivated seller lead generation for real estate investors
-**Stack:** FastAPI + Celery + Supabase + Playwright + Next.js + Stripe + Cloudflare R2
-**North star:** Records that lead to closed deals per customer per month
-**Status:** Approved — ready to build
+## Analysis
 
----
+### Group 1: EagleWeb counties — JUST RERUN (9 counties)
+These failed because they ran before the EagleWeb template fix was deployed.
+The template now works (proven: Benton = 4,528 records).
 
-## Decisions (locked)
+Counties: Benton*, Grant, Grays Harbor, Island, Jefferson, Kitsap, Lincoln, Pacific, Stevens
+*Benton already succeeded in a separate test run.
 
-| Decision | Choice |
-|----------|--------|
-| Entry point | FastAPI app (CLI replaced) |
-| Scraper engine | Playwright only (Selenium dropped) |
-| Database | Supabase (PostgreSQL + RLS) |
-| Billing | Stripe |
-| County naming | `{county}_{state}_{record_type}.py` |
-| Enrichment | County-agnostic `enrichment/parcel.py` module |
+**Action:** Rerun all 9 via API. No code changes needed.
 
----
+### Group 2: DNS/Unreachable (3 counties)
+- Clallam: `erecording.clallam.net` — DNS failure
+- Douglas: `edocs.douglascountywa.net` — DNS failure
+- Okanogan: `selfservice.co.okanogan.wa.us` — DNS failure
 
-## Phase 13 — Free Enrichment System (County GIS + AI Scraper)
+**Action:** Find correct/updated URLs for these counties, or mark as temporarily down.
 
-> Replace $375/mo Regrid with free county GIS APIs + AI scraper fallback.
-> Cost: $0 infrastructure + ~$0.01/lookup Claude API (fallback only).
+### Group 3: AcclaimWeb (2 counties)
+- Chelan: `acclaim.co.chelan.wa.us/acclaimweb` — reachable
+- Pend Oreille: `aptitudeweb.pendoreille.org/AcclaimWeb` — reachable
 
-### The Problem
-Regrid Standard costs $375/mo — too expensive pre-revenue. Need free alternatives.
+AcclaimWeb is Tyler Technologies (like EagleWeb) but different UI.
+Need to study the interface and either build a template or fix the AI scraper for it.
 
-### The Solution
-Three-tier enrichment pipeline:
-1. **Primary: County GIS REST APIs** — Free ArcGIS endpoints (no API key, ~60-70% of counties)
-2. **Fallback: AI Scraper** — Claude navigates county assessor websites (~$0.01/lookup)
-3. **Last resort: "(enrichment unavailable)"**
+**Action:** Navigate to AcclaimWeb sites, study form structure, build template or tune AI.
 
-### Todo
+### Group 4: Custom portals (3 counties)
+- Columbia: `idocmarket.com` — third-party service
+- San Juan: `apps.sanjuancountywa.gov/Auditor/DigitalResearchRoom` — custom
+- Whatcom: `recording.whatcomcounty.us/Disclaimer` — custom "Digital Research Room"
 
-#### 13.1 — County GIS API Client ✅
-- [x] Create `src/scrapers/enrichment/county_gis.py`:
-  - `enrich_parcel_gis(parcel_id, county, state) -> dict`
-  - Built-in Pierce County ArcGIS endpoint (no DB lookup needed)
-  - HTTP GET to ArcGIS REST API (no auth needed)
-  - Parse JSON response → property_address, mailing_address, owner_name
-  - Timeout: 10s
-  - Returns `{"property_address": None, "mailing_address": None}` on failure
-  - **Tested: returns real addresses for real parcels**
+**Action:** AI scraper should handle these. Debug why AI scraper failed on each.
 
-#### 13.2 — AI Assessor Scraper ✅
-- [x] Create `src/scrapers/enrichment/ai_assessor.py`:
-  - `enrich_parcel_ai(parcel_id, county, state) -> dict`
-  - Uses Claude API + Playwright to navigate assessor websites
-  - Two-step: Claude analyzes screenshot → navigates form → extracts results
-  - Returns same dict format as other enrichment sources
+### Group 5: Other platforms (2 counties)
+- Yakima: `tapestry.fidlar.com/Tapestry2/` — Fidlar Tapestry platform
+- Snohomish: `snoco.org/RecordedDocuments/` — LandmarkWeb, requires account creation
 
-#### 13.3 — Update Enrichment Pipeline ✅
-- [x] Update `src/scrapers/enrichment/parcel.py`:
-  - New priority order:
-    1. County GIS REST API (free, fast) ← NEW
-    2. Regrid national API (paid, if enabled)
-    3. AI assessor scraper (Claude API) ← NEW
-    4. Pierce County ATIP fallback (legacy)
-    5. "(enrichment unavailable)"
-  - Circuit breaker per source (existing pattern)
+**Action:**
+- Yakima: Study Fidlar Tapestry, build template or fix AI
+- Snohomish: Requires account — mark as needing manual setup or automate registration
 
-#### 13.4 — County GIS Endpoint Discovery ✅
-- [x] Add `gis_endpoint` column to `county_connectors` table
-- [x] Add `assessor_url` column to `county_connectors` table
-- [x] Alembic migration 003 — applied to Supabase
-- [x] Pierce County populated with GIS endpoint + assessor URL
+## Plan
 
-#### 13.5 — Settings & Config ✅
-- [x] Add to `settings.py`: `GIS_ENRICHMENT_ENABLED` (default: True)
-- [x] Add to `settings.py`: `AI_ENRICHMENT_ENABLED` (default: True)
-- [x] Add to `.env.example`
-- [x] Update DB model with new columns
-- [x] Update API schemas (ConnectorCreate, ConnectorResponse)
+### Step 1: Rerun EagleWeb counties (9 counties) — immediate
+- [x] Rerun Grant, Grays Harbor, Island, Pacific, Thurston, Clark, Lewis, Whitman, Okanogan
+- [x] Spokane: DONE (5,653 records), Kitsap: DONE (5,076), Benton: DONE (4,528), Jefferson: DONE (1,355)
+- [ ] Monitor results — Grant + Island currently scraping, 7 more pending
+- [ ] Expected: ~1000-5000 records per county
+- Note: Lincoln + Stevens are Tyler Self-Service (not EagleWeb) — need separate template
 
-#### 13.6 — Test with Pierce County ✅
-- [x] Found Pierce County GIS REST API: `services2.arcgis.com/1UvBaQ5y1ubjUPmd/.../Tax_Parcels/FeatureServer/0/query`
-- [x] Tested GIS enrichment with real parcel IDs — returns property + mailing addresses
-- [x] APN 0219011007 → 3624 96TH ST SW, mailing: 5634 S ADAMS ST, TACOMA, WA 98409-2617
-- [x] APN 0320261028 → 3410 64TH ST E, mailing: 3410 64TH ST E, TACOMA, WA 98443-1304
-- [x] Unknown parcels correctly return empty (not found)
-- [ ] Deploy to Railway and run end-to-end test
+### Step 2: Fix DNS/unreachable (3 counties)
+- [x] Research correct URLs for Clallam, Douglas, Okanogan
+- [x] Clallam: erecording.clallamcountywa.gov/recorder/web/ (was .net → .gov)
+- [x] Douglas: edocs.douglascountywa.gov/AcclaimWeb (was .net → .gov)
+- [x] Okanogan: okanogancountywa-web.tylerhost.net/Web (migrated to Tyler hosting)
+- [x] Update DB with working URLs
+- [x] Dispatch jobs for Clallam and Douglas (Okanogan already in queue)
+- [ ] Monitor results — Clallam (EagleWeb), Douglas (AcclaimWeb/AI), Okanogan (EagleWeb)
+- [x] Cancelled 4 stale Pierce jobs blocking queue
 
-### Build Order (strict)
+### Step 3: Fix AcclaimWeb (3 counties: Chelan, Douglas, Pend Oreille)
+- [x] Research AcclaimWeb interface (Kendo UI, DatePicker, Grid)
+- [x] Build AcclaimWeb template scraper (src/scrapers/templates/acclaimweb.py)
+- [x] Register in registry.py (auto-detects /acclaimweb in URL)
+- [x] Updated __init__.py exports
+- [ ] Deploy to Railway (commit + push)
+- [ ] Trigger jobs for Chelan and Pend Oreille (Douglas already in queue)
+
+### Step 4: Fix custom portals (3 counties)
+- [ ] Debug AI scraper on Columbia, San Juan, Whatcom
+- [ ] Check if AI scraper needs more wait time or different navigation
+- [ ] Rerun
+
+### Step 5: Fix other platforms (2 counties)
+- [ ] Study Yakima Fidlar Tapestry
+- [ ] Handle Snohomish account requirement
+- [ ] Rerun
+
+## Build Order
 ```
-1. settings.py + .env.example updates         (13.5)
-2. county_gis.py                              (13.1)
-3. ai_assessor.py                             (13.2)
-4. Update parcel.py pipeline                  (13.3)
-5. DB migration + column additions            (13.4)
-6. Test with Pierce County                    (13.6)
+1. Rerun 9 EagleWeb counties          (Step 1 — immediate, no code)
+2. Fix 3 DNS counties                 (Step 2 — URL research)
+3. Fix 2 AcclaimWeb counties          (Step 3 — may need template)
+4. Fix 3 custom portal counties       (Step 4 — AI scraper debug)
+5. Fix 2 other platform counties      (Step 5 — platform-specific)
 ```
-
----
-
-*(Previous phases preserved below for reference)*
-
-## Previous Phases (Completed)
-
-- Phase 1-9: Foundation through Production Launch — all completed
-- Phase 10: Go-to-Market — pending
-- Phase 11: Scale — pending
-- Phase 12/12A: AI-Powered Extraction — completed

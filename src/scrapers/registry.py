@@ -140,8 +140,8 @@ def _detect_template(base_url: str):
 
     # AcclaimWeb (Tyler) — Chelan, Douglas, Pend Oreille
     if "/acclaimweb" in url_lower:
-        # Similar to EagleWeb but different interface — use AI for now
-        return None
+        from src.scrapers.templates.acclaimweb import AcclaimWebScraper
+        return AcclaimWebScraper
 
     return None
 

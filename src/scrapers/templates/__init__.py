@@ -9,6 +9,7 @@ Supported platforms:
 - AcclaimWeb (Tyler) — 3 WA counties
 """
 
+from src.scrapers.templates.acclaimweb import AcclaimWebScraper
 from src.scrapers.templates.eagleweb import EagleWebScraper
 
-__all__ = ["EagleWebScraper"]
+__all__ = ["AcclaimWebScraper", "EagleWebScraper"]

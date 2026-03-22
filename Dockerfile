@@ -50,7 +50,8 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/home/bridge/.cache/ms-playwright
 # Cache-bust: force fresh copy of source files on every build
 ARG CACHEBUST=1
 COPY --chown=bridge:bridge . .
-RUN chmod +x /app/start.sh
+# Fix Windows CRLF line endings and set executable
+RUN sed -i 's/\r$//' /app/start.sh && chmod +x /app/start.sh
 
 EXPOSE 8000
 

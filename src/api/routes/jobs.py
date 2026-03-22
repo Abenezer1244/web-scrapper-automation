@@ -119,9 +119,12 @@ async def create_job(
     db.add(job)
     await db.flush()
 
-    # Enqueue Celery task (imported here to avoid circular imports at startup)
+    # Enqueue Celery task — paid plans get priority queue
     from src.workers.tasks import run_scrape_job
-    run_scrape_job.delay(job.id)
+
+    priority_plans = {"business", "agency"}
+    queue = "scrape-priority" if current_user.plan in priority_plans else "scrape"
+    run_scrape_job.apply_async(args=[job.id], queue=queue)
 
     audit_log(request, "job_created", current_user.id, f"job_id={job.id}")
     return JobResponse.model_validate(job)

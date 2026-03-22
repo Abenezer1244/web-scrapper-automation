@@ -8,11 +8,12 @@ echo "start.sh: RAILWAY_SERVICE_NAME=${RAILWAY_SERVICE_NAME:-unset}"
 CONCURRENCY="${WORKER_CONCURRENCY:-2}"
 
 # ─── Worker queue routing ────────────────────────────────────────────────────
-# WORKER_QUEUES: which queues this worker consumes.
-# "scrape" = scrape jobs only (default for worker service)
-# "enrichment" = enrichment jobs only (for dedicated enrichment workers)
-# "scrape,enrichment" = both (default if not set)
-QUEUES="${WORKER_QUEUES:-scrape,enrichment}"
+# WORKER_QUEUES: which queues this worker consumes (comma-separated).
+# Priority queue listed first = processed first when multiple jobs are waiting.
+# "scrape-priority,scrape,enrichment" = default (paid users first)
+# "scrape" = scrape jobs only
+# "enrichment" = enrichment jobs only
+QUEUES="${WORKER_QUEUES:-scrape-priority,scrape,enrichment}"
 
 if [ "$RAILWAY_SERVICE_NAME" = "worker" ]; then
   echo "Starting Celery worker (concurrency=$CONCURRENCY, queues=$QUEUES)..."

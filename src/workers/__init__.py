@@ -25,16 +25,16 @@ _default = Exchange("default", type="direct")
 
 app.conf.task_queues = (
     Queue("celery", _default, routing_key="celery"),
+    Queue("scrape-priority", _default, routing_key="scrape-priority"),
     Queue("scrape", _default, routing_key="scrape"),
     Queue("enrichment", _default, routing_key="enrichment"),
 )
 app.conf.task_default_queue = "celery"
 
-# Route tasks to their queues
+# Route tasks to their queues (default routing — can be overridden per-call)
 app.conf.task_routes = {
     "src.workers.tasks.run_scrape_job": {"queue": "scrape"},
     "src.workers.tasks.enrich_job_results": {"queue": "enrichment"},
-    # Scheduler tasks stay on default queue (picked up by beat worker)
     "src.workers.scheduler.*": {"queue": "celery"},
 }
 

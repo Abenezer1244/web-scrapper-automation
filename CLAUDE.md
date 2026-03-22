@@ -131,6 +131,46 @@ The scraper system is county-agnostic. Each county is a plugin — adding one re
 **Supported record types:** probate, pre_foreclosure, tax_delinquent, divorce, code_violation, eviction
 **Expansion path:** WA counties → top 10 investor states → national
 
+## Agent Rules
+
+### Planning
+- Before any non-trivial task, create a plan in `tasks/todo.md` with checkboxes.
+- Break complex features into small, independent steps (max 1–2 files changed per step).
+- Each step must be testable on its own — no "big bang" commits.
+- Identify risks and unknowns upfront. Research before coding.
+- If a plan has more than 10 steps, split it into phases.
+
+### Subagent Usage
+- Use `Explore` subagents for codebase research before making changes.
+- Use `research` subagents for web lookups, API docs, and external information.
+- Use `code-reviewer` subagents after completing significant code changes.
+- Launch independent subagents in parallel to save time.
+- Never duplicate work a subagent is already doing.
+
+### Self-Improvement
+- After every failed attempt, log what went wrong and why before retrying.
+- If a fix takes more than 2 attempts, step back and re-analyze the root cause.
+- When a pattern works well, note it for future use.
+- Track which approaches succeed and fail — prefer proven patterns.
+- Read error messages carefully. The answer is usually in the error.
+
+### Autonomous Bug Fixing
+- When a test or deployment fails, read the full error trace before acting.
+- Reproduce the bug first — confirm you can trigger it before fixing.
+- Fix the root cause, not the symptom. Band-aids create more bugs.
+- After fixing, verify the fix works by running the relevant test or check.
+- If a fix requires changes across multiple files, commit atomically.
+- Never suppress errors or add try/except as a "fix" — find out why it fails.
+
+### Proving Work
+- Every feature must be demonstrated working before marking as done.
+- For API changes: show a successful request/response.
+- For scrapers: show extracted records with expected fields.
+- For bug fixes: show the error before and success after.
+- Screenshots, logs, or test output are all valid proof.
+
+---
+
 ## Environment Variables
 
 See `.env.example` for all options. Key vars:

@@ -179,64 +179,87 @@ class EagleWebScraper(BridgeScraper):
         return all_records
 
     async def _accept_disclaimer(self) -> None:
-        """Click 'I Acknowledge' disclaimer if present."""
+        """Click 'I Acknowledge' disclaimer if present.
+
+        Uses Playwright's native .click() (not JS el.click()) so form
+        submission + navigation fires correctly on every EagleWeb variant.
+        """
         try:
-            # EagleWeb disclaimer buttons: "I Acknowledge", "Accept", "Agree"
-            clicked = await self.page.evaluate("""
-                (() => {
-                    // Step 1: Try disclaimer buttons (various EagleWeb labels)
-                    const btns = document.querySelectorAll('button, input[type="button"], input[type="submit"], a');
-                    for (const b of btns) {
-                        const text = (b.textContent || b.value || '').trim().toLowerCase();
-                        if (text.includes('acknowledge') || text.includes('accept') || text.includes('agree') || text === 'enter') {
-                            b.click();
-                            return 'acknowledge';
-                        }
-                    }
-                    // Step 2: Try "Public Login" button (Spokane-style EagleWeb)
-                    for (const b of btns) {
-                        const text = (b.textContent || b.value || '').trim().toLowerCase();
-                        if (text === 'public login' || text.includes('public log in')) {
-                            b.click();
-                            return 'public_login';
-                        }
-                    }
-                    // Step 3: Try generic "Login" button on disclaimer page
-                    for (const b of btns) {
-                        const text = (b.textContent || b.value || '').trim().toLowerCase();
-                        if (text === 'login' || text === 'log in') {
-                            b.click();
-                            return 'login';
-                        }
-                    }
-                    return null;
-                })()
-            """)
-            if clicked:
-                await self.page.wait_for_timeout(2_000)
-                _logger.info("Disclaimer step 1: %s", clicked)
-                # Some EagleWeb sites need a second step (Login → Public Login)
-                if clicked == 'login':
-                    clicked2 = await self.page.evaluate("""
-                        (() => {
-                            const btns = document.querySelectorAll('button, input[type="button"], input[type="submit"]');
-                            for (const b of btns) {
-                                const text = (b.textContent || b.value || '').trim().toLowerCase();
-                                if (text === 'public login' || text.includes('public log in')) {
-                                    b.click();
-                                    return true;
-                                }
-                            }
-                            return false;
-                        })()
-                    """)
-                    if clicked2:
-                        await self.page.wait_for_timeout(2_000)
-                        _logger.info("Disclaimer step 2: public login")
-            else:
-                _logger.info("No disclaimer found, continuing")
-        except Exception:
+            # Step 1: Try disclaimer buttons (various EagleWeb labels)
+            # Priority order: Acknowledge > Accept > Agree > Enter
+            disclaimer_btn = self.page.locator(
+                "input[type='submit'][value*='Acknowledge' i], "
+                "button:has-text('Acknowledge'), "
+                "input[type='submit'][value*='Accept' i], "
+                "button:has-text('Accept'), "
+                "a:has-text('Accept'), "
+                "input[type='submit'][value*='Agree' i], "
+                "button:has-text('Agree'), "
+                "input[type='submit'][value='Enter'], "
+                "input[type='submit'][value='ENTER']"
+            )
+            if await disclaimer_btn.count() > 0:
+                btn_text = await disclaimer_btn.first.get_attribute("value") or ""
+                _logger.info("Disclaimer button found: '%s'", btn_text)
+                try:
+                    async with self.page.expect_navigation(timeout=15_000):
+                        await disclaimer_btn.first.click()
+                    _logger.info("Disclaimer accepted via navigation, now at: %s", self.page.url)
+                except Exception:
+                    # Navigation event may not fire on all sites
+                    await self.page.wait_for_timeout(3_000)
+                    _logger.info("Disclaimer clicked (no nav event), now at: %s", self.page.url)
+
+                # Step 2: Some EagleWeb sites need a second click (Login → Public Login)
+                public_btn = self.page.locator(
+                    "input[type='submit'][value*='Public Login' i], "
+                    "button:has-text('Public Login'), "
+                    "input[type='submit'][value*='Public Log In' i]"
+                )
+                if await public_btn.count() > 0:
+                    _logger.info("Found 'Public Login' button, clicking step 2")
+                    try:
+                        async with self.page.expect_navigation(timeout=15_000):
+                            await public_btn.first.click()
+                        _logger.info("Public login accepted, now at: %s", self.page.url)
+                    except Exception:
+                        await self.page.wait_for_timeout(3_000)
+                return
+
+            # Step 2 fallback: Try "Public Login" directly (Spokane-style)
+            public_btn = self.page.locator(
+                "input[type='submit'][value*='Public Login' i], "
+                "button:has-text('Public Login')"
+            )
+            if await public_btn.count() > 0:
+                _logger.info("Found 'Public Login' button (no disclaimer)")
+                try:
+                    async with self.page.expect_navigation(timeout=15_000):
+                        await public_btn.first.click()
+                    _logger.info("Public login clicked, now at: %s", self.page.url)
+                except Exception:
+                    await self.page.wait_for_timeout(3_000)
+                return
+
+            # Step 3: Try generic Login button
+            login_btn = self.page.locator(
+                "input[type='submit'][value='Login'], "
+                "input[type='submit'][value='Log In'], "
+                "button:has-text('Login')"
+            )
+            if await login_btn.count() > 0:
+                _logger.info("Found generic 'Login' button")
+                try:
+                    async with self.page.expect_navigation(timeout=15_000):
+                        await login_btn.first.click()
+                    _logger.info("Login clicked, now at: %s", self.page.url)
+                except Exception:
+                    await self.page.wait_for_timeout(3_000)
+                return
+
             _logger.info("No disclaimer found, continuing")
+        except Exception as exc:
+            _logger.info("No disclaimer found: %s", str(exc)[:80])
 
     async def _configure_search(self, record_type: str, date_from: str, date_to: str) -> None:
         """Configure EagleWeb search form.

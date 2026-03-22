@@ -51,6 +51,7 @@ class AcclaimWebScraper(BridgeScraper):
         self.county = county
         self.state = state
         self.record_types = record_types or []
+        self._single_date_mode = False  # Set by _fill_dates when only 1 date input exists
 
         from urllib.parse import urlparse
         domain = urlparse(base_url).hostname
@@ -89,7 +90,9 @@ class AcclaimWebScraper(BridgeScraper):
         chunk_start = start
 
         while chunk_start < end:
-            chunk_end = min(chunk_start + timedelta(days=chunk_days), end)
+            # Use 1-day chunks in single-date mode, 7-day chunks otherwise
+            effective_days = 1 if self._single_date_mode else chunk_days
+            chunk_end = min(chunk_start + timedelta(days=effective_days), end)
             cf = chunk_start.strftime("%m/%d/%Y")
             ct = chunk_end.strftime("%m/%d/%Y")
 
@@ -277,7 +280,7 @@ class AcclaimWebScraper(BridgeScraper):
                 await self.page.wait_for_timeout(1_000)
                 return
 
-            # Fallback: type into input elements directly
+            # Fallback: type into paired input elements directly
             for from_id, to_id in [
                 ("FromDatePicker", "ToDatePicker"),
                 ("RecordDateFrom", "RecordDateTo"),
@@ -296,12 +299,36 @@ class AcclaimWebScraper(BridgeScraper):
                     _logger.info("Dates typed via fallback: %s to %s (ids: %s, %s)", date_from, date_to, from_id, to_id)
                     return
 
-            # Last resort: find any date-looking inputs
-            date_inputs = await self.page.locator("input[type='text'], input[type='date']").all()
-            _logger.info("Found %d text/date inputs for fallback", len(date_inputs))
-            for inp in date_inputs[:2]:
-                val = await inp.get_attribute("placeholder") or ""
-                _logger.info("  placeholder=%s", val)
+            # Single date field fallback (e.g. Douglas AcclaimWeb has only #RecordDate)
+            # Type the start date — the search returns records ON that date.
+            # The chunking loop will iterate day-by-day for single-date sites.
+            single_el = self.page.locator("#RecordDate")
+            if await single_el.count() > 0:
+                await single_el.click()
+                await single_el.fill("")
+                await single_el.press_sequentially(date_from, delay=30)
+                _logger.info("Single date typed: %s (RecordDate field)", date_from)
+                self._single_date_mode = True
+                return
+
+            # Last resort: find any visible date-looking text inputs
+            date_inputs = await self.page.locator(
+                "input[type='text']:visible, input[type='date']:visible"
+            ).all()
+            if date_inputs:
+                _logger.info("Found %d visible date inputs for last-resort fill", len(date_inputs))
+                await date_inputs[0].click()
+                await date_inputs[0].fill("")
+                await date_inputs[0].press_sequentially(date_from, delay=30)
+                if len(date_inputs) >= 2:
+                    await date_inputs[1].click()
+                    await date_inputs[1].fill("")
+                    await date_inputs[1].press_sequentially(date_to, delay=30)
+                    _logger.info("Dates typed via last-resort: %s to %s", date_from, date_to)
+                else:
+                    _logger.info("Single date typed via last-resort: %s", date_from)
+                    self._single_date_mode = True
+                return
 
             _logger.warning("Could not find date inputs on page")
 

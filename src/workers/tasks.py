@@ -137,23 +137,30 @@ def run_scrape_job(self, job_id: str) -> None:
         def _trunc(val: str | None, max_len: int) -> str | None:
             return val[:max_len] if val and len(val) > max_len else val
 
-        for record in records:
-            import uuid as _uuid
-            db.add(Result(
-                id=str(_uuid.uuid4()),
-                job_id=job_id,
-                user_id=job.user_id,
-                date_recorded=_trunc(record.date_recorded, 32),
-                party_name=_trunc(record.party_name, 512),
-                heirs=record.heirs,
-                legal_description=record.legal_description,
-                parcel_id=_trunc(record.parcel_id, 64),
-                property_address=_trunc(record.property_address, 512),
-                mailing_address=_trunc(record.mailing_address, 512),
-                enrichment_data=record.enrichment_data or {},
-                raw_html_hash=record.raw_html_hash,
-            ))
-        db.commit()
+        import uuid as _uuid
+
+        # Batch insert records (500 at a time to avoid memory/timeout issues)
+        batch_size = 500
+        for i in range(0, len(records), batch_size):
+            batch = records[i:i + batch_size]
+            for record in batch:
+                db.add(Result(
+                    id=str(_uuid.uuid4()),
+                    job_id=job_id,
+                    user_id=job.user_id,
+                    date_recorded=_trunc(record.date_recorded, 32),
+                    party_name=_trunc(record.party_name, 512),
+                    heirs=record.heirs,
+                    legal_description=record.legal_description,
+                    parcel_id=_trunc(record.parcel_id, 64),
+                    property_address=_trunc(record.property_address, 512),
+                    mailing_address=_trunc(record.mailing_address, 512),
+                    enrichment_data=record.enrichment_data or {},
+                    raw_html_hash=record.raw_html_hash,
+                ))
+            db.commit()
+            _publish_log(r, job_id, "info", f"Saved batch {i//batch_size + 1} ({min(i+batch_size, len(records))}/{len(records)} records)")
+
         _publish_log(r, job_id, "success", f"{len(records)} records saved")
 
         # ── EXPORT ────────────────────────────────────────────────────────────

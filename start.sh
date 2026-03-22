@@ -41,7 +41,8 @@ if [ "$RAILWAY_SERVICE_NAME" = "worker" ]; then
     --loglevel=info \
     --concurrency="$CONCURRENCY" \
     --queues="$QUEUES" \
-    --hostname="worker-${RAILWAY_REPLICA_ID:-0}@%h"
+    --hostname="worker-${RAILWAY_REPLICA_ID:-0}@%h" \
+    --max-tasks-per-child=3
 elif [ "$RAILWAY_SERVICE_NAME" = "beat" ]; then
   echo "Starting Celery beat scheduler..."
   exec celery -A src.workers beat --loglevel=info --scheduler celery.beat.PersistentScheduler

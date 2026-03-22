@@ -8,9 +8,12 @@ from sqlalchemy.pool import NullPool
 from src.config import settings
 
 # ─── Async engine — FastAPI / async routes ────────────────────────────────────
-# NullPool + statement_cache_size=0 for Supabase PgBouncer compatibility.
+# Supabase port 6543 = pgbouncer (breaks asyncpg prepared statements).
+# Force port 5432 (direct connection) for asyncpg compatibility.
+_async_url = settings.DATABASE_URL.replace(":6543/", ":5432/")
+
 async_engine = create_async_engine(
-    settings.DATABASE_URL,
+    _async_url,
     poolclass=NullPool,
     echo=settings.DEBUG,
     connect_args={"statement_cache_size": 0},

@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     FRONTEND_URL: str = "https://app.bridgeleads.io"
     ALLOWED_ORIGINS: str = "https://app.bridgeleads.io"
 
+    # ─── Worker scaling ──────────────────────────────────────────────────────
+    WORKER_CONCURRENCY: int = 2
+    WORKER_QUEUES: str = "scrape,enrichment"
+
     # ─── Playwright ───────────────────────────────────────────────────────────
     PLAYWRIGHT_HEADLESS: bool = True
 

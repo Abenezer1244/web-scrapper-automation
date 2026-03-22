@@ -38,8 +38,13 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 # ─── Sync engine — Celery workers / Alembic ───────────────────────────────────
+# Route through pgbouncer (port 6543) to avoid MaxClientsInSessionMode errors
+# when 4+ Celery workers open direct connections. psycopg2 works fine with
+# pgbouncer transaction mode (unlike asyncpg which needs direct for prepared stmts).
+_sync_url = settings.DATABASE_URL_SYNC.replace(":5432/", ":6543/")
+
 sync_engine = create_engine(
-    settings.DATABASE_URL_SYNC,
+    _sync_url,
     poolclass=NullPool,
     echo=settings.DEBUG,
 )

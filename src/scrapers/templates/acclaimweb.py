@@ -121,10 +121,6 @@ class AcclaimWebScraper(BridgeScraper):
 
             _logger.info("Chunk %s-%s: %d new records (total: %d)", cf, ct, new_count, len(all_records))
 
-            if len(all_records) >= 5000:
-                _logger.info("Reached 5000 record cap, stopping")
-                break
-
             chunk_start = chunk_end
             await self.polite_delay()
 

@@ -89,6 +89,14 @@ class BridgeScraper:
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--single-process",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-default-apps",
+                "--disable-sync",
+                "--disable-translate",
+                "--no-first-run",
+                "--js-flags=--max-old-space-size=256",
             ],
         )
         self._context = await self._browser.new_context(

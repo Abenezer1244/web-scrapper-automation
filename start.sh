@@ -17,6 +17,12 @@ QUEUES="${WORKER_QUEUES:-scrape-priority,scrape,enrichment}"
 
 if [ "$RAILWAY_SERVICE_NAME" = "worker" ]; then
   echo "Starting Celery worker (concurrency=$CONCURRENCY, queues=$QUEUES)..."
+
+  # Expand /dev/shm for multiple Chromium instances (default 64MB is too small)
+  if mount | grep -q '/dev/shm'; then
+    mount -o remount,size=512M /dev/shm 2>/dev/null && echo "/dev/shm expanded to 512MB" || echo "/dev/shm remount skipped (no permission)"
+  fi
+
   # Try to start Xvfb for headed Playwright (fixes EagleWeb JS redirects).
   if command -v Xvfb > /dev/null 2>&1; then
     export DISPLAY=:99

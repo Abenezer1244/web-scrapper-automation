@@ -42,6 +42,11 @@ USER bridge
 # Install Playwright Chromium as the bridge user
 RUN playwright install chromium
 
+# Increase shared memory for multiple concurrent Chromium instances.
+# Default /dev/shm is 64MB — crashes when running 3+ browsers.
+# Railway mounts tmpfs at /dev/shm; ensure startup script handles this.
+ENV PLAYWRIGHT_BROWSERS_PATH=/home/bridge/.cache/ms-playwright
+
 # Cache-bust: force fresh copy of source files on every build
 ARG CACHEBUST=1
 COPY --chown=bridge:bridge . .

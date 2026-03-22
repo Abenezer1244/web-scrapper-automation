@@ -155,30 +155,33 @@ class AcclaimWebScraper(BridgeScraper):
             body_text = await self.page.inner_text("body")
             _logger.info("Page text (first 500): %s", body_text[:500].replace('\n', ' '))
 
-            # AcclaimWeb disclaimer: look for accept/continue links
-            clicked = await self.page.evaluate("""
-                (() => {
-                    const links = document.querySelectorAll('a, button, input[type="button"], input[type="submit"]');
-                    const found = [];
-                    for (const el of links) {
-                        const text = (el.textContent || el.value || '').trim().toLowerCase();
-                        if (text.length > 0 && text.length < 50) found.push(text);
-                        if (text.includes('accept') || text.includes('agree') ||
-                            text.includes('acknowledge') || text.includes('continue') ||
-                            text.includes('public') || text.includes('search')) {
-                            el.click();
-                            return text;
-                        }
-                    }
-                    return 'NO_MATCH:' + found.slice(0, 10).join('|');
-                })()
-            """)
-            if clicked and not clicked.startswith('NO_MATCH'):
-                await self.page.wait_for_timeout(3_000)
-                _logger.info("Disclaimer accepted: %s", clicked)
+            # AcclaimWeb disclaimer: click the accept button.
+            # The button is input[type="submit"] — must use Playwright click
+            # (not JS el.click()) to properly trigger form submission + navigation.
+            accept_btn = self.page.locator(
+                "input[type='submit'][value*='accept' i], "
+                "input[type='submit'][value*='agree' i], "
+                "input[type='submit'][value*='acknowledge' i], "
+                "button:has-text('accept'), button:has-text('agree'), "
+                "a:has-text('accept'), a:has-text('agree'), "
+                "a:has-text('continue'), a:has-text('public')"
+            )
+            if await accept_btn.count() > 0:
+                btn_val = await accept_btn.first.get_attribute("value") or ""
+                _logger.info("Found disclaimer button: %s", btn_val[:60])
+
+                # Use Playwright click + wait for navigation
+                try:
+                    async with self.page.expect_navigation(timeout=15_000):
+                        await accept_btn.first.click()
+                    _logger.info("Disclaimer accepted via navigation")
+                except Exception:
+                    await self.page.wait_for_timeout(3_000)
+                    _logger.info("Disclaimer clicked (no navigation event)")
+
                 _logger.info("After disclaimer URL: %s", self.page.url)
             else:
-                _logger.info("No disclaimer match found. Links: %s", clicked)
+                _logger.info("No disclaimer button found on page")
         except Exception as exc:
             _logger.info("Disclaimer error: %s", str(exc)[:100])
 

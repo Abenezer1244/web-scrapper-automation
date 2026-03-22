@@ -147,29 +147,40 @@ class AcclaimWebScraper(BridgeScraper):
 
     async def _accept_disclaimer(self) -> None:
         """Click disclaimer accept link/button if present."""
+        _logger.info("Page URL: %s", self.page.url)
+        _logger.info("Page title: %s", await self.page.title())
+
         try:
+            # Log page content for debugging
+            body_text = await self.page.inner_text("body")
+            _logger.info("Page text (first 500): %s", body_text[:500].replace('\n', ' '))
+
             # AcclaimWeb disclaimer: look for accept/continue links
             clicked = await self.page.evaluate("""
                 (() => {
                     const links = document.querySelectorAll('a, button, input[type="button"], input[type="submit"]');
+                    const found = [];
                     for (const el of links) {
                         const text = (el.textContent || el.value || '').trim().toLowerCase();
+                        if (text.length > 0 && text.length < 50) found.push(text);
                         if (text.includes('accept') || text.includes('agree') ||
-                            text.includes('acknowledge') || text.includes('continue')) {
+                            text.includes('acknowledge') || text.includes('continue') ||
+                            text.includes('public') || text.includes('search')) {
                             el.click();
                             return text;
                         }
                     }
-                    return null;
+                    return 'NO_MATCH:' + found.slice(0, 10).join('|');
                 })()
             """)
-            if clicked:
+            if clicked and not clicked.startswith('NO_MATCH'):
                 await self.page.wait_for_timeout(3_000)
                 _logger.info("Disclaimer accepted: %s", clicked)
+                _logger.info("After disclaimer URL: %s", self.page.url)
             else:
-                _logger.info("No disclaimer found, continuing")
-        except Exception:
-            _logger.info("No disclaimer found, continuing")
+                _logger.info("No disclaimer match found. Links: %s", clicked)
+        except Exception as exc:
+            _logger.info("Disclaimer error: %s", str(exc)[:100])
 
     async def _go_to_search(self) -> None:
         """Navigate back to the Record Date search form."""
@@ -191,74 +202,84 @@ class AcclaimWebScraper(BridgeScraper):
         await self.page.wait_for_timeout(2_000)
 
     async def _fill_dates(self, date_from: str, date_to: str) -> None:
-        """Fill the Kendo DatePicker date inputs.
-
-        AcclaimWeb uses Kendo UI DatePicker widgets. We use JavaScript
-        to set values directly through the Kendo API, which is more
-        reliable than trying to interact with the rendered input elements.
-        """
+        """Fill the Kendo DatePicker date inputs."""
+        _logger.info("Fill dates page URL: %s", self.page.url)
         try:
-            # Wait for Kendo widgets to initialize
-            await self.page.wait_for_timeout(2_000)
+            await self.page.wait_for_timeout(3_000)
 
-            # First try: set "Specific Date Range" in the dropdown if it exists
-            try:
-                await self.page.evaluate("""
-                    (() => {
-                        const dd = document.querySelector('#DateRangeDropDown');
-                        if (dd) {
-                            const widget = $(dd).data('kendoDropDownList');
-                            if (widget) {
-                                widget.value('SpecificDateRange');
-                                widget.trigger('change');
-                            }
-                        }
-                    })()
-                """)
-                await self.page.wait_for_timeout(1_000)
-            except Exception:
-                pass
+            # Log what elements exist on page
+            page_info = await self.page.evaluate("""
+                (() => {
+                    const info = {
+                        has_jquery: typeof $ !== 'undefined',
+                        inputs: [],
+                        selects: [],
+                        buttons: [],
+                    };
+                    document.querySelectorAll('input').forEach(el => {
+                        info.inputs.push({id: el.id, name: el.name, type: el.type, value: el.value});
+                    });
+                    document.querySelectorAll('select').forEach(el => {
+                        info.selects.push({id: el.id, name: el.name});
+                    });
+                    document.querySelectorAll('button, input[type="submit"]').forEach(el => {
+                        info.buttons.push({id: el.id, text: (el.textContent || el.value || '').trim()});
+                    });
+                    return info;
+                })()
+            """)
+            _logger.info("Page elements: jQuery=%s inputs=%d selects=%d buttons=%d",
+                         page_info.get('has_jquery'), len(page_info.get('inputs', [])),
+                         len(page_info.get('selects', [])), len(page_info.get('buttons', [])))
+            for inp in page_info.get('inputs', [])[:10]:
+                _logger.info("  input: id=%s name=%s type=%s val=%s", inp.get('id'), inp.get('name'), inp.get('type'), inp.get('value', '')[:30])
+            for btn in page_info.get('buttons', []):
+                _logger.info("  button: id=%s text=%s", btn.get('id'), btn.get('text', '')[:30])
 
-            # Set dates via Kendo API (most reliable for Kendo DatePicker)
+            # Try Kendo DatePicker API first
             filled = await self.page.evaluate(f"""
                 (() => {{
-                    let filled = false;
+                    if (typeof $ === 'undefined') return 'no_jquery';
 
-                    // Try Kendo DatePicker API
-                    if (typeof $ !== 'undefined') {{
-                        const fromPicker = $('#FromDatePicker').data('kendoDatePicker');
-                        const toPicker = $('#ToDatePicker').data('kendoDatePicker');
-                        if (fromPicker && toPicker) {{
-                            fromPicker.value('{date_from}');
-                            fromPicker.trigger('change');
-                            toPicker.value('{date_to}');
-                            toPicker.trigger('change');
-                            filled = true;
-                        }}
-
-                        // Try alternate: RecordDatePicker with date range
-                        if (!filled) {{
-                            const singlePicker = $('#RecordDatePicker').data('kendoDatePicker');
-                            if (singlePicker) {{
-                                singlePicker.value('{date_from}');
-                                singlePicker.trigger('change');
-                                filled = true;
-                            }}
-                        }}
+                    // Try setting date range dropdown first
+                    const dd = $('#DateRangeDropDown').data('kendoDropDownList');
+                    if (dd) {{
+                        dd.value('SpecificDateRange');
+                        dd.trigger('change');
                     }}
 
-                    return filled;
+                    const fromPicker = $('#FromDatePicker').data('kendoDatePicker');
+                    const toPicker = $('#ToDatePicker').data('kendoDatePicker');
+                    if (fromPicker && toPicker) {{
+                        fromPicker.value('{date_from}');
+                        fromPicker.trigger('change');
+                        toPicker.value('{date_to}');
+                        toPicker.trigger('change');
+                        return 'kendo_ok';
+                    }}
+
+                    const singlePicker = $('#RecordDatePicker').data('kendoDatePicker');
+                    if (singlePicker) {{
+                        singlePicker.value('{date_from}');
+                        singlePicker.trigger('change');
+                        return 'kendo_single';
+                    }}
+
+                    return 'no_kendo_pickers';
                 }})()
             """)
+            _logger.info("Kendo fill result: %s", filled)
 
-            if filled:
-                _logger.info("Dates set via Kendo API: %s to %s", date_from, date_to)
+            if filled in ('kendo_ok', 'kendo_single'):
+                await self.page.wait_for_timeout(1_000)
                 return
 
-            # Fallback: type into the input elements directly
+            # Fallback: type into input elements directly
             for from_id, to_id in [
                 ("FromDatePicker", "ToDatePicker"),
                 ("RecordDateFrom", "RecordDateTo"),
+                ("txtStartDate", "txtEndDate"),
+                ("StartDate", "EndDate"),
             ]:
                 from_el = self.page.locator(f"#{from_id}")
                 to_el = self.page.locator(f"#{to_id}")
@@ -269,25 +290,44 @@ class AcclaimWebScraper(BridgeScraper):
                     await to_el.click()
                     await to_el.fill("")
                     await to_el.press_sequentially(date_to, delay=30)
-                    _logger.info("Dates typed: %s to %s", date_from, date_to)
+                    _logger.info("Dates typed via fallback: %s to %s (ids: %s, %s)", date_from, date_to, from_id, to_id)
                     return
 
-            _logger.warning("Could not find date inputs")
+            # Last resort: find any date-looking inputs
+            date_inputs = await self.page.locator("input[type='text'], input[type='date']").all()
+            _logger.info("Found %d text/date inputs for fallback", len(date_inputs))
+            for inp in date_inputs[:2]:
+                val = await inp.get_attribute("placeholder") or ""
+                _logger.info("  placeholder=%s", val)
+
+            _logger.warning("Could not find date inputs on page")
 
         except Exception as exc:
-            _logger.warning("Could not set dates: %s", str(exc)[:80])
+            _logger.warning("Could not set dates: %s", str(exc)[:120])
 
     async def _submit_search(self) -> None:
         """Click the Search button and wait for results grid to populate."""
         try:
-            # Click the search button
+            # Find the search button
             search_btn = self.page.locator("#SearchBtn")
-            if await search_btn.count() == 0:
+            btn_count = await search_btn.count()
+            _logger.info("SearchBtn count: %d", btn_count)
+
+            if btn_count == 0:
                 search_btn = self.page.locator(
                     "button:has-text('Search'), input[type='submit'][value='Search']"
                 )
+                btn_count = await search_btn.count()
+                _logger.info("Fallback search button count: %d", btn_count)
+
+            if btn_count == 0:
+                _logger.warning("No search button found!")
+                body = await self.page.inner_text("body")
+                _logger.info("Page body (500 chars): %s", body[:500].replace('\n', ' '))
+                return
 
             await search_btn.first.click()
+            _logger.info("Search button clicked, waiting for results...")
 
             # Wait for results grid to populate (Kendo Grid loads via AJAX)
             try:
@@ -295,15 +335,20 @@ class AcclaimWebScraper(BridgeScraper):
                     "#SearchResultGrid tbody tr, .k-grid-content tr, .no-results, .k-grid-norecords",
                     timeout=60_000,
                 )
+                _logger.info("Results selector found")
             except Exception:
-                # May have loaded differently — check after a delay
                 await self.page.wait_for_timeout(5_000)
+                _logger.info("Results selector timeout, continuing anyway")
 
             await self.page.wait_for_timeout(2_000)
-            _logger.info("Search submitted, page: %s", self.page.url)
+
+            # Log page state after search
+            body = await self.page.inner_text("body")
+            _logger.info("After search URL: %s", self.page.url)
+            _logger.info("After search text (500): %s", body[:500].replace('\n', ' '))
 
         except Exception as exc:
-            _logger.warning("Could not submit search: %s", str(exc)[:80])
+            _logger.warning("Could not submit search: %s", str(exc)[:120])
 
     async def _extract_all_pages(self) -> list[ScrapedRecord]:
         """Extract records from all result pages in the Kendo Grid."""

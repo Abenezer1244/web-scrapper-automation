@@ -158,7 +158,24 @@ class EagleWebScraper(BridgeScraper):
             chunk_start = chunk_end
             await self.polite_delay()
 
-        _logger.info("EagleWeb scraper complete — %d records", len(all_records))
+        # Enrich records that have parcel IDs with property/mailing addresses
+        enrichable = [r for r in all_records if r.parcel_id and len(r.parcel_id) >= 8]
+        if enrichable:
+            _logger.info("Enriching %d records with parcel data", len(enrichable))
+            from src.scrapers.enrichment import enrich_parcel
+
+            for record in enrichable[:200]:  # Cap at 200 enrichments per job
+                try:
+                    enriched = await enrich_parcel(record.parcel_id, self.county, self.state)
+                    record.property_address = enriched.get("property_address") or record.property_address
+                    record.mailing_address = enriched.get("mailing_address") or record.mailing_address
+                    if enriched.get("property_address"):
+                        record.enrichment_data = enriched
+                except Exception:
+                    pass
+                await self.polite_delay()
+
+        _logger.info("EagleWeb scraper complete — %d records (%d enriched)", len(all_records), len(enrichable))
         return all_records
 
     async def _accept_disclaimer(self) -> None:

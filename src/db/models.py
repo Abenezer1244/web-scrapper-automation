@@ -4,6 +4,7 @@ from sqlalchemy import (
     JSON,
     Boolean,
     Column,
+    Date,
     DateTime,
     ForeignKey,
     Integer,
@@ -136,3 +137,34 @@ class JobLog(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     job = relationship("Job", back_populates="logs")
+
+
+class CountyRecord(Base):
+    __tablename__ = "county_records"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    county = Column(String(64), nullable=False, index=True)
+    state = Column(String(4), nullable=False, index=True)
+    doc_type = Column(String(128), nullable=True)
+    date_recorded = Column(String(32), nullable=True)
+    party_name = Column(String(512), nullable=True)
+    heirs = Column(Text, nullable=True)
+    legal_description = Column(Text, nullable=True)
+    parcel_id = Column(String(64), nullable=True)
+    property_address = Column(String(512), nullable=True)
+    mailing_address = Column(String(512), nullable=True)
+    enrichment_data = Column(JSON, nullable=True, default=dict)
+    record_hash = Column(String(32), nullable=False, unique=True, index=True)
+    scraped_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    batch_date = Column(Date, server_default=func.current_date(), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class UserRecordView(Base):
+    __tablename__ = "user_record_views"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    scraper_config_id = Column(UUID(as_uuid=False), ForeignKey("scraper_configs.id", ondelete="CASCADE"), nullable=False, index=True)
+    last_viewed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

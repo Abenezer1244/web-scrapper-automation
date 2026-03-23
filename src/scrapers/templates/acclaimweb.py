@@ -130,7 +130,7 @@ class AcclaimWebScraper(BridgeScraper):
             _logger.info("Enriching %d records with parcel data", len(enrichable))
             from src.scrapers.enrichment import enrich_parcel
 
-            for record in enrichable[:200]:
+            for record in enrichable:
                 try:
                     enriched = await enrich_parcel(record.parcel_id, self.county, self.state)
                     record.property_address = enriched.get("property_address") or record.property_address

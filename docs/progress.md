@@ -1,7 +1,66 @@
 # BridgeLeads — Progress Report
 
-**Date:** 2026-03-22 (updated)
-**Status:** Production — fixing county scrapers, worker stable at 2×2 concurrency
+**Date:** 2026-03-23 (comprehensive update)
+**Status:** Production SaaS — backend scraping live, frontend deployed, cached records system built
+
+---
+
+## Session Summary (2026-03-22 to 2026-03-23)
+
+### What Was Built This Session
+
+#### Backend — Scraper Fixes
+- Fixed EagleWeb disclaimer (Playwright native click instead of JS el.click())
+- Fixed AcclaimWeb single-date field handling (#RecordDate)
+- Fixed Thurston EagleWeb variant (recordingDateIDStart/End date input IDs)
+- Added "eagleweb." domain pattern to template detection
+- Removed 5,000 record cap from template scrapers
+- Removed 200 enrichment cap — all records now enriched
+- Scaled to 4 replicas × 2 concurrency = 8 workers
+- Fixed MaxClients DB error (routed sync engine through pgbouncer port 6543)
+- Added --max-tasks-per-child=3 to prevent OOM
+- Updated Anthropic API key (credits topped up)
+- Triggered 32-county backfill with full enrichment
+
+#### Backend — Cached Scraping System (NEW)
+- **Design spec:** `docs/superpowers/specs/2026-03-23-cached-scraping-design.md`
+- **Implementation plan:** `docs/superpowers/plans/2026-03-23-cached-scraping.md`
+- **New DB tables:** `county_records` (shared cache) + `user_record_views` (per-user "new" badges)
+- **New API endpoint:** `GET /scrapers/{config_id}/records` — serves cached records instantly with is_new flags
+- **Daily scrape worker:** `src/workers/daily_scrape.py` — runs at 2 AM UTC, backfills 90 days for new counties
+- **Beat tasks:** `scrape_county_daily` + `purge_old_records` (365-day retention)
+- **Settings:** `ENABLE_DAILY_SCRAPE=true`, `RECORD_RETENTION_DAYS=365`
+- **Atomic "new" badge:** SELECT FOR UPDATE + UPSERT pattern prevents race conditions
+- **RLS policies:** county_records (shared read), user_record_views (user-only)
+- **Verified E2E:** Benton County — 2,574 records served instantly, new badges working
+
+#### Frontend — Landing Page (Phase 1)
+- **Repo:** `bridgeleads-web` on GitHub + Vercel
+- **URL:** https://bridgeleads-web.vercel.app/
+- **Design spec:** `docs/superpowers/specs/2026-03-23-frontend-ui-ux-design.md`
+- **Design system:** Generated via ui-ux-pro-max skill + taste-skill
+- Premium dark landing page with:
+  - Spline 3D animated background
+  - Progressive gradient blur overlay (6-layer backdrop-filter)
+  - Shimmer mask on headlines
+  - Word-by-word text reveal animation
+  - Section enter/exit blur transitions
+  - Horizontal snap-scroll carousel
+  - Glass card features with gradient icon containers
+  - Timeline process section
+  - 3-tier pricing with monthly/annual toggle
+  - Urgency-driven CTA sections
+  - Premium 4-column footer
+- Route setup: `/` = public landing, `/dashboard` = protected app
+- Vercel deployment protection disabled for public access
+
+#### Frontend — Dashboard + Records (Phase 2)
+- **Implementation plan:** `docs/superpowers/plans/2026-03-23-dashboard-records.md`
+- **New types:** `CachedRecord`, `CachedResultsPage` in `lib/types.ts`
+- **New API function:** `getCachedRecords()` in `lib/api.ts`
+- **New components:** `NewBadge`, `ScraperCard`
+- **Dashboard redesign:** Scraper config cards with new count badges + recent activity
+- **Cached records page:** `/scrapers/[id]/records` with NEW badges, search, pagination
 
 ---
 
@@ -12,131 +71,99 @@
 | Spokane, WA | 5,653 | EagleWeb Template | $0 |
 | Kitsap, WA | 5,076 | EagleWeb Template | $0 |
 | Benton, WA | 4,528 | EagleWeb Template | $0 |
-| Grant, WA | 3,541 | EagleWeb Template (disclaimer fix) | $0 |
-| Island, WA | 3,194 | EagleWeb Template (disclaimer fix) | $0 |
+| Grant, WA | 3,541 | EagleWeb Template | $0 |
+| Island, WA | 3,194 | EagleWeb Template | $0 |
 | Jefferson, WA | 1,413 | EagleWeb Template | $0 |
 | Whitman, WA | 1,087 | EagleWeb Template | $0 |
 | Pierce, WA | 325 | Manual Scraper | $0 |
-| Pierce AI, WA | 25 | AI Scraper (Claude) | $0.10 |
-| Mason, WA | 14 | AI Scraper (Claude) | $0.10 |
+| Pierce AI, WA | 25 | AI Scraper | $0.10 |
+| Mason, WA | 14 | AI Scraper | $0.10 |
 | **TOTAL** | **24,856** | **10 counties** | **~$0.20** |
 
----
-
-## Today's Fixes (2026-03-22)
-
-### Fix 1: EagleWeb Disclaimer — Playwright Native Click
-**Problem:** JS `el.click()` on `<input type="submit">` doesn't reliably submit forms in headless Chromium. Grant and Island counties stayed on `login.jsp` after the disclaimer click — the form submitted via GET but redirected back to itself.
-
-**Fix:** Replaced `page.evaluate()` JS clicks with Playwright's native `.click()` + `expect_navigation()`. Playwright handles form submission, actionability checks, and navigation tracking correctly.
-
-**Counties fixed:** Grant, Island, Grays Harbor, Clallam, Okanogan (all EagleWeb)
-
-### Fix 2: AcclaimWeb Single Date Field
-**Problem:** Douglas County's AcclaimWeb has a single `#RecordDate` input, not the `#FromDatePicker`/`#ToDatePicker` pair the template expected. Template fell through all tiers and logged "Could not find date inputs."
-
-**Fix:** Added `#RecordDate` detection in `_fill_dates()`. When single-date mode is detected, chunking switches from 7-day ranges to daily searches.
-
-**Counties fixed:** Douglas (AcclaimWeb)
-
-### Fix 3: Stuck Job Cleanup
-Marked 9 jobs stuck in "scraping" state for >2 hours as failed.
+**32-county backfill in progress** — 8 workers processing all active WA counties with full enrichment.
 
 ---
 
-## Current State
+## Infrastructure Status
 
-### Railway Worker
-- **Deploy:** SUCCESS (2×2 = 4 concurrent workers, all active)
-- **Status:** All 4 workers confirmed active across both replicas
-- **Fixes applied:** pgbouncer routing (MaxClients fix), --max-tasks-per-child=3 (OOM fix)
-- **Previous issue:** 4 replicas caused OOM crashes → scaled to 2 replicas × 2 concurrency
+### Railway (Backend)
+- **API:** `api.bridgeleads.io` — FastAPI, deployed
+- **Worker:** 4 replicas × 2 concurrency = 8 workers
+- **Beat:** Celery beat scheduler with 6 periodic tasks
+- **Deploy:** Auto-deploy from GitHub push
 
-### County Status (39 WA counties)
+### Vercel (Frontend)
+- **URL:** https://bridgeleads-web.vercel.app/
+- **Stack:** Next.js 16, React 19, Tailwind CSS 4, Framer Motion, shadcn/ui
+- **Deploy:** Manual via `vercel deploy --prod`
+- **Auth:** NextAuth v5 (JWT + Credentials)
 
-**Done (10):** Spokane (5,653), Kitsap (5,076), Benton (4,528), Grant (3,541), Island (3,194), Jefferson (1,413), Whitman (1,087), Pierce (325), Pierce AI (25), Mason (14)
+### Database (Supabase)
+- **Tables:** users, scraper_configs, jobs, results, job_logs, county_connectors, county_records, user_record_views
+- **RLS:** Enabled on all tables
+- **Connection:** pgbouncer (port 6543) for workers, direct (port 5432) for async API
 
-**Actively Scraping (1):**
-- Clallam — EagleWeb, disclaimer fix confirmed working, extracting records
-
-**Pending/Queued (12 — waiting for worker capacity):**
-- EagleWeb: Grays Harbor, Okanogan, Lewis, Pacific, Thurston (disclaimer fix applied)
-- AcclaimWeb: Chelan, Douglas, Pend Oreille (single-date fix applied)
-- Duplicates: Grant, Island, Whitman (already done, will skip or produce more)
-
-**Failed — Need Fixes (22):**
-
-| Group | Counties | Issue | Next Step |
-|-------|----------|-------|-----------|
-| EagleWeb (stale fails) | Lewis, Pacific, Thurston, Whitman | Failed before today's fix | Rerun after current batch |
-| AcclaimWeb | Pend Oreille | May have similar single-date issue | Rerun after fix deploys |
-| Tyler Self-Service | Lincoln, Stevens | Different UI from EagleWeb | Needs template or AI debug |
-| Custom portals | Columbia, San Juan, Whatcom, Cowlitz | AI scraper failed | Debug AI scraper |
-| LandmarkWeb | King, Snohomish | reCAPTCHA / account required | Needs CAPTCHA solving |
-| Fidlar Tapestry | Yakima | Different platform | Build template or fix AI |
-| Small counties | Ferry, Garfield, Klickitat, Skamania, Skagit, Walla Walla | AI scraper failed | Debug individually |
-| No portal | Adams, Asotin, Franklin, Kittitas, Wahkiakum | No online recorder | Mark inactive |
-
-### Infrastructure Built (50+ commits)
-
-1. **EagleWeb Template Scraper** — zero-cost for Tyler EagleWeb sites (16+ WA counties)
-2. **AcclaimWeb Template Scraper** — zero-cost for Tyler AcclaimWeb sites (3 WA counties)
-3. **Free GIS Enrichment Pipeline** — $0/month (replaces $375/mo Regrid)
-4. **AI Scraper** — Claude-powered for non-standard county websites
-5. **Production Deployment** — Railway with Xvfb, Celery workers, beat scheduler
-
----
-
-## Next Steps
-
-### Immediate (today)
-1. ✅ Fix EagleWeb disclaimer (deployed)
-2. ✅ Fix AcclaimWeb single-date handling (deployed)
-3. ⏳ Monitor Grant, Island, Grays Harbor, Douglas, Clallam, Okanogan results
-4. Rerun Lewis, Pacific, Thurston, Whitman (EagleWeb — should work now)
-5. Rerun Pend Oreille (AcclaimWeb)
-
-### Priority 1: Get More EagleWeb Counties Working
-- Expected: 2,000-5,000 records per county
-- 10+ EagleWeb counties should "just work" with disclaimer fix
-
-### Priority 2: Fix Remaining Platforms
-- Tyler Self-Service (Lincoln, Stevens)
-- Custom portals via AI scraper debug
-- LandmarkWeb (King, Snohomish) — CAPTCHA handling
-
-### Priority 3: Expand Beyond WA
-- TX, FL, CA top investor counties
-- Many states use EagleWeb — template works immediately
+### Key Environment Variables
+- `ENABLE_DAILY_SCRAPE=true` — daily county scrape at 2 AM UTC
+- `RECORD_RETENTION_DAYS=365` — auto-purge old records
+- `WORKER_CONCURRENCY=2` — per replica
+- `ANTHROPIC_API_KEY` — updated with funded key
 
 ---
 
 ## Architecture
 
 ```
-User → Frontend (Vercel) → API (Railway) → Job Queue (Redis/Celery)
-                                              ↓
-                                         Worker (Railway, 2×2)
-                                              ↓
-                                    ┌─────────┴──────────┐
-                                    │                    │
-                              EagleWeb Template    AcclaimWeb Template
-                              (16 WA counties)     (3 WA counties)
-                                    │                    │
-                                    ├────────────────────┤
-                                    │                    │
-                              AI Scraper (Claude)   Manual Scrapers
-                              (any county)          (Pierce)
-                                    │                    │
-                                    └─────────┬──────────┘
-                                              ↓
-                                    GIS Enrichment (free)
-                                    WA Statewide API
-                                              ↓
-                                    PostgreSQL (Supabase)
-                                              ↓
-                                    CSV/Excel/JSON Export
+Visitor → Landing Page (Vercel, public)
+                ↓ Sign Up
+User → Dashboard (Vercel, protected)
+                ↓ GET /scrapers/{id}/records
+        API (Railway) → county_records table (cached)
+                            ↓ instant response + "NEW" badges
+                            ↓ user_record_views tracks last_viewed_at
+
+Nightly (2 AM UTC):
+        Beat Scheduler → scrape_county_daily task
+                            ↓ dispatches 1 task per county
+        8 Workers → EagleWeb/AcclaimWeb/AI scrapers
+                            ↓ records → county_records (ON CONFLICT DO NOTHING)
+                            ↓ enrichment → GIS APIs (property + mailing address)
 ```
+
+---
+
+## Remaining Work
+
+### Phase 3: Frontend (Not Started)
+- Scraper creation wizard redesign
+- Settings page redesign
+- Auth pages (login/register) redesign
+- Live job monitoring page redesign
+
+### Backend
+- Fix remaining failing counties (Tyler Self-Service, LandmarkWeb, custom portals)
+- AcclaimWeb Kendo Grid extraction (Chelan shows data but extraction gets 0)
+- Okanogan Tyler Self-Service disclaimer flow
+- State expansion (TX, FL, CA)
+
+### Product
+- Stripe billing integration testing
+- Email delivery via Resend
+- R2 export upload fix (currently Unauthorized)
+- Custom domain setup (bridgeleads.io)
+
+---
+
+## Key Files & Specs
+
+| Document | Path |
+|----------|------|
+| UI/UX Design Spec | `docs/superpowers/specs/2026-03-23-frontend-ui-ux-design.md` |
+| Cached Scraping Spec | `docs/superpowers/specs/2026-03-23-cached-scraping-design.md` |
+| Cached Scraping Plan | `docs/superpowers/plans/2026-03-23-cached-scraping.md` |
+| Landing Page Plan | `docs/superpowers/plans/2026-03-23-landing-page.md` |
+| Dashboard Plan | `docs/superpowers/plans/2026-03-23-dashboard-records.md` |
+| Design System | `design-system/bridgeleads/MASTER.md` |
 
 ## Cost Structure
 | Component | Monthly Cost |
@@ -144,7 +171,7 @@ User → Frontend (Vercel) → API (Railway) → Job Queue (Redis/Celery)
 | EagleWeb + AcclaimWeb scraping | $0 |
 | GIS enrichment (all WA) | $0 |
 | AI scraper (non-template counties) | ~$5-10 |
-| Railway hosting (API + Worker + Beat) | ~$20 |
+| Railway hosting (API + 4 worker replicas + Beat) | ~$40 |
 | Supabase (PostgreSQL) | Free tier |
 | Vercel (Frontend) | Free tier |
-| **Total** | **~$25-30/mo** |
+| **Total** | **~$45-50/mo** |

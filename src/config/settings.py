@@ -41,9 +41,11 @@ class Settings(BaseSettings):
         return v
 
     # ─── Cloudflare R2 ────────────────────────────────────────────────────────
-    R2_ENDPOINT_URL: str = ""
-    R2_ACCESS_KEY_ID: str = ""
-    R2_SECRET_ACCESS_KEY: str = ""
+    R2_ENDPOINT_URL: str = ""           # Legacy S3-compatible (kept for backwards compat)
+    R2_ACCESS_KEY_ID: str = ""          # Legacy S3 access key
+    R2_SECRET_ACCESS_KEY: str = ""      # Legacy S3 secret key
+    R2_ACCOUNT_ID: str = ""             # Cloudflare account ID
+    R2_API_TOKEN: str = ""              # Cloudflare API token with Workers R2 Storage Edit
     R2_BUCKET_NAME: str = "bridgeleads-exports"
     R2_PUBLIC_URL: str = ""
 

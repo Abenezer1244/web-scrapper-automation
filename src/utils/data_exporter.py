@@ -5,9 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import boto3
 import pandas as pd
-from botocore.config import Config
+import requests as _requests
 
 from src.api.middleware.security import sanitize_for_csv
 from src.config import settings
@@ -30,16 +29,16 @@ _COLUMN_ORDER = [
 _AMBER_HEX = "F5A623"
 
 
-def _get_r2_client():
-    """Return a boto3 S3 client configured for Cloudflare R2."""
-    return boto3.client(
-        "s3",
-        endpoint_url=settings.R2_ENDPOINT_URL,
-        aws_access_key_id=settings.R2_ACCESS_KEY_ID,
-        aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
-        config=Config(signature_version="s3v4"),
-        region_name="auto",
-    )
+def _r2_api_base() -> str:
+    """Return the Cloudflare R2 API base URL for the configured account + bucket."""
+    account_id = settings.R2_ACCOUNT_ID
+    bucket = settings.R2_BUCKET_NAME
+    return f"https://api.cloudflare.com/client/v4/accounts/{account_id}/r2/buckets/{bucket}"
+
+
+def _r2_headers() -> dict[str, str]:
+    """Return auth headers for the Cloudflare R2 API."""
+    return {"Authorization": f"Bearer {settings.R2_API_TOKEN}"}
 
 
 def _build_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
@@ -146,6 +145,9 @@ class DataExporter:
     def upload_to_r2(self, local_path: Path, object_key: str) -> str:
         """Upload a local file to Cloudflare R2 and return the object key.
 
+        Uses the Cloudflare R2 REST API (not S3-compatible endpoint) to avoid
+        credential issues with boto3.
+
         Args:
             local_path: Path to the local file.
             object_key: S3-style key (e.g. 'exports/job_id/leads.csv').
@@ -153,7 +155,6 @@ class DataExporter:
         Returns:
             The object key stored in R2.
         """
-        client = _get_r2_client()
         content_types = {
             ".csv": "text/csv",
             ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -161,34 +162,48 @@ class DataExporter:
         }
         content_type = content_types.get(local_path.suffix, "application/octet-stream")
 
+        url = f"{_r2_api_base()}/objects/{object_key}"
+        headers = _r2_headers()
+        headers["Content-Type"] = content_type
+
         with open(local_path, "rb") as f:
-            client.put_object(
-                Bucket=settings.R2_BUCKET_NAME,
-                Key=object_key,
-                Body=f,
-                ContentType=content_type,
-                ContentDisposition=f'attachment; filename="{local_path.name}"',
-            )
+            resp = _requests.put(url, headers=headers, data=f, timeout=120)
+
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(f"R2 upload failed ({resp.status_code}): {resp.text[:200]}")
+
         _logger.info("Uploaded to R2: %s", object_key)
         return object_key
 
     def get_download_url(self, object_key: str, expires_in: int = 3600) -> str:
-        """Generate a pre-signed download URL for an R2 object.
+        """Generate a temporary download URL for an R2 object.
+
+        Uses the Cloudflare R2 API to create a presigned URL. Falls back to
+        the R2 public URL if configured.
 
         Args:
             object_key: The R2 object key.
             expires_in: URL expiry in seconds (default: 1hr for in-app, use 172800 for email).
 
         Returns:
-            Pre-signed HTTPS URL.
+            HTTPS download URL.
         """
-        client = _get_r2_client()
-        url = client.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": settings.R2_BUCKET_NAME, "Key": object_key},
-            ExpiresIn=expires_in,
-        )
-        return url
+        if settings.R2_PUBLIC_URL:
+            return f"{settings.R2_PUBLIC_URL}/{object_key}"
+
+        # Use Cloudflare R2 API presigned URL endpoint
+        url = f"{_r2_api_base()}/objects/{object_key}?presigned=true&expiresIn={expires_in}"
+        resp = _requests.get(url, headers=_r2_headers(), timeout=30)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            presigned = data.get("result", {}).get("presignedUrl")
+            if presigned:
+                return presigned
+
+        # Fallback: direct Cloudflare R2 API download (proxied)
+        _logger.warning("Presigned URL not available, using API proxy download")
+        return f"{_r2_api_base()}/objects/{object_key}"
 
     # ─── Helper ───────────────────────────────────────────────────────────────
 

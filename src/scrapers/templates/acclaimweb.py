@@ -145,18 +145,68 @@ class AcclaimWebScraper(BridgeScraper):
         return all_records
 
     async def _accept_disclaimer(self) -> None:
-        """Click disclaimer accept link/button if present."""
+        """Click disclaimer accept link/button/checkbox if present.
+
+        AcclaimWeb sites vary:
+        - Some have an input[type='submit'] button (e.g. Pend Oreille)
+        - Some have a checkbox labeled 'Accept Disclaimer' (e.g. Chelan)
+        - Some have a link with 'accept'/'agree' text
+        """
         _logger.info("Page URL: %s", self.page.url)
         _logger.info("Page title: %s", await self.page.title())
 
         try:
-            # Log page content for debugging
             body_text = await self.page.inner_text("body")
             _logger.info("Page text (first 500): %s", body_text[:500].replace('\n', ' '))
 
-            # AcclaimWeb disclaimer: click the accept button.
-            # The button is input[type="submit"] — must use Playwright click
-            # (not JS el.click()) to properly trigger form submission + navigation.
+            # Strategy 1: Checkbox-based disclaimer (Chelan pattern)
+            # Some AcclaimWeb sites use a checkbox labeled "Accept Disclaimer"
+            accept_checkbox = self.page.locator(
+                "input[type='checkbox']"
+            )
+            checkbox_count = await accept_checkbox.count()
+            if checkbox_count > 0:
+                for i in range(checkbox_count):
+                    cb = accept_checkbox.nth(i)
+                    # Check label text or nearby text
+                    cb_id = await cb.get_attribute("id") or ""
+                    cb_name = await cb.get_attribute("name") or ""
+                    parent_text = await cb.evaluate(
+                        "el => (el.parentElement?.textContent || el.closest('label')?.textContent || '').trim()"
+                    )
+                    _logger.info("Checkbox %d: id=%s name=%s label=%s", i, cb_id, cb_name, parent_text[:60])
+
+                    if any(kw in (cb_id + cb_name + parent_text).lower()
+                           for kw in ["accept", "disclaim", "agree", "acknowledge"]):
+                        if not await cb.is_checked():
+                            await cb.check()
+                            _logger.info("Checked disclaimer checkbox: %s", cb_id or cb_name)
+
+                        # After checking, look for a submit/continue button
+                        await self.page.wait_for_timeout(1_000)
+                        submit_after = self.page.locator(
+                            "input[type='submit'], button[type='submit'], "
+                            "button:has-text('Continue'), button:has-text('Search'), "
+                            "a:has-text('Continue'), a:has-text('Search')"
+                        )
+                        if await submit_after.count() > 0:
+                            _logger.info("Clicking submit after checkbox")
+                            try:
+                                async with self.page.expect_navigation(timeout=15_000):
+                                    await submit_after.first.click()
+                                _logger.info("Disclaimer accepted via checkbox + submit")
+                            except Exception:
+                                await self.page.wait_for_timeout(3_000)
+                                _logger.info("Disclaimer checkbox + submit (no nav event)")
+                        else:
+                            # Checkbox alone may trigger JS navigation
+                            await self.page.wait_for_timeout(3_000)
+                            _logger.info("Disclaimer checkbox checked (no submit button found)")
+
+                        _logger.info("After disclaimer URL: %s", self.page.url)
+                        return
+
+            # Strategy 2: Submit button (standard pattern)
             accept_btn = self.page.locator(
                 "input[type='submit'][value*='accept' i], "
                 "input[type='submit'][value*='agree' i], "
@@ -166,10 +216,9 @@ class AcclaimWebScraper(BridgeScraper):
                 "a:has-text('continue'), a:has-text('public')"
             )
             if await accept_btn.count() > 0:
-                btn_val = await accept_btn.first.get_attribute("value") or ""
+                btn_val = await accept_btn.first.get_attribute("value") or await accept_btn.first.inner_text()
                 _logger.info("Found disclaimer button: %s", btn_val[:60])
 
-                # Use Playwright click + wait for navigation
                 try:
                     async with self.page.expect_navigation(timeout=15_000):
                         await accept_btn.first.click()
@@ -180,7 +229,7 @@ class AcclaimWebScraper(BridgeScraper):
 
                 _logger.info("After disclaimer URL: %s", self.page.url)
             else:
-                _logger.info("No disclaimer button found on page")
+                _logger.info("No disclaimer button or checkbox found on page")
         except Exception as exc:
             _logger.info("Disclaimer error: %s", str(exc)[:100])
 
@@ -358,7 +407,9 @@ class AcclaimWebScraper(BridgeScraper):
             # Wait for results grid to populate (Kendo Grid loads via AJAX)
             try:
                 await self.page.wait_for_selector(
-                    "#SearchResultGrid tbody tr, .k-grid-content tr, .no-results, .k-grid-norecords",
+                    "#SearchResultGrid tbody tr, .k-grid-content tr, "
+                    ".no-results, .k-grid-norecords, "
+                    "table.k-grid tbody tr, [data-role='grid'] tbody tr",
                     timeout=60_000,
                 )
                 _logger.info("Results selector found")
@@ -366,7 +417,17 @@ class AcclaimWebScraper(BridgeScraper):
                 await self.page.wait_for_timeout(5_000)
                 _logger.info("Results selector timeout, continuing anyway")
 
-            await self.page.wait_for_timeout(2_000)
+            # Extra wait for Kendo AJAX to fully populate grid data
+            await self.page.wait_for_timeout(3_000)
+
+            # Wait for any Kendo loading indicator to disappear
+            try:
+                loading = self.page.locator(".k-loading-mask, .k-loading-image")
+                if await loading.count() > 0:
+                    await loading.first.wait_for(state="hidden", timeout=10_000)
+                    _logger.info("Kendo loading indicator cleared")
+            except Exception:
+                pass
 
             # Log page state after search
             body = await self.page.inner_text("body")
@@ -418,6 +479,33 @@ class AcclaimWebScraper(BridgeScraper):
         records: list[ScrapedRecord] = []
 
         try:
+            # First, log grid diagnostic info
+            diag = await self.page.evaluate("""
+                (() => {
+                    const d = {
+                        has_jquery: typeof $ !== 'undefined',
+                        grid_el: !!document.querySelector('#SearchResultGrid'),
+                        grid_rows: document.querySelectorAll('#SearchResultGrid tbody tr, .k-grid-content tbody tr').length,
+                        all_tables: document.querySelectorAll('table').length,
+                        all_trs: document.querySelectorAll('table tbody tr').length,
+                    };
+                    if (d.has_jquery) {
+                        const grid = $('#SearchResultGrid').data('kendoGrid');
+                        d.has_kendo_grid = !!grid;
+                        if (grid) {
+                            const view = grid.dataSource.view();
+                            d.kendo_view_len = view ? view.length : 0;
+                            d.kendo_total = grid.dataSource.total();
+                            if (view && view.length > 0) {
+                                d.first_row_keys = Object.keys(view[0]).filter(k => !k.startsWith('_'));
+                            }
+                        }
+                    }
+                    return d;
+                })()
+            """)
+            _logger.info("Grid diagnostics: %s", diag)
+
             raw = await self.page.evaluate("""
                 (() => {
                     // Try Kendo Grid data first (most reliable)
@@ -427,21 +515,44 @@ class AcclaimWebScraper(BridgeScraper):
                             const data = grid.dataSource.view();
                             if (data && data.length > 0) {
                                 return Array.from(data).map(item => ({
-                                    instrument: item.InstrumentNumber || item.Instrument || '',
-                                    date_recorded: item.RecordDate || item.RecordingDate || '',
-                                    doc_type: item.DocType || item.DocumentType || item.DocTypeName || '',
-                                    grantor: item.Grantor || item.GrantorName || '',
-                                    grantee: item.Grantee || item.GranteeName || '',
-                                    legal: item.LegalDescription || item.Legal || '',
-                                    parcel: item.ParcelId || item.Parcel || item.APN || '',
+                                    instrument: item.InstrumentNumber || item.Instrument || item.AFN || item.instrumentNumber || '',
+                                    date_recorded: item.RecordDate || item.RecordingDate || item.recordDate || item.RecordedDate || '',
+                                    doc_type: item.DocType || item.DocumentType || item.DocTypeName || item.docType || item.DocumentDescription || '',
+                                    grantor: item.Grantor || item.GrantorName || item.grantor || item.DirectName || '',
+                                    grantee: item.Grantee || item.GranteeName || item.grantee || item.IndirectName || '',
+                                    legal: item.LegalDescription || item.Legal || item.legalDescription || '',
+                                    parcel: item.ParcelId || item.Parcel || item.APN || item.parcelId || '',
                                 }));
+                            }
+                        }
+
+                        // Try alternate grid selectors
+                        const altGrids = ['.k-grid', '[data-role="grid"]', '#resultsGrid', '#searchResults'];
+                        for (const sel of altGrids) {
+                            const el = $(sel).data('kendoGrid');
+                            if (el) {
+                                const data = el.dataSource.view();
+                                if (data && data.length > 0) {
+                                    return Array.from(data).map(item => {
+                                        const keys = Object.keys(item).filter(k => !k.startsWith('_'));
+                                        return {
+                                            instrument: item[keys.find(k => /instrument|afn/i.test(k))] || '',
+                                            date_recorded: item[keys.find(k => /date|record/i.test(k))] || '',
+                                            doc_type: item[keys.find(k => /doc.*type|document/i.test(k))] || '',
+                                            grantor: item[keys.find(k => /grantor|direct/i.test(k))] || '',
+                                            grantee: item[keys.find(k => /grantee|indirect/i.test(k))] || '',
+                                            legal: item[keys.find(k => /legal/i.test(k))] || '',
+                                            parcel: item[keys.find(k => /parcel|apn/i.test(k))] || '',
+                                        };
+                                    });
+                                }
                             }
                         }
                     }
 
                     // Fallback: extract from DOM table rows
                     const rows = document.querySelectorAll(
-                        '#SearchResultGrid tbody tr, .k-grid-content tbody tr'
+                        '#SearchResultGrid tbody tr, .k-grid-content tbody tr, table.k-grid tbody tr'
                     );
                     if (!rows.length) return [];
 

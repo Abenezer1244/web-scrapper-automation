@@ -5,11 +5,12 @@ handle standardized platforms with zero AI cost.
 
 Supported platforms:
 - EagleWeb (Tyler Technologies) — 16+ WA counties
-- LandmarkWeb (Hyland) — 3 WA counties (has reCAPTCHA on some)
+- LandmarkWeb (Hyland) — King County (largest in WA)
 - AcclaimWeb (Tyler) — 3 WA counties
 """
 
 from src.scrapers.templates.acclaimweb import AcclaimWebScraper
 from src.scrapers.templates.eagleweb import EagleWebScraper
+from src.scrapers.templates.landmarkweb import LandmarkWebScraper
 
-__all__ = ["AcclaimWebScraper", "EagleWebScraper"]
+__all__ = ["AcclaimWebScraper", "EagleWebScraper", "LandmarkWebScraper"]

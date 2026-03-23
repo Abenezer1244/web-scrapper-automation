@@ -121,6 +121,11 @@ def _detect_template(base_url: str):
     # EagleWeb (Tyler Technologies) — template scraper for all EagleWeb sites.
     # With Xvfb virtual display, Playwright runs in headed mode which fixes
     # the JS redirect issue on docSearchPOST.jsp.
+    # Tyler Self-Service uses /web/ paths on tylerhost.net — exclude from EagleWeb
+    selfservice_patterns = ["/web/user/disclaimer", "/web/search/", "selfservice."]
+    if any(p in url_lower for p in selfservice_patterns):
+        return None  # Fall through to AI scraper
+
     eagleweb_patterns = [
         "/recorder/web",
         "recorder/web",     # also matches /thurstonrecorder/web, /grantrecorder/web
@@ -133,12 +138,11 @@ def _detect_template(base_url: str):
         from src.scrapers.templates.eagleweb import EagleWebScraper
         return EagleWebScraper
 
-    # LandmarkWeb (Hyland) — Clark, King, Snohomish
+    # LandmarkWeb (Hyland) — King County (and potentially Clark, Snohomish)
     # URL pattern: /LandmarkWeb/
     if "/landmarkweb" in url_lower:
-        # LandmarkWeb may have reCAPTCHA — fall through to AI scraper
-        # which has CAPTCHA detection
-        return None
+        from src.scrapers.templates.landmarkweb import LandmarkWebScraper
+        return LandmarkWebScraper
 
     # AcclaimWeb (Tyler) — Chelan, Douglas, Pend Oreille
     if "/acclaimweb" in url_lower:

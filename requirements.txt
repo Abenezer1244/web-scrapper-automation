@@ -23,7 +23,7 @@ passlib[bcrypt]==1.7.4
 
 # Task queue
 celery[redis]==5.4.0
-redis==5.2.1
+redis==7.3.0
 
 # Scraping
 playwright==1.49.1

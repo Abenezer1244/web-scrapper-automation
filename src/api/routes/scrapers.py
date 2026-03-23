@@ -256,7 +256,7 @@ async def get_cached_records(
             param_name = f"kw_{i}"
             conditions.append(f"doc_type ILIKE :{param_name}")
             type_params[param_name] = f"%{kw}%"
-        type_filter = "AND (" + " OR ".join(conditions) + ")"
+        type_filter = "AND (doc_type IS NULL OR " + " OR ".join(conditions) + ")"
 
     # 4. Search filter
     search_filter = ""

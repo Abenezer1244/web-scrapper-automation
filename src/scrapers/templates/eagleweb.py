@@ -127,7 +127,10 @@ class EagleWebScraper(BridgeScraper):
 
                 # Wait for search form to be ready
                 try:
-                    await self.page.wait_for_selector("#RecDateIDStart", timeout=10_000)
+                    await self.page.wait_for_selector(
+                        "#RecDateIDStart, #recordingDateIDStart, #StartDate",
+                        timeout=10_000,
+                    )
                 except Exception:
                     _logger.warning("Date input not found after navigation back")
 
@@ -272,17 +275,24 @@ class EagleWebScraper(BridgeScraper):
         try:
             # Wait for the search form to load (date inputs may take a moment)
             try:
-                await self.page.wait_for_selector("#RecDateIDStart", timeout=10_000)
+                await self.page.wait_for_selector(
+                    "#RecDateIDStart, #recordingDateIDStart, #StartDate",
+                    timeout=10_000,
+                )
             except Exception:
                 # Try alternate selector
                 try:
-                    await self.page.wait_for_selector("input[name*='RecDate']", timeout=5_000)
+                    await self.page.wait_for_selector(
+                        "input[name*='Date'][name*='Start'], input[name*='recording']",
+                        timeout=5_000,
+                    )
                 except Exception:
                     pass
 
             filled = False
             for start_id, end_id in [
                 ("RecDateIDStart", "RecDateIDEnd"),
+                ("recordingDateIDStart", "recordingDateIDEnd"),
                 ("StartDate", "EndDate"),
             ]:
                 start_el = self.page.locator(f"#{start_id}")

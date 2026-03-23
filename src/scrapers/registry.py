@@ -123,7 +123,9 @@ def _detect_template(base_url: str):
     # the JS redirect issue on docSearchPOST.jsp.
     eagleweb_patterns = [
         "/recorder/web",
+        "recorder/web",     # also matches /thurstonrecorder/web, /grantrecorder/web
         "/eagleweb/",
+        "eagleweb.",         # matches eagleweb.co.thurston.wa.us (domain)
         "tylerhost.net",
         "countygovernmentrecords.com",
     ]

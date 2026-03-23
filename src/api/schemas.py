@@ -225,3 +225,34 @@ class ConnectorResponse(BaseModel):
     active: bool
 
     model_config = {"from_attributes": True}
+
+
+# ─── Cached Records ──────────────────────────────────────────────────────────
+
+class CachedRecordRow(BaseModel):
+    id: str
+    date_recorded: str | None = None
+    party_name: str | None = None
+    heirs: str | None = None
+    doc_type: str | None = None
+    legal_description: str | None = None
+    parcel_id: str | None = None
+    property_address: str | None = None
+    mailing_address: str | None = None
+    is_new: bool = False
+    scraped_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class CachedResultsPage(BaseModel):
+    config_id: str
+    county: str
+    state: str
+    total: int
+    new_count: int
+    cache_age: str | None = None
+    cache_stale: bool = False
+    page: int
+    page_size: int
+    items: list[CachedRecordRow]

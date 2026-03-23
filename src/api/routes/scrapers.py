@@ -1,14 +1,17 @@
 """Scraper config routes: CRUD for user's scraper configurations."""
 
 import uuid
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
 from src.api.schemas import (
+    CachedRecordRow,
+    CachedResultsPage,
     ConnectorCreate,
     ConnectorResponse,
     ScraperConfigCreate,
@@ -190,3 +193,154 @@ async def create_connector(
     db.add(connector)
     await db.flush()
     return ConnectorResponse.model_validate(connector)
+
+
+# ─── Cached records endpoint ─────────────────────────────────────────────────
+
+
+@router.get("/{config_id}/records", response_model=CachedResultsPage)
+async def get_cached_records(
+    config_id: str,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_rls_db),
+    page: int = 1,
+    page_size: int = 50,
+    q: str | None = None,
+):
+    """Serve pre-scraped records from cache with per-user 'new' badges."""
+    # 1. Verify config belongs to user
+    config_result = await db.execute(
+        select(ScraperConfig).where(
+            ScraperConfig.id == config_id,
+            ScraperConfig.user_id == current_user.id,
+            ScraperConfig.active,
+        )
+    )
+    config = config_result.scalar_one_or_none()
+    if config is None:
+        raise HTTPException(status_code=404, detail="Scraper config not found")
+
+    county = config.county.lower()
+    state = config.state.upper()
+
+    # 2. Atomic: read old last_viewed_at, then update to NOW()
+    old_view_result = await db.execute(
+        text("""
+            SELECT last_viewed_at FROM user_record_views
+            WHERE user_id = :user_id AND scraper_config_id = :config_id
+            FOR UPDATE
+        """),
+        {"user_id": current_user.id, "config_id": config_id},
+    )
+    old_row = old_view_result.fetchone()
+    previous_viewed = old_row.last_viewed_at if old_row else None
+
+    await db.execute(
+        text("""
+            INSERT INTO user_record_views (id, user_id, scraper_config_id, last_viewed_at)
+            VALUES (gen_random_uuid(), :user_id, :config_id, NOW())
+            ON CONFLICT (user_id, scraper_config_id)
+            DO UPDATE SET last_viewed_at = NOW()
+        """),
+        {"user_id": current_user.id, "config_id": config_id},
+    )
+
+    # 3. Build doc_type filter from record_type keywords
+    from src.scrapers.templates.eagleweb import _DOC_TYPE_MAP
+    keywords = _DOC_TYPE_MAP.get(config.record_type, [])
+    type_filter = ""
+    type_params = {}
+    if keywords:
+        conditions = []
+        for i, kw in enumerate(keywords):
+            param_name = f"kw_{i}"
+            conditions.append(f"doc_type ILIKE :{param_name}")
+            type_params[param_name] = f"%{kw}%"
+        type_filter = "AND (" + " OR ".join(conditions) + ")"
+
+    # 4. Search filter
+    search_filter = ""
+    if q and len(q) <= 100:
+        from src.api.middleware.security import sanitize_search
+        clean_q = sanitize_search(q)
+        search_filter = "AND (party_name ILIKE :q OR property_address ILIKE :q OR parcel_id ILIKE :q)"
+        type_params["q"] = f"%{clean_q}%"
+
+    # 5. Count total + new_count
+    count_sql = f"""
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE scraped_at > COALESCE(:prev_viewed, '1970-01-01'::timestamptz)) AS new_count
+        FROM county_records
+        WHERE LOWER(county) = :county AND UPPER(state) = :state
+        {type_filter} {search_filter}
+    """
+    counts = await db.execute(
+        text(count_sql),
+        {"county": county, "state": state, "prev_viewed": previous_viewed, **type_params},
+    )
+    count_row = counts.fetchone()
+    total = count_row.total if count_row else 0
+    new_count = count_row.new_count if count_row else 0
+
+    # 6. Fetch paginated records
+    offset = (page - 1) * page_size
+    records_sql = f"""
+        SELECT *,
+            CASE WHEN scraped_at > COALESCE(:prev_viewed, '1970-01-01'::timestamptz) THEN true ELSE false END AS is_new
+        FROM county_records
+        WHERE LOWER(county) = :county AND UPPER(state) = :state
+        {type_filter} {search_filter}
+        ORDER BY scraped_at DESC
+        LIMIT :limit OFFSET :offset
+    """
+    result = await db.execute(
+        text(records_sql),
+        {"county": county, "state": state, "prev_viewed": previous_viewed,
+         "limit": page_size, "offset": offset, **type_params},
+    )
+    rows = result.fetchall()
+
+    # 7. Cache age
+    cache_age = None
+    cache_stale = True
+    if rows:
+        latest_batch = await db.execute(
+            text("SELECT MAX(batch_date) FROM county_records WHERE LOWER(county) = :county AND UPPER(state) = :state"),
+            {"county": county, "state": state},
+        )
+        max_batch = latest_batch.scalar()
+        if max_batch:
+            age = datetime.now(UTC).date() - max_batch
+            cache_age = f"{age.days}d" if age.days > 0 else "today"
+            cache_stale = age.days > 1
+
+    await db.commit()
+
+    return CachedResultsPage(
+        config_id=config_id,
+        county=config.county,
+        state=config.state,
+        total=total,
+        new_count=new_count,
+        cache_age=cache_age,
+        cache_stale=cache_stale,
+        page=page,
+        page_size=page_size,
+        items=[
+            CachedRecordRow(
+                id=str(r.id),
+                date_recorded=r.date_recorded,
+                party_name=r.party_name,
+                heirs=r.heirs,
+                doc_type=r.doc_type,
+                legal_description=r.legal_description,
+                parcel_id=r.parcel_id,
+                property_address=r.property_address,
+                mailing_address=r.mailing_address,
+                is_new=r.is_new,
+                scraped_at=r.scraped_at,
+            )
+            for r in rows
+        ],
+    )

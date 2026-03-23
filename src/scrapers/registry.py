@@ -144,6 +144,11 @@ def _detect_template(base_url: str):
         from src.scrapers.templates.landmarkweb import LandmarkWebScraper
         return LandmarkWebScraper
 
+    # AVA Fidlar — Yakima
+    if "ava.fidlar.com" in url_lower or "/avaWeb" in url_lower or "/avaweb" in url_lower:
+        from src.scrapers.templates.ava_fidlar import AvaFidlarScraper
+        return AvaFidlarScraper
+
     # AcclaimWeb (Tyler) — Chelan, Douglas, Pend Oreille
     if "/acclaimweb" in url_lower:
         from src.scrapers.templates.acclaimweb import AcclaimWebScraper

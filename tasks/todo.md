@@ -46,9 +46,10 @@ Need to study the interface and either build a template or fix the AI scraper fo
 
 ### Step 1: Rerun EagleWeb counties (9 counties) — immediate
 - [x] Rerun Grant, Grays Harbor, Island, Pacific, Thurston, Clark, Lewis, Whitman, Okanogan
-- [x] Spokane: DONE (5,653 records), Kitsap: DONE (5,076), Benton: DONE (4,528), Jefferson: DONE (1,355)
-- [ ] Monitor results — Grant + Island currently scraping, 7 more pending
-- [ ] Expected: ~1000-5000 records per county
+- [x] Spokane: DONE (5,653 records), Kitsap: DONE (5,076), Benton: DONE (4,528), Jefferson: DONE (1,413)
+- [x] Grant: DONE (3,541), Island: DONE (3,194), Whitman: DONE (1,087)
+- [x] Fixed EagleWeb disclaimer (Playwright native click)
+- [ ] Monitor remaining: Grays Harbor, Clallam, Okanogan, Lewis, Pacific, Thurston (queued)
 - Note: Lincoln + Stevens are Tyler Self-Service (not EagleWeb) — need separate template
 
 ### Step 2: Fix DNS/unreachable (3 counties)
@@ -66,8 +67,10 @@ Need to study the interface and either build a template or fix the AI scraper fo
 - [x] Build AcclaimWeb template scraper (src/scrapers/templates/acclaimweb.py)
 - [x] Register in registry.py (auto-detects /acclaimweb in URL)
 - [x] Updated __init__.py exports
-- [ ] Deploy to Railway (commit + push)
-- [ ] Trigger jobs for Chelan and Pend Oreille (Douglas already in queue)
+- [x] Fixed single-date field handling (#RecordDate for Douglas)
+- [x] Deployed to Railway (commit + push)
+- [x] Triggered jobs for Chelan, Douglas, and Pend Oreille
+- [ ] Monitor AcclaimWeb results
 
 ### Step 4: Fix custom portals (3 counties)
 - [ ] Debug AI scraper on Columbia, San Juan, Whatcom

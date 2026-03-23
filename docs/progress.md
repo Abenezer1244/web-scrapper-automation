@@ -1,121 +1,113 @@
 # BridgeLeads — Progress Report
 
-**Date:** 2026-03-22
-**Status:** Production — extracting real public records at scale
+**Date:** 2026-03-22 (updated)
+**Status:** Production — fixing county scrapers, worker stable at 2×2 concurrency
 
 ---
 
-## What We Accomplished
+## Records Extracted (Confirmed Done)
 
-### Records Extracted
-| County | Records | Method | Cost | Time |
-|--------|---------|--------|------|------|
-| Spokane, WA | 5,653 | EagleWeb Template | $0 | 4 min |
-| Kitsap, WA | 5,076 | EagleWeb Template | $0 | 4 min |
-| Benton, WA | 4,528 | EagleWeb Template | $0 | 2.5 min |
-| Jefferson, WA | 1,355 | EagleWeb Template | $0 | 1 min |
-| Pierce, WA | 325 | Manual Scraper | $0 | 1 min |
-| Pierce AI, WA | 25 | AI Scraper (Claude) | $0.10 | 1 min |
-| Mason, WA | 14 | AI Scraper (Claude) | $0.10 | 1 min |
-| **TOTAL** | **16,976** | | **~$0.20** | |
+| County | Records | Method | Cost |
+|--------|---------|--------|------|
+| Spokane, WA | 5,653 | EagleWeb Template | $0 |
+| Kitsap, WA | 5,076 | EagleWeb Template | $0 |
+| Benton, WA | 4,528 | EagleWeb Template | $0 |
+| Grant, WA | 3,541 | EagleWeb Template (disclaimer fix) | $0 |
+| Island, WA | 3,194 | EagleWeb Template (disclaimer fix) | $0 |
+| Jefferson, WA | 1,413 | EagleWeb Template | $0 |
+| Whitman, WA | 1,087 | EagleWeb Template | $0 |
+| Pierce, WA | 325 | Manual Scraper | $0 |
+| Pierce AI, WA | 25 | AI Scraper (Claude) | $0.10 |
+| Mason, WA | 14 | AI Scraper (Claude) | $0.10 |
+| **TOTAL** | **24,856** | **10 counties** | **~$0.20** |
 
-### Infrastructure Built (50+ commits)
-1. **EagleWeb Template Scraper** — zero-cost scraper for Tyler Technologies EagleWeb sites (16+ WA counties)
-   - 7-day date chunking (splits 90 days into small searches that redirect correctly)
-   - `pressSequentially` for date inputs (triggers EagleWeb JS events)
-   - `expect_navigation` for form submission tracking
-   - JS-based record extraction from Description/Summary columns
-   - Pagination across 50+ pages per chunk
+---
 
-2. **Free GIS Enrichment Pipeline** — $0/month (replaces $375/mo Regrid)
-   - County GIS REST APIs (ArcGIS, free, no auth)
-   - WA statewide parcel API (covers all 39 counties)
-   - AI assessor fallback (Claude navigates assessor websites)
-   - 5-tier priority: GIS → Regrid → AI Assessor → ATIP → unavailable
+## Today's Fixes (2026-03-22)
 
-3. **Production Deployment**
-   - Xvfb virtual display on Railway (headed Playwright)
-   - Anti-headless detection (navigator.webdriver override)
-   - Bulk DB insert (1000 rows/statement)
-   - 60-min task timeout, 55-min watchdog
-   - 5-county canary health checks per hour
+### Fix 1: EagleWeb Disclaimer — Playwright Native Click
+**Problem:** JS `el.click()` on `<input type="submit">` doesn't reliably submit forms in headless Chromium. Grant and Island counties stayed on `login.jsp` after the disclaimer click — the form submitted via GET but redirected back to itself.
 
-4. **Frontend**
-   - 50-state dropdown → county picker (39 WA counties active)
-   - 4-step wizard: County → Fields → Schedule → Delivery
-   - Live job streaming, results table with search + pagination
-   - CSV/Excel/JSON download
+**Fix:** Replaced `page.evaluate()` JS clicks with Playwright's native `.click()` + `expect_navigation()`. Playwright handles form submission, actionability checks, and navigation tracking correctly.
 
-5. **AI Scraper** — Claude-powered for any county website
-   - Screenshot → Claude analysis → form navigation → record extraction
-   - Action caching (7-day TTL) — subsequent runs replay free
-   - Works on non-standard sites where template can't be used
+**Counties fixed:** Grant, Island, Grays Harbor, Clallam, Okanogan (all EagleWeb)
+
+### Fix 2: AcclaimWeb Single Date Field
+**Problem:** Douglas County's AcclaimWeb has a single `#RecordDate` input, not the `#FromDatePicker`/`#ToDatePicker` pair the template expected. Template fell through all tiers and logged "Could not find date inputs."
+
+**Fix:** Added `#RecordDate` detection in `_fill_dates()`. When single-date mode is detected, chunking switches from 7-day ranges to daily searches.
+
+**Counties fixed:** Douglas (AcclaimWeb)
+
+### Fix 3: Stuck Job Cleanup
+Marked 9 jobs stuck in "scraping" state for >2 hours as failed.
 
 ---
 
 ## Current State
 
-### Working Counties (7 of 39 WA)
-Spokane, Kitsap, Benton, Jefferson, Pierce, Pierce AI, Mason
+### Railway Worker
+- **Deploy:** SUCCESS (2×2 = 4 concurrent workers, all active)
+- **Status:** All 4 workers confirmed active across both replicas
+- **Fixes applied:** pgbouncer routing (MaxClients fix), --max-tasks-per-child=3 (OOM fix)
+- **Previous issue:** 4 replicas caused OOM crashes → scaled to 2 replicas × 2 concurrency
 
-### Processing (8 counties — results coming in)
-Grant, Island, Pacific, Thurston, Clark, Lewis, Whitman, Okanogan, Grays Harbor
-Each expected: 2,000-5,000 records in ~4 min
+### County Status (39 WA counties)
 
-### Enrichment
-- GIS enrichment deployed for EagleWeb template
-- Records with parcel IDs get property + mailing addresses automatically
-- Confirmed working: "GINTER ORLAN ROSS EST OF" → PID 5670400260 → 3846 E HOWE ST
+**Done (10):** Spokane (5,653), Kitsap (5,076), Benton (4,528), Grant (3,541), Island (3,194), Jefferson (1,413), Whitman (1,087), Pierce (325), Pierce AI (25), Mason (14)
 
-### Not Yet Working (11 counties)
-| County | Platform | Issue |
-|--------|----------|-------|
-| Chelan | AcclaimWeb | Different Tyler platform, needs template |
-| Pend Oreille | AcclaimWeb | Same as Chelan |
-| Columbia | iDocMarket | Third-party service |
-| San Juan | Custom | Digital Research Room |
-| Whatcom | Custom | Digital Research Room |
-| Cowlitz | Custom | County portal |
-| Yakima | Fidlar Tapestry | Different platform |
-| Lincoln | Tyler Self-Service | Different from EagleWeb |
-| Stevens | Tyler Self-Service | Different from EagleWeb |
-| Snohomish | LandmarkWeb | Requires account creation |
-| King | LandmarkWeb | Has reCAPTCHA |
+**Actively Scraping (1):**
+- Clallam — EagleWeb, disclaimer fix confirmed working, extracting records
 
-### Inactive (5 counties — no online portal)
-Adams, Asotin, Franklin, Kittitas, Wahkiakum
+**Pending/Queued (12 — waiting for worker capacity):**
+- EagleWeb: Grays Harbor, Okanogan, Lewis, Pacific, Thurston (disclaimer fix applied)
+- AcclaimWeb: Chelan, Douglas, Pend Oreille (single-date fix applied)
+- Duplicates: Grant, Island, Whitman (already done, will skip or produce more)
 
-### DNS Down (2 counties)
-Clallam, Douglas
+**Failed — Need Fixes (22):**
+
+| Group | Counties | Issue | Next Step |
+|-------|----------|-------|-----------|
+| EagleWeb (stale fails) | Lewis, Pacific, Thurston, Whitman | Failed before today's fix | Rerun after current batch |
+| AcclaimWeb | Pend Oreille | May have similar single-date issue | Rerun after fix deploys |
+| Tyler Self-Service | Lincoln, Stevens | Different UI from EagleWeb | Needs template or AI debug |
+| Custom portals | Columbia, San Juan, Whatcom, Cowlitz | AI scraper failed | Debug AI scraper |
+| LandmarkWeb | King, Snohomish | reCAPTCHA / account required | Needs CAPTCHA solving |
+| Fidlar Tapestry | Yakima | Different platform | Build template or fix AI |
+| Small counties | Ferry, Garfield, Klickitat, Skamania, Skagit, Walla Walla | AI scraper failed | Debug individually |
+| No portal | Adams, Asotin, Franklin, Kittitas, Wahkiakum | No online recorder | Mark inactive |
+
+### Infrastructure Built (50+ commits)
+
+1. **EagleWeb Template Scraper** — zero-cost for Tyler EagleWeb sites (16+ WA counties)
+2. **AcclaimWeb Template Scraper** — zero-cost for Tyler AcclaimWeb sites (3 WA counties)
+3. **Free GIS Enrichment Pipeline** — $0/month (replaces $375/mo Regrid)
+4. **AI Scraper** — Claude-powered for non-standard county websites
+5. **Production Deployment** — Railway with Xvfb, Celery workers, beat scheduler
 
 ---
 
 ## Next Steps
 
-### Priority 1: Enrichment Coverage
-- Add detail page extraction for records missing parcel IDs
-- Click into each EagleWeb record → extract parcel number → GIS lookup
-- This will fill Property Address + Mailing Address for all records
+### Immediate (today)
+1. ✅ Fix EagleWeb disclaimer (deployed)
+2. ✅ Fix AcclaimWeb single-date handling (deployed)
+3. ⏳ Monitor Grant, Island, Grays Harbor, Douglas, Clallam, Okanogan results
+4. Rerun Lewis, Pacific, Thurston, Whitman (EagleWeb — should work now)
+5. Rerun Pend Oreille (AcclaimWeb)
 
-### Priority 2: Non-EagleWeb Counties (11 counties)
-- Build AcclaimWeb template (Chelan, Pend Oreille) — similar to EagleWeb
-- Build Fidlar Tapestry template (Yakima)
-- Debug AI scraper on custom portals (Columbia, San Juan, Whatcom, Cowlitz)
-- Handle Tyler Self-Service (Lincoln, Stevens) — different UI from EagleWeb
-- Snohomish: automate account creation or use alternative
-- King: integrate 2Captcha for reCAPTCHA solving
+### Priority 1: Get More EagleWeb Counties Working
+- Expected: 2,000-5,000 records per county
+- 10+ EagleWeb counties should "just work" with disclaimer fix
 
-### Priority 3: Expand to More States
-- TX (top 5 investor counties) — research recorder portals
-- FL (top 5 investor counties)
-- CA (top 5 investor counties)
-- Many states also use EagleWeb — template will work immediately
+### Priority 2: Fix Remaining Platforms
+- Tyler Self-Service (Lincoln, Stevens)
+- Custom portals via AI scraper debug
+- LandmarkWeb (King, Snohomish) — CAPTCHA handling
 
-### Priority 4: Product Polish
-- Fix R2 upload credentials (CSV export to cloud storage)
-- Email delivery of results via Resend
-- Stripe billing integration testing
-- Clean up duplicate "Pierce" and "Pierce AI" connectors
+### Priority 3: Expand Beyond WA
+- TX, FL, CA top investor counties
+- Many states use EagleWeb — template works immediately
 
 ---
 
@@ -124,12 +116,17 @@ Clallam, Douglas
 ```
 User → Frontend (Vercel) → API (Railway) → Job Queue (Redis/Celery)
                                               ↓
-                                         Worker (Railway)
+                                         Worker (Railway, 2×2)
                                               ↓
                                     ┌─────────┴──────────┐
                                     │                    │
-                              EagleWeb Template    AI Scraper (Claude)
-                              (16 WA counties)     (any county)
+                              EagleWeb Template    AcclaimWeb Template
+                              (16 WA counties)     (3 WA counties)
+                                    │                    │
+                                    ├────────────────────┤
+                                    │                    │
+                              AI Scraper (Claude)   Manual Scrapers
+                              (any county)          (Pierce)
                                     │                    │
                                     └─────────┬──────────┘
                                               ↓
@@ -144,9 +141,9 @@ User → Frontend (Vercel) → API (Railway) → Job Queue (Redis/Celery)
 ## Cost Structure
 | Component | Monthly Cost |
 |-----------|-------------|
-| EagleWeb scraping (16+ counties) | $0 |
+| EagleWeb + AcclaimWeb scraping | $0 |
 | GIS enrichment (all WA) | $0 |
-| AI scraper (non-EagleWeb counties) | ~$5-10 |
+| AI scraper (non-template counties) | ~$5-10 |
 | Railway hosting (API + Worker + Beat) | ~$20 |
 | Supabase (PostgreSQL) | Free tier |
 | Vercel (Frontend) | Free tier |

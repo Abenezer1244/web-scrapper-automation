@@ -1,4 +1,4 @@
-"""Celery beat scheduler: 4 periodic tasks."""
+"""Celery beat scheduler: 6 periodic tasks."""
 
 from datetime import UTC, datetime, timedelta
 
@@ -27,6 +27,14 @@ app.conf.beat_schedule = {
     "reset-monthly-usage": {
         "task": "src.workers.scheduler.reset_monthly_usage",
         "schedule": crontab(hour=0, minute=0, day_of_month=1),  # 1st of month, midnight UTC
+    },
+    "scrape-county-daily": {
+        "task": "src.workers.scheduler.scrape_county_daily",
+        "schedule": crontab(hour=2, minute=0),
+    },
+    "purge-old-records": {
+        "task": "src.workers.scheduler.purge_old_records",
+        "schedule": crontab(hour=3, minute=0, day_of_week=0),
     },
 }
 
@@ -253,3 +261,62 @@ def reset_monthly_usage() -> None:
         result = db.execute(update(User).values(records_used=0))
         db.commit()
         _logger.info("Monthly reset complete — cleared records_used for %d users", result.rowcount)
+
+
+# ─── Task 5: Daily county scrape ────────────────────────────────────────────
+
+@app.task(name="src.workers.scheduler.scrape_county_daily")
+def scrape_county_daily() -> None:
+    """Dispatch daily scrape for each active county. Runs at 2 AM UTC."""
+    from src.config import settings
+
+    if not settings.ENABLE_DAILY_SCRAPE:
+        return
+
+    from sqlalchemy import select
+
+    from src.db.models import CountyConnector
+    from src.db.session import SyncSessionLocal
+
+    with SyncSessionLocal() as db:
+        connectors = db.execute(
+            select(CountyConnector).where(CountyConnector.active)
+        ).scalars().all()
+
+    _logger.info("Daily scrape: dispatching %d counties", len(connectors))
+
+    for conn in connectors:
+        run_single_county_scrape.delay(conn.county, conn.state)
+
+
+@app.task(name="src.workers.scheduler.run_single_county_scrape", queue="scrape")
+def run_single_county_scrape(county: str, state: str) -> None:
+    """Scrape a single county's daily records into county_records cache."""
+    from src.workers.daily_scrape import run_daily_scrape_for_county
+
+    try:
+        count = run_daily_scrape_for_county(county, state)
+        _logger.info("Daily scrape %s/%s: %d new records", county, state, count)
+    except Exception:
+        _logger.exception("Daily scrape failed for %s/%s", county, state)
+
+
+# ─── Task 6: Purge old records ──────────────────────────────────────────────
+
+@app.task(name="src.workers.scheduler.purge_old_records")
+def purge_old_records() -> None:
+    """Delete county_records older than RECORD_RETENTION_DAYS. Weekly."""
+    from sqlalchemy import text
+
+    from src.config import settings
+    from src.db.session import SyncSessionLocal
+
+    cutoff = datetime.now(UTC) - timedelta(days=settings.RECORD_RETENTION_DAYS)
+
+    with SyncSessionLocal() as db:
+        result = db.execute(
+            text("DELETE FROM county_records WHERE created_at < :cutoff"),
+            {"cutoff": cutoff},
+        )
+        db.commit()
+        _logger.info("Purged %d records older than %d days", result.rowcount, settings.RECORD_RETENTION_DAYS)

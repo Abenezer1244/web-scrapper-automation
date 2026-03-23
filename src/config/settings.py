@@ -95,6 +95,10 @@ class Settings(BaseSettings):
     GIS_ENRICHMENT_ENABLED: bool = True
     AI_ENRICHMENT_ENABLED: bool = True
 
+    # ─── Daily Scrape Cache ────────────────────────────────────────────────
+    ENABLE_DAILY_SCRAPE: bool = False
+    RECORD_RETENTION_DAYS: int = 365
+
     # ─── Logging ──────────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 

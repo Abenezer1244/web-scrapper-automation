@@ -18,7 +18,7 @@ from src.api.auth import (
     verify_password,
 )
 from src.api.middleware import BruteForceProtection, audit_log, rate_limit
-from src.api.schemas import ApiKeyResponse, TokenResponse, UserRegister, UserResponse
+from src.api.schemas import ApiKeyResponse, PasswordChange, TokenResponse, UserRegister, UserResponse
 from src.config import settings
 from src.db import User, get_db  # noqa: F401 (User used in Annotated type)
 
@@ -132,6 +132,30 @@ async def logout_all(
     from src.api.middleware.auth_hardening import TokenBlacklist
     await TokenBlacklist.revoke_all_for_user(current_user.id)
     audit_log(request, "logout_all", current_user.id)
+
+
+@router.post("/change-password", status_code=status.HTTP_204_NO_CONTENT)
+async def change_password(
+    body: PasswordChange,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Change the current user's password."""
+    await rate_limit(request, zone="auth")
+
+    result = await db.execute(select(User).where(User.id == current_user.id))
+    user = result.scalar_one()
+
+    if not verify_password(body.current_password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect.",
+        )
+
+    user.password_hash = hash_password(body.new_password)
+    await db.flush()
+    audit_log(request, "password_changed", current_user.id)
 
 
 @router.post("/api-key", response_model=ApiKeyResponse, status_code=status.HTTP_201_CREATED)

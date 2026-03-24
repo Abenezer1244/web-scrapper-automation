@@ -156,24 +156,9 @@ class EagleWebScraper(BridgeScraper):
             chunk_start = chunk_end
             await self.polite_delay()
 
-        # Fast GIS-only enrichment — call county GIS REST API directly, skip full pipeline
-        from src.scrapers.enrichment.county_gis import enrich_parcel_gis
-
-        enrichable = [r for r in all_records if r.parcel_id and len(r.parcel_id) >= 10]
-        _logger.info("GIS enrichment: %d/%d records have parcel IDs", len(enrichable), len(all_records))
-        enriched_count = 0
-        for record in enrichable:
-            try:
-                result = enrich_parcel_gis(record.parcel_id, self.county, self.state)
-                if result.get("property_address"):
-                    record.property_address = result["property_address"]
-                    record.mailing_address = result.get("mailing_address") or record.mailing_address
-                    record.enrichment_data = result
-                    enriched_count += 1
-            except Exception:
-                pass
-
-        _logger.info("EagleWeb complete — %d records (%d enriched)", len(all_records), enriched_count)
+        # No inline enrichment — records are enriched in a separate background task
+        # (enrich_job_results) after the job completes. This keeps scraping fast (~5 min).
+        _logger.info("EagleWeb complete — %d records (enrichment runs after save)", len(all_records))
         return all_records
 
     async def _accept_disclaimer(self) -> None:

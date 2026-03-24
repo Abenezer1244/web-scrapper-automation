@@ -126,27 +126,7 @@ class AcclaimWebScraper(BridgeScraper):
             pass
 
         # Enrich records with parcel data
-        # Enrich ALL records — by parcel ID if available, by owner name as fallback
-        from src.scrapers.enrichment.county_gis import enrich_parcel_gis
-
-        enriched_count = 0
-        _logger.info("Enriching %d records (parcel ID + name-based fallback)", len(all_records))
-        for record in all_records:
-            try:
-                
-                result = enrich_parcel_gis(
-                    record.parcel_id, self.county, self.state
-                )
-                if result.get("property_address"):
-                    record.property_address = result["property_address"]
-                    record.mailing_address = result.get("mailing_address") or record.mailing_address
-                    record.enrichment_data = result
-                    enriched_count += 1
-            except Exception:
-                pass
-            pass
-
-        _logger.info("AcclaimWeb scraper complete — %d records (%d enriched)", len(all_records), enriched_count)
+        _logger.info("acclaimweb complete � %d records (enrichment runs after save)", len(all_records))
         return all_records
 
     async def _accept_disclaimer(self) -> None:

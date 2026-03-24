@@ -329,11 +329,11 @@ def enrich_job_results(self, job_id: str) -> None:
             parcel_count = asyncio.run(_fetch_parcel_ids_from_arms(needs_parcel, db, r, job_id))
             _publish_log(r, job_id, "info", f"Found {parcel_count} parcel IDs from detail pages")
 
-        # Step 3: Enrich records that have parcel_id but no address
+        # Step 3: GIS enrichment for records with parcel_id but no address
         results = [
             res for res in all_results
             if res.parcel_id
-            and res.parcel_id.strip()
+            and len(res.parcel_id.strip()) >= 10
             and (not res.property_address or res.property_address == "(enrichment unavailable)")
         ]
 
@@ -342,15 +342,31 @@ def enrich_job_results(self, job_id: str) -> None:
             _publish_log(r, job_id, "info", "No records with parcel IDs to enrich")
             return
 
-        _logger.info("Enriching %d results for job %s", len(results), job_id)
-        _publish_log(r, job_id, "info", f"Enriching {len(results)} records with property addresses...")
+        _logger.info("GIS enriching %d results for job %s", len(results), job_id)
+        _publish_log(r, job_id, "info", f"Enriching {len(results)} records via GIS...")
 
-        # Run async enrichment
-        enriched_count = asyncio.run(
-            _run_enrichment(results, config.county, config.state, db, r, job_id)
-        )
+        # Direct GIS enrichment — fast, free, no browser needed
+        from src.scrapers.enrichment.county_gis import enrich_parcel_gis
 
-        _publish_log(r, job_id, "success", f"Enrichment complete — {enriched_count} addresses found")
+        enriched_count = 0
+        for i, result in enumerate(results):
+            try:
+                gis_result = enrich_parcel_gis(result.parcel_id.strip(), config.county, config.state)
+                if gis_result.get("property_address"):
+                    result.property_address = gis_result["property_address"]
+                    result.mailing_address = gis_result.get("mailing_address") or result.mailing_address
+                    result.enrichment_data = gis_result
+                    enriched_count += 1
+            except Exception:
+                pass
+
+            # Commit every 50 records to avoid losing progress
+            if (i + 1) % 50 == 0:
+                db.commit()
+                _publish_log(r, job_id, "info", f"Enriched {enriched_count}/{i + 1} records...")
+
+        db.commit()
+        _publish_log(r, job_id, "success", f"Enrichment complete — {enriched_count}/{len(results)} addresses found")
         _logger.info("Enrichment complete for job %s: %d/%d enriched", job_id, enriched_count, len(results))
 
 

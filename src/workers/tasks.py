@@ -343,27 +343,35 @@ def enrich_job_results(self, job_id: str) -> None:
             return
 
         _logger.info("GIS enriching %d results for job %s", len(results), job_id)
-        _publish_log(r, job_id, "info", f"Enriching {len(results)} records via GIS...")
+        _publish_log(r, job_id, "info", f"Enriching {len(results)} records via batch GIS...")
 
-        # Direct GIS enrichment — fast, free, no browser needed
-        from src.scrapers.enrichment.county_gis import enrich_parcel_gis
+        # Batch GIS enrichment — 50 parcels per API call instead of 1
+        from src.scrapers.enrichment.county_gis import batch_enrich_parcels_gis
 
+        # Build parcel_id -> result mapping
+        parcel_map: dict[str, list] = {}
+        for result in results:
+            pid = result.parcel_id.strip()
+            if pid not in parcel_map:
+                parcel_map[pid] = []
+            parcel_map[pid].append(result)
+
+        all_parcels = list(parcel_map.keys())
+        _logger.info("Batch GIS: %d unique parcels from %d records", len(all_parcels), len(results))
+
+        # Single batch call handles chunking internally (50 per API call)
+        gis_results = batch_enrich_parcels_gis(all_parcels, config.county, config.state)
+
+        # Apply results to DB records
         enriched_count = 0
-        for i, result in enumerate(results):
-            try:
-                gis_result = enrich_parcel_gis(result.parcel_id.strip(), config.county, config.state)
-                if gis_result.get("property_address"):
-                    result.property_address = gis_result["property_address"]
-                    result.mailing_address = gis_result.get("mailing_address") or result.mailing_address
-                    result.enrichment_data = gis_result
-                    enriched_count += 1
-            except Exception:
-                pass
-
-            # Commit every 50 records to avoid losing progress
-            if (i + 1) % 50 == 0:
-                db.commit()
-                _publish_log(r, job_id, "info", f"Enriched {enriched_count}/{i + 1} records...")
+        for pid, gis_data in gis_results.items():
+            if not gis_data.get("property_address"):
+                continue
+            for result in parcel_map.get(pid, []):
+                result.property_address = gis_data["property_address"]
+                result.mailing_address = gis_data.get("mailing_address") or result.mailing_address
+                result.enrichment_data = gis_data
+                enriched_count += 1
 
         db.commit()
         _publish_log(r, job_id, "success", f"Enrichment complete — {enriched_count}/{len(results)} addresses found")

@@ -320,3 +320,79 @@ def _make_generic_config(endpoint: str) -> dict:
 
 def _empty() -> dict[str, str | None]:
     return {"property_address": None, "mailing_address": None}
+
+
+def batch_enrich_parcels_gis(
+    parcel_ids: list[str], county: str, state: str
+) -> dict[str, dict[str, str | None]]:
+    """Batch enrich multiple parcels in a single GIS API call.
+
+    Uses WHERE ORIG_PARCEL_ID IN ('x','y','z') to look up many parcels at once.
+    Returns a dict mapping parcel_id -> {property_address, mailing_address}.
+    Parcels not found return empty dict.
+
+    Processes in chunks of 50 (ArcGIS URL length limit).
+    """
+    if state.upper() != "WA":
+        return {}
+
+    fips = _WA_COUNTY_FIPS.get(county.lower())
+    results: dict[str, dict] = {}
+
+    # Process in chunks of 50
+    chunk_size = 50
+    for i in range(0, len(parcel_ids), chunk_size):
+        chunk = parcel_ids[i:i + chunk_size]
+        clean = [pid.replace("-", "").strip() for pid in chunk if pid and len(pid.strip()) >= 10]
+        if not clean:
+            continue
+
+        in_clause = ",".join(f"'{p}'" for p in clean)
+        where = f"ORIG_PARCEL_ID IN ({in_clause})"
+        if fips:
+            where += f" AND FIPS_NR='{fips}'"
+
+        params = {
+            "where": where,
+            "outFields": "ORIG_PARCEL_ID,SITUS_ADDRESS,SITUS_CITY_NM,SITUS_ZIP_NR",
+            "returnGeometry": "false",
+            "f": "json",
+            "resultRecordCount": chunk_size,
+        }
+
+        try:
+            resp = requests.get(_WA_STATEWIDE_ENDPOINT, params=params, timeout=30)
+            if resp.status_code != 200:
+                _logger.warning("Batch GIS returned %d for %d parcels", resp.status_code, len(clean))
+                continue
+
+            data = resp.json()
+            for feature in data.get("features") or []:
+                attrs = feature.get("attributes") or {}
+                pid = attrs.get("ORIG_PARCEL_ID")
+                address = attrs.get("SITUS_ADDRESS")
+                if not pid or not address:
+                    continue
+
+                address = " ".join(address.strip().split())
+                city = " ".join((attrs.get("SITUS_CITY_NM") or "").strip().split())
+                zipcode = str(attrs.get("SITUS_ZIP_NR") or "").strip()
+
+                parts = [address]
+                if city:
+                    parts.append(city)
+                if zipcode:
+                    parts.append(f"WA {zipcode}")
+
+                results[pid] = {
+                    "property_address": address,
+                    "mailing_address": ", ".join(parts),
+                    "parcel_id": pid,
+                }
+
+            _logger.info("Batch GIS: %d/%d parcels enriched", len([r for r in clean if r in results]), len(clean))
+
+        except Exception as exc:
+            _logger.warning("Batch GIS error: %s", str(exc)[:80])
+
+    return results

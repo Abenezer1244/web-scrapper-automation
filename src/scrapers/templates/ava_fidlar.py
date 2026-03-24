@@ -111,7 +111,7 @@ class AvaFidlarScraper(BridgeScraper):
             pass
 
         # Enrich records with parcel data
-        _logger.info("ava_fidlar complete — %d records (enrichment runs after save)", len(all_records))
+        _logger.info("ava_fidlar complete - %d records (enrichment runs after save)", len(all_records))
         return all_records
 
     async def _wait_for_angular(self) -> None:

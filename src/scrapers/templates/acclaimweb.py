@@ -126,7 +126,7 @@ class AcclaimWebScraper(BridgeScraper):
             pass
 
         # Enrich records with parcel data
-        _logger.info("acclaimweb complete — %d records (enrichment runs after save)", len(all_records))
+        _logger.info("acclaimweb complete - %d records (enrichment runs after save)", len(all_records))
         return all_records
 
     async def _accept_disclaimer(self) -> None:

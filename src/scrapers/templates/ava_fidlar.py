@@ -108,30 +108,28 @@ class AvaFidlarScraper(BridgeScraper):
             _logger.info("Chunk %s-%s: %d new records (total: %d)", cf, ct, new_count, len(all_records))
 
             chunk_start = chunk_end
-            await asyncio.sleep(0.05)
+            pass
 
         # Enrich records with parcel data
         # Enrich ALL records — by parcel ID if available, by owner name as fallback
-        from src.scrapers.enrichment import enrich_parcel
+        from src.scrapers.enrichment.county_gis import enrich_parcel_gis
 
         enriched_count = 0
         _logger.info("Enriching %d records (parcel ID + name-based fallback)", len(all_records))
         for record in all_records:
             try:
-                pid = record.parcel_id or ""
-                enriched = await enrich_parcel(
-                    pid, self.county, self.state, owner_name=record.party_name
+                
+                result = enrich_parcel_gis(
+                    record.parcel_id, self.county, self.state
                 )
-                if enriched.get("property_address") and enriched["property_address"] != "(enrichment unavailable)":
-                    record.property_address = enriched["property_address"]
-                    record.mailing_address = enriched.get("mailing_address") or record.mailing_address
-                    record.enrichment_data = enriched
-                    if not record.parcel_id and enriched.get("parcel_id"):
-                        record.parcel_id = enriched["parcel_id"]
+                if result.get("property_address"):
+                    record.property_address = result["property_address"]
+                    record.mailing_address = result.get("mailing_address") or record.mailing_address
+                    record.enrichment_data = result
                     enriched_count += 1
             except Exception:
                 pass
-            await asyncio.sleep(0.05)
+            pass
 
         _logger.info("AVA Fidlar scraper complete — %d records (%d enriched)", len(all_records), enriched_count)
         return all_records

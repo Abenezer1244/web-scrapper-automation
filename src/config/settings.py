@@ -63,8 +63,8 @@ class Settings(BaseSettings):
     # ─── App ──────────────────────────────────────────────────────────────────
     DEBUG: bool = False
     ENVIRONMENT: str = "production"
-    FRONTEND_URL: str = "https://app.bridgeleads.io"
-    ALLOWED_ORIGINS: str = "https://app.bridgeleads.io"
+    FRONTEND_URL: str = "https://bridgeleads.io"
+    ALLOWED_ORIGINS: str = "https://bridgeleads.io,https://app.bridgeleads.io,https://bridgeleads-web.vercel.app"
 
     # ─── Worker scaling ──────────────────────────────────────────────────────
     WORKER_CONCURRENCY: int = 2

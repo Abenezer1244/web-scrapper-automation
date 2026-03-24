@@ -30,7 +30,7 @@ app.conf.beat_schedule = {
     },
     "scrape-county-daily": {
         "task": "src.workers.scheduler.scrape_county_daily",
-        "schedule": crontab(hour=2, minute=0),
+        "schedule": crontab(hour=9, minute=0),  # 9 AM UTC = 2 AM PT (Seattle)
     },
     "purge-old-records": {
         "task": "src.workers.scheduler.purge_old_records",

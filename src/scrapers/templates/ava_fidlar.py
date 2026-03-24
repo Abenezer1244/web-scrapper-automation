@@ -1,3 +1,4 @@
+import asyncio
 """AVA Fidlar template scraper for Fidlar Technologies AVA recorder portals.
 
 Covers WA counties using the AVA (Angular SPA) interface.
@@ -107,7 +108,7 @@ class AvaFidlarScraper(BridgeScraper):
             _logger.info("Chunk %s-%s: %d new records (total: %d)", cf, ct, new_count, len(all_records))
 
             chunk_start = chunk_end
-            await self.polite_delay()
+            await asyncio.sleep(0.05)
 
         # Enrich records with parcel data
         # Enrich ALL records — by parcel ID if available, by owner name as fallback
@@ -130,7 +131,7 @@ class AvaFidlarScraper(BridgeScraper):
                     enriched_count += 1
             except Exception:
                 pass
-            await self.polite_delay()
+            await asyncio.sleep(0.05)
 
         _logger.info("AVA Fidlar scraper complete — %d records (%d enriched)", len(all_records), enriched_count)
         return all_records

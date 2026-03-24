@@ -1,3 +1,4 @@
+import asyncio
 """LandmarkWeb template scraper for Hyland LandmarkWeb recorder portals.
 
 Covers WA counties using the Hyland LandmarkWeb interface.
@@ -109,7 +110,7 @@ class LandmarkWebScraper(BridgeScraper):
             _logger.info("Chunk %s-%s: %d new records (total: %d)", cf, ct, new_count, len(all_records))
 
             chunk_start = chunk_end
-            await self.polite_delay()
+            await asyncio.sleep(0.05)
 
         # Enrich records with parcel data
         # Enrich ALL records — by parcel ID if available, by owner name as fallback
@@ -132,7 +133,7 @@ class LandmarkWebScraper(BridgeScraper):
                     enriched_count += 1
             except Exception:
                 pass
-            await self.polite_delay()
+            await asyncio.sleep(0.05)
 
         _logger.info("LandmarkWeb scraper complete — %d records (%d enriched)", len(all_records), enriched_count)
         return all_records
@@ -328,7 +329,7 @@ class LandmarkWebScraper(BridgeScraper):
             if not has_next:
                 break
 
-            await self.polite_delay()
+            await asyncio.sleep(0.05)
 
         return all_records
 

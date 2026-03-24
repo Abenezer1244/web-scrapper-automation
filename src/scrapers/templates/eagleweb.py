@@ -156,28 +156,27 @@ class EagleWebScraper(BridgeScraper):
             chunk_start = chunk_end
             await self.polite_delay()
 
-        # Enrich ALL records — by parcel ID if available, by owner name as fallback
+        # Enrich records that have parcel IDs via GIS (no delay — it's an API, not a website)
         from src.scrapers.enrichment import enrich_parcel
+        import asyncio
 
+        enrichable = [r for r in all_records if r.parcel_id and len(r.parcel_id) >= 5]
+        _logger.info("Enriching %d/%d records with parcel IDs via GIS", len(enrichable), len(all_records))
         enriched_count = 0
-        _logger.info("Enriching %d records (parcel ID + name-based fallback)", len(all_records))
-        for record in all_records:
+        for record in enrichable:
             try:
-                pid = record.parcel_id or ""
                 enriched = await enrich_parcel(
-                    pid, self.county, self.state, owner_name=record.party_name
+                    record.parcel_id, self.county, self.state, owner_name=record.party_name
                 )
                 if enriched.get("property_address") and enriched["property_address"] != "(enrichment unavailable)":
                     record.property_address = enriched["property_address"]
                     record.mailing_address = enriched.get("mailing_address") or record.mailing_address
                     record.enrichment_data = enriched
-                    # If we got a parcel ID back from GIS but didn't have one, save it
-                    if not record.parcel_id and enriched.get("parcel_id"):
-                        record.parcel_id = enriched["parcel_id"]
                     enriched_count += 1
             except Exception:
                 pass
-            await self.polite_delay()
+            # Minimal delay for API calls (50ms, not 300ms)
+            await asyncio.sleep(0.05)
 
         _logger.info("EagleWeb scraper complete — %d records (%d enriched)", len(all_records), enriched_count)
         return all_records

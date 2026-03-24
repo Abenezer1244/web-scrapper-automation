@@ -33,9 +33,8 @@ async def enrich_parcel(
     3. AI assessor scraper (Claude API)
     4. County-specific fallback (ATIP for Pierce)
     """
-    # Skip enrichment if no parcel ID — don't waste time/money on Regrid/AI/ATIP
-    if not parcel_id or len(parcel_id.strip()) < 5:
-        _logger.info("Skipping enrichment — no parcel ID (%s, %s)", county, state)
+    # Skip enrichment if no parcel ID or too short — real parcels are 10+ digits
+    if not parcel_id or len(parcel_id.strip()) < 10:
         return _EMPTY
 
     _logger.info("Enriching parcel %s (%s, %s)", parcel_id, county, state)

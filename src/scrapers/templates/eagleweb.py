@@ -160,7 +160,7 @@ class EagleWebScraper(BridgeScraper):
         from src.scrapers.enrichment import enrich_parcel
         import asyncio
 
-        enrichable = [r for r in all_records if r.parcel_id and len(r.parcel_id) >= 5]
+        enrichable = [r for r in all_records if r.parcel_id and len(r.parcel_id) >= 10]
         _logger.info("Enriching %d/%d records with parcel IDs via GIS", len(enrichable), len(all_records))
         enriched_count = 0
         for record in enrichable:

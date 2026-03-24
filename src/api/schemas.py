@@ -181,6 +181,8 @@ class ResultsPage(BaseModel):
     page: int
     page_size: int
     items: list[ResultRow]
+    enriched_count: int = 0      # records with property_address filled
+    enriching: bool = False       # True while background enrichment is running
 
 
 # ─── Live run (SSE) ───────────────────────────────────────────────────────────

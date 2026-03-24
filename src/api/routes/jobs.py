@@ -204,7 +204,33 @@ async def get_results(
     )
     items = [ResultRow.model_validate(r) for r in rows_result.scalars().all()]
 
-    return ResultsPage(job_id=job_id, total=total, page=page, page_size=page_size, items=items)
+    # Count enriched records (have real property_address)
+    enriched_result = await db.execute(
+        select(func.count()).where(
+            Result.job_id == job_id,
+            Result.user_id == current_user.id,
+            Result.property_address.isnot(None),
+            Result.property_address != "",
+            Result.property_address != "(enrichment unavailable)",
+        )
+    )
+    enriched_count = enriched_result.scalar_one()
+
+    # Check if enrichment is still running (parcels exist but not all enriched)
+    parcel_count_result = await db.execute(
+        select(func.count()).where(
+            Result.job_id == job_id,
+            Result.user_id == current_user.id,
+            func.length(Result.parcel_id) >= 10,
+        )
+    )
+    parcel_count = parcel_count_result.scalar_one()
+    enriching = parcel_count > 0 and enriched_count < parcel_count
+
+    return ResultsPage(
+        job_id=job_id, total=total, page=page, page_size=page_size,
+        items=items, enriched_count=enriched_count, enriching=enriching,
+    )
 
 
 @router.get("/{job_id}/logs")

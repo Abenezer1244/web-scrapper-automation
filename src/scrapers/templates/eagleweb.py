@@ -156,24 +156,30 @@ class EagleWebScraper(BridgeScraper):
             chunk_start = chunk_end
             await self.polite_delay()
 
-        # Enrich records that have parcel IDs with property/mailing addresses
-        enrichable = [r for r in all_records if r.parcel_id and len(r.parcel_id) >= 8]
-        if enrichable:
-            _logger.info("Enriching %d records with parcel data", len(enrichable))
-            from src.scrapers.enrichment import enrich_parcel
+        # Enrich ALL records — by parcel ID if available, by owner name as fallback
+        from src.scrapers.enrichment import enrich_parcel
 
-            for record in enrichable:
-                try:
-                    enriched = await enrich_parcel(record.parcel_id, self.county, self.state)
-                    record.property_address = enriched.get("property_address") or record.property_address
+        enriched_count = 0
+        _logger.info("Enriching %d records (parcel ID + name-based fallback)", len(all_records))
+        for record in all_records:
+            try:
+                pid = record.parcel_id or ""
+                enriched = await enrich_parcel(
+                    pid, self.county, self.state, owner_name=record.party_name
+                )
+                if enriched.get("property_address") and enriched["property_address"] != "(enrichment unavailable)":
+                    record.property_address = enriched["property_address"]
                     record.mailing_address = enriched.get("mailing_address") or record.mailing_address
-                    if enriched.get("property_address"):
-                        record.enrichment_data = enriched
-                except Exception:
-                    pass
-                await self.polite_delay()
+                    record.enrichment_data = enriched
+                    # If we got a parcel ID back from GIS but didn't have one, save it
+                    if not record.parcel_id and enriched.get("parcel_id"):
+                        record.parcel_id = enriched["parcel_id"]
+                    enriched_count += 1
+            except Exception:
+                pass
+            await self.polite_delay()
 
-        _logger.info("EagleWeb scraper complete — %d records (%d enriched)", len(all_records), len(enrichable))
+        _logger.info("EagleWeb scraper complete — %d records (%d enriched)", len(all_records), enriched_count)
         return all_records
 
     async def _accept_disclaimer(self) -> None:
@@ -526,10 +532,25 @@ class EagleWebScraper(BridgeScraper):
                     if grantee:
                         record.heirs = grantee
 
-                # Parcel ID
-                parcel_match = re.search(r"\b(\d{10,})\b", summary)
-                if parcel_match:
-                    record.parcel_id = parcel_match.group(1)
+                # Parcel ID — check both summary and description
+                combined = f"{summary} {desc}"
+                # Try "Parcel: XXXXX" or "Parcel:XXXXX" pattern first
+                parcel_labeled = re.search(r"[Pp]arcel[:\s]+(\d{5,})", combined)
+                if parcel_labeled:
+                    record.parcel_id = parcel_labeled.group(1)
+                else:
+                    # Fallback: any standalone 10+ digit number (not an instrument/year prefix)
+                    parcel_match = re.search(r"\b(\d{10,})\b", combined)
+                    if parcel_match:
+                        pid = parcel_match.group(1)
+                        # Skip instrument numbers (start with 2024/2025/2026)
+                        if not pid[:4] in ("2024", "2025", "2026"):
+                            record.parcel_id = pid
+
+                # Also store the legal description text
+                legal_text = re.search(r"(?:Subdivision|Section|Lot|Block|Plat|Tract)\s+.+", combined, re.IGNORECASE)
+                if legal_text and not record.legal_description:
+                    record.legal_description = legal_text.group(0).strip()[:200]
 
                 if record.party_name or record.date_recorded:
                     records.append(record)

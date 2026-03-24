@@ -125,23 +125,29 @@ class AcclaimWebScraper(BridgeScraper):
             await self.polite_delay()
 
         # Enrich records with parcel data
-        enrichable = [r for r in all_records if r.parcel_id and len(r.parcel_id) >= 8]
-        if enrichable:
-            _logger.info("Enriching %d records with parcel data", len(enrichable))
-            from src.scrapers.enrichment import enrich_parcel
+        # Enrich ALL records — by parcel ID if available, by owner name as fallback
+        from src.scrapers.enrichment import enrich_parcel
 
-            for record in enrichable:
-                try:
-                    enriched = await enrich_parcel(record.parcel_id, self.county, self.state)
-                    record.property_address = enriched.get("property_address") or record.property_address
+        enriched_count = 0
+        _logger.info("Enriching %d records (parcel ID + name-based fallback)", len(all_records))
+        for record in all_records:
+            try:
+                pid = record.parcel_id or ""
+                enriched = await enrich_parcel(
+                    pid, self.county, self.state, owner_name=record.party_name
+                )
+                if enriched.get("property_address") and enriched["property_address"] != "(enrichment unavailable)":
+                    record.property_address = enriched["property_address"]
                     record.mailing_address = enriched.get("mailing_address") or record.mailing_address
-                    if enriched.get("property_address"):
-                        record.enrichment_data = enriched
-                except Exception:
-                    pass
-                await self.polite_delay()
+                    record.enrichment_data = enriched
+                    if not record.parcel_id and enriched.get("parcel_id"):
+                        record.parcel_id = enriched["parcel_id"]
+                    enriched_count += 1
+            except Exception:
+                pass
+            await self.polite_delay()
 
-        _logger.info("AcclaimWeb scraper complete — %d records (%d enriched)", len(all_records), len(enrichable))
+        _logger.info("AcclaimWeb scraper complete — %d records (%d enriched)", len(all_records), enriched_count)
         return all_records
 
     async def _accept_disclaimer(self) -> None:

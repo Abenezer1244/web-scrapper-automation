@@ -220,17 +220,28 @@ def _query_wa_statewide(parcel_id: str, county: str) -> dict[str, str | None]:
         zipcode = attrs.get("SITUS_ZIP_NR") or ""
 
         if address:
-            address = address.strip()
+            # Clean newlines from addresses (WA statewide has embedded \n)
+            address = " ".join(address.strip().split())
+            if city:
+                city = " ".join(city.strip().split())
+            if zipcode:
+                zipcode = str(zipcode).strip()
+
             # Build full mailing address
             parts = [address]
             if city:
-                parts.append(city.strip())
+                parts.append(city)
             if zipcode:
-                parts.append(f"WA {str(zipcode).strip()}")
+                parts.append(f"WA {zipcode}")
             mailing = ", ".join(parts)
 
-            _logger.info("WA statewide GIS enriched parcel %s: %s", parcel_id, address)
-            return {"property_address": address, "mailing_address": mailing}
+            parcel_found = attrs.get("ORIG_PARCEL_ID") or apn_clean
+            _logger.info("WA statewide GIS enriched parcel %s: %s", parcel_found, address)
+            return {
+                "property_address": address,
+                "mailing_address": mailing,
+                "parcel_id": parcel_found,
+            }
 
         return _empty()
 
@@ -272,9 +283,11 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
     owner_field = gis_config.get("owner_field")
     owner_name = attrs.get(owner_field) if owner_field else None
 
+    parcel_field = gis_config.get("parcel_field", "TaxParcelNumber")
     result = {
         "property_address": property_address,
         "mailing_address": mailing_address,
+        "parcel_id": attrs.get(parcel_field) or None,
     }
 
     if property_address:

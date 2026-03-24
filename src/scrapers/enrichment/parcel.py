@@ -22,16 +22,18 @@ _UNAVAILABLE = {
 _source_down: dict[str, bool] = {}
 
 
-async def enrich_parcel(parcel_id: str, county: str, state: str) -> dict[str, str | None]:
+async def enrich_parcel(
+    parcel_id: str, county: str, state: str, owner_name: str | None = None
+) -> dict[str, str | None]:
     """Enrich a parcel record with property and mailing address data.
 
     Tries sources in order of cost (cheapest first):
-    1. County GIS REST API (free)
+    1. County GIS REST API (free) — by parcel ID, then by owner name
     2. Regrid national API (paid, if enabled)
     3. AI assessor scraper (Claude API)
     4. County-specific fallback (ATIP for Pierce)
     """
-    _logger.info("Enriching parcel %s (%s, %s)", parcel_id, county, state)
+    _logger.info("Enriching parcel %s (%s, %s) owner=%s", parcel_id, county, state, owner_name or "?")
 
     from src.config import settings
 
@@ -40,12 +42,11 @@ async def enrich_parcel(parcel_id: str, county: str, state: str) -> dict[str, st
         try:
             from src.scrapers.enrichment.county_gis import enrich_parcel_gis
 
-            result = enrich_parcel_gis(parcel_id, county, state)
+            result = enrich_parcel_gis(parcel_id, county, state, owner_name=owner_name)
             if result.get("property_address"):
                 _logger.info("GIS enrichment succeeded for parcel %s", parcel_id)
                 return result
 
-            # No data but API worked — don't mark as down
             _logger.info("GIS: no data for parcel %s", parcel_id)
         except Exception as exc:
             _logger.warning("GIS enrichment error: %s", str(exc)[:60])

@@ -27,10 +27,11 @@ _KNOWN_GIS_ENDPOINTS: dict[str, dict] = {
         "parcel_field": "TaxParcelNumber",
         "address_field": "Site_Address",
         "mailing_fields": ["Delivery_Address", "City_State", "Zipcode"],
-        "owner_field": "Business_Name",
+        "owner_field": "Legal_Description",
         "out_fields": (
             "TaxParcelNumber,Site_Address,Delivery_Address,"
-            "City_State,Zipcode,Business_Name,Land_Value,Taxable_Value"
+            "City_State,Zipcode,Business_Name,Legal_Description,"
+            "Land_Value,Taxable_Value,Longitude,Latitude"
         ),
     },
 }
@@ -62,6 +63,7 @@ def enrich_parcel_gis(
     county: str,
     state: str,
     gis_endpoint: str | None = None,
+    owner_name: str | None = None,
 ) -> dict[str, str | None]:
     """Look up a parcel via free county ArcGIS REST API.
 
@@ -70,6 +72,7 @@ def enrich_parcel_gis(
         county: County slug (e.g. "pierce").
         state: 2-letter state code (e.g. "WA").
         gis_endpoint: Optional override URL. If None, looks up from known endpoints.
+        owner_name: Optional owner/party name for name-based fallback search.
 
     Returns:
         Dict with: property_address, mailing_address. Any may be None.
@@ -82,16 +85,22 @@ def enrich_parcel_gis(
     # Resolve GIS config: explicit endpoint OR known built-in
     gis_config = None
     if gis_endpoint:
-        # Custom endpoint from county_connectors table
         gis_config = _make_generic_config(gis_endpoint)
     elif county_key in _KNOWN_GIS_ENDPOINTS:
         gis_config = _KNOWN_GIS_ENDPOINTS[county_key]
 
-    # Try county-specific endpoint first
+    # Try county-specific endpoint first (by parcel ID)
     if gis_config:
         result = _query_gis(parcel_id, gis_config, county_key)
         if result.get("property_address"):
             return result
+
+        # Fallback: search by owner name if parcel ID didn't match
+        if owner_name and gis_config.get("owner_field"):
+            result = _query_gis_by_name(owner_name, gis_config, county_key)
+            if result.get("property_address"):
+                _logger.info("GIS name-based fallback succeeded for %s", owner_name)
+                return result
 
     # Fallback: WA statewide parcel service (covers all 39 WA counties)
     if state.upper() == "WA":
@@ -136,6 +145,38 @@ def _query_gis(parcel_id: str, gis_config: dict, county_key: str) -> dict[str, s
         return _empty()
     except Exception as exc:
         _logger.warning("GIS API error for parcel %s: %s", parcel_id, str(exc)[:80])
+        return _empty()
+
+
+def _query_gis_by_name(owner_name: str, gis_config: dict, county_key: str) -> dict[str, str | None]:
+    """Fallback: search GIS by owner/business name when parcel ID doesn't match."""
+    endpoint = gis_config["endpoint"]
+    owner_field = gis_config.get("owner_field", "Business_Name")
+    out_fields = gis_config.get("out_fields", "*")
+
+    # Clean name: take last name only for broader match
+    name_clean = owner_name.strip().upper().split(",")[0].split(" ")[0]
+    if len(name_clean) < 3:
+        return _empty()
+
+    params = {
+        "where": f"{owner_field} LIKE '{name_clean}%'",
+        "outFields": out_fields,
+        "returnGeometry": "false",
+        "resultRecordCount": 1,
+        "f": "json",
+    }
+
+    try:
+        resp = requests.get(endpoint, params=params, timeout=10)
+        if resp.status_code != 200:
+            return _empty()
+
+        data = resp.json()
+        return _parse_gis_response(data, gis_config)
+
+    except Exception as exc:
+        _logger.warning("GIS name search error for %s: %s", owner_name, str(exc)[:60])
         return _empty()
 
 

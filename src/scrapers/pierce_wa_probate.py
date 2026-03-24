@@ -119,18 +119,20 @@ class PierceWAProbateScraper(BridgeScraper):
         _logger.info("Parcel IDs found: %d/%d", parcels_found, len(all_records))
 
         # ── Enrichment pass ───────────────────────────────────────────────────
-        _logger.info("Enriching %d records with parcel data", len(all_records))
-        for record in all_records:
-            if record.parcel_id:
-                enriched = await enrich_parcel(record.parcel_id, "pierce", "WA")
-                record.property_address = enriched.get("property_address") or record.property_address
-                record.mailing_address = enriched.get("mailing_address") or record.mailing_address
-                # Merge enrichment data (preserve instrument_number)
-                if isinstance(record.enrichment_data, dict):
-                    record.enrichment_data.update(enriched)
-                else:
-                    record.enrichment_data = enriched
-                await self.polite_delay()
+        enrichable = [r for r in all_records if r.parcel_id or r.party_name]
+        _logger.info("Enriching %d records with parcel data", len(enrichable))
+        for record in enrichable:
+            pid = record.parcel_id or ""
+            enriched = await enrich_parcel(
+                pid, "pierce", "WA", owner_name=record.party_name
+            )
+            record.property_address = enriched.get("property_address") or record.property_address
+            record.mailing_address = enriched.get("mailing_address") or record.mailing_address
+            if isinstance(record.enrichment_data, dict):
+                record.enrichment_data.update(enriched)
+            else:
+                record.enrichment_data = enriched
+            await self.polite_delay()
 
         _logger.info("Pierce WA Probate — complete. %d records", len(all_records))
         return all_records
@@ -291,14 +293,38 @@ class PierceWAProbateScraper(BridgeScraper):
                     await legal_tab.click(timeout=3_000)
                     await page.wait_for_timeout(300)
 
-                # Extract Parcel Id
+                # Extract Parcel Id from Legal Description section
+                # ARMS shows parcel ID as a 10-digit number in the legal description
+                # area (after the text description like "FIRWOOD LANE LT 47")
                 parcel_id = await page.evaluate("""() => {
+                    // Method 1: Look for labeled "Parcel Id:" cell
                     const cells = document.querySelectorAll('td');
                     for (let i = 0; i < cells.length; i++) {
                         if (cells[i].textContent.trim() === 'Parcel Id:' && cells[i+1]) {
                             return cells[i+1].textContent.trim();
                         }
                     }
+
+                    // Method 2: Find 10-digit number in Legal Descriptions area
+                    // The detail panel shows legal desc text + parcel number below it
+                    const body = document.body.innerText;
+                    const legalIdx = body.indexOf('Legal Description');
+                    if (legalIdx > -1) {
+                        const afterLegal = body.substring(legalIdx, legalIdx + 500);
+                        // Find a standalone 10-digit number (the parcel ID)
+                        const match = afterLegal.match(/\\b(\\d{10})\\b/);
+                        if (match) return match[1];
+                    }
+
+                    // Method 3: Look in any visible text for 10-digit parcel pattern
+                    const allText = document.body.innerText;
+                    const matches = allText.match(/\\b(\\d{10})\\b/g);
+                    if (matches) {
+                        // Filter out instrument numbers (start with 2026, 2025, etc.)
+                        const parcels = matches.filter(m => !m.startsWith('2026') && !m.startsWith('2025') && !m.startsWith('2024'));
+                        if (parcels.length > 0) return parcels[parcels.length - 1];
+                    }
+
                     return null;
                 }""")
 

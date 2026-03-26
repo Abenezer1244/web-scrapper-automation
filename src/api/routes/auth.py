@@ -154,7 +154,7 @@ async def change_password(
         )
 
     user.password_hash = hash_password(body.new_password)
-    await db.flush()
+    await db.commit()
     audit_log(request, "password_changed", current_user.id)
 
 

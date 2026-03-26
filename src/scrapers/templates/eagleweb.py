@@ -400,7 +400,7 @@ class EagleWebScraper(BridgeScraper):
             _logger.warning("Could not submit search: %s", str(exc)[:60])
 
     async def _extract_all_pages(self) -> list[ScrapedRecord]:
-        """Extract records from all result pages."""
+        """Extract records from all result pages, then fetch missing parcel IDs."""
         all_records: list[ScrapedRecord] = []
         seen_hashes: set[str] = set()
         page_num = 0
@@ -411,18 +411,26 @@ class EagleWebScraper(BridgeScraper):
 
             records = await self._extract_page()
             new_count = 0
+            new_records: list[ScrapedRecord] = []
             for record in records:
                 h = self.make_hash(record.to_dict())
                 if h not in seen_hashes:
                     seen_hashes.add(h)
                     record.raw_html_hash = h
                     all_records.append(record)
+                    new_records.append(record)
                     new_count += 1
 
             _logger.info("Page %d — %d new records (total: %d)", page_num, new_count, len(all_records))
 
             if new_count == 0:
                 break
+
+            # Fetch parcel IDs from detail pages for records missing them
+            needs_parcel = [r for r in new_records if not r.parcel_id and r.enrichment_data.get("instrument_number")]
+            if needs_parcel:
+                _logger.info("  Clicking detail pages for %d records missing parcel IDs...", len(needs_parcel))
+                await self._fetch_parcel_ids_from_details(needs_parcel)
 
             # Check for Next page link
             has_next = await self._go_next_page()
@@ -431,6 +439,9 @@ class EagleWebScraper(BridgeScraper):
 
             await self.polite_delay()
 
+        parcels_found = sum(1 for r in all_records if r.parcel_id)
+        _logger.info("Parcel IDs found: %d/%d (%.0f%%)", parcels_found, len(all_records),
+                     (parcels_found / len(all_records) * 100) if all_records else 0)
         return all_records
 
     async def _extract_page(self) -> list[ScrapedRecord]:
@@ -438,11 +449,13 @@ class EagleWebScraper(BridgeScraper):
 
         Uses browser-side JS extraction instead of BeautifulSoup for reliability.
         EagleWeb results: Description (doc type + AFN) | Summary (date + Grantor + Grantee)
+        Also captures detail page links for parcel ID extraction.
         """
         records: list[ScrapedRecord] = []
 
         try:
             # Extract directly via JavaScript — more reliable than BeautifulSoup
+            # Also capture detail page links (href containing docDetail) for parcel lookups
             raw = await self.page.evaluate("""
                 (() => {
                     const tables = document.querySelectorAll('table');
@@ -468,7 +481,10 @@ class EagleWebScraper(BridgeScraper):
                         if (desc.includes('function ') || desc.includes('var ')) continue;
                         // Valid rows have a date in summary (MM/DD/YYYY)
                         if (!/\d{1,2}\/\d{1,2}\/\d{4}/.test(summary)) continue;
-                        results.push({desc, summary});
+                        // Capture detail link from first cell (instrument number is a link)
+                        const link = cells[0].querySelector('a[href*="docDetail"], a[href*="Detail"]');
+                        const detailHref = link ? link.href : '';
+                        results.push({desc, summary, detailHref});
                     }
                     return results;
                 })()
@@ -486,13 +502,16 @@ class EagleWebScraper(BridgeScraper):
             for item in raw:
                 desc = item.get("desc", "")
                 summary = item.get("summary", "")
+                detail_href = item.get("detailHref", "")
 
                 record = ScrapedRecord()
 
-                # Parse AFN from description
+                # Parse AFN from description and store in enrichment_data
                 afn_match = re.search(r"\b(\d{5,})\b", desc)
                 if afn_match:
-                    record.instrument_number = afn_match.group(1)
+                    record.enrichment_data["instrument_number"] = afn_match.group(1)
+                    if detail_href:
+                        record.enrichment_data["detail_href"] = detail_href
 
                 # Parse date
                 date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", summary)
@@ -540,6 +559,105 @@ class EagleWebScraper(BridgeScraper):
             _logger.warning("Error extracting page: %s", str(exc)[:80])
 
         return records
+
+    async def _fetch_parcel_ids_from_details(self, records: list[ScrapedRecord]) -> None:
+        """Click into EagleWeb detail pages to extract parcel IDs.
+
+        EagleWeb detail pages (docDetail.jsp) show full document info including
+        the parcel/tax ID that isn't visible in search results.
+
+        Strategy: click each detail link, extract parcel, use browser back to
+        return to results. EagleWeb maintains pagination state across back navigation.
+        """
+        page = self.page
+        found = 0
+        results_url = page.url  # Save current results URL for recovery
+
+        for record in records:
+            href = record.enrichment_data.get("detail_href", "")
+            inst = record.enrichment_data.get("instrument_number", "?")
+
+            if not href:
+                # No direct link — try clicking the instrument number text
+                try:
+                    link = page.locator(f"a:has-text('{inst}')").first
+                    if await link.count() == 0:
+                        continue
+                    await link.click(timeout=8_000)
+                    await page.wait_for_timeout(1_500)
+                except Exception:
+                    continue
+            else:
+                try:
+                    await page.goto(href, wait_until="domcontentloaded", timeout=15_000)
+                    await page.wait_for_timeout(1_000)
+                except Exception as exc:
+                    _logger.debug("Could not navigate to detail: %s", str(exc)[:50])
+                    continue
+
+            # Extract parcel ID from detail page
+            try:
+                parcel_id = await page.evaluate(r"""() => {
+                    const body = document.body.innerText;
+
+                    // Method 1: Look for "Parcel" or "Tax" labeled field
+                    const labelPatterns = [
+                        /[Pp]arcel\s*(?:[#:]|ID[:\s]|Number[:\s])\s*(\d{5,})/,
+                        /[Tt]ax\s*(?:[#:]|ID[:\s]|Number[:\s])\s*(\d{5,})/,
+                        /APN[:\s]+(\d{5,})/,
+                    ];
+                    for (const pat of labelPatterns) {
+                        const m = body.match(pat);
+                        if (m) return m[1];
+                    }
+
+                    // Method 2: Check table cells for "Parcel" label + adjacent value
+                    const cells = document.querySelectorAll('td, th, dt, dd, span, div');
+                    for (let i = 0; i < cells.length; i++) {
+                        const text = cells[i].textContent.trim().toLowerCase();
+                        if ((text.includes('parcel') || text.includes('tax id') || text.includes('apn'))
+                            && cells[i+1]) {
+                            const val = cells[i+1].textContent.trim();
+                            const m = val.match(/(\d{5,})/);
+                            if (m) return m[1];
+                        }
+                    }
+
+                    // Method 3: Look for Legal Description section with parcel number
+                    const legalIdx = body.indexOf('Legal');
+                    if (legalIdx > -1) {
+                        const section = body.substring(legalIdx, legalIdx + 1000);
+                        const m = section.match(/\b(\d{10,})\b/);
+                        if (m) {
+                            // Skip year-like prefixes
+                            if (!m[1].startsWith('2024') && !m[1].startsWith('2025') && !m[1].startsWith('2026'))
+                                return m[1];
+                        }
+                    }
+
+                    return null;
+                }""")
+
+                if parcel_id and parcel_id.strip():
+                    record.parcel_id = parcel_id.strip()
+                    found += 1
+            except Exception:
+                pass
+
+            # Go back to results page
+            try:
+                await page.go_back(wait_until="domcontentloaded", timeout=10_000)
+                await page.wait_for_timeout(1_000)
+            except Exception:
+                # Recovery: navigate directly to saved results URL
+                try:
+                    await page.goto(results_url, wait_until="domcontentloaded", timeout=15_000)
+                    await page.wait_for_timeout(1_500)
+                except Exception:
+                    _logger.warning("Could not return to results page — stopping detail fetch")
+                    break
+
+        _logger.info("  Detail pages: found %d parcel IDs from %d lookups", found, len(records))
 
     async def _go_next_page(self) -> bool:
         """Click the Next page link if present."""

@@ -296,3 +296,28 @@ async def stream_logs(
             "X-Accel-Buffering": "no",  # Disable nginx buffering for SSE
         },
     )
+
+
+# ─── Export URL (presigned R2 download) ──────────────────────────────────────
+
+@router.get("/jobs/{job_id}/export-url", tags=["jobs"])
+async def get_export_url(
+    job_id: str,
+    user: CurrentUser = Depends(),
+    db: AsyncSession = Depends(get_rls_db),
+) -> dict:
+    """Generate a presigned download URL for the job's CSV export."""
+    result = await db.execute(
+        select(Job).where(Job.id == job_id, Job.user_id == user.id)
+    )
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.export_key:
+        raise HTTPException(status_code=404, detail="No export available yet")
+
+    from src.utils.data_exporter import DataExporter
+
+    exporter = DataExporter()
+    url = exporter.get_download_url(job.export_key, expires_in=3600)
+    return {"url": url}

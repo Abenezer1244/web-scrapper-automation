@@ -3,16 +3,12 @@
 Source: ARMS Web (armsweb.co.pierce.wa.us)
 Record type: probate
 
-ARMS results table columns (0-indexed):
-  0: Row #
-  1: Image link
-  2: Select checkbox
-  3: Instrument # / Book-Page
-  4: Date Recorded
-  5: Document Type
-  6: Name ([R] recording party) + Associated Name ([E] heir/executor)
-  7: Legal Description (may contain embedded parcel IDs)
-  8: Status
+Approach:
+  1. Search PROBATE records by date range
+  2. Extract records from the results table
+  3. Click each row to expand inline detail panel at bottom of page
+  4. Read parcel ID from "Legal Descriptions" section in that panel
+  5. Batch GIS enrichment for property + mailing addresses
 """
 
 import re
@@ -21,7 +17,7 @@ from bs4 import BeautifulSoup, Tag
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
-from src.scrapers.enrichment import enrich_parcel
+from src.scrapers.enrichment.county_gis import batch_enrich_parcels_gis
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.pierce_wa_probate")
@@ -33,6 +29,13 @@ add_scrape_domain("armsweb.co.pierce.wa.us")
 
 _ARMS_HOME = "https://armsweb.co.pierce.wa.us/"
 _ARMS_SEARCH = "https://armsweb.co.pierce.wa.us/RealEstate/SearchEntry.aspx"
+
+_PARCEL_10 = re.compile(r"\b(\d{10})\b")
+_DATE_PATTERN = re.compile(r"\b(\d{2}/\d{2}/\d{4})\b")
+_LEGAL_KEYWORDS = re.compile(
+    r"\b(LT|LOT|BLK|BLOCK|SEC|TWNSHP|RNG|ADDN|PLAT|DIV|SHORT PLAT)\b",
+    re.IGNORECASE,
+)
 
 
 class PierceWAProbateScraper(BridgeScraper):
@@ -54,33 +57,7 @@ class PierceWAProbateScraper(BridgeScraper):
             _logger.info("Processing page %d", page_num)
 
             soup = await self.get_soup_async()
-
-            # Capture instrument numbers via Playwright DOM
-            # ARMS uses <td> with cursor:pointer, not <a> tags
-            instrument_numbers = await self.page.evaluate(r"""() => {
-                const nums = [];
-                const cells = document.querySelectorAll('td[style*="cursor"], td[onclick], a');
-                for (const el of cells) {
-                    const text = el.textContent.trim();
-                    if (/^\d{10,12}$/.test(text)) nums.push(text);
-                }
-                if (nums.length === 0) {
-                    // Fallback: search all text nodes for 12-digit instrument numbers
-                    const body = document.body.innerText;
-                    const matches = body.match(/\b\d{12}\b/g);
-                    if (matches) return [...new Set(matches)];
-                }
-                return nums;
-            }""")
-
             page_records = self._extract_records(soup)
-
-            # Assign instrument numbers to records by order
-            for idx, record in enumerate(page_records):
-                if idx < len(instrument_numbers):
-                    if not record.enrichment_data or not record.enrichment_data.get("instrument_number"):
-                        record.enrichment_data = record.enrichment_data or {}
-                        record.enrichment_data["instrument_number"] = instrument_numbers[idx]
 
             new_count = 0
             for record in page_records:
@@ -93,46 +70,52 @@ class PierceWAProbateScraper(BridgeScraper):
 
             _logger.info("Page %d — %d new records (total: %d)", page_num, new_count, len(all_records))
 
-            # ── Fetch parcel IDs from detail pages for THIS page ─────────
-            _logger.info("  Instruments captured: %d, records needing parcel: %d",
-                         len(instrument_numbers),
-                         sum(1 for r in page_records if not r.parcel_id and r in all_records))
-            if instrument_numbers:
-                page_needs_parcel = [
-                    r for r in page_records
-                    if not r.parcel_id and r in all_records
-                ]
-                if page_needs_parcel:
-                    _logger.info("  Clicking into detail pages for %d records...", len(page_needs_parcel))
-                    await self._fetch_parcel_ids_inline(
-                        page_needs_parcel, instrument_numbers,
-                        all_page_records=page_records,
-                    )
+            # Don't click detail pages during pagination — it breaks page state
+            # Parcel IDs will be extracted after all pages are collected
 
             if not await self._go_to_next_page():
                 break
 
             await self.polite_delay()
 
-        # ── Note: parcel IDs are fetched during pagination (see _scrape_page_details)
+        # ── Second pass: extract parcel IDs by clicking each row ──────────
+        # Navigate back to page 1 and click through all rows
+        needs_parcel = [r for r in all_records if not r.parcel_id and r.enrichment_data]
+        if needs_parcel:
+            _logger.info("Extracting parcel IDs for %d records via detail pages...", len(needs_parcel))
+            try:
+                # Go to first page
+                first_btn = self.page.locator("#OptionsBar1_imgFirst")
+                if await first_btn.count() > 0:
+                    await first_btn.click(timeout=5_000)
+                    await self.page.wait_for_load_state("load")
+                    await self.page.wait_for_timeout(1_000)
+            except Exception:
+                pass
+
+            await self._fetch_parcels_from_detail(needs_parcel)
+
         parcels_found = sum(1 for r in all_records if r.parcel_id)
         _logger.info("Parcel IDs found: %d/%d", parcels_found, len(all_records))
 
-        # ── Enrichment pass ───────────────────────────────────────────────────
-        enrichable = [r for r in all_records if r.parcel_id or r.party_name]
-        _logger.info("Enriching %d records with parcel data", len(enrichable))
-        for record in enrichable:
-            pid = record.parcel_id or ""
-            enriched = await enrich_parcel(
-                pid, "pierce", "WA", owner_name=record.party_name
-            )
-            record.property_address = enriched.get("property_address") or record.property_address
-            record.mailing_address = enriched.get("mailing_address") or record.mailing_address
-            if isinstance(record.enrichment_data, dict):
-                record.enrichment_data.update(enriched)
-            else:
-                record.enrichment_data = enriched
-            await self.polite_delay()
+        # ── Batch GIS enrichment (50 parcels per API call) ────────────────────
+        parcel_records = [r for r in all_records if r.parcel_id and len(r.parcel_id) >= 10]
+        _logger.info("Batch GIS enriching %d records with parcel IDs", len(parcel_records))
+        if parcel_records:
+            parcel_ids = [r.parcel_id for r in parcel_records]
+            gis_results = batch_enrich_parcels_gis(parcel_ids, "pierce", "WA")
+            enriched_count = 0
+            for record in parcel_records:
+                gis_data = gis_results.get(record.parcel_id)
+                if gis_data and gis_data.get("property_address"):
+                    record.property_address = gis_data["property_address"]
+                    record.mailing_address = gis_data.get("mailing_address") or record.mailing_address
+                    if isinstance(record.enrichment_data, dict):
+                        record.enrichment_data.update(gis_data)
+                    else:
+                        record.enrichment_data = gis_data
+                    enriched_count += 1
+            _logger.info("Batch GIS: %d/%d records enriched with addresses", enriched_count, len(parcel_records))
 
         _logger.info("Pierce WA Probate — complete. %d records", len(all_records))
         return all_records
@@ -159,299 +142,198 @@ class PierceWAProbateScraper(BridgeScraper):
         await page.wait_for_load_state("load")
         await page.wait_for_timeout(1_000)
 
+        # Type dates into Infragistics WebDateChooser controls
+        # These controls require keyboard input — JS .value= doesn't register
+        from_input = page.locator('input[title="mm/dd/yyyy"]').first
+        await from_input.click(force=True)
+        await page.wait_for_timeout(200)
+        await page.keyboard.press("Control+a")
+        await page.keyboard.type(date_from, delay=30)
+        await page.keyboard.press("Tab")
+        await page.wait_for_timeout(300)
+
+        # Tab moves focus to the To date input
+        await page.keyboard.press("Control+a")
+        await page.keyboard.type(date_to, delay=30)
+        await page.keyboard.press("Tab")
+        await page.wait_for_timeout(300)
+        _logger.info("Typed date range: %s — %s", date_from, date_to)
+
         # Check PROBATE checkbox
-        probate_cb = page.get_by_role("checkbox", name="PROBATE")
+        probate_cb = page.locator("#cphNoMargin_f_dclDocType_226")
+        await probate_cb.scroll_into_view_if_needed(timeout=5_000)
+        await probate_cb.check(timeout=5_000)
+        await page.wait_for_timeout(300)
+        _logger.info("Checked PROBATE")
+
+        # Submit and wait for results page
+        await page.click("#cphNoMargin_SearchButtons1_btnSearch", timeout=10_000)
         try:
-            await probate_cb.scroll_into_view_if_needed(timeout=10_000)
-            await probate_cb.check(timeout=5_000)
-            _logger.info("Checked PROBATE document type")
+            await page.wait_for_url("**/SearchResults**", timeout=30_000)
         except Exception:
-            _logger.warning("Could not check PROBATE via locator, trying JS fallback")
-            await page.evaluate("""
-                () => {
-                    const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-                    for (const cb of checkboxes) {
-                        const label = cb.nextSibling;
-                        if (label && label.textContent && label.textContent.trim() === 'PROBATE') {
-                            cb.checked = true;
-                            cb.dispatchEvent(new Event('change', { bubbles: true }));
-                            break;
-                        }
-                    }
-                }
-            """)
-            _logger.info("Checked PROBATE via JS fallback")
+            await page.wait_for_timeout(5_000)
+        await page.wait_for_load_state("domcontentloaded")
+        await page.wait_for_timeout(2_000)
 
-        # Fill date range via JS
-        await page.evaluate("""
-            ([dateFrom, dateTo]) => {
-                const inputs = document.querySelectorAll('input[title="mm/dd/yyyy"]');
-                if (inputs.length >= 2) {
-                    inputs[0].value = dateFrom;
-                    inputs[0].dispatchEvent(new Event('change', { bubbles: true }));
-                    inputs[1].value = dateTo;
-                    inputs[1].dispatchEvent(new Event('change', { bubbles: true }));
-                } else {
-                    const altInputs = document.querySelectorAll('input[alt="mm/dd/yyyy"]');
-                    if (altInputs.length >= 2) {
-                        altInputs[0].value = dateFrom;
-                        altInputs[0].dispatchEvent(new Event('change', { bubbles: true }));
-                        altInputs[1].value = dateTo;
-                        altInputs[1].dispatchEvent(new Event('change', { bubbles: true }));
-                    }
-                }
-            }
-        """, [date_from, date_to])
-        _logger.info("Filled date range: %s — %s", date_from, date_to)
-
-        # Submit
-        search_btn = page.get_by_role("button", name="Search", exact=True).first
-        await search_btn.scroll_into_view_if_needed(timeout=5_000)
-        await search_btn.click(timeout=10_000)
-        await page.wait_for_load_state("load")
-        await page.wait_for_timeout(3_000)
-        _logger.info("Search form submitted for %s — %s", date_from, date_to)
+        record_count = await page.evaluate(r"""() => {
+            const m = document.body.innerText.match(/(\d+) records found/);
+            return m ? m[1] : 'unknown';
+        }""")
+        _logger.info("Search: %s records found", record_count)
 
     async def _go_to_next_page(self) -> bool:
-        """Click the Next page button. Returns True if navigated."""
+        """Click the Next arrow to go to the next results page."""
         page = self.page
-
-        # ARMS uses <button> elements for pagination, not <a> links
-        next_btn = page.get_by_role("button", name="Next", exact=True).first
         try:
+            # ARMS uses input[type=image] with title="Next" for pagination
+            next_btn = page.locator("#OptionsBar1_imgNext")
             if await next_btn.count() == 0:
+                next_btn = page.locator("input[title='Next']").first
+
+            if await next_btn.count() == 0:
+                _logger.info("No next button — last page")
                 return False
-            is_disabled = await next_btn.get_attribute("disabled")
-            if is_disabled:
+
+            # Check if we're on the last page via the page dropdown
+            is_last = await page.evaluate("""() => {
+                const sel = document.getElementById('cphNoMargin_cphNoMargin_OptionsBar1_ItemList');
+                if (!sel) return true;
+                return sel.selectedIndex >= sel.options.length - 1;
+            }""")
+            if is_last:
+                _logger.info("Last page reached")
                 return False
-            await next_btn.click(timeout=10_000)
+
+            await next_btn.click(timeout=5_000)
             await page.wait_for_load_state("load")
             await page.wait_for_timeout(2_000)
             _logger.info("Navigated to next page")
             return True
+
         except Exception as exc:
-            _logger.warning("Next page navigation failed: %s", exc)
+            _logger.warning("Next page failed: %s", str(exc)[:60])
             return False
 
-    async def _fetch_parcel_ids_inline(
-        self, records: list[ScrapedRecord], instrument_numbers: list[str],
-        all_page_records: list[ScrapedRecord] | None = None,
-    ) -> None:
-        """Click into detail pages within the SAME browser session to get parcel IDs.
+    async def _fetch_parcels_from_detail(self, records: list[ScrapedRecord]) -> None:
+        """Extract parcel IDs from the Legal Description tab on each detail page.
 
-        This runs on the search results page. It clicks the first instrument,
-        iterates through the dropdown, extracts parcel IDs, then goes back.
-        Same session = ASP.NET state preserved = reliable.
+        For each results page:
+        1. Click first instrument to enter detail view
+        2. Iterate ALL instruments via the dropdown selector
+        3. Click Legal Description tab → read "Parcel Id:" value
+        4. Go back to results, advance to next page, repeat
         """
         page = self.page
 
-        # Build map: instrument_number → record
+        # Build map: instrument number → record
         inst_map: dict[str, ScrapedRecord] = {}
-        for record in records:
-            inst = (record.enrichment_data or {}).get("instrument_number")
+        for rec in records:
+            inst = (rec.enrichment_data or {}).get("instrument_number")
             if inst:
-                inst_map[inst] = record
+                inst_map[inst] = rec
 
         if not inst_map:
             return
 
-        # Click the first instrument link to enter detail view
-        first_inst = instrument_numbers[0] if instrument_numbers else None
-        if not first_inst:
-            return
-
-        try:
-            # Instrument numbers are in <td class="fauxDetailLink"> cells
-            inst_cell = page.locator(f"td.fauxDetailLink:has-text('{first_inst}')").first
-            await inst_cell.click(timeout=10_000)
-            await page.wait_for_load_state("load")
-            await page.wait_for_timeout(500)
-            _logger.info("  Entered detail view for %s", first_inst)
-        except Exception as exc:
-            _logger.warning("Could not enter detail view: %s", str(exc)[:50])
-            return
-
-        # Get all instruments from the dropdown (this page's 25)
-        options = await page.evaluate("""() => {
-            const sel = document.querySelector('select');
-            if (!sel) return [];
-            return Array.from(sel.options).map(o => o.value.trim());
-        }""")
-
         found = 0
-        for inst_num in options:
+        page_num = 0
+
+        while True:
+            page_num += 1
+
+            # Click first instrument link on results page to enter detail view
+            first_inst = await page.evaluate(r"""() => {
+                const cells = document.querySelectorAll('td.fauxDetailLink');
+                for (const c of cells) {
+                    if (/^\d{10,12}$/.test(c.textContent.trim())) return c.textContent.trim();
+                }
+                return null;
+            }""")
+
+            if not first_inst:
+                break
+
             try:
-                # Select this instrument from dropdown
-                dropdown = page.locator("select").first
-                await dropdown.select_option(value=inst_num, timeout=5_000)
+                await page.locator(f"td.fauxDetailLink:has-text('{first_inst}')").first.click(timeout=5_000)
                 await page.wait_for_load_state("load")
-                await page.wait_for_timeout(300)
-
-                # Click Legal Description tab
-                legal_tab = page.locator("text=Legal Description").first
-                if await legal_tab.count() > 0:
-                    await legal_tab.click(timeout=3_000)
-                    await page.wait_for_timeout(300)
-
-                # Extract Parcel Id from Legal Description section
-                # ARMS shows parcel ID as a 10-digit number in the legal description
-                # area (after the text description like "FIRWOOD LANE LT 47")
-                parcel_id = await page.evaluate("""() => {
-                    // Method 1: Look for labeled "Parcel Id:" cell
-                    const cells = document.querySelectorAll('td');
-                    for (let i = 0; i < cells.length; i++) {
-                        if (cells[i].textContent.trim() === 'Parcel Id:' && cells[i+1]) {
-                            return cells[i+1].textContent.trim();
-                        }
-                    }
-
-                    // Method 2: Find 10-digit number in Legal Descriptions area
-                    // The detail panel shows legal desc text + parcel number below it
-                    const body = document.body.innerText;
-                    const legalIdx = body.indexOf('Legal Description');
-                    if (legalIdx > -1) {
-                        const afterLegal = body.substring(legalIdx, legalIdx + 500);
-                        // Find a standalone 10-digit number (the parcel ID)
-                        const match = afterLegal.match(/\\b(\\d{10})\\b/);
-                        if (match) return match[1];
-                    }
-
-                    // Method 3: Look in any visible text for 10-digit parcel pattern
-                    const allText = document.body.innerText;
-                    const matches = allText.match(/\\b(\\d{10})\\b/g);
-                    if (matches) {
-                        // Filter out instrument numbers (start with 2026, 2025, etc.)
-                        const parcels = matches.filter(m => !m.startsWith('2026') && !m.startsWith('2025') && !m.startsWith('2024'));
-                        if (parcels.length > 0) return parcels[parcels.length - 1];
-                    }
-
-                    return null;
-                }""")
-
-                if parcel_id and parcel_id.strip():
-                    # Find the record with this instrument number
-                    if inst_num in inst_map:
-                        inst_map[inst_num].parcel_id = parcel_id.strip()
-                    else:
-                        # Try to match against ALL page records (not just needs_parcel)
-                        search_list = all_page_records or records
-                        for rec in search_list:
-                            ed = rec.enrichment_data or {}
-                            if ed.get("instrument_number") == inst_num and not rec.parcel_id:
-                                rec.parcel_id = parcel_id.strip()
-                                break
-                    found += 1
-
+                await page.wait_for_timeout(500)
             except Exception:
-                pass  # Skip this record, continue with next
+                break
 
-        # Go back to search results (ARMS preserves pagination state)
-        try:
-            back_link = page.locator("text=Back to Results").first
-            if await back_link.count() > 0:
-                await back_link.click(timeout=5_000)
-                await page.wait_for_load_state("load")
-                await page.wait_for_timeout(2_000)  # Wait for results to fully render
-                _logger.info("  Back to results page")
-        except Exception:
-            _logger.warning("  Could not go back to results")
+            # Get instrument dropdown options
+            inst_select = page.locator("#cphNoMargin_OptionsBar1_ItemList")
+            options = await inst_select.evaluate(
+                """el => Array.from(el.options).map(o => ({v: o.value, t: o.text.trim()}))"""
+            )
 
-        _logger.info("  Detail pages: found %d parcel IDs", found)
-
-    async def _fetch_parcel_ids(self, records: list[ScrapedRecord]) -> None:
-        """Click into each record's detail page to get the real parcel ID.
-
-        The ARMS detail page has a 'Legal Description' tab that shows the
-        actual assessor parcel ID (not visible in search results).
-
-        Uses the instrument number dropdown on the detail page to navigate
-        between records without going back to search results.
-        """
-        page = self.page
-
-        # Get records that need parcel IDs (skip ones that already have one)
-        needs_parcel = [
-            r for r in records
-            if not r.parcel_id and r.enrichment_data and r.enrichment_data.get("instrument_number")
-        ]
-
-        if not needs_parcel:
-            _logger.info("All records already have parcel IDs or no instrument numbers")
-            return
-
-        _logger.info("Fetching parcel IDs for %d records from detail pages", len(needs_parcel))
-
-        # Click the first instrument number to enter the detail view
-        first_inst = needs_parcel[0].enrichment_data["instrument_number"]
-        try:
-            inst_link = page.locator(f"text={first_inst}").first
-            await inst_link.click(timeout=10_000)
-            await page.wait_for_load_state("load")
-            await page.wait_for_timeout(1_000)
-        except Exception as exc:
-            _logger.warning("Could not click into detail page: %s", str(exc)[:60])
-            return
-
-        # Now iterate through records using the instrument dropdown
-        for i, record in enumerate(needs_parcel):
-            inst_num = record.enrichment_data["instrument_number"]
-
-            try:
-                # Select this instrument from the dropdown
-                dropdown = page.locator("select").first
-                if await dropdown.count() > 0:
-                    await dropdown.select_option(value=inst_num, timeout=5_000)
+            for opt in options:
+                try:
+                    await inst_select.select_option(value=opt["v"], timeout=3_000)
                     await page.wait_for_load_state("load")
-                    await page.wait_for_timeout(500)
+                    await page.wait_for_timeout(200)
 
-                # Click "Legal Description" tab
-                legal_tab = page.locator("text=Legal Description").first
-                if await legal_tab.count() > 0:
-                    await legal_tab.click(timeout=5_000)
-                    await page.wait_for_timeout(500)
+                    # Click Legal Description tab
+                    await page.locator("span:has-text('Legal Description')").first.click(timeout=3_000)
+                    await page.wait_for_timeout(200)
 
-                # Extract parcel ID from the detail page
-                parcel_text = await page.evaluate("""() => {
-                    const cells = document.querySelectorAll('td');
-                    for (let i = 0; i < cells.length; i++) {
-                        if (cells[i].textContent.trim() === 'Parcel Id:' && cells[i+1]) {
-                            return cells[i+1].textContent.trim();
+                    # Extract "Parcel Id:" from the tab content
+                    parcel_id = await page.evaluate("""() => {
+                        const cells = document.querySelectorAll('td');
+                        for (let i = 0; i < cells.length; i++) {
+                            if (cells[i].textContent.trim() === 'Parcel Id:' && cells[i+1]) {
+                                const val = cells[i+1].textContent.trim();
+                                if (val && val.length >= 6) return val;
+                            }
                         }
-                    }
-                    return null;
-                }""")
+                        return null;
+                    }""")
 
-                if parcel_text and parcel_text.strip():
-                    record.parcel_id = parcel_text.strip()
-                    if (i + 1) <= 5 or (i + 1) % 20 == 0:
-                        _logger.info("  %s → parcel %s", inst_num, record.parcel_id)
+                    if parcel_id and parcel_id.strip():
+                        target = inst_map.get(opt["t"])
+                        if target and not target.parcel_id:
+                            target.parcel_id = parcel_id.strip()
+                            found += 1
+                            if found <= 3 or found % 10 == 0:
+                                _logger.info("  %s → parcel %s", opt["t"], target.parcel_id)
 
-            except Exception as exc:
-                _logger.warning("  Detail page failed for %s: %s", inst_num, str(exc)[:50])
+                except Exception:
+                    pass
 
-        # Navigate back to results
-        try:
-            back_link = page.locator("text=Back to Results").first
-            if await back_link.count() > 0:
-                await back_link.click(timeout=5_000)
+            # Back to results
+            try:
+                await page.locator("a:has-text('Back to Results')").first.click(timeout=5_000)
                 await page.wait_for_load_state("load")
-        except Exception:
-            pass
+                await page.wait_for_timeout(1_000)
+            except Exception:
+                break
+
+            # Check if last page
+            is_last = await page.evaluate("""() => {
+                const sel = document.getElementById('cphNoMargin_cphNoMargin_OptionsBar1_ItemList');
+                if (!sel) return true;
+                return sel.selectedIndex >= sel.options.length - 1;
+            }""")
+            if is_last:
+                break
+
+            # Next results page
+            try:
+                await page.locator("#OptionsBar1_imgNext").click(timeout=5_000)
+                await page.wait_for_load_state("load")
+                await page.wait_for_timeout(1_000)
+            except Exception:
+                break
+
+        _logger.info("  Detail pages: %d parcel IDs found across %d pages", found, page_num)
 
     def _extract_records(self, soup: BeautifulSoup) -> list[ScrapedRecord]:
-        """Extract records from the ARMS results table.
-
-        The ARMS page uses nested tables with many td cells per row (~39).
-        The data table is identified by: 20+ rows, first data row starts with
-        a numeric row number, and has many td cells.
-        """
+        """Extract records from the ARMS results table."""
         tables = soup.find_all("table")
         data_table = None
         for t in tables:
             data_rows = t.find_all("tr")
             if len(data_rows) < 5:
                 continue
-            # Check if the second row starts with a number (row counter)
             if len(data_rows) > 1:
                 first_td = data_rows[1].find("td")
                 if first_td and first_td.get_text(strip=True).isdigit():
@@ -465,30 +347,21 @@ class PierceWAProbateScraper(BridgeScraper):
         rows = data_table.find_all("tr")
         records: list[ScrapedRecord] = []
 
-        # Skip header row
         for row in rows[1:]:
             cells = row.find_all("td")
             if len(cells) < 9:
                 continue
-
-            # First cell should be a row number
             first_text = cells[0].get_text(strip=True)
             if not first_text.isdigit():
                 continue
-
-            record = self._map_row_by_text(cells)
+            record = self._map_row(cells)
             if record:
                 records.append(record)
 
         return records
 
-    def _map_row_by_text(self, cells: list[Tag]) -> ScrapedRecord | None:
-        """Map a table row by extracting text from all cells and parsing.
-
-        Since ARMS uses nested tables with varying td counts (~39 per row),
-        we extract all cell text and find fields by content patterns.
-        """
-        # Gather all cell texts
+    def _map_row(self, cells: list[Tag]) -> ScrapedRecord | None:
+        """Parse a single table row into a ScrapedRecord."""
         all_texts = []
         for c in cells:
             text = self.clean(c.get_text(separator=" ", strip=True))
@@ -500,86 +373,70 @@ class PierceWAProbateScraper(BridgeScraper):
 
         record = ScrapedRecord()
 
-        # Find instrument number — clickable link in the results table
-        # Modern format: 12 digits starting with 20 (e.g., 202601020064)
-        # Old format: 10 digits starting with 8 or 9 (e.g., 8207220167)
+        # Instrument number — clickable link (12 digits for modern, 10+ for old)
         inst_re = re.compile(r"\b(\d{10,12})\b")
         for c in cells:
-            # Instrument numbers are in clickable <a> or <td> with cursor:pointer
-            links = c.find_all("a")
-            for link in links:
+            for link in c.find_all("a"):
                 link_text = link.get_text(strip=True)
                 m = inst_re.match(link_text)
                 if m and len(link_text) >= 10:
                     record.enrichment_data = {"instrument_number": m.group(1)}
                     break
-            if record.enrichment_data and record.enrichment_data.get("instrument_number"):
+            if record.enrichment_data:
                 break
-        # Fallback: search all text for instrument-like numbers
-        if not record.enrichment_data or not record.enrichment_data.get("instrument_number"):
+        if not record.enrichment_data:
             for text in all_texts:
                 m = re.search(r"\b(20\d{10})\b", text)
                 if m:
                     record.enrichment_data = {"instrument_number": m.group(1)}
                     break
 
-        # Find date (MM/DD/YYYY pattern)
-        date_re = re.compile(r"\b\d{2}/\d{2}/\d{4}\b")
+        # Date — must be valid MM/DD/YYYY
         for text in all_texts:
-            m = date_re.search(text)
+            m = _DATE_PATTERN.search(text)
             if m:
-                record.date_recorded = m.group()
-                break
+                date_str = m.group(1)
+                month, day, year = date_str.split("/")
+                if 1 <= int(month) <= 12 and 1 <= int(day) <= 31 and 1980 <= int(year) <= 2030:
+                    record.date_recorded = date_str
+                    break
 
-        # Find the Name cell — contains [R] and/or [E] markers
+        # Name — contains [R] and/or [E] markers
         for c in cells:
             cell_text = c.get_text(separator="|", strip=True)
             if "[R]" in cell_text or "[E]" in cell_text:
-                party_name, heirs = self._parse_name_cell(c)
-                record.party_name = party_name
-                record.heirs = heirs
+                record.party_name, record.heirs = self._parse_name_cell(c)
                 break
 
-        # Find Legal Description — contains land keywords (LOT, BLK, SEC, etc.)
-        legal_re = re.compile(r"\b(LT|LOT|BLK|BLOCK|SEC|TWNSHP|RNG|ADDN|PLAT|DIV|SHORT PLAT)\b", re.IGNORECASE)
+        # Legal description
         for text in all_texts:
-            if legal_re.search(text) and text != record.party_name:
+            if _LEGAL_KEYWORDS.search(text) and text != record.party_name:
                 record.legal_description = text
                 break
 
-        # Extract parcel ID: exactly 10 digits (Pierce County format)
-        # Only search in legal description text to avoid matching instrument numbers
-        parcel_10_re = re.compile(r"\b(\d{10})\b")
+        # Parcel ID from legal description (some have it inline)
         if record.legal_description:
-            m = parcel_10_re.search(record.legal_description)
+            m = _PARCEL_10.search(record.legal_description)
             if m:
                 record.parcel_id = m.group(1)
 
-        # Skip empty rows
-        if not record.date_recorded and not record.party_name:
+        # Require valid date + party name
+        if not record.date_recorded or not record.party_name:
             return None
 
         # Skip garbage
-        if record.party_name and len(record.party_name) > 200:
+        if len(record.party_name) > 200:
             return None
-        junk = ["Page 1", "Sort By", "New Search", "Criteria:", "records found", "Select All"]
-        if record.party_name and any(kw in record.party_name for kw in junk):
+        junk = ["Page 1", "Sort By", "New Search", "Criteria:", "records found",
+                "Select All", "#ImageItem", "SelectInstrument", "#Boo"]
+        if any(kw in record.party_name for kw in junk):
             return None
 
         return record
 
     @staticmethod
     def _parse_name_cell(cell: Tag) -> tuple[str | None, str | None]:
-        """Parse the Name/Associated Name cell into (party_name, heirs).
-
-        The cell structure is:
-          [R] ESTATE_NAME EST OF
-          [E] HEIR_NAME HEIRS OF
-
-        Where [R] = Recording party, [E] = Associated name (heir/executor).
-        These are in separate text nodes or child <span>/<div> elements.
-        """
-        # Get all text segments from the cell
+        """Parse the Name/Associated Name cell into (party_name, heirs)."""
         text_parts = []
         for child in cell.children:
             if isinstance(child, Tag):
@@ -589,23 +446,18 @@ class PierceWAProbateScraper(BridgeScraper):
                 if stripped:
                     text_parts.append(stripped)
 
-        # Join and split by [R] and [E] markers
         full_text = " ".join(text_parts)
-
         party_name = None
         heirs = None
 
-        # Extract [R] portion (recording party / estate)
         r_match = re.search(r"\[R\]\s*(.+?)(?=\s*\[E\]|$)", full_text)
         if r_match:
             party_name = r_match.group(1).strip()
 
-        # Extract [E] portion (associated name / heir)
         e_match = re.search(r"\[E\]\s*(.+?)$", full_text)
         if e_match:
             heirs = e_match.group(1).strip()
 
-        # Fallback: if no [R]/[E] markers, use full text as party_name
         if not party_name and not heirs:
             cleaned = full_text.strip()
             if cleaned:

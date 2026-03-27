@@ -89,14 +89,13 @@ class BridgeScraper:
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--single-process",
                 "--disable-extensions",
                 "--disable-background-networking",
                 "--disable-default-apps",
                 "--disable-sync",
                 "--disable-translate",
                 "--no-first-run",
-                "--js-flags=--max-old-space-size=256",
+                "--js-flags=--max-old-space-size=512",
             ],
         )
         self._context = await self._browser.new_context(
@@ -122,10 +121,16 @@ class BridgeScraper:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        if self._context:
-            await self._context.close()
-        if self._browser:
-            await self._browser.close()
+        try:
+            if self._context:
+                await self._context.close()
+        except Exception:
+            pass
+        try:
+            if self._browser:
+                await self._browser.close()
+        except Exception:
+            pass
         if self._playwright:
             await self._playwright.stop()
         _logger.info("Browser context closed")

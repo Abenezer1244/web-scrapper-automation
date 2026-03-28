@@ -325,22 +325,93 @@ def _empty() -> dict[str, str | None]:
 def batch_enrich_parcels_gis(
     parcel_ids: list[str], county: str, state: str
 ) -> dict[str, dict[str, str | None]]:
-    """Batch enrich multiple parcels in a single GIS API call.
+    """Batch enrich multiple parcels via GIS API.
 
-    Uses WHERE ORIG_PARCEL_ID IN ('x','y','z') to look up many parcels at once.
-    Returns a dict mapping parcel_id -> {property_address, mailing_address}.
-    Parcels not found return empty dict.
+    Strategy:
+    1. Try county-specific endpoint first (has mailing address from Delivery_Address)
+    2. Fall back to WA statewide for any parcels not found
 
     Processes in chunks of 50 (ArcGIS URL length limit).
     """
     if state.upper() != "WA":
         return {}
 
+    results: dict[str, dict] = {}
+    county_key = f"{county.lower()}_{state.upper()}"
+    gis_config = _KNOWN_GIS_ENDPOINTS.get(county_key)
+
+    # Step 1: County-specific endpoint (has real mailing addresses)
+    if gis_config:
+        results = _batch_query_county(parcel_ids, gis_config)
+
+    # Step 2: WA statewide fallback for parcels not found in county endpoint
+    missing = [pid for pid in parcel_ids if pid not in results and pid and len(pid.strip()) >= 10]
+    if missing:
+        statewide = _batch_query_wa_statewide(missing, county)
+        results.update(statewide)
+
+    return results
+
+
+def _batch_query_county(
+    parcel_ids: list[str], gis_config: dict
+) -> dict[str, dict[str, str | None]]:
+    """Batch query a county-specific ArcGIS endpoint (has mailing address)."""
+    endpoint = gis_config["endpoint"]
+    parcel_field = gis_config["parcel_field"]
+    out_fields = gis_config.get("out_fields", "*")
+    results: dict[str, dict] = {}
+    chunk_size = 50
+
+    for i in range(0, len(parcel_ids), chunk_size):
+        chunk = parcel_ids[i:i + chunk_size]
+        clean = [pid.replace("-", "").strip() for pid in chunk if pid and len(pid.strip()) >= 10]
+        if not clean:
+            continue
+
+        in_clause = ",".join(f"'{p}'" for p in clean)
+        params = {
+            "where": f"{parcel_field} IN ({in_clause})",
+            "outFields": out_fields,
+            "returnGeometry": "false",
+            "f": "json",
+            "resultRecordCount": chunk_size,
+        }
+
+        try:
+            resp = requests.get(endpoint, params=params, timeout=30)
+            if resp.status_code != 200:
+                _logger.warning("County GIS batch returned %d", resp.status_code)
+                continue
+
+            data = resp.json()
+            for feature in data.get("features") or []:
+                attrs = feature.get("attributes") or {}
+                pid = attrs.get(parcel_field)
+                if not pid:
+                    continue
+
+                parsed = _parse_gis_response({"features": [feature]}, gis_config)
+                if parsed.get("property_address"):
+                    parsed["parcel_id"] = pid
+                    results[pid] = parsed
+
+            _logger.info("County GIS batch: %d/%d parcels enriched", len([p for p in clean if p in results]), len(clean))
+
+        except Exception as exc:
+            _logger.warning("County GIS batch error: %s", str(exc)[:80])
+
+    return results
+
+
+def _batch_query_wa_statewide(
+    parcel_ids: list[str], county: str
+) -> dict[str, dict[str, str | None]]:
+    """Batch query WA statewide endpoint (property address only, no mailing)."""
     fips = _WA_COUNTY_FIPS.get(county.lower())
     results: dict[str, dict] = {}
-
-    # Process in chunks of 50
     chunk_size = 50
+
     for i in range(0, len(parcel_ids), chunk_size):
         chunk = parcel_ids[i:i + chunk_size]
         clean = [pid.replace("-", "").strip() for pid in chunk if pid and len(pid.strip()) >= 10]
@@ -363,7 +434,6 @@ def batch_enrich_parcels_gis(
         try:
             resp = requests.get(_WA_STATEWIDE_ENDPOINT, params=params, timeout=30)
             if resp.status_code != 200:
-                _logger.warning("Batch GIS returned %d for %d parcels", resp.status_code, len(clean))
                 continue
 
             data = resp.json()
@@ -375,24 +445,15 @@ def batch_enrich_parcels_gis(
                     continue
 
                 address = " ".join(address.strip().split())
-                city = " ".join((attrs.get("SITUS_CITY_NM") or "").strip().split())
-                zipcode = str(attrs.get("SITUS_ZIP_NR") or "").strip()
-
-                parts = [address]
-                if city:
-                    parts.append(city)
-                if zipcode:
-                    parts.append(f"WA {zipcode}")
-
                 results[pid] = {
                     "property_address": address,
-                    "mailing_address": ", ".join(parts),
+                    "mailing_address": None,  # Statewide API doesn't have mailing address
                     "parcel_id": pid,
                 }
 
-            _logger.info("Batch GIS: %d/%d parcels enriched", len([r for r in clean if r in results]), len(clean))
+            _logger.info("Statewide GIS batch: %d/%d parcels enriched", len([p for p in clean if p in results]), len(clean))
 
         except Exception as exc:
-            _logger.warning("Batch GIS error: %s", str(exc)[:80])
+            _logger.warning("Statewide GIS batch error: %s", str(exc)[:80])
 
     return results

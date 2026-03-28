@@ -267,13 +267,23 @@ def _resolve_date_range(schedule: dict) -> tuple[str, str]:
     from datetime import timedelta
 
     today = datetime.now(UTC).date()
-    range_mode = schedule.get("range_mode", "rolling_90")
+    # Support both key names: schema uses "date_range_mode", legacy used "range_mode"
+    range_mode = schedule.get("date_range_mode") or schedule.get("range_mode", "rolling_90")
 
     if range_mode == "custom":
-        return schedule.get("date_from", ""), schedule.get("date_to", "")
+        date_from = schedule.get("date_from", "")
+        date_to = schedule.get("date_to", "")
+        if date_from and date_to:
+            return date_from, date_to
+        # Fall through to rolling_90 if custom dates are missing
+
     if range_mode == "since_last_run":
         # Fallback to rolling_90 until last_run tracking is implemented
         date_from = today - timedelta(days=90)
+    elif range_mode == "rolling_30":
+        date_from = today - timedelta(days=30)
+    elif range_mode == "rolling_7":
+        date_from = today - timedelta(days=7)
     else:
         date_from = today - timedelta(days=90)
 

@@ -69,6 +69,7 @@ class BridgeScraper:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self.page: Page | None = None
+        self.on_progress: Any | None = None  # callback(page_current, page_total, record_count)
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 

@@ -70,6 +70,11 @@ class PierceWAProbateScraper(BridgeScraper):
 
             _logger.info("Page %d — %d new records (total: %d)", page_num, new_count, len(all_records))
 
+            # Report progress to worker (updates DB for real-time API polling)
+            page_total = getattr(self, "_page_total", 0)
+            if self.on_progress:
+                self.on_progress(page_num, page_total, len(all_records))
+
             # Don't click detail pages during pagination — it breaks page state
             # Parcel IDs will be extracted after all pages are collected
 
@@ -180,6 +185,14 @@ class PierceWAProbateScraper(BridgeScraper):
             return m ? m[1] : 'unknown';
         }""")
         _logger.info("Search: %s records found", record_count)
+
+        # Detect total pages from the page dropdown
+        page_total = await page.evaluate("""() => {
+            const sel = document.getElementById('cphNoMargin_cphNoMargin_OptionsBar1_ItemList');
+            return sel ? sel.options.length : 1;
+        }""")
+        self._page_total = page_total
+        _logger.info("Total pages: %d", page_total)
 
     async def _go_to_next_page(self) -> bool:
         """Click the Next arrow to go to the next results page."""

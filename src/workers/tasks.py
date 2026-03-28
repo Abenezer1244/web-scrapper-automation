@@ -120,8 +120,15 @@ def run_scrape_job(self, job_id: str) -> None:
         date_from, date_to = _resolve_date_range(schedule)
         _publish_log(r, job_id, "info", f"Date range: {date_from} → {date_to}")
 
+        def _on_progress(page_current, page_total, record_count):
+            """Called by the scraper after each page — updates the DB in real time."""
+            job.page_current = page_current
+            job.page_total = page_total
+            job.record_count = record_count
+            db.commit()
+
         try:
-            records = asyncio.run(_run_scraper(scraper_class, date_from, date_to, r, job_id))
+            records = asyncio.run(_run_scraper(scraper_class, date_from, date_to, r, job_id, _on_progress))
         except Exception:
             _logger.exception("Scraper error for job %s", job_id)
             _fail_job(db, job, r, job_id, "Scraper encountered an error — our team has been notified.")
@@ -228,9 +235,11 @@ def run_scrape_job(self, job_id: str) -> None:
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-async def _run_scraper(scraper_class, date_from: str, date_to: str, r, job_id: str):
+async def _run_scraper(scraper_class, date_from: str, date_to: str, r, job_id: str, on_progress=None):
     """Run the async scraper and stream progress logs back to Redis."""
     async with scraper_class() as scraper:
+        if on_progress:
+            scraper.on_progress = on_progress
         records = await scraper.scrape(date_from, date_to)
 
         # Log AI usage if this was an AI-powered scrape

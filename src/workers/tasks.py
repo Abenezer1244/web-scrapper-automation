@@ -262,6 +262,30 @@ def _fail_job(db, job, r, job_id: str, reason: str) -> None:
     _logger.error("Job %s failed: %s", job_id, reason)
 
 
+def _to_mmddyyyy(date_str: str) -> str:
+    """Convert any date string to MM/DD/YYYY format for county portals.
+
+    Handles: YYYY-MM-DD (ISO), MM/DD/YYYY (already correct), M/D/YYYY.
+    """
+    date_str = date_str.strip()
+    # Already MM/DD/YYYY
+    if len(date_str) == 10 and date_str[2] == "/" and date_str[5] == "/":
+        return date_str
+    # ISO format: YYYY-MM-DD
+    if len(date_str) >= 10 and date_str[4] == "-":
+        parts = date_str[:10].split("-")
+        if len(parts) == 3:
+            return f"{parts[1]}/{parts[2]}/{parts[0]}"
+    # Fallback: try parsing with datetime
+    from datetime import datetime as _dt
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"):
+        try:
+            return _dt.strptime(date_str[:10], fmt).strftime("%m/%d/%Y")
+        except ValueError:
+            continue
+    return date_str  # Return as-is if nothing works
+
+
 def _resolve_date_range(schedule: dict) -> tuple[str, str]:
     """Compute date_from and date_to from a scraper's schedule config."""
     from datetime import timedelta
@@ -274,7 +298,8 @@ def _resolve_date_range(schedule: dict) -> tuple[str, str]:
         date_from = schedule.get("date_from", "")
         date_to = schedule.get("date_to", "")
         if date_from and date_to:
-            return date_from, date_to
+            # Normalize to MM/DD/YYYY — frontend may send YYYY-MM-DD (ISO)
+            return _to_mmddyyyy(date_from), _to_mmddyyyy(date_to)
         # Fall through to rolling_90 if custom dates are missing
 
     if range_mode == "since_last_run":

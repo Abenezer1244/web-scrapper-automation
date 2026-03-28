@@ -216,7 +216,9 @@ async def get_results(
     )
     enriched_count = enriched_result.scalar_one()
 
-    # Check if enrichment is still running (parcels exist but not all enriched)
+    # Check if enrichment is still running:
+    # It's running if parcels exist without addresses AND the enrichment
+    # task hasn't finished yet (no "Enrichment complete" log entry).
     parcel_count_result = await db.execute(
         select(func.count()).where(
             Result.job_id == job_id,
@@ -225,7 +227,26 @@ async def get_results(
         )
     )
     parcel_count = parcel_count_result.scalar_one()
-    enriching = parcel_count > 0 and enriched_count < parcel_count
+
+    enrichment_done_result = await db.execute(
+        select(func.count()).where(
+            JobLog.job_id == job_id,
+            JobLog.message.like("Enrichment complete%"),
+        )
+    )
+    enrichment_task_finished = enrichment_done_result.scalar_one() > 0
+
+    # Also check the "No records" log — enrichment skipped
+    if not enrichment_task_finished:
+        skip_result = await db.execute(
+            select(func.count()).where(
+                JobLog.job_id == job_id,
+                JobLog.message.like("No records with parcel%"),
+            )
+        )
+        enrichment_task_finished = skip_result.scalar_one() > 0
+
+    enriching = parcel_count > 0 and not enrichment_task_finished
 
     return ResultsPage(
         job_id=job_id, total=total, page=page, page_size=page_size,

@@ -156,8 +156,43 @@ class JobResponse(BaseModel):
     started_at: datetime | None
     finished_at: datetime | None
     created_at: datetime
+    # Computed progress fields (not stored in DB)
+    progress_pct: int | None = None
+    estimated_total_records: int | None = None
+    estimated_seconds_remaining: int | None = None
+    elapsed_seconds: int | None = None
 
     model_config = {"from_attributes": True}
+
+    def model_post_init(self, __context: Any) -> None:
+        now = datetime.utcnow()
+
+        # Elapsed time
+        if self.started_at:
+            started = self.started_at.replace(tzinfo=None) if self.started_at.tzinfo else self.started_at
+            self.elapsed_seconds = max(0, int((now - started).total_seconds()))
+
+        # Terminal states: 100% done, no estimate needed
+        if self.status in ("done", "failed", "cancelled"):
+            self.progress_pct = 100 if self.status == "done" else None
+            self.estimated_seconds_remaining = 0
+            return
+
+        # Progress based on page_current / page_total
+        if self.page_total > 0 and self.page_current > 0:
+            self.progress_pct = min(99, int(self.page_current / self.page_total * 100))
+
+            # Estimate total records: (records so far / pages done) * total pages
+            if self.record_count > 0:
+                self.estimated_total_records = int(
+                    self.record_count / self.page_current * self.page_total
+                )
+
+            # Estimate time remaining: (elapsed / pages done) * pages left
+            if self.elapsed_seconds and self.elapsed_seconds > 0:
+                secs_per_page = self.elapsed_seconds / self.page_current
+                pages_left = self.page_total - self.page_current
+                self.estimated_seconds_remaining = max(0, int(secs_per_page * pages_left))
 
 
 class ResultRow(BaseModel):

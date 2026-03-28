@@ -120,12 +120,22 @@ def run_scrape_job(self, job_id: str) -> None:
         date_from, date_to = _resolve_date_range(schedule)
         _publish_log(r, job_id, "info", f"Date range: {date_from} → {date_to}")
 
-        def _on_progress(page_current, page_total, record_count):
+        _last_phase = [None]  # mutable for closure
+
+        def _on_progress(page_current, page_total, record_count, phase="scraping"):
             """Called by the scraper after each page — updates the DB in real time."""
             job.page_current = page_current
             job.page_total = page_total
             job.record_count = record_count
             db.commit()
+
+            # Log phase transitions so the frontend shows what's happening
+            if phase != _last_phase[0]:
+                _last_phase[0] = phase
+                if phase == "parcel_lookup":
+                    _publish_log(r, job_id, "info", f"Looking up parcel IDs from detail pages ({page_total} records)...")
+                elif phase == "enriching":
+                    _publish_log(r, job_id, "info", f"Looking up addresses for {page_total} parcels...")
 
         try:
             records = asyncio.run(_run_scraper(scraper_class, date_from, date_to, r, job_id, _on_progress))

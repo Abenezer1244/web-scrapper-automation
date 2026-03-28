@@ -88,6 +88,9 @@ class PierceWAProbateScraper(BridgeScraper):
         needs_parcel = [r for r in all_records if not r.parcel_id and r.enrichment_data]
         if needs_parcel:
             _logger.info("Extracting parcel IDs for %d records via detail pages...", len(needs_parcel))
+            # Report phase change so frontend shows "Looking up parcel IDs..."
+            if self.on_progress:
+                self.on_progress(0, len(needs_parcel), len(all_records), "parcel_lookup")
             try:
                 # Go to first page
                 first_btn = self.page.locator("#OptionsBar1_imgFirst")
@@ -106,6 +109,8 @@ class PierceWAProbateScraper(BridgeScraper):
         # ── Batch GIS enrichment (50 parcels per API call) ────────────────────
         parcel_records = [r for r in all_records if r.parcel_id and len(r.parcel_id) >= 10]
         _logger.info("Batch GIS enriching %d records with parcel IDs", len(parcel_records))
+        if self.on_progress:
+            self.on_progress(0, len(parcel_records), len(all_records), "enriching")
         if parcel_records:
             parcel_ids = [r.parcel_id for r in parcel_records]
             gis_results = batch_enrich_parcels_gis(parcel_ids, "pierce", "WA")
@@ -308,6 +313,8 @@ class PierceWAProbateScraper(BridgeScraper):
                             found += 1
                             if found <= 3 or found % 10 == 0:
                                 _logger.info("  %s → parcel %s", opt["t"], target.parcel_id)
+                            if self.on_progress:
+                                self.on_progress(found, len(inst_map), found, "parcel_lookup")
 
                 except Exception:
                     pass

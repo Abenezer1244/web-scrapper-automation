@@ -303,7 +303,7 @@ async def stream_logs(
 @router.get("/jobs/{job_id}/export-url", tags=["jobs"])
 async def get_export_url(
     job_id: str,
-    user: CurrentUser = Depends(),
+    user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> dict:
     """Generate a presigned download URL for the job's CSV export."""

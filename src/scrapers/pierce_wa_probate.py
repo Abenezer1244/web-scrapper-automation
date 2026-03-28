@@ -427,11 +427,10 @@ class PierceWAProbateScraper(BridgeScraper):
                 record.legal_description = text
                 break
 
-        # Parcel ID from legal description (some have it inline)
-        if record.legal_description:
-            m = _PARCEL_10.search(record.legal_description)
-            if m:
-                record.parcel_id = m.group(1)
+        # Don't extract parcel IDs from inline legal description text —
+        # 10-digit numbers there are often Remarks or subdivision codes,
+        # not real parcel IDs. Real parcel IDs come from the detail page
+        # "Parcel Id:" field (fetched in _fetch_parcels_from_detail).
 
         # Require valid date + party name
         if not record.date_recorded or not record.party_name:

@@ -151,25 +151,16 @@ async def create_checkout(
     if price_or_product_id not in _PRICE_TO_PLAN:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
 
-    # Resolve to actual Stripe Price ID if we have a Product ID (prod_xxx)
+    # Resolve Product ID → Price ID (hardcoded to avoid extra Stripe API calls)
     import asyncio
-    stripe_price_id = price_or_product_id
-    if price_or_product_id.startswith("prod_"):
-        try:
-            loop = asyncio.get_event_loop()
-            product = await loop.run_in_executor(None, stripe.Product.retrieve, price_or_product_id)
-            stripe_price_id = product.default_price
-            if not stripe_price_id:
-                prices = await loop.run_in_executor(None, lambda: stripe.Price.list(product=price_or_product_id, active=True, limit=1))
-                if prices.data:
-                    stripe_price_id = prices.data[0].id
-                else:
-                    raise HTTPException(status_code=400, detail="No price found for this plan")
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Stripe lookup error: {type(e).__name__}: {str(e)[:100]}")
+    _PRODUCT_TO_PRICE = {
+        "prod_UANuoAMKafnDJ5": "price_1TC38PHE9wT1C7yZ7XDpF2Ln",  # Pro
+        "prod_UANwwzFn0msFok": "price_1TC3AgHE9wT1C7yZWVcdX3cv",  # Business
+        "prod_UANxJNomPNWE5l": "price_1TC3BRHE9wT1C7yZ6Jja7hHZ",  # Agency
+    }
+    stripe_price_id = _PRODUCT_TO_PRICE.get(price_or_product_id, price_or_product_id)
 
+    loop = asyncio.get_event_loop()
     customer_id = current_user.stripe_customer_id
     if not customer_id:
         customer = await loop.run_in_executor(

@@ -56,12 +56,13 @@ def dispatch_scheduled_jobs() -> None:
 
     from sqlalchemy import select
 
-    from src.db.models import Job, ScraperConfig
+    from src.db.models import Job, ScraperConfig, User
     from src.db.session import SyncSessionLocal
     from src.workers.tasks import run_scrape_job
 
     now = datetime.now(UTC)
     enqueued = 0
+    skipped_limit = 0
 
     with SyncSessionLocal() as db:
         configs = db.execute(
@@ -75,7 +76,22 @@ def dispatch_scheduled_jobs() -> None:
             if frequency == "manual":
                 continue
 
-            if not _should_run_now(frequency, schedule.get("time", "06:00"), now):
+            # Build run time from run_at_hour/run_at_minute (frontend format)
+            run_hour = schedule.get("run_at_hour", 6)
+            run_minute = schedule.get("run_at_minute", 0)
+            run_time_str = f"{run_hour}:{run_minute:02d}"
+
+            if not _should_run_now(frequency, run_time_str, now):
+                continue
+
+            # Check user's record limit BEFORE creating the job
+            user = db.execute(select(User).where(User.id == config.user_id)).scalar_one_or_none()
+            if user and user.records_limit != -1 and user.records_used >= user.records_limit:
+                _logger.info(
+                    "Skipping %s — user %s at record limit (%d/%d)",
+                    config.name, user.email, user.records_used, user.records_limit,
+                )
+                skipped_limit += 1
                 continue
 
             # Idempotency: skip if a job is already pending or running for this config
@@ -106,8 +122,11 @@ def dispatch_scheduled_jobs() -> None:
 
         db.commit()
 
-    if enqueued:
-        _logger.info("dispatch_scheduled_jobs: enqueued %d jobs", enqueued)
+    if enqueued or skipped_limit:
+        _logger.info(
+            "dispatch_scheduled_jobs: enqueued %d, skipped %d (over limit)",
+            enqueued, skipped_limit,
+        )
 
 
 def _should_run_now(frequency: str, run_time_str: str, now: datetime) -> bool:

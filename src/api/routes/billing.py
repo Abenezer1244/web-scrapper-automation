@@ -83,6 +83,7 @@ async def list_plans() -> list[dict]:
     return _PLANS
 
 
+
 # ─── Usage ────────────────────────────────────────────────────────────────────
 
 @router.get("/usage")
@@ -150,6 +151,10 @@ async def create_checkout(
     """Create a Stripe Checkout session to upgrade the user's plan."""
     price_or_product_id = body.price_id
 
+    # Validate: input must be a known product/price ID from the plan catalog
+    if price_or_product_id not in _PRICE_TO_PLAN:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
+
     # Resolve Product ID → Price ID (hardcoded to avoid extra Stripe API calls)
     _PRODUCT_TO_PRICE = {
         "prod_UANuoAMKafnDJ5": "price_1TC38PHE9wT1C7yZ7XDpF2Ln",  # Pro
@@ -157,10 +162,6 @@ async def create_checkout(
         "prod_UANxJNomPNWE5l": "price_1TC3BRHE9wT1C7yZ6Jja7hHZ",  # Agency
     }
     stripe_price_id = _PRODUCT_TO_PRICE.get(price_or_product_id, price_or_product_id)
-
-    # Validate: must resolve to a known price
-    if stripe_price_id not in _PRICE_TO_PLAN:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
 
     try:
         customer_id = current_user.stripe_customer_id

@@ -397,40 +397,46 @@ async def download_export(
     if not job.export_key:
         raise HTTPException(status_code=404, detail="No export available yet")
 
-    from src.config import settings
-    from src.utils.data_exporter import DataExporter
+    import csv
+    import io
 
-    object_key = job.export_key
-    filename = object_key.split("/")[-1] or "leads.csv"
-    content_type = "text/csv" if filename.endswith(".csv") else "application/octet-stream"
+    # Generate CSV directly from database results (most reliable)
+    results_query = await db.execute(
+        select(Result).where(Result.job_id == job_id, Result.user_id == user.id)
+    )
+    records = results_query.scalars().all()
 
-    # Try S3-compatible download first (most reliable)
-    try:
-        exporter = DataExporter()
-        file_bytes = exporter.download_object(object_key)
-    except Exception as exc:
-        # Fallback: Cloudflare REST API
-        try:
-            account_id = settings.R2_ACCOUNT_ID
-            bucket = settings.R2_BUCKET_NAME
-            api_token = settings.R2_API_TOKEN
-            r2_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/r2/buckets/{bucket}/objects/{object_key}"
-            resp = sync_requests.get(r2_url, headers={"Authorization": f"Bearer {api_token}"}, timeout=60)
-            if resp.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"Storage returned {resp.status_code}")
-            file_bytes = resp.content
-        except HTTPException:
-            raise
-        except Exception:
-            raise HTTPException(status_code=502, detail="Storage service unavailable")
+    if not records:
+        raise HTTPException(status_code=404, detail="No records found for this job")
+
+    # Build CSV in memory
+    output = io.StringIO()
+    fieldnames = [
+        "date_recorded", "party_name", "heirs", "parcel_id",
+        "property_address", "mailing_address", "legal_description",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in records:
+        writer.writerow({
+            "date_recorded": r.date_recorded or "",
+            "party_name": r.party_name or "",
+            "heirs": r.heirs or "",
+            "parcel_id": r.parcel_id or "",
+            "property_address": r.property_address or "",
+            "mailing_address": r.mailing_address or "",
+            "legal_description": r.legal_description or "",
+        })
+
+    csv_bytes = output.getvalue().encode("utf-8")
 
     from starlette.responses import Response
 
     return Response(
-        content=file_bytes,
-        media_type=content_type,
+        content=csv_bytes,
+        media_type="text/csv",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": f'attachment; filename="bridgeleads_{job_id[:8]}.csv"',
             "Cache-Control": "private, max-age=3600",
         },
     )

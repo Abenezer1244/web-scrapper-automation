@@ -178,8 +178,10 @@ class DataExporter:
     def get_download_url(self, object_key: str, expires_in: int = 3600) -> str:
         """Generate a temporary download URL for an R2 object.
 
-        Uses the Cloudflare R2 API to create a presigned URL. Falls back to
-        the R2 public URL if configured.
+        Strategy (in order):
+        1. R2 public URL if configured
+        2. S3-compatible presigned URL via boto3 (most reliable)
+        3. Cloudflare R2 API presigned URL (requires ACCOUNT_ID)
 
         Args:
             object_key: The R2 object key.
@@ -191,19 +193,45 @@ class DataExporter:
         if settings.R2_PUBLIC_URL:
             return f"{settings.R2_PUBLIC_URL}/{object_key}"
 
-        # Use Cloudflare R2 API presigned URL endpoint
-        url = f"{_r2_api_base()}/objects/{object_key}?presigned=true&expiresIn={expires_in}"
-        resp = _requests.get(url, headers=_r2_headers(), timeout=30)
+        # S3-compatible presigned URL (works with R2 S3 endpoint)
+        if settings.R2_ENDPOINT_URL and settings.R2_ACCESS_KEY_ID and settings.R2_SECRET_ACCESS_KEY:
+            try:
+                import boto3
+                from botocore.config import Config
 
-        if resp.status_code == 200:
-            data = resp.json()
-            presigned = data.get("result", {}).get("presignedUrl")
-            if presigned:
+                s3 = boto3.client(
+                    "s3",
+                    endpoint_url=settings.R2_ENDPOINT_URL,
+                    aws_access_key_id=settings.R2_ACCESS_KEY_ID,
+                    aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
+                    config=Config(signature_version="s3v4"),
+                    region_name="auto",
+                )
+                presigned = s3.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": settings.R2_BUCKET_NAME, "Key": object_key},
+                    ExpiresIn=expires_in,
+                )
+                _logger.info("Generated S3 presigned URL for %s", object_key)
                 return presigned
+            except Exception as exc:
+                _logger.warning("S3 presigned URL failed: %s", str(exc)[:80])
 
-        # Fallback: direct Cloudflare R2 API download (proxied)
-        _logger.warning("Presigned URL not available, using API proxy download")
-        return f"{_r2_api_base()}/objects/{object_key}"
+        # Fallback: Cloudflare R2 API presigned URL
+        if settings.R2_ACCOUNT_ID:
+            url = f"{_r2_api_base()}/objects/{object_key}?presigned=true&expiresIn={expires_in}"
+            try:
+                resp = _requests.get(url, headers=_r2_headers(), timeout=30)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    presigned = data.get("result", {}).get("presignedUrl")
+                    if presigned:
+                        return presigned
+            except Exception as exc:
+                _logger.warning("R2 API presigned URL failed: %s", str(exc)[:80])
+
+        _logger.error("No download URL method available for %s", object_key)
+        raise RuntimeError("Export download is not configured. Contact support.")
 
     # ─── Helper ───────────────────────────────────────────────────────────────
 

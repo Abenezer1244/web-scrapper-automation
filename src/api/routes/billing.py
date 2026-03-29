@@ -149,8 +149,6 @@ async def create_checkout(
 ) -> dict:
     """Create a Stripe Checkout session to upgrade the user's plan."""
     price_or_product_id = body.price_id
-    if price_or_product_id not in _PRICE_TO_PLAN:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
 
     # Resolve Product ID → Price ID (hardcoded to avoid extra Stripe API calls)
     _PRODUCT_TO_PRICE = {
@@ -159,6 +157,10 @@ async def create_checkout(
         "prod_UANxJNomPNWE5l": "price_1TC3BRHE9wT1C7yZ6Jja7hHZ",  # Agency
     }
     stripe_price_id = _PRODUCT_TO_PRICE.get(price_or_product_id, price_or_product_id)
+
+    # Validate: must resolve to a known price
+    if stripe_price_id not in _PRICE_TO_PLAN:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
 
     try:
         customer_id = current_user.stripe_customer_id
@@ -198,7 +200,7 @@ async def customer_portal(current_user: CurrentUser) -> dict:
     if not current_user.stripe_customer_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No active subscription found",
+            detail="No active subscription. Choose a plan below to get started.",
         )
     session = stripe.billing_portal.Session.create(
         customer=current_user.stripe_customer_id,

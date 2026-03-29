@@ -152,13 +152,15 @@ async def create_checkout(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
 
     # Resolve to actual Stripe Price ID if we have a Product ID (prod_xxx)
+    import asyncio
     stripe_price_id = price_or_product_id
     if price_or_product_id.startswith("prod_"):
         try:
-            product = stripe.Product.retrieve(price_or_product_id)
+            loop = asyncio.get_event_loop()
+            product = await loop.run_in_executor(None, stripe.Product.retrieve, price_or_product_id)
             stripe_price_id = product.default_price
             if not stripe_price_id:
-                prices = stripe.Price.list(product=price_or_product_id, active=True, limit=1)
+                prices = await loop.run_in_executor(None, lambda: stripe.Price.list(product=price_or_product_id, active=True, limit=1))
                 if prices.data:
                     stripe_price_id = prices.data[0].id
                 else:
@@ -170,9 +172,8 @@ async def create_checkout(
 
     customer_id = current_user.stripe_customer_id
     if not customer_id:
-        customer = stripe.Customer.create(
-            email=current_user.email,
-            metadata={"user_id": current_user.id},
+        customer = await loop.run_in_executor(
+            None, lambda: stripe.Customer.create(email=current_user.email, metadata={"user_id": current_user.id})
         )
         customer_id = customer.id
         result = await db.execute(select(User).where(User.id == current_user.id))
@@ -181,14 +182,17 @@ async def create_checkout(
         await db.flush()
 
     try:
-        session = stripe.checkout.Session.create(
-            customer=customer_id,
-            mode="subscription",
-            line_items=[{"price": stripe_price_id, "quantity": 1}],
-            success_url=f"{settings.FRONTEND_URL}/settings?upgrade=success",
-            cancel_url=f"{settings.FRONTEND_URL}/settings?upgrade=cancelled",
-            metadata={"user_id": current_user.id, "price_id": price_or_product_id},
-            allow_promotion_codes=True,
+        session = await loop.run_in_executor(
+            None,
+            lambda: stripe.checkout.Session.create(
+                customer=customer_id,
+                mode="subscription",
+                line_items=[{"price": stripe_price_id, "quantity": 1}],
+                success_url=f"{settings.FRONTEND_URL}/settings?upgrade=success",
+                cancel_url=f"{settings.FRONTEND_URL}/settings?upgrade=cancelled",
+                metadata={"user_id": current_user.id, "price_id": price_or_product_id},
+                allow_promotion_codes=True,
+            ),
         )
         return {"checkout_url": session.url}
     except Exception as e:

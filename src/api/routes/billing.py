@@ -176,6 +176,7 @@ async def create_checkout(
         session = stripe.checkout.Session.create(
             customer=customer_id,
             mode="subscription",
+            payment_method_types=["card"],
             line_items=[{"price": stripe_price_id, "quantity": 1}],
             success_url=f"{settings.FRONTEND_URL}/settings?upgrade=success",
             cancel_url=f"{settings.FRONTEND_URL}/settings?upgrade=cancelled",

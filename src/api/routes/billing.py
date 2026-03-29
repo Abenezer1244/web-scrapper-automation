@@ -147,9 +147,25 @@ async def create_checkout(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Create a Stripe Checkout session to upgrade the user's plan."""
-    price_id = body.price_id
-    if price_id not in _PRICE_TO_PLAN:
+    price_or_product_id = body.price_id
+    if price_or_product_id not in _PRICE_TO_PLAN:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
+
+    # Resolve to actual Stripe Price ID if we have a Product ID (prod_xxx)
+    stripe_price_id = price_or_product_id
+    if price_or_product_id.startswith("prod_"):
+        try:
+            product = stripe.Product.retrieve(price_or_product_id)
+            stripe_price_id = product.default_price
+            if not stripe_price_id:
+                # List prices for this product and use the first active one
+                prices = stripe.Price.list(product=price_or_product_id, active=True, limit=1)
+                if prices.data:
+                    stripe_price_id = prices.data[0].id
+                else:
+                    raise HTTPException(status_code=400, detail="No price found for this plan")
+        except stripe.error.StripeError as e:
+            raise HTTPException(status_code=502, detail=f"Stripe error: {str(e)[:100]}")
 
     customer_id = current_user.stripe_customer_id
     if not customer_id:
@@ -166,10 +182,10 @@ async def create_checkout(
     session = stripe.checkout.Session.create(
         customer=customer_id,
         mode="subscription",
-        line_items=[{"price": price_id, "quantity": 1}],
+        line_items=[{"price": stripe_price_id, "quantity": 1}],
         success_url=f"{settings.FRONTEND_URL}/settings?upgrade=success",
         cancel_url=f"{settings.FRONTEND_URL}/settings?upgrade=cancelled",
-        metadata={"user_id": current_user.id},
+        metadata={"user_id": current_user.id, "price_id": price_or_product_id},
         allow_promotion_codes=True,
     )
     return {"checkout_url": session.url}

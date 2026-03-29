@@ -399,44 +399,53 @@ async def download_export(
 
     import csv
     import io
+    from sqlalchemy import text
 
-    # Generate CSV directly from database results (most reliable)
-    results_query = await db.execute(
-        select(Result).where(Result.job_id == job_id, Result.user_id == user.id)
-    )
-    records = results_query.scalars().all()
+    try:
+        # Set RLS context for this session
+        await db.execute(text(f"SET LOCAL app.current_user_id = '{user.id}'"))
 
-    if not records:
-        raise HTTPException(status_code=404, detail="No records found for this job")
+        # Generate CSV directly from database results
+        results_query = await db.execute(
+            select(Result).where(Result.job_id == job_id, Result.user_id == user.id)
+        )
+        records = results_query.scalars().all()
 
-    # Build CSV in memory
-    output = io.StringIO()
-    fieldnames = [
-        "date_recorded", "party_name", "heirs", "parcel_id",
-        "property_address", "mailing_address", "legal_description",
-    ]
-    writer = csv.DictWriter(output, fieldnames=fieldnames)
-    writer.writeheader()
-    for r in records:
-        writer.writerow({
-            "date_recorded": r.date_recorded or "",
-            "party_name": r.party_name or "",
-            "heirs": r.heirs or "",
-            "parcel_id": r.parcel_id or "",
-            "property_address": r.property_address or "",
-            "mailing_address": r.mailing_address or "",
-            "legal_description": r.legal_description or "",
-        })
+        if not records:
+            raise HTTPException(status_code=404, detail="No records found for this job")
 
-    csv_bytes = output.getvalue().encode("utf-8")
+        # Build CSV in memory
+        output = io.StringIO()
+        fieldnames = [
+            "date_recorded", "party_name", "heirs", "parcel_id",
+            "property_address", "mailing_address", "legal_description",
+        ]
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in records:
+            writer.writerow({
+                "date_recorded": r.date_recorded or "",
+                "party_name": r.party_name or "",
+                "heirs": r.heirs or "",
+                "parcel_id": r.parcel_id or "",
+                "property_address": r.property_address or "",
+                "mailing_address": r.mailing_address or "",
+                "legal_description": r.legal_description or "",
+            })
 
-    from starlette.responses import Response
+        csv_bytes = output.getvalue().encode("utf-8")
 
-    return Response(
-        content=csv_bytes,
-        media_type="text/csv",
-        headers={
-            "Content-Disposition": f'attachment; filename="bridgeleads_{job_id[:8]}.csv"',
-            "Cache-Control": "private, max-age=3600",
-        },
-    )
+        from starlette.responses import Response
+
+        return Response(
+            content=csv_bytes,
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f'attachment; filename="bridgeleads_{job_id[:8]}.csv"',
+                "Cache-Control": "private, max-age=3600",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Download error: {str(exc)[:200]}")

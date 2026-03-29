@@ -321,7 +321,7 @@ async def stream_logs(
 
 # ─── Export URL (presigned R2 download) ──────────────────────────────────────
 
-@router.get("/jobs/{job_id}/export-url", tags=["jobs"])
+@router.get("/{job_id}/export-url", tags=["jobs"])
 async def get_export_url(
     job_id: str,
     user: CurrentUser,

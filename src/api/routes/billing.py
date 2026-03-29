@@ -158,14 +158,15 @@ async def create_checkout(
             product = stripe.Product.retrieve(price_or_product_id)
             stripe_price_id = product.default_price
             if not stripe_price_id:
-                # List prices for this product and use the first active one
                 prices = stripe.Price.list(product=price_or_product_id, active=True, limit=1)
                 if prices.data:
                     stripe_price_id = prices.data[0].id
                 else:
                     raise HTTPException(status_code=400, detail="No price found for this plan")
-        except stripe.error.StripeError as e:
-            raise HTTPException(status_code=502, detail=f"Stripe error: {str(e)[:100]}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Stripe lookup error: {type(e).__name__}: {str(e)[:100]}")
 
     customer_id = current_user.stripe_customer_id
     if not customer_id:
@@ -179,16 +180,19 @@ async def create_checkout(
         user.stripe_customer_id = customer_id
         await db.flush()
 
-    session = stripe.checkout.Session.create(
-        customer=customer_id,
-        mode="subscription",
-        line_items=[{"price": stripe_price_id, "quantity": 1}],
-        success_url=f"{settings.FRONTEND_URL}/settings?upgrade=success",
-        cancel_url=f"{settings.FRONTEND_URL}/settings?upgrade=cancelled",
-        metadata={"user_id": current_user.id, "price_id": price_or_product_id},
-        allow_promotion_codes=True,
-    )
-    return {"checkout_url": session.url}
+    try:
+        session = stripe.checkout.Session.create(
+            customer=customer_id,
+            mode="subscription",
+            line_items=[{"price": stripe_price_id, "quantity": 1}],
+            success_url=f"{settings.FRONTEND_URL}/settings?upgrade=success",
+            cancel_url=f"{settings.FRONTEND_URL}/settings?upgrade=cancelled",
+            metadata={"user_id": current_user.id, "price_id": price_or_product_id},
+            allow_promotion_codes=True,
+        )
+        return {"checkout_url": session.url}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Checkout failed: {type(e).__name__}: {str(e)[:200]}")
 
 
 # ─── Customer portal ──────────────────────────────────────────────────────────

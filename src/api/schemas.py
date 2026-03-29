@@ -40,9 +40,21 @@ class UserResponse(BaseModel):
     plan: str
     records_used: int
     records_limit: int
+    trial_ends_at: datetime | None = None
+    is_trial: bool = False
+    trial_days_remaining: int | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.trial_ends_at:
+            now = datetime.utcnow()
+            ends = self.trial_ends_at.replace(tzinfo=None) if self.trial_ends_at.tzinfo else self.trial_ends_at
+            remaining = (ends - now).total_seconds()
+            if remaining > 0:
+                self.is_trial = True
+                self.trial_days_remaining = max(0, int(remaining / 86400))
 
 
 class TokenResponse(BaseModel):

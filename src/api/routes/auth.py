@@ -48,12 +48,17 @@ async def register(
             detail="Registration failed. Please try again.",
         )
 
+    from datetime import UTC, datetime, timedelta
+
+    trial_end = datetime.now(UTC) + timedelta(days=7)
+
     user = User(
         id=str(uuid.uuid4()),
         email=body.email,
         password_hash=hash_password(body.password),
-        plan="starter",
-        records_limit=settings.PLAN_LIMITS["starter"],
+        plan="pro",
+        records_limit=settings.PLAN_LIMITS["pro"],  # 500 records during trial
+        trial_ends_at=trial_end,
     )
     db.add(user)
     await db.flush()

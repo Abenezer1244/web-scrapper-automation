@@ -36,6 +36,10 @@ app.conf.beat_schedule = {
         "task": "src.workers.scheduler.purge_old_records",
         "schedule": crontab(hour=3, minute=0, day_of_week=0),
     },
+    "expire-trials": {
+        "task": "src.workers.scheduler.expire_trials",
+        "schedule": 3600.0,  # every 1 hour
+    },
 }
 
 
@@ -263,7 +267,48 @@ def reset_monthly_usage() -> None:
         _logger.info("Monthly reset complete — cleared records_used for %d users", result.rowcount)
 
 
-# ─── Task 5: Daily county scrape ────────────────────────────────────────────
+# ─── Task 5: Expire free trials ──────────────────────────────────────────────
+
+@app.task(name="src.workers.scheduler.expire_trials")
+def expire_trials() -> None:
+    """Downgrade expired trial users from Pro to Starter.
+
+    Runs hourly. Finds users where trial_ends_at < now and plan is still 'pro'
+    with no stripe_customer_id (paying users keep their plan).
+    """
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select, update
+
+    from src.db.models import User
+    from src.db.session import SyncSessionLocal
+
+    now = datetime.now(UTC)
+
+    with SyncSessionLocal() as db:
+        # Find trial users whose trial has expired and who haven't paid
+        expired = db.execute(
+            select(User).where(
+                User.trial_ends_at.isnot(None),
+                User.trial_ends_at < now,
+                User.plan != "starter",
+                User.stripe_customer_id.is_(None),  # Not a paying customer
+            )
+        ).scalars().all()
+
+        for user in expired:
+            user.plan = "starter"
+            user.records_limit = 50  # Starter limit
+            _logger.info("Trial expired for %s — downgraded to starter", user.email)
+
+        if expired:
+            db.commit()
+            _logger.info("Expired %d trials", len(expired))
+        else:
+            _logger.info("No expired trials to process")
+
+
+# ─── Task 6: Daily county scrape ────────────────────────────────────────────
 
 @app.task(name="src.workers.scheduler.scrape_county_daily")
 def scrape_county_daily() -> None:

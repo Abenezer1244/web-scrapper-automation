@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
-from src.api.deps import get_rls_db
+from src.api.deps import get_db, get_rls_db
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.schemas import JobCreate, JobResponse, LogLine, ResultRow, ResultsPage
 from src.config import settings
@@ -346,7 +346,7 @@ async def download_export(
     job_id: str,
     token: str = Query(default=""),
     request: Request = None,
-    db: AsyncSession = Depends(get_rls_db),
+    db: AsyncSession = Depends(get_db),
 ):
     """Stream the CSV export directly from R2 via Cloudflare API.
 
@@ -368,12 +368,20 @@ async def download_export(
         raise HTTPException(status_code=401, detail="Authentication required")
 
     try:
-        payload = pyjwt.decode(auth_token, app_settings.SECRET_KEY, algorithms=["HS256"], audience="bridgeleads-api")
+        payload = pyjwt.decode(
+            auth_token,
+            app_settings.SECRET_KEY,
+            algorithms=["HS256"],
+            audience="bridgeleads-api",
+            issuer="bridgeleads",
+        )
         user_id = payload.get("sub")
         if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token")
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
+            raise HTTPException(status_code=401, detail="Invalid token: no sub claim")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid or expired credentials")
 
     user_result = await db.execute(select(User).where(User.id == user_id))
     user = user_result.scalar_one_or_none()

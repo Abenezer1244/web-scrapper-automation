@@ -152,7 +152,6 @@ async def create_checkout(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
 
     # Resolve Product ID → Price ID (hardcoded to avoid extra Stripe API calls)
-    import asyncio
     _PRODUCT_TO_PRICE = {
         "prod_UANuoAMKafnDJ5": "price_1TC38PHE9wT1C7yZ7XDpF2Ln",  # Pro
         "prod_UANwwzFn0msFok": "price_1TC3AgHE9wT1C7yZWVcdX3cv",  # Business
@@ -160,32 +159,31 @@ async def create_checkout(
     }
     stripe_price_id = _PRODUCT_TO_PRICE.get(price_or_product_id, price_or_product_id)
 
-    loop = asyncio.get_event_loop()
-    customer_id = current_user.stripe_customer_id
-    if not customer_id:
-        customer = await loop.run_in_executor(
-            None, lambda: stripe.Customer.create(email=current_user.email, metadata={"user_id": current_user.id})
-        )
-        customer_id = customer.id
-        result = await db.execute(select(User).where(User.id == current_user.id))
-        user = result.scalar_one()
-        user.stripe_customer_id = customer_id
-        await db.flush()
-
     try:
-        session = await loop.run_in_executor(
-            None,
-            lambda: stripe.checkout.Session.create(
-                customer=customer_id,
-                mode="subscription",
-                line_items=[{"price": stripe_price_id, "quantity": 1}],
-                success_url=f"{settings.FRONTEND_URL}/settings?upgrade=success",
-                cancel_url=f"{settings.FRONTEND_URL}/settings?upgrade=cancelled",
-                metadata={"user_id": current_user.id, "price_id": price_or_product_id},
-                allow_promotion_codes=True,
-            ),
+        customer_id = current_user.stripe_customer_id
+        if not customer_id:
+            customer = stripe.Customer.create(
+                email=current_user.email,
+                metadata={"user_id": current_user.id},
+            )
+            customer_id = customer.id
+            result = await db.execute(select(User).where(User.id == current_user.id))
+            user = result.scalar_one()
+            user.stripe_customer_id = customer_id
+            await db.flush()
+
+        session = stripe.checkout.Session.create(
+            customer=customer_id,
+            mode="subscription",
+            line_items=[{"price": stripe_price_id, "quantity": 1}],
+            success_url=f"{settings.FRONTEND_URL}/settings?upgrade=success",
+            cancel_url=f"{settings.FRONTEND_URL}/settings?upgrade=cancelled",
+            metadata={"user_id": current_user.id, "price_id": price_or_product_id},
+            allow_promotion_codes=True,
         )
         return {"checkout_url": session.url}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Checkout failed: {type(e).__name__}: {str(e)[:200]}")
 

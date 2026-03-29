@@ -175,6 +175,18 @@ class DataExporter:
         _logger.info("Uploaded to R2: %s", object_key)
         return object_key
 
+    def download_object(self, object_key: str) -> bytes:
+        """Download an object from R2 and return its bytes.
+
+        Uses the Cloudflare REST API (same auth as upload).
+        """
+        url = f"{_r2_api_base()}/objects/{object_key}"
+        resp = _requests.get(url, headers=_r2_headers(), timeout=60)
+        if resp.status_code != 200:
+            raise RuntimeError(f"R2 download failed ({resp.status_code}): {resp.text[:200]}")
+        _logger.info("Downloaded from R2: %s (%d bytes)", object_key, len(resp.content))
+        return resp.content
+
     def get_download_url(self, object_key: str, expires_in: int = 3600) -> str:
         """Generate a temporary download URL for an R2 object.
 

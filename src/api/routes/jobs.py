@@ -398,31 +398,36 @@ async def download_export(
         raise HTTPException(status_code=404, detail="No export available yet")
 
     from src.config import settings
+    from src.utils.data_exporter import DataExporter
 
-    # Download from R2 via Cloudflare API
-    account_id = settings.R2_ACCOUNT_ID
-    bucket = settings.R2_BUCKET_NAME
-    api_token = settings.R2_API_TOKEN
     object_key = job.export_key
-
-    r2_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/r2/buckets/{bucket}/objects/{object_key}"
-    headers = {"Authorization": f"Bearer {api_token}"}
-
-    try:
-        resp = sync_requests.get(r2_url, headers=headers, timeout=60, stream=True)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail="Failed to fetch export from storage")
-    except Exception:
-        raise HTTPException(status_code=502, detail="Storage service unavailable")
-
-    # Determine filename
     filename = object_key.split("/")[-1] or "leads.csv"
     content_type = "text/csv" if filename.endswith(".csv") else "application/octet-stream"
+
+    # Try S3-compatible download first (most reliable)
+    try:
+        exporter = DataExporter()
+        file_bytes = exporter.download_object(object_key)
+    except Exception as exc:
+        # Fallback: Cloudflare REST API
+        try:
+            account_id = settings.R2_ACCOUNT_ID
+            bucket = settings.R2_BUCKET_NAME
+            api_token = settings.R2_API_TOKEN
+            r2_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/r2/buckets/{bucket}/objects/{object_key}"
+            resp = sync_requests.get(r2_url, headers={"Authorization": f"Bearer {api_token}"}, timeout=60)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Storage returned {resp.status_code}")
+            file_bytes = resp.content
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=502, detail="Storage service unavailable")
 
     from starlette.responses import Response
 
     return Response(
-        content=resp.content,
+        content=file_bytes,
         media_type=content_type,
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',

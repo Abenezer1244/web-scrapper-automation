@@ -16,7 +16,7 @@ from src.api.deps import get_rls_db
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.schemas import JobCreate, JobResponse, LogLine, ResultRow, ResultsPage
 from src.config import settings
-from src.db import CountyConnector, Job, JobLog, Result, ScraperConfig
+from src.db import CountyConnector, Job, JobLog, Result, ScraperConfig, User
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -327,7 +327,7 @@ async def get_export_url(
     user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> dict:
-    """Generate a presigned download URL for the job's CSV export."""
+    """Return the direct download URL for the job's CSV export."""
     result = await db.execute(
         select(Job).where(Job.id == job_id, Job.user_id == user.id)
     )
@@ -337,8 +337,87 @@ async def get_export_url(
     if not job.export_key:
         raise HTTPException(status_code=404, detail="No export available yet")
 
-    from src.utils.data_exporter import DataExporter
+    # Return a URL to our own download proxy endpoint (avoids R2 auth issues)
+    return {"url": f"/jobs/{job_id}/download"}
 
-    exporter = DataExporter()
-    url = exporter.get_download_url(job.export_key, expires_in=3600)
-    return {"url": url}
+
+@router.get("/{job_id}/download", tags=["jobs"])
+async def download_export(
+    job_id: str,
+    token: str = Query(default=""),
+    request: Request = None,
+    db: AsyncSession = Depends(get_rls_db),
+):
+    """Stream the CSV export directly from R2 via Cloudflare API.
+
+    Accepts auth via either Authorization header or ?token= query parameter
+    (needed for window.open downloads where headers can't be set).
+    """
+    import requests as sync_requests
+    import jwt as pyjwt
+    from src.config import settings as app_settings
+
+    # Authenticate via query token or header
+    auth_token = token
+    if not auth_token and request:
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            auth_token = auth_header[7:]
+
+    if not auth_token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    try:
+        payload = pyjwt.decode(auth_token, app_settings.SECRET_KEY, algorithms=["HS256"], audience="bridgeleads-api")
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user_result = await db.execute(select(User).where(User.id == user_id))
+    user = user_result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    result = await db.execute(
+        select(Job).where(Job.id == job_id, Job.user_id == user.id)
+    )
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.export_key:
+        raise HTTPException(status_code=404, detail="No export available yet")
+
+    from src.config import settings
+
+    # Download from R2 via Cloudflare API
+    account_id = settings.R2_ACCOUNT_ID
+    bucket = settings.R2_BUCKET_NAME
+    api_token = settings.R2_API_TOKEN
+    object_key = job.export_key
+
+    r2_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/r2/buckets/{bucket}/objects/{object_key}"
+    headers = {"Authorization": f"Bearer {api_token}"}
+
+    try:
+        resp = sync_requests.get(r2_url, headers=headers, timeout=60, stream=True)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Failed to fetch export from storage")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Storage service unavailable")
+
+    # Determine filename
+    filename = object_key.split("/")[-1] or "leads.csv"
+    content_type = "text/csv" if filename.endswith(".csv") else "application/octet-stream"
+
+    from starlette.responses import Response
+
+    return Response(
+        content=resp.content,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "private, max-age=3600",
+        },
+    )

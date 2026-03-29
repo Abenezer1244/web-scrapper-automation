@@ -146,6 +146,16 @@ def run_scrape_job(self, job_id: str) -> None:
 
         _publish_log(r, job_id, "success", f"Scrape complete — {len(records)} records found")
 
+        # ── Cap records to user's remaining plan quota ────────────────────────
+        if user.records_limit != -1:
+            remaining = max(0, user.records_limit - (user.records_used or 0))
+            if remaining < len(records):
+                _publish_log(
+                    r, job_id, "warning",
+                    f"Plan limit: saving {remaining} of {len(records)} records. Upgrade for more."
+                )
+                records = records[:remaining]
+
         # ── ENRICHING ─────────────────────────────────────────────────────────
         _set_status(db, job, "enriching", record_count=len(records))
         _publish_log(r, job_id, "info", "Saving records to database...")
@@ -216,6 +226,11 @@ def run_scrape_job(self, job_id: str) -> None:
         # Update user's monthly record usage
         user.records_used = (user.records_used or 0) + len(records)
         db.commit()
+
+        # Check if user exceeded their limit and warn
+        if user.records_limit != -1 and user.records_used > user.records_limit:
+            overage = user.records_used - user.records_limit
+            _publish_log(r, job_id, "warning", f"Plan limit exceeded by {overage} records. Upgrade to keep scraping.")
 
         _publish_log(r, job_id, "success", f"Job complete — {len(records)} records ready")
         r.publish(f"job_logs:{job_id}", json.dumps({"type": "done", "record_count": len(records)}))

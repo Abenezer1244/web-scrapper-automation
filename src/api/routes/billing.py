@@ -2,6 +2,7 @@
 
 import stripe
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -135,13 +136,18 @@ async def get_subscription(current_user: CurrentUser) -> dict:
 
 # ─── Checkout ─────────────────────────────────────────────────────────────────
 
+class CheckoutRequest(BaseModel):
+    price_id: str
+
+
 @router.post("/checkout")
 async def create_checkout(
-    price_id: str,
+    body: CheckoutRequest,
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Create a Stripe Checkout session to upgrade the user's plan."""
+    price_id = body.price_id
     if price_id not in _PRICE_TO_PLAN:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
 

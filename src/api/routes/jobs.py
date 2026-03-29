@@ -354,7 +354,7 @@ async def download_export(
     (needed for window.open downloads where headers can't be set).
     """
     import requests as sync_requests
-    import jwt as pyjwt
+    from jose import jwt as jose_jwt, JWTError
     from src.config import settings as app_settings
 
     # Authenticate via query token or header
@@ -368,7 +368,7 @@ async def download_export(
         raise HTTPException(status_code=401, detail="Authentication required")
 
     try:
-        payload = pyjwt.decode(
+        payload = jose_jwt.decode(
             auth_token,
             app_settings.SECRET_KEY,
             algorithms=["HS256"],
@@ -378,10 +378,10 @@ async def download_export(
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token: no sub claim")
+    except JWTError as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid or expired credentials")
     except HTTPException:
         raise
-    except Exception as exc:
-        raise HTTPException(status_code=401, detail=f"Invalid or expired credentials")
 
     user_result = await db.execute(select(User).where(User.id == user_id))
     user = user_result.scalar_one_or_none()

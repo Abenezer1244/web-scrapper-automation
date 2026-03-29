@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.auth import CurrentUser
 from src.config import settings
 from src.db import User, get_db
+from src.api.deps import get_rls_db
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
@@ -144,7 +145,7 @@ class CheckoutRequest(BaseModel):
 async def create_checkout(
     body: CheckoutRequest,
     current_user: CurrentUser,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_rls_db),
 ) -> dict:
     """Create a Stripe Checkout session to upgrade the user's plan."""
     price_or_product_id = body.price_id

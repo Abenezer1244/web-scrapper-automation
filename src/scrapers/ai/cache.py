@@ -24,7 +24,7 @@ def _redis() -> sync_redis.Redis:
     kwargs = {}
     if settings.REDIS_URL.startswith("rediss://"):
         import ssl
-        kwargs["ssl_cert_reqs"] = ssl.CERT_REQUIRED
+        kwargs["ssl_cert_reqs"] = ssl.CERT_NONE  # Upstash uses custom certs not in system CA
     return sync_redis.from_url(settings.REDIS_URL, decode_responses=True, **kwargs)
 
 

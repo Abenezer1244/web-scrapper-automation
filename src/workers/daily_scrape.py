@@ -91,8 +91,7 @@ def run_daily_scrape_for_county(county: str, state: str) -> int:
                 return 0
 
             import redis
-            import ssl as _ssl
-            r = redis.from_url(settings.REDIS_URL, ssl_cert_reqs=_ssl.CERT_REQUIRED)
+            r = redis.from_url(settings.REDIS_URL, ssl_cert_reqs=None)  # Upstash custom certs
             records = asyncio.run(_run_scraper(scraper_class, date_from, date_to, r, "system_daily"))
 
             if not records:

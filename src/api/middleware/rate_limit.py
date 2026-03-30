@@ -30,8 +30,7 @@ def _get_redis() -> aioredis.Redis:
     if _redis_client is None:
         kwargs: dict = {"decode_responses": True}
         if settings.REDIS_URL.startswith("rediss://"):
-            import ssl
-            kwargs["ssl_cert_reqs"] = ssl.CERT_REQUIRED
+            kwargs["ssl_cert_reqs"] = None  # Upstash uses custom certs not in system CA
         _redis_client = aioredis.from_url(settings.REDIS_URL, **kwargs)
     return _redis_client
 

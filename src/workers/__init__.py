@@ -14,7 +14,7 @@ app = Celery(
 
 # Upstash Redis uses TLS (rediss://) — kombu needs explicit SSL config
 if settings.REDIS_URL.startswith("rediss://"):
-    _ssl_opts = {"ssl_cert_reqs": ssl.CERT_REQUIRED}
+    _ssl_opts = {"ssl_cert_reqs": ssl.CERT_NONE}  # Upstash uses custom certs not in system CA
     app.conf.broker_use_ssl = _ssl_opts
     app.conf.redis_backend_use_ssl = _ssl_opts
 

@@ -245,6 +245,18 @@ async def stripe_webhook(
             detail="Invalid webhook signature",
         )
 
+    # Idempotency: skip duplicate webhook deliveries
+    import aioredis
+    redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+    event_id = event.get("id", "")
+    if event_id:
+        dedup_key = f"stripe_event:{event_id}"
+        if await redis.get(dedup_key):
+            await redis.aclose()
+            return {"received": True}
+        await redis.setex(dedup_key, 3600, "1")
+    await redis.aclose()
+
     event_type: str = event["type"]
     data: dict = event["data"]["object"]
 

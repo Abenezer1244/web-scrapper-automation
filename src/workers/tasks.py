@@ -223,9 +223,15 @@ def run_scrape_job(self, job_id: str) -> None:
             export_key=object_key,
         )
 
-        # Update user's monthly record usage
-        user.records_used = (user.records_used or 0) + len(records)
+        # Atomic update of monthly record usage to prevent race conditions
+        from sqlalchemy import update as sa_update
+        db.execute(
+            sa_update(User)
+            .where(User.id == user.id)
+            .values(records_used=User.records_used + len(records))
+        )
         db.commit()
+        db.refresh(user)
 
         # Check if user exceeded their limit and warn
         if user.records_limit != -1 and user.records_used > user.records_limit:

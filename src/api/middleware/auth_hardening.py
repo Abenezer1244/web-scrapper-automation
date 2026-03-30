@@ -16,7 +16,8 @@ def _get_redis() -> aioredis.Redis:
     if _redis_client is None:
         kwargs: dict = {"decode_responses": True}
         if settings.REDIS_URL.startswith("rediss://"):
-            kwargs["ssl_cert_reqs"] = None
+            import ssl
+            kwargs["ssl_cert_reqs"] = ssl.CERT_REQUIRED
         _redis_client = aioredis.from_url(settings.REDIS_URL, **kwargs)
     return _redis_client
 

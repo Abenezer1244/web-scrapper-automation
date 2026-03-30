@@ -44,11 +44,8 @@ class AIScraper(BridgeScraper):
         self._total_input_tokens = 0
         self._total_output_tokens = 0
 
-        # Register the domain for SSRF allowlist
-        from urllib.parse import urlparse
-        domain = urlparse(base_url).hostname
-        if domain:
-            add_scrape_domain(domain)
+        # Domain is validated at connector creation time via validate_scraping_target()
+        # No dynamic domain registration — only pre-approved domains are allowed
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         """Run full AI-powered scrape for the given date range.

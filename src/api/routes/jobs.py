@@ -383,10 +383,21 @@ async def download_export(
             issuer="bridgeleads",
         )
         user_id = payload.get("sub")
+        jti = payload.get("jti", "")
+        iat = payload.get("iat", 0)
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token: no sub claim")
+
+        # Check token blacklist (logout / revoke-all)
+        from src.api.middleware.auth_hardening import TokenBlacklist
+        if jti and await TokenBlacklist.is_blacklisted(jti):
+            raise HTTPException(status_code=401, detail="Token has been revoked")
+        revoke_time = await TokenBlacklist.get_user_revoke_time(user_id)
+        if revoke_time and iat < revoke_time:
+            raise HTTPException(status_code=401, detail="Token has been revoked")
+
     except JWTError as exc:
-        raise HTTPException(status_code=401, detail=f"Invalid or expired credentials")
+        raise HTTPException(status_code=401, detail="Invalid or expired credentials")
     except HTTPException:
         raise
 

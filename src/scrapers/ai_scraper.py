@@ -8,7 +8,7 @@ Usage:
         records = await scraper.scrape("01/01/2025", "03/01/2025")
 """
 
-from src.api.middleware.security import add_scrape_domain
+# SSRF validation happens at connector creation time (scrapers.py route handler)
 from src.scrapers.ai.cache import get_cached_actions, invalidate_cache, save_cached_actions
 from src.scrapers.ai.extractor import ai_extract_records
 from src.scrapers.ai.navigator import (

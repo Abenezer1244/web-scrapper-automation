@@ -287,6 +287,10 @@ async def stream_logs(
             return
 
         # 3. Subscribe to Redis Pub/Sub channel for live events
+        import time as _time
+        max_duration = 1800  # 30 minutes max SSE connection
+        start_time = _time.time()
+
         r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
         pubsub = r.pubsub()
         channel = f"job_logs:{job_id}"
@@ -294,6 +298,9 @@ async def stream_logs(
 
         try:
             while True:
+                if _time.time() - start_time > max_duration:
+                    yield "data: {\"type\": \"timeout\"}\n\n"
+                    break
                 message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=30.0)
                 if message and message.get("type") == "message":
                     yield f"data: {message['data']}\n\n"
@@ -402,8 +409,11 @@ async def download_export(
     from sqlalchemy import text
 
     try:
-        # Set RLS context for this session
-        await db.execute(text(f"SET LOCAL app.current_user_id = '{user.id}'"))
+        # Set RLS context for this session (parameterized to prevent injection)
+        await db.execute(
+            text("SELECT set_config('app.current_user_id', :uid, true)"),
+            {"uid": str(user.id)},
+        )
 
         # Generate CSV directly from database results
         results_query = await db.execute(
@@ -448,4 +458,5 @@ async def download_export(
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Download error: {str(exc)[:200]}")
+        _logger.exception("Download error for job %s", job_id)
+        raise HTTPException(status_code=500, detail="Download temporarily unavailable")

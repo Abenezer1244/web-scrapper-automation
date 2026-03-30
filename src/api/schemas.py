@@ -11,9 +11,11 @@ class UserRegister(BaseModel):
 
     @field_validator("password")
     @classmethod
-    def password_min_length(cls, v: str) -> str:
-        if len(v) < 8:
-            raise ValueError("Password must be at least 8 characters")
+    def password_validation(cls, v: str) -> str:
+        if len(v) < 10:
+            raise ValueError("Password must be at least 10 characters")
+        if len(v) > 72:
+            raise ValueError("Password must not exceed 72 characters")
         return v
 
 
@@ -78,9 +80,16 @@ class ScheduleConfig(BaseModel):
 
 
 class DeliverConfig(BaseModel):
-    emails: list[str] = []
+    emails: list[EmailStr] = []
     formats: list[str] = ["csv"]    # csv | excel | json (one or more)
     webhook_url: str | None = None
+
+    @field_validator("emails")
+    @classmethod
+    def limit_recipients(cls, v: list) -> list:
+        if len(v) > 10:
+            raise ValueError("Maximum 10 delivery email addresses")
+        return v
 
 
 class FieldsConfig(BaseModel):

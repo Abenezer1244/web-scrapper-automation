@@ -93,7 +93,20 @@ def get_scraper_class(county: str, state: str, record_type: str):
         )
 
     # Manual mode: dynamically import the hand-coded scraper class
+    # SECURITY: Only allow imports from pre-approved modules to prevent code injection
+    _ALLOWED_SCRAPER_MODULES = frozenset([
+        "src.scrapers.pierce_wa_probate",
+        "src.scrapers.ai_scraper",
+        "src.scrapers.base_scraper",
+    ])
+
     module_path, class_name = connector.scraper_class.rsplit(".", 1)
+
+    if module_path not in _ALLOWED_SCRAPER_MODULES:
+        raise UnsupportedCountyError(
+            f"Scraper module '{module_path}' not in allowlist"
+        )
+
     try:
         module = importlib.import_module(module_path)
         scraper_class = getattr(module, class_name)

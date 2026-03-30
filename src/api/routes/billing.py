@@ -10,6 +10,9 @@ from src.api.auth import CurrentUser
 from src.config import settings
 from src.db import User, get_db
 from src.api.deps import get_rls_db
+from src.utils.logger import setup_logger
+
+_logger = setup_logger("billing")
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
@@ -190,7 +193,8 @@ async def create_checkout(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Checkout failed: {type(e).__name__}: {str(e)[:200]}")
+        _logger.exception("Checkout failed for user %s", current_user.id)
+        raise HTTPException(status_code=502, detail="Checkout temporarily unavailable")
 
 
 # ─── Customer portal ──────────────────────────────────────────────────────────
@@ -216,7 +220,7 @@ async def customer_portal(current_user: CurrentUser) -> dict:
 async def stripe_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db),
-    stripe_signature: str = Header(None, alias="stripe-signature"),
+    stripe_signature: str = Header(..., alias="stripe-signature"),
 ) -> dict:
     """Handle Stripe webhook events to keep plan state in sync.
 
@@ -226,6 +230,9 @@ async def stripe_webhook(
       - customer.subscription.deleted   → downgrade to starter
       - invoice.payment_failed          → notify user by email
     """
+    if not settings.STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="Webhook not configured")
+
     payload = await request.body()
 
     try:

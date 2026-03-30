@@ -3,7 +3,7 @@
 import uuid
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -203,8 +203,8 @@ async def get_cached_records(
     config_id: str,
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
-    page: int = 1,
-    page_size: int = 50,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
     q: str | None = None,
 ):
     """Serve pre-scraped records from cache with per-user 'new' badges."""

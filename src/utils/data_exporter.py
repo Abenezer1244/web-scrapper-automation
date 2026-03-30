@@ -117,11 +117,18 @@ class DataExporter:
         return filepath
 
     def to_json(self, records: list[dict[str, Any]], filename: str = "export") -> Path:
-        """Export records to JSON (orient=records)."""
+        """Export records to JSON (orient=records) with sanitization."""
         filepath = self._timestamped_path(filename, "json")
+        # Sanitize string values before export
+        sanitized = []
+        for row in records:
+            clean_row = {}
+            for k, v in row.items():
+                clean_row[k] = sanitize_for_csv(str(v)) if isinstance(v, str) and v else v
+            sanitized.append(clean_row)
         with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(records, f, ensure_ascii=False, indent=2, default=str)
-        _logger.info("JSON exported: %s (%d rows)", filepath.name, len(records))
+            json.dump(sanitized, f, ensure_ascii=False, indent=2, default=str)
+        _logger.info("JSON exported: %s (%d rows)", filepath.name, len(sanitized))
         return filepath
 
     def export(

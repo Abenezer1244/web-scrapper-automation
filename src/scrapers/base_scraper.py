@@ -32,6 +32,7 @@ class ScrapedRecord:
     party_name: str | None = None
     heirs: str | None = None
     legal_description: str | None = None
+    doc_type: str | None = None
     parcel_id: str | None = None
     property_address: str | None = None
     mailing_address: str | None = None
@@ -44,6 +45,7 @@ class ScrapedRecord:
             "party_name": self.party_name,
             "heirs": self.heirs,
             "legal_description": self.legal_description,
+            "doc_type": self.doc_type,
             "parcel_id": self.parcel_id,
             "property_address": self.property_address,
             "mailing_address": self.mailing_address,

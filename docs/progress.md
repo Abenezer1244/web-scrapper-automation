@@ -1,177 +1,62 @@
-# BridgeLeads — Progress Report
+# BridgeLeads — Progress
 
-**Date:** 2026-03-23 (comprehensive update)
-**Status:** Production SaaS — backend scraping live, frontend deployed, cached records system built
+## Current State (2026-04-01)
 
----
+### Production Stats
+- **74,430+ records** scraped across 10 WA counties
+- **97 Pierce County records** with 98% parcel IDs and 90% addresses
+- **King County probate scraper live** — 40 records/week, 6 cause types
+- **34 active county connectors** in database
+- **90 users**, Agency plan active
+- **Daily scrape enabled** at 2 AM PT (9 AM UTC)
 
-## Session Summary (2026-03-22 to 2026-03-23)
+### Infrastructure
+- Railway: API + 4 workers + Beat scheduler (all redeployed 2026-03-26)
+- Supabase: PostgreSQL with RLS (8 tables)
+- Upstash: Redis (rate limiting, job logs, token blacklist)
+- Cloudflare R2: Export storage (CSV/Excel/JSON)
+- Resend: Email delivery
+- Stripe: Billing (4 plans: Starter/Pro/Business/Agency)
+- Vercel: Frontend (app.bridgeleads.io)
 
-### What Was Built This Session
+### What Works
+- EagleWeb template: 16 counties producing records at $0
+- Pierce County ARMS scraper: 88 PROBATE records with parcel IDs + addresses
+- Batch GIS enrichment: Free ArcGIS API, 50 parcels per call
+- Full job pipeline: PENDING → QUEUED → PROBING → SCRAPING → ENRICHING → DONE
+- Email delivery with pre-signed R2 download links
+- Stripe billing with webhook handlers
+- SSE live job logs
+- Daily scheduled scraping (Beat scheduler)
 
-#### Backend — Scraper Fixes
-- Fixed EagleWeb disclaimer (Playwright native click instead of JS el.click())
-- Fixed AcclaimWeb single-date field handling (#RecordDate)
-- Fixed Thurston EagleWeb variant (recordingDateIDStart/End date input IDs)
-- Added "eagleweb." domain pattern to template detection
-- Removed 5,000 record cap from template scrapers
-- Removed 200 enrichment cap — all records now enriched
-- Scaled to 4 replicas × 2 concurrency = 8 workers
-- Fixed MaxClients DB error (routed sync engine through pgbouncer port 6543)
-- Added --max-tasks-per-child=3 to prevent OOM
-- Updated Anthropic API key (credits topped up)
-- Triggered 32-county backfill with full enrichment
+### Recent Changes (2026-04-01)
+1. **King County probate scraper**: Custom scraper for King County Superior Court Clerk (Journal Technologies eCourt). Searches by filing date, extracts case number, party name, and cause of action (Estate, Trust, Guardianship, etc.). No CAPTCHA — uses `dja-prd-ecexap1.kingcounty.gov` instead of the recorder's office (which has reCAPTCHA). Registered in DB with `scraper_mode=manual`, included in daily schedule.
+2. **`doc_type` field added to `ScrapedRecord`**: Cause of action (Estate, Trust, Guardianship, etc.) stored separately in `county_records.doc_type` for frontend filtering.
 
-#### Backend — Cached Scraping System (NEW)
-- **Design spec:** `docs/superpowers/specs/2026-03-23-cached-scraping-design.md`
-- **Implementation plan:** `docs/superpowers/plans/2026-03-23-cached-scraping.md`
-- **New DB tables:** `county_records` (shared cache) + `user_record_views` (per-user "new" badges)
-- **New API endpoint:** `GET /scrapers/{config_id}/records` — serves cached records instantly with is_new flags
-- **Daily scrape worker:** `src/workers/daily_scrape.py` — runs at 2 AM UTC, backfills 90 days for new counties
-- **Beat tasks:** `scrape_county_daily` + `purge_old_records` (365-day retention)
-- **Settings:** `ENABLE_DAILY_SCRAPE=true`, `RECORD_RETENTION_DAYS=365`
-- **Atomic "new" badge:** SELECT FOR UPDATE + UPSERT pattern prevents race conditions
-- **RLS policies:** county_records (shared read), user_record_views (user-only)
-- **Verified E2E:** Benton County — 2,574 records served instantly, new badges working
+### Previous Changes (2026-03-30)
+1. **Landing page — CTA button fix**: "Start Free Trial" button was rendering as a tall green blob due to `display: inline` on the `<Link>` element. Added `inline-flex items-center` so the absolute-positioned shine overlay computes correct dimensions. Fixed both hero and bottom CTA buttons.
+2. **Landing page — Remotion video background**: Removed black background from product demo video. Made all 5 Remotion scenes (CountySelect, Scraping, Enrichment, Delivery, CallToAction) transparent. Removed dark card wrapper from player container.
+3. **Landing page — Solution video**: Added a second standalone Remotion video player in the Solution section. Animated "BridgeLeads does it all for you" with 3 staggered feature cards: county portal scraping, automatic enrichment, fresh daily leads. Each card slides in with numbered icons, green accent lines, and detail text.
+4. **CSS fix**: Invalid `.dark @keyframes pulse-amber` syntax fixed — `@keyframes` can't be nested inside a class selector. Renamed to `@keyframes pulse-amber-dark` with proper `.dark .pulse-amber` class override.
+5. **Vercel deployment**: Discovered GitHub webhook was missing — Vercel wasn't auto-deploying on push. Used `npx vercel --prod` CLI to deploy directly.
 
-#### Frontend — Landing Page (Phase 1)
-- **Repo:** `bridgeleads-web` on GitHub + Vercel
-- **URL:** https://bridgeleads-web.vercel.app/
-- **Design spec:** `docs/superpowers/specs/2026-03-23-frontend-ui-ux-design.md`
-- **Design system:** Generated via ui-ux-pro-max skill + taste-skill
-- Premium dark landing page with:
-  - Spline 3D animated background
-  - Progressive gradient blur overlay (6-layer backdrop-filter)
-  - Shimmer mask on headlines
-  - Word-by-word text reveal animation
-  - Section enter/exit blur transitions
-  - Horizontal snap-scroll carousel
-  - Glass card features with gradient icon containers
-  - Timeline process section
-  - 3-tier pricing with monthly/annual toggle
-  - Urgency-driven CTA sections
-  - Premium 4-column footer
-- Route setup: `/` = public landing, `/dashboard` = protected app
-- Vercel deployment protection disabled for public access
+### Previous Changes (2026-03-26)
+1. Pierce County scraper rewritten (615→405 lines)
+   - Infragistics date inputs fixed (keyboard typing)
+   - PROBATE checkbox fixed (Playwright click for ASP.NET)
+   - Pagination fixed (arrow buttons + page dropdown)
+   - Parcel extraction via Legal Description tab (96% hit rate)
+   - Batch GIS enrichment (90% address rate)
+2. Removed debug exception handler from main.py
+3. Removed dead _run_enrichment() from tasks.py
+4. Crash-safe browser cleanup in base_scraper.py
+5. Frontend: Custom date picker added to scraper wizard
+6. All Railway services redeployed
 
-#### Frontend — Dashboard + Records (Phase 2)
-- **Implementation plan:** `docs/superpowers/plans/2026-03-23-dashboard-records.md`
-- **New types:** `CachedRecord`, `CachedResultsPage` in `lib/types.ts`
-- **New API function:** `getCachedRecords()` in `lib/api.ts`
-- **New components:** `NewBadge`, `ScraperCard`
-- **Dashboard redesign:** Scraper config cards with new count badges + recent activity
-- **Cached records page:** `/scrapers/[id]/records` with NEW badges, search, pagination
-
----
-
-## Records Extracted (Confirmed Done)
-
-| County | Records | Method | Cost |
-|--------|---------|--------|------|
-| Spokane, WA | 5,653 | EagleWeb Template | $0 |
-| Kitsap, WA | 5,076 | EagleWeb Template | $0 |
-| Benton, WA | 4,528 | EagleWeb Template | $0 |
-| Grant, WA | 3,541 | EagleWeb Template | $0 |
-| Island, WA | 3,194 | EagleWeb Template | $0 |
-| Jefferson, WA | 1,413 | EagleWeb Template | $0 |
-| Whitman, WA | 1,087 | EagleWeb Template | $0 |
-| Pierce, WA | 325 | Manual Scraper | $0 |
-| Pierce AI, WA | 25 | AI Scraper | $0.10 |
-| Mason, WA | 14 | AI Scraper | $0.10 |
-| **TOTAL** | **24,856** | **10 counties** | **~$0.20** |
-
-**32-county backfill in progress** — 8 workers processing all active WA counties with full enrichment.
-
----
-
-## Infrastructure Status
-
-### Railway (Backend)
-- **API:** `api.bridgeleads.io` — FastAPI, deployed
-- **Worker:** 4 replicas × 2 concurrency = 8 workers
-- **Beat:** Celery beat scheduler with 6 periodic tasks
-- **Deploy:** Auto-deploy from GitHub push
-
-### Vercel (Frontend)
-- **URL:** https://bridgeleads-web.vercel.app/
-- **Stack:** Next.js 16, React 19, Tailwind CSS 4, Framer Motion, shadcn/ui
-- **Deploy:** Manual via `vercel deploy --prod`
-- **Auth:** NextAuth v5 (JWT + Credentials)
-
-### Database (Supabase)
-- **Tables:** users, scraper_configs, jobs, results, job_logs, county_connectors, county_records, user_record_views
-- **RLS:** Enabled on all tables
-- **Connection:** pgbouncer (port 6543) for workers, direct (port 5432) for async API
-
-### Key Environment Variables
-- `ENABLE_DAILY_SCRAPE=true` — daily county scrape at 2 AM UTC
-- `RECORD_RETENTION_DAYS=365` — auto-purge old records
-- `WORKER_CONCURRENCY=2` — per replica
-- `ANTHROPIC_API_KEY` — updated with funded key
-
----
-
-## Architecture
-
-```
-Visitor → Landing Page (Vercel, public)
-                ↓ Sign Up
-User → Dashboard (Vercel, protected)
-                ↓ GET /scrapers/{id}/records
-        API (Railway) → county_records table (cached)
-                            ↓ instant response + "NEW" badges
-                            ↓ user_record_views tracks last_viewed_at
-
-Nightly (2 AM UTC):
-        Beat Scheduler → scrape_county_daily task
-                            ↓ dispatches 1 task per county
-        8 Workers → EagleWeb/AcclaimWeb/AI scrapers
-                            ↓ records → county_records (ON CONFLICT DO NOTHING)
-                            ↓ enrichment → GIS APIs (property + mailing address)
-```
-
----
-
-## Remaining Work
-
-### Phase 3: Frontend (Not Started)
-- Scraper creation wizard redesign
-- Settings page redesign
-- Auth pages (login/register) redesign
-- Live job monitoring page redesign
-
-### Backend
-- Fix remaining failing counties (Tyler Self-Service, LandmarkWeb, custom portals)
-- AcclaimWeb Kendo Grid extraction (Chelan shows data but extraction gets 0)
-- Okanogan Tyler Self-Service disclaimer flow
-- State expansion (TX, FL, CA)
-
-### Product
-- Stripe billing integration testing
-- Email delivery via Resend
-- R2 export upload fix (currently Unauthorized)
-- Custom domain setup (bridgeleads.io)
-
----
-
-## Key Files & Specs
-
-| Document | Path |
-|----------|------|
-| UI/UX Design Spec | `docs/superpowers/specs/2026-03-23-frontend-ui-ux-design.md` |
-| Cached Scraping Spec | `docs/superpowers/specs/2026-03-23-cached-scraping-design.md` |
-| Cached Scraping Plan | `docs/superpowers/plans/2026-03-23-cached-scraping.md` |
-| Landing Page Plan | `docs/superpowers/plans/2026-03-23-landing-page.md` |
-| Dashboard Plan | `docs/superpowers/plans/2026-03-23-dashboard-records.md` |
-| Design System | `design-system/bridgeleads/MASTER.md` |
-
-## Cost Structure
-| Component | Monthly Cost |
-|-----------|-------------|
-| EagleWeb + AcclaimWeb scraping | $0 |
-| GIS enrichment (all WA) | $0 |
-| AI scraper (non-template counties) | ~$5-10 |
-| Railway hosting (API + 4 worker replicas + Beat) | ~$40 |
-| Supabase (PostgreSQL) | Free tier |
-| Vercel (Frontend) | Free tier |
-| **Total** | **~$45-50/mo** |
+### What Needs Work
+- AcclaimWeb template: 3 counties (Chelan, Douglas, Pend Oreille) — needs live testing
+- LandmarkWeb template: 2 counties (Clark, King?) — needs live testing
+- AVA Fidlar template: 1 county (Yakima) — needs live testing
+- 10 custom portal counties need individual scrapers
+- EagleWeb parcel ID extraction (detail page clicks) — varies by county
+- GIS enrichment coverage for non-Pierce counties

@@ -49,21 +49,26 @@ class KingWaProbateScraper(BridgeScraper):
         end = datetime.strptime(date_to, "%m/%d/%Y")
         chunk_days = 7
 
+        # Calculate total chunks for progress reporting
+        total_chunks = max(1, (end - start).days // chunk_days + 1)
+
         _logger.info(
-            "King County probate — %s to %s (%d-day chunks)",
-            date_from, date_to, chunk_days,
+            "King County probate — %s to %s (%d chunks of %d days)",
+            date_from, date_to, total_chunks, chunk_days,
         )
 
         all_records: list[ScrapedRecord] = []
         seen: set[str] = set()
         chunk_start = start
+        chunk_num = 0
 
         while chunk_start < end:
             chunk_end = min(chunk_start + timedelta(days=chunk_days), end)
             cf = chunk_start.strftime("%m/%d/%Y")
             ct = chunk_end.strftime("%m/%d/%Y")
+            chunk_num += 1
 
-            _logger.info("Chunk: %s to %s", cf, ct)
+            _logger.info("Chunk %d/%d: %s to %s", chunk_num, total_chunks, cf, ct)
 
             records = await self._search_chunk(cf, ct)
 
@@ -77,12 +82,13 @@ class KingWaProbateScraper(BridgeScraper):
                     new_count += 1
 
             _logger.info(
-                "Chunk %s–%s: %d new (total %d)",
-                cf, ct, new_count, len(all_records),
+                "Chunk %d/%d done: %d new (total %d)",
+                chunk_num, total_chunks, new_count, len(all_records),
             )
 
+            # Report progress so frontend shows live updates
             if self.on_progress:
-                self.on_progress(None, None, len(all_records))
+                self.on_progress(chunk_num, total_chunks, len(all_records))
 
             chunk_start = chunk_end
 
@@ -93,6 +99,15 @@ class KingWaProbateScraper(BridgeScraper):
         """Navigate to search page, fill dates, submit, extract all pages."""
         await self.navigate(_SEARCH_URL)
         await self.page.wait_for_timeout(4000)
+
+        # Set records per page to 150 (max) to reduce pagination
+        rpp_select = self.page.locator("select")
+        if await rpp_select.count() > 0:
+            try:
+                await rpp_select.first.select_option("150")
+                _logger.info("Set records per page to 150")
+            except Exception:
+                pass
 
         # Fill Filing Date range
         from_el = self.page.locator(_FROM_DATE_ID)

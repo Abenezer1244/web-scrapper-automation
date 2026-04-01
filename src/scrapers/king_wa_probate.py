@@ -70,7 +70,12 @@ class KingWaProbateScraper(BridgeScraper):
 
             _logger.info("Chunk %d/%d: %s to %s", chunk_num, total_chunks, cf, ct)
 
-            records = await self._search_chunk(cf, ct)
+            try:
+                records = await self._search_chunk(cf, ct)
+            except Exception as exc:
+                _logger.warning("Chunk %d/%d failed: %s — skipping", chunk_num, total_chunks, str(exc)[:100])
+                chunk_start = chunk_end
+                continue
 
             new_count = 0
             for record in records:
@@ -109,22 +114,17 @@ class KingWaProbateScraper(BridgeScraper):
             except Exception:
                 pass
 
-        # Fill Filing Date range
+        # Fill Filing Date range — use fill() directly (no click needed)
         from_el = self.page.locator(_FROM_DATE_ID)
         to_el = self.page.locator(_TO_DATE_ID)
 
-        await from_el.click()
         await from_el.fill(date_from)
-        await from_el.press("Tab")
         await self.page.wait_for_timeout(200)
-
-        await to_el.click()
         await to_el.fill(date_to)
-        await to_el.press("Tab")
         await self.page.wait_for_timeout(300)
 
-        # Submit search
-        await self.page.locator(_SUBMIT_ID).click()
+        # Submit search (force=True bypasses any overlay/navbar interception)
+        await self.page.locator(_SUBMIT_ID).click(force=True)
         _logger.info("Search submitted")
 
         # Wait for results table
@@ -275,7 +275,7 @@ class KingWaProbateScraper(BridgeScraper):
         try:
             next_link = self.page.locator('.pagination a')
             if await next_link.count() > 0:
-                await next_link.first.click()
+                await next_link.first.click(force=True)
                 await self.page.wait_for_timeout(5000)
                 return True
         except Exception:

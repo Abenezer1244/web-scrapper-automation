@@ -5,11 +5,17 @@ Platform: Journal Technologies eCourt
 No CAPTCHA required.
 
 Search by Filing Date range, extracts:
-- Case Number
+- Case Number (e.g. 26-4-02709-6 SEA)
 - Filing Date
-- Case Name (party name)
-- Cause of Action (Estate, Trust, Guardianship)
-- Status
+- Case Name / Party Name
+- Charge/Cause of Action:
+    Estate, Non Probate Notice to Creditor, Guardianship / Conservatorship,
+    Minor Settlement, Trust, Trust/Estate Dispute Resolution, Will Only,
+    Non Judicial Binding/TEDRA Agreement, Miscellaneous,
+    Emergency Minor Guardianship
+- Next Hearing date
+- Status (Active / Completed)
+- Court Location (SEA = Seattle, KNT = Kent)
 """
 
 import re
@@ -131,7 +137,7 @@ class KingWaProbateScraper(BridgeScraper):
             # Deduplicate by case number within this chunk
             new_records = []
             for r in records:
-                case_num = (r.legal_description or "").split(" | ")[0]
+                case_num = (r.enrichment_data or {}).get("case_number", "")
                 if case_num and case_num not in seen_cases:
                     seen_cases.add(case_num)
                     new_records.append(r)
@@ -190,8 +196,10 @@ class KingWaProbateScraper(BridgeScraper):
             for item in raw:
                 record = ScrapedRecord()
 
-                # Extract party name from case name (e.g. "IN RE JOHN DOE" -> "JOHN DOE")
-                case_name = item.get("case_name", "")
+                # Full case name preserved
+                case_name = item.get("case_name", "").strip()
+
+                # Extract party name (e.g. "IN RE JOHN DOE" -> "JOHN DOE")
                 name = re.sub(r"^IN\s+RE\s+(?:THE\s+)?(?:ESTATE\s+OF\s+)?", "", case_name, flags=re.IGNORECASE).strip()
                 if name:
                     record.party_name = name
@@ -202,15 +210,37 @@ class KingWaProbateScraper(BridgeScraper):
                 if date_match:
                     record.date_recorded = date_match.group(1)
 
-                # Case number as legal description
-                case_num = item.get("case_number", "")
-                if case_num:
-                    record.legal_description = case_num
-
-                # Cause of action as doc_type (e.g. Estate, Trust, Guardianship)
+                # Cause of action as doc_type
                 cause = item.get("cause", "").strip()
                 if cause:
                     record.doc_type = cause
+
+                # Case number
+                case_num = item.get("case_number", "").strip()
+                if case_num:
+                    record.legal_description = case_num
+
+                # Parse court location from case number (SEA/KNT suffix)
+                court_match = re.search(r"\b(SEA|KNT)\b", case_num)
+                court_location = court_match.group(1) if court_match else ""
+
+                # Next hearing (e.g. "Probate/Guardianship 05/21/2026")
+                next_hearing = item.get("next_hearing", "").strip()
+
+                # Status (e.g. "Active 03/27/2026", "Completed 03/27/2026")
+                status_raw = item.get("status", "").strip()
+                status = status_raw.split()[0] if status_raw else ""
+
+                # Store all King County-specific fields in enrichment_data
+                record.enrichment_data = {
+                    "source": "king_county_court",
+                    "case_number": case_num,
+                    "case_name": case_name,
+                    "cause_of_action": cause,
+                    "next_hearing": next_hearing,
+                    "status": status,
+                    "court_location": court_location,
+                }
 
                 if record.party_name or record.date_recorded:
                     records.append(record)

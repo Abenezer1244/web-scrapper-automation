@@ -1,23 +1,27 @@
-"""King County (WA) Superior Court Clerk — Probate/Guardianship scraper.
+"""King County (WA) Recorder — Death Certificate scraper via LandmarkWeb.
 
-Portal: https://dja-prd-ecexap1.kingcounty.gov/node/411?caseType=511110
-Platform: Journal Technologies eCourt
-No CAPTCHA required.
+Portal: https://recordsearch.kingcounty.gov/LandmarkWeb/search/index
+Platform: Hyland LandmarkWeb
 
-Search by Filing Date range, extracts:
-- Case Number (e.g. 26-4-02709-6 SEA)
-- Filing Date
-- Case Name / Party Name
-- Charge/Cause of Action:
-    Estate, Non Probate Notice to Creditor, Guardianship / Conservatorship,
-    Minor Settlement, Trust, Trust/Estate Dispute Resolution, Will Only,
-    Non Judicial Binding/TEDRA Agreement, Miscellaneous,
-    Emergency Minor Guardianship
-- Next Hearing date
-- Status (Active / Completed)
-- Court Location (SEA = Seattle, KNT = Kent)
+Flow:
+1. Accept disclaimer (if present)
+2. Click "Document Type Search" in left sidebar
+3. Select "Death Certificates" from Document Category dropdown (#documentCategory-DocumentType)
+4. Fill date range (#beginDate-DocumentType / #endDate-DocumentType)
+5. Solve reCAPTCHA (manual in headed mode, or automated via service)
+6. Click Submit (#submit-DocumentType)
+7. Extract results: Recording #, Date, Grantor (deceased), Grantee (heir), Legal
+8. Filter for records with PID (Parcel ID) in the Legal column
+
+Key:
+- Grantor = deceased person
+- Grantee = heir/family member inheriting the property (the lead)
+- PID:####### in Legal column = property parcel ID
+
+Enrichment (Phase 2): eRealProperty for property + mailing addresses.
 """
 
+import asyncio
 import re
 from datetime import datetime, timedelta
 
@@ -27,41 +31,58 @@ from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.king_wa_probate")
 
-_BASE_URL = "https://dja-prd-ecexap1.kingcounty.gov"
-_SEARCH_URL = f"{_BASE_URL}/node/411?caseType=511110"
+_BASE_URL = "https://recordsearch.kingcounty.gov"
+_SEARCH_URL = f"{_BASE_URL}/LandmarkWeb/search/index"
 
-# Field IDs on the Journal Technologies form
-_FROM_DATE_ID = "#dataRange_from_324159715051700"
-_TO_DATE_ID = "#dataRange_to_324159715051700"
-_SUBMIT_ID = "#edit-submit"
-_TABLE_SEL = 'table[id*="searchPage"]'
+# Regex to extract parcel ID from legal description (e.g. "PID:1234567890")
+_PID_PATTERN = re.compile(r"PID[:\s]*(\d{6,12})", re.IGNORECASE)
 
 
-class KingWaProbateScraper(BridgeScraper):
-    """Scrapes probate/guardianship filings from King County Superior Court."""
+class LandmarkWebDeathCertScraper(BridgeScraper):
+    """Scrapes death certificate filings from any LandmarkWeb Recorder portal.
 
-    def __init__(self):
+    Works with: King, Clark, Snohomish (WA) — all use Hyland LandmarkWeb.
+
+    Death certificates with parcel IDs indicate property ownership by the deceased.
+    Grantor = deceased, Grantee = heir/family inheriting the property.
+    """
+
+    def __init__(self, base_url: str | None = None, county: str = "king", state: str = "WA"):
         super().__init__()
-        add_scrape_domain("dja-prd-ecexap1.kingcounty.gov")
+        self._base_url = (base_url or _BASE_URL).rstrip("/")
+        self._county = county
+        self._state = state
+
+        from urllib.parse import urlparse
+        domain = urlparse(self._base_url).hostname
+        if domain:
+            add_scrape_domain(domain)
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         start = datetime.strptime(date_from, "%m/%d/%Y")
         end = datetime.strptime(date_to, "%m/%d/%Y")
-        chunk_days = 7
+        chunk_days = 30
 
-        # Calculate total chunks for progress reporting
         total_chunks = max(1, (end - start).days // chunk_days + 1)
 
         _logger.info(
-            "King County probate — %s to %s (%d chunks of %d days)",
-            date_from, date_to, total_chunks, chunk_days,
+            "%s County death certs — %s to %s (%d chunks of %d days)",
+            self._county.title(), date_from, date_to, total_chunks, chunk_days,
         )
 
         all_records: list[ScrapedRecord] = []
         seen: set[str] = set()
-        chunk_start = start
         chunk_num = 0
 
+        # Navigate and accept disclaimer once
+        search_url = f"{self._base_url}/search/index" if "/search/" not in self._base_url else self._base_url
+        await self.navigate(search_url)
+        await self._accept_disclaimer()
+
+        # Solve CAPTCHA once at the start (user does it manually in headed mode)
+        await self._solve_captcha_once()
+
+        chunk_start = start
         while chunk_start < end:
             chunk_end = min(chunk_start + timedelta(days=chunk_days), end)
             cf = chunk_start.strftime("%m/%d/%Y")
@@ -73,7 +94,7 @@ class KingWaProbateScraper(BridgeScraper):
             try:
                 records = await self._search_chunk(cf, ct)
             except Exception as exc:
-                _logger.warning("Chunk %d/%d failed: %s — skipping", chunk_num, total_chunks, str(exc)[:100])
+                _logger.warning("Chunk %d failed: %s — skipping", chunk_num, str(exc)[:120])
                 chunk_start = chunk_end
                 continue
 
@@ -91,78 +112,324 @@ class KingWaProbateScraper(BridgeScraper):
                 chunk_num, total_chunks, new_count, len(all_records),
             )
 
-            # Report progress so frontend shows live updates
             if self.on_progress:
                 self.on_progress(chunk_num, total_chunks, len(all_records))
 
             chunk_start = chunk_end
 
-        _logger.info("King County probate complete — %d records", len(all_records))
+        _logger.info("King County death certs complete — %d records with parcel IDs", len(all_records))
         return all_records
 
-    async def _search_chunk(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
-        """Navigate to search page, fill dates, submit, extract all pages."""
-        await self.navigate(_SEARCH_URL)
-        await self.page.wait_for_timeout(4000)
+    # ─── Disclaimer ──────────────────────────────────────────────────────────
 
-        # Set records per page to 150 (max) to reduce pagination
-        rpp_select = self.page.locator("select")
-        if await rpp_select.count() > 0:
+    async def _accept_disclaimer(self) -> None:
+        """Accept the LandmarkWeb disclaimer if present."""
+        try:
+            await self.page.wait_for_timeout(2000)
+            accept_btn = self.page.locator(
+                "button:has-text('Accept'), a:has-text('Accept'), "
+                "#btnDisclaimerAccept, [onclick*='SetDisclaimer'], "
+                "a:has-text('I Accept'), a:has-text('Agree')"
+            )
+            if await accept_btn.count() > 0:
+                _logger.info("Disclaimer found — clicking Accept")
+                try:
+                    async with self.page.expect_navigation(timeout=10_000):
+                        await accept_btn.first.click()
+                except Exception:
+                    await accept_btn.first.click()
+                    await self.page.wait_for_timeout(3000)
+                _logger.info("Disclaimer accepted")
+            else:
+                _logger.info("No disclaimer — already accepted")
+            await self.page.wait_for_timeout(1000)
+        except Exception as exc:
+            _logger.info("Disclaimer: %s", str(exc)[:80])
+
+    # ─── CAPTCHA handling ────────────────────────────────────────────────────
+
+    async def _solve_captcha_once(self) -> None:
+        """Handle reCAPTCHA — auto-solve via 2Captcha or wait for manual solve.
+
+        Priority:
+        1. If CAPTCHA_ENABLED + CAPTCHA_API_KEY set → use 2Captcha service
+        2. Otherwise → wait for user to solve manually in headed mode
+
+        The reCAPTCHA stays solved for the entire browser session,
+        so we only need to solve it once.
+        """
+        # Navigate to Document Type Search to make the captcha visible
+        await self._go_to_doc_type_search()
+        await self.page.wait_for_timeout(1000)
+
+        # Check if reCAPTCHA is present
+        recaptcha = self.page.locator(
+            "iframe[src*='recaptcha'], .g-recaptcha, [data-sitekey]"
+        )
+        if await recaptcha.count() == 0:
+            _logger.info("No reCAPTCHA found — proceeding")
+            return
+
+        # Extract the sitekey from the page
+        sitekey = await self.page.evaluate("""
+            (() => {
+                const el = document.querySelector('[data-sitekey]');
+                return el ? el.getAttribute('data-sitekey') : null;
+            })()
+        """)
+        _logger.info("reCAPTCHA detected (sitekey: %s)", sitekey[:20] if sitekey else "unknown")
+
+        # Method 1: Auto-solve via 2Captcha if available
+        from src.config import settings
+        if settings.CAPTCHA_ENABLED and settings.CAPTCHA_API_KEY and sitekey:
+            _logger.info("Solving reCAPTCHA via 2Captcha service...")
             try:
-                await rpp_select.first.select_option("150")
-                _logger.info("Set records per page to 150")
+                from src.scrapers.enrichment.captcha import solve_recaptcha
+                token = await solve_recaptcha(self._base_url, sitekey)
+                if token:
+                    # Inject the solved token into the page
+                    await self.page.evaluate(f"""
+                        (() => {{
+                            const textarea = document.querySelector(
+                                '#g-recaptcha-response, textarea[name="g-recaptcha-response"]'
+                            );
+                            if (textarea) {{
+                                textarea.value = '{token}';
+                                textarea.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            }}
+                            // Also set via callback if available
+                            if (typeof grecaptcha !== 'undefined') {{
+                                try {{ grecaptcha.enterprise?.execute?.(); }} catch(e) {{}}
+                            }}
+                        }})()
+                    """)
+                    _logger.info("reCAPTCHA token injected via 2Captcha")
+                    await self.page.wait_for_timeout(1000)
+                    return
+                else:
+                    _logger.warning("2Captcha failed — falling back to manual solve")
+            except Exception as exc:
+                _logger.warning("2Captcha error: %s — falling back to manual", str(exc)[:80])
+
+        # Method 2: Wait for user to solve manually (headed mode)
+        _logger.info("=" * 60)
+        _logger.info("reCAPTCHA — PLEASE SOLVE IT IN THE BROWSER")
+        _logger.info("Click 'I'm not a robot' and complete the challenge")
+        _logger.info("Waiting up to 5 minutes...")
+        _logger.info("=" * 60)
+
+        solved = False
+        for _ in range(150):  # 150 * 2s = 5 minutes
+            try:
+                is_solved = await self.page.evaluate("""
+                    (() => {
+                        const ta = document.querySelector(
+                            '#g-recaptcha-response, textarea[name="g-recaptcha-response"]'
+                        );
+                        return ta && ta.value && ta.value.length > 20;
+                    })()
+                """)
+                if is_solved:
+                    solved = True
+                    _logger.info("reCAPTCHA solved!")
+                    break
             except Exception:
                 pass
+            await asyncio.sleep(2)
 
-        # Fill Filing Date range — use fill() directly (no click needed)
-        from_el = self.page.locator(_FROM_DATE_ID)
-        to_el = self.page.locator(_TO_DATE_ID)
+        if not solved:
+            _logger.warning("reCAPTCHA was not solved within 5 minutes")
 
-        await from_el.fill(date_from)
-        await self.page.wait_for_timeout(200)
-        await to_el.fill(date_to)
-        await self.page.wait_for_timeout(300)
+        await self.page.wait_for_timeout(1000)
 
-        # Submit search (force=True bypasses any overlay/navbar interception)
-        await self.page.locator(_SUBMIT_ID).click(force=True)
-        _logger.info("Search submitted")
+    # ─── Search flow ─────────────────────────────────────────────────────────
 
-        # Wait for results table
-        try:
-            await self.page.wait_for_selector(
-                f'{_TABLE_SEL} tbody tr',
-                timeout=30_000,
-            )
-        except Exception:
-            await self.page.wait_for_timeout(8000)
-
+    async def _search_chunk(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
+        """Navigate to Document Type Search, select Death Certificate, fill dates, submit."""
+        await self._go_to_doc_type_search()
+        await self._select_death_certificate()
+        await self._fill_dates(date_from, date_to)
+        await self._submit_search()
         return await self._extract_all_pages()
 
+    async def _go_to_doc_type_search(self) -> None:
+        """Click Document Type Search in the left sidebar."""
+        try:
+            doc_type_link = self.page.locator(
+                "#searchCriteriaDocuments-tab, "
+                "a:has-text('Document Type Search')"
+            )
+            if await doc_type_link.count() > 0:
+                await doc_type_link.first.click()
+                await self.page.wait_for_timeout(1500)
+                _logger.info("Clicked Document Type Search tab")
+                return
+        except Exception:
+            pass
+
+        # Fallback: navigate directly
+        url = f"{self._base_url}/search/index?theme=.blue&section=searchCriteriaDocuments"
+        if "/search/" in self._base_url:
+            url = f"{self._base_url}?theme=.blue&section=searchCriteriaDocuments"
+        await self.page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        await self.page.wait_for_timeout(2000)
+        _logger.info("Navigated to Document Type Search via URL")
+
+    async def _select_death_certificate(self) -> None:
+        """Select Death Certificates from Document Category (#documentCategory-DocumentType).
+
+        Uses jQuery Select2 API since the dropdown is a Select2 widget.
+        """
+        await self.page.wait_for_timeout(500)
+
+        result = await self.page.evaluate("""
+            (() => {
+                const sel = document.querySelector('#documentCategory-DocumentType');
+                if (!sel) return {success: false, error: 'documentCategory-DocumentType not found'};
+
+                // Find Death Certificate option
+                for (const opt of sel.options) {
+                    if (opt.text.toLowerCase().includes('death cert')) {
+                        // Use Select2 API if available (required for form to recognize selection)
+                        if (window.jQuery && jQuery.fn.select2) {
+                            jQuery('#documentCategory-DocumentType').val(opt.value).trigger('change');
+                        } else {
+                            sel.value = opt.value;
+                            sel.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
+                        return {success: true, value: opt.value, text: opt.text.trim()};
+                    }
+                }
+                const opts = Array.from(sel.options).slice(0, 10).map(o => o.text.trim());
+                return {success: false, error: 'Death Certificate not in options', opts: opts};
+            })()
+        """)
+
+        if result.get('success'):
+            _logger.info("Selected '%s' (value=%s)", result.get('text'), result.get('value'))
+        else:
+            _logger.warning("Could not select Death Certificate: %s", result.get('error'))
+            _logger.info("Available options: %s", result.get('opts', []))
+
+        await self.page.wait_for_timeout(500)
+
+    async def _fill_dates(self, date_from: str, date_to: str) -> None:
+        """Fill the begin/end date fields in the DocumentType section."""
+        try:
+            begin_el = self.page.locator("#beginDate-DocumentType")
+            end_el = self.page.locator("#endDate-DocumentType")
+
+            if await begin_el.count() > 0 and await end_el.count() > 0:
+                await begin_el.first.click()
+                await begin_el.first.fill("")
+                await begin_el.first.press_sequentially(date_from, delay=30)
+                await begin_el.first.press("Tab")
+
+                await end_el.first.click()
+                await end_el.first.fill("")
+                await end_el.first.press_sequentially(date_to, delay=30)
+                await end_el.first.press("Tab")
+
+                _logger.info("Dates filled: %s to %s", date_from, date_to)
+            else:
+                _logger.warning("Date inputs #beginDate-DocumentType / #endDate-DocumentType not found")
+
+            await self.page.wait_for_timeout(500)
+        except Exception as exc:
+            _logger.warning("Could not set dates: %s", str(exc)[:120])
+
+    async def _submit_search(self) -> None:
+        """Click the DocumentType Submit button and wait for results to load."""
+        try:
+            submit_btn = self.page.locator("#submit-DocumentType")
+            if await submit_btn.count() == 0:
+                _logger.warning("Submit button #submit-DocumentType not found")
+                return
+
+            await submit_btn.first.scroll_into_view_if_needed()
+            await self.page.wait_for_timeout(300)
+            await submit_btn.first.click()
+            _logger.info("Submit clicked")
+
+            # Wait for AJAX results to load (spinner appears then disappears)
+            try:
+                await self.page.wait_for_function(
+                    """() => {
+                        const sr = document.querySelector('#searchResults');
+                        if (!sr) return false;
+                        const html = sr.innerHTML;
+                        // Still loading if spinner/loader is present
+                        if (html.includes('ajax-loader') || html.includes('LOADING')) return false;
+                        // Done when: has a table, or has meaningful content
+                        return html.includes('<table') ||
+                               html.toLowerCase().includes('no results') ||
+                               html.toLowerCase().includes('no records') ||
+                               html.toLowerCase().includes('invalid captcha');
+                    }""",
+                    timeout=60_000,
+                )
+            except Exception:
+                await self.page.wait_for_timeout(10_000)
+
+            # Check for captcha error
+            captcha_error = await self.page.evaluate("""
+                (() => {
+                    const body = document.body.innerText || '';
+                    return body.includes('Invalid Captcha') || body.includes('invalid captcha');
+                })()
+            """)
+            if captcha_error:
+                _logger.warning("Invalid Captcha error — waiting for user to solve reCAPTCHA...")
+                await self._solve_captcha_once()
+                # Retry submit after captcha is solved
+                await submit_btn.first.click()
+                _logger.info("Retrying submit after captcha...")
+                try:
+                    await self.page.wait_for_function(
+                        """() => {
+                            const sr = document.querySelector('#searchResults');
+                            if (!sr) return false;
+                            const html = sr.innerHTML;
+                            if (html.includes('ajax-loader') || html.includes('LOADING')) return false;
+                            return html.includes('<table') ||
+                                   html.toLowerCase().includes('no results');
+                        }""",
+                        timeout=60_000,
+                    )
+                except Exception:
+                    await self.page.wait_for_timeout(10_000)
+
+            _logger.info("Results page ready")
+            await self.page.wait_for_timeout(2000)
+
+        except Exception as exc:
+            _logger.warning("Submit error: %s", str(exc)[:120])
+
+    # ─── Extraction ──────────────────────────────────────────────────────────
+
     async def _extract_all_pages(self) -> list[ScrapedRecord]:
-        """Extract records from all result pages."""
+        """Extract records from all result pages, filtering for PID."""
         all_records: list[ScrapedRecord] = []
-        seen_cases: set[str] = set()
+        seen_hashes: set[str] = set()
         page_num = 0
         max_pages = 50
 
         while page_num < max_pages:
             page_num += 1
+
             records = await self._extract_page()
+            new_count = 0
+            for record in records:
+                h = self.make_hash(record.to_dict())
+                if h not in seen_hashes:
+                    seen_hashes.add(h)
+                    record.raw_html_hash = h
+                    all_records.append(record)
+                    new_count += 1
 
-            # Deduplicate by case number within this chunk
-            new_records = []
-            for r in records:
-                case_num = (r.enrichment_data or {}).get("case_number", "")
-                if case_num and case_num not in seen_cases:
-                    seen_cases.add(case_num)
-                    new_records.append(r)
+            _logger.info("Page %d — %d records with PID (total: %d)", page_num, new_count, len(all_records))
 
-            all_records.extend(new_records)
-            _logger.info("Page %d — %d new records (total %d)", page_num, len(new_records), len(all_records))
-
-            # If no new records, we've looped back to the start
-            if not new_records:
-                _logger.info("No new records — pagination complete")
+            if new_count == 0 and page_num > 1:
                 break
 
             has_next = await self._go_next_page()
@@ -172,112 +439,203 @@ class KingWaProbateScraper(BridgeScraper):
         return all_records
 
     async def _extract_page(self) -> list[ScrapedRecord]:
-        """Extract records from the current results page."""
+        """Extract death certificate records from current results page.
+
+        LandmarkWeb results table columns:
+        Recording #, Record Date, Doc Type, Grantor, Grantee, Legal
+        """
         records: list[ScrapedRecord] = []
 
         try:
+            # LandmarkWeb uses DataTables (#resultsTable) with many header columns.
+            # Build a header-to-index map dynamically, then extract each row.
             raw = await self.page.evaluate("""
                 (() => {
-                    const table = document.querySelector('table[id*="searchPage"]');
-                    if (!table) return [];
+                    const table = document.querySelector('#resultsTable, table.dataTable');
+                    if (!table) return {error: 'no table', html: document.querySelector('#searchResults')?.innerHTML?.substring(0, 300) || ''};
+
+                    // DataTable rows have 24 visible <td> cells.
+                    // The <th> headers have hidden columns so we can't map by index.
+                    // Use the ACTUAL cell positions from inspection:
+                    //   0: row#, 3: status, 5: grantor, 6: grantee, 7: date,
+                    //   8: doc_type, 12: rec#, 14: legal
+                    const COL = {grantor: 5, grantee: 6, date: 7, docType: 8, recNum: 12, legal: 14};
 
                     const rows = table.querySelectorAll('tbody tr');
-                    return Array.from(rows).map(row => {
-                        const cells = Array.from(row.querySelectorAll('td'));
-                        if (cells.length < 4) return null;
+                    const results = [];
 
-                        const caseNum = (cells[0]?.textContent || '').trim();
-                        // Skip spacer rows (empty or no case number pattern)
-                        if (!caseNum || !/\\d{2}-\\d-\\d{5}/.test(caseNum)) return null;
+                    for (const row of rows) {
+                        const cells = row.querySelectorAll('td');
+                        if (cells.length < 15) continue;  // Need at least 15 cells for legal column
 
-                        return {
-                            case_number: caseNum,
-                            filing_date: (cells[1]?.textContent || '').trim(),
-                            case_name: (cells[2]?.textContent || '').trim(),
-                            cause: (cells[3]?.textContent || '').trim(),
-                            next_hearing: (cells[4]?.textContent || '').trim(),
-                            status: (cells[5]?.textContent || '').trim(),
-                        };
-                    }).filter(r => r !== null);
+                        const get = (idx) => cells[idx] ? cells[idx].textContent.trim() : '';
+
+                        const grantor = get(COL.grantor);
+                        const grantee = get(COL.grantee);
+                        const dateStr = get(COL.date);
+                        const docType = get(COL.docType);
+                        const recNum = get(COL.recNum);
+                        const legal = get(COL.legal);
+
+                        // Skip rows without meaningful data
+                        if (!grantor && !dateStr) continue;
+
+                        results.push({
+                            instrument: recNum,
+                            grantor: grantor,
+                            grantee: grantee,
+                            date_recorded: dateStr,
+                            doc_type: docType,
+                            legal: legal,
+                        });
+                    }
+
+                    return {
+                        data: results,
+                        totalRows: rows.length,
+                    };
                 })()
             """)
 
-            if not raw:
-                body_text = await self.page.inner_text("body")
-                if "no results" in body_text.lower() or "0 record" in body_text.lower():
-                    _logger.info("No results found")
+            # Handle the response — could be error dict or data dict
+            if isinstance(raw, dict) and 'error' in raw:
+                _logger.info("No results table: %s — html: %s", raw.get('error'), raw.get('html', '')[:200])
                 return []
 
+            if isinstance(raw, dict):
+                header_map = raw.get('headerMap', {})
+                total_rows = raw.get('totalRows', 0)
+                data = raw.get('data', [])
+                _logger.info("DataTable: %d total rows, %d data rows, headerMap=%s",
+                             total_rows, len(data), header_map)
+                raw = data
+            else:
+                raw = raw or []
+
+            if not raw:
+                _logger.info("No results found")
+                return []
+
+            _logger.info("Data rows: %d", len(raw))
+
+            # Log first 3 rows
+            for i, sample in enumerate(raw[:3]):
+                if sample:
+                    _logger.info("  Row %d: %s", i + 1,
+                                 {k: (v[:80] if isinstance(v, str) and v else v) for k, v in sample.items()})
+
             for item in raw:
+                if not item:
+                    continue
+
+                legal = (item.get("legal") or "").strip()
+
+                # Extract parcel ID from legal description
+                # Formats seen: "PID:1234567890", "PID 1234567890", just digits
+                pid_match = _PID_PATTERN.search(legal)
+                if not pid_match:
+                    # Skip records without a parcel ID
+                    continue
+
+                parcel_id = pid_match.group(1)
+
                 record = ScrapedRecord()
+                record.parcel_id = parcel_id
 
-                # Full case name preserved
-                case_name = item.get("case_name", "").strip()
+                # Recording number
+                inst = (item.get("instrument") or "").strip()
+                if inst:
+                    record.legal_description = inst
 
-                # Extract party name (e.g. "IN RE JOHN DOE" -> "JOHN DOE")
-                name = re.sub(r"^IN\s+RE\s+(?:THE\s+)?(?:ESTATE\s+OF\s+)?", "", case_name, flags=re.IGNORECASE).strip()
-                if name:
-                    record.party_name = name
+                # Recording date
+                date_str = (item.get("date_recorded") or "").strip()
+                if date_str:
+                    date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", date_str)
+                    if date_match:
+                        record.date_recorded = date_match.group(1)
 
-                # Filing date
-                date_str = item.get("filing_date", "")
-                date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", date_str)
-                if date_match:
-                    record.date_recorded = date_match.group(1)
+                # Grantor = deceased person
+                grantor = (item.get("grantor") or "").strip()
+                if grantor:
+                    record.party_name = grantor
 
-                # Cause of action as doc_type
-                cause = item.get("cause", "").strip()
-                if cause:
-                    record.doc_type = cause
+                # Grantee = heir/family inheriting the property
+                grantee = (item.get("grantee") or "").strip()
+                if grantee:
+                    record.heirs = grantee
 
-                # Case number
-                case_num = item.get("case_number", "").strip()
-                if case_num:
-                    record.legal_description = case_num
+                # Doc type
+                doc_type = (item.get("doc_type") or "").strip()
+                record.doc_type = doc_type or "DEATH CERTIFICATE"
 
-                # Parse court location from case number (SEA/KNT suffix)
-                court_match = re.search(r"\b(SEA|KNT)\b", case_num)
-                court_location = court_match.group(1) if court_match else ""
-
-                # Next hearing (e.g. "Probate/Guardianship 05/21/2026")
-                next_hearing = item.get("next_hearing", "").strip()
-
-                # Status (e.g. "Active 03/27/2026", "Completed 03/27/2026")
-                status_raw = item.get("status", "").strip()
-                status = status_raw.split()[0] if status_raw else ""
-
-                # Store all King County-specific fields in enrichment_data
+                # Store all metadata in enrichment_data
                 record.enrichment_data = {
-                    "source": "king_county_court",
-                    "case_number": case_num,
-                    "case_name": case_name,
-                    "cause_of_action": cause,
-                    "next_hearing": next_hearing,
-                    "status": status,
-                    "court_location": court_location,
+                    "source": "king_county_recorder",
+                    "recording_number": inst,
+                    "parcel_id": parcel_id,
+                    "legal_description": legal,
+                    "doc_type": doc_type,
                 }
 
                 if record.party_name or record.date_recorded:
                     records.append(record)
 
+            _logger.info("Records with PID: %d / %d total", len(records), len(raw))
+
         except Exception as exc:
-            _logger.warning("Error extracting page: %s", str(exc)[:120])
+            _logger.warning("Extract error: %s", str(exc)[:120])
 
         return records
 
     async def _go_next_page(self) -> bool:
-        """Click the next page link if it exists.
-
-        Journal Technologies uses a single forward-arrow link in .pagination.
-        When there are no more pages, the .pagination element is empty or absent.
-        Clicking (not navigating) preserves the search session state.
-        """
+        """Click the Next page button in LandmarkWeb pagination."""
         try:
-            next_link = self.page.locator('.pagination a')
-            if await next_link.count() > 0:
-                await next_link.first.click(force=True)
-                await self.page.wait_for_timeout(5000)
+            next_btn = self.page.locator(
+                "a:has-text('Next'), button:has-text('Next'), "
+                "a[title*='Next'], .pagination .next a, "
+                "[aria-label='Next']"
+            )
+            if await next_btn.count() > 0:
+                first = next_btn.first
+                disabled = await first.get_attribute("disabled")
+                cls = await first.get_attribute("class") or ""
+                if disabled or "disabled" in cls.lower():
+                    return False
+
+                await first.click()
+                await self.page.wait_for_timeout(4000)
                 return True
         except Exception:
             pass
         return False
+
+
+# ─── County-specific aliases ─────────────────────────────────────────────────
+# Each alias pre-configures the base URL for a specific LandmarkWeb county.
+# The registry uses these class names in county_connectors.scraper_class.
+
+class KingWaProbateScraper(LandmarkWebDeathCertScraper):
+    """King County, WA — recordsearch.kingcounty.gov"""
+    def __init__(self):
+        super().__init__(
+            base_url="https://recordsearch.kingcounty.gov/LandmarkWeb",
+            county="king", state="WA",
+        )
+
+
+class ClarkWaProbateScraper(LandmarkWebDeathCertScraper):
+    """Clark County, WA — e-docs.clark.wa.gov/LandmarkWeb"""
+    def __init__(self):
+        super().__init__(
+            base_url="https://e-docs.clark.wa.gov/LandmarkWeb",
+            county="clark", state="WA",
+        )
+
+
+class SnohomishWaProbateScraper(LandmarkWebDeathCertScraper):
+    """Snohomish County, WA — snoco.org/RecordedDocuments (requires login — NOT PUBLIC)"""
+    def __init__(self):
+        super().__init__(
+            base_url="https://www.snoco.org/RecordedDocuments",
+            county="snohomish", state="WA",
+        )

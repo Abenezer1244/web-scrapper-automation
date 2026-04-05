@@ -188,59 +188,26 @@ class LandmarkWebDeathCertScraper(BridgeScraper):
                 from src.scrapers.enrichment.captcha import solve_recaptcha
                 token = await solve_recaptcha(self._base_url, sitekey)
                 if token:
-                    # Inject the solved token AND trigger the reCAPTCHA callback
-                    injected = await self.page.evaluate("""
+                    # Inject the token by:
+                    # 1. Setting the textarea value
+                    # 2. Monkey-patching grecaptcha.getResponse() to return our token
+                    # LandmarkWeb reads the token via grecaptcha.getResponse() in its
+                    # AJAX submit — setting the textarea alone doesn't work.
+                    await self.page.evaluate("""
                         (token) => {
-                            // 1. Set the response textarea (standard)
-                            const textareas = document.querySelectorAll(
+                            // Set all reCAPTCHA response textareas
+                            document.querySelectorAll(
                                 '#g-recaptcha-response, textarea[name="g-recaptcha-response"]'
-                            );
-                            for (const ta of textareas) {
-                                ta.value = token;
-                                ta.style.display = 'block';  // Some sites hide it
+                            ).forEach(ta => { ta.value = token; });
+
+                            // Monkey-patch grecaptcha.getResponse to return our token
+                            if (typeof grecaptcha !== 'undefined') {
+                                grecaptcha.getResponse = () => token;
                             }
-
-                            // 2. Call the reCAPTCHA callback function
-                            // LandmarkWeb registers a callback that the widget calls on solve
-                            // We need to find and call it with the token
-                            let callbackCalled = false;
-
-                            // Method A: Check data-callback attribute on the reCAPTCHA div
-                            const recaptchaDiv = document.querySelector('.g-recaptcha, [data-callback]');
-                            if (recaptchaDiv) {
-                                const cbName = recaptchaDiv.getAttribute('data-callback');
-                                if (cbName && typeof window[cbName] === 'function') {
-                                    window[cbName](token);
-                                    callbackCalled = true;
-                                }
-                            }
-
-                            // Method B: Try common callback names
-                            const commonCallbacks = ['onRecaptchaSuccess', 'recaptchaCallback', 'captchaCallback', 'onCaptchaVerified'];
-                            for (const name of commonCallbacks) {
-                                if (typeof window[name] === 'function') {
-                                    window[name](token);
-                                    callbackCalled = true;
-                                    break;
-                                }
-                            }
-
-                            // Method C: Search for the callback in grecaptcha internals
-                            if (!callbackCalled && typeof grecaptcha !== 'undefined') {
-                                try {
-                                    // Get all reCAPTCHA widget IDs and call their callbacks
-                                    const clients = grecaptcha.getResponse ? [0] : [];
-                                    for (const id of clients) {
-                                        try { grecaptcha.execute(id); } catch(e) {}
-                                    }
-                                } catch(e) {}
-                            }
-
-                            return {callbackCalled, textareasSet: textareas.length};
                         }
                     """, token)
-                    _logger.info("reCAPTCHA token injected: %s", injected)
-                    await self.page.wait_for_timeout(2000)
+                    _logger.info("reCAPTCHA token injected + getResponse patched")
+                    await self.page.wait_for_timeout(1000)
                     return
                 else:
                     _logger.warning("2Captcha failed — falling back to manual solve")

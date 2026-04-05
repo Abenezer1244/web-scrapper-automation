@@ -179,9 +179,10 @@ class LandmarkWebDeathCertScraper(BridgeScraper):
         """)
         _logger.info("reCAPTCHA detected (sitekey: %s)", sitekey[:20] if sitekey else "unknown")
 
-        # Method 1: Auto-solve via 2Captcha if available
+        # Method 1: Auto-solve via 2Captcha if API key is available
         from src.config import settings
-        if settings.CAPTCHA_ENABLED and settings.CAPTCHA_API_KEY and sitekey:
+        has_captcha_key = bool(settings.CAPTCHA_API_KEY)
+        if has_captcha_key and sitekey:
             _logger.info("Solving reCAPTCHA via 2Captcha service...")
             try:
                 from src.scrapers.enrichment.captcha import solve_recaptcha

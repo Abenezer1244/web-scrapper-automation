@@ -127,7 +127,15 @@ def run_scrape_job(self, job_id: str) -> None:
             job.page_current = page_current
             job.page_total = page_total
             job.record_count = record_count
-            db.commit()
+            try:
+                db.commit()
+            except Exception:
+                # DB connection may have gone stale during long scrape — reconnect
+                try:
+                    db.rollback()
+                    db.commit()
+                except Exception:
+                    _logger.warning("Progress commit failed — will retry on next update")
 
             # Log phase transitions so the frontend shows what's happening
             if phase != _last_phase[0]:
@@ -141,6 +149,11 @@ def run_scrape_job(self, job_id: str) -> None:
             records = asyncio.run(_run_scraper(scraper_class, date_from, date_to, r, job_id, _on_progress))
         except Exception:
             _logger.exception("Scraper error for job %s", job_id)
+            # Reconnect DB session if it went stale during long scrape
+            try:
+                db.rollback()
+            except Exception:
+                pass
             _fail_job(db, job, r, job_id, "Scraper encountered an error — our team has been notified.")
             return
 
@@ -287,6 +300,10 @@ async def _run_scraper(scraper_class, date_from: str, date_to: str, r, job_id: s
 
 def _fail_job(db, job, r, job_id: str, reason: str) -> None:
     """Transition job to FAILED with a human-readable error message."""
+    try:
+        db.rollback()  # Clear any pending rollback from previous errors
+    except Exception:
+        pass
     _set_status(db, job, "failed", finished_at=_now(), error_message=reason)
     _publish_log(r, job_id, "error", reason)
     r.publish(f"job_logs:{job_id}", json.dumps({"type": "failed", "error": reason}))

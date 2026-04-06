@@ -310,7 +310,7 @@ async def get_cached_records(
     result = await db.execute(
         records_sql,
         {"county": county, "state": state, "prev_viewed": previous_viewed,
-         "limit": page_size, "offset": offset, **type_params},
+         "limit": page_size, "offset": offset, **query_params},
     )
     rows = result.fetchall()
 

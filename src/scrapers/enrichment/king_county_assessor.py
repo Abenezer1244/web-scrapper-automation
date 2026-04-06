@@ -20,7 +20,7 @@ from src.utils.logger import setup_logger
 _logger = setup_logger("scraper.enrichment.king_assessor")
 
 _TAX_URL = "https://payment.kingcounty.gov/Home/Index?app=PropertyTaxes&Search="
-_PARALLEL_TABS = 5
+_PARALLEL_TABS = 10
 
 add_scrape_domain("payment.kingcounty.gov")
 
@@ -136,7 +136,7 @@ async def batch_enrich_king_county(
                 if result and (result.get("property_address") or result.get("mailing_address")):
                     results[pid] = result
 
-            await asyncio.sleep(0.5)  # brief pause between batches
+            await asyncio.sleep(0.3)  # brief pause between batches
 
         # Close extra pages
         for page in pages[1:]:
@@ -154,9 +154,9 @@ async def _lookup_on_page(page, parcel_id: str) -> dict[str, str | None]:
             wait_until="domcontentloaded",
             timeout=15_000,
         )
-        await page.wait_for_timeout(2500)
+        await page.wait_for_timeout(2000)
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(300)
 
         data = await page.evaluate(_EXTRACT_JS)
 

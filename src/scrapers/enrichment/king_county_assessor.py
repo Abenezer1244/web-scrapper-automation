@@ -13,7 +13,7 @@ from src.utils.logger import setup_logger
 _logger = setup_logger("scraper.enrichment.king_assessor")
 
 _TAX_URL = "https://payment.kingcounty.gov/Home/Index?app=PropertyTaxes&Search="
-_PARALLEL = 10
+_PARALLEL = 3  # 3 tabs — reliable on Railway's memory limits
 
 add_scrape_domain("payment.kingcounty.gov")
 

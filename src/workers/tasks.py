@@ -373,8 +373,8 @@ def _resolve_date_range(schedule: dict) -> tuple[str, str]:
     max_retries=1,
     default_retry_delay=60,
     acks_late=True,
-    soft_time_limit=900,   # 15 min
-    time_limit=960,        # 16 min
+    soft_time_limit=2700,  # 45 min (mailing enrichment for 500+ parcels)
+    time_limit=3000,       # 50 min
 )
 def enrich_job_results(self, job_id: str) -> None:
     """Enrich all results in a completed job with property/mailing addresses.

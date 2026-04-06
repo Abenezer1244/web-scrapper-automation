@@ -230,7 +230,7 @@ async def stripe_webhook(
       - customer.subscription.deleted   → downgrade to starter
       - invoice.payment_failed          → notify user by email
     """
-    if not settings.STRIPE_WEBHOOK_SECRET:
+    if not settings.STRIPE_WEBHOOK_SECRET or len(settings.STRIPE_WEBHOOK_SECRET) < 20:
         raise HTTPException(status_code=503, detail="Webhook not configured")
 
     payload = await request.body()

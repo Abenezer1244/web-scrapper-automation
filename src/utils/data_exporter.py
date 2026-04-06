@@ -152,16 +152,19 @@ class DataExporter:
     def upload_to_r2(self, local_path: Path, object_key: str) -> str:
         """Upload a local file to Cloudflare R2 and return the object key.
 
-        Uses the Cloudflare R2 REST API (not S3-compatible endpoint) to avoid
-        credential issues with boto3.
-
         Args:
             local_path: Path to the local file.
-            object_key: S3-style key (e.g. 'exports/job_id/leads.csv').
+            object_key: S3-style key (e.g. 'exports/user_id/job_id/leads.csv').
 
         Returns:
             The object key stored in R2.
+
+        Raises:
+            ValueError: If object_key contains path traversal.
         """
+        # Prevent path traversal attacks
+        if ".." in object_key or object_key.startswith("/"):
+            raise ValueError(f"Invalid object key: {object_key}")
         content_types = {
             ".csv": "text/csv",
             ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

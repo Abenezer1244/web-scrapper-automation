@@ -364,7 +364,8 @@ async def download_export(
     from jose import jwt as jose_jwt, JWTError
     from src.config import settings as app_settings
 
-    # Authenticate via query token or header
+    # Authenticate via query token or Authorization header
+    # Query token needed for window.open downloads where headers can't be set
     auth_token = token
     if not auth_token and request:
         auth_header = request.headers.get("authorization", "")
@@ -381,6 +382,7 @@ async def download_export(
             algorithms=["HS256"],
             audience="bridgeleads-api",
             issuer="bridgeleads",
+            options={"verify_exp": True},  # FIX: enforce expiration check
         )
         user_id = payload.get("sub")
         jti = payload.get("jti", "")

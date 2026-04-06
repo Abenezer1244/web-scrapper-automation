@@ -56,7 +56,7 @@ async def solve_recaptcha(site_url: str, sitekey: str) -> str | None:
 
             token = result.get("code", "")
             if not token:
-                _logger.error("2Captcha returned empty token: %s", result)
+                _logger.error("2Captcha returned empty token (status=%s)", result.get("status", "unknown"))
                 continue
 
             _token_cache[sitekey] = (token, time.time() + _TOKEN_TTL)

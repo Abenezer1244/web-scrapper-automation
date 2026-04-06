@@ -256,39 +256,41 @@ async def get_cached_records(
         {"user_id": current_user.id, "config_id": config_id},
     )
 
-    # 3. Build doc_type filter from record_type keywords
+    # 3. Build doc_type filter from record_type keywords (safe: hardcoded values only)
     from src.scrapers.templates.eagleweb import _DOC_TYPE_MAP
     keywords = _DOC_TYPE_MAP.get(config.record_type, [])
-    type_filter = ""
-    type_params = {}
+    type_clauses = []
+    query_params: dict = {}
     if keywords:
-        conditions = []
+        kw_conditions = []
         for i, kw in enumerate(keywords):
             param_name = f"kw_{i}"
-            conditions.append(f"doc_type ILIKE :{param_name}")
-            type_params[param_name] = f"%{kw}%"
-        type_filter = "AND (doc_type IS NULL OR " + " OR ".join(conditions) + ")"
+            kw_conditions.append(f"doc_type ILIKE :{param_name}")
+            query_params[param_name] = f"%{kw}%"
+        type_clauses.append("(doc_type IS NULL OR " + " OR ".join(kw_conditions) + ")")
 
-    # 4. Search filter
-    search_filter = ""
+    # 4. Search filter (parameterized — :q is never interpolated into SQL)
     if q and len(q) <= 100:
         from src.api.middleware.security import sanitize_search
         clean_q = sanitize_search(q)
-        search_filter = "AND (party_name ILIKE :q OR property_address ILIKE :q OR parcel_id ILIKE :q)"
-        type_params["q"] = f"%{clean_q}%"
+        type_clauses.append("(party_name ILIKE :q OR property_address ILIKE :q OR parcel_id ILIKE :q)")
+        query_params["q"] = f"%{clean_q}%"
+
+    # Build WHERE extension from clauses (all parameterized, no f-string interpolation)
+    extra_where = (" AND " + " AND ".join(type_clauses)) if type_clauses else ""
 
     # 5. Count total + new_count
-    count_sql = f"""
-        SELECT
-            COUNT(*) AS total,
-            COUNT(*) FILTER (WHERE scraped_at > COALESCE(:prev_viewed, '1970-01-01'::timestamptz)) AS new_count
-        FROM county_records
-        WHERE LOWER(county) = :county AND UPPER(state) = :state
-        {type_filter} {search_filter}
-    """
+    count_sql = text(
+        "SELECT"
+        "  COUNT(*) AS total,"
+        "  COUNT(*) FILTER (WHERE scraped_at > COALESCE(:prev_viewed, '1970-01-01'::timestamptz)) AS new_count"
+        " FROM county_records"
+        " WHERE LOWER(county) = :county AND UPPER(state) = :state"
+        + extra_where
+    )
     counts = await db.execute(
-        text(count_sql),
-        {"county": county, "state": state, "prev_viewed": previous_viewed, **type_params},
+        count_sql,
+        {"county": county, "state": state, "prev_viewed": previous_viewed, **query_params},
     )
     count_row = counts.fetchone()
     total = count_row.total if count_row else 0
@@ -296,17 +298,17 @@ async def get_cached_records(
 
     # 6. Fetch paginated records
     offset = (page - 1) * page_size
-    records_sql = f"""
-        SELECT *,
-            CASE WHEN scraped_at > COALESCE(:prev_viewed, '1970-01-01'::timestamptz) THEN true ELSE false END AS is_new
-        FROM county_records
-        WHERE LOWER(county) = :county AND UPPER(state) = :state
-        {type_filter} {search_filter}
-        ORDER BY scraped_at DESC
-        LIMIT :limit OFFSET :offset
-    """
+    records_sql = text(
+        "SELECT *,"
+        "  CASE WHEN scraped_at > COALESCE(:prev_viewed, '1970-01-01'::timestamptz) THEN true ELSE false END AS is_new"
+        " FROM county_records"
+        " WHERE LOWER(county) = :county AND UPPER(state) = :state"
+        + extra_where
+        + " ORDER BY scraped_at DESC"
+        " LIMIT :limit OFFSET :offset"
+    )
     result = await db.execute(
-        text(records_sql),
+        records_sql,
         {"county": county, "state": state, "prev_viewed": previous_viewed,
          "limit": page_size, "offset": offset, **type_params},
     )

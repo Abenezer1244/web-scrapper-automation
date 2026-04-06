@@ -14,13 +14,20 @@ _logger = setup_logger("security.audit")
 
 # ─── SSRF Prevention ──────────────────────────────────────────────────────────
 
-# Approved county portal domains — new counties must be explicitly added here
+# Approved county portal domains — new counties must be explicitly added here.
+# add_scrape_domain() may extend this at module init time (scraper constructors).
 _ALLOWED_SCRAPE_DOMAINS: frozenset[str] = frozenset(
     [
         "armsweb.co.pierce.wa.us",
         "atip.piercecountywa.gov",
+        "recordsearch.kingcounty.gov",
+        "blue.kingcounty.com",
+        "payment.kingcounty.gov",
+        "e-docs.clark.wa.gov",
+        "www.snoco.org",
     ]
 )
+_DOMAIN_REGISTRATION_LOCKED = False  # Set True after app startup to prevent runtime additions
 
 # RFC 1918 private networks, loopback, link-local, cloud metadata
 _BLOCKED_NETWORKS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
@@ -88,12 +95,31 @@ def validate_scraping_target(url: str) -> None:
 
 
 def add_scrape_domain(domain: str) -> None:
-    """Register a new county portal domain as an approved scraping target.
+    """Register a county portal domain as an approved scraping target.
 
-    Call this from each county connector's module-level code.
+    Only allowed during module initialization (scraper constructors).
+    After app startup, runtime additions are logged as warnings.
     """
     global _ALLOWED_SCRAPE_DOMAINS
-    _ALLOWED_SCRAPE_DOMAINS = _ALLOWED_SCRAPE_DOMAINS | {domain.lower()}
+    domain = domain.lower().strip()
+
+    if domain in _ALLOWED_SCRAPE_DOMAINS:
+        return  # Already registered
+
+    if _DOMAIN_REGISTRATION_LOCKED:
+        import logging
+        logging.getLogger("security").warning(
+            "Attempted to add scrape domain after lock: %s — ignoring", domain
+        )
+        return
+
+    _ALLOWED_SCRAPE_DOMAINS = _ALLOWED_SCRAPE_DOMAINS | {domain}
+
+
+def lock_scrape_domains() -> None:
+    """Lock the domain allowlist — no more runtime additions. Call after app startup."""
+    global _DOMAIN_REGISTRATION_LOCKED
+    _DOMAIN_REGISTRATION_LOCKED = True
 
 
 # ─── CSV / Formula Injection Prevention ──────────────────────────────────────

@@ -36,10 +36,22 @@ def _get_redis() -> aioredis.Redis:
 
 
 def _client_ip(request: Request) -> str:
+    """Extract client IP. Only trust X-Forwarded-For from Railway's proxy."""
+    direct_ip = request.client.host if request.client else "unknown"
+
+    # Only trust X-Forwarded-For if request came from a known proxy (Railway, Docker)
+    # Railway sets this header; direct requests from attackers are ignored.
     forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
+    if forwarded and direct_ip in ("127.0.0.1", "::1", "10.0.0.0/8"):
         return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+
+    # Use Fly-Client-IP or CF-Connecting-IP (set by trusted proxies, not spoofable)
+    for header in ("Fly-Client-IP", "CF-Connecting-IP", "X-Real-IP"):
+        val = request.headers.get(header)
+        if val:
+            return val.strip()
+
+    return direct_ip
 
 
 async def rate_limit(request: Request, zone: str = "general", identifier: str | None = None) -> None:

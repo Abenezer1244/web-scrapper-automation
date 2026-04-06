@@ -103,7 +103,7 @@ async def enrich_parcel(
                             async (args) => {
                                 const [pid, tok] = args;
                                 try {
-                                    const r = await fetch('/api/parcelSearch?value=' + pid, {
+                                    const r = await fetch('/api/parcelSearch?value=' + encodeURIComponent(pid), {
                                         headers: {'Accept':'application/json','recaptcha-response':tok}
                                     });
                                     if (r.status !== 200) return null;

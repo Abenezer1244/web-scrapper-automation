@@ -107,12 +107,12 @@ async def get_current_user(
         result = await db.execute(
             select(User).where(User.api_key_hash.isnot(None), User.is_active)
         )
-        # constant-time comparison across all users with api keys
+        # constant-time comparison across ALL users — no early exit to prevent timing attacks
         user_match: User | None = None
         for row in result.scalars().all():
             if row.api_key_hash and constant_time_compare(row.api_key_hash, key_hash):
                 user_match = row
-                break
+                # DO NOT break — continue looping to prevent timing leaks
         if user_match is None:
             raise _CREDENTIALS_EXCEPTION
         return user_match

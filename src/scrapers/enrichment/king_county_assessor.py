@@ -20,7 +20,7 @@ from src.utils.logger import setup_logger
 _logger = setup_logger("scraper.enrichment.king_assessor")
 
 _TAX_URL = "https://payment.kingcounty.gov/Home/Index?app=PropertyTaxes&Search="
-_PARALLEL_TABS = 10
+_PARALLEL_TABS = 5  # 5 tabs balances speed vs reliability
 
 add_scrape_domain("payment.kingcounty.gov")
 
@@ -151,12 +151,19 @@ async def _lookup_on_page(page, parcel_id: str) -> dict[str, str | None]:
     try:
         await page.goto(
             f"{_TAX_URL}{parcel_id}",
-            wait_until="domcontentloaded",
-            timeout=15_000,
+            wait_until="load",
+            timeout=20_000,
         )
-        await page.wait_for_timeout(2000)
+        # Wait for Account Summary to render (it loads via JS after page load)
+        try:
+            await page.wait_for_function(
+                "() => document.body.innerText.includes('Mailing Address') || document.body.innerText.includes('No accounts')",
+                timeout=10_000,
+            )
+        except Exception:
+            await page.wait_for_timeout(4000)
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(300)
+        await page.wait_for_timeout(500)
 
         data = await page.evaluate(_EXTRACT_JS)
 

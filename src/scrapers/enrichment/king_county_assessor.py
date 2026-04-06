@@ -190,8 +190,8 @@ async def _lookup_parcel(scraper: BridgeScraper, parcel_id: str) -> dict[str, st
     property_address = " ".join(property_address.strip().split())
     _logger.info("Property address: %s", property_address)
 
-    # Try to get mailing address from Property Tax Bill page
-    mailing_address = await _get_mailing_address(scraper)
+    # Get mailing address from Property Tax Bill page (payment.kingcounty.gov)
+    mailing_address = await _get_mailing_address(scraper, parcel_id)
 
     return {
         "property_address": property_address,
@@ -199,74 +199,48 @@ async def _lookup_parcel(scraper: BridgeScraper, parcel_id: str) -> dict[str, st
     }
 
 
-async def _get_mailing_address(scraper: BridgeScraper) -> str | None:
-    """Navigate to Property Tax Bill page and extract mailing address.
+async def _get_mailing_address(scraper: BridgeScraper, parcel_id: str) -> str | None:
+    """Navigate directly to payment.kingcounty.gov and extract mailing address.
 
-    The Tax Bill link goes to payment.kingcounty.gov — a separate site
-    that shows the owner name and mailing address.
+    URL: payment.kingcounty.gov/Home/Index?app=PropertyTaxes&Search={parcel_id}
+
+    Page shows Account Summary with:
+    - Parcel Number: ######
+    - Mailing Address: 29852 11TH AV SW \\n FEDERAL WAY WA 98023
     """
     try:
-        # The Tax Bill link: #cphContent_HyperLinkPropertyTaxInformationSystem
-        # Goes to: payment.kingcounty.gov/Home/Index?app=PropertyTaxes&Search=PARCEL
-        tax_link = scraper.page.locator(
-            "#cphContent_HyperLinkPropertyTaxInformationSystem, "
-            "a:has-text('Property Tax Bill')"
-        )
-        if await tax_link.count() == 0:
-            _logger.info("No Property Tax Bill link found")
-            return None
-
-        # Get the href and navigate (it's a different domain)
-        href = await tax_link.first.get_attribute("href")
-        if not href:
-            return None
-
         add_scrape_domain("payment.kingcounty.gov")
-        await scraper.page.goto(href, wait_until="domcontentloaded", timeout=30_000)
+        url = f"https://payment.kingcounty.gov/Home/Index?app=PropertyTaxes&Search={parcel_id}"
+        await scraper.page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         await scraper.page.wait_for_timeout(5000)
 
-        # The payment page shows owner info + mailing address
+        # Scroll down to Account Summary section (mailing address is below the fold)
+        await scraper.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await scraper.page.wait_for_timeout(2000)
+
+        # Extract mailing address from Account Summary section
         mailing = await scraper.page.evaluate("""
             (() => {
                 const body = document.body.innerText || '';
 
-                // Look for mailing address patterns on the tax bill page
-                const patterns = [
-                    /Mailing Address[:\\s]*\\n?\\s*(.+?)(?:\\n\\n|\\n[A-Z]|$)/im,
-                    /Mail(?:ing)?[:\\s]+(.+?)(?:\\n\\n|$)/im,
-                ];
-                for (const p of patterns) {
-                    const m = body.match(p);
-                    if (m && m[1] && m[1].trim().length > 5) return m[1].trim();
-                }
+                // Find "Mailing Address" and grab lines after it
+                const idx = body.indexOf('Mailing Address');
+                if (idx === -1) return null;
 
-                // Look in any element with "mailing" in id/class
-                const els = document.querySelectorAll('[id*="mail" i], [class*="mail" i], [id*="Mail"], [class*="Mail"]');
-                for (const el of els) {
-                    const text = el.textContent.trim();
-                    if (text.length > 5 && text.length < 200) return text;
-                }
+                const afterMailing = body.substring(idx + 15).trim();
+                const lines = afterMailing.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
 
-                // Look for address pattern after owner name
-                // Tax bill pages typically show: Owner Name \\n Address Line 1 \\n City State Zip
-                const lines = body.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
-                for (let i = 0; i < lines.length; i++) {
-                    if (/Taxpayer|Owner|Name/i.test(lines[i])) {
-                        // Next 2-3 lines might be the address
-                        const addr = [];
-                        for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
-                            const line = lines[j].trim();
-                            if (line.length > 3 && line.length < 100 && !/Taxpayer|Owner|Parcel|Account|Tax Year/i.test(line)) {
-                                addr.push(line);
-                            } else {
-                                break;
-                            }
-                        }
-                        if (addr.length >= 1) return addr.join(', ');
+                // Collect address lines — stop at next label
+                const addrLines = [];
+                for (const line of lines) {
+                    if (/^(Pay by|Tax Account|Annual|This account|Parcel|Account Summary)/i.test(line)) break;
+                    if (line.length > 3 && line.length < 100) {
+                        addrLines.push(line);
                     }
+                    if (addrLines.length >= 3) break;
                 }
 
-                return null;
+                return addrLines.length > 0 ? addrLines.join(', ') : null;
             })()
         """)
 
@@ -275,9 +249,7 @@ async def _get_mailing_address(scraper: BridgeScraper) -> str | None:
             _logger.info("Mailing address: %s", mailing)
             return mailing
 
-        # Log page text for debugging
-        text = await scraper.page.inner_text("body")
-        _logger.info("No mailing found. Tax bill text (300): %s", text[:300].replace('\n', ' '))
+        _logger.info("No mailing address found on tax bill page")
 
     except Exception as exc:
         _logger.info("Tax bill page: %s", str(exc)[:80])

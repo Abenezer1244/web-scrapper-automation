@@ -61,7 +61,7 @@ class LandmarkWebDeathCertScraper(BridgeScraper):
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         start = datetime.strptime(date_from, "%m/%d/%Y")
         end = datetime.strptime(date_to, "%m/%d/%Y")
-        chunk_days = 30
+        chunk_days = 90  # ~120 results per chunk, 3 pages — fewer captcha solves
 
         total_chunks = max(1, (end - start).days // chunk_days + 1)
 

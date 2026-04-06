@@ -465,10 +465,71 @@ def enrich_job_results(self, job_id: str) -> None:
                 result.enrichment_data = gis_data
                 enriched_count += 1
 
-        db.commit()
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            db.commit()
+        _publish_log(r, job_id, "info", f"GIS enrichment: {enriched_count}/{len(results)} property addresses found")
+        _logger.info("GIS enrichment for job %s: %d/%d enriched", job_id, enriched_count, len(results))
+
+        # Step 4: King County mailing address enrichment via payment.kingcounty.gov
+        # GIS gives property (situs) address but not real mailing address.
+        # For King County, look up mailing address from Property Tax Bill page.
+        if config.county.lower() == "king" and config.state.upper() == "WA":
+            needs_mailing = [
+                res for res in all_results
+                if res.parcel_id
+                and len(res.parcel_id.strip()) >= 10
+                and res.property_address
+                and (not res.mailing_address or res.mailing_address == res.property_address)
+            ]
+            if needs_mailing:
+                _logger.info("King County mailing enrichment: %d records", len(needs_mailing))
+                _publish_log(r, job_id, "info", f"Looking up mailing addresses for {len(needs_mailing)} records...")
+                mailing_count = asyncio.run(
+                    _enrich_king_county_mailing(needs_mailing, db, r, job_id)
+                )
+                _publish_log(r, job_id, "info", f"Mailing addresses found: {mailing_count}/{len(needs_mailing)}")
+
         _publish_log(r, job_id, "success", f"Enrichment complete — {enriched_count}/{len(results)} addresses found")
         _logger.info("Enrichment complete for job %s: %d/%d enriched", job_id, enriched_count, len(results))
 
+
+async def _enrich_king_county_mailing(results, db, r, job_id: str) -> int:
+    """Look up mailing addresses from payment.kingcounty.gov for King County records."""
+    from src.scrapers.enrichment.king_county_assessor import batch_enrich_king_county
+
+    parcel_ids = list({res.parcel_id.strip() for res in results if res.parcel_id})
+    if not parcel_ids:
+        return 0
+
+    # Build parcel_id -> results mapping
+    parcel_map: dict[str, list] = {}
+    for res in results:
+        pid = res.parcel_id.strip()
+        if pid not in parcel_map:
+            parcel_map[pid] = []
+        parcel_map[pid].append(res)
+
+    enriched = await batch_enrich_king_county(parcel_ids)
+
+    count = 0
+    for pid, data in enriched.items():
+        mailing = data.get("mailing_address")
+        if not mailing:
+            continue
+        for res in parcel_map.get(pid, []):
+            res.mailing_address = mailing
+            count += 1
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        db.commit()
+
+    return count
 
 
 async def _fetch_parcel_ids_from_arms(results, db, r, job_id: str) -> int:

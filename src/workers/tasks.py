@@ -474,24 +474,22 @@ def enrich_job_results(self, job_id: str) -> None:
         _publish_log(r, job_id, "info", f"GIS enrichment: {enriched_count}/{len(results)} property addresses found")
         _logger.info("GIS enrichment for job %s: %d/%d enriched", job_id, enriched_count, len(results))
 
-        # Step 4: King County mailing address enrichment via payment.kingcounty.gov
-        # GIS gives property (situs) address but not real mailing address.
-        # For King County, look up mailing address from Property Tax Bill page.
+        # Step 4: King County — get property + mailing from payment.kingcounty.gov
+        # This gives both addresses in one lookup (better than GIS for mailing)
         if config.county.lower() == "king" and config.state.upper() == "WA":
-            needs_mailing = [
+            needs_address = [
                 res for res in all_results
                 if res.parcel_id
-                and len(res.parcel_id.strip()) >= 10
-                and res.property_address
-                and (not res.mailing_address or res.mailing_address == res.property_address)
+                and len(res.parcel_id.strip()) >= 6
+                and (not res.mailing_address)
             ]
-            if needs_mailing:
-                _logger.info("King County mailing enrichment: %d records", len(needs_mailing))
-                _publish_log(r, job_id, "info", f"Looking up mailing addresses for {len(needs_mailing)} records...")
-                mailing_count = asyncio.run(
-                    _enrich_king_county_mailing(needs_mailing, db, r, job_id)
+            if needs_address:
+                _logger.info("King County address enrichment: %d records", len(needs_address))
+                _publish_log(r, job_id, "info", f"Looking up addresses for {len(needs_address)} records...")
+                addr_count = asyncio.run(
+                    _enrich_king_county_mailing(needs_address, db, r, job_id)
                 )
-                _publish_log(r, job_id, "info", f"Mailing addresses found: {mailing_count}/{len(needs_mailing)}")
+                _publish_log(r, job_id, "info", f"Addresses found: {addr_count}/{len(needs_address)}")
 
         _publish_log(r, job_id, "success", f"Enrichment complete — {enriched_count}/{len(results)} addresses found")
         _logger.info("Enrichment complete for job %s: %d/%d enriched", job_id, enriched_count, len(results))
@@ -536,11 +534,15 @@ async def _enrich_king_county_mailing(results, db, r, job_id: str) -> int:
 
     count = 0
     for pid, data in enriched.items():
+        prop = data.get("property_address")
         mailing = data.get("mailing_address")
-        if not mailing:
+        if not mailing and not prop:
             continue
         for res in parcel_map.get(pid, []):
-            res.mailing_address = mailing
+            if prop and not res.property_address:
+                res.property_address = prop
+            if mailing:
+                res.mailing_address = mailing
             count += 1
 
     try:

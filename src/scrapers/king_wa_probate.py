@@ -341,13 +341,65 @@ class LandmarkWebDeathCertScraper(BridgeScraper):
         except Exception as exc:
             _logger.warning("Could not set dates: %s", str(exc)[:120])
 
+    async def _ensure_captcha_token(self) -> None:
+        """Ensure a valid reCAPTCHA token is available for the next submit.
+
+        Solves via 2Captcha if key is available, then patches grecaptcha.getResponse().
+        Must be called RIGHT BEFORE submit so the token is fresh.
+        """
+        from src.config import settings
+        if not settings.CAPTCHA_API_KEY:
+            return  # No auto-solve available
+
+        # Check if captcha is on this page
+        has_captcha = await self.page.evaluate("""
+            () => !!document.querySelector('[data-sitekey], .g-recaptcha, iframe[src*="recaptcha"]')
+        """)
+        if not has_captcha:
+            return
+
+        sitekey = await self.page.evaluate("""
+            () => {
+                const el = document.querySelector('[data-sitekey]');
+                return el ? el.getAttribute('data-sitekey') : null;
+            }
+        """)
+        if not sitekey:
+            return
+
+        _logger.info("Solving reCAPTCHA before submit...")
+        try:
+            from src.scrapers.enrichment.captcha import solve_recaptcha
+            token = await solve_recaptcha(self._base_url, sitekey)
+            if token:
+                await self.page.evaluate("""
+                    (token) => {
+                        // Set textarea
+                        document.querySelectorAll(
+                            '#g-recaptcha-response, textarea[name="g-recaptcha-response"]'
+                        ).forEach(ta => { ta.value = token; });
+                        // Patch getResponse so the AJAX submit reads our token
+                        if (typeof grecaptcha !== 'undefined') {
+                            grecaptcha.getResponse = () => token;
+                        }
+                    }
+                """, token)
+                _logger.info("reCAPTCHA token ready for submit")
+            else:
+                _logger.warning("2Captcha failed to solve")
+        except Exception as exc:
+            _logger.warning("Captcha solve error: %s", str(exc)[:80])
+
     async def _submit_search(self) -> None:
-        """Click the DocumentType Submit button and wait for results to load."""
+        """Solve captcha + click Submit + wait for results."""
         try:
             submit_btn = self.page.locator("#submit-DocumentType")
             if await submit_btn.count() == 0:
                 _logger.warning("Submit button #submit-DocumentType not found")
                 return
+
+            # Solve captcha RIGHT BEFORE clicking submit (token is freshest here)
+            await self._ensure_captcha_token()
 
             await submit_btn.first.scroll_into_view_if_needed()
             await self.page.wait_for_timeout(300)
@@ -382,9 +434,13 @@ class LandmarkWebDeathCertScraper(BridgeScraper):
                 })()
             """)
             if captcha_error:
-                _logger.warning("Invalid Captcha error — waiting for user to solve reCAPTCHA...")
-                await self._solve_captcha_once()
-                # Retry submit after captcha is solved
+                _logger.warning("Invalid Captcha — solving fresh token and retrying...")
+                # Invalidate cached token and solve fresh
+                from src.scrapers.enrichment.captcha import invalidate_token
+                invalidate_token(await self.page.evaluate(
+                    "() => document.querySelector('[data-sitekey]')?.getAttribute('data-sitekey') || ''"
+                ))
+                await self._ensure_captcha_token()
                 await submit_btn.first.click()
                 _logger.info("Retrying submit after captcha...")
                 try:

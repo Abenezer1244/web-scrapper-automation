@@ -495,6 +495,25 @@ def enrich_job_results(self, job_id: str) -> None:
         _publish_log(r, job_id, "success", f"Enrichment complete — {enriched_count}/{len(results)} addresses found")
         _logger.info("Enrichment complete for job %s: %d/%d enriched", job_id, enriched_count, len(results))
 
+        # Re-export CSV with enriched data (original export happened before enrichment)
+        try:
+            from src.utils.data_exporter import DataExporter
+            refreshed = db.execute(
+                select(Result).where(Result.job_id == job_id)
+            ).scalars().all()
+            record_dicts = [
+                {c: getattr(r, c) for c in ["date_recorded", "party_name", "heirs", "parcel_id",
+                                             "property_address", "mailing_address", "legal_description"]}
+                for r in refreshed
+            ]
+            exporter = DataExporter()
+            local_file = exporter.export(record_dicts, filename=f"job_{job_id[:8]}", fmt="csv")
+            object_key = f"exports/{job.user_id}/{job_id}/leads.csv"
+            exporter.upload_to_r2(local_file, object_key)
+            _logger.info("Re-exported CSV with enriched data: %d records", len(record_dicts))
+        except Exception as exc:
+            _logger.warning("CSV re-export failed: %s", str(exc)[:80])
+
 
 async def _enrich_king_county_mailing(results, db, r, job_id: str) -> int:
     """Look up mailing addresses from payment.kingcounty.gov for King County records."""

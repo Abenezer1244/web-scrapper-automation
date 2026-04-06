@@ -114,7 +114,8 @@ def run_scrape_job(self, job_id: str) -> None:
 
         # ── SCRAPING ──────────────────────────────────────────────────────────
         _set_status(db, job, "scraping")
-        _publish_log(r, job_id, "success", f"Starting scrape — {config.record_type} records")
+        record_label = config.record_type.replace("_", " ").title()
+        _publish_log(r, job_id, "success", f"Starting scrape — {record_label} records")
 
         schedule = config.schedule or {}
         date_from, date_to = _resolve_date_range(schedule)

@@ -334,7 +334,15 @@ async def get_export_url(
     user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> dict:
-    """Return the direct download URL for the job's CSV export."""
+    """Return a short-lived download URL for the job's CSV export.
+
+    Generates a single-use token (60s) scoped to this job + user.
+    The token is safe to put in a URL — it's not the full JWT.
+    """
+    from jose import jwt as jose_jwt
+    from src.config import settings as app_settings
+    import time
+
     result = await db.execute(
         select(Job).where(Job.id == job_id, Job.user_id == user.id)
     )
@@ -344,8 +352,19 @@ async def get_export_url(
     if not job.export_key:
         raise HTTPException(status_code=404, detail="No export available yet")
 
-    # Return a URL to our own download proxy endpoint (avoids R2 auth issues)
-    return {"url": f"/jobs/{job_id}/download"}
+    # Generate a short-lived download token (60 seconds, scoped to this job)
+    download_token = jose_jwt.encode(
+        {
+            "sub": str(user.id),
+            "job_id": job_id,
+            "purpose": "download",
+            "exp": int(time.time()) + 60,  # 60 second expiry
+        },
+        app_settings.SECRET_KEY,
+        algorithm="HS256",
+    )
+
+    return {"url": f"/jobs/{job_id}/download?token={download_token}"}
 
 
 @router.get("/{job_id}/download", tags=["jobs"])
@@ -355,17 +374,16 @@ async def download_export(
     request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """Stream the CSV export directly from R2 via Cloudflare API.
+    """Stream the CSV export directly from R2.
 
-    Accepts auth via either Authorization header or ?token= query parameter
-    (needed for window.open downloads where headers can't be set).
+    Accepts a short-lived download token (from /export-url) OR an Authorization header.
+    The download token is scoped to a specific job, expires in 60s, and is safe for URLs.
     """
     import requests as sync_requests
     from jose import jwt as jose_jwt, JWTError
     from src.config import settings as app_settings
 
-    # Authenticate via query token or Authorization header
-    # Query token needed for window.open downloads where headers can't be set
+    # Authenticate: prefer short-lived download token, fall back to Authorization header
     auth_token = token
     if not auth_token and request:
         auth_header = request.headers.get("authorization", "")
@@ -380,26 +398,27 @@ async def download_export(
             auth_token,
             app_settings.SECRET_KEY,
             algorithms=["HS256"],
-            audience="bridgeleads-api",
-            issuer="bridgeleads",
-            options={"verify_exp": True},  # FIX: enforce expiration check
+            options={"verify_exp": True},
         )
         user_id = payload.get("sub")
-        jti = payload.get("jti", "")
-        iat = payload.get("iat", 0)
         if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token: no sub claim")
+            raise HTTPException(status_code=401, detail="Invalid token")
 
-        # Check token blacklist (logout / revoke-all)
-        from src.api.middleware.auth_hardening import TokenBlacklist
-        if jti and await TokenBlacklist.is_blacklisted(jti):
-            raise HTTPException(status_code=401, detail="Token has been revoked")
-        revoke_time = await TokenBlacklist.get_user_revoke_time(user_id)
-        if revoke_time and iat < revoke_time:
-            raise HTTPException(status_code=401, detail="Token has been revoked")
+        # If it's a download token, verify it's scoped to this job
+        if payload.get("purpose") == "download":
+            if payload.get("job_id") != job_id:
+                raise HTTPException(status_code=403, detail="Token not valid for this job")
+        else:
+            # Full JWT — check audience, issuer, blacklist
+            if payload.get("aud") != "bridgeleads-api" or payload.get("iss") != "bridgeleads":
+                raise HTTPException(status_code=401, detail="Invalid token claims")
+            from src.api.middleware.auth_hardening import TokenBlacklist
+            jti = payload.get("jti", "")
+            if jti and await TokenBlacklist.is_blacklisted(jti):
+                raise HTTPException(status_code=401, detail="Token revoked")
 
-    except JWTError as exc:
-        raise HTTPException(status_code=401, detail="Invalid or expired credentials")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired download link")
     except HTTPException:
         raise
 

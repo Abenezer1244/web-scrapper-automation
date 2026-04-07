@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -47,6 +48,28 @@ app.include_router(auth_router)
 app.include_router(scrapers_router)
 app.include_router(jobs_router)
 app.include_router(billing_router)
+
+
+# ─── Logging: strip tokens from access logs ──────────────────────────────────
+
+import re
+
+_TOKEN_RE = re.compile(r"token=[A-Za-z0-9_\-\.]+")
+
+
+class _StripTokenFilter(logging.Filter):
+    """Redact download tokens from uvicorn access log lines."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if hasattr(record, "args") and record.args:
+            record.args = tuple(
+                _TOKEN_RE.sub("token=REDACTED", str(a)) if isinstance(a, str) else a
+                for a in record.args
+            )
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_StripTokenFilter())
 
 
 # ─── Health check ─────────────────────────────────────────────────────────────

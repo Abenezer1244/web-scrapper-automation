@@ -161,11 +161,11 @@ async def create_connector(
     For AI-mode connectors, no Python scraper code is needed — just provide
     the county portal URL and Claude handles the rest.
     """
-    # Agency-only (admin feature)
-    if current_user.plan != "agency":
+    # Admin-only: only admin users can modify scraper infrastructure
+    if not current_user.is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Adding county connectors requires an Agency plan",
+            detail="Adding county connectors requires admin privileges",
         )
 
     # Check for duplicate

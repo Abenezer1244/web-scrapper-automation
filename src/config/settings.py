@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     STRIPE_PRICE_PRO: str = ""
     STRIPE_PRICE_BUSINESS: str = ""
     STRIPE_PRICE_AGENCY: str = ""
+    STRIPE_PRODUCT_PRO: str = ""
+    STRIPE_PRODUCT_BUSINESS: str = ""
+    STRIPE_PRODUCT_AGENCY: str = ""
 
     # ─── Email ────────────────────────────────────────────────────────────────
     RESEND_API_KEY: str = ""
@@ -125,6 +128,17 @@ class Settings(BaseSettings):
 
     def get_allowed_origins(self) -> list[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
+
+    def redis_kwargs(self, decode_responses: bool = True) -> dict:
+        """Return kwargs for redis.from_url() with correct SSL config.
+
+        Upstash Redis uses custom TLS certificates not in the system CA store.
+        This is the single place where ssl_cert_reqs is configured.
+        """
+        kwargs: dict = {"decode_responses": decode_responses}
+        if self.REDIS_URL.startswith("rediss://"):
+            kwargs["ssl_cert_reqs"] = "none"
+        return kwargs
 
     def ensure_dirs(self) -> None:
         self.EXPORTS_DIR.mkdir(parents=True, exist_ok=True)

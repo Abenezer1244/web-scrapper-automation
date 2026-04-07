@@ -278,45 +278,61 @@ async def stream_logs(
     )
     existing_logs = logs_result.scalars().all()
 
-    async def event_stream() -> AsyncGenerator[str, None]:
-        # 1. Replay persisted logs
-        for log in existing_logs:
-            payload = LogLine.model_validate(log).model_dump_json()
-            yield f"data: {payload}\n\n"
+    _MAX_SSE_PER_USER = 5
 
-        # 2. If job is already terminal, stop here
-        if job.status in {"done", "failed", "cancelled"}:
-            yield "data: {\"type\": \"done\"}\n\n"
+    async def event_stream() -> AsyncGenerator[str, None]:
+        # Track concurrent SSE connections per user
+        sse_key = f"sse_connections:{current_user.id}"
+        r = aioredis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+        conn_count = await r.incr(sse_key)
+        await r.expire(sse_key, 1800)  # Auto-expire if process crashes
+
+        if conn_count > _MAX_SSE_PER_USER:
+            await r.decr(sse_key)
+            await r.aclose()
+            yield f"data: {{\"type\": \"error\", \"message\": \"Too many concurrent streams (max {_MAX_SSE_PER_USER})\"}}\n\n"
             return
 
-        # 3. Subscribe to Redis Pub/Sub channel for live events
-        import time as _time
-        max_duration = 1800  # 30 minutes max SSE connection
-        start_time = _time.time()
-
-        r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-        pubsub = r.pubsub()
-        channel = f"job_logs:{job_id}"
-        await pubsub.subscribe(channel)
-
         try:
-            while True:
-                if _time.time() - start_time > max_duration:
-                    yield "data: {\"type\": \"timeout\"}\n\n"
-                    break
-                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=30.0)
-                if message and message.get("type") == "message":
-                    yield f"data: {message['data']}\n\n"
-                    # Check for terminal event
-                    try:
-                        data = json.loads(message["data"])
-                        if data.get("type") in {"done", "failed", "cancelled"}:
-                            break
-                    except (json.JSONDecodeError, KeyError):
-                        pass
-                await asyncio.sleep(0.1)
+            # 1. Replay persisted logs
+            for log in existing_logs:
+                payload = LogLine.model_validate(log).model_dump_json()
+                yield f"data: {payload}\n\n"
+
+            # 2. If job is already terminal, stop here
+            if job.status in {"done", "failed", "cancelled"}:
+                yield "data: {\"type\": \"done\"}\n\n"
+                return
+
+            # 3. Subscribe to Redis Pub/Sub channel for live events
+            import time as _time
+            max_duration = 1800  # 30 minutes max SSE connection
+            start_time = _time.time()
+
+            pubsub = r.pubsub()
+            channel = f"job_logs:{job_id}"
+            await pubsub.subscribe(channel)
+
+            try:
+                while True:
+                    if _time.time() - start_time > max_duration:
+                        yield "data: {\"type\": \"timeout\"}\n\n"
+                        break
+                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=30.0)
+                    if message and message.get("type") == "message":
+                        yield f"data: {message['data']}\n\n"
+                        # Check for terminal event
+                        try:
+                            data = json.loads(message["data"])
+                            if data.get("type") in {"done", "failed", "cancelled"}:
+                                break
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+                    await asyncio.sleep(0.1)
+            finally:
+                await pubsub.unsubscribe(channel)
         finally:
-            await pubsub.unsubscribe(channel)
+            await r.decr(sse_key)
             await r.aclose()
 
     return StreamingResponse(

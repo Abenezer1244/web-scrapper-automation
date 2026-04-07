@@ -5,11 +5,13 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import (
     CurrentUser,
+    create_refresh_token,
     create_secure_token,
     decode_secure_token,
     generate_api_key,
@@ -57,8 +59,9 @@ async def register(
     await db.flush()
 
     token = create_secure_token(user.id)
+    refresh = create_refresh_token(user.id)
     audit_log(request, "register", user.id)
-    return TokenResponse(access_token=token)
+    return TokenResponse(access_token=token, refresh_token=refresh)
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -90,8 +93,47 @@ async def login(
 
     await BruteForceProtection.clear(ip, body.email)
     token = create_secure_token(user.id)
+    refresh = create_refresh_token(user.id)
     audit_log(request, "login_success", user.id)
-    return TokenResponse(access_token=token)
+    return TokenResponse(access_token=token, refresh_token=refresh)
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+@router.post("/refresh", response_model=TokenResponse)
+async def refresh_token(
+    body: RefreshRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> TokenResponse:
+    """Exchange a valid refresh token for a new access + refresh token pair."""
+    await rate_limit(request, zone="auth")
+    from jose import JWTError
+    try:
+        payload = decode_secure_token(body.refresh_token)
+    except (JWTError, Exception):
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+
+    if payload.get("purpose") != "refresh":
+        raise HTTPException(status_code=401, detail="Not a refresh token")
+
+    user_id = payload.get("sub")
+    result = await db.execute(select(User).where(User.id == user_id, User.is_active))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+
+    # Check if the refresh token's jti was blacklisted (logout-all)
+    from src.api.middleware.auth_hardening import TokenBlacklist
+    jti = payload.get("jti", "")
+    if jti and await TokenBlacklist.is_blacklisted(jti):
+        raise HTTPException(status_code=401, detail="Refresh token revoked")
+
+    new_access = create_secure_token(user.id)
+    new_refresh = create_refresh_token(user.id)
+    return TokenResponse(access_token=new_access, refresh_token=new_refresh)
 
 
 @router.get("/me", response_model=UserResponse)

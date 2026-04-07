@@ -12,9 +12,10 @@ app = Celery(
     include=["src.workers.tasks", "src.workers.scheduler"],
 )
 
-# Upstash Redis uses TLS (rediss://) — kombu needs explicit SSL config
+# Upstash Redis uses TLS (rediss://) — kombu needs explicit SSL config.
+# See settings.redis_kwargs() for the single-source SSL policy.
 if settings.REDIS_URL.startswith("rediss://"):
-    _ssl_opts = {"ssl_cert_reqs": ssl.CERT_NONE}  # Upstash uses custom certs not in system CA
+    _ssl_opts = {"ssl_cert_reqs": ssl.CERT_NONE}
     app.conf.broker_use_ssl = _ssl_opts
     app.conf.redis_backend_use_ssl = _ssl_opts
 

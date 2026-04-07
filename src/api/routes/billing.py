@@ -158,11 +158,11 @@ async def create_checkout(
     if price_or_product_id not in _PRICE_TO_PLAN:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
 
-    # Resolve Product ID → Price ID (hardcoded to avoid extra Stripe API calls)
+    # Resolve Product ID → Price ID (sourced from env vars via settings)
     _PRODUCT_TO_PRICE = {
-        "prod_UANuoAMKafnDJ5": "price_1TC38PHE9wT1C7yZ7XDpF2Ln",  # Pro
-        "prod_UANwwzFn0msFok": "price_1TC3AgHE9wT1C7yZWVcdX3cv",  # Business
-        "prod_UANxJNomPNWE5l": "price_1TC3BRHE9wT1C7yZ6Jja7hHZ",  # Agency
+        settings.STRIPE_PRODUCT_PRO: settings.STRIPE_PRICE_PRO,
+        settings.STRIPE_PRODUCT_BUSINESS: settings.STRIPE_PRICE_BUSINESS,
+        settings.STRIPE_PRODUCT_AGENCY: settings.STRIPE_PRICE_AGENCY,
     }
     stripe_price_id = _PRODUCT_TO_PRICE.get(price_or_product_id, price_or_product_id)
 

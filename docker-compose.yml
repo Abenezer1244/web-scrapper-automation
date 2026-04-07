@@ -1,3 +1,6 @@
+# LOCAL DEVELOPMENT ONLY — production runs on Railway (no docker-compose).
+# The .:/app volume mounts enable hot-reload but expose .env to containers.
+# Never use this file in production.
 services:
   postgres:
     image: postgres:16-alpine

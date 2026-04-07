@@ -44,6 +44,7 @@ class UserResponse(BaseModel):
     plan: str
     records_used: int
     records_limit: int
+    is_admin: bool = False
     trial_ends_at: datetime | None = None
     is_trial: bool = False
     trial_days_remaining: int | None = None
@@ -63,7 +64,9 @@ class UserResponse(BaseModel):
 
 class TokenResponse(BaseModel):
     access_token: str
+    refresh_token: str | None = None
     token_type: str = "bearer"
+    expires_in: int = 3600
 
 
 class ApiKeyResponse(BaseModel):
@@ -103,7 +106,7 @@ class FieldsConfig(BaseModel):
     legal_description: bool = False
     date_recorded: bool = True
 
-    model_config = {"extra": "allow"}
+    model_config = {"extra": "forbid"}
 
 
 class EnrichmentConfig(BaseModel):

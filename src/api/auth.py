@@ -46,11 +46,12 @@ def hash_api_key(raw: str) -> str:
 # ─── JWT ──────────────────────────────────────────────────────────────────────
 
 _ALGORITHM = "HS256"
-_TOKEN_EXPIRE_SECONDS = 7 * 24 * 3600  # 7 days
+_ACCESS_TOKEN_EXPIRE_SECONDS = 3600  # 1 hour
+_REFRESH_TOKEN_EXPIRE_SECONDS = 7 * 24 * 3600  # 7 days
 
 
 def create_secure_token(user_id: str) -> str:
-    """Create a signed JWT with jti, iss, aud, and exp claims."""
+    """Create a signed access JWT (1 hour) with jti, iss, aud, and exp claims."""
     now = int(time.time())
     payload = {
         "sub": user_id,
@@ -58,7 +59,22 @@ def create_secure_token(user_id: str) -> str:
         "iss": "bridgeleads",
         "aud": "bridgeleads-api",
         "iat": now,
-        "exp": now + _TOKEN_EXPIRE_SECONDS,
+        "exp": now + _ACCESS_TOKEN_EXPIRE_SECONDS,
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=_ALGORITHM)
+
+
+def create_refresh_token(user_id: str) -> str:
+    """Create a signed refresh JWT (7 days) for obtaining new access tokens."""
+    now = int(time.time())
+    payload = {
+        "sub": user_id,
+        "jti": str(uuid.uuid4()),
+        "iss": "bridgeleads",
+        "aud": "bridgeleads-api",
+        "purpose": "refresh",
+        "iat": now,
+        "exp": now + _REFRESH_TOKEN_EXPIRE_SECONDS,
     }
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=_ALGORITHM)
 

@@ -265,7 +265,9 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
     address_field = gis_config.get("address_field", "Site_Address")
     property_address = attrs.get(address_field) or None
     if property_address:
-        property_address = property_address.strip()
+        property_address = property_address.replace("&nbsp;", "").strip()
+        if not property_address:
+            property_address = None
 
     # Mailing address (may be multiple fields joined)
     mailing_fields = gis_config.get("mailing_fields", [])

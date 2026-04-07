@@ -58,7 +58,9 @@ async def batch_enrich_king_county(
 
             # Extract Site Address
             m = re.search(r"Site Address</td>\s*<td[^>]*>([^<]+)", r.text)
-            prop = m.group(1).strip() if m else None
+            prop = m.group(1).replace("&nbsp;", "").strip() if m else None
+            if not prop:
+                prop = None
 
             # Extract Tax Bill URL (has correct tax account number)
             m2 = re.search(

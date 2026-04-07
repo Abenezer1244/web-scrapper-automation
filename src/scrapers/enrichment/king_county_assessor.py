@@ -1,17 +1,22 @@
-"""King County address enrichment via eRealProperty + Property Tax Bill.
+"""King County address enrichment — hybrid HTTP + Playwright.
 
-Flow (matches user's screenshots):
-1. eRealProperty (blue.kingcounty.com/Assessor/eRealProperty/Dashboard.aspx?ParcelNbr=PID)
-   → Site Address (property address)
-   → "Property Tax Bill" link (has correct tax account number)
-2. Property Tax Bill (payment.kingcounty.gov)
-   → Mailing Address
+Step 1 (HTTP, fast): eRealProperty → property address + tax bill URL
+Step 2 (Playwright, reliable): payment.kingcounty.gov → mailing address
 
-Key: the parcel number (10 digits) != tax account number (12 digits).
-eRealProperty bridges this — its "Property Tax Bill" link has the right account number.
+500 parcels in ~5 min:
+- Step 1: 500 × 1s = ~8 min (but can run 5 concurrent HTTP requests = ~2 min)
+- Step 2: 500 × 4s / 1 tab = ~33 min → too slow
+- Better: use 3 Playwright tabs for step 2 = ~11 min total
+
+Actually: since Step 2 only needs Playwright for JS-rendered content,
+we run Step 1 (HTTP) for ALL parcels first (fast), then Step 2 (Playwright)
+for the subset that need mailing addresses.
 """
 
 import asyncio
+import re
+
+import requests as sync_requests
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper
@@ -20,7 +25,7 @@ from src.utils.logger import setup_logger
 _logger = setup_logger("scraper.enrichment.king_assessor")
 
 _ERP_URL = "https://blue.kingcounty.com/Assessor/eRealProperty/Dashboard.aspx?ParcelNbr="
-_PARALLEL = 3
+_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"}
 
 add_scrape_domain("blue.kingcounty.com")
 add_scrape_domain("payment.kingcounty.gov")
@@ -29,119 +34,101 @@ add_scrape_domain("payment.kingcounty.gov")
 async def batch_enrich_king_county(
     parcel_ids: list[str],
 ) -> dict[str, dict[str, str | None]]:
-    """Enrich parcels: eRealProperty for property address, then Tax Bill for mailing."""
+    """Two-phase enrichment: HTTP for property, Playwright for mailing."""
     results: dict[str, dict[str, str | None]] = {}
     clean = list(dict.fromkeys(pid.strip() for pid in parcel_ids if pid and len(pid.strip()) >= 6))
 
     if not clean:
         return results
 
-    _logger.info("King County enrichment: %d parcels, %d tabs", len(clean), _PARALLEL)
+    # ── Phase 1: HTTP requests for property address + tax URLs (fast) ─────
+    _logger.info("Phase 1: HTTP lookup for %d parcels...", len(clean))
+    tax_urls: dict[str, str] = {}  # pid → payment.kingcounty.gov URL
+
+    for i, pid in enumerate(clean):
+        if i % 100 == 0 and i > 0:
+            _logger.info("  HTTP: %d / %d ...", i, len(clean))
+
+        try:
+            r = sync_requests.get(
+                f"{_ERP_URL}{pid}", headers=_HEADERS, timeout=10
+            )
+            if r.status_code != 200:
+                continue
+
+            # Extract Site Address
+            m = re.search(r"Site Address</td>\s*<td[^>]*>([^<]+)", r.text)
+            prop = m.group(1).strip() if m else None
+
+            # Extract Tax Bill URL (has correct tax account number)
+            m2 = re.search(
+                r'href="(https://payment\.kingcounty\.gov[^"]+)"', r.text
+            )
+            tax_url = m2.group(1).replace("&amp;", "&") if m2 else None
+
+            if prop or tax_url:
+                results[pid] = {"property_address": prop, "mailing_address": None}
+                if tax_url:
+                    tax_urls[pid] = tax_url
+
+        except Exception:
+            pass
+
+        await asyncio.sleep(0.1)  # minimal delay for HTTP
+
+    _logger.info("Phase 1 done: %d/%d property addresses, %d tax URLs",
+                 sum(1 for r in results.values() if r.get("property_address")),
+                 len(clean), len(tax_urls))
+
+    # ── Phase 2: Playwright for mailing addresses (JS-rendered page) ──────
+    if not tax_urls:
+        return results
+
+    _logger.info("Phase 2: Playwright lookup for %d mailing addresses...", len(tax_urls))
 
     async with BridgeScraper() as scraper:
-        pages = [scraper.page]
-        for _ in range(_PARALLEL - 1):
-            pages.append(await scraper._context.new_page())
+        pids_to_lookup = list(tax_urls.keys())
 
-        for batch_start in range(0, len(clean), _PARALLEL):
-            batch = clean[batch_start:batch_start + _PARALLEL]
+        for i, pid in enumerate(pids_to_lookup):
+            if i % 50 == 0:
+                _logger.info("  Mailing: %d / %d ...", i, len(pids_to_lookup))
 
-            if batch_start % 50 == 0:
-                _logger.info("  %d / %d ...", batch_start, len(clean))
+            try:
+                url = tax_urls[pid]
+                await scraper.page.goto(url, wait_until="load", timeout=15_000)
 
-            tasks = [_lookup(pages[i], pid) for i, pid in enumerate(batch)]
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for pid, res in zip(batch, batch_results):
-                if isinstance(res, dict) and (res.get("property_address") or res.get("mailing_address")):
-                    results[pid] = res
-
-            await asyncio.sleep(0.5)
-
-        # Retry failed parcels one at a time (slower but more reliable)
-        failed = [pid for pid in clean if pid not in results]
-        if failed:
-            _logger.info("Retrying %d failed parcels one at a time...", len(failed))
-            for pid in failed:
                 try:
-                    res = await _lookup(pages[0], pid)
-                    if isinstance(res, dict) and (res.get("property_address") or res.get("mailing_address")):
-                        results[pid] = res
+                    await scraper.page.wait_for_function(
+                        "() => document.body.innerText.includes('Mailing Address') || document.body.innerText.includes('No accounts')",
+                        timeout=8_000,
+                    )
                 except Exception:
                     pass
-                await asyncio.sleep(0.5)
 
-        for p in pages[1:]:
-            await p.close()
+                body = await scraper.page.inner_text("body")
+                if "Mailing Address" in body:
+                    idx = body.index("Mailing Address") + len("Mailing Address")
+                    after = body[idx:idx + 200]
+                    lines = [l.strip() for l in after.split("\n") if l.strip()]
+                    addr_lines = []
+                    for line in lines:
+                        if line.startswith("Pay by") or line.startswith("Annual") or line.startswith("Billing"):
+                            break
+                        if len(line) > 3:
+                            addr_lines.append(line)
+                        if len(addr_lines) >= 2:
+                            break
+                    if addr_lines:
+                        mailing = " ".join(", ".join(addr_lines).strip().split())
+                        results[pid]["mailing_address"] = mailing
 
-    _logger.info("Enrichment done: %d/%d found", len(results), len(clean))
-    return results
-
-
-async def _lookup(page, parcel_id: str) -> dict[str, str | None]:
-    """Step 1: eRealProperty for property address + tax bill link.
-       Step 2: Property Tax Bill for mailing address."""
-    try:
-        # Step 1: Go to eRealProperty Dashboard (no disclaimer needed for Dashboard URL)
-        await page.goto(f"{_ERP_URL}{parcel_id}", wait_until="load", timeout=15_000)
-        await page.wait_for_timeout(3000)
-
-        # Extract Site Address from the PARCEL table
-        prop = await page.evaluate("""
-            (() => {
-                // Look for "Site Address" in table cells
-                const tds = document.querySelectorAll('td');
-                for (let i = 0; i < tds.length; i++) {
-                    if (tds[i].textContent.trim() === 'Site Address' && tds[i+1]) {
-                        return tds[i+1].textContent.trim();
-                    }
-                }
-                return null;
-            })()
-        """)
-
-        # Get the Property Tax Bill link (has the correct tax account number)
-        tax_url = await page.evaluate("""
-            (() => {
-                const link = document.querySelector('#cphContent_HyperLinkPropertyTaxInformationSystem, a[href*="PropertyTaxes"]');
-                return link ? link.href : null;
-            })()
-        """)
-
-        # Step 2: Follow the Tax Bill link for mailing address
-        mailing = None
-        if tax_url:
-            await page.goto(tax_url, wait_until="load", timeout=15_000)
-            try:
-                await page.wait_for_function(
-                    "() => document.body.innerText.includes('Mailing Address') || document.body.innerText.includes('No accounts')",
-                    timeout=8_000,
-                )
             except Exception:
                 pass
 
-            body = await page.inner_text("body")
-            if "Mailing Address" in body:
-                idx = body.index("Mailing Address") + len("Mailing Address")
-                after = body[idx:idx + 200]
-                lines = [l.strip() for l in after.split("\n") if l.strip()]
-                addr_lines = []
-                for line in lines:
-                    if line.startswith("Pay by") or line.startswith("Annual") or line.startswith("Billing"):
-                        break
-                    if len(line) > 3:
-                        addr_lines.append(line)
-                    if len(addr_lines) >= 2:
-                        break
-                if addr_lines:
-                    mailing = ", ".join(addr_lines)
+            await asyncio.sleep(0.3)
 
-        if prop:
-            prop = " ".join(prop.strip().split())
-        if mailing:
-            mailing = " ".join(mailing.strip().split())
-
-        return {"property_address": prop, "mailing_address": mailing}
-
-    except Exception:
-        return {"property_address": None, "mailing_address": None}
+    found_mail = sum(1 for r in results.values() if r.get("mailing_address"))
+    found_prop = sum(1 for r in results.values() if r.get("property_address"))
+    _logger.info("Enrichment done: %d/%d property, %d/%d mailing",
+                 found_prop, len(clean), found_mail, len(clean))
+    return results

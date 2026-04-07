@@ -24,6 +24,59 @@ router = APIRouter(prefix="/scrapers", tags=["scrapers"])
 _BUSINESS_PLANS = ("business", "agency")
 
 
+@router.get("/sample")
+async def sample_records(db: AsyncSession = Depends(get_rls_db)) -> dict:
+    """Public endpoint: returns 5 anonymized sample records for the landing page.
+
+    Shows real data quality (with names partially redacted) so potential
+    users can see what they'll get before signing up. No auth required.
+    """
+    from src.db.models import Result, Job
+
+    # Find a recent successful job with good enrichment
+    result = await db.execute(
+        select(Result)
+        .join(Job, Result.job_id == Job.id)
+        .where(
+            Job.status == "done",
+            Result.property_address.isnot(None),
+            Result.property_address != "",
+            Result.mailing_address.isnot(None),
+            Result.mailing_address != "",
+        )
+        .order_by(Job.created_at.desc())
+        .limit(5)
+    )
+    records = result.scalars().all()
+
+    samples = []
+    for r in records:
+        # Partially anonymize: show first name + initial, full addresses
+        name = r.party_name or ""
+        parts = name.split()
+        if len(parts) >= 2:
+            anon_name = f"{parts[0]} {parts[1][0]}."
+        else:
+            anon_name = f"{parts[0][0]}." if parts else "—"
+
+        samples.append({
+            "date_recorded": r.date_recorded,
+            "party_name": anon_name,
+            "county": "Pierce" if "pierce" in (r.job_id or "").lower() else "King",
+            "property_address": r.property_address,
+            "mailing_address": r.mailing_address,
+            "has_parcel": bool(r.parcel_id),
+        })
+
+    return {
+        "records": samples,
+        "total_scraped": "93,000+",
+        "counties_active": 2,
+        "enrichment_rate": "98%",
+        "freshness": "Updated daily",
+    }
+
+
 @router.get("", response_model=list[ScraperConfigResponse])
 async def list_scrapers(
     current_user: CurrentUser,

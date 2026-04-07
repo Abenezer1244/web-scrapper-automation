@@ -27,6 +27,26 @@ from src.db import User, get_db  # noqa: F401 (User used in Annotated type)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+@router.get("/config")
+async def auth_config() -> dict:
+    """Public endpoint: returns auth validation rules for frontend forms.
+
+    Keeps frontend placeholder text in sync with backend validation.
+    """
+    return {
+        "password": {
+            "min_length": 10,
+            "max_length": 72,
+            "placeholder": "Min. 10 characters",
+        },
+        "trial": {
+            "days": 7,
+            "plan": "pro",
+            "records_limit": 500,
+        },
+    }
+
+
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 async def register(
     body: UserRegister,
@@ -139,6 +159,95 @@ async def refresh_token(
 @router.get("/me", response_model=UserResponse)
 async def me(current_user: CurrentUser) -> UserResponse:
     return UserResponse.model_validate(current_user)
+
+
+@router.get("/onboarding")
+async def onboarding_status(
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Return the user's onboarding progress and next suggested action.
+
+    The frontend uses this to show a getting-started wizard or checklist.
+    """
+    from src.db.models import Job, ScraperConfig
+
+    # Check what the user has done
+    configs_result = await db.execute(
+        select(ScraperConfig).where(ScraperConfig.user_id == current_user.id)
+    )
+    configs = configs_result.scalars().all()
+
+    jobs_result = await db.execute(
+        select(Job).where(Job.user_id == current_user.id)
+    )
+    jobs = jobs_result.scalars().all()
+
+    done_jobs = [j for j in jobs if j.status == "done"]
+
+    steps = {
+        "account_created": True,
+        "scraper_configured": len(configs) > 0,
+        "first_scrape_run": len(jobs) > 0,
+        "first_scrape_completed": len(done_jobs) > 0,
+        "first_export_downloaded": any(j.export_key for j in done_jobs),
+    }
+
+    completed = sum(1 for v in steps.values() if v)
+    total = len(steps)
+
+    # Determine next action
+    if not steps["scraper_configured"]:
+        next_action = {
+            "action": "create_scraper",
+            "title": "Set up your first scraper",
+            "description": "Choose a county and record type to start pulling leads.",
+            "cta": "New Scraper",
+            "route": "/dashboard/scrapers/new",
+        }
+    elif not steps["first_scrape_run"]:
+        config = configs[0]
+        next_action = {
+            "action": "run_scrape",
+            "title": f"Run your first scrape on {config.county.title()}, {config.state.upper()}",
+            "description": "Click 'Run Now' to start pulling records from the county portal.",
+            "cta": "Run Now",
+            "route": f"/dashboard/scrapers/{config.id}",
+        }
+    elif not steps["first_scrape_completed"]:
+        next_action = {
+            "action": "wait_for_scrape",
+            "title": "Your scrape is running",
+            "description": "Records are being pulled from the county portal. This usually takes 2-5 minutes.",
+            "cta": "View Progress",
+            "route": "/dashboard",
+        }
+    elif not steps["first_export_downloaded"]:
+        job = done_jobs[0]
+        next_action = {
+            "action": "download_export",
+            "title": f"Download your {job.record_count or 0} leads",
+            "description": "Your records are ready. Download the CSV and start mailing today.",
+            "cta": "Download CSV",
+            "route": f"/dashboard/jobs/{job.id}",
+        }
+    else:
+        next_action = {
+            "action": "complete",
+            "title": "You're all set!",
+            "description": "Set up a daily schedule to get fresh leads automatically, or add more counties.",
+            "cta": "Add Another County",
+            "route": "/dashboard/scrapers/new",
+        }
+
+    return {
+        "steps": steps,
+        "completed": completed,
+        "total": total,
+        "progress_pct": int(completed / total * 100),
+        "next_action": next_action,
+        "trial_days_remaining": current_user.trial_ends_at and max(0, (current_user.trial_ends_at.replace(tzinfo=None) - __import__("datetime").datetime.utcnow()).days) if current_user.trial_ends_at else None,
+    }
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)

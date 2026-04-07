@@ -32,15 +32,22 @@ _PLANS = [
     {
         "id": "pro",
         "name": "Pro",
-        "price_monthly": 99,
+        "price_monthly": 49,
         "records_limit": 500,
-        "features": ["500 records/month", "5 counties", "CSV + Excel export", "Daily schedule", "Email delivery"],
+        "features": [
+            "500 records/month",
+            "5 counties",
+            "All record types",
+            "CSV + Excel export",
+            "Daily/weekly schedule",
+            "Email delivery",
+        ],
         "stripe_price_id": settings.STRIPE_PRICE_PRO,
     },
     {
         "id": "business",
         "name": "Business",
-        "price_monthly": 299,
+        "price_monthly": 149,
         "records_limit": 5000,
         "features": [
             "5,000 records/month",
@@ -48,23 +55,25 @@ _PLANS = [
             "All export formats",
             "All schedules",
             "Email + Webhook delivery",
-            "Skip tracing",
+            "Skip tracing (coming soon)",
             "API access",
+            "5 team members",
         ],
         "stripe_price_id": settings.STRIPE_PRICE_BUSINESS,
     },
     {
         "id": "agency",
         "name": "Agency",
-        "price_monthly": 799,
+        "price_monthly": 499,
         "records_limit": -1,
         "features": [
             "Unlimited records",
             "Unlimited counties",
             "All features",
-            "Team members",
-            "White-label",
+            "Unlimited team members",
+            "White-label (coming soon)",
             "Priority support",
+            "Dedicated account manager",
         ],
         "stripe_price_id": settings.STRIPE_PRICE_AGENCY,
     },
@@ -85,6 +94,43 @@ async def list_plans() -> list[dict]:
     """Return the full plan catalog. Used by the frontend upgrade UI."""
     return _PLANS
 
+
+@router.get("/pricing")
+async def pricing_page() -> dict:
+    """Return full pricing page data including feature comparison matrix.
+
+    Public endpoint — no auth required. Used by the frontend pricing page.
+    """
+    return {
+        "plans": _PLANS,
+        "comparison": {
+            "Records per month": {"starter": "50", "pro": "500", "business": "5,000", "agency": "Unlimited"},
+            "Counties": {"starter": "1", "pro": "5", "business": "Unlimited", "agency": "Unlimited"},
+            "Record types": {"starter": "Probate", "pro": "All", "business": "All", "agency": "All"},
+            "Data freshness": {"starter": "Daily", "pro": "Daily", "business": "Daily", "agency": "Daily"},
+            "Export formats": {"starter": "CSV", "pro": "CSV, Excel", "business": "CSV, Excel, JSON, API", "agency": "CSV, Excel, JSON, API"},
+            "Scheduling": {"starter": "Manual only", "pro": "Daily, Weekly", "business": "All frequencies", "agency": "All frequencies"},
+            "Email delivery": {"starter": False, "pro": True, "business": True, "agency": True},
+            "Webhook delivery": {"starter": False, "pro": False, "business": True, "agency": True},
+            "Skip tracing": {"starter": False, "pro": False, "business": "Coming soon", "agency": "Coming soon"},
+            "API access": {"starter": False, "pro": False, "business": True, "agency": True},
+            "Team members": {"starter": "1", "pro": "1", "business": "5", "agency": "Unlimited"},
+            "White-label": {"starter": False, "pro": False, "business": False, "agency": "Coming soon"},
+            "Support": {"starter": "Community", "pro": "Email", "business": "Priority email", "agency": "Dedicated manager"},
+        },
+        "trial": {
+            "days": 7,
+            "plan": "pro",
+            "description": "7-day free Pro trial. No credit card required. 500 records/month.",
+        },
+        "faq": [
+            {"q": "What are motivated seller leads?", "a": "Public records (probate, foreclosure, tax delinquent, etc.) that indicate a property owner may be willing to sell below market value."},
+            {"q": "How fresh is the data?", "a": "We scrape county portals daily. Records appear in BridgeLeads within 24 hours of being filed at the county."},
+            {"q": "What counties do you cover?", "a": "Currently all 39 Washington State counties, with expansion to TX, FL, CA, and more states coming soon."},
+            {"q": "Can I cancel anytime?", "a": "Yes. No contracts, no cancellation fees. Your data exports remain available for 30 days after cancellation."},
+            {"q": "What export formats do you support?", "a": "CSV, Excel, and JSON. Business and Agency plans also get API access for direct integration."},
+        ],
+    }
 
 
 # ─── Usage ────────────────────────────────────────────────────────────────────
@@ -154,17 +200,17 @@ async def create_checkout(
     """Create a Stripe Checkout session to upgrade the user's plan."""
     price_or_product_id = body.price_id
 
-    # Validate: input must be a known product/price ID from the plan catalog
-    if price_or_product_id not in _PRICE_TO_PLAN:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
-
-    # Resolve Product ID → Price ID (sourced from env vars via settings)
+    # Resolve Product ID → Price ID first (sourced from env vars via settings)
     _PRODUCT_TO_PRICE = {
         settings.STRIPE_PRODUCT_PRO: settings.STRIPE_PRICE_PRO,
         settings.STRIPE_PRODUCT_BUSINESS: settings.STRIPE_PRICE_BUSINESS,
         settings.STRIPE_PRODUCT_AGENCY: settings.STRIPE_PRICE_AGENCY,
     }
     stripe_price_id = _PRODUCT_TO_PRICE.get(price_or_product_id, price_or_product_id)
+
+    # Validate: resolved price must be a known plan price
+    if stripe_price_id not in _PRICE_TO_PLAN:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
 
     try:
         customer_id = current_user.stripe_customer_id

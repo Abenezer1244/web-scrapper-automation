@@ -163,7 +163,7 @@ def watchdog_stuck_jobs() -> None:
     from src.db.session import SyncSessionLocal
     from src.workers.tasks import run_scrape_job
 
-    stuck_cutoff = datetime.now(UTC) - timedelta(minutes=55)
+    stuck_cutoff = datetime.now(UTC) - timedelta(minutes=20)
     active_statuses = {"queued", "probing", "scraping", "enriching"}
 
     with SyncSessionLocal() as db:

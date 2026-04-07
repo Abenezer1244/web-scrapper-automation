@@ -74,13 +74,19 @@ class LandmarkWebDeathCertScraper(BridgeScraper):
         seen: set[str] = set()
         chunk_num = 0
 
-        # Navigate and accept disclaimer once
+        # Navigate and accept disclaimer — retry up to 3 times on crash
         search_url = f"{self._base_url}/search/index" if "/search/" not in self._base_url else self._base_url
-        await self.navigate(search_url)
-        await self._accept_disclaimer()
-
-        # Solve CAPTCHA once at the start (user does it manually in headed mode)
-        await self._solve_captcha_once()
+        for attempt in range(1, 4):
+            try:
+                await self.navigate(search_url)
+                await self._accept_disclaimer()
+                await self._solve_captcha_once()
+                break
+            except Exception as exc:
+                _logger.warning("Startup attempt %d/3 failed: %s", attempt, str(exc)[:80])
+                if attempt == 3:
+                    raise
+                await asyncio.sleep(5)
 
         chunk_start = start
         while chunk_start < end:

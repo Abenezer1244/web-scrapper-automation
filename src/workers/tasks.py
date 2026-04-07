@@ -240,15 +240,7 @@ def run_scrape_job(self, job_id: str) -> None:
         finally:
             local_file.unlink(missing_ok=True)
 
-        # ── DONE ─────────────────────────────────────────────────────────────
-        _set_status(
-            db, job, "done",
-            finished_at=_now(),
-            record_count=len(records),
-            export_key=object_key,
-        )
-
-        # Atomic update of monthly record usage to prevent race conditions
+        # Atomic update of monthly record usage
         from sqlalchemy import update as sa_update
         db.execute(
             sa_update(User)
@@ -258,17 +250,16 @@ def run_scrape_job(self, job_id: str) -> None:
         db.commit()
         db.refresh(user)
 
-        # Check if user exceeded their limit and warn
         if user.records_limit != -1 and user.records_used > user.records_limit:
             overage = user.records_used - user.records_limit
             _publish_log(r, job_id, "warning", f"Plan limit exceeded by {overage} records. Upgrade to keep scraping.")
 
-        # ── INLINE ENRICHMENT (before marking done) ─────────────────────────
+        # ── INLINE ENRICHMENT (BEFORE marking done) ──────────────────────────
+        _publish_log(r, job_id, "info", "Looking up property and mailing addresses...")
         try:
             _run_inline_enrichment(db, job, r, job_id, config)
         except Exception as exc:
             _logger.warning("Inline enrichment error: %s", str(exc)[:80])
-        # Signal to frontend that enrichment is done (matches the log pattern it checks)
         _publish_log(r, job_id, "success", f"Enrichment complete — addresses added")
 
         # Re-export CSV with enriched data
@@ -288,6 +279,13 @@ def run_scrape_job(self, job_id: str) -> None:
         except Exception as exc:
             _logger.warning("CSV re-export failed: %s", str(exc)[:60])
 
+        # ── NOW mark done (after enrichment + re-export) ────────────────────
+        _set_status(
+            db, job, "done",
+            finished_at=_now(),
+            record_count=len(records),
+            export_key=object_key,
+        )
         _publish_log(r, job_id, "success", f"Job complete — {len(records)} records ready")
         r.publish(f"job_logs:{job_id}", json.dumps({"type": "done", "record_count": len(records)}))
 

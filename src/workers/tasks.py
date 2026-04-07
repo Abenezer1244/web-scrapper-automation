@@ -148,6 +148,15 @@ def run_scrape_job(self, job_id: str) -> None:
                 elif phase == "enriching":
                     _publish_log(r, job_id, "info", f"Looking up addresses for {page_total} parcels...")
 
+        _publish_log(r, job_id, "info", "Connecting to county portal...")
+        # Update progress label so the live page shows activity during captcha solve
+        job.progress_label = "Connecting to portal..."
+        try:
+            db.commit()
+        except Exception:
+            try: db.rollback(); db.commit()
+            except Exception: pass
+
         try:
             records = asyncio.run(_run_scraper(scraper_class, date_from, date_to, r, job_id, _on_progress))
         except Exception:

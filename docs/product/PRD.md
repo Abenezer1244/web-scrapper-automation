@@ -423,68 +423,141 @@ These look tempting but are traps. They're expensive, regulated, or outside Brid
 
 ---
 
-## 6. Product Roadmap
+## 6. Build Priority Stack
 
-### Phase 0: Foundation Hardening (Current - April 2026)
+Follow these sprints in order. Each sprint builds on the previous one. Do not skip ahead.
 
-**Goal:** Improve reliability and enrichment to make existing WA users successful.
-**North star:** Job success rate > 85%, enrichment coverage > 75%.
+### Sprint 1: Get 10 Beta Users (Week 1)
 
-| Deliverable | Description | Success Criteria |
-|-------------|-------------|------------------|
-| Job reliability | Fix failure modes, retry logic, portal health checks | Success rate > 85% (from 51%) |
-| Enrichment coverage | GIS fallback chain, Regrid volume pricing | Property address > 75% (from 25%) |
-| Activation flow | First-scrape onboarding, sample data preview | Time to first lead < 5 minutes |
-| Cancellation analytics | Track why users cancel, exit surveys | Data collected for 50+ churned users |
+**Goal:** Get real investors using the product. Pierce + King County probate data is production-ready (98%+ enrichment). No code needed.
+**Gate:** Do not start Sprint 2 until you have 5+ beta users actively running scrapes.
 
-### Phase 1: WA State Domination (May-June 2026)
+| # | Task | How | Done When |
+|---|------|-----|-----------|
+| 1.1 | Find 10 WA wholesalers/flippers | BiggerPockets forums, local REIA meetups, Facebook RE investor groups, r/realestateinvesting | 10 investors identified |
+| 1.2 | Create free Pro accounts for each | Give them 500 records/month, no time limit | Accounts created |
+| 1.3 | Onboard them 1-on-1 | Screen share, show them Pierce or King County probate, run a scrape together | Each user has downloaded their first CSV |
+| 1.4 | Set up feedback channel | Slack group, WhatsApp, or simple Google Form | Channel active, users posting |
+| 1.5 | Collect first feedback | Ask: "What's missing?" "Would you pay for this?" "What county do you need?" | 5+ responses collected |
 
-**Goal:** Cover all 39 WA counties with 3+ record types. Hit 50 paid customers.
-**North star:** $5K MRR.
+### Sprint 2: Expand to 5 WA Counties (Week 2-3)
 
-| Deliverable | Description | Success Criteria |
-|-------------|-------------|------------------|
-| All WA counties active | AI scraper verified on remaining 27 counties | 39/39 counties producing data |
-| Pre-foreclosure records | Second record type launched statewide | Available in 10+ counties |
-| Tax delinquent records | Third record type launched | Available in 5+ counties |
-| Regrid volume pricing | Negotiate $0.005-0.01/record | Business plan achieves 70%+ margin |
-| Referral program | $20 credit per referred paid user | 10+ referral signups |
+**Goal:** Verify Spokane, Snohomish, and Clark County scrapers to give beta users more coverage.
+**Gate:** Do not start Sprint 3 until all 5 counties pass data completeness check (95%+ enrichment).
 
-### Phase 2: Regional Expansion (July-September 2026)
+| # | Task | Detail | Done When |
+|---|------|--------|-----------|
+| 2.1 | Test Spokane County probate | AI scraper on Spokane recorder portal. Verify records + enrichment. | 50+ records with 95%+ property/mailing address |
+| 2.2 | Test Snohomish County probate | LandmarkWeb portal (same platform as King). Connector exists, needs verification. | 50+ records with 95%+ enrichment |
+| 2.3 | Test Clark County probate | LandmarkWeb portal. Connector exists, needs verification. | 50+ records with 95%+ enrichment |
+| 2.4 | Fix any enrichment gaps | If a county has low enrichment, debug GIS config or add county-specific assessor lookup | All 5 counties at 95%+ |
+| 2.5 | Notify beta users | "3 new counties available: Spokane, Snohomish, Clark" | Users creating configs for new counties |
 
-**Goal:** Expand to top 10 investor states. Hit 200 paid customers.
-**North star:** $15K MRR.
+### Sprint 3: Add Pre-Foreclosure Record Type (Week 3-4)
 
-| Deliverable | Description | Success Criteria |
-|-------------|-------------|------------------|
-| 10-state coverage | CA, TX, FL, AZ, OH, IL, GA, NC, PA, MI | 100+ counties producing data |
-| Skip tracing | Phone + email enrichment (Business+ tier) | Available as paid add-on |
-| CRM integrations | Zapier/Make webhook templates, HubSpot native | 50+ users connected |
-| Lead deduplication | Cross-run duplicate flagging | Duplicates marked, not double-counted |
-| Mobile-responsive results | View and download leads from phone | Full mobile experience |
+**Goal:** Launch the second record type. Pre-foreclosure is the highest-value record for investors after probate.
+**Gate:** Do not start Sprint 4 until pre-foreclosure works on at least 3 counties with 90%+ enrichment.
 
-### Phase 3: National Scale (October 2026 - March 2027)
+| # | Task | Detail | Done When |
+|---|------|--------|-----------|
+| 3.1 | Identify pre-foreclosure source for Pierce | NOD / lis pendens filings on ARMS portal. May be a different document type filter. | Source URL and document type confirmed |
+| 3.2 | Build Pierce pre-foreclosure scraper | Extend existing ARMS scraper or create new config | 20+ records scraped with enrichment |
+| 3.3 | Identify pre-foreclosure source for King | LandmarkWeb or separate county portal. Research how King publishes NODs. | Source confirmed |
+| 3.4 | Build King pre-foreclosure scraper | Same approach as probate but different document filter | 20+ records scraped |
+| 3.5 | Test on Spokane with AI scraper | Use Claude to navigate Spokane's recorder for pre-foreclosure docs | Records extracted |
+| 3.6 | Collect beta user feedback | "Do you want pre-foreclosure? What record type next?" | Clear signal on next priority |
 
-**Goal:** Cover all 3,100+ US counties. Hit 1,000 paid customers.
-**North star:** $75K MRR.
+### Sprint 4: Skip Tracing Integration (Week 4-5)
 
-| Deliverable | Description | Success Criteria |
-|-------------|-------------|------------------|
-| National coverage | AI scraper on all county portals | 3,100+ counties, 6 record types |
-| Lead scoring | ML model ranks leads by deal probability | Score available on every record |
-| Team management | Multi-user accounts with role-based access | Agency tier fully functional |
-| White-label | Custom branding, subdomain for Agency clients | 5+ agencies using white-label |
-| Direct mail integration | One-click "send yellow letters" from results | Integration with Ballpoint/YellowLetters |
+**Goal:** Add phone + email to every record. This is the #1 table-stakes feature investors expect.
+**Gate:** Do not start Sprint 5 until skip tracing returns valid phone numbers for 60%+ of records.
 
-### Phase 4: Platform (2027+)
+| # | Task | Detail | Done When |
+|---|------|--------|-----------|
+| 4.1 | Evaluate skip trace providers | BatchData API, REISkip, SkipGenie. Compare: hit rate, price per trace, API quality. | Provider selected |
+| 4.2 | Integrate skip trace API | Add phone + email columns to Result model. Call API during enrichment phase. | Phone/email populated on test scrape |
+| 4.3 | Add to CSV/Excel export | New columns: phone, email, skip_trace_status | Visible in downloaded CSV |
+| 4.4 | Gate to Business+ tier (or per-record add-on) | Decide pricing: bundled with Business ($149/mo) or $0.10-0.15/trace add-on | Pricing live in Stripe |
+| 4.5 | Add to frontend results table | Show phone/email in the results view with click-to-copy | Visible in UI |
 
-**Goal:** Become the operating system for RE investor lead generation.
+### Sprint 5: Onboarding + Activation (Week 5-6)
 
-- Marketplace (investors sell/trade lead lists)
-- Comps and ARV data integration
-- Disposition management (sell to end buyers)
-- International expansion (CA, UK, AU)
-- Series A fundraise ($2M+ ARR target)
+**Goal:** Make the first-run experience so fast that investors convert to paid within 7 days.
+**Gate:** Time to first lead must be < 5 minutes for a new user.
+
+| # | Task | Detail | Done When |
+|---|------|--------|-----------|
+| 5.1 | Sample data preview (pre-signup) | Show 5 real anonymized records on the landing page. "Here's what you get." | Visible on app.bridgeleads.io |
+| 5.2 | One-click first scrape | After signup, pre-select nearest county + probate. One button to start. | New user can scrape in < 2 clicks |
+| 5.3 | Onboarding email sequence | Day 1: welcome + how to run first scrape. Day 3: "Download your leads yet?" Day 7: "Upgrade for more counties" | 3 emails configured in Resend |
+| 5.4 | In-app upgrade prompts | When user hits 50-record limit: "Upgrade to Pro for 500 records/month" | Prompt shown at limit |
+| 5.5 | Track activation metrics | Log: signup > first scrape > first download > upgrade. Identify dropoff points. | Dashboard or analytics in DB |
+
+### Sprint 6: Tax Delinquent + More Counties (Week 6-8)
+
+**Goal:** Third record type + expand to 10 WA counties based on beta user requests.
+**Gate:** Only build counties that beta users actually ask for.
+
+| # | Task | Detail | Done When |
+|---|------|--------|-----------|
+| 6.1 | Identify tax delinquent source | County treasurer portals (different from recorder). Research WA county treasurer websites. | Source URLs for 5 counties |
+| 6.2 | Build tax delinquent scraper | New scraper type targeting treasurer/tax collector portals | Records scraped for 3+ counties |
+| 6.3 | Expand to user-requested counties | Whatever counties beta users ask for. Expected: Thurston, Kitsap, Whatcom, Yakima. | 10 total counties active |
+| 6.4 | Lead deduplication | Flag records that appeared in previous scrapes. Don't count duplicates against record limits. | Duplicates marked in results |
+| 6.5 | Zapier/webhook integration | POST job results to a webhook URL on completion. Enables CRM push. | Working webhook delivery |
+
+### Sprint 7: Growth + Revenue (Week 8-12)
+
+**Goal:** Convert beta users to paid. Hit $5K MRR.
+**Gate:** 25+ paying customers before expanding beyond WA.
+
+| # | Task | Detail | Done When |
+|---|------|--------|-----------|
+| 7.1 | Convert beta users to paid | End free Pro period. Offer discounted first 3 months ($29/mo). | 10+ conversions |
+| 7.2 | Regrid volume pricing | Negotiate $0.005-0.01/record for Business tier viability | Agreement signed |
+| 7.3 | Referral program | $20 account credit per referred paid user | Referral flow live |
+| 7.4 | County health dashboard (public) | Show which counties are active, when last scraped, record counts. SEO + trust. | Public page live |
+| 7.5 | "First to file" alerts | Push notification / email when a new filing matches your criteria. Real-time, not batch. | Working for Pro+ users |
+
+### Sprint 8+: Regional Expansion (Month 3-6)
+
+**Goal:** Expand to top investor states. Hit 200 paid customers, $15K MRR.
+**Only start after WA is profitable and growing.**
+
+| # | Task | Done When |
+|---|------|-----------|
+| 8.1 | Expand to TX (Harris, Dallas, Tarrant, Bexar counties) | 4 TX counties producing data |
+| 8.2 | Expand to FL (Miami-Dade, Broward, Palm Beach, Hillsborough) | 4 FL counties producing data |
+| 8.3 | Expand to CA (Los Angeles, San Diego, Orange, Riverside) | 4 CA counties producing data |
+| 8.4 | Expand to AZ, OH, IL, GA, NC, PA, MI (top metros only) | 2 counties per state |
+| 8.5 | Direct mail integration (Lob.com) | One-click "mail this list" from results page |
+| 8.6 | Exclusive lead windows | 24-48hr exclusivity for subscribers, then shared pool |
+| 8.7 | Deal outcome tracking | Users mark leads as contacted/responded/under contract/closed |
+| 8.8 | Mobile-responsive results | Full mobile experience for results + download |
+
+### Sprint 9+: National Scale (Month 6-12)
+
+| # | Task | Done When |
+|---|------|-----------|
+| 9.1 | AI scraper coverage for all 3,100+ US counties | National coverage |
+| 9.2 | All 6 record types nationwide | Probate, pre-foreclosure, tax delinquent, divorce, code violation, eviction |
+| 9.3 | Lead scoring (AI, trained on deal outcomes) | Score on every record |
+| 9.4 | Team management (multi-user accounts) | Agency tier fully functional |
+| 9.5 | White-label for agencies | Custom branding, subdomain |
+| 9.6 | Automatic re-enrichment | Failed enrichments retried weekly |
+| 9.7 | Neighborhood targeting (ZIP/subdivision filter) | Filter results by area |
+| 9.8 | Competitor switching tool | Import PropStream/BatchLeads CSV, show what's new |
+
+### What NOT to Build (Park These)
+
+| Feature | Build After | Why Wait |
+|---------|------------|----------|
+| Divorce / eviction / code violation records | 100+ customers | Low volume, niche. Wait for customer demand. |
+| Bankruptcy records (PACER) | 200+ customers | Federal system, different scraping approach. |
+| Built-in dialer | Never (integrate instead) | TCPA regulated, expensive, low margin. Use Zapier to push to existing dialers. |
+| Driving for dollars | Never | Different product entirely (mobile GPS app). Not your lane. |
+| Comps / ARV calculator | 500+ customers | Requires licensed MLS data. Investors use Zillow/Redfin for free. |
+| International expansion | $2M+ ARR | Different legal systems, different data sources. |
 
 ---
 

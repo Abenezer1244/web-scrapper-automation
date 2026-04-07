@@ -349,6 +349,68 @@ All requirements verified and implemented as of April 7, 2026:
 
 **Rate limits:** 60 requests/minute general, 10/minute auth, 5/minute job creation.
 
+### 5.8 Competitive Moat: Existing Unique Features
+
+These features exist today and no competitor offers them:
+
+| Feature | What It Does | Why It's a Moat |
+|---------|-------------|-----------------|
+| **AI scraping (Claude)** | Add any county in 30 seconds by pasting a URL. No per-county code needed. | PropStream/BatchLeads buy bulk data and can't add counties on demand. Goliath Data claims direct scraping but charges $1,499/mo. |
+| **Same-day freshness** | Records available within hours of being filed. Daily automated scraping. | Competitors rely on aggregators with 7-30 day lag. Goliath Data offers hourly at $1,499/mo. BridgeLeads does daily at $49/mo. |
+| **Free tier with real data** | 50 real county records/month, not a demo or sample. | No competitor gives free real leads. PropStream offers a 7-day trial then $99/mo minimum. |
+| **Per-record-type selection** | Choose probate, pre-foreclosure, tax delinquent, etc. independently per county. | Competitors bundle everything into one "leads" database with filters. BridgeLeads scrapes the actual filing type from source. |
+| **Live job streaming (SSE)** | Watch your scrape happen in real-time with progress and log lines. | Competitors are batch mode. You request a list and wait. No visibility into what's happening. |
+
+### 5.9 Unique Features to Build (Differentiation Roadmap)
+
+These features don't exist in any competitor. They create defensible advantages.
+
+#### Phase 1: Launch Differentiators
+
+| Feature | What It Does | Why It Matters | Effort |
+|---------|-------------|----------------|--------|
+| **"First to file" alerts** | Real-time push notification the moment a new probate/foreclosure is filed. Not daily batch — within minutes. | The fastest lead source in RE investing. Even Goliath Data (hourly) can't match per-filing alerts. Investors pay premium for speed. | Medium — requires webhook + polling interval reduction |
+| **County health dashboard** | Public page showing which counties are online, when data was last pulled, record counts, uptime. | Radical transparency. Investors can see exactly when data was scraped. PropStream can't do this — they don't know when their aggregator last updated. Also doubles as a marketing/SEO page. | Small — aggregate existing canary health data into a public endpoint |
+
+#### Phase 2: Retention Differentiators
+
+| Feature | What It Does | Why It Matters | Effort |
+|---------|-------------|----------------|--------|
+| **Exclusive lead windows** | For 24-48 hours after scraping, only the subscriber who configured that county+record type gets the leads. After the window, leads enter the shared pool. | Creates urgency to subscribe and stay subscribed. Investors pay for exclusivity — being the first to mail a motivated seller is the entire value proposition. | Medium — add time-gated visibility to results query |
+| **Deal outcome tracking** | After downloading leads, investor marks which ones became deals (contacted, responded, under contract, closed). | Nobody tracks closed deals back to lead source. Over time this data becomes a proprietary scoring model. It answers "which record types in which counties produce the most deals?" | Medium — new UI + DB model for deal stages |
+| **Automatic re-enrichment** | Records where property/mailing address enrichment failed are retried weekly with updated GIS data. Leads improve over time. | Nobody does this. Once a lead is pulled from PropStream/BatchLeads, it's frozen. BridgeLeads records get better retroactively. | Small — cron job to re-enrich NULL address records |
+
+#### Phase 3: Scale Differentiators
+
+| Feature | What It Does | Why It Matters | Effort |
+|---------|-------------|----------------|--------|
+| **Neighborhood targeting** | Filter leads by ZIP code, subdivision, school district, or draw on a map. Not just county-wide dumps. | Wholesalers work specific neighborhoods. Getting 500 leads for a whole county when you only want one ZIP is wasteful and eats your record limit. | Medium — GIS overlay + ZIP filter on results |
+| **Lead scoring (AI)** | ML model ranks each lead by deal probability, trained on deal outcome data from Phase 2. | Proprietary and gets better with every customer. PropStream can't build this — they don't have deal outcome data. This becomes the ultimate moat. | Large — requires deal outcome data volume first |
+| **Competitor switching tool** | Import your PropStream/BatchLeads CSV, BridgeLeads deduplicates against its data and shows what's new vs stale. | Reduces switching friction. Investor sees "BridgeLeads found 47 leads PropStream missed" — instant conversion proof. | Small — CSV parser + dedup logic |
+
+### 5.10 Features to Copy From Competitors (Table Stakes)
+
+These aren't differentiators. They're expected features that investors need to complete their workflow.
+
+| Feature | Copy From | Why It's Needed | Effort | Target Phase |
+|---------|----------|-----------------|--------|-------------|
+| **Skip tracing (phone + email)** | BatchLeads, PropStream | Investors need phone numbers for cold calling. Every competitor has this. Without it, investors can only mail. | Medium (API: BatchData or REISkip) | Phase 2 |
+| **Zapier/webhook export** | BatchLeads | Investors already use CRMs (Podio, Follow Up Boss, REI Blackbook). Push leads there automatically. | Small (webhook POST on job completion) | Phase 1 |
+| **Direct mail integration** | DealMachine (via Lob.com) | "Download CSV then upload to mail house" is friction. One-click "mail this list" is the expected experience. | Medium (Lob.com API) | Phase 3 |
+| **Mobile-responsive results** | DealMachine | Investors check leads on their phone between appointments. Dashboard must work on mobile. | Medium (frontend responsive) | Phase 1 |
+
+### 5.11 Features NOT to Build
+
+These look tempting but are traps. They're expensive, regulated, or outside BridgeLeads' core value.
+
+| Feature | Who Has It | Why Skip It |
+|---------|-----------|------------|
+| **Built-in dialer** | BatchLeads ($89/mo add-on) | Huge engineering effort, TCPA regulated, low margin. Let investors use their existing dialer. Integrate via Zapier instead. |
+| **Driving for dollars** | DealMachine (core feature) | Completely different product (mobile-first GPS app). BridgeLeads is a data platform, not a field tool. |
+| **Property comps / ARV** | PropStream ($5/report) | Requires licensed MLS/ATTOM data. Expensive, low margin. Investors already use Zillow/Redfin for free comps. |
+| **Full MLS integration** | PropStream | Requires MLS board partnerships in each market. Years of work, heavy legal. Not your lane. |
+| **AI deal analysis** | DealMachine (Alma AI) | Interesting but not core. Investors know how to evaluate deals. They need leads, not advice. Build this after lead scoring is proven. |
+
 ---
 
 ## 6. Product Roadmap

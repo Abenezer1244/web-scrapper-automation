@@ -46,6 +46,16 @@ class User(Base):
     jobs = relationship("Job", back_populates="user", cascade="all, delete-orphan")
 
 
+class PasswordHistory(Base):
+    """Stores recent password hashes to prevent reuse."""
+    __tablename__ = "password_history"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class ScraperConfig(Base):
     __tablename__ = "scraper_configs"
 

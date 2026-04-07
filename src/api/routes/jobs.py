@@ -358,7 +358,7 @@ async def get_export_url(
     Generates a single-use token (60s) scoped to this job + user.
     The token is safe to put in a URL — it's not the full JWT.
     """
-    from jose import jwt as jose_jwt
+    import jwt as jose_jwt
     from src.config import settings as app_settings
     import time
 
@@ -399,7 +399,8 @@ async def download_export(
     The download token is scoped to a specific job, expires in 60s, and is safe for URLs.
     """
     import requests as sync_requests
-    from jose import jwt as jose_jwt, JWTError
+    import jwt as jose_jwt
+    from jwt.exceptions import InvalidTokenError as JWTError
     from src.config import settings as app_settings
 
     # Authenticate: prefer short-lived download token, fall back to Authorization header

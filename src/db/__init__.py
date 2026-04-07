@@ -1,4 +1,4 @@
-from .models import Base, CountyConnector, CountyRecord, Job, JobLog, Result, ScraperConfig, User, UserRecordView
+from .models import Base, CountyConnector, CountyRecord, Job, JobLog, PasswordHistory, Result, ScraperConfig, User, UserRecordView
 from .session import (
     AsyncSessionLocal,
     SyncSessionLocal,
@@ -18,6 +18,7 @@ __all__ = [
     "CountyRecord",
     "JobLog",
     "UserRecordView",
+    "PasswordHistory",
     "async_engine",
     "sync_engine",
     "AsyncSessionLocal",

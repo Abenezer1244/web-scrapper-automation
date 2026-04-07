@@ -110,10 +110,10 @@ async def refresh_token(
 ) -> TokenResponse:
     """Exchange a valid refresh token for a new access + refresh token pair."""
     await rate_limit(request, zone="auth")
-    from jose import JWTError
+    from jwt.exceptions import InvalidTokenError
     try:
         payload = decode_secure_token(body.refresh_token)
-    except (JWTError, Exception):
+    except (InvalidTokenError, Exception):
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
     if payload.get("purpose") != "refresh":
@@ -192,6 +192,33 @@ async def change_password(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Current password is incorrect.",
         )
+
+    # Check password history — reject reuse of last 5 passwords
+    from src.db.models import PasswordHistory
+    history_result = await db.execute(
+        select(PasswordHistory)
+        .where(PasswordHistory.user_id == current_user.id)
+        .order_by(PasswordHistory.created_at.desc())
+        .limit(5)
+    )
+    recent_hashes = history_result.scalars().all()
+
+    # Also check against the current password
+    if verify_password(body.new_password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password cannot be the same as your current password.",
+        )
+
+    for entry in recent_hashes:
+        if verify_password(body.new_password, entry.password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="New password cannot be one of your last 5 passwords.",
+            )
+
+    # Save current password to history before changing
+    db.add(PasswordHistory(user_id=current_user.id, password_hash=user.password_hash))
 
     user.password_hash = hash_password(body.new_password)
     await db.commit()

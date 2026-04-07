@@ -116,17 +116,38 @@ class BruteForceProtection:
                     headers={"Retry-After": str(lockout)},
                 )
 
+    _NOTIFY_THRESHOLD = 10  # Send email after this many failures
+
     @staticmethod
     async def record_failure(ip: str, email: str) -> None:
-        """Increment failure counters for both the IP and email."""
+        """Increment failure counters for both the IP and email.
+
+        Sends a one-time lockout notification email when the email-based
+        counter crosses the notification threshold.
+        """
         r = _get_redis()
+        email_failures = 0
         for key_suffix, ttl in [
             (f"ip:{ip}", 24 * 3600),
             (f"email:{email}", 24 * 3600),
         ]:
             key = f"{BruteForceProtection._KEY_PREFIX}{key_suffix}"
-            await r.incr(key)
+            count = await r.incr(key)
             await r.expire(key, ttl)
+            if key_suffix.startswith("email:"):
+                email_failures = count
+
+        # Send lockout notification once when threshold is first crossed
+        if email_failures == BruteForceProtection._NOTIFY_THRESHOLD:
+            dedup_key = f"{BruteForceProtection._KEY_PREFIX}notified:{email}"
+            already_sent = await r.get(dedup_key)
+            if not already_sent:
+                await r.setex(dedup_key, 24 * 3600, "1")
+                try:
+                    from src.workers.delivery import send_lockout_notification
+                    send_lockout_notification(email, email_failures, ip)
+                except Exception:
+                    pass  # Never let notification failure affect auth flow
 
     @staticmethod
     async def clear(ip: str, email: str) -> None:

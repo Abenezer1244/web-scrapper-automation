@@ -177,3 +177,72 @@ def _send_payment_failed_email(email: str, attempt_count: int) -> None:
         _logger.info("Payment failed email sent to %s (attempt %d)", email, attempt_count)
     except Exception as exc:
         _logger.error("Failed to send payment failed email to %s: %s", email, exc)
+
+
+def send_lockout_notification(email: str, failure_count: int, ip: str) -> None:
+    """Notify a user that their account is under a brute-force attack.
+
+    Soft-fails — never raises so auth flow is not disrupted.
+    """
+    if not settings.RESEND_API_KEY:
+        return
+
+    safe_email = html.escape(email)
+    safe_ip = html.escape(ip)
+    subject = "Security alert: suspicious login activity on your BridgeLeads account"
+
+    html_body = f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0b; color: #f0efe8; margin: 0; padding: 40px 20px; }}
+    .card {{ background: #111113; border: 1px solid #2a2a32; border-radius: 12px; max-width: 520px; margin: 0 auto; padding: 36px; }}
+    .logo {{ font-size: 18px; font-weight: 600; color: #f5a623; margin-bottom: 28px; }}
+    h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 8px; }}
+    .alert {{ background: #1a0808; border: 1px solid #7a0808; border-radius: 8px; padding: 16px 20px; margin-bottom: 24px; color: #f87171; font-size: 14px; }}
+    .footer {{ font-size: 12px; color: #55545e; border-top: 1px solid #2a2a32; padding-top: 20px; margin-top: 8px; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">BridgeLeads</div>
+    <h1>Suspicious login activity</h1>
+
+    <div class="alert">
+      We detected {failure_count} failed login attempts on your account from IP {safe_ip}.
+      Your account has been temporarily locked for your protection.
+    </div>
+
+    <p>If this was you, wait a few minutes and try again. If you didn't attempt to log in,
+    we recommend changing your password immediately.</p>
+
+    <div class="footer">
+      This is an automated security notification from BridgeLeads.<br>
+      Contact support@bridgeleads.io if you need help.
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+    text_body = (
+        f"Security alert: {failure_count} failed login attempts detected on your "
+        f"BridgeLeads account from IP {ip}.\n\n"
+        "Your account has been temporarily locked.\n\n"
+        "If this wasn't you, change your password immediately.\n"
+        "Contact support@bridgeleads.io if you need help."
+    )
+
+    try:
+        resend.Emails.send({
+            "from": settings.EMAIL_FROM,
+            "to": [email],
+            "subject": subject,
+            "html": html_body,
+            "text": text_body,
+        })
+        _logger.info("Lockout notification sent to %s (%d failures from %s)", email, failure_count, ip)
+    except Exception as exc:
+        _logger.error("Failed to send lockout notification to %s: %s", email, exc)

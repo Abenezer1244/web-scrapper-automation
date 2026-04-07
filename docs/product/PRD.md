@@ -159,13 +159,15 @@ Note: All accounts below are internal test accounts. BridgeLeads has not launche
 
 | Gap | Impact | Priority |
 |-----|--------|----------|
-| 51% job success rate | Users lose trust, churn | P0 |
-| 25% property address coverage | Leads aren't actionable without addresses | P0 |
-| 120 starter users, 7 paid | Revenue depends on conversion | P1 |
-| WA-only coverage | Limits addressable market to 1 state | P1 |
-| No skip tracing | Investors need phone numbers for cold calling | P2 |
-| No CRM integration | Manual CSV import is friction | P2 |
-| Business plan loses money at Regrid rates | Unit economics don't work at scale | P1 |
+| 51% job success rate | Can't launch with half of scrapes failing | P0 — blocks launch |
+| 25% property address coverage | Leads without addresses are useless to investors | P0 — blocks launch |
+| 17% mailing address coverage | Investors can't mail letters without mailing addresses | P0 — blocks launch |
+| Zero real customers | No revenue, no feedback, no validation | P0 — need beta users |
+| WA-only coverage | Limits addressable market to 1 state | P1 — after launch |
+| No skip tracing (phone/email) | Table-stakes feature every competitor has | P2 — Phase 2 |
+| No CRM integration | Manual CSV import is friction for repeat users | P2 — Phase 3 |
+| No direct mail integration | Extra step to go from leads to letters | P2 — Phase 3 |
+| Business plan loses money at Regrid rates | Unit economics break at 5,000 records/month | P1 — before scaling |
 
 ---
 
@@ -173,20 +175,69 @@ Note: All accounts below are internal test accounts. BridgeLeads has not launche
 
 ### 5.1 Record Types
 
-BridgeLeads scrapes 6 categories of motivated seller indicators from county public records:
+BridgeLeads serves 4 tiers of data that investors use to find deals, prioritized by implementation order.
 
-| Record Type | Description | Motivation Signal | Status |
-|-------------|-------------|-------------------|--------|
-| **Probate** | Estate filings after death | Heirs want to sell inherited property quickly | Production (Pierce, King) |
-| **Pre-foreclosure** | Notice of default / lis pendens | Owner facing foreclosure, motivated to sell before auction | Schema ready |
-| **Tax delinquent** | Unpaid property taxes | Owner can't afford taxes, likely open to below-market offers | Schema ready |
-| **Divorce** | Dissolution of marriage filings | Couples splitting assets, often need quick sale | Schema ready |
-| **Code violation** | Building/health code violations | Owner facing fines, may prefer to sell vs. repair | Schema ready |
-| **Eviction** | Landlord eviction filings | Landlord tired of problem tenants, may sell rental | Schema ready |
+#### Tier 1: Core Motivated Seller Records (Scraped from county portals)
 
-**Acceptance criteria per record type:**
+These are the primary product. Each record type is a public filing that signals a property owner is motivated to sell.
+
+| Record Type | Source | Motivation Signal | Status | Target Phase |
+|-------------|--------|-------------------|--------|-------------|
+| **Probate** | County recorder | Heirs inherited a house they don't want, want cash fast | Production (Pierce, King) | Launched |
+| **Pre-foreclosure** | County recorder (NOD / lis pendens) | Owner stopped paying mortgage, 90-120 days from auction | Schema ready | Phase 1 |
+| **Tax delinquent** | County treasurer | Can't afford taxes = can't afford the house, county will seize | Schema ready | Phase 1 |
+| **Divorce** | County clerk | Both parties want house gone, need to split assets quickly | Schema ready | Phase 2 |
+| **Code violation** | City/county code enforcement | Facing fines and repair orders, easier to sell as-is | Schema ready | Phase 2 |
+| **Eviction** | County court | Landlord tired of problem tenants, may exit landlording | Schema ready | Phase 2 |
+
+#### Tier 2: Additional Public Records (Future scraping targets)
+
+These are public records that provide additional motivated seller signals. Each requires identifying the county portal and building/verifying the scraper.
+
+| Record Type | Source | Motivation Signal | Status | Target Phase |
+|-------------|--------|-------------------|--------|-------------|
+| **Bankruptcy** | Federal court (PACER) | Owner's assets being liquidated, property often sold | Not started | Phase 2 |
+| **Liens** (mechanic/tax/judgment) | County recorder | Owner owes money, may need to sell to clear debt | Not started | Phase 2 |
+| **Lis pendens** | County recorder | Lawsuit involving the property, signals distress | Not started (overlaps pre-foreclosure) | Phase 2 |
+| **Death certificates** | County health dept | Identify properties of deceased before probate is filed | Production (King County) | Phase 1 |
+| **Vacant property** | USPS / utility disconnect records | No one living there, owner may want to offload | Not started | Phase 3 |
+| **Absentee owner** | County assessor (owner address != property address) | Owner lives elsewhere, often a tired landlord | Not started | Phase 3 |
+| **Failed listings** | MLS (expired/withdrawn/cancelled) | Tried to sell on market, couldn't. Still motivated. | Not started (requires MLS data partner) | Phase 3 |
+| **Inheritance / transfer on death** | County recorder (TOD deeds) | Similar to probate but avoided court process | Not started | Phase 2 |
+
+#### Tier 3: Data Enrichment (Per-record lookups, not scraped as records)
+
+These data points are appended to each scraped record to make it actionable. Investors can't do anything with a name and date alone.
+
+| Data Point | Source | Why Investors Need It | Status | Target Phase |
+|-----------|--------|----------------------|--------|-------------|
+| **Parcel ID** | County recorder detail pages | Links the filing to a specific property | Production (43% coverage) | Phase 0 (improve) |
+| **Property address** | County GIS / assessor | The house they want to buy | Production (25% coverage) | Phase 0 (improve to 75%) |
+| **Mailing address** | County tax records / assessor | Where to send the letter (often different from property) | Production (17% coverage) | Phase 0 (improve to 60%) |
+| **Skip trace: phone** | BatchData / REISkip / SkipGenie API | For cold calling (faster than mail) | Not started | Phase 2 |
+| **Skip trace: email** | Same providers | For email/SMS outreach campaigns | Not started | Phase 2 |
+| **Property value / ARV** | Zillow / Redfin / ATTOM API | Is the deal worth pursuing? What to offer? | Not started | Phase 3 |
+| **Equity estimate** | Mortgage records + property value | High equity = more motivated, better deal | Not started | Phase 3 |
+| **Mortgage balance** | County recorder (deed of trust) | How much they owe, determines max offer | Not started | Phase 3 |
+| **Owner-occupied vs rental** | Tax records / homestead exemption | Different pitch for owner-occupant vs landlord | Not started | Phase 3 |
+| **Years owned** | County assessor (deed date) | Long-term owners have more equity | Not started | Phase 3 |
+
+#### Tier 4: Workflow Integrations (Platform features, not data)
+
+These turn BridgeLeads from a lead source into a complete investor workflow tool.
+
+| Feature | What It Does | Why Investors Need It | Status | Target Phase |
+|---------|-------------|----------------------|--------|-------------|
+| **Direct mail sending** | Print and mail letters/postcards from the platform | Skip the mail house, one-click marketing | Not started (Lob.com API) | Phase 3 |
+| **Built-in dialer** | Cold call leads directly from the results page | No switching between tabs and spreadsheets | Not started | Phase 4 |
+| **CRM / deal pipeline** | Track leads from first contact through closing | Know which leads are hot, follow up on time | Not started | Phase 3 |
+| **Seller intent scoring** | AI predicts likelihood to sell based on record signals | Prioritize the best leads, skip the rest | Not started | Phase 4 |
+| **Comps / ARV calculator** | Compare to recently sold nearby homes | Estimate deal profitability before making offer | Not started (ATTOM API) | Phase 4 |
+| **Driving for dollars** | Mobile app to photograph distressed houses | Supplement public records with visual scouting | Not started | Phase 4+ |
+
+**Acceptance criteria per record type (Tier 1 and 2):**
 - Extracts: date recorded, party name(s), document number
-- Enriches: parcel ID, property address, mailing address
+- Enriches: parcel ID, property address, mailing address (Tier 3 data)
 - Deduplicates: same record from consecutive scrapes is not counted twice
 - Exports: all fields available in CSV/Excel/JSON
 

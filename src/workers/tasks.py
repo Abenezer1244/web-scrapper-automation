@@ -26,12 +26,14 @@ def _redis() -> sync_redis.Redis:
     return sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
 
 
-def _publish_log(r: sync_redis.Redis, job_id: str, level: str, message: str) -> None:
-    """Publish a log line to Redis Pub/Sub and persist it to the DB."""
+def _publish_log(r: sync_redis.Redis, job_id: str, level: str, message: str, db=None) -> None:
+    """Publish a log line to Redis Pub/Sub and persist it to the DB.
+
+    Pass an existing ``db`` session to avoid opening a new connection per log line.
+    """
     import uuid
 
     from src.db.models import JobLog
-    from src.db.session import SyncSessionLocal
 
     payload = {
         "id": str(uuid.uuid4()),
@@ -43,7 +45,7 @@ def _publish_log(r: sync_redis.Redis, job_id: str, level: str, message: str) -> 
     r.publish(f"job_logs:{job_id}", json.dumps(payload))
 
     # Persist to DB for SSE replay
-    with SyncSessionLocal() as db:
+    if db is not None:
         db.add(JobLog(
             id=payload["id"],
             job_id=job_id,
@@ -51,6 +53,16 @@ def _publish_log(r: sync_redis.Redis, job_id: str, level: str, message: str) -> 
             message=message,
         ))
         db.commit()
+    else:
+        from src.db.session import SyncSessionLocal
+        with SyncSessionLocal() as _db:
+            _db.add(JobLog(
+                id=payload["id"],
+                job_id=job_id,
+                level=level,
+                message=message,
+            ))
+            _db.commit()
 
 
 def _set_status(db, job, status: str, **kwargs) -> None:
@@ -102,11 +114,11 @@ def run_scrape_job(self, job_id: str) -> None:
 
         # ── QUEUED ────────────────────────────────────────────────────────────
         _set_status(db, job, "queued", started_at=_now())
-        _publish_log(r, job_id, "info", f"Job queued — {config.name} ({config.county}, {config.state})")
+        _publish_log(r, job_id, "info", f"Job queued — {config.name} ({config.county}, {config.state})", db=db)
 
         # ── PROBING ───────────────────────────────────────────────────────────
         _set_status(db, job, "probing")
-        _publish_log(r, job_id, "info", "Probing county portal...")
+        _publish_log(r, job_id, "info", "Probing county portal...", db=db)
 
         try:
             scraper_class = get_scraper_class(config.county, config.state, config.record_type)
@@ -117,11 +129,11 @@ def run_scrape_job(self, job_id: str) -> None:
         # ── SCRAPING ──────────────────────────────────────────────────────────
         _set_status(db, job, "scraping")
         record_label = config.record_type.replace("_", " ").title()
-        _publish_log(r, job_id, "success", f"Starting scrape — {record_label} records")
+        _publish_log(r, job_id, "success", f"Starting scrape — {record_label} records", db=db)
 
         schedule = config.schedule or {}
         date_from, date_to = _resolve_date_range(schedule)
-        _publish_log(r, job_id, "info", f"Date range: {date_from} → {date_to}")
+        _publish_log(r, job_id, "info", f"Date range: {date_from} → {date_to}", db=db)
 
         _last_phase = [None]  # mutable for closure
 
@@ -144,11 +156,11 @@ def run_scrape_job(self, job_id: str) -> None:
             if phase != _last_phase[0]:
                 _last_phase[0] = phase
                 if phase == "parcel_lookup":
-                    _publish_log(r, job_id, "info", f"Looking up parcel IDs from detail pages ({page_total} records)...")
+                    _publish_log(r, job_id, "info", f"Looking up parcel IDs from detail pages ({page_total} records)...", db=db)
                 elif phase == "enriching":
-                    _publish_log(r, job_id, "info", f"Looking up addresses for {page_total} parcels...")
+                    _publish_log(r, job_id, "info", f"Looking up addresses for {page_total} parcels...", db=db)
 
-        _publish_log(r, job_id, "info", "Connecting to county portal...")
+        _publish_log(r, job_id, "info", "Connecting to county portal...", db=db)
         # Update progress label so the live page shows activity during captcha solve
         job.progress_label = "Connecting to portal..."
         try:
@@ -169,7 +181,7 @@ def run_scrape_job(self, job_id: str) -> None:
             _fail_job(db, job, r, job_id, "Scraper encountered an error — our team has been notified.")
             return
 
-        _publish_log(r, job_id, "success", f"Scrape complete — {len(records)} records found")
+        _publish_log(r, job_id, "success", f"Scrape complete — {len(records)} records found", db=db)
 
         # ── Cap records to user's remaining plan quota ────────────────────────
         if user.records_limit != -1:
@@ -177,13 +189,13 @@ def run_scrape_job(self, job_id: str) -> None:
             if remaining < len(records):
                 _publish_log(
                     r, job_id, "warning",
-                    f"Plan limit: saving {remaining} of {len(records)} records. Upgrade for more."
-                )
+                    f"Plan limit: saving {remaining} of {len(records)} records. Upgrade for more.",
+                    db=db)
                 records = records[:remaining]
 
         # ── ENRICHING ─────────────────────────────────────────────────────────
         _set_status(db, job, "enriching", record_count=len(records))
-        _publish_log(r, job_id, "info", "Saving records to database...")
+        _publish_log(r, job_id, "info", "Saving records to database...", db=db)
 
         # Bulk insert results (truncate fields to fit DB column limits)
         def _trunc(val: str | None, max_len: int) -> str | None:
@@ -217,13 +229,13 @@ def run_scrape_job(self, job_id: str) -> None:
             db.execute(sa_insert(Result), rows)
             db.commit()
 
-        _publish_log(r, job_id, "success", f"{len(records)} records saved")
+        _publish_log(r, job_id, "success", f"{len(records)} records saved", db=db)
 
         # ── EXPORT ────────────────────────────────────────────────────────────
         deliver_config = config.deliver or {}
         fmt = deliver_config.get("format", "csv")
 
-        _publish_log(r, job_id, "info", f"Building {fmt.upper()} export...")
+        _publish_log(r, job_id, "info", f"Building {fmt.upper()} export...", db=db)
 
         record_dicts = [r_obj.to_dict() for r_obj in records]
         exporter = DataExporter()
@@ -232,10 +244,10 @@ def run_scrape_job(self, job_id: str) -> None:
         object_key = f"exports/{job.user_id}/{job_id}/leads.{local_file.suffix.lstrip('.')}"
         try:
             exporter.upload_to_r2(local_file, object_key)
-            _publish_log(r, job_id, "success", "Export uploaded to cloud storage")
+            _publish_log(r, job_id, "success", "Export uploaded to cloud storage", db=db)
         except Exception as upload_exc:
             _logger.warning("R2 upload failed (non-fatal): %s", upload_exc)
-            _publish_log(r, job_id, "warning", "Cloud upload unavailable — export saved locally")
+            _publish_log(r, job_id, "warning", "Cloud upload unavailable — export saved locally", db=db)
             object_key = None  # No cloud export available
         finally:
             local_file.unlink(missing_ok=True)
@@ -252,32 +264,36 @@ def run_scrape_job(self, job_id: str) -> None:
 
         if user.records_limit != -1 and user.records_used > user.records_limit:
             overage = user.records_used - user.records_limit
-            _publish_log(r, job_id, "warning", f"Plan limit exceeded by {overage} records. Upgrade to keep scraping.")
+            _publish_log(r, job_id, "warning", f"Plan limit exceeded by {overage} records. Upgrade to keep scraping.", db=db)
 
         # ── INLINE ENRICHMENT (BEFORE marking done) ──────────────────────────
-        _publish_log(r, job_id, "info", "Looking up property and mailing addresses...")
+        _publish_log(r, job_id, "info", "Looking up property and mailing addresses...", db=db)
         try:
             _run_inline_enrichment(db, job, r, job_id, config)
         except Exception as exc:
             _logger.warning("Inline enrichment error: %s", str(exc)[:80])
-        _publish_log(r, job_id, "success", f"Enrichment complete — addresses added")
+        _publish_log(r, job_id, "success", f"Enrichment complete — addresses added", db=db)
 
         # Re-export CSV with enriched data
+        enriched_file = None
         try:
             refreshed = db.execute(
-                select(Result).where(Result.job_id == job_id)
+                select(Result).where(Result.job_id == job_id, Result.user_id == job.user_id)
             ).scalars().all()
             record_dicts = [
                 {c: getattr(res, c) for c in ["date_recorded", "party_name", "heirs", "parcel_id",
                                                "property_address", "mailing_address", "legal_description"]}
                 for res in refreshed
             ]
-            local_file = exporter.export(record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt)
+            enriched_file = exporter.export(record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt)
             if object_key:
-                exporter.upload_to_r2(local_file, object_key)
+                exporter.upload_to_r2(enriched_file, object_key)
                 _logger.info("Re-exported CSV with enriched data")
         except Exception as exc:
             _logger.warning("CSV re-export failed: %s", str(exc)[:60])
+        finally:
+            if enriched_file:
+                enriched_file.unlink(missing_ok=True)
 
         # ── NOW mark done (after enrichment + re-export) ────────────────────
         _set_status(
@@ -286,7 +302,7 @@ def run_scrape_job(self, job_id: str) -> None:
             record_count=len(records),
             export_key=object_key,
         )
-        _publish_log(r, job_id, "success", f"Job complete — {len(records)} records ready")
+        _publish_log(r, job_id, "success", f"Job complete — {len(records)} records ready", db=db)
         r.publish(f"job_logs:{job_id}", json.dumps({"type": "done", "record_count": len(records)}))
 
         # ── EMAIL DELIVERY ─────────────────────────────────────────────────────
@@ -304,7 +320,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 )
             except Exception as email_exc:
                 _logger.warning("Email delivery failed (non-fatal): %s", email_exc)
-                _publish_log(r, job_id, "warning", "Email delivery unavailable")
+                _publish_log(r, job_id, "warning", "Email delivery unavailable", db=db)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -323,7 +339,7 @@ async def _run_scraper(scraper_class, date_from: str, date_to: str, r, job_id: s
                 r, job_id, "info",
                 f"AI usage: ${scraper.ai_cost:.4f} "
                 f"({tokens['input_tokens']} input + {tokens['output_tokens']} output tokens)",
-            )
+             db=db)
 
     return records
 
@@ -334,7 +350,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
     from src.db.models import Result
 
     all_results = db.execute(
-        sa_select(Result).where(Result.job_id == job_id)
+        sa_select(Result).where(Result.job_id == job_id, Result.user_id == job.user_id)
     ).scalars().all()
 
     # GIS batch enrichment for property addresses
@@ -344,7 +360,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
         and (not res.property_address or res.property_address == "(enrichment unavailable)")
     ]
     if results_need_addr:
-        _publish_log(r, job_id, "info", f"Looking up {len(results_need_addr)} property addresses...")
+        _publish_log(r, job_id, "info", f"Looking up {len(results_need_addr)} property addresses...", db=db)
         from src.scrapers.enrichment.county_gis import batch_enrich_parcels_gis
         parcel_map: dict[str, list] = {}
         for res in results_need_addr:
@@ -373,7 +389,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             and not res.mailing_address
         ]
         if needs:
-            _publish_log(r, job_id, "info", f"Looking up {len(needs)} mailing addresses...")
+            _publish_log(r, job_id, "info", f"Looking up {len(needs)} mailing addresses...", db=db)
             from src.scrapers.enrichment.king_county_assessor import batch_enrich_king_county
             pids = list({res.parcel_id.strip() for res in needs})
             pid_map: dict[str, list] = {}
@@ -397,7 +413,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 db.rollback()
                 db.commit()
             found = sum(1 for d in enriched.values() if d.get("mailing_address"))
-            _publish_log(r, job_id, "info", f"Found {found}/{len(pids)} mailing addresses")
+            _publish_log(r, job_id, "info", f"Found {found}/{len(pids)} mailing addresses", db=db)
 
 
 def _fail_job(db, job, r, job_id: str, reason: str) -> None:
@@ -407,7 +423,7 @@ def _fail_job(db, job, r, job_id: str, reason: str) -> None:
     except Exception:
         pass
     _set_status(db, job, "failed", finished_at=_now(), error_message=reason)
-    _publish_log(r, job_id, "error", reason)
+    _publish_log(r, job_id, "error", reason, db=db)
     r.publish(f"job_logs:{job_id}", json.dumps({"type": "failed", "error": reason}))
     _logger.error("Job %s failed: %s", job_id, reason)
 
@@ -483,136 +499,6 @@ def enrich_job_results(self, job_id: str) -> None:
     This task is kept as a no-op so old queued messages don't crash.
     """
     _logger.info("enrich_job_results called for %s — skipping (enrichment is now inline)", job_id)
-    return
-    from sqlalchemy import select
-
-    from src.db.models import Job, Result, ScraperConfig
-    from src.db.session import SyncSessionLocal
-
-    r = _redis()
-
-    with SyncSessionLocal() as db:
-        job = db.execute(select(Job).where(Job.id == job_id)).scalar_one_or_none()
-        if job is None or job.status != "done":
-            _logger.info("Enrichment skipped for job %s (status=%s)", job_id, job.status if job else "not found")
-            return
-
-        config = db.execute(
-            select(ScraperConfig).where(ScraperConfig.id == job.scraper_config_id)
-        ).scalar_one_or_none()
-        if config is None:
-            return
-
-        # Step 1: Find ALL results (for parcel ID fetching from ARMS detail pages)
-        all_results = db.execute(
-            select(Result).where(Result.job_id == job_id)
-        ).scalars().all()
-
-        # Step 2: Fetch parcel IDs from ARMS detail pages for records missing them
-        needs_parcel = [
-            res for res in all_results
-            if not res.parcel_id
-            and res.enrichment_data
-            and isinstance(res.enrichment_data, dict)
-            and res.enrichment_data.get("instrument_number")
-        ]
-
-        if needs_parcel:
-            _logger.info("Fetching parcel IDs from ARMS detail pages for %d records", len(needs_parcel))
-            _publish_log(r, job_id, "info", f"Fetching parcel IDs from detail pages ({len(needs_parcel)} records)...")
-            parcel_count = asyncio.run(_fetch_parcel_ids_from_arms(needs_parcel, db, r, job_id))
-            _publish_log(r, job_id, "info", f"Found {parcel_count} parcel IDs from detail pages")
-
-        # Step 3: GIS enrichment for records with parcel_id but no address
-        results = [
-            res for res in all_results
-            if res.parcel_id
-            and len(res.parcel_id.strip()) >= 10
-            and (not res.property_address or res.property_address == "(enrichment unavailable)")
-        ]
-
-        if not results:
-            _logger.info("No results need address enrichment for job %s", job_id)
-            _publish_log(r, job_id, "info", "No records with parcel IDs to enrich")
-            return
-
-        _logger.info("GIS enriching %d results for job %s", len(results), job_id)
-        _publish_log(r, job_id, "info", f"Enriching {len(results)} records via batch GIS...")
-
-        # Batch GIS enrichment — 50 parcels per API call instead of 1
-        from src.scrapers.enrichment.county_gis import batch_enrich_parcels_gis
-
-        # Build parcel_id -> result mapping
-        parcel_map: dict[str, list] = {}
-        for result in results:
-            pid = result.parcel_id.strip()
-            if pid not in parcel_map:
-                parcel_map[pid] = []
-            parcel_map[pid].append(result)
-
-        all_parcels = list(parcel_map.keys())
-        _logger.info("Batch GIS: %d unique parcels from %d records", len(all_parcels), len(results))
-
-        # Single batch call handles chunking internally (50 per API call)
-        gis_results = batch_enrich_parcels_gis(all_parcels, config.county, config.state)
-
-        # Apply results to DB records
-        enriched_count = 0
-        for pid, gis_data in gis_results.items():
-            if not gis_data.get("property_address"):
-                continue
-            for result in parcel_map.get(pid, []):
-                result.property_address = gis_data["property_address"]
-                result.mailing_address = gis_data.get("mailing_address") or result.mailing_address
-                result.enrichment_data = gis_data
-                enriched_count += 1
-
-        try:
-            db.commit()
-        except Exception:
-            db.rollback()
-            db.commit()
-        _publish_log(r, job_id, "info", f"GIS enrichment: {enriched_count}/{len(results)} property addresses found")
-        _logger.info("GIS enrichment for job %s: %d/%d enriched", job_id, enriched_count, len(results))
-
-        # Step 4: King County — get property + mailing from payment.kingcounty.gov
-        # This gives both addresses in one lookup (better than GIS for mailing)
-        if config.county.lower() == "king" and config.state.upper() == "WA":
-            needs_address = [
-                res for res in all_results
-                if res.parcel_id
-                and len(res.parcel_id.strip()) >= 6
-                and (not res.mailing_address)
-            ]
-            if needs_address:
-                _logger.info("King County address enrichment: %d records", len(needs_address))
-                _publish_log(r, job_id, "info", f"Looking up addresses for {len(needs_address)} records...")
-                addr_count = asyncio.run(
-                    _enrich_king_county_mailing(needs_address, db, r, job_id)
-                )
-                _publish_log(r, job_id, "info", f"Addresses found: {addr_count}/{len(needs_address)}")
-
-        _publish_log(r, job_id, "success", f"Enrichment complete — {enriched_count}/{len(results)} addresses found")
-        _logger.info("Enrichment complete for job %s: %d/%d enriched", job_id, enriched_count, len(results))
-
-        # Re-export CSV with enriched data (original export happened before enrichment)
-        try:
-            from src.utils.data_exporter import DataExporter
-            refreshed = db.execute(
-                select(Result).where(Result.job_id == job_id)
-            ).scalars().all()
-            record_dicts = [
-                {c: getattr(r, c) for c in ["date_recorded", "party_name", "heirs", "parcel_id",
-                                             "property_address", "mailing_address", "legal_description"]}
-                for r in refreshed
-            ]
-            exporter = DataExporter()
-            local_file = exporter.export(record_dicts, filename=f"job_{job_id[:8]}", fmt="csv")
-            object_key = f"exports/{job.user_id}/{job_id}/leads.csv"
-            exporter.upload_to_r2(local_file, object_key)
-            _logger.info("Re-exported CSV with enriched data: %d records", len(record_dicts))
-        except Exception as exc:
-            _logger.warning("CSV re-export failed: %s", str(exc)[:80])
 
 
 async def _enrich_king_county_mailing(results, db, r, job_id: str) -> int:
@@ -797,7 +683,7 @@ async def _fetch_parcel_ids_from_arms(results, db, r, job_id: str) -> int:
                     found += 1
 
                     if found <= 5 or found % 20 == 0:
-                        _publish_log(r, job_id, "info", f"  {inst_num} → parcel {parcel_id.strip()}")
+                        _publish_log(r, job_id, "info", f"  {inst_num} → parcel {parcel_id.strip()}", db=db)
 
             except Exception as exc:
                 _logger.warning("Detail failed for %s: %s", inst_num, str(exc)[:40])

@@ -8,6 +8,7 @@ Usage:
         await rate_limit(request, zone="auth")
 """
 
+import ipaddress
 import time
 
 import redis.asyncio as aioredis
@@ -35,21 +36,37 @@ def _get_redis() -> aioredis.Redis:
     return _redis_client
 
 
-def _client_ip(request: Request) -> str:
-    """Extract client IP. Only trust X-Forwarded-For from Railway's proxy."""
+_TRUSTED_PROXY_NETWORKS = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+
+
+def _is_trusted_proxy(ip_str: str) -> bool:
+    """Check if an IP belongs to a known proxy / private network."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return any(addr in net for net in _TRUSTED_PROXY_NETWORKS)
+
+
+def client_ip(request: Request) -> str:
+    """Extract client IP. Only trust forwarded headers from known proxies."""
     direct_ip = request.client.host if request.client else "unknown"
 
     # Only trust X-Forwarded-For if request came from a known proxy (Railway, Docker)
-    # Railway sets this header; direct requests from attackers are ignored.
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded and direct_ip in ("127.0.0.1", "::1", "10.0.0.0/8"):
-        return forwarded.split(",")[0].strip()
-
-    # Use Fly-Client-IP or CF-Connecting-IP (set by trusted proxies, not spoofable)
-    for header in ("Fly-Client-IP", "CF-Connecting-IP", "X-Real-IP"):
-        val = request.headers.get(header)
-        if val:
-            return val.strip()
+    if _is_trusted_proxy(direct_ip):
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        for header in ("Fly-Client-IP", "CF-Connecting-IP", "X-Real-IP"):
+            val = request.headers.get(header)
+            if val:
+                return val.strip()
 
     return direct_ip
 
@@ -63,7 +80,7 @@ async def rate_limit(request: Request, zone: str = "general", identifier: str | 
         identifier: Custom key (e.g. user_id). Falls back to client IP.
     """
     max_requests, window_seconds = _ZONES.get(zone, _ZONES["general"])
-    key_id = identifier or _client_ip(request)
+    key_id = identifier or client_ip(request)
     redis_key = f"rl:{zone}:{key_id}"
 
     now = time.time()

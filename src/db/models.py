@@ -10,6 +10,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import UUID
@@ -163,6 +164,9 @@ class CountyRecord(Base):
 
 class UserRecordView(Base):
     __tablename__ = "user_record_views"
+    __table_args__ = (
+        UniqueConstraint("user_id", "scraper_config_id", name="uq_user_scraper_view"),
+    )
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
     user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)

@@ -13,10 +13,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
 from src.api.deps import get_db, get_rls_db
-from src.api.middleware import audit_log, rate_limit, sanitize_search
+from src.api.middleware import audit_log, rate_limit, sanitize_for_csv, sanitize_search
 from src.api.schemas import JobCreate, JobResponse, LogLine, ResultRow, ResultsPage
 from src.config import settings
 from src.db import CountyConnector, Job, JobLog, Result, ScraperConfig, User
+from src.utils.logger import setup_logger
+
+_logger = setup_logger("api.jobs")
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -466,13 +469,13 @@ async def download_export(
         writer.writeheader()
         for r in records:
             writer.writerow({
-                "date_recorded": r.date_recorded or "",
-                "party_name": r.party_name or "",
-                "heirs": r.heirs or "",
-                "parcel_id": r.parcel_id or "",
-                "property_address": r.property_address or "",
-                "mailing_address": r.mailing_address or "",
-                "legal_description": r.legal_description or "",
+                "date_recorded": sanitize_for_csv(r.date_recorded),
+                "party_name": sanitize_for_csv(r.party_name),
+                "heirs": sanitize_for_csv(r.heirs),
+                "parcel_id": sanitize_for_csv(r.parcel_id),
+                "property_address": sanitize_for_csv(r.property_address),
+                "mailing_address": sanitize_for_csv(r.mailing_address),
+                "legal_description": sanitize_for_csv(r.legal_description),
             })
 
         csv_bytes = output.getvalue().encode("utf-8")

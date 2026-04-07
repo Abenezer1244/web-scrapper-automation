@@ -246,7 +246,7 @@ async def stripe_webhook(
         )
 
     # Idempotency: skip duplicate webhook deliveries
-    import aioredis
+    import redis.asyncio as aioredis
     redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
     event_id = event.get("id", "")
     if event_id:

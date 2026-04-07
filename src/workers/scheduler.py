@@ -130,13 +130,20 @@ def dispatch_scheduled_jobs() -> None:
 
 
 def _should_run_now(frequency: str, run_time_str: str, now: datetime) -> bool:
-    """Return True if this frequency + run_time combination should fire at `now`."""
+    """Return True if this frequency + run_time combination should fire at `now`.
+
+    Uses a ±1 minute tolerance window so that beat-tick drift (e.g. firing at
+    06:01 instead of 06:00) does not skip an entire day's scheduled jobs.
+    """
     try:
         hour, minute = (int(x) for x in run_time_str.split(":"))
     except (ValueError, AttributeError):
         hour, minute = 6, 0
 
-    if now.hour != hour or now.minute != minute:
+    # Check if we're within ±1 minute of the target time
+    target_minutes = hour * 60 + minute
+    current_minutes = now.hour * 60 + now.minute
+    if abs(current_minutes - target_minutes) > 1:
         return False
 
     if frequency == "daily":

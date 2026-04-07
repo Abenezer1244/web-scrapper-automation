@@ -1,5 +1,7 @@
 """Email delivery: send job results via Resend after successful export."""
 
+import html
+
 import resend
 
 from src.config import settings
@@ -38,6 +40,7 @@ def deliver_job_results(
         _logger.warning("RESEND_API_KEY not configured — skipping email delivery for job %s", job_id)
         return
 
+    safe_name = html.escape(scraper_name)
     subject = f"Your {scraper_name} leads are ready — {record_count:,} records"
 
     html_body = f"""
@@ -63,19 +66,19 @@ def deliver_job_results(
   <div class="card">
     <div class="logo">BridgeLeads</div>
     <h1>Your leads are ready</h1>
-    <p class="meta">{scraper_name}</p>
+    <p class="meta">{safe_name}</p>
 
     <div class="stat">
       <div class="stat-number">{record_count:,}</div>
       <div class="stat-label">Records found</div>
     </div>
 
-    <a href="{download_url}" class="btn">Download {fmt.upper()}</a>
+    <a href="{html.escape(download_url)}" class="btn">Download {fmt.upper()}</a>
 
     <p class="expiry">This download link expires in 48 hours.</p>
 
     <div class="footer">
-      You're receiving this because you set up automated delivery for {scraper_name}.<br>
+      You're receiving this because you set up automated delivery for {safe_name}.<br>
       Manage your delivery settings at app.bridgeleads.io
     </div>
   </div>

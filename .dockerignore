@@ -1,1 +1,48 @@
-# bust cache Thu, Mar 19, 2026  7:54:54 PM
+# Version control
+.git
+.gitignore
+
+# Claude / AI tooling
+.claude
+.agents
+.swarm
+
+# Data and logs (runtime artifacts)
+data/exports/*
+logs/*
+
+# Tests and docs (not needed in prod image)
+tests
+docs
+tasks
+
+# Python cache
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.coverage
+htmlcov
+.ruff_cache
+
+# Environment
+.env
+.env.*
+!.env.example
+venv
+.venv
+
+# IDE
+.vscode
+.idea
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Terraform
+infra/terraform/.terraform
+
+# Docker
+docker-compose.yml
+Dockerfile

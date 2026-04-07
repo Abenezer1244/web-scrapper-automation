@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, EmailStr, field_validator
@@ -31,8 +31,10 @@ class PasswordChange(BaseModel):
     @field_validator("new_password")
     @classmethod
     def password_min_length(cls, v: str) -> str:
-        if len(v) < 8:
-            raise ValueError("Password must be at least 8 characters")
+        if len(v) < 10:
+            raise ValueError("Password must be at least 10 characters")
+        if len(v) > 72:
+            raise ValueError("Password must not exceed 72 characters")
         return v
 
 
@@ -51,8 +53,8 @@ class UserResponse(BaseModel):
 
     def model_post_init(self, __context: Any) -> None:
         if self.trial_ends_at:
-            now = datetime.utcnow()
-            ends = self.trial_ends_at.replace(tzinfo=None) if self.trial_ends_at.tzinfo else self.trial_ends_at
+            now = datetime.now(UTC)
+            ends = self.trial_ends_at if self.trial_ends_at.tzinfo else self.trial_ends_at.replace(tzinfo=UTC)
             remaining = (ends - now).total_seconds()
             if remaining > 0:
                 self.is_trial = True
@@ -200,11 +202,11 @@ class JobResponse(BaseModel):
         return f"{s}s"
 
     def model_post_init(self, __context: Any) -> None:
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
 
         # Elapsed time
         if self.started_at:
-            started = self.started_at.replace(tzinfo=None) if self.started_at.tzinfo else self.started_at
+            started = self.started_at if self.started_at.tzinfo else self.started_at.replace(tzinfo=UTC)
             self.elapsed_seconds = max(0, int((now - started).total_seconds()))
             self.elapsed_time = self._fmt_time(self.elapsed_seconds)
 

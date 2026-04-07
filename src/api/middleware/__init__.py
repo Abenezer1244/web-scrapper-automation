@@ -1,5 +1,5 @@
 from .auth_hardening import BruteForceProtection, TokenBlacklist, constant_time_compare
-from .rate_limit import rate_limit
+from .rate_limit import client_ip, rate_limit
 from .security import (
     SecurityHeadersMiddleware,
     add_scrape_domain,
@@ -22,4 +22,5 @@ __all__ = [
     "sanitize_search",
     "clean_text",
     "audit_log",
+    "client_ip",
 ]

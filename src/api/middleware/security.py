@@ -194,20 +194,14 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 # ─── Audit Logger ─────────────────────────────────────────────────────────────
 
-def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
-
-
 def audit_log(request: Request, event: str, user_id: str | None = None, detail: str = "") -> None:
     """Write a structured audit log entry for security-relevant events.
 
     Events: login_success, login_failure, logout, register, api_key_created,
             api_key_revoked, plan_upgraded, job_created
     """
-    ip = _client_ip(request)
+    from .rate_limit import client_ip
+    ip = client_ip(request)
     _logger.info(
         "AUDIT event=%s user_id=%s ip=%s path=%s detail=%s",
         clean_text(event),

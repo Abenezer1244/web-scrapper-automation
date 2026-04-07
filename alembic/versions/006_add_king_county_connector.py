@@ -8,7 +8,7 @@ Create Date: 2026-04-05
 from alembic import op
 
 revision = "006"
-down_revision = "005"
+down_revision = "005_add_trial"
 branch_labels = None
 depends_on = None
 

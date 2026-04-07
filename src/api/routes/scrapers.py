@@ -172,7 +172,7 @@ async def create_connector(
     result = await db.execute(
         select(CountyConnector).where(
             CountyConnector.county == body.county,
-            CountyConnector.state == body.state.lower(),
+            func.upper(CountyConnector.state) == body.state.upper(),
         )
     )
     if result.scalar_one_or_none():
@@ -195,7 +195,7 @@ async def create_connector(
     connector = CountyConnector(
         id=str(uuid.uuid4()),
         county=body.county,
-        state=body.state.lower(),
+        state=body.state.upper(),
         record_types=body.record_types,
         scraper_class="src.scrapers.ai_scraper.AIScraper",
         scraper_mode=body.scraper_mode,

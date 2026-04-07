@@ -17,19 +17,12 @@ from src.api.auth import (
     require_plan,
     verify_password,
 )
-from src.api.middleware import BruteForceProtection, audit_log, rate_limit
-from src.api.schemas import ApiKeyResponse, PasswordChange, TokenResponse, UserRegister, UserResponse
+from src.api.middleware import BruteForceProtection, audit_log, client_ip, rate_limit
+from src.api.schemas import ApiKeyResponse, PasswordChange, TokenResponse, UserLogin, UserRegister, UserResponse
 from src.config import settings
 from src.db import User, get_db  # noqa: F401 (User used in Annotated type)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-
-
-def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
 
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
@@ -70,13 +63,13 @@ async def register(
 
 @router.post("/login", response_model=TokenResponse)
 async def login(
-    body: UserRegister,
+    body: UserLogin,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
     await rate_limit(request, zone="auth")
 
-    ip = _client_ip(request)
+    ip = client_ip(request)
     await BruteForceProtection.check(ip, body.email)
 
     result = await db.execute(select(User).where(User.email == body.email, User.is_active))

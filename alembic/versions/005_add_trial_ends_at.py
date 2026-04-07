@@ -7,7 +7,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision = "005_add_trial"
-down_revision = None  # Will be set by Alembic chain
+down_revision = "005"
 branch_labels = None
 depends_on = None
 

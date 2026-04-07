@@ -59,8 +59,59 @@ infra/terraform/terraform.tfstate
 infra/terraform/terraform.tfstate.backup
 infra/terraform/.terraform.lock.hcl
 
-# Claude worktrees
+# Claude worktrees & skills
 .claude/worktrees/
+.claude/skills/gstack/
 tests/screenshots/
 .playwright-mcp/
+.playwright-cli/
+.playwright/
 *.png
+
+# AI tool configs (bulk-installed, not project files)
+.adal/
+.agent/
+.agents/
+.augment/
+.codebuddy/
+.commandcode/
+.continue/
+.cortex/
+.crush/
+.factory/
+.goose/
+.iflow/
+.junie/
+.kilocode/
+.kiro/
+.kode/
+.mcpjam/
+.mux/
+.neovate/
+.openhands/
+.pi/
+.pochi/
+.qoder/
+.qwen/
+.roo/
+.trae/
+.vibe/
+.windsurf/
+.zencoder/
+.claude-flow/
+.swarm/
+skills/
+skills-lock.json
+design-system/
+
+# Separate projects (not part of this repo)
+aiwebscrapper/
+
+# E2E test credentials (never commit)
+scripts/.e2e_creds.json
+scripts/.e2e_configs.json
+scripts/.e2e_jobs.json
+
+# Runtime artifacts
+.ruff_cache/
+.firecrawl/

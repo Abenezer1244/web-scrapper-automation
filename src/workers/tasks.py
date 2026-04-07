@@ -68,6 +68,8 @@ def _set_status(db, job, status: str, **kwargs) -> None:
     max_retries=3,
     default_retry_delay=30,
     acks_late=True,
+    soft_time_limit=3600,  # 60 min (scrape + enrichment in one job)
+    time_limit=3900,       # 65 min
 )
 def run_scrape_job(self, job_id: str) -> None:
     """Execute a full scrape job lifecycle for the given job_id."""
@@ -252,13 +254,33 @@ def run_scrape_job(self, job_id: str) -> None:
             overage = user.records_used - user.records_limit
             _publish_log(r, job_id, "warning", f"Plan limit exceeded by {overage} records. Upgrade to keep scraping.")
 
+        # ── INLINE ENRICHMENT (before marking done) ─────────────────────────
+        # Run enrichment NOW so results have addresses when user sees them.
+        _publish_log(r, job_id, "info", "Enriching addresses...")
+        try:
+            _run_inline_enrichment(db, job, r, job_id, config)
+        except Exception as exc:
+            _logger.warning("Inline enrichment error: %s", str(exc)[:80])
+
+        # Re-export CSV with enriched data
+        try:
+            refreshed = db.execute(
+                select(Result).where(Result.job_id == job_id)
+            ).scalars().all()
+            record_dicts = [
+                {c: getattr(res, c) for c in ["date_recorded", "party_name", "heirs", "parcel_id",
+                                               "property_address", "mailing_address", "legal_description"]}
+                for res in refreshed
+            ]
+            local_file = exporter.export(record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt)
+            if object_key:
+                exporter.upload_to_r2(local_file, object_key)
+                _logger.info("Re-exported CSV with enriched data")
+        except Exception as exc:
+            _logger.warning("CSV re-export failed: %s", str(exc)[:60])
+
         _publish_log(r, job_id, "success", f"Job complete — {len(records)} records ready")
         r.publish(f"job_logs:{job_id}", json.dumps({"type": "done", "record_count": len(records)}))
-
-        # ── TRIGGER ENRICHMENT (separate task) ────────────────────────────────
-        # Enrichment runs in a separate Celery task to avoid running two
-        # Playwright browsers in the same worker (memory exhaustion).
-        enrich_job_results.delay(job_id)
 
         # ── EMAIL DELIVERY ─────────────────────────────────────────────────────
         emails = deliver_config.get("emails", [])
@@ -297,6 +319,75 @@ async def _run_scraper(scraper_class, date_from: str, date_to: str, r, job_id: s
             )
 
     return records
+
+
+def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
+    """Run GIS + King County enrichment inline (before job marks done)."""
+    all_results = db.execute(
+        select(Result).where(Result.job_id == job_id)
+    ).scalars().all()
+
+    # GIS batch enrichment for property addresses
+    results_need_addr = [
+        res for res in all_results
+        if res.parcel_id and len(res.parcel_id.strip()) >= 6
+        and (not res.property_address or res.property_address == "(enrichment unavailable)")
+    ]
+    if results_need_addr:
+        _publish_log(r, job_id, "info", f"Looking up {len(results_need_addr)} property addresses...")
+        from src.scrapers.enrichment.county_gis import batch_enrich_parcels_gis
+        parcel_map: dict[str, list] = {}
+        for res in results_need_addr:
+            pid = res.parcel_id.strip()
+            if pid not in parcel_map:
+                parcel_map[pid] = []
+            parcel_map[pid].append(res)
+        gis_results = batch_enrich_parcels_gis(list(parcel_map.keys()), config.county, config.state)
+        for pid, gis_data in gis_results.items():
+            if not gis_data.get("property_address"):
+                continue
+            for res in parcel_map.get(pid, []):
+                res.property_address = gis_data["property_address"]
+                res.mailing_address = gis_data.get("mailing_address") or res.mailing_address
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            db.commit()
+
+    # King County: eRealProperty + Tax Bill for property + mailing
+    if config.county.lower() == "king" and config.state.upper() == "WA":
+        needs = [
+            res for res in all_results
+            if res.parcel_id and len(res.parcel_id.strip()) >= 6
+            and not res.mailing_address
+        ]
+        if needs:
+            _publish_log(r, job_id, "info", f"Looking up {len(needs)} mailing addresses...")
+            from src.scrapers.enrichment.king_county_assessor import batch_enrich_king_county
+            pids = list({res.parcel_id.strip() for res in needs})
+            pid_map: dict[str, list] = {}
+            for res in needs:
+                pid = res.parcel_id.strip()
+                if pid not in pid_map:
+                    pid_map[pid] = []
+                pid_map[pid].append(res)
+            enriched = asyncio.run(batch_enrich_king_county(pids))
+            for pid, data in enriched.items():
+                prop = data.get("property_address")
+                mail = data.get("mailing_address")
+                for res in pid_map.get(pid, []):
+                    if prop and not res.property_address:
+                        res.property_address = prop
+                    if mail:
+                        res.mailing_address = mail
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+                db.commit()
+            found = sum(1 for d in enriched.values() if d.get("mailing_address"))
+            _publish_log(r, job_id, "info", f"Found {found}/{len(pids)} mailing addresses")
 
 
 def _fail_job(db, job, r, job_id: str, reason: str) -> None:

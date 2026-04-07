@@ -58,6 +58,19 @@ async def batch_enrich_king_county(
 
             await asyncio.sleep(0.5)
 
+        # Retry failed parcels one at a time (slower but more reliable)
+        failed = [pid for pid in clean if pid not in results]
+        if failed:
+            _logger.info("Retrying %d failed parcels one at a time...", len(failed))
+            for pid in failed:
+                try:
+                    res = await _lookup(pages[0], pid)
+                    if isinstance(res, dict) and (res.get("property_address") or res.get("mailing_address")):
+                        results[pid] = res
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+
         for p in pages[1:]:
             await p.close()
 

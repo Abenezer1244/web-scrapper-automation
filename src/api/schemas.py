@@ -262,6 +262,14 @@ class ResultRow(BaseModel):
 
     model_config = {"from_attributes": True}
 
+    def model_post_init(self, __context: Any) -> None:
+        # Sanitize HTML entities from all string fields before API response
+        for field in ("property_address", "mailing_address", "party_name", "heirs", "legal_description"):
+            val = getattr(self, field, None)
+            if val and isinstance(val, str):
+                cleaned = val.replace("&nbsp;", "").replace("&amp;", "&").strip()
+                object.__setattr__(self, field, cleaned if cleaned else None)
+
 
 class ResultsPage(BaseModel):
     job_id: str

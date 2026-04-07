@@ -332,8 +332,11 @@ async def _run_scraper(scraper_class, date_from: str, date_to: str, r, job_id: s
 
 def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
     """Run GIS + King County enrichment inline (before job marks done)."""
+    from sqlalchemy import select as sa_select
+    from src.db.models import Result
+
     all_results = db.execute(
-        select(Result).where(Result.job_id == job_id)
+        sa_select(Result).where(Result.job_id == job_id)
     ).scalars().all()
 
     # GIS batch enrichment for property addresses

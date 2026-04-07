@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
+from src.db import get_db
 from src.api.schemas import (
     CachedRecordRow,
     CachedResultsPage,
@@ -25,7 +26,7 @@ _BUSINESS_PLANS = ("business", "agency")
 
 
 @router.get("/sample")
-async def sample_records(db: AsyncSession = Depends(get_rls_db)) -> dict:
+async def sample_records(db: AsyncSession = Depends(get_db)) -> dict:
     """Public endpoint: returns 5 anonymized sample records for the landing page.
 
     Shows real data quality (with names partially redacted) so potential

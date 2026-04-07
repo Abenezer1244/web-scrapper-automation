@@ -264,12 +264,12 @@ def run_scrape_job(self, job_id: str) -> None:
             _publish_log(r, job_id, "warning", f"Plan limit exceeded by {overage} records. Upgrade to keep scraping.")
 
         # ── INLINE ENRICHMENT (before marking done) ─────────────────────────
-        # Run enrichment NOW so results have addresses when user sees them.
-        _publish_log(r, job_id, "info", "Enriching addresses...")
         try:
             _run_inline_enrichment(db, job, r, job_id, config)
         except Exception as exc:
             _logger.warning("Inline enrichment error: %s", str(exc)[:80])
+        # Signal to frontend that enrichment is done (matches the log pattern it checks)
+        _publish_log(r, job_id, "success", f"Enrichment complete — addresses added")
 
         # Re-export CSV with enriched data
         try:

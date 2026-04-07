@@ -118,22 +118,23 @@ Sources: Market Research Intellect RE Lead Gen report; CoreLogic Q3 2024 investo
 
 ## 4. Current State (as of April 7, 2026)
 
-### 4.1 Traction Metrics
+### 4.1 Platform Metrics (Pre-launch, Internal Testing)
 
-| Metric | Value |
-|--------|-------|
-| Total users | 127 |
-| Paid subscribers | 7 (4 Pro, 3 Agency) |
-| Free-to-paid conversion | 5.8% |
-| Monthly records scraped | 93,563 |
-| Active counties producing data | 12 (all WA) |
-| County connectors registered | 42 (39 unique WA counties) |
-| Job success rate | 51.3% (265 done / 517 total) |
-| Enrichment: parcel ID | 43.1% |
-| Enrichment: property address | 24.6% |
-| Enrichment: mailing address | 16.8% |
-| MRR | ~$1,700 (4 x $49 + 3 x $499 estimated) |
-| Platform age | 3 weeks |
+Note: All accounts below are internal test accounts. BridgeLeads has not launched to real customers yet. These metrics represent engineering validation, not market traction.
+
+| Metric | Value | Context |
+|--------|-------|---------|
+| Test accounts | 127 | Internal testing only, zero real customers |
+| Paying customers | 0 | Pre-revenue, pre-launch |
+| MRR | $0 | Pre-launch |
+| Records scraped (testing) | 93,563 | Validates scraping infrastructure works at scale |
+| Active counties producing data | 12 (all WA) | 12 of 39 WA counties verified working |
+| County connectors registered | 42 (39 unique WA counties) | Architecture supports all WA counties |
+| Job success rate | 51.3% (265 done / 517 total) | Must reach 85%+ before launch |
+| Enrichment: parcel ID | 43.1% | Must reach 80%+ before launch |
+| Enrichment: property address | 24.6% | Must reach 75%+ before launch |
+| Enrichment: mailing address | 16.8% | Must reach 60%+ before launch |
+| Platform age | 3 weeks of development |
 
 ### 4.2 What's Built and Working
 
@@ -374,17 +375,16 @@ This metric captures the entire value chain: scraping works, enrichment is accur
 
 ### 7.2 Proxy Metrics
 
-| Metric | Current | Phase 0 Target | Phase 1 Target |
-|--------|---------|----------------|----------------|
+| Metric | Current (Pre-launch) | Launch-Ready Target | Phase 1 Target (3mo post-launch) |
+|--------|---------------------|--------------------|---------------------------------|
 | Job success rate | 51% | 85% | 95% |
 | Property address coverage | 25% | 75% | 90% |
 | Mailing address coverage | 17% | 60% | 80% |
-| Free-to-paid conversion | 5.8% | 10% | 15% |
-| Monthly paid subscribers | 7 | 25 | 50 |
-| MRR | ~$1,700 | $2,500 | $5,000 |
-| Monthly churn rate | Unknown | < 10% | < 5% |
+| Real customers | 0 | First 10 beta users | 50 paid |
+| MRR | $0 | $500 (beta pricing) | $5,000 |
+| Monthly churn rate | N/A | < 15% | < 5% |
 | Time to first lead | Unknown | < 5 min | < 3 min |
-| NPS | Unknown | > 30 | > 50 |
+| NPS | N/A | > 30 | > 50 |
 
 ### 7.3 Health Metrics (Operational)
 

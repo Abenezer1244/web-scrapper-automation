@@ -339,7 +339,7 @@ async def _run_scraper(scraper_class, date_from: str, date_to: str, r, job_id: s
                 r, job_id, "info",
                 f"AI usage: ${scraper.ai_cost:.4f} "
                 f"({tokens['input_tokens']} input + {tokens['output_tokens']} output tokens)",
-             db=db)
+            )
 
     return records
 

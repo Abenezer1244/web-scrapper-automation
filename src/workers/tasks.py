@@ -480,12 +480,12 @@ def _resolve_date_range(schedule: dict) -> tuple[str, str]:
     time_limit=3000,       # 50 min
 )
 def enrich_job_results(self, job_id: str) -> None:
-    """Enrich all results in a completed job with property/mailing addresses.
+    """DEPRECATED — enrichment now runs inline in run_scrape_job.
 
-    Runs as a separate Celery task after scraping completes.
-    Uses its own Playwright browser (no conflict with the scraper).
-    Only enriches records that have a parcel_id but no property_address.
+    This task is kept as a no-op so old queued messages don't crash.
     """
+    _logger.info("enrich_job_results called for %s — skipping (enrichment is now inline)", job_id)
+    return
     from sqlalchemy import select
 
     from src.db.models import Job, Result, ScraperConfig

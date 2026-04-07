@@ -30,31 +30,49 @@ The product launched March 2026 with Washington State coverage. In 3 weeks it ha
 | Real estate agents (investor-focused) | ~500,000 | $1,200-12,000/yr |
 | List providers / agencies | ~5,000 | $6,000-60,000/yr |
 
-**TAM:** $500M+ annually for automated lead generation tools.
-**SAM:** $50M (investors actively buying county record leads).
+**TAM:** $3.2B (RE lead gen software market 2023, projected $9B by 2031 at 14.2% CAGR).
+**SAM:** $240-480M (200K+ active wholesalers/flippers paying $99-199/mo for data tools).
 **SOM (Year 1):** $300K ARR (600 paid subscribers at ~$40/mo blended ARPU).
+
+Sources: Market Research Intellect RE Lead Gen report; CoreLogic Q3 2024 investor data; ATTOM 2025 Home Flipping Report (297K homes flipped in 2025).
 
 ### 2.2 Competitive Landscape
 
-| Feature | BridgeLeads | PropStream | BatchLeads | DealMachine |
-|---------|-------------|------------|------------|-------------|
-| **Data source** | Direct county scraping | Bulk aggregator (ATTOM) | Bulk aggregator | Driving for dollars |
-| **Freshness** | Daily (same-day) | Monthly updates | Weekly updates | Real-time (manual) |
-| **County coverage** | 39 WA (expanding) | National | National | National |
-| **Price** | $0-499/mo | $99/mo | $79-299/mo | $49-199/mo |
-| **Record types** | 6 (probate, pre-foreclosure, tax delinquent, divorce, code violation, eviction) | 5+ | 3 | 1 |
-| **Enrichment** | Property + mailing address | Property data included | Basic | None |
-| **Skip tracing** | Planned | $0.15/record | $0.12/record | $0.15/record |
-| **API access** | Business+ tier | No | Enterprise only | No |
-| **Custom counties** | Any county in 30 seconds | Fixed catalog | Fixed catalog | N/A |
+**Market event:** In July 2025, PropStream (owned by Stewart Information Services, NYSE: STC) acquired both BatchLeads and BatchDialer, consolidating the #1 and #2 players. This creates pricing risk and switching opportunity for their combined user base.
 
-### 2.3 Why BridgeLeads Wins
+| Feature | BridgeLeads | PropStream ($99-699/mo) | BatchLeads (PropStream-owned) | PropertyRadar ($119-599/mo) | DealMachine ($49-249/mo) | Goliath Data ($99-1,499/mo) |
+|---------|-------------|------------------------|------------------------------|---------------------------|------------------------|--------------------------|
+| **Data source** | Direct county scraping | Bulk aggregator (ATTOM) | Bulk aggregator | Bulk aggregator | Driving for dollars | Direct scraping |
+| **Freshness** | Daily (same-day) | 30-90 day lag | Weekly updates | Weekly updates | Real-time (manual) | Hourly (claimed) |
+| **County coverage** | 39 WA (expanding) | National (160M+ records) | National | Western US focus | National | National |
+| **Price** | $0-499/mo | $99-699/mo + add-ons | $71-449/mo | $119-599/mo | $49-249/mo | $99-1,499/mo |
+| **Record types** | 6 native | 5+ (aggregated flags) | 3+ (aggregated) | Property filters | 1 (driving) | Multiple |
+| **Skip tracing** | Planned | $0.12/record (free on Pro+) | Bundled credits | Built-in | $0.12-14/record | Included |
+| **Direct mail** | Planned | $0.48+/postcard | No | No | $0.49-76/postcard | No |
+| **CRM / pipeline** | Planned | Basic | Basic | No | Basic | No |
+| **Dialer** | No | Click-to-dial (Pro+) | DialerAI ($89/mo add-on) | No | AI dialer | No |
+| **API access** | Business+ tier | No | Enterprise only | No | No | No |
+| **AI features** | AI county scraping | None | BatchRank AI (scoring) | None | Alma AI (analysis) | None |
+| **Custom counties** | Any county in 30 seconds | Fixed catalog | Fixed catalog | Fixed catalog | N/A | Unknown |
 
-1. **Freshness beats bulk.** A probate filing from today is worth 10x one from 30 days ago. The first investor to reach the motivated seller gets the deal. BridgeLeads scrapes county portals daily. Competitors resell month-old data.
+### 2.3 User Pain Points (sourced from BiggerPockets, Trustpilot, BBB, G2)
+
+1. **Data staleness** — The #1 complaint across the entire category. County record refresh cycles lag 30+ days for aggregator-based tools. Goliath Data built its entire positioning around hourly scraping and charges $1,499/mo for it.
+2. **Duplicate leads** — Users pulling 10K leads/month find they've already pulled some in prior months with no dedup flag.
+3. **Price hikes** — BatchLeads doubled prices with short notice. PropStream billing drew BBB complaints.
+4. **Data loss on cancel** — BatchLeads deletes all saved lead data on account cancellation.
+5. **Skip tracing costs compound** — At $0.12-15/trace, a list of 10K leads costs $1,200-1,500 on top of the subscription.
+6. **Tool fragmentation** — Even "all-in-one" platforms require separate CRM, mail tracking, and dialer integrations.
+
+### 2.4 Why BridgeLeads Wins
+
+1. **Freshness beats bulk.** A probate filing from today is worth 10x one from 30 days ago. The first investor to reach the motivated seller gets the deal. BridgeLeads scrapes county portals daily. Competitors resell month-old data. Goliath Data charges $1,499/mo for this same freshness advantage.
 
 2. **AI scraping scales without engineering.** Adding a county to PropStream requires a data partnership negotiation. Adding a county to BridgeLeads requires pasting a URL. Claude navigates the portal, extracts records, and caches the navigation for subsequent runs.
 
 3. **Price-to-value ratio.** Free tier gets investors hooked on fresh data. Pro at $49/mo is half the price of PropStream with better data freshness. The value ladder is designed around how many counties and records an investor needs as they scale.
+
+4. **Consolidation opportunity.** The PropStream + BatchLeads merger creates user uncertainty about pricing and product direction. BridgeLeads is positioned to capture switching investors who want an independent alternative with fresher data.
 
 ---
 

@@ -31,7 +31,9 @@ def get_scraper_class(county: str, state: str, record_type: str):
         record_type: Record type slug (e.g. 'probate').
 
     Returns:
-        The scraper class (a subclass of BridgeScraper).
+        Tuple of (scraper_class, record_type) — the scraper class (a subclass
+        of BridgeScraper) and the matched record_type string. Callers should
+        pass record_type when instantiating: scraper_class(record_type=record_type).
 
     Raises:
         UnsupportedCountyError: If no active connector matches.
@@ -84,7 +86,7 @@ def get_scraper_class(county: str, state: str, record_type: str):
                 county=connector.county,
                 state=connector.state,
                 record_types=connector.record_types,
-            )
+            ), record_type
 
         from src.scrapers.ai_scraper import AIScraper
 
@@ -99,7 +101,7 @@ def get_scraper_class(county: str, state: str, record_type: str):
             county=connector.county,
             state=connector.state,
             record_types=connector.record_types,
-        )
+        ), record_type
 
     # Manual mode: dynamically import the hand-coded scraper class
     # SECURITY: Only allow imports from pre-approved modules to prevent code injection
@@ -129,7 +131,7 @@ def get_scraper_class(county: str, state: str, record_type: str):
         "Registry resolved %s/%s/%s → %s (manual mode)",
         county, state, record_type, connector.scraper_class,
     )
-    return scraper_class
+    return scraper_class, record_type
 
 
 def _detect_template(base_url: str):

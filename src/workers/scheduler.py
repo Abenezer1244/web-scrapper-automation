@@ -245,7 +245,7 @@ def canary_check() -> None:
 
         for connector in connectors:
             try:
-                scraper_class = get_scraper_class(
+                scraper_class, _ = get_scraper_class(
                     connector.county, connector.state, connector.record_types[0]
                 )
                 # Probe a single day to minimise load on county portal

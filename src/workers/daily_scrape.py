@@ -85,7 +85,7 @@ def run_daily_scrape_for_county(county: str, state: str) -> int:
 
             record_type = connector.record_types[0] if connector.record_types else "probate"
             try:
-                scraper_class = get_scraper_class(county, state, record_type)
+                scraper_class, _ = get_scraper_class(county, state, record_type)
             except UnsupportedCountyError as exc:
                 _logger.warning("Unsupported county %s/%s: %s", county, state, exc)
                 return 0

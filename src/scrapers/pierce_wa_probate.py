@@ -39,11 +39,32 @@ _LEGAL_KEYWORDS = re.compile(
 
 
 class PierceWAARMSScraper(BridgeScraper):
-    """Base scraper for Pierce County ARMS Web portal. Subclass and set DOC_TYPE_IDS."""
+    """Pierce County ARMS Web portal scraper — supports multiple record types.
 
-    # Subclasses override these to select different document types
-    DOC_TYPE_IDS: list[str] = ["226"]  # Default: PROBATE
-    DOC_TYPE_LABEL: str = "PROBATE"
+    Pass record_type to constructor to select which document checkboxes to use.
+    """
+
+    # Maps record_type → (checkbox IDs, label)
+    RECORD_TYPE_CONFIG: dict[str, dict] = {
+        "probate": {
+            "ids": ["226"],
+            "label": "PROBATE",
+        },
+        "pre_foreclosure": {
+            "ids": ["187", "188", "146", "324"],  # NOD, Notice of Foreclosure, Lis Pendens, Trustee Sale
+            "label": "PRE-FORECLOSURE",
+        },
+        "divorce": {
+            "ids": ["87"],  # DECREE OF DISSOLUTION
+            "label": "DIVORCE",
+        },
+    }
+
+    def __init__(self, record_type: str = "probate"):
+        super().__init__()
+        cfg = self.RECORD_TYPE_CONFIG.get(record_type, self.RECORD_TYPE_CONFIG["probate"])
+        self.DOC_TYPE_IDS: list[str] = cfg["ids"]
+        self.DOC_TYPE_LABEL: str = cfg["label"]
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         _logger.info("Pierce WA %s — scraping %s to %s", self.DOC_TYPE_LABEL, date_from, date_to)
@@ -490,19 +511,8 @@ class PierceWAARMSScraper(BridgeScraper):
         return party_name, heirs
 
 
-# ─── Backward-compatible alias ───────────────────────────────────────────────
+# ─── Backward-compatible aliases ─────────────────────────────────────────────
+# All resolve to the base class which accepts record_type in constructor.
 PierceWAProbateScraper = PierceWAARMSScraper
-
-
-# ─── Pre-foreclosure (Notice of Default, Foreclosure, Lis Pendens, Trustee Sale)
-class PierceWAPreForeclosureScraper(PierceWAARMSScraper):
-    """Scrapes pre-foreclosure filings from Pierce County ARMS Web portal."""
-    DOC_TYPE_IDS = ["187", "188", "146", "324"]  # NOD, Notice of Foreclosure, Lis Pendens, Trustee Sale
-    DOC_TYPE_LABEL = "PRE-FORECLOSURE"
-
-
-# ─── Divorce (Decree of Dissolution) ────────────────────────────────────────
-class PierceWADivorceScraper(PierceWAARMSScraper):
-    """Scrapes divorce/dissolution decrees from Pierce County ARMS Web portal."""
-    DOC_TYPE_IDS = ["87"]  # DECREE OF DISSOLUTION
-    DOC_TYPE_LABEL = "DIVORCE"
+PierceWAPreForeclosureScraper = PierceWAARMSScraper
+PierceWADivorceScraper = PierceWAARMSScraper

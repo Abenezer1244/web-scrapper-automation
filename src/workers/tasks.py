@@ -121,7 +121,7 @@ def run_scrape_job(self, job_id: str) -> None:
         _publish_log(r, job_id, "info", "Probing county portal...", db=db)
 
         try:
-            scraper_class = get_scraper_class(config.county, config.state, config.record_type)
+            scraper_class, matched_record_type = get_scraper_class(config.county, config.state, config.record_type)
         except UnsupportedCountyError as exc:
             _fail_job(db, job, r, job_id, str(exc))
             return
@@ -170,7 +170,7 @@ def run_scrape_job(self, job_id: str) -> None:
             except Exception: pass
 
         try:
-            records = asyncio.run(_run_scraper(scraper_class, date_from, date_to, r, job_id, _on_progress))
+            records = asyncio.run(_run_scraper(scraper_class, date_from, date_to, r, job_id, _on_progress, record_type=matched_record_type))
         except Exception:
             _logger.exception("Scraper error for job %s", job_id)
             # Reconnect DB session if it went stale during long scrape
@@ -325,9 +325,10 @@ def run_scrape_job(self, job_id: str) -> None:
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-async def _run_scraper(scraper_class, date_from: str, date_to: str, r, job_id: str, on_progress=None):
+async def _run_scraper(scraper_class, date_from: str, date_to: str, r, job_id: str, on_progress=None, record_type: str | None = None):
     """Run the async scraper and stream progress logs back to Redis."""
-    async with scraper_class() as scraper:
+    kwargs = {"record_type": record_type} if record_type else {}
+    async with scraper_class(**kwargs) as scraper:
         if on_progress:
             scraper.on_progress = on_progress
         records = await scraper.scrape(date_from, date_to)

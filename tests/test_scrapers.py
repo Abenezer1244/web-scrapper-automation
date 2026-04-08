@@ -109,14 +109,15 @@ def test_deduplication_removes_duplicate_hashes():
 
 def test_registry_lookup_pierce_wa_probate():
     """The seed connector (pierce/WA/probate) must be resolvable."""
-    cls = get_scraper_class("pierce", "WA", "probate")
+    cls, record_type = get_scraper_class("pierce", "WA", "probate")
     assert cls is not None
+    assert record_type == "probate"
 
 
 def test_registry_lookup_case_insensitive():
     """County and state lookups must be case-insensitive."""
-    cls_lower = get_scraper_class("pierce", "wa", "probate")
-    cls_upper = get_scraper_class("PIERCE", "WA", "PROBATE")
+    cls_lower, _ = get_scraper_class("pierce", "wa", "probate")
+    cls_upper, _ = get_scraper_class("PIERCE", "WA", "PROBATE")
     assert cls_lower is cls_upper
 
 

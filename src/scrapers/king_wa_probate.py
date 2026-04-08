@@ -37,27 +37,55 @@ _PID_PATTERN = re.compile(r"PID[:\s]*(\d{6,12})", re.IGNORECASE)
 
 
 class KingCountyLandmarkWebScraper(BridgeScraper):
-    """Base scraper for King County LandmarkWeb Recorder portal.
+    """King County LandmarkWeb Recorder scraper — supports multiple record types.
 
-    Subclass and override DOC_TYPE_SEARCH_TEXTS to scrape different record types.
     Uses Document Type Search dropdown for precise category selection.
+    Pass record_type to constructor to select which document category to scrape.
 
     Records without PID (parcel ID) in the Legal column are filtered out
     since they can't be enriched with property/mailing addresses.
     """
 
-    # Subclasses override these to select different document types
-    DOC_TYPE_SEARCH_TEXTS: list[str] = ["death cert"]  # Default: death certificates
-    DOC_TYPE_LABEL: str = "DEATH CERTIFICATE"
-    # Field mapping — subclasses override to change semantics
-    GRANTOR_LABEL: str = "deceased"    # What the grantor represents
-    GRANTEE_LABEL: str = "heir"       # What the grantee represents
+    # Maps record_type → (search_texts, label, grantor_label, grantee_label)
+    RECORD_TYPE_CONFIG: dict[str, dict] = {
+        "probate": {
+            "search_texts": ["death cert"],
+            "label": "DEATH CERTIFICATE",
+            "grantor": "deceased",
+            "grantee": "heir",
+        },
+        "death_certificate": {
+            "search_texts": ["death cert"],
+            "label": "DEATH CERTIFICATE",
+            "grantor": "deceased",
+            "grantee": "heir",
+        },
+        "pre_foreclosure": {
+            "search_texts": ["notice of trustee sale"],
+            "label": "PRE-FORECLOSURE",
+            "grantor": "borrower",
+            "grantee": "lender",
+        },
+        "divorce": {
+            "search_texts": ["dissolution", "divorce", "decree"],
+            "label": "DIVORCE",
+            "grantor": "petitioner",
+            "grantee": "respondent",
+        },
+    }
 
-    def __init__(self, base_url: str | None = None, county: str = "king", state: str = "WA"):
+    def __init__(self, base_url: str | None = None, county: str = "king", state: str = "WA", record_type: str = "probate"):
         super().__init__()
         self._base_url = (base_url or _BASE_URL).rstrip("/")
         self._county = county
         self._state = state
+
+        # Look up config for the requested record type
+        cfg = self.RECORD_TYPE_CONFIG.get(record_type, self.RECORD_TYPE_CONFIG["probate"])
+        self.DOC_TYPE_SEARCH_TEXTS = cfg["search_texts"]
+        self.DOC_TYPE_LABEL = cfg["label"]
+        self.GRANTOR_LABEL = cfg["grantor"]
+        self.GRANTEE_LABEL = cfg["grantee"]
 
         from urllib.parse import urlparse
         domain = urlparse(self._base_url).hostname
@@ -689,85 +717,29 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         return False
 
 
-# ─── Backward-compatible alias ───────────────────────────────────────────────
+# ─── Backward-compatible aliases ─────────────────────────────────────────────
+# Old code may reference these class names — they all resolve to the base class
+# which now accepts record_type in constructor.
 LandmarkWebDeathCertScraper = KingCountyLandmarkWebScraper
-
-
-# ─── King County: Death Certificates (probate) ──────────────────────────────
-
-class KingWaProbateScraper(KingCountyLandmarkWebScraper):
-    """King County, WA — Death Certificates via LandmarkWeb."""
-    DOC_TYPE_SEARCH_TEXTS = ["death cert"]
-    DOC_TYPE_LABEL = "DEATH CERTIFICATE"
-    GRANTOR_LABEL = "deceased"
-    GRANTEE_LABEL = "heir"
-
-    def __init__(self):
-        super().__init__(
-            base_url="https://recordsearch.kingcounty.gov/LandmarkWeb",
-            county="king", state="WA",
-        )
-
-
-# ─── King County: Pre-Foreclosure (NOD, Trustee Sale, Lis Pendens) ──────────
-
-class KingWaPreForeclosureScraper(KingCountyLandmarkWebScraper):
-    """King County, WA — Pre-foreclosure filings via LandmarkWeb.
-
-    Uses "Notice of Trustee Sale" category (value=172) — the primary
-    pre-foreclosure signal in WA state (90 days before auction).
-    Grantor = borrower (property owner in distress), Grantee = lender/trustee.
-    """
-    DOC_TYPE_SEARCH_TEXTS = ["notice of trustee sale"]
-    DOC_TYPE_LABEL = "PRE-FORECLOSURE"
-    GRANTOR_LABEL = "borrower"
-    GRANTEE_LABEL = "lender"
-
-    def __init__(self):
-        super().__init__(
-            base_url="https://recordsearch.kingcounty.gov/LandmarkWeb",
-            county="king", state="WA",
-        )
-
-
-# ─── King County: Divorce (Decree of Dissolution) ───────────────────────────
-
-class KingWaDivorceScraper(KingCountyLandmarkWebScraper):
-    """King County, WA — Divorce/dissolution decrees via LandmarkWeb.
-
-    NOTE: King County LandmarkWeb does NOT have a "Divorce" or "Dissolution"
-    category in its dropdown. Divorce decrees are filed at King County Superior
-    Court (dja.kingcounty.gov), not the recorder. This scraper is a placeholder
-    that will attempt to match any dissolution-related category if one is added.
-
-    For actual King County divorce data, a separate Superior Court scraper is needed.
-    """
-    DOC_TYPE_SEARCH_TEXTS = ["dissolution", "divorce", "decree"]
-    DOC_TYPE_LABEL = "DIVORCE"
-    GRANTOR_LABEL = "petitioner"
-    GRANTEE_LABEL = "respondent"
-
-    def __init__(self):
-        super().__init__(
-            base_url="https://recordsearch.kingcounty.gov/LandmarkWeb",
-            county="king", state="WA",
-        )
+KingWaProbateScraper = KingCountyLandmarkWebScraper
+KingWaPreForeclosureScraper = KingCountyLandmarkWebScraper
+KingWaDivorceScraper = KingCountyLandmarkWebScraper
 
 
 # ─── Other LandmarkWeb counties ─────────────────────────────────────────────
 
 class ClarkWaProbateScraper(KingCountyLandmarkWebScraper):
     """Clark County, WA — e-docs.clark.wa.gov/LandmarkWeb"""
-    def __init__(self):
+    def __init__(self, record_type: str = "probate"):
         super().__init__(
             base_url="https://e-docs.clark.wa.gov/LandmarkWeb",
-            county="clark", state="WA",
+            county="clark", state="WA", record_type=record_type,
         )
 
 
 class SnohomishWaProbateScraper(KingCountyLandmarkWebScraper):
     """Snohomish County, WA — snoco.org/RecordedDocuments (requires login — NOT PUBLIC)"""
-    def __init__(self):
+    def __init__(self, record_type: str = "probate"):
         super().__init__(
             base_url="https://www.snoco.org/RecordedDocuments",
             county="snohomish", state="WA",

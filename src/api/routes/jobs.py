@@ -69,7 +69,7 @@ async def create_job(
             CountyConnector.active,
         )
     )
-    connector = connector_result.scalar_one_or_none()
+    connector = connector_result.scalars().first()
     if connector and getattr(connector, "scraper_mode", "manual") == "ai":
         ai_limit = settings.AI_JOB_LIMITS.get(current_user.plan, 5)
         if ai_limit != -1:

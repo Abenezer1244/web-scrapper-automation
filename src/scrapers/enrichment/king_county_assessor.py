@@ -82,78 +82,52 @@ async def batch_enrich_king_county(
                  sum(1 for r in results.values() if r.get("property_address")),
                  len(clean), len(tax_urls))
 
-    # ── Phase 2: Playwright for mailing addresses (5 concurrent tabs) ──────
+    # ── Phase 2: Playwright for mailing addresses ──────────────────────────
     if not tax_urls:
         return results
 
-    _CONCURRENT_TABS = 5
-    _logger.info("Phase 2: Playwright lookup for %d mailing addresses (%d concurrent tabs)...",
-                 len(tax_urls), _CONCURRENT_TABS)
+    _logger.info("Phase 2: Playwright lookup for %d mailing addresses...", len(tax_urls))
 
-    async def _lookup_mailing(page, pid: str, url: str) -> tuple[str, str | None]:
-        """Look up mailing address from a single tax bill page."""
-        try:
-            await page.goto(url, wait_until="load", timeout=15_000)
+    async with BridgeScraper() as scraper:
+        pids_to_lookup = list(tax_urls.keys())
+
+        for i, pid in enumerate(pids_to_lookup):
+            if i % 25 == 0:
+                _logger.info("  Mailing: %d / %d ...", i, len(pids_to_lookup))
+
             try:
-                await page.wait_for_function(
-                    "() => document.body.innerText.includes('Mailing Address') || document.body.innerText.includes('No accounts')",
-                    timeout=8_000,
-                )
+                url = tax_urls[pid]
+                await scraper.page.goto(url, wait_until="load", timeout=10_000)
+
+                try:
+                    await scraper.page.wait_for_function(
+                        "() => document.body.innerText.includes('Mailing Address') || document.body.innerText.includes('No accounts')",
+                        timeout=5_000,
+                    )
+                except Exception:
+                    pass
+
+                body = await scraper.page.inner_text("body")
+                if "Mailing Address" in body:
+                    idx = body.index("Mailing Address") + len("Mailing Address")
+                    after = body[idx:idx + 200]
+                    lines = [l.strip() for l in after.split("\n") if l.strip()]
+                    addr_lines = []
+                    for line in lines:
+                        if line.startswith("Pay by") or line.startswith("Annual") or line.startswith("Billing"):
+                            break
+                        if len(line) > 3:
+                            addr_lines.append(line)
+                        if len(addr_lines) >= 2:
+                            break
+                    if addr_lines:
+                        mailing = " ".join(", ".join(addr_lines).strip().split())
+                        results[pid]["mailing_address"] = mailing
+
             except Exception:
                 pass
 
-            body = await page.inner_text("body")
-            if "Mailing Address" in body:
-                idx = body.index("Mailing Address") + len("Mailing Address")
-                after = body[idx:idx + 200]
-                lines = [l.strip() for l in after.split("\n") if l.strip()]
-                addr_lines = []
-                for line in lines:
-                    if line.startswith("Pay by") or line.startswith("Annual") or line.startswith("Billing"):
-                        break
-                    if len(line) > 3:
-                        addr_lines.append(line)
-                    if len(addr_lines) >= 2:
-                        break
-                if addr_lines:
-                    return pid, " ".join(", ".join(addr_lines).strip().split())
-        except Exception:
-            pass
-        return pid, None
-
-    async with BridgeScraper() as scraper:
-        # Open additional tabs (scraper already has 1 page)
-        extra_pages = []
-        for _ in range(_CONCURRENT_TABS - 1):
-            extra_pages.append(await scraper.context.new_page())
-        pages = [scraper.page] + extra_pages
-
-        pids_to_lookup = list(tax_urls.keys())
-        completed = 0
-
-        # Process in batches of _CONCURRENT_TABS
-        for batch_start in range(0, len(pids_to_lookup), _CONCURRENT_TABS):
-            batch = pids_to_lookup[batch_start:batch_start + _CONCURRENT_TABS]
-
-            tasks = []
-            for i, pid in enumerate(batch):
-                page = pages[i % len(pages)]
-                tasks.append(_lookup_mailing(page, pid, tax_urls[pid]))
-
-            batch_results = await asyncio.gather(*tasks)
-            for pid, mailing in batch_results:
-                if mailing and pid in results:
-                    results[pid]["mailing_address"] = mailing
-
-            completed += len(batch)
-            if completed % 50 == 0 or completed == len(pids_to_lookup):
-                _logger.info("  Mailing: %d / %d ...", completed, len(pids_to_lookup))
-
             await asyncio.sleep(0.2)
-
-        # Close extra tabs
-        for page in extra_pages:
-            await page.close()
 
     found_mail = sum(1 for r in results.values() if r.get("mailing_address"))
     found_prop = sum(1 for r in results.values() if r.get("property_address"))

@@ -38,11 +38,15 @@ _LEGAL_KEYWORDS = re.compile(
 )
 
 
-class PierceWAProbateScraper(BridgeScraper):
-    """Scrapes probate filings from Pierce County ARMS Web portal."""
+class PierceWAARMSScraper(BridgeScraper):
+    """Base scraper for Pierce County ARMS Web portal. Subclass and set DOC_TYPE_IDS."""
+
+    # Subclasses override these to select different document types
+    DOC_TYPE_IDS: list[str] = ["226"]  # Default: PROBATE
+    DOC_TYPE_LABEL: str = "PROBATE"
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
-        _logger.info("Pierce WA Probate — scraping %s to %s", date_from, date_to)
+        _logger.info("Pierce WA %s — scraping %s to %s", self.DOC_TYPE_LABEL, date_from, date_to)
 
         await self._accept_disclaimer()
         await self.navigate(_ARMS_SEARCH)
@@ -127,7 +131,7 @@ class PierceWAProbateScraper(BridgeScraper):
                     enriched_count += 1
             _logger.info("Batch GIS: %d/%d records enriched with addresses", enriched_count, len(parcel_records))
 
-        _logger.info("Pierce WA Probate — complete. %d records", len(all_records))
+        _logger.info("Pierce WA %s — complete. %d records", self.DOC_TYPE_LABEL, len(all_records))
         return all_records
 
     # ─── Private helpers ──────────────────────────────────────────────────────
@@ -169,12 +173,13 @@ class PierceWAProbateScraper(BridgeScraper):
         await page.wait_for_timeout(300)
         _logger.info("Typed date range: %s — %s", date_from, date_to)
 
-        # Check PROBATE checkbox
-        probate_cb = page.locator("#cphNoMargin_f_dclDocType_226")
-        await probate_cb.scroll_into_view_if_needed(timeout=5_000)
-        await probate_cb.check(timeout=5_000)
-        await page.wait_for_timeout(300)
-        _logger.info("Checked PROBATE")
+        # Check document type checkboxes (configurable per subclass)
+        for doc_id in self.DOC_TYPE_IDS:
+            cb = page.locator(f"#cphNoMargin_f_dclDocType_{doc_id}")
+            await cb.scroll_into_view_if_needed(timeout=5_000)
+            await cb.check(timeout=5_000)
+            await page.wait_for_timeout(200)
+        _logger.info("Checked %d doc types for %s", len(self.DOC_TYPE_IDS), self.DOC_TYPE_LABEL)
 
         # Submit and wait for results page
         await page.click("#cphNoMargin_SearchButtons1_btnSearch", timeout=10_000)
@@ -483,3 +488,21 @@ class PierceWAProbateScraper(BridgeScraper):
                 party_name = cleaned
 
         return party_name, heirs
+
+
+# ─── Backward-compatible alias ───────────────────────────────────────────────
+PierceWAProbateScraper = PierceWAARMSScraper
+
+
+# ─── Pre-foreclosure (Notice of Default, Foreclosure, Lis Pendens, Trustee Sale)
+class PierceWAPreForeclosureScraper(PierceWAARMSScraper):
+    """Scrapes pre-foreclosure filings from Pierce County ARMS Web portal."""
+    DOC_TYPE_IDS = ["187", "188", "146", "324"]  # NOD, Notice of Foreclosure, Lis Pendens, Trustee Sale
+    DOC_TYPE_LABEL = "PRE-FORECLOSURE"
+
+
+# ─── Divorce (Decree of Dissolution) ────────────────────────────────────────
+class PierceWADivorceScraper(PierceWAARMSScraper):
+    """Scrapes divorce/dissolution decrees from Pierce County ARMS Web portal."""
+    DOC_TYPE_IDS = ["87"]  # DECREE OF DISSOLUTION
+    DOC_TYPE_LABEL = "DIVORCE"

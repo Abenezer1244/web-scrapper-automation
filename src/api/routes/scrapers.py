@@ -106,17 +106,21 @@ async def create_scraper(
             CountyConnector.active,
         )
     )
-    connector = result.scalar_one_or_none()
-    if connector is None:
+    connectors = result.scalars().all()
+    if not connectors:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"No active connector found for {body.county}, {body.state}",
         )
-    if body.record_type not in connector.record_types:
+    # Find the connector that supports this record type
+    supported_types = []
+    for c in connectors:
+        supported_types.extend(c.record_types)
+    if body.record_type not in supported_types:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Record type '{body.record_type}' not supported for {body.county}, {body.state}. "
-                   f"Supported: {connector.record_types}",
+                   f"Supported: {list(set(supported_types))}",
         )
 
     # Business+ feature gating

@@ -40,6 +40,10 @@ app.conf.beat_schedule = {
         "task": "src.workers.scheduler.expire_trials",
         "schedule": 3600.0,  # every 1 hour
     },
+    "onboarding-emails": {
+        "task": "src.workers.scheduler.send_onboarding_emails",
+        "schedule": crontab(hour=14, minute=0),  # 2 PM UTC = 7 AM PT
+    },
 }
 
 
@@ -391,3 +395,49 @@ def purge_old_records() -> None:
         )
         db.commit()
         _logger.info("Purged %d records older than %d days", result.rowcount, settings.RECORD_RETENTION_DAYS)
+
+
+# ─── Task: Onboarding emails (daily at 7 AM PT) ─────────────────────────────
+
+@app.task(name="src.workers.scheduler.send_onboarding_emails")
+def send_onboarding_emails() -> None:
+    """Send activation nudges (day 3) and trial expiry warnings (day 6-7)."""
+    from sqlalchemy import select
+
+    from src.db.models import Job, ScraperConfig, User
+    from src.db.session import SyncSessionLocal
+    from src.workers.onboarding_emails import send_activation_reminder, send_trial_ending_email
+
+    now = datetime.now(UTC)
+
+    with SyncSessionLocal() as db:
+        users = db.execute(
+            select(User).where(User.is_active, User.trial_ends_at.isnot(None))
+        ).scalars().all()
+
+        for user in users:
+            if not user.trial_ends_at:
+                continue
+
+            trial_end = user.trial_ends_at.replace(tzinfo=None) if user.trial_ends_at.tzinfo else user.trial_ends_at
+            now_naive = now.replace(tzinfo=None)
+            days_since_signup = (now_naive - user.created_at.replace(tzinfo=None)).days
+            days_left = (trial_end - now_naive).days
+
+            # Day 3: activation nudge
+            if days_since_signup == 3:
+                has_scraper = db.execute(
+                    select(ScraperConfig).where(ScraperConfig.user_id == user.id)
+                ).scalar_one_or_none() is not None
+
+                has_download = db.execute(
+                    select(Job).where(Job.user_id == user.id, Job.export_key.isnot(None))
+                ).scalar_one_or_none() is not None
+
+                send_activation_reminder(user.email, has_scraper, has_download)
+
+            # Day 6 or 7: trial expiry warning
+            if days_left in (1, 2):
+                send_trial_ending_email(user.email, days_left)
+
+    _logger.info("Onboarding email check complete: %d trial users evaluated", len(users))

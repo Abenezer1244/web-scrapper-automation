@@ -81,6 +81,14 @@ async def register(
     token = create_secure_token(user.id)
     refresh = create_refresh_token(user.id)
     audit_log(request, "register", user.id)
+
+    # Send welcome email (non-blocking — failure must not break registration)
+    try:
+        from src.workers.onboarding_emails import send_welcome_email
+        send_welcome_email(body.email)
+    except Exception:
+        pass
+
     return TokenResponse(access_token=token, refresh_token=refresh)
 
 

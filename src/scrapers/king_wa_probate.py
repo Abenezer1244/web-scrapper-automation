@@ -1,4 +1,4 @@
-"""King County (WA) Recorder — Death Certificate scraper via LandmarkWeb.
+"""King County (WA) Recorder — LandmarkWeb scraper for multiple record types.
 
 Portal: https://recordsearch.kingcounty.gov/LandmarkWeb/search/index
 Platform: Hyland LandmarkWeb
@@ -6,19 +6,17 @@ Platform: Hyland LandmarkWeb
 Flow:
 1. Accept disclaimer (if present)
 2. Click "Document Type Search" in left sidebar
-3. Select "Death Certificates" from Document Category dropdown (#documentCategory-DocumentType)
+3. Select document category from dropdown (#documentCategory-DocumentType)
 4. Fill date range (#beginDate-DocumentType / #endDate-DocumentType)
 5. Solve reCAPTCHA (manual in headed mode, or automated via service)
 6. Click Submit (#submit-DocumentType)
-7. Extract results: Recording #, Date, Grantor (deceased), Grantee (heir), Legal
+7. Extract results: Recording #, Date, Grantor, Grantee, Legal
 8. Filter for records with PID (Parcel ID) in the Legal column
 
-Key:
-- Grantor = deceased person
-- Grantee = heir/family member inheriting the property (the lead)
-- PID:####### in Legal column = property parcel ID
-
-Enrichment (Phase 2): eRealProperty for property + mailing addresses.
+Supported record types (subclass and set DOC_TYPE_SEARCH_TEXTS):
+- Death Certificates (probate): grantor=deceased, grantee=heir
+- Pre-foreclosure (NOD, Trustee Sale, Lis Pendens): grantor=borrower, grantee=lender
+- Divorce (Decree of Dissolution): grantor=petitioner, grantee=respondent
 """
 
 import asyncio
@@ -38,14 +36,22 @@ _SEARCH_URL = f"{_BASE_URL}/LandmarkWeb/search/index"
 _PID_PATTERN = re.compile(r"PID[:\s]*(\d{6,12})", re.IGNORECASE)
 
 
-class LandmarkWebDeathCertScraper(BridgeScraper):
-    """Scrapes death certificate filings from any LandmarkWeb Recorder portal.
+class KingCountyLandmarkWebScraper(BridgeScraper):
+    """Base scraper for King County LandmarkWeb Recorder portal.
 
-    Works with: King, Clark, Snohomish (WA) — all use Hyland LandmarkWeb.
+    Subclass and override DOC_TYPE_SEARCH_TEXTS to scrape different record types.
+    Uses Document Type Search dropdown for precise category selection.
 
-    Death certificates with parcel IDs indicate property ownership by the deceased.
-    Grantor = deceased, Grantee = heir/family inheriting the property.
+    Records without PID (parcel ID) in the Legal column are filtered out
+    since they can't be enriched with property/mailing addresses.
     """
+
+    # Subclasses override these to select different document types
+    DOC_TYPE_SEARCH_TEXTS: list[str] = ["death cert"]  # Default: death certificates
+    DOC_TYPE_LABEL: str = "DEATH CERTIFICATE"
+    # Field mapping — subclasses override to change semantics
+    GRANTOR_LABEL: str = "deceased"    # What the grantor represents
+    GRANTEE_LABEL: str = "heir"       # What the grantee represents
 
     def __init__(self, base_url: str | None = None, county: str = "king", state: str = "WA"):
         super().__init__()
@@ -66,8 +72,8 @@ class LandmarkWebDeathCertScraper(BridgeScraper):
         total_chunks = max(1, (end - start).days // chunk_days + 1)
 
         _logger.info(
-            "%s County death certs — %s to %s (%d chunks of %d days)",
-            self._county.title(), date_from, date_to, total_chunks, chunk_days,
+            "%s County %s — %s to %s (%d chunks of %d days)",
+            self._county.title(), self.DOC_TYPE_LABEL, date_from, date_to, total_chunks, chunk_days,
         )
 
         all_records: list[ScrapedRecord] = []
@@ -123,7 +129,7 @@ class LandmarkWebDeathCertScraper(BridgeScraper):
 
             chunk_start = chunk_end
 
-        _logger.info("King County death certs complete — %d records with parcel IDs", len(all_records))
+        _logger.info("King County %s complete — %d records with parcel IDs", self.DOC_TYPE_LABEL, len(all_records))
         return all_records
 
     # ─── Disclaimer ──────────────────────────────────────────────────────────
@@ -254,9 +260,9 @@ class LandmarkWebDeathCertScraper(BridgeScraper):
     # ─── Search flow ─────────────────────────────────────────────────────────
 
     async def _search_chunk(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
-        """Navigate to Document Type Search, select Death Certificate, fill dates, submit."""
+        """Navigate to Document Type Search, select document type, fill dates, submit."""
         await self._go_to_doc_type_search()
-        await self._select_death_certificate()
+        await self._select_document_type()
         await self._fill_dates(date_from, date_to)
         await self._submit_search()
         return await self._extract_all_pages()
@@ -284,40 +290,48 @@ class LandmarkWebDeathCertScraper(BridgeScraper):
         await self.page.wait_for_timeout(2000)
         _logger.info("Navigated to Document Type Search via URL")
 
-    async def _select_death_certificate(self) -> None:
-        """Select Death Certificates from Document Category (#documentCategory-DocumentType).
+    async def _select_document_type(self) -> None:
+        """Select document type from Document Category dropdown (#documentCategory-DocumentType).
 
         Uses jQuery Select2 API since the dropdown is a Select2 widget.
+        Matches against DOC_TYPE_SEARCH_TEXTS (case-insensitive substring match).
+        If multiple search texts are provided, selects the first match found.
         """
         await self.page.wait_for_timeout(500)
 
+        search_texts = [t.lower() for t in self.DOC_TYPE_SEARCH_TEXTS]
+
         result = await self.page.evaluate("""
-            (() => {
+            ((searchTexts) => {
                 const sel = document.querySelector('#documentCategory-DocumentType');
                 if (!sel) return {success: false, error: 'documentCategory-DocumentType not found'};
 
-                // Find Death Certificate option
+                // Find first option matching any of our search texts
                 for (const opt of sel.options) {
-                    if (opt.text.toLowerCase().includes('death cert')) {
-                        // Use Select2 API if available (required for form to recognize selection)
-                        if (window.jQuery && jQuery.fn.select2) {
-                            jQuery('#documentCategory-DocumentType').val(opt.value).trigger('change');
-                        } else {
-                            sel.value = opt.value;
-                            sel.dispatchEvent(new Event('change', {bubbles: true}));
+                    const optText = opt.text.toLowerCase();
+                    for (const search of searchTexts) {
+                        if (optText.includes(search)) {
+                            // Use Select2 API if available (required for form to recognize selection)
+                            if (window.jQuery && jQuery.fn.select2) {
+                                jQuery('#documentCategory-DocumentType').val(opt.value).trigger('change');
+                            } else {
+                                sel.value = opt.value;
+                                sel.dispatchEvent(new Event('change', {bubbles: true}));
+                            }
+                            return {success: true, value: opt.value, text: opt.text.trim()};
                         }
-                        return {success: true, value: opt.value, text: opt.text.trim()};
                     }
                 }
-                const opts = Array.from(sel.options).slice(0, 10).map(o => o.text.trim());
-                return {success: false, error: 'Death Certificate not in options', opts: opts};
-            })()
-        """)
+                const opts = Array.from(sel.options).map(o => o.text.trim());
+                return {success: false, error: 'No matching document type', searchTexts: searchTexts, opts: opts};
+            })
+        """, search_texts)
 
         if result.get('success'):
             _logger.info("Selected '%s' (value=%s)", result.get('text'), result.get('value'))
         else:
-            _logger.warning("Could not select Death Certificate: %s", result.get('error'))
+            _logger.warning("Could not select %s: %s", self.DOC_TYPE_LABEL, result.get('error'))
+            _logger.info("Searched for: %s", result.get('searchTexts', []))
             _logger.info("Available options: %s", result.get('opts', []))
 
         await self.page.wait_for_timeout(500)
@@ -631,7 +645,7 @@ class LandmarkWebDeathCertScraper(BridgeScraper):
 
                 # Doc type
                 doc_type = (item.get("doc_type") or "").strip()
-                record.doc_type = doc_type or "DEATH CERTIFICATE"
+                record.doc_type = doc_type or self.DOC_TYPE_LABEL
 
                 # Store all metadata in enrichment_data
                 record.enrichment_data = {
@@ -675,12 +689,19 @@ class LandmarkWebDeathCertScraper(BridgeScraper):
         return False
 
 
-# ─── County-specific aliases ─────────────────────────────────────────────────
-# Each alias pre-configures the base URL for a specific LandmarkWeb county.
-# The registry uses these class names in county_connectors.scraper_class.
+# ─── Backward-compatible alias ───────────────────────────────────────────────
+LandmarkWebDeathCertScraper = KingCountyLandmarkWebScraper
 
-class KingWaProbateScraper(LandmarkWebDeathCertScraper):
-    """King County, WA — recordsearch.kingcounty.gov"""
+
+# ─── King County: Death Certificates (probate) ──────────────────────────────
+
+class KingWaProbateScraper(KingCountyLandmarkWebScraper):
+    """King County, WA — Death Certificates via LandmarkWeb."""
+    DOC_TYPE_SEARCH_TEXTS = ["death cert"]
+    DOC_TYPE_LABEL = "DEATH CERTIFICATE"
+    GRANTOR_LABEL = "deceased"
+    GRANTEE_LABEL = "heir"
+
     def __init__(self):
         super().__init__(
             base_url="https://recordsearch.kingcounty.gov/LandmarkWeb",
@@ -688,7 +709,54 @@ class KingWaProbateScraper(LandmarkWebDeathCertScraper):
         )
 
 
-class ClarkWaProbateScraper(LandmarkWebDeathCertScraper):
+# ─── King County: Pre-Foreclosure (NOD, Trustee Sale, Lis Pendens) ──────────
+
+class KingWaPreForeclosureScraper(KingCountyLandmarkWebScraper):
+    """King County, WA — Pre-foreclosure filings via LandmarkWeb.
+
+    Uses "Notice of Trustee Sale" category (value=172) — the primary
+    pre-foreclosure signal in WA state (90 days before auction).
+    Grantor = borrower (property owner in distress), Grantee = lender/trustee.
+    """
+    DOC_TYPE_SEARCH_TEXTS = ["notice of trustee sale"]
+    DOC_TYPE_LABEL = "PRE-FORECLOSURE"
+    GRANTOR_LABEL = "borrower"
+    GRANTEE_LABEL = "lender"
+
+    def __init__(self):
+        super().__init__(
+            base_url="https://recordsearch.kingcounty.gov/LandmarkWeb",
+            county="king", state="WA",
+        )
+
+
+# ─── King County: Divorce (Decree of Dissolution) ───────────────────────────
+
+class KingWaDivorceScraper(KingCountyLandmarkWebScraper):
+    """King County, WA — Divorce/dissolution decrees via LandmarkWeb.
+
+    NOTE: King County LandmarkWeb does NOT have a "Divorce" or "Dissolution"
+    category in its dropdown. Divorce decrees are filed at King County Superior
+    Court (dja.kingcounty.gov), not the recorder. This scraper is a placeholder
+    that will attempt to match any dissolution-related category if one is added.
+
+    For actual King County divorce data, a separate Superior Court scraper is needed.
+    """
+    DOC_TYPE_SEARCH_TEXTS = ["dissolution", "divorce", "decree"]
+    DOC_TYPE_LABEL = "DIVORCE"
+    GRANTOR_LABEL = "petitioner"
+    GRANTEE_LABEL = "respondent"
+
+    def __init__(self):
+        super().__init__(
+            base_url="https://recordsearch.kingcounty.gov/LandmarkWeb",
+            county="king", state="WA",
+        )
+
+
+# ─── Other LandmarkWeb counties ─────────────────────────────────────────────
+
+class ClarkWaProbateScraper(KingCountyLandmarkWebScraper):
     """Clark County, WA — e-docs.clark.wa.gov/LandmarkWeb"""
     def __init__(self):
         super().__init__(
@@ -697,7 +765,7 @@ class ClarkWaProbateScraper(LandmarkWebDeathCertScraper):
         )
 
 
-class SnohomishWaProbateScraper(LandmarkWebDeathCertScraper):
+class SnohomishWaProbateScraper(KingCountyLandmarkWebScraper):
     """Snohomish County, WA — snoco.org/RecordedDocuments (requires login — NOT PUBLIC)"""
     def __init__(self):
         super().__init__(

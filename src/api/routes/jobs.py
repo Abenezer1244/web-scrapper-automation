@@ -279,19 +279,32 @@ async def stream_logs(
     existing_logs = logs_result.scalars().all()
 
     _MAX_SSE_PER_USER = 5
+    _SSE_HEARTBEAT_TTL = 60  # Each connection key expires after 60s if not refreshed
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        # Track concurrent SSE connections per user
-        sse_key = f"sse_connections:{current_user.id}"
-        r = aioredis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
-        conn_count = await r.incr(sse_key)
-        await r.expire(sse_key, 1800)  # Auto-expire if process crashes
+        # Track concurrent SSE connections using per-connection keys with TTL.
+        # Each connection registers a unique key that auto-expires in 60s.
+        # The polling loop refreshes the TTL — if the connection dies (crash,
+        # network loss, tab close), the key expires automatically.
+        conn_id = f"{current_user.id}:{uuid.uuid4().hex[:8]}"
+        conn_key = f"sse_conn:{conn_id}"
+        user_pattern = f"sse_conn:{current_user.id}:*"
 
-        if conn_count > _MAX_SSE_PER_USER:
-            await r.decr(sse_key)
+        r = aioredis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+
+        # Count active connections for this user (keys that haven't expired)
+        active_keys = []
+        async for key in r.scan_iter(user_pattern):
+            active_keys.append(key)
+        conn_count = len(active_keys)
+
+        if conn_count >= _MAX_SSE_PER_USER:
             await r.aclose()
-            yield f"data: {{\"type\": \"error\", \"message\": \"Too many concurrent streams (max {_MAX_SSE_PER_USER})\"}}\n\n"
+            yield f"data: {{\"type\": \"error\", \"message\": \"Too many concurrent streams (max {_MAX_SSE_PER_USER}). Close other tabs and retry.\"}}\n\n"
             return
+
+        # Register this connection with auto-expiring key
+        await r.set(conn_key, "1", ex=_SSE_HEARTBEAT_TTL)
 
         try:
             # 1. Replay persisted logs
@@ -308,6 +321,7 @@ async def stream_logs(
             import time as _time
             max_duration = 1800  # 30 minutes max SSE connection
             start_time = _time.time()
+            last_heartbeat = _time.time()
 
             pubsub = r.pubsub()
             channel = f"job_logs:{job_id}"
@@ -318,6 +332,12 @@ async def stream_logs(
                     if _time.time() - start_time > max_duration:
                         yield "data: {\"type\": \"timeout\"}\n\n"
                         break
+
+                    # Refresh TTL every 30s to prove connection is alive
+                    if _time.time() - last_heartbeat > 30:
+                        await r.expire(conn_key, _SSE_HEARTBEAT_TTL)
+                        last_heartbeat = _time.time()
+
                     message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=30.0)
                     if message and message.get("type") == "message":
                         yield f"data: {message['data']}\n\n"
@@ -332,7 +352,8 @@ async def stream_logs(
             finally:
                 await pubsub.unsubscribe(channel)
         finally:
-            await r.decr(sse_key)
+            # Clean up — delete our connection key immediately
+            await r.delete(conn_key)
             await r.aclose()
 
     return StreamingResponse(

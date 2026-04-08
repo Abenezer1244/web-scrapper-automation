@@ -29,8 +29,8 @@ from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.king_wa_probate")
 
-_BASE_URL = "https://recordsearch.kingcounty.gov"
-_SEARCH_URL = f"{_BASE_URL}/LandmarkWeb/search/index"
+_BASE_URL = "https://recordsearch.kingcounty.gov/LandmarkWeb"
+_SEARCH_URL = f"{_BASE_URL}/search/index"
 
 # Regex to extract parcel ID from legal description (e.g. "PID:1234567890")
 _PID_PATTERN = re.compile(r"PID[:\s]*(\d{6,12})", re.IGNORECASE)

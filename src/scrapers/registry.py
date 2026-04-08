@@ -44,17 +44,26 @@ def get_scraper_class(county: str, state: str, record_type: str):
                 CountyConnector.active,
             )
         )
-        connector = result.scalar_one_or_none()
+        connectors = result.scalars().all()
 
-    if connector is None:
+    if not connectors:
         raise UnsupportedCountyError(
             f"No active connector for {county.lower()}, {state.upper()}"
         )
 
-    if record_type.lower() not in [rt.lower() for rt in connector.record_types]:
+    # Find the connector that supports this specific record type
+    connector = None
+    all_types = []
+    for c in connectors:
+        all_types.extend(c.record_types)
+        if record_type.lower() in [rt.lower() for rt in c.record_types]:
+            connector = c
+            break
+
+    if connector is None:
         raise UnsupportedCountyError(
             f"Record type '{record_type}' not supported for {county}, {state}. "
-            f"Supported: {connector.record_types}"
+            f"Supported: {list(set(all_types))}"
         )
 
     # AI-powered scraper: return AIScraper configured with the connector's base_url

@@ -354,11 +354,13 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
         sa_select(Result).where(Result.job_id == job_id, Result.user_id == job.user_id)
     ).scalars().all()
 
-    # GIS batch enrichment for property addresses
+    # GIS batch enrichment for property AND mailing addresses
+    # Run for records missing either property address or mailing address
     results_need_addr = [
         res for res in all_results
         if res.parcel_id and len(res.parcel_id.strip()) >= 6
-        and (not res.property_address or res.property_address == "(enrichment unavailable)")
+        and (not res.property_address or res.property_address == "(enrichment unavailable)"
+             or not res.mailing_address)
     ]
     if results_need_addr:
         _publish_log(r, job_id, "info", f"Looking up {len(results_need_addr)} property addresses...", db=db)

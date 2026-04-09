@@ -135,7 +135,9 @@ class EagleWebScraper(BridgeScraper):
                     _logger.warning("Date input not found after navigation back")
 
             # Fill dates for this chunk
-            await self._configure_search("all", cf, ct)
+            # Use first record_type for doc type filtering (e.g., "probate")
+            active_type = self.record_types[0] if self.record_types else "all"
+            await self._configure_search(active_type, cf, ct)
 
             # Submit and extract
             await self._submit_search()
@@ -539,7 +541,7 @@ class EagleWebScraper(BridgeScraper):
                 record = ScrapedRecord()
 
                 # Use parcel from results table if available (avoids detail page clicks)
-                if table_parcel and re.match(r"\d{5,}", table_parcel):
+                if table_parcel and re.match(r"\d{4,}[\.\d]*", table_parcel):
                     record.parcel_id = table_parcel
 
                 # Parse AFN from description and store in enrichment_data
@@ -569,7 +571,7 @@ class EagleWebScraper(BridgeScraper):
                 # Parcel ID — check both summary and description
                 combined = f"{summary} {desc}"
                 # Try "Parcel: XXXXX" or "Parcel:XXXXX" pattern first
-                parcel_labeled = re.search(r"[Pp]arcel[:\s]+(\d{5,})", combined)
+                parcel_labeled = re.search(r"[Pp]arcel[:\s]+(\d{4,}\.\d{3,}|\d{5,})", combined)
                 if parcel_labeled:
                     record.parcel_id = parcel_labeled.group(1)
                 else:
@@ -587,6 +589,19 @@ class EagleWebScraper(BridgeScraper):
                     record.legal_description = legal_text.group(0).strip()[:200]
 
                 if record.party_name or record.date_recorded:
+                    # Filter by record type keywords if configured
+                    if self.record_types and self.record_types != ["all"]:
+                        doc_upper = desc.upper()
+                        matched = False
+                        for rt in self.record_types:
+                            for kw in _DOC_TYPE_MAP.get(rt, []):
+                                if kw in doc_upper:
+                                    matched = True
+                                    break
+                            if matched:
+                                break
+                        if not matched:
+                            continue  # Skip non-matching doc types
                     records.append(record)
 
             _logger.info("Extracted %d records from page", len(records))
@@ -609,9 +624,10 @@ class EagleWebScraper(BridgeScraper):
         import requests as _requests
 
         _PARCEL_PATTERNS = [
-            _re.compile(r'[Pp]arcel\s*(?:[#:]|ID[:\s]|Number[:\s])\s*(\d{5,})'),
-            _re.compile(r'[Tt]ax\s*(?:[#:]|ID[:\s]|Number[:\s])\s*(\d{5,})'),
-            _re.compile(r'APN[:\s]+(\d{5,})'),
+            # Dotted format (Spokane: 44042.0202) and plain digits
+            _re.compile(r'[Pp]arcel[:\s]*\s*(\d{4,}\.\d{3,}|\d{5,})'),
+            _re.compile(r'[Tt]ax\s*(?:[#:]|ID[:\s]|Number[:\s])\s*(\d{4,}\.\d{3,}|\d{5,})'),
+            _re.compile(r'APN[:\s]+(\d{4,}\.\d{3,}|\d{5,})'),
         ]
         _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"}
 

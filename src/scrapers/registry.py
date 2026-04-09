@@ -108,6 +108,7 @@ def get_scraper_class(county: str, state: str, record_type: str):
     _ALLOWED_SCRAPER_MODULES = frozenset([
         "src.scrapers.pierce_wa_probate",
         "src.scrapers.pierce_wa_code_violation",
+        "src.scrapers.king_wa_code_violation",
         "src.scrapers.king_wa_probate",
         "src.scrapers.ai_scraper",
         "src.scrapers.base_scraper",

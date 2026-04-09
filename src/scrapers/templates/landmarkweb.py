@@ -284,9 +284,12 @@ class LandmarkWebScraper(BridgeScraper):
             # Wait for results grid
             try:
                 await self.page.wait_for_selector(
+                    "#searchResults table tbody tr, "
+                    "#resultsTable tbody tr, "
                     "#resultsGridDiv table tbody tr, "
                     "#resultsGrid tbody tr, "
                     ".search-results tbody tr, "
+                    ".dataTables_wrapper tbody tr, "
                     ".no-results, #noResults",
                     timeout=60_000,
                 )
@@ -348,12 +351,12 @@ class LandmarkWebScraper(BridgeScraper):
                 (() => {
                     const d = {
                         results_div: !!document.querySelector('#resultsGridDiv'),
-                        tables: document.querySelectorAll('#resultsGridDiv table, .search-results table').length,
-                        rows: document.querySelectorAll('#resultsGridDiv tbody tr, .search-results tbody tr').length,
+                        tables: document.querySelectorAll('#searchResults table, #resultsTable, #resultsGridDiv table, .search-results table').length,
+                        rows: document.querySelectorAll('#searchResults tbody tr, #resultsTable tbody tr, #resultsGridDiv tbody tr, .search-results tbody tr').length,
                         all_rows: document.querySelectorAll('table tbody tr').length,
                     };
                     // Get column headers
-                    const ths = document.querySelectorAll('#resultsGridDiv th, .search-results th');
+                    const ths = document.querySelectorAll('#searchResults th, #resultsTable th, #resultsGridDiv th, .search-results th');
                     d.headers = Array.from(ths).map(th => th.textContent?.trim() || '');
                     return d;
                 })()
@@ -365,7 +368,7 @@ class LandmarkWebScraper(BridgeScraper):
                 (() => {
                     // Find the results table
                     const tables = document.querySelectorAll(
-                        '#resultsGridDiv table, .search-results table, #resultsGrid'
+                        '#searchResults table, #resultsTable, #resultsGridDiv table, .search-results table, #resultsGrid, table.dataTable'
                     );
                     if (!tables.length) return [];
 

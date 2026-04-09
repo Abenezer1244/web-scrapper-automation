@@ -327,7 +327,16 @@ def run_scrape_job(self, job_id: str) -> None:
 
 async def _run_scraper(scraper_class, date_from: str, date_to: str, r, job_id: str, on_progress=None, record_type: str | None = None):
     """Run the async scraper and stream progress logs back to Redis."""
-    kwargs = {"record_type": record_type} if record_type else {}
+    # Pass record_type if the scraper accepts it — template/AI scrapers may not
+    import inspect
+    kwargs = {}
+    if record_type:
+        try:
+            sig = inspect.signature(scraper_class)
+            if "record_type" in sig.parameters:
+                kwargs["record_type"] = record_type
+        except (ValueError, TypeError):
+            pass
     async with scraper_class(**kwargs) as scraper:
         if on_progress:
             scraper.on_progress = on_progress

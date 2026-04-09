@@ -729,7 +729,30 @@ KingWaDivorceScraper = KingCountyLandmarkWebScraper
 # ─── Other LandmarkWeb counties ─────────────────────────────────────────────
 
 class ClarkWaProbateScraper(KingCountyLandmarkWebScraper):
-    """Clark County, WA — e-docs.clark.wa.gov/LandmarkWeb"""
+    """Clark County, WA — e-docs.clark.wa.gov/LandmarkWeb
+
+    Clark's Document Type dropdown doesn't have specific categories like
+    'Death Certificate'. Uses 'Main Dump for Digital Archives' (all docs)
+    and relies on PID filtering to get property-related records.
+    """
+
+    # Override: Clark uses "Main Dump" instead of specific doc categories
+    RECORD_TYPE_CONFIG = {
+        **KingCountyLandmarkWebScraper.RECORD_TYPE_CONFIG,
+        "probate": {
+            "search_texts": ["main dump", "all categories"],
+            "label": "PROBATE",
+            "grantor": "deceased",
+            "grantee": "heir",
+        },
+        "pre_foreclosure": {
+            "search_texts": ["main dump", "all categories"],
+            "label": "PRE-FORECLOSURE",
+            "grantor": "borrower",
+            "grantee": "lender",
+        },
+    }
+
     def __init__(self, record_type: str = "probate"):
         super().__init__(
             base_url="https://e-docs.clark.wa.gov/LandmarkWeb",

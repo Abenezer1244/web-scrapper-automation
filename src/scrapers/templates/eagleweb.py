@@ -485,6 +485,16 @@ class EagleWebScraper(BridgeScraper):
                     }
                     if (!bestTable) return [];
 
+                    // Build header-to-index map for flexible column extraction
+                    const ths = Array.from(bestTable.querySelectorAll('th'));
+                    const headerMap = {};
+                    ths.forEach((th, idx) => {
+                        const t = th.textContent.trim().toUpperCase();
+                        if (t.includes('PARCEL')) headerMap.parcel = idx;
+                        if (t.includes('LEGAL')) headerMap.legal = idx;
+                        if (t.includes('REMARK')) headerMap.remarks = idx;
+                    });
+
                     const results = [];
                     const rows = bestTable.querySelectorAll('tr');
                     for (let i = 1; i < rows.length; i++) {
@@ -500,7 +510,12 @@ class EagleWebScraper(BridgeScraper):
                         // Capture detail link from first cell (instrument number is a link)
                         const link = cells[0].querySelector('a[href*="docDetail"], a[href*="Detail"]');
                         const detailHref = link ? link.href : '';
-                        results.push({desc, summary, detailHref});
+                        // Extract parcel from its column if available
+                        let parcel = '';
+                        if (headerMap.parcel !== undefined && cells[headerMap.parcel]) {
+                            parcel = cells[headerMap.parcel].textContent.trim();
+                        }
+                        results.push({desc, summary, detailHref, parcel});
                     }
                     return results;
                 })()
@@ -519,8 +534,13 @@ class EagleWebScraper(BridgeScraper):
                 desc = item.get("desc", "")
                 summary = item.get("summary", "")
                 detail_href = item.get("detailHref", "")
+                table_parcel = item.get("parcel", "").strip()
 
                 record = ScrapedRecord()
+
+                # Use parcel from results table if available (avoids detail page clicks)
+                if table_parcel and re.match(r"\d{5,}", table_parcel):
+                    record.parcel_id = table_parcel
 
                 # Parse AFN from description and store in enrichment_data
                 afn_match = re.search(r"\b(\d{5,})\b", desc)

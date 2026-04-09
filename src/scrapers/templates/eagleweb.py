@@ -25,7 +25,8 @@ _logger = setup_logger("scraper.template.eagleweb")
 _DOC_TYPE_MAP = {
     "probate": ["PROBATE", "LETTERS TESTAMENTARY", "LETTERS OF ADMINISTRATION",
                 "PERSONAL REPRESENTATIVE", "PERSONAL REP",
-                "DEATH CERTIFICATE", "AFFIDAVIT OF HEIRSHIP"],
+                "DEATH CERTIFICATE", "AFFIDAVIT OF HEIRSHIP",
+                "TRANSFER ON DEATH"],
     "pre_foreclosure": ["LIS PENDENS", "NOTICE OF TRUSTEE SALE", "TRUSTEE SALE",
                         "TRUSTEE'S SALE", "NOTICE OF DEFAULT", "FORECLOSURE"],
     "tax_delinquent": ["TAX LIEN", "CERTIFICATE OF DELINQUENCY",

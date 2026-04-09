@@ -24,14 +24,12 @@ _logger = setup_logger("scraper.template.eagleweb")
 # Document type keywords in EagleWeb checkbox labels
 _DOC_TYPE_MAP = {
     "probate": ["PROBATE", "LETTERS TESTAMENTARY", "LETTERS OF ADMINISTRATION",
-                "PERSONAL REPRESENTATIVE", "PERSONAL REP", "ESTATE", "WILL",
-                "DEATH", "AFFIDAVIT OF HEIRSHIP", "HEIR"],
-    "pre_foreclosure": ["LIS PENDENS", "NOTICE OF TRUSTEE", "TRUSTEE SALE",
-                        "TRUSTEE'S SALE", "DISCONTINUANCE TRUSTEE",
-                        "SUBSTITUTION OF TRUSTEE", "DEFAULT", "FORECLOSURE",
-                        "NOTICE OF DEFAULT"],
-    "tax_delinquent": ["TAX", "DELINQUENT", "TAX LIEN", "CERTIFICATE OF DELINQUENCY",
-                       "CERTIFICATE OF SALE"],
+                "PERSONAL REPRESENTATIVE", "PERSONAL REP",
+                "DEATH CERTIFICATE", "AFFIDAVIT OF HEIRSHIP"],
+    "pre_foreclosure": ["LIS PENDENS", "NOTICE OF TRUSTEE SALE", "TRUSTEE SALE",
+                        "TRUSTEE'S SALE", "NOTICE OF DEFAULT", "FORECLOSURE"],
+    "tax_delinquent": ["TAX LIEN", "CERTIFICATE OF DELINQUENCY",
+                       "TAX DELINQUENT", "CERTIFICATE OF SALE"],
     "divorce": ["DIVORCE", "DISSOLUTION", "DECREE OF DISSOLUTION"],
 }
 

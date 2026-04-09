@@ -238,6 +238,22 @@ class EagleWebScraper(BridgeScraper):
                     _logger.info("Login clicked, now at: %s", self.page.url)
                 except Exception:
                     await self.page.wait_for_timeout(3_000)
+
+                # After generic Login, check for Public Login (Spokane-style 2-step)
+                await self.page.wait_for_timeout(1_000)
+                public_btn2 = self.page.locator(
+                    "input[type='submit'][value*='Public Login' i], "
+                    "button:has-text('Public Login'), "
+                    "input[type='submit'][value*='Public Log In' i]"
+                )
+                if await public_btn2.count() > 0:
+                    _logger.info("Found 'Public Login' after generic Login, clicking...")
+                    try:
+                        async with self.page.expect_navigation(timeout=15_000):
+                            await public_btn2.first.click()
+                        _logger.info("Public login accepted, now at: %s", self.page.url)
+                    except Exception:
+                        await self.page.wait_for_timeout(3_000)
                 return
 
             _logger.info("No disclaimer found, continuing")

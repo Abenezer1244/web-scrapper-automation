@@ -442,15 +442,11 @@ class EagleWebScraper(BridgeScraper):
             if new_count == 0:
                 break
 
-            # Fetch parcel IDs from detail pages — capped at 20 per page
-            # to balance data quality vs speed (~2 min per page with 20 clicks)
-            _MAX_DETAIL_CLICKS = 20
+            # Fetch parcel IDs from detail pages via HTTP (fast, concurrent)
             needs_parcel = [r for r in new_records if not r.parcel_id and r.enrichment_data.get("detail_href")]
             if needs_parcel:
-                batch = needs_parcel[:_MAX_DETAIL_CLICKS]
-                _logger.info("  Detail lookup: %d/%d records (capped at %d)",
-                             len(batch), len(needs_parcel), _MAX_DETAIL_CLICKS)
-                await self._fetch_parcel_ids_from_details(batch)
+                _logger.info("  Fetching parcel IDs for %d records via HTTP...", len(needs_parcel))
+                await self._fetch_parcel_ids_from_details(needs_parcel)
 
             # Check for Next page link
             has_next = await self._go_next_page()
@@ -601,103 +597,73 @@ class EagleWebScraper(BridgeScraper):
         return records
 
     async def _fetch_parcel_ids_from_details(self, records: list[ScrapedRecord]) -> None:
-        """Click into EagleWeb detail pages to extract parcel IDs.
+        """Fetch parcel IDs from EagleWeb detail pages via HTTP (not Playwright).
 
-        EagleWeb detail pages (docDetail.jsp) show full document info including
-        the parcel/tax ID that isn't visible in search results.
-
-        Strategy: click each detail link, extract parcel, use browser back to
-        return to results. EagleWeb maintains pagination state across back navigation.
+        Uses concurrent HTTP requests to fetch detail pages — 10x faster than
+        clicking through the browser. Extracts parcel IDs from the HTML with regex.
+        Does NOT navigate the browser, so pagination state is preserved.
         """
-        page = self.page
-        found = 0
-        results_url = page.url  # Save current results URL for recovery
+        import re as _re
+        import asyncio as _asyncio
+        from concurrent.futures import ThreadPoolExecutor
+        import requests as _requests
 
-        for record in records:
-            href = record.enrichment_data.get("detail_href", "")
-            inst = record.enrichment_data.get("instrument_number", "?")
+        _PARCEL_PATTERNS = [
+            _re.compile(r'[Pp]arcel\s*(?:[#:]|ID[:\s]|Number[:\s])\s*(\d{5,})'),
+            _re.compile(r'[Tt]ax\s*(?:[#:]|ID[:\s]|Number[:\s])\s*(\d{5,})'),
+            _re.compile(r'APN[:\s]+(\d{5,})'),
+        ]
+        _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"}
 
-            if not href:
-                # No direct link — try clicking the instrument number text
-                try:
-                    link = page.locator(f"a:has-text('{inst}')").first
-                    if await link.count() == 0:
-                        continue
-                    await link.click(timeout=8_000)
-                    await page.wait_for_timeout(1_500)
-                except Exception:
-                    continue
-            else:
-                try:
-                    await page.goto(href, wait_until="domcontentloaded", timeout=15_000)
-                    await page.wait_for_timeout(1_000)
-                except Exception as exc:
-                    _logger.debug("Could not navigate to detail: %s", str(exc)[:50])
-                    continue
+        # Get browser cookies for authenticated session
+        cookies = await self.page.context.cookies()
+        cookie_dict = {c["name"]: c["value"] for c in cookies}
 
-            # Extract parcel ID from detail page
+        def _fetch_one(href: str) -> str | None:
+            """Fetch a detail page via HTTP and extract parcel ID."""
             try:
-                parcel_id = await page.evaluate(r"""() => {
-                    const body = document.body.innerText;
+                resp = _requests.get(href, headers=_HEADERS, cookies=cookie_dict, timeout=8)
+                if resp.status_code != 200:
+                    return None
+                text = resp.text
 
-                    // Method 1: Look for "Parcel" or "Tax" labeled field
-                    const labelPatterns = [
-                        /[Pp]arcel\s*(?:[#:]|ID[:\s]|Number[:\s])\s*(\d{5,})/,
-                        /[Tt]ax\s*(?:[#:]|ID[:\s]|Number[:\s])\s*(\d{5,})/,
-                        /APN[:\s]+(\d{5,})/,
-                    ];
-                    for (const pat of labelPatterns) {
-                        const m = body.match(pat);
-                        if (m) return m[1];
-                    }
+                # Try regex patterns on HTML text
+                for pat in _PARCEL_PATTERNS:
+                    m = pat.search(text)
+                    if m:
+                        return m.group(1)
 
-                    // Method 2: Check table cells for "Parcel" label + adjacent value
-                    const cells = document.querySelectorAll('td, th, dt, dd, span, div');
-                    for (let i = 0; i < cells.length; i++) {
-                        const text = cells[i].textContent.trim().toLowerCase();
-                        if ((text.includes('parcel') || text.includes('tax id') || text.includes('apn'))
-                            && cells[i+1]) {
-                            const val = cells[i+1].textContent.trim();
-                            const m = val.match(/(\d{5,})/);
-                            if (m) return m[1];
-                        }
-                    }
-
-                    // Method 3: Look for Legal Description section with parcel number
-                    const legalIdx = body.indexOf('Legal');
-                    if (legalIdx > -1) {
-                        const section = body.substring(legalIdx, legalIdx + 1000);
-                        const m = section.match(/\b(\d{10,})\b/);
-                        if (m) {
-                            // Skip year-like prefixes
-                            if (!m[1].startsWith('2024') && !m[1].startsWith('2025') && !m[1].startsWith('2026'))
-                                return m[1];
-                        }
-                    }
-
-                    return null;
-                }""")
-
-                if parcel_id and parcel_id.strip():
-                    record.parcel_id = parcel_id.strip()
-                    found += 1
+                # Try finding parcel in Legal Description section
+                legal_idx = text.find("Legal")
+                if legal_idx == -1:
+                    legal_idx = text.find("legal")
+                if legal_idx > -1:
+                    section = text[legal_idx:legal_idx + 1000]
+                    m = _re.search(r'\b(\d{10,})\b', section)
+                    if m and not m.group(1).startswith(("2024", "2025", "2026")):
+                        return m.group(1)
             except Exception:
                 pass
+            return None
 
-            # Go back to results page
-            try:
-                await page.go_back(wait_until="domcontentloaded", timeout=10_000)
-                await page.wait_for_timeout(1_000)
-            except Exception:
-                # Recovery: navigate directly to saved results URL
-                try:
-                    await page.goto(results_url, wait_until="domcontentloaded", timeout=15_000)
-                    await page.wait_for_timeout(1_500)
-                except Exception:
-                    _logger.warning("Could not return to results page — stopping detail fetch")
-                    break
+        # Run HTTP fetches concurrently (10 at a time)
+        found = 0
+        hrefs = [(r, r.enrichment_data.get("detail_href", "")) for r in records if r.enrichment_data.get("detail_href")]
 
-        _logger.info("  Detail pages: found %d parcel IDs from %d lookups", found, len(records))
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            loop = _asyncio.get_event_loop()
+            futures = {
+                loop.run_in_executor(executor, _fetch_one, href): record
+                for record, href in hrefs
+            }
+            for future in _asyncio.as_completed(futures):
+                record = futures[future]
+                parcel = await future
+                if parcel:
+                    record.parcel_id = parcel
+                    found += 1
+
+        _logger.info("  Detail pages (HTTP): found %d parcel IDs from %d lookups", found, len(hrefs))
 
     async def _go_next_page(self) -> bool:
         """Click the Next page link if present."""

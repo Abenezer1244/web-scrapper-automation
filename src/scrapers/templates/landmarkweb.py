@@ -295,11 +295,12 @@ class LandmarkWebScraper(BridgeScraper):
                 )
                 _logger.info("Results selector found")
             except Exception:
-                await self.page.wait_for_timeout(5_000)
-                _logger.info("Results selector timeout, continuing anyway")
+                # Some LandmarkWeb sites (Clark) take 10-15s to render DataTable
+                await self.page.wait_for_timeout(10_000)
+                _logger.info("Results selector timeout, waiting extra for AJAX...")
 
-            # Extra wait for AJAX
-            await self.page.wait_for_timeout(3_000)
+            # Extra wait for AJAX / DataTable render
+            await self.page.wait_for_timeout(5_000)
 
         except Exception as exc:
             _logger.warning("Could not submit search: %s", str(exc)[:120])

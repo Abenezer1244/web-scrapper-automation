@@ -366,10 +366,20 @@ class LandmarkWebScraper(BridgeScraper):
             # Extract rows from results table
             raw = await self.page.evaluate("""
                 (() => {
-                    // Find the results table
-                    const tables = document.querySelectorAll(
+                    // Find the results table — try specific selectors then fallback to largest table
+                    let tables = document.querySelectorAll(
                         '#searchResults table, #resultsTable, #resultsGridDiv table, .search-results table, #resultsGrid, table.dataTable'
                     );
+                    if (!tables.length) {
+                        // Fallback: find the table with the most rows (likely results)
+                        const allTables = document.querySelectorAll('table');
+                        let best = null, bestRows = 0;
+                        for (const t of allTables) {
+                            const rows = t.querySelectorAll('tbody tr').length;
+                            if (rows > bestRows) { bestRows = rows; best = t; }
+                        }
+                        if (best && bestRows >= 5) tables = [best];
+                    }
                     if (!tables.length) return [];
 
                     const rows = tables[0].querySelectorAll('tbody tr');

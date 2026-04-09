@@ -160,6 +160,7 @@ class LandmarkWebScraper(BridgeScraper):
         try:
             # Try clicking the Record Date search icon/link
             date_link = self.page.locator(
+                "#searchCriteriaRecordDate-tab, "
                 "a[href*='RecordDate'], a[href*='recordDate'], "
                 "a:has-text('Record Date'), "
                 "[data-section='searchCriteriaRecordDate']"

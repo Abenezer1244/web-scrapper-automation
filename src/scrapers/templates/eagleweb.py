@@ -442,9 +442,15 @@ class EagleWebScraper(BridgeScraper):
             if new_count == 0:
                 break
 
-            # Skip detail page clicks — too slow (5s each, causes timeouts).
-            # Parcel IDs come from: 1) results table Parcel column, or
-            # 2) legal description parsing. GIS enrichment handles the rest.
+            # Fetch parcel IDs from detail pages — capped at 20 per page
+            # to balance data quality vs speed (~2 min per page with 20 clicks)
+            _MAX_DETAIL_CLICKS = 20
+            needs_parcel = [r for r in new_records if not r.parcel_id and r.enrichment_data.get("detail_href")]
+            if needs_parcel:
+                batch = needs_parcel[:_MAX_DETAIL_CLICKS]
+                _logger.info("  Detail lookup: %d/%d records (capped at %d)",
+                             len(batch), len(needs_parcel), _MAX_DETAIL_CLICKS)
+                await self._fetch_parcel_ids_from_details(batch)
 
             # Check for Next page link
             has_next = await self._go_next_page()

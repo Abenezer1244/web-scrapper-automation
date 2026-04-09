@@ -255,17 +255,31 @@ class LandmarkWebScraper(BridgeScraper):
     async def _submit_search(self) -> None:
         """Click the Submit button and wait for results."""
         try:
-            submit_btn = self.page.locator(
-                "a:has-text('Submit'), button:has-text('Submit'), "
-                "input[type='submit'][value*='Submit' i], "
-                "#btnSubmit, .submitButton"
-            )
-            if await submit_btn.count() > 0:
-                await submit_btn.first.click()
-                _logger.info("Submit clicked, waiting for results...")
+            # Try JS click first (avoids overlay/visibility issues)
+            clicked = await self.page.evaluate("""() => {
+                const btn = document.querySelector(
+                    '#submit-RecordDate, #btnSubmit, .submitButton, ' +
+                    'a.submitButton, button.submitButton'
+                );
+                if (btn) { btn.click(); return true; }
+                return false;
+            }""")
+            if clicked:
+                _logger.info("Submit clicked via JS, waiting for results...")
             else:
-                _logger.warning("No submit button found")
-                return
+                # Fallback to Playwright click
+                submit_btn = self.page.locator(
+                    "#submit-RecordDate, "
+                    "a:has-text('Submit'), button:has-text('Submit'), "
+                    "input[type='submit'][value*='Submit' i], "
+                    "#btnSubmit, .submitButton"
+                )
+                if await submit_btn.count() > 0:
+                    await submit_btn.first.click(force=True)
+                    _logger.info("Submit clicked via Playwright, waiting for results...")
+                else:
+                    _logger.warning("No submit button found")
+                    return
 
             # Wait for results grid
             try:

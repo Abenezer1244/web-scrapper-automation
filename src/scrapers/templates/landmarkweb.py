@@ -124,24 +124,32 @@ class LandmarkWebScraper(BridgeScraper):
 
             # LandmarkWeb uses a modal with Accept/No buttons
             # The Accept button calls SetDisclaimer() JS function
-            accept_btn = self.page.locator(
-                "button:has-text('Accept'), a:has-text('Accept'), "
-                "input[value*='Accept' i], "
-                "#btnDisclaimerAccept, [onclick*='SetDisclaimer']"
-            )
-            if await accept_btn.count() > 0:
-                _logger.info("Found disclaimer Accept button")
-                try:
-                    async with self.page.expect_navigation(timeout=15_000):
-                        await accept_btn.first.click()
-                    _logger.info("Disclaimer accepted via navigation")
-                except Exception:
-                    # Some sites don't navigate — modal just closes
-                    await accept_btn.first.click()
-                    await self.page.wait_for_timeout(3_000)
-                    _logger.info("Disclaimer accepted (modal close)")
+            # Try JS function first (works even when button is hidden behind modal)
+            has_fn = await self.page.evaluate("typeof SetDisclaimer === 'function'")
+            if has_fn:
+                _logger.info("Calling SetDisclaimer() via JS")
+                await self.page.evaluate("SetDisclaimer()")
+                await self.page.wait_for_timeout(3_000)
+                _logger.info("Disclaimer accepted via JS")
             else:
-                _logger.info("No disclaimer modal found")
+                # Fallback: click the button
+                accept_btn = self.page.locator(
+                    "button:has-text('Accept'), a:has-text('Accept'), "
+                    "input[value*='Accept' i], "
+                    "#btnDisclaimerAccept, [onclick*='SetDisclaimer']"
+                )
+                if await accept_btn.count() > 0:
+                    _logger.info("Found disclaimer Accept button")
+                    try:
+                        async with self.page.expect_navigation(timeout=15_000):
+                            await accept_btn.first.click()
+                        _logger.info("Disclaimer accepted via navigation")
+                    except Exception:
+                        await accept_btn.first.click()
+                        await self.page.wait_for_timeout(3_000)
+                        _logger.info("Disclaimer accepted (modal close)")
+                else:
+                    _logger.info("No disclaimer modal found")
 
             _logger.info("After disclaimer URL: %s", self.page.url)
         except Exception as exc:

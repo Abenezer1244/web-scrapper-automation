@@ -86,10 +86,16 @@ async def batch_enrich_king_county(
     if not tax_urls:
         return results
 
-    _logger.info("Phase 2: Playwright lookup for %d mailing addresses...", len(tax_urls))
+    # Cap at 200 parcels to avoid job timeout (~5-10s per lookup)
+    _MAX_MAILING_LOOKUPS = 200
+    pids_to_lookup = list(tax_urls.keys())
+    if len(pids_to_lookup) > _MAX_MAILING_LOOKUPS:
+        _logger.info("Capping mailing lookups: %d → %d (to avoid timeout)", len(pids_to_lookup), _MAX_MAILING_LOOKUPS)
+        pids_to_lookup = pids_to_lookup[:_MAX_MAILING_LOOKUPS]
+
+    _logger.info("Phase 2: Playwright lookup for %d mailing addresses...", len(pids_to_lookup))
 
     async with BridgeScraper() as scraper:
-        pids_to_lookup = list(tax_urls.keys())
 
         for i, pid in enumerate(pids_to_lookup):
             if i % 25 == 0:
@@ -97,12 +103,12 @@ async def batch_enrich_king_county(
 
             try:
                 url = tax_urls[pid]
-                await scraper.page.goto(url, wait_until="load", timeout=10_000)
+                await scraper.page.goto(url, wait_until="domcontentloaded", timeout=8_000)
 
                 try:
                     await scraper.page.wait_for_function(
                         "() => document.body.innerText.includes('Mailing Address') || document.body.innerText.includes('No accounts')",
-                        timeout=5_000,
+                        timeout=4_000,
                     )
                 except Exception:
                     pass

@@ -648,22 +648,26 @@ class EagleWebScraper(BridgeScraper):
 
         # Run HTTP fetches concurrently (10 at a time)
         found = 0
-        hrefs = [(r, r.enrichment_data.get("detail_href", "")) for r in records if r.enrichment_data.get("detail_href")]
+        items = [(r, r.enrichment_data.get("detail_href", "")) for r in records if r.enrichment_data.get("detail_href")]
 
+        if not items:
+            _logger.info("  No detail URLs to fetch")
+            return
+
+        loop = _asyncio.get_event_loop()
         with ThreadPoolExecutor(max_workers=10) as executor:
-            loop = _asyncio.get_event_loop()
-            futures = {
-                loop.run_in_executor(executor, _fetch_one, href): record
-                for record, href in hrefs
-            }
-            for future in _asyncio.as_completed(futures):
-                record = futures[future]
-                parcel = await future
-                if parcel:
-                    record.parcel_id = parcel
-                    found += 1
+            # Batch in groups of 50 to avoid overwhelming the server
+            for batch_start in range(0, len(items), 50):
+                batch = items[batch_start:batch_start + 50]
+                tasks = [loop.run_in_executor(executor, _fetch_one, href) for _, href in batch]
+                results_list = await _asyncio.gather(*tasks, return_exceptions=True)
 
-        _logger.info("  Detail pages (HTTP): found %d parcel IDs from %d lookups", found, len(hrefs))
+                for (record, _), parcel in zip(batch, results_list):
+                    if isinstance(parcel, str) and parcel:
+                        record.parcel_id = parcel
+                        found += 1
+
+        _logger.info("  Detail pages (HTTP): found %d parcel IDs from %d lookups", found, len(items))
 
     async def _go_next_page(self) -> bool:
         """Click the Next page link if present."""

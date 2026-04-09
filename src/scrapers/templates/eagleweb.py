@@ -508,7 +508,7 @@ class EagleWebScraper(BridgeScraper):
                         // Valid rows have a date in summary (MM/DD/YYYY)
                         if (!/\d{1,2}\/\d{1,2}\/\d{4}/.test(summary)) continue;
                         // Capture detail link from first cell (instrument number is a link)
-                        const link = cells[0].querySelector('a[href*="docDetail"], a[href*="Detail"]');
+                        const link = cells[0].querySelector('a[href*="docDetail"], a[href*="Detail"], a[href*="viewDoc"]');
                         const detailHref = link ? link.href : '';
                         // Extract parcel from its column if available
                         let parcel = '';

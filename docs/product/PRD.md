@@ -1,7 +1,7 @@
 # BridgeLeads Product Requirements Document
 
-**Version:** 1.0
-**Date:** April 7, 2026
+**Version:** 1.2
+**Date:** April 10, 2026 (originally April 7, 2026)
 **Status:** Living document
 **Owner:** Product
 
@@ -221,11 +221,12 @@ These data points are appended to each scraped record to make it actionable. Inv
 
 | Data Point | Source | Why Investors Need It | Status | Target Phase |
 |-----------|--------|----------------------|--------|-------------|
-| **Parcel ID** | County recorder detail pages | Links the filing to a specific property | Production (43% coverage) | Phase 0 (improve) |
-| **Property address** | County GIS / assessor | The house they want to buy | Production (25% coverage) | Phase 0 (improve to 75%) |
-| **Mailing address** | County tax records / assessor | Where to send the letter (often different from property) | Production (17% coverage) | Phase 0 (improve to 60%) |
-| **Skip trace: phone** | BatchData / REISkip / SkipGenie API | For cold calling (faster than mail) | Not started | Phase 2 |
-| **Skip trace: email** | Same providers | For email/SMS outreach campaigns | Not started | Phase 2 |
+| **Parcel ID** | County recorder detail pages | Links the filing to a specific property | Production — 95-100% across 7 WA counties (Sprint 2) | Shipped |
+| **Property address** | County GIS / statewide ArcGIS / county assessor | The house they want to buy | Production — 95-100% (Sprint 2, delivered-records definition) | Shipped |
+| **Mailing address** | County tax records / assessor / WA statewide | Where to send the letter (often different from property) | Production — 95-100% (Sprint 2, delivered-records definition) | Shipped |
+| **Skip trace: phone** | **Tracerfy API** (Phase 1) → BatchData (Phase 2 when volume justifies $2K/mo floor) | For cold calling (faster than mail) | In progress (Sprint 4) | Sprint 4 — gate: 60%+ hit rate |
+| **Skip trace: email** | Same provider | For email/SMS outreach campaigns | In progress (Sprint 4) | Sprint 4 |
+| **TCPA / DNC scrub** | Tracerfy add-on ($0.02/number) or standalone litigator list subscription | Avoid calling numbers on the Do-Not-Call registry or known TCPA litigators | Deferred to Sprint 5 | Sprint 5 |
 | **Property value / ARV** | Zillow / Redfin / ATTOM API | Is the deal worth pursuing? What to offer? | Not started | Phase 3 |
 | **Equity estimate** | Mortgage records + property value | High equity = more motivated, better deal | Not started | Phase 3 |
 | **Mortgage balance** | County recorder (deed of trust) | How much they owe, determines max offer | Not started | Phase 3 |
@@ -305,21 +306,31 @@ County Portal ──scrape──> Raw Records ──enrich──> Property Data 
 | **Record types** | Probate only | All | All | All |
 | **Schedules** | Manual only | Daily/weekly | All | All |
 | **Export formats** | CSV | CSV, Excel | All + API | All + API |
-| **Enrichment** | Property address | Property + mailing | Property + mailing + skip trace | All |
+| **Address enrichment** | Property address | Property + mailing | Property + mailing | Property + mailing |
+| **Skip trace (phone + email)** | Not available | $0.08 per lookup (opt-in) | $0.08 per lookup (opt-in) — 500 included | $0.05 per lookup (opt-in) — 2,000 included |
 | **Delivery** | In-app download | Email | Email + webhook | Email + webhook + white-label |
 | **Team members** | 1 | 1 | 5 | Unlimited |
 | **Support** | Community | Email | Priority email | Dedicated |
 | **Trial** | N/A | 7 days free | 7 days free | Contact sales |
 
-**Unit economics targets:**
+**Unit economics targets (updated 2026-04-10 after skip-trace provider research):**
 
-| Plan | Revenue | COGS (enrichment + compute) | Gross margin |
-|------|---------|----------------------------|-------------|
-| Pro | $49/mo | ~$8/mo | 84% |
-| Business | $149/mo | ~$45/mo | 70% |
-| Agency | $499/mo | ~$100/mo | 80% |
+| Plan | Base revenue | Base COGS | Base margin | + Skip trace revenue (typical user) | Blended margin |
+|------|------|-------|------|------|-------|
+| Pro | $49/mo | ~$8/mo | 84% | +$16 (200 traces × $0.08) — $4 COGS | 84% |
+| Business | $149/mo | ~$35/mo | 77% | +$40 (1,000 included, no markup) | 72% |
+| Agency | $499/mo | ~$80/mo | 84% | +$100 (2,000 included, no markup) | 80% |
 
-Note: Business tier enrichment costs assume Regrid volume pricing ($0.005-0.01/record). Current trial pricing ($0.03/record) is unsustainable at 5,000 records/month.
+**Skip-trace COGS math (Tracerfy @ $0.02/trace, verified 2026-04-10):**
+- Per-trace cost: $0.02 wholesale, charge $0.08 (Pro), $0.08 (Business overage), $0.05 (Agency overage) — 60-75% gross margin on skip trace
+- Business tier includes 1,000 traces/month bundled ($20 COGS absorbed into base price)
+- Agency tier includes 2,000 traces/month bundled ($40 COGS absorbed into base price)
+- No minimum volume commit with Tracerfy — zero exposure if feature unused
+
+**Why the pricing model changed from the earlier draft of this PRD:**
+The original PRD (§5.4 pre-2026-04-10) assumed Business tier bundled unlimited skip trace at $149/mo with COGS under $45. Research in 2026-04-10 showed no viable provider hits $0.009/trace at 5K volume: Tracerfy is the cheapest credible option at $0.02 wholesale; BatchData has a $2K/mo floor. Bundling unlimited skip trace at $149 would have made Business tier unprofitable by -34%. The new model unbundles skip trace as a metered add-on on top of every paid tier (Starter excluded), matching how PropStream, DealMachine, and BatchLeads actually sell it.
+
+**Base-tier address enrichment** (property + mailing) stays bundled because it's nearly free via county GIS + WA statewide ArcGIS (already verified at 95-100% coverage across 7 WA counties in Sprint 2).
 
 ### 5.5 Security Requirements
 
@@ -469,16 +480,26 @@ Follow these sprints in order. Each sprint builds on the previous one. Do not sk
 
 ### Sprint 4: Skip Tracing Integration (Week 4-5)
 
-**Goal:** Add phone + email to every record. This is the #1 table-stakes feature investors expect.
-**Gate:** Do not start Sprint 5 until skip tracing returns valid phone numbers for 60%+ of records.
+**Goal:** Add phone + email to every actionable record via a metered add-on. Opt-in, not bundled — matches how PropStream, DealMachine, and BatchLeads sell skip tracing.
+**Provider:** Tracerfy ($0.02 wholesale, no minimum commit, REST JSON, bulk endpoint). Backup: BatchData when volume crosses $2K/month wholesale.
+**Gate:** Do not start Sprint 5 until a live Tracerfy call against 50+ Pierce/King probate records returns valid US phone numbers for ≥60% of lookups (PRD gate) AND email for ≥25% of lookups.
+
+**Scope notes (decisions locked 2026-04-10 before coding started):**
+- Unbundled metered billing per the new §5.4 pricing table. Starter excluded. Pro pays $0.08/trace. Business gets 1,000 bundled + $0.08/trace overage. Agency gets 2,000 bundled + $0.05/trace overage.
+- Only records with a non-null `property_address` are eligible for skip trace — no point tracing records we can't deliver anyway.
+- 90-day parcel-level cache in a new `skip_trace_cache` table — re-scraping the same parcel across daily jobs should not re-bill the user.
+- TCPA DNC/litigator scrub deferred to Sprint 5 (add +$0.02/number via Tracerfy add-on, or subscribe to a standalone litigator list). CSV export in Sprint 4 will include a disclaimer: "Verify numbers against the National DNC Registry before calling."
 
 | # | Task | Detail | Done When |
 |---|------|--------|-----------|
-| 4.1 | Evaluate skip trace providers | BatchData API, REISkip, SkipGenie. Compare: hit rate, price per trace, API quality. | Provider selected |
-| 4.2 | Integrate skip trace API | Add phone + email columns to Result model. Call API during enrichment phase. | Phone/email populated on test scrape |
-| 4.3 | Add to CSV/Excel export | New columns: phone, email, skip_trace_status | Visible in downloaded CSV |
-| 4.4 | Gate to Business+ tier (or per-record add-on) | Decide pricing: bundled with Business ($149/mo) or $0.10-0.15/trace add-on | Pricing live in Stripe |
-| 4.5 | Add to frontend results table | Show phone/email in the results view with click-to-copy | Visible in UI |
+| 4.1 | Evaluate skip trace providers | ✅ DONE 2026-04-10. Tracerfy selected (see §5.1 and §5.4). BatchData is Phase-2 upgrade path. | Provider selected |
+| 4.2 | DB schema + provider module | Alembic migration `014_add_skip_trace_columns`: add `phone`, `phone_scrub_status`, `email`, `skip_trace_status`, `skip_trace_attempted_at` to `results`. Create `skip_trace_cache` table (parcel_id unique, 90-day TTL). Build `src/scrapers/enrichment/skip_trace.py` with `batch_skip_trace_tracerfy()`. | Unit test hits Tracerfy test endpoint with 5 real records and returns ≥60% phone. |
+| 4.3 | Worker pipeline integration | `_run_inline_enrichment` calls skip trace after GIS + King fallback, only for records with non-null property_address AND user's plan has skip trace enabled AND cache miss. | End-to-end Pierce job writes phone/email to DB. Job log shows "Found N phones / M emails". |
+| 4.4 | CSV/Excel export columns | `DataExporter` emits `phone`, `email`, `skip_trace_status`, and a DNC disclaimer row in the CSV footer until TCPA scrub ships in Sprint 5. | Visible in downloaded CSV. |
+| 4.5 | Stripe metered billing | New Stripe Product "Skip Trace Lookup" with three Prices ($0.08 Pro, $0.08 Business-overage, $0.05 Agency-overage). Worker reports usage after each batch. Webhook handler for invoice.created. | Test charge lands on Stripe dashboard for 1 trace in staging. |
+| 4.6 | Plan gating + opt-in UI | `check_plan_enforcement` rejects skip-trace for Starter. Frontend shows an opt-in checkbox on scraper config: "Include skip trace ($0.08/lookup)". Default OFF to avoid accidental charges. | Starter user sees 402 Payment Required on skip-trace attempt. |
+| 4.7 | Frontend results table + opt-in | Add `phone`, `email` columns with click-to-copy. Show skip-trace usage meter on billing page (traces used this month vs bundled quota). | Columns visible, meter updates. |
+| 4.8 | Production verification | Run Pierce + King pre_foreclosure with skip trace enabled against an internal test account. Confirm ≥60% phone hit rate across real records. Measure Tracerfy latency + retry behavior. | Verification logs pasted into Sprint 4 memory file. |
 
 ### Sprint 5: Onboarding + Activation (Week 5-6)
 
@@ -677,11 +698,14 @@ This metric captures the entire value chain: scraping works, enrichment is accur
 
 ## 10. Open Questions
 
-1. **Regrid volume pricing** — What rate can we negotiate for 50K+ lookups/month? This determines Business tier viability.
-2. **Skip trace provider** — Who offers the best phone/email append at scale? (BatchSkipTracing, REISkip, SkipGenie)
+1. ~~**Regrid volume pricing**~~ — **Resolved 2026-04-10.** Not needed for Sprint 2/3. WA statewide ArcGIS REST API is free and covers 95-100% of residential parcels. Regrid becomes relevant only when expanding outside WA; defer the vendor question until then.
+2. ~~**Skip trace provider**~~ — **Resolved 2026-04-10.** Tracerfy selected for Phase 1 ($0.02 wholesale, no minimum, self-serve). BatchData becomes the upgrade path when monthly volume justifies the $2K/mo floor (~100K traces/month). See §5.1 and §5.4.
 3. **North star tracking** — How do we learn which leads result in closed deals? In-app feedback? CRM integration? Survey?
 4. **Cancellation reasons** — Why are users churning? Need exit survey data.
 5. **International expansion** — Is there demand for county-equivalent scraping in Canada, UK, or Australia?
+6. **TCPA litigator list vendor** — Sprint 5 question. Tracerfy's $0.02/number add-on vs a standalone subscription (~$50-100/mo for unlimited scrubs)? Depends on monthly trace volume.
+7. **Skip trace hit rate on WA-specific records** — Tracerfy's 75-90% claim is nationwide. WA has a higher-than-average absentee-owner rate and more LLC/trust grantors. Actual hit rate to be measured in Sprint 4 task 4.8 against real Pierce + King probate data. If we miss the 60% gate, the fallback is to re-try with Tracerfy "Advanced" mode ($0.04) or BatchData.
+8. **Bundled quota sizing** — Business tier bundles 1,000 traces/month; Agency bundles 2,000. These are guesses. Measure actual trace usage per customer in the first 60 days post-launch and re-tune.
 
 ---
 
@@ -698,6 +722,11 @@ This metric captures the entire value chain: scraping works, enrichment is accur
 | **RLS** | Row-Level Security — PostgreSQL feature that filters data by user at the database level |
 | **ARMS** | Auditor's Records Management System (Pierce County portal) |
 | **LandmarkWeb** | Hyland document management portal used by multiple WA counties |
+| **Tracerfy** | Skip-trace API provider selected for Sprint 4 Phase 1 — $0.02 per lookup, no minimum commit, self-serve signup |
+| **TCPA** | Telephone Consumer Protection Act — US federal law governing cold calls and SMS; violations carry statutory damages of $500-1,500/call |
+| **DNC** | Do Not Call — national and state registries of phone numbers that cannot be cold-called |
+| **RPC** | Right-Party Contact — skip-trace industry metric measuring % of returned phones that actually belong to the subject (more rigorous than "match returned") |
+| **Metered billing** | Stripe billing mode where the customer is charged per unit (e.g., per skip trace lookup) on top of a subscription, invoiced at cycle close |
 
 ---
 
@@ -706,3 +735,5 @@ This metric captures the entire value chain: scraping works, enrichment is accur
 | Date | Version | Author | Changes |
 |------|---------|--------|---------|
 | 2026-04-07 | 1.0 | AI Product Manager | Initial PRD based on production data, security audit, and market research |
+| 2026-04-10 | 1.1 | Engineering | Sprint 2 + Sprint 3 shipped. 7 WA counties (Pierce, King, Clark, Spokane, Thurston, Kitsap, Whatcom) at 95%+ address enrichment on probate + pre-foreclosure. Snohomish dropped due to Pioneer portal ToS prohibiting automated access (replaced by Whatcom — Helion platform, new dedicated scraper). Sprint 1 beta user count still 0. |
+| 2026-04-10 | 1.2 | Engineering | **Pricing model restructured before Sprint 4 coding started.** Skip trace moves from "bundled with Business tier" to "metered add-on on all paid tiers" after provider research showed no credible skip-trace API hits $0.009/trace at 5K volume (the rate needed for the old $149/mo bundled model to hit 70% margin). Tracerfy selected ($0.02 wholesale, no minimum). New model: Pro pays $0.08/trace, Business bundles 1,000 + $0.08 overage, Agency bundles 2,000 + $0.05 overage. §5.1 and §5.4 updated. §10 open questions 1 & 2 resolved, new questions 6-8 added for Sprint 4 execution. |

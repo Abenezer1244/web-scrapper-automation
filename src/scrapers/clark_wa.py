@@ -123,38 +123,32 @@ class ClarkWAScraper(BridgeScraper):
                 await tab.first.click()
                 await self.page.wait_for_timeout(2000)
 
-        # Select Custom Selection in category dropdown
+        # Select "Custom Selection" from category dropdown
         await self.page.evaluate("""() => {
             const sel = document.querySelector('#documentCategory-DocumentType');
-            if (sel && window.jQuery) {
-                jQuery('#documentCategory-DocumentType').val('custom').trigger('change');
-            }
-        }""")
-        await self.page.wait_for_timeout(1000)
-
-        # Check the doc type checkboxes
-        checked = await self.page.evaluate("""(docTypes) => {
-            const checkboxes = document.querySelectorAll(
-                '#documentType-DocumentType input[type="checkbox"], ' +
-                '.document-type-list input[type="checkbox"], ' +
-                'input[name="documentType"]'
-            );
-            let count = 0;
-            for (const cb of checkboxes) {
-                const label = cb.parentElement ? cb.parentElement.textContent.trim().toUpperCase() : '';
-                const val = (cb.value || '').toUpperCase();
-                for (const dt of docTypes) {
-                    if (label.includes(dt) || val.includes(dt)) {
-                        cb.checked = true;
-                        cb.dispatchEvent(new Event('change', {bubbles: true}));
-                        count++;
-                        break;
-                    }
+            if (!sel) return;
+            // Find "Custom Selection" option
+            for (const opt of sel.options) {
+                if (opt.text.toLowerCase().includes('custom')) {
+                    sel.value = opt.value;
+                    if (window.jQuery) jQuery('#documentCategory-DocumentType').val(opt.value).trigger('change');
+                    break;
                 }
             }
-            return count;
-        }""", self._doc_types)
-        _logger.info("Checked %d doc type checkboxes", checked)
+        }""")
+        await self.page.wait_for_timeout(1500)
+
+        # Fill the Custom Selection textarea with doc types (one per line)
+        doc_types_text = "\n".join(self._doc_types)
+        filled = await self.page.evaluate("""(text) => {
+            const ta = document.querySelector('#documentType-DocumentType, textarea[name="documentType"], #documentType-Name');
+            if (!ta) return false;
+            ta.value = text;
+            ta.dispatchEvent(new Event('input', {bubbles: true}));
+            ta.dispatchEvent(new Event('change', {bubbles: true}));
+            return true;
+        }""", doc_types_text)
+        _logger.info("Filled Custom Selection textarea with %d doc types: %s", len(self._doc_types), filled)
 
         # Fill dates
         begin = self.page.locator("#beginDate-DocumentType")

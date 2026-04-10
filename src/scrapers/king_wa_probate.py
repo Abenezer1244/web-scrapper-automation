@@ -577,14 +577,16 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                     // Use the ACTUAL cell positions from inspection:
                     //   0: row#, 3: status, 5: grantor, 6: grantee, 7: date,
                     //   8: doc_type, 12: rec#, 14: legal
-                    const COL = {grantor: 5, grantee: 6, date: 7, docType: 8, recNum: 12, legal: 14};
+                    // Column positions vary by county (King=24 cols, Clark=25 cols).
+                    // Use flexible extraction: find PID in ANY cell, map known positions.
+                    const COL = {grantor: 5, grantee: 6, date: 7, docType: 8, recNum: 12};
 
                     const rows = table.querySelectorAll('tbody tr');
                     const results = [];
 
                     for (const row of rows) {
                         const cells = row.querySelectorAll('td');
-                        if (cells.length < 15) continue;  // Need at least 15 cells for legal column
+                        if (cells.length < 8) continue;
 
                         const get = (idx) => cells[idx] ? cells[idx].textContent.trim() : '';
 
@@ -593,7 +595,15 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                         const dateStr = get(COL.date);
                         const docType = get(COL.docType);
                         const recNum = get(COL.recNum);
-                        const legal = get(COL.legal);
+                        // Search ALL cells for legal/PID (column varies by county)
+                        let legal = '';
+                        for (let i = 10; i < cells.length; i++) {
+                            const txt = cells[i].textContent.trim();
+                            if (txt.includes('PID') || txt.includes('SUB:') || txt.includes('LOT') || txt.includes('SEC')) {
+                                legal = txt;
+                                break;
+                            }
+                        }
 
                         // Skip rows without meaningful data
                         if (!grantor && !dateStr) continue;

@@ -42,12 +42,24 @@ class EagleWebScraper(BridgeScraper):
     EagleWeb interface used by 16+ WA counties.
     """
 
-    def __init__(self, base_url: str, county: str, state: str, record_types: list[str] | None = None):
+    def __init__(
+        self,
+        base_url: str,
+        county: str,
+        state: str,
+        record_types: list[str] | None = None,
+        require_parcel_id: bool = True,
+    ):
         super().__init__()
         self.base_url = base_url
         self.county = county
         self.state = state
         self.record_types = record_types or []
+        # Some EagleWeb counties (e.g., Thurston) have probate records
+        # with no parcel in upstream data — these are pure estate/name
+        # filings, not property-linked. Drop them so we only deliver
+        # actionable property leads the GIS pipeline can enrich.
+        self.require_parcel_id = require_parcel_id
 
         from urllib.parse import urlparse
         domain = urlparse(base_url).hostname
@@ -156,6 +168,19 @@ class EagleWebScraper(BridgeScraper):
 
             chunk_start = chunk_end
             await self.polite_delay()
+
+        # Drop records without parcel_id if required — these are upstream
+        # data gaps (e.g., Thurston death certificates with empty Parcel
+        # field), not scraper bugs, and they cannot be GIS-enriched.
+        if self.require_parcel_id:
+            before = len(all_records)
+            all_records = [r for r in all_records if r.parcel_id]
+            dropped = before - len(all_records)
+            if dropped:
+                _logger.info(
+                    "Dropped %d/%d records with no parcel_id (upstream data gap)",
+                    dropped, before,
+                )
 
         # No inline enrichment — records are enriched in a separate background task
         # (enrich_job_results) after the job completes. This keeps scraping fast (~5 min).

@@ -58,6 +58,28 @@ _WA_COUNTY_FIPS: dict[str, str] = {
 }
 
 
+def _format_kitsap(plain: str) -> list[str]:
+    """Kitsap uses two dashed parcel formats, both 14 plain digits:
+    - ``dddddd-d-ddd-dddd`` (6-1-3-4) e.g. ``012302-2-005-2007``
+    - ``dddd-ddd-ddd-dddd`` (4-3-3-4) e.g. ``4178-000-002-0006``
+    """
+    if len(plain) == 14 and plain.isdigit():
+        return [
+            f"{plain[:6]}-{plain[6]}-{plain[7:10]}-{plain[10:]}",
+            f"{plain[:4]}-{plain[4:7]}-{plain[7:10]}-{plain[10:]}",
+        ]
+    return []
+
+
+# Per-county WA statewide parcel normalizers. Given the scraper's
+# plain-digit parcel_id, returns a list of candidate ORIG_PARCEL_ID
+# formats to try in the query. Empty list means fall back to plain
+# digits (default behavior).
+_WA_COUNTY_PARCEL_FORMATTERS: dict[str, callable] = {
+    "kitsap": _format_kitsap,
+}
+
+
 def enrich_parcel_gis(
     parcel_id: str,
     county: str,
@@ -409,18 +431,47 @@ def _batch_query_county(
 def _batch_query_wa_statewide(
     parcel_ids: list[str], county: str
 ) -> dict[str, dict[str, str | None]]:
-    """Batch query WA statewide endpoint (property address only, no mailing)."""
+    """Batch query WA statewide endpoint (property address only, no mailing).
+
+    Some counties (Kitsap) store parcels with embedded dashes in
+    ORIG_PARCEL_ID. The per-county formatter in
+    ``_WA_COUNTY_PARCEL_FORMATTERS`` converts our scraper's plain-digit
+    parcel into the canonical county format before querying, then we
+    map results back to the caller's original parcel_id.
+    """
     fips = _WA_COUNTY_FIPS.get(county.lower())
+    formatter = _WA_COUNTY_PARCEL_FORMATTERS.get(county.lower())
     results: dict[str, dict] = {}
     chunk_size = 50
 
     for i in range(0, len(parcel_ids), chunk_size):
         chunk = parcel_ids[i:i + chunk_size]
-        clean = [pid.replace("-", "").strip() for pid in chunk if pid and len(pid.strip()) >= 6]
-        if not clean:
+
+        # Build (query_value, original_parcel_id) pairs so we can map
+        # responses back to the scraper's parcel_id regardless of format.
+        # Formatters may return multiple candidate formats (e.g., Kitsap
+        # uses two different dash patterns) — we try them all.
+        query_pairs: list[tuple[str, str]] = []
+        for pid in chunk:
+            if not pid or len(pid.strip()) < 6:
+                continue
+            plain = pid.replace("-", "").strip()
+            if formatter:
+                candidates = formatter(plain)
+                if candidates:
+                    for c in candidates:
+                        query_pairs.append((c, pid))
+                    continue
+            query_pairs.append((plain, pid))
+
+        if not query_pairs:
             continue
 
-        in_clause = ",".join(f"'{p}'" for p in clean)
+        # Reverse map: query_value -> original caller parcel_id
+        query_to_original = {qv: orig for qv, orig in query_pairs}
+        in_values = list(query_to_original.keys())
+
+        in_clause = ",".join(f"'{p}'" for p in in_values)
         where = f"ORIG_PARCEL_ID IN ({in_clause})"
         if fips:
             where += f" AND FIPS_NR='{fips}'"
@@ -446,6 +497,9 @@ def _batch_query_wa_statewide(
                 if not pid or not address:
                     continue
 
+                # Map back to caller's original parcel_id
+                caller_pid = query_to_original.get(pid, pid)
+
                 address = " ".join(address.strip().split())
                 city = (attrs.get("SITUS_CITY_NM") or "").strip()
                 zipcode = (attrs.get("SITUS_ZIP_NR") or "").strip()
@@ -456,13 +510,17 @@ def _batch_query_wa_statewide(
                 mailing += ", WA"
                 if zipcode:
                     mailing += f" {zipcode}"
-                results[pid] = {
+                results[caller_pid] = {
                     "property_address": address,
                     "mailing_address": mailing,
-                    "parcel_id": pid,
+                    "parcel_id": pid,  # canonical format from server
                 }
 
-            _logger.info("Statewide GIS batch: %d/%d parcels enriched", len([p for p in clean if p in results]), len(clean))
+            _logger.info(
+                "Statewide GIS batch: %d/%d parcels enriched",
+                len([qv for qv, orig in query_pairs if orig in results]),
+                len(query_pairs),
+            )
 
         except Exception as exc:
             _logger.warning("Statewide GIS batch error: %s", str(exc)[:80])

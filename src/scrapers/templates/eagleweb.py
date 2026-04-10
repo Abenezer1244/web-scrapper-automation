@@ -444,7 +444,11 @@ class EagleWebScraper(BridgeScraper):
                 break
 
             # Fetch parcel IDs from detail pages via HTTP (fast, concurrent)
+            missing_parcel_total = sum(1 for r in new_records if not r.parcel_id)
             needs_parcel = [r for r in new_records if not r.parcel_id and r.enrichment_data.get("detail_href")]
+            no_href_count = missing_parcel_total - len(needs_parcel)
+            if no_href_count:
+                _logger.info("  %d records missing parcel but no detail_href (cannot HTTP fetch)", no_href_count)
             if needs_parcel:
                 _logger.info("  Fetching parcel IDs for %d records via HTTP...", len(needs_parcel))
                 await self._fetch_parcel_ids_from_details(needs_parcel)
@@ -531,6 +535,7 @@ class EagleWebScraper(BridgeScraper):
                 return []
 
             import re
+            parcel_source_counts = {"table": 0, "summary_labeled": 0, "summary_digit": 0, "none_yet": 0}
             for item in raw:
                 desc = item.get("desc", "")
                 summary = item.get("summary", "")
@@ -542,6 +547,7 @@ class EagleWebScraper(BridgeScraper):
                 # Use parcel from results table if available (avoids detail page clicks)
                 if table_parcel and re.match(r"\d{4,}[\.\d]*", table_parcel):
                     record.parcel_id = table_parcel
+                    parcel_source_counts["table"] += 1
 
                 # Parse AFN from description and store in enrichment_data
                 afn_match = re.search(r"\b(\d{5,})\b", desc)
@@ -567,20 +573,27 @@ class EagleWebScraper(BridgeScraper):
                     if grantee:
                         record.heirs = grantee
 
-                # Parcel ID — check both summary and description
+                # Parcel ID — check both summary and description (if not already from table)
                 combined = f"{summary} {desc}"
-                # Try "Parcel: XXXXX" or "Parcel:XXXXX" pattern first
-                parcel_labeled = re.search(r"[Pp]arcel[:\s]+(\d{4,}\.\d{3,}|\d{5,})", combined)
-                if parcel_labeled:
-                    record.parcel_id = parcel_labeled.group(1)
-                else:
-                    # Fallback: any standalone 10+ digit number (not an instrument/year prefix)
-                    parcel_match = re.search(r"\b(\d{10,})\b", combined)
-                    if parcel_match:
-                        pid = parcel_match.group(1)
-                        # Skip instrument numbers (start with 2024/2025/2026)
-                        if not pid[:4] in ("2024", "2025", "2026"):
-                            record.parcel_id = pid
+                if not record.parcel_id:
+                    # Try "Parcel: XXXXX" or "Parcel:XXXXX" pattern first
+                    parcel_labeled = re.search(r"[Pp]arcel[:\s]+(\d{4,}\.\d{3,}|\d{5,})", combined)
+                    if parcel_labeled:
+                        record.parcel_id = parcel_labeled.group(1)
+                        parcel_source_counts["summary_labeled"] += 1
+                    else:
+                        # Fallback: any standalone 10+ digit number (not an instrument/year prefix)
+                        parcel_match = re.search(r"\b(\d{10,})\b", combined)
+                        if parcel_match:
+                            pid = parcel_match.group(1)
+                            # Skip instrument numbers (start with 2024/2025/2026)
+                            if not pid[:4] in ("2024", "2025", "2026"):
+                                record.parcel_id = pid
+                                parcel_source_counts["summary_digit"] += 1
+                            else:
+                                parcel_source_counts["none_yet"] += 1
+                        else:
+                            parcel_source_counts["none_yet"] += 1
 
                 # Also store the legal description text
                 legal_text = re.search(r"(?:Subdivision|Section|Lot|Block|Plat|Tract)\s+.+", combined, re.IGNORECASE)
@@ -603,7 +616,14 @@ class EagleWebScraper(BridgeScraper):
                             continue  # Skip non-matching doc types
                     records.append(record)
 
-            _logger.info("Extracted %d records from page", len(records))
+            _logger.info(
+                "Extracted %d records from page — parcel sources: table=%d summary_labeled=%d summary_digit=%d needs_detail_fetch=%d",
+                len(records),
+                parcel_source_counts["table"],
+                parcel_source_counts["summary_labeled"],
+                parcel_source_counts["summary_digit"],
+                parcel_source_counts["none_yet"],
+            )
 
         except Exception as exc:
             _logger.warning("Error extracting page: %s", str(exc)[:80])

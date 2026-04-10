@@ -26,6 +26,12 @@ _logger = setup_logger("scraper.clark_wa")
 
 _BASE_URL = "https://e-docs.clark.wa.gov/LandmarkWeb"
 _PID_PATTERN = re.compile(r"PID[:\s]*(\d{6,12})", re.IGNORECASE)
+# Fallback: Clark's legal column may print the parcel without the "PID:" prefix.
+# Accept any 6-12 digit run that appears alongside Lot/Block/Sub/Plat tokens.
+_PID_FALLBACK_PATTERN = re.compile(
+    r"(?:LOT|BLOCK|SUB|PLAT|TRACT|PARCEL|APN)[^\n]{0,80}?\b(\d{6,12})\b",
+    re.IGNORECASE,
+)
 
 # Map record_type → checkbox labels to select
 _DOC_TYPES = {
@@ -71,7 +77,7 @@ class ClarkWAScraper(BridgeScraper):
             _logger.info("Chunk: %s to %s", cf, ct)
 
             try:
-                records = await self._search_chunk(cf, ct)
+                records = await self._search_chunk_all_pages(cf, ct)
             except Exception as exc:
                 _logger.warning("Chunk failed: %s — skipping", str(exc)[:80])
                 chunk_start = chunk_end
@@ -186,6 +192,60 @@ class ClarkWAScraper(BridgeScraper):
         await self.page.wait_for_timeout(5000)
         return await self._extract_results()
 
+    async def _search_chunk_all_pages(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
+        """Run `_search_chunk` then walk LandmarkWeb pagination until exhausted."""
+        first_page = await self._search_chunk(date_from, date_to)
+        all_records: list[ScrapedRecord] = list(first_page)
+        seen_hashes: set[str] = {self.make_hash(r.to_dict()) for r in first_page}
+
+        max_pages = 50  # safety cap
+        for page_num in range(2, max_pages + 1):
+            has_next = await self._go_next_page()
+            if not has_next:
+                _logger.info("No next page link — stopping at page %d", page_num - 1)
+                break
+
+            await self.page.wait_for_timeout(4000)
+            page_records = await self._extract_results()
+            if not page_records:
+                _logger.info("Page %d empty — stopping", page_num)
+                break
+
+            new_count = 0
+            for rec in page_records:
+                h = self.make_hash(rec.to_dict())
+                if h not in seen_hashes:
+                    seen_hashes.add(h)
+                    all_records.append(rec)
+                    new_count += 1
+
+            _logger.info("Page %d — %d new (chunk total %d)", page_num, new_count, len(all_records))
+            if new_count == 0:
+                break
+
+        return all_records
+
+    async def _go_next_page(self) -> bool:
+        """Click the LandmarkWeb Next page button if enabled."""
+        try:
+            next_btn = self.page.locator(
+                "a:has-text('Next'), button:has-text('Next'), "
+                "a[title*='Next'], .pagination .next a, "
+                "[aria-label='Next']"
+            )
+            if await next_btn.count() == 0:
+                return False
+            first = next_btn.first
+            disabled = await first.get_attribute("disabled")
+            cls = await first.get_attribute("class") or ""
+            if disabled or "disabled" in cls.lower():
+                return False
+            await first.click()
+            return True
+        except Exception as exc:
+            _logger.info("Next page click failed: %s", str(exc)[:80])
+            return False
+
     async def _extract_results(self) -> list[ScrapedRecord]:
         """Extract records from the results table."""
         records: list[ScrapedRecord] = []
@@ -237,10 +297,17 @@ class ClarkWAScraper(BridgeScraper):
 
         _logger.info("Extracted %d rows", len(raw))
 
+        dropped_no_pid = 0
+        sample_legal: list[str] = []
         for item in raw:
             legal = (item.get("legal") or "").strip()
             pid_match = _PID_PATTERN.search(legal)
             if not pid_match:
+                pid_match = _PID_FALLBACK_PATTERN.search(legal)
+            if not pid_match:
+                dropped_no_pid += 1
+                if len(sample_legal) < 3 and legal:
+                    sample_legal.append(legal[:120])
                 continue
 
             record = ScrapedRecord()
@@ -266,5 +333,9 @@ class ClarkWAScraper(BridgeScraper):
             if record.party_name or record.date_recorded:
                 records.append(record)
 
-        _logger.info("Records with PID: %d / %d", len(records), len(raw))
+        _logger.info("Records with PID: %d / %d (dropped_no_pid=%d)",
+                      len(records), len(raw), dropped_no_pid)
+        if sample_legal:
+            for i, s in enumerate(sample_legal):
+                _logger.info("  Sample dropped legal[%d]: %s", i, s)
         return records

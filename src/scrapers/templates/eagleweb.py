@@ -604,21 +604,35 @@ class EagleWebScraper(BridgeScraper):
                     # Try "Parcel: XXXXX" or "Parcel:XXXXX" pattern first
                     parcel_labeled = re.search(r"[Pp]arcel[:\s]+(\d{4,}\.\d{3,}|\d{5,})", combined)
                     if parcel_labeled:
-                        record.parcel_id = parcel_labeled.group(1)
-                        parcel_source_counts["summary_labeled"] += 1
+                        # Reject if Kitsap-style truncation marker follows
+                        # the digits (e.g. "Parcel: 43200000080..." — Kitsap
+                        # hides the last digits in the results table for
+                        # records still in workflow processing).
+                        next_chars = combined[parcel_labeled.end():parcel_labeled.end() + 3]
+                        if next_chars.startswith("..."):
+                            parcel_source_counts["none_yet"] += 1
+                        else:
+                            record.parcel_id = parcel_labeled.group(1)
+                            parcel_source_counts["summary_labeled"] += 1
                     else:
                         # Fallback: any standalone 10+ digit number (not an instrument/year prefix)
-                        parcel_match = re.search(r"\b(\d{10,})\b", combined)
-                        if parcel_match:
-                            pid = parcel_match.group(1)
-                            # Skip instrument numbers (start with 2024/2025/2026)
-                            if not pid[:4] in ("2024", "2025", "2026"):
-                                record.parcel_id = pid
-                                parcel_source_counts["summary_digit"] += 1
+                        # Skip this fallback entirely if "Related:" appears in the
+                        # text — Kitsap (and others) list related document numbers
+                        # there which look like parcels but aren't.
+                        if "Related:" in combined or "related:" in combined:
+                            parcel_source_counts["none_yet"] += 1
+                        else:
+                            parcel_match = re.search(r"\b(\d{10,})\b", combined)
+                            if parcel_match:
+                                pid = parcel_match.group(1)
+                                # Skip instrument numbers (start with 2024/2025/2026)
+                                if not pid[:4] in ("2024", "2025", "2026"):
+                                    record.parcel_id = pid
+                                    parcel_source_counts["summary_digit"] += 1
+                                else:
+                                    parcel_source_counts["none_yet"] += 1
                             else:
                                 parcel_source_counts["none_yet"] += 1
-                        else:
-                            parcel_source_counts["none_yet"] += 1
 
                 # Also store the legal description text
                 legal_text = re.search(r"(?:Subdivision|Section|Lot|Block|Plat|Tract)\s+.+", combined, re.IGNORECASE)

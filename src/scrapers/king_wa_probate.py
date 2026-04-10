@@ -166,9 +166,20 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         """Accept the LandmarkWeb disclaimer if present."""
         try:
             await self.page.wait_for_timeout(2000)
+
+            # Method 1: Call SetDisclaimer() JS directly (works for Clark + hidden modals)
+            has_fn = await self.page.evaluate("typeof SetDisclaimer === 'function'")
+            if has_fn:
+                _logger.info("Disclaimer — calling SetDisclaimer() via JS")
+                await self.page.evaluate("SetDisclaimer()")
+                await self.page.wait_for_timeout(3000)
+                _logger.info("Disclaimer accepted via JS")
+                return
+
+            # Method 2: Click the Accept button (King County style)
             accept_btn = self.page.locator(
                 "button:has-text('Accept'), a:has-text('Accept'), "
-                "#btnDisclaimerAccept, [onclick*='SetDisclaimer'], "
+                "#btnDisclaimerAccept, "
                 "a:has-text('I Accept'), a:has-text('Agree')"
             )
             if await accept_btn.count() > 0:

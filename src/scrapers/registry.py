@@ -109,6 +109,7 @@ def get_scraper_class(county: str, state: str, record_type: str):
         "src.scrapers.pierce_wa_probate",
         "src.scrapers.pierce_wa_code_violation",
         "src.scrapers.clark_wa",
+        "src.scrapers.whatcom_wa",
         "src.scrapers.king_wa_code_violation",
         "src.scrapers.king_wa_tax_delinquent",
         "src.scrapers.king_wa_probate",

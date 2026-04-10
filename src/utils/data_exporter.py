@@ -23,7 +23,26 @@ _COLUMN_ORDER = [
     "parcel_id",
     "property_address",
     "mailing_address",
+    # Sprint 4: skip trace (Tracerfy). These are populated asynchronously
+    # by the skip-trace dispatcher + webhook. On first export they may be
+    # empty if the dispatcher hasn't submitted yet OR Tracerfy hasn't
+    # webhook'd back yet — users can re-download later for the filled
+    # values, or check the job's skip_trace status in the UI.
+    "phone",
+    "phone_type",
+    "email",
+    "skip_trace_status",
 ]
+
+# Sprint 4: DNC compliance disclaimer appended as a footer to CSV/Excel.
+# Removed once Sprint 5 adds pre-call DNC/TCPA litigator scrubbing.
+_DNC_DISCLAIMER = (
+    "IMPORTANT: Verify numbers against the National DNC Registry and your "
+    "state DNC list before calling. BridgeLeads does not currently pre-scrub "
+    "phone numbers against DNC or TCPA litigator lists. Contacting a number "
+    "on the DNC Registry without prior express consent may result in "
+    "statutory damages of $500-$1,500 per call under the TCPA."
+)
 
 # Amber header colour for Excel (matches BridgeLeads design system)
 _AMBER_HEX = "F5A623"
@@ -87,6 +106,23 @@ class DataExporter:
         filepath = self._timestamped_path(filename, "csv")
         df = _build_dataframe(records)
         df.to_csv(filepath, index=False, encoding="utf-8")
+
+        # Sprint 4: append DNC/TCPA disclaimer footer when any phone value
+        # exists in the export. Prefixed with '#' so pandas readers can
+        # skip it via comment='#' and Excel displays it as plain text.
+        # Note: pandas `astype(bool)` on an object column returns True for
+        # any non-None value (including empty strings), so we explicitly
+        # check for non-empty stripped strings.
+        has_phones = False
+        if "phone" in df.columns:
+            has_phones = any(
+                str(v).strip() for v in df["phone"].tolist() if v is not None
+            )
+        if has_phones:
+            with open(filepath, "a", encoding="utf-8") as f:
+                f.write("\n")
+                f.write("# " + _DNC_DISCLAIMER + "\n")
+
         _logger.info("CSV exported: %s (%d rows)", filepath.name, len(df))
         return filepath
 

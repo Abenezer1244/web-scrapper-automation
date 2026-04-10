@@ -123,6 +123,9 @@ class ScraperConfigCreate(BaseModel):
     enrichment: EnrichmentConfig = EnrichmentConfig()
     schedule: ScheduleConfig = ScheduleConfig()
     deliver: DeliverConfig = DeliverConfig()
+    # Sprint 4: skip trace opt-in. Default False to avoid accidental
+    # charges. Backend rejects with 402 if the user's plan is 'starter'.
+    skip_trace_enabled: bool = False
 
     @field_validator("state")
     @classmethod
@@ -146,6 +149,7 @@ class ScraperConfigResponse(BaseModel):
     enrichment: dict[str, Any]
     schedule: dict[str, Any]
     deliver: dict[str, Any]
+    skip_trace_enabled: bool = False
     active: bool
     created_at: datetime
     updated_at: datetime

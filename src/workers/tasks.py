@@ -281,8 +281,13 @@ def run_scrape_job(self, job_id: str) -> None:
                 select(Result).where(Result.job_id == job_id, Result.user_id == job.user_id)
             ).scalars().all()
             record_dicts = [
-                {c: getattr(res, c) for c in ["date_recorded", "party_name", "heirs", "parcel_id",
-                                               "property_address", "mailing_address", "legal_description"]}
+                {c: getattr(res, c) for c in [
+                    "date_recorded", "party_name", "heirs", "parcel_id",
+                    "property_address", "mailing_address", "legal_description",
+                    # Sprint 4: skip trace fields (may be null on first export
+                    # if dispatcher hasn't submitted or webhook hasn't fired)
+                    "phone", "phone_type", "email", "skip_trace_status",
+                ]}
                 for res in refreshed
             ]
             enriched_file = exporter.export(record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt)
@@ -460,6 +465,144 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             "Job %s: dropped %d/%d unactionable records after enrichment",
             job_id, len(unactionable), len(fresh),
         )
+
+    # ── Sprint 4: skip trace enqueue ─────────────────────────────────────
+    # Only runs if:
+    #   1. SKIP_TRACE_ENABLED globally (env flag)
+    #   2. The user's scraper config has skip_trace_enabled=True
+    #   3. The user's plan permits skip trace (Starter blocked)
+    #   4. TRACERFY_API_TOKEN is configured
+    # Matching records are either hydrated from skip_trace_cache (free)
+    # or inserted into pending_skip_trace_rows for the dispatcher to
+    # submit in a batch. Actual Tracerfy calls happen in the dispatcher;
+    # this step is instant and never blocks scrape completion.
+    _enqueue_skip_trace_rows(db, job, r, job_id, config)
+
+
+def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
+    """Enqueue eligible Result rows into pending_skip_trace_rows.
+
+    Runs at the end of _run_inline_enrichment, after GIS + county
+    assessor + post-enrichment cleanup. Only records that survived the
+    cleanup (have a property_address) are eligible.
+    """
+    from src.db.models import PendingSkipTraceRow, Result, SkipTraceCache
+    from src.scrapers.enrichment.skip_trace import (
+        address_cache_key,
+        build_pending_row_payload,
+    )
+
+    if not settings.SKIP_TRACE_ENABLED:
+        return
+    if not settings.TRACERFY_API_TOKEN:
+        _publish_log(
+            r, job_id, "warning",
+            "Skip trace requested but TRACERFY_API_TOKEN not configured",
+            db=db,
+        )
+        return
+    if not getattr(config, "skip_trace_enabled", False):
+        return
+    # Plan gate: Starter excluded. Pro/Business/Agency allowed.
+    if (job.user.plan or "starter").lower() == "starter":
+        _publish_log(
+            r, job_id, "warning",
+            "Skip trace requested but user plan (starter) does not include it. "
+            "Upgrade to Pro to unlock skip trace ($0.08/lookup).",
+            db=db,
+        )
+        return
+
+    # Reload the surviving results after the unactionable drop
+    eligible = db.execute(
+        sa_select(Result).where(
+            Result.job_id == job_id,
+            Result.user_id == job.user_id,
+            Result.property_address.isnot(None),
+            Result.skip_trace_status == "not_attempted",
+        )
+    ).scalars().all()
+
+    if not eligible:
+        return
+
+    cache_hits = 0
+    cache_misses = 0
+    enqueued_normal = 0
+    enqueued_advanced = 0
+
+    for rec in eligible:
+        # Parse the combined address to get canonical city/state for the cache key
+        payload = build_pending_row_payload(rec)
+        if payload is None:
+            continue
+
+        cache_key = address_cache_key(
+            payload["property_address"],
+            payload["city"],
+            payload["state"],
+        )
+        cached = db.get(SkipTraceCache, cache_key)
+        cache_valid = False
+        if cached:
+            # 90-day TTL check
+            age = _now() - cached.fetched_at
+            if age.days < settings.SKIP_TRACE_CACHE_DAYS:
+                cache_valid = True
+
+        if cache_valid:
+            # Copy cached values directly to the Result — no Tracerfy call
+            rec.phone = cached.phone
+            rec.phone_type = cached.phone_type
+            rec.phone_dnc_flag = cached.phone_dnc_flag
+            rec.email = cached.email
+            rec.skip_trace_status = "hit" if (cached.phone or cached.email) else "miss"
+            rec.skip_trace_attempted_at = _now()
+            cache_hits += 1
+        else:
+            # Enqueue for the dispatcher
+            pending = PendingSkipTraceRow(
+                job_id=payload["job_id"],
+                result_id=payload["result_id"],
+                user_id=payload["user_id"],
+                property_address=payload["property_address"],
+                city=payload["city"],
+                state=payload["state"],
+                zip=payload["zip"],
+                first_name=payload["first_name"],
+                last_name=payload["last_name"],
+                mail_address=payload["mail_address"],
+                mail_city=payload["mail_city"],
+                mail_state=payload["mail_state"],
+                mail_zip=payload["mail_zip"],
+                trace_type=payload["trace_type"],
+                status="queued",
+            )
+            db.add(pending)
+            rec.skip_trace_status = "queued"
+            cache_misses += 1
+            if payload["trace_type"] == "advanced":
+                enqueued_advanced += 1
+            else:
+                enqueued_normal += 1
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        db.commit()
+
+    _publish_log(
+        r, job_id, "info",
+        f"Skip trace: {cache_hits} cache hits, {cache_misses} queued "
+        f"({enqueued_normal} normal + {enqueued_advanced} advanced). "
+        f"Dispatcher submits batches every 5 min.",
+        db=db,
+    )
+    _logger.info(
+        "Job %s skip trace enqueue: cache_hits=%d queued=%d (normal=%d advanced=%d)",
+        job_id, cache_hits, cache_misses, enqueued_normal, enqueued_advanced,
+    )
 
 
 def _fail_job(db, job, r, job_id: str, reason: str) -> None:

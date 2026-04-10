@@ -23,6 +23,10 @@ from src.db import CountyConnector, ScraperConfig, get_db
 router = APIRouter(prefix="/scrapers", tags=["scrapers"])
 
 _BUSINESS_PLANS = ("business", "agency")
+# Sprint 4: skip trace is available to Pro/Business/Agency (all paid tiers).
+# Starter is excluded — backend returns 402 and the frontend shows an
+# upsell tooltip "Upgrade to Pro to unlock skip trace ($0.08/lookup)".
+_SKIP_TRACE_PLANS = ("pro", "business", "agency")
 
 
 @router.get("/sample")
@@ -135,6 +139,17 @@ async def create_scraper(
             detail="Skip tracing enrichment requires a Business or Agency plan",
         )
 
+    # Sprint 4: new dedicated skip_trace_enabled flag (metered add-on).
+    # Available on Pro/Business/Agency. Starter gets 402 with upsell text.
+    if body.skip_trace_enabled and (current_user.plan or "starter").lower() not in _SKIP_TRACE_PLANS:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=(
+                "Skip trace ($0.08/lookup) requires a Pro plan or higher. "
+                "Upgrade to Pro to unlock phone + email lookups."
+            ),
+        )
+
     config = ScraperConfig(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
@@ -146,6 +161,7 @@ async def create_scraper(
         enrichment=body.enrichment.model_dump(),
         schedule=body.schedule.model_dump(),
         deliver=body.deliver.model_dump(),
+        skip_trace_enabled=body.skip_trace_enabled,
     )
     db.add(config)
     await db.flush()

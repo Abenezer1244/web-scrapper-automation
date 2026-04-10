@@ -321,12 +321,21 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         except Exception:
             pass
 
-        # Fallback: navigate directly
+        # Fallback: navigate directly then re-accept disclaimer
         url = f"{self._base_url}/search/index?theme=.blue&section=searchCriteriaDocuments"
         if "/search/" in self._base_url:
             url = f"{self._base_url}?theme=.blue&section=searchCriteriaDocuments"
         await self.page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         await self.page.wait_for_timeout(2000)
+        await self._accept_disclaimer()
+        # After disclaimer, try clicking the tab again
+        try:
+            tab = self.page.locator("#searchCriteriaDocuments-tab, a:has-text('Document Type')")
+            if await tab.count() > 0:
+                await tab.first.click()
+                await self.page.wait_for_timeout(1500)
+        except Exception:
+            pass
         _logger.info("Navigated to Document Type Search via URL")
 
     async def _select_document_type(self) -> None:

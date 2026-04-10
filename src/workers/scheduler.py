@@ -44,6 +44,14 @@ app.conf.beat_schedule = {
         "task": "src.workers.scheduler.send_onboarding_emails",
         "schedule": crontab(hour=14, minute=0),  # 2 PM UTC = 7 AM PT
     },
+    "dispatch-pending-skip-trace": {
+        # Sprint 4: drains pending_skip_trace_rows, submits Tracerfy batches.
+        # Tracerfy rate-limits batch POSTs to 10 per 5 min, so we run every
+        # 5 min and submit at most SKIP_TRACE_MAX_BATCHES_PER_TICK (default 2)
+        # per tick. The task is a no-op if SKIP_TRACE_ENABLED=False.
+        "task": "src.workers.skip_trace_dispatcher.dispatch_pending_skip_trace",
+        "schedule": 300.0,  # every 5 minutes
+    },
 }
 
 

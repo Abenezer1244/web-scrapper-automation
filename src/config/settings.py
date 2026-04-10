@@ -100,6 +100,30 @@ class Settings(BaseSettings):
     GIS_ENRICHMENT_ENABLED: bool = True
     AI_ENRICHMENT_ENABLED: bool = True
 
+    # ─── Skip Trace (Tracerfy, Sprint 4) ──────────────────────────────────────
+    TRACERFY_API_TOKEN: str = ""
+    TRACERFY_API_BASE_URL: str = "https://tracerfy.com"
+    TRACERFY_WEBHOOK_SECRET: str = ""
+    SKIP_TRACE_ENABLED: bool = False
+    SKIP_TRACE_CACHE_DAYS: int = 90
+    # Tracerfy rate limit is 10 POSTs per 5-minute window. We leave headroom
+    # by only submitting up to 2 batches per dispatcher tick (Beat runs every
+    # 5 min). Each batch can hold thousands of rows, so throughput is fine;
+    # the constraint is burst count, not total rows.
+    SKIP_TRACE_MAX_BATCHES_PER_TICK: int = 2
+
+    @field_validator("TRACERFY_WEBHOOK_SECRET")
+    @classmethod
+    def webhook_secret_must_be_strong_if_set(cls, v: str) -> str:
+        """If a webhook secret is configured, it must be at least 24 chars.
+        Empty string is allowed (skip trace disabled)."""
+        if v and len(v) < 24:
+            raise ValueError(
+                "TRACERFY_WEBHOOK_SECRET must be at least 24 characters. "
+                "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+            )
+        return v
+
     # ─── Daily Scrape Cache ────────────────────────────────────────────────
     ENABLE_DAILY_SCRAPE: bool = False
     RECORD_RETENTION_DAYS: int = 365

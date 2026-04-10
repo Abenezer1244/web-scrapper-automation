@@ -4,7 +4,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.api import auth_router, billing_router, jobs_router, scrapers_router
+from src.api import (
+    auth_router,
+    billing_router,
+    jobs_router,
+    scrapers_router,
+    webhooks_router,
+)
 from src.api.middleware import SecurityHeadersMiddleware
 from src.config import settings
 
@@ -48,6 +54,7 @@ app.include_router(auth_router)
 app.include_router(scrapers_router)
 app.include_router(jobs_router)
 app.include_router(billing_router)
+app.include_router(webhooks_router)
 
 
 # ─── Logging: strip tokens from access logs ──────────────────────────────────

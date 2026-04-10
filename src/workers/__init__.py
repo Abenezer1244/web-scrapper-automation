@@ -9,7 +9,11 @@ app = Celery(
     "bridgeleads",
     broker=settings.REDIS_URL,
     backend=settings.REDIS_URL,
-    include=["src.workers.tasks", "src.workers.scheduler"],
+    include=[
+        "src.workers.tasks",
+        "src.workers.scheduler",
+        "src.workers.skip_trace_dispatcher",
+    ],
 )
 
 # Upstash Redis uses TLS (rediss://) — kombu needs explicit SSL config.
@@ -37,6 +41,7 @@ app.conf.task_routes = {
     "src.workers.tasks.run_scrape_job": {"queue": "scrape"},
     "src.workers.tasks.enrich_job_results": {"queue": "enrichment"},
     "src.workers.scheduler.*": {"queue": "celery"},
+    "src.workers.skip_trace_dispatcher.*": {"queue": "celery"},
 }
 
 app.conf.update(

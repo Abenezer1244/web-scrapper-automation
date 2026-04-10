@@ -178,8 +178,11 @@ class PierceWAARMSScraper(BridgeScraper):
         await page.wait_for_timeout(1_000)
 
         # Type dates into Infragistics WebDateChooser controls
-        # These controls require keyboard input — JS .value= doesn't register
-        from_input = page.locator('input[title="mm/dd/yyyy"]').first
+        # These controls require keyboard input — JS .value= doesn't register.
+        # ARMS updated the title attribute in 2026 from "mm/dd/yyyy" to
+        # "Date Filed From/To, format mm/dd/yyyy", so match by prefix.
+        from_input = page.locator('input[title*="Date Filed From"]').first
+        await from_input.wait_for(state="visible", timeout=15_000)
         await from_input.click(force=True)
         await page.wait_for_timeout(200)
         await page.keyboard.press("Control+a")
@@ -187,7 +190,11 @@ class PierceWAARMSScraper(BridgeScraper):
         await page.keyboard.press("Tab")
         await page.wait_for_timeout(300)
 
-        # Tab moves focus to the To date input
+        # Click the To date input explicitly (don't rely on Tab order which
+        # can skip to a different field if the page re-renders).
+        to_input = page.locator('input[title*="Date Filed To"]').first
+        await to_input.click(force=True)
+        await page.wait_for_timeout(200)
         await page.keyboard.press("Control+a")
         await page.keyboard.type(date_to, delay=30)
         await page.keyboard.press("Tab")

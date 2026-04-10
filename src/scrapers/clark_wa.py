@@ -297,9 +297,30 @@ class ClarkWAScraper(BridgeScraper):
 
         _logger.info("Extracted %d rows", len(raw))
 
+        # Clark's portal-side Custom Selection filter is unreliable — the
+        # search returns every document type regardless of what we put in
+        # the textarea. Apply the doc-type filter client-side against the
+        # extracted docType cell to guarantee we only return matching records.
+        allowed_types_upper = [t.upper() for t in self._doc_types]
+
         dropped_no_pid = 0
+        dropped_wrong_doctype = 0
+        doc_type_counter: dict[str, int] = {}
         sample_legal: list[str] = []
         for item in raw:
+            item_doc_type = (item.get("docType") or "").strip().upper()
+            doc_type_counter[item_doc_type] = doc_type_counter.get(item_doc_type, 0) + 1
+
+            # Skip rows whose docType doesn't match any configured keyword
+            matched = False
+            for keyword in allowed_types_upper:
+                if keyword and keyword in item_doc_type:
+                    matched = True
+                    break
+            if not matched:
+                dropped_wrong_doctype += 1
+                continue
+
             legal = (item.get("legal") or "").strip()
             pid_match = _PID_PATTERN.search(legal)
             if not pid_match:
@@ -333,8 +354,15 @@ class ClarkWAScraper(BridgeScraper):
             if record.party_name or record.date_recorded:
                 records.append(record)
 
-        _logger.info("Records with PID: %d / %d (dropped_no_pid=%d)",
-                      len(records), len(raw), dropped_no_pid)
+        _logger.info(
+            "Records kept: %d / %d (dropped_wrong_doctype=%d, dropped_no_pid=%d)",
+            len(records), len(raw), dropped_wrong_doctype, dropped_no_pid,
+        )
+        # Log top 5 doc types seen so we can tune _DOC_TYPES if probate variants are missed
+        top_types = sorted(doc_type_counter.items(), key=lambda kv: -kv[1])[:5]
+        if top_types:
+            _logger.info("  Top doc types in page: %s",
+                          ", ".join(f"{t}={n}" for t, n in top_types))
         if sample_legal:
             for i, s in enumerate(sample_legal):
                 _logger.info("  Sample dropped legal[%d]: %s", i, s)

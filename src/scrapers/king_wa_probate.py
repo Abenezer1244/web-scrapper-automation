@@ -747,18 +747,18 @@ class ClarkWaProbateScraper(KingCountyLandmarkWebScraper):
     and relies on PID filtering to get property-related records.
     """
 
-    # Override: Clark uses "Main Dump" instead of specific doc categories
+    # Override: Clark uses "All Categories" from dropdown (gets everything with PID)
     RECORD_TYPE_CONFIG = {
         **KingCountyLandmarkWebScraper.RECORD_TYPE_CONFIG,
         "probate": {
-            "search_texts": ["main dump", "all categories"],
-            "label": "PROBATE",
-            "grantor": "deceased",
-            "grantee": "heir",
+            "search_texts": ["all categories"],
+            "label": "ALL RECORDS",
+            "grantor": "grantor",
+            "grantee": "grantee",
         },
         "pre_foreclosure": {
-            "search_texts": ["main dump", "all categories"],
-            "label": "PRE-FORECLOSURE",
+            "search_texts": ["all categories"],
+            "label": "ALL RECORDS",
             "grantor": "borrower",
             "grantee": "lender",
         },

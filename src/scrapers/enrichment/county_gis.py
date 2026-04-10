@@ -347,7 +347,7 @@ def batch_enrich_parcels_gis(
         results = _batch_query_county(parcel_ids, gis_config)
 
     # Step 2: WA statewide fallback for parcels not found in county endpoint
-    missing = [pid for pid in parcel_ids if pid not in results and pid and len(pid.strip()) >= 10]
+    missing = [pid for pid in parcel_ids if pid not in results and pid and len(pid.strip()) >= 6]
     if missing:
         statewide = _batch_query_wa_statewide(missing, county)
         results.update(statewide)
@@ -367,7 +367,7 @@ def _batch_query_county(
 
     for i in range(0, len(parcel_ids), chunk_size):
         chunk = parcel_ids[i:i + chunk_size]
-        clean = [pid.replace("-", "").strip() for pid in chunk if pid and len(pid.strip()) >= 10]
+        clean = [pid.replace("-", "").strip() for pid in chunk if pid and len(pid.strip()) >= 6]
         if not clean:
             continue
 
@@ -416,7 +416,7 @@ def _batch_query_wa_statewide(
 
     for i in range(0, len(parcel_ids), chunk_size):
         chunk = parcel_ids[i:i + chunk_size]
-        clean = [pid.replace("-", "").strip() for pid in chunk if pid and len(pid.strip()) >= 10]
+        clean = [pid.replace("-", "").strip() for pid in chunk if pid and len(pid.strip()) >= 6]
         if not clean:
             continue
 
@@ -447,9 +447,18 @@ def _batch_query_wa_statewide(
                     continue
 
                 address = " ".join(address.strip().split())
+                city = (attrs.get("SITUS_CITY_NM") or "").strip()
+                zipcode = (attrs.get("SITUS_ZIP_NR") or "").strip()
+                # Build mailing from situs address + city + state + zip
+                mailing = address
+                if city:
+                    mailing += f", {city}"
+                mailing += ", WA"
+                if zipcode:
+                    mailing += f" {zipcode}"
                 results[pid] = {
                     "property_address": address,
-                    "mailing_address": None,  # Statewide API doesn't have mailing address
+                    "mailing_address": mailing,
                     "parcel_id": pid,
                 }
 

@@ -327,14 +327,26 @@ class PierceWAARMSScraper(BridgeScraper):
                     await page.locator("span:has-text('Legal Description')").first.click(timeout=3_000)
                     await page.wait_for_timeout(200)
 
-                    # Extract "Parcel Id:" from the tab content
-                    parcel_id = await page.evaluate("""() => {
-                        const cells = document.querySelectorAll('td');
-                        for (let i = 0; i < cells.length; i++) {
-                            if (cells[i].textContent.trim() === 'Parcel Id:' && cells[i+1]) {
-                                const val = cells[i+1].textContent.trim();
-                                if (val && val.length >= 6) return val;
+                    # Extract "Parcel Id:" from the tab content.
+                    # ARMS updated the Legal Description tab in 2026: the
+                    # "Parcel Id:" label is now a <th>, not a <td>, and the
+                    # value lives in the next sibling element (can be td or
+                    # th). Use nextElementSibling and query both tag types.
+                    parcel_id = await page.evaluate(r"""() => {
+                        const labels = document.querySelectorAll('td, th, span');
+                        for (const el of labels) {
+                            const t = el.textContent.trim();
+                            if (!/^Parcel\s*Id:?$/i.test(t)) continue;
+                            // Try next sibling first
+                            let val = '';
+                            if (el.nextElementSibling) {
+                                val = el.nextElementSibling.textContent.trim();
                             }
+                            // Fallback: parent's next cell
+                            if ((!val || val.length < 6) && el.parentElement && el.parentElement.nextElementSibling) {
+                                val = el.parentElement.nextElementSibling.textContent.trim();
+                            }
+                            if (val && /^\d{6,}$/.test(val)) return val;
                         }
                         return null;
                     }""")

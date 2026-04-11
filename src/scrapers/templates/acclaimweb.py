@@ -535,25 +535,81 @@ class AcclaimWebScraper(BridgeScraper):
                         }
                     }
 
-                    // Fallback: extract from DOM table rows
-                    const rows = document.querySelectorAll(
+                    // Fallback 1: Kendo-style selectors (for standard deployments)
+                    let rows = document.querySelectorAll(
                         '#SearchResultGrid tbody tr, .k-grid-content tbody tr, table.k-grid tbody tr'
                     );
-                    if (!rows.length) return [];
+                    if (rows.length) {
+                        return Array.from(rows).map(row => {
+                            const cells = row.querySelectorAll('td');
+                            if (cells.length < 4) return null;
+                            return {
+                                instrument: (cells[0] || {}).textContent?.trim() || '',
+                                date_recorded: (cells[1] || {}).textContent?.trim() || '',
+                                doc_type: (cells[2] || {}).textContent?.trim() || '',
+                                grantor: (cells[3] || {}).textContent?.trim() || '',
+                                grantee: (cells[4] || {}).textContent?.trim() || '',
+                                legal: (cells[5] || {}).textContent?.trim() || '',
+                                parcel: '',
+                            };
+                        }).filter(r => r !== null);
+                    }
 
-                    return Array.from(rows).map(row => {
-                        const cells = row.querySelectorAll('td');
-                        if (cells.length < 4) return null;
-                        return {
-                            instrument: (cells[0] || {}).textContent?.trim() || '',
-                            date_recorded: (cells[1] || {}).textContent?.trim() || '',
-                            doc_type: (cells[2] || {}).textContent?.trim() || '',
-                            grantor: (cells[3] || {}).textContent?.trim() || '',
-                            grantee: (cells[4] || {}).textContent?.trim() || '',
-                            legal: (cells[5] || {}).textContent?.trim() || '',
-                            parcel: '',
-                        };
-                    }).filter(r => r !== null);
+                    // Fallback 2: header-aware scan of every table on the page.
+                    // Chelan County and other non-Kendo AcclaimWeb deployments
+                    // render results as a plain HTML table. Find the widest
+                    // table whose header row contains recognisable AcclaimWeb
+                    // column names, then map each data row by column index.
+                    const tables = Array.from(document.querySelectorAll('table'));
+                    const HEADER_SYNONYMS = {
+                        instrument: /^(afn|instrument|document.?no|doc.?no|number|inst)/i,
+                        date_recorded: /(record.*date|recorded|date.*record|filing.*date|date$)/i,
+                        doc_type: /(doc.*type|document.*type|type)/i,
+                        grantor: /(grantor|direct|from)/i,
+                        grantee: /(grantee|indirect|to)/i,
+                        legal: /(legal|description|desc)/i,
+                    };
+                    let best = null;
+                    for (const t of tables) {
+                        const headerCells = Array.from(
+                            t.querySelectorAll('thead tr th, thead tr td, tr:first-child th, tr:first-child td')
+                        );
+                        if (headerCells.length < 4) continue;
+                        const headers = headerCells.map(c => (c.textContent || '').trim().toLowerCase());
+                        const colMap = {};
+                        for (const [key, pattern] of Object.entries(HEADER_SYNONYMS)) {
+                            const idx = headers.findIndex(h => pattern.test(h));
+                            if (idx >= 0) colMap[key] = idx;
+                        }
+                        // Require at least date + grantor + doc_type for a valid match
+                        if (colMap.date_recorded == null || colMap.grantor == null) continue;
+                        const bodyRows = t.querySelectorAll('tbody tr');
+                        if (!bodyRows.length) continue;
+                        if (!best || bodyRows.length > best.rows.length) {
+                            best = { table: t, rows: bodyRows, colMap };
+                        }
+                    }
+                    if (best) {
+                        return Array.from(best.rows).map(row => {
+                            const cells = row.querySelectorAll('td');
+                            if (cells.length < 3) return null;
+                            const getCell = k => best.colMap[k] != null && cells[best.colMap[k]]
+                                ? (cells[best.colMap[k]].textContent || '').trim() : '';
+                            const r = {
+                                instrument: getCell('instrument'),
+                                date_recorded: getCell('date_recorded'),
+                                doc_type: getCell('doc_type'),
+                                grantor: getCell('grantor'),
+                                grantee: getCell('grantee'),
+                                legal: getCell('legal'),
+                                parcel: '',
+                            };
+                            // Filter out header / summary / pager rows
+                            if (!r.date_recorded && !r.grantor && !r.instrument) return null;
+                            return r;
+                        }).filter(r => r !== null);
+                    }
+                    return [];
                 })()
             """)
 

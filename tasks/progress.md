@@ -105,12 +105,17 @@ with documented rationale.
 
 ### WA county matrix — complete breakdown
 
-**WORKING (12) — verified producing records this session:**
+**WORKING (14) — verified producing records with parcels:**
 ```
 benton     clark      douglas    island
 jefferson  king       kitsap     lewis
-pierce     spokane    thurston   whatcom
+pacific    pierce     spokane    thurston
+whatcom    whitman
 ```
+
+**Added 2026-04-11 (session 2):**
+- **pacific** — 30-day probate: 31 raw → 18 kept, 100% parcels. Real probate (SNYDER/HILL/BIGGS families) + real pre-foreclosure (JPMorgan/North Star Trustee). No code changes — just misclassified as degraded. Promoted to healthy.
+- **whitman** — 90-day probate: 6/6 records with full parcels after regex fix. Previously 0/6 because whitman uses dash-segmented parcels with digit OR letter prefix (`L-0985-00-00-27-0000`) that the existing `\d{5,}` regex couldn't match. Fixed in commit `bbf17df` (EagleWeb template). Low volume (~2/month, rural eastern WA) but clean.
 
 Record-type coverage on the top counties:
 - Clark:   probate, pre_foreclosure, divorce, tax_delinquent (4)
@@ -120,18 +125,16 @@ Record-type coverage on the top counties:
 
 Full type count: King 5, Clark 4, Pierce 4, every other WA county 2.
 
-**NEEDS WORK — visible but degraded (8):**
+**NEEDS WORK — visible but degraded (6):**
 
 | County | Platform | Known issue |
 |---|---|---|
 | chelan | AcclaimWeb | Portal uses SINGLE-DATE picker, not range. Needs per-instance day-by-day iteration. Portal HAS data (saw "11 of 59" in one probe). |
-| clallam | EagleWeb | Returns 0 on 30/60/90 day probes. Unclear if selector mismatch or truly empty. |
-| grant | Tyler SelfService | Returns 0 on 60-day. Template mismatch. |
+| clallam | EagleWeb | **Probed 2026-04-11 (session 2)**: genuinely empty — portal only has ~5 total docs/week, none probate. Not a scraper bug. |
+| grant | EagleWeb | **Session 3 update**: correctly routed to EagleWebScraper via `/grantrecorder/web/` path. Extracts ~11 records in 30 days but 0 parcels (detail HTTP fetch returns 0/N). Grant-specific EagleWeb parcel extraction bug — separate from Tyler SelfService work. |
 | mason | EagleWeb | "Could not find date inputs" — Mason's DOM differs from template. Per-instance selector fix needed. |
-| okanogan | Tyler SelfService | Not directly probed this session |
-| pacific | CountyGovernmentRecords | Not directly probed this session |
+| okanogan | Tyler SelfService | **Session 3 update**: TylerSelfServiceScraper template shipped (`dff01d2`). Now extracts **17 probate + 2 pre_foreclosure in 30d** (was timing out at 240s). Real probate data (BENSON/EIFFERT estates). STILL `degraded` because records have no parcel_id — detail-page fetch returns an "error has occurred" GUID on direct goto, so parcel enrichment is blocked pending a server-session replay strategy. |
 | pend oreille | AcclaimWeb-variant | TargetClosedError on probe |
-| whitman | CountyGovernmentRecords | Not directly probed this session |
 
 **NEEDS WORK — hidden, status=down (12):**
 

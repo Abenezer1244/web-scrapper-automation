@@ -200,6 +200,27 @@ class ScraperConfigResponse(BaseModel):
 
     model_config = {"from_attributes": True}
 
+    def model_post_init(self, __context: Any) -> None:
+        # Backfill missing deliver keys so the frontend never has to
+        # defensively access `deliver.formats?.map(...)`. Three Sprint
+        # 4 verification configs were created with `deliver = {}` and
+        # crashed the /scrapers and /deliver pages. This normalizer
+        # runs on every response so any legacy config gets reasonable
+        # defaults on read without a migration.
+        if not isinstance(self.deliver, dict):
+            self.deliver = {}
+        self.deliver.setdefault("formats", ["csv"])
+        self.deliver.setdefault("emails", [])
+        self.deliver.setdefault("webhook_url", None)
+        self.deliver.setdefault("webhook_secret", None)
+        # Also normalize fields / enrichment / schedule defensively
+        if not isinstance(self.fields, dict):
+            self.fields = {}
+        if not isinstance(self.enrichment, dict):
+            self.enrichment = {}
+        if not isinstance(self.schedule, dict):
+            self.schedule = {}
+
 
 # ─── Jobs ─────────────────────────────────────────────────────────────────────
 

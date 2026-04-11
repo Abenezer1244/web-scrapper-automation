@@ -298,7 +298,24 @@ def canary_check() -> None:
                 records = asyncio.run(
                     _canary_scrape(scraper_class, week_ago.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y"))
                 )
-                connector.health_status = "healthy" if records else "degraded"
+                # Sticky health: once a connector has been marked
+                # 'healthy', do NOT downgrade it to 'degraded' just
+                # because the most recent 7-day probe returned zero
+                # records. Small counties oscillate based on which
+                # week the canary happens to sample, and flipping the
+                # status causes them to vanish from the user-facing
+                # connectors endpoint. Only a real exception path
+                # (caught below) downgrades a healthy connector.
+                # Non-healthy connectors still get upgraded normally
+                # when they produce records.
+                if records:
+                    connector.health_status = "healthy"
+                elif connector.health_status != "healthy":
+                    # Was degraded/down/unknown and is still empty —
+                    # stay in whatever non-healthy state we had, or
+                    # move to 'degraded' if we were 'unknown'.
+                    if connector.health_status in ("unknown", "down"):
+                        connector.health_status = "degraded"
                 _logger.info(
                     "Canary %s/%s: %s (%d records)",
                     connector.county, connector.state, connector.health_status, len(records)

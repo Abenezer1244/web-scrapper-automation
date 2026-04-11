@@ -228,22 +228,29 @@ async def list_connectors(
     Public endpoint — no auth required so the county browser loads for
     anonymous visitors.
 
-    By default returns only connectors whose canary health check has
-    most recently marked them as ``healthy`` — meaning the scraper is
-    working and the portal was reachable with non-zero records on the
-    last probe. This prevents users from selecting counties that are
-    currently broken or genuinely have no data flowing.
+    By default returns connectors whose canary health check has marked
+    them as either ``healthy`` or ``degraded``. Excludes only ``down``
+    (scraper threw an exception on last probe) and ``unknown`` (never
+    canary-checked).
 
-    Pass ``?include_all=true`` to list every active connector
-    regardless of health — useful for admin tooling and the support
-    team when investigating county-specific issues.
+    The ``degraded`` status means "scraper ran cleanly, but last
+    probe returned zero records on a 7-day window". For small counties
+    with sparse filings (e.g., rural WA counties that file <5 probates
+    per week), this oscillates randomly based on which week the canary
+    happens to sample. Excluding them from the picker just because
+    the most recent 7-day sample was empty would remove most of our
+    coverage for smaller markets. Instead, we surface them as
+    available and the user sees 0 records only if the actual scrape
+    window is empty — which is the correct honest outcome.
 
-    See ``docs/compliance/connector-audit-2026-04-10.md`` for why this
-    filter exists.
+    Pass ``?include_all=true`` to include ``down`` and ``unknown``
+    connectors for admin tooling and support investigation.
     """
     query = select(CountyConnector).where(CountyConnector.active)
     if not include_all:
-        query = query.where(CountyConnector.health_status == "healthy")
+        query = query.where(
+            CountyConnector.health_status.in_(("healthy", "degraded"))
+        )
     query = query.order_by(CountyConnector.state, CountyConnector.county)
     result = await db.execute(query)
     return [ConnectorResponse.model_validate(c) for c in result.scalars().all()]

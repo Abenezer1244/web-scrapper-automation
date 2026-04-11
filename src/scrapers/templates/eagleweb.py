@@ -615,24 +615,48 @@ class EagleWebScraper(BridgeScraper):
                             record.parcel_id = parcel_labeled.group(1)
                             parcel_source_counts["summary_labeled"] += 1
                     else:
-                        # Fallback: any standalone 10+ digit number (not an instrument/year prefix)
-                        # Skip this fallback entirely if "Related:" appears in the
-                        # text — Kitsap (and others) list related document numbers
-                        # there which look like parcels but aren't.
-                        if "Related:" in combined or "related:" in combined:
-                            parcel_source_counts["none_yet"] += 1
-                        else:
-                            parcel_match = re.search(r"\b(\d{10,})\b", combined)
-                            if parcel_match:
-                                pid = parcel_match.group(1)
-                                # Skip instrument numbers (start with 2024/2025/2026)
-                                if not pid[:4] in ("2024", "2025", "2026"):
-                                    record.parcel_id = pid
-                                    parcel_source_counts["summary_digit"] += 1
+                        # Whitman-style dash-segmented parcel (digit or letter prefix):
+                        #   2-0000-44-14-25-3390  (digit-prefixed, 6 segments)
+                        #   L-0985-00-00-27-0000  (letter-prefixed, 6 segments)
+                        #   8-0800-00-00-0013     (5 segments)
+                        # The first-pass digit regex above requires 5+ consecutive
+                        # digits, which whitman parcels never have since they max
+                        # out at 4 digits per segment.
+                        #
+                        # Whitman's legal-description field often contains a
+                        # TRUNCATED copy of the parcel followed by "..." before
+                        # the full parcel appears later in the summary. Walk all
+                        # matches and skip any immediately followed by "...".
+                        dash_pattern = re.compile(
+                            r"[Pp]arcel[:\s]+([A-Z]-\d+(?:-\d+){2,}|\d-\d+(?:-\d+){2,})"
+                        )
+                        for m in dash_pattern.finditer(combined):
+                            tail = combined[m.end():m.end() + 3]
+                            if tail.startswith("..."):
+                                continue  # truncated — keep scanning
+                            record.parcel_id = m.group(1)
+                            parcel_source_counts["summary_labeled"] += 1
+                            break
+
+                        if not record.parcel_id:
+                            # Fallback: any standalone 10+ digit number (not an instrument/year prefix)
+                            # Skip this fallback entirely if "Related:" appears in the
+                            # text — Kitsap (and others) list related document numbers
+                            # there which look like parcels but aren't.
+                            if "Related:" in combined or "related:" in combined:
+                                parcel_source_counts["none_yet"] += 1
+                            else:
+                                parcel_match = re.search(r"\b(\d{10,})\b", combined)
+                                if parcel_match:
+                                    pid = parcel_match.group(1)
+                                    # Skip instrument numbers (start with 2024/2025/2026)
+                                    if not pid[:4] in ("2024", "2025", "2026"):
+                                        record.parcel_id = pid
+                                        parcel_source_counts["summary_digit"] += 1
+                                    else:
+                                        parcel_source_counts["none_yet"] += 1
                                 else:
                                     parcel_source_counts["none_yet"] += 1
-                            else:
-                                parcel_source_counts["none_yet"] += 1
 
                 # Also store the legal description text
                 legal_text = re.search(r"(?:Subdivision|Section|Lot|Block|Plat|Tract)\s+.+", combined, re.IGNORECASE)

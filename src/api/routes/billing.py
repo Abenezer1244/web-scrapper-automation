@@ -426,11 +426,31 @@ async def create_checkout(
     try:
         customer_id = current_user.stripe_customer_id
         if not customer_id:
-            customer = stripe.Customer.create(
-                email=current_user.email,
-                metadata={"user_id": current_user.id},
-            )
-            customer_id = customer.id
+            # C3 (full-SaaS review): check Stripe for an existing
+            # customer with this email before creating a new one.
+            # If one exists AND its metadata matches this user_id,
+            # adopt it — prevents orphaned Stripe customers when a
+            # user completes checkout in multiple browser tabs or
+            # when a prior checkout was abandoned after customer
+            # creation but before success. If an existing customer
+            # has mismatched metadata, we refuse to adopt and
+            # create a fresh one so we never reuse another
+            # account's Stripe customer.
+            existing = stripe.Customer.list(email=current_user.email, limit=5)
+            reusable = None
+            for c in (existing.get("data") or []):
+                md_user_id = (c.get("metadata") or {}).get("user_id")
+                if md_user_id == current_user.id:
+                    reusable = c
+                    break
+            if reusable is not None:
+                customer_id = reusable["id"]
+            else:
+                customer = stripe.Customer.create(
+                    email=current_user.email,
+                    metadata={"user_id": current_user.id},
+                )
+                customer_id = customer["id"]
             result = await db.execute(select(User).where(User.id == current_user.id))
             user = result.scalar_one()
             user.stripe_customer_id = customer_id
@@ -557,6 +577,7 @@ async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
     """Activate new plan after a successful checkout session."""
     user_id = (data.get("metadata") or {}).get("user_id")
     subscription_id = data.get("subscription")
+    session_customer_id = data.get("customer")
 
     if not user_id or not subscription_id:
         return
@@ -574,17 +595,43 @@ async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
     plan_name, records_limit = plan_info
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
-    if user:
-        user.plan = plan_name
-        user.records_limit = records_limit
-        await db.flush()
+    if user is None:
+        _logger.warning(
+            "checkout.session.completed: user %s not found — session=%s",
+            user_id, data.get("id"),
+        )
+        return
 
-        # Sprint 7.3: grant referral credit if this is the referee's
-        # first paid conversion. The unique constraint on
-        # referral_events.referee_id makes this idempotent against
-        # webhook replay.
-        if user.referred_by_user_id:
-            await _grant_referral_credit(db, user)
+    # C3 (full-SaaS review): verify that the Stripe customer on
+    # this session matches (or can be bound to) this BridgeLeads
+    # user. Without this check, a session whose metadata.user_id
+    # was tampered with — or a webhook replayed after the caller
+    # changed the user's stripe_customer_id via a second checkout
+    # flow — could grant a plan to the wrong account. If the user
+    # already has a stripe_customer_id set, it must match the
+    # session customer. If not set, we bind it now.
+    if session_customer_id:
+        if user.stripe_customer_id and user.stripe_customer_id != session_customer_id:
+            _logger.error(
+                "checkout.session.completed: customer_id mismatch for user "
+                "%s — session customer=%s, stored customer=%s. Refusing to "
+                "apply plan change.",
+                user_id, session_customer_id, user.stripe_customer_id,
+            )
+            return
+        if not user.stripe_customer_id:
+            user.stripe_customer_id = session_customer_id
+
+    user.plan = plan_name
+    user.records_limit = records_limit
+    await db.flush()
+
+    # Sprint 7.3: grant referral credit if this is the referee's
+    # first paid conversion. The unique constraint on
+    # referral_events.referee_id makes this idempotent against
+    # webhook replay.
+    if user.referred_by_user_id:
+        await _grant_referral_credit(db, user)
 
 
 _REFERRAL_BONUS_CENTS = 2000  # $20 per successful referral

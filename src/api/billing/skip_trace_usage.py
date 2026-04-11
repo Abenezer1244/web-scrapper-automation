@@ -37,7 +37,12 @@ def _stripe_enabled() -> bool:
     )
 
 
-def report_lookups_for_user(db, user_id: str, new_lookups: int) -> dict:
+def report_lookups_for_user(
+    db,
+    user_id: str,
+    new_lookups: int,
+    queue_id: int | None = None,
+) -> dict:
     """Increment user counter and report over-quota units to Stripe.
 
     Args:
@@ -45,6 +50,9 @@ def report_lookups_for_user(db, user_id: str, new_lookups: int) -> dict:
         user_id: UUID string of the user whose rows were ingested
         new_lookups: Number of rows in the completed Tracerfy batch that
             were attributable to this user
+        queue_id: Tracerfy queue_id for the batch. Used to build a
+            stable Stripe MeterEvent identifier so webhook replay
+            dedupes on Stripe's side. H12 from the full-SaaS review.
 
     Returns:
         Dict with keys:
@@ -109,6 +117,19 @@ def report_lookups_for_user(db, user_id: str, new_lookups: int) -> dict:
         {"used": used_after, "uid": user_id},
     )
 
+    # H11 (full-SaaS review): commit the counter + release the
+    # SELECT FOR UPDATE row lock BEFORE calling Stripe. Previously
+    # we held the lock for the duration of the Stripe API call
+    # (~500ms per user), which serialized concurrent webhook
+    # ingests for the same user and held DB connections open
+    # during every skip-trace meter report. Committing here also
+    # guarantees the counter increment survives even if Stripe is
+    # down — the next cycle will still see used_this_month
+    # advanced correctly. If the Stripe call fails we log an error
+    # but do not raise, since the counter is already committed
+    # and raising would prompt a meaningless rollback.
+    db.commit()
+
     result = {
         "plan": plan,
         "quota": quota,
@@ -141,7 +162,25 @@ def report_lookups_for_user(db, user_id: str, new_lookups: int) -> dict:
         result["error"] = "no_customer_id"
         return result
 
-    # Report to Stripe
+    # Report to Stripe. H12 (full-SaaS review): the identifier must
+    # be STABLE across webhook replays so Stripe's own dedup kicks in.
+    # The old identifier included now.isoformat() which changed on
+    # every retry, so a replayed Tracerfy webhook would create a
+    # new MeterEvent and bill the customer twice. Use
+    # (queue_id, user_id) when queue_id is provided (the webhook
+    # path); fall back to a period-stable key only when called
+    # without queue_id (no current caller, but safe default).
+    if queue_id is not None:
+        stable_identifier = f"skip_trace_q{queue_id}_u{user_id}"
+    else:
+        # Legacy fallback — stable within a billing period but not
+        # across. No current caller hits this path.
+        period_tag = (
+            user_row.skip_trace_period_start.isoformat()
+            if user_row.skip_trace_period_start else "no_period"
+        )
+        stable_identifier = f"skip_trace_legacy_{user_id}_{period_tag}"
+
     try:
         import stripe
         stripe.api_key = settings.STRIPE_SECRET_KEY
@@ -151,7 +190,7 @@ def report_lookups_for_user(db, user_id: str, new_lookups: int) -> dict:
                 "value": str(billable_units),
                 "stripe_customer_id": user_row.stripe_customer_id,
             },
-            identifier=f"skip_trace_{user_id}_{now.isoformat()}",
+            identifier=stable_identifier,
         )
         result["meter_event_id"] = event.get("identifier") or event.get("id")
         _logger.info(
@@ -193,7 +232,9 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
 
     summary = {"queue_id": queue_id, "users": []}
     for row in rows:
-        result = report_lookups_for_user(db, str(row.user_id), row.n)
+        result = report_lookups_for_user(
+            db, str(row.user_id), row.n, queue_id=queue_id
+        )
         summary["users"].append({
             "user_id_prefix": str(row.user_id)[:8],
             "n": row.n,

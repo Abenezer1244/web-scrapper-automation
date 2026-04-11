@@ -14,6 +14,7 @@ app = Celery(
         "src.workers.scheduler",
         "src.workers.skip_trace_dispatcher",
         "src.workers.webhook_delivery",
+        "src.workers.tracerfy_ingest",
     ],
 )
 
@@ -44,6 +45,7 @@ app.conf.task_routes = {
     "src.workers.scheduler.*": {"queue": "celery"},
     "src.workers.skip_trace_dispatcher.*": {"queue": "celery"},
     "src.workers.webhook_delivery.*": {"queue": "celery"},
+    "src.workers.tracerfy_ingest.*": {"queue": "enrichment"},
 }
 
 app.conf.update(

@@ -48,6 +48,7 @@ class EagleWebScraper(BridgeScraper):
         county: str,
         state: str,
         record_types: list[str] | None = None,
+        record_type: str | None = None,
         require_parcel_id: bool = True,
     ):
         super().__init__()
@@ -55,6 +56,12 @@ class EagleWebScraper(BridgeScraper):
         self.county = county
         self.state = state
         self.record_types = record_types or []
+        # active_record_type is the SINGLE record type the caller wants for
+        # this scrape run. When tasks.py dispatches a probate job it passes
+        # record_type="probate" via inspect.signature forwarding; the template
+        # then filters for probate keywords only. Falls back to record_types[0]
+        # so bare-bones probe scripts (and the legacy call site) still work.
+        self.active_record_type = record_type or (self.record_types[0] if self.record_types else None)
         # Some EagleWeb counties (e.g., Thurston) have probate records
         # with no parcel in upstream data — these are pure estate/name
         # filings, not property-linked. Drop them so we only deliver
@@ -145,9 +152,9 @@ class EagleWebScraper(BridgeScraper):
                 except Exception:
                     _logger.warning("Date input not found after navigation back")
 
-            # Fill dates for this chunk
-            # Use first record_type for doc type filtering (e.g., "probate")
-            active_type = self.record_types[0] if self.record_types else "all"
+            # Fill dates for this chunk — use the caller-requested record type
+            # so the filter below only keeps documents matching THAT type.
+            active_type = self.active_record_type or "all"
             await self._configure_search(active_type, cf, ct)
 
             # Submit and extract
@@ -664,18 +671,17 @@ class EagleWebScraper(BridgeScraper):
                     record.legal_description = legal_text.group(0).strip()[:200]
 
                 if record.party_name or record.date_recorded:
-                    # Filter by record type keywords if configured
-                    if self.record_types and self.record_types != ["all"]:
+                    # Filter by the caller-requested record type ONLY. Previously
+                    # this loop OR-combined keywords across self.record_types,
+                    # so a user asking for "probate" on a ['probate','pre_foreclosure']
+                    # connector would get both types mixed. Now active_record_type
+                    # is the single-type request from tasks.py (or the first entry
+                    # in record_types for legacy probe scripts).
+                    active_rt = self.active_record_type
+                    if active_rt and active_rt != "all":
                         doc_upper = desc.upper()
-                        matched = False
-                        for rt in self.record_types:
-                            for kw in _DOC_TYPE_MAP.get(rt, []):
-                                if kw in doc_upper:
-                                    matched = True
-                                    break
-                            if matched:
-                                break
-                        if not matched:
+                        kws = _DOC_TYPE_MAP.get(active_rt, [])
+                        if not any(kw in doc_upper for kw in kws):
                             continue  # Skip non-matching doc types
                     records.append(record)
 

@@ -148,25 +148,32 @@ def _detect_template(base_url: str):
     """
     url_lower = base_url.lower()
 
-    # EagleWeb (Tyler Technologies) — template scraper for all EagleWeb sites.
-    # With Xvfb virtual display, Playwright runs in headed mode which fixes
-    # the JS redirect issue on docSearchPOST.jsp.
-    # Tyler Self-Service uses /web/ paths on tylerhost.net — exclude from EagleWeb
-    selfservice_patterns = ["/web/user/disclaimer", "/web/search/", "selfservice."]
-    if any(p in url_lower for p in selfservice_patterns):
-        return None  # Fall through to AI scraper
-
+    # EagleWeb (Tyler Technologies) — template scraper for EagleWeb sites.
+    # Check EagleWeb patterns FIRST because some installations sit on the
+    # tylerhost.net domain but use the /{county}recorder/web/ path layout
+    # (e.g. grant: grantcountywa-recorder.tylerhost.net/grantrecorder/web/).
+    # Those are EagleWeb even though they share the tylerhost.net domain
+    # with Tyler SelfService.
     eagleweb_patterns = [
         "/recorder/web",
         "recorder/web",     # also matches /thurstonrecorder/web, /grantrecorder/web
         "/eagleweb/",
         "eagleweb.",         # matches eagleweb.co.thurston.wa.us (domain)
-        "tylerhost.net",
         "countygovernmentrecords.com",
     ]
     if any(p in url_lower for p in eagleweb_patterns):
         from src.scrapers.templates.eagleweb import EagleWebScraper
         return EagleWebScraper
+
+    # Tyler SelfService — a separate platform despite the shared vendor.
+    # URLs end in `/Web` (case-insensitive in the url_lower check) and the
+    # portal subdomain is either `*.tylerhost.net` or `selfservice.*`.
+    # Matches okanogan (tylerhost.net/Web), lincoln (tylerhost.net/web/...),
+    # stevens (selfservice.stevenscountywa.gov/web). Grant is NOT matched
+    # here — its /grantrecorder/web/ path was already caught above.
+    if "tylerhost.net" in url_lower or "selfservice." in url_lower:
+        from src.scrapers.templates.tyler_selfservice import TylerSelfServiceScraper
+        return TylerSelfServiceScraper
 
     # LandmarkWeb (Hyland) — King County (and potentially Clark, Snohomish)
     # URL pattern: /LandmarkWeb/

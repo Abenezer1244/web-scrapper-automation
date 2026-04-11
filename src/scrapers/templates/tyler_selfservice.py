@@ -1,0 +1,509 @@
+"""Tyler SelfService template scraper for `*.tylerhost.net/Web` recorder portals.
+
+Covers Tyler SelfService Web installations used by several WA counties:
+Grant, Okanogan, Lincoln, Stevens (initially — potentially more).
+
+This platform is DIFFERENT from Tyler EagleWeb despite sharing a vendor:
+- Disclaimer page: `/Web/user/disclaimer` with `#submitDisclaimerAccept` that
+  is `disabled=true` on load. A client-side script is supposed to enable it
+  on user interaction; in headless Playwright the trigger never fires so we
+  force-enable it via JS before clicking.
+- Search flow goes via Official Records Search → Document Type Search at
+  `/Web/search/DOCSEARCH{ACTIONGROUP}S3`. The ACTIONGROUP id varies per
+  county (e.g. okanogan: 769, grant: TBD). We discover it by following the
+  "Official Records Search" link on the home page.
+- Search form fields are fixed across counties:
+  - `#field_RecDateID_DOT_StartDate` (mm/dd/yyyy)
+  - `#field_RecDateID_DOT_EndDate` (mm/dd/yyyy)
+  - `#field_selfservice_documentTypes` (autocomplete, left empty so we search
+    all types and filter client-side)
+  - Submit via `#searchButton` (an `<a>`, not a `<button>`)
+- Results render via AJAX into `li.ss-search-row` elements — 100 per page.
+  Each row has `data-documentid="DOC{...}"` and `data-href="/Web/document/..."`.
+- Parcel IDs do NOT appear in the search result rows. They live on the
+  detail page, which requires additional server-side session state we
+  don't yet know how to establish programmatically. This first version
+  therefore extracts metadata only (no parcel), relying on
+  require_parcel_id=False so records survive. Detail-page parcel
+  enrichment is TODO.
+
+Volume reference (okanogan 2026-04-11):
+- 30-day total docs: ~537 (all types)
+- 30-day probate-relevant: ~9 (Death Cert, TOD Deed, Personal Rep Deed, Will, CPA)
+- 30-day pre_foreclosure-relevant: ~2 (Notice of Trustee's Sale, Lis Pendens)
+- 90-day probate-relevant: ~63
+"""
+
+import re
+
+from src.api.middleware.security import add_scrape_domain
+from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.utils.logger import setup_logger
+
+_logger = setup_logger("scraper.template.tyler_selfservice")
+
+# Keywords that mark a row as matching each record type. Tyler SelfService
+# doc type labels vary slightly from EagleWeb (e.g. "Personal Representative's
+# Deed" has the apostrophe, "Notice Of Trustee's Sale" is capitalised
+# differently). We match case-insensitively so style differences don't matter.
+_DOC_TYPE_MAP = {
+    "probate": [
+        "PROBATE",
+        "LETTERS TESTAMENTARY",
+        "LETTERS OF ADMINISTRATION",
+        "PERSONAL REPRESENTATIVE",
+        "DEATH CERTIFICATE",
+        "AFFIDAVIT OF HEIRSHIP",
+        "TRANSFER ON DEATH",
+        "COMMUNITY PROPERTY AGREEMENT",
+        "WILL",
+    ],
+    "pre_foreclosure": [
+        "LIS PENDENS",
+        "NOTICE OF TRUSTEE",
+        "TRUSTEE'S SALE",
+        "NOTICE OF DEFAULT",
+        "FORECLOSURE",
+        "NOTICE OF INTENT TO FORFEIT",
+    ],
+    "tax_delinquent": [
+        "TAX LIEN",
+        "CERTIFICATE OF DELINQUENCY",
+        "TREASURER'S DEED",
+    ],
+    "divorce": [
+        "DIVORCE",
+        "DISSOLUTION",
+        "DECREE OF DISSOLUTION",
+    ],
+}
+
+
+class TylerSelfServiceScraper(BridgeScraper):
+    """Template scraper for Tyler SelfService Web recorder installations.
+
+    Zero Claude AI cost — uses standardized selectors for the shared
+    Tyler SelfService interface.
+
+    WARNING (2026-04-11): this version does NOT extract parcel_id — the
+    search-result rows don't contain it and the detail page requires
+    server-side session state we can't yet replicate. Instantiate with
+    require_parcel_id=False to keep records.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        county: str,
+        state: str,
+        record_types: list[str] | None = None,
+        record_type: str | None = None,
+        require_parcel_id: bool = False,
+    ):
+        super().__init__()
+        # Normalise base_url so the rest of the template can build sub-paths
+        # predictably. Connectors in the DB store a variety of URLs for the
+        # same platform — some point to the root /Web, some to /web/ with
+        # lowercase, some to /web/user/disclaimer (the first page a user
+        # lands on). We normalize ALL of them to `https://{host}/Web`, the
+        # canonical entry point, by stripping any path suffix and always
+        # re-appending /Web. This also avoids the "/Web/Web/" double-prefix
+        # bug and the case-sensitivity mismatch between /Web and /web.
+        from urllib.parse import urlparse
+        parsed = urlparse(base_url)
+        scheme = parsed.scheme or "https"
+        host = parsed.netloc
+        if not host:
+            # Tolerate callers that passed a path-only URL
+            raise ValueError(f"Tyler SelfService base_url has no host: {base_url!r}")
+        self.web_root = f"{scheme}://{host}/Web"
+        # base_url is the entry URL we navigate to; Tyler SelfService will
+        # immediately redirect to /Web/user/disclaimer. Both /Web and /web
+        # resolve to the same place on every installation we've seen.
+        self.base_url = self.web_root
+        self.county = county
+        self.state = state
+        self.record_types = record_types or []
+        self.active_record_type = record_type or (self.record_types[0] if self.record_types else None)
+        # Tyler SelfService doesn't expose parcel IDs in search results yet,
+        # so callers must opt INTO parcel dropping. Default is False, which
+        # is the opposite of EagleWebScraper.
+        self.require_parcel_id = require_parcel_id
+
+        from urllib.parse import urlparse
+        domain = urlparse(base_url).hostname
+        if domain:
+            add_scrape_domain(domain)
+
+    async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
+        """Scrape Tyler SelfService records for the given date range.
+
+        Flow:
+        1. Navigate to base_url, get redirected to /Web/user/disclaimer
+        2. Force-enable #submitDisclaimerAccept via JS (the client-side
+           enable script doesn't fire in headless) and click
+        3. Navigate to /Web/ home, find "Official Records Search" link and
+           follow it to discover the ACTIONGROUP id
+        4. Navigate to /Web/search/DOCSEARCH{actionGroup}S3 (Document Type Search)
+        5. Fill date range fields, click #searchButton
+        6. Wait for AJAX response — results render into li.ss-search-row
+        7. Extract metadata from each row
+        8. Paginate by clicking "next" until all pages consumed
+        9. Filter by self.active_record_type keywords client-side
+        """
+        _logger.info(
+            "Tyler SelfService scraper — %s/%s — %s to %s",
+            self.county, self.state, date_from, date_to,
+        )
+
+        # Some Tyler SelfService installations mount at /Web (okanogan) and
+        # others at /web (lincoln, stevens). Try the canonical /Web first,
+        # fall back to /web if we get a 404 / "Not Found" title.
+        await self.navigate(self.base_url)
+        title = (await self.page.title()) or ""
+        if "Not Found" in title or "404" in title:
+            lowercase_root = self.web_root[:-4] + "/web"  # swap "/Web" -> "/web"
+            _logger.info("/Web returned 404, retrying %s", lowercase_root)
+            self.web_root = lowercase_root
+            self.base_url = lowercase_root
+            await self.navigate(lowercase_root)
+
+        # Step 1: disclaimer
+        if not await self._bypass_disclaimer():
+            _logger.error("Disclaimer bypass failed")
+            return []
+
+        # Step 2: find the Official Records Search action group id by walking
+        # the home page. Tyler names links like "Official Records Search" —
+        # the href points to /Web/action/ACTIONGROUP{N}S1 where N is the
+        # county-specific group id. We then swap ACTIONGROUP...S1 for
+        # DOCSEARCH...S3 (Document Type Search).
+        search_url = await self._discover_search_url()
+        if not search_url:
+            _logger.error("Could not discover Document Type Search URL")
+            return []
+
+        _logger.info("Document Type Search URL: %s", search_url)
+        await self.navigate(search_url)
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=15_000)
+        except Exception:
+            pass
+        await self.page.wait_for_timeout(2_000)
+
+        # Step 3: fill dates and submit
+        if not await self._fill_and_submit(date_from, date_to):
+            _logger.warning("Failed to submit search for %s-%s", date_from, date_to)
+            return []
+
+        # Step 4: wait for results to render
+        try:
+            await self.page.wait_for_selector("li.ss-search-row", timeout=15_000)
+        except Exception:
+            page_text = (await self.page.inner_text("body"))[:500]
+            _logger.warning("No result rows appeared. Body starts: %s", page_text)
+            return []
+        await self.page.wait_for_timeout(2_000)
+
+        # Step 5: paginate + extract
+        all_records: list[ScrapedRecord] = []
+        seen_ids: set[str] = set()
+        page_num = 1
+        max_pages = 20  # safety cap — 2000 records for a 30-day window is plenty
+        while page_num <= max_pages:
+            page_records = await self._extract_page()
+            new = 0
+            for r in page_records:
+                did = r.enrichment_data.get("document_id")
+                if did and did in seen_ids:
+                    continue
+                if did:
+                    seen_ids.add(did)
+                all_records.append(r)
+                new += 1
+            _logger.info("Page %d: %d new records (total: %d)", page_num, new, len(all_records))
+
+            if new == 0:
+                break
+
+            if not await self._goto_next_page():
+                break
+            page_num += 1
+
+        # Step 6: filter by active record type
+        filtered = self._filter_by_type(all_records)
+        _logger.info(
+            "Tyler SelfService %s: %d/%d records after %s filter",
+            self.county, len(filtered), len(all_records), self.active_record_type or "none",
+        )
+
+        # Step 7: drop records without parcel_id if opted in (default off for Tyler)
+        if self.require_parcel_id:
+            before = len(filtered)
+            filtered = [r for r in filtered if r.parcel_id]
+            dropped = before - len(filtered)
+            if dropped:
+                _logger.info(
+                    "Dropped %d/%d records with no parcel_id (Tyler SelfService detail fetch not yet implemented)",
+                    dropped, before,
+                )
+
+        return filtered
+
+    async def _bypass_disclaimer(self) -> bool:
+        """Force-enable and click the disclaimer Accept button.
+
+        The client-side `$('#submitDisclaimerAccept').prop('disabled', false)`
+        is supposed to fire on user interaction but doesn't trigger in
+        headless Playwright. We remove the disabled attribute via JS and
+        click. This is safe because the disclaimer is purely informational
+        — no real consent is recorded beyond a cookie that subsequent
+        page loads respect.
+        """
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=10_000)
+        except Exception:
+            pass
+
+        btn = self.page.locator("#submitDisclaimerAccept").first
+        if await btn.count() == 0:
+            # Already past disclaimer (cookie set from prior run)
+            _logger.info("No disclaimer found — assumed already accepted")
+            return True
+
+        await self.page.evaluate(
+            "() => { const b = document.getElementById('submitDisclaimerAccept');"
+            "  if (b) { b.disabled = false; b.removeAttribute('disabled'); } }"
+        )
+
+        try:
+            async with self.page.expect_navigation(timeout=15_000, wait_until="domcontentloaded"):
+                await btn.click()
+        except Exception as exc:
+            _logger.warning("Disclaimer click failed: %s", str(exc)[:120])
+            return False
+
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=10_000)
+        except Exception:
+            pass
+        _logger.info("Disclaimer accepted, now at: %s", self.page.url)
+        return True
+
+    async def _discover_search_url(self) -> str | None:
+        """Walk from /Web/ home to the Document Type Search URL.
+
+        The Tyler SelfService action group id varies per installation
+        (e.g. okanogan: 769). We can't hardcode. Instead we find the
+        "Official Records Search" link on the home page, extract the
+        ACTIONGROUP number from its href, and construct the Document
+        Type Search URL.
+        """
+        # After the disclaimer click, the URL may be left as
+        # "…/Web/user/disclaimer#/Web/" — the hash fragment is NOT a
+        # real navigation, so we force a hard goto to the home page.
+        # web_root is "https://host/Web" (no trailing slash), so
+        # appending "/" gives the Tyler SelfService home URL exactly.
+        home_url = self.web_root + "/"
+        if self.page.url.split("#")[0] != home_url:
+            await self.navigate(home_url)
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=10_000)
+            except Exception:
+                pass
+            await self.page.wait_for_timeout(2_000)
+
+        # Find the Official Records Search link
+        try:
+            href = await self.page.evaluate(
+                """() => {
+                    const anchors = Array.from(document.querySelectorAll('a'));
+                    for (const a of anchors) {
+                        const t = (a.innerText || '').trim();
+                        if (t.startsWith('Official Records Search')) {
+                            return a.getAttribute('href');
+                        }
+                    }
+                    return null;
+                }"""
+            )
+        except Exception as exc:
+            _logger.warning("JS error finding search link: %s", str(exc)[:120])
+            return None
+
+        if not href:
+            _logger.warning("No 'Official Records Search' link on home page")
+            return None
+
+        # href looks like /Web/action/ACTIONGROUP769S1 — extract 769
+        match = re.search(r"ACTIONGROUP(\d+)S", href)
+        if not match:
+            _logger.warning("Unexpected Official Records Search href: %s", href)
+            return None
+        action_id = match.group(1)
+
+        # Derive the Document Type Search URL.
+        # Path is /Web/search/DOCSEARCH{id}S3 (S3 = Document Type Search,
+        # verified on okanogan). web_root already includes the /Web prefix.
+        search_url = f"{self.web_root}/search/DOCSEARCH{action_id}S3"
+        return search_url
+
+    async def _fill_and_submit(self, date_from: str, date_to: str) -> bool:
+        """Fill the date range and click Search.
+
+        Returns True if the AJAX search fired. Detection is by waiting for
+        the result row selector afterwards, not by checking this method.
+        """
+        try:
+            await self.page.wait_for_selector("#field_RecDateID_DOT_StartDate", timeout=10_000)
+        except Exception:
+            _logger.warning("Start date field didn't appear")
+            return False
+
+        try:
+            await self.page.locator("#field_RecDateID_DOT_StartDate").fill(date_from)
+            await self.page.locator("#field_RecDateID_DOT_EndDate").fill(date_to)
+            await self.page.wait_for_timeout(500)
+        except Exception as exc:
+            _logger.warning("Date fill failed: %s", str(exc)[:120])
+            return False
+
+        try:
+            await self.page.locator("#searchButton").click()
+        except Exception as exc:
+            _logger.warning("Search button click failed: %s", str(exc)[:120])
+            return False
+
+        # Search is AJAX — no navigation. The caller waits for results.
+        return True
+
+    async def _extract_page(self) -> list[ScrapedRecord]:
+        """Extract all ss-search-row elements on the current page.
+
+        Tyler SelfService renders each record as an <li class="ss-search-row">
+        with the following structure:
+          - data-documentid: stable document identifier (DOC{...})
+          - data-href: detail page URL (requires session context — TODO)
+          - <h1>: instrument number + doc type
+          - Lists of Recording Date, Grantor, Grantee fields
+
+        Parcel IDs are NOT present at the list level — they're on the
+        detail page only. This extraction returns metadata only for now.
+        """
+        try:
+            raw = await self.page.evaluate(
+                """() => {
+                    const rows = [];
+                    document.querySelectorAll('li.ss-search-row').forEach(li => {
+                        const doc_id = li.getAttribute('data-documentid') || '';
+                        const detail_href = li.getAttribute('data-href') || '';
+                        const h1 = li.querySelector('h1');
+                        const h1_text = h1 ? h1.innerText.replace(/\\s+/g, ' ').trim() : '';
+                        const full_text = li.innerText.replace(/\\r\\n/g, '\\n').trim();
+                        rows.push({doc_id, detail_href, h1_text, full_text});
+                    });
+                    return rows;
+                }"""
+            )
+        except Exception as exc:
+            _logger.warning("Page extraction failed: %s", str(exc)[:120])
+            return []
+
+        records: list[ScrapedRecord] = []
+        for item in raw:
+            doc_id = item.get("doc_id", "")
+            h1_text = item.get("h1_text", "")
+            full_text = item.get("full_text", "")
+            detail_href = item.get("detail_href", "")
+
+            # Parse instrument number + doc type from h1.
+            # Format: "3290696   ·   Boundary Adjustment"
+            # Some rows show just a number then doc type separated by · or -
+            instr_match = re.match(r"^\s*(\d{4,})\s*[\u00B7\-\|]*\s*(.+)$", h1_text)
+            if instr_match:
+                instrument_number = instr_match.group(1).strip()
+                doc_type = instr_match.group(2).strip()
+            else:
+                instrument_number = ""
+                doc_type = h1_text
+
+            # Parse "Recording Date" — text looks like
+            # "Recording Date\n04/10/2026 02:12 PM"
+            date_match = re.search(r"Recording Date\s*\n?\s*(\d{1,2}/\d{1,2}/\d{4})", full_text)
+            date_recorded = date_match.group(1) if date_match else None
+
+            # Parse Grantor(s) — text looks like
+            # "Grantor (2)\nNAME ONE\nNAME TWO"  or  "Grantor\nNAME"
+            grantor = None
+            gm = re.search(r"Grantor(?:\s*\(\d+\))?\s*\n([^\n]+(?:\n[^\n]+)*?)(?=\nGrantee|\n\n|$)", full_text)
+            if gm:
+                lines = [ln.strip() for ln in gm.group(1).splitlines() if ln.strip()]
+                grantor = ", ".join(lines[:5]) if lines else None
+
+            # Parse Grantee(s)
+            grantee = None
+            gem = re.search(r"Grantee(?:\s*\(\d+\))?\s*\n([^\n]+(?:\n[^\n]+)*?)(?=\n\n|$)", full_text)
+            if gem:
+                lines = [ln.strip() for ln in gem.group(1).splitlines() if ln.strip()]
+                grantee = ", ".join(lines[:5]) if lines else None
+
+            record = ScrapedRecord()
+            record.date_recorded = date_recorded
+            record.doc_type = doc_type or None
+            record.party_name = grantor
+            record.heirs = grantee  # reuse heirs field for grantee (matches EagleWeb convention)
+            record.enrichment_data = {
+                "document_id": doc_id,
+                "instrument_number": instrument_number,
+                "detail_href": detail_href,
+                "source": "tyler_selfservice",
+            }
+            records.append(record)
+
+        return records
+
+    async def _goto_next_page(self) -> bool:
+        """Click the 'next' pagination link. Returns False if there is none."""
+        try:
+            # Find all "next" links, pick the first that is both visible
+            # and enabled. On the last page, Tyler SelfService renders the
+            # Next link with display:none so the locator matches but
+            # is_visible() returns False.
+            next_btns = await self.page.locator(
+                "a:has-text('next'), a:has-text('Next')"
+            ).all()
+            clickable = None
+            for btn in next_btns:
+                try:
+                    if await btn.is_visible() and not await btn.is_disabled():
+                        clickable = btn
+                        break
+                except Exception:
+                    continue
+            if clickable is None:
+                return False
+            await clickable.click(timeout=5_000)
+            await self.page.wait_for_timeout(4_000)
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=10_000)
+            except Exception:
+                pass
+            await self.page.wait_for_selector("li.ss-search-row", timeout=10_000)
+            return True
+        except Exception as exc:
+            _logger.info("Pagination ended: %s", str(exc)[:80])
+            return False
+
+    def _filter_by_type(self, records: list[ScrapedRecord]) -> list[ScrapedRecord]:
+        """Keep only records whose doc_type matches the active record type."""
+        if not self.active_record_type or self.active_record_type == "all":
+            return records
+        keywords = _DOC_TYPE_MAP.get(self.active_record_type, [])
+        if not keywords:
+            return records
+        kept = []
+        for r in records:
+            doc = (r.doc_type or "").upper()
+            if any(kw in doc for kw in keywords):
+                kept.append(r)
+        return kept

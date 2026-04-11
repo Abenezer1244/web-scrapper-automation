@@ -175,15 +175,16 @@ class Settings(BaseSettings):
         Upstash Redis uses custom TLS certificates not in the system CA store.
         This is the single place where ssl_cert_reqs is configured.
 
-        L5 (full-SaaS review): passes ssl.CERT_NONE directly instead
-        of the string "none". redis-py coerces the string to the
-        ssl module constant internally, but the direct value is
-        less magic and grep-friendlier for audit.
+        NOTE: redis-py's SSL context builder accepts the STRING
+        "none" (and "required" / "optional") here — not the
+        ssl.CERT_NONE integer constant. Passing ssl.CERT_NONE
+        directly crashes at connect time with
+        "RedisSSLContext object has no attribute cert_reqs".
+        Reverted from L5 after it took down register/login in prod.
         """
-        import ssl
         kwargs: dict = {"decode_responses": decode_responses}
         if self.REDIS_URL.startswith("rediss://"):
-            kwargs["ssl_cert_reqs"] = ssl.CERT_NONE
+            kwargs["ssl_cert_reqs"] = "none"
         return kwargs
 
     def ensure_dirs(self) -> None:

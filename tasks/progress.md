@@ -227,7 +227,7 @@ User asked to:
 
 ## Critical gotchas for the next session
 
-1. **Vercel GitHub integration is broken** — manual `vercel --prod` required for frontend deploys
+1. **Vercel GitHub integration** — FIXED in session 3 (2026-04-11). Root cause was that the Vercel project `prj_d5VDnAKmeI1uUt707VZeHCwV6sRR` had no GitHub repo linked at all (every prior deploy was `source=cli`). Ran `vercel git connect` in the `bridgeleads-web` checkout; Vercel auto-picked `master` as production branch. Verified via empty commit `1df1046` → deployment `bridgeleads-q21x5fjxi` with `source=git`. Pushes to `master` on `Abenezer1244/bridgeleads-web` now auto-deploy. No more manual `vercel --prod`.
 2. **Railway auto-deploys backend** on push to `main`, takes ~60-90s
 3. **`ssl_cert_reqs` must be the STRING `"none"`** in `redis_kwargs`, NOT `ssl.CERT_NONE`. This is counter-intuitive but correct per redis-py's API. Don't "fix" it again.
 4. **Postgres role has BYPASSRLS=true** — RLS policies are defense-in-depth, not enforced. Integration test `tests/test_rls_isolation.py` proves they WOULD work under a non-bypass role. Role downgrade is a future ops task.

@@ -189,13 +189,22 @@ def run_scrape_job(self, job_id: str) -> None:
                     _publish_log(r, job_id, "info", f"Looking up addresses for {page_total} parcels...", db=db)
 
         _publish_log(r, job_id, "info", "Connecting to county portal...", db=db)
-        # Update progress label so the live page shows activity during captcha solve
+        # Update progress label so the live page shows activity during captcha solve.
+        # L7 (full-SaaS review): the previous "rollback() then commit()"
+        # recovery dance is fragile — unpack it into explicit branches
+        # so the intent is grep-friendly.
         job.progress_label = "Connecting to portal..."
         try:
             db.commit()
-        except Exception:
-            try: db.rollback(); db.commit()
-            except Exception: pass
+        except Exception as commit_exc:
+            _logger.warning(
+                "Failed to commit progress_label for job %s: %s",
+                job_id, str(commit_exc)[:120],
+            )
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
         try:
             records = asyncio.run(_run_scraper(scraper_class, date_from, date_to, r, job_id, _on_progress, record_type=matched_record_type))
@@ -1094,41 +1103,48 @@ async def _fetch_parcel_ids_from_arms(results, db, r, job_id: str) -> int:
                 if inst_num not in inst_map:
                     continue
 
-            try:
-                # Select this instrument
-                dropdown = scraper.page.locator("select").first
-                await dropdown.select_option(value=inst_num, timeout=5_000)
-                await scraper.page.wait_for_load_state("load")
-                await scraper.page.wait_for_timeout(500)
-
-                # Click Legal Description tab
-                legal_tab = scraper.page.locator("text=Legal Description").first
-                if await legal_tab.count() > 0:
-                    await legal_tab.click(timeout=3_000)
+                # L9 (full-SaaS review): this try/except was
+                # previously dedented out of the `for inst_num`
+                # loop, so the loop body only ran once per page with
+                # the FINAL inst_num instead of every instrument.
+                # Result: ~90% of instruments per page were never
+                # processed, so Pierce parcel-ID extraction via the
+                # detail dropdown was massively under-performing.
+                try:
+                    # Select this instrument
+                    dropdown = scraper.page.locator("select").first
+                    await dropdown.select_option(value=inst_num, timeout=5_000)
+                    await scraper.page.wait_for_load_state("load")
                     await scraper.page.wait_for_timeout(500)
 
-                # Extract parcel ID
-                parcel_id = await scraper.page.evaluate("""() => {
-                    const cells = document.querySelectorAll('td');
-                    for (let i = 0; i < cells.length; i++) {
-                        if (cells[i].textContent.trim() === 'Parcel Id:' && cells[i+1]) {
-                            return cells[i+1].textContent.trim();
+                    # Click Legal Description tab
+                    legal_tab = scraper.page.locator("text=Legal Description").first
+                    if await legal_tab.count() > 0:
+                        await legal_tab.click(timeout=3_000)
+                        await scraper.page.wait_for_timeout(500)
+
+                    # Extract parcel ID
+                    parcel_id = await scraper.page.evaluate("""() => {
+                        const cells = document.querySelectorAll('td');
+                        for (let i = 0; i < cells.length; i++) {
+                            if (cells[i].textContent.trim() === 'Parcel Id:' && cells[i+1]) {
+                                return cells[i+1].textContent.trim();
+                            }
                         }
-                    }
-                    return null;
-                }""")
+                        return null;
+                    }""")
 
-                if parcel_id and parcel_id.strip():
-                    result = inst_map[inst_num]
-                    result.parcel_id = parcel_id.strip()
-                    db.commit()
-                    found += 1
+                    if parcel_id and parcel_id.strip():
+                        result = inst_map[inst_num]
+                        result.parcel_id = parcel_id.strip()
+                        db.commit()
+                        found += 1
 
-                    if found <= 5 or found % 20 == 0:
-                        _publish_log(r, job_id, "info", f"  {inst_num} → parcel {parcel_id.strip()}", db=db)
+                        if found <= 5 or found % 20 == 0:
+                            _publish_log(r, job_id, "info", f"  {inst_num} → parcel {parcel_id.strip()}", db=db)
 
-            except Exception as exc:
-                _logger.warning("Detail failed for %s: %s", inst_num, str(exc)[:40])
+                except Exception as exc:
+                    _logger.warning("Detail failed for %s: %s", inst_num, str(exc)[:40])
 
             # Navigate to next page of results (to get more instruments in dropdown)
             try:

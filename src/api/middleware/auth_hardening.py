@@ -146,8 +146,20 @@ class BruteForceProtection:
                 try:
                     from src.workers.delivery import send_lockout_notification
                     send_lockout_notification(email, email_failures, ip)
-                except Exception:
-                    pass  # Never let notification failure affect auth flow
+                except Exception as notify_exc:
+                    # L10 (full-SaaS review): never let notification
+                    # failure affect auth flow — but DO log it. The
+                    # previous `except Exception: pass` swallowed
+                    # legitimate coding errors (typo in function
+                    # name, import error) as well as the intended
+                    # transient email failures, making regressions
+                    # invisible until the notification simply
+                    # stopped firing in production.
+                    import logging
+                    logging.getLogger("auth.lockout").warning(
+                        "Lockout notification failed for %s: %s",
+                        email, str(notify_exc)[:200],
+                    )
 
     @staticmethod
     async def clear(ip: str, email: str) -> None:

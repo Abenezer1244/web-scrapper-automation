@@ -2,6 +2,7 @@
 
 import time
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -62,8 +63,6 @@ async def register(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Registration failed. Please try again.",
         )
-
-    from datetime import UTC, datetime, timedelta
 
     trial_end = datetime.now(UTC) + timedelta(days=7)
 
@@ -292,7 +291,10 @@ async def onboarding_status(
         "total": total,
         "progress_pct": int(completed / total * 100),
         "next_action": next_action,
-        "trial_days_remaining": current_user.trial_ends_at and max(0, (current_user.trial_ends_at.replace(tzinfo=None) - __import__("datetime").datetime.utcnow()).days) if current_user.trial_ends_at else None,
+        "trial_days_remaining": (
+            max(0, (current_user.trial_ends_at - datetime.now(UTC)).days)
+            if current_user.trial_ends_at else None
+        ),
     }
 
 

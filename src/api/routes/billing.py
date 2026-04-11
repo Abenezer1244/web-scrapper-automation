@@ -469,7 +469,7 @@ async def create_checkout(
         return {"checkout_url": session.url}
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         _logger.exception("Checkout failed for user %s", current_user.id)
         raise HTTPException(status_code=502, detail="Checkout temporarily unavailable")
 

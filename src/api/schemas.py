@@ -262,6 +262,14 @@ class ResultRow(BaseModel):
     property_address: str | None
     mailing_address: str | None
     enrichment_data: dict[str, Any] | None
+    # Sprint 4: skip trace fields (populated asynchronously via the
+    # dispatcher + Tracerfy webhook ingest path)
+    phone: str | None = None
+    phone_type: str | None = None
+    phone_dnc_flag: bool | None = None
+    email: str | None = None
+    skip_trace_status: str = "not_attempted"  # not_attempted|queued|submitted|hit|miss|errored
+    skip_trace_attempted_at: datetime | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

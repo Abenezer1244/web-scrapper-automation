@@ -18,6 +18,48 @@ stripe.api_key = settings.STRIPE_SECRET_KEY
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
+
+@router.get("/skip-trace-usage")
+async def skip_trace_usage(
+    current_user: CurrentUser,
+) -> dict:
+    """Return the user's skip-trace lookup usage + bundled quota.
+
+    Used by the frontend billing page to render a progress bar and
+    overage estimate. Values are read from the cached counter on the
+    User row — no external calls.
+    """
+    plan = (current_user.plan or "starter").lower()
+    quota = settings.SKIP_TRACE_BUNDLED_QUOTAS.get(plan, 0)
+    used = current_user.skip_trace_used_this_month or 0
+    overage_units = max(0, used - quota)
+
+    # Per-lookup overage rate by plan (see PRD v1.3 §5.4)
+    overage_rate_usd: float | None
+    if plan == "agency":
+        overage_rate_usd = 0.05
+    elif plan in ("pro", "business"):
+        overage_rate_usd = 0.08
+    else:
+        overage_rate_usd = None
+
+    estimated_charges_usd = round(overage_units * (overage_rate_usd or 0), 2)
+
+    return {
+        "plan": plan,
+        "quota": quota,
+        "used": used,
+        "remaining": max(0, quota - used) if quota > 0 else None,
+        "overage_units": overage_units,
+        "overage_rate_usd": overage_rate_usd,
+        "estimated_charges_usd": estimated_charges_usd,
+        "period_start": (
+            current_user.skip_trace_period_start.isoformat()
+            if current_user.skip_trace_period_start
+            else None
+        ),
+    }
+
 # ─── Plan catalog ─────────────────────────────────────────────────────────────
 
 _PLANS = [

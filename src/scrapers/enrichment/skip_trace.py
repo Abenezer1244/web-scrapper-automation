@@ -40,7 +40,11 @@ _ENTITY_TOKENS = {
     "LLC", "L.L.C", "L.L.C.",
     "INC", "INC.",
     "TRUST", "TRUSTEE",
-    "ESTATE", "EST.",
+    # Post-M9 audit: probate scrapers store names like
+    # "INGRAM ROY W EST OF" (Estate Of) — add bare EST so those get
+    # routed to advanced trace rather than a normal-trace attempt
+    # on a deceased person.
+    "ESTATE", "EST.", "EST",
     "LP", "L.P.", "L.P",
     "LLP", "L.L.P.",
     "COMPANY", "CO.",
@@ -57,6 +61,13 @@ _ENTITY_TOKENS = {
     "MORTGAGE",
     "TITLE",
     "INSURANCE",
+    # Probate helpers — "EXEC" / "EXECUTOR" appear in personal
+    # representative filings ("MCCUNE MYRNA J EXEC"). These
+    # identify the estate's representative, not the owner, so
+    # route to advanced trace.
+    "EXEC", "EXECUTOR", "EXECUTRIX",
+    "ADMIN", "ADMINISTRATOR",
+    "PR",  # Personal Representative
 }
 
 
@@ -113,22 +124,37 @@ def address_cache_key(
 # ─── Name splitter ────────────────────────────────────────────────────────────
 
 def split_name(full_name: str | None) -> tuple[str | None, str | None]:
-    """Split 'LAST, FIRST MIDDLE' into (first, last).
+    """Split a grantor name into (first, last) for Tracerfy normal trace.
 
-    Only comma-separated forms are reliably splittable. County
-    recorders vary — some store 'LAST FIRST MIDDLE', others store
-    'FIRST LAST'. When there is no comma we cannot know which
-    convention is in use without a per-county mapping, so we return
-    (None, None) and let the dispatcher route the row through
-    advanced trace instead of guessing and burning Tracerfy credits
-    on the wrong name order.
+    History of this function (read before changing it):
 
-    M9 (full-SaaS review): the previous version assumed 'LAST FIRST'
-    for comma-free names which silently mis-identified non-ARMS
-    names like 'JOHN SMITH' — last=JOHN, first=SMITH — producing
-    garbage Tracerfy matches. Routing those to advanced trace
-    (which uses address-only keying) is both correct and preserves
-    credit spending.
+    The original implementation assumed WA recorder portals store
+    names as 'LAST FIRST MIDDLE' (which is true for ARMS/LandmarkWeb/
+    Helion/AcclaimWeb/EagleWeb). For comma-free 2-token names it
+    returned (tokens[1], tokens[0]).
+
+    M9 of the full-SaaS review flagged this as wrong for
+    'FIRST LAST' convention outside WA and replaced it with a
+    (None, None) return for all comma-free names. That pushed those
+    records to advanced trace.
+
+    Post-M9 audit (this session): the (None, None) fallback was
+    over-aggressive. A query of 7 days of production data showed
+    that ~37% of eligible records have no comma AND look like
+    Seattle code violation case descriptions ('LandLord/Tenant ?
+    419 21ST AVE'), which are neither personal names nor
+    skip-traceable — routing them to advanced just burns more
+    credits. The correct policy is:
+
+      1. Reject non-name patterns at a higher layer (this function
+         does not see record_type, so the caller must filter).
+      2. For genuine personal names, keep the WA-appropriate
+         LAST FIRST heuristic for 2-token comma-free names.
+      3. For 3+ token comma-free names, give up and return None
+         because the split is genuinely ambiguous.
+
+    (2) is restored here. (1) is handled in
+    build_pending_row_payload via looks_like_non_personal_party_name.
     """
     if not full_name:
         return None, None
@@ -141,9 +167,52 @@ def split_name(full_name: str | None) -> tuple[str | None, str | None]:
         first = rest.strip().split()[0] if rest.strip() else None
         return (first or None), (last.strip() or None)
 
-    # No comma: unsplittable without county-specific knowledge.
-    # Return None so the caller routes to advanced trace.
+    # Comma-free: use LAST FIRST heuristic ONLY for clean 2-token
+    # names. 3+ tokens could be "FIRST MIDDLE LAST" or
+    # "LAST FIRST MIDDLE" — too ambiguous, return None.
+    tokens = name.split()
+    if len(tokens) == 2:
+        return tokens[1], tokens[0]
     return None, None
+
+
+def looks_like_non_personal_party_name(name: str | None) -> bool:
+    """Return True when party_name clearly is NOT a human name.
+
+    Code violation scrapers store synthetic values like
+    'LandLord/Tenant ? 419 21ST AVE' or 'Weeds ? 1819 HARVARD AVE'
+    in party_name — there is no real person to trace. Those records
+    should be excluded from skip-trace eligibility entirely, not
+    just routed to advanced. This function is the eligibility gate.
+
+    Heuristics:
+      - Contains a street-address suffix word (AVE/ST/RD/BLVD/DR/LN
+        etc.) — entity/personal names effectively never contain those
+      - Contains common non-name punctuation separators (' ? ',
+        ' - ') followed by digits (address patterns)
+      - Starts with a case-category keyword (LandLord, Weeds,
+        Construction, Tenant, Land Use, Tree, Non-licensed, etc.)
+    """
+    if not name:
+        return False
+    lower = name.lower()
+    # Street-suffix words — a person's legal name does not contain
+    # these in practice. Word-boundary match to avoid false-positives
+    # on things like 'AVERY' (contains 'ave').
+    street_suffixes = (
+        " ave", " ave ", " st ", " rd ", " blvd", " dr ", " ln ",
+        " way", " pl ", " ct ", " ter ", " pkwy", " cir ",
+    )
+    if any(s in f" {lower} " for s in street_suffixes):
+        return True
+    # Case-category prefixes that appear in code_violation party_name
+    if any(lower.startswith(p) for p in (
+        "landlord", "tenant", "weeds", "construction", "land use",
+        "tree", "non-licensed", "project keeps", "noise",
+        "nuisance", "derelict",
+    )):
+        return True
+    return False
 
 
 # ─── Tracerfy batch submit ────────────────────────────────────────────────────
@@ -410,11 +479,25 @@ def download_tracerfy_csv(download_url: str) -> str:
 def build_pending_row_payload(result) -> dict | None:
     """Convert a Result row into the PendingSkipTraceRow kwargs dict.
 
-    Returns None if the Result is not eligible for skip trace (no
-    property_address). The caller is responsible for the actual insert
-    and for the cache lookup before enqueueing.
+    Returns None if the Result is not eligible for skip trace:
+      - No property_address (can't look up owner without one)
+      - party_name is clearly a code-violation case description
+        rather than a person/entity (see
+        looks_like_non_personal_party_name). Those records would
+        burn credits on advanced trace with zero match potential.
+
+    The caller is responsible for the actual insert and for the
+    cache lookup before enqueueing.
     """
     if not result.property_address:
+        return None
+
+    # Post-M9 audit gate: reject records whose party_name is a
+    # code-violation case description ('LandLord/Tenant ? 419 21ST
+    # AVE', 'Weeds ? 1819 HARVARD AVE'). Without this filter those
+    # records still passed eligibility and were routed to advanced
+    # trace, burning ~$0.12 per record for zero hit rate.
+    if looks_like_non_personal_party_name(result.party_name):
         return None
 
     first_name, last_name = split_name(result.party_name)

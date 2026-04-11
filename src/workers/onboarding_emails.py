@@ -84,6 +84,67 @@ h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 12px; }}
     ))
 
 
+# ─── Day 1: "Having trouble getting started?" ──────────────────────────────
+
+def send_day1_nudge(email: str) -> None:
+    """Sent on day 1 to users who haven't created a scraper yet.
+
+    Different from the welcome email (day 0) — this one acknowledges the
+    gap and offers help. Escalation sequence:
+      Day 0: Welcome (send_welcome_email)
+      Day 1: Day-1 nudge (THIS)                — only if zero scrapers
+      Day 3: Activation reminder               — only if no download
+      Day 6-7: Trial expiry warning            — only if trial user
+    """
+    url = f"{settings.FRONTEND_URL}/dashboard"
+    subject = "Need a hand getting your first leads?"
+
+    html_body = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+body {{ font-family: -apple-system, sans-serif; background: #0a0a0b; color: #f0efe8; margin: 0; padding: 40px 20px; }}
+.card {{ {_CARD_STYLE} }}
+.logo {{ font-size: 18px; font-weight: 600; color: #10b981; margin-bottom: 28px; }}
+h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 12px; }}
+.btn {{ {_BTN_STYLE} }}
+.hint {{ background: #0f1a15; border: 1px solid #1f3a2e; border-radius: 8px; padding: 16px 20px; margin: 20px 0; color: #c8c7cf; font-size: 13px; }}
+.foot {{ font-size: 12px; color: #55545e; border-top: 1px solid #2a2a32; padding-top: 20px; margin-top: 8px; }}
+</style></head><body>
+<div class="card">
+  <div class="logo">BridgeLeads</div>
+  <h1>Ready to pull your first leads?</h1>
+  <p style="color: #c8c7cf; font-size: 14px;">
+    You signed up yesterday &mdash; if you haven&rsquo;t run your first
+    scrape yet, we made it a one-click button on your dashboard.
+  </p>
+  <div class="hint">
+    <b style="color: #10b981;">The fastest path:</b> log in, click
+    <i>&ldquo;Run first scrape now&rdquo;</i> on your dashboard. We&rsquo;ll
+    pull the last 90 days of Pierce County probate records &mdash; our
+    highest-enrichment county &mdash; and show them live while they scrape.
+  </div>
+  <a href="{url}" class="btn">Go to dashboard</a>
+  <p style="font-size: 13px; color: #9998a0;">
+    Your free Pro trial is active for 6 more days &mdash; 500 records/month,
+    5 counties, daily auto-scrape.
+  </p>
+  <div class="foot">
+    Stuck on something? Just reply to this email and I&rsquo;ll help directly.
+  </div>
+</div></body></html>"""
+
+    _send(email, subject, html_body, (
+        "Ready to pull your first leads?\n\n"
+        "You signed up yesterday. If you haven't run your first scrape yet,\n"
+        "we made it a one-click button on your dashboard.\n\n"
+        "The fastest path: log in, click 'Run first scrape now'.\n"
+        "We'll pull the last 90 days of Pierce County probate records\n"
+        "and show them live while they scrape.\n\n"
+        f"Go to dashboard: {url}\n\n"
+        "Stuck? Reply to this email."
+    ))
+
+
 # ─── Day 3: Activation nudge ────────────────────────────────────────────────
 
 def send_activation_reminder(email: str, has_scraper: bool, has_download: bool) -> None:

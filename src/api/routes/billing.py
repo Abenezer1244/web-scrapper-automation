@@ -19,6 +19,106 @@ stripe.api_key = settings.STRIPE_SECRET_KEY
 router = APIRouter(prefix="/billing", tags=["billing"])
 
 
+@router.get("/activation-funnel")
+async def activation_funnel(
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    days: int = 30,
+) -> dict:
+    """Sprint 5.5: activation funnel metrics (admin-only).
+
+    Returns the conversion funnel across the last `days` days:
+      signup -> first scraper -> first job -> first download -> paid upgrade
+
+    All derived from existing tables — no new schema needed.
+    Percentages are computed from signup count, so every step shows both
+    an absolute count and a conversion rate from signup.
+    """
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required",
+        )
+
+    if days < 1 or days > 365:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="days must be between 1 and 365",
+        )
+
+    from sqlalchemy import text as sa_text
+
+    # Use raw SQL for the funnel — expresses the intent more clearly
+    # than 5 separate SQLAlchemy expressions.
+    result = await db.execute(
+        sa_text("""
+            WITH window_users AS (
+                SELECT id, plan, created_at
+                FROM users
+                WHERE created_at >= NOW() - (:days || ' days')::interval
+                  AND is_active = true
+            )
+            SELECT
+                -- 1. Signups in window
+                (SELECT COUNT(*) FROM window_users) AS signups,
+
+                -- 2. Users who created at least one scraper_config
+                (SELECT COUNT(DISTINCT u.id)
+                 FROM window_users u
+                 JOIN scraper_configs sc ON sc.user_id = u.id) AS first_scraper,
+
+                -- 3. Users who ran at least one scrape job (any status)
+                (SELECT COUNT(DISTINCT u.id)
+                 FROM window_users u
+                 JOIN jobs j ON j.user_id = u.id) AS first_job,
+
+                -- 4. Users whose job produced a downloadable export
+                (SELECT COUNT(DISTINCT u.id)
+                 FROM window_users u
+                 JOIN jobs j ON j.user_id = u.id
+                 WHERE j.export_key IS NOT NULL) AS first_download,
+
+                -- 5. Users who upgraded to a paid plan (any of pro/business/agency)
+                (SELECT COUNT(*)
+                 FROM window_users
+                 WHERE LOWER(plan) IN ('pro', 'business', 'agency')
+                   AND stripe_customer_id IS NOT NULL) AS paid_upgrade
+        """),
+        {"days": str(days)},
+    )
+    row = result.fetchone()
+    if row is None:
+        return {"days": days, "signups": 0, "funnel": []}
+
+    signups = row.signups or 0
+    first_scraper = row.first_scraper or 0
+    first_job = row.first_job or 0
+    first_download = row.first_download or 0
+    paid_upgrade = row.paid_upgrade or 0
+
+    def _pct(n: int) -> float:
+        return round(100 * n / signups, 1) if signups else 0.0
+
+    return {
+        "days": days,
+        "signups": signups,
+        "funnel": [
+            {"step": "signup", "count": signups, "pct_from_signup": 100.0},
+            {"step": "first_scraper", "count": first_scraper, "pct_from_signup": _pct(first_scraper)},
+            {"step": "first_job", "count": first_job, "pct_from_signup": _pct(first_job)},
+            {"step": "first_download", "count": first_download, "pct_from_signup": _pct(first_download)},
+            {"step": "paid_upgrade", "count": paid_upgrade, "pct_from_signup": _pct(paid_upgrade)},
+        ],
+        # Step-to-step conversion rates (what the dropoff looks like)
+        "step_conversions": {
+            "signup_to_scraper": _pct(first_scraper),
+            "scraper_to_job": round(100 * first_job / first_scraper, 1) if first_scraper else 0.0,
+            "job_to_download": round(100 * first_download / first_job, 1) if first_job else 0.0,
+            "download_to_paid": round(100 * paid_upgrade / first_download, 1) if first_download else 0.0,
+        },
+    }
+
+
 @router.get("/skip-trace-usage")
 async def skip_trace_usage(
     current_user: CurrentUser,

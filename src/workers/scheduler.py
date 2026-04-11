@@ -25,8 +25,14 @@ app.conf.beat_schedule = {
         "schedule": 3600.0,  # every 1 hour
     },
     "reset-monthly-usage": {
+        # H5 (full-SaaS review): daily catch-up instead of cron-on-1st.
+        # The task is idempotent — it only resets users whose
+        # records_period_start is earlier than the current month, so
+        # running it daily has the same net effect when Beat is
+        # healthy and catches up cleanly when Beat was down at the
+        # instant of the 1st-of-month rollover.
         "task": "src.workers.scheduler.reset_monthly_usage",
-        "schedule": crontab(hour=0, minute=0, day_of_month=1),  # 1st of month, midnight UTC
+        "schedule": crontab(hour=0, minute=5),  # 00:05 UTC daily
     },
     "scrape-county-daily": {
         "task": "src.workers.scheduler.scrape_county_daily",
@@ -178,18 +184,35 @@ def watchdog_stuck_jobs() -> None:
     """
     from sqlalchemy import select
 
+    from sqlalchemy import or_
+
     from src.db.models import Job
-    from src.db.session import SyncSessionLocal
+    from src.db.session import system_sync_session
     from src.workers.tasks import run_scrape_job
 
-    stuck_cutoff = datetime.now(UTC) - timedelta(minutes=20)
+    now = datetime.now(UTC)
+    stuck_cutoff = now - timedelta(minutes=20)
+    # A job stuck in 'queued' state with started_at=NULL is a zombie
+    # — the worker died before it could mark the job started. The
+    # old predicate `Job.started_at < stuck_cutoff` returned NULL
+    # for those rows and Postgres filtered them OUT, so they were
+    # invisible to the watchdog forever. H8 from the full-SaaS
+    # review: catch them via a separate "queued forever" branch.
+    queued_cutoff = now - timedelta(minutes=10)
     active_statuses = {"queued", "probing", "scraping", "enriching"}
 
-    with SyncSessionLocal() as db:
+    with system_sync_session() as db:
         stuck_jobs = db.execute(
             select(Job).where(
                 Job.status.in_(active_statuses),
-                Job.started_at < stuck_cutoff,
+                or_(
+                    Job.started_at < stuck_cutoff,
+                    # Zombie: never got a started_at, but was created
+                    # more than 10 minutes ago. A legitimate job goes
+                    # from pending → queued → probing within seconds.
+                    (Job.started_at.is_(None))
+                    & (Job.created_at < queued_cutoff),
+                ),
             )
         ).scalars().all()
 
@@ -290,35 +313,64 @@ async def _canary_scrape(scraper_class, date_from: str, date_to: str) -> list:
         return await scraper.scrape(date_from, date_to)
 
 
-# ─── Task 4: Monthly usage reset ─────────────────────────────────────────────
+# ─── Task 4: Monthly usage reset (daily catch-up) ────────────────────────────
 
 @app.task(name="src.workers.scheduler.reset_monthly_usage")
 def reset_monthly_usage() -> None:
-    """Reset records_used to 0 for all users on the 1st of each month.
+    """Roll over monthly usage counters when the billing period ends.
 
-    Runs at midnight UTC on the 1st. This clears the monthly quota so
-    all plans get a fresh allocation each billing cycle.
+    H5 (full-SaaS review): previously this ran on a crontab at
+    day_of_month=1, hour=0, minute=0. Celery Beat does NOT backfill
+    missed cron ticks — if Beat was down at that instant (Railway
+    redeploy, broker hiccup) the reset was SKIPPED ENTIRELY and every
+    user carried last month's records_used forward into the new
+    month. A user at 500/500 last month started the new month
+    instantly at cap.
+
+    Now runs daily at 00:05 UTC. On each run, finds users whose
+    records_period_start points at a month strictly earlier than
+    this run's current month and resets their counters +
+    advances records_period_start to the first of the current
+    month. Idempotent: a user who was already reset this month
+    has records_period_start = this month and is skipped.
+
+    The same logic applies to skip_trace_used_this_month +
+    skip_trace_period_start for Sprint 4 billing.
     """
-    from sqlalchemy import update
-
-    from src.db.models import User
-    from src.db.session import SyncSessionLocal
-
     from datetime import UTC, datetime
 
-    with SyncSessionLocal() as db:
-        # Reset records_used and Sprint 4 skip_trace_used_this_month
+    from sqlalchemy import text
+
+    from src.db.session import system_sync_session
+
+    now = datetime.now(UTC)
+
+    with system_sync_session() as db:
+        # Truncate to first-of-current-month at UTC. Postgres
+        # date_trunc('month', ...) gives us the boundary.
         result = db.execute(
-            update(User).values(
-                records_used=0,
-                skip_trace_used_this_month=0,
-                skip_trace_period_start=datetime.now(UTC),
-            )
+            text("""
+                WITH period_start AS (
+                    SELECT date_trunc('month', NOW() AT TIME ZONE 'UTC')
+                           AT TIME ZONE 'UTC' AS this_month
+                )
+                UPDATE users
+                SET
+                    records_used = 0,
+                    records_period_start = (SELECT this_month FROM period_start),
+                    skip_trace_used_this_month = 0,
+                    skip_trace_period_start = (SELECT this_month FROM period_start)
+                WHERE
+                    records_period_start IS NULL
+                    OR records_period_start
+                       < (SELECT this_month FROM period_start)
+            """)
         )
         db.commit()
         _logger.info(
-            "Monthly reset complete — cleared records_used + skip_trace_used_this_month for %d users",
-            result.rowcount,
+            "Daily usage rollover: reset %d users whose period_start "
+            "was earlier than %s",
+            result.rowcount, now.isoformat(),
         )
 
 

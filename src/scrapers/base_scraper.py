@@ -124,18 +124,35 @@ class BridgeScraper:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        # H13 (full-SaaS review): defensively close every layer with
+        # individual try/except so a failure on one doesn't skip the
+        # next. Previously a failure in context.close() would skip
+        # browser.close() AND playwright.stop(), leaking Chromium
+        # processes. We also explicitly null the references so a
+        # subsequent __aenter__ on the same instance can re-create
+        # cleanly.
         try:
-            if self._context:
+            if self._context is not None:
                 await self._context.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.warning("context.close failed (leak risk): %s", str(exc)[:120])
+        self._context = None
+
         try:
-            if self._browser:
+            if self._browser is not None:
                 await self._browser.close()
-        except Exception:
-            pass
-        if self._playwright:
-            await self._playwright.stop()
+        except Exception as exc:
+            _logger.warning("browser.close failed (leak risk): %s", str(exc)[:120])
+        self._browser = None
+
+        try:
+            if self._playwright is not None:
+                await self._playwright.stop()
+        except Exception as exc:
+            _logger.warning("playwright.stop failed (leak risk): %s", str(exc)[:120])
+        self._playwright = None
+
+        self.page = None
         _logger.info("Browser context closed")
 
     # ─── Core navigation ──────────────────────────────────────────────────────

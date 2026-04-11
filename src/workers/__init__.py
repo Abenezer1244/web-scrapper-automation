@@ -58,6 +58,14 @@ app.conf.update(
     accept_content=["json"],
     timezone="UTC",
     enable_utc=True,
+    # H13 (full-SaaS review): recycle worker processes after every
+    # 25 completed tasks. Playwright sometimes leaves orphaned
+    # Chromium processes when a task is hard-killed at time_limit,
+    # or when one of the close() calls in base_scraper.__aexit__
+    # fails silently. Recycling the worker process reclaims those
+    # file handles + RAM and prevents a slow memory creep that
+    # ends in OOM on long-running Railway deploys.
+    worker_max_tasks_per_child=25,
 )
 
 

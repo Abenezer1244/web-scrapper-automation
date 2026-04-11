@@ -35,6 +35,12 @@ class User(Base):
     plan = Column(String(32), nullable=False, default="starter")
     records_used = Column(Integer, nullable=False, default=0)
     records_limit = Column(Integer, nullable=False, default=50)
+    # H5 (full-SaaS review): track the start of the current
+    # billing period so the daily reset task can detect a missed
+    # month-boundary reset (Celery Beat downtime on the 1st) and
+    # catch up on the next run instead of silently carrying last
+    # month's records_used forward.
+    records_period_start = Column(DateTime(timezone=True), nullable=True)
     stripe_customer_id = Column(String(64), nullable=True)
     trial_ends_at = Column(DateTime(timezone=True), nullable=True)
     # Sprint 4: skip-trace usage counter for bundled-quota + overage billing

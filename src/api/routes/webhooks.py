@@ -273,6 +273,20 @@ def _ingest_webhook_payload(
             )
         )
 
+        # Sprint 4: report metered usage to Stripe. Only over-quota units
+        # are billed. Below-quota usage increments a counter without
+        # reporting. Any Stripe error is logged and does NOT roll back
+        # the ingest — the phone/email data is still saved.
+        try:
+            from src.api.billing.skip_trace_usage import report_usage_from_webhook
+            billing_summary = report_usage_from_webhook(db, queue_id)
+            _logger.info("Billing summary for queue %d: %s", queue_id, billing_summary)
+        except Exception as exc:
+            _logger.error(
+                "Billing report failed for queue %d: %s (ingest still committed)",
+                queue_id, str(exc)[:200],
+            )
+
         db.commit()
 
     _logger.info(

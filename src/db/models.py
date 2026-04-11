@@ -37,6 +37,9 @@ class User(Base):
     records_limit = Column(Integer, nullable=False, default=50)
     stripe_customer_id = Column(String(64), nullable=True)
     trial_ends_at = Column(DateTime(timezone=True), nullable=True)
+    # Sprint 4: skip-trace usage counter for bundled-quota + overage billing
+    skip_trace_used_this_month = Column(Integer, nullable=False, default=0)
+    skip_trace_period_start = Column(DateTime(timezone=True), nullable=True)
     is_active = Column(Boolean, nullable=False, default=True)
     is_admin = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

@@ -299,10 +299,22 @@ def reset_monthly_usage() -> None:
     from src.db.models import User
     from src.db.session import SyncSessionLocal
 
+    from datetime import UTC, datetime
+
     with SyncSessionLocal() as db:
-        result = db.execute(update(User).values(records_used=0))
+        # Reset records_used and Sprint 4 skip_trace_used_this_month
+        result = db.execute(
+            update(User).values(
+                records_used=0,
+                skip_trace_used_this_month=0,
+                skip_trace_period_start=datetime.now(UTC),
+            )
+        )
         db.commit()
-        _logger.info("Monthly reset complete — cleared records_used for %d users", result.rowcount)
+        _logger.info(
+            "Monthly reset complete — cleared records_used + skip_trace_used_this_month for %d users",
+            result.rowcount,
+        )
 
 
 # ─── Task 5: Expire free trials ──────────────────────────────────────────────

@@ -58,6 +58,22 @@ class Settings(BaseSettings):
     STRIPE_PRODUCT_PRO: str = ""
     STRIPE_PRODUCT_BUSINESS: str = ""
     STRIPE_PRODUCT_AGENCY: str = ""
+    # Sprint 4: Stripe metered billing for skip-trace lookups
+    STRIPE_PRODUCT_SKIP_TRACE: str = ""
+    STRIPE_METER_SKIP_TRACE: str = ""
+    STRIPE_METER_EVENT_NAME_SKIP_TRACE: str = "skip_trace_lookup"
+    STRIPE_PRICE_SKIP_TRACE_PRO: str = ""
+    STRIPE_PRICE_SKIP_TRACE_BUSINESS_OVERAGE: str = ""
+    STRIPE_PRICE_SKIP_TRACE_AGENCY_OVERAGE: str = ""
+    # Bundled monthly quotas by plan — the webhook ingest reports usage
+    # only for lookups BEYOND these quotas. Below the quota, the user is
+    # not billed per-trace (the cost is absorbed into the base plan price).
+    SKIP_TRACE_BUNDLED_QUOTAS: ClassVar[dict[str, int]] = {
+        "starter": 0,
+        "pro": 0,          # Pro pays per-trace from lookup #1
+        "business": 1000,  # Business gets 1000 free/month, then $0.08/trace
+        "agency": 2000,    # Agency gets 2000 free/month, then $0.05/trace
+    }
 
     # ─── Email ────────────────────────────────────────────────────────────────
     RESEND_API_KEY: str = ""

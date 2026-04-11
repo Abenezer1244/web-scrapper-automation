@@ -21,6 +21,13 @@ _ZONES: dict[str, tuple[int, int]] = {
     "auth": (10, 60),       # 10 req/min per IP
     "jobs": (5, 60),        # 5 job creations/min per user
     "general": (60, 60),    # 60 req/min per IP
+    # C5 (full-SaaS review): webhook endpoints were unthrottled.
+    # Legitimate Stripe delivers ~1-2 events/sec to a busy account
+    # with retries; Tracerfy webhooks fire once per batch completion
+    # (minutes apart). 120 req/min per source IP is ample headroom
+    # for both while still blocking attackers who spray invalid
+    # signatures to burn CPU on HMAC verification.
+    "webhook": (120, 60),
 }
 
 _redis_client: aioredis.Redis | None = None

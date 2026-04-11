@@ -29,6 +29,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 
+from src.api.middleware import rate_limit
 from src.config import settings
 from src.utils.logger import setup_logger
 
@@ -58,6 +59,13 @@ async def tracerfy_webhook(
     are unknown, and we don't want to hold the connection open for a
     large CSV parse).
     """
+    # C5 (full-SaaS review): rate-limit BEFORE the secret comparison
+    # so a brute-force loop hitting invalid secrets gets 429'd
+    # quickly. Legitimate Tracerfy deliveries fire once per batch
+    # completion — minutes apart — so the 120/min cap is far above
+    # any normal traffic.
+    await rate_limit(request, zone="webhook")
+
     expected = settings.TRACERFY_WEBHOOK_SECRET
     if not expected:
         _logger.error("Tracerfy webhook hit but TRACERFY_WEBHOOK_SECRET is unset")

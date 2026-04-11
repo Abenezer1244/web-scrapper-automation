@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
+from src.api.middleware import rate_limit
 from src.config import settings
 from src.db import User, get_db
 from src.api.deps import get_rls_db
@@ -489,6 +490,12 @@ async def stripe_webhook(
     if not settings.STRIPE_WEBHOOK_SECRET or len(settings.STRIPE_WEBHOOK_SECRET) < 20:
         raise HTTPException(status_code=503, detail="Webhook not configured")
 
+    # C5 (full-SaaS review): rate-limit BEFORE the HMAC check so that
+    # a flood of invalid-signature requests can't burn CPU. Stripe
+    # sends legitimate webhooks at well under the 120/min cap; an
+    # attacker spraying bogus events gets 429'd quickly.
+    await rate_limit(request, zone="webhook")
+
     payload = await request.body()
 
     try:
@@ -501,17 +508,30 @@ async def stripe_webhook(
             detail="Invalid webhook signature",
         )
 
-    # Idempotency: skip duplicate webhook deliveries
+    # Idempotency: skip duplicate webhook deliveries. Uses SET NX EX
+    # (atomic set-if-not-exists with TTL) so two Stripe retries
+    # delivered within milliseconds of each other cannot both pass
+    # the check — the second call returns None from .set() and we
+    # bail. The prior get-then-setex pattern was racy and allowed
+    # duplicate plan updates + duplicate notification emails when
+    # Stripe's retry latency overlapped request processing. C4 from
+    # the full-SaaS review. Stripe retries for up to 3 days, so we
+    # keep the TTL at 3 days to cover the full retry window.
     import redis.asyncio as aioredis
     redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-    event_id = event.get("id", "")
-    if event_id:
-        dedup_key = f"stripe_event:{event_id}"
-        if await redis.get(dedup_key):
-            await redis.aclose()
-            return {"received": True}
-        await redis.setex(dedup_key, 3600, "1")
-    await redis.aclose()
+    try:
+        event_id = event.get("id", "")
+        if event_id:
+            dedup_key = f"stripe_event:{event_id}"
+            # set(..., nx=True, ex=N) returns True on first write,
+            # None on conflict. On conflict we've already processed
+            # this event — return success so Stripe stops retrying.
+            claimed = await redis.set(dedup_key, "1", nx=True, ex=259200)  # 3 days
+            if not claimed:
+                _logger.info("stripe webhook dedup: already processed %s", event_id)
+                return {"received": True}
+    finally:
+        await redis.aclose()
 
     event_type: str = event["type"]
     data: dict = event["data"]["object"]
@@ -590,27 +610,38 @@ async def _grant_referral_credit(db: AsyncSession, referee: User) -> None:
     if referrer is None:
         return  # Referrer was deleted between signup and conversion
 
-    # Create the audit-log row first. If it conflicts on the unique
-    # constraint (webhook replay), we bail without touching the
-    # running balance.
+    # Create the audit-log row inside a SAVEPOINT so that a duplicate
+    # (webhook replay hitting the unique constraint on referee_id)
+    # only rolls back the INSERT, not the enclosing transaction.
+    # Without the savepoint, `db.rollback()` after the IntegrityError
+    # would throw away the plan upgrade and records_limit change that
+    # _handle_checkout_completed just flushed — silently reverting a
+    # paid user to their old plan on every Stripe retry. CRIT-1 from
+    # the Sprint 7.3 code review.
     event = ReferralEvent(
         referrer_id=referrer.id,
         referee_id=referee.id,
         amount_cents=_REFERRAL_BONUS_CENTS,
         reason="referee_converted_to_paid",
     )
-    db.add(event)
     try:
-        await db.flush()
+        async with db.begin_nested():
+            db.add(event)
+            # flush is implicit at savepoint exit, but being explicit
+            # makes the IntegrityError surface here rather than later
+            await db.flush()
     except IntegrityError:
-        await db.rollback()
         _logger.info(
             "referral: duplicate grant ignored referee=%s", referee.id
         )
         return
 
     # Atomic increment on the referrer's balance so concurrent
-    # grants from different referees don't race.
+    # grants from different referees don't race. Kept outside the
+    # savepoint — if this UPDATE fails, the whole webhook transaction
+    # should roll back (caller will see the exception and Stripe will
+    # retry) because we absolutely cannot have an audit-log row
+    # without a matching balance increment.
     from sqlalchemy import update as sa_update
     await db.execute(
         sa_update(User)

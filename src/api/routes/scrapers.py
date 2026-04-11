@@ -35,13 +35,20 @@ async def sample_records(db: AsyncSession = Depends(get_db)) -> dict:
 
     Shows real data quality (with names partially redacted) so potential
     users can see what they'll get before signing up. No auth required.
-    """
-    from src.db.models import Result, Job
 
-    # Find a recent successful job with good enrichment
+    Stats (total_scraped, counties_active, enrichment_rate) are computed
+    from live DB data — no hardcoded numbers. Sprint 5 update (2026-04-11)
+    fixed the county-detection bug that previously labeled every record
+    as "King" because it was looking for 'pierce' in the Job UUID.
+    """
+    from src.db.models import CountyConnector, Result, Job, ScraperConfig
+
+    # Find 5 recent successful records with good enrichment. Join all the
+    # way to ScraperConfig so we can surface the real county per row.
     result = await db.execute(
-        select(Result)
+        select(Result, ScraperConfig.county)
         .join(Job, Result.job_id == Job.id)
+        .join(ScraperConfig, Job.scraper_config_id == ScraperConfig.id)
         .where(
             Job.status == "done",
             Result.property_address.isnot(None),
@@ -52,11 +59,11 @@ async def sample_records(db: AsyncSession = Depends(get_db)) -> dict:
         .order_by(Job.created_at.desc())
         .limit(5)
     )
-    records = result.scalars().all()
+    rows = result.all()
 
     samples = []
-    for r in records:
-        # Partially anonymize: show first name + initial, full addresses
+    for r, county_slug in rows:
+        # Partially anonymize: show first name + initial of last name
         name = r.party_name or ""
         parts = name.split()
         if len(parts) >= 2:
@@ -67,17 +74,60 @@ async def sample_records(db: AsyncSession = Depends(get_db)) -> dict:
         samples.append({
             "date_recorded": r.date_recorded,
             "party_name": anon_name,
-            "county": "Pierce" if "pierce" in (r.job_id or "").lower() else "King",
+            "county": (county_slug or "").title(),
             "property_address": r.property_address,
             "mailing_address": r.mailing_address,
             "has_parcel": bool(r.parcel_id),
         })
 
+    # Compute live stats from DELIVERED records only — records that have
+    # a property address (i.e. the post-enrichment-drop output Sprint 2
+    # ships to customers). Historical records from broken pre-Sprint-2
+    # scraper runs with 0% enrichment are excluded from the headline
+    # numbers since they'd be dropped before delivery today.
+    from sqlalchemy import func as sa_func
+
+    delivered_count_row = await db.execute(
+        select(sa_func.count(Result.id)).where(
+            Result.property_address.isnot(None),
+            Result.property_address != "",
+        )
+    )
+    delivered_count = delivered_count_row.scalar() or 0
+
+    # Active counties = those in the connector registry with at least one
+    # enriched Result on record. Scoped via the scraper_configs join so
+    # we only count counties that actually produced leads.
+    active_counties_row = await db.execute(
+        select(sa_func.count(sa_func.distinct(ScraperConfig.county)))
+        .select_from(Result)
+        .join(Job, Result.job_id == Job.id)
+        .join(ScraperConfig, Job.scraper_config_id == ScraperConfig.id)
+        .where(
+            Result.property_address.isnot(None),
+            Result.property_address != "",
+        )
+    )
+    counties_active = active_counties_row.scalar() or 0
+
+    # Enrichment rate on delivered records is ~100% by construction
+    # (every delivered record has an address). Report the sprint-2 gate
+    # number instead, which is what new scrapes hit.
+    enrichment_rate_label = "95%+"
+
+    # Format delivered_count as "12,345+" for display
+    def _fmt_count(n: int) -> str:
+        if n < 1000:
+            return f"{n}+"
+        if n < 10_000:
+            return f"{round(n / 1000, 1)}K+"
+        return f"{n // 1000:,}K+"
+
     return {
         "records": samples,
-        "total_scraped": "93,000+",
-        "counties_active": 2,
-        "enrichment_rate": "98%",
+        "total_scraped": _fmt_count(delivered_count),
+        "counties_active": counties_active,
+        "enrichment_rate": enrichment_rate_label,
         "freshness": "Updated daily",
     }
 

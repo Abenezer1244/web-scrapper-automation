@@ -57,3 +57,31 @@ app.conf.update(
     timezone="UTC",
     enable_utc=True,
 )
+
+
+# ─── SSRF allowlist bootstrap ────────────────────────────────────────────────
+# Load every active county connector's base_url hostname into the
+# SSRF allowlist when a worker boots. Connectors seeded via Alembic
+# migration or scripts never pass through the API route that calls
+# validate_scraping_target(), so without this hook the scrape worker
+# would throw "Scraping target not in approved domain list" on the
+# first scrape of any un-template-matched AI connector. See Sprint
+# 6.3 Phase 3 audit in docs/compliance/connector-audit-2026-04-10.md
+from celery.signals import worker_ready  # noqa: E402
+
+
+@worker_ready.connect
+def _bootstrap_ssrf_allowlist(sender=None, **_kwargs) -> None:
+    """Register all active connector domains with the SSRF allowlist.
+
+    Runs once per worker process at startup. Failures are logged and
+    swallowed so a transient DB issue does not block worker boot.
+    """
+    try:
+        from src.api.middleware import register_connector_domains_from_db
+        register_connector_domains_from_db()
+    except Exception as exc:  # noqa: BLE001 — defensive
+        import logging
+        logging.getLogger("worker.bootstrap").warning(
+            "Connector domain registration skipped at worker boot: %s", exc
+        )

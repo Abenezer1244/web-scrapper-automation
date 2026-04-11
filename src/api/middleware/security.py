@@ -122,6 +122,61 @@ def lock_scrape_domains() -> None:
     _DOMAIN_REGISTRATION_LOCKED = True
 
 
+def register_connector_domains_from_db() -> int:
+    """Load every active connector's base_url hostname into the allowlist.
+
+    Connectors seeded via Alembic migration or scripts never pass through
+    the API route that calls ``validate_scraping_target``. Without this
+    function the first scrape attempt for each such connector throws
+    ``Scraping target not in approved domain list``, even when the
+    scraper would otherwise work. Call from both the FastAPI ``lifespan``
+    hook and Celery ``worker_ready`` so every process starts with a
+    complete allowlist.
+
+    Returns the number of domains newly added. Safe to call multiple
+    times — already-registered domains are a no-op.
+
+    Failures (DB unreachable, bad row, etc.) are logged and swallowed so
+    a misconfigured DB does not block app startup. Scrapers that hit an
+    un-allowlisted domain will still fail safely at the validator.
+    """
+    import logging
+
+    log = logging.getLogger("security.ssrf")
+    added = 0
+    try:
+        from src.db.models import CountyConnector
+        from src.db.session import SyncSessionLocal
+
+        with SyncSessionLocal() as db:
+            rows = db.query(CountyConnector).filter(CountyConnector.active).all()
+            for row in rows:
+                url = (row.base_url or "").strip()
+                if not url:
+                    continue
+                try:
+                    parsed = urlparse(url)
+                    hostname = (parsed.hostname or "").lower()
+                    if not hostname:
+                        continue
+                    before = len(_ALLOWED_SCRAPE_DOMAINS)
+                    add_scrape_domain(hostname)
+                    if len(_ALLOWED_SCRAPE_DOMAINS) > before:
+                        added += 1
+                except Exception as exc:  # noqa: BLE001 — defensive
+                    log.warning(
+                        "Failed to register connector domain %s (%s/%s): %s",
+                        url, row.county, row.state, exc,
+                    )
+        log.info(
+            "SSRF allowlist: registered %d new connector domains (total: %d)",
+            added, len(_ALLOWED_SCRAPE_DOMAINS),
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive
+        log.warning("register_connector_domains_from_db skipped: %s", exc)
+    return added
+
+
 # ─── CSV / Formula Injection Prevention ──────────────────────────────────────
 
 _FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")

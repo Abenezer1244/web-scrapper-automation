@@ -220,17 +220,32 @@ async def create_scraper(
 
 @router.get("/connectors", response_model=list[ConnectorResponse])
 async def list_connectors(
+    include_all: bool = False,
     db: AsyncSession = Depends(get_db),
 ) -> list[ConnectorResponse]:
-    """Return all active county connectors. Used by the frontend county picker.
+    """Return county connectors for the frontend county picker.
 
-    Public endpoint — no auth required so the county browser loads for anonymous visitors.
+    Public endpoint — no auth required so the county browser loads for
+    anonymous visitors.
+
+    By default returns only connectors whose canary health check has
+    most recently marked them as ``healthy`` — meaning the scraper is
+    working and the portal was reachable with non-zero records on the
+    last probe. This prevents users from selecting counties that are
+    currently broken or genuinely have no data flowing.
+
+    Pass ``?include_all=true`` to list every active connector
+    regardless of health — useful for admin tooling and the support
+    team when investigating county-specific issues.
+
+    See ``docs/compliance/connector-audit-2026-04-10.md`` for why this
+    filter exists.
     """
-    result = await db.execute(
-        select(CountyConnector)
-        .where(CountyConnector.active)
-        .order_by(CountyConnector.state, CountyConnector.county)
-    )
+    query = select(CountyConnector).where(CountyConnector.active)
+    if not include_all:
+        query = query.where(CountyConnector.health_status == "healthy")
+    query = query.order_by(CountyConnector.state, CountyConnector.county)
+    result = await db.execute(query)
     return [ConnectorResponse.model_validate(c) for c in result.scalars().all()]
 
 

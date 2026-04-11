@@ -256,12 +256,17 @@ def canary_check() -> None:
                 scraper_class, _ = get_scraper_class(
                     connector.county, connector.state, connector.record_types[0]
                 )
-                # Probe a single day to minimise load on county portal
+                # Probe a 7-day window. A 1-day window produces
+                # false-positive "degraded" statuses for rural counties
+                # that routinely file 0 probates or pre-foreclosures on
+                # a given day. 7 days is short enough to stay cheap but
+                # long enough that any county with meaningful filing
+                # volume will return at least one record when healthy.
                 today = datetime.now(UTC).date()
-                yesterday = today - timedelta(days=1)
+                week_ago = today - timedelta(days=7)
 
                 records = asyncio.run(
-                    _canary_scrape(scraper_class, yesterday.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y"))
+                    _canary_scrape(scraper_class, week_ago.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y"))
                 )
                 connector.health_status = "healthy" if records else "degraded"
                 _logger.info(

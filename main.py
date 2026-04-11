@@ -18,6 +18,14 @@ from src.config import settings
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.ensure_dirs()
+    # Load every active county connector's domain into the SSRF
+    # allowlist. Connectors seeded via Alembic migration never pass
+    # through the API route that calls validate_scraping_target(), so
+    # without this call the scrape worker would reject them with
+    # "Scraping target not in approved domain list". See Sprint 6.3
+    # Phase 3 audit in docs/compliance/connector-audit-2026-04-10.md
+    from src.api.middleware import register_connector_domains_from_db
+    register_connector_domains_from_db()
     yield
 
 

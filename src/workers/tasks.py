@@ -327,6 +327,53 @@ def run_scrape_job(self, job_id: str) -> None:
                 _logger.warning("Email delivery failed (non-fatal): %s", email_exc)
                 _publish_log(r, job_id, "warning", "Email delivery unavailable", db=db)
 
+        # ── SPRINT 6.5: WEBHOOK DELIVERY ───────────────────────────────────────
+        # Business+ plan feature (gated at scraper config creation time).
+        # Fire-and-forget via Celery so retries happen on the celery queue
+        # independently of the scrape job. Non-fatal: webhook failures
+        # must never mark the scrape job as errored.
+        webhook_url = deliver_config.get("webhook_url")
+        if webhook_url and object_key:
+            try:
+                from src.workers.webhook_delivery import (
+                    build_webhook_payload,
+                    deliver_job_webhook,
+                )
+                signed_download = exporter.get_download_url(object_key, expires_in=172800)
+                webhook_secret = deliver_config.get("webhook_secret")
+                payload = build_webhook_payload(
+                    job_id=job_id,
+                    scraper_config_id=str(config.id),
+                    scraper_name=config.name,
+                    county=config.county,
+                    state=config.state,
+                    record_type=config.record_type,
+                    status="done",
+                    record_count=len(records),
+                    started_at=job.started_at,
+                    finished_at=_now(),
+                    export_key=object_key,
+                    fmt=fmt,
+                    download_url=signed_download,
+                    webhook_secret=webhook_secret,
+                )
+                deliver_job_webhook.delay(job_id, webhook_url, payload)
+                _publish_log(
+                    r, job_id, "info",
+                    f"Webhook queued for delivery to {webhook_url[:60]}",
+                    db=db,
+                )
+            except Exception as webhook_exc:
+                _logger.warning(
+                    "Webhook enqueue failed (non-fatal) for job %s: %s",
+                    job_id, str(webhook_exc)[:200],
+                )
+                _publish_log(
+                    r, job_id, "warning",
+                    "Webhook queue unavailable — job completed successfully",
+                    db=db,
+                )
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 

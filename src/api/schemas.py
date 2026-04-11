@@ -88,12 +88,40 @@ class DeliverConfig(BaseModel):
     emails: list[EmailStr] = []
     formats: list[str] = ["csv"]    # csv | excel | json (one or more)
     webhook_url: str | None = None
+    # Sprint 6.5: optional HMAC-SHA256 shared secret. When set, every
+    # webhook POST carries an `X-BridgeLeads-Signature` header and
+    # `signature` field that the consumer can verify against the secret
+    # using sha256(secret, canonical_json_payload). Empty = unsigned
+    # (relies on URL secrecy alone). Min 24 chars when set.
+    webhook_secret: str | None = None
 
     @field_validator("emails")
     @classmethod
     def limit_recipients(cls, v: list) -> list:
         if len(v) > 10:
             raise ValueError("Maximum 10 delivery email addresses")
+        return v
+
+    @field_validator("webhook_url")
+    @classmethod
+    def webhook_url_format(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if not (v.startswith("https://") or v.startswith("http://")):
+            raise ValueError("webhook_url must start with http:// or https://")
+        if len(v) > 2000:
+            raise ValueError("webhook_url too long (max 2000 chars)")
+        return v
+
+    @field_validator("webhook_secret")
+    @classmethod
+    def webhook_secret_length(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if len(v) < 24:
+            raise ValueError("webhook_secret must be at least 24 characters")
+        if len(v) > 256:
+            raise ValueError("webhook_secret too long (max 256 chars)")
         return v
 
 

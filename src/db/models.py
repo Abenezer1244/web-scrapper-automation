@@ -128,10 +128,54 @@ class Result(Base):
     email = Column(String(255), nullable=True)
     skip_trace_status = Column(String(16), nullable=False, default="not_attempted")
     skip_trace_attempted_at = Column(DateTime(timezone=True), nullable=True)
+    # Sprint 6.4: cross-job deduplication
+    dedup_hash = Column(String(64), nullable=True, index=True)
+    is_duplicate = Column(Boolean, nullable=False, default=False)
     raw_html_hash = Column(String(32), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     job = relationship("Job", back_populates="results")
+
+
+class DeliveredRecord(Base):
+    """Append-only log of (user_id, dedup_hash) pairs (Sprint 6.4).
+
+    Unique constraint on (user_id, dedup_hash) — the first successful
+    INSERT for a given hash wins. Subsequent scrape runs that produce
+    the same parcel_id + property_address hash get an ON CONFLICT and
+    the worker flags the new Result as is_duplicate=true.
+
+    Duplicates are still stored in `results` (so the UI can show
+    "3 duplicate leads filtered this run" for transparency) but they
+    do NOT count against the user's monthly records quota.
+    """
+
+    __tablename__ = "delivered_records"
+    __table_args__ = (
+        UniqueConstraint("user_id", "dedup_hash", name="uq_delivered_records_user_hash"),
+    )
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    dedup_hash = Column(String(64), nullable=False)
+    first_result_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("results.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    first_job_id = Column(UUID(as_uuid=False), nullable=True)
+    parcel_id = Column(String(64), nullable=True)
+    property_address = Column(String(512), nullable=True)
+    first_delivered_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
 
 
 class CountyConnector(Base):

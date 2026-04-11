@@ -201,12 +201,32 @@ def run_scrape_job(self, job_id: str) -> None:
         def _trunc(val: str | None, max_len: int) -> str | None:
             return val[:max_len] if val and len(val) > max_len else val
 
+        import hashlib
+        import re as _re
         import uuid as _uuid
+
+        def _compute_dedup_hash(parcel_id: str | None, property_address: str | None) -> str | None:
+            """Sprint 6.4: canonical dedup key.
+
+            Joins normalized (parcel_id, property_address) and hashes with
+            sha256. Resilient to whitespace, punctuation, and case variation
+            across repeat scrapes of the same parcel. Returns None if both
+            inputs are empty — those records can't be deduped reliably.
+            """
+            parcel = (parcel_id or "").strip().upper().replace("-", "").replace(" ", "")
+            addr = (property_address or "").strip().upper()
+            addr = _re.sub(r"[\.,#]", " ", addr)
+            addr = _re.sub(r"\s+", " ", addr).strip()
+            if not parcel and not addr:
+                return None
+            key = f"{parcel}|{addr}"
+            return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
         # Bulk insert using execute + multi-row VALUES (much faster than db.add loop)
         from sqlalchemy import insert as sa_insert
 
         batch_size = 1000
+        total_rows_inserted = 0
         for i in range(0, len(records), batch_size):
             batch = records[i:i + batch_size]
             rows = [
@@ -223,13 +243,121 @@ def run_scrape_job(self, job_id: str) -> None:
                     "mailing_address": _trunc(rec.mailing_address, 512),
                     "enrichment_data": rec.enrichment_data or {},
                     "raw_html_hash": rec.raw_html_hash,
+                    # Sprint 6.4: dedup hash computed now, duplicate flag
+                    # resolved in the post-insert dedup scan below
+                    "dedup_hash": _compute_dedup_hash(rec.parcel_id, rec.property_address),
+                    "is_duplicate": False,
                 }
                 for rec in batch
             ]
             db.execute(sa_insert(Result), rows)
             db.commit()
+            total_rows_inserted += len(rows)
 
-        _publish_log(r, job_id, "success", f"{len(records)} records saved", db=db)
+        # ── SPRINT 6.4: CROSS-JOB DEDUPLICATION ────────────────────────────
+        # For each newly-inserted Result that has a dedup_hash, try to
+        # INSERT into delivered_records. PostgreSQL's ON CONFLICT DO
+        # NOTHING tells us which rows were successfully claimed (first
+        # delivery) vs which conflicted (user has seen this lead before).
+        # The conflicting rows get their Result flagged is_duplicate=true.
+        _publish_log(r, job_id, "info", "Checking for duplicate leads...", db=db)
+
+        # Step 1: pull the freshly-inserted results back so we have their
+        # Result.id for the first_result_id foreign key
+        from sqlalchemy import text as sa_text
+        fresh_rows = db.execute(
+            sa_text("""
+                SELECT id, dedup_hash, parcel_id, property_address
+                FROM results
+                WHERE job_id = :jid AND dedup_hash IS NOT NULL
+            """),
+            {"jid": job_id},
+        ).fetchall()
+
+        dup_count = 0
+        unique_count = 0
+        if fresh_rows:
+            # Step 2: single batched upsert into delivered_records.
+            # ON CONFLICT DO NOTHING is the atomic "claim first delivery"
+            # primitive — the unique (user_id, dedup_hash) constraint
+            # guarantees exactly one winner per lead per user.
+            # RETURNING tells us which hashes were actually inserted
+            # (the "first delivery" ones) so we can derive duplicates
+            # via set difference.
+            insert_payload = [
+                {
+                    "id": str(_uuid.uuid4()),
+                    "user_id": str(job.user_id),
+                    "dedup_hash": row.dedup_hash,
+                    "first_result_id": str(row.id),
+                    "first_job_id": job_id,
+                    "parcel_id": row.parcel_id,
+                    "property_address": row.property_address,
+                }
+                for row in fresh_rows
+            ]
+            # Batch in groups of 500 to keep the SQL statement reasonable
+            claimed_hashes: set[str] = set()
+            for j in range(0, len(insert_payload), 500):
+                chunk = insert_payload[j:j + 500]
+                values_sql = ",".join(
+                    f"(:id_{k}, :user_id_{k}, :dedup_hash_{k}, :first_result_id_{k}, "
+                    f":first_job_id_{k}, :parcel_id_{k}, :property_address_{k}, NOW())"
+                    for k in range(len(chunk))
+                )
+                params = {}
+                for k, c in enumerate(chunk):
+                    params[f"id_{k}"] = c["id"]
+                    params[f"user_id_{k}"] = c["user_id"]
+                    params[f"dedup_hash_{k}"] = c["dedup_hash"]
+                    params[f"first_result_id_{k}"] = c["first_result_id"]
+                    params[f"first_job_id_{k}"] = c["first_job_id"]
+                    params[f"parcel_id_{k}"] = c["parcel_id"]
+                    params[f"property_address_{k}"] = c["property_address"]
+
+                result = db.execute(
+                    sa_text(f"""
+                        INSERT INTO delivered_records
+                            (id, user_id, dedup_hash, first_result_id,
+                             first_job_id, parcel_id, property_address,
+                             first_delivered_at)
+                        VALUES {values_sql}
+                        ON CONFLICT (user_id, dedup_hash) DO NOTHING
+                        RETURNING dedup_hash
+                    """),
+                    params,
+                )
+                for row in result.fetchall():
+                    claimed_hashes.add(row.dedup_hash)
+            db.commit()
+
+            # Step 3: any fresh Result whose dedup_hash is NOT in claimed_hashes
+            # was a duplicate. Mark those rows.
+            duplicate_result_ids = [
+                str(row.id) for row in fresh_rows
+                if row.dedup_hash not in claimed_hashes
+            ]
+            unique_count = len(claimed_hashes)
+            dup_count = len(duplicate_result_ids)
+
+            if duplicate_result_ids:
+                # Batch the UPDATE to avoid an IN clause explosion
+                for j in range(0, len(duplicate_result_ids), 500):
+                    chunk = duplicate_result_ids[j:j + 500]
+                    db.execute(
+                        sa_text(
+                            "UPDATE results SET is_duplicate = true "
+                            "WHERE id = ANY(:ids)"
+                        ),
+                        {"ids": chunk},
+                    )
+                db.commit()
+
+        _publish_log(
+            r, job_id, "success",
+            f"{len(records)} records saved ({unique_count} new leads, {dup_count} duplicates)",
+            db=db,
+        )
 
         # ── EXPORT ────────────────────────────────────────────────────────────
         deliver_config = config.deliver or {}
@@ -252,12 +380,17 @@ def run_scrape_job(self, job_id: str) -> None:
         finally:
             local_file.unlink(missing_ok=True)
 
-        # Atomic update of monthly record usage
+        # Atomic update of monthly record usage.
+        # Sprint 6.4: duplicates delivered to this user in a prior scrape
+        # do NOT count against the monthly quota. Records without a
+        # dedup_hash (no parcel AND no address) still count, because
+        # they are genuinely new data even though we can't dedupe them.
+        billable_count = len(records) - dup_count
         from sqlalchemy import update as sa_update
         db.execute(
             sa_update(User)
             .where(User.id == user.id)
-            .values(records_used=User.records_used + len(records))
+            .values(records_used=User.records_used + billable_count)
         )
         db.commit()
         db.refresh(user)

@@ -165,11 +165,12 @@ class WhatcomWAScraper(BridgeScraper):
 
         all_records: list[ScrapedRecord] = []
         seen_hashes: set[str] = set()
+        seen_raw_hashes: set[str] = set()
         max_pages = 50
 
         for page_num in range(1, max_pages + 1):
             await self.page.wait_for_timeout(1500)
-            page_records = await self._extract_page()
+            page_records, raw_texts = await self._extract_page()
 
             new_count = 0
             for rec in page_records:
@@ -179,8 +180,29 @@ class WhatcomWAScraper(BridgeScraper):
                     all_records.append(rec)
                     new_count += 1
 
-            _logger.info("Page %d — %d new (chunk total %d)", page_num, new_count, len(all_records))
-            if new_count == 0 and page_num > 1:
+            # Pagination-failure detection. Previously we broke when
+            # new_count == 0, but that conflates "the next-page click
+            # didn't advance" with "all 50 records on this page failed
+            # the doc-type filter". For counties like Whatcom where
+            # Helion returns unfiltered results and probate filings
+            # are sparse, the second case happens constantly — and
+            # bailing on it meant we never saw probates that lived
+            # past page 2. Check whether the raw card set is actually
+            # new (any new fingerprint = a real next page) instead.
+            new_raw_count = 0
+            for raw_text in raw_texts:
+                import hashlib
+                rh = hashlib.sha1(raw_text.encode("utf-8")).hexdigest()
+                if rh not in seen_raw_hashes:
+                    seen_raw_hashes.add(rh)
+                    new_raw_count += 1
+
+            _logger.info(
+                "Page %d — %d new records, %d new raw cards (chunk total %d)",
+                page_num, new_count, new_raw_count, len(all_records),
+            )
+            if new_raw_count == 0 and page_num > 1:
+                _logger.info("  Pagination stalled (0 new raw cards) — stopping")
                 break
 
             if not await self._go_next_page():
@@ -188,8 +210,15 @@ class WhatcomWAScraper(BridgeScraper):
 
         return all_records
 
-    async def _extract_page(self) -> list[ScrapedRecord]:
-        """Extract records from the current results page."""
+    async def _extract_page(self) -> tuple[list[ScrapedRecord], list[str]]:
+        """Extract records from the current results page.
+
+        Returns ``(kept_records, raw_texts)``. ``raw_texts`` is the full
+        set of card contents on this page — the caller uses it to
+        detect pagination failure (identical cards across pages) vs a
+        page whose records were all filtered out by the doc-type
+        allowlist.
+        """
         raw = await self.page.evaluate("""
             (() => {
                 const cards = document.querySelectorAll('.search-result');
@@ -205,7 +234,7 @@ class WhatcomWAScraper(BridgeScraper):
 
         if not raw:
             _logger.info("No .search-result cards on this page")
-            return []
+            return [], []
 
         _logger.info("Raw cards on page: %d", len(raw))
 
@@ -287,7 +316,7 @@ class WhatcomWAScraper(BridgeScraper):
                 "  Top doc types on page: %s",
                 ", ".join(f"{t}={n}" for t, n in top_types),
             )
-        return records
+        return records, raw
 
     async def _go_next_page(self) -> bool:
         """Click the 'Next 50' pagination button if enabled."""

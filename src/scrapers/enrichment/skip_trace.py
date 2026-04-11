@@ -185,14 +185,13 @@ def submit_batch(
     url = f"{settings.TRACERFY_API_BASE_URL.rstrip('/')}/v1/api/trace/"
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
     }
 
-    # Tracerfy's batch endpoint accepts either multipart/form-data with a
-    # CSV file OR application/json with a json_data array. We use the JSON
-    # path — no temp file, no multipart encoding, no filesystem writes.
-    # We still have to pass the *_column names alongside json_data because
-    # the endpoint parses the JSON the same way it parses a CSV header.
+    # Tracerfy's batch endpoint docs list both multipart/form-data and
+    # application/json, but in practice (verified against live API 2026-04-10)
+    # the JSON path returns 415 Unsupported Media Type. Use form-encoded
+    # fields, with json_data as a JSON string field — this matches Tracerfy's
+    # curl examples and works reliably.
     import json
     json_rows = []
     for r in rows:
@@ -209,7 +208,7 @@ def submit_batch(
             "mailing_zip": r.get("mailing_zip") or "",
         })
 
-    payload = {
+    form_fields = {
         "address_column": "address",
         "city_column": "city",
         "state_column": "state",
@@ -230,7 +229,10 @@ def submit_batch(
     )
 
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        # data=form_fields sends application/x-www-form-urlencoded.
+        # Tracerfy's doc says multipart/form-data but urlencoded is the
+        # standard fallback and works with the same field names.
+        resp = requests.post(url, headers=headers, data=form_fields, timeout=30)
     except requests.RequestException as exc:
         raise TracerfyError(f"Network error submitting batch: {exc}") from exc
 
@@ -288,21 +290,33 @@ def pick_best_phone(row: dict) -> tuple[str | None, str | None]:
     Tracerfy returns up to 5 mobiles and 3 landlines plus a primary_phone.
     For cold-call use, mobile is strictly better than landline (higher
     answer rate, SMS-capable). We pick in this order:
-      1. mobile_1 (first mobile)
+      1. Mobile-1 (first mobile)
       2. primary_phone if it's Mobile
       3. primary_phone (any type)
-      4. landline_1
+      4. Landline-1
+
+    Column naming: Tracerfy's JSON API docs show ``mobile_1`` / ``landline_1``
+    (snake_case) but the actual CSV delivered via webhook uses
+    ``Mobile-1`` / ``Landline-1`` (title-case with dash separator). We
+    handle both for safety.
     """
-    mobile_1 = (row.get("mobile_1") or "").strip()
+    def _get(row: dict, *keys: str) -> str:
+        for k in keys:
+            v = row.get(k)
+            if v and str(v).strip():
+                return str(v).strip()
+        return ""
+
+    mobile_1 = _get(row, "Mobile-1", "mobile_1")
     if mobile_1:
         return mobile_1, "Mobile"
 
-    primary = (row.get("primary_phone") or "").strip()
-    primary_type = (row.get("primary_phone_type") or "").strip() or None
+    primary = _get(row, "primary_phone")
+    primary_type = _get(row, "primary_phone_type") or None
     if primary:
         return primary, primary_type
 
-    landline_1 = (row.get("landline_1") or "").strip()
+    landline_1 = _get(row, "Landline-1", "landline_1")
     if landline_1:
         return landline_1, "Landline"
 
@@ -310,11 +324,16 @@ def pick_best_phone(row: dict) -> tuple[str | None, str | None]:
 
 
 def pick_best_email(row: dict) -> str | None:
-    """Return the first non-empty email_1..5."""
+    """Return the first non-empty Email-1..5.
+
+    Tracerfy's CSV uses ``Email-1`` / ``Email-2`` / ... (title-case, dash).
+    The JSON API docs showed ``email_1`` (snake_case) — we handle both.
+    """
     for i in range(1, 6):
-        val = (row.get(f"email_{i}") or "").strip()
-        if val:
-            return val
+        for key in (f"Email-{i}", f"email_{i}"):
+            val = (row.get(key) or "").strip()
+            if val:
+                return val
     return None
 
 
@@ -433,10 +452,12 @@ _ADDRESS_RE = re.compile(
 def _parse_full_address(addr: str) -> dict:
     """Split a combined street address into street / city / state / zip.
 
-    Handles common formats like:
-        '123 MAIN ST, SEATTLE, WA 98101'
-        '123 MAIN ST'
-        '123 MAIN ST, SEATTLE'
+    Handles common formats:
+        '123 MAIN ST'                                  (1 part)
+        '123 MAIN ST, SEATTLE'                         (2 parts)
+        '123 MAIN ST, SEATTLE, WA 98101'               (3 parts — state+zip combined)
+        '123 MAIN ST, SEATTLE, WA, 98101'              (4 parts — state+zip split)
+        '123 MAIN ST, SEATTLE, WA, 98101-1234'         (4 parts — ZIP+4)
 
     Returns a dict with keys street, city, state, zip — any of which may
     be None if not parseable. Always returns at least `street`.
@@ -447,23 +468,40 @@ def _parse_full_address(addr: str) -> dict:
 
     clean = addr.strip().rstrip(",")
     parts = [p.strip() for p in clean.split(",")]
-    # Shape: [street, city, "ST 98101"]
+
     if len(parts) >= 1:
         result["street"] = parts[0] or None
-    if len(parts) >= 2:
+
+    if len(parts) == 2:
+        # "STREET, CITY"
         result["city"] = parts[1] or None
-    if len(parts) >= 3:
-        # Last chunk: "ST 98101" or "ST" or "98101"
+    elif len(parts) == 3:
+        # "STREET, CITY, ST 98101" — state+zip combined in last part
+        result["city"] = parts[1] or None
         last = parts[2]
         m = re.match(r"([A-Z]{2})\s*(\d{5}(?:-\d{4})?)?", last.upper())
         if m:
             result["state"] = m.group(1)
             result["zip"] = m.group(2) or None
         else:
-            # fallback: zip only
             m2 = re.match(r"(\d{5}(?:-\d{4})?)", last)
             if m2:
                 result["zip"] = m2.group(1)
+    elif len(parts) >= 4:
+        # "STREET, CITY, ST, 98101"  OR  "STREET, CITY, ST, 98101-1234"
+        # Pierce County's mailing_address field uses this format.
+        result["city"] = parts[1] or None
+        state_part = parts[2].strip().upper()
+        zip_part = parts[3].strip()
+        # Validate state is 2 uppercase letters
+        m_state = re.match(r"^([A-Z]{2})$", state_part)
+        if m_state:
+            result["state"] = m_state.group(1)
+        # Validate zip is 5 or 9 digits (with optional dash)
+        m_zip = re.match(r"(\d{5}(?:-\d{4})?)", zip_part)
+        if m_zip:
+            result["zip"] = m_zip.group(1)
+
     return result
 
 

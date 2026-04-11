@@ -225,6 +225,13 @@ def watchdog_stuck_jobs() -> None:
                 job.retry_count += 1
                 job.status = "pending"
                 job.started_at = None
+                # M12 (full-SaaS review): also reset the progress
+                # counters so the UI doesn't show nonsense like
+                # "Page 3 of 5" after a job was re-queued from
+                # page 3. The retried scrape starts over from page 1.
+                job.page_current = 0
+                job.page_total = 0
+                job.record_count = 0
                 db.flush()
                 run_scrape_job.delay(job.id)
                 _logger.warning(

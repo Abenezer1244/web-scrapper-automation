@@ -194,6 +194,15 @@ def _inject_dates(actions: list[dict], date_from: str, date_to: str) -> list[dic
     result = []
     date_pattern = re.compile(r"\d{1,2}/\d{1,2}/\d{4}")
 
+    # M10 (full-SaaS review): track "first date used" with a local
+    # variable instead of a function attribute. The previous
+    # implementation used `_inject_dates._used_from` which is a
+    # module-level variable and scrambles date injection when two
+    # AI scrapers run concurrently in the same process (e.g., a
+    # Celery worker running two scraper tasks in parallel). The
+    # local variable is per-call and therefore thread-safe.
+    used_from = False
+
     for action in actions:
         a = copy.deepcopy(action)
 
@@ -201,15 +210,12 @@ def _inject_dates(actions: list[dict], date_from: str, date_to: str) -> list[dic
             # If the value looks like a date, replace it
             if date_pattern.fullmatch(a["value"].strip()):
                 # First date fill → date_from, second → date_to
-                # We track this by checking if date_from was already used
-                if not hasattr(_inject_dates, "_used_from"):
-                    _inject_dates._used_from = False
-                if not _inject_dates._used_from:
+                if not used_from:
                     a["value"] = date_from
-                    _inject_dates._used_from = True
+                    used_from = True
                 else:
                     a["value"] = date_to
-                    _inject_dates._used_from = False
+                    used_from = False  # reset for next pair
 
         elif a.get("action") == "evaluate" and a.get("js"):
             # Replace date literals in JS code

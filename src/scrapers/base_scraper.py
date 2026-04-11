@@ -163,7 +163,35 @@ class BridgeScraper:
 
         for attempt in range(1, settings.MAX_RETRIES + 1):
             try:
-                await self.page.goto(url, wait_until=wait_until, timeout=settings.DEFAULT_TIMEOUT * 1000)
+                response = await self.page.goto(
+                    url, wait_until=wait_until, timeout=settings.DEFAULT_TIMEOUT * 1000
+                )
+                # M6 (full-SaaS review): Playwright follows redirects
+                # automatically, so validate_scraping_target(url) above
+                # only checks the INITIAL URL. A county portal that
+                # 302s to a non-allowlisted domain would otherwise
+                # land on the blocked target without the SSRF firewall
+                # noticing. Re-validate the final URL after
+                # navigation. If it differs from the request and
+                # fails validation, we immediately close the page and
+                # raise so no content is read from the disallowed
+                # origin.
+                final_url = response.url if response else self.page.url
+                if final_url and final_url != url:
+                    try:
+                        validate_scraping_target(final_url)
+                    except ValueError as ssrf_exc:
+                        _logger.error(
+                            "SSRF: redirect from %s landed on disallowed target %s",
+                            url, final_url,
+                        )
+                        try:
+                            await self.page.goto("about:blank", timeout=5000)
+                        except Exception:
+                            pass
+                        raise RuntimeError(
+                            f"Navigation redirected to disallowed target: {ssrf_exc}"
+                        ) from ssrf_exc
                 _logger.info("Navigated to %s", url)
                 return
             except Exception as exc:

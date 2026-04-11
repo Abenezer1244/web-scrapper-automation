@@ -467,7 +467,8 @@ async def get_cached_records(
             cache_age = f"{age.days}d" if age.days > 0 else "today"
             cache_stale = age.days > 1
 
-    await db.commit()
+    # M2 (full-SaaS review): get_db dependency commits on normal
+    # exit, so the explicit commit here is redundant. Removed.
 
     return CachedResultsPage(
         config_id=config_id,

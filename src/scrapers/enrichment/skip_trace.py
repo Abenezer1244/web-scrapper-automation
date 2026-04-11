@@ -113,13 +113,22 @@ def address_cache_key(
 # ─── Name splitter ────────────────────────────────────────────────────────────
 
 def split_name(full_name: str | None) -> tuple[str | None, str | None]:
-    """Split a 'LAST, FIRST MIDDLE' or 'FIRST LAST' string into (first, last).
+    """Split 'LAST, FIRST MIDDLE' into (first, last).
 
-    County recorders commonly format names as 'LAST FIRST MIDDLE' with no
-    comma, or 'LAST, FIRST MIDDLE' with a comma. Tracerfy's batch trace
-    accepts first_name + last_name columns separately. If the input is
-    unsplittable (entity name, single token) we return (None, None) and
-    let the dispatcher route the row through advanced trace instead.
+    Only comma-separated forms are reliably splittable. County
+    recorders vary — some store 'LAST FIRST MIDDLE', others store
+    'FIRST LAST'. When there is no comma we cannot know which
+    convention is in use without a per-county mapping, so we return
+    (None, None) and let the dispatcher route the row through
+    advanced trace instead of guessing and burning Tracerfy credits
+    on the wrong name order.
+
+    M9 (full-SaaS review): the previous version assumed 'LAST FIRST'
+    for comma-free names which silently mis-identified non-ARMS
+    names like 'JOHN SMITH' — last=JOHN, first=SMITH — producing
+    garbage Tracerfy matches. Routing those to advanced trace
+    (which uses address-only keying) is both correct and preserves
+    credit spending.
     """
     if not full_name:
         return None, None
@@ -132,13 +141,8 @@ def split_name(full_name: str | None) -> tuple[str | None, str | None]:
         first = rest.strip().split()[0] if rest.strip() else None
         return (first or None), (last.strip() or None)
 
-    # Fallback: "LAST FIRST" (common in WA recorders) — take first token
-    # as last name, second as first name. This is wrong for Western
-    # "FIRST LAST" convention but matches how grantor names are stored
-    # in ARMS / LandmarkWeb / Helion portals.
-    tokens = name.split()
-    if len(tokens) >= 2:
-        return tokens[1], tokens[0]
+    # No comma: unsplittable without county-specific knowledge.
+    # Return None so the caller routes to advanced trace.
     return None, None
 
 

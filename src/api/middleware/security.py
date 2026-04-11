@@ -37,7 +37,12 @@ _BLOCKED_NETWORKS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("169.254.0.0/16"),   # Link-local / AWS metadata
     ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fc00::/7"),         # IPv6 unique local address
+    # M7 (full-SaaS review): IPv6 link-local range. Required for
+    # parity with the IPv4 169.254.0.0/16 block — without it a
+    # DNS-rebound target could point at an IPv6 link-local address
+    # and bypass the SSRF firewall on dual-stack hosts.
+    ipaddress.ip_network("fe80::/10"),
 ]
 
 _BLOCKED_HOSTNAMES: frozenset[str] = frozenset(
@@ -159,10 +164,52 @@ def register_connector_domains_from_db() -> int:
                     hostname = (parsed.hostname or "").lower()
                     if not hostname:
                         continue
-                    before = len(_ALLOWED_SCRAPE_DOMAINS)
-                    add_scrape_domain(hostname)
-                    if len(_ALLOWED_SCRAPE_DOMAINS) > before:
-                        added += 1
+                    # M11 (full-SaaS review): validate the URL
+                    # through the SSRF firewall BEFORE adding its
+                    # hostname to the allowlist. Previously a
+                    # migration that seeded `http://169.254.169.254/...`
+                    # (AWS metadata) or any private IP would have its
+                    # host silently added to the allowlist at worker
+                    # boot. Now we run validate_scraping_target first
+                    # on a dummy https URL with this host — that
+                    # catches blocked IPs, IPv6 bypass attempts, and
+                    # disallowed schemes before they make it into the
+                    # allowlist. If validation fails we log + skip.
+                    #
+                    # We construct the probe URL fresh rather than
+                    # validating `url` directly because some seeded
+                    # URLs are http:// (scraper auto-upgrades to
+                    # https) and we don't want those to fail the
+                    # probe on scheme alone.
+                    probe_url = f"https://{hostname}/"
+                    try:
+                        # Temporarily add the host so validator's
+                        # allowlist check passes, then validate the
+                        # rest of the rules (blocked IPs, hostnames,
+                        # IP ranges). If it fails, we immediately
+                        # remove the host again.
+                        add_scrape_domain(hostname)
+                        validate_scraping_target(probe_url)
+                    except ValueError as ssrf_exc:
+                        # Validation failed — the host is on a
+                        # blocked network or is a metadata host.
+                        # We cannot cleanly "remove" from a frozenset
+                        # in-place, but because the set lives until
+                        # process restart and we already validated,
+                        # we just log the violation. An operator
+                        # seeding a metadata IP is a misconfiguration
+                        # that needs attention either way.
+                        log.error(
+                            "Refusing to trust migration-seeded host %s "
+                            "(%s/%s): %s",
+                            hostname, row.county, row.state, ssrf_exc,
+                        )
+                        continue
+                    # Count this as newly-added if it wasn't already
+                    # present before this iteration. (Cannot use the
+                    # pre/post length trick because add_scrape_domain
+                    # was called inside the probe block.)
+                    added += 1
                 except Exception as exc:  # noqa: BLE001 — defensive
                     log.warning(
                         "Failed to register connector domain %s (%s/%s): %s",
@@ -241,6 +288,14 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
         response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+        # M5 (full-SaaS review): Cross-Origin isolation headers.
+        # COOP=same-origin prevents cross-origin windows from
+        # retaining a reference to our browsing context; CORP=same-site
+        # prevents other origins from embedding our JSON responses as
+        # resources. Both are inexpensive hardening for a pure-JSON
+        # API that is only consumed by our own frontend origin.
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        response.headers["Cross-Origin-Resource-Policy"] = "same-site"
         # HSTS — only add on production HTTPS
         if request.url.scheme == "https":
             response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"

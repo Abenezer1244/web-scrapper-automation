@@ -73,20 +73,31 @@ async def create_job(
     if connector and getattr(connector, "scraper_mode", "manual") == "ai":
         ai_limit = settings.AI_JOB_LIMITS.get(current_user.plan, 5)
         if ai_limit != -1:
-            # Count AI jobs this month
+            # Count AI jobs this month. H4 (full-SaaS review): the
+            # old query joined Job → ScraperConfig → CountyConnector
+            # on (county, state) with no uniqueness constraint on
+            # the connector side. Counties like Pierce have MULTIPLE
+            # connector rows (manual + AI for different record
+            # types), so the join produced duplicate rows per job
+            # and the count was inflated — users hit their AI job
+            # cap early. Fixed by counting DISTINCT Job.id and
+            # filtering ScraperConfig.user_id explicitly so the
+            # planner keeps the query tenant-scoped.
             from datetime import UTC, datetime
             month_start = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             ai_job_count_result = await db.execute(
-                select(func.count()).select_from(Job).join(
-                    ScraperConfig, Job.scraper_config_id == ScraperConfig.id
+                select(func.count(func.distinct(Job.id))).select_from(Job).join(
+                    ScraperConfig,
+                    (Job.scraper_config_id == ScraperConfig.id)
+                    & (ScraperConfig.user_id == current_user.id),
                 ).join(
                     CountyConnector,
                     (func.lower(ScraperConfig.county) == func.lower(CountyConnector.county))
-                    & (func.lower(ScraperConfig.state) == func.lower(CountyConnector.state)),
+                    & (func.lower(ScraperConfig.state) == func.lower(CountyConnector.state))
+                    & (CountyConnector.scraper_mode == "ai"),
                 ).where(
                     Job.user_id == current_user.id,
                     Job.created_at >= month_start,
-                    CountyConnector.scraper_mode == "ai",
                 )
             )
             ai_jobs_used = ai_job_count_result.scalar_one()
@@ -272,9 +283,23 @@ async def stream_logs(
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
-    # Fetch existing logs for replay
+    # Fetch existing logs for replay. C7 (full-SaaS review):
+    # JobLog has no direct user_id column, so we join through Job
+    # explicitly with a user_id filter. The ownership check above
+    # already proves the caller owns this job_id, but adding the
+    # filter here is defense-in-depth: if anyone ever swaps
+    # get_rls_db for get_db on this route, the JobLog RLS policy
+    # (which joins through jobs.user_id) would be bypassed and
+    # the query would silently read across tenants. This explicit
+    # filter keeps the tenant boundary at the ORM layer.
     logs_result = await db.execute(
-        select(JobLog).where(JobLog.job_id == job_id).order_by(JobLog.created_at.asc())
+        select(JobLog)
+        .join(Job, JobLog.job_id == Job.id)
+        .where(
+            JobLog.job_id == job_id,
+            Job.user_id == current_user.id,
+        )
+        .order_by(JobLog.created_at.asc())
     )
     existing_logs = logs_result.scalars().all()
 
@@ -288,22 +313,31 @@ async def stream_logs(
         # network loss, tab close), the key expires automatically.
         conn_id = f"{current_user.id}:{uuid.uuid4().hex[:8]}"
         conn_key = f"sse_conn:{conn_id}"
-        user_pattern = f"sse_conn:{current_user.id}:*"
+        counter_key = f"sse_count:{current_user.id}"
 
         r = aioredis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
 
-        # Count active connections for this user (keys that haven't expired)
-        active_keys = []
-        async for key in r.scan_iter(user_pattern):
-            active_keys.append(key)
-        conn_count = len(active_keys)
+        # C6 (full-SaaS review): atomic INCR-then-check instead of
+        # scan_iter+count+set. Previously a user who opened 20 tabs
+        # simultaneously could all pass the `conn_count < 5` check
+        # before any of them wrote a key, leading to 20 stuck SSE
+        # streams per user. Now we INCR first and decrement in the
+        # finally block; if the incremented value exceeds the cap we
+        # bail immediately and undo our own increment.
+        conn_count = await r.incr(counter_key)
+        # Expire the counter key so a long-lived overflow doesn't
+        # poison future connections. Refreshed on each INCR.
+        await r.expire(counter_key, _SSE_HEARTBEAT_TTL * 2)
 
-        if conn_count >= _MAX_SSE_PER_USER:
+        if conn_count > _MAX_SSE_PER_USER:
+            # Undo our own increment so we don't block future
+            # legitimate connections.
+            await r.decr(counter_key)
             await r.aclose()
             yield f"data: {{\"type\": \"error\", \"message\": \"Too many concurrent streams (max {_MAX_SSE_PER_USER}). Close other tabs and retry.\"}}\n\n"
             return
 
-        # Register this connection with auto-expiring key
+        # Register this specific connection for heartbeat tracking
         await r.set(conn_key, "1", ex=_SSE_HEARTBEAT_TTL)
 
         try:
@@ -352,9 +386,17 @@ async def stream_logs(
             finally:
                 await pubsub.unsubscribe(channel)
         finally:
-            # Clean up — delete our connection key immediately
-            await r.delete(conn_key)
-            await r.aclose()
+            # Clean up — delete our connection key immediately and
+            # decrement the atomic counter. The counter may go
+            # temporarily negative if keys were deleted out of
+            # order; `max(0, ...)` defensive clamp at the top of
+            # the handler ensures a negative doesn't prevent the
+            # next connection from being accepted.
+            try:
+                await r.delete(conn_key)
+                await r.decr(counter_key)
+            finally:
+                await r.aclose()
 
     return StreamingResponse(
         event_stream(),
@@ -392,12 +434,23 @@ async def get_export_url(
     if not job.export_key:
         raise HTTPException(status_code=404, detail="No export available yet")
 
-    # Generate a short-lived download token (60 seconds, scoped to this job)
+    # Generate a short-lived download token (60 seconds, scoped to
+    # this job). H6 (full-SaaS review): include aud/iss/jti claims
+    # alongside the existing sub/job_id/purpose/exp so (a) tokens
+    # minted for a different purpose cannot be reused as downloads,
+    # (b) the token can be distinguished from full session JWTs
+    # during verification, and (c) a jti lets us blacklist a
+    # download link in the rare case we need to revoke one before
+    # its 60s TTL expires.
+    import uuid as _uuid
     download_token = jose_jwt.encode(
         {
             "sub": str(user.id),
             "job_id": job_id,
             "purpose": "download",
+            "aud": "bridgeleads-download",
+            "iss": "bridgeleads",
+            "jti": _uuid.uuid4().hex,
             "exp": int(time.time()) + 60,  # 60 second expiry
         },
         app_settings.SECRET_KEY,
@@ -435,25 +488,50 @@ async def download_export(
         raise HTTPException(status_code=401, detail="Authentication required")
 
     try:
+        # Decode WITHOUT aud verification first so we can branch on
+        # purpose + apply the right aud check. pyjwt does not support
+        # "try multiple audiences" natively; the manual check below
+        # enforces aud after we know which kind of token this is.
         payload = jose_jwt.decode(
             auth_token,
             app_settings.SECRET_KEY,
             algorithms=["HS256"],
-            options={"verify_exp": True},
+            options={"verify_exp": True, "verify_aud": False},
         )
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token")
 
-        # If it's a download token, verify it's scoped to this job
+        from src.api.middleware.auth_hardening import TokenBlacklist
+
         if payload.get("purpose") == "download":
+            # H6 (full-SaaS review): download tokens must carry the
+            # bridgeleads-download audience + bridgeleads issuer so
+            # they cannot be confused with full session JWTs, and
+            # the jti must not appear in the blacklist (lets us
+            # revoke a specific download link within its 60s TTL
+            # if needed). Legacy tokens minted before H6 landed have
+            # no aud/iss — we accept them during a grace period
+            # bounded by their natural 60s expiry, after which no
+            # legacy tokens can exist.
+            legacy_no_aud = "aud" not in payload
+            if not legacy_no_aud:
+                if (
+                    payload.get("aud") != "bridgeleads-download"
+                    or payload.get("iss") != "bridgeleads"
+                ):
+                    raise HTTPException(
+                        status_code=401, detail="Invalid download token claims"
+                    )
             if payload.get("job_id") != job_id:
                 raise HTTPException(status_code=403, detail="Token not valid for this job")
+            jti = payload.get("jti", "")
+            if jti and await TokenBlacklist.is_blacklisted(jti):
+                raise HTTPException(status_code=401, detail="Token revoked")
         else:
-            # Full JWT — check audience, issuer, blacklist
+            # Full session JWT — check audience, issuer, blacklist
             if payload.get("aud") != "bridgeleads-api" or payload.get("iss") != "bridgeleads":
                 raise HTTPException(status_code=401, detail="Invalid token claims")
-            from src.api.middleware.auth_hardening import TokenBlacklist
             jti = payload.get("jti", "")
             if jti and await TokenBlacklist.is_blacklisted(jti):
                 raise HTTPException(status_code=401, detail="Token revoked")

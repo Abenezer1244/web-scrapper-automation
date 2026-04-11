@@ -239,14 +239,28 @@ def run_scrape_job(self, job_id: str) -> None:
             Joins normalized (parcel_id, property_address) and hashes with
             sha256. Resilient to whitespace, punctuation, and case variation
             across repeat scrapes of the same parcel. Returns None if both
-            inputs are empty — those records can't be deduped reliably.
+            inputs are empty OR if neither field has enough signal to
+            distinguish records (H2 from the full-SaaS review — a single
+            garbage character from HTML scraping should not collide with
+            a legitimate parcel).
             """
             parcel = (parcel_id or "").strip().upper().replace("-", "").replace(" ", "")
             addr = (property_address or "").strip().upper()
             addr = _re.sub(r"[\.,#]", " ", addr)
             addr = _re.sub(r"\s+", " ", addr).strip()
-            if not parcel and not addr:
+
+            # H2: require at least one of the two fields to carry
+            # meaningful signal. A valid WA parcel has 10+ digits;
+            # a valid street address has at least "N STREET_NAME"
+            # (8+ chars after normalization). Anything shorter is
+            # almost certainly a scrape artifact (a stray character
+            # extracted from malformed HTML) and must not be allowed
+            # to dedupe against a real record.
+            parcel_ok = len(parcel) >= 4 and any(c.isdigit() for c in parcel)
+            addr_ok = len(addr) >= 8 and any(c.isalpha() for c in addr)
+            if not parcel_ok and not addr_ok:
                 return None
+
             key = f"{parcel}|{addr}"
             return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
@@ -817,13 +831,41 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
 
 
 def _fail_job(db, job, r, job_id: str, reason: str) -> None:
-    """Transition job to FAILED with a human-readable error message."""
+    """Transition job to FAILED with a human-readable error message.
+
+    H3 (full-SaaS review): the previous implementation rolled back
+    the main session before calling _set_status and _publish_log.
+    If any JobLog rows had been queued via _publish_log(db=db) but
+    not yet committed in the same transaction, the rollback
+    destroyed them — losing the failure context for the user. The
+    final failure log line also ran against a session that had
+    just been rolled back, which is a fragile code path.
+
+    Now:
+      1. The state transition (jobs.status = 'failed') goes through
+         the main session so _set_status can commit + refresh
+         normally. If the main session was in a failed transaction
+         state from an upstream exception, we recover it once with
+         rollback() before the update.
+      2. The failure-log _publish_log call passes db=None so it
+         opens a fresh system_sync_session for the INSERT. This
+         guarantees the failure message lands in job_logs even if
+         the main session is misbehaving.
+    """
     try:
-        db.rollback()  # Clear any pending rollback from previous errors
+        db.rollback()  # Recover from any pending failed transaction
     except Exception:
         pass
-    _set_status(db, job, "failed", finished_at=_now(), error_message=reason)
-    _publish_log(r, job_id, "error", reason, db=db)
+    try:
+        _set_status(db, job, "failed", finished_at=_now(), error_message=reason)
+    except Exception as exc:
+        _logger.error(
+            "Job %s: _set_status failed during _fail_job: %s",
+            job_id, str(exc)[:200],
+        )
+    # Publish the failure log via a fresh session (db=None) so it
+    # is not coupled to the main session's transaction state.
+    _publish_log(r, job_id, "error", reason, db=None)
     r.publish(f"job_logs:{job_id}", json.dumps({"type": "failed", "error": reason}))
     _logger.error("Job %s failed: %s", job_id, reason)
 

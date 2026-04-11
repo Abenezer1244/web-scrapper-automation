@@ -76,12 +76,22 @@ def _bootstrap_ssrf_allowlist(sender=None, **_kwargs) -> None:
 
     Runs once per worker process at startup. Failures are logged and
     swallowed so a transient DB issue does not block worker boot.
+    Also runs the RLS advisory check so worker logs make the
+    multi-tenant isolation posture visible alongside the API logs.
     """
+    import logging
+
     try:
         from src.api.middleware import register_connector_domains_from_db
         register_connector_domains_from_db()
     except Exception as exc:  # noqa: BLE001 — defensive
-        import logging
         logging.getLogger("worker.bootstrap").warning(
             "Connector domain registration skipped at worker boot: %s", exc
+        )
+    try:
+        from src.db.session import check_rls_role_status
+        check_rls_role_status()
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logging.getLogger("worker.bootstrap").warning(
+            "RLS advisory check skipped at worker boot: %s", exc
         )

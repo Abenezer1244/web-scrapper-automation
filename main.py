@@ -26,6 +26,12 @@ async def lifespan(app: FastAPI):
     # Phase 3 audit in docs/compliance/connector-audit-2026-04-10.md
     from src.api.middleware import register_connector_domains_from_db
     register_connector_domains_from_db()
+    # Advisory check: report whether the DB role bypasses RLS. If it
+    # does, tenant isolation relies entirely on the application-level
+    # WHERE filters. C2 from the full-SaaS code review — see
+    # docs/compliance/connector-audit-2026-04-10.md follow-ups.
+    from src.db.session import check_rls_role_status
+    check_rls_role_status()
     yield
 
 

@@ -154,7 +154,7 @@ def _ingest_webhook_payload(
         SkipTraceCache,
         SkipTraceQueue,
     )
-    from src.db.session import SyncSessionLocal
+    from src.db.session import system_sync_session
     from src.scrapers.enrichment.skip_trace import (
         TracerfyError,
         address_cache_key,
@@ -178,7 +178,14 @@ def _ingest_webhook_payload(
     miss_count = 0
     now = datetime.now(UTC)
 
-    with SyncSessionLocal() as db:
+    # SYSTEM SESSION: a single Tracerfy batch can contain pending rows
+    # from multiple users (the dispatcher groups by trace_type, not
+    # user). This ingest path legitimately needs to update Result
+    # rows across tenants, so it opens a system_sync_session that
+    # does NOT set app.current_user_id. The updates are still keyed
+    # on (result_id AND user_id) for defense in depth against a
+    # tracerfy_queue_id spoofing or collision (H10 from the review).
+    with system_sync_session() as db:
         # Load all PendingSkipTraceRow for this queue to match rows back.
         # We match on (lowered street address, city, state) because CSV
         # whitespace may differ slightly from the enqueue-time values.
@@ -249,11 +256,18 @@ def _ingest_webhook_payload(
                     )
                 )
 
-            # Update the matched Result row(s)
+            # Update the matched Result row(s). The WHERE includes
+            # Result.user_id == p.user_id as defense-in-depth against
+            # a spoofed or collided tracerfy_queue_id that could
+            # otherwise land phone/email on the wrong tenant's row.
+            # H10 from the full-SaaS review.
             for p in matches:
                 db.execute(
                     update(Result)
-                    .where(Result.id == p.result_id)
+                    .where(
+                        Result.id == p.result_id,
+                        Result.user_id == p.user_id,
+                    )
                     .values(
                         phone=phone,
                         phone_type=csv_row.get("phone_type"),

@@ -45,7 +45,7 @@ def dispatch_pending_skip_trace() -> dict:
     from sqlalchemy import and_, select, update
 
     from src.db.models import PendingSkipTraceRow, SkipTraceQueue
-    from src.db.session import SyncSessionLocal
+    from src.db.session import system_sync_session
     from src.scrapers.enrichment.skip_trace import TracerfyError, submit_batch
 
     max_batches = max(1, settings.SKIP_TRACE_MAX_BATCHES_PER_TICK)
@@ -53,7 +53,11 @@ def dispatch_pending_skip_trace() -> dict:
     submitted_rows = 0
     errors: list[str] = []
 
-    with SyncSessionLocal() as db:
+    # SYSTEM SESSION: the dispatcher drains pending rows across all
+    # tenants in a single pass (Tracerfy batches are grouped by
+    # trace_type, not by user). This is a legitimate cross-tenant
+    # system operation.
+    with system_sync_session() as db:
         for _ in range(max_batches):
             # Pick a trace_type to drain this pass. Prefer 'normal' first
             # (cheaper per row), then 'advanced'. Within a pass we batch

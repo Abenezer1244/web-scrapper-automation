@@ -54,8 +54,13 @@ def _publish_log(r: sync_redis.Redis, job_id: str, level: str, message: str, db=
         ))
         db.commit()
     else:
-        from src.db.session import SyncSessionLocal
-        with SyncSessionLocal() as _db:
+        # Fallback path — no session was passed in, so we open a
+        # system-level session. JobLog writes are keyed on job_id and
+        # the caller has already verified ownership upstream; the
+        # table's RLS policy (job_logs_via_job) filters reads via a
+        # subquery on jobs.user_id, not writes.
+        from src.db.session import system_sync_session
+        with system_sync_session() as _db:
             _db.add(JobLog(
                 id=payload["id"],
                 job_id=job_id,
@@ -88,18 +93,41 @@ def run_scrape_job(self, job_id: str) -> None:
     from sqlalchemy import select
 
     from src.db.models import Job, Result, ScraperConfig, User
-    from src.db.session import SyncSessionLocal
+    from src.db.session import rls_sync_session, system_sync_session
     from src.scrapers.registry import UnsupportedCountyError, get_scraper_class
     from src.utils.data_exporter import DataExporter
     from src.workers.delivery import deliver_job_results
 
     r = _redis()
 
-    with SyncSessionLocal() as db:
+    # ── Bootstrap: look up user_id for this job_id without RLS ──────────────
+    # We need the user_id BEFORE we can enter the RLS-scoped session, and
+    # the Celery task only receives job_id. This bootstrap query is a
+    # legitimate system operation — the Celery task was dispatched by the
+    # API which already authorized this user, and the worker's role is to
+    # act on their behalf. Loading the user_id by job_id cannot leak data:
+    # the caller already knows the job_id they're asking about.
+    with system_sync_session() as _boot:
+        boot_row = _boot.execute(
+            select(Job.user_id, Job.status).where(Job.id == job_id)
+        ).first()
+        if boot_row is None:
+            _logger.error("Job %s not found — aborting", job_id)
+            return
+        _boot_user_id, _boot_status = boot_row
+        if _boot_status == "cancelled":
+            _logger.info("Job %s was cancelled before worker picked it up", job_id)
+            return
+
+    # Everything past this point runs with the RLS policies bound to
+    # this job's user_id. Inserts into results, delivered_records,
+    # pending_skip_trace_rows etc. are now scoped at the DB level as
+    # well as the ORM level. H1 + C1 from the full-SaaS review.
+    with rls_sync_session(_boot_user_id) as db:
         # ── Load job ─────────────────────────────────────────────────────────
         job = db.execute(select(Job).where(Job.id == job_id)).scalar_one_or_none()
         if job is None:
-            _logger.error("Job %s not found — aborting", job_id)
+            _logger.error("Job %s disappeared between bootstrap and load", job_id)
             return
 
         if job.status == "cancelled":

@@ -486,6 +486,9 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     assessor + post-enrichment cleanup. Only records that survived the
     cleanup (have a property_address) are eligible.
     """
+    # Local imports — sa_select must be imported here because the module-
+    # level import is scoped inside _run_inline_enrichment, not globally
+    from sqlalchemy import select as sa_select
     from src.db.models import PendingSkipTraceRow, Result, SkipTraceCache
     from src.scrapers.enrichment.skip_trace import (
         address_cache_key,

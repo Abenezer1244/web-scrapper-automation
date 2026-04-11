@@ -119,6 +119,74 @@ async def activation_funnel(
     }
 
 
+@router.get("/referral")
+async def referral_status(
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Sprint 7.3: referral program — code, stats, and credit balance.
+
+    Returns:
+      - code: the user's shareable referral code
+      - share_url: canonical signup URL with ?ref= appended
+      - referred_count: number of users who signed up via this code
+      - paid_conversions: number of those users who converted to paid
+      - credit_earned_cents / credit_earned_usd: running balance
+      - bonus_per_conversion_cents: display constant for the frontend
+
+    Referrals that don't yet have a code (legacy accounts created
+    before migration 017) get one generated on first call so the
+    endpoint is always safe to hit.
+    """
+    from sqlalchemy import func as sa_func
+
+    from src.db.models import ReferralEvent
+
+    # Ensure the current user has a referral code — backfill if null
+    # for legacy accounts.
+    result = await db.execute(select(User).where(User.id == current_user.id))
+    user = result.scalar_one()
+    if not user.referral_code:
+        import secrets
+        _ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+        for _ in range(8):
+            candidate = "".join(secrets.choice(_ALPHABET) for _ in range(8))
+            existing = await db.execute(
+                select(User).where(User.referral_code == candidate)
+            )
+            if existing.scalar_one_or_none() is None:
+                user.referral_code = candidate
+                await db.flush()
+                break
+
+    # How many users signed up via this code?
+    referred_res = await db.execute(
+        select(sa_func.count(User.id)).where(User.referred_by_user_id == user.id)
+    )
+    referred_count = referred_res.scalar() or 0
+
+    # How many of those triggered a bonus (i.e. converted to paid)?
+    paid_res = await db.execute(
+        select(sa_func.count(ReferralEvent.id)).where(
+            ReferralEvent.referrer_id == user.id
+        )
+    )
+    paid_conversions = paid_res.scalar() or 0
+
+    base = settings.PUBLIC_APP_URL.rstrip("/") if hasattr(settings, "PUBLIC_APP_URL") else "https://app.bridgeleads.io"
+    share_url = f"{base}/signup?ref={user.referral_code}"
+
+    return {
+        "code": user.referral_code,
+        "share_url": share_url,
+        "referred_count": int(referred_count),
+        "paid_conversions": int(paid_conversions),
+        "credit_earned_cents": user.referral_credit_cents or 0,
+        "credit_earned_usd": round((user.referral_credit_cents or 0) / 100, 2),
+        "bonus_per_conversion_cents": _REFERRAL_BONUS_CENTS,
+    }
+
+
 @router.get("/skip-trace-usage")
 async def skip_trace_usage(
     current_user: CurrentUser,
@@ -490,6 +558,69 @@ async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
         user.plan = plan_name
         user.records_limit = records_limit
         await db.flush()
+
+        # Sprint 7.3: grant referral credit if this is the referee's
+        # first paid conversion. The unique constraint on
+        # referral_events.referee_id makes this idempotent against
+        # webhook replay.
+        if user.referred_by_user_id:
+            await _grant_referral_credit(db, user)
+
+
+_REFERRAL_BONUS_CENTS = 2000  # $20 per successful referral
+
+
+async def _grant_referral_credit(db: AsyncSession, referee: User) -> None:
+    """Credit the referrer $20 when a referred user converts to paid.
+
+    Idempotent: the unique constraint on referral_events.referee_id
+    guarantees each referee can only trigger the bonus once, even if
+    Stripe replays the webhook.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from src.db.models import ReferralEvent
+
+    # Fetch the referrer (they may no longer exist if account was
+    # deleted — SET NULL would have already cleared the FK).
+    referrer_res = await db.execute(
+        select(User).where(User.id == referee.referred_by_user_id)
+    )
+    referrer = referrer_res.scalar_one_or_none()
+    if referrer is None:
+        return  # Referrer was deleted between signup and conversion
+
+    # Create the audit-log row first. If it conflicts on the unique
+    # constraint (webhook replay), we bail without touching the
+    # running balance.
+    event = ReferralEvent(
+        referrer_id=referrer.id,
+        referee_id=referee.id,
+        amount_cents=_REFERRAL_BONUS_CENTS,
+        reason="referee_converted_to_paid",
+    )
+    db.add(event)
+    try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        _logger.info(
+            "referral: duplicate grant ignored referee=%s", referee.id
+        )
+        return
+
+    # Atomic increment on the referrer's balance so concurrent
+    # grants from different referees don't race.
+    from sqlalchemy import update as sa_update
+    await db.execute(
+        sa_update(User)
+        .where(User.id == referrer.id)
+        .values(referral_credit_cents=User.referral_credit_cents + _REFERRAL_BONUS_CENTS)
+    )
+    await db.flush()
+    _logger.info(
+        "referral: +$20 credit referrer=%s referee=%s", referrer.id, referee.id
+    )
 
 
 async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:

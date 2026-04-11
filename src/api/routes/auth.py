@@ -67,6 +67,42 @@ async def register(
 
     trial_end = datetime.now(UTC) + timedelta(days=7)
 
+    # Sprint 7.3: resolve the referral code (if any) to a referrer user.
+    # Unknown codes are silently dropped — we don't leak whether a
+    # code exists, and a bad code must not block signup.
+    referred_by_id: str | None = None
+    if body.ref:
+        referrer_res = await db.execute(
+            select(User).where(
+                User.referral_code == body.ref,
+                User.is_active,
+            )
+        )
+        referrer = referrer_res.scalar_one_or_none()
+        if referrer is not None:
+            referred_by_id = referrer.id
+
+    # Generate a unique 8-char referral code for the new user. The
+    # alphabet excludes ambiguous characters (0/O, 1/I/L) so the code
+    # is unambiguous when shared verbally. Retry on collision — the
+    # DB unique constraint is the final authority but we pre-check to
+    # avoid most round-trips.
+    import secrets
+    _ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+    async def _generate_referral_code() -> str:
+        for _ in range(8):
+            candidate = "".join(secrets.choice(_ALPHABET) for _ in range(8))
+            existing_code = await db.execute(
+                select(User).where(User.referral_code == candidate)
+            )
+            if existing_code.scalar_one_or_none() is None:
+                return candidate
+        # Extremely unlikely after 8 tries with a 30^8 keyspace
+        raise RuntimeError("Failed to generate unique referral code")
+
+    referral_code = await _generate_referral_code()
+
     user = User(
         id=str(uuid.uuid4()),
         email=body.email,
@@ -74,6 +110,8 @@ async def register(
         plan="pro",
         records_limit=settings.PLAN_LIMITS["pro"],  # 500 records during trial
         trial_ends_at=trial_end,
+        referral_code=referral_code,
+        referred_by_user_id=referred_by_id,
     )
     db.add(user)
     await db.flush()

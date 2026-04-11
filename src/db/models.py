@@ -40,6 +40,18 @@ class User(Base):
     # Sprint 4: skip-trace usage counter for bundled-quota + overage billing
     skip_trace_used_this_month = Column(Integer, nullable=False, default=0)
     skip_trace_period_start = Column(DateTime(timezone=True), nullable=True)
+    # Sprint 7.3: referral program — each user has a unique shareable
+    # code; referred_by_user_id is set when they sign up via another
+    # user's link; referral_credit_cents accumulates $20 per successful
+    # conversion of a referred user to a paid plan.
+    referral_code = Column(String(16), unique=True, nullable=True, index=True)
+    referred_by_user_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    referral_credit_cents = Column(Integer, nullable=False, default=0)
     is_active = Column(Boolean, nullable=False, default=True)
     is_admin = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -349,3 +361,38 @@ class PendingSkipTraceRow(Base):
     tracerfy_queue_id = Column(Integer, nullable=True, index=True)
     enqueued_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     submitted_at = Column(DateTime(timezone=True), nullable=True)
+
+
+# ─── Sprint 7.3: Referral program ────────────────────────────────────────────
+
+
+class ReferralEvent(Base):
+    """Append-only audit log of referral credit grants.
+
+    One row per successful referee → paid conversion. The unique
+    constraint on referee_id is the idempotency guard — if the Stripe
+    webhook replays a checkout.session.completed event, the second
+    INSERT conflicts and the bonus is not granted twice.
+    """
+
+    __tablename__ = "referral_events"
+    __table_args__ = (
+        UniqueConstraint("referee_id", name="uq_referral_events_referee"),
+    )
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    referrer_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    referee_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    amount_cents = Column(Integer, nullable=False)
+    reason = Column(String(64), nullable=False)
+    # e.g. "referee_converted_to_paid"
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

@@ -8,6 +8,12 @@ from pydantic import BaseModel, EmailStr, field_validator
 class UserRegister(BaseModel):
     email: EmailStr
     password: str
+    # Sprint 7.3: optional referral code passed from the ?ref= URL
+    # parameter. When present and valid, the new user gets linked to
+    # the referrer and the referrer earns $20 credit on paid
+    # conversion. Unknown/invalid codes are silently dropped — no
+    # error to avoid leaking which codes exist.
+    ref: str | None = None
 
     @field_validator("password")
     @classmethod
@@ -16,6 +22,16 @@ class UserRegister(BaseModel):
             raise ValueError("Password must be at least 10 characters")
         if len(v) > 72:
             raise ValueError("Password must not exceed 72 characters")
+        return v
+
+    @field_validator("ref")
+    @classmethod
+    def ref_format(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        v = v.strip().upper()
+        if len(v) > 16 or not v.isalnum():
+            return None  # Silently drop malformed codes
         return v
 
 

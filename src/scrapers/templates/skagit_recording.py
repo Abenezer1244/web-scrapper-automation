@@ -73,12 +73,76 @@ class SkagitRecordingScraper(BridgeScraper):
         if domain:
             add_scrape_domain(domain)
 
+    # Map each record type to the exact dropdown option values in Skagit's
+    # content_ddlDocumentType. Running one search per doc type keeps the
+    # result set small enough to fit on page 1 (no pagination needed).
+    _SERVER_DOC_TYPES: dict[str, list[str]] = {
+        "probate": [
+            "Affidavit", "Death Certificate", "Transfer on Death Deed", "Will",
+        ],
+        "pre_foreclosure": [
+            "Lis Pendens", "Notice Of Default", "Notice Of Foreclosure",
+            "Notice Of Trustees Sale",
+        ],
+        "tax_delinquent": [
+            "Federal Tax Lien",
+        ],
+        "divorce": [
+            "Decree-divorce",
+        ],
+    }
+
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         _logger.info(
             "Skagit Recording scraper - %s/%s - %s to %s",
             self.county, self.state, date_from, date_to,
         )
 
+        # Determine which doc types to search for. Use server-side filtering
+        # via the dropdown so each search returns a small result set that
+        # fits on page 1. This avoids the ASP.NET pagination issue entirely.
+        doc_types_to_search = []
+        if self.active_record_type and self.active_record_type in self._SERVER_DOC_TYPES:
+            doc_types_to_search = self._SERVER_DOC_TYPES[self.active_record_type]
+        else:
+            # No filter or unknown type — search all mapped types
+            for types in self._SERVER_DOC_TYPES.values():
+                doc_types_to_search.extend(types)
+
+        all_records: list[ScrapedRecord] = []
+        seen_hashes: set[str] = set()
+
+        for doc_type_label in doc_types_to_search:
+            records = await self._search_one_doc_type(date_from, date_to, doc_type_label)
+            new = 0
+            for r in records:
+                h = self.make_hash(r.to_dict())
+                if h not in seen_hashes:
+                    seen_hashes.add(h)
+                    r.raw_html_hash = h
+                    all_records.append(r)
+                    new += 1
+            if new:
+                _logger.info("Doc type '%s': %d new records", doc_type_label, new)
+
+        _logger.info(
+            "Skagit %s: %d total records from %d doc type searches",
+            self.active_record_type or "all", len(all_records), len(doc_types_to_search),
+        )
+
+        if self.require_parcel_id:
+            before = len(all_records)
+            all_records = [r for r in all_records if r.parcel_id]
+            dropped = before - len(all_records)
+            if dropped:
+                _logger.info("Dropped %d/%d records with no parcel_id", dropped, before)
+
+        return all_records
+
+    async def _search_one_doc_type(
+        self, date_from: str, date_to: str, doc_type_label: str,
+    ) -> list[ScrapedRecord]:
+        """Run a single search for one doc type and extract all pages."""
         await self.navigate(self.base_url)
         try:
             await self.page.wait_for_load_state("networkidle", timeout=15_000)
@@ -86,8 +150,7 @@ class SkagitRecordingScraper(BridgeScraper):
             pass
         await self.page.wait_for_timeout(2_000)
 
-        # Fill date range — use Tab between fields to dismiss the AJAX
-        # CalendarExtender popup that covers the Search button.
+        # Fill date range
         await self.page.locator("#content_txtStartDate").click()
         await self.page.locator("#content_txtStartDate").fill(date_from)
         await self.page.keyboard.press("Tab")
@@ -95,7 +158,15 @@ class SkagitRecordingScraper(BridgeScraper):
         await self.page.locator("#content_txtEndDate").fill(date_to)
         await self.page.keyboard.press("Tab")
         await self.page.wait_for_timeout(500)
-        # Force-hide any remaining calendar overlays via JS
+
+        # Select doc type in dropdown
+        try:
+            await self.page.locator("#content_ddlDocumentType").select_option(label=doc_type_label)
+        except Exception as exc:
+            _logger.warning("Could not select doc type '%s': %s", doc_type_label, str(exc)[:80])
+            return []
+
+        # Force-hide calendar overlays
         await self.page.evaluate(
             "document.querySelectorAll('.ajax__calendar_container').forEach(c => c.style.display = 'none')"
         )
@@ -106,7 +177,7 @@ class SkagitRecordingScraper(BridgeScraper):
                 "input[type='submit'][value='Search'], input[name*='btnSearch']"
             ).first.click(timeout=10_000)
         except Exception as exc:
-            _logger.error("Search button click failed: %s", str(exc)[:120])
+            _logger.warning("Search click failed for '%s': %s", doc_type_label, str(exc)[:80])
             return []
 
         await self.page.wait_for_timeout(5_000)
@@ -119,48 +190,30 @@ class SkagitRecordingScraper(BridgeScraper):
         body = await self.page.inner_text("body")
         count_match = re.search(r"returned\s+(\d+)\s+records?", body)
         total = int(count_match.group(1)) if count_match else 0
-        _logger.info("Search returned %d total results", total)
         if total == 0:
             return []
 
-        # Extract all pages
-        all_records: list[ScrapedRecord] = []
-        seen_hashes: set[str] = set()
+        # Extract all pages for this doc type
+        all_page_records: list[ScrapedRecord] = []
         page_num = 1
-        max_pages = 30  # 25 per page * 30 = 750 records cap
+        max_pages = 20
 
         while page_num <= max_pages:
             page_records = await self._extract_page()
-            new = 0
-            for r in page_records:
-                h = self.make_hash(r.to_dict())
-                if h not in seen_hashes:
-                    seen_hashes.add(h)
-                    r.raw_html_hash = h
-                    all_records.append(r)
-                    new += 1
-            _logger.info("Page %d: %d new records (total: %d)", page_num, new, len(all_records))
-            if new == 0:
+            if not page_records:
+                break
+            all_page_records.extend(page_records)
+            _logger.info(
+                "  '%s' page %d: %d records (total %d/%d)",
+                doc_type_label, page_num, len(page_records), len(all_page_records), total,
+            )
+            if len(all_page_records) >= total:
                 break
             if not await self._goto_next_page():
                 break
             page_num += 1
 
-        # Filter by record type
-        filtered = self._filter_by_type(all_records)
-        _logger.info(
-            "Skagit: %d/%d after %s filter",
-            len(filtered), len(all_records), self.active_record_type or "none",
-        )
-
-        if self.require_parcel_id:
-            before = len(filtered)
-            filtered = [r for r in filtered if r.parcel_id]
-            dropped = before - len(filtered)
-            if dropped:
-                _logger.info("Dropped %d/%d records with no parcel_id", dropped, before)
-
-        return filtered
+        return all_page_records
 
     async def _extract_page(self) -> list[ScrapedRecord]:
         """Extract records from the Skagit results table.

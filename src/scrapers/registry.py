@@ -191,6 +191,11 @@ def _detect_template(base_url: str):
         from src.scrapers.templates.acclaimweb import AcclaimWebScraper
         return AcclaimWebScraper
 
+    # Laserfiche WebLink — Cowlitz (and potentially others)
+    if "wlaudpublic" in url_lower or "laserfiche" in url_lower or "weblink" in url_lower:
+        from src.scrapers.templates.laserfiche_weblink import LaserficheWebLinkScraper
+        return LaserficheWebLinkScraper
+
     return None
 
 

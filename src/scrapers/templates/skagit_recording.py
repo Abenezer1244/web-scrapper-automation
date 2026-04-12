@@ -261,11 +261,18 @@ class SkagitRecordingScraper(BridgeScraper):
                     record.legal_description = legal[:200]
 
                 # Parcel — cell contains "P125914\n35040\n2-3-005-0100" etc
-                # Extract first parcel-like pattern
+                # concatenated. The ACTUAL parcel is the "P" + digits portion
+                # (e.g. "P125914") — the rest is PLSS/tax account data.
+                # The WA statewide GIS matches on just the P-number.
                 parcel_text = item.get("parcelCell", "")
-                parcel_match = re.search(r"[A-Z]?\d[\d\-\.]{4,}", parcel_text)
+                parcel_match = re.search(r"(P\d{4,})", parcel_text)
                 if parcel_match:
-                    record.parcel_id = parcel_match.group(0)
+                    record.parcel_id = parcel_match.group(1)
+                elif not parcel_match:
+                    # Fallback: any 6+ digit number
+                    digit_match = re.search(r"\b(\d{6,})\b", parcel_text)
+                    if digit_match:
+                        record.parcel_id = digit_match.group(1)
 
                 record.enrichment_data["source"] = "skagit_recording"
 

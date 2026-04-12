@@ -511,6 +511,18 @@ def build_pending_row_payload(result) -> dict | None:
     # Many of our scrapers concatenate "STREET, CITY, ST ZIP" in one field.
     parsed = _parse_full_address(result.property_address)
 
+    # If property_address only has the street (no city/state), fall back
+    # to mailing_address which often has the full "STREET, CITY, ST ZIP".
+    # Pierce County GIS returns property_address as street-only and
+    # mailing_address as the full format — without this fallback, every
+    # skip trace row gets city=None/state=None and errors in Tracerfy.
+    if not parsed["city"] and result.mailing_address:
+        mail_parsed = _parse_full_address(result.mailing_address)
+        if mail_parsed["city"]:
+            parsed["city"] = mail_parsed["city"]
+            parsed["state"] = mail_parsed["state"]
+            parsed["zip"] = mail_parsed["zip"]
+
     return {
         "job_id": result.job_id,
         "result_id": result.id,

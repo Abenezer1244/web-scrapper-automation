@@ -28,13 +28,19 @@ _logger = setup_logger("scraper.template.acclaimweb")
 _DOC_TYPE_MAP = {
     "probate": ["PROBATE", "LETTERS TESTAMENTARY", "LETTERS OF ADMINISTRATION",
                 "PERSONAL REPRESENTATIVE", "PERSONAL REP", "ESTATE", "WILL",
-                "DEATH", "AFFIDAVIT OF HEIRSHIP", "HEIR"],
+                "DEATH", "AFFIDAVIT OF HEIRSHIP", "HEIR",
+                # Chelan abbreviations
+                "TOD", "AFFD", "PTREC"],
     "pre_foreclosure": ["LIS PENDENS", "NOTICE OF TRUSTEE", "TRUSTEE SALE",
                         "TRUSTEE'S SALE", "DISCONTINUANCE TRUSTEE",
                         "SUBSTITUTION OF TRUSTEE", "DEFAULT", "FORECLOSURE",
-                        "NOTICE OF DEFAULT"],
+                        "NOTICE OF DEFAULT",
+                        # Chelan abbreviations
+                        "NTS", "NOD", "APPT"],
     "tax_delinquent": ["TAX", "DELINQUENT", "TAX LIEN", "CERTIFICATE OF DELINQUENCY",
-                       "CERTIFICATE OF SALE"],
+                       "CERTIFICATE OF SALE",
+                       # Chelan abbreviations
+                       "FTL"],
     "divorce": ["DIVORCE", "DISSOLUTION", "DECREE OF DISSOLUTION"],
 }
 
@@ -46,12 +52,20 @@ class AcclaimWebScraper(BridgeScraper):
     shared AcclaimWeb interface.
     """
 
-    def __init__(self, base_url: str, county: str, state: str, record_types: list[str] | None = None):
+    def __init__(
+        self,
+        base_url: str,
+        county: str,
+        state: str,
+        record_types: list[str] | None = None,
+        record_type: str | None = None,
+    ):
         super().__init__()
         self.base_url = base_url.rstrip("/")
         self.county = county
         self.state = state
         self.record_types = record_types or []
+        self.active_record_type = record_type or (self.record_types[0] if self.record_types else None)
         self._single_date_mode = False  # Set by _fill_dates when only 1 date input exists
 
         from urllib.parse import urlparse
@@ -89,6 +103,20 @@ class AcclaimWebScraper(BridgeScraper):
         all_records: list[ScrapedRecord] = []
         seen_hashes: set[str] = set()
         chunk_start = start
+
+        # Pre-detect single-date mode BEFORE the loop so day-by-day
+        # chunking applies from chunk #1. Chelan's AcclaimWeb has a
+        # #RecordDate field (no Kendo DatePicker, no date-range pair).
+        try:
+            has_single = await self.page.locator("#RecordDate").count() > 0
+            has_pair = (
+                await self.page.locator("#FromDatePicker, #RecordDateFrom, #txtStartDate, #StartDate").count() > 0
+            )
+            if has_single and not has_pair:
+                self._single_date_mode = True
+                _logger.info("Pre-detected single-date mode (#RecordDate without date-range pair)")
+        except Exception:
+            pass
 
         while chunk_start < end:
             # Use 1-day chunks in single-date mode, 7-day chunks otherwise
@@ -222,18 +250,20 @@ class AcclaimWebScraper(BridgeScraper):
         """Navigate back to the Record Date search form."""
         search_url = f"{self.base_url}/search/SearchTypeRecordDate"
         try:
-            # Try clicking search tab link first (stays in session)
+            # Try clicking search tab link first (stays in session).
+            # On Chelan the link is often hidden behind the results panel
+            # so check is_visible() with a short timeout to avoid a 30s hang.
             search_link = self.page.locator(
                 "a[href*='SearchTypeRecordDate'], a:has-text('Record Date')"
-            )
-            if await search_link.count() > 0:
-                await search_link.first.click()
+            ).first
+            if await search_link.count() > 0 and await search_link.is_visible():
+                await search_link.click(timeout=5_000)
                 await self.page.wait_for_timeout(2_000)
                 return
         except Exception:
             pass
 
-        # Fallback: navigate directly
+        # Fallback: navigate directly (reliable even when the link is hidden)
         await self.page.goto(search_url, wait_until="domcontentloaded", timeout=15_000)
         await self.page.wait_for_timeout(2_000)
 
@@ -329,15 +359,33 @@ class AcclaimWebScraper(BridgeScraper):
                     _logger.info("Dates typed via fallback: %s to %s (ids: %s, %s)", date_from, date_to, from_id, to_id)
                     return
 
-            # Single date field fallback (e.g. Douglas AcclaimWeb has only #RecordDate)
+            # Single date field fallback (e.g. Chelan/Douglas AcclaimWeb has only #RecordDate)
             # Type the start date — the search returns records ON that date.
             # The chunking loop will iterate day-by-day for single-date sites.
+            #
+            # Chelan's #RecordDate is wrapped in a DatePicker widget that
+            # silently swallows press_sequentially keystrokes — the old value
+            # stays in the input even after typing. We verify the value
+            # actually changed and fall back to JS-based value injection +
+            # change event dispatch if it didn't.
             single_el = self.page.locator("#RecordDate")
             if await single_el.count() > 0:
                 await single_el.click()
                 await single_el.fill("")
                 await single_el.press_sequentially(date_from, delay=30)
-                _logger.info("Single date typed: %s (RecordDate field)", date_from)
+                # Verify the value actually stuck
+                actual = (await single_el.get_attribute("value") or "").strip()
+                if actual != date_from:
+                    _logger.info(
+                        "RecordDate press_sequentially failed (value=%r, expected=%r) — forcing via JS",
+                        actual, date_from,
+                    )
+                    await single_el.evaluate(
+                        f"el => {{ el.value = '{date_from}'; "
+                        f"el.dispatchEvent(new Event('change', {{bubbles: true}})); "
+                        f"el.dispatchEvent(new Event('input', {{bubbles: true}})); }}"
+                    )
+                _logger.info("Single date set: %s (RecordDate field)", date_from)
                 self._single_date_mode = True
                 return
 
@@ -389,17 +437,21 @@ class AcclaimWebScraper(BridgeScraper):
             await search_btn.first.click()
             _logger.info("Search button clicked, waiting for results...")
 
-            # Wait for results grid to populate (Kendo Grid loads via AJAX)
+            # Wait for results to populate — either Kendo Grid (Douglas, Pend Oreille)
+            # or plain HTML table (Chelan). Use a short timeout (10s) instead of 60s
+            # because Chelan iterates day-by-day and 60s * 30 days = 30 min of wasted
+            # wait time on a selector that Chelan never produces.
             try:
                 await self.page.wait_for_selector(
                     "#SearchResultGrid tbody tr, .k-grid-content tr, "
                     ".no-results, .k-grid-norecords, "
-                    "table.k-grid tbody tr, [data-role='grid'] tbody tr",
-                    timeout=60_000,
+                    "table.k-grid tbody tr, [data-role='grid'] tbody tr, "
+                    "table tbody tr td:nth-child(5)",  # Chelan plain table: 5+ columns
+                    timeout=10_000,
                 )
                 _logger.info("Results selector found")
             except Exception:
-                await self.page.wait_for_timeout(5_000)
+                await self.page.wait_for_timeout(3_000)
                 _logger.info("Results selector timeout, continuing anyway")
 
             # Extra wait for Kendo AJAX to fully populate grid data
@@ -584,7 +636,10 @@ class AcclaimWebScraper(BridgeScraper):
                         // Require at least date + grantor + doc_type for a valid match
                         if (colMap.date_recorded == null || colMap.grantor == null) continue;
                         const bodyRows = t.querySelectorAll('tbody tr');
-                        if (!bodyRows.length) continue;
+                        // Require >=2 body rows — Chelan's filter-bar table has
+                        // header cells AND 1 body row (the filter inputs), which
+                        // tricks us into picking it over the real data table.
+                        if (bodyRows.length < 2) continue;
                         if (!best || bodyRows.length > best.rows.length) {
                             best = { table: t, rows: bodyRows, colMap };
                         }
@@ -608,6 +663,38 @@ class AcclaimWebScraper(BridgeScraper):
                             if (!r.date_recorded && !r.grantor && !r.instrument) return null;
                             return r;
                         }).filter(r => r !== null);
+                    }
+                    // Fallback 3: Chelan-style headless data table.
+                    // Chelan County AcclaimWeb renders the filter bar as a
+                    // separate <table> with header cells, and the ACTUAL data
+                    // in a second <table> with NO <thead> and NO <th> cells.
+                    // Detect by finding a table with 7+ td cells per body row
+                    // and no headers, then map by AcclaimWeb's known column
+                    // order: [View, Row#, Grantor, Grantee, AFN, RecordDate,
+                    // Book/Page, DocType, DocLegal].
+                    for (const t of tables) {
+                        const bodyRows = Array.from(t.querySelectorAll('tbody tr'));
+                        if (bodyRows.length < 2) continue;
+                        const firstCells = bodyRows[0].querySelectorAll('td');
+                        if (firstCells.length < 7) continue;
+                        // Skip if this table HAS proper headers (was already checked above)
+                        const ths = t.querySelectorAll('thead th, tr:first-child th');
+                        if (ths.length >= 4) continue;
+                        return bodyRows.map(row => {
+                            const cells = row.querySelectorAll('td');
+                            if (cells.length < 7) return null;
+                            // AcclaimWeb column order (0-indexed):
+                            // 0=View 1=Row# 2=Grantor 3=Grantee 4=AFN 5=Date 6=Book/Page 7=DocType 8=Legal
+                            return {
+                                instrument: (cells[4] || {}).textContent?.trim() || '',
+                                date_recorded: (cells[5] || {}).textContent?.trim() || '',
+                                doc_type: (cells[7] || {}).textContent?.trim() || '',
+                                grantor: (cells[2] || {}).textContent?.trim() || '',
+                                grantee: (cells[3] || {}).textContent?.trim() || '',
+                                legal: (cells[8] || {}).textContent?.trim() || '',
+                                parcel: '',
+                            };
+                        }).filter(r => r !== null && (r.date_recorded || r.grantor));
                     }
                     return [];
                 })()
@@ -648,16 +735,16 @@ class AcclaimWebScraper(BridgeScraper):
                 # Doc type — use for filtering
                 doc_type = item.get("doc_type", "").strip().upper()
 
-                # Filter by record type if specified
-                if self.record_types and doc_type:
-                    matched = False
-                    for rt in self.record_types:
-                        keywords = _DOC_TYPE_MAP.get(rt, [])
-                        if any(kw in doc_type for kw in keywords):
-                            matched = True
-                            break
-                    if not matched:
+                # Filter by the caller-requested record type ONLY (same fix
+                # as EagleWeb Phase A — use active_record_type, not the full
+                # record_types list, so "probate" doesn't mix in pre_foreclosure)
+                active_rt = self.active_record_type
+                if active_rt and doc_type:
+                    keywords = _DOC_TYPE_MAP.get(active_rt, [])
+                    if keywords and not any(kw in doc_type for kw in keywords):
                         continue
+
+                record.doc_type = doc_type if doc_type else None
 
                 # Grantor → party_name
                 grantor = item.get("grantor", "").strip()

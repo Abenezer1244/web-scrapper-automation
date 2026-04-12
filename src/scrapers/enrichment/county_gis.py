@@ -112,22 +112,30 @@ def enrich_parcel_gis(
         gis_config = _KNOWN_GIS_ENDPOINTS[county_key]
 
     # Try county-specific endpoint first (by parcel ID)
-    if gis_config:
+    if gis_config and parcel_id:
         result = _query_gis(parcel_id, gis_config, county_key)
         if result.get("property_address"):
             return result
 
-        # Fallback: search by owner name if parcel ID didn't match
-        if owner_name and gis_config.get("owner_field"):
-            result = _query_gis_by_name(owner_name, gis_config, county_key)
-            if result.get("property_address"):
-                _logger.info("GIS name-based fallback succeeded for %s", owner_name)
-                return result
+    # Fallback: search by owner name if parcel ID didn't match or is None
+    # (e.g. Tyler SelfService records that have names but no parcel)
+    if gis_config and owner_name and gis_config.get("owner_field"):
+        result = _query_gis_by_name(owner_name, gis_config, county_key)
+        if result.get("property_address"):
+            _logger.info("GIS name-based fallback succeeded for %s", owner_name)
+            return result
 
     # Fallback: WA statewide parcel service (covers all 39 WA counties)
-    if state.upper() == "WA":
+    if state.upper() == "WA" and parcel_id:
         result = _query_wa_statewide(parcel_id, county)
         if result.get("property_address"):
+            return result
+
+    # WA statewide name-based fallback when parcel_id is None
+    if state.upper() == "WA" and not parcel_id and owner_name:
+        result = _query_wa_statewide_by_name(owner_name, county)
+        if result.get("property_address"):
+            _logger.info("WA statewide name search succeeded for %s", owner_name)
             return result
 
     return _empty()

@@ -348,32 +348,59 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         return await self._extract_all_pages()
 
     async def _go_to_doc_type_search(self) -> None:
-        """Click Document Type Search in the left sidebar."""
+        """Switch to Document Type Search tab WITHOUT a page reload.
+
+        A full page.goto() wipes the reCAPTCHA verification state on
+        Railway, causing "Could not set dates" because LandmarkWeb
+        keeps the form locked until the captcha is verified server-side.
+        Using JS to click the tab or show the section avoids a reload.
+        """
+        # Method 1: click the tab via Playwright
         try:
             doc_type_link = self.page.locator(
                 "#searchCriteriaDocuments-tab, "
                 "a:has-text('Document Type Search')"
             )
             if await doc_type_link.count() > 0:
-                await doc_type_link.first.click()
+                await doc_type_link.first.click(force=True)
                 await self.page.wait_for_timeout(1500)
                 _logger.info("Clicked Document Type Search tab")
                 return
         except Exception:
             pass
 
-        # Fallback: navigate directly then re-accept disclaimer
+        # Method 2: JS click (bypasses visibility/interception issues)
+        try:
+            clicked = await self.page.evaluate("""() => {
+                const tab = document.querySelector('#searchCriteriaDocuments-tab')
+                    || document.querySelector('a[href*="searchCriteriaDocuments"]');
+                if (tab) { tab.click(); return true; }
+                // Try showing the section directly via jQuery
+                if (typeof $ !== 'undefined') {
+                    $('#searchCriteriaDocuments').show().addClass('active');
+                    return true;
+                }
+                return false;
+            }""")
+            if clicked:
+                await self.page.wait_for_timeout(1500)
+                _logger.info("Switched to Document Type Search via JS")
+                return
+        except Exception:
+            pass
+
+        # Method 3 (last resort): full navigation — loses captcha state
+        _logger.warning("Tab click failed — falling back to goto (will lose captcha state)")
         url = f"{self._base_url}/search/index?theme=.blue&section=searchCriteriaDocuments"
         if "/search/" in self._base_url:
             url = f"{self._base_url}?theme=.blue&section=searchCriteriaDocuments"
         await self.page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         await self.page.wait_for_timeout(2000)
         await self._accept_disclaimer()
-        # After disclaimer, try clicking the tab again
         try:
             tab = self.page.locator("#searchCriteriaDocuments-tab, a:has-text('Document Type')")
             if await tab.count() > 0:
-                await tab.first.click()
+                await tab.first.click(force=True)
                 await self.page.wait_for_timeout(1500)
         except Exception:
             pass

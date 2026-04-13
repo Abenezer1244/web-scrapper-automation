@@ -299,9 +299,19 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
     # ─── Search flow ─────────────────────────────────────────────────────────
 
     async def _search_chunk(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
-        """Navigate to Document Type Search, select document type, fill dates, submit."""
+        """Navigate to Document Type Search, select document type, fill dates, submit.
+
+        The captcha token must be re-injected AFTER navigating to the search
+        form because _go_to_doc_type_search() may do a full page.goto() on
+        Railway (when the tab click falls through), which wipes the
+        grecaptcha.getResponse() monkey-patch from _solve_captcha_once().
+        Without re-injection, LandmarkWeb's JS sees an unsolved captcha and
+        keeps the date fields locked/hidden → "Could not set dates: Timeout".
+        """
         await self._go_to_doc_type_search()
         await self._select_document_type()
+        # Re-inject captcha token AFTER navigation so form fields unlock
+        await self._ensure_captcha_token()
         await self._fill_dates(date_from, date_to)
         await self._submit_search()
         return await self._extract_all_pages()

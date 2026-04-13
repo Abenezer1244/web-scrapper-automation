@@ -255,9 +255,40 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                             if (typeof grecaptcha !== 'undefined') {
                                 grecaptcha.getResponse = () => token;
                             }
+
+                            // Trigger the reCAPTCHA success callback that LandmarkWeb
+                            // registered. Without this, the server-side form validation
+                            // never fires and the date fields stay locked. The callback
+                            // is stored in the data-callback attribute of the reCAPTCHA
+                            // div, or as a global function.
+                            const cbName = document.querySelector('[data-callback]')
+                                ?.getAttribute('data-callback');
+                            if (cbName && typeof window[cbName] === 'function') {
+                                window[cbName](token);
+                            }
+                            // Also try calling ___grecaptcha_cfg callbacks
+                            try {
+                                if (typeof ___grecaptcha_cfg !== 'undefined') {
+                                    const clients = ___grecaptcha_cfg.clients || {};
+                                    for (const cid of Object.keys(clients)) {
+                                        const client = clients[cid];
+                                        // Walk the client object tree to find callback fns
+                                        const walk = (obj) => {
+                                            if (!obj || typeof obj !== 'object') return;
+                                            for (const k of Object.keys(obj)) {
+                                                if (typeof obj[k] === 'function' && k.length < 3) {
+                                                    try { obj[k](token); } catch(e) {}
+                                                }
+                                                if (typeof obj[k] === 'object') walk(obj[k]);
+                                            }
+                                        };
+                                        walk(client);
+                                    }
+                                }
+                            } catch(e) {}
                         }
                     """, token)
-                    _logger.info("reCAPTCHA token injected + getResponse patched")
+                    _logger.info("reCAPTCHA token injected + getResponse patched + callbacks fired")
                     await self.page.wait_for_timeout(1000)
                     return
                 else:

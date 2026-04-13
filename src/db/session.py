@@ -56,7 +56,16 @@ sync_engine = create_engine(
     pool_recycle=300,
     pool_size=2,
     max_overflow=3,
+    pool_timeout=30,  # wait max 30s for a connection from the pool
     echo=settings.DEBUG,
+    connect_args={
+        "connect_timeout": 10,  # 10s to establish TCP connection
+        # 120s max per SQL statement — prevents infinite hangs when
+        # Supabase/pgbouncer stalls during commit. This was the root
+        # cause of Railway workers hanging at "Checking for duplicate
+        # leads" — the db.commit() would wait forever.
+        "options": "-c statement_timeout=120000",
+    },
 )
 
 SyncSessionLocal = sessionmaker(

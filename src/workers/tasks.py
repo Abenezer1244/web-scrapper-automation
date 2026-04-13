@@ -312,6 +312,7 @@ def run_scrape_job(self, job_id: str) -> None:
         # delivery) vs which conflicted (user has seen this lead before).
         # The conflicting rows get their Result flagged is_duplicate=true.
         _publish_log(r, job_id, "info", "Checking for duplicate leads...", db=db)
+        _logger.info("Job %s: dedup step 1 — SELECT fresh rows", job_id)
 
         # Step 1: pull the freshly-inserted results back so we have their
         # Result.id for the first_result_id foreign key
@@ -325,9 +326,11 @@ def run_scrape_job(self, job_id: str) -> None:
             {"jid": job_id},
         ).fetchall()
 
+        _logger.info("Job %s: dedup step 1 done — %d fresh rows", job_id, len(fresh_rows))
         dup_count = 0
         unique_count = 0
         if fresh_rows:
+            _logger.info("Job %s: dedup step 2 — INSERT delivered_records", job_id)
             # Step 2: single batched upsert into delivered_records.
             # ON CONFLICT DO NOTHING is the atomic "claim first delivery"
             # primitive — the unique (user_id, dedup_hash) constraint
@@ -380,7 +383,9 @@ def run_scrape_job(self, job_id: str) -> None:
                 )
                 for row in result.fetchall():
                     claimed_hashes.add(row.dedup_hash)
+            _logger.info("Job %s: dedup step 2 INSERT done — committing", job_id)
             db.commit()
+            _logger.info("Job %s: dedup step 2 committed — %d claimed", job_id, len(claimed_hashes))
 
             # Step 3: any fresh Result whose dedup_hash is NOT in claimed_hashes
             # was a duplicate. Mark those rows.

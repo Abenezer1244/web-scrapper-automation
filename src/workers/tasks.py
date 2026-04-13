@@ -397,13 +397,16 @@ def run_scrape_job(self, job_id: str) -> None:
             dup_count = len(duplicate_result_ids)
 
             if duplicate_result_ids:
-                # Batch the UPDATE to avoid an IN clause explosion
+                # Batch the UPDATE to avoid an IN clause explosion.
+                # Cast text[] to uuid[] — results.id is UUID type but
+                # duplicate_result_ids are Python strings. Without the
+                # cast, Postgres raises "operator does not exist: uuid = text".
                 for j in range(0, len(duplicate_result_ids), 500):
                     chunk = duplicate_result_ids[j:j + 500]
                     db.execute(
                         sa_text(
                             "UPDATE results SET is_duplicate = true "
-                            "WHERE id = ANY(:ids)"
+                            "WHERE id = ANY(:ids::uuid[])"
                         ),
                         {"ids": chunk},
                     )

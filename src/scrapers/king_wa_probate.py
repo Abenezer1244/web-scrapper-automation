@@ -351,25 +351,24 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
 
         async def _inject_token(route):
             req = route.request
-            if "DocumentTypeSearch" in req.url and req.method == "POST":
-                body = req.post_data or ""
-                # Check if g-recaptcha-response is empty in the POST body
-                if "g-recaptcha-response=" in body:
-                    parts = body.split("g-recaptcha-response=")
-                    after = parts[1] if len(parts) > 1 else ""
-                    existing_val = after.split("&")[0]
-                    if not existing_val:
-                        # Inject our stored token
-                        body = body.replace(
-                            "g-recaptcha-response=",
-                            f"g-recaptcha-response={self._captcha_token}",
-                        )
-                        _logger.info("Route interceptor: injected captcha token into POST")
+            _logger.info("Route interceptor: %s %s", req.method, req.url[-60:])
+            if req.method == "POST" and req.post_data and "g-recaptcha-response=" in req.post_data:
+                body = req.post_data
+                # Check if the token field is empty
+                parts = body.split("g-recaptcha-response=")
+                existing_val = parts[1].split("&")[0] if len(parts) > 1 else ""
+                if not existing_val:
+                    body = body.replace(
+                        "g-recaptcha-response=",
+                        f"g-recaptcha-response={self._captcha_token}",
+                    )
+                    _logger.info("Route interceptor: INJECTED captcha token")
                 await route.continue_(post_data=body)
             else:
                 await route.continue_()
 
-        await self.page.route("**/Search/**", _inject_token)
+        # Use broad pattern — Playwright glob matching is case-insensitive
+        await self.page.route("**/*Search*", _inject_token)
         _logger.info("Captcha route interceptor installed")
 
     # ─── Search flow ─────────────────────────────────────────────────────────

@@ -453,26 +453,29 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         await self.page.wait_for_timeout(500)
 
     async def _fill_dates(self, date_from: str, date_to: str) -> None:
-        """Fill the begin/end date fields in the DocumentType section."""
+        """Fill the begin/end date fields in the DocumentType section.
+
+        On Railway headless, the reCAPTCHA overlay may cover the date
+        inputs even after token injection. Use JS-based fill (bypasses
+        overlay) instead of Playwright click + type.
+        """
         try:
-            begin_el = self.page.locator("#beginDate-DocumentType")
-            end_el = self.page.locator("#endDate-DocumentType")
-
-            if await begin_el.count() > 0 and await end_el.count() > 0:
-                await begin_el.first.click()
-                await begin_el.first.fill("")
-                await begin_el.first.press_sequentially(date_from, delay=30)
-                await begin_el.first.press("Tab")
-
-                await end_el.first.click()
-                await end_el.first.fill("")
-                await end_el.first.press_sequentially(date_to, delay=30)
-                await end_el.first.press("Tab")
-
-                _logger.info("Dates filled: %s to %s", date_from, date_to)
+            filled = await self.page.evaluate(f"""() => {{
+                const begin = document.querySelector('#beginDate-DocumentType');
+                const end = document.querySelector('#endDate-DocumentType');
+                if (!begin || !end) return false;
+                begin.value = '{date_from}';
+                begin.dispatchEvent(new Event('change', {{bubbles: true}}));
+                begin.dispatchEvent(new Event('input', {{bubbles: true}}));
+                end.value = '{date_to}';
+                end.dispatchEvent(new Event('change', {{bubbles: true}}));
+                end.dispatchEvent(new Event('input', {{bubbles: true}}));
+                return true;
+            }}""")
+            if filled:
+                _logger.info("Dates filled via JS: %s to %s", date_from, date_to)
             else:
                 _logger.warning("Date inputs #beginDate-DocumentType / #endDate-DocumentType not found")
-
             await self.page.wait_for_timeout(500)
         except Exception as exc:
             _logger.warning("Could not set dates: %s", str(exc)[:120])
@@ -537,10 +540,11 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
             # Solve captcha RIGHT BEFORE clicking submit (token is freshest here)
             await self._ensure_captcha_token()
 
-            await submit_btn.first.scroll_into_view_if_needed()
-            await self.page.wait_for_timeout(300)
-            await submit_btn.first.click()
-            _logger.info("Submit clicked")
+            # Use JS click to bypass any overlay covering the button
+            await self.page.evaluate(
+                "document.querySelector('#submit-DocumentType')?.click()"
+            )
+            _logger.info("Submit clicked via JS")
 
             # Wait for AJAX results to load (spinner appears then disappears)
             try:

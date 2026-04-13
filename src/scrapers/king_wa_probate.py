@@ -574,21 +574,58 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
             _logger.warning("Captcha solve error: %s", str(exc)[:80])
 
     async def _submit_search(self) -> None:
-        """Solve captcha + click Submit + wait for results."""
+        """Submit the search via direct AJAX fetch (bypasses form + reCAPTCHA overlay).
+
+        LandmarkWeb's submit button calls announceValidationErrors() which
+        serializes the form including g-recaptcha-response from the iframe
+        textarea. Our 2Captcha token can't reach that iframe textarea. Instead
+        we call the /Search/DocumentTypeSearch endpoint directly via fetch()
+        in the page context, injecting the captcha token into the POST body.
+        The response HTML is then injected into #searchResults for the
+        extraction code to parse.
+        """
         try:
-            submit_btn = self.page.locator("#submit-DocumentType")
-            if await submit_btn.count() == 0:
-                _logger.warning("Submit button #submit-DocumentType not found")
-                return
-
-            # Solve captcha RIGHT BEFORE clicking submit (token is freshest here)
+            # Get fresh captcha token
             await self._ensure_captcha_token()
+            token = getattr(self, "_captcha_token", "") or ""
 
-            # Use JS click to bypass any overlay covering the button
-            await self.page.evaluate(
-                "document.querySelector('#submit-DocumentType')?.click()"
+            # Read the selected doc type and dates from the form
+            form_data = await self.page.evaluate("""() => {
+                return {
+                    doctype: document.querySelector('#documentCategory-DocumentType')?.value || '60',
+                    beginDate: document.querySelector('#beginDate-DocumentType')?.value || '',
+                    endDate: document.querySelector('#endDate-DocumentType')?.value || '',
+                };
+            }""")
+
+            # Direct AJAX call with token baked into the POST body
+            result = await self.page.evaluate(f"""async () => {{
+                const params = new URLSearchParams({{
+                    doctype: '{form_data["doctype"]}',
+                    beginDate: '{form_data["beginDate"]}',
+                    endDate: '{form_data["endDate"]}',
+                    recordCount: '0',
+                    exclude: 'false',
+                    ReturnIndexGroups: 'false',
+                    townName: '',
+                    mobileHomesOnly: 'false',
+                    'g-recaptcha-response': '{token}',
+                }});
+                const resp = await fetch('/LandmarkWeb/Search/DocumentTypeSearch', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+                    body: params.toString(),
+                }});
+                const html = await resp.text();
+                // Inject results into the page for the extraction code
+                const sr = document.querySelector('#searchResults');
+                if (sr) sr.innerHTML = html;
+                return {{ status: resp.status, len: html.length, hasTable: html.includes('<table') }};
+            }}""")
+            _logger.info(
+                "Direct AJAX submit: status=%s len=%s hasTable=%s",
+                result.get("status"), result.get("len"), result.get("hasTable"),
             )
-            _logger.info("Submit clicked via JS")
 
             # Wait for AJAX results to load (spinner appears then disappears)
             try:

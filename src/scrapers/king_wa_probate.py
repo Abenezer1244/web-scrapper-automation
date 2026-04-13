@@ -756,9 +756,12 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         import re as _re
         records: list[ScrapedRecord] = []
         for row in data_rows:
-            # Strip HTML from cell values
+            # Strip HTML tags AND LandmarkWeb prefixes like "nobreak_", "unclickable_"
             def strip_html(s):
-                return _re.sub(r'<[^>]+>', '', str(s)).strip()
+                cleaned = _re.sub(r'<[^>]+>', '', str(s)).strip()
+                # Remove LandmarkWeb CSS class prefixes baked into cell text
+                cleaned = _re.sub(r'^(nobreak_|unclickable_)\s*', '', cleaned)
+                return cleaned
 
             grantor = strip_html(row.get("5", ""))
             grantee = strip_html(row.get("6", ""))

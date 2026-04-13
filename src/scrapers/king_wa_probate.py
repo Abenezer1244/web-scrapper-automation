@@ -115,6 +115,12 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                 await self.navigate(search_url)
                 await self._accept_disclaimer()
                 await self._solve_captcha_once()
+                # Install route interceptor to inject captcha token into
+                # every DocumentTypeSearch POST. The reCAPTCHA textarea
+                # lives in an iframe context that our JS injection can't
+                # reach, so the form serializes g-recaptcha-response as
+                # empty. The route intercept fixes it in flight.
+                await self._install_captcha_route_interceptor()
                 break
             except Exception as exc:
                 _logger.warning("Startup attempt %d/3 failed: %s", attempt, str(exc)[:80])
@@ -288,6 +294,7 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                             } catch(e) {}
                         }
                     """, token)
+                    self._captcha_token = token  # Store for route interceptor
                     _logger.info("reCAPTCHA token injected + getResponse patched + callbacks fired")
                     await self.page.wait_for_timeout(1000)
                     return
@@ -326,6 +333,44 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
             _logger.warning("reCAPTCHA was not solved within 5 minutes")
 
         await self.page.wait_for_timeout(1000)
+
+    async def _install_captcha_route_interceptor(self) -> None:
+        """Install a Playwright route handler that injects the captcha token
+        into every DocumentTypeSearch POST body.
+
+        The reCAPTCHA textarea lives inside Google's iframe — our JS
+        injection can set grecaptcha.getResponse() but can't reach the
+        textarea in the cross-origin iframe. When LandmarkWeb serializes
+        the form, g-recaptcha-response is empty. This route handler
+        intercepts the POST in-flight and fills in the token.
+        """
+        token = getattr(self, "_captcha_token", None)
+        if not token:
+            _logger.info("No captcha token stored — skipping route interceptor")
+            return
+
+        async def _inject_token(route):
+            req = route.request
+            if "DocumentTypeSearch" in req.url and req.method == "POST":
+                body = req.post_data or ""
+                # Check if g-recaptcha-response is empty in the POST body
+                if "g-recaptcha-response=" in body:
+                    parts = body.split("g-recaptcha-response=")
+                    after = parts[1] if len(parts) > 1 else ""
+                    existing_val = after.split("&")[0]
+                    if not existing_val:
+                        # Inject our stored token
+                        body = body.replace(
+                            "g-recaptcha-response=",
+                            f"g-recaptcha-response={self._captcha_token}",
+                        )
+                        _logger.info("Route interceptor: injected captcha token into POST")
+                await route.continue_(post_data=body)
+            else:
+                await route.continue_()
+
+        await self.page.route("**/Search/**", _inject_token)
+        _logger.info("Captcha route interceptor installed")
 
     # ─── Search flow ─────────────────────────────────────────────────────────
 

@@ -59,3 +59,4 @@ pytest-cov==6.0.0
 pytest-asyncio==0.24.0
 httpx==0.28.1
 # Worker restart: 2026-04-13T06:07:58Z
+playwright-recaptcha==0.5.1

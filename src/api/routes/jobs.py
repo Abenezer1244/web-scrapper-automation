@@ -575,11 +575,15 @@ async def download_export(
         if not records:
             raise HTTPException(status_code=404, detail="No records found for this job")
 
-        # Build CSV in memory
+        # Build CSV in memory — includes skip trace fields (phone, email)
+        # when available. The download always reads LIVE from the DB, so
+        # phone/email appear as soon as the skip trace dispatcher completes,
+        # even if the original export was uploaded before skip trace ran.
         output = io.StringIO()
         fieldnames = [
             "date_recorded", "party_name", "heirs", "parcel_id",
             "property_address", "mailing_address", "legal_description",
+            "phone", "phone_type", "email",
         ]
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
@@ -592,6 +596,9 @@ async def download_export(
                 "property_address": sanitize_for_csv(r.property_address),
                 "mailing_address": sanitize_for_csv(r.mailing_address),
                 "legal_description": sanitize_for_csv(r.legal_description),
+                "phone": sanitize_for_csv(getattr(r, "phone", None)),
+                "phone_type": sanitize_for_csv(getattr(r, "phone_type", None)),
+                "email": sanitize_for_csv(getattr(r, "email", None)),
             })
 
         csv_bytes = output.getvalue().encode("utf-8")

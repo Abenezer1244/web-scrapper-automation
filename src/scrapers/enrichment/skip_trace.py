@@ -572,8 +572,16 @@ def _parse_full_address(addr: str) -> dict:
         result["street"] = parts[0] or None
 
     if len(parts) == 2:
-        # "STREET, CITY"
-        result["city"] = parts[1] or None
+        # "STREET, CITY" or "STREET, CITY STATE ZIP" (King County GIS format)
+        # Try to split "SEATTLE WA 98146" into city/state/zip
+        second = parts[1].strip()
+        m = re.match(r"^(.+?)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$", second)
+        if m:
+            result["city"] = m.group(1).strip() or None
+            result["state"] = m.group(2)
+            result["zip"] = m.group(3)
+        else:
+            result["city"] = second or None
     elif len(parts) == 3:
         # "STREET, CITY, ST 98101" — state+zip combined in last part
         result["city"] = parts[1] or None

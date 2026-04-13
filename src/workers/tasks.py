@@ -406,7 +406,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     db.execute(
                         sa_text(
                             "UPDATE results SET is_duplicate = true "
-                            "WHERE id = ANY(:ids::uuid[])"
+                            "WHERE id = ANY(CAST(:ids AS uuid[]))"
                         ),
                         {"ids": chunk},
                     )

@@ -451,12 +451,24 @@ def run_scrape_job(self, job_id: str) -> None:
             _publish_log(r, job_id, "warning", f"Plan limit exceeded by {overage} records. Upgrade to keep scraping.", db=db)
 
         # ── INLINE ENRICHMENT (BEFORE marking done) ──────────────────────────
+        # Wrapped in a thread-based timeout so a hanging GIS/assessor HTTP
+        # request can't stall the entire Celery worker forever. The Railway
+        # workers were consistently hanging at this step when ArcGIS
+        # responses were slow. 5 minutes is generous — typical enrichment
+        # for 50-100 parcels takes 30-60 seconds.
         _publish_log(r, job_id, "info", "Looking up property and mailing addresses...", db=db)
+        import concurrent.futures
+        _ENRICHMENT_TIMEOUT = 300  # 5 minutes
         try:
-            _run_inline_enrichment(db, job, r, job_id, config)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_run_inline_enrichment, db, job, r, job_id, config)
+                future.result(timeout=_ENRICHMENT_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            _logger.error("Enrichment timed out after %ds — skipping", _ENRICHMENT_TIMEOUT)
+            _publish_log(r, job_id, "warning", f"Address lookup timed out after {_ENRICHMENT_TIMEOUT}s — some addresses may be missing", db=db)
         except Exception as exc:
             _logger.warning("Inline enrichment error: %s", str(exc)[:80])
-        _publish_log(r, job_id, "success", f"Enrichment complete — addresses added", db=db)
+        _publish_log(r, job_id, "success", "Enrichment complete — addresses added", db=db)
 
         # Re-export CSV with enriched data
         enriched_file = None

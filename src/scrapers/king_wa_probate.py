@@ -599,33 +599,44 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
             }""")
 
             # Direct AJAX call with token baked into the POST body
-            result = await self.page.evaluate(f"""async () => {{
-                const params = new URLSearchParams({{
-                    doctype: '{form_data["doctype"]}',
-                    beginDate: '{form_data["beginDate"]}',
-                    endDate: '{form_data["endDate"]}',
-                    recordCount: '0',
-                    exclude: 'false',
-                    ReturnIndexGroups: 'false',
-                    townName: '',
-                    mobileHomesOnly: 'false',
-                    'g-recaptcha-response': '{token}',
-                }});
-                const resp = await fetch('/LandmarkWeb/Search/DocumentTypeSearch', {{
+            # Step 1: POST DocumentTypeSearch (initial search, sets server state)
+            await self.page.evaluate(f"""async () => {{
+                await fetch('/LandmarkWeb/Search/DocumentTypeSearch', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
-                    body: params.toString(),
+                    body: new URLSearchParams({{
+                        doctype: '{form_data["doctype"]}',
+                        beginDate: '{form_data["beginDate"]}',
+                        endDate: '{form_data["endDate"]}',
+                        recordCount: '0',
+                        exclude: 'false',
+                        ReturnIndexGroups: 'false',
+                        townName: '',
+                        mobileHomesOnly: 'false',
+                        'g-recaptcha-response': '{token}',
+                    }}).toString(),
                 }});
-                const html = await resp.text();
-                // Inject results into the page for the extraction code
-                const sr = document.querySelector('#searchResults');
-                if (sr) sr.innerHTML = html;
-                return {{ status: resp.status, len: html.length, hasTable: html.includes('<table') }};
             }}""")
-            _logger.info(
-                "Direct AJAX submit: status=%s len=%s hasTable=%s",
-                result.get("status"), result.get("len"), result.get("hasTable"),
-            )
+
+            # Step 2: POST GetSearchResults (DataTables JSON data source)
+            # This is the REAL data endpoint that returns JSON with all records.
+            # DocumentTypeSearch just sets server state; GetSearchResults returns data.
+            json_data = await self.page.evaluate("""async () => {
+                const resp = await fetch('/LandmarkWeb/Search/GetSearchResults', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: 'draw=1&start=0&length=1000',
+                });
+                return await resp.json();
+            }""")
+
+            total = json_data.get("recordsTotal", 0)
+            data_rows = json_data.get("data", [])
+            _logger.info("GetSearchResults: %d total, %d rows returned", total, len(data_rows))
+
+            # Store JSON data for extraction — inject as a JS global
+            # so _extract_results_page can read it without DOM parsing
+            self._json_results = data_rows
 
             # Wait for AJAX results to load (spinner appears then disappears)
             try:
@@ -719,7 +730,74 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         return all_records
 
     async def _extract_page(self) -> list[ScrapedRecord]:
-        """Extract death certificate records from current results page.
+        """Extract records from current page or from JSON results.
+
+        When _json_results is populated (direct AJAX path on Railway),
+        parses records from the DataTables JSON. Otherwise falls back
+        to DOM extraction (local/headed mode).
+        """
+        # Fast path: parse from JSON if available (Railway direct AJAX)
+        json_data = getattr(self, "_json_results", None)
+        if json_data:
+            self._json_results = None  # consume once
+            return self._parse_json_results(json_data)
+
+        # Fallback: DOM extraction (original code below)
+        return await self._extract_page_dom()
+
+    def _parse_json_results(self, data_rows: list) -> list[ScrapedRecord]:
+        """Parse DataTables JSON rows into ScrapedRecords.
+
+        Each row in data_rows is a dict with numeric string keys ("0", "1", ...).
+        The values contain HTML fragments. Key columns (from local inspection):
+          5: Grantor name, 6: Grantee name, 7: Record date,
+          8: Doc type, 12: Recording number, 14+: Legal description with PID
+        """
+        import re as _re
+        records: list[ScrapedRecord] = []
+        for row in data_rows:
+            # Strip HTML from cell values
+            def strip_html(s):
+                return _re.sub(r'<[^>]+>', '', str(s)).strip()
+
+            grantor = strip_html(row.get("5", ""))
+            grantee = strip_html(row.get("6", ""))
+            date_str = strip_html(row.get("7", ""))
+            doc_type = strip_html(row.get("8", ""))
+            rec_num = strip_html(row.get("12", ""))
+
+            # Search ALL cells for legal/PID
+            legal = ""
+            for i in range(10, 25):
+                val = strip_html(row.get(str(i), ""))
+                if "PID" in val or "SUB:" in val or "LOT" in val or "SEC" in val:
+                    legal = val
+                    break
+
+            # Extract PID from legal
+            pid_match = _PID_PATTERN.search(legal)
+            parcel_id = pid_match.group(1) if pid_match else None
+
+            if not grantor and not date_str:
+                continue
+
+            record = ScrapedRecord()
+            record.date_recorded = date_str
+            record.party_name = grantor
+            record.heirs = grantee
+            record.doc_type = doc_type
+            record.parcel_id = parcel_id
+            record.legal_description = legal[:200] if legal else None
+            record.enrichment_data = {"instrument_number": rec_num, "source": "king_landmark_json"}
+
+            if parcel_id:
+                records.append(record)
+
+        _logger.info("JSON extraction: %d records with PID from %d rows", len(records), len(data_rows))
+        return records
+
+    async def _extract_page_dom(self) -> list[ScrapedRecord]:
+        """Extract death certificate records from current results page (DOM path).
 
         LandmarkWeb results table columns:
         Recording #, Record Date, Doc Type, Grantor, Grantee, Legal

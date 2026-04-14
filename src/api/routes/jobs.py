@@ -37,7 +37,28 @@ async def list_jobs(
         .order_by(Job.created_at.desc())
         .limit(100)
     )
-    return [JobResponse.model_validate(j) for j in result.scalars().all()]
+    jobs = result.scalars().all()
+
+    # Batch-load scraper configs for all jobs in one query
+    config_ids = list({j.scraper_config_id for j in jobs})
+    config_map: dict[str, ScraperConfig] = {}
+    if config_ids:
+        configs_result = await db.execute(
+            select(ScraperConfig).where(ScraperConfig.id.in_(config_ids))
+        )
+        config_map = {str(c.id): c for c in configs_result.scalars().all()}
+
+    responses = []
+    for j in jobs:
+        resp = JobResponse.model_validate(j)
+        sc = config_map.get(str(j.scraper_config_id))
+        if sc:
+            resp.scraper_name = sc.name
+            resp.county = sc.county
+            resp.state = sc.state
+            resp.record_type = sc.record_type
+        responses.append(resp)
+    return responses
 
 
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)

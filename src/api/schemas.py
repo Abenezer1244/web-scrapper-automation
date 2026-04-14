@@ -251,6 +251,11 @@ class JobResponse(BaseModel):
     started_at: datetime | None
     finished_at: datetime | None
     created_at: datetime
+    # Scraper config context — avoids separate lookup on frontend
+    scraper_name: str | None = None
+    county: str | None = None
+    state: str | None = None
+    record_type: str | None = None
     # Computed progress fields (not stored in DB)
     progress_pct: int | None = None
     estimated_total_records: int | None = None

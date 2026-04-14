@@ -444,7 +444,7 @@ def run_scrape_job(self, job_id: str) -> None:
         # do NOT count against the monthly quota. Records without a
         # dedup_hash (no parcel AND no address) still count, because
         # they are genuinely new data even though we can't dedupe them.
-        billable_count = len(records) - dup_count
+        billable_count = max(0, len(records) - dup_count)
         from sqlalchemy import update as sa_update
         db.execute(
             sa_update(User)

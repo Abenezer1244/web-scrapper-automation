@@ -666,7 +666,14 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 if pid not in pid_map:
                     pid_map[pid] = []
                 pid_map[pid].append(res)
-            enriched = asyncio.run(batch_enrich_king_county(pids))
+            # Cap at 300 parcels to avoid 10+ minute hangs on large batches.
+            # King County assessor is slow (~0.5s per parcel) — 1354 parcels
+            # takes ~11 min which exceeds the enrichment timeout.
+            _MAX_KING_PARCELS = 300
+            if len(pids) > _MAX_KING_PARCELS:
+                _logger.info("Capping King County mailing lookup to %d/%d parcels", _MAX_KING_PARCELS, len(pids))
+                pids = pids[:_MAX_KING_PARCELS]
+            enriched = asyncio.run(asyncio.wait_for(batch_enrich_king_county(pids), timeout=240))
             for pid, data in enriched.items():
                 prop = data.get("property_address")
                 mail = data.get("mailing_address")

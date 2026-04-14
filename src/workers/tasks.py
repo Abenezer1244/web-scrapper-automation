@@ -160,8 +160,9 @@ def run_scrape_job(self, job_id: str) -> None:
         _publish_log(r, job_id, "success", f"Starting scrape — {record_label} records", db=db)
 
         schedule = config.schedule or {}
+        range_mode = schedule.get("date_range_mode") or schedule.get("range_mode", "rolling_90")
         date_from, date_to = _resolve_date_range(schedule, config_id=config.id, job_id=job_id)
-        _publish_log(r, job_id, "info", f"Date range: {date_from} → {date_to}", db=db)
+        _publish_log(r, job_id, "info", f"Date range: {date_from} → {date_to} (mode: {range_mode})", db=db)
 
         _last_phase = [None]  # mutable for closure
 
@@ -973,13 +974,23 @@ def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: st
                     ).order_by(Job.finished_at.desc()).limit(1)
                 ).scalar()
                 if last_job and last_job.finished_at:
-                    # Start from the day the last job finished
-                    date_from = last_job.finished_at.date()
-                    _logger.info("since_last_run: last job finished %s, scraping from %s", last_job.finished_at.date(), date_from)
+                    # Start from the day AFTER the last job finished to
+                    # avoid re-scraping records already in that job's
+                    # results. Without +1 day, every record from the
+                    # overlap day is a guaranteed duplicate.
+                    date_from = last_job.finished_at.date() + timedelta(days=1)
+                    _logger.info(
+                        "since_last_run: last job %s finished %s, scraping from %s",
+                        last_job.id, last_job.finished_at.date(), date_from,
+                    )
                 else:
                     date_from = today - timedelta(days=30)
-                    _logger.info("since_last_run: no previous job found, defaulting to 30 days")
-        except Exception:
+                    _logger.info(
+                        "since_last_run: no previous done job for config_id=%s, defaulting to 30 days",
+                        config_id,
+                    )
+        except Exception as exc:
+            _logger.error("since_last_run: DB lookup failed (%s), defaulting to 30 days", exc)
             date_from = today - timedelta(days=30)
     elif range_mode == "rolling_30":
         date_from = today - timedelta(days=30)

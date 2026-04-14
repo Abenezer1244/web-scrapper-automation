@@ -356,6 +356,9 @@ class ResultsPage(BaseModel):
     items: list[ResultRow]
     enriched_count: int = 0      # records with property_address filled
     enriching: bool = False       # True while background enrichment is running
+    total_scraped: int = 0       # all records before dedup
+    duplicate_count: int = 0     # records flagged as duplicate
+    date_range_mode: str = ""    # rolling_90 | since_last_run | custom etc.
 
 
 # ─── Live run (SSE) ───────────────────────────────────────────────────────────

@@ -192,8 +192,17 @@ async def get_results(
     result = await db.execute(
         select(Job).where(Job.id == job_id, Job.user_id == current_user.id)
     )
-    if result.scalar_one_or_none() is None:
+    job = result.scalar_one_or_none()
+    if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    # Look up the scraper config to get the date_range_mode
+    config_result = await db.execute(
+        select(ScraperConfig).where(ScraperConfig.id == job.scraper_config_id)
+    )
+    config = config_result.scalar_one_or_none()
+    schedule = (config.schedule or {}) if config else {}
+    date_range_mode = schedule.get("date_range_mode") or schedule.get("range_mode", "rolling_90")
 
     safe_q = sanitize_search(q)
 
@@ -271,9 +280,29 @@ async def get_results(
 
     enriching = parcel_count > 0 and not enrichment_task_finished
 
+    # Total scraped (including duplicates) and duplicate count
+    total_scraped_result = await db.execute(
+        select(func.count()).where(
+            Result.job_id == job_id,
+            Result.user_id == current_user.id,
+        )
+    )
+    total_scraped = total_scraped_result.scalar_one()
+
+    dup_count_result = await db.execute(
+        select(func.count()).where(
+            Result.job_id == job_id,
+            Result.user_id == current_user.id,
+            Result.is_duplicate.is_(True),
+        )
+    )
+    duplicate_count = dup_count_result.scalar_one()
+
     return ResultsPage(
         job_id=job_id, total=total, page=page, page_size=page_size,
         items=items, enriched_count=enriched_count, enriching=enriching,
+        total_scraped=total_scraped, duplicate_count=duplicate_count,
+        date_range_mode=date_range_mode,
     )
 
 

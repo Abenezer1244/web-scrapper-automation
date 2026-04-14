@@ -821,25 +821,36 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
             rec.skip_trace_attempted_at = _now()
             cache_hits += 1
         else:
-            # Enqueue for the dispatcher
-            pending = PendingSkipTraceRow(
-                job_id=payload["job_id"],
-                result_id=payload["result_id"],
-                user_id=payload["user_id"],
-                property_address=payload["property_address"],
-                city=payload["city"],
-                state=payload["state"],
-                zip=payload["zip"],
-                first_name=payload["first_name"],
-                last_name=payload["last_name"],
-                mail_address=payload["mail_address"],
-                mail_city=payload["mail_city"],
-                mail_state=payload["mail_state"],
-                mail_zip=payload["mail_zip"],
-                trace_type=payload["trace_type"],
-                status="queued",
-            )
-            db.add(pending)
+            # Enqueue for the dispatcher. Truncate string fields to fit
+            # VARCHAR(128) — code violation descriptions can be 250+ chars
+            # and crash the INSERT with StringDataRightTruncation, which
+            # poisons the session with PendingRollbackError and hangs the job.
+            def _trunc128(v: str | None) -> str | None:
+                return v[:128] if v and len(v) > 128 else v
+
+            try:
+                pending = PendingSkipTraceRow(
+                    job_id=payload["job_id"],
+                    result_id=payload["result_id"],
+                    user_id=payload["user_id"],
+                    property_address=_trunc128(payload["property_address"]),
+                    city=_trunc128(payload["city"]),
+                    state=_trunc128(payload["state"]),
+                    zip=_trunc128(payload["zip"]),
+                    first_name=_trunc128(payload["first_name"]),
+                    last_name=_trunc128(payload["last_name"]),
+                    mail_address=_trunc128(payload["mail_address"]),
+                    mail_city=_trunc128(payload["mail_city"]),
+                    mail_state=_trunc128(payload["mail_state"]),
+                    mail_zip=_trunc128(payload["mail_zip"]),
+                    trace_type=payload["trace_type"],
+                    status="queued",
+                )
+                db.add(pending)
+            except Exception as exc:
+                _logger.warning("Skip trace enqueue failed for %s: %s", rec.party_name[:30] if rec.party_name else "?", str(exc)[:80])
+                db.rollback()
+                continue
             rec.skip_trace_status = "queued"
             cache_misses += 1
             if payload["trace_type"] == "advanced":

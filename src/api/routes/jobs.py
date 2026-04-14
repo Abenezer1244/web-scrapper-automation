@@ -197,7 +197,15 @@ async def get_results(
 
     safe_q = sanitize_search(q)
 
-    base_query = select(Result).where(Result.job_id == job_id, Result.user_id == current_user.id)
+    # Exclude duplicates from the results view — users should only see
+    # unique new leads, not re-scraped records they already received.
+    # The log says "2729 records saved (0 new, 8169 duplicates)" but
+    # without this filter, all 8169 show in the table.
+    base_query = select(Result).where(
+        Result.job_id == job_id,
+        Result.user_id == current_user.id,
+        Result.is_duplicate.is_(False),
+    )
     if safe_q:
         pattern = f"%{safe_q}%"
         base_query = base_query.where(
@@ -218,11 +226,12 @@ async def get_results(
     )
     items = [ResultRow.model_validate(r) for r in rows_result.scalars().all()]
 
-    # Count enriched records (have real property_address)
+    # Count enriched records (have real property_address), excluding duplicates
     enriched_result = await db.execute(
         select(func.count()).where(
             Result.job_id == job_id,
             Result.user_id == current_user.id,
+            Result.is_duplicate.is_(False),
             Result.property_address.isnot(None),
             Result.property_address != "",
             Result.property_address != "(enrichment unavailable)",

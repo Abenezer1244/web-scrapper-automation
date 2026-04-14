@@ -113,6 +113,8 @@ class Job(Base):
     export_key = Column(String(512), nullable=True)
     error_message = Column(Text, nullable=True)
     retry_count = Column(Integer, nullable=False, default=0)
+    date_from = Column(String(16), nullable=True)   # resolved MM/DD/YYYY
+    date_to = Column(String(16), nullable=True)     # resolved MM/DD/YYYY
     started_at = Column(DateTime(timezone=True), nullable=True)
     finished_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

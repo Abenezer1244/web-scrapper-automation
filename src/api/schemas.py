@@ -248,6 +248,8 @@ class JobResponse(BaseModel):
     export_key: str | None
     error_message: str | None
     retry_count: int
+    date_from: str | None = None       # resolved scrape date range
+    date_to: str | None = None
     started_at: datetime | None
     finished_at: datetime | None
     created_at: datetime

@@ -162,6 +162,9 @@ def run_scrape_job(self, job_id: str) -> None:
         schedule = config.schedule or {}
         range_mode = schedule.get("date_range_mode") or schedule.get("range_mode", "rolling_90")
         date_from, date_to = _resolve_date_range(schedule, config_id=config.id, job_id=job_id)
+        job.date_from = date_from
+        job.date_to = date_to
+        db.flush()
         _publish_log(r, job_id, "info", f"Date range: {date_from} → {date_to} (mode: {range_mode})", db=db)
 
         _last_phase = [None]  # mutable for closure

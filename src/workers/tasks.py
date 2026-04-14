@@ -160,7 +160,7 @@ def run_scrape_job(self, job_id: str) -> None:
         _publish_log(r, job_id, "success", f"Starting scrape — {record_label} records", db=db)
 
         schedule = config.schedule or {}
-        date_from, date_to = _resolve_date_range(schedule)
+        date_from, date_to = _resolve_date_range(schedule, config_id=config.id, job_id=job_id)
         _publish_log(r, job_id, "info", f"Date range: {date_from} → {date_to}", db=db)
 
         _last_phase = [None]  # mutable for closure
@@ -923,7 +923,7 @@ def _to_mmddyyyy(date_str: str) -> str:
     return date_str  # Return as-is if nothing works
 
 
-def _resolve_date_range(schedule: dict) -> tuple[str, str]:
+def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: str | None = None) -> tuple[str, str]:
     """Compute date_from and date_to from a scraper's schedule config."""
     from datetime import timedelta
 
@@ -940,8 +940,29 @@ def _resolve_date_range(schedule: dict) -> tuple[str, str]:
         # Fall through to rolling_90 if custom dates are missing
 
     if range_mode == "since_last_run":
-        # Fallback to rolling_90 until last_run tracking is implemented
-        date_from = today - timedelta(days=90)
+        # Look up the last completed job for this scraper config and use
+        # its date range end as our start. If no previous job exists,
+        # fall back to 30 days (not 90 — avoids massive duplicate sets).
+        from src.db.models import Job
+        from src.db.session import SyncSessionLocal
+        try:
+            with SyncSessionLocal() as _db:
+                last_job = _db.execute(
+                    select(Job).where(
+                        Job.scraper_config_id == config_id,
+                        Job.status == "done",
+                        Job.id != job_id,  # exclude current job
+                    ).order_by(Job.finished_at.desc()).limit(1)
+                ).scalar()
+                if last_job and last_job.finished_at:
+                    # Start from the day the last job finished
+                    date_from = last_job.finished_at.date()
+                    _logger.info("since_last_run: last job finished %s, scraping from %s", last_job.finished_at.date(), date_from)
+                else:
+                    date_from = today - timedelta(days=30)
+                    _logger.info("since_last_run: no previous job found, defaulting to 30 days")
+        except Exception:
+            date_from = today - timedelta(days=30)
     elif range_mode == "rolling_30":
         date_from = today - timedelta(days=30)
     elif range_mode == "rolling_7":

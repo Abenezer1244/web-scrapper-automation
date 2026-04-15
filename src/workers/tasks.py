@@ -509,14 +509,18 @@ def run_scrape_job(self, job_id: str) -> None:
                 enriched_file.unlink(missing_ok=True)
 
         # ── NOW mark done (after enrichment + re-export) ────────────────────
+        # record_count reflects unique (non-duplicate) leads — what the user
+        # actually sees on the results page. The raw scrape total is in the
+        # log: "{N} records saved ({unique} new leads, {dup} duplicates)".
+        display_count = max(0, len(records) - dup_count)
         _set_status(
             db, job, "done",
             finished_at=_now(),
-            record_count=len(records),
+            record_count=display_count,
             export_key=object_key,
         )
-        _publish_log(r, job_id, "success", f"Job complete — {len(records)} records ready", db=db)
-        r.publish(f"job_logs:{job_id}", json.dumps({"type": "done", "record_count": len(records)}))
+        _publish_log(r, job_id, "success", f"Job complete — {display_count} new leads ({dup_count} duplicates filtered)", db=db)
+        r.publish(f"job_logs:{job_id}", json.dumps({"type": "done", "record_count": display_count}))
 
         # ── EMAIL DELIVERY ─────────────────────────────────────────────────────
         emails = deliver_config.get("emails", [])
@@ -526,7 +530,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 deliver_job_results(
                     job_id=job_id,
                     scraper_name=config.name,
-                    record_count=len(records),
+                    record_count=display_count,
                     download_url=download_url,
                     recipient_emails=emails,
                     fmt=fmt,

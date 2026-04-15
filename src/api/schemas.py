@@ -189,10 +189,10 @@ class ScraperConfigResponse(BaseModel):
     county: str
     state: str
     record_type: str
-    fields: dict[str, Any]
-    enrichment: dict[str, Any]
-    schedule: dict[str, Any]
-    deliver: dict[str, Any]
+    fields: dict[str, Any] | list[str] | Any
+    enrichment: dict[str, Any] | Any
+    schedule: dict[str, Any] | Any
+    deliver: dict[str, Any] | Any
     skip_trace_enabled: bool = False
     active: bool
     created_at: datetime
@@ -214,7 +214,9 @@ class ScraperConfigResponse(BaseModel):
         self.deliver.setdefault("webhook_url", None)
         self.deliver.setdefault("webhook_secret", None)
         # Also normalize fields / enrichment / schedule defensively
-        if not isinstance(self.fields, dict):
+        if isinstance(self.fields, list):
+            self.fields = {f: True for f in self.fields}
+        elif not isinstance(self.fields, dict):
             self.fields = {}
         if not isinstance(self.enrichment, dict):
             self.enrichment = {}

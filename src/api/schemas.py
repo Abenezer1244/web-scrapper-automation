@@ -368,6 +368,7 @@ class ResultsPage(BaseModel):
     total_scraped: int = 0       # all records before dedup
     duplicate_count: int = 0     # records flagged as duplicate
     date_range_mode: str = ""    # rolling_90 | since_last_run | custom etc.
+    previous_job_id: str | None = None  # most recent job with results (for "view previous" link)
 
 
 # ─── Live run (SSE) ───────────────────────────────────────────────────────────

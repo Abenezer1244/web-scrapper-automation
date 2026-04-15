@@ -319,11 +319,33 @@ async def get_results(
     )
     duplicate_count = dup_count_result.scalar_one()
 
+    # When all records are duplicates, find the most recent previous job
+    # for the same scraper config that has non-duplicate results, so the
+    # frontend can link to "View previous results".
+    previous_job_id = None
+    if total == 0 and total_scraped > 0 and job.scraper_config_id:
+        prev_result = await db.execute(
+            select(Job.id)
+            .where(
+                Job.scraper_config_id == job.scraper_config_id,
+                Job.user_id == current_user.id,
+                Job.id != job_id,
+                Job.status == "done",
+                Job.record_count > 0,
+            )
+            .order_by(Job.created_at.desc())
+            .limit(1)
+        )
+        prev_row = prev_result.scalar_one_or_none()
+        if prev_row:
+            previous_job_id = prev_row
+
     return ResultsPage(
         job_id=job_id, total=total, page=page, page_size=page_size,
         items=items, enriched_count=enriched_count, enriching=enriching,
         total_scraped=total_scraped, duplicate_count=duplicate_count,
         date_range_mode=date_range_mode,
+        previous_job_id=previous_job_id,
     )
 
 

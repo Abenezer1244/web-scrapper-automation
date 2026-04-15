@@ -307,9 +307,22 @@ _PRICE_TO_PLAN: dict[str, tuple[str, int]] = {
 # ─── Plans catalog ────────────────────────────────────────────────────────────
 
 @router.get("/plans")
-async def list_plans() -> list[dict]:
-    """Return the full plan catalog. Used by the frontend upgrade UI."""
-    return _PLANS
+async def list_plans() -> dict:
+    """Return the full plan catalog + founding member offer status."""
+    # Check remaining founding member spots via Stripe coupon
+    founding = {"active": False, "code": "FOUNDING40", "percent_off": 40, "spots_total": 25, "spots_remaining": 0}
+    try:
+        import stripe
+        stripe.api_key = settings.STRIPE_SECRET_KEY
+        coupon = stripe.Coupon.retrieve("8mX1xa35")
+        if coupon.valid:
+            redeemed = coupon.times_redeemed or 0
+            remaining = max(0, (coupon.max_redemptions or 25) - redeemed)
+            founding["active"] = remaining > 0
+            founding["spots_remaining"] = remaining
+    except Exception:
+        pass  # Coupon may not exist, offer is inactive
+    return {"plans": _PLANS, "founding_offer": founding}
 
 
 @router.get("/pricing")
@@ -318,18 +331,33 @@ async def pricing_page() -> dict:
 
     Public endpoint — no auth required. Used by the frontend pricing page.
     """
+    # Check founding member offer
+    founding = {"active": False, "code": "FOUNDING40", "percent_off": 40, "spots_total": 25, "spots_remaining": 0}
+    try:
+        import stripe
+        stripe.api_key = settings.STRIPE_SECRET_KEY
+        coupon = stripe.Coupon.retrieve("8mX1xa35")
+        if coupon.valid:
+            redeemed = coupon.times_redeemed or 0
+            remaining = max(0, (coupon.max_redemptions or 25) - redeemed)
+            founding["active"] = remaining > 0
+            founding["spots_remaining"] = remaining
+    except Exception:
+        pass
+
     return {
         "plans": _PLANS,
+        "founding_offer": founding,
         "comparison": {
-            "Records per month": {"starter": "50", "pro": "500", "business": "5,000", "agency": "Unlimited"},
+            "Records per month": {"starter": "50", "pro": "1,000", "business": "5,000", "agency": "Unlimited"},
             "Counties": {"starter": "1", "pro": "5", "business": "Unlimited", "agency": "Unlimited"},
             "Record types": {"starter": "Probate", "pro": "All", "business": "All", "agency": "All"},
-            "Data freshness": {"starter": "Daily", "pro": "Daily", "business": "Daily", "agency": "Daily"},
+            "Data freshness": {"starter": "7-day delay", "pro": "Daily", "business": "Daily", "agency": "Daily"},
             "Export formats": {"starter": "CSV", "pro": "CSV, Excel", "business": "CSV, Excel, JSON, API", "agency": "CSV, Excel, JSON, API"},
             "Scheduling": {"starter": "Manual only", "pro": "Daily, Weekly", "business": "All frequencies", "agency": "All frequencies"},
             "Email delivery": {"starter": False, "pro": True, "business": True, "agency": True},
             "Webhook delivery": {"starter": False, "pro": False, "business": True, "agency": True},
-            "Skip tracing": {"starter": False, "pro": False, "business": "Coming soon", "agency": "Coming soon"},
+            "Skip tracing": {"starter": False, "pro": "Per-lookup", "business": "1,000 included", "agency": "2,000 included"},
             "API access": {"starter": False, "pro": False, "business": True, "agency": True},
             "Team members": {"starter": "1", "pro": "1", "business": "5", "agency": "Unlimited"},
             "White-label": {"starter": False, "pro": False, "business": False, "agency": "Coming soon"},
@@ -338,12 +366,13 @@ async def pricing_page() -> dict:
         "trial": {
             "days": 7,
             "plan": "pro",
-            "description": "7-day free Pro trial. No credit card required. 500 records/month.",
+            "description": "7-day free Pro trial. No credit card required. 1,000 records/month.",
         },
         "faq": [
             {"q": "What are motivated seller leads?", "a": "Public records (probate, foreclosure, tax delinquent, etc.) that indicate a property owner may be willing to sell below market value."},
-            {"q": "How fresh is the data?", "a": "We scrape county portals daily. Records appear in BridgeLeads within 24 hours of being filed at the county."},
-            {"q": "What counties do you cover?", "a": "Currently all 39 Washington State counties, with expansion to TX, FL, CA, and more states coming soon."},
+            {"q": "How fresh is the data?", "a": "We scrape county portals daily. Paid plans get same-day data. Free tier has a 7-day delay."},
+            {"q": "What counties do you cover?", "a": "22 Washington State counties are live and scraped daily. We can add any US county in 30 seconds — request yours after signing up."},
+            {"q": "Does it include phone and email?", "a": "Yes. Skip tracing is built in — every lead gets phone number, phone type, and email via Tracerfy within 10-15 minutes."},
             {"q": "Can I cancel anytime?", "a": "Yes. No contracts, no cancellation fees. Your data exports remain available for 30 days after cancellation."},
             {"q": "What export formats do you support?", "a": "CSV, Excel, and JSON. Business and Agency plans also get API access for direct integration."},
         ],

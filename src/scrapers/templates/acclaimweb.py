@@ -83,20 +83,6 @@ class AcclaimWebScraper(BridgeScraper):
         end = datetime.strptime(date_to, "%m/%d/%Y")
         chunk_days = 7
 
-        # Cap single-date-mode portals (Chelan) at 30 days max.
-        # These portals require one navigation per day, so 90 days =
-        # 90 page loads = frequent timeouts. 30 days is ~30 loads,
-        # which completes in ~10 minutes on a good connection.
-        total_days = (end - start).days
-        _MAX_SINGLE_DATE_DAYS = 30
-        if total_days > _MAX_SINGLE_DATE_DAYS:
-            # Pre-check will confirm single-date after page load, but
-            # we can check the county name heuristically here too.
-            _logger.info(
-                "AcclaimWeb %s: %d-day range may be capped to %d for single-date portals",
-                self.county, total_days, _MAX_SINGLE_DATE_DAYS,
-            )
-
         _logger.info(
             "AcclaimWeb scraper — %s/%s — %s to %s (%d-day chunks)",
             self.county, self.state, date_from, date_to, chunk_days,
@@ -129,12 +115,6 @@ class AcclaimWebScraper(BridgeScraper):
             if has_single and not has_pair:
                 self._single_date_mode = True
                 _logger.info("Pre-detected single-date mode (#RecordDate without date-range pair)")
-                # Cap date range to avoid 90+ page loads
-                if (end - start).days > _MAX_SINGLE_DATE_DAYS:
-                    start = end - timedelta(days=_MAX_SINGLE_DATE_DAYS)
-                    chunk_start = start
-                    _logger.info("Capped single-date range to %d days: %s → %s",
-                                 _MAX_SINGLE_DATE_DAYS, start.strftime("%m/%d/%Y"), end.strftime("%m/%d/%Y"))
         except Exception:
             pass
 

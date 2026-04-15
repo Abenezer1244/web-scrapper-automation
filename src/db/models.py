@@ -212,6 +212,7 @@ class CountyConnector(Base):
     gis_endpoint = Column(Text, nullable=True)  # Free ArcGIS REST API URL
     assessor_url = Column(Text, nullable=True)  # County assessor website (AI fallback)
     health_status = Column(String(16), nullable=False, default="unknown")  # healthy | degraded | down | unknown
+    max_date_range_days = Column(Integer, nullable=True)  # null = unlimited, 30 = single-date portals
     last_checked = Column(DateTime(timezone=True), nullable=True)
     active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

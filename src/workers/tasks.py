@@ -162,6 +162,33 @@ def run_scrape_job(self, job_id: str) -> None:
         schedule = config.schedule or {}
         range_mode = schedule.get("date_range_mode") or schedule.get("range_mode", "rolling_90")
         date_from, date_to = _resolve_date_range(schedule, config_id=config.id, job_id=job_id, user_plan=user.plan)
+
+        # Enforce per-connector max date range (e.g. Chelan single-date = 30 days max).
+        # Look up the connector to get the limit.
+        from src.db.models import CountyConnector
+        connector = db.execute(
+            select(CountyConnector).where(
+                func.lower(CountyConnector.county) == config.county.lower(),
+                func.upper(CountyConnector.state) == config.state.upper(),
+                CountyConnector.active,
+            )
+        ).scalars().first()
+        max_days = connector.max_date_range_days if connector else None
+        if max_days:
+            from datetime import timedelta as _td
+            _df = datetime.strptime(date_from, "%m/%d/%Y")
+            _dt = datetime.strptime(date_to, "%m/%d/%Y")
+            actual_days = (_dt - _df).days
+            if actual_days > max_days:
+                # Trim date_from to respect the limit (keep the most recent data)
+                _df = _dt - _td(days=max_days)
+                date_from = _df.strftime("%m/%d/%Y")
+                _publish_log(
+                    r, job_id, "warning",
+                    f"{config.county.title()} County supports max {max_days} days. Range trimmed to {date_from} → {date_to}.",
+                    db=db,
+                )
+
         job.date_from = date_from
         job.date_to = date_to
         db.flush()

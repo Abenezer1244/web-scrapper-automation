@@ -418,6 +418,7 @@ class ConnectorResponse(BaseModel):
     gis_endpoint: str | None = None
     assessor_url: str | None = None
     health_status: str
+    max_date_range_days: int | None = None  # null = unlimited
     last_checked: datetime | None
     active: bool
 

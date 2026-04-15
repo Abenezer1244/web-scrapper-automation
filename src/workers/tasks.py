@@ -211,7 +211,23 @@ def run_scrape_job(self, job_id: str) -> None:
                 pass
 
         try:
-            records = asyncio.run(_run_scraper(scraper_class, date_from, date_to, r, job_id, _on_progress, record_type=matched_record_type))
+            # Wrap scraper in a 30-minute timeout so a hung Playwright
+            # session doesn't burn the full 60-min Celery soft_time_limit.
+            _SCRAPE_TIMEOUT = 1800  # 30 minutes
+            records = asyncio.run(
+                asyncio.wait_for(
+                    _run_scraper(scraper_class, date_from, date_to, r, job_id, _on_progress, record_type=matched_record_type),
+                    timeout=_SCRAPE_TIMEOUT,
+                )
+            )
+        except asyncio.TimeoutError:
+            _logger.error("Scraper timed out after %ds for job %s", _SCRAPE_TIMEOUT, job_id)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            _fail_job(db, job, r, job_id, f"Scraper timed out after {_SCRAPE_TIMEOUT // 60} minutes. Try a shorter date range.")
+            return
         except Exception:
             _logger.exception("Scraper error for job %s", job_id)
             # Reconnect DB session if it went stale during long scrape

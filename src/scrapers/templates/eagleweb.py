@@ -671,8 +671,12 @@ class EagleWebScraper(BridgeScraper):
                                 else:
                                     parcel_source_counts["none_yet"] += 1
 
-                # Also store the legal description text
-                legal_text = re.search(r"(?:Subdivision|Section|Lot|Block|Plat|Tract)\s+.+", combined, re.IGNORECASE)
+                # Also store the legal description text — stop before
+                # Grantor/Grantee labels and doc type names that follow.
+                legal_text = re.search(
+                    r"(?:Subdivision|Section[\s:]+\d|Lot|Block|Plat|Tract)\s*.+?(?=\s*(?:Grant(?:or|ee):|Notice\s|Affidavit|Deed|Warranty|Quit\s*Claim|$))",
+                    combined, re.IGNORECASE,
+                )
                 if legal_text and not record.legal_description:
                     record.legal_description = legal_text.group(0).strip()[:200]
 

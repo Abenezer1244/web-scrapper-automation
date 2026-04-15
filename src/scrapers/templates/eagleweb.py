@@ -593,13 +593,19 @@ class EagleWebScraper(BridgeScraper):
                 if date_match:
                     record.date_recorded = date_match.group(1)
 
+                # Legal description keywords that appear AFTER party names in the
+                # summary cell. Without these as stop markers, the Grantor regex
+                # captures "FORD, MICHAEL M ESTSubdivision HIDDEN EST Lot 5..."
+                # because probate records often have no Grantee: label.
+                _LEGAL_STOP = r"(?:Grantee:|Subdivision|Section\s*:|Section\s+\d|Lot\s+\d|Block\s+\d|Parcel[:\s]|Plat\s|Tract\s|$)"
+
                 # Parse Grantor
-                grantor_match = re.search(r"Grantor:\s*(.+?)(?:Grantee:|$)", summary, re.DOTALL)
+                grantor_match = re.search(r"Grantor:\s*(.+?)" + _LEGAL_STOP, summary, re.DOTALL)
                 if grantor_match:
                     record.party_name = grantor_match.group(1).strip().rstrip(",")
 
                 # Parse Grantee
-                grantee_match = re.search(r"Grantee:\s*(.+?)(?:Grantor:|$)", summary, re.DOTALL)
+                grantee_match = re.search(r"Grantee:\s*(.+?)(?:Grantor:|" + _LEGAL_STOP[4:], summary, re.DOTALL)
                 if grantee_match:
                     grantee = grantee_match.group(1).strip().rstrip(",").rstrip(".")
                     if grantee:

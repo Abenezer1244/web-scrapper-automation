@@ -153,7 +153,7 @@ class Settings(BaseSettings):
     # ─── Plan limits: records per month (-1 = unlimited) ──────────────────────
     PLAN_LIMITS: ClassVar[dict[str, int]] = {
         "starter": 50,
-        "pro": 500,
+        "pro": 1000,
         "business": 5000,
         "agency": -1,
     }

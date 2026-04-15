@@ -243,22 +243,26 @@ _PLANS = [
     {
         "id": "pro",
         "name": "Pro",
-        "price_monthly": 49,
-        "records_limit": 500,
+        "price_monthly": 79,
+        "price_annual": 758,  # ~$63/mo, 20% off
+        "records_limit": 1000,
         "features": [
-            "500 records/month",
+            "1,000 records/month",
             "5 counties",
             "All record types",
+            "Skip tracing (phone + email)",
             "CSV + Excel export",
             "Daily/weekly schedule",
             "Email delivery",
         ],
         "stripe_price_id": settings.STRIPE_PRICE_PRO,
+        "popular": True,
     },
     {
         "id": "business",
         "name": "Business",
         "price_monthly": 149,
+        "price_annual": 1430,  # ~$119/mo, 20% off
         "records_limit": 5000,
         "features": [
             "5,000 records/month",
@@ -266,7 +270,7 @@ _PLANS = [
             "All export formats",
             "All schedules",
             "Email + Webhook delivery",
-            "Skip tracing (coming soon)",
+            "Skip tracing (1,000 included)",
             "API access",
             "5 team members",
         ],
@@ -276,11 +280,13 @@ _PLANS = [
         "id": "agency",
         "name": "Agency",
         "price_monthly": 499,
+        "price_annual": 4790,  # ~$399/mo, 20% off
         "records_limit": -1,
         "features": [
             "Unlimited records",
             "Unlimited counties",
             "All features",
+            "Skip tracing (2,000 included)",
             "Unlimited team members",
             "White-label (coming soon)",
             "Priority support",

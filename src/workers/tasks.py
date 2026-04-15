@@ -161,7 +161,7 @@ def run_scrape_job(self, job_id: str) -> None:
 
         schedule = config.schedule or {}
         range_mode = schedule.get("date_range_mode") or schedule.get("range_mode", "rolling_90")
-        date_from, date_to = _resolve_date_range(schedule, config_id=config.id, job_id=job_id)
+        date_from, date_to = _resolve_date_range(schedule, config_id=config.id, job_id=job_id, user_plan=user.plan)
         job.date_from = date_from
         job.date_to = date_to
         db.flush()
@@ -949,11 +949,20 @@ def _to_mmddyyyy(date_str: str) -> str:
     return date_str  # Return as-is if nothing works
 
 
-def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: str | None = None) -> tuple[str, str]:
+def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: str | None = None, user_plan: str = "starter") -> tuple[str, str]:
     """Compute date_from and date_to from a scraper's schedule config."""
     from datetime import timedelta
 
     today = datetime.now(UTC).date()
+
+    # Starter (free) tier gets a 7-day data delay — daily freshness
+    # is the paid moat. Starter users see records from 7+ days ago.
+    _STARTER_DELAY_DAYS = 7
+    if user_plan == "starter":
+        end_date = today - timedelta(days=_STARTER_DELAY_DAYS)
+        _logger.info("Starter plan: applying %d-day data delay (end_date=%s)", _STARTER_DELAY_DAYS, end_date)
+    else:
+        end_date = today
     # Support both key names: schema uses "date_range_mode", legacy used "range_mode"
     range_mode = schedule.get("date_range_mode") or schedule.get("range_mode", "rolling_90")
 
@@ -1000,13 +1009,13 @@ def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: st
             _logger.error("since_last_run: DB lookup failed (%s), defaulting to 30 days", exc)
             date_from = today - timedelta(days=30)
     elif range_mode == "rolling_30":
-        date_from = today - timedelta(days=30)
+        date_from = end_date - timedelta(days=30)
     elif range_mode == "rolling_7":
-        date_from = today - timedelta(days=7)
+        date_from = end_date - timedelta(days=7)
     else:
-        date_from = today - timedelta(days=90)
+        date_from = end_date - timedelta(days=90)
 
-    return date_from.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y")
+    return date_from.strftime("%m/%d/%Y"), end_date.strftime("%m/%d/%Y")
 
 
 # ─── Enrichment task (runs separately from scraping) ─────────────────────────

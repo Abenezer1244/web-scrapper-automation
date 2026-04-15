@@ -90,7 +90,7 @@ def _set_status(db, job, status: str, **kwargs) -> None:
 )
 def run_scrape_job(self, job_id: str) -> None:
     """Execute a full scrape job lifecycle for the given job_id."""
-    from sqlalchemy import select
+    from sqlalchemy import func, select
 
     from src.db.models import Job, Result, ScraperConfig, User
     from src.db.session import rls_sync_session, system_sync_session

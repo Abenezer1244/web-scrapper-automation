@@ -153,9 +153,21 @@ class AcclaimWebScraper(BridgeScraper):
             chunk_start = chunk_end
             pass
 
-        # Enrich records missing addresses via county assessor (PACS) lookup
-        needs_address = [r for r in all_records if not r.property_address and r.party_name and len(r.party_name) >= 3]
+        # Enrich records missing addresses via county assessor (PACS) lookup.
+        # Only look up person names — companies won't match in the assessor.
+        _CO_WORDS = {"INC", "LLC", "CORP", "CORPORATION", "BANK", "TRUST",
+            "INSURANCE", "MORTGAGE", "SYSTEMS", "FINANCIAL", "NATIONAL",
+            "SERVICES", "CLEARING", "REPUBLIC", "FARGO", "TITLE", "FEDERAL",
+            "ASSOCIATION", "CREDIT", "UNION", "SECRETARY", "HOUSING", "URBAN",
+            "COMMISSION", "DEVELOPMENT", "AUTHORITY", "AGENCY", "LP"}
+        needs_address = [
+            r for r in all_records
+            if not r.property_address and r.party_name and len(r.party_name) >= 3
+            and not any(w in _CO_WORDS for w in r.party_name.upper().split())
+        ]
         if needs_address:
+            _logger.info("PACS: %d person-named records to look up (skipping %d companies)",
+                         len(needs_address), len(all_records) - len(needs_address))
             await self._lookup_pacs_addresses(needs_address)
 
         _logger.info("acclaimweb complete - %d records (enrichment runs after save)", len(all_records))
@@ -841,8 +853,11 @@ class AcclaimWebScraper(BridgeScraper):
         def _lookup_one(name: str) -> dict | None:
             """Search PACS by owner name, return {address, parcel_id, mailing} or None."""
             try:
-                # Need fresh VIEWSTATE for each search
-                r0 = sess.get(pacs_url, timeout=8)
+                # Each lookup needs its own session (shared sessions cause
+                # VIEWSTATE conflicts under concurrency)
+                _s = _requests.Session()
+                _s.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"
+                r0 = _s.get(pacs_url, timeout=8)
                 vs = re.search(r'__VIEWSTATE.*?value="([^"]+)"', r0.text)
                 ev = re.search(r'__EVENTVALIDATION.*?value="([^"]+)"', r0.text)
                 vsg = re.search(r'__VIEWSTATEGENERATOR.*?value="([^"]+)"', r0.text)
@@ -856,7 +871,7 @@ class AcclaimWebScraper(BridgeScraper):
                     "propertySearchOptions$ownerName": name,
                     "propertySearchOptions$search": "Search",
                 }
-                r = sess.post(pacs_url, data=data, timeout=10, allow_redirects=True)
+                r = _s.post(pacs_url, data=data, timeout=10, allow_redirects=True)
                 if r.status_code != 200:
                     return None
 

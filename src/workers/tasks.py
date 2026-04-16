@@ -289,36 +289,42 @@ def run_scrape_job(self, job_id: str) -> None:
         import re as _re
         import uuid as _uuid
 
-        def _compute_dedup_hash(parcel_id: str | None, property_address: str | None) -> str | None:
+        def _compute_dedup_hash(
+            parcel_id: str | None,
+            property_address: str | None,
+            party_name: str | None = None,
+            date_recorded: str | None = None,
+        ) -> str | None:
             """Sprint 6.4: canonical dedup key.
 
-            Joins normalized (parcel_id, property_address) and hashes with
-            sha256. Resilient to whitespace, punctuation, and case variation
-            across repeat scrapes of the same parcel. Returns None if both
-            inputs are empty OR if neither field has enough signal to
-            distinguish records (H2 from the full-SaaS review — a single
-            garbage character from HTML scraping should not collide with
-            a legitimate parcel).
+            Primary key: normalized (parcel_id, property_address).
+            Fallback key: normalized (party_name, date_recorded) — used
+            when records have no parcel/address (e.g. pre-foreclosure
+            from AcclaimWeb). Without this fallback, records with no
+            parcel and no address would never deduplicate and show as
+            NEW on every scrape.
             """
             parcel = (parcel_id or "").strip().upper().replace("-", "").replace(" ", "")
             addr = (property_address or "").strip().upper()
             addr = _re.sub(r"[\.,#]", " ", addr)
             addr = _re.sub(r"\s+", " ", addr).strip()
 
-            # H2: require at least one of the two fields to carry
-            # meaningful signal. A valid WA parcel has 10+ digits;
-            # a valid street address has at least "N STREET_NAME"
-            # (8+ chars after normalization). Anything shorter is
-            # almost certainly a scrape artifact (a stray character
-            # extracted from malformed HTML) and must not be allowed
-            # to dedupe against a real record.
             parcel_ok = len(parcel) >= 4 and any(c.isdigit() for c in parcel)
             addr_ok = len(addr) >= 8 and any(c.isalpha() for c in addr)
-            if not parcel_ok and not addr_ok:
-                return None
 
-            key = f"{parcel}|{addr}"
-            return hashlib.sha256(key.encode("utf-8")).hexdigest()
+            if parcel_ok or addr_ok:
+                key = f"{parcel}|{addr}"
+                return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+            # Fallback: party_name + date_recorded
+            name = (party_name or "").strip().upper()
+            name = _re.sub(r"\s+", " ", name).strip()
+            date = (date_recorded or "").strip()
+            if len(name) >= 3 and len(date) >= 6:
+                key = f"NAME:{name}|DATE:{date}"
+                return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+            return None
 
         # Bulk insert using execute + multi-row VALUES (much faster than db.add loop)
         from sqlalchemy import insert as sa_insert
@@ -343,7 +349,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     "raw_html_hash": rec.raw_html_hash,
                     # Sprint 6.4: dedup hash computed now, duplicate flag
                     # resolved in the post-insert dedup scan below
-                    "dedup_hash": _compute_dedup_hash(rec.parcel_id, rec.property_address),
+                    "dedup_hash": _compute_dedup_hash(rec.parcel_id, rec.property_address, rec.party_name, rec.date_recorded),
                     "is_duplicate": False,
                 }
                 for rec in batch

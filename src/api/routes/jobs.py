@@ -319,26 +319,48 @@ async def get_results(
     )
     duplicate_count = dup_count_result.scalar_one()
 
-    # When all records are duplicates, find the most recent previous job
-    # for the same scraper config that has non-duplicate results, so the
-    # frontend can link to "View previous results".
+    # When results are empty (all duplicates or no new leads), find
+    # the most recent previous job for the same county/record_type
+    # that has actual Result rows, so the user can navigate there.
+    # Searches across ALL scraper configs for the same county+type,
+    # not just the same config_id.
     previous_job_id = None
-    if total == 0 and (total_scraped > 0 or job.record_count > 0) and job.scraper_config_id:
-        prev_result = await db.execute(
-            select(Job.id)
-            .where(
-                Job.scraper_config_id == job.scraper_config_id,
-                Job.user_id == current_user.id,
-                Job.id != job_id,
-                Job.status == "done",
-                Job.record_count > 0,
+    if total == 0 and config:
+        # Find all config IDs for same county/state/record_type
+        sibling_configs = await db.execute(
+            select(ScraperConfig.id).where(
+                func.lower(ScraperConfig.county) == config.county.lower(),
+                func.upper(ScraperConfig.state) == config.state.upper(),
+                ScraperConfig.record_type == config.record_type,
+                ScraperConfig.user_id == current_user.id,
             )
-            .order_by(Job.created_at.desc())
-            .limit(1)
         )
-        prev_row = prev_result.scalar_one_or_none()
-        if prev_row:
-            previous_job_id = prev_row
+        sibling_ids = [r for r in sibling_configs.scalars().all()]
+
+        if sibling_ids:
+            # Find most recent done job across all sibling configs
+            # that has at least 1 non-duplicate Result row
+            from sqlalchemy import exists
+            prev_result = await db.execute(
+                select(Job.id)
+                .where(
+                    Job.scraper_config_id.in_(sibling_ids),
+                    Job.user_id == current_user.id,
+                    Job.id != job_id,
+                    Job.status == "done",
+                    exists(
+                        select(Result.id).where(
+                            Result.job_id == Job.id,
+                            Result.is_duplicate.is_(False),
+                        )
+                    ),
+                )
+                .order_by(Job.created_at.desc())
+                .limit(1)
+            )
+            prev_row = prev_result.scalar_one_or_none()
+            if prev_row:
+                previous_job_id = prev_row
 
     return ResultsPage(
         job_id=job_id, total=total, page=page, page_size=page_size,

@@ -753,14 +753,23 @@ class AcclaimWebScraper(BridgeScraper):
                 grantor = item.get("grantor", "").strip()
                 grantee = item.get("grantee", "").strip()
 
-                # For pre-foreclosure, the grantee is the homeowner (the lead)
-                # and the grantor is the lender (WELLS FARGO, MERS, etc.).
-                # For other record types (probate, death cert), grantor is the
-                # deceased/filing party which IS the lead.
-                if active_rt == "pre_foreclosure" and grantee:
+                # Grantor → party_name, Grantee → heirs (default).
+                # For pre-foreclosure: if the grantee looks like a person
+                # (not a company), use them as party_name — they're the
+                # homeowner. Company indicators: INC, LLC, CORP, BANK, etc.
+                _COMPANY_WORDS = {"INC", "LLC", "CORP", "CORPORATION", "BANK",
+                    "TRUST", "INSURANCE", "MORTGAGE", "SYSTEMS", "FINANCIAL",
+                    "NATIONAL", "SERVICES", "CLEARING", "REPUBLIC", "FARGO",
+                    "TITLE", "FEDERAL", "ASSOCIATION", "CREDIT", "UNION"}
+
+                def _is_person(name: str) -> bool:
+                    words = set(name.upper().split())
+                    return not any(w in _COMPANY_WORDS for w in words) and len(name) >= 3
+
+                if active_rt == "pre_foreclosure" and grantee and _is_person(grantee):
                     record.party_name = grantee
                     if grantor:
-                        record.heirs = grantor  # store lender in heirs field
+                        record.heirs = grantor
                 else:
                     if grantor:
                         record.party_name = grantor

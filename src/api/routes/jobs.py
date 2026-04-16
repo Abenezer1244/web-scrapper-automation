@@ -323,7 +323,7 @@ async def get_results(
     # for the same scraper config that has non-duplicate results, so the
     # frontend can link to "View previous results".
     previous_job_id = None
-    if total == 0 and total_scraped > 0 and job.scraper_config_id:
+    if total == 0 and (total_scraped > 0 or job.record_count > 0) and job.scraper_config_id:
         prev_result = await db.execute(
             select(Job.id)
             .where(

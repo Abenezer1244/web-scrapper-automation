@@ -344,6 +344,7 @@ class ResultRow(BaseModel):
     email: str | None = None
     skip_trace_status: str = "not_attempted"  # not_attempted|queued|submitted|hit|miss|errored
     skip_trace_attempted_at: datetime | None = None
+    is_duplicate: bool = False
     created_at: datetime
 
     model_config = {"from_attributes": True}

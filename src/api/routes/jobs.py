@@ -227,14 +227,12 @@ async def get_results(
 
     safe_q = sanitize_search(q)
 
-    # Exclude duplicates from the results view — users should only see
-    # unique new leads, not re-scraped records they already received.
-    # The log says "2729 records saved (0 new, 8169 duplicates)" but
-    # without this filter, all 8169 show in the table.
+    # Show ALL results (new + duplicates). New leads appear first,
+    # duplicates appear after — grayed out in the frontend so users
+    # can see what was scraped while focusing on fresh leads.
     base_query = select(Result).where(
         Result.job_id == job_id,
         Result.user_id == current_user.id,
-        Result.is_duplicate.is_(False),
     )
     if safe_q:
         pattern = f"%{safe_q}%"
@@ -250,7 +248,7 @@ async def get_results(
     total = count_result.scalar_one()
 
     rows_result = await db.execute(
-        base_query.order_by(Result.created_at.asc())
+        base_query.order_by(Result.is_duplicate.asc(), Result.created_at.asc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )

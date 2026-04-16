@@ -746,15 +746,22 @@ class AcclaimWebScraper(BridgeScraper):
 
                 record.doc_type = doc_type if doc_type else None
 
-                # Grantor → party_name
                 grantor = item.get("grantor", "").strip()
-                if grantor:
-                    record.party_name = grantor
-
-                # Grantee → heirs
                 grantee = item.get("grantee", "").strip()
-                if grantee:
-                    record.heirs = grantee
+
+                # For pre-foreclosure, the grantee is the homeowner (the lead)
+                # and the grantor is the lender (WELLS FARGO, MERS, etc.).
+                # For other record types (probate, death cert), grantor is the
+                # deceased/filing party which IS the lead.
+                if active_rt == "pre_foreclosure" and grantee:
+                    record.party_name = grantee
+                    if grantor:
+                        record.heirs = grantor  # store lender in heirs field
+                else:
+                    if grantor:
+                        record.party_name = grantor
+                    if grantee:
+                        record.heirs = grantee
 
                 # Legal description
                 legal = item.get("legal", "").strip()

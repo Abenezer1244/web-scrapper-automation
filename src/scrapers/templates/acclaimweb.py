@@ -153,7 +153,11 @@ class AcclaimWebScraper(BridgeScraper):
             chunk_start = chunk_end
             pass
 
-        # Enrich records with parcel data
+        # Enrich records missing addresses via county assessor (PACS) lookup
+        needs_address = [r for r in all_records if not r.property_address and r.party_name and len(r.party_name) >= 3]
+        if needs_address:
+            await self._lookup_pacs_addresses(needs_address)
+
         _logger.info("acclaimweb complete - %d records (enrichment runs after save)", len(all_records))
         return all_records
 
@@ -784,6 +788,134 @@ class AcclaimWebScraper(BridgeScraper):
             _logger.warning("Error extracting page: %s", str(exc)[:80])
 
         return records
+
+    # County assessor (PACS) URLs for address lookup by owner name.
+    # Tyler PropertyAccess is used by many WA counties.
+    _PACS_URLS = {
+        "chelan": "https://pacs.co.chelan.wa.us/PropertyAccess/?cid=90",
+        "douglas": "https://pacs.co.douglas.wa.us/PropertyAccess/?cid=50",
+    }
+
+    async def _lookup_pacs_addresses(self, records: list[ScrapedRecord]) -> None:
+        """Look up property addresses from county assessor (PACS) by owner name.
+
+        Uses HTTP POST to the Tyler PropertyAccess search — no browser needed.
+        Concurrent lookups, 5 at a time to be respectful.
+        """
+        import hashlib
+        from concurrent.futures import ThreadPoolExecutor
+        import requests as _requests
+
+        pacs_url = self._PACS_URLS.get(self.county.lower())
+        if not pacs_url:
+            _logger.info("No PACS URL for %s — skipping address lookup", self.county)
+            return
+
+        _logger.info("Looking up addresses for %d records via PACS (%s)...", len(records), self.county)
+
+        # Get initial page for VIEWSTATE
+        sess = _requests.Session()
+        sess.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"
+        try:
+            init = sess.get(pacs_url, timeout=10)
+        except Exception as exc:
+            _logger.warning("PACS init failed: %s", str(exc)[:80])
+            return
+
+        vs_match = re.search(r'__VIEWSTATE.*?value="([^"]+)"', init.text)
+        ev_match = re.search(r'__EVENTVALIDATION.*?value="([^"]+)"', init.text)
+        vsg_match = re.search(r'__VIEWSTATEGENERATOR.*?value="([^"]+)"', init.text)
+        if not vs_match:
+            _logger.warning("PACS: no VIEWSTATE found")
+            return
+
+        def _lookup_one(name: str) -> dict | None:
+            """Search PACS by owner name, return {address, parcel_id, mailing} or None."""
+            try:
+                # Need fresh VIEWSTATE for each search
+                r0 = sess.get(pacs_url, timeout=8)
+                vs = re.search(r'__VIEWSTATE.*?value="([^"]+)"', r0.text)
+                ev = re.search(r'__EVENTVALIDATION.*?value="([^"]+)"', r0.text)
+                vsg = re.search(r'__VIEWSTATEGENERATOR.*?value="([^"]+)"', r0.text)
+                if not vs:
+                    return None
+
+                data = {
+                    "__VIEWSTATE": vs.group(1),
+                    "__EVENTVALIDATION": ev.group(1) if ev else "",
+                    "__VIEWSTATEGENERATOR": vsg.group(1) if vsg else "",
+                    "propertySearchOptions$ownerName": name,
+                    "propertySearchOptions$search": "Search",
+                }
+                r = sess.post(pacs_url, data=data, timeout=10, allow_redirects=True)
+                if r.status_code != 200:
+                    return None
+
+                # Check for "None found"
+                if "None found" in r.text:
+                    return None
+
+                # Extract from search results table
+                idx = r.text.find("SearchResults")
+                if idx == -1:
+                    return None
+
+                chunk = r.text[idx:idx + 5000]
+                # Extract cells: account, parcel, type, tax_code, address, legal, owner, value
+                tds = re.findall(r"<td[^>]*>(.*?)</td>", chunk, re.DOTALL)
+                cells = [re.sub(r"<[^>]+>", " ", td).strip() for td in tds]
+                cells = [c for c in cells if c and c != "&nbsp;"]
+
+                if len(cells) < 5:
+                    return None
+
+                # Parse the first result row
+                # Typical order: account, parcel_id, type, tax_code, address, legal, owner, value
+                result = {}
+                for cell in cells:
+                    # Parcel ID: 12-digit number
+                    if re.match(r"^\d{10,}$", cell.replace(" ", "")):
+                        result["parcel_id"] = cell.replace(" ", "")
+                    # Address: number + street name + city/state/zip
+                    elif re.search(r"\d+\s+[A-Z].*(?:WA|Washington)\s+\d{5}", cell, re.I):
+                        # Multi-line address
+                        parts = [p.strip() for p in cell.split("\n") if p.strip()]
+                        result["address"] = parts[0] if parts else cell
+                        if len(parts) > 1:
+                            result["mailing"] = ", ".join(parts)
+                    elif re.search(r"^\d+\s+[A-Z]", cell) and len(cell) > 8 and "address" not in result:
+                        result["address"] = cell.split("\n")[0].strip()
+                    # Value: dollar amount
+                    elif cell.startswith("$"):
+                        result["value"] = cell
+
+                return result if result.get("address") or result.get("parcel_id") else None
+            except Exception:
+                return None
+
+        # Run lookups concurrently (5 at a time)
+        found = 0
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            for batch_start in range(0, len(records), 20):
+                batch = records[batch_start:batch_start + 20]
+                tasks = [loop.run_in_executor(executor, _lookup_one, r.party_name) for r in batch]
+                results_list = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for record, result in zip(batch, results_list):
+                    if isinstance(result, dict) and result:
+                        if result.get("address"):
+                            record.property_address = result["address"]
+                        if result.get("mailing"):
+                            record.mailing_address = result["mailing"]
+                        if result.get("parcel_id"):
+                            record.parcel_id = result["parcel_id"]
+                        if result.get("value"):
+                            record.enrichment_data = record.enrichment_data or {}
+                            record.enrichment_data["assessed_value"] = result["value"]
+                        found += 1
+
+        _logger.info("PACS lookup: found addresses for %d/%d records", found, len(records))
 
     async def _go_next_page(self) -> bool:
         """Click the Next page button in the Kendo pager."""

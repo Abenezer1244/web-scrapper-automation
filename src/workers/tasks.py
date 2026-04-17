@@ -991,8 +991,12 @@ def _to_mmddyyyy(date_str: str) -> str:
 def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: str | None = None, user_plan: str = "starter") -> tuple[str, str]:
     """Compute date_from and date_to from a scraper's schedule config."""
     from datetime import timedelta
+    from zoneinfo import ZoneInfo
 
-    today = datetime.now(UTC).date()
+    # Use US/Pacific date since all counties are in WA.
+    # Worker runs in UTC where midnight is already "tomorrow" for Pacific users,
+    # causing the rolling range to be off by +1 day.
+    today = datetime.now(ZoneInfo("US/Pacific")).date()
 
     # Starter (free) tier gets a 7-day data delay — daily freshness
     # is the paid moat. Starter users see records from 7+ days ago.

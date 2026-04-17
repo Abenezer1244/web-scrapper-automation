@@ -879,38 +879,35 @@ class AcclaimWebScraper(BridgeScraper):
                 if "None found" in r.text:
                     return None
 
-                # Extract from search results table
-                idx = r.text.find("SearchResults")
-                if idx == -1:
+                # Extract from search results table (ID: propertySearchResults_resultsTable)
+                table_start = r.text.find("resultsTable")
+                if table_start == -1:
                     return None
+                table_end = r.text.find("</table>", table_start)
+                chunk = r.text[table_start:table_end] if table_end > table_start else r.text[table_start:table_start + 5000]
 
-                chunk = r.text[idx:idx + 5000]
-                # Extract cells: account, parcel, type, tax_code, address, legal, owner, value
                 tds = re.findall(r"<td[^>]*>(.*?)</td>", chunk, re.DOTALL)
-                cells = [re.sub(r"<[^>]+>", " ", td).strip() for td in tds]
-                cells = [c for c in cells if c and c != "&nbsp;"]
+                cells = [re.sub(r"<[^>]+>", " ", td).strip().replace("&nbsp;", "").strip() for td in tds]
+                cells = [c for c in cells if c]
 
                 if len(cells) < 5:
                     return None
 
-                # Parse the first result row
-                # Typical order: account, parcel_id, type, tax_code, address, legal, owner, value
+                # PACS table order: checkbox, account, parcel, type, tax_code, address, legal, owner, value, view
                 result = {}
                 for cell in cells:
-                    # Parcel ID: 12-digit number
-                    if re.match(r"^\d{10,}$", cell.replace(" ", "")):
+                    cell_clean = cell.replace("\r\n", "\n").replace("\r", "\n")
+                    # Parcel ID: 10-12 digit number
+                    if re.match(r"^\d{10,}$", cell.replace(" ", "")) and "parcel_id" not in result:
                         result["parcel_id"] = cell.replace(" ", "")
-                    # Address: number + street name + city/state/zip
-                    elif re.search(r"\d+\s+[A-Z].*(?:WA|Washington)\s+\d{5}", cell, re.I):
-                        # Multi-line address
-                        parts = [p.strip() for p in cell.split("\n") if p.strip()]
-                        result["address"] = parts[0] if parts else cell
-                        if len(parts) > 1:
-                            result["mailing"] = ", ".join(parts)
-                    elif re.search(r"^\d+\s+[A-Z]", cell) and len(cell) > 8 and "address" not in result:
-                        result["address"] = cell.split("\n")[0].strip()
+                    # Address: number + street, may have city/state on next line
+                    elif re.search(r"\d+\s+[A-Z].*WA\s+\d{5}", cell_clean, re.I | re.DOTALL):
+                        lines = [ln.strip() for ln in cell_clean.split("\n") if ln.strip()]
+                        result["address"] = lines[0]
+                        if len(lines) > 1:
+                            result["mailing"] = ", ".join(lines)
                     # Value: dollar amount
-                    elif cell.startswith("$"):
+                    elif cell.startswith("$") and "value" not in result:
                         result["value"] = cell
 
                 return result if result.get("address") or result.get("parcel_id") else None

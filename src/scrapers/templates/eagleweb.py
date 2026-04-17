@@ -26,12 +26,18 @@ _DOC_TYPE_MAP = {
     "probate": ["PROBATE", "LETTERS TESTAMENTARY", "LETTERS OF ADMINISTRATION",
                 "PERSONAL REPRESENTATIVE", "PERSONAL REP",
                 "DEATH CERTIFICATE", "AFFIDAVIT OF HEIRSHIP",
-                "TRANSFER ON DEATH"],
+                "TRANSFER ON DEATH",
+                # Abbreviated codes (e.g. Clallam: DEATH, LETTR, EXEC, TOD, SUCC)
+                "DEATH", "LETTR", "EXEC", "TOD", "SUCC"],
     "pre_foreclosure": ["LIS PENDENS", "NOTICE OF TRUSTEE SALE", "TRUSTEE SALE",
-                        "TRUSTEE'S SALE", "NOTICE OF DEFAULT", "FORECLOSURE"],
+                        "TRUSTEE'S SALE", "NOTICE OF DEFAULT", "FORECLOSURE",
+                        # Abbreviated codes (e.g. Clallam: LISP, NTS, NTSCL)
+                        "LISP", "NTS"],
     "tax_delinquent": ["TAX LIEN", "CERTIFICATE OF DELINQUENCY",
                        "TAX DELINQUENT", "CERTIFICATE OF SALE"],
-    "divorce": ["DIVORCE", "DISSOLUTION", "DECREE OF DISSOLUTION"],
+    "divorce": ["DIVORCE", "DISSOLUTION", "DECREE OF DISSOLUTION",
+                # Abbreviated codes
+                "DISS", "DISOL"],
 }
 
 

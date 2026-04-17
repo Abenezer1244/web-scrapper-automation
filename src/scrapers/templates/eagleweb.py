@@ -698,6 +698,7 @@ class EagleWebScraper(BridgeScraper):
                         doc_upper = desc.upper()
                         kws = _DOC_TYPE_MAP.get(active_rt, [])
                         if not any(kw in doc_upper for kw in kws):
+                            _logger.info("Doc type filtered out: '%s' (looking for %s keywords)", desc[:60], active_rt)
                             continue  # Skip non-matching doc types
                     records.append(record)
 

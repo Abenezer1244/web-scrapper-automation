@@ -1,17 +1,20 @@
-"""Clark County (WA) — LandmarkWeb scraper via Document Type checkbox search.
+"""Clark County (WA) — LandmarkWeb scraper via Document Type modal checkbox search.
 
 Portal: https://e-docs.clark.wa.gov/LandmarkWeb/
 Platform: Hyland LandmarkWeb (different UI from King County)
 
 Flow:
-1. Navigate to home page → click "document" icon
-2. Select doc type checkboxes (DEATH CERTIFICATE, NOTICE OF TRUSTEE SALE, etc.)
-3. Set Document Category to "All Categories"
-4. Fill Begin/End Date
-5. Click Submit
-6. Extract results from the table below (has PID in Legal column)
+1. Navigate to home page → accept disclaimer via SetDisclaimer() JS
+2. Click Document Type tab
+3. Open doc-type modal via ShowDocumentModal()
+4. Check checkboxes for target doc types (e.g., DEATH CERTIFICATE, WILL)
+5. Click "Select" button in modal to apply
+6. Fill Begin/End Date
+7. Click Submit
+8. Extract results from the results table (PID in Legal column)
 
-Clark uses checkbox multi-select for doc types, not a dropdown like King.
+Clark's doc-type modal uses checkbox IDs like `dt-DocumentType-{value}`.
+The portal does NOT record divorce/dissolution — those are court records.
 """
 
 import asyncio
@@ -42,6 +45,20 @@ _DOC_TYPES = {
     "tax_delinquent": ["CERTIFICATE OF DELIQUENCY", "CERTIFICATE OF SALE", "FEDERAL TAX LIEN"],
 }
 
+# Map record_type → checkbox value IDs on the Document Type tab.
+# These are the `value` attributes of `input[type="checkbox"]` elements
+# with IDs like `dt-DocumentType-{value}`.
+# Discovered from the live portal on 2026-04-18.
+_DOC_TYPE_CHECKBOX_VALUES = {
+    "probate": ["62", "316", "340", "278"],       # DEATH CERT, LACK OF PROBATE, TOD DEED, WILL
+    "pre_foreclosure": ["167", "129", "166", "157", "93"],  # TRUSTEE SALE, LIS PENDENS, DEFAULT, FORECL
+    "divorce": ["68", "71"],                        # DISSOLUTION, DIVORCE
+    "tax_delinquent": ["97"],                       # FEDERAL TAX LIEN
+}
+
+# Record types where records don't have parcel IDs (e.g., divorce, probate)
+_NO_PID_RECORD_TYPES = {"divorce"}
+
 add_scrape_domain("e-docs.clark.wa.gov")
 
 
@@ -52,6 +69,8 @@ class ClarkWAScraper(BridgeScraper):
         super().__init__()
         self._record_type = record_type
         self._doc_types = _DOC_TYPES.get(record_type, _DOC_TYPES["probate"])
+        self._checkbox_values = _DOC_TYPE_CHECKBOX_VALUES.get(record_type, [])
+        self._skip_pid = record_type in _NO_PID_RECORD_TYPES
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         start = datetime.strptime(date_from, "%m/%d/%Y")
@@ -115,46 +134,48 @@ class ClarkWAScraper(BridgeScraper):
             _logger.info("Disclaimer: %s", str(exc)[:80])
 
     async def _search_chunk(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
-        """Navigate to Document Type search, select types, fill dates, submit, extract."""
+        """Navigate to Document Type search, select doc types via modal, fill dates, submit."""
 
-        # Click "document" icon on home page
-        doc_icon = self.page.locator("a:has-text('document'), img[alt*='document' i]").first
-        try:
+        # Click Document Type tab
+        tab = self.page.locator("#searchCriteriaDocuments-tab")
+        if await tab.count() > 0:
+            await tab.click()
+            await self.page.wait_for_timeout(2000)
+        else:
+            doc_icon = self.page.locator("a:has-text('document'), img[alt*='document' i]").first
             await doc_icon.click()
             await self.page.wait_for_timeout(2000)
-        except Exception:
-            # Fallback: click Document Type tab
-            tab = self.page.locator("#searchCriteriaDocuments-tab, a:has-text('Document Type')")
-            if await tab.count() > 0:
-                await tab.first.click()
-                await self.page.wait_for_timeout(2000)
 
-        # Select "Custom Selection" from category dropdown
-        await self.page.evaluate("""() => {
-            const sel = document.querySelector('#documentCategory-DocumentType');
-            if (!sel) return;
-            // Find "Custom Selection" option
-            for (const opt of sel.options) {
-                if (opt.text.toLowerCase().includes('custom')) {
-                    sel.value = opt.value;
-                    if (window.jQuery) jQuery('#documentCategory-DocumentType').val(opt.value).trigger('change');
-                    break;
-                }
-            }
-        }""")
+        # Open the document type modal via the "select" button
+        await self.page.evaluate(
+            "ShowDocumentModal($('#documentTypeModal-DocumentType'))"
+        )
         await self.page.wait_for_timeout(1500)
 
-        # Fill the Custom Selection textarea with doc types (one per line)
-        doc_types_text = "\n".join(self._doc_types)
-        filled = await self.page.evaluate("""(text) => {
-            const ta = document.querySelector('#documentType-DocumentType, textarea[name="documentType"], #documentType-Name');
-            if (!ta) return false;
-            ta.value = text;
-            ta.dispatchEvent(new Event('input', {bubbles: true}));
-            ta.dispatchEvent(new Event('change', {bubbles: true}));
-            return true;
-        }""", doc_types_text)
-        _logger.info("Filled Custom Selection textarea with %d doc types: %s", len(self._doc_types), filled)
+        # Check the doc type checkboxes inside the modal
+        for val in self._checkbox_values:
+            cb = self.page.locator(f"#dt-DocumentType-{val}")
+            try:
+                await cb.check(timeout=5000)
+            except Exception:
+                # Fallback: force via JS
+                await self.page.evaluate(f"""() => {{
+                    const cb = document.querySelector('#dt-DocumentType-{val}');
+                    if (cb) cb.checked = true;
+                }}""")
+
+        # Click the "Select" button (btn-primary) in the modal to apply
+        select_btn = self.page.locator(
+            "#documentTypeModal-DocumentType a.btn-primary"
+        )
+        await select_btn.click()
+        await self.page.wait_for_timeout(1000)
+
+        # Verify textarea got populated
+        ta_val = await self.page.evaluate(
+            "document.querySelector('#documentType-DocumentType')?.value || ''"
+        )
+        _logger.info("Doc types selected: '%s'", ta_val[:100])
 
         # Fill dates
         begin = self.page.locator("#beginDate-DocumentType")
@@ -325,14 +346,14 @@ class ClarkWAScraper(BridgeScraper):
             pid_match = _PID_PATTERN.search(legal)
             if not pid_match:
                 pid_match = _PID_FALLBACK_PATTERN.search(legal)
-            if not pid_match:
+            if not pid_match and not self._skip_pid:
                 dropped_no_pid += 1
                 if len(sample_legal) < 3 and legal:
                     sample_legal.append(legal[:120])
                 continue
 
             record = ScrapedRecord()
-            record.parcel_id = pid_match.group(1)
+            record.parcel_id = pid_match.group(1) if pid_match else None
             record.party_name = (item.get("grantor") or "").strip()
             record.heirs = (item.get("grantee") or "").strip()
             record.doc_type = (item.get("docType") or "").strip()

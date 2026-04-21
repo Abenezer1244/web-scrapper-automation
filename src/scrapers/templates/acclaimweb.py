@@ -26,23 +26,51 @@ _logger = setup_logger("scraper.template.acclaimweb")
 
 # Same doc type keywords as EagleWeb — AcclaimWeb uses similar naming
 _DOC_TYPE_MAP = {
+    # Bare "ESTATE" is excluded — it matched "REAL ESTATE CONTRACT" via
+    # whole-word match. "ESTATE OF" (phrase) only appears on actual
+    # probate filings like "ESTATE OF JOHN DOE".
     "probate": ["PROBATE", "LETTERS TESTAMENTARY", "LETTERS OF ADMINISTRATION",
-                "PERSONAL REPRESENTATIVE", "PERSONAL REP", "ESTATE", "WILL",
-                "DEATH", "AFFIDAVIT OF HEIRSHIP", "HEIR",
+                "PERSONAL REPRESENTATIVE", "PERSONAL REP",
+                "ESTATE OF", "WILL", "DEATH",
+                "AFFIDAVIT OF HEIRSHIP", "HEIR",
                 # Chelan abbreviations
                 "TOD", "AFFD", "PTREC"],
+    # SUBSTITUTION OF TRUSTEE and APPT (appointment) are intentionally
+    # excluded — they signal a pre-foreclosure stage but don't name the
+    # homeowner in grantor/grantee, so they produce low-quality leads.
     "pre_foreclosure": ["LIS PENDENS", "NOTICE OF TRUSTEE", "TRUSTEE SALE",
                         "TRUSTEE'S SALE", "DISCONTINUANCE TRUSTEE",
-                        "SUBSTITUTION OF TRUSTEE", "DEFAULT", "FORECLOSURE",
-                        "NOTICE OF DEFAULT",
-                        # Chelan abbreviations
-                        "NTS", "NOD", "APPT"],
+                        "FORECLOSURE", "NOTICE OF DEFAULT",
+                        # Chelan abbreviations for Notice of Trustee Sale
+                        # and Notice of Default — both name the borrower
+                        # (homeowner) in the grantor column.
+                        "NTS", "NOD"],
     "tax_delinquent": ["TAX", "DELINQUENT", "TAX LIEN", "CERTIFICATE OF DELINQUENCY",
                        "CERTIFICATE OF SALE",
                        # Chelan abbreviations
                        "FTL"],
     "divorce": ["DIVORCE", "DISSOLUTION", "DECREE OF DISSOLUTION"],
 }
+
+
+def _doc_type_matches(doc_type: str, keywords: list[str]) -> bool:
+    """Match a doc_type against a keyword list using a safe strategy.
+
+    Multi-word keywords use substring match ("NOTICE OF TRUSTEE" inside
+    "NOTICE OF TRUSTEE SALE"). Single-word abbreviations use whole-word
+    match — otherwise tokens like "NTS" substring-match COVENANTS or
+    RENTS and leak unrelated records into pre_foreclosure results.
+    """
+    doc_upper = doc_type.upper()
+    doc_words = set(doc_upper.split())
+    for kw in keywords:
+        if " " in kw:
+            if kw in doc_upper:
+                return True
+        else:
+            if kw in doc_words:
+                return True
+    return False
 
 
 class AcclaimWebScraper(BridgeScraper):
@@ -751,37 +779,63 @@ class AcclaimWebScraper(BridgeScraper):
                 # Doc type — use for filtering
                 doc_type = item.get("doc_type", "").strip().upper()
 
-                # Filter by the caller-requested record type ONLY (same fix
-                # as EagleWeb Phase A — use active_record_type, not the full
-                # record_types list, so "probate" doesn't mix in pre_foreclosure)
+                # Filter by the caller-requested record type. If the
+                # caller asked for a filtered type (e.g. pre_foreclosure)
+                # and this row has no doc_type, drop it — otherwise
+                # Deeds of Trust and other unrelated records leak
+                # through the filter and appear as "pre-foreclosures".
                 active_rt = self.active_record_type
-                if active_rt and doc_type:
+                if active_rt:
                     keywords = _DOC_TYPE_MAP.get(active_rt, [])
-                    if keywords and not any(kw in doc_type for kw in keywords):
-                        continue
+                    if keywords:
+                        if not doc_type or not _doc_type_matches(doc_type, keywords):
+                            continue
 
                 record.doc_type = doc_type if doc_type else None
 
                 grantor = item.get("grantor", "").strip()
                 grantee = item.get("grantee", "").strip()
 
-                # Grantor → party_name, Grantee → heirs (default).
-                # For pre-foreclosure: if the grantee looks like a person
-                # (not a company), use them as party_name — they're the
-                # homeowner. Company indicators: INC, LLC, CORP, BANK, etc.
+                # Person-vs-company heuristic. For pre-foreclosure the
+                # homeowner can show up as either grantor or grantee
+                # depending on the document type (Trustee's Sale has
+                # trustee as grantor; other pre-foreclosure filings may
+                # have borrower as grantor). Pick whichever side looks
+                # like a real person; drop the record if both sides are
+                # companies — banks foreclosing on banks is not a
+                # homeowner lead.
                 _COMPANY_WORDS = {"INC", "LLC", "CORP", "CORPORATION", "BANK",
                     "TRUST", "INSURANCE", "MORTGAGE", "SYSTEMS", "FINANCIAL",
                     "NATIONAL", "SERVICES", "CLEARING", "REPUBLIC", "FARGO",
-                    "TITLE", "FEDERAL", "ASSOCIATION", "CREDIT", "UNION"}
+                    "TITLE", "FEDERAL", "ASSOCIATION", "CREDIT", "UNION",
+                    "COMPANY", "CO", "CAPITAL", "PARTNERS", "GROUP",
+                    "SOLUTIONS", "AGENCY", "AUTHORITY", "DEPARTMENT"}
 
                 def _is_person(name: str) -> bool:
-                    words = set(name.upper().split())
-                    return not any(w in _COMPANY_WORDS for w in words) and len(name) >= 3
+                    upper = name.upper()
+                    words = upper.split()
+                    if any(w in _COMPANY_WORDS for w in words):
+                        return False
+                    # Real people have first+last names. One-word tokens
+                    # (FIG, NA, MERS) are almost always company
+                    # abbreviations even when not in the keyword list.
+                    if len(words) < 2:
+                        return False
+                    # Guard against very short strings that slip past.
+                    return len(name) >= 5
 
-                if active_rt == "pre_foreclosure" and grantee and _is_person(grantee):
-                    record.party_name = grantee
-                    if grantor:
-                        record.heirs = grantor
+                if active_rt == "pre_foreclosure":
+                    if grantor and _is_person(grantor):
+                        record.party_name = grantor
+                        if grantee:
+                            record.heirs = grantee
+                    elif grantee and _is_person(grantee):
+                        record.party_name = grantee
+                        if grantor:
+                            record.heirs = grantor
+                    else:
+                        # Both sides are companies — no homeowner lead.
+                        continue
                 else:
                     if grantor:
                         record.party_name = grantor

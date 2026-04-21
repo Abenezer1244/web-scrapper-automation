@@ -61,16 +61,6 @@ def run_daily_scrape_for_county(county: str, state: str) -> int:
                 )
             ).scalar_one()
 
-            if total_records == 0:
-                date_from = (today - timedelta(days=90)).strftime("%m/%d/%Y")
-                date_to = today.strftime("%m/%d/%Y")
-                _logger.info("Backfill %s/%s: %s to %s", county, state, date_from, date_to)
-            else:
-                yesterday = today - timedelta(days=1)
-                date_from = yesterday.strftime("%m/%d/%Y")
-                date_to = today.strftime("%m/%d/%Y")
-                _logger.info("Daily scrape %s/%s: %s to %s", county, state, date_from, date_to)
-
             connector = db.execute(
                 select(CountyConnector).where(
                     func.lower(CountyConnector.county) == county.lower(),
@@ -84,6 +74,27 @@ def run_daily_scrape_for_county(county: str, state: str) -> int:
                 return 0
 
             record_type = connector.record_types[0] if connector.record_types else "probate"
+
+            # Low-frequency record types (probate, pre-foreclosure, etc.)
+            # can produce 0 records on any given day even when the county
+            # is healthy. A 1-day rolling window caps visibility and
+            # amplifies the zero-records problem. Use a 7-day window for
+            # these types — dedup via record_hash prevents duplicate
+            # inserts, so the only cost is slightly longer scrape time.
+            _LOW_FREQ_TYPES = {"probate", "pre_foreclosure", "tax_delinquent", "divorce"}
+            lookback_days = 7 if record_type in _LOW_FREQ_TYPES else 1
+
+            if total_records == 0:
+                date_from = (today - timedelta(days=90)).strftime("%m/%d/%Y")
+                date_to = today.strftime("%m/%d/%Y")
+                _logger.info("Backfill %s/%s: %s to %s", county, state, date_from, date_to)
+            else:
+                date_from = (today - timedelta(days=lookback_days)).strftime("%m/%d/%Y")
+                date_to = today.strftime("%m/%d/%Y")
+                _logger.info(
+                    "Daily scrape %s/%s (%s, %dd window): %s to %s",
+                    county, state, record_type, lookback_days, date_from, date_to,
+                )
             try:
                 scraper_class, _ = get_scraper_class(county, state, record_type)
             except UnsupportedCountyError as exc:

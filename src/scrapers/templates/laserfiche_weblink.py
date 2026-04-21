@@ -27,11 +27,13 @@ from src.utils.logger import setup_logger
 _logger = setup_logger("scraper.template.laserfiche")
 
 _DOC_TYPE_MAP = {
+    # Bare "ESTATE" is excluded — it whole-word-matches "REAL ESTATE
+    # CONTRACT". "ESTATE OF" only appears on genuine probate filings.
     "probate": [
         "PROBATE", "LETTERS TESTAMENTARY", "LETTERS OF ADMINISTRATION",
         "PERSONAL REPRESENTATIVE", "PERSONAL REP", "DEATH CERTIFICATE",
-        "AFFIDAVIT OF HEIRSHIP", "TRANSFER ON DEATH", "ESTATE", "WILL",
-        "HEIR",
+        "AFFIDAVIT OF HEIRSHIP", "TRANSFER ON DEATH", "ESTATE OF",
+        "WILL", "HEIR",
     ],
     "pre_foreclosure": [
         "LIS PENDENS", "NOTICE OF TRUSTEE", "TRUSTEE SALE",
@@ -45,6 +47,26 @@ _DOC_TYPE_MAP = {
         "DIVORCE", "DISSOLUTION", "DECREE OF DISSOLUTION",
     ],
 }
+
+
+def _doc_type_matches(doc_type: str, keywords: list[str]) -> bool:
+    """Match doc_type against keywords without substring false-positives.
+
+    Multi-word keywords use substring match; single-word keywords must
+    match as a whole word so "WILL" doesn't leak "GOODWILL" into probate
+    and "NTS"-style abbreviations don't leak "COVENANTS" into
+    pre_foreclosure.
+    """
+    doc_upper = doc_type.upper()
+    doc_words = set(doc_upper.split())
+    for kw in keywords:
+        if " " in kw:
+            if kw in doc_upper:
+                return True
+        else:
+            if kw in doc_words:
+                return True
+    return False
 
 
 class LaserficheWebLinkScraper(BridgeScraper):
@@ -127,29 +149,98 @@ class LaserficheWebLinkScraper(BridgeScraper):
         if total == 0:
             return []
 
-        # Extract all pages
+        # Laserfiche WebLink uses PrimeFaces virtual-scroll datatable —
+        # only ~40 rows are in the DOM at once. We incrementally scroll
+        # the results container and capture visible rows at each
+        # position. Dedupe is by AFN (instrument number) so rows
+        # that stay in the DOM across scrolls aren't counted twice.
         all_records: list[ScrapedRecord] = []
+        seen_afns: set[str] = set()
         seen_hashes: set[str] = set()
-        page_num = 1
-        max_pages = 50
+        empty_scroll_streak = 0
+        max_scrolls = 200
 
-        while page_num <= max_pages:
+        for scroll_idx in range(max_scrolls):
             page_records = await self._extract_page()
             new = 0
             for r in page_records:
+                afn = (r.enrichment_data or {}).get("instrument_number", "") if r.enrichment_data else ""
+                key = afn or self.make_hash(r.to_dict())
+                if key in seen_afns or key in seen_hashes:
+                    continue
+                seen_afns.add(key)
                 h = self.make_hash(r.to_dict())
-                if h not in seen_hashes:
-                    seen_hashes.add(h)
-                    r.raw_html_hash = h
-                    all_records.append(r)
-                    new += 1
-            _logger.info("Page %d: %d new records (total: %d)", page_num, new, len(all_records))
+                seen_hashes.add(h)
+                r.raw_html_hash = h
+                all_records.append(r)
+                new += 1
+
+            if len(all_records) >= total:
+                _logger.info("Scroll %d: captured %d/%d — done", scroll_idx, len(all_records), total)
+                break
 
             if new == 0:
+                empty_scroll_streak += 1
+                # PrimeFaces only recycles rows every ~1.5 viewports of
+                # scroll, so several consecutive 800px scrolls can
+                # return 0 new rows before the DOM advances. Tolerate
+                # up to 8 empty scrolls before giving up.
+                if empty_scroll_streak >= 8:
+                    _logger.info(
+                        "Scroll %d: no new rows after 8 attempts — stopping at %d/%d",
+                        scroll_idx, len(all_records), total,
+                    )
+                    break
+            else:
+                empty_scroll_streak = 0
+
+            if scroll_idx % 5 == 0:
+                _logger.info("Scroll %d: %d new (total: %d/%d)", scroll_idx, new, len(all_records), total)
+
+            # Advance the virtual scroll viewport. Scroll by roughly a
+            # viewport-height less than the full client height so we
+            # overlap by one row (guards against the top/bottom row
+            # being cut off during virtual-row recycling).
+            advanced = await self._advance_scroll()
+            if not advanced:
+                _logger.info("Scroll %d: reached bottom at %d/%d — sweeping", scroll_idx, len(all_records), total)
+                # Bottom sweep: near the end the remaining scroll
+                # distance can be smaller than PrimeFaces's virtual
+                # recycle threshold, so the final frames never render.
+                # Oscillate up/down in 400px steps to force the widget
+                # to re-render rows we may have skipped.
+                for sweep_top in (-2400, -1600, -800, 0, -2000, -1200, -400):
+                    await self.page.evaluate(f"""() => {{
+                        const vt = document.querySelector('.ui-datatable-virtual-table') || document.querySelector('table');
+                        if (!vt) return;
+                        let el = vt;
+                        for (let i = 0; i < 10 && el; i++) {{
+                            const s = window.getComputedStyle(el);
+                            if ((s.overflowY === 'scroll' || s.overflowY === 'auto') && el.scrollHeight > el.clientHeight) {{
+                                const max = el.scrollHeight - el.clientHeight;
+                                el.scrollTop = Math.max(0, max + ({sweep_top}));
+                                el.dispatchEvent(new Event('scroll', {{ bubbles: true }}));
+                                return;
+                            }}
+                            el = el.parentElement;
+                        }}
+                    }}""")
+                    await self.page.wait_for_timeout(900)
+                    sweep_records = await self._extract_page()
+                    for r in sweep_records:
+                        afn = (r.enrichment_data or {}).get("instrument_number", "") if r.enrichment_data else ""
+                        key = afn or self.make_hash(r.to_dict())
+                        if key in seen_afns:
+                            continue
+                        seen_afns.add(key)
+                        h = self.make_hash(r.to_dict())
+                        r.raw_html_hash = h
+                        all_records.append(r)
+                    if len(all_records) >= total:
+                        break
+                _logger.info("Bottom sweep complete: %d/%d", len(all_records), total)
                 break
-            if not await self._goto_next_page():
-                break
-            page_num += 1
+            await self.page.wait_for_timeout(1_200)
 
         # Filter by active record type
         filtered = self._filter_by_type(all_records)
@@ -269,34 +360,54 @@ class LaserficheWebLinkScraper(BridgeScraper):
 
         return records
 
-    async def _goto_next_page(self) -> bool:
-        """Click the next page link in Laserfiche WebLink pagination.
+    async def _advance_scroll(self) -> bool:
+        """Advance the virtual-scroll results container by one viewport.
 
-        WebLink uses ASP.NET __doPostBack for pagination. The pager
-        typically has numbered links and a 'Next' or '>' link.
+        Laserfiche WebLink uses a PrimeFaces datatable with virtual
+        scrolling (`.ui-datatable-scrollable-body`). Only the rows in
+        the current viewport are in the DOM; scrolling triggers the
+        widget to render new rows on top/below. Returns False when the
+        scroll container is already at the bottom.
         """
         try:
-            # Laserfiche WebLink pager uses "Next" link (exact text match).
-            # Use text= selector for exact match to avoid matching numbered
-            # page links that also contain digits.
-            next_link = self.page.get_by_text("Next", exact=True).first
-            if await next_link.count() == 0:
-                # Try ">" as fallback
-                next_link = self.page.get_by_text(">", exact=True).first
-                if await next_link.count() == 0:
-                    return False
-            # Laserfiche pager links may be outside the viewport or
-            # styled as invisible by CSS — use force=True to bypass
-            # Playwright's visibility check.
-            await next_link.click(timeout=5_000, force=True)
-            await self.page.wait_for_timeout(3_000)
-            try:
-                await self.page.wait_for_load_state("networkidle", timeout=10_000)
-            except Exception:
-                pass
-            return True
+            result = await self.page.evaluate("""() => {
+                // Locate the scrollable body by climbing up from the
+                // virtual table. The container has overflow-y set to
+                // 'auto' or 'scroll' and is recognisable by the
+                // 'ui-datatable-scrollable-body' class on Laserfiche.
+                const vtable = document.querySelector('.ui-datatable-virtual-table')
+                    || document.querySelector('table');
+                if (!vtable) return { ok: false, reason: 'no-table' };
+                let el = vtable;
+                let container = null;
+                for (let i = 0; i < 10 && el; i++) {
+                    const style = window.getComputedStyle(el);
+                    if (style.overflowY === 'scroll' || style.overflowY === 'auto') {
+                        if (el.scrollHeight > el.clientHeight) {
+                            container = el;
+                            break;
+                        }
+                    }
+                    el = el.parentElement;
+                }
+                if (!container) return { ok: false, reason: 'no-container' };
+                const before = container.scrollTop;
+                const max = container.scrollHeight - container.clientHeight;
+                if (before >= max - 1) return { ok: false, reason: 'at-bottom', scrollTop: before, max };
+                // Step by ~20 rows (~800px at 40px/row). Small enough
+                // to not skip past the virtual recycle window, large
+                // enough to reliably trigger PrimeFaces to re-render
+                // rows once the cumulative scroll crosses its
+                // recycle threshold.
+                const step = 800;
+                container.scrollTop = Math.min(before + step, max);
+                // Fire a scroll event — PrimeFaces listens for it.
+                container.dispatchEvent(new Event('scroll', { bubbles: true }));
+                return { ok: true, scrollTop: container.scrollTop, max };
+            }""")
+            return bool(result and result.get('ok'))
         except Exception as exc:
-            _logger.info("Pagination ended: %s", str(exc)[:80])
+            _logger.info("Scroll advance failed: %s", str(exc)[:80])
             return False
 
     def _filter_by_type(self, records: list[ScrapedRecord]) -> list[ScrapedRecord]:
@@ -309,6 +420,6 @@ class LaserficheWebLinkScraper(BridgeScraper):
         kept = []
         for r in records:
             doc = (r.doc_type or "").upper()
-            if any(kw in doc for kw in keywords):
+            if _doc_type_matches(doc, keywords):
                 kept.append(r)
         return kept

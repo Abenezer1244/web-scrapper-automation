@@ -20,6 +20,8 @@ _logger = setup_logger("scraper.enrichment.ai_assessor")
 # ─── Known assessor URLs (built-in) ──────────────────────────────────────────
 _KNOWN_ASSESSOR_URLS: dict[str, str] = {
     "pierce_WA": "https://atip.piercecountywa.gov/app/parcelSearch",
+    # Tyler PACS PropertyAccess (same vendor as Chelan/Douglas AcclaimWeb PACS)
+    "island_WA": "https://assessor.islandcountywa.gov/propertyaccess/?cid=0",
 }
 
 _SYSTEM_PROMPT = """You are a browser automation agent looking at a county property/assessor search website.

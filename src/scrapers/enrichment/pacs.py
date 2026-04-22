@@ -47,19 +47,24 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> dict | None:
     """
     if not pacs_url or not owner_name:
         return None
-    try:
+
+    # Island PACS responses run 10-18s on estate-name searches — bumped
+    # timeouts + one retry on read timeout recovers ~2x the records
+    # that the original 10/12s budget was dropping.
+    _GET_TIMEOUT = 20
+    _POST_TIMEOUT = 25
+
+    def _do_request():
         sess = requests.Session()
         sess.headers.update(_HEADERS)
-        r0 = sess.get(pacs_url, timeout=10)
+        r0 = sess.get(pacs_url, timeout=_GET_TIMEOUT)
         if r0.status_code != 200:
-            return None
-
+            return None, None
         vs = re.search(r'__VIEWSTATE.*?value="([^"]+)"', r0.text)
         ev = re.search(r'__EVENTVALIDATION.*?value="([^"]+)"', r0.text)
         vsg = re.search(r'__VIEWSTATEGENERATOR.*?value="([^"]+)"', r0.text)
         if not vs:
-            return None
-
+            return None, None
         data = {
             "__VIEWSTATE": vs.group(1),
             "__EVENTVALIDATION": ev.group(1) if ev else "",
@@ -67,8 +72,19 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> dict | None:
             "propertySearchOptions$ownerName": owner_name,
             "propertySearchOptions$search": "Search",
         }
-        r = sess.post(pacs_url, data=data, timeout=12, allow_redirects=True)
-        if r.status_code != 200 or "None found" in r.text:
+        r = sess.post(pacs_url, data=data, timeout=_POST_TIMEOUT, allow_redirects=True)
+        return sess, r
+
+    try:
+        sess, r = None, None
+        for attempt in range(2):  # one retry on read timeout
+            try:
+                sess, r = _do_request()
+                break
+            except requests.exceptions.ReadTimeout:
+                if attempt == 1:
+                    raise
+        if r is None or r.status_code != 200 or "None found" in r.text:
             return None
 
         table_start = r.text.find("resultsTable")

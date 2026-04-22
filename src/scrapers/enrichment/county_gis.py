@@ -283,6 +283,23 @@ def _query_wa_statewide(parcel_id: str, county: str) -> dict[str, str | None]:
         return _empty()
 
 
+def _query_wa_statewide_by_name(owner_name: str, county: str) -> dict[str, str | None]:
+    """WA statewide name-based fallback — intentionally a no-op.
+
+    Referenced from enrich_parcel_gis() but the underlying WAGeoservices
+    Current_Parcels FeatureServer publishes NO owner-name column (fields
+    are FIPS_NR, COUNTY_NM, PARCEL_ID_NR, SITUS_ADDRESS, etc. — no
+    OWNER_NM). A name search here is impossible against that service.
+
+    Name-based enrichment is handled instead at the tasks.py layer via
+    the connector's assessor_url (Tyler PACS PropertyAccess — see
+    src/scrapers/enrichment/pacs.py). This stub exists so the
+    enrich_parcel_gis() fallback branch does not raise NameError
+    if called with parcel_id=None.
+    """
+    return _empty()
+
+
 def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
     """Parse ArcGIS REST API response into enrichment fields."""
     features = data.get("features") or []

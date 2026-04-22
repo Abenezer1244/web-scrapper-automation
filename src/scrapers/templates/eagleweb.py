@@ -25,8 +25,8 @@ _logger = setup_logger("scraper.template.eagleweb")
 _DOC_TYPE_MAP = {
     "probate": ["PROBATE", "LETTERS TESTAMENTARY", "LETTERS OF ADMINISTRATION",
                 "PERSONAL REPRESENTATIVE", "PERSONAL REP",
-                "DEATH CERTIFICATE", "AFFIDAVIT OF HEIRSHIP",
-                "TRANSFER ON DEATH",
+                "DEATH CERTIFICATE", "CERTIFICATE OF DEATH",
+                "AFFIDAVIT OF HEIRSHIP", "TRANSFER ON DEATH",
                 # Abbreviated codes (e.g. Clallam: DEATH, LETTR, EXEC, TOD, SUCC)
                 "DEATH", "LETTR", "EXEC", "TOD", "SUCC"],
     "pre_foreclosure": ["LIS PENDENS", "NOTICE OF TRUSTEE SALE", "TRUSTEE SALE",
@@ -38,6 +38,12 @@ _DOC_TYPE_MAP = {
     "divorce": ["DIVORCE", "DISSOLUTION", "DECREE OF DISSOLUTION",
                 # Abbreviated codes
                 "DISS", "DISOL"],
+}
+
+# Doc type phrases that LOOK like a match but document the opposite.
+# Checked AFTER _DOC_TYPE_MAP — any match here drops the record.
+_DOC_TYPE_EXCLUDE = {
+    "probate": ["LACK OF PROBATE"],  # affidavit stating there is NO probate
 }
 
 
@@ -55,23 +61,26 @@ class EagleWebScraper(BridgeScraper):
         state: str,
         record_types: list[str] | None = None,
         record_type: str | None = None,
-        require_parcel_id: bool = True,
+        require_parcel_id: bool | None = None,
     ):
         super().__init__()
         self.base_url = base_url
         self.county = county
         self.state = state
         self.record_types = record_types or []
-        # active_record_type is the SINGLE record type the caller wants for
-        # this scrape run. When tasks.py dispatches a probate job it passes
-        # record_type="probate" via inspect.signature forwarding; the template
-        # then filters for probate keywords only. Falls back to record_types[0]
-        # so bare-bones probe scripts (and the legacy call site) still work.
         self.active_record_type = record_type or (self.record_types[0] if self.record_types else None)
-        # Some EagleWeb counties (e.g., Thurston) have probate records
-        # with no parcel in upstream data — these are pure estate/name
-        # filings, not property-linked. Drop them so we only deliver
-        # actionable property leads the GIS pipeline can enrich.
+        # Parcel-ID requirement policy:
+        #   - Probate records are estate/name filings (Cert of Death, Letters
+        #     Testamentary, Personal Rep Deed, Transfer-on-Death, etc.) that
+        #     often carry no parcel in the recording index. Dropping them
+        #     deletes most of the signal — name-only leads are still
+        #     actionable via skip trace. Default OFF for probate.
+        #   - Property-linked types (pre_foreclosure, tax_delinquent) have
+        #     a parcel in every record; a missing parcel there means the
+        #     extraction regex failed, so dropping is correct. Default ON.
+        #   - Explicit caller override (True/False) always wins.
+        if require_parcel_id is None:
+            require_parcel_id = self.active_record_type not in ("probate", "divorce")
         self.require_parcel_id = require_parcel_id
 
         from urllib.parse import urlparse
@@ -698,8 +707,10 @@ class EagleWebScraper(BridgeScraper):
                         doc_upper = desc.upper()
                         kws = _DOC_TYPE_MAP.get(active_rt, [])
                         if not any(kw in doc_upper for kw in kws):
-                            pass
                             continue  # Skip non-matching doc types
+                        excludes = _DOC_TYPE_EXCLUDE.get(active_rt, [])
+                        if any(neg in doc_upper for neg in excludes):
+                            continue  # e.g. "LACK OF PROBATE AFFIDAVIT"
                     records.append(record)
 
             _logger.info(

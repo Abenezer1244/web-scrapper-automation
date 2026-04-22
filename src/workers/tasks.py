@@ -669,7 +669,7 @@ async def _run_scraper(scraper_class, date_from: str, date_to: str, r, job_id: s
 
 def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
     """Run GIS + King County enrichment inline (before job marks done)."""
-    from sqlalchemy import select as sa_select
+    from sqlalchemy import func, select as sa_select
     from src.db.models import Result
 
     all_results = db.execute(

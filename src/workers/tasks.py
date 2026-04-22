@@ -722,6 +722,13 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
         )
     ).scalars().first()
     connector_assessor_url = getattr(_conn_row, "assessor_url", None) if _conn_row else None
+    # Fall back to the hardcoded _KNOWN_ASSESSOR_URLS map so PACS enrichment
+    # works even when the connector row's assessor_url is still NULL
+    # (e.g. migration 022 not yet applied to this environment).
+    if not connector_assessor_url:
+        from src.scrapers.enrichment.ai_assessor import _KNOWN_ASSESSOR_URLS
+        key = f"{config.county.lower()}_{config.state.upper()}"
+        connector_assessor_url = _KNOWN_ASSESSOR_URLS.get(key)
     from src.scrapers.enrichment.pacs import is_pacs_url, batch_lookup_pacs_by_name
     if connector_assessor_url and is_pacs_url(connector_assessor_url):
         results_no_addr = [

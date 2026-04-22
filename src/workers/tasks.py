@@ -706,6 +706,62 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             db.rollback()
             db.commit()
 
+    # Name-based PACS fallback for records with no parcel (e.g. probate
+    # estate filings: Cert of Death, Letters Testamentary, Personal Rep
+    # Deed). These carry owner/heir names but no parcel_id in the
+    # recording index. The county connector's assessor_url points at the
+    # Tyler PACS PropertyAccess portal; we search it by owner name to
+    # hydrate property_address. Skip trace downstream requires an
+    # address, so this is what unlocks phone/email lookup for probate.
+    from src.db.models import CountyConnector
+    _conn_row = db.execute(
+        sa_select(CountyConnector).where(
+            func.lower(CountyConnector.county) == config.county.lower(),
+            func.upper(CountyConnector.state) == config.state.upper(),
+            CountyConnector.active,
+        )
+    ).scalars().first()
+    connector_assessor_url = getattr(_conn_row, "assessor_url", None) if _conn_row else None
+    from src.scrapers.enrichment.pacs import is_pacs_url, batch_lookup_pacs_by_name
+    if connector_assessor_url and is_pacs_url(connector_assessor_url):
+        results_no_addr = [
+            res for res in all_results
+            if res.party_name
+            and not res.property_address
+        ]
+        if results_no_addr:
+            _publish_log(
+                r, job_id, "info",
+                f"Looking up {len(results_no_addr)} addresses via PACS by owner name...",
+                db=db,
+            )
+            names = [res.party_name for res in results_no_addr]
+            pacs_results = batch_lookup_pacs_by_name(
+                connector_assessor_url, names, max_workers=5,
+            )
+            name_hits = 0
+            for res, pacs in zip(results_no_addr, pacs_results):
+                if not pacs:
+                    continue
+                if pacs.get("address"):
+                    res.property_address = pacs["address"]
+                if pacs.get("mailing") and not res.mailing_address:
+                    res.mailing_address = pacs["mailing"]
+                if pacs.get("parcel_id") and not res.parcel_id:
+                    res.parcel_id = pacs["parcel_id"]
+                name_hits += 1
+            if name_hits:
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    db.commit()
+            _publish_log(
+                r, job_id, "info",
+                f"Found {name_hits}/{len(results_no_addr)} addresses via PACS",
+                db=db,
+            )
+
     # King County: eRealProperty + Tax Bill for property + mailing
     if config.county.lower() == "king" and config.state.upper() == "WA":
         needs = [

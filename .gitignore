@@ -62,6 +62,9 @@ infra/terraform/.terraform.lock.hcl
 # Claude worktrees & skills
 .claude/worktrees/
 .claude/skills/gstack/
+# Per-machine local settings file. Do NOT commit — it carries an
+# ANTHROPIC_API_KEY plus per-MCP bearer tokens by default.
+.claude/settings.local.json
 tests/screenshots/
 .playwright-mcp/
 .playwright-cli/

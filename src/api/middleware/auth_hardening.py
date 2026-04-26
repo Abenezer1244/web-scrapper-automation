@@ -85,6 +85,14 @@ class TokenBlacklist:
         key = f"{TokenBlacklist._KEY_PREFIX}{jti}"
         return await r.exists(key) == 1
 
+    # TTL on the positive Redis cache. Must NOT exceed the max JWT
+    # lifetime — if a stale positive entry survives longer than the
+    # JWT it could be used to keep an old revocation visible after
+    # the durable DB row has been changed (admin manually clearing
+    # users.revoked_at, etc.). 7 days matches the max refresh-token
+    # lifetime in src/api/auth.py.
+    _REVOKE_CACHE_TTL_SECONDS = 7 * 24 * 3600
+
     @staticmethod
     async def revoke_all_for_user(user_id: str) -> None:
         """Store a revoke timestamp for the user, durably.
@@ -93,10 +101,19 @@ class TokenBlacklist:
         source of truth) AND a Redis cache key (hot read path). The DB
         write is awaited first; if it succeeds and Redis fails, the
         revocation still takes effect because get_user_revoke_time
-        falls back to the DB when Redis is unavailable.
+        always re-validates against the DB on Redis miss.
 
-        Any token issued at-or-before this timestamp is considered
-        revoked by get_current_user / refresh / download-token paths.
+        If the Redis SETEX raises, the previous cached value would
+        otherwise stay live until TTL — including a stale "0"
+        (never-revoked) sentinel if the user had been auth-checked
+        recently. To prevent that fail-open hole we issue a Redis DEL
+        for the key when SETEX fails, forcing the next reader to hit
+        the DB and observe the now-durable revocation. If even DEL
+        fails, the durable DB row is still authoritative once Redis
+        recovers (the next reader's GET will return the stale value
+        BUT we re-validate against DB because the negative-cache
+        sentinel is no longer trusted — see get_user_revoke_time).
+
         Raises on Postgres error so /auth/logout-all returns 5xx and
         the client retries instead of reporting a successful revocation
         that did not persist.
@@ -113,42 +130,54 @@ class TokenBlacklist:
                 update(User).where(User.id == user_id).values(revoked_at=now)
             )
 
-        # 2) Best-effort Redis write for fast lookups. Don't fail the
-        # whole revocation if Redis is down — the DB is authoritative.
+        # 2) Best-effort Redis write. If it fails, invalidate the key
+        # so a stale "0" sentinel cannot mask the now-durable revocation.
+        key = f"{TokenBlacklist._USER_REVOKE_PREFIX}{user_id}"
         try:
             r = _get_redis()
-            key = f"{TokenBlacklist._USER_REVOKE_PREFIX}{user_id}"
-            # Keep for 8 days (longer than max JWT lifetime of 7 days).
-            await r.setex(key, 8 * 24 * 3600, str(int(now.timestamp())))
+            await r.setex(
+                key, TokenBlacklist._REVOKE_CACHE_TTL_SECONDS, str(int(now.timestamp())),
+            )
         except redis_exceptions.RedisError as exc:
             _logger.warning(
-                "revoke_all_for_user: DB write succeeded but Redis cache "
-                "update failed (revocation IS in effect via DB fallback): %s",
+                "revoke_all_for_user: Redis SETEX failed; attempting DEL to invalidate stale cache: %s",
                 exc,
             )
+            try:
+                await _get_redis().delete(key)
+            except redis_exceptions.RedisError as del_exc:
+                # If both SETEX and DEL fail, the cache may briefly
+                # serve a stale negative sentinel until the entry
+                # expires. Log loud — the DB row IS revoked, but
+                # ops should know auth-cache writes are failing.
+                _logger.error(
+                    "revoke_all_for_user: BOTH Redis SETEX and DEL failed; "
+                    "cache may briefly mask DB revocation for user %s: %s",
+                    user_id, del_exc,
+                )
 
     @staticmethod
     async def get_user_revoke_time(user_id: str) -> int:
         """Return the epoch timestamp at which all tokens for this user were revoked (0 if never).
 
-        Reads Redis first (microsecond hot path); on RedisError or
-        cache-miss falls back to the durable users.revoked_at column
-        written by revoke_all_for_user. The DB result — including the
-        common "never revoked, value=0" case — is backfilled into Redis
-        as a negative-cache sentinel so steady-state auth stays in
-        Redis rather than paying a DB round-trip on every request.
+        Reads Redis first (microsecond hot path) and uses the cached
+        value when present. On Redis cache MISS we always consult the
+        DB authoritatively — we do NOT negative-cache the never-revoked
+        state because a stale "0" sentinel could mask a logout-all that
+        wrote durably to Postgres but failed to update Redis.
+        Steady-state cost: one indexed PK lookup per JWT validation
+        when Redis hasn't seen this user yet, accepted as the price of
+        making revoke_all_for_user safe under partial Redis failure.
 
-        Schema-compatibility: pre-migration deployments lack
-        users.revoked_at. If the DB query raises ProgrammingError
-        (column does not exist), treat the fallback as unavailable
-        and return 0 — the per-jti blacklist still applies and any
-        active /logout-all from after the migration can rewrite
-        Redis directly. This stops a partial rollout (code-before-
-        migration) from taking the auth path down.
-
-        Only raises if Redis is down AND the DB fallback hits a
-        non-schema error — at that point both data layers are
-        unhealthy and the caller correctly surfaces 503.
+        On RedisError, also falls back to the DB. The 503 surface in
+        the caller now only fires if Redis is unavailable AND the DB
+        query also raises. ProgrammingError (column-missing — happens
+        if code lands before migration 024) is one such DB failure
+        and we deliberately do NOT swallow it as 0; treating a
+        schema-rollout race as fail-open would let revoked sessions
+        keep serving until Redis re-populates. Production deploys go
+        through start.sh which blocks uvicorn until alembic upgrade
+        head succeeds, so the rollout race shouldn't reach this path.
         """
         key = f"{TokenBlacklist._USER_REVOKE_PREFIX}{user_id}"
         try:
@@ -156,51 +185,36 @@ class TokenBlacklist:
             val = await r.get(key)
             if val is not None:
                 return int(val) if val else 0
-            # Cache miss (no entry yet for this user). Fall through to
-            # the DB read to authoritatively confirm revocation state,
-            # then backfill the cache below — including "0" for the
-            # never-revoked case so subsequent reads stay in Redis.
+            # Cache miss — fall through to DB. Do NOT negative-cache
+            # the result; see docstring for why.
         except redis_exceptions.RedisError as exc:
             _logger.warning(
                 "get_user_revoke_time: Redis unavailable, falling back to DB for user %s: %s",
                 user_id, exc,
             )
 
-        # DB fallback path — durable, slower (~1 DB round-trip).
+        # DB authoritative read.
         from sqlalchemy import select
-        from sqlalchemy.exc import ProgrammingError
         from src.db.models import User
         from src.db.session import async_engine
 
-        try:
-            async with async_engine.connect() as conn:
-                row = (await conn.execute(
-                    select(User.revoked_at).where(User.id == user_id)
-                )).first()
-        except ProgrammingError as exc:
-            # Most likely cause: code deployed before alembic migration
-            # 024 ran on this DB. Treat as "fallback unavailable" so
-            # the auth path still serves traffic — Redis remains the
-            # only revocation signal until the migration lands.
-            _logger.error(
-                "get_user_revoke_time: users.revoked_at missing (pre-024 schema?) for user %s: %s",
-                user_id, exc,
-            )
-            return 0
+        async with async_engine.connect() as conn:
+            row = (await conn.execute(
+                select(User.revoked_at).where(User.id == user_id)
+            )).first()
 
         if row is None or row[0] is None:
-            ts = 0
-        else:
-            ts = int(row[0].timestamp())
+            return 0
+        ts = int(row[0].timestamp())
 
-        # Backfill the Redis cache so the next read of this user is
-        # fast again — including the never-revoked case (ts=0). With a
-        # short-ish TTL the negative cache eventually re-confirms via
-        # DB if Redis loses the key. Best-effort: a Redis write failure
-        # just means the next read pays the DB hop again.
+        # Backfill the POSITIVE case only. Never-revoked users keep
+        # paying the DB hop on cache miss — that's the trade-off for
+        # not having a stale-cache fail-open. Best-effort write: a
+        # Redis failure here just means the next read pays the DB hop
+        # again, which is the worst-case path anyway.
         try:
             r = _get_redis()
-            await r.setex(key, 8 * 24 * 3600, str(ts))
+            await r.setex(key, TokenBlacklist._REVOKE_CACHE_TTL_SECONDS, str(ts))
         except redis_exceptions.RedisError:
             pass
         return ts

@@ -184,9 +184,23 @@ class TokenBlacklist:
             r = _get_redis()
             val = await r.get(key)
             if val is not None:
-                return int(val) if val else 0
-            # Cache miss — fall through to DB. Do NOT negative-cache
-            # the result; see docstring for why.
+                # Trust ONLY positive cached timestamps. A "0" sentinel
+                # is no longer written by this code, but pre-deploy
+                # commits (specifically 6b74d5a, the brief window
+                # before this stale-0 fix) wrote ts=0 to Upstash with
+                # an 8-day TTL. Until those entries naturally expire,
+                # honoring them would let a successful /logout-all
+                # whose cache write happened to fail be silently
+                # masked. Treating "0" as an untrusted miss closes
+                # that window: the next read goes to the DB and
+                # observes the durable users.revoked_at row.
+                try:
+                    cached_ts = int(val)
+                except (TypeError, ValueError):
+                    cached_ts = 0
+                if cached_ts > 0:
+                    return cached_ts
+                # Stale "0" sentinel or empty value — fall through to DB.
         except redis_exceptions.RedisError as exc:
             _logger.warning(
                 "get_user_revoke_time: Redis unavailable, falling back to DB for user %s: %s",

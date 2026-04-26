@@ -102,8 +102,11 @@ class KingWACodeViolationScraper(BridgeScraper):
                     try:
                         dt = datetime.fromisoformat(opendate.replace("Z", "+00:00").split(".")[0])
                         record.date_recorded = dt.strftime("%m/%d/%Y")
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _logger.debug(
+                            "Could not parse opendate=%r for %s: %s",
+                            opendate, rec_num, exc,
+                        )
 
                 # Party name — case type + address (no owner name in API)
                 desc = (item.get("recordtypedesc") or item.get("description") or "").strip()

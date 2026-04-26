@@ -73,8 +73,11 @@ async def batch_enrich_king_county(
                 if tax_url:
                     tax_urls[pid] = tax_url
 
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.debug(
+                "Property URL fetch failed for parcel=%s: %s",
+                pid, str(exc)[:200],
+            )
 
         await asyncio.sleep(0.1)  # minimal delay for HTTP
 

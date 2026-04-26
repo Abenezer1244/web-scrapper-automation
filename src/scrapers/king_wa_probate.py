@@ -325,8 +325,11 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                     solved = True
                     _logger.info("reCAPTCHA solved!")
                     break
-            except Exception:
-                pass
+            except Exception as exc:
+                _logger.warning(
+                    "reCAPTCHA solve check failed (will retry): %s",
+                    str(exc)[:200],
+                )
             await asyncio.sleep(2)
 
         if not solved:

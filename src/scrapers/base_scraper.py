@@ -222,8 +222,8 @@ class BridgeScraper:
             resp = requests.get(url, timeout=10, headers={"User-Agent": "BridgeLeads-Probe/1.0"})
             if resp.status_code == 200 and len(resp.text) > 500:
                 return "static"
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.debug("Render-mode probe failed for %s: %s", url, exc)
         return "playwright"
 
     # ─── Utilities ────────────────────────────────────────────────────────────

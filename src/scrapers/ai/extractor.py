@@ -101,8 +101,8 @@ async def _get_results_html(page: Page) -> str:
                 if len(html) > 15_000:
                     html = html[:15_000] + "\n<!-- ... trimmed ... -->"
                 return html
-    except Exception:
-        pass
+    except Exception as exc:
+        _logger.debug("Targeted HTML snapshot failed, falling back to body: %s", exc)
 
     # Fallback: get the main content area
     try:
@@ -110,7 +110,12 @@ async def _get_results_html(page: Page) -> str:
         if len(body) > 15_000:
             body = body[:15_000] + "\n<!-- ... trimmed ... -->"
         return body
-    except Exception:
+    except Exception as exc:
+        _logger.warning(
+            "AI extractor body fallback failed; returning empty HTML "
+            "(Claude will get nothing): %s",
+            exc,
+        )
         return ""
 
 

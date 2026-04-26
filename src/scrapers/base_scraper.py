@@ -255,6 +255,33 @@ class BridgeScraper:
         stable = json.dumps(row_dict, sort_keys=True, ensure_ascii=False, default=str)
         return hashlib.md5(stable.encode("utf-8")).hexdigest()  # noqa: S324 (dedup only, not security)
 
+    def dedupe_extend(
+        self,
+        new_records: list[ScrapedRecord],
+        seen_hashes: set[str],
+        all_records: list[ScrapedRecord],
+    ) -> int:
+        """Append non-duplicate records to ``all_records`` and return the new count.
+
+        Mutates both ``seen_hashes`` (adds new fingerprints) and
+        ``all_records`` (appends accepted records). Sets each kept
+        record's ``raw_html_hash`` to its fingerprint. Returns the number
+        of records that were genuinely new this batch — useful for the
+        per-chunk / per-page progress log lines templates emit. The
+        per-template chunk and pagination loops are deliberately kept
+        site-specific because each portal's navigation differs; only
+        this dedup tail is portable, so it lives here.
+        """
+        new_count = 0
+        for record in new_records:
+            h = self.make_hash(record.to_dict())
+            if h not in seen_hashes:
+                seen_hashes.add(h)
+                record.raw_html_hash = h
+                all_records.append(record)
+                new_count += 1
+        return new_count
+
     @staticmethod
     def clean(text: str | None) -> str | None:
         """Strip control characters and normalise whitespace in scraped text."""

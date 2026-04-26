@@ -176,16 +176,7 @@ class EagleWebScraper(BridgeScraper):
             await self._submit_search()
             chunk_records = await self._extract_all_pages()
 
-            # Deduplicate against all records
-            new_count = 0
-            for record in chunk_records:
-                h = self.make_hash(record.to_dict())
-                if h not in seen_hashes:
-                    seen_hashes.add(h)
-                    record.raw_html_hash = h
-                    all_records.append(record)
-                    new_count += 1
-
+            new_count = self.dedupe_extend(chunk_records, seen_hashes, all_records)
             _logger.info("Chunk %s-%s: %d new records (total: %d)", cf, ct, new_count, len(all_records))
 
             chunk_start = chunk_end

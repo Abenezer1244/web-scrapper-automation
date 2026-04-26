@@ -166,20 +166,15 @@ def report_lookups_for_user(
     # be STABLE across webhook replays so Stripe's own dedup kicks in.
     # The old identifier included now.isoformat() which changed on
     # every retry, so a replayed Tracerfy webhook would create a
-    # new MeterEvent and bill the customer twice. Use
-    # (queue_id, user_id) when queue_id is provided (the webhook
-    # path); fall back to a period-stable key only when called
-    # without queue_id (no current caller, but safe default).
-    if queue_id is not None:
-        stable_identifier = f"skip_trace_q{queue_id}_u{user_id}"
-    else:
-        # Legacy fallback — stable within a billing period but not
-        # across. No current caller hits this path.
-        period_tag = (
-            user_row.skip_trace_period_start.isoformat()
-            if user_row.skip_trace_period_start else "no_period"
+    # new MeterEvent and bill the customer twice. queue_id is
+    # required — report_usage_from_webhook is the only caller and it
+    # always passes one — so the identifier is uniquely keyed on
+    # (queue_id, user_id) and a Stripe replay always dedupes.
+    if queue_id is None:
+        raise ValueError(
+            "queue_id is required to build a stable Stripe MeterEvent identifier"
         )
-        stable_identifier = f"skip_trace_legacy_{user_id}_{period_tag}"
+    stable_identifier = f"skip_trace_q{queue_id}_u{user_id}"
 
     try:
         import stripe

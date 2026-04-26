@@ -643,19 +643,17 @@ async def download_export(
             # they cannot be confused with full session JWTs, and
             # the jti must not appear in the blacklist (lets us
             # revoke a specific download link within its 60s TTL
-            # if needed). Legacy tokens minted before H6 landed have
-            # no aud/iss — we accept them during a grace period
-            # bounded by their natural 60s expiry, after which no
-            # legacy tokens can exist.
-            legacy_no_aud = "aud" not in payload
-            if not legacy_no_aud:
-                if (
-                    payload.get("aud") != "bridgeleads-download"
-                    or payload.get("iss") != "bridgeleads"
-                ):
-                    raise HTTPException(
-                        status_code=401, detail="Invalid download token claims"
-                    )
+            # if needed). The pre-H6 grace path that accepted tokens
+            # without aud/iss has been removed — those tokens had a
+            # 60-second lifetime and H6 has been deployed for many
+            # months, so no such tokens can exist anywhere.
+            if (
+                payload.get("aud") != "bridgeleads-download"
+                or payload.get("iss") != "bridgeleads"
+            ):
+                raise HTTPException(
+                    status_code=401, detail="Invalid download token claims"
+                )
             if payload.get("job_id") != job_id:
                 raise HTTPException(status_code=403, detail="Token not valid for this job")
             jti = payload.get("jti", "")

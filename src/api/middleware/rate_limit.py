@@ -9,12 +9,16 @@ Usage:
 """
 
 import ipaddress
+import logging
 import time
 
 import redis.asyncio as aioredis
+import redis.exceptions as redis_exceptions
 from fastapi import HTTPException, Request, status
 
 from src.config import settings
+
+_logger = logging.getLogger("security.rate_limit")
 
 # Zone config: (max_requests, window_seconds)
 _ZONES: dict[str, tuple[int, int]] = {
@@ -96,7 +100,23 @@ async def rate_limit(request: Request, zone: str = "general", identifier: str | 
     pipe.zadd(redis_key, {str(now): now})
     pipe.zcard(redis_key)
     pipe.expire(redis_key, window_seconds)
-    results = await pipe.execute()
+    try:
+        results = await pipe.execute()
+    except redis_exceptions.RedisError as exc:
+        # Rate limiting is best-effort defense — if the limiter itself
+        # cannot run (Upstash quota throttle, network blip, connection
+        # pool exhaustion, ...) we MUST fail open. Failing closed turns
+        # every request into a 500 and takes the entire API down for
+        # the duration of the Redis incident, which is exactly what we
+        # observed when Upstash rate-limited the project's own DB and
+        # /auth/login started returning Internal Server Error to users.
+        # The log + audit trail here is enough for ops to notice and
+        # investigate without taking real users offline.
+        _logger.warning(
+            "rate_limit fail-open: Redis error while checking zone=%s key=%s: %s",
+            zone, redis_key, exc,
+        )
+        return
 
     request_count: int = results[2]
 

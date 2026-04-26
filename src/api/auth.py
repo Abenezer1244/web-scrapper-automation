@@ -157,14 +157,23 @@ async def get_current_user(
     if not user_id:
         raise _CREDENTIALS_EXCEPTION
 
-    # Check blacklist (individual token logout)
-    if await TokenBlacklist.is_blacklisted(jti):
-        raise _CREDENTIALS_EXCEPTION
+    # Check blacklist (individual token logout) and user-level
+    # revocation (logout-all). Both are SECURITY BOUNDARIES — if Redis
+    # is unavailable we cannot prove the token has not been revoked,
+    # so we MUST refuse to serve the request. Surface 503 (Service
+    # Unavailable) so the client can distinguish "auth-infra is
+    # temporarily down" from a normal 401 ("your credentials are
+    # invalid") and avoid forcing a re-login on a transient outage.
+    import redis.exceptions as _redis_exceptions
+    from src.api.middleware.auth_hardening import revocation_unavailable_503
+    try:
+        if await TokenBlacklist.is_blacklisted(jti):
+            raise _CREDENTIALS_EXCEPTION
 
-    # Check user-level revocation (logout-all)
-    revoke_time = await TokenBlacklist.get_user_revoke_time(user_id)
-    if revoke_time > 0 and issued_at < revoke_time:
-        raise _CREDENTIALS_EXCEPTION
+        if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
+            raise _CREDENTIALS_EXCEPTION
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
 
     result = await db.execute(
         select(User).where(User.id == user_id, User.is_active)

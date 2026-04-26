@@ -190,11 +190,26 @@ async def refresh_token(
     if not user:
         raise HTTPException(status_code=401, detail="User not found or inactive")
 
-    # Check if the refresh token's jti was blacklisted (logout-all)
-    from src.api.middleware.auth_hardening import TokenBlacklist
+    # Honor BOTH revocation paths:
+    #   1. is_blacklisted(jti) — this specific refresh token was revoked
+    #   2. get_user_revoke_time(user_id) — user clicked "log out
+    #      everywhere"; any refresh token issued before that timestamp
+    #      must be rejected. Without this check, an attacker holding a
+    #      stale refresh token could still mint fresh access tokens
+    #      after the user invalidated all sessions.
+    # Revocation is a security boundary — if Redis is unavailable we
+    # cannot prove the refresh token wasn't revoked, so surface 503.
+    import redis.exceptions as _redis_exceptions
+    from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
     jti = payload.get("jti", "")
-    if jti and await TokenBlacklist.is_blacklisted(jti):
-        raise HTTPException(status_code=401, detail="Refresh token revoked")
+    issued_at: int = payload.get("iat", 0)
+    try:
+        if jti and await TokenBlacklist.is_blacklisted(jti):
+            raise HTTPException(status_code=401, detail="Refresh token revoked")
+        if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
+            raise HTTPException(status_code=401, detail="Refresh token revoked")
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
 
     new_access = create_secure_token(user.id)
     new_refresh = create_refresh_token(user.id)
@@ -307,14 +322,23 @@ async def logout(
     auth_header = request.headers.get("Authorization", "")
     token = auth_header.removeprefix("Bearer ").strip()
 
+    # Logout MUST actually revoke the token. If Redis is unavailable
+    # we cannot complete revocation, so surface 503 — silently
+    # returning success here would tell the client the token is dead
+    # while leaving it usable, which defeats the entire purpose of
+    # the logout flow. Other decode errors (already-expired token,
+    # malformed token, etc.) are still benign and swallowed below.
+    import redis.exceptions as _redis_exceptions
+    from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
     try:
         payload = decode_secure_token(token)
         jti = payload.get("jti", "")
         exp = payload.get("exp", 0)
         ttl = max(0, exp - int(time.time()))
         if jti and ttl > 0:
-            from src.api.middleware.auth_hardening import TokenBlacklist
             await TokenBlacklist.add(jti, ttl)
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
     except Exception:
         pass  # Token already invalid — that's fine
 
@@ -326,8 +350,16 @@ async def logout_all(
     request: Request,
     current_user: CurrentUser,
 ) -> None:
-    from src.api.middleware.auth_hardening import TokenBlacklist
-    await TokenBlacklist.revoke_all_for_user(current_user.id)
+    # logout-all writes the user-revoke timestamp that every JWT decoder
+    # checks. If Redis is unavailable, the revocation cannot take effect
+    # — surface 503 so the caller knows to retry rather than report a
+    # successful logout that did not actually log anyone out.
+    import redis.exceptions as _redis_exceptions
+    from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
+    try:
+        await TokenBlacklist.revoke_all_for_user(current_user.id)
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
     audit_log(request, "logout_all", current_user.id)
 
 

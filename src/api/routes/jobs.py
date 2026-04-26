@@ -6,6 +6,7 @@ import uuid
 from collections.abc import AsyncGenerator
 
 import redis.asyncio as aioredis
+import redis.exceptions as _redis_exceptions
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
@@ -544,6 +545,7 @@ async def get_export_url(
     # download link in the rare case we need to revoke one before
     # its 60s TTL expires.
     import uuid as _uuid
+    _now = int(time.time())
     download_token = jose_jwt.encode(
         {
             "sub": str(user.id),
@@ -552,7 +554,15 @@ async def get_export_url(
             "aud": "bridgeleads-download",
             "iss": "bridgeleads",
             "jti": _uuid.uuid4().hex,
-            "exp": int(time.time()) + 60,  # 60 second expiry
+            # `iat` lets the user-level revocation check
+            # (TokenBlacklist.is_revoked_by_user_logout_all) compare
+            # this token's age against the user's most recent
+            # /auth/logout-all timestamp. Without iat, a download
+            # token would be falsely revoked for 8 days after any
+            # logout-all (default of payload.get("iat", 0) makes
+            # 0 <= revoke_time always true).
+            "iat": _now,
+            "exp": _now + 60,  # 60 second expiry
         },
         app_settings.SECRET_KEY,
         algorithm="HS256",
@@ -603,7 +613,31 @@ async def download_export(
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token")
 
-        from src.api.middleware.auth_hardening import TokenBlacklist
+        from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
+
+        # Both branches honor BOTH revocation paths:
+        #   1. is_blacklisted(jti) — this specific token was revoked
+        #   2. get_user_revoke_time(user_id) — user clicked "log out
+        #      everywhere"; any token issued before that must be
+        #      rejected, including download tokens. Without #2 a
+        #      user could /logout-all and an attacker holding a
+        #      pre-revocation download link would still be served.
+        #
+        # Reconstruct iat for older download tokens that were minted
+        # before the iat claim was added. We know download tokens have
+        # a fixed 60s lifetime (see download_token mint above), so
+        # `exp - 60` is the exact issuance time. Without this bridge,
+        # any in-flight download token at deploy time would default
+        # iat=0 and be falsely rejected by the user-revoke check
+        # whenever the user has done /logout-all in the last 8 days.
+        # Bridge is harmless after the 60s post-deploy window since
+        # all such legacy tokens have expired.
+        issued_at = payload.get("iat")
+        if issued_at is None:
+            if payload.get("purpose") == "download" and payload.get("exp"):
+                issued_at = max(0, int(payload["exp"]) - 60)
+            else:
+                issued_at = 0
 
         if payload.get("purpose") == "download":
             # H6 (full-SaaS review): download tokens must carry the
@@ -629,6 +663,8 @@ async def download_export(
             jti = payload.get("jti", "")
             if jti and await TokenBlacklist.is_blacklisted(jti):
                 raise HTTPException(status_code=401, detail="Token revoked")
+            if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
+                raise HTTPException(status_code=401, detail="Token revoked")
         else:
             # Full session JWT — check audience, issuer, blacklist
             if payload.get("aud") != "bridgeleads-api" or payload.get("iss") != "bridgeleads":
@@ -636,9 +672,18 @@ async def download_export(
             jti = payload.get("jti", "")
             if jti and await TokenBlacklist.is_blacklisted(jti):
                 raise HTTPException(status_code=401, detail="Token revoked")
+            if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
+                raise HTTPException(status_code=401, detail="Token revoked")
 
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired download link")
+    except _redis_exceptions.RedisError:
+        # Either is_blacklisted call above hit Redis — surface 503 so
+        # the client can retry instead of treating the failure as a
+        # 401-revoked. Same security boundary as the main JWT decoder
+        # in src/api/auth.py: failing open here would silently accept
+        # revoked download tokens.
+        raise revocation_unavailable_503()
     except HTTPException:
         raise
 

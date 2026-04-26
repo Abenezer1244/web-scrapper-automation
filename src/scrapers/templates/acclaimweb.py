@@ -24,7 +24,15 @@ from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.acclaimweb")
 
-# Same doc type keywords as EagleWeb — AcclaimWeb uses similar naming
+# Per-site doc type keywords. DO NOT merge with the equivalent maps in
+# other templates (eagleweb, landmarkweb, tyler_selfservice, etc.) —
+# each template's keyword list is tuned to its underlying site's doc-type
+# vocabulary. Examples of intentional divergence: AcclaimWeb (Chelan)
+# uses abbreviated codes like "TOD"/"AFFD"/"PTREC"/"NTS"/"NOD"/"FTL"
+# that no other site emits; AcclaimWeb deliberately excludes bare
+# "ESTATE" (it matches "REAL ESTATE CONTRACT") and "SUBSTITUTION OF
+# TRUSTEE" (low-quality leads), while ava_fidlar/landmarkweb include
+# both. A shared map would produce false positives or miss records.
 _DOC_TYPE_MAP = {
     # Bare "ESTATE" is excluded — it matched "REAL ESTATE CONTRACT" via
     # whole-word match. "ESTATE OF" (phrase) only appears on actual

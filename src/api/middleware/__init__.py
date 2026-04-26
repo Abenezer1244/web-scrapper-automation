@@ -1,4 +1,4 @@
-from .auth_hardening import BruteForceProtection, TokenBlacklist, constant_time_compare
+from .auth_hardening import BruteForceProtection, TokenBlacklist
 from .rate_limit import client_ip, rate_limit
 from .security import (
     SecurityHeadersMiddleware,
@@ -16,7 +16,6 @@ __all__ = [
     "rate_limit",
     "TokenBlacklist",
     "BruteForceProtection",
-    "constant_time_compare",
     "SecurityHeadersMiddleware",
     "validate_scraping_target",
     "add_scrape_domain",

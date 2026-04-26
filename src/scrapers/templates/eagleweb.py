@@ -204,8 +204,8 @@ class EagleWebScraper(BridgeScraper):
                     dropped, before,
                 )
 
-        # No inline enrichment — records are enriched in a separate background task
-        # (enrich_job_results) after the job completes. This keeps scraping fast (~5 min).
+        # Records are returned raw; the run_scrape_job worker enriches
+        # them inline (county_gis + AI assessor) before saving Result rows.
         _logger.info("EagleWeb complete — %d records (enrichment runs after save)", len(all_records))
         return all_records
 

@@ -41,7 +41,6 @@ app.conf.task_default_queue = "celery"
 # Route tasks to their queues (default routing — can be overridden per-call)
 app.conf.task_routes = {
     "src.workers.tasks.run_scrape_job": {"queue": "scrape"},
-    "src.workers.tasks.enrich_job_results": {"queue": "enrichment"},
     "src.workers.scheduler.*": {"queue": "celery"},
     "src.workers.skip_trace_dispatcher.*": {"queue": "celery"},
     "src.workers.webhook_delivery.*": {"queue": "celery"},

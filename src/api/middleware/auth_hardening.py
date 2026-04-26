@@ -1,6 +1,5 @@
-"""Auth hardening: token blacklist, brute-force protection, constant-time comparison."""
+"""Auth hardening: token blacklist + brute-force protection (Redis-backed)."""
 
-import hmac
 import logging
 import time
 
@@ -20,13 +19,6 @@ def _get_redis() -> aioredis.Redis:
     if _redis_client is None:
         _redis_client = aioredis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
     return _redis_client
-
-
-# ─── Constant-time comparison ─────────────────────────────────────────────────
-
-def constant_time_compare(val1: str, val2: str) -> bool:
-    """Compare two strings in constant time to prevent timing attacks."""
-    return hmac.compare_digest(val1.encode(), val2.encode())
 
 
 # ─── Token blacklist ──────────────────────────────────────────────────────────

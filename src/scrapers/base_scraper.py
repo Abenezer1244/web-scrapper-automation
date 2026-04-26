@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 import requests
 from bs4 import BeautifulSoup
@@ -22,6 +22,23 @@ from src.config import settings
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.base")
+
+
+class ProgressCallback(Protocol):
+    """Signature every BridgeScraper subclass invokes on its `on_progress` slot.
+
+    workers/tasks.py installs a callable matching this shape; some
+    scrapers also pass a 4th `phase` arg (e.g. "parcel_lookup",
+    "enriching") which defaults to "scraping" when omitted.
+    """
+
+    def __call__(
+        self,
+        page_current: int,
+        page_total: int,
+        record_count: int,
+        phase: str = "scraping",
+    ) -> None: ...
 
 
 @dataclass
@@ -71,7 +88,7 @@ class BridgeScraper:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self.page: Page | None = None
-        self.on_progress: Any | None = None  # callback(page_current, page_total, record_count)
+        self.on_progress: ProgressCallback | None = None
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 

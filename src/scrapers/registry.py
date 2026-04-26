@@ -6,12 +6,16 @@ and being listed in the DB.
 """
 
 import importlib
+from typing import TYPE_CHECKING, Callable
 
 from sqlalchemy import func, select
 
 from src.db.models import CountyConnector
 from src.db.session import SyncSessionLocal
 from src.utils.logger import setup_logger
+
+if TYPE_CHECKING:
+    from src.scrapers.base_scraper import BridgeScraper
 
 _logger = setup_logger("scraper.registry")
 
@@ -20,7 +24,15 @@ class UnsupportedCountyError(ValueError):
     """Raised when no active connector exists for a county/state/record_type combination."""
 
 
-def get_scraper_class(county: str, state: str, record_type: str):
+# Either a BridgeScraper subclass or a functools.partial that returns one.
+# Both are callables that, when invoked with no positional args, yield a
+# BridgeScraper instance — that's all the caller needs.
+ScraperFactory = Callable[..., "BridgeScraper"]
+
+
+def get_scraper_class(
+    county: str, state: str, record_type: str
+) -> tuple[ScraperFactory, str]:
     """Look up and return the scraper class for the given county connector.
 
     Performs a case-insensitive lookup against the county_connectors table.

@@ -8,14 +8,38 @@ State machine:
 import asyncio
 import json
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING, TypedDict, Unpack
 
 import redis as sync_redis
+
+if TYPE_CHECKING:
+    from src.scrapers.base_scraper import ProgressCallback
 
 from src.config import settings
 from src.utils.logger import setup_logger
 from src.workers import app
 
 _logger = setup_logger("worker.task")
+
+
+class JobUpdateFields(TypedDict, total=False):
+    """Fields _set_status() may set on a Job ORM row alongside `status`.
+
+    Every key is a column on src.db.models.Job; total=False because each
+    callsite passes a different subset (e.g. just `started_at` on
+    transition into "queued", but `finished_at` + `record_count` +
+    `export_key` on transition into "done"). Using TypedDict + Unpack
+    means a typo like `started=` (instead of `started_at`) is now a
+    static type error rather than a silent setattr no-op.
+    """
+
+    started_at: datetime
+    finished_at: datetime
+    record_count: int
+    page_current: int
+    page_total: int
+    error_message: str
+    export_key: str
 
 
 def _now() -> datetime:
@@ -70,8 +94,13 @@ def _publish_log(r: sync_redis.Redis, job_id: str, level: str, message: str, db=
             _db.commit()
 
 
-def _set_status(db, job, status: str, **kwargs) -> None:
-    """Update job status and any extra fields, then commit."""
+def _set_status(db, job, status: str, **kwargs: Unpack[JobUpdateFields]) -> None:
+    """Update job status and any extra fields, then commit.
+
+    `kwargs` keys are constrained by the JobUpdateFields TypedDict so a
+    typo like `started=...` (instead of `started_at=...`) fails type
+    checking instead of silently doing nothing.
+    """
     job.status = status
     for k, v in kwargs.items():
         setattr(job, k, v)
@@ -645,7 +674,15 @@ def run_scrape_job(self, job_id: str) -> None:
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-async def _run_scraper(scraper_class, date_from: str, date_to: str, r, job_id: str, on_progress=None, record_type: str | None = None):
+async def _run_scraper(
+    scraper_class,
+    date_from: str,
+    date_to: str,
+    r: sync_redis.Redis,
+    job_id: str,
+    on_progress: "ProgressCallback | None" = None,
+    record_type: str | None = None,
+):
     """Run the async scraper and stream progress logs back to Redis."""
     # Pass record_type if the scraper accepts it — template/AI scrapers may not
     import inspect

@@ -48,5 +48,15 @@ elif [ "$RAILWAY_SERVICE_NAME" = "beat" ]; then
   exec celery -A src.workers beat --loglevel=info --scheduler celery.beat.PersistentScheduler
 else
   echo "Starting API server..."
+  # Run Alembic migrations from the API service only. Worker + beat share
+  # the same DB — running upgrade-head from multiple replicas at once
+  # races; Alembic's own locking will serialize within ONE service but
+  # cross-service races (api + worker booting simultaneously) can deadlock
+  # on long migrations. The API service is the natural single-replica
+  # serializer. If the upgrade fails the deploy fails fast (set -e on the
+  # combined command) instead of starting uvicorn against a stale schema.
+  echo "Running alembic upgrade head..."
+  alembic upgrade head || { echo "alembic upgrade head failed; refusing to start API"; exit 1; }
+  echo "Migrations applied."
   exec uvicorn main:app --host 0.0.0.0 --port "${PORT:-8000}"
 fi

@@ -88,8 +88,10 @@ def dispatch_scheduled_jobs() -> None:
             select(ScraperConfig).where(ScraperConfig.active)
         ).scalars().all()
 
+        from typing import cast
+        from src.api.schemas import ScheduleConfigDict
         for config in configs:
-            schedule = config.schedule or {}
+            schedule: ScheduleConfigDict = cast(ScheduleConfigDict, config.schedule or {})
             frequency = schedule.get("frequency", "manual")
 
             if frequency == "manual":

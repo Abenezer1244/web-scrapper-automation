@@ -1,5 +1,5 @@
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypedDict
 
 from pydantic import BaseModel, EmailStr, field_validator
 
@@ -156,6 +156,43 @@ class FieldsConfig(BaseModel):
 class EnrichmentConfig(BaseModel):
     property_lookup: bool = True
     skip_tracing: bool = False
+
+
+# TypedDict shapes for the same configs as stored in JSON columns on the
+# ScraperConfig ORM row. The Pydantic models above validate inputs at the
+# API boundary; workers and the scheduler read the persisted dicts and
+# need static type help to spot typos like config.schedule.get("date_rage_mode").
+# total=False because each call site reads a different subset and missing
+# keys are expected (the readers default via .get(key, fallback)).
+class FieldsConfigDict(TypedDict, total=False):
+    party_name: bool
+    parcel_id: bool
+    property_address: bool
+    mailing_address: bool
+    heirs: bool
+    legal_description: bool
+    date_recorded: bool
+
+
+class EnrichmentConfigDict(TypedDict, total=False):
+    property_lookup: bool
+    skip_tracing: bool
+
+
+class ScheduleConfigDict(TypedDict, total=False):
+    frequency: str           # one of: manual, daily, weekly, monthly
+    run_at_hour: int
+    run_at_minute: int
+    date_range_mode: str     # one of: rolling_90, custom, since_last_run
+    date_from: str | None
+    date_to: str | None
+
+
+class DeliverConfigDict(TypedDict, total=False):
+    emails: list[str]
+    formats: list[str]       # subset of: csv, excel, json
+    webhook_url: str | None
+    webhook_secret: str | None
 
 
 class ScraperConfigCreate(BaseModel):

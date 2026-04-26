@@ -221,8 +221,12 @@ async def get_results(
         select(ScraperConfig).where(ScraperConfig.id == job.scraper_config_id)
     )
     config = config_result.scalar_one_or_none()
-    schedule = (config.schedule or {}) if config else {}
-    date_range_mode = schedule.get("date_range_mode") or schedule.get("range_mode", "rolling_90")
+    from typing import cast
+    from src.api.schemas import ScheduleConfigDict
+    schedule: ScheduleConfigDict = cast(
+        ScheduleConfigDict, (config.schedule or {}) if config else {}
+    )
+    date_range_mode = schedule.get("date_range_mode") or schedule.get("range_mode", "rolling_90")  # type: ignore[call-overload]  # legacy "range_mode" alias
 
     safe_q = sanitize_search(q)
 

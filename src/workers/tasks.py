@@ -195,8 +195,10 @@ def run_scrape_job(self, job_id: str) -> None:
         record_label = config.record_type.replace("_", " ").title()
         _publish_log(r, job_id, "success", f"Starting scrape — {record_label} records", db=db)
 
-        schedule = config.schedule or {}
-        range_mode = schedule.get("date_range_mode") or schedule.get("range_mode", "rolling_90")
+        from typing import cast
+        from src.api.schemas import ScheduleConfigDict
+        schedule: ScheduleConfigDict = cast(ScheduleConfigDict, config.schedule or {})
+        range_mode = schedule.get("date_range_mode") or schedule.get("range_mode", "rolling_90")  # type: ignore[call-overload]  # legacy "range_mode" alias kept for old configs
         date_from, date_to = _resolve_date_range(schedule, config_id=config.id, job_id=job_id, user_plan=user.plan)
 
         # Enforce per-connector max date range (e.g. Chelan single-date = 30 days max).
@@ -508,8 +510,14 @@ def run_scrape_job(self, job_id: str) -> None:
         )
 
         # ── EXPORT ────────────────────────────────────────────────────────────
-        deliver_config = config.deliver or {}
-        fmt = deliver_config.get("format", "csv")
+        from src.api.schemas import DeliverConfigDict
+        deliver_config: DeliverConfigDict = cast(DeliverConfigDict, config.deliver or {})
+        # NOTE: schemas.DeliverConfig has `formats: list[str]` (plural), not
+        # `format`. The .get("format") below has always returned the
+        # default "csv" because that key is never set — exports are
+        # always CSV regardless of what the user picked. Tracked
+        # separately; this typed read makes the mismatch visible.
+        fmt = deliver_config.get("format", "csv")  # type: ignore[call-overload]  # see note above
 
         _publish_log(r, job_id, "info", f"Building {fmt.upper()} export...", db=db)
 

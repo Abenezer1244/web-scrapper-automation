@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 from celery.schedules import crontab
 
+from src.config.constants import ACTIVE_STATUSES, STUCK_CHECK_STATUSES
 from src.utils.logger import setup_logger
 from src.workers import app
 
@@ -113,11 +114,10 @@ def dispatch_scheduled_jobs() -> None:
                 continue
 
             # Idempotency: skip if a job is already pending or running for this config
-            active_statuses = {"pending", "queued", "probing", "scraping", "enriching"}
             existing = db.execute(
                 select(Job).where(
                     Job.scraper_config_id == config.id,
-                    Job.status.in_(active_statuses),
+                    Job.status.in_(ACTIVE_STATUSES),
                 )
             ).scalar_one_or_none()
 
@@ -199,12 +199,11 @@ def watchdog_stuck_jobs() -> None:
     # invisible to the watchdog forever. H8 from the full-SaaS
     # review: catch them via a separate "queued forever" branch.
     queued_cutoff = now - timedelta(minutes=10)
-    active_statuses = {"queued", "probing", "scraping", "enriching"}
 
     with system_sync_session() as db:
         stuck_jobs = db.execute(
             select(Job).where(
-                Job.status.in_(active_statuses),
+                Job.status.in_(STUCK_CHECK_STATUSES),
                 or_(
                     Job.started_at < stuck_cutoff,
                     # Zombie: never got a started_at, but was created

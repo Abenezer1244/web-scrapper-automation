@@ -17,14 +17,13 @@ from src.api.deps import get_db, get_rls_db
 from src.api.middleware import audit_log, rate_limit, sanitize_for_csv, sanitize_search
 from src.api.schemas import JobCreate, JobResponse, LogLine, ResultRow, ResultsPage
 from src.config import settings
+from src.config.constants import CANCELLABLE_STATUSES, PRIORITY_QUEUE_PLANS
 from src.db import CountyConnector, Job, JobLog, Result, ScraperConfig, User
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("api.jobs")
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
-
-_CANCELLABLE_STATUSES = {"pending", "queued", "scraping", "enriching"}
 
 
 @router.get("", response_model=list[JobResponse])
@@ -158,8 +157,7 @@ async def create_job(
     # Enqueue Celery task — paid plans get priority queue
     from src.workers.tasks import run_scrape_job
 
-    priority_plans = {"business", "agency"}
-    queue = "scrape-priority" if current_user.plan in priority_plans else "scrape"
+    queue = "scrape-priority" if current_user.plan in PRIORITY_QUEUE_PLANS else "scrape"
     run_scrape_job.apply_async(args=[job.id], queue=queue)
 
     audit_log(request, "job_created", current_user.id, f"job_id={job.id}")
@@ -193,7 +191,7 @@ async def cancel_job(
     job = result.scalar_one_or_none()
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-    if job.status not in _CANCELLABLE_STATUSES:
+    if job.status not in CANCELLABLE_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot cancel a job in '{job.status}' status",

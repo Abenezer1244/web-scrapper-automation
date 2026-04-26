@@ -18,15 +18,10 @@ from src.api.schemas import (
     ScraperConfigCreate,
     ScraperConfigResponse,
 )
+from src.config.constants import BUSINESS_FEATURES_PLANS, SKIP_TRACE_ADDON_PLANS
 from src.db import CountyConnector, ScraperConfig, get_db
 
 router = APIRouter(prefix="/scrapers", tags=["scrapers"])
-
-_BUSINESS_PLANS = ("business", "agency")
-# Sprint 4: skip trace is available to Pro/Business/Agency (all paid tiers).
-# Starter is excluded — backend returns 402 and the frontend shows an
-# upsell tooltip "Upgrade to Pro to unlock skip trace ($0.08/lookup)".
-_SKIP_TRACE_PLANS = ("pro", "business", "agency")
 
 
 @router.get("/sample")
@@ -178,12 +173,12 @@ async def create_scraper(
         )
 
     # Business+ feature gating
-    if body.deliver.webhook_url and current_user.plan not in _BUSINESS_PLANS:
+    if body.deliver.webhook_url and current_user.plan not in BUSINESS_FEATURES_PLANS:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail="Webhook delivery requires a Business or Agency plan",
         )
-    if body.enrichment.skip_tracing and current_user.plan not in _BUSINESS_PLANS:
+    if body.enrichment.skip_tracing and current_user.plan not in BUSINESS_FEATURES_PLANS:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail="Skip tracing enrichment requires a Business or Agency plan",
@@ -191,7 +186,7 @@ async def create_scraper(
 
     # Sprint 4: new dedicated skip_trace_enabled flag (metered add-on).
     # Available on Pro/Business/Agency. Starter gets 402 with upsell text.
-    if body.skip_trace_enabled and (current_user.plan or "starter").lower() not in _SKIP_TRACE_PLANS:
+    if body.skip_trace_enabled and (current_user.plan or "starter").lower() not in SKIP_TRACE_ADDON_PLANS:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail=(

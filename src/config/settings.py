@@ -41,10 +41,21 @@ class Settings(BaseSettings):
         return v
 
     # ─── Cloudflare R2 ────────────────────────────────────────────────────────
-    R2_ENDPOINT_URL: str = ""           # Legacy S3-compatible (kept for backwards compat)
-    R2_ACCESS_KEY_ID: str = ""          # Legacy S3 access key
-    R2_SECRET_ACCESS_KEY: str = ""      # Legacy S3 secret key
-    R2_ACCOUNT_ID: str = ""             # Cloudflare account ID
+    # Two ways to talk to R2 are supported, in priority order from
+    # data_exporter.get_download_url():
+    #   1. R2_PUBLIC_URL: if set, exports are returned as direct public
+    #      URLs (no presigning). Cheapest path; only safe if the bucket
+    #      itself is configured for public read.
+    #   2. R2_ENDPOINT_URL + R2_ACCESS_KEY_ID + R2_SECRET_ACCESS_KEY:
+    #      S3-compatible presigning via boto3. THIS IS THE PRODUCTION
+    #      PATH today on Railway — do not delete it as "legacy" without
+    #      first migrating prod to either path 1 or path 3.
+    #   3. R2_ACCOUNT_ID + R2_API_TOKEN: Cloudflare R2 native API
+    #      presigning. Reserved for future migration off boto3.
+    R2_ENDPOINT_URL: str = ""           # S3-compatible endpoint (production)
+    R2_ACCESS_KEY_ID: str = ""          # S3-compatible access key (production)
+    R2_SECRET_ACCESS_KEY: str = ""      # S3-compatible secret key (production)
+    R2_ACCOUNT_ID: str = ""             # Cloudflare account ID (R2 native API)
     R2_API_TOKEN: str = ""              # Cloudflare API token with Workers R2 Storage Edit
     R2_BUCKET_NAME: str = "bridgeleads-exports"
     R2_PUBLIC_URL: str = ""

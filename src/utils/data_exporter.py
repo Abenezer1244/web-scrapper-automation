@@ -251,7 +251,11 @@ class DataExporter:
         if settings.R2_PUBLIC_URL:
             return f"{settings.R2_PUBLIC_URL}/{object_key}"
 
-        # S3-compatible presigned URL (works with R2 S3 endpoint)
+        # S3-compatible presigned URL via boto3 against the R2 S3 endpoint.
+        # This is the active production path on Railway (R2_ENDPOINT_URL +
+        # R2_ACCESS_KEY_ID + R2_SECRET_ACCESS_KEY are the env vars set in
+        # prod). Don't remove this branch as "legacy" without first
+        # migrating prod onto either R2_PUBLIC_URL or R2_ACCOUNT_ID.
         if settings.R2_ENDPOINT_URL and settings.R2_ACCESS_KEY_ID and settings.R2_SECRET_ACCESS_KEY:
             try:
                 import boto3
@@ -275,7 +279,9 @@ class DataExporter:
             except Exception as exc:
                 _logger.warning("S3 presigned URL failed: %s", str(exc)[:80])
 
-        # Fallback: Cloudflare R2 API presigned URL
+        # Cloudflare R2 native API presigned URL (used only when the
+        # boto3 S3-compatible path above is not configured — currently
+        # not the production path).
         if settings.R2_ACCOUNT_ID:
             url = f"{_r2_api_base()}/objects/{object_key}?presigned=true&expiresIn={expires_in}"
             try:

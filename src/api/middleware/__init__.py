@@ -2,6 +2,7 @@ from .auth_hardening import BruteForceProtection, TokenBlacklist, constant_time_
 from .rate_limit import client_ip, rate_limit
 from .security import (
     SecurityHeadersMiddleware,
+    add_http_allowed_host,
     add_scrape_domain,
     audit_log,
     clean_text,
@@ -19,6 +20,7 @@ __all__ = [
     "SecurityHeadersMiddleware",
     "validate_scraping_target",
     "add_scrape_domain",
+    "add_http_allowed_host",
     "register_connector_domains_from_db",
     "sanitize_for_csv",
     "sanitize_search",

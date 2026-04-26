@@ -327,16 +327,36 @@ async def create_connector(
             detail=f"Connector for {body.county}, {body.state} already exists",
         )
 
-    # Validate base_url against SSRF allowlist before persisting
+    # Validate base_url against SSRF objective rules (scheme + blocked IPs +
+    # blocked hostnames) before persisting. require_allowlisted=False because
+    # this route is the onboarding path for new county portals — by design
+    # the host has not been seen before. We trust the admin caller for the
+    # destination but still enforce the SSRF firewall, then register the
+    # hostname so subsequent scrape calls (which use the strict default) pass.
+    # If the admin chose http:// (typically because the portal's HTTPS 404s),
+    # we additionally opt the host into the narrow HTTP allowlist so the
+    # validator does not reject plaintext at runtime.
     if body.base_url:
-        from src.api.middleware.security import validate_scraping_target
+        from urllib.parse import urlparse as _urlparse
+
+        from src.api.middleware.security import (
+            add_http_allowed_host,
+            add_scrape_domain,
+            validate_scraping_target,
+        )
         try:
-            validate_scraping_target(body.base_url)
+            validate_scraping_target(body.base_url, require_allowlisted=False)
         except ValueError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid base_url: {exc}",
             )
+        parsed_base = _urlparse(body.base_url)
+        new_host = (parsed_base.hostname or "").lower()
+        if new_host:
+            add_scrape_domain(new_host)
+            if parsed_base.scheme == "http":
+                add_http_allowed_host(new_host)
 
     connector = CountyConnector(
         id=str(uuid.uuid4()),

@@ -92,11 +92,18 @@ def run_scrape_job(self, job_id: str) -> None:
     """Execute a full scrape job lifecycle for the given job_id."""
     from sqlalchemy import func, select
 
+    from src.api.middleware.security import register_connector_domains_from_db
     from src.db.models import Job, Result, ScraperConfig, User
     from src.db.session import rls_sync_session, system_sync_session
     from src.scrapers.registry import UnsupportedCountyError, get_scraper_class
     from src.utils.data_exporter import DataExporter
     from src.workers.delivery import deliver_job_results
+
+    # Refresh the in-process SSRF allowlist from the connectors table before
+    # scraping. A connector added through POST /scrapers/connectors after this
+    # worker booted would otherwise still be missing from the frozenset that
+    # validate_scraping_target() checks. Idempotent and cheap.
+    register_connector_domains_from_db()
 
     r = _redis()
 

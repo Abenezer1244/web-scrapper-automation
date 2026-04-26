@@ -267,9 +267,19 @@ def canary_check() -> None:
 
     from sqlalchemy import select
 
+    from src.api.middleware.security import register_connector_domains_from_db
     from src.db.models import CountyConnector
     from src.db.session import SyncSessionLocal
     from src.scrapers.registry import UnsupportedCountyError, get_scraper_class
+
+    # Refresh the in-process SSRF allowlist so connectors added via
+    # POST /scrapers/connectors after this worker booted are not falsely
+    # marked `down` by the next canary cycle. Without this, the API
+    # process's add_scrape_domain() call doesn't propagate to the worker
+    # that runs canary_check, the canary's validate_scraping_target()
+    # rejects the new base_url, and list_connectors() then hides the
+    # connector from users (it filters out `down` rows by default).
+    register_connector_domains_from_db()
 
     with SyncSessionLocal() as db:
         all_connectors = db.execute(
@@ -468,7 +478,16 @@ def scrape_county_daily() -> None:
 @app.task(name="src.workers.scheduler.run_single_county_scrape", queue="scrape")
 def run_single_county_scrape(county: str, state: str) -> None:
     """Scrape a single county's daily records into county_records cache."""
+    # Refresh the in-process SSRF allowlist from the connectors table before
+    # scraping. Without this, a connector added through POST /scrapers/connectors
+    # while this worker was already running would be rejected by
+    # validate_scraping_target() because its host hasn't been registered in
+    # this process's _ALLOWED_SCRAPE_DOMAINS frozenset (which is loaded only
+    # at worker_ready). Idempotent and cheap (one query, set-union).
+    from src.api.middleware.security import register_connector_domains_from_db
     from src.workers.daily_scrape import run_daily_scrape_for_county
+
+    register_connector_domains_from_db()
 
     try:
         count = run_daily_scrape_for_county(county, state)

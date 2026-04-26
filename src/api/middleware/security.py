@@ -27,7 +27,22 @@ _ALLOWED_SCRAPE_DOMAINS: frozenset[str] = frozenset(
         "www.snoco.org",
     ]
 )
+# Hosts that legitimately serve only over HTTP (their HTTPS endpoint
+# 404s or cert-fails). Membership here is an explicit per-host opt-in
+# — being on _ALLOWED_SCRAPE_DOMAINS does NOT grant HTTP access.
+# Populated at runtime by add_http_allowed_host() — scraper modules
+# call it for known HTTP-only county portals (e.g. Grays Harbor
+# EagleWeb), and POST /scrapers/connectors calls it when an admin
+# seeds a connector with an http:// base_url.
+_HTTP_ALLOWED_DOMAINS: frozenset[str] = frozenset()
 _DOMAIN_REGISTRATION_LOCKED = False  # Set True after app startup to prevent runtime additions
+
+
+def _host_matches_set(hostname: str, domain_set: frozenset[str]) -> bool:
+    """True if hostname is in domain_set, or is a subdomain of any entry."""
+    if hostname in domain_set:
+        return True
+    return any(hostname.endswith(f".{d}") for d in domain_set)
 
 # RFC 1918 private networks, loopback, link-local, cloud metadata
 _BLOCKED_NETWORKS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
@@ -55,22 +70,30 @@ _BLOCKED_HOSTNAMES: frozenset[str] = frozenset(
 )
 
 
-def validate_scraping_target(url: str) -> None:
+def validate_scraping_target(url: str, *, require_allowlisted: bool = True) -> None:
     """Raise ValueError if the URL is not an approved scraping target.
 
     Blocks:
-    - Non-HTTPS schemes
-    - Any domain not on the explicit allowlist
+    - Non-HTTP(S) schemes
     - IP addresses in private/loopback/link-local/metadata ranges
     - Known cloud metadata hostnames
+    - With ``require_allowlisted=True`` (default): hosts not on the
+      explicit allowlist, and HTTP scheme for any host not already
+      on the allowlist.
+
+    Pass ``require_allowlisted=False`` ONLY from admin onboarding paths
+    that are about to call ``add_scrape_domain()`` for the validated
+    host. The objective SSRF rules (scheme, blocked hostnames, blocked
+    IP ranges) still apply — only the allowlist-membership check and
+    the HTTP-must-be-allowlisted check are skipped.
     """
     try:
         parsed = urlparse(url)
     except Exception:
         raise ValueError("Invalid URL")
 
-    if parsed.scheme != "https":
-        raise ValueError("Only HTTPS scraping targets are permitted")
+    if parsed.scheme not in ("https", "http"):
+        raise ValueError("Only HTTP/HTTPS scraping targets are permitted")
 
     hostname = (parsed.hostname or "").lower()
 
@@ -80,7 +103,8 @@ def validate_scraping_target(url: str) -> None:
     if hostname in _BLOCKED_HOSTNAMES:
         raise ValueError("Scraping target not permitted")
 
-    # Block IP addresses in restricted ranges
+    # Block IP addresses in restricted ranges. Runs unconditionally so
+    # admin onboarding cannot register a private/metadata IP host.
     try:
         addr = ipaddress.ip_address(hostname)
     except ValueError:
@@ -91,11 +115,19 @@ def validate_scraping_target(url: str) -> None:
             if addr in network:
                 raise ValueError("Scraping target not permitted")
 
-    # Allowlist check
-    if hostname not in _ALLOWED_SCRAPE_DOMAINS:
-        # Also check subdomains of allowed domains
-        allowed = any(hostname.endswith(f".{d}") or hostname == d for d in _ALLOWED_SCRAPE_DOMAINS)
-        if not allowed:
+    if require_allowlisted:
+        # HTTP is only permitted for explicitly opted-in hosts. Being on
+        # the general scrape allowlist (which is a tenant-isolation /
+        # SSRF gate) is NOT enough — an HTTPS-capable portal accidentally
+        # seeded with `http://` must still fail fast over plaintext. The
+        # opt-in is by hostname OR parent domain so a portal at
+        # `county.gov` that 302s to `www.county.gov` over HTTP works
+        # without onboarding both forms.
+        if parsed.scheme == "http" and not _host_matches_set(hostname, _HTTP_ALLOWED_DOMAINS):
+            raise ValueError("HTTP is only permitted for explicitly opted-in scraping targets")
+
+        # Allowlist check (subdomain-aware)
+        if not _host_matches_set(hostname, _ALLOWED_SCRAPE_DOMAINS):
             raise ValueError("Scraping target not in approved domain list")
 
 
@@ -119,6 +151,27 @@ def add_scrape_domain(domain: str) -> None:
         return
 
     _ALLOWED_SCRAPE_DOMAINS = _ALLOWED_SCRAPE_DOMAINS | {domain}
+
+
+def add_http_allowed_host(domain: str) -> None:
+    """Opt a host into HTTP scraping.
+
+    Use ONLY for portals that genuinely have no working HTTPS endpoint
+    (their HTTPS returns 404 or has a cert error). HTTPS is the default
+    for every other host on the scrape allowlist, even ones that were
+    seeded with an http:// base_url by mistake — that mistake should
+    fail fast at the validator, not silently fall back to plaintext.
+    Subdomains of opt-in hosts are also permitted (so a portal at
+    `county.gov` that 302s to `www.county.gov` does not need both
+    onboarded). Idempotent — calling twice with the same host is a no-op.
+    """
+    global _HTTP_ALLOWED_DOMAINS
+    domain = domain.lower().strip()
+    if not domain:
+        return
+    if domain in _HTTP_ALLOWED_DOMAINS:
+        return
+    _HTTP_ALLOWED_DOMAINS = _HTTP_ALLOWED_DOMAINS | {domain}
 
 
 def lock_scrape_domains() -> None:
@@ -164,51 +217,37 @@ def register_connector_domains_from_db() -> int:
                     hostname = (parsed.hostname or "").lower()
                     if not hostname:
                         continue
-                    # M11 (full-SaaS review): validate the URL
-                    # through the SSRF firewall BEFORE adding its
-                    # hostname to the allowlist. Previously a
-                    # migration that seeded `http://169.254.169.254/...`
-                    # (AWS metadata) or any private IP would have its
-                    # host silently added to the allowlist at worker
-                    # boot. Now we run validate_scraping_target first
-                    # on a dummy https URL with this host — that
-                    # catches blocked IPs, IPv6 bypass attempts, and
-                    # disallowed schemes before they make it into the
-                    # allowlist. If validation fails we log + skip.
+                    # M11 (full-SaaS review): validate the URL through
+                    # the SSRF firewall BEFORE adding its hostname to
+                    # the allowlist. Previously, a migration that
+                    # seeded http://169.254.169.254/... (AWS metadata)
+                    # or any private IP would have its host silently
+                    # added at worker boot.
                     #
-                    # We construct the probe URL fresh rather than
-                    # validating `url` directly because some seeded
-                    # URLs are http:// (scraper auto-upgrades to
-                    # https) and we don't want those to fail the
-                    # probe on scheme alone.
-                    probe_url = f"https://{hostname}/"
+                    # require_allowlisted=False lets the validator
+                    # check scheme + blocked-hostnames + blocked IP
+                    # ranges WITHOUT requiring the host to already be
+                    # on the allowlist (we're about to add it). Older
+                    # versions of this code added first and validated
+                    # second, which leaked failed hosts onto the
+                    # frozen allowlist with no way to remove them.
                     try:
-                        # Temporarily add the host so validator's
-                        # allowlist check passes, then validate the
-                        # rest of the rules (blocked IPs, hostnames,
-                        # IP ranges). If it fails, we immediately
-                        # remove the host again.
-                        add_scrape_domain(hostname)
-                        validate_scraping_target(probe_url)
+                        validate_scraping_target(url, require_allowlisted=False)
                     except ValueError as ssrf_exc:
-                        # Validation failed — the host is on a
-                        # blocked network or is a metadata host.
-                        # We cannot cleanly "remove" from a frozenset
-                        # in-place, but because the set lives until
-                        # process restart and we already validated,
-                        # we just log the violation. An operator
-                        # seeding a metadata IP is a misconfiguration
-                        # that needs attention either way.
                         log.error(
                             "Refusing to trust migration-seeded host %s "
                             "(%s/%s): %s",
                             hostname, row.county, row.state, ssrf_exc,
                         )
                         continue
-                    # Count this as newly-added if it wasn't already
-                    # present before this iteration. (Cannot use the
-                    # pre/post length trick because add_scrape_domain
-                    # was called inside the probe block.)
+                    # If this connector legitimately serves HTTP only, opt
+                    # the host into the narrow HTTP allowlist. Validation
+                    # above already confirmed the URL is safe SSRF-wise.
+                    if parsed.scheme == "http":
+                        add_http_allowed_host(hostname)
+                    if hostname in _ALLOWED_SCRAPE_DOMAINS:
+                        continue  # already registered, do not double-count
+                    add_scrape_domain(hostname)
                     added += 1
                 except Exception as exc:  # noqa: BLE001 — defensive
                     log.warning(

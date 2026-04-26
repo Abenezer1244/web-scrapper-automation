@@ -87,34 +87,100 @@ class TokenBlacklist:
 
     @staticmethod
     async def revoke_all_for_user(user_id: str) -> None:
-        """Store a revoke timestamp for the user.
+        """Store a revoke timestamp for the user, durably.
 
-        Any token issued before this timestamp is considered revoked.
-        JWT decoder must check this alongside the blacklist. Raises on
-        Redis error — caller should surface a 503 rather than report
-        success without actually revoking.
+        Writes to BOTH the Postgres `users.revoked_at` column (durable
+        source of truth) AND a Redis cache key (hot read path). The DB
+        write is awaited first; if it succeeds and Redis fails, the
+        revocation still takes effect because get_user_revoke_time
+        falls back to the DB when Redis is unavailable.
+
+        Any token issued at-or-before this timestamp is considered
+        revoked by get_current_user / refresh / download-token paths.
+        Raises on Postgres error so /auth/logout-all returns 5xx and
+        the client retries instead of reporting a successful revocation
+        that did not persist.
         """
-        r = _get_redis()
-        key = f"{TokenBlacklist._USER_REVOKE_PREFIX}{user_id}"
-        # Keep the timestamp for 8 days (longer than max token lifetime of 7 days)
-        await r.setex(key, 8 * 24 * 3600, str(int(time.time())))
+        from sqlalchemy import update
+        from datetime import datetime, UTC
+        from src.db.models import User
+        from src.db.session import async_engine
+
+        now = datetime.now(UTC)
+        # 1) Durable write to users.revoked_at — must succeed.
+        async with async_engine.begin() as conn:
+            await conn.execute(
+                update(User).where(User.id == user_id).values(revoked_at=now)
+            )
+
+        # 2) Best-effort Redis write for fast lookups. Don't fail the
+        # whole revocation if Redis is down — the DB is authoritative.
+        try:
+            r = _get_redis()
+            key = f"{TokenBlacklist._USER_REVOKE_PREFIX}{user_id}"
+            # Keep for 8 days (longer than max JWT lifetime of 7 days).
+            await r.setex(key, 8 * 24 * 3600, str(int(now.timestamp())))
+        except redis_exceptions.RedisError as exc:
+            _logger.warning(
+                "revoke_all_for_user: DB write succeeded but Redis cache "
+                "update failed (revocation IS in effect via DB fallback): %s",
+                exc,
+            )
 
     @staticmethod
     async def get_user_revoke_time(user_id: str) -> int:
         """Return the epoch timestamp at which all tokens for this user were revoked (0 if never).
 
-        Fails CLOSED on Redis errors. Same security-boundary rationale
-        as is_blacklisted — if we cannot read the global revocation
-        timestamp, we cannot tell whether a token was issued before a
-        password reset / account compromise / "log out everywhere"
-        action. Failing open here would re-authorize any token issued
-        before the revocation for the duration of the Redis outage.
-        Caller catches the RedisError and surfaces 503.
+        Reads Redis first (microsecond hot path); on RedisError falls
+        back to the durable users.revoked_at column written by
+        revoke_all_for_user. This keeps revocation enforcement strong
+        (still security-boundary fail-closed at the data layer) while
+        avoiding the Phase 0 availability regression where any Redis
+        blip took the entire authenticated API down.
+
+        Only raises if BOTH Redis and Postgres are unavailable — caller
+        in src/api/auth.py still catches that and surfaces 503, but
+        the surface area for that is now "two-system outage" rather
+        than "Redis blip".
         """
-        r = _get_redis()
         key = f"{TokenBlacklist._USER_REVOKE_PREFIX}{user_id}"
-        val = await r.get(key)
-        return int(val) if val else 0
+        try:
+            r = _get_redis()
+            val = await r.get(key)
+            if val is not None:
+                return int(val) if val else 0
+            # Cache miss (no entry yet for this user). Fall through to
+            # the DB read so we authoritatively confirm whether or not
+            # the user has been revoked. The DB result, if any, is
+            # backfilled into Redis below for future hot reads.
+        except redis_exceptions.RedisError as exc:
+            _logger.warning(
+                "get_user_revoke_time: Redis unavailable, falling back to DB for user %s: %s",
+                user_id, exc,
+            )
+
+        # DB fallback path — durable, slower (~1 DB round-trip).
+        from sqlalchemy import select
+        from src.db.models import User
+        from src.db.session import async_engine
+
+        async with async_engine.connect() as conn:
+            row = (await conn.execute(
+                select(User.revoked_at).where(User.id == user_id)
+            )).first()
+        if row is None or row[0] is None:
+            return 0
+        ts = int(row[0].timestamp())
+
+        # Backfill the Redis cache so the next read of this user is
+        # fast again. Best-effort — failure here just means the next
+        # read pays the DB hop too.
+        try:
+            r = _get_redis()
+            await r.setex(key, 8 * 24 * 3600, str(ts))
+        except redis_exceptions.RedisError:
+            pass
+        return ts
 
     @staticmethod
     async def is_revoked_by_user_logout_all(user_id: str, issued_at: int) -> bool:

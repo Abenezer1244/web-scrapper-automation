@@ -60,6 +60,13 @@ class User(Base):
     referral_credit_cents = Column(Integer, nullable=False, default=0)
     is_active = Column(Boolean, nullable=False, default=True)
     is_admin = Column(Boolean, nullable=False, default=False)
+    # Logout-everywhere / password-reset / account-compromise revocation
+    # timestamp. Any JWT issued at-or-before this moment is rejected by
+    # get_current_user. Persisted in DB (not just Redis) so JWT
+    # validation still has a durable source of truth when Upstash is
+    # rate-limited or unreachable — see the Phase 0 Codex adversarial
+    # review of the auth fail-closed posture.
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

@@ -560,24 +560,32 @@ def run_scrape_job(self, job_id: str) -> None:
             _publish_log(r, job_id, "warning", f"Plan limit exceeded by {overage} records. Upgrade to keep scraping.", db=db)
 
         # ── INLINE ENRICHMENT (BEFORE marking done) ──────────────────────────
-        # Wrapped in a thread-based timeout so a hanging GIS/assessor HTTP
-        # request can't stall the entire Celery worker forever. The Railway
-        # workers were consistently hanging at this step when ArcGIS
-        # responses were slow. 5 minutes is generous — typical enrichment
-        # for 50-100 parcels takes 30-60 seconds.
+        # Runs on this Celery task's thread, sharing the same DB session.
+        # Earlier this code wrapped the call in a ThreadPoolExecutor with a
+        # 5-minute future.result(timeout=...) so a hanging ArcGIS/assessor
+        # HTTP request couldn't stall the worker forever. Two issues: (1)
+        # the `with ThreadPoolExecutor(...) as executor:` exit waits for
+        # the worker thread to finish, so the timeout never actually freed
+        # the Celery worker on a real hang. (2) Passing the caller's
+        # SQLAlchemy session across threads is unsafe and can corrupt
+        # transaction state under concurrency. Both flagged by Codex
+        # adversarial review. The Celery task's time_limit=3900s remains
+        # the real hard cap; per-HTTP-call timeouts inside the enrichment
+        # helpers (county_gis / king_county_assessor / etc) bound each
+        # request's wait. If a hang slips through both, Celery hard-kills
+        # the worker — which is what the previous thread guard was
+        # actually relying on anyway.
         _publish_log(r, job_id, "info", "Looking up property and mailing addresses...", db=db)
-        import concurrent.futures
-        _ENRICHMENT_TIMEOUT = 300  # 5 minutes
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_run_inline_enrichment, db, job, r, job_id, config)
-                future.result(timeout=_ENRICHMENT_TIMEOUT)
-        except concurrent.futures.TimeoutError:
-            _logger.error("Enrichment timed out after %ds — skipping", _ENRICHMENT_TIMEOUT)
-            _publish_log(r, job_id, "warning", f"Address lookup timed out after {_ENRICHMENT_TIMEOUT}s — some addresses may be missing", db=db)
+            _run_inline_enrichment(db, job, r, job_id, config)
+            _publish_log(r, job_id, "success", "Enrichment complete — addresses added", db=db)
         except Exception as exc:
-            _logger.warning("Inline enrichment error: %s", str(exc)[:80])
-        _publish_log(r, job_id, "success", "Enrichment complete — addresses added", db=db)
+            _logger.warning("Inline enrichment error: %s", str(exc)[:200])
+            _publish_log(
+                r, job_id, "warning",
+                "Address enrichment failed — leads delivered without enriched fields",
+                db=db,
+            )
 
         # Re-export CSV with enriched data
         enriched_file = None

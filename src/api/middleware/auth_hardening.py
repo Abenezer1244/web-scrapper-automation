@@ -131,17 +131,24 @@ class TokenBlacklist:
     async def get_user_revoke_time(user_id: str) -> int:
         """Return the epoch timestamp at which all tokens for this user were revoked (0 if never).
 
-        Reads Redis first (microsecond hot path); on RedisError falls
-        back to the durable users.revoked_at column written by
-        revoke_all_for_user. This keeps revocation enforcement strong
-        (still security-boundary fail-closed at the data layer) while
-        avoiding the Phase 0 availability regression where any Redis
-        blip took the entire authenticated API down.
+        Reads Redis first (microsecond hot path); on RedisError or
+        cache-miss falls back to the durable users.revoked_at column
+        written by revoke_all_for_user. The DB result — including the
+        common "never revoked, value=0" case — is backfilled into Redis
+        as a negative-cache sentinel so steady-state auth stays in
+        Redis rather than paying a DB round-trip on every request.
 
-        Only raises if BOTH Redis and Postgres are unavailable — caller
-        in src/api/auth.py still catches that and surfaces 503, but
-        the surface area for that is now "two-system outage" rather
-        than "Redis blip".
+        Schema-compatibility: pre-migration deployments lack
+        users.revoked_at. If the DB query raises ProgrammingError
+        (column does not exist), treat the fallback as unavailable
+        and return 0 — the per-jti blacklist still applies and any
+        active /logout-all from after the migration can rewrite
+        Redis directly. This stops a partial rollout (code-before-
+        migration) from taking the auth path down.
+
+        Only raises if Redis is down AND the DB fallback hits a
+        non-schema error — at that point both data layers are
+        unhealthy and the caller correctly surfaces 503.
         """
         key = f"{TokenBlacklist._USER_REVOKE_PREFIX}{user_id}"
         try:
@@ -150,9 +157,9 @@ class TokenBlacklist:
             if val is not None:
                 return int(val) if val else 0
             # Cache miss (no entry yet for this user). Fall through to
-            # the DB read so we authoritatively confirm whether or not
-            # the user has been revoked. The DB result, if any, is
-            # backfilled into Redis below for future hot reads.
+            # the DB read to authoritatively confirm revocation state,
+            # then backfill the cache below — including "0" for the
+            # never-revoked case so subsequent reads stay in Redis.
         except redis_exceptions.RedisError as exc:
             _logger.warning(
                 "get_user_revoke_time: Redis unavailable, falling back to DB for user %s: %s",
@@ -161,20 +168,36 @@ class TokenBlacklist:
 
         # DB fallback path — durable, slower (~1 DB round-trip).
         from sqlalchemy import select
+        from sqlalchemy.exc import ProgrammingError
         from src.db.models import User
         from src.db.session import async_engine
 
-        async with async_engine.connect() as conn:
-            row = (await conn.execute(
-                select(User.revoked_at).where(User.id == user_id)
-            )).first()
-        if row is None or row[0] is None:
+        try:
+            async with async_engine.connect() as conn:
+                row = (await conn.execute(
+                    select(User.revoked_at).where(User.id == user_id)
+                )).first()
+        except ProgrammingError as exc:
+            # Most likely cause: code deployed before alembic migration
+            # 024 ran on this DB. Treat as "fallback unavailable" so
+            # the auth path still serves traffic — Redis remains the
+            # only revocation signal until the migration lands.
+            _logger.error(
+                "get_user_revoke_time: users.revoked_at missing (pre-024 schema?) for user %s: %s",
+                user_id, exc,
+            )
             return 0
-        ts = int(row[0].timestamp())
+
+        if row is None or row[0] is None:
+            ts = 0
+        else:
+            ts = int(row[0].timestamp())
 
         # Backfill the Redis cache so the next read of this user is
-        # fast again. Best-effort — failure here just means the next
-        # read pays the DB hop too.
+        # fast again — including the never-revoked case (ts=0). With a
+        # short-ish TTL the negative cache eventually re-confirms via
+        # DB if Redis loses the key. Best-effort: a Redis write failure
+        # just means the next read pays the DB hop again.
         try:
             r = _get_redis()
             await r.setex(key, 8 * 24 * 3600, str(ts))

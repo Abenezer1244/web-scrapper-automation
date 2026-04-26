@@ -41,7 +41,7 @@ def report_lookups_for_user(
     db,
     user_id: str,
     new_lookups: int,
-    queue_id: int | None = None,
+    queue_id: int,
 ) -> dict:
     """Increment user counter and report over-quota units to Stripe.
 
@@ -50,9 +50,14 @@ def report_lookups_for_user(
         user_id: UUID string of the user whose rows were ingested
         new_lookups: Number of rows in the completed Tracerfy batch that
             were attributable to this user
-        queue_id: Tracerfy queue_id for the batch. Used to build a
-            stable Stripe MeterEvent identifier so webhook replay
-            dedupes on Stripe's side. H12 from the full-SaaS review.
+        queue_id: Tracerfy queue_id for the batch. REQUIRED — used to
+            build a stable Stripe MeterEvent identifier so webhook
+            replay dedupes on Stripe's side. H12 from the full-SaaS
+            review. Previously had a None default with a runtime
+            ValueError that fired AFTER db.commit(), which would have
+            advanced the user's counter without the matching Stripe
+            event and let a retry double-count. Now enforced at the
+            signature so callers can never reach that path.
 
     Returns:
         Dict with keys:
@@ -166,14 +171,10 @@ def report_lookups_for_user(
     # be STABLE across webhook replays so Stripe's own dedup kicks in.
     # The old identifier included now.isoformat() which changed on
     # every retry, so a replayed Tracerfy webhook would create a
-    # new MeterEvent and bill the customer twice. queue_id is
-    # required — report_usage_from_webhook is the only caller and it
-    # always passes one — so the identifier is uniquely keyed on
-    # (queue_id, user_id) and a Stripe replay always dedupes.
-    if queue_id is None:
-        raise ValueError(
-            "queue_id is required to build a stable Stripe MeterEvent identifier"
-        )
+    # new MeterEvent and bill the customer twice. queue_id is now
+    # signature-required (see the function definition) so the
+    # identifier is uniquely keyed on (queue_id, user_id) and a
+    # Stripe replay always dedupes.
     stable_identifier = f"skip_trace_q{queue_id}_u{user_id}"
 
     try:

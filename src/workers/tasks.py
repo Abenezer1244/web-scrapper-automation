@@ -512,12 +512,16 @@ def run_scrape_job(self, job_id: str) -> None:
         # ── EXPORT ────────────────────────────────────────────────────────────
         from src.api.schemas import DeliverConfigDict
         deliver_config: DeliverConfigDict = cast(DeliverConfigDict, config.deliver or {})
-        # NOTE: schemas.DeliverConfig has `formats: list[str]` (plural), not
-        # `format`. The .get("format") below has always returned the
-        # default "csv" because that key is never set — exports are
-        # always CSV regardless of what the user picked. Tracked
-        # separately; this typed read makes the mismatch visible.
-        fmt = deliver_config.get("format", "csv")  # type: ignore[call-overload]  # see note above
+        # Honor the user's chosen export format. DeliverConfig stores
+        # `formats: list[str]`. We export the first format in the list;
+        # if a user selected multiple, only the first is generated for
+        # now (multi-format export is a separate feature). An empty or
+        # missing list falls back to CSV. Previously the worker read a
+        # `format` (singular) key that schemas.DeliverConfig never sets,
+        # so every export silently came out as CSV regardless of the
+        # user's selection — flagged by Codex adversarial review.
+        formats = deliver_config.get("formats") or ["csv"]
+        fmt = formats[0]
 
         _publish_log(r, job_id, "info", f"Building {fmt.upper()} export...", db=db)
 

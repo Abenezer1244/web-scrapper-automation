@@ -9,7 +9,7 @@ import redis.asyncio as aioredis
 import redis.exceptions as _redis_exceptions
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
@@ -695,6 +695,15 @@ async def download_export(
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
 
+    # Set RLS context BEFORE any tenant read so the Job/Result queries get the
+    # RLS belt in addition to the explicit user_id filter. This route uses
+    # get_db (not get_rls_db) because the user is resolved from a download
+    # token rather than the standard dependency, so we set the context here.
+    await db.execute(
+        text("SELECT set_config('app.current_user_id', :uid, true)"),
+        {"uid": str(user.id)},
+    )
+
     result = await db.execute(
         select(Job).where(Job.id == job_id, Job.user_id == user.id)
     )
@@ -706,15 +715,9 @@ async def download_export(
 
     import csv
     import io
-    from sqlalchemy import text
 
     try:
-        # Set RLS context for this session (parameterized to prevent injection)
-        await db.execute(
-            text("SELECT set_config('app.current_user_id', :uid, true)"),
-            {"uid": str(user.id)},
-        )
-
+        # RLS context already set above (before the Job ownership read).
         # Generate CSV directly from database results
         results_query = await db.execute(
             select(Result).where(Result.job_id == job_id, Result.user_id == user.id)

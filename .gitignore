@@ -114,10 +114,10 @@ design-system/
 # Separate projects (not part of this repo)
 aiwebscrapper/
 
-# E2E test credentials (never commit)
-scripts/.e2e_creds.json
-scripts/.e2e_configs.json
-scripts/.e2e_jobs.json
+# E2E test credentials (never commit) — broad glob so variant names
+# (.e2e_king_creds.json, .e2e_pierce_live.json, ...) can't slip past.
+scripts/.e2e_*.json
+scripts/.e2e*.json
 
 # Runtime artifacts
 .ruff_cache/

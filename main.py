@@ -1,8 +1,10 @@
 import logging
+import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from src.api import (
     auth_router,
@@ -69,6 +71,23 @@ app.include_router(scrapers_router)
 app.include_router(jobs_router)
 app.include_router(billing_router)
 app.include_router(webhooks_router)
+
+
+# ─── Global exception handler ─────────────────────────────────────────────────
+# Any uncaught exception returns a generic message + a reference id (logged
+# server-side), so a stack trace is never sent to the client even if DEBUG is
+# accidentally enabled. HTTPException / validation errors keep their own
+# handlers (this only catches the otherwise-unhandled).
+_unhandled_logger = logging.getLogger("api.unhandled")
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    ref = uuid.uuid4().hex[:12]
+    _unhandled_logger.exception(
+        "Unhandled error ref=%s method=%s path=%s", ref, request.method, request.url.path
+    )
+    return JSONResponse(status_code=500, content={"detail": "Internal error", "ref": ref})
 
 
 # ─── Logging: strip tokens from access logs ──────────────────────────────────

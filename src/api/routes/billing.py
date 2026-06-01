@@ -38,10 +38,11 @@ async def activation_funnel(
     """
     # Rate-limit the raw-SQL funnel before any DB work.
     await rate_limit(request, zone="general", identifier=current_user.id)
+    # 404 (not 403) to non-admins — don't confirm the admin endpoint exists.
     if not current_user.is_admin:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Not found",
         )
 
     if days < 1 or days > 365:

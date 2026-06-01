@@ -45,9 +45,11 @@ import hashlib
 import hmac
 import json
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlparse
 
 import requests
 
+from src.api.middleware.security import validate_outbound_webhook
 from src.utils.logger import setup_logger
 from src.workers import app
 
@@ -59,6 +61,12 @@ _BACKOFF_BASE = 5  # seconds — actual waits: 5s, 25s, 125s
 
 # Webhook target timeout — enough for slow Zapier/Make cold starts
 _HTTP_TIMEOUT = 15
+
+# Dedicated session with trust_env=False: an ambient HTTPS_PROXY/NO_PROXY in
+# the worker env could otherwise move DNS resolution off-box (to the proxy),
+# bypassing the SSRF guard's resolved-IP check. We resolve + connect locally.
+_SESSION = requests.Session()
+_SESSION.trust_env = False
 
 
 def _sign_payload(payload: dict, secret: str | None) -> str:
@@ -115,7 +123,6 @@ def build_webhook_payload(
             "format": fmt,
             "url": download_url,
             "expires_at": expires_at,
-            "export_key": export_key,
         },
     }
     payload["signature"] = _sign_payload(payload, webhook_secret)
@@ -148,9 +155,29 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
         Exception: on non-2xx status (Celery retries up to _MAX_RETRIES times)
     """
     attempt = self.request.retries + 1
+    host = urlparse(webhook_url).hostname or "?"
+
+    # SSRF guard (authoritative): re-validate the destination immediately
+    # before the POST so a host that rebinds to a private/metadata IP after
+    # config-save is still caught. A blocked target is a permanent config
+    # problem — return WITHOUT raising so Celery does not retry it. Never
+    # log the full URL (it may carry query-string secrets); host only.
+    try:
+        validate_outbound_webhook(webhook_url)
+    except ValueError as exc:
+        _logger.warning(
+            "Webhook %s blocked by SSRF guard (host=%s): %s",
+            job_id[:8], host, exc,
+        )
+        return {
+            "status": "blocked",
+            "reason": "webhook target not permitted",
+            "attempts": attempt,
+        }
+
     _logger.info(
-        "Delivering webhook for job %s to %s (attempt %d/%d)",
-        job_id[:8], webhook_url[:80], attempt, _MAX_RETRIES + 1,
+        "Delivering webhook for job %s to host %s (attempt %d/%d)",
+        job_id[:8], host, attempt, _MAX_RETRIES + 1,
     )
 
     headers = {
@@ -166,11 +193,12 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
         headers["X-BridgeLeads-Signature"] = payload["signature"]
 
     try:
-        resp = requests.post(
+        resp = _SESSION.post(
             webhook_url,
             json=payload,
             headers=headers,
             timeout=_HTTP_TIMEOUT,
+            allow_redirects=False,  # don't follow 30x to a (possibly internal) Location
         )
     except requests.RequestException as exc:
         _logger.warning(
@@ -178,6 +206,21 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
             job_id[:8], attempt, str(exc)[:200],
         )
         raise  # Celery autoretry_for catches this
+
+    # Redirects are disabled, so a 3xx is a misconfigured endpoint, not a
+    # success — and following the Location is exactly the SSRF vector we
+    # are closing. Treat as a permanent (non-retryable) failure.
+    if 300 <= resp.status_code < 400:
+        _logger.warning(
+            "Webhook %s endpoint returned redirect %d to %s — not following",
+            job_id[:8], resp.status_code, (resp.headers.get("Location") or "?")[:80],
+        )
+        return {
+            "status": "failed",
+            "reason": "redirect_not_followed",
+            "status_code": resp.status_code,
+            "attempts": attempt,
+        }
 
     # Non-2xx → treat as retryable failure
     if resp.status_code >= 400:

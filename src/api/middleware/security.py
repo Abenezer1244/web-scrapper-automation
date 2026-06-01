@@ -2,6 +2,7 @@
 
 import ipaddress
 import re
+import socket
 from urllib.parse import urlparse
 
 from fastapi import Request
@@ -58,6 +59,20 @@ _BLOCKED_NETWORKS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
     # DNS-rebound target could point at an IPv6 link-local address
     # and bypass the SSRF firewall on dual-stack hosts.
     ipaddress.ip_network("fe80::/10"),
+    # 2026-06-01 security review (Codex cross-check): additional egress
+    # ranges, relevant now that resolved IPs are checked (DNS rebinding).
+    ipaddress.ip_network("0.0.0.0/8"),          # "this host" / unspecified
+    ipaddress.ip_network("100.64.0.0/10"),      # CGNAT (RFC 6598)
+    ipaddress.ip_network("192.0.0.0/24"),       # IETF protocol assignments
+    ipaddress.ip_network("192.0.2.0/24"),       # TEST-NET-1
+    ipaddress.ip_network("198.18.0.0/15"),      # benchmarking
+    ipaddress.ip_network("198.51.100.0/24"),    # TEST-NET-2
+    ipaddress.ip_network("203.0.113.0/24"),     # TEST-NET-3
+    ipaddress.ip_network("224.0.0.0/4"),        # multicast
+    ipaddress.ip_network("240.0.0.0/4"),        # reserved (incl. 255.255.255.255)
+    ipaddress.ip_network("::/128"),             # IPv6 unspecified
+    ipaddress.ip_network("2001:db8::/32"),      # IPv6 documentation
+    ipaddress.ip_network("ff00::/8"),           # IPv6 multicast
 ]
 
 _BLOCKED_HOSTNAMES: frozenset[str] = frozenset(
@@ -70,7 +85,59 @@ _BLOCKED_HOSTNAMES: frozenset[str] = frozenset(
 )
 
 
-def validate_scraping_target(url: str, *, require_allowlisted: bool = True) -> None:
+def _ip_is_blocked(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True if addr (or the IPv4 it maps to) falls in any blocked network.
+
+    IPv4-mapped IPv6 (e.g. ``::ffff:169.254.169.254``) is normalized back
+    to its IPv4 form so it can't dodge the IPv4 ranges.
+    """
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    return any(addr in network for network in _BLOCKED_NETWORKS)
+
+
+def _normalize_hostname(raw: str) -> str:
+    """Lowercase, strip trailing dot and IPv6 zone id, IDNA-encode unicode."""
+    host = (raw or "").strip().rstrip(".").lower()
+    host = host.split("%", 1)[0]  # drop IPv6 zone id (e.g. fe80::1%eth0)
+    try:
+        host = host.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        pass  # non-IDNA host; the checks below still apply
+    return host
+
+
+def _assert_resolved_ips_safe(hostname: str) -> None:
+    """DNS-rebinding defense: reject if the host resolves to a blocked IP.
+
+    The literal-IP check in ``validate_scraping_target`` is bypassable by
+    a hostname that resolves to a private/loopback/metadata address. This
+    resolves the host and rejects if ANY returned A/AAAA is blocked.
+    Fails CLOSED — a resolution failure raises ``ValueError``.
+    """
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except OSError as exc:
+        # gaierror (NXDOMAIN), timeout, and other resolver OSErrors all
+        # fail closed as a clean ValueError so callers' blocked-return
+        # path handles them (never escapes to crash a worker task).
+        raise ValueError("Target host could not be resolved") from exc
+    if not infos:
+        raise ValueError("Target host did not resolve")
+    for info in infos:
+        ip_str = info[4][0].split("%", 1)[0]  # sockaddr[0], minus zone id
+        try:
+            addr = ipaddress.ip_address(ip_str)
+        except ValueError as exc:
+            raise ValueError("Target resolved to an invalid address") from exc
+        if _ip_is_blocked(addr):
+            raise ValueError("Target resolves to a blocked address")
+
+
+def validate_scraping_target(
+    url: str, *, require_allowlisted: bool = True, resolve: bool = False
+) -> None:
     """Raise ValueError if the URL is not an approved scraping target.
 
     Blocks:
@@ -80,6 +147,10 @@ def validate_scraping_target(url: str, *, require_allowlisted: bool = True) -> N
     - With ``require_allowlisted=True`` (default): hosts not on the
       explicit allowlist, and HTTP scheme for any host not already
       on the allowlist.
+    - With ``resolve=True``: hosts that RESOLVE to a blocked IP range
+      (DNS-rebinding defense). Off by default so scraper navigation and
+      tests keep their current no-DNS behavior; outbound-webhook
+      validation passes True.
 
     Pass ``require_allowlisted=False`` ONLY from admin onboarding paths
     that are about to call ``add_scrape_domain()`` for the validated
@@ -95,7 +166,7 @@ def validate_scraping_target(url: str, *, require_allowlisted: bool = True) -> N
     if parsed.scheme not in ("https", "http"):
         raise ValueError("Only HTTP/HTTPS scraping targets are permitted")
 
-    hostname = (parsed.hostname or "").lower()
+    hostname = _normalize_hostname(parsed.hostname or "")
 
     if not hostname:
         raise ValueError("Invalid URL: no hostname")
@@ -110,10 +181,8 @@ def validate_scraping_target(url: str, *, require_allowlisted: bool = True) -> N
     except ValueError:
         addr = None  # hostname is a domain name, not a raw IP
 
-    if addr is not None:
-        for network in _BLOCKED_NETWORKS:
-            if addr in network:
-                raise ValueError("Scraping target not permitted")
+    if addr is not None and _ip_is_blocked(addr):
+        raise ValueError("Scraping target not permitted")
 
     if require_allowlisted:
         # HTTP is only permitted for explicitly opted-in hosts. Being on
@@ -129,6 +198,31 @@ def validate_scraping_target(url: str, *, require_allowlisted: bool = True) -> N
         # Allowlist check (subdomain-aware)
         if not _host_matches_set(hostname, _ALLOWED_SCRAPE_DOMAINS):
             raise ValueError("Scraping target not in approved domain list")
+
+    # DNS-rebinding defense (opt-in). A literal-IP host was already
+    # checked above, so only resolve real domain names.
+    if resolve and addr is None:
+        _assert_resolved_ips_safe(hostname)
+
+
+def validate_outbound_webhook(url: str) -> None:
+    """Validate a user-supplied outbound webhook URL (SSRF defense).
+
+    Stricter than ``validate_scraping_target``: HTTPS only, no allowlist
+    (users choose their own endpoint), and DNS resolution is REQUIRED so
+    a host that resolves to a private/metadata IP is rejected. Call this
+    immediately before the outbound POST so the check reflects current
+    DNS. Raises ``ValueError`` if the target is not permitted.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        raise ValueError("Invalid webhook URL")
+    if parsed.scheme != "https":
+        raise ValueError("Webhook URL must use HTTPS")
+    if len(url) > 2000:
+        raise ValueError("Webhook URL too long")
+    validate_scraping_target(url, require_allowlisted=False, resolve=True)
 
 
 def add_scrape_domain(domain: str) -> None:

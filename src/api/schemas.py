@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from typing import Any, TypedDict
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, EmailStr, field_validator
 
@@ -121,12 +122,20 @@ class DeliverConfig(BaseModel):
     @field_validator("webhook_url")
     @classmethod
     def webhook_url_format(cls, v: str | None) -> str | None:
+        # Structural validation only — HTTPS scheme + a real host + length.
+        # The authoritative SSRF check (DNS resolution against blocked IP
+        # ranges) runs in the worker via validate_outbound_webhook()
+        # immediately before the POST, so a config save never depends on
+        # live DNS and a host that rebinds after save is still caught.
         if v is None or v == "":
             return None
-        if not (v.startswith("https://") or v.startswith("http://")):
-            raise ValueError("webhook_url must start with http:// or https://")
         if len(v) > 2000:
             raise ValueError("webhook_url too long (max 2000 chars)")
+        parsed = urlparse(v)
+        if parsed.scheme != "https":
+            raise ValueError("webhook_url must use https://")
+        if not parsed.hostname:
+            raise ValueError("webhook_url must include a host")
         return v
 
     @field_validator("webhook_secret")

@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from typing import Any, TypedDict
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, EmailStr, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -28,8 +28,8 @@ class UserRegister(BaseModel):
     @field_validator("ref")
     @classmethod
     def ref_format(cls, v: str | None) -> str | None:
-        if v is None or v == "":
-            return None
+        if v is None or v == "" or len(v) > 64:
+            return None  # bound raw input before normalization
         v = v.strip().upper()
         if len(v) > 16 or not v.isalnum():
             return None  # Silently drop malformed codes
@@ -38,11 +38,13 @@ class UserRegister(BaseModel):
 
 class UserLogin(BaseModel):
     email: EmailStr
-    password: str
+    # Bounded so a multi-MB body can't drive bcrypt CPU on the login path
+    # (bcrypt only uses the first 72 bytes anyway).
+    password: str = Field(max_length=72)
 
 
 class PasswordChange(BaseModel):
-    current_password: str
+    current_password: str = Field(max_length=72)  # bcrypt only uses first 72 bytes
     new_password: str
 
     @field_validator("new_password")
@@ -93,17 +95,17 @@ class ApiKeyResponse(BaseModel):
 # ─── Scraper Configs ──────────────────────────────────────────────────────────
 
 class ScheduleConfig(BaseModel):
-    frequency: str = "manual"           # manual | daily | weekly | monthly
-    run_at_hour: int = 6                # 0–23 UTC
-    run_at_minute: int = 0              # 0–59
-    date_range_mode: str = "rolling_90" # rolling_90 | custom | since_last_run
-    date_from: str | None = None
-    date_to: str | None = None
+    frequency: str = Field(default="manual", max_length=16)      # manual | daily | weekly | monthly
+    run_at_hour: int = Field(default=6, ge=0, le=23)             # UTC
+    run_at_minute: int = Field(default=0, ge=0, le=59)
+    date_range_mode: str = Field(default="rolling_90", max_length=24)  # rolling_90 | custom | since_last_run
+    date_from: str | None = Field(default=None, max_length=32)   # ISO date string
+    date_to: str | None = Field(default=None, max_length=32)
 
 
 class DeliverConfig(BaseModel):
-    emails: list[EmailStr] = []
-    formats: list[str] = ["csv"]    # csv | excel | json (one or more)
+    emails: list[EmailStr] = Field(default_factory=list, max_length=10)
+    formats: list[str] = Field(default=["csv"], max_length=5)  # csv | excel | json (one or more)
     webhook_url: str | None = None
     # Sprint 6.5: optional HMAC-SHA256 shared secret. When set, every
     # webhook POST carries an `X-BridgeLeads-Signature` header and
@@ -117,6 +119,13 @@ class DeliverConfig(BaseModel):
     def limit_recipients(cls, v: list) -> list:
         if len(v) > 10:
             raise ValueError("Maximum 10 delivery email addresses")
+        return v
+
+    @field_validator("formats")
+    @classmethod
+    def bound_formats(cls, v: list[str]) -> list[str]:
+        if any(len(f) > 16 for f in v):
+            raise ValueError("invalid format value")
         return v
 
     @field_validator("webhook_url")
@@ -205,10 +214,10 @@ class DeliverConfigDict(TypedDict, total=False):
 
 
 class ScraperConfigCreate(BaseModel):
-    name: str
-    county: str
-    state: str
-    record_type: str
+    name: str = Field(max_length=120)
+    county: str = Field(max_length=64)
+    state: str = Field(max_length=16)
+    record_type: str = Field(max_length=64)
     fields: FieldsConfig = FieldsConfig()
     enrichment: EnrichmentConfig = EnrichmentConfig()
     schedule: ScheduleConfig = ScheduleConfig()
@@ -220,7 +229,10 @@ class ScraperConfigCreate(BaseModel):
     @field_validator("state")
     @classmethod
     def state_uppercase(cls, v: str) -> str:
-        return v.upper()
+        v = v.strip().upper()
+        if len(v) != 2:
+            raise ValueError("state must be a 2-letter code")
+        return v
 
     @field_validator("county", "record_type")
     @classmethod
@@ -273,8 +285,8 @@ class ScraperConfigResponse(BaseModel):
 # ─── Jobs ─────────────────────────────────────────────────────────────────────
 
 class JobCreate(BaseModel):
-    scraper_config_id: str
-    trigger: str = "manual"  # manual | test
+    scraper_config_id: str = Field(max_length=64)  # UUID string
+    trigger: str = Field(default="manual", max_length=16)  # manual | test
 
     @field_validator("trigger")
     @classmethod
@@ -438,23 +450,33 @@ class ProgressEvent(BaseModel):
 # ─── County connectors ────────────────────────────────────────────────────────
 
 class ConnectorCreate(BaseModel):
-    county: str
-    state: str
-    record_types: list[str]
-    base_url: str
-    scraper_mode: str = "ai"  # ai | manual
-    gis_endpoint: str | None = None  # Free ArcGIS REST API URL
-    assessor_url: str | None = None  # County assessor website (AI fallback)
+    county: str = Field(max_length=64)
+    state: str = Field(max_length=16)
+    record_types: list[str] = Field(max_length=20)
+    base_url: str = Field(max_length=2000)
+    scraper_mode: str = Field(default="ai", max_length=16)  # ai | manual
+    gis_endpoint: str | None = Field(default=None, max_length=2000)  # Free ArcGIS REST API URL
+    assessor_url: str | None = Field(default=None, max_length=2000)  # County assessor website (AI fallback)
 
     @field_validator("state")
     @classmethod
     def state_uppercase(cls, v: str) -> str:
-        return v.upper()
+        v = v.strip().upper()
+        if len(v) != 2:
+            raise ValueError("state must be a 2-letter code")
+        return v
 
     @field_validator("county")
     @classmethod
     def county_lowercase(cls, v: str) -> str:
         return v.lower().strip()
+
+    @field_validator("record_types")
+    @classmethod
+    def bound_record_types(cls, v: list[str]) -> list[str]:
+        if any(len(rt) > 64 for rt in v):
+            raise ValueError("invalid record_type value")
+        return v
 
 
 class ConnectorResponse(BaseModel):

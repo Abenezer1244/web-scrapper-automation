@@ -5,7 +5,7 @@ No network: every assertion exercises a path that raises BEFORE requests.get
 """
 import pytest
 
-from src.utils.safe_http import safe_get, same_origin
+from src.utils.safe_http import safe_get, safe_get_following, same_origin
 
 
 @pytest.mark.parametrize(
@@ -36,6 +36,21 @@ def test_safe_get_blocks_private_ip():
 def test_safe_get_blocks_loopback_hostname():
     with pytest.raises(ValueError):
         safe_get("https://localhost/x")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://169.254.169.254/obj",  # metadata IP (initial hop)
+        "https://10.0.0.1/obj",          # private IP
+        "https://localhost/obj",         # loopback hostname
+    ],
+)
+def test_safe_get_following_blocks_initial_hop(url):
+    # The redirect-following variant must still reject a blocked initial URL
+    # before any request (per-hop validation reuses the same check).
+    with pytest.raises(ValueError):
+        safe_get_following(url)
 
 
 def test_safe_get_refuses_cross_origin_when_pinned():

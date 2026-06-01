@@ -27,6 +27,7 @@ import requests
 
 from src.config import settings
 from src.utils.logger import setup_logger
+from src.utils.safe_http import safe_get_following
 
 _logger = setup_logger("scraper.enrichment.skip_trace")
 
@@ -456,20 +457,30 @@ def download_tracerfy_csv(download_url: str) -> str:
     The webhook payload includes a `download_url` pointing at a public
     DigitalOcean Spaces CDN URL — no auth header required. We still pass
     a polite User-Agent and bound the timeout to be safe.
+
+    SSRF gate: download_url comes from the (signature-verified) Tracerfy
+    webhook, but we still fetch it through safe_get_following — which
+    validates the initial URL AND every redirect hop (resolve=True, DNS-
+    rebinding aware), so the CDN's 302-to-object works while a redirect to a
+    private/metadata host is refused. require_allowlisted=False (the CDN host
+    is not on the scrape allowlist). The URL may carry a signed token, so it
+    is never included in error messages.
     """
     try:
-        resp = requests.get(
+        resp = safe_get_following(
             download_url,
+            require_allowlisted=False,
+            require_https=True,  # no scheme downgrade — URL may carry a signed token
             headers={"User-Agent": "BridgeLeads/1.0 (+https://bridgeleads.io)"},
             timeout=60,
         )
+    except ValueError as exc:
+        raise TracerfyError(f"Refusing to download from disallowed URL: {exc}") from exc
     except requests.RequestException as exc:
-        raise TracerfyError(f"Failed to download CSV from {download_url}: {exc}") from exc
+        raise TracerfyError(f"Failed to download Tracerfy CSV: {exc}") from exc
 
     if resp.status_code != 200:
-        raise TracerfyError(
-            f"Tracerfy CSV download returned {resp.status_code}: {download_url}"
-        )
+        raise TracerfyError(f"Tracerfy CSV download returned {resp.status_code}")
 
     return resp.text
 

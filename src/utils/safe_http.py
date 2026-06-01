@@ -15,7 +15,7 @@ SSRF vectors. This module centralizes the safe path:
 Lives in utils (not on BridgeScraper) so plain enrichment modules like
 ``county_gis`` can use it without importing the scraper base class.
 """
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -80,3 +80,43 @@ def safe_get(
         timeout=timeout,
         allow_redirects=False,  # a 3xx must not bounce us to an internal host
     )
+
+
+_REDIRECT_CODES = (301, 302, 303, 307, 308)
+
+
+def safe_get_following(
+    url: str,
+    *,
+    require_allowlisted: bool = False,
+    require_https: bool = False,
+    headers: dict | None = None,
+    timeout: int = 10,
+    max_redirects: int = 5,
+) -> requests.Response:
+    """Like ``safe_get`` but follows redirects, re-validating EVERY hop.
+
+    For trusted-but-redirecting endpoints (e.g. a CDN that 302s to the actual
+    object). `requests`' own redirect-following would jump to a `Location`
+    without re-checking it — letting a validated public URL bounce to an
+    internal/metadata host. Here each hop (initial URL AND every `Location`)
+    is validated with `resolve=True`, so a redirect to a blocked target is
+    refused. Caps the hop count. Raises `ValueError` on a blocked hop or too
+    many redirects.
+    """
+    current = url
+    for _ in range(max_redirects + 1):
+        # require_https blocks a scheme downgrade (e.g. an HTTPS URL that 302s
+        # to plaintext http://) which would leak a signed URL and allow MITM.
+        if require_https and urlparse(current).scheme != "https":
+            raise ValueError("HTTPS required for this fetch")
+        validate_scraping_target(current, require_allowlisted=require_allowlisted, resolve=True)
+        resp = _SESSION.get(current, headers=headers, timeout=timeout, allow_redirects=False)
+        if resp.status_code in _REDIRECT_CODES:
+            location = resp.headers.get("Location")
+            if not location:
+                return resp
+            current = urljoin(current, location)  # resolve relative Location
+            continue
+        return resp
+    raise ValueError("Too many redirects")

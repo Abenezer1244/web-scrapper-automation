@@ -18,6 +18,7 @@ Lewis, Lincoln, Mason, Okanogan, Pacific, Spokane, Stevens, Thurston, Whitman
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.utils.logger import setup_logger
+from src.utils.safe_http import safe_get
 
 _logger = setup_logger("scraper.template.eagleweb")
 
@@ -603,7 +604,7 @@ class EagleWebScraper(BridgeScraper):
                 # summary cell. Without these as stop markers, the Grantor regex
                 # captures "FORD, MICHAEL M ESTSubdivision HIDDEN EST Lot 5..."
                 # because probate records often have no Grantee: label.
-                _LEGAL_STOP = r"(?:Grantee:|Subdivision|Section\s*:|Section\s+\d|Lot\s+\d|Block\s+\d|Parcel[:\s]|Plat\s|Tract\s|$)"
+                _LEGAL_STOP = r"(?:Grantee:|Legal[:\s]|Subdivision|Section\s*:|Section\s+\d|Lot\s+\d|Block\s+\d|Parcel[:\s]|Plat\s|Tract\s|$)"
 
                 # Parse Grantor
                 grantor_match = re.search(r"Grantor:\s*(.+?)" + _LEGAL_STOP, summary, re.DOTALL)
@@ -728,11 +729,12 @@ class EagleWebScraper(BridgeScraper):
         import re as _re
         import asyncio as _asyncio
         from concurrent.futures import ThreadPoolExecutor
-        import requests as _requests
 
         _PARCEL_PATTERNS = [
             # Dotted format (Spokane: 44042.0202) and plain digits
             _re.compile(r'[Pp]arcel[:\s]*\s*(\d{4,}\.\d{3,}|\d{5,})'),
+            # Whitman dash-segmented: 2-0000-44-14-25-3390 or L-0985-00-00-27-0000
+            _re.compile(r'[Pp]arcel[:\s]*\s*([A-Z]-\d+(?:-\d+){2,}|\d-\d+(?:-\d+){2,})'),
             _re.compile(r'[Tt]ax\s*(?:[#:]|ID[:\s]|Number[:\s])\s*(\d{4,}\.\d{3,}|\d{5,})'),
             _re.compile(r'APN[:\s]+(\d{4,}\.\d{3,}|\d{5,})'),
         ]
@@ -741,11 +743,23 @@ class EagleWebScraper(BridgeScraper):
         # Get browser cookies for authenticated session
         cookies = await self.page.context.cookies()
         cookie_dict = {c["name"]: c["value"] for c in cookies}
+        base = self.base_url  # pin detail fetches to the portal origin
 
         def _fetch_one(href: str) -> str | None:
             """Fetch a detail page via HTTP and extract parcel ID."""
             try:
-                resp = _requests.get(href, headers=_HEADERS, cookies=cookie_dict, timeout=8)
+                # SSRF-safe: the detail href is scraped from page DOM. safe_get
+                # validates (DNS-rebinding aware) and same_origin_as=base ensures
+                # the authenticated session cookies are only ever sent to the
+                # portal's own origin — never a host injected into the page.
+                resp = safe_get(
+                    href,
+                    same_origin_as=base,
+                    require_allowlisted=True,
+                    headers=_HEADERS,
+                    cookies=cookie_dict,
+                    timeout=8,
+                )
                 if resp.status_code != 200:
                     return None
                 text = resp.text

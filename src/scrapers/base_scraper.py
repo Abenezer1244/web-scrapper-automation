@@ -183,49 +183,57 @@ class BridgeScraper:
 
     # ─── Core navigation ──────────────────────────────────────────────────────
 
-    async def _ssrf_route_guard(self, route) -> None:
-        """Abort document navigations to disallowed targets BEFORE the request.
+    async def _ssrf_nav_allowed(self, request) -> bool:
+        """Return False if this DOCUMENT navigation must be aborted (SSRF).
 
-        Fires for every request in the context but only validates DOCUMENT
-        loads (the main page and each redirect hop) — the requests whose
-        responses we actually read. Main-frame documents must be on the scrape
-        allowlist; sub-frame documents (e.g. a reCAPTCHA iframe to google.com)
-        only need to clear the blocked-IP / DNS-rebinding checks, so legitimate
-        third-party frames keep working. Everything else passes straight
-        through. Non-HTTP(S) schemes (about:blank, data:) are not validated.
-
-        getaddrinfo is sync, so it runs in the default executor to avoid
-        blocking the event loop. The guard never raises — on any internal
-        error it falls through to continue() so it can't wedge a scrape.
+        Validates only DOCUMENT loads (the main page and each redirect hop) —
+        the requests whose responses we read. Main-frame documents must be on
+        the scrape allowlist; sub-frame documents (e.g. a reCAPTCHA iframe to
+        google.com) only need to clear the blocked-IP / DNS-rebinding checks,
+        so legitimate third-party frames keep working. Non-document requests
+        and non-HTTP(S) schemes (about:blank, data:) are allowed through.
+        getaddrinfo is sync, so it runs in the executor (no event-loop block).
+        Never raises — on an internal error it allows (continue) so the guard
+        can't wedge a scrape. Shared by the context route guard AND any
+        page-level route (which takes precedence over the context route).
         """
-        request = route.request
         try:
             url = request.url
+            if request.resource_type != "document":
+                return True
             scheme = url.split(":", 1)[0].lower()
-            if request.resource_type == "document" and scheme in ("http", "https"):
-                try:
-                    is_subframe = request.frame.parent_frame is not None
-                except Exception:
-                    is_subframe = False
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    None,
-                    functools.partial(
-                        validate_scraping_target,
-                        url,
-                        require_allowlisted=not is_subframe,
-                        resolve=True,
-                    ),
-                )
+            if scheme not in ("http", "https"):
+                return True
+            try:
+                is_subframe = request.frame.parent_frame is not None
+            except Exception:
+                is_subframe = False
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                functools.partial(
+                    validate_scraping_target,
+                    url,
+                    require_allowlisted=not is_subframe,
+                    resolve=True,
+                ),
+            )
+            return True
         except ValueError:
-            _logger.error("SSRF: aborted navigation to disallowed target %s", request.url)
+            _logger.error("SSRF: blocked navigation to disallowed target %s", request.url)
+            return False
+        except Exception as exc:  # never let the guard itself wedge navigation
+            _logger.debug("SSRF nav check passthrough (%s): %s", request.url[:80], exc)
+            return True
+
+    async def _ssrf_route_guard(self, route) -> None:
+        """Context route guard: abort disallowed document navigations pre-flight."""
+        if not await self._ssrf_nav_allowed(route.request):
             try:
                 await route.abort("blockedbyclient")
             except Exception:
                 pass
             return
-        except Exception as exc:  # never let the guard itself wedge navigation
-            _logger.debug("SSRF route guard passthrough (%s): %s", request.url[:80], exc)
         try:
             await route.continue_()
         except Exception:

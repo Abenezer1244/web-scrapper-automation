@@ -13,6 +13,7 @@ import requests
 
 from src.config import settings
 from src.utils.logger import setup_logger
+from src.utils.safe_http import safe_get
 
 _logger = setup_logger("scraper.enrichment.gis")
 
@@ -158,7 +159,9 @@ def _query_gis(parcel_id: str, gis_config: dict, county_key: str) -> dict[str, s
     }
 
     try:
-        resp = requests.get(endpoint, params=params, timeout=10)
+        # SSRF-safe: endpoint comes from DB county_connectors.gis_endpoint.
+        # safe_get validates (DNS-rebinding aware) + blocks private/metadata IPs.
+        resp = safe_get(endpoint, params=params, require_allowlisted=False, timeout=10)
 
         if resp.status_code != 200:
             _logger.warning(
@@ -198,7 +201,9 @@ def _query_gis_by_name(owner_name: str, gis_config: dict, county_key: str) -> di
     }
 
     try:
-        resp = requests.get(endpoint, params=params, timeout=10)
+        # SSRF-safe: endpoint comes from DB county_connectors.gis_endpoint.
+        # safe_get validates (DNS-rebinding aware) + blocks private/metadata IPs.
+        resp = safe_get(endpoint, params=params, require_allowlisted=False, timeout=10)
         if resp.status_code != 200:
             return _empty()
 
@@ -428,7 +433,8 @@ def _batch_query_county(
         }
 
         try:
-            resp = requests.get(endpoint, params=params, timeout=30)
+            # SSRF-safe (DB-supplied endpoint) — see _query_gis.
+            resp = safe_get(endpoint, params=params, require_allowlisted=False, timeout=30)
             if resp.status_code != 200:
                 _logger.warning("County GIS batch returned %d", resp.status_code)
                 continue

@@ -353,6 +353,21 @@ async def create_connector(
             if parsed_base.scheme == "http":
                 add_http_allowed_host(new_host)
 
+    # gis_endpoint is fetched server-side during enrichment (county_gis). Run it
+    # through the SSRF firewall here too so a private/metadata endpoint can't be
+    # persisted. require_allowlisted=False: GIS hosts are varied public ArcGIS
+    # servers, not on the scrape allowlist — the resolve + blocked-IP checks are
+    # the gate. (Fetch-time safe_get is the authoritative guard for any path.)
+    if body.gis_endpoint:
+        from src.api.middleware.security import validate_scraping_target
+        try:
+            validate_scraping_target(body.gis_endpoint, require_allowlisted=False, resolve=True)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid gis_endpoint: {exc}",
+            )
+
     connector = CountyConnector(
         id=str(uuid.uuid4()),
         county=body.county,

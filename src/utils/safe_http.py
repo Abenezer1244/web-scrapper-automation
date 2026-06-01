@@ -53,6 +53,7 @@ def safe_get(
     *,
     same_origin_as: str | None = None,
     require_allowlisted: bool = False,
+    params: dict | None = None,
     cookies: dict | None = None,
     headers: dict | None = None,
     timeout: int = 10,
@@ -73,6 +74,7 @@ def safe_get(
         raise ValueError("Refusing to send request to a different origin")
     return _SESSION.get(
         url,
+        params=params,
         cookies=cookies,
         headers=headers,
         timeout=timeout,

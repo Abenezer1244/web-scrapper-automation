@@ -21,13 +21,13 @@ Codex review. Max 5 files per sub-phase.
   (+ `probe` no-redirect + Location recheck); add `safe_goto(url, wait_until, timeout_ms)`
   (validate resolve=True → goto → redirect recheck) and `safe_get(url, *, same_host_as=None,
   cookies, headers, timeout)` (validate resolve=True → no-redirect → optional host match).
-  Tests. **Foundation everything else reuses.**
-- [ ] **2b — HIGH-5 (eagleweb/king group) + HIGH-3:** eagleweb (goto:156 → safe_goto;
-  detail-href:750 → safe_get(same_host_as=base_url)), king_wa_probate (guard goto:444),
-  king_county_assessor (goto:109), whatcom_wa (goto:137). [4 files]
-- [ ] **2c — HIGH-5 remainder:** acclaimweb (136,311), ava_fidlar (329), landmarkweb (170). [3 files]
-- [ ] **2d — HIGH-4:** county_gis (validate endpoint via safe_get), scrapers route
-  (validate `gis_endpoint` at creation like `base_url`), schemas (structural). [3 files]
+  Tests. **Foundation everything else reuses.** [x] DONE + per-hop context route guard.
+- [x] **HIGH-5 — closed by the context `_ssrf_route_guard`** (per-hop interception of every
+  document navigation, incl. raw `page.goto`). No per-template changes needed. Fixed the one
+  page-level route precedence bypass (`king_wa_probate` `**/*Search*` → shared `_ssrf_nav_allowed`).
+- [x] **2b — HIGH-3:** eagleweb detail-href → `safe_get(same_origin_as=base_url, cookies=...)`.
+- [x] **2d — HIGH-4:** county_gis DB-endpoint fetches → `safe_get`; connector route validates
+  `gis_endpoint`. (2c dropped — the context guard subsumed the template goto wiring.)
 
 ## Verification
 - Each sub-phase: targeted tests + `ruff` + Codex review of the diff.

@@ -354,6 +354,16 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
 
         async def _inject_token(route):
             req = route.request
+            # Page-level routes take precedence over the context-level
+            # _ssrf_route_guard, so this handler must run the same SSRF check
+            # before continuing or it would be a per-hop SSRF bypass for any
+            # document navigation matching the pattern.
+            if not await self._ssrf_nav_allowed(req):
+                try:
+                    await route.abort("blockedbyclient")
+                except Exception:
+                    pass
+                return
             _logger.info("Route interceptor: %s %s", req.method, req.url[-60:])
             if req.method == "POST" and req.post_data and "g-recaptcha-response=" in req.post_data:
                 body = req.post_data

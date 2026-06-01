@@ -424,10 +424,13 @@ async def get_subscription(current_user: CurrentUser) -> dict:
             "amount_monthly": price["unit_amount"] // 100,
             "currency": price["currency"],
         }
-    except stripe.error.StripeError as exc:
+    except stripe.error.StripeError:
+        # Never surface Stripe's user_message to the client — it can disclose
+        # Stripe-side state/config. Log server-side, return a generic message.
+        _logger.exception("subscription lookup failed for user %s", current_user.id)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Could not retrieve subscription: {exc.user_message}",
+            detail="Could not retrieve subscription. Please try again.",
         )
 
 

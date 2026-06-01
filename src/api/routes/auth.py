@@ -349,6 +349,7 @@ async def logout(
 async def logout_all(
     request: Request,
     current_user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
 ) -> None:
     # logout-all writes the user-revoke timestamp that every JWT decoder
     # checks. If Redis is unavailable, the revocation cannot take effect
@@ -360,6 +361,16 @@ async def logout_all(
         await TokenBlacklist.revoke_all_for_user(current_user.id)
     except _redis_exceptions.RedisError:
         raise revocation_unavailable_503()
+    # Also revoke the API key. The API-key auth path has no issued-at to
+    # compare against the revoke timestamp, so clearing the hash is the only
+    # way logout-all ("kill all my credentials") can invalidate a leaked key.
+    # The user re-issues via POST /api-key. RedisError above already aborted,
+    # so reaching here means the JWT revoke landed.
+    result = await db.execute(select(User).where(User.id == current_user.id))
+    user = result.scalar_one_or_none()
+    if user is not None and user.api_key_hash is not None:
+        user.api_key_hash = None
+        await db.commit()
     audit_log(request, "logout_all", current_user.id)
 
 

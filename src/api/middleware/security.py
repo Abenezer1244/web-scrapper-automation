@@ -359,21 +359,30 @@ def register_connector_domains_from_db() -> int:
 
 # ─── CSV / Formula Injection Prevention ──────────────────────────────────────
 
-_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
 
 
 def sanitize_for_csv(value: str | None) -> str:
     """Prevent CSV formula injection (Excel/Sheets formula execution).
 
-    Prefixes any cell value starting with =, +, -, @, TAB, or CR with a
+    Prefixes any cell value starting with =, +, -, @, TAB, CR, or LF with a
     single quote so spreadsheet applications treat it as plain text.
+
+    The prefix check runs on the RAW value BEFORE clean_text() — clean_text
+    replaces CR/LF with spaces and strips leading whitespace, so checking
+    after it would never see a leading TAB/CR/LF and those prefixes would be
+    silently un-neutralized. Non-str inputs (dates, numbers) are coerced.
     """
     if value is None:
         return ""
-    value = clean_text(value)
-    if value.startswith(_FORMULA_PREFIXES):
-        return "'" + value
-    return value
+    raw = str(value)
+    cleaned = clean_text(raw)
+    # Quote if the RAW value leads with a dangerous char (catches leading
+    # TAB/CR/LF that clean_text would strip) OR if the CLEANED value does
+    # (catches leading whitespace like " \t=cmd" that clean_text strips to
+    # reveal a formula char). Checking only one side leaves a bypass.
+    needs_quote = raw.startswith(_FORMULA_PREFIXES) or cleaned.startswith(_FORMULA_PREFIXES)
+    return ("'" + cleaned) if needs_quote else cleaned
 
 
 # ─── Log Injection Prevention ─────────────────────────────────────────────────

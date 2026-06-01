@@ -204,11 +204,14 @@ async def cancel_job(
 async def get_results(
     job_id: str,
     current_user: CurrentUser,
+    request: Request,
     db: AsyncSession = Depends(get_rls_db),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     q: str | None = Query(None, max_length=100),
 ) -> ResultsPage:
+    # Rate-limit before the (expensive, multi-query) read to prevent DB-amplification DoS.
+    await rate_limit(request, zone="general", identifier=current_user.id)
     result = await db.execute(
         select(Job).where(Job.id == job_id, Job.user_id == current_user.id)
     )

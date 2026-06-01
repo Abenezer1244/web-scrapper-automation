@@ -3,12 +3,13 @@
 import uuid
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
+from src.api.middleware.rate_limit import rate_limit
 from src.db import get_db
 from src.api.schemas import (
     CachedRecordRow,
@@ -389,12 +390,15 @@ async def create_connector(
 async def get_cached_records(
     config_id: str,
     current_user: CurrentUser,
+    request: Request,
     db: AsyncSession = Depends(get_rls_db),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     q: str | None = None,
 ):
     """Serve pre-scraped records from cache with per-user 'new' badges."""
+    # Rate-limit before the cached-records query (FOR UPDATE + counts).
+    await rate_limit(request, zone="general", identifier=current_user.id)
     # 1. Verify config belongs to user
     config_result = await db.execute(
         select(ScraperConfig).where(

@@ -23,6 +23,7 @@ router = APIRouter(prefix="/billing", tags=["billing"])
 @router.get("/activation-funnel")
 async def activation_funnel(
     current_user: CurrentUser,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     days: int = 30,
 ) -> dict:
@@ -35,6 +36,8 @@ async def activation_funnel(
     Percentages are computed from signup count, so every step shows both
     an absolute count and a conversion rate from signup.
     """
+    # Rate-limit the raw-SQL funnel before any DB work.
+    await rate_limit(request, zone="general", identifier=current_user.id)
     if not current_user.is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

@@ -21,6 +21,20 @@ from src.workers import app
 
 _logger = setup_logger("worker.task")
 
+# Delivery download links: prefer a revocable app download-token URL (honors
+# logout-all + the jti blacklist, scoped to user+job) over a raw 48h R2
+# presigned bearer URL sitting in an inbox. Falls back to the presigned URL
+# only until settings.API_BASE_URL is configured, so delivery never breaks.
+_DELIVERY_TOKEN_TTL = 172800  # 48h — matches the prior presigned URL lifetime
+
+
+def _delivery_download_url(job_id: str, user_id, object_key: str, exporter) -> str:
+    if settings.API_BASE_URL:
+        from src.api.download_tokens import mint_download_token
+        token = mint_download_token(str(user_id), job_id, ttl_seconds=_DELIVERY_TOKEN_TTL)
+        return f"{settings.API_BASE_URL.rstrip('/')}/jobs/{job_id}/download?token={token}"
+    return exporter.get_download_url(object_key, expires_in=_DELIVERY_TOKEN_TTL)
+
 
 class JobUpdateFields(TypedDict, total=False):
     """Fields _set_status() may set on a Job ORM row alongside `status`.
@@ -631,7 +645,7 @@ def run_scrape_job(self, job_id: str) -> None:
         emails = deliver_config.get("emails", [])
         if emails and object_key:
             try:
-                download_url = exporter.get_download_url(object_key, expires_in=172800)  # 48hr
+                download_url = _delivery_download_url(job_id, job.user_id, object_key, exporter)
                 deliver_job_results(
                     job_id=job_id,
                     scraper_name=config.name,
@@ -656,7 +670,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     build_webhook_payload,
                     deliver_job_webhook,
                 )
-                signed_download = exporter.get_download_url(object_key, expires_in=172800)
+                signed_download = _delivery_download_url(job_id, job.user_id, object_key, exporter)
                 webhook_secret = deliver_config.get("webhook_secret")
                 payload = build_webhook_payload(
                     job_id=job_id,

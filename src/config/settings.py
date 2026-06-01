@@ -99,6 +99,11 @@ class Settings(BaseSettings):
     DEBUG: bool = False
     ENVIRONMENT: str = "production"
     FRONTEND_URL: str = "https://bridgeleads.io"
+    # Public base URL of THIS API (the host serving /jobs/{id}/download).
+    # When set, delivery emails/webhooks send a revocable app download-token
+    # link instead of a raw 48h R2 presigned URL. Empty = fall back to the
+    # presigned URL (so delivery keeps working until this is configured).
+    API_BASE_URL: str = ""
     ALLOWED_ORIGINS: str = "https://bridgeleads.io,https://app.bridgeleads.io,https://bridgeleads-web.vercel.app"
 
     # ─── Worker scaling ──────────────────────────────────────────────────────

@@ -528,10 +528,6 @@ async def get_export_url(
     Generates a single-use token (60s) scoped to this job + user.
     The token is safe to put in a URL — it's not the full JWT.
     """
-    import jwt as jose_jwt
-    from src.config import settings as app_settings
-    import time
-
     result = await db.execute(
         select(Job).where(Job.id == job_id, Job.user_id == user.id)
     )
@@ -549,29 +545,11 @@ async def get_export_url(
     # during verification, and (c) a jti lets us blacklist a
     # download link in the rare case we need to revoke one before
     # its 60s TTL expires.
-    import uuid as _uuid
-    _now = int(time.time())
-    download_token = jose_jwt.encode(
-        {
-            "sub": str(user.id),
-            "job_id": job_id,
-            "purpose": "download",
-            "aud": "bridgeleads-download",
-            "iss": "bridgeleads",
-            "jti": _uuid.uuid4().hex,
-            # `iat` lets the user-level revocation check
-            # (TokenBlacklist.is_revoked_by_user_logout_all) compare
-            # this token's age against the user's most recent
-            # /auth/logout-all timestamp. Without iat, a download
-            # token would be falsely revoked for 8 days after any
-            # logout-all (default of payload.get("iat", 0) makes
-            # 0 <= revoke_time always true).
-            "iat": _now,
-            "exp": _now + 60,  # 60 second expiry
-        },
-        app_settings.SECRET_KEY,
-        algorithm="HS256",
-    )
+    # Shared mint helper (also used by worker delivery). Claims: sub/job_id/
+    # purpose/aud/iss/jti/iat/exp. iat lets the logout-all revocation check
+    # compare the token's age against the user's most recent /auth/logout-all.
+    from src.api.download_tokens import mint_download_token
+    download_token = mint_download_token(str(user.id), job_id, ttl_seconds=60)
 
     return {"url": f"/jobs/{job_id}/download?token={download_token}"}
 

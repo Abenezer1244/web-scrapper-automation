@@ -248,8 +248,17 @@ class DataExporter:
         Returns:
             HTTPS download URL.
         """
-        if settings.R2_PUBLIC_URL:
+        # Public-URL path requires an EXPLICIT opt-in (R2_ALLOW_PUBLIC_URLS).
+        # Exports contain seller PII; a stray R2_PUBLIC_URL must not silently
+        # hand out permanent unauthenticated links. Without the flag we fall
+        # through to the presigned/streamed path below.
+        if settings.R2_PUBLIC_URL and settings.R2_ALLOW_PUBLIC_URLS:
             return f"{settings.R2_PUBLIC_URL}/{object_key}"
+        if settings.R2_PUBLIC_URL and not settings.R2_ALLOW_PUBLIC_URLS:
+            _logger.warning(
+                "R2_PUBLIC_URL is set but R2_ALLOW_PUBLIC_URLS is false — "
+                "ignoring it and using presigned URLs (export PII safety)."
+            )
 
         # S3-compatible presigned URL via boto3 against the R2 S3 endpoint.
         # This is the active production path on Railway (R2_ENDPOINT_URL +

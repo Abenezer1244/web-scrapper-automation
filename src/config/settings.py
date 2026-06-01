@@ -43,9 +43,10 @@ class Settings(BaseSettings):
     # ─── Cloudflare R2 ────────────────────────────────────────────────────────
     # Two ways to talk to R2 are supported, in priority order from
     # data_exporter.get_download_url():
-    #   1. R2_PUBLIC_URL: if set, exports are returned as direct public
-    #      URLs (no presigning). Cheapest path; only safe if the bucket
-    #      itself is configured for public read.
+    #   1. R2_PUBLIC_URL: if set AND R2_ALLOW_PUBLIC_URLS=true, exports are
+    #      returned as direct public URLs (no presigning, no expiry). Exports
+    #      contain seller PII, so this is OFF unless BOTH are set — a single
+    #      stray R2_PUBLIC_URL must not silently make the bucket world-linkable.
     #   2. R2_ENDPOINT_URL + R2_ACCESS_KEY_ID + R2_SECRET_ACCESS_KEY:
     #      S3-compatible presigning via boto3. THIS IS THE PRODUCTION
     #      PATH today on Railway — do not delete it as "legacy" without
@@ -59,6 +60,10 @@ class Settings(BaseSettings):
     R2_API_TOKEN: str = ""              # Cloudflare API token with Workers R2 Storage Edit
     R2_BUCKET_NAME: str = "bridgeleads-exports"
     R2_PUBLIC_URL: str = ""
+    # Explicit opt-in for the public-URL path above. Default False so exports
+    # stay behind presigned/streamed URLs (PII). Only set true if the bucket is
+    # deliberately public-read AND that's acceptable for the data.
+    R2_ALLOW_PUBLIC_URLS: bool = False
 
     # ─── Stripe ───────────────────────────────────────────────────────────────
     STRIPE_SECRET_KEY: str = ""

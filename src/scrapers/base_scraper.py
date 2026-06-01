@@ -7,7 +7,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-import requests
 from bs4 import BeautifulSoup
 from playwright.async_api import (
     Browser,
@@ -20,6 +19,7 @@ from playwright.async_api import (
 from src.api.middleware.security import validate_scraping_target
 from src.config import settings
 from src.utils.logger import setup_logger
+from src.utils.safe_http import safe_get
 
 _logger = setup_logger("scraper.base")
 
@@ -175,8 +175,15 @@ class BridgeScraper:
     # ─── Core navigation ──────────────────────────────────────────────────────
 
     async def navigate(self, url: str, wait_until: str = "domcontentloaded") -> None:
-        """Navigate to a URL. Validates against SSRF allowlist before any request."""
-        validate_scraping_target(url)
+        """Navigate to a URL. Validates against SSRF allowlist before any request.
+
+        ``resolve=True`` adds a DNS-rebinding check (rejects a host that
+        resolves to a private/metadata IP). NOTE: validation covers the
+        initial and final URLs; an intermediate redirect hop through a
+        blocked host is not intercepted — a tracked residual, low risk
+        because navigation targets are built from allowlisted county hosts.
+        """
+        validate_scraping_target(url, resolve=True)
 
         for attempt in range(1, settings.MAX_RETRIES + 1):
             try:
@@ -196,7 +203,7 @@ class BridgeScraper:
                 final_url = response.url if response else self.page.url
                 if final_url and final_url != url:
                     try:
-                        validate_scraping_target(final_url)
+                        validate_scraping_target(final_url, resolve=True)
                     except ValueError as ssrf_exc:
                         _logger.error(
                             "SSRF: redirect from %s landed on disallowed target %s",
@@ -217,6 +224,42 @@ class BridgeScraper:
                     raise
                 await asyncio.sleep(2 ** attempt)  # exponential backoff
 
+    async def safe_goto(
+        self,
+        url: str,
+        *,
+        wait_until: str = "domcontentloaded",
+        timeout_ms: int = 15_000,
+    ):
+        """SSRF-guarded ``page.goto`` for templates that can't use ``navigate()``.
+
+        Some portals require a raw single-shot goto (e.g. King's reCAPTCHA
+        flow, where ``navigate()``'s retry loop would re-trip the captcha).
+        This validates the target (with DNS resolution) before navigating and
+        re-validates the final landing URL after redirects. Same residual as
+        ``navigate()``: intermediate redirect hops are not intercepted.
+        Returns the goto response.
+        """
+        validate_scraping_target(url, resolve=True)
+        response = await self.page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+        final_url = response.url if response else self.page.url
+        if final_url and final_url != url:
+            try:
+                validate_scraping_target(final_url, resolve=True)
+            except ValueError as ssrf_exc:
+                _logger.error(
+                    "SSRF: redirect from %s landed on disallowed target %s",
+                    url, final_url,
+                )
+                try:
+                    await self.page.goto("about:blank", timeout=5000)
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"Navigation redirected to disallowed target: {ssrf_exc}"
+                ) from ssrf_exc
+        return response
+
     async def get_soup_async(self) -> BeautifulSoup:
         """Return a BeautifulSoup parse of the current page content."""
         if not self.page:
@@ -234,9 +277,16 @@ class BridgeScraper:
             'static' if requests.get returns the expected content,
             'playwright' otherwise.
         """
-        validate_scraping_target(url)
         try:
-            resp = requests.get(url, timeout=10, headers={"User-Agent": "BridgeLeads-Probe/1.0"})
+            # safe_get validates (resolve=True, allowlisted), disables
+            # redirects, and uses a no-ambient-proxy session. A redirecting or
+            # blocked probe raises/falls through to playwright (safe default).
+            resp = safe_get(
+                url,
+                require_allowlisted=True,
+                headers={"User-Agent": "BridgeLeads-Probe/1.0"},
+                timeout=10,
+            )
             if resp.status_code == 200 and len(resp.text) > 500:
                 return "static"
         except Exception as exc:

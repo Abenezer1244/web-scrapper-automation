@@ -1,38 +1,38 @@
-# Chelan County — Fix scraping + add all 6 record types
+# Plan: SSRF scraper cluster (HIGH-3, HIGH-4, HIGH-5) + scraper-side DNS resolution
 
-**Date:** 2026-04-11 (session 4)
-**Goal:** Make Chelan's AcclaimWeb portal fully working and wire up all viable record types.
+**Date:** 2026-06-01
+**Driver:** `docs/security/REVIEW-2026-06-01.md` HIGH-3/4/5 + the deferred scraper-side
+half of HIGH-1 (DNS rebinding). User approved bundling scraper-side `resolve=True` here.
+**Rule:** brainstorm → Codex partner → implement → verify (don't break live scrapes) →
+Codex review. Max 5 files per sub-phase.
 
-## Known issues from probe
+## Verified site map
+- **HIGH-5 (8 `page.goto` bypasses):** eagleweb:156, king_wa_probate:444 (reCAPTCHA last-resort),
+  king_county_assessor:109, whatcom_wa:137, acclaimweb:136+311, ava_fidlar:329, landmarkweb:170
+- **HIGH-3:** eagleweb:750 `_requests.get(detail_href, cookies=...)` — scraped URL + cookie forwarding
+- **HIGH-4:** county_gis:161/201/431 `requests.get(endpoint)` (endpoint = DB `gis_endpoint`);
+  validate `gis_endpoint` at connector creation (scrapers route + schema). (236/513 use a
+  constant `_WA_STATEWIDE_ENDPOINT` — safe.)
+- **Out of scope (constant URLs):** king_wa_code_violation:67, king_wa_tax_delinquent:66,
+  pierce_wa_code_violation:75, national:57 — fixed third-party endpoints, not DB/scraped.
 
-1. `#RecordDate` single-date field ignores `press_sequentially` — DatePicker widget swallows keystrokes, value stays stale. Fix: force-set via JS eval + trigger change event as fallback.
-2. AcclaimWebScraper missing `record_type: str | None = None` kwarg (Phase A only fixed EagleWeb + TylerSelfService). Chelan gets mixed types until this is added.
-3. Results table is plain HTML (not Kendo grid) — needs the header-aware fallback path (commit `67b66cd`). The fallback exists but may not be triggering for Chelan's specific table structure. Need to debug.
+## Sub-phases (each ≤5 files, verify + Codex review between)
+- [ ] **2a — Foundation:** `base_scraper.py` — `resolve=True` on `navigate()` + `probe()`
+  (+ `probe` no-redirect + Location recheck); add `safe_goto(url, wait_until, timeout_ms)`
+  (validate resolve=True → goto → redirect recheck) and `safe_get(url, *, same_host_as=None,
+  cookies, headers, timeout)` (validate resolve=True → no-redirect → optional host match).
+  Tests. **Foundation everything else reuses.**
+- [ ] **2b — HIGH-5 (eagleweb/king group) + HIGH-3:** eagleweb (goto:156 → safe_goto;
+  detail-href:750 → safe_get(same_host_as=base_url)), king_wa_probate (guard goto:444),
+  king_county_assessor (goto:109), whatcom_wa (goto:137). [4 files]
+- [ ] **2c — HIGH-5 remainder:** acclaimweb (136,311), ava_fidlar (329), landmarkweb (170). [3 files]
+- [ ] **2d — HIGH-4:** county_gis (validate endpoint via safe_get), scrapers route
+  (validate `gis_endpoint` at creation like `base_url`), schemas (structural). [3 files]
 
-## Phase 1 — Fix base scraping
-
-- [ ] 1. Add JS fallback to `_fill_dates` in `acclaimweb.py`: after typing, verify value via `get_attribute("value")`; if wrong, force-set via `el.value = X; el.dispatchEvent(new Event('change'))`
-- [ ] 2. Add `record_type: str | None = None` kwarg to `AcclaimWebScraper.__init__` (same pattern as EagleWeb Phase A)
-- [ ] 3. Use `self.active_record_type` in the extraction filter (if AcclaimWeb has one — check)
-- [ ] 4. Probe Chelan probate (14-day window) — target: > 0 records with party data
-
-## Phase 2 — Test each record type (1 by 1)
-
-For each type: probe 30-day, check for > 0 records, document what doc_type labels appear.
-
-- [ ] 1. **probate** — Death Certificate, Personal Representative Deed, Will, Transfer on Death, Affidavit of Heirship
-- [ ] 2. **pre_foreclosure** — Notice of Trustee Sale, Lis Pendens, Notice of Default
-- [ ] 3. **tax_delinquent** — Tax Lien, Certificate of Delinquency (may be blocked by RCW 42.56.070(8))
-- [ ] 4. **divorce** — Decree of Dissolution (county recorder only, court records blocked)
-- [ ] 5. **code_violation** — unlikely on recorder portal (municipal source), document if absent
-- [ ] 6. **eviction** — court records, blocked at source (LINX/Odyssey), document
-
-## Phase 3 — Wire up + promote
-
-- [ ] 1. Update Chelan's `record_types` in DB to include all verified types
-- [ ] 2. Promote Chelan to `health_status=healthy` if probate + at least 1 other type works
-- [ ] 3. Commit + push (backend auto-deploys to Railway, frontend already marks "In progress" counties dynamically)
-- [ ] 4. Verify live API shows Chelan as healthy with updated types
+## Verification
+- Each sub-phase: targeted tests + `ruff` + Codex review of the diff.
+- Confirm `resolve=True` doesn't break a real scrape (run one live county scrape after 2a/2b).
+- Two clean Codex passes before marking the cluster done in REVIEW-2026-06-01.md.
 
 ## Review
-(Fill in after execution)
+_(filled in after execution)_

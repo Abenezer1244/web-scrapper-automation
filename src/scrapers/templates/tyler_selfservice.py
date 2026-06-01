@@ -201,7 +201,8 @@ class TylerSelfServiceScraper(BridgeScraper):
             await self.page.wait_for_selector("li.ss-search-row", timeout=15_000)
         except Exception:
             page_text = (await self.page.inner_text("body"))[:500]
-            _logger.warning("No result rows appeared. Body starts: %s", page_text)
+            _logger.warning("No result rows appeared for Tyler search")
+            _logger.debug("Body starts: %s", page_text)  # scraped body may contain PII
             return []
         await self.page.wait_for_timeout(2_000)
 

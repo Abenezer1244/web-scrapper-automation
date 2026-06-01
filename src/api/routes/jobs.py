@@ -44,7 +44,10 @@ async def list_jobs(
     config_map: dict[str, ScraperConfig] = {}
     if config_ids:
         configs_result = await db.execute(
-            select(ScraperConfig).where(ScraperConfig.id.in_(config_ids))
+            select(ScraperConfig).where(
+                ScraperConfig.id.in_(config_ids),
+                ScraperConfig.user_id == current_user.id,  # defense-in-depth owner filter
+            )
         )
         config_map = {str(c.id): c for c in configs_result.scalars().all()}
 
@@ -221,7 +224,10 @@ async def get_results(
 
     # Look up the scraper config to get the date_range_mode
     config_result = await db.execute(
-        select(ScraperConfig).where(ScraperConfig.id == job.scraper_config_id)
+        select(ScraperConfig).where(
+            ScraperConfig.id == job.scraper_config_id,
+            ScraperConfig.user_id == current_user.id,  # defense-in-depth owner filter
+        )
     )
     config = config_result.scalar_one_or_none()
     from typing import cast

@@ -404,7 +404,7 @@ class LandmarkWebScraper(BridgeScraper):
                     _logger.info("No results found on this page")
                 else:
                     _logger.warning("Could not extract results from grid")
-                    _logger.info("Page text (300): %s", page_text[:300].replace('\n', ' '))
+                    _logger.debug("Page text (300): %s", page_text[:300].replace('\n', ' '))
                 return []
 
             for item in raw:

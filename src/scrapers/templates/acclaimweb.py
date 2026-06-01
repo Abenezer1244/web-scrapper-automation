@@ -214,7 +214,7 @@ class AcclaimWebScraper(BridgeScraper):
 
         try:
             body_text = await self.page.inner_text("body")
-            _logger.info("Page text (first 500): %s", body_text[:500].replace('\n', ' '))
+            _logger.debug("Page text (first 500): %s", body_text[:500].replace('\n', ' '))
 
             # Strategy 1: Checkbox-based disclaimer (Chelan pattern)
             # Some AcclaimWeb sites use a checkbox labeled "Accept Disclaimer"
@@ -475,7 +475,7 @@ class AcclaimWebScraper(BridgeScraper):
             if btn_count == 0:
                 _logger.warning("No search button found!")
                 body = await self.page.inner_text("body")
-                _logger.info("Page body (500 chars): %s", body[:500].replace('\n', ' '))
+                _logger.debug("Page body (500 chars): %s", body[:500].replace('\n', ' '))
                 return
 
             await search_btn.first.click()
@@ -513,7 +513,7 @@ class AcclaimWebScraper(BridgeScraper):
             # Log page state after search
             body = await self.page.inner_text("body")
             _logger.info("After search URL: %s", self.page.url)
-            _logger.info("After search text (500): %s", body[:500].replace('\n', ' '))
+            _logger.debug("After search text (500): %s", body[:500].replace('\n', ' '))
 
         except Exception as exc:
             _logger.warning("Could not submit search: %s", str(exc)[:120])

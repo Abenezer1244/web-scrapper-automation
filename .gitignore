@@ -65,6 +65,10 @@ infra/terraform/.terraform.lock.hcl
 # Per-machine local settings file. Do NOT commit — it carries an
 # ANTHROPIC_API_KEY plus per-MCP bearer tokens by default.
 .claude/settings.local.json
+# Per-machine settings: wires claude-flow hooks to local-only helper scripts
+# (.claude/helpers/*.cjs|mjs) that are not tracked. Keep local to avoid
+# dangling hook references in the repo.
+.claude/settings.json
 tests/screenshots/
 .playwright-mcp/
 .playwright-cli/

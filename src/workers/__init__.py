@@ -19,7 +19,16 @@ app = Celery(
 )
 
 # Upstash Redis uses TLS (rediss://) — kombu needs explicit SSL config.
-# See settings.redis_kwargs() for the single-source SSL policy.
+#
+# Why the INT constant here, but the STRING "none" in settings.redis_kwargs():
+# the Celery/Kombu broker+backend path uses SYNC redis-py (kombu's redis
+# transport builds a redis.SSLConnection; Celery's result backend normalizes
+# both forms), and sync redis-py 5.2.1 accepts BOTH ssl.CERT_NONE and "none".
+# The direct app client uses redis.asyncio.from_url, whose RedisSSLContext
+# crashes on the int ("no attribute cert_reqs") — that's the prod outage
+# redis_kwargs() documents, and it does NOT apply to this sync worker path.
+# Do not "unify" these to the string without a live-broker smoke test; the int
+# is the form proven in production here. (Verified vs kombu 5.4 / redis-py 5.2.1.)
 if settings.REDIS_URL.startswith("rediss://"):
     _ssl_opts = {"ssl_cert_reqs": ssl.CERT_NONE}
     app.conf.broker_use_ssl = _ssl_opts

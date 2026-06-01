@@ -1,6 +1,7 @@
 """Playwright-only base scraper for all BridgeLeads county connectors."""
 
 import asyncio
+import functools
 import hashlib
 import json
 import re
@@ -127,6 +128,14 @@ class BridgeScraper:
             viewport={"width": 1280, "height": 800},
             locale="en-US",
         )
+        # Per-hop SSRF enforcement: validate every DOCUMENT navigation
+        # (initial load AND each redirect hop) BEFORE the request leaves the
+        # browser. Without this, validate_scraping_target only sees the
+        # initial and final URLs — a portal that 302s through an internal /
+        # metadata host would already have made that request by the time we
+        # re-check the landing URL. Aborting at the route layer closes that.
+        await self._context.route("**/*", self._ssrf_route_guard)
+
         self.page = await self._context.new_page()
 
         # Anti-headless-detection: override navigator.webdriver
@@ -174,14 +183,63 @@ class BridgeScraper:
 
     # ─── Core navigation ──────────────────────────────────────────────────────
 
+    async def _ssrf_route_guard(self, route) -> None:
+        """Abort document navigations to disallowed targets BEFORE the request.
+
+        Fires for every request in the context but only validates DOCUMENT
+        loads (the main page and each redirect hop) — the requests whose
+        responses we actually read. Main-frame documents must be on the scrape
+        allowlist; sub-frame documents (e.g. a reCAPTCHA iframe to google.com)
+        only need to clear the blocked-IP / DNS-rebinding checks, so legitimate
+        third-party frames keep working. Everything else passes straight
+        through. Non-HTTP(S) schemes (about:blank, data:) are not validated.
+
+        getaddrinfo is sync, so it runs in the default executor to avoid
+        blocking the event loop. The guard never raises — on any internal
+        error it falls through to continue() so it can't wedge a scrape.
+        """
+        request = route.request
+        try:
+            url = request.url
+            scheme = url.split(":", 1)[0].lower()
+            if request.resource_type == "document" and scheme in ("http", "https"):
+                try:
+                    is_subframe = request.frame.parent_frame is not None
+                except Exception:
+                    is_subframe = False
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        validate_scraping_target,
+                        url,
+                        require_allowlisted=not is_subframe,
+                        resolve=True,
+                    ),
+                )
+        except ValueError:
+            _logger.error("SSRF: aborted navigation to disallowed target %s", request.url)
+            try:
+                await route.abort("blockedbyclient")
+            except Exception:
+                pass
+            return
+        except Exception as exc:  # never let the guard itself wedge navigation
+            _logger.debug("SSRF route guard passthrough (%s): %s", request.url[:80], exc)
+        try:
+            await route.continue_()
+        except Exception:
+            pass
+
     async def navigate(self, url: str, wait_until: str = "domcontentloaded") -> None:
         """Navigate to a URL. Validates against SSRF allowlist before any request.
 
         ``resolve=True`` adds a DNS-rebinding check (rejects a host that
-        resolves to a private/metadata IP). NOTE: validation covers the
-        initial and final URLs; an intermediate redirect hop through a
-        blocked host is not intercepted — a tracked residual, low risk
-        because navigation targets are built from allowlisted county hosts.
+        resolves to a private/metadata IP). Intermediate redirect hops are
+        enforced per-hop by ``_ssrf_route_guard`` (registered on the context),
+        which aborts a disallowed document navigation before the request is
+        sent — so this check plus the guard cover initial, intermediate, and
+        final URLs.
         """
         validate_scraping_target(url, resolve=True)
 
@@ -236,8 +294,8 @@ class BridgeScraper:
         Some portals require a raw single-shot goto (e.g. King's reCAPTCHA
         flow, where ``navigate()``'s retry loop would re-trip the captcha).
         This validates the target (with DNS resolution) before navigating and
-        re-validates the final landing URL after redirects. Same residual as
-        ``navigate()``: intermediate redirect hops are not intercepted.
+        re-validates the final landing URL after redirects. Intermediate hops
+        are aborted pre-flight by ``_ssrf_route_guard`` on the context.
         Returns the goto response.
         """
         validate_scraping_target(url, resolve=True)

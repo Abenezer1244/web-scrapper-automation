@@ -19,6 +19,46 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-02 — SQL-injection audit (Claude × Codex): NO SQLi found; pivoted to DB role least-privilege cutover plan
+
+**Built / Shipped:**
+- Full SQLi audit of the FastAPI/SQLAlchemy/Supabase app on a user request ("search bar wiped the users table").
+  Traced every user-input→DB path. **Verdict: no SQL injection exists.** Everything is parameterized:
+  `text()` with `:named` binds throughout; search uses ORM `ilike(pattern, escape="\\")` (`jobs.py:241`) and
+  static clause-strings with `:q`/`:kw_n` binds (`scrapers.py:477-532`, plus `sanitize_search()`); the f-string
+  INSERT in `tasks.py:463` interpolates only placeholder *tokens* (data → `params`); alembic/scripts f-strings
+  use hardcoded constants only; advisory-lock f-string is a guaranteed `int(md5,16)`. No psycopg/asyncpg raw
+  cursor, no `from_statement`/`literal_column` w/ user data, no dynamic `order_by`/column injection.
+- **Codex independently CONFIRMED** "no SQLi" (read the files itself; also noted `billing.py:58` — `days` bound,
+  int 1-365, safe). Codex then sharpened the real fix (below). Cross-confirmation per codex-collaboration rule.
+- **Real risk = over-privileged role,** not injection: prod connects as a `BYPASSRLS` role (matches today's
+  earlier journal entry + the RLS_ENFORCE landmine). Authored a staged least-privilege cutover:
+  `tasks/rls-cutover-todo.md` + `docs/security/RLS-CUTOVER-RUNBOOK.md` + Phase-0 `scripts/provision_rls_roles.sql`.
+
+**Tried / Decided:** Three-role model (Codex's refinement of my single-restricted-role idea): `bridgeleads_owner`
+(DDL/alembic), `bridgeleads_app` (API: SELECT/INSERT/UPDATE, **no DELETE** — user deletes are soft:
+`jobs.status='cancelled'`, `scraper_configs.active=false`), `bridgeleads_system` (workers: + DELETE on
+`county_records` only, the lone physical delete at `scheduler.py:521`). Rejected blanket-DELETE app role.
+
+**Caught & fixed:** Self-review of the Phase-0 SQL (Codex was rate-limited) caught a missing grant: the API
+**writes** `county_connectors` via `POST /connectors` (`scrapers.py:313`). SELECT-only would have permission-
+denied at Phase 4 — changed to **SELECT + INSERT** on that table.
+
+**Failed / Blocked:** Codex CLI hit its usage limit mid-session (resets ~3:25 PM local) → the Phase-0 Codex
+review gate is DEFERRED, must run before Phase 3 repoints connections. Did NOT fabricate any SQLi "fix" — there
+was nothing to fix; reported that honestly instead.
+
+**Pending / Handoff:** Phases 1-4 await user approval (per phased-execution rule). Open Qs answered: custom roles
+OK; API uses `DATABASE_URL` / workers+alembic share `DATABASE_URL_SYNC` (`alembic/env.py:15`) → Phase 3 adds
+`DATABASE_URL_MIGRATE` for the owner role. Phase 1 is the load-bearing code change (per-transaction GUC reapply
+so `app.current_user_id` survives the mid-task commit; else NOBYPASSRLS breaks `run_scrape_job`).
+
+**Facts learned:** This codebase is genuinely hardened against SQLi (8 prior red-team rounds show). The tenancy
+boundary today is the app-layer `WHERE user_id` filter, NOT RLS — because the role bypasses RLS. The cutover is
+what makes RLS actually load-bearing. `FORCE ROW LEVEL SECURITY` must be the very last step.
+
+---
+
 ## 2026-06-02 — CRITICAL: Supabase `rls_disabled_in_public` (county_records PII) — live-fixed + Codex-verified
 
 **Built / Shipped:**

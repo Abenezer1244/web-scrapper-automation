@@ -109,7 +109,16 @@ def _bootstrap_ssrf_allowlist(sender=None, **_kwargs) -> None:
     try:
         from src.db.session import check_rls_role_status
         check_rls_role_status()
-    except Exception as exc:  # noqa: BLE001 — defensive
+    except RuntimeError:
+        # REDTEAM HIGH T2 (Codex convergence P1): production fail-closed. A
+        # BYPASSRLS/superuser runtime role makes the 025 WITH CHECK policies
+        # (and all RLS) inert. check_rls_role_status raises ONLY in that
+        # production case — let it propagate so the WORKER refuses to boot too
+        # (the API lifespan already does), instead of silently running
+        # tenant-unsafe with RLS effectively off. The previous bare
+        # `except Exception` swallowed exactly this guard.
+        raise
+    except Exception as exc:  # noqa: BLE001 — other (advisory) errors must not wedge boot
         logging.getLogger("worker.bootstrap").warning(
             "RLS advisory check skipped at worker boot: %s", exc
         )

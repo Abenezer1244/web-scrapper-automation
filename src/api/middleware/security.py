@@ -367,28 +367,39 @@ def register_connector_domains_from_db() -> int:
 # ─── CSV / Formula Injection Prevention ──────────────────────────────────────
 
 _FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
+# Characters a spreadsheet strips from the front of a cell as quoting BEFORE
+# it evaluates the contents. A value like `"=HYPERLINK(...)` (leading double
+# quote) passes a naive first-char check yet still executes as a formula once
+# Excel/Sheets unwrap the quote. (E1)
+_WRAPPING_QUOTES = "'\"`"
 
 
 def sanitize_for_csv(value: str | None) -> str:
-    """Prevent CSV formula injection (Excel/Sheets formula execution).
+    """Prevent CSV/spreadsheet formula injection (Excel/Sheets formula execution).
 
-    Prefixes any cell value starting with =, +, -, @, TAB, CR, or LF with a
-    single quote so spreadsheet applications treat it as plain text.
+    Prefixes any cell value that resolves to a formula trigger (=, +, -, @,
+    TAB, CR, LF) with a single quote so spreadsheet applications treat it as
+    plain text.
 
-    The prefix check runs on the RAW value BEFORE clean_text() — clean_text
-    replaces CR/LF with spaces and strips leading whitespace, so checking
-    after it would never see a leading TAB/CR/LF and those prefixes would be
-    silently un-neutralized. Non-str inputs (dates, numbers) are coerced.
+    Three checks, because the spreadsheet sees a different string than Python:
+    - RAW value (before clean_text) — catches a leading TAB/CR/LF that
+      clean_text would strip away;
+    - CLEANED value — catches leading whitespace like " \t=cmd";
+    - DE-QUOTED probe — strips leading whitespace AND wrapping quote chars,
+      catching `"=cmd` / `'=cmd` / `""=cmd` that the spreadsheet unwraps to a
+      live formula. Checking only the first character leaves this bypass open.
+    Non-str inputs (dates, numbers) are coerced.
     """
     if value is None:
         return ""
     raw = str(value)
     cleaned = clean_text(raw)
-    # Quote if the RAW value leads with a dangerous char (catches leading
-    # TAB/CR/LF that clean_text would strip) OR if the CLEANED value does
-    # (catches leading whitespace like " \t=cmd" that clean_text strips to
-    # reveal a formula char). Checking only one side leaves a bypass.
-    needs_quote = raw.startswith(_FORMULA_PREFIXES) or cleaned.startswith(_FORMULA_PREFIXES)
+    probe = cleaned.lstrip().lstrip(_WRAPPING_QUOTES).lstrip()
+    needs_quote = (
+        raw.startswith(_FORMULA_PREFIXES)
+        or cleaned.startswith(_FORMULA_PREFIXES)
+        or probe.startswith(_FORMULA_PREFIXES)
+    )
     return ("'" + cleaned) if needs_quote else cleaned
 
 
@@ -406,7 +417,11 @@ def clean_text(text: str | None) -> str:
     if text is None:
         return ""
     text = _CONTROL_CHAR_RE.sub("", text)
-    text = text.replace("\n", " ").replace("\r", " ")
+    # E3: replace TAB along with CR/LF. _CONTROL_CHAR_RE deliberately keeps
+    # \t, but an embedded TAB acts as a column delimiter on TSV import /
+    # copy-paste, splitting "123 Main\t=cmd" into a new cell that begins with
+    # "=" and evaluates — a formula injection the leading-char check misses.
+    text = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
     return text.strip()
 
 

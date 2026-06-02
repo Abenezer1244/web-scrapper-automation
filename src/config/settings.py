@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     # ─── Database ─────────────────────────────────────────────────────────────
     DATABASE_URL: str
     DATABASE_URL_SYNC: str
+    # HIGH-2: dedicated sync URL for cross-tenant worker work (system_sync_session).
+    # Empty = use DATABASE_URL_SYNC (no-op until the bridgeleads_system role is
+    # provisioned and the RLS cutover happens — see docs/security/HIGH-2-*).
+    DATABASE_URL_SYSTEM: str = ""
 
     # ─── Redis ────────────────────────────────────────────────────────────────
     REDIS_URL: str

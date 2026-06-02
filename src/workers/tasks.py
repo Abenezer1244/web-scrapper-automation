@@ -1162,10 +1162,11 @@ def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: st
         # Look up the last completed job for this scraper config and use
         # its date range end as our start. If no previous job exists,
         # fall back to 30 days (not 90 — avoids massive duplicate sets).
+        from sqlalchemy import select
         from src.db.models import Job
-        from src.db.session import SyncSessionLocal
+        from src.db.session import system_sync_session
         try:
-            with SyncSessionLocal() as _db:
+            with system_sync_session() as _db:  # HIGH-2: cross-tenant jobs read -> system role
                 last_job = _db.execute(
                     select(Job).where(
                         Job.scraper_config_id == config_id,

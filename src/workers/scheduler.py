@@ -76,14 +76,14 @@ def dispatch_scheduled_jobs() -> None:
     from sqlalchemy import select
 
     from src.db.models import Job, ScraperConfig, User
-    from src.db.session import SyncSessionLocal
+    from src.db.session import system_sync_session  # HIGH-2: cross-tenant -> system role
     from src.workers.tasks import run_scrape_job
 
     now = datetime.now(UTC)
     enqueued = 0
     skipped_limit = 0
 
-    with SyncSessionLocal() as db:
+    with system_sync_session() as db:  # HIGH-2: cross-tenant (configs/users/jobs) -> system role
         configs = db.execute(
             select(ScraperConfig).where(ScraperConfig.active)
         ).scalars().all()
@@ -526,7 +526,7 @@ def send_onboarding_emails() -> None:
     from sqlalchemy import select
 
     from src.db.models import Job, ScraperConfig, User
-    from src.db.session import SyncSessionLocal
+    from src.db.session import system_sync_session  # HIGH-2: cross-tenant -> system role
     from src.workers.onboarding_emails import (
         send_activation_reminder,
         send_day1_nudge,
@@ -538,7 +538,7 @@ def send_onboarding_emails() -> None:
     day3_sent = 0
     expiry_sent = 0
 
-    with SyncSessionLocal() as db:
+    with system_sync_session() as db:  # HIGH-2: cross-tenant (users/configs/jobs) -> system role
         users = db.execute(
             select(User).where(User.is_active, User.trial_ends_at.isnot(None))
         ).scalars().all()

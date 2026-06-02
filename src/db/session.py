@@ -1,10 +1,10 @@
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import NullPool, QueuePool
+from sqlalchemy.pool import NullPool
 
 from src.config import settings
 
@@ -73,6 +73,42 @@ SyncSessionLocal = sessionmaker(
     expire_on_commit=False,
 )
 
+# HIGH-2: a SEPARATE engine for cross-tenant system work, connecting as the
+# dedicated `bridgeleads_system` role (which the RLS policies' `OR current_user
+# = 'bridgeleads_system'` escape permits). Until DATABASE_URL_SYSTEM is set this
+# reuses the app sync URL, so behavior is unchanged until the RLS cutover.
+_system_url = (settings.DATABASE_URL_SYSTEM or settings.DATABASE_URL_SYNC).replace(":5432/", ":6543/")
+system_engine = create_engine(
+    _system_url,
+    pool_pre_ping=True,
+    pool_recycle=300,
+    pool_size=2,
+    max_overflow=3,
+    pool_timeout=30,
+    echo=settings.DEBUG,
+    connect_args={"connect_timeout": 10, "options": "-c statement_timeout=120000"},
+)
+
+SystemSessionLocal = sessionmaker(system_engine, expire_on_commit=False)
+
+
+@event.listens_for(SyncSessionLocal, "after_begin")
+def _reapply_rls_user(session: Session, transaction, connection) -> None:
+    """Re-apply app.current_user_id on EVERY transaction begin.
+
+    HIGH-2: `set_config(..., true)` is transaction-local, so it dies on commit().
+    Worker code commits inside `rls_sync_session()` blocks, so a one-time SET at
+    open would leave later queries context-less (and fail closed once FORCE RLS
+    is on). Binding the uid to session.info and re-applying here means every
+    transaction in the block carries the RLS context. No-op for sessions that
+    don't set rls_user_id (system_sync_session, plain get_sync_db).
+    """
+    uid = session.info.get("rls_user_id")
+    if uid:
+        connection.execute(
+            text("SELECT set_config('app.current_user_id', :uid, true)"), {"uid": uid}
+        )
+
 
 def get_sync_db() -> Session:
     """Returns a synchronous database session for Celery workers.
@@ -119,6 +155,10 @@ def rls_sync_session(user_id: str) -> Iterator[Session]:
     not have to change shape.
     """
     session = SyncSessionLocal()
+    # Bind the uid so the `after_begin` listener re-applies it on every
+    # transaction in this block (survives mid-block commits — HIGH-2). Also set
+    # it now for the implicit transaction the first query opens.
+    session.info["rls_user_id"] = str(user_id)
     try:
         session.execute(
             text("SELECT set_config('app.current_user_id', :uid, true)"),
@@ -142,8 +182,14 @@ def system_sync_session() -> Iterator[Session]:
     Do NOT use this for per-user work. Grep for this function name
     in code review — anything inside its `with` block that touches
     a user-scoped table should have a very good reason.
+
+    HIGH-2: connects via the system engine (the `bridgeleads_system` role once
+    the cutover happens), which the RLS policies' system-role escape permits —
+    so this keeps working across tenants after FORCE RLS is enabled. Sets no
+    app.current_user_id (the role IS the authorization), which also lets the
+    county_records trigger — that blocks writes when the GUC is set — pass.
     """
-    session = SyncSessionLocal()
+    session = SystemSessionLocal()
     try:
         yield session
     finally:

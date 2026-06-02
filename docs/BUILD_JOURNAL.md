@@ -73,7 +73,7 @@ to understand *why* the code is the way it is and *what's been attempted before*
   `.gitignore` missing root scratch paths.
 
 **Pending / Handoff (user/ops):**
-- Rotate `KingDemo!2026` on the King County portal (local files already deleted).
+- Rotate `the King E2E portal password [REDACTED]` on the King County portal (local files already deleted).
 - HIGH-2 cutover: provision `bridgeleads_app`/`bridgeleads_system` non-owner `NOBYPASSRLS` roles,
   switch all 3 DB URLs, extend `tests/test_rls_isolation.py` to 10 tables, `FORCE` last on staging
   → promote. Runbook: `docs/security/high-2-cutover-runbook.sql`.

@@ -287,6 +287,12 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
 
     from src.db.models import SkipTraceMeterEvent
 
+    # ORDER BY user_id (Codex review): report_lookups_for_user takes a
+    # SELECT ... FOR UPDATE lock on each user row and the outbox change keeps it
+    # held until the caller's single commit. Two concurrent webhooks whose
+    # batches share users could otherwise lock them in opposite orders (U1→U2
+    # vs U2→U1) and deadlock. Taking the locks in a deterministic ascending
+    # user_id order across all batches makes a deadlock impossible.
     rows = db.execute(
         text("""
             SELECT user_id, COUNT(*) as n
@@ -294,6 +300,7 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
             WHERE tracerfy_queue_id = :qid
               AND status = 'completed'
             GROUP BY user_id
+            ORDER BY user_id
         """),
         {"qid": queue_id},
     ).fetchall()

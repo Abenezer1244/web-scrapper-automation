@@ -19,6 +19,41 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-02 — CRITICAL: Supabase `rls_disabled_in_public` (county_records PII) — live-fixed + Codex-verified
+
+**Built / Shipped:**
+- Supabase advisor flagged CRITICAL "Table publicly accessible — RLS not enabled." Different surface from the
+  red-team (which audited the FastAPI app): this is Supabase's auto-exposed PostgREST API (anon key in the
+  frontend) where **RLS is the only guard**. A `public` table without RLS is readable/writable by anyone with
+  the project URL + anon key, bypassing the app.
+- **Live audit** (`scripts/check_rls_roles.py`, read-only): both app roles (`DATABASE_URL` async +
+  `DATABASE_URL_SYNC` sync) = `postgres`, `bypassrls=true`. Live, exactly ONE public table had RLS disabled:
+  **`county_records`** (3305 rows of scraped homeowner PII) — RLS was *explicitly* disabled in migration 023
+  (which relied on a write-trigger that does nothing against anon *reads*).
+- **Live hotfix applied** (`scripts/apply_rls_hotfix.py`): `ENABLE ROW LEVEL SECURITY` + a shared-read SELECT
+  policy on `county_records`. **Verified live by role impersonation:** `postgres`(BYPASSRLS)=3305 rows,
+  `anon`=0, `authenticated`=0 → exposure closed, app unaffected.
+- **Permanent migrations:** `027` (ENABLE RLS on the 5 anon-exposed app tables — idempotent, covers the new
+  `skip_trace_meter_events` once 026 deploys) + `028` (the county_records shared-read policy).
+- **Codex** consulted on the plan (consensus: enable RLS, no policy/FORCE = default-deny for anon, safe under
+  BYPASSRLS), then reviewed the build → caught a real **deadlock** (concurrent webhooks locking overlapping
+  users in opposite order in the meter outbox) → fixed with `ORDER BY user_id` deterministic locking.
+
+**Tried / Decided:** enable-RLS-no-policy (not FORCE) for the emergency lockout — default-deny stops anon while
+the BYPASSRLS app is untouched; FORCE/the WITH-CHECK enforcement belongs in the deferred HIGH-2 cutover. The
+county_records SELECT policy denies anon (never sets `app.current_user_id`) yet allows authenticated app
+sessions — forward-compat for the non-bypass cutover, inert today.
+
+**Facts learned:** the app connects as `postgres` (BYPASSRLS, not superuser) on both URLs. Supabase exposes a
+public PostgREST API guarded ONLY by RLS — every `public` table needs RLS even though the app never uses that
+API. `county_records` write-trigger ≠ read protection.
+
+**Pending:** `alembic upgrade head` (applies 025–028) on the next deploy; the live hotfix already covers the
+exposed table so prod is safe meanwhile. county_records *writes* under a future non-bypass role still need the
+HIGH-2 system-role handling.
+
+---
+
 ## 2026-06-01 — Claude × Codex adversarial red-team + remediation (branch `security/redteam-remediation-2026-06-01`)
 
 **Built / Shipped** (14 atomic commits on the branch; full register `docs/security/REDTEAM-2026-06-01.md`):

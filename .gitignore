@@ -122,3 +122,14 @@ scripts/.e2e*.json
 # Runtime artifacts
 .ruff_cache/
 .firecrawl/
+
+# Terraform local state + provider cache (never commit — contains binaries/state)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+
+# Scratch test outputs (exports, dumps, screenshots, logs)
+scripts/*.csv
+scripts/e2e_results.log
+scripts/e2e_screenshots/
+_diag_is_pro/

@@ -23,11 +23,54 @@ on the queueing change.
 """
 
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
 
+from src.config import settings
 from src.utils.logger import setup_logger
 from src.workers import app
 
 _logger = setup_logger("worker.tracerfy_ingest")
+
+
+def _host_is_tracerfy(download_url: str) -> bool:
+    """REDTEAM B1/T3: confirm a webhook-supplied download_url points at a
+    Tracerfy-owned host before we fetch it server-side.
+
+    The webhook body is shared-secret authenticated, but the secret is a
+    static URL path component — a leaked/guessed secret lets an attacker
+    POST an arbitrary download_url and have our worker fetch it (SSRF).
+    download_tracerfy_csv() already routes through safe_get_following
+    (blocks private/metadata IPs + validates every redirect hop), but it
+    deliberately allows ANY public host. Tracerfy delivers CSVs from its
+    own domain and its DigitalOcean Spaces CDN bucket, so we additionally
+    pin the host to those before trusting the URL.
+
+    Allowed:
+      - the configured TRACERFY_API_BASE_URL host (and its subdomains)
+      - DigitalOcean Spaces CDN buckets owned by Tracerfy
+        (e.g. tracerfy.nyc3.cdn.digitaloceanspaces.com)
+    """
+    try:
+        parts = urlsplit(download_url)
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https"):
+        return False
+    host = (parts.hostname or "").lower()
+    if not host:
+        return False
+
+    api_host = (urlsplit(settings.TRACERFY_API_BASE_URL).hostname or "").lower()
+    if api_host and (host == api_host or host.endswith("." + api_host)):
+        return True
+
+    # DigitalOcean Spaces CDN: bucket name is the leftmost label and must
+    # be Tracerfy's own bucket. Matches "<bucket>.<region>.cdn.digitalocean
+    # spaces.com" and "<bucket>.<region>.digitaloceanspaces.com".
+    if host.endswith(".digitaloceanspaces.com") and host.split(".", 1)[0] == "tracerfy":
+        return True
+
+    return False
 
 
 @app.task(
@@ -54,7 +97,7 @@ def ingest_tracerfy_batch(
     max_retries attempts the task gives up and the batch is marked
     errored on the SkipTraceQueue row so ops can see what happened.
     """
-    from sqlalchemy import and_, select, update
+    from sqlalchemy import select, update
 
     from src.db.models import (
         PendingSkipTraceRow,
@@ -69,6 +112,18 @@ def ingest_tracerfy_batch(
         download_tracerfy_csv,
         ingest_webhook_csv,
     )
+
+    # REDTEAM T3: refuse to fetch a forged/body-supplied download_url that
+    # does not point at a Tracerfy-owned host. Reject BEFORE any DB work or
+    # network fetch so a forged webhook is a cheap, logged no-op.
+    if not _host_is_tracerfy(download_url):
+        _logger.error(
+            "Refusing Tracerfy ingest for queue %d: download_url host not "
+            "Tracerfy-owned (host=%s)",
+            queue_id,
+            (urlsplit(download_url).hostname or "<none>"),
+        )
+        return {"queue_id": queue_id, "skipped": "untrusted_download_host"}
 
     try:
         csv_text = download_tracerfy_csv(download_url)
@@ -94,6 +149,39 @@ def ingest_tracerfy_batch(
     # trace_type, not user). This ingest path legitimately needs
     # to update Result rows across tenants.
     with system_sync_session() as db:
+        # REDTEAM B1: replay/idempotency guard. Lock the SkipTraceQueue row
+        # FOR UPDATE as the FIRST statement so the lock is held through the
+        # ingest + billing + status flip below, all inside this single
+        # transaction (committed once at db.commit()). Replaying a
+        # completed-batch webhook previously re-ran ingest and re-incremented
+        # skip_trace_used_this_month, double-billing the victim. Now a
+        # concurrent replay blocks on this lock, then sees status="completed"
+        # and no-ops; a serial replay sees it immediately. Missing row =
+        # unknown/forged queue id → refuse.
+        queue_row = (
+            db.execute(
+                select(SkipTraceQueue)
+                .where(SkipTraceQueue.tracerfy_queue_id == queue_id)
+                .with_for_update()
+            )
+            .scalars()
+            .first()
+        )
+        if queue_row is None:
+            _logger.warning(
+                "Tracerfy ingest queue %d: no SkipTraceQueue row — refusing "
+                "to process an unknown/forged batch id",
+                queue_id,
+            )
+            return {"queue_id": queue_id, "skipped": "unknown_queue"}
+        if queue_row.status in ("completed", "billed", "errored"):
+            _logger.info(
+                "Tracerfy ingest queue %d: already %s — idempotent no-op",
+                queue_id,
+                queue_row.status,
+            )
+            return {"queue_id": queue_id, "skipped": f"already_{queue_row.status}"}
+
         pending = (
             db.execute(
                 select(PendingSkipTraceRow)
@@ -190,24 +278,56 @@ def ingest_tracerfy_batch(
             )
         )
 
-        db.commit()
-
-        # Report Stripe metered billing for over-quota lookups
-        # (H11 + H12: stable identifier, commit-before-stripe)
+        # REDTEAM B1+B2: advance each user's skip-trace counter HERE, BEFORE
+        # the single db.commit() below, so the counter advance, the pending-
+        # row "completed" flips, and the SkipTraceQueue status="completed"
+        # flip all land in ONE transaction under the queue-row lock taken at
+        # the top of this block. This is the idempotency anchor: a replay of
+        # this batch finds status="completed" and no-ops before reaching this
+        # point, so the counter can never be re-advanced. report_usage_from_
+        # webhook no longer commits or calls Stripe — it returns the deferred
+        # Stripe MeterEvents for us to fire AFTER commit.
+        pending_meter_events: list[dict] = []
         try:
             from src.api.billing.skip_trace_usage import (
                 report_usage_from_webhook,
             )
             billing_summary = report_usage_from_webhook(db, queue_id)
+            pending_meter_events = billing_summary.get("pending_meter_events", [])
             _logger.info(
                 "Tracerfy ingest queue=%d: %d hits / %d misses / billing=%s",
                 queue_id, hit_count, miss_count, billing_summary,
             )
         except Exception as exc:  # noqa: BLE001 — defensive
+            # A billing-advance failure must roll back the whole ingest so we
+            # never mark the queue completed while leaving counters un-advanced
+            # (which a replay could then never correct). Re-raise to abort the
+            # transaction; Celery will retry, and the retry will re-process
+            # because the queue was never committed as completed.
             _logger.error(
-                "Stripe meter report failed for queue %d: %s",
+                "Skip-trace counter advance failed for queue %d: %s",
                 queue_id, str(exc)[:200],
             )
+            raise
+
+        # Single atomic commit: ingest + status flip + counter advances.
+        db.commit()
+
+    # REDTEAM B2 phase 2: fire the Stripe MeterEvents AFTER the commit and
+    # AFTER the session/lock is released. The counter is already durably
+    # advanced and the queue is marked completed, so a Stripe failure here is
+    # logged (not raised) and dedupes on retry via its stable (queue_id,
+    # user_id) identifier — it can never re-advance the counter.
+    if pending_meter_events:
+        from src.api.billing.skip_trace_usage import report_meter_event_to_stripe
+        for ev in pending_meter_events:
+            try:
+                report_meter_event_to_stripe(**ev)
+            except Exception as exc:  # noqa: BLE001 — defensive
+                _logger.error(
+                    "Stripe meter report failed for queue %d user %s: %s",
+                    queue_id, ev.get("user_id", "?")[:8], str(exc)[:200],
+                )
 
     return {
         "queue_id": queue_id,

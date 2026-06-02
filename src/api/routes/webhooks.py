@@ -25,7 +25,6 @@ matching `Result` rows by (address, city, state), and upsert phone/email.
 
 import hmac
 import secrets as _secrets
-from datetime import UTC, datetime
 
 from fastapi import APIRouter, HTTPException, Request, status
 
@@ -119,6 +118,39 @@ async def tracerfy_webhook(
         payload.get("rows_uploaded"),
         payload.get("credits_deducted"),
     )
+
+    # REDTEAM B1: edge dedup. Drop duplicate inbound deliveries of the same
+    # completed batch BEFORE we dispatch a Celery task, mirroring the Stripe
+    # webhook's SET NX EX idempotency in billing.py. The worker also has a
+    # DB-level replay guard (locks the SkipTraceQueue row and no-ops once it
+    # is "completed"), but this Redis claim is the cheap first line of
+    # defense: two near-simultaneous retries can't both enqueue an ingest.
+    # set(..., nx=True, ex=N) returns True on first write, None on conflict.
+    # TTL covers Tracerfy's redelivery window with margin. If Redis is
+    # unavailable we do NOT block the delivery — the worker's DB guard still
+    # makes re-processing idempotent — so a Redis error falls through to
+    # dispatch rather than dropping the batch.
+    import redis.asyncio as aioredis
+    redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+    try:
+        dedup_key = f"tracerfy_webhook:{queue_id}"
+        claimed = await redis.set(dedup_key, "1", nx=True, ex=86400)  # 1 day
+        if not claimed:
+            _logger.info(
+                "Tracerfy webhook dedup: already dispatched queue_id=%d", queue_id
+            )
+            return {"received": True, "queue_id": queue_id, "deduped": True}
+    except Exception as exc:  # noqa: BLE001 — Redis down must not drop the batch
+        _logger.warning(
+            "Tracerfy webhook dedup check failed (queue_id=%d): %s — "
+            "falling through to dispatch; worker DB guard stays idempotent",
+            queue_id, str(exc)[:120],
+        )
+    finally:
+        try:
+            await redis.aclose()
+        except Exception:  # noqa: BLE001 — best-effort close
+            pass
 
     # M8 (full-SaaS review): dispatch to Celery instead of
     # FastAPI BackgroundTasks. The previous BackgroundTask ran

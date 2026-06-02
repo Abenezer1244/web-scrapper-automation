@@ -7,10 +7,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
+from src.api.deps import get_rls_db
 from src.api.middleware import rate_limit
 from src.config import settings
 from src.db import User, get_db
-from src.api.deps import get_rls_db
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("billing")
@@ -310,22 +310,77 @@ _PRICE_TO_PLAN: dict[str, tuple[str, int]] = {
 
 # ─── Plans catalog ────────────────────────────────────────────────────────────
 
+_FOUNDING_COUPON_ID = "8mX1xa35"
+_FOUNDING_CACHE_KEY = "founding_offer:8mX1xa35"
+_FOUNDING_CACHE_TTL = 60  # seconds
+
+
+async def _get_founding_offer() -> dict:
+    """Return the founding-member offer status (cached).
+
+    REDTEAM B4: the founding coupon was retrieved from Stripe on EVERY hit of
+    the PUBLIC, unauthenticated /plans and /pricing endpoints, inside a bare
+    `except Exception: pass`. That meant (a) an unauthenticated visitor could
+    drive one synchronous Stripe API call per request (latency + a cheap DoS
+    amplifier against our Stripe rate limits), and (b) any error — including a
+    real Stripe outage — was silently swallowed. This caches the result in
+    Redis for ~60s and narrows the except to stripe.error.StripeError, logged
+    at warning. On any cache/Stripe failure we fall back to the offer being
+    inactive (fail-closed for a promo banner).
+    """
+    founding = {
+        "active": False, "code": "FOUNDING40", "percent_off": 40,
+        "spots_total": 25, "spots_remaining": 0,
+    }
+
+    import json
+
+    import redis.asyncio as aioredis
+    redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+    try:
+        cached = await redis.get(_FOUNDING_CACHE_KEY)
+        if cached is not None:
+            try:
+                return json.loads(cached)
+            except (ValueError, TypeError):
+                pass  # corrupt cache value — recompute below
+
+        try:
+            import stripe
+            stripe.api_key = settings.STRIPE_SECRET_KEY
+            coupon = stripe.Coupon.retrieve(_FOUNDING_COUPON_ID)
+            if coupon.valid:
+                redeemed = coupon.times_redeemed or 0
+                remaining = max(0, (coupon.max_redemptions or 25) - redeemed)
+                founding["active"] = remaining > 0
+                founding["spots_remaining"] = remaining
+        except stripe.error.StripeError as exc:
+            # Coupon may not exist, or Stripe is unreachable — offer inactive.
+            _logger.warning("founding coupon lookup failed: %s", str(exc)[:200])
+
+        # Cache whatever we computed (active or inactive) to absorb the next
+        # ~60s of public traffic without another Stripe round-trip.
+        try:
+            await redis.set(
+                _FOUNDING_CACHE_KEY, json.dumps(founding), ex=_FOUNDING_CACHE_TTL
+            )
+        except Exception as exc:  # noqa: BLE001 — caching is best-effort
+            _logger.warning("founding offer cache write failed: %s", str(exc)[:120])
+    except Exception as exc:  # noqa: BLE001 — Redis down must not 500 a public page
+        _logger.warning("founding offer cache unavailable: %s", str(exc)[:120])
+    finally:
+        try:
+            await redis.aclose()
+        except Exception:  # noqa: BLE001 — best-effort close
+            pass
+
+    return founding
+
+
 @router.get("/plans")
 async def list_plans() -> dict:
     """Return the full plan catalog + founding member offer status."""
-    # Check remaining founding member spots via Stripe coupon
-    founding = {"active": False, "code": "FOUNDING40", "percent_off": 40, "spots_total": 25, "spots_remaining": 0}
-    try:
-        import stripe
-        stripe.api_key = settings.STRIPE_SECRET_KEY
-        coupon = stripe.Coupon.retrieve("8mX1xa35")
-        if coupon.valid:
-            redeemed = coupon.times_redeemed or 0
-            remaining = max(0, (coupon.max_redemptions or 25) - redeemed)
-            founding["active"] = remaining > 0
-            founding["spots_remaining"] = remaining
-    except Exception:
-        pass  # Coupon may not exist, offer is inactive
+    founding = await _get_founding_offer()
     return {"plans": _PLANS, "founding_offer": founding}
 
 
@@ -335,19 +390,7 @@ async def pricing_page() -> dict:
 
     Public endpoint — no auth required. Used by the frontend pricing page.
     """
-    # Check founding member offer
-    founding = {"active": False, "code": "FOUNDING40", "percent_off": 40, "spots_total": 25, "spots_remaining": 0}
-    try:
-        import stripe
-        stripe.api_key = settings.STRIPE_SECRET_KEY
-        coupon = stripe.Coupon.retrieve("8mX1xa35")
-        if coupon.valid:
-            redeemed = coupon.times_redeemed or 0
-            remaining = max(0, (coupon.max_redemptions or 25) - redeemed)
-            founding["active"] = remaining > 0
-            founding["spots_remaining"] = remaining
-    except Exception:
-        pass
+    founding = await _get_founding_offer()
 
     return {
         "plans": _PLANS,
@@ -785,7 +828,16 @@ async def _handle_subscription_deleted(data: dict, db: AsyncSession) -> None:
 async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:
     """Send a payment failure notification email via Resend."""
     customer_id = data.get("customer")
-    attempt_count = data.get("attempt_count", 1)
+
+    # REDTEAM B3: clamp the webhook-supplied attempt_count before it flows
+    # into the email body / logs. Stripe normally sends a small integer, but
+    # the value is attacker-influenceable on a forged-but-replayed payload and
+    # was previously passed through unbounded. Coerce to int and bound to
+    # [1, 20]; anything non-numeric falls back to 1.
+    try:
+        attempt_count = max(1, min(int(data.get("attempt_count", 1)), 20))
+    except (TypeError, ValueError):
+        attempt_count = 1
 
     if not customer_id:
         return

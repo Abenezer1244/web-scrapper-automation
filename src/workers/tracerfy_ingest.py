@@ -41,22 +41,72 @@ _logger = setup_logger("worker.tracerfy_ingest")
     retry_backoff_max=600,
     retry_jitter=True,
 )
-def report_skip_trace_meter_event(self, **event) -> None:
-    """REDTEAM (Codex convergence): durably report ONE Stripe skip-trace
-    MeterEvent.
+def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
+    """REDTEAM (Codex convergence — meter outbox): durably report ONE Stripe
+    skip-trace MeterEvent from its outbox row.
 
-    Split out of ``ingest_tracerfy_batch`` so a Stripe/network failure RETRIES
-    instead of being swallowed. Previously the meter call ran inline after the
-    DB commit and only logged on failure — but the same committed transaction
-    already advanced the local usage counter AND marked the SkipTraceQueue
-    ``completed``, so the completed-status guard blocks any ingest replay. The
-    net effect was: usage consumed locally, MeterEvent lost, account
-    under-billed with no recovery. The MeterEvent carries a stable
-    ``(queue_id, user_id)`` identifier, so a retry is idempotent and never
-    double-bills. After ``max_retries`` the failure surfaces loudly for ops.
+    Driven entirely off the persisted ``skip_trace_meter_events`` outbox row
+    (by id) rather than in-memory kwargs, so an event survives broker-down /
+    worker-crash: report_usage_from_webhook commits the row in the same
+    transaction that advances the usage counter, and either this inline
+    enqueue or the ``flush_skip_trace_meter_outbox`` beat sweep delivers it.
+
+    Idempotency:
+      * if ``reported_at`` is already set, this is a no-op (a retry, a
+        duplicate enqueue, or a beat sweep racing the inline enqueue);
+      * the Stripe MeterEvent uses the STABLE ``skip_trace_q{queue}_u{user}``
+        identifier, so even a double-fire dedupes server-side.
+
+    Durability: a transient Stripe/network failure RAISES (it is no longer
+    swallowed), so ``autoretry_for=(Exception,)`` retries with backoff. A
+    terminal condition (Stripe not configured, no customer id, nothing to
+    bill) stamps ``reported_at`` and stops — no pointless retries. After
+    ``max_retries`` a real failure surfaces loudly for ops.
     """
-    from src.api.billing.skip_trace_usage import report_meter_event_to_stripe
-    report_meter_event_to_stripe(**event)
+    from datetime import UTC, datetime
+
+    from src.api.billing.skip_trace_usage import (
+        _StripeNotConfiguredError,
+        report_meter_event_to_stripe,
+    )
+    from src.db.models import SkipTraceMeterEvent
+    from src.db.session import system_sync_session
+
+    with system_sync_session() as db:
+        row = db.get(SkipTraceMeterEvent, outbox_id)
+        if row is None:
+            _logger.warning(
+                "Skip-trace meter outbox %s: row not found — nothing to report",
+                outbox_id,
+            )
+            return {"outbox_id": outbox_id, "skipped": "not_found"}
+        if row.reported_at is not None:
+            # Already reported by a prior attempt / the inline enqueue / a
+            # beat sweep. Idempotent no-op.
+            return {"outbox_id": outbox_id, "skipped": "already_reported"}
+
+        # Terminal no-ops (_StripeNotConfiguredError) still stamp reported_at so the
+        # row stops being swept; transient Stripe failures propagate to
+        # autoretry. The stable identifier inside makes any retry idempotent.
+        try:
+            report_meter_event_to_stripe(
+                user_id=str(row.user_id),
+                queue_id=row.tracerfy_queue_id,
+                billable_units=row.billable_units,
+                stripe_customer_id=row.stripe_customer_id,
+                plan=row.plan or "",
+            )
+        except _StripeNotConfiguredError as exc:
+            _logger.warning(
+                "Skip-trace meter outbox %s: terminal no-op (%s) — marking "
+                "reported to stop the sweep",
+                outbox_id, exc,
+            )
+
+        row.reported_at = datetime.now(UTC)
+        db.commit()
+
+    return {"outbox_id": outbox_id, "reported": True}
 
 
 def _host_is_tracerfy(download_url: str) -> bool:
@@ -312,15 +362,16 @@ def ingest_tracerfy_batch(
         # the top of this block. This is the idempotency anchor: a replay of
         # this batch finds status="completed" and no-ops before reaching this
         # point, so the counter can never be re-advanced. report_usage_from_
-        # webhook no longer commits or calls Stripe — it returns the deferred
-        # Stripe MeterEvents for us to fire AFTER commit.
-        pending_meter_events: list[dict] = []
+        # webhook no longer commits or calls Stripe — it INSERTs a durable
+        # SkipTraceMeterEvent outbox row per billable user into THIS same
+        # transaction and returns their ids for us to enqueue AFTER commit.
+        outbox_ids: list[str] = []
         try:
             from src.api.billing.skip_trace_usage import (
                 report_usage_from_webhook,
             )
             billing_summary = report_usage_from_webhook(db, queue_id)
-            pending_meter_events = billing_summary.get("pending_meter_events", [])
+            outbox_ids = billing_summary.get("outbox_ids", [])
             _logger.info(
                 "Tracerfy ingest queue=%d: %d hits / %d misses / billing=%s",
                 queue_id, hit_count, miss_count, billing_summary,
@@ -340,22 +391,23 @@ def ingest_tracerfy_batch(
         # Single atomic commit: ingest + status flip + counter advances.
         db.commit()
 
-    # REDTEAM B2 phase 2 (+ Codex convergence): fire the Stripe MeterEvents
-    # AFTER commit / lock release, but ENQUEUE them as their own retrying Celery
-    # task rather than calling inline-and-swallowing. The counter is already
-    # durably advanced and the queue is marked completed (so an ingest replay
-    # no-ops) — therefore the meter event MUST be reported durably or the
-    # account is silently under-billed. report_skip_trace_meter_event retries
-    # on transient Stripe failures and dedupes via its stable (queue_id,
-    # user_id) identifier, so it can neither be lost nor double-billed.
-    for ev in pending_meter_events:
+    # REDTEAM (Codex convergence — meter outbox): the billable MeterEvents are
+    # now durably persisted as skip_trace_meter_events outbox rows inside the
+    # committed transaction above, so they can no longer be lost. Enqueue each
+    # by id as a best-effort fast path; if .delay() raises (broker down at this
+    # instant) we only LOG — the flush_skip_trace_meter_outbox beat task sweeps
+    # any row still reported_at IS NULL and re-enqueues it. The report task
+    # no-ops if reported_at is already set and uses a stable (queue_id,
+    # user_id) Stripe identifier, so the event can be neither lost nor
+    # double-billed.
+    for outbox_id in outbox_ids:
         try:
-            report_skip_trace_meter_event.delay(**ev)
+            report_skip_trace_meter_event.delay(outbox_id)
         except Exception as exc:  # noqa: BLE001 — enqueue failure must not fail ingest
             _logger.error(
-                "Failed to enqueue Stripe meter report for queue %d user %s: %s "
-                "— usage advanced but meter event not queued",
-                queue_id, str(ev.get("user_id", "?"))[:8], str(exc)[:200],
+                "Failed to enqueue Stripe meter report for queue %d outbox %s: "
+                "%s — persisted to outbox, beat sweep will recover it",
+                queue_id, outbox_id, str(exc)[:200],
             )
 
     return {

@@ -59,6 +59,14 @@ app.conf.beat_schedule = {
         "task": "src.workers.skip_trace_dispatcher.dispatch_pending_skip_trace",
         "schedule": 300.0,  # every 5 minutes
     },
+    "flush-skip-trace-meter-outbox": {
+        # REDTEAM (Codex convergence — meter outbox): recover skip-trace
+        # MeterEvents whose inline post-commit enqueue was lost (broker down /
+        # worker crash). Sweeps skip_trace_meter_events rows still
+        # reported_at IS NULL and re-enqueues report_skip_trace_meter_event.
+        "task": "src.workers.scheduler.flush_skip_trace_meter_outbox",
+        "schedule": 180.0,  # every 3 minutes
+    },
 }
 
 
@@ -89,6 +97,7 @@ def dispatch_scheduled_jobs() -> None:
         ).scalars().all()
 
         from typing import cast
+
         from src.api.schemas import ScheduleConfigDict
         for config in configs:
             schedule: ScheduleConfigDict = cast(ScheduleConfigDict, config.schedule or {})
@@ -184,9 +193,7 @@ def watchdog_stuck_jobs() -> None:
     Runs every 5 minutes. Re-queues the job for retry up to max_retries times.
     EagleWeb chunked scraping can take 15-20min scrape + 15min DB save = 35min.
     """
-    from sqlalchemy import select
-
-    from sqlalchemy import or_
+    from sqlalchemy import or_, select
 
     from src.db.models import Job
     from src.db.session import system_sync_session
@@ -420,7 +427,7 @@ def expire_trials() -> None:
     """
     from datetime import UTC, datetime
 
-    from sqlalchemy import select, update
+    from sqlalchemy import select
 
     from src.db.models import User
     from src.db.session import SyncSessionLocal
@@ -585,3 +592,57 @@ def send_onboarding_emails() -> None:
         "Onboarding email check: %d trial users evaluated (day1=%d day3=%d expiry=%d)",
         len(users), day1_sent, day3_sent, expiry_sent,
     )
+
+
+# ─── Task: Flush skip-trace meter outbox (every 3 min) ──────────────────────
+
+@app.task(name="src.workers.scheduler.flush_skip_trace_meter_outbox")
+def flush_skip_trace_meter_outbox() -> None:
+    """Recover skip-trace Stripe MeterEvents whose inline enqueue was lost.
+
+    REDTEAM (Codex convergence — meter outbox): the Tracerfy ingest worker
+    commits a skip_trace_meter_events outbox row per billable user in the same
+    transaction that advances the usage counter, then best-effort enqueues
+    report_skip_trace_meter_event for each. If the broker was down at that
+    instant — or the worker crashed between commit and enqueue — the row sits
+    with reported_at IS NULL and would never be billed. This sweep picks those
+    up and re-enqueues them.
+
+    Runs every ~3 minutes. Only sweeps rows older than 30 seconds so the inline
+    enqueue gets first crack (avoids a duplicate enqueue racing the fast path;
+    the report task is idempotent on reported_at anyway). The report task fires
+    the Stripe MeterEvent with a stable (queue_id, user_id) identifier, so a
+    re-enqueue can neither lose the event nor double-bill.
+    """
+    from sqlalchemy import text
+
+    from src.db.session import system_sync_session
+    from src.workers.tracerfy_ingest import report_skip_trace_meter_event
+
+    with system_sync_session() as db:
+        rows = db.execute(
+            text("""
+                SELECT id
+                FROM skip_trace_meter_events
+                WHERE reported_at IS NULL
+                  AND created_at < NOW() - INTERVAL '30 seconds'
+            """)
+        ).fetchall()
+
+    enqueued = 0
+    for row in rows:
+        try:
+            report_skip_trace_meter_event.delay(str(row.id))
+            enqueued += 1
+        except Exception as exc:  # noqa: BLE001 — broker still down; try next sweep
+            _logger.error(
+                "Outbox sweep: failed to re-enqueue meter report for outbox "
+                "%s: %s — will retry next sweep",
+                row.id, str(exc)[:200],
+            )
+
+    if enqueued:
+        _logger.info(
+            "Skip-trace meter outbox sweep: re-enqueued %d unreported event(s)",
+            enqueued,
+        )

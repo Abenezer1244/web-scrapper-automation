@@ -359,9 +359,15 @@ async def _execute_action(page: Page, action: dict) -> None:
         await el.select_option(label=value, timeout=10_000)
 
     elif action_type == "evaluate":
-        js_code = action.get("js", "")
-        if js_code:
-            await page.evaluate(js_code)
+        # S2: REFUSED. This branch used to run page.evaluate(js) with JS emitted
+        # by the model from an attacker-controllable page snapshot — a
+        # prompt-injection -> arbitrary in-page JS primitive (session/cookie
+        # theft, CSRF against the portal, and pre-S1 internal fetch to cloud
+        # metadata). The model is not a trusted control plane for raw JS. The
+        # declarative actions (click/fill/check/select) cover legitimate
+        # navigation; any JS a specific portal truly needs must be a hard-coded
+        # template snippet, never model-generated.
+        _logger.error("SSRF/RCE guard: refusing model-emitted 'evaluate' action")
 
     elif action_type == "wait":
         ms = action.get("ms", 2000)

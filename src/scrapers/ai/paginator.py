@@ -88,11 +88,10 @@ async def ai_go_next_page(page: Page, action: dict) -> None:
         _logger.info("Navigated to next page via click: %s", selector)
 
     elif action_type == "evaluate":
-        js = action.get("js", "")
-        await page.evaluate(js)
-        await page.wait_for_load_state("load")
-        await page.wait_for_timeout(2_000)
-        _logger.info("Navigated to next page via JS evaluate")
+        # S2: REFUSED — see navigator._execute_action. Model-emitted JS run in
+        # the page origin is a prompt-injection -> arbitrary-JS vector. Use a
+        # declarative 'click' pagination action instead of generated JS.
+        _logger.error("SSRF/RCE guard: refusing model-emitted 'evaluate' pagination action")
 
     else:
         _logger.warning("Unknown pagination action: %s", action_type)

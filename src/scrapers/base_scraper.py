@@ -184,23 +184,27 @@ class BridgeScraper:
     # ─── Core navigation ──────────────────────────────────────────────────────
 
     async def _ssrf_nav_allowed(self, request) -> bool:
-        """Return False if this DOCUMENT navigation must be aborted (SSRF).
+        """Return False if this request must be aborted (SSRF).
 
-        Validates only DOCUMENT loads (the main page and each redirect hop) —
-        the requests whose responses we read. Main-frame documents must be on
-        the scrape allowlist; sub-frame documents (e.g. a reCAPTCHA iframe to
-        google.com) only need to clear the blocked-IP / DNS-rebinding checks,
-        so legitimate third-party frames keep working. Non-document requests
-        and non-HTTP(S) schemes (about:blank, data:) are allowed through.
-        getaddrinfo is sync, so it runs in the executor (no event-loop block).
+        S1: validates EVERY http(s) request, not just document loads. In-page
+        fetch()/XHR, scripts and images are a first-class egress channel — JS
+        running in a loaded page (including anything the AI navigator is
+        prompt-injected into emitting via ``evaluate``) could otherwise reach
+        169.254.169.254 or any internal host completely outside this guard,
+        because the route is registered for ``**/*`` and previously waved every
+        non-document request straight through. Only the MAIN-FRAME DOCUMENT
+        must be on the scrape allowlist; sub-frames (e.g. a reCAPTCHA iframe)
+        and sub-resources (CDN JS/CSS/images, XHR) only need the blocked-IP /
+        DNS-rebinding check, so legitimate third-party assets keep working.
+        Non-HTTP(S) schemes (about:blank, data:, blob:) carry no host egress
+        and pass through. getaddrinfo is sync, so it runs in the executor (no
+        event-loop block; the OS resolver cache keeps repeat hosts cheap).
         Never raises — on an internal error it allows (continue) so the guard
         can't wedge a scrape. Shared by the context route guard AND any
         page-level route (which takes precedence over the context route).
         """
         try:
             url = request.url
-            if request.resource_type != "document":
-                return True
             scheme = url.split(":", 1)[0].lower()
             if scheme not in ("http", "https"):
                 return True
@@ -208,13 +212,14 @@ class BridgeScraper:
                 is_subframe = request.frame.parent_frame is not None
             except Exception:
                 is_subframe = False
+            require_allowlisted = request.resource_type == "document" and not is_subframe
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 None,
                 functools.partial(
                     validate_scraping_target,
                     url,
-                    require_allowlisted=not is_subframe,
+                    require_allowlisted=require_allowlisted,
                     resolve=True,
                 ),
             )

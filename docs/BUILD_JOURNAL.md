@@ -75,8 +75,9 @@ connection errors) — not logic regressions.
   Add `RLS_ENFORCE` to `.env.example` (access-restricted in this session). Run `alembic upgrade head` (025 + 026).
 - **Migration collision:** the older `security/high-2-rls` branch also has a `025_*`; this branch's
   `025_rls_with_check_write_policies` + `026_add_skip_trace_meter_outbox` chain off `024`. Reconcile before merge.
-- **Final RLS-gating commit (`RLS_ENFORCE`) is Claude-self-reviewed only** — Codex hit its usage limit (resets
-  ~2026-06-02 02:08). Re-run `/codex review` after the reset to confirm closure of the last 2 P1s.
+- **✅ CONVERGED (2026-06-02):** final Codex review (round 9) over the whole 19-commit diff returned CLEAN —
+  "no discrete, actionable regressions ... that would break existing behavior or undermine the intended
+  fixes." Both reviewers agree. Branch is review-ready (pending the RLS_ENFORCE/`.env.example` handoff above).
 
 **Facts learned:**
 - The codebase was already well-hardened from the prior 2026-06-01 review — remaining bugs were subtle

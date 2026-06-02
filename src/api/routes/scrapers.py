@@ -10,7 +10,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
 from src.api.middleware.rate_limit import rate_limit
-from src.db import get_db
 from src.api.schemas import (
     CachedRecordRow,
     CachedResultsPage,
@@ -37,7 +36,7 @@ async def sample_records(db: AsyncSession = Depends(get_db)) -> dict:
     fixed the county-detection bug that previously labeled every record
     as "King" because it was looking for 'pierce' in the Job UUID.
     """
-    from src.db.models import CountyConnector, Result, Job, ScraperConfig
+    from src.db.models import Job, Result, ScraperConfig
 
     # Find 5 recent successful records with good enrichment. Join all the
     # way to ScraperConfig so we can surface the real county per row.
@@ -57,6 +56,21 @@ async def sample_records(db: AsyncSession = Depends(get_db)) -> dict:
     )
     rows = result.all()
 
+    # REDTEAM MED N2: this endpoint is UNAUTHENTICATED, so it must never
+    # expose a real homeowner's street address or mailing address (PII).
+    # Generalize each combined address to city + state + ZIP only by
+    # dropping the leading street segment. Combined addresses are stored
+    # as "123 Main St, Tacoma, WA 98402" — splitting on commas and
+    # dropping the first part removes the street line while keeping the
+    # region the marketing page wants to show.
+    def _generalize_address(addr: str | None) -> str | None:
+        if not addr:
+            return None
+        parts = [p.strip() for p in addr.split(",") if p.strip()]
+        # 2+ parts → drop the street segment, keep the city/state/zip tail.
+        # 1 part (no comma) → can't isolate the street safely, so redact it.
+        return ", ".join(parts[1:]) if len(parts) >= 2 else None
+
     samples = []
     for r, county_slug in rows:
         # Partially anonymize: show first name + initial of last name
@@ -71,8 +85,12 @@ async def sample_records(db: AsyncSession = Depends(get_db)) -> dict:
             "date_recorded": r.date_recorded,
             "party_name": anon_name,
             "county": (county_slug or "").title(),
-            "property_address": r.property_address,
-            "mailing_address": r.mailing_address,
+            # Street dropped; only city/state/ZIP surfaced publicly (N2).
+            "property_address": _generalize_address(r.property_address),
+            # Mailing address is the strongest re-identifier — generalize
+            # it the same way (street dropped) so we never leak where the
+            # owner receives mail (N2).
+            "mailing_address": _generalize_address(r.mailing_address),
             "has_parcel": bool(r.parcel_id),
         })
 
@@ -370,6 +388,21 @@ async def create_connector(
                 detail=f"Invalid gis_endpoint: {exc}",
             )
 
+    # assessor_url is also fetched server-side (AI enrichment fallback), so
+    # it must clear the same SSRF firewall as gis_endpoint before we persist
+    # it. REDTEAM LOW N3 flagged that gis_endpoint/assessor_url were validated
+    # (gis) but never stored, and assessor_url was neither validated nor
+    # stored — dead input that silently dropped admin-supplied config.
+    if body.assessor_url:
+        from src.api.middleware.security import validate_scraping_target
+        try:
+            validate_scraping_target(body.assessor_url, require_allowlisted=False, resolve=True)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid assessor_url: {exc}",
+            )
+
     connector = CountyConnector(
         id=str(uuid.uuid4()),
         county=body.county,
@@ -378,6 +411,10 @@ async def create_connector(
         scraper_class="src.scrapers.ai_scraper.AIScraper",
         scraper_mode=body.scraper_mode,
         base_url=body.base_url,
+        # REDTEAM LOW N3: persist the validated enrichment endpoints so the
+        # validation isn't dead — enrichment reads these off the connector row.
+        gis_endpoint=body.gis_endpoint,
+        assessor_url=body.assessor_url,
     )
     db.add(connector)
     await db.flush()

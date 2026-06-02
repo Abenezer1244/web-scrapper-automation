@@ -210,6 +210,7 @@ def run_scrape_job(self, job_id: str) -> None:
         _publish_log(r, job_id, "success", f"Starting scrape — {record_label} records", db=db)
 
         from typing import cast
+
         from src.api.schemas import ScheduleConfigDict
         schedule: ScheduleConfigDict = cast(ScheduleConfigDict, config.schedule or {})
         range_mode = schedule.get("date_range_mode") or schedule.get("range_mode", "rolling_90")  # type: ignore[call-overload]  # legacy "range_mode" alias kept for old configs
@@ -299,7 +300,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     timeout=_SCRAPE_TIMEOUT,
                 )
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _logger.error("Scraper timed out after %ds for job %s", _SCRAPE_TIMEOUT, job_id)
             try:
                 db.rollback()
@@ -747,7 +748,9 @@ async def _run_scraper(
 
 def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
     """Run GIS + King County enrichment inline (before job marks done)."""
-    from sqlalchemy import func, select as sa_select
+    from sqlalchemy import func
+    from sqlalchemy import select as sa_select
+
     from src.db.models import Result
 
     all_results = db.execute(
@@ -807,7 +810,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
         from src.scrapers.enrichment.ai_assessor import _KNOWN_ASSESSOR_URLS
         key = f"{config.county.lower()}_{config.state.upper()}"
         connector_assessor_url = _KNOWN_ASSESSOR_URLS.get(key)
-    from src.scrapers.enrichment.pacs import is_pacs_url, batch_lookup_pacs_by_name
+    from src.scrapers.enrichment.pacs import batch_lookup_pacs_by_name, is_pacs_url
     if connector_assessor_url and is_pacs_url(connector_assessor_url):
         results_no_addr = [
             res for res in all_results
@@ -935,6 +938,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     # Local imports — sa_select must be imported here because the module-
     # level import is scoped inside _run_inline_enrichment, not globally
     from sqlalchemy import select as sa_select
+
     from src.db.models import PendingSkipTraceRow, Result, SkipTraceCache
     from src.scrapers.enrichment.skip_trace import (
         address_cache_key,
@@ -1036,7 +1040,9 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
                 )
                 db.add(pending)
             except Exception as exc:
-                _logger.warning("Skip trace enqueue failed for %s: %s", rec.party_name[:30] if rec.party_name else "?", str(exc)[:80])
+                # REDTEAM MED I3: log the non-PII Result id, never the
+                # homeowner's party_name, in application logs.
+                _logger.warning("Skip trace enqueue failed for result %s: %s", rec.id, str(exc)[:80])
                 db.rollback()
                 continue
             rec.skip_trace_status = "queued"

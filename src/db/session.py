@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import NullPool, QueuePool
+from sqlalchemy.pool import NullPool
 
 from src.config import settings
 
@@ -163,10 +163,19 @@ def check_rls_role_status() -> dict:
     to make the security posture visible in logs. If bypassrls is
     True, the RLS policies defined in the migrations are effectively
     decorative — the app's application-level WHERE user_id filters
-    are the only tenant boundary. This function does NOT raise; it
-    returns the facts so the caller can log a warning and the ops
-    team can plan a role downgrade later. C2 from the full-SaaS
-    review.
+    are the only tenant boundary.
+
+    REDTEAM HIGH T2 (docs/security/REDTEAM-2026-06-01.md): in
+    production this is no longer advisory. If the runtime role
+    bypasses RLS (BYPASSRLS or superuser), the WITH CHECK write
+    policies added in migration 025 are silently skipped and the
+    per-query user_id filter becomes the *only* tenant boundary —
+    one missing WHERE clause leaks across tenants. So when
+    ENVIRONMENT == "production" and the role carries an implicit
+    bypass, this function raises RuntimeError to refuse boot. Outside
+    production it stays advisory (logs only) so local/dev databases —
+    where the connecting role is often the superuser/owner — still
+    start. C2 from the full-SaaS review.
     """
     import logging
 
@@ -185,6 +194,25 @@ def check_rls_role_status() -> dict:
             role, bypassrls, is_super = row[0], bool(row[1]), bool(row[2])
             effective_bypass = bypassrls or is_super
             if effective_bypass:
+                # REDTEAM HIGH T2: fail closed in production — an
+                # RLS-bypassing runtime role makes the 025 WITH CHECK
+                # write policies (and all RLS) inert, leaving the tenant
+                # boundary to application WHERE filters alone. Refuse to
+                # boot rather than serve multi-tenant traffic that way.
+                if settings.ENVIRONMENT == "production":
+                    log.error(
+                        "RLS fail-closed: DB role '%s' has BYPASSRLS=%s "
+                        "SUPERUSER=%s in production — row-level security is "
+                        "NOT enforced. Refusing to start. Downgrade the "
+                        "runtime role to one without BYPASSRLS/superuser.",
+                        role, bypassrls, is_super,
+                    )
+                    raise RuntimeError(
+                        f"Refusing to start in production: DB role '{role}' "
+                        f"bypasses RLS (BYPASSRLS={bypassrls}, "
+                        f"SUPERUSER={is_super}). RLS policies are not "
+                        "enforced — connect with a non-bypassing role."
+                    )
                 log.error(
                     "RLS advisory: DB role '%s' has BYPASSRLS=%s SUPERUSER=%s — "
                     "row-level security policies are NOT enforced. Tenant "
@@ -203,6 +231,10 @@ def check_rls_role_status() -> dict:
                 "bypassrls": bypassrls,
                 "is_superuser": is_super,
             }
+    except RuntimeError:
+        # REDTEAM HIGH T2: the production fail-closed above must
+        # propagate, not be swallowed by the defensive handler below.
+        raise
     except Exception as exc:  # noqa: BLE001 — defensive
         log.warning("RLS status check failed: %s", exc)
         return {"role": None, "bypassrls": None, "is_superuser": None}

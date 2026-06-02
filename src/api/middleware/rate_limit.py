@@ -78,18 +78,20 @@ def client_ip(request: Request) -> str:
     send `X-Forwarded-For: <random>` on each request to mint unlimited distinct
     rate-limit keys and bypass the limit entirely — defeating /auth/login
     brute-force protection and webhook signature-spray throttling. We now take
-    the Nth-from-last entry (N = trusted hops) and prefer single-value edge
-    headers that the client cannot append to.
+    the Nth-from-last entry (N = trusted hops).
+
+    Note: vendor headers like Fly-Client-IP / CF-Connecting-IP are NOT trusted
+    here. They are only authentic when the app actually sits behind that
+    specific vendor's edge; on Railway (the deploy target) an attacker can set
+    them and the proxy passes them through, which would reintroduce the bypass.
+    The only non-forgeable value behind a known proxy is the hop the proxy
+    itself appended to X-Forwarded-For. If a CDN like Cloudflare is added in
+    front later, validate the immediate peer or strip/normalize the header at
+    the edge before trusting its vendor header.
     """
     direct_ip = request.client.host if request.client else "unknown"
 
     if _is_trusted_proxy(direct_ip):
-        # Single-value vendor headers are written by the edge and cannot be
-        # appended-to by the client — most trustworthy when present.
-        for header in ("Fly-Client-IP", "CF-Connecting-IP", "True-Client-IP"):
-            val = request.headers.get(header)
-            if val:
-                return val.strip()
         forwarded = request.headers.get("X-Forwarded-For")
         if forwarded:
             parts = [p.strip() for p in forwarded.split(",") if p.strip()]

@@ -210,42 +210,35 @@ async def refresh_token(
     if not user:
         raise HTTPException(status_code=401, detail="User not found or inactive")
 
-    # Honor BOTH revocation paths:
-    #   1. is_blacklisted(jti) — this specific refresh token was revoked
-    #   2. get_user_revoke_time(user_id) — user clicked "log out
-    #      everywhere"; any refresh token issued before that timestamp
-    #      must be rejected. Without this check, an attacker holding a
-    #      stale refresh token could still mint fresh access tokens
-    #      after the user invalidated all sessions.
-    # Revocation is a security boundary — if Redis is unavailable we
-    # cannot prove the refresh token wasn't revoked, so surface 503.
+    # Refresh-token revocation + single-use rotation (A1).
+    #   1. logout-all (user-level): any refresh token issued at/before the
+    #      user's revoke timestamp is rejected — an attacker holding a stale
+    #      refresh token cannot mint fresh access tokens after the user
+    #      invalidated all sessions.
+    #   2. A1 + race fix: ATOMICALLY consume this token's jti via SET NX.
+    #      The NX succeeds exactly once, so a replay — OR a second /refresh
+    #      racing the SAME token concurrently (the TOCTOU that a separate
+    #      is_blacklisted()+add() leaves open: both racers pass the check
+    #      before either writes) — loses the race and is rejected. This both
+    #      rotates (single-use refresh tokens) and closes the race in one
+    #      step. Once the victim's client refreshes, the attacker's stolen
+    #      copy 401s, killing the session and surfacing the theft.
+    # Revocation is a security boundary — if Redis is unavailable we cannot
+    # prove the token wasn't revoked or already used, so surface 503.
     import redis.exceptions as _redis_exceptions
 
     from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
     jti = payload.get("jti", "")
     issued_at: int = payload.get("iat", 0)
-    try:
-        if jti and await TokenBlacklist.is_blacklisted(jti):
-            raise HTTPException(status_code=401, detail="Refresh token revoked")
-        if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
-            raise HTTPException(status_code=401, detail="Refresh token revoked")
-    except _redis_exceptions.RedisError:
-        raise revocation_unavailable_503()
-
-    # A1: rotate — consume this refresh token so it can never be replayed.
-    # Without rotation a single stolen refresh token is reusable for its
-    # full 7-day life and self-renews indefinitely (each refresh mints a
-    # new 7-day token while the old one stays valid). Blacklisting the
-    # consumed jti makes refresh tokens single-use: once the victim's
-    # client refreshes, the attacker's copy 401s — killing the session
-    # AND surfacing the theft. Revocation is a security boundary, so a
-    # Redis failure here 503s like the checks above rather than minting a
-    # new pair while leaving the old token live.
     exp: int = payload.get("exp", 0)
     ttl = max(0, exp - int(time.time()))
+    if not jti or ttl <= 0:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
     try:
-        if jti and ttl > 0:
-            await TokenBlacklist.add(jti, ttl)
+        if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
+            raise HTTPException(status_code=401, detail="Refresh token revoked")
+        if not await TokenBlacklist.consume_once(jti, ttl):
+            raise HTTPException(status_code=401, detail="Refresh token already used")
     except _redis_exceptions.RedisError:
         raise revocation_unavailable_503()
 

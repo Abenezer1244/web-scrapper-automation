@@ -60,6 +60,27 @@ class TokenBlacklist:
         await r.setex(key, expires_in_seconds, "1")
 
     @staticmethod
+    async def consume_once(jti: str, expires_in_seconds: int) -> bool:
+        """Atomically claim a jti exactly once (single-use token rotation).
+
+        Uses Redis ``SET key 1 NX EX ttl``: returns True if THIS call set
+        the key (the token had not been used or blacklisted yet), False if
+        the key already existed — a replay, OR a second refresh racing the
+        same token concurrently. This closes the check-then-add TOCTOU that
+        a separate ``is_blacklisted()`` + ``add()`` leaves open (both racers
+        pass the check before either writes). Shares the jti key space with
+        ``add``/``is_blacklisted`` so a consumed refresh jti is also seen as
+        blacklisted. Raises on Redis error so the caller fails CLOSED (503):
+        we must not mint a rotated token when we cannot prove the old one
+        was not already consumed.
+        """
+        r = _get_redis()
+        key = f"{TokenBlacklist._KEY_PREFIX}{jti}"
+        # redis-py returns True when the key was set, None when NX failed.
+        result = await r.set(key, "1", nx=True, ex=expires_in_seconds)
+        return result is not None
+
+    @staticmethod
     async def is_blacklisted(jti: str) -> bool:
         """Return True if this jti has been blacklisted.
 

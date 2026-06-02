@@ -1,7 +1,7 @@
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
@@ -104,14 +104,40 @@ def get_sync_db() -> Session:
 # full-SaaS review for the bug this fixes (H1).
 
 
+# ─── Per-transaction RLS GUC reapply (Phase 1 of the RLS cutover) ───────────
+# ``set_config('app.current_user_id', uid, is_local=true)`` is TRANSACTION
+# scoped — it is cleared on every COMMIT/ROLLBACK. run_scrape_job commits
+# mid-task, so the GUC vanishes and the NEXT transaction on the same session
+# runs with no user context. Today that is masked because the prod role has
+# BYPASSRLS; under the non-BYPASSRLS cutover role it would make RLS block
+# every user-scoped query after the first commit.
+#
+# This after_begin listener re-binds the GUC at the start of EVERY transaction,
+# reading the user_id off ``session.info`` so it survives commits. It is gated
+# on ``session.info['rls_user_id']`` so sessions that intentionally carry no
+# user context (system_sync_session, plain get_db) are untouched — the handler
+# returns immediately for them. set_config(local=true) self-clears at tx end,
+# so no GUC leaks across pooled-connection reuse.
+_RLS_GUC_SQL = text("SELECT set_config('app.current_user_id', :uid, true)")
+
+
+@event.listens_for(Session, "after_begin")
+def _reapply_rls_guc(session: Session, transaction, connection) -> None:
+    uid = session.info.get("rls_user_id")
+    if uid is None:
+        return
+    connection.execute(_RLS_GUC_SQL, {"uid": uid})
+
+
 @contextmanager
 def rls_sync_session(user_id: str) -> Iterator[Session]:
     """Open a sync session with PostgreSQL RLS bound to a specific user.
 
-    Issues ``SELECT set_config('app.current_user_id', :uid, true)``
-    inside the session's implicit transaction so every subsequent
-    query inside this block runs with the USING clause of the RLS
-    policies evaluating against the given user_id.
+    Stores ``user_id`` on ``session.info['rls_user_id']`` so the
+    ``after_begin`` listener re-applies ``app.current_user_id`` on EVERY
+    transaction — surviving the mid-task commits run_scrape_job performs.
+    The explicit set_config below covers the very first transaction
+    immediately (belt-and-suspenders; the listener also fires for it).
 
     Caller must commit/rollback explicitly — this context manager
     only handles open/close so the existing worker code (which
@@ -119,11 +145,9 @@ def rls_sync_session(user_id: str) -> Iterator[Session]:
     not have to change shape.
     """
     session = SyncSessionLocal()
+    session.info["rls_user_id"] = str(user_id)
     try:
-        session.execute(
-            text("SELECT set_config('app.current_user_id', :uid, true)"),
-            {"uid": str(user_id)},
-        )
+        session.execute(_RLS_GUC_SQL, {"uid": str(user_id)})
         yield session
     finally:
         session.close()

@@ -704,6 +704,10 @@ async def download_export(
     # RLS belt in addition to the explicit user_id filter. This route uses
     # get_db (not get_rls_db) because the user is resolved from a download
     # token rather than the standard dependency, so we set the context here.
+    # Also store it on session.info so the after_begin listener (session.py)
+    # re-applies the GUC if this path ever commits mid-request — consistent
+    # with get_rls_db and forward-safe for the non-BYPASSRLS cutover role.
+    db.sync_session.info["rls_user_id"] = str(user.id)
     await db.execute(
         text("SELECT set_config('app.current_user_id', :uid, true)"),
         {"uid": str(user.id)},

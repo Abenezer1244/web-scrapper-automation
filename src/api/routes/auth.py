@@ -450,22 +450,22 @@ async def change_password(
                 detail="New password cannot be one of your last 5 passwords.",
             )
 
-    # Save current password to history before changing
-    db.add(PasswordHistory(user_id=current_user.id, password_hash=user.password_hash))
-
-    user.password_hash = hash_password(body.new_password)
-    await db.commit()
-
     # A2: a password change MUST evict every existing session and refresh
     # token. Without this, an attacker who already holds a token (or the
     # victim's refresh token) rides straight through the password change —
     # the single most common "I think I've been hacked" reaction would not
-    # actually lock them out, and the never-rotated refresh token (A1) lets
-    # them self-renew forever. revoke_all_for_user stamps users.revoked_at
-    # so every token issued before now is rejected. The caller is logged
-    # out too and must re-authenticate (standard, safe post-change UX).
-    # Revocation is a security boundary: on Redis failure, 503 so the
-    # client retries rather than believing the change secured the account.
+    # actually lock them out, and refresh-token rotation (A1) alone lets a
+    # held token self-renew. revoke_all_for_user stamps users.revoked_at so
+    # every token issued before now is rejected.
+    #
+    # Revoke BEFORE committing the new password so the two outcomes are
+    # fail-safe (Codex review): if revocation fails we 503 with the password
+    # UNCHANGED (nothing happened — safe); if revocation succeeds but the
+    # password commit later fails, the account is merely logged out and the
+    # old password still works (safe). The dangerous ordering is the reverse
+    # — password changed but sessions left alive — so we never do that.
+    # Revocation is a security boundary: on Redis failure, 503 so the client
+    # retries rather than believing the change secured the account.
     import redis.exceptions as _redis_exceptions
 
     from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
@@ -473,6 +473,11 @@ async def change_password(
         await TokenBlacklist.revoke_all_for_user(current_user.id)
     except _redis_exceptions.RedisError:
         raise revocation_unavailable_503()
+
+    # Save current password to history, set the new hash, commit.
+    db.add(PasswordHistory(user_id=current_user.id, password_hash=user.password_hash))
+    user.password_hash = hash_password(body.new_password)
+    await db.commit()
     audit_log(request, "password_changed", current_user.id)
 
 

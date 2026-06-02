@@ -373,9 +373,17 @@ class BruteForceProtection:
         r = _get_redis()
         email_failures = 0
         try:
+            # A6: the IP counter persists 24h (punish a single attacking
+            # source). The EMAIL counter expires after the cap so a targeted
+            # lockout actually DECAYS — without this, capping only the
+            # returned Retry-After is cosmetic: check() still rejects while
+            # the count is over threshold and a 24h key TTL would keep the
+            # victim blocked for a full day (Codex review). With a short TTL
+            # the email key (and therefore the lockout) clears within the cap
+            # window after the last failed attempt.
             for key_suffix, ttl in [
                 (f"ip:{ip}", 24 * 3600),
-                (f"email:{email}", 24 * 3600),
+                (f"email:{email}", BruteForceProtection._EMAIL_LOCKOUT_CAP_SECONDS),
             ]:
                 key = f"{BruteForceProtection._KEY_PREFIX}{key_suffix}"
                 pipe = r.pipeline(transaction=True)

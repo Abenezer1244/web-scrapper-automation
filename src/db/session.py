@@ -194,12 +194,30 @@ def check_rls_role_status() -> dict:
             role, bypassrls, is_super = row[0], bool(row[1]), bool(row[2])
             effective_bypass = bypassrls or is_super
             if effective_bypass:
-                # REDTEAM HIGH T2: fail closed in production — an
-                # RLS-bypassing runtime role makes the 025 WITH CHECK
-                # write policies (and all RLS) inert, leaving the tenant
-                # boundary to application WHERE filters alone. Refuse to
-                # boot rather than serve multi-tenant traffic that way.
-                if settings.ENVIRONMENT == "production":
+                # REDTEAM HIGH T2: a BYPASSRLS/superuser runtime role makes the
+                # 025 WITH CHECK write policies (and all RLS) inert, leaving the
+                # tenant boundary to the application WHERE filters alone.
+                #
+                # We can only HARD-FAIL on this once the full RLS cutover is in
+                # place — and it is NOT yet (Codex convergence P1). The current
+                # production role HAS BYPASSRLS, and worker paths depend on that:
+                #   * rls_sync_session() sets app.current_user_id via SET LOCAL,
+                #     which is cleared on every commit — and run_scrape_job
+                #     commits status/progress mid-task before inserting job_logs
+                #     and results, so those later writes would have no GUC and be
+                #     rejected by the WITH CHECK/USING predicates;
+                #   * system_sync_session() sets NO app.current_user_id at all
+                #     for legitimate cross-tenant work (Tracerfy ingest updating
+                #     user-scoped Result rows), which a non-BYPASSRLS role would
+                #     then see as empty and block.
+                # Forcing a non-bypassing role before those are fixed would take
+                # scrapes + ingest down. So enforcement is GATED behind
+                # RLS_ENFORCE (default False = advisory log, today's behavior).
+                # Flip it ON only after the staged cutover lands (role downgrade
+                # + per-transaction GUC reapply in rls_sync_session + a system
+                # RLS policy for system_sync_session) — see the deferred HIGH-2
+                # work on branch security/high-2-rls.
+                if settings.RLS_ENFORCE:
                     log.error(
                         "RLS fail-closed: DB role '%s' has BYPASSRLS=%s "
                         "SUPERUSER=%s in production — row-level security is "

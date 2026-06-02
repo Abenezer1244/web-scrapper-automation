@@ -98,6 +98,14 @@ class Settings(BaseSettings):
     # ─── App ──────────────────────────────────────────────────────────────────
     DEBUG: bool = False
     ENVIRONMENT: str = "production"
+    # RLS enforcement gate (REDTEAM T2). Default False = advisory-only: startup
+    # LOGS if the DB role bypasses RLS but still boots (today's behavior — the
+    # production role currently has BYPASSRLS and worker paths depend on it).
+    # Set True ONLY after the staged RLS cutover (non-BYPASSRLS role +
+    # per-transaction GUC reapply + a system RLS policy for system_sync_session,
+    # the deferred HIGH-2 work); with it on, the API + workers REFUSE to boot on
+    # a bypassing role. Enabling it before the cutover WILL break scrapes/ingest.
+    RLS_ENFORCE: bool = False
     FRONTEND_URL: str = "https://bridgeleads.io"
     # Public base URL of THIS API (the host serving /jobs/{id}/download).
     # When set, delivery emails/webhooks send a revocable app download-token

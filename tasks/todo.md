@@ -47,10 +47,16 @@ Rule: ≤5 files/phase · py_compile after each · atomic commit per phase · Co
 - [ ] I3 — log result id, not party_name
 - [ ] T1 — decode download token with explicit audience
 
-## Round 3 verify
-- [ ] py_compile + pytest after each phase
-- [ ] Codex `codex review` over full diff; reconcile; re-fix any new HIGH/Critical
-- [ ] Update REDTEAM register statuses to ✅; BUILD_JOURNAL entry
+All 8 phases ✅ implemented + committed (12 commits on `security/redteam-remediation-2026-06-01`).
+Phases 1–5 by Claude directly; Phases 6/7/8/2 by 4 parallel subagents (disjoint files).
 
-## Review (filled at end)
-_pending_
+## Round 3 verify
+- [x] py_compile + ruff clean every phase; CSV sanitizer proven vs 11 payloads
+- [x] Codex review × multiple rounds — caught 4 bugs in Claude's fixes (I1,A1,A2,A6) + 3 in subagent code (webhook dedup, reset timing, reset reuse-policy); all fixed
+- [x] Codex `codex review` over full diff; reconciled; convergence re-review running
+- [ ] Update REDTEAM register statuses to ✅; BUILD_JOURNAL entry (after convergence verdict)
+
+## Review
+Cross-verification (Claude×Codex) caught **7 total bugs in the fixes themselves** across 3 Codex
+rounds — the core value of two independent reviewers. Integration tests need CI Postgres+Redis.
+T2 needs the Supabase runtime role confirmed `NOBYPASSRLS` for the RLS belt to engage.

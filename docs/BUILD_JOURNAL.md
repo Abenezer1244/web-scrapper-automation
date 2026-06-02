@@ -19,6 +19,65 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-01 — Claude × Codex adversarial red-team + remediation (branch `security/redteam-remediation-2026-06-01`)
+
+**Built / Shipped** (14 atomic commits on the branch; full register `docs/security/REDTEAM-2026-06-01.md`):
+- **Round 1 — Claude red team:** 6 parallel security-auditor subagents across auth, SSRF, multi-tenancy,
+  exports, billing, infra. ~26 findings, each with a proven exploit.
+- **Round 2 — Codex independent verification:** Codex re-derived every finding from code — **refuted 6**
+  Claude over-claimed (incl. 2 fake "Criticals" → both real but HIGH), and **found 3 Claude missed**
+  (PACS assessor SSRF `N1`, unauth `/scrapers/sample` real-PII leak `N2`, dead connector validation `N3`).
+- **Round 3 — remediation:** Phases 1–5 by Claude directly; Phases 6/7/8 + the A3 reset flow by 4 parallel
+  coder subagents on disjoint files. Fixes (all committed):
+  - Auth: refresh rotation (atomic `consume_once`), change-pw revokes sessions, **new password-reset flow**,
+    register timing parity, lockout-DoS cap (real TTL decay), narrowed `/refresh` except.
+  - SSRF: in-page fetch/XHR egress closed (`base_scraper` route guard validates ALL resource types),
+    model-emitted `evaluate` JS removed, PACS `assessor_url` validated, raw `requests`→`safe_http`,
+    `validate_scraping_target` resolve-by-default + IDNA fail-closed + loopback aliases.
+  - CSV: leading-quote + embedded-tab formula-injection bypasses closed (proven vs 11 payloads) + tests.
+  - Billing: Tracerfy webhook replay/SSRF guard, counter↔meter consistency, **transactional meter outbox**
+    (`SkipTraceMeterEvent`, migration 026, retrying task + 180s beat sweep), coupon caching.
+  - Tenancy: migration 025 adds `WITH CHECK` to RLS write policies + startup hard-fails on a BYPASSRLS
+    role; download-token audience hardened; PII log demoted to `Result.id`.
+  - Infra: XFF rightmost-hop (kill spoof bypass), fail-closed auth rate-limit fallback, CORS origin validation.
+
+**Tried / Decided:**
+- Two independent reviewers with different blind spots is the whole point — kept Claude and Codex passes
+  fully independent in Round 1/2 (Codex never saw Claude's findings before re-deriving them).
+- Billing durability: rejected fire-and-forget meter reporting; chose a **transactional outbox** (intent
+  persisted in the same txn as the counter advance, swept by a beat task) — the only design that survives
+  Stripe-down AND broker-down without double-billing (stable MeterEvent id).
+- Removed the Tracerfy webhook edge dedup entirely — the worker `FOR UPDATE` + status guard is the
+  authoritative idempotency; the edge claim was net-negative (could drop a legit retry).
+- Phased, ≤5 files/phase, atomic commit per phase; subagents on disjoint files to parallelize safely.
+
+**Caught & fixed (the headline):** the Claude×Codex loop caught **12 bugs in the fixes themselves** across
+5 Codex rounds — e.g. refresh-rotation TOCTOU (→ SET NX), XFF trusting spoofable Fly/CF headers on Railway,
+password-change revoking *after* commit, a cosmetic lockout cap, a swallowed Stripe error defeating
+autoretry, an enqueue-failure losing a meter event, a stale second reset link surviving a reset. Each was
+re-fixed and re-verified. This is why two reviewers > one.
+
+**Failed / Blocked:** full integration tests can't run locally (need CI Postgres+Redis; `conftest.py` wires
+real infra) — verified statically (`py_compile` + `ruff` every phase) + pure-function CSV tests + the Codex
+review gate. Local `pytest -k auth` ran against degraded infra (503s from Redis-unavailable revocation, DB
+connection errors) — not logic regressions.
+
+**Pending / Handoff:**
+- **NOT merged to `main`** — branch awaits review/merge.
+- **T2 ops:** confirm the deployed Supabase/Postgres runtime role is `NOBYPASSRLS NOSUPERUSER` (migration 025
+  + startup guard only bite if the role can actually be constrained); run `alembic upgrade head` (025 + 026).
+- **Migration collision heads-up:** the older `security/high-2-rls` branch also has a `025_*`; this branch's
+  `025_rls_with_check_write_policies` + `026_add_skip_trace_meter_outbox` chain off `024`. Reconcile before
+  merging either branch.
+- Final Codex convergence review of the whole diff in progress at write time.
+
+**Facts learned:**
+- The codebase was already well-hardened from the prior 2026-06-01 review — remaining bugs were subtle
+  (races, TOCTOU, fail-open ordering, durability), exactly where a second independent model pays off.
+- New `settings` added: `TRUSTED_PROXY_HOPS` (default 1). New tables: `skip_trace_meter_events`.
+
+---
+
 ## 2026-06-01 — Security pack adoption + full review remediation
 
 **Built / Shipped** (all on `main` unless noted; every fix Codex-reviewed):

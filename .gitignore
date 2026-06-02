@@ -133,3 +133,8 @@ scripts/*.csv
 scripts/e2e_results.log
 scripts/e2e_screenshots/
 _diag_is_pro/
+# Root-level scratch screenshots / diagnostic dumps (the ones cleaned 2026-06-01)
+/e2e_*.png
+/*arms*.png
+/diag_*
+/_diag_*

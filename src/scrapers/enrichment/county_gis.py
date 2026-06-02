@@ -238,7 +238,10 @@ def _query_wa_statewide(parcel_id: str, county: str) -> dict[str, str | None]:
     }
 
     try:
-        resp = requests.get(_WA_STATEWIDE_ENDPOINT, params=params, timeout=15)
+        # S4: safe_http (SSRF defense-in-depth). Fixed HTTPS ArcGIS endpoint,
+        # but safe_get re-validates (resolve=True), disables ambient proxy,
+        # and refuses redirect-to-internal. Returns a requests.Response.
+        resp = safe_get(_WA_STATEWIDE_ENDPOINT, params=params, timeout=15)
 
         if resp.status_code != 200:
             _logger.warning("WA statewide GIS returned %d for parcel %s", resp.status_code, parcel_id)
@@ -516,7 +519,8 @@ def _batch_query_wa_statewide(
         }
 
         try:
-            resp = requests.get(_WA_STATEWIDE_ENDPOINT, params=params, timeout=30)
+            # S4: safe_http (SSRF defense-in-depth) — see batch note above.
+            resp = safe_get(_WA_STATEWIDE_ENDPOINT, params=params, timeout=30)
             if resp.status_code != 200:
                 continue
 

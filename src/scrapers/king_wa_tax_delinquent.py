@@ -13,11 +13,10 @@ in the API — relies on GIS + eRealProperty enrichment.
 
 from datetime import datetime
 
-import requests
-
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.utils.logger import setup_logger
+from src.utils.safe_http import safe_get
 
 _logger = setup_logger("scraper.king_wa_tax_delinquent")
 
@@ -63,7 +62,10 @@ class KingWATaxDelinquentScraper(BridgeScraper):
             }
 
             try:
-                resp = requests.get(_API_URL, params=params, headers=_HEADERS, timeout=30)
+                # S4: safe_http (SSRF defense-in-depth). Fixed HTTPS Socrata
+                # endpoint, but safe_get re-validates (resolve=True), disables
+                # ambient proxy, and refuses redirect-to-internal. Same API.
+                resp = safe_get(_API_URL, params=params, headers=_HEADERS, timeout=30)
                 resp.raise_for_status()
                 data = resp.json()
             except Exception as exc:

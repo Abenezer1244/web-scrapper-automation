@@ -88,6 +88,13 @@ _BLOCKED_HOSTNAMES: frozenset[str] = frozenset(
         "instance-data",
         "169.254.169.254",  # AWS/GCP/Azure instance metadata
         "localhost",
+        # S5: additional loopback aliases. These resolve to 127.0.0.1 / ::1
+        # on common systems but are textual hostnames the literal-IP and
+        # resolve checks may miss on a host with /etc/hosts overrides.
+        "localhost.localdomain",
+        "ip6-localhost",
+        "ip6-loopback",
+        "0",  # shorthand many resolvers map to 0.0.0.0 / 127.0.0.1
     ]
 )
 
@@ -104,6 +111,28 @@ def _ip_is_blocked(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return any(addr in network for network in _BLOCKED_NETWORKS)
 
 
+def _idna_encodable(host: str) -> bool:
+    """True if ``host`` can be IDNA-encoded to ASCII.
+
+    S5: a host that cannot be IDNA-encoded (crafted unicode, empty label,
+    over-long label) must be REJECTED by ``validate_scraping_target`` —
+    not silently waved through. ASCII-only hosts and raw IP literals (no
+    non-ASCII to encode) trivially pass. We keep ``_normalize_hostname``
+    lossless/best-effort and centralize the fail-closed decision here so
+    callers that only need a normalized string are unaffected.
+    """
+    if not host:
+        return False
+    try:
+        host.encode("idna")
+    except (UnicodeError, ValueError):
+        # IP literals and some all-ASCII hosts raise on encode("idna")
+        # (idna codec rejects e.g. labels with no alphanumerics); accept
+        # them only when they are pure ASCII — non-ASCII that fails is unsafe.
+        return host.isascii()
+    return True
+
+
 def _normalize_hostname(raw: str) -> str:
     """Lowercase, strip trailing dot and IPv6 zone id, IDNA-encode unicode."""
     host = (raw or "").strip().rstrip(".").lower()
@@ -111,7 +140,7 @@ def _normalize_hostname(raw: str) -> str:
     try:
         host = host.encode("idna").decode("ascii")
     except (UnicodeError, ValueError):
-        pass  # non-IDNA host; the checks below still apply
+        pass  # non-IDNA host; validate_scraping_target fails it closed (S5)
     return host
 
 
@@ -143,7 +172,7 @@ def _assert_resolved_ips_safe(hostname: str) -> None:
 
 
 def validate_scraping_target(
-    url: str, *, require_allowlisted: bool = True, resolve: bool = False
+    url: str, *, require_allowlisted: bool = True, resolve: bool = True
 ) -> None:
     """Raise ValueError if the URL is not an approved scraping target.
 
@@ -154,10 +183,14 @@ def validate_scraping_target(
     - With ``require_allowlisted=True`` (default): hosts not on the
       explicit allowlist, and HTTP scheme for any host not already
       on the allowlist.
-    - With ``resolve=True``: hosts that RESOLVE to a blocked IP range
-      (DNS-rebinding defense). Off by default so scraper navigation and
-      tests keep their current no-DNS behavior; outbound-webhook
-      validation passes True.
+    - With ``resolve=True`` (S5 — now the DEFAULT, fail-safe): hosts that
+      RESOLVE to a blocked IP range (DNS-rebinding defense). Made the
+      default so every caller is SSRF-safe by default; the only paths
+      that opt OUT (``resolve=False``) are ones that must NOT perform DNS
+      at validation time (e.g. allowlist registration at app/worker boot,
+      where a transiently-unresolvable but legitimately-public host must
+      not be silently dropped). Outbound-webhook validation also passes
+      True explicitly.
 
     Pass ``require_allowlisted=False`` ONLY from admin onboarding paths
     that are about to call ``add_scrape_domain()`` for the validated
@@ -173,10 +206,18 @@ def validate_scraping_target(
     if parsed.scheme not in ("https", "http"):
         raise ValueError("Only HTTP/HTTPS scraping targets are permitted")
 
+    raw_hostname = (parsed.hostname or "").strip().rstrip(".").lower().split("%", 1)[0]
     hostname = _normalize_hostname(parsed.hostname or "")
 
     if not hostname:
         raise ValueError("Invalid URL: no hostname")
+
+    # S5: fail closed on a host that cannot be IDNA-encoded. Previously the
+    # bare `except (UnicodeError, ValueError): pass` in _normalize_hostname
+    # let a crafted host fall through un-normalized and slip past the checks
+    # below. A host we cannot canonicalize is not a host we can trust.
+    if not _idna_encodable(raw_hostname):
+        raise ValueError("Scraping target host could not be canonicalized")
 
     if hostname in _BLOCKED_HOSTNAMES:
         raise ValueError("Scraping target not permitted")
@@ -333,7 +374,16 @@ def register_connector_domains_from_db() -> int:
                     # second, which leaked failed hosts onto the
                     # frozen allowlist with no way to remove them.
                     try:
-                        validate_scraping_target(url, require_allowlisted=False)
+                        # S5: resolve=False here is intentional. This runs at
+                        # app/worker boot to seed the allowlist from DB-config
+                        # connectors; a legitimately-public host that is
+                        # transiently unresolvable at boot must not be dropped.
+                        # Scheme + blocked-hostname + blocked literal-IP checks
+                        # still apply; the resolve-time DNS-rebinding check runs
+                        # later on every actual outbound fetch (safe_http).
+                        validate_scraping_target(
+                            url, require_allowlisted=False, resolve=False
+                        )
                     except ValueError as ssrf_exc:
                         log.error(
                             "Refusing to trust migration-seeded host %s "

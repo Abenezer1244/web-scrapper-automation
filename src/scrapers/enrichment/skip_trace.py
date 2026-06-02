@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 
 import requests
 
+from src.api.middleware.security import validate_scraping_target
 from src.config import settings
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get_following
@@ -261,6 +262,19 @@ def submit_batch(
         "Authorization": f"Bearer {token}",
     }
 
+    # S4: SSRF defense-in-depth for this server-side POST. TRACERFY_API_BASE_URL
+    # is operator config; validate it (resolve=True, DNS-rebinding aware) and
+    # require HTTPS before sending the bearer token so a misconfigured/poisoned
+    # base URL can't exfiltrate the token to an internal/metadata host. The
+    # POST below uses a trust_env=False session with allow_redirects=False
+    # (safe_http is GET-only; this mirrors its guarantees for the POST path).
+    if not url.lower().startswith("https://"):
+        raise TracerfyError("TRACERFY_API_BASE_URL must use HTTPS")
+    try:
+        validate_scraping_target(url, require_allowlisted=False, resolve=True)
+    except ValueError as ssrf_exc:
+        raise TracerfyError(f"Refusing unsafe Tracerfy endpoint: {ssrf_exc}") from ssrf_exc
+
     # Tracerfy's batch endpoint docs list both multipart/form-data and
     # application/json, but in practice (verified against live API 2026-04-10)
     # the JSON path returns 415 Unsupported Media Type. Use form-encoded
@@ -306,7 +320,14 @@ def submit_batch(
         # data=form_fields sends application/x-www-form-urlencoded.
         # Tracerfy's doc says multipart/form-data but urlencoded is the
         # standard fallback and works with the same field names.
-        resp = requests.post(url, headers=headers, data=form_fields, timeout=30)
+        # S4: trust_env=False (no ambient proxy reroute) + allow_redirects=False
+        # (a poisoned 302 can't bounce the token-bearing POST to an internal
+        # host). Validation above already ran resolve=True on this URL.
+        _sess = requests.Session()
+        _sess.trust_env = False
+        resp = _sess.post(
+            url, headers=headers, data=form_fields, timeout=30, allow_redirects=False
+        )
     except requests.RequestException as exc:
         raise TracerfyError(f"Network error submitting batch: {exc}") from exc
 

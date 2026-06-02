@@ -32,6 +32,33 @@ from src.workers import app
 _logger = setup_logger("worker.tracerfy_ingest")
 
 
+@app.task(
+    bind=True,
+    acks_late=True,
+    max_retries=5,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+)
+def report_skip_trace_meter_event(self, **event) -> None:
+    """REDTEAM (Codex convergence): durably report ONE Stripe skip-trace
+    MeterEvent.
+
+    Split out of ``ingest_tracerfy_batch`` so a Stripe/network failure RETRIES
+    instead of being swallowed. Previously the meter call ran inline after the
+    DB commit and only logged on failure — but the same committed transaction
+    already advanced the local usage counter AND marked the SkipTraceQueue
+    ``completed``, so the completed-status guard blocks any ingest replay. The
+    net effect was: usage consumed locally, MeterEvent lost, account
+    under-billed with no recovery. The MeterEvent carries a stable
+    ``(queue_id, user_id)`` identifier, so a retry is idempotent and never
+    double-bills. After ``max_retries`` the failure surfaces loudly for ops.
+    """
+    from src.api.billing.skip_trace_usage import report_meter_event_to_stripe
+    report_meter_event_to_stripe(**event)
+
+
 def _host_is_tracerfy(download_url: str) -> bool:
     """REDTEAM B1/T3: confirm a webhook-supplied download_url points at a
     Tracerfy-owned host before we fetch it server-side.
@@ -313,21 +340,23 @@ def ingest_tracerfy_batch(
         # Single atomic commit: ingest + status flip + counter advances.
         db.commit()
 
-    # REDTEAM B2 phase 2: fire the Stripe MeterEvents AFTER the commit and
-    # AFTER the session/lock is released. The counter is already durably
-    # advanced and the queue is marked completed, so a Stripe failure here is
-    # logged (not raised) and dedupes on retry via its stable (queue_id,
-    # user_id) identifier — it can never re-advance the counter.
-    if pending_meter_events:
-        from src.api.billing.skip_trace_usage import report_meter_event_to_stripe
-        for ev in pending_meter_events:
-            try:
-                report_meter_event_to_stripe(**ev)
-            except Exception as exc:  # noqa: BLE001 — defensive
-                _logger.error(
-                    "Stripe meter report failed for queue %d user %s: %s",
-                    queue_id, ev.get("user_id", "?")[:8], str(exc)[:200],
-                )
+    # REDTEAM B2 phase 2 (+ Codex convergence): fire the Stripe MeterEvents
+    # AFTER commit / lock release, but ENQUEUE them as their own retrying Celery
+    # task rather than calling inline-and-swallowing. The counter is already
+    # durably advanced and the queue is marked completed (so an ingest replay
+    # no-ops) — therefore the meter event MUST be reported durably or the
+    # account is silently under-billed. report_skip_trace_meter_event retries
+    # on transient Stripe failures and dedupes via its stable (queue_id,
+    # user_id) identifier, so it can neither be lost nor double-billed.
+    for ev in pending_meter_events:
+        try:
+            report_skip_trace_meter_event.delay(**ev)
+        except Exception as exc:  # noqa: BLE001 — enqueue failure must not fail ingest
+            _logger.error(
+                "Failed to enqueue Stripe meter report for queue %d user %s: %s "
+                "— usage advanced but meter event not queued",
+                queue_id, str(ev.get("user_id", "?"))[:8], str(exc)[:200],
+            )
 
     return {
         "queue_id": queue_id,

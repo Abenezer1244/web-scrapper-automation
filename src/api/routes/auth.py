@@ -618,6 +618,7 @@ async def reset_password(
 
     user_id: str = payload.get("sub", "")
     jti: str = payload.get("jti", "")
+    issued_at: int = payload.get("iat", 0)
     exp: int = payload.get("exp", 0)
     ttl = max(0, exp - int(time.time()))
     if not user_id or not jti or ttl <= 0:
@@ -667,10 +668,22 @@ async def reset_password(
                 detail="New password cannot be one of your last 5 passwords.",
             )
 
-    # Single-use: atomically claim the jti now that validation passed. False =>
-    # already redeemed (or racing a concurrent redemption) — reject. Redis
-    # failure => 503 (fail closed): we can't prove the token is unused.
+    # Token validity + single-use, both fail-closed on Redis error:
+    #   1. (Codex convergence) reject any reset token issued at/before the
+    #      user's last revoke timestamp. A completed reset calls
+    #      revoke_all_for_user (stamping users.revoked_at = now), so ANY OTHER
+    #      reset link outstanding at that moment is invalidated — without this,
+    #      a second 30-min link could change the password again after a
+    #      legitimate reset (or after a logout-all). consume_once only burns the
+    #      ONE redeemed jti; this closes the others.
+    #   2. atomically claim THIS jti — False => already redeemed or racing a
+    #      concurrent redemption.
     try:
+        if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or expired reset link",
+            )
         if not await TokenBlacklist.consume_once(jti, ttl):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

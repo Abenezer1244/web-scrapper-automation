@@ -40,7 +40,14 @@ _DOMAIN_REGISTRATION_LOCKED = False  # Set True after app startup to prevent run
 
 
 def _host_matches_set(hostname: str, domain_set: frozenset[str]) -> bool:
-    """True if hostname is in domain_set, or is a subdomain of any entry."""
+    """True if hostname is in domain_set, or is a subdomain of any entry.
+
+    SECURITY: allowlist entries MUST be specific FQDNs (e.g.
+    ``recordsearch.kingcounty.gov``), never a registrable parent like
+    ``kingcounty.gov`` — the ``.endswith`` subdomain match would then admit
+    any sibling host (``evil.kingcounty.gov``). All current entries are full
+    FQDNs; keep it that way when onboarding connectors.
+    """
     if hostname in domain_set:
         return True
     return any(hostname.endswith(f".{d}") for d in domain_set)

@@ -541,9 +541,15 @@ async def change_password(
     except _redis_exceptions.RedisError:
         raise revocation_unavailable_503()
 
-    # Save current password to history, set the new hash, commit.
+    # Save current password to history, set the new hash, and ALSO revoke the
+    # API key. revoke_all_for_user only invalidates JWTs; the API-key auth path
+    # has no issued-at to compare against revoked_at, so a stolen/attacker-
+    # created key would survive a password change otherwise — defeating the
+    # "secure my account" intent. Clearing api_key_hash matches /logout-all;
+    # the user re-issues via POST /api-key. (Codex convergence review.)
     db.add(PasswordHistory(user_id=current_user.id, password_hash=user.password_hash))
     user.password_hash = hash_password(body.new_password)
+    user.api_key_hash = None
     await db.commit()
     audit_log(request, "password_changed", current_user.id)
 
@@ -703,8 +709,13 @@ async def reset_password(
     except _redis_exceptions.RedisError:
         raise revocation_unavailable_503()
 
+    # Also revoke the API key — a password reset is the canonical compromise-
+    # recovery action and MUST evict every credential, not just JWTs (the
+    # API-key path never checks revoked_at). Matches /logout-all + change-
+    # password; re-issue via POST /api-key. (Codex convergence review.)
     db.add(PasswordHistory(user_id=user.id, password_hash=user.password_hash))
     user.password_hash = hash_password(body.new_password)
+    user.api_key_hash = None
     await db.commit()
     audit_log(request, "password_reset", user.id)
 

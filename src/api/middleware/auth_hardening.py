@@ -168,15 +168,20 @@ class TokenBlacklist:
             try:
                 await _get_redis().delete(key)
             except redis_exceptions.RedisError as del_exc:
-                # If both SETEX and DEL fail, the cache may briefly
-                # serve a stale negative sentinel until the entry
-                # expires. Log loud — the DB row IS revoked, but
-                # ops should know auth-cache writes are failing.
+                # If both SETEX and DEL fail, the cache can retain a STALE
+                # POSITIVE revoke timestamp (an earlier revoke) that
+                # get_user_revoke_time trusts WITHOUT re-reading the DB —
+                # masking THIS revocation and letting tokens issued after the
+                # old timestamp survive. Fail CLOSED: re-raise so the caller
+                # 503s and retries. The DB write above is durable + idempotent,
+                # so a retry once Redis recovers makes the cache consistent.
+                # (Codex convergence review.)
                 _logger.error(
                     "revoke_all_for_user: BOTH Redis SETEX and DEL failed; "
-                    "cache may briefly mask DB revocation for user %s: %s",
+                    "failing closed for user %s: %s",
                     user_id, del_exc,
                 )
+                raise
 
     @staticmethod
     async def get_user_revoke_time(user_id: str) -> int:

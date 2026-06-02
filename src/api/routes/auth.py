@@ -21,7 +21,14 @@ from src.api.auth import (
     verify_password,
 )
 from src.api.middleware import BruteForceProtection, audit_log, client_ip, rate_limit
-from src.api.schemas import ApiKeyResponse, PasswordChange, TokenResponse, UserLogin, UserRegister, UserResponse
+from src.api.schemas import (
+    ApiKeyResponse,
+    PasswordChange,
+    TokenResponse,
+    UserLogin,
+    UserRegister,
+    UserResponse,
+)
 from src.config import settings
 from src.db import User, get_db  # noqa: F401 (User used in Annotated type)
 
@@ -59,6 +66,13 @@ async def register(
     # Check for duplicate — but return generic error (no user enumeration)
     existing = await db.execute(select(User).where(User.email == body.email))
     if existing.scalar_one_or_none():
+        # A4: constant-time parity with the success path. The new-account
+        # branch below runs bcrypt via hash_password(); burn an equivalent
+        # bcrypt cost here so response latency cannot distinguish a
+        # registered email (otherwise fast — returns before any hashing)
+        # from a new one (slow), closing the account-enumeration timing
+        # oracle that the generic error message alone does not.
+        hash_password(body.password)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Registration failed. Please try again.",
@@ -178,7 +192,13 @@ async def refresh_token(
     from jwt.exceptions import InvalidTokenError
     try:
         payload = decode_secure_token(body.refresh_token)
-    except (InvalidTokenError, Exception):
+    except InvalidTokenError:
+        # A5: catch ONLY the JWT error. `decode_secure_token` performs no
+        # infra I/O, so an operational error (e.g. a SECRET_KEY rotation
+        # mishap) must surface as a 500 — not be silently masked as a 401
+        # "invalid token", which would hide the misconfiguration and erase
+        # the distinction between "attacker sent garbage" and "our config
+        # is broken".
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
     if payload.get("purpose") != "refresh":
@@ -200,6 +220,7 @@ async def refresh_token(
     # Revocation is a security boundary — if Redis is unavailable we
     # cannot prove the refresh token wasn't revoked, so surface 503.
     import redis.exceptions as _redis_exceptions
+
     from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
     jti = payload.get("jti", "")
     issued_at: int = payload.get("iat", 0)
@@ -208,6 +229,23 @@ async def refresh_token(
             raise HTTPException(status_code=401, detail="Refresh token revoked")
         if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
             raise HTTPException(status_code=401, detail="Refresh token revoked")
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
+
+    # A1: rotate — consume this refresh token so it can never be replayed.
+    # Without rotation a single stolen refresh token is reusable for its
+    # full 7-day life and self-renews indefinitely (each refresh mints a
+    # new 7-day token while the old one stays valid). Blacklisting the
+    # consumed jti makes refresh tokens single-use: once the victim's
+    # client refreshes, the attacker's copy 401s — killing the session
+    # AND surfacing the theft. Revocation is a security boundary, so a
+    # Redis failure here 503s like the checks above rather than minting a
+    # new pair while leaving the old token live.
+    exp: int = payload.get("exp", 0)
+    ttl = max(0, exp - int(time.time()))
+    try:
+        if jti and ttl > 0:
+            await TokenBlacklist.add(jti, ttl)
     except _redis_exceptions.RedisError:
         raise revocation_unavailable_503()
 
@@ -329,6 +367,7 @@ async def logout(
     # the logout flow. Other decode errors (already-expired token,
     # malformed token, etc.) are still benign and swallowed below.
     import redis.exceptions as _redis_exceptions
+
     from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
     try:
         payload = decode_secure_token(token)
@@ -356,6 +395,7 @@ async def logout_all(
     # — surface 503 so the caller knows to retry rather than report a
     # successful logout that did not actually log anyone out.
     import redis.exceptions as _redis_exceptions
+
     from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
     try:
         await TokenBlacklist.revoke_all_for_user(current_user.id)
@@ -422,6 +462,24 @@ async def change_password(
 
     user.password_hash = hash_password(body.new_password)
     await db.commit()
+
+    # A2: a password change MUST evict every existing session and refresh
+    # token. Without this, an attacker who already holds a token (or the
+    # victim's refresh token) rides straight through the password change —
+    # the single most common "I think I've been hacked" reaction would not
+    # actually lock them out, and the never-rotated refresh token (A1) lets
+    # them self-renew forever. revoke_all_for_user stamps users.revoked_at
+    # so every token issued before now is rejected. The caller is logged
+    # out too and must re-authenticate (standard, safe post-change UX).
+    # Revocation is a security boundary: on Redis failure, 503 so the
+    # client retries rather than believing the change secured the account.
+    import redis.exceptions as _redis_exceptions
+
+    from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
+    try:
+        await TokenBlacklist.revoke_all_for_user(current_user.id)
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
     audit_log(request, "password_changed", current_user.id)
 
 

@@ -1,7 +1,6 @@
 """Auth hardening: token blacklist + brute-force protection (Redis-backed)."""
 
 import logging
-import time
 
 import redis.asyncio as aioredis
 import redis.exceptions as redis_exceptions
@@ -118,8 +117,10 @@ class TokenBlacklist:
         the client retries instead of reporting a successful revocation
         that did not persist.
         """
+        from datetime import UTC, datetime
+
         from sqlalchemy import update
-        from datetime import datetime, UTC
+
         from src.db.models import User
         from src.db.session import async_engine
 
@@ -209,6 +210,7 @@ class TokenBlacklist:
 
         # DB authoritative read.
         from sqlalchemy import select
+
         from src.db.models import User
         from src.db.session import async_engine
 
@@ -273,13 +275,26 @@ class BruteForceProtection:
 
     _KEY_PREFIX = "bf:"
 
+    # A6: the per-email counter exists to catch distributed attacks (many
+    # IPs, one email). But an unauthenticated attacker who knows a victim's
+    # email can spray bad passwords from throwaway IPs to drive that email
+    # counter to the 24h tier and deny the real user login at will — a
+    # cheap, repeatable account-lockout DoS. Cap email-driven lockout at a
+    # short ceiling: it still slows distributed guessing, but cannot be
+    # weaponised into a long denial of service. The per-IP counter keeps
+    # the FULL escalation (incl. 24h) against the actual source of an
+    # attack, where a long lockout is the desired outcome.
+    _EMAIL_LOCKOUT_CAP_SECONDS = 15 * 60
+
     @staticmethod
-    def _lockout_duration(failures: int) -> int:
+    def _lockout_duration(failures: int, *, is_email: bool = False) -> int:
         """Return lockout seconds for a given failure count (0 = not locked out)."""
         duration = 0
         for threshold, seconds in _LOCKOUT_THRESHOLDS:
             if failures >= threshold:
                 duration = seconds
+        if is_email:
+            duration = min(duration, BruteForceProtection._EMAIL_LOCKOUT_CAP_SECONDS)
         return duration
 
     @staticmethod
@@ -300,7 +315,9 @@ class BruteForceProtection:
                 key = f"{BruteForceProtection._KEY_PREFIX}{key_suffix}"
                 val = await r.get(key)
                 failures = int(val) if val else 0
-                lockout = BruteForceProtection._lockout_duration(failures)
+                lockout = BruteForceProtection._lockout_duration(
+                    failures, is_email=key_suffix.startswith("email:")
+                )
                 if lockout > 0:
                     raise HTTPException(
                         status_code=status.HTTP_429_TOO_MANY_REQUESTS,

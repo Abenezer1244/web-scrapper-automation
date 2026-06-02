@@ -51,11 +51,15 @@ to understand *why* the code is the way it is and *what's been attempted before*
   authoritative idempotency; the edge claim was net-negative (could drop a legit retry).
 - Phased, ≤5 files/phase, atomic commit per phase; subagents on disjoint files to parallelize safely.
 
-**Caught & fixed (the headline):** the Claude×Codex loop caught **12 bugs in the fixes themselves** across
-5 Codex rounds — e.g. refresh-rotation TOCTOU (→ SET NX), XFF trusting spoofable Fly/CF headers on Railway,
-password-change revoking *after* commit, a cosmetic lockout cap, a swallowed Stripe error defeating
-autoretry, an enqueue-failure losing a meter event, a stale second reset link surviving a reset. Each was
-re-fixed and re-verified. This is why two reviewers > one.
+**Caught & fixed (the headline):** the Claude×Codex loop caught **~17 bugs in the fixes themselves** across
+**8 Codex review rounds** — refresh-rotation TOCTOU (→ SET NX), XFF trusting spoofable Fly/CF headers on
+Railway, password-change revoking *after* commit, a cosmetic lockout cap, a swallowed Stripe error defeating
+autoretry, an enqueue-failure losing a meter event, a stale second reset link surviving a reset, password
+recovery leaving the API key valid, a fail-open revoke cache, an RLS guard swallowed by the worker
+bootstrap, and — biggest — a **production-outage-class** T2 bug: the hard-fail-on-BYPASSRLS would have made
+the API + workers refuse to boot on the *current* prod role, and a downgraded role would block scrapes/ingest
+(mid-task commit clears the `SET LOCAL` GUC; `system_sync_session` has no tenant context). Findings shrank
+and deepened each round (3→2→3→2→2→1→2) — convergence. Each was re-fixed + re-verified. Two reviewers > one.
 
 **Failed / Blocked:** full integration tests can't run locally (need CI Postgres+Redis; `conftest.py` wires
 real infra) — verified statically (`py_compile` + `ruff` every phase) + pure-function CSV tests + the Codex
@@ -64,12 +68,15 @@ connection errors) — not logic regressions.
 
 **Pending / Handoff:**
 - **NOT merged to `main`** — branch awaits review/merge.
-- **T2 ops:** confirm the deployed Supabase/Postgres runtime role is `NOBYPASSRLS NOSUPERUSER` (migration 025
-  + startup guard only bite if the role can actually be constrained); run `alembic upgrade head` (025 + 026).
-- **Migration collision heads-up:** the older `security/high-2-rls` branch also has a `025_*`; this branch's
-  `025_rls_with_check_write_policies` + `026_add_skip_trace_meter_outbox` chain off `024`. Reconcile before
-  merging either branch.
-- Final Codex convergence review of the whole diff in progress at write time.
+- **T2 / `RLS_ENFORCE` — DO NOT enable yet:** default is OFF (advisory log; the API/workers boot normally on
+  today's BYPASSRLS role). The `025` WITH CHECK policies are inert until the role is downgraded. Flip
+  `RLS_ENFORCE=True` ONLY after the deferred HIGH-2 cutover lands (non-BYPASSRLS role + per-transaction GUC
+  reapply in `rls_sync_session` + a system RLS policy for `system_sync_session`) — else scrapes + ingest break.
+  Add `RLS_ENFORCE` to `.env.example` (access-restricted in this session). Run `alembic upgrade head` (025 + 026).
+- **Migration collision:** the older `security/high-2-rls` branch also has a `025_*`; this branch's
+  `025_rls_with_check_write_policies` + `026_add_skip_trace_meter_outbox` chain off `024`. Reconcile before merge.
+- **Final RLS-gating commit (`RLS_ENFORCE`) is Claude-self-reviewed only** — Codex hit its usage limit (resets
+  ~2026-06-02 02:08). Re-run `/codex review` after the reset to confirm closure of the last 2 P1s.
 
 **Facts learned:**
 - The codebase was already well-hardened from the prior 2026-06-01 review — remaining bugs were subtle

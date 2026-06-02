@@ -73,7 +73,10 @@ to understand *why* the code is the way it is and *what's been attempted before*
   `.gitignore` missing root scratch paths.
 
 **Pending / Handoff (user/ops):**
-- Rotate `the King E2E portal password [REDACTED]` on the King County portal (local files already deleted).
+- The leaked credential was an **auto-generated E2E demo test-user login**
+  (`king_e2e_*@bridgeleads.io`, created by the E2E test tooling — not a real
+  customer/admin or external-portal password). Low severity. Optional: rotate or
+  disable that throwaway test account. (Local `.e2e_*` files already deleted.)
 - HIGH-2 cutover: provision `bridgeleads_app`/`bridgeleads_system` non-owner `NOBYPASSRLS` roles,
   switch all 3 DB URLs, extend `tests/test_rls_isolation.py` to 10 tables, `FORCE` last on staging
   → promote. Runbook: `docs/security/high-2-cutover-runbook.sql`.

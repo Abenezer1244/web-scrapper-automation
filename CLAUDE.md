@@ -72,6 +72,7 @@ When reading files, read the whole file chunk by chunk to ensure nothing is miss
 5. At every step, give a high level explanation of what changes were made.
 6. Make every task and code change as simple as possible. Avoid massive or complex changes. Every change should impact as little code as possible. Everything is about simplicity.
 7. Finally, add a review section to `tasks/todo.md` with a summary of the changes made and any notes.
+8. At the end of any substantial session, append an entry to **`docs/BUILD_JOURNAL.md`** — the running record of what was **built / tried / failed / succeeded** and the decisions behind them. Record failures and dead ends honestly, not just wins. Follow the format at the top of that file.
 
 ---
 

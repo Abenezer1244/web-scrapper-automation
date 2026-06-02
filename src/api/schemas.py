@@ -6,6 +6,20 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
+def _validate_password_rules(v: str) -> str:
+    """Shared password policy: min 10, max 72 chars.
+
+    Single source of truth so UserRegister, PasswordChange, and the
+    A3 reset flow (ResetPasswordRequest) enforce IDENTICAL rules — a
+    reset must never be a back door around the registration policy.
+    """
+    if len(v) < 10:
+        raise ValueError("Password must be at least 10 characters")
+    if len(v) > 72:
+        raise ValueError("Password must not exceed 72 characters")
+    return v
+
+
 class UserRegister(BaseModel):
     email: EmailStr
     password: str
@@ -19,11 +33,7 @@ class UserRegister(BaseModel):
     @field_validator("password")
     @classmethod
     def password_validation(cls, v: str) -> str:
-        if len(v) < 10:
-            raise ValueError("Password must be at least 10 characters")
-        if len(v) > 72:
-            raise ValueError("Password must not exceed 72 characters")
-        return v
+        return _validate_password_rules(v)
 
     @field_validator("ref")
     @classmethod
@@ -50,11 +60,34 @@ class PasswordChange(BaseModel):
     @field_validator("new_password")
     @classmethod
     def password_min_length(cls, v: str) -> str:
-        if len(v) < 10:
-            raise ValueError("Password must be at least 10 characters")
-        if len(v) > 72:
-            raise ValueError("Password must not exceed 72 characters")
-        return v
+        return _validate_password_rules(v)
+
+
+class ForgotPasswordRequest(BaseModel):
+    """A3: request a password-reset link. Body for POST /auth/forgot-password.
+
+    Only the email is needed. The endpoint is enumeration-safe — it
+    ALWAYS returns 200 regardless of whether this address has an
+    account — so no other field is accepted or revealed here.
+    """
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    """A3: complete a password reset. Body for POST /auth/reset-password.
+
+    `token` is the short-lived single-use reset JWT (aud=bridgeleads-reset)
+    minted by /auth/forgot-password. `new_password` is validated against
+    the SAME policy as registration/change-password via the shared
+    validator so the reset path cannot weaken the password rules.
+    """
+    token: str = Field(max_length=4096)  # bound — a JWT is ~hundreds of bytes
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def password_policy(cls, v: str) -> str:
+        return _validate_password_rules(v)
 
 
 class UserResponse(BaseModel):
@@ -273,7 +306,7 @@ class ScraperConfigResponse(BaseModel):
         self.deliver.setdefault("webhook_secret", None)
         # Also normalize fields / enrichment / schedule defensively
         if isinstance(self.fields, list):
-            self.fields = {f: True for f in self.fields}
+            self.fields = dict.fromkeys(self.fields, True)
         elif not isinstance(self.fields, dict):
             self.fields = {}
         if not isinstance(self.enrichment, dict):

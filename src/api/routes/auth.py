@@ -23,7 +23,9 @@ from src.api.auth import (
 from src.api.middleware import BruteForceProtection, audit_log, client_ip, rate_limit
 from src.api.schemas import (
     ApiKeyResponse,
+    ForgotPasswordRequest,
     PasswordChange,
+    ResetPasswordRequest,
     TokenResponse,
     UserLogin,
     UserRegister,
@@ -33,6 +35,71 @@ from src.config import settings
 from src.db import User, get_db  # noqa: F401 (User used in Annotated type)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+# ─── A3: password-reset token (stateless) ─────────────────────────────────────
+# A3 finding: there is no forgot/reset-password flow, so a user whose password
+# is compromised has no recovery path. We reuse the existing JWT/HS256 machinery
+# (same SECRET_KEY as src/api/auth.py) rather than add a DB table, but mint reset
+# tokens under a DISTINCT audience so the two token families cannot cross over:
+#   - a session/access token (aud="bridgeleads-api") CANNOT reset a password
+#     (verify below pins audience="bridgeleads-reset"), and
+#   - a reset token CANNOT authenticate a request (get_current_user's
+#     decode_secure_token pins audience="bridgeleads-api").
+# We deliberately do NOT reuse decode_secure_token here because it hard-codes
+# aud="bridgeleads-api"; we call jwt.* directly with the reset audience.
+
+_RESET_TOKEN_PURPOSE = "reset"
+_RESET_TOKEN_AUDIENCE = "bridgeleads-reset"
+_RESET_TOKEN_ISSUER = "bridgeleads"
+_RESET_TOKEN_ALGORITHM = "HS256"
+_RESET_TOKEN_EXPIRE_SECONDS = 30 * 60  # short-lived: ~30 minutes
+
+
+def _mint_reset_token(user_id: str) -> str:
+    """Mint a short-lived, single-use-able password-reset JWT (A3).
+
+    Fresh jti so TokenBlacklist.consume_once can burn it exactly once on
+    redemption. Signed with the app SECRET_KEY/HS256, scoped to the reset
+    audience so it is useless on any other endpoint.
+    """
+    import jwt
+
+    now = int(time.time())
+    payload = {
+        "sub": user_id,
+        "jti": str(uuid.uuid4()),
+        "iss": _RESET_TOKEN_ISSUER,
+        "aud": _RESET_TOKEN_AUDIENCE,
+        "purpose": _RESET_TOKEN_PURPOSE,
+        "iat": now,
+        "exp": now + _RESET_TOKEN_EXPIRE_SECONDS,
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=_RESET_TOKEN_ALGORITHM)
+
+
+def _decode_reset_token(token: str) -> dict:
+    """Decode + verify a password-reset JWT (A3). Raises jwt.InvalidTokenError.
+
+    Pins audience="bridgeleads-reset" and issuer="bridgeleads" (so a session
+    token cannot be used here) and checks purpose=="reset". Caller catches
+    jwt.InvalidTokenError ONLY and maps it to a generic 400 — any non-JWT
+    error must surface, not be masked as "invalid link".
+    """
+    import jwt
+
+    payload = jwt.decode(
+        token,
+        settings.SECRET_KEY,
+        algorithms=[_RESET_TOKEN_ALGORITHM],
+        audience=_RESET_TOKEN_AUDIENCE,
+        issuer=_RESET_TOKEN_ISSUER,
+        options={"verify_exp": True},
+    )
+    if payload.get("purpose") != _RESET_TOKEN_PURPOSE:
+        # Right audience but wrong purpose — treat as an invalid reset token.
+        raise jwt.InvalidTokenError("not a reset token")
+    return payload
 
 
 @router.get("/config")
@@ -479,6 +546,132 @@ async def change_password(
     user.password_hash = hash_password(body.new_password)
     await db.commit()
     audit_log(request, "password_changed", current_user.id)
+
+
+@router.post("/forgot-password", status_code=status.HTTP_200_OK)
+async def forgot_password(
+    body: ForgotPasswordRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """A3: request a password-reset link.
+
+    ENUMERATION-SAFE: ALWAYS returns 200 with the same generic message
+    whether or not the email has an account. We never reveal existence —
+    not via the body, not via the status code, and not via email-send
+    success/failure (the send is best-effort and swallowed). If a matching
+    active user exists we mint a short-lived reset token and email a link;
+    otherwise we do nothing observable.
+    """
+    await rate_limit(request, zone="auth")
+
+    generic = {"message": "If that email exists, a reset link has been sent."}
+
+    result = await db.execute(select(User).where(User.email == body.email, User.is_active))
+    user = result.scalar_one_or_none()
+
+    if user is not None:
+        token = _mint_reset_token(user.id)
+        reset_link = f"{settings.FRONTEND_URL}/reset-password?token={token}"
+        # Best-effort send — a delivery failure must NOT change the 200 or
+        # leak that the account exists. send_password_reset_email already
+        # soft-fails internally; the extra guard covers import/unexpected
+        # errors so the enumeration-safe response is never disturbed.
+        try:
+            from src.workers.delivery import send_password_reset_email
+            send_password_reset_email(body.email, reset_link)
+        except Exception:
+            pass
+
+    # audit_log records the attempt without leaking existence to the client.
+    audit_log(request, "password_reset_requested", user.id if user else None)
+    return generic
+
+
+@router.post("/reset-password", status_code=status.HTTP_200_OK)
+async def reset_password(
+    body: ResetPasswordRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """A3: complete a password reset with a token from /forgot-password.
+
+    Verifies the reset token (distinct audience — a session token cannot be
+    used here), single-uses it atomically, rotates the password, writes
+    history, and revokes ALL existing sessions BEFORE committing the new
+    password (fail-safe ordering).
+    """
+    await rate_limit(request, zone="auth")
+
+    import jwt
+
+    # Decode + verify. Catch ONLY the JWT error → generic 400. Any other
+    # exception (e.g. a SECRET_KEY misconfiguration) must surface as 500,
+    # not be masked as "invalid link" (mirrors the /refresh A5 reasoning).
+    try:
+        payload = _decode_reset_token(body.token)
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired reset link",
+        )
+
+    user_id: str = payload.get("sub", "")
+    jti: str = payload.get("jti", "")
+    exp: int = payload.get("exp", 0)
+    ttl = max(0, exp - int(time.time()))
+    if not user_id or not jti or ttl <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired reset link",
+        )
+
+    import redis.exceptions as _redis_exceptions
+
+    from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
+
+    # Single-use: atomically claim the jti. If it returns False the token was
+    # already redeemed (or is racing a concurrent redemption) — reject. On
+    # Redis failure we cannot prove the token is unused, so 503 (fail closed)
+    # rather than risk honoring a replayed reset link.
+    try:
+        if not await TokenBlacklist.consume_once(jti, ttl):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Reset link already used",
+            )
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
+
+    result = await db.execute(select(User).where(User.id == user_id, User.is_active))
+    user = result.scalar_one_or_none()
+    if user is None:
+        # Generic — never reveal whether the subject still exists/is active.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired reset link",
+        )
+
+    # A3 + A2 fail-safe ordering (mirrors change_password): revoke ALL sessions
+    # and refresh tokens BEFORE committing the new password. A password reset is
+    # the canonical "I've been compromised" action — it MUST evict every live
+    # token. Ordering rationale: if revoke fails we 503 with the password
+    # UNCHANGED (safe); if revoke succeeds but the commit later fails, the
+    # account is merely logged out and the old password still works (safe). The
+    # dangerous reverse (password changed, sessions left alive) never happens.
+    try:
+        await TokenBlacklist.revoke_all_for_user(user.id)
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
+
+    # Save the outgoing password to history, set the new hash, commit.
+    from src.db.models import PasswordHistory
+    db.add(PasswordHistory(user_id=user.id, password_hash=user.password_hash))
+    user.password_hash = hash_password(body.new_password)
+    await db.commit()
+    audit_log(request, "password_reset", user.id)
+
+    return {"message": "Your password has been reset. Please log in with your new password."}
 
 
 @router.post("/api-key", response_model=ApiKeyResponse, status_code=status.HTTP_201_CREATED)

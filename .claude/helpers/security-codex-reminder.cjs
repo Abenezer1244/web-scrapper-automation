@@ -1,34 +1,53 @@
 #!/usr/bin/env node
 /**
- * SessionStart hook: surfaces the standing security baseline + Codex-first
- * collaboration workflow into every session's context.
+ * SessionStart hook: surfaces, into every session's context,
+ *   1. the SECURITY-FIRST baseline (security is prioritized on every build),
+ *   2. the Codex-first collaboration workflow, and
+ *   3. the latest docs/BUILD_JOURNAL.md entry (so it is "read" at session start).
  *
- * Stdout from a SessionStart hook is injected as additionalContext, so this
- * makes the workflow impossible to miss at the start of each session.
- *
+ * Stdout from a SessionStart hook is injected as additionalContext.
  * Wired in .claude/settings.json under hooks.SessionStart.
  */
+const fs = require("fs");
+const path = require("path");
+
+// Repo root = two levels up from .claude/helpers/ (robust regardless of cwd).
+const repoRoot = path.resolve(__dirname, "..", "..");
+
+function latestJournalEntry() {
+  const journal = path.join(repoRoot, "docs", "BUILD_JOURNAL.md");
+  try {
+    const lines = fs.readFileSync(journal, "utf8").split(/\r?\n/);
+    const start = lines.findIndex((l) => /^## /.test(l)); // first dated entry (newest)
+    if (start === -1) return "(BUILD_JOURNAL.md has no entries yet)";
+    let end = lines.findIndex((l, i) => i > start && /^## /.test(l));
+    if (end === -1) end = lines.length;
+    let entry = lines.slice(start, end);
+    if (entry.length > 70) entry = entry.slice(0, 70).concat("…(truncated — read docs/BUILD_JOURNAL.md for the full entry)");
+    return entry.join("\n");
+  } catch {
+    return "(docs/BUILD_JOURNAL.md not found — create it; see CLAUDE.md step 8)";
+  }
+}
 
 const lines = [
   "=== BridgeLeads standing workflow (every session, every build) ===",
   "",
-  "SECURITY BASELINE — docs/security/ + .claude/rules/security.md (auto-loaded):",
-  "  - Run the Master Security Review (SECURITY_PROMPT_PACK.md §14) after every",
-  "    meaningful feature / scraper / endpoint. Run it twice — until two passes are clean.",
-  "  - Run the Pre-Launch Prompt (§15) before any production deploy.",
-  "  - The pack is Abro-tuned (Next.js/Supabase). Apply the stack-translation table",
-  "    in .claude/rules/security.md to map it onto FastAPI/Celery/Playwright/Pydantic.",
-  "  - Non-negotiables: user_id filter on every query, validate_scraping_target() before",
-  "    any user URL (SSRF), sanitize_for_csv() before export, secrets via env only.",
+  "SECURITY IS PRIORITIZED ON EVERY BUILD — docs/security/ + .claude/rules/security.md (auto-loaded):",
+  "  - Run the Master Security Review (SECURITY_PROMPT_PACK.md §14) after every feature/scraper/endpoint;",
+  "    run the Pre-Launch Prompt (§15) before any production deploy. Run §14 until two passes are clean.",
+  "  - Apply the stack-translation table in .claude/rules/security.md (the pack is Abro-tuned → FastAPI/Celery).",
+  "  - Non-negotiables: user_id filter on every query, validate_scraping_target() before any user URL (SSRF),",
+  "    sanitize_for_csv() before export, secrets via env only, no secret values in code/commits/docs.",
   "",
-  "CODEX-FIRST COLLABORATION — .claude/rules/codex-collaboration.md:",
-  "  - BEFORE touching any code or starting any build: brainstorm with Codex.",
-  "    Use the `codex` skill in consult mode (or `codex` CLI) to pressure-test the",
-  "    approach. Reconcile Codex's view with the plan BEFORE writing code.",
-  "  - AFTER every build/feature: Codex reviews the diff (`codex review` / challenge).",
-  "    Codex is a different model family — it catches what Claude misses, and vice versa.",
-  "    Consensus findings take the higher severity; when CLAUDE.md/PRD is silent, Codex wins.",
-  "  - Codex CLI is installed and ready (codex-cli).",
+  "CODEX-FIRST — .claude/rules/codex-collaboration.md:",
+  "  - BEFORE touching any code/build: brainstorm with Codex (consult). AFTER every build: Codex reviews the diff.",
+  "  - Consensus takes the higher severity; any Critical/High from either reviewer = NO-GO until fixed.",
+  "",
+  "LATEST BUILD JOURNAL ENTRY (docs/BUILD_JOURNAL.md — read this before starting; append a new entry at session end):",
+  "----------------------------------------------------------------",
+  latestJournalEntry(),
+  "----------------------------------------------------------------",
   "=================================================================",
 ];
 

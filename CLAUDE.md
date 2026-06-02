@@ -72,7 +72,7 @@ When reading files, read the whole file chunk by chunk to ensure nothing is miss
 5. At every step, give a high level explanation of what changes were made.
 6. Make every task and code change as simple as possible. Avoid massive or complex changes. Every change should impact as little code as possible. Everything is about simplicity.
 7. Finally, add a review section to `tasks/todo.md` with a summary of the changes made and any notes.
-8. At the end of any substantial session, append an entry to **`docs/BUILD_JOURNAL.md`** — the running record of what was **built / tried / failed / succeeded** and the decisions behind them. Record failures and dead ends honestly, not just wins. Follow the format at the top of that file.
+8. **`docs/BUILD_JOURNAL.md` — read at start, write at end.** At session start, review the latest entry (the SessionStart hook surfaces it automatically alongside the security baseline). At the end of any substantial session, append a new entry — the running record of what was **built / tried / failed / succeeded** and the decisions behind them. Record failures and dead ends honestly, not just wins. Follow the format at the top of that file. **Security is prioritized on every build** (see the Security section above + `.claude/rules/security.md`).
 
 ---
 

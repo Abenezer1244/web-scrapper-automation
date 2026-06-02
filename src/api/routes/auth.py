@@ -5,7 +5,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -552,16 +552,19 @@ async def change_password(
 async def forgot_password(
     body: ForgotPasswordRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """A3: request a password-reset link.
 
-    ENUMERATION-SAFE: ALWAYS returns 200 with the same generic message
-    whether or not the email has an account. We never reveal existence —
-    not via the body, not via the status code, and not via email-send
-    success/failure (the send is best-effort and swallowed). If a matching
-    active user exists we mint a short-lived reset token and email a link;
-    otherwise we do nothing observable.
+    ENUMERATION-SAFE: ALWAYS returns 200 with the same generic message whether
+    or not the email has an account. We never reveal existence — not via the
+    body, not via the status code, not via email send/failure, AND not via
+    response TIMING: the slow Resend network call is queued as a BACKGROUND
+    task that runs AFTER the response is sent, so the existing-email and
+    missing-email paths return with the same latency (Codex final review). If a
+    matching active user exists we mint a short-lived reset token and email a
+    link; otherwise we do nothing observable.
     """
     await rate_limit(request, zone="auth")
 
@@ -573,15 +576,12 @@ async def forgot_password(
     if user is not None:
         token = _mint_reset_token(user.id)
         reset_link = f"{settings.FRONTEND_URL}/reset-password?token={token}"
-        # Best-effort send — a delivery failure must NOT change the 200 or
-        # leak that the account exists. send_password_reset_email already
-        # soft-fails internally; the extra guard covers import/unexpected
-        # errors so the enumeration-safe response is never disturbed.
-        try:
-            from src.workers.delivery import send_password_reset_email
-            send_password_reset_email(body.email, reset_link)
-        except Exception:
-            pass
+        # Queue the email AFTER the response so the Resend call's latency can't
+        # distinguish an existing account from a missing one. send_password_
+        # reset_email soft-fails internally, so a delivery failure never
+        # surfaces or disturbs the enumeration-safe 200.
+        from src.workers.delivery import send_password_reset_email
+        background_tasks.add_task(send_password_reset_email, body.email, reset_link)
 
     # audit_log records the attempt without leaking existence to the client.
     audit_log(request, "password_reset_requested", user.id if user else None)
@@ -629,20 +629,14 @@ async def reset_password(
     import redis.exceptions as _redis_exceptions
 
     from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
+    from src.db.models import PasswordHistory
 
-    # Single-use: atomically claim the jti. If it returns False the token was
-    # already redeemed (or is racing a concurrent redemption) — reject. On
-    # Redis failure we cannot prove the token is unused, so 503 (fail closed)
-    # rather than risk honoring a replayed reset link.
-    try:
-        if not await TokenBlacklist.consume_once(jti, ttl):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Reset link already used",
-            )
-    except _redis_exceptions.RedisError:
-        raise revocation_unavailable_503()
-
+    # Look up the subject and enforce the password-reuse policy BEFORE we burn
+    # the single-use token or revoke sessions. Doing the validation first means
+    # a policy rejection does NOT consume the link or log the user out — they
+    # can retry the same link with a compliant password. The valid signed token
+    # already proves the caller holds a link we emailed only to a real active
+    # user, so this lookup is not an enumeration vector.
     result = await db.execute(select(User).where(User.id == user_id, User.is_active))
     user = result.scalar_one_or_none()
     if user is None:
@@ -652,20 +646,50 @@ async def reset_password(
             detail="Invalid or expired reset link",
         )
 
+    # Reuse policy (mirrors change_password): a reset link must NOT be a way
+    # around the repository's password-reuse rules (Codex final review). Reject
+    # the current password and any of the last 5.
+    if verify_password(body.new_password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password cannot be the same as your current password.",
+        )
+    history_result = await db.execute(
+        select(PasswordHistory)
+        .where(PasswordHistory.user_id == user.id)
+        .order_by(PasswordHistory.created_at.desc())
+        .limit(5)
+    )
+    for entry in history_result.scalars().all():
+        if verify_password(body.new_password, entry.password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="New password cannot be one of your last 5 passwords.",
+            )
+
+    # Single-use: atomically claim the jti now that validation passed. False =>
+    # already redeemed (or racing a concurrent redemption) — reject. Redis
+    # failure => 503 (fail closed): we can't prove the token is unused.
+    try:
+        if not await TokenBlacklist.consume_once(jti, ttl):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Reset link already used",
+            )
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
+
     # A3 + A2 fail-safe ordering (mirrors change_password): revoke ALL sessions
-    # and refresh tokens BEFORE committing the new password. A password reset is
-    # the canonical "I've been compromised" action — it MUST evict every live
-    # token. Ordering rationale: if revoke fails we 503 with the password
-    # UNCHANGED (safe); if revoke succeeds but the commit later fails, the
-    # account is merely logged out and the old password still works (safe). The
-    # dangerous reverse (password changed, sessions left alive) never happens.
+    # BEFORE committing the new password. A reset is the canonical "I've been
+    # compromised" action — it MUST evict every live token. If revoke fails we
+    # 503 with the password UNCHANGED (safe); if revoke succeeds but the commit
+    # later fails, the account is merely logged out and the old password still
+    # works (safe). The dangerous reverse never happens.
     try:
         await TokenBlacklist.revoke_all_for_user(user.id)
     except _redis_exceptions.RedisError:
         raise revocation_unavailable_503()
 
-    # Save the outgoing password to history, set the new hash, commit.
-    from src.db.models import PasswordHistory
     db.add(PasswordHistory(user_id=user.id, password_hash=user.password_hash))
     user.password_hash = hash_password(body.new_password)
     await db.commit()

@@ -130,44 +130,62 @@ async def tracerfy_webhook(
     # unavailable we do NOT block the delivery — the worker's DB guard still
     # makes re-processing idempotent — so a Redis error falls through to
     # dispatch rather than dropping the batch.
+    # set(..., nx=True, ex=N) -> True on first write, None on conflict. A
+    # shorter TTL than before (1h vs 1d) bounds the damage if a claim is ever
+    # orphaned; the redelivery window is minutes and the worker's DB guard is
+    # the real idempotency backstop. The Codex final review flagged that
+    # claiming BEFORE dispatch means a dispatch failure would suppress a
+    # legitimate redelivery for the whole TTL — so we RELEASE the claim if
+    # dispatch raises (below), and re-raise so the failure is visible.
     import redis.asyncio as aioredis
     redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+    dedup_key = f"tracerfy_webhook:{queue_id}"
+    claimed = False
     try:
-        dedup_key = f"tracerfy_webhook:{queue_id}"
-        claimed = await redis.set(dedup_key, "1", nx=True, ex=86400)  # 1 day
-        if not claimed:
-            _logger.info(
-                "Tracerfy webhook dedup: already dispatched queue_id=%d", queue_id
+        try:
+            claimed = await redis.set(dedup_key, "1", nx=True, ex=3600) is not None
+        except Exception as exc:  # noqa: BLE001 — Redis down must not drop the batch
+            _logger.warning(
+                "Tracerfy webhook dedup check failed (queue_id=%d): %s — falling "
+                "through to dispatch; worker DB guard stays idempotent",
+                queue_id, str(exc)[:120],
             )
-            return {"received": True, "queue_id": queue_id, "deduped": True}
-    except Exception as exc:  # noqa: BLE001 — Redis down must not drop the batch
-        _logger.warning(
-            "Tracerfy webhook dedup check failed (queue_id=%d): %s — "
-            "falling through to dispatch; worker DB guard stays idempotent",
-            queue_id, str(exc)[:120],
-        )
+        else:
+            if not claimed:
+                _logger.info(
+                    "Tracerfy webhook dedup: already dispatched queue_id=%d", queue_id
+                )
+                return {"received": True, "queue_id": queue_id, "deduped": True}
+
+        # M8 (full-SaaS review): dispatch to Celery instead of FastAPI
+        # BackgroundTasks. A BackgroundTask runs inside the API process after
+        # the 200 — if the API restarts before CSV parsing completes, the batch
+        # is dropped (Tracerfy does NOT reliably retry webhooks). Celery
+        # persists the task in Redis and retries if the worker dies mid-task.
+        from src.workers.tracerfy_ingest import ingest_tracerfy_batch
+        try:
+            ingest_tracerfy_batch.delay(
+                queue_id=queue_id,
+                download_url=download_url,
+                rows_uploaded=payload.get("rows_uploaded", 0),
+                credits_deducted=payload.get("credits_deducted", 0),
+            )
+        except Exception:
+            # Release the dedup claim so a redelivery can re-enqueue instead of
+            # being suppressed for the TTL; then re-raise (failure is visible).
+            if claimed:
+                try:
+                    await redis.delete(dedup_key)
+                except Exception:  # noqa: BLE001 — best-effort release
+                    pass
+            raise
+
+        return {"received": True, "queue_id": queue_id}
     finally:
         try:
             await redis.aclose()
         except Exception:  # noqa: BLE001 — best-effort close
             pass
-
-    # M8 (full-SaaS review): dispatch to Celery instead of
-    # FastAPI BackgroundTasks. The previous BackgroundTask ran
-    # inside the API process after the 200 was returned — if the
-    # API process restarted before CSV parsing completed, the
-    # batch was dropped on the floor because Tracerfy does NOT
-    # retry webhooks. Celery persists the task in Redis and retries
-    # automatically if the worker dies mid-task.
-    from src.workers.tracerfy_ingest import ingest_tracerfy_batch
-    ingest_tracerfy_batch.delay(
-        queue_id=queue_id,
-        download_url=download_url,
-        rows_uploaded=payload.get("rows_uploaded", 0),
-        credits_deducted=payload.get("credits_deducted", 0),
-    )
-
-    return {"received": True, "queue_id": queue_id}
 
 
 

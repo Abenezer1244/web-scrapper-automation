@@ -202,6 +202,32 @@ def ingest_tracerfy_batch(
         )
         return {"queue_id": queue_id, "skipped": "untrusted_download_host"}
 
+    # REDTEAM (Codex review): cheap pre-check BEFORE any network I/O. A replay
+    # of an already completed/billed/errored batch — or an unknown/forged queue
+    # id that happened to pass the host check — must no-op WITHOUT downloading
+    # the (possibly expired/slow) signed CSV URL. The authoritative guard is
+    # still the SELECT ... FOR UPDATE re-check below (handles the race where the
+    # status flips between this peek and the lock); this only spares the
+    # wasteful/erroring fetch for the common replay/forged case.
+    with system_sync_session() as _precheck:
+        _pre = _precheck.execute(
+            select(SkipTraceQueue.status).where(
+                SkipTraceQueue.tracerfy_queue_id == queue_id
+            )
+        ).first()
+    if _pre is None:
+        _logger.warning(
+            "Tracerfy ingest queue %d: unknown/forged batch id — no-op (pre-download)",
+            queue_id,
+        )
+        return {"queue_id": queue_id, "skipped": "unknown_queue"}
+    if _pre[0] in ("completed", "billed", "errored"):
+        _logger.info(
+            "Tracerfy ingest queue %d: already %s — idempotent no-op (pre-download)",
+            queue_id, _pre[0],
+        )
+        return {"queue_id": queue_id, "skipped": f"already_{_pre[0]}"}
+
     try:
         csv_text = download_tracerfy_csv(download_url)
     except TracerfyError as exc:

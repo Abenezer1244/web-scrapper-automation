@@ -7,6 +7,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -106,6 +107,19 @@ class ScraperConfig(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
+    # PERF (migration 033): the get_results sibling lookup filters on
+    # user_id + lower(county) + upper(state) + record_type, so this is an
+    # expression index (a plain btree on county/state would not be used).
+    __table_args__ = (
+        Index(
+            "ix_scraper_configs_user_county_state_type",
+            "user_id",
+            func.lower(county),
+            func.upper(state),
+            "record_type",
+        ),
+    )
+
     user = relationship("User", back_populates="scraper_configs")
     jobs = relationship("Job", back_populates="scraper_config", cascade="all, delete-orphan")
 
@@ -129,6 +143,11 @@ class Job(Base):
     started_at = Column(DateTime(timezone=True), nullable=True)
     finished_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    # PERF (migration 033): list_jobs filters user_id and orders by created_at.
+    __table_args__ = (
+        Index("ix_jobs_user_created", "user_id", "created_at"),
+    )
 
     user = relationship("User", back_populates="jobs")
     scraper_config = relationship("ScraperConfig", back_populates="jobs")
@@ -164,6 +183,18 @@ class Result(Base):
     is_duplicate = Column(Boolean, nullable=False, default=False)
     raw_html_hash = Column(String(32), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    # PERF (migration 033): get_results filters job_id + user_id, aggregates
+    # by is_duplicate, and orders by (is_duplicate, created_at).
+    __table_args__ = (
+        Index(
+            "ix_results_job_user_dup_created",
+            "job_id",
+            "user_id",
+            "is_duplicate",
+            "created_at",
+        ),
+    )
 
     job = relationship("Job", back_populates="results")
 
@@ -227,6 +258,18 @@ class CountyConnector(Base):
     last_checked = Column(DateTime(timezone=True), nullable=True)
     active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    # PERF (migration 033): the public /scrapers/connectors picker filters
+    # active + health_status and orders by state, county.
+    __table_args__ = (
+        Index(
+            "ix_county_connectors_picker",
+            "active",
+            "health_status",
+            "state",
+            "county",
+        ),
+    )
 
 
 class JobLog(Base):
@@ -381,6 +424,17 @@ class PendingSkipTraceRow(Base):
     tracerfy_queue_id = Column(Integer, nullable=True, index=True)
     enqueued_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     submitted_at = Column(DateTime(timezone=True), nullable=True)
+
+    # PERF (migration 033): the skip-trace dispatcher drains the queue by
+    # filtering status + trace_type and ordering by enqueued_at.
+    __table_args__ = (
+        Index(
+            "ix_pending_skip_trace_dispatch",
+            "status",
+            "trace_type",
+            "enqueued_at",
+        ),
+    )
 
 
 class SkipTraceMeterEvent(Base):

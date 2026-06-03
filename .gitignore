@@ -141,3 +141,4 @@ _diag_is_pro/
 
 # RLS cutover role passwords (local operator secret — never commit)
 .rls-cutover-secrets
+.rls-cutover-repoint.sh

@@ -7,7 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import (
@@ -31,6 +31,7 @@ from src.api.schemas import (
     UserRegister,
     UserResponse,
 )
+from src.api.deps import get_rls_db
 from src.config import settings
 from src.db import User, get_db  # noqa: F401 (User used in Annotated type)
 
@@ -322,7 +323,11 @@ async def me(current_user: CurrentUser) -> UserResponse:
 @router.get("/onboarding")
 async def onboarding_status(
     current_user: CurrentUser,
-    db: AsyncSession = Depends(get_db),
+    # get_rls_db (not get_db): this route reads the tenant-scoped
+    # scraper_configs and jobs tables. Under the non-BYPASSRLS cutover role,
+    # a session with no app.current_user_id would return ZERO rows and report
+    # the user as having no scrapers/jobs. Setting the GUC keeps it correct.
+    db: AsyncSession = Depends(get_rls_db),
 ) -> dict:
     """Return the user's onboarding progress and next suggested action.
 
@@ -479,7 +484,11 @@ async def change_password(
     body: PasswordChange,
     request: Request,
     current_user: CurrentUser,
-    db: AsyncSession = Depends(get_db),
+    # get_rls_db (not get_db): the password-reuse check reads the tenant-scoped
+    # password_history table. Without the GUC, under the cutover role that
+    # SELECT returns ZERO rows and the "last 5 passwords" reuse block silently
+    # passes — a security regression. Setting the RLS context keeps it enforced.
+    db: AsyncSession = Depends(get_rls_db),
 ) -> None:
     """Change the current user's password."""
     await rate_limit(request, zone="auth")
@@ -652,6 +661,19 @@ async def reset_password(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid or expired reset link",
         )
+
+    # RLS context: this route authenticates via the reset token (no
+    # get_rls_db dependency), so set app.current_user_id manually now that the
+    # subject is resolved. The password-reuse check below reads the tenant-
+    # scoped password_history table — under the non-BYPASSRLS cutover role a
+    # session with no GUC returns ZERO rows, silently skipping the reuse block
+    # (security regression). session.info lets the after_begin listener
+    # re-apply the GUC across the commit at the end. (Codex Phase-2a review.)
+    db.sync_session.info["rls_user_id"] = str(user.id)
+    await db.execute(
+        text("SELECT set_config('app.current_user_id', :uid, true)"),
+        {"uid": str(user.id)},
+    )
 
     # Reuse policy (mirrors change_password): a reset link must NOT be a way
     # around the repository's password-reuse rules (Codex final review). Reject

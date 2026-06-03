@@ -127,7 +127,12 @@ async def activation_funnel(
 @router.get("/referral")
 async def referral_status(
     current_user: CurrentUser,
-    db: AsyncSession = Depends(get_db),
+    # get_rls_db (not get_db): paid_conversions reads the tenant-scoped
+    # referral_events table (policy: referrer_id OR referee_id = GUC). Without
+    # the RLS context, under the cutover role that count returns 0 and the
+    # referral dashboard underreports. The cross-user `users` uniqueness/count
+    # reads here rely on the broad app policy on users, unaffected by the GUC.
+    db: AsyncSession = Depends(get_rls_db),
 ) -> dict:
     """Sprint 7.3: referral program — code, stats, and credit balance.
 

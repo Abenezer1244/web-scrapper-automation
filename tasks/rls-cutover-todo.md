@@ -61,15 +61,55 @@ Why no blanket DELETE for the app role: user "deletes" are soft — job cancel i
 - [ ] **Follow-up (Codex note D):** add an async `AsyncSession` reapply-after-commit test
       (sync path proven; async uses the identical listener). Low risk; do before Phase 4.
 
-## Phase 2 — System-role RLS carve-out for cross-tenant work
-**Files (≤5):** `alembic/versions/0XX_system_role_rls_policies.py`, `tests/test_rls_isolation.py` (extend)
-- [ ] `system_sync_session()` sets no GUC (canary, watchdog, ingest, retention). Under
-      NOBYPASSRLS it would be blocked by user-scoped policies.
-- [ ] Add policies per user-scoped table: `USING (user_id = <guc> OR current_user = 'bridgeleads_system')`
-      + matching `WITH CHECK`. Named-role carve-out = explicit, greppable, not a settable GUC.
-- [ ] Extend `test_rls_isolation.py`: (a) `bridgeleads_app` sees only its rows, (b) `bridgeleads_system`
-      can do cross-tenant ops, (c) anon still denied.
-- [ ] **Gate:** isolation tests green + Codex review → STOP for approval
+## Phase 2 — Role-targeted RLS policies (REVISED after Codex design consult) ⏸ AWAITING DECISION
+**Design (Codex-confirmed):** use `CREATE POLICY ... TO bridgeleads_app/bridgeleads_system`
+(role-targeted), NOT `OR current_user=`. Permissive policies OR together; anon/authenticated
+have no policy → default-deny (027 lockout preserved). Migration must be inert under today's
+BYPASSRLS role (RLS_ENFORCE=False does NOT disable Postgres RLS — only the startup check).
+
+**Full RLS state mapped (alembic 001/018/023/025/027/028):**
+- Tenant GUC policies exist: scraper_configs, jobs, results, job_logs, delivered_records,
+  pending_skip_trace_rows, skip_trace_queues, password_history, referral_events, user_record_views.
+- RLS-on / NO-policy = default-deny (027): users, skip_trace_cache, county_connectors, skip_trace_meter_events.
+- county_records: shared-read SELECT (028, guc IS NOT NULL) + 023 trigger blocking GUC-scoped writes.
+
+**System role:** `FOR ALL TO bridgeleads_system USING(true) WITH CHECK(true)` on every table it
+touches (trusted cross-tenant infra). 023 trigger still allows system (no GUC) on county_records.
+
+**⚠️ Codex found the blocker — routes that use `get_db` and never set the GUC** would break
+under tenant RLS on the cutover role:
+- Stripe webhook writes `referral_events` + updates `users` (billing.py, no GUC)
+- `password_history` change routes (auth.py:477, no GUC)
+- `/auth/onboarding` reads `scraper_configs`/`jobs` (auth.py:322, no GUC → empty results)
+- admin activation funnel — cross-tenant app traffic (billing.py, no GUC)
+
+**DECISION NEEDED (see AskUserQuestion):** thorough (fix routes to set GUC → full tenant RLS)
+vs pragmatic (broad trusted-server policy `TO bridgeleads_app` on the no-GUC tables; tenant RLS
+only where routes already set the GUC). Pragmatic still removes BYPASSRLS + keeps anon lockout;
+the app-layer `WHERE user_id` filter remains the tenant boundary on the broad tables (today's model).
+- [ ] **Gate:** Codex review of the migration + extend `tests/test_rls_isolation.py` (app/system/anon) → STOP
+
+### DECISION: THOROUGH cutover (user-chosen 2026-06-02). Sub-phases:
+Route→DB-dependency audit complete. Routes already on `get_rls_db` (set GUC) are fine:
+list/create/get/cancel jobs, get_results, stream_logs, export-url, list/create/get/delete
+scrapers, get_cached_records, checkout. `/download` resolves identity from token + sets GUC (Phase 1).
+
+- **Phase 2a (code, fixable routes):** ✅ DONE + Codex APPROVE. Switched to `get_rls_db`:
+  `/auth/onboarding` (scraper_configs+jobs), `/auth/change-password` (password_history),
+  `/billing/referral` (referral_events). `/auth/reset-password` sets GUC manually (token-auth, no
+  current_user — mirrors /download). `/api-key` + `/logout-all` left on get_db (touch only `users`,
+  broad policy). Codex caught reset-password in review (silent reuse-check regression) — fixed.
+  Files: auth.py, billing.py. py_compile clean.
+- **Phase 2b (code, cross-tenant/webhook):** add an async system DB context; route `/billing/webhook`
+  (Stripe, cross-user referral grant) + `/billing/activation-funnel` (admin analytics) through it.
+- **Phase 2c (migration 029, role-targeted policies):** `FOR ALL TO bridgeleads_system USING(true)
+  WITH CHECK(true)` on all worker tables; tenant GUC policies `TO bridgeleads_app` on user-scoped
+  tables; broad `TO bridgeleads_app` on `users` (auth-bootstrap: register/login/refresh/forgot/reset
+  query users pre-identity — inherent, app-layer enforces) + shared catalogs (county_records read,
+  county_connectors). county_records `FOR ALL TO bridgeleads_system`. Inert under BYPASSRLS today.
+- **Phase 2d (tests):** extend `test_rls_isolation.py` — app sees only own rows, system cross-tenant,
+  anon denied, auth-bootstrap flows still work.
+- Each sub-phase: ≤5 files, Codex review, STOP for approval.
 
 ## Phase 3 — Repoint connection URLs to the downgraded roles
 **Files (≤5):** `.env.example`, Railway env (manual), `src/db/session.py` (migrate URL if needed), runbook

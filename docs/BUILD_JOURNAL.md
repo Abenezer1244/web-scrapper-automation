@@ -19,6 +19,36 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-02 — RLS cutover: Codex HOLISTIC review caught a ship blocker → restructured (commit 3225778)
+
+**The catch:** after all phases were committed, a final cross-phase Codex review (the kind per-phase
+review can't do) found that migrations 030/031 (role-targeted policies + FORCE) would **no-op on the
+first post-merge `alembic upgrade head`** (cutover roles don't exist yet), advance `alembic_version`,
+and then **never re-run when the roles are actually provisioned** — silently skipping the entire policy
+install. Root cause: role-dependent DDL doesn't belong in Alembic's one-shot chain.
+
+**Fix (Codex blueprint):** moved cutover DDL out of Alembic into idempotent operator scripts.
+- 030/031 → no-op placeholders (chain intact).
+- `scripts/apply_rls_cutover_policies.sql` (NEW) — role-targeted policies, hard-fail unless both roles,
+  029 binding backfill, transactional, idempotent.
+- `scripts/apply_rls_force.sql` (NEW) — FORCE, hard-fail unless policies converged + owner BYPASSRLS.
+
+**6 more findings fixed in the same pass:** referral_events app SELECT-only (grant+policy; write is via
+the definer fn); delivered_records/pending/queues system-only (grant/policy aligned); provision REVOKEs +
+verify block (idempotent convergence vs prior over-grants); password_history app SELECT+INSERT not FOR ALL
+(immutable audit rows); FORCE convergence check verifies every table's system policy; worker boot warms
+public_sample_cache; corrected the false "inert under BYPASSRLS" claim (the route CODE is active today —
+only the policies are inert). Codex final: SHIP-READY.
+
+**Lesson:** per-phase Codex review APPROVED every piece; only the holistic "review the whole diff for
+cross-phase gaps" pass caught the migration-consumption blocker. Worth doing on any multi-migration change.
+
+**Canonical cutover order:** `alembic upgrade head` → `provision_rls_roles.sql` →
+`apply_rls_cutover_policies.sql` → repoint connections (staging, RLS_ENFORCE=False) → verify →
+RLS_ENFORCE=True → `apply_rls_force.sql`. All operational; no more code.
+
+---
+
 ## 2026-06-02 — RLS cutover CODE COMPLETE: Phases 2c→4 (policies, repoint, FORCE)
 
 **Built / Shipped (continuing the cutover):**

@@ -19,6 +19,40 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-02 — RLS cutover CODE COMPLETE: Phases 2c→4 (policies, repoint, FORCE)
+
+**Built / Shipped (continuing the cutover):**
+- **Phase 2c** (`40497ce`): migration 030 — role-targeted policies. Drops the untargeted tenant
+  policies; adds `<t>_app TO bridgeleads_app` (tenant GUC) + `<t>_system FOR ALL TO bridgeleads_system`
+  on every table. referral_events app=SELECT-only (writes via the definer fn). users/county_connectors
+  broad app + system. county_records app shared-read + system all. skip_trace_* system-only. Python
+  role-guard: no-op if neither role exists (CI), RAISE if exactly one, swap if both. Backfills 029
+  bindings. anon/authenticated default-denied.
+- **Phase 2d** (`51655ca`): `test_rls_role_policies.py` — SET LOCAL ROLE bridgeleads_app tenant
+  isolation + bridgeleads_system cross-tenant; skips unless the cutover is applied.
+- **Phase 3** (`a268fd1`): `alembic/env.py` prefers `DATABASE_URL_MIGRATE` (owner/DDL), falls back to
+  `DATABASE_URL_SYNC`; `settings.DATABASE_URL_MIGRATE` added.
+- **Phase 4** (`9893633`): migration 031 — FORCE ROW LEVEL SECURITY on 16 tables, gated on both roles
+  existing + a guard that RAISEs unless the 029 SECURITY DEFINER function owners carry BYPASSRLS.
+
+**Caught & fixed (Codex):** 2c — backfill 029 bindings (roles may be provisioned after 029) + downgrade
+idempotency + restore 025 WITH CHECK. 4 — exact-function guard via `to_regprocedure` (bare proname+LIMIT 1
+could match wrong overload) + ungated downgrade.
+
+**Decided:** referral_events app SELECT-only once writes moved to the definer fn (vs Codex's earlier
+asymmetric-WITH-CHECK, which assumed direct app write). FORCE shipped as an audited migration (not
+manual-only) after the owner-bypass guard — it adds little since app/system aren't table owners, but is
+harmless defence-in-depth.
+
+**Pending / Handoff — NO MORE CODE.** All 11 commits authored + Codex-reviewed (e5d50e8→9893633).
+Remaining = OPERATIONAL per `docs/security/RLS-CUTOVER-RUNBOOK.md`: (1) `scripts/provision_rls_roles.sql`
++ add `DATABASE_URL_MIGRATE` to `.env.example`; (2) deploy staging, run migrations 029/030, repoint
+connections, verify with `RLS_ENFORCE=False`; (3) staging `RLS_ENFORCE=True` + E2E; (4) prod: flip
+`RLS_ENFORCE=True`, run migration 031 (FORCE) — `postgres` owner keeps BYPASSRLS so the definer fns
+survive. Everything inert under today's BYPASSRLS role; nothing deployed.
+
+---
+
 ## 2026-06-02 — RLS least-privilege cutover: Phases 0→2b executed (6 commits, Codex-gated)
 
 **Built / Shipped (branch `security/redteam-remediation-2026-06-01`):**

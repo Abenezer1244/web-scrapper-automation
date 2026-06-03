@@ -20,8 +20,16 @@ class Settings(BaseSettings):
     LOGS_DIR: ClassVar[Path] = BASE_DIR / "logs"
 
     # ─── Database ─────────────────────────────────────────────────────────────
+    # RLS cutover (Phase 3) target roles:
+    #   DATABASE_URL       → bridgeleads_app    (FastAPI request traffic)
+    #   DATABASE_URL_SYNC  → bridgeleads_system (Celery workers / scheduler)
+    #   DATABASE_URL_MIGRATE → owner/DDL role, Alembic only (optional; falls back
+    #     to DATABASE_URL_SYNC pre-cutover — see alembic/env.py). Read directly
+    #     by alembic/env.py via os.getenv; declared here for documentation and so
+    #     pydantic-settings does not reject it from the environment.
     DATABASE_URL: str
     DATABASE_URL_SYNC: str
+    DATABASE_URL_MIGRATE: str = ""
 
     # ─── Redis ────────────────────────────────────────────────────────────────
     REDIS_URL: str

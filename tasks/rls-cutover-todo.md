@@ -167,13 +167,13 @@ the owner keeps BYPASSRLS (Supabase `postgres` does) or the definer helpers brea
   anon denied, auth-bootstrap flows still work.
 - Each sub-phase: ≤5 files, Codex review, STOP for approval.
 
-## Phase 3 — Repoint connection URLs to the downgraded roles
-**Files (≤5):** `.env.example`, Railway env (manual), `src/db/session.py` (migrate URL if needed), runbook
-- [ ] `DATABASE_URL` → `bridgeleads_app`; `DATABASE_URL_SYNC` → `bridgeleads_system`;
-      add `DATABASE_URL_MIGRATE` → `bridgeleads_owner` (alembic only)
-- [ ] Update `.env.example` + document; rotate any exposed credentials during the swap
-- [ ] Deploy to **staging** with `RLS_ENFORCE=False` (advisory) — confirm boot, scrapes run,
-      startup role-status log shows `bypassrls=False`
+## Phase 3 — Repoint connection URLs — CODE ✅ Codex APPROVE / DEPLOY ⬜ (manual)
+- [x] `alembic/env.py` prefers `DATABASE_URL_MIGRATE` (owner/DDL), falls back to `DATABASE_URL_SYNC`
+      (pre-cutover unchanged); `settings.DATABASE_URL_MIGRATE` added (optional, default "").
+- [ ] **MANUAL:** add `DATABASE_URL_MIGRATE` to `.env.example` (Read blocked on `.env*`).
+- [ ] **MANUAL DEPLOY (staging→prod):** run `scripts/provision_rls_roles.sql` + migrations 029/030
+      FIRST, then point `DATABASE_URL`→app, `DATABASE_URL_SYNC`→system, `DATABASE_URL_MIGRATE`→owner.
+      Deploy staging with `RLS_ENFORCE=False`; confirm boot + full scrape cycle + `bypassrls=False`.
 - [ ] **Gate:** staging healthy for a full scrape cycle → STOP for approval
 
 ## Phase 4 — Enforce + FORCE RLS (production, last)

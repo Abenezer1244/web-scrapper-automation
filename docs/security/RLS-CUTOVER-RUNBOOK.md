@@ -70,9 +70,18 @@ the NOBYPASSRLS system role do legitimate cross-tenant work without a global byp
 Extend `tests/test_rls_isolation.py` for app/system/anon.
 
 ### Phase 3 — repoint connections (staging first)
-Set the three connection vars to the new roles. Deploy to **staging** with
-`RLS_ENFORCE=False` (advisory). Confirm boot, a full scrape cycle, and the startup
-role-status log shows `bypassrls=False`.
+Set the three connection vars to the new roles:
+- `DATABASE_URL` → `bridgeleads_app` (keep the asyncpg `+asyncpg` driver + 5432/6543 handling)
+- `DATABASE_URL_SYNC` → `bridgeleads_system`
+- `DATABASE_URL_MIGRATE` → the owner/DDL role (Alembic only). `alembic/env.py` prefers it and
+  falls back to `DATABASE_URL_SYNC`, so pre-cutover envs are unchanged. **CODE DONE** (env.py +
+  `settings.DATABASE_URL_MIGRATE`).
+- **Manual:** add `DATABASE_URL_MIGRATE` to `.env.example` (the Read tool is blocked on `.env*`
+  by a security rule, so this one line is a manual edit):
+  `DATABASE_URL_MIGRATE=  # owner/DDL role for Alembic; falls back to DATABASE_URL_SYNC`
+
+Deploy to **staging** with `RLS_ENFORCE=False` (advisory). Confirm boot, a full scrape cycle, and
+the startup role-status log shows `bypassrls=False` for the app + system roles.
 
 ### Phase 4 — enforce, then FORCE (production, last)
 Staging `RLS_ENFORCE=True` → full E2E + isolation tests. Then production: deploy roles →

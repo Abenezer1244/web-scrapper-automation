@@ -11,10 +11,17 @@ load_dotenv()
 
 config = context.config
 
-# Override sqlalchemy.url from environment
-database_url_sync = os.getenv("DATABASE_URL_SYNC")
-if database_url_sync:
-    config.set_main_option("sqlalchemy.url", database_url_sync)
+# Override sqlalchemy.url from environment.
+#
+# RLS cutover (Phase 3): migrations need DDL/owner privileges, which the runtime
+# roles (bridgeleads_app / bridgeleads_system) deliberately lack. Prefer
+# DATABASE_URL_MIGRATE (the owner role) when set; fall back to DATABASE_URL_SYNC
+# so pre-cutover environments — where workers + Alembic share one role — are
+# unchanged. Do NOT point DATABASE_URL_SYNC at bridgeleads_system without also
+# setting DATABASE_URL_MIGRATE, or `alembic upgrade` would run as a non-DDL role.
+migrate_url = os.getenv("DATABASE_URL_MIGRATE") or os.getenv("DATABASE_URL_SYNC")
+if migrate_url:
+    config.set_main_option("sqlalchemy.url", migrate_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

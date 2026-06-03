@@ -139,9 +139,23 @@ scrapers, get_cached_records, checkout. `/download` resolves identity from token
   idempotency (replay = no double-grant) + no-op without referrer + activation_funnel deltas. Real DB,
   seed-in-txn-rollback (mirrors test_rls_isolation). Route/worker integration → CI/staging.
 
-  **➡️ PHASE 2b COMPLETE.** Commits: 5efda74 (2b-i/ii), 06ce1c8 (2b-iii), + 2b-iv. Next: **Phase 2c**
-  (the big migration — role-targeted tenant/system policies on ALL tables; MUST include
-  `FOR ALL TO bridgeleads_system` on results/jobs/scraper_configs per the 2b-iii dependency).
+  **➡️ PHASE 2b COMPLETE.** Commits: 5efda74 (2b-i/ii), 06ce1c8 (2b-iii), de3d40e (2b-iv).
+
+**Phase 2c ✅ DONE + Codex APPROVE** — migration 030 `030_rls_role_targeted_policies.py`:
+- Python role-existence guard: no-op if NEITHER role exists (CI), RAISE if exactly one, swap if both.
+- Tenant tables → `<t>_app TO bridgeleads_app` (USING+WITH CHECK guc) + `<t>_system FOR ALL TO
+  bridgeleads_system` (incl. results/jobs/scraper_configs — the 2b-iii dependency). referral_events
+  app=SELECT-only (writes via definer fn). users/county_connectors broad app + system. county_records
+  app shared-read + system FOR ALL (023 trigger still guards). skip_trace_cache/meter = system-only.
+  anon/authenticated default-denied (027 preserved + tightened).
+- Backfills 029 role bindings (in case roles were provisioned after 029). Idempotent up + down.
+- Codex: 2 rounds (backfill + downgrade idempotency + restore 025 WITH CHECK).
+**Phase 2d (next):** rewrite test_rls_isolation.py for the real bridgeleads_app/bridgeleads_system roles
+(the bridgeleads_rls_test role no longer matches role-targeted policies) + app/system/anon assertions.
+
+⚠️ **PHASE 4 CAVEAT (Codex):** `FORCE ROW LEVEL SECURITY` makes even the table OWNER subject to policies.
+The SECURITY DEFINER fns (grant_referral_credit/activation_funnel) run as the owner — Phase 4 MUST verify
+the owner keeps BYPASSRLS (Supabase `postgres` does) or the definer helpers break under FORCE.
 - **Phase 2c (migration 029, role-targeted policies):** `FOR ALL TO bridgeleads_system USING(true)
   WITH CHECK(true)` on all worker tables; tenant GUC policies `TO bridgeleads_app` on user-scoped
   tables; broad `TO bridgeleads_app` on `users` (auth-bootstrap: register/login/refresh/forgot/reset

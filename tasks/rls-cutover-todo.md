@@ -127,9 +127,16 @@ scrapers, get_cached_records, checkout. `/download` resolves identity from token
   **2b-ii ✅ DONE + Codex APPROVE** — billing.py: `_grant_referral_credit` → calls the definer fn
   (idempotency/atomic-increment now in-DB via ON CONFLICT); `/activation-funnel` → `SELECT * FROM
   public.activation_funnel(:days)`. Behavior parity confirmed.
-  **2b-iii (next):** Celery refresh task populates public_sample_cache (sanitized); `/scrapers/sample`
-  reads the cache instead of live-querying results/jobs/scraper_configs.
-  **2b-iv:** tests.
+  **2b-iii ✅ DONE + Codex APPROVE** — `refresh_public_sample_cache` Celery task (hourly, system
+  session) computes sanitized samples + stats → upserts public_sample_cache; `/scrapers/sample`
+  reads the cache (empty-shape fallback). Codex caught a bug I introduced (`date_recorded` is
+  String(32) not a date — `.isoformat()` would crash the task) — fixed to store it verbatim.
+  ⚠️ **CROSS-PHASE DEP (Codex):** this task reads results/jobs/scraper_configs via the system role,
+  which needs `FOR ALL TO bridgeleads_system` policies on those tables — those land in **Phase 2c**.
+  Works today under BYPASSRLS; **Phase 2c MUST add system policies on results/jobs/scraper_configs
+  (+ all worker tables) and MUST precede the Phase 3 role downgrade.**
+  **2b-iv (next):** tests — refresh task warms cache + sanitization; /sample reads cache; definer
+  fns idempotent (referral) + aggregate (funnel).
 - **Phase 2c (migration 029, role-targeted policies):** `FOR ALL TO bridgeleads_system USING(true)
   WITH CHECK(true)` on all worker tables; tenant GUC policies `TO bridgeleads_app` on user-scoped
   tables; broad `TO bridgeleads_app` on `users` (auth-bootstrap: register/login/refresh/forgot/reset

@@ -1,7 +1,6 @@
 """Auth hardening: token blacklist + brute-force protection (Redis-backed)."""
 
 import logging
-import time
 
 import redis.asyncio as aioredis
 import redis.exceptions as redis_exceptions
@@ -61,6 +60,27 @@ class TokenBlacklist:
         await r.setex(key, expires_in_seconds, "1")
 
     @staticmethod
+    async def consume_once(jti: str, expires_in_seconds: int) -> bool:
+        """Atomically claim a jti exactly once (single-use token rotation).
+
+        Uses Redis ``SET key 1 NX EX ttl``: returns True if THIS call set
+        the key (the token had not been used or blacklisted yet), False if
+        the key already existed — a replay, OR a second refresh racing the
+        same token concurrently. This closes the check-then-add TOCTOU that
+        a separate ``is_blacklisted()`` + ``add()`` leaves open (both racers
+        pass the check before either writes). Shares the jti key space with
+        ``add``/``is_blacklisted`` so a consumed refresh jti is also seen as
+        blacklisted. Raises on Redis error so the caller fails CLOSED (503):
+        we must not mint a rotated token when we cannot prove the old one
+        was not already consumed.
+        """
+        r = _get_redis()
+        key = f"{TokenBlacklist._KEY_PREFIX}{jti}"
+        # redis-py returns True when the key was set, None when NX failed.
+        result = await r.set(key, "1", nx=True, ex=expires_in_seconds)
+        return result is not None
+
+    @staticmethod
     async def is_blacklisted(jti: str) -> bool:
         """Return True if this jti has been blacklisted.
 
@@ -118,8 +138,10 @@ class TokenBlacklist:
         the client retries instead of reporting a successful revocation
         that did not persist.
         """
+        from datetime import UTC, datetime
+
         from sqlalchemy import update
-        from datetime import datetime, UTC
+
         from src.db.models import User
         from src.db.session import async_engine
 
@@ -146,15 +168,20 @@ class TokenBlacklist:
             try:
                 await _get_redis().delete(key)
             except redis_exceptions.RedisError as del_exc:
-                # If both SETEX and DEL fail, the cache may briefly
-                # serve a stale negative sentinel until the entry
-                # expires. Log loud — the DB row IS revoked, but
-                # ops should know auth-cache writes are failing.
+                # If both SETEX and DEL fail, the cache can retain a STALE
+                # POSITIVE revoke timestamp (an earlier revoke) that
+                # get_user_revoke_time trusts WITHOUT re-reading the DB —
+                # masking THIS revocation and letting tokens issued after the
+                # old timestamp survive. Fail CLOSED: re-raise so the caller
+                # 503s and retries. The DB write above is durable + idempotent,
+                # so a retry once Redis recovers makes the cache consistent.
+                # (Codex convergence review.)
                 _logger.error(
                     "revoke_all_for_user: BOTH Redis SETEX and DEL failed; "
-                    "cache may briefly mask DB revocation for user %s: %s",
+                    "failing closed for user %s: %s",
                     user_id, del_exc,
                 )
+                raise
 
     @staticmethod
     async def get_user_revoke_time(user_id: str) -> int:
@@ -209,6 +236,7 @@ class TokenBlacklist:
 
         # DB authoritative read.
         from sqlalchemy import select
+
         from src.db.models import User
         from src.db.session import async_engine
 
@@ -273,13 +301,26 @@ class BruteForceProtection:
 
     _KEY_PREFIX = "bf:"
 
+    # A6: the per-email counter exists to catch distributed attacks (many
+    # IPs, one email). But an unauthenticated attacker who knows a victim's
+    # email can spray bad passwords from throwaway IPs to drive that email
+    # counter to the 24h tier and deny the real user login at will — a
+    # cheap, repeatable account-lockout DoS. Cap email-driven lockout at a
+    # short ceiling: it still slows distributed guessing, but cannot be
+    # weaponised into a long denial of service. The per-IP counter keeps
+    # the FULL escalation (incl. 24h) against the actual source of an
+    # attack, where a long lockout is the desired outcome.
+    _EMAIL_LOCKOUT_CAP_SECONDS = 15 * 60
+
     @staticmethod
-    def _lockout_duration(failures: int) -> int:
+    def _lockout_duration(failures: int, *, is_email: bool = False) -> int:
         """Return lockout seconds for a given failure count (0 = not locked out)."""
         duration = 0
         for threshold, seconds in _LOCKOUT_THRESHOLDS:
             if failures >= threshold:
                 duration = seconds
+        if is_email:
+            duration = min(duration, BruteForceProtection._EMAIL_LOCKOUT_CAP_SECONDS)
         return duration
 
     @staticmethod
@@ -300,7 +341,9 @@ class BruteForceProtection:
                 key = f"{BruteForceProtection._KEY_PREFIX}{key_suffix}"
                 val = await r.get(key)
                 failures = int(val) if val else 0
-                lockout = BruteForceProtection._lockout_duration(failures)
+                lockout = BruteForceProtection._lockout_duration(
+                    failures, is_email=key_suffix.startswith("email:")
+                )
                 if lockout > 0:
                     raise HTTPException(
                         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -335,9 +378,17 @@ class BruteForceProtection:
         r = _get_redis()
         email_failures = 0
         try:
+            # A6: the IP counter persists 24h (punish a single attacking
+            # source). The EMAIL counter expires after the cap so a targeted
+            # lockout actually DECAYS — without this, capping only the
+            # returned Retry-After is cosmetic: check() still rejects while
+            # the count is over threshold and a 24h key TTL would keep the
+            # victim blocked for a full day (Codex review). With a short TTL
+            # the email key (and therefore the lockout) clears within the cap
+            # window after the last failed attempt.
             for key_suffix, ttl in [
                 (f"ip:{ip}", 24 * 3600),
-                (f"email:{email}", 24 * 3600),
+                (f"email:{email}", BruteForceProtection._EMAIL_LOCKOUT_CAP_SECONDS),
             ]:
                 key = f"{BruteForceProtection._KEY_PREFIX}{key_suffix}"
                 pipe = r.pipeline(transaction=True)

@@ -62,21 +62,63 @@ def _is_trusted_proxy(ip_str: str) -> bool:
     return any(addr in net for net in _TRUSTED_PROXY_NETWORKS)
 
 
+# Number of trusted reverse-proxy hops in front of the app. Each trusted proxy
+# APPENDS the address it received from to the RIGHT of X-Forwarded-For, so the
+# real client is the Nth entry from the end. Railway/Fly = 1. (I1)
+_TRUSTED_PROXY_HOPS = max(1, settings.TRUSTED_PROXY_HOPS)
+
+
 def client_ip(request: Request) -> str:
-    """Extract client IP. Only trust forwarded headers from known proxies."""
+    """Extract the client IP, trusting forwarded headers only from known proxies.
+
+    I1: each trusted proxy APPENDS the address it received from to the RIGHT of
+    X-Forwarded-For. With one proxy in front (Railway/Fly) the real client is
+    the LAST entry; everything to its left was written by the client and is
+    forgeable. The previous code took the LEFTMOST entry, so an attacker could
+    send `X-Forwarded-For: <random>` on each request to mint unlimited distinct
+    rate-limit keys and bypass the limit entirely — defeating /auth/login
+    brute-force protection and webhook signature-spray throttling. We now take
+    the Nth-from-last entry (N = trusted hops).
+
+    Note: vendor headers like Fly-Client-IP / CF-Connecting-IP are NOT trusted
+    here. They are only authentic when the app actually sits behind that
+    specific vendor's edge; on Railway (the deploy target) an attacker can set
+    them and the proxy passes them through, which would reintroduce the bypass.
+    The only non-forgeable value behind a known proxy is the hop the proxy
+    itself appended to X-Forwarded-For. If a CDN like Cloudflare is added in
+    front later, validate the immediate peer or strip/normalize the header at
+    the edge before trusting its vendor header.
+    """
     direct_ip = request.client.host if request.client else "unknown"
 
-    # Only trust X-Forwarded-For if request came from a known proxy (Railway, Docker)
     if _is_trusted_proxy(direct_ip):
         forwarded = request.headers.get("X-Forwarded-For")
         if forwarded:
-            return forwarded.split(",")[0].strip()
-        for header in ("Fly-Client-IP", "CF-Connecting-IP", "X-Real-IP"):
-            val = request.headers.get(header)
-            if val:
-                return val.strip()
+            parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+            if parts:
+                hops = min(len(parts), _TRUSTED_PROXY_HOPS)
+                return parts[-hops]
 
     return direct_ip
+
+
+# I2: per-process fallback limiter for security-critical zones so a Redis
+# outage cannot fully disable throttling there. Coarse (per-worker, not shared)
+# but enough to stop a single worker from accepting unlimited auth/webhook
+# attempts during an incident. Other zones still fail fully open (availability
+# over abuse-resistance is the right trade for non-security paths).
+_FALLBACK_ZONES = frozenset({"auth", "webhook"})
+_fallback_hits: dict[str, list[float]] = {}
+
+
+def _fallback_allow(key: str, max_requests: int, window_seconds: int, now: float) -> bool:
+    cutoff = now - window_seconds
+    bucket = _fallback_hits.setdefault(key, [])
+    bucket[:] = [t for t in bucket if t > cutoff]
+    bucket.append(now)
+    if len(_fallback_hits) > 10_000:  # crude memory bound for the fallback path
+        _fallback_hits.clear()
+    return len(bucket) <= max_requests
 
 
 async def rate_limit(request: Request, zone: str = "general", identifier: str | None = None) -> None:
@@ -116,6 +158,17 @@ async def rate_limit(request: Request, zone: str = "general", identifier: str | 
             "rate_limit fail-open: Redis error while checking zone=%s key=%s: %s",
             zone, redis_key, exc,
         )
+        # I2: for security-critical zones, fall back to a per-process limiter
+        # instead of fully failing open — a Redis incident must not hand an
+        # attacker an unthrottled /auth/login or webhook-spray window.
+        if zone in _FALLBACK_ZONES and not _fallback_allow(
+            f"{zone}:{key_id}", max_requests, window_seconds, now
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many requests. Please slow down.",
+                headers={"Retry-After": str(window_seconds)},
+            )
         return
 
     request_count: int = results[2]

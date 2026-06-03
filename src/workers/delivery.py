@@ -246,3 +246,82 @@ def send_lockout_notification(email: str, failure_count: int, ip: str) -> None:
         _logger.info("Lockout notification sent to %s (%d failures from %s)", email, failure_count, ip)
     except Exception as exc:
         _logger.error("Failed to send lockout notification to %s: %s", email, exc)
+
+
+def send_password_reset_email(email: str, reset_link: str) -> None:
+    """A3: send a password-reset link via Resend.
+
+    Called best-effort by POST /auth/forgot-password. Soft-fails — never
+    raises so the caller's enumeration-safe 200 is unaffected and a send
+    failure cannot leak whether the account exists. The link carries a
+    short-lived single-use reset token (~30 min) and resetting signs out
+    all of the account's existing sessions.
+    """
+    if not settings.RESEND_API_KEY:
+        _logger.warning("RESEND_API_KEY not configured — skipping password reset email to %s", email)
+        return
+
+    # reset_link is a server-built FRONTEND_URL + signed token — escape
+    # it anyway so it is never an HTML-injection vector in the markup.
+    safe_link = html.escape(reset_link)
+    subject = "Reset your BridgeLeads password"
+
+    html_body = f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0b; color: #f0efe8; margin: 0; padding: 40px 20px; }}
+    .card {{ background: #111113; border: 1px solid #2a2a32; border-radius: 12px; max-width: 520px; margin: 0 auto; padding: 36px; }}
+    .logo {{ font-size: 18px; font-weight: 600; color: #f5a623; margin-bottom: 28px; }}
+    h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 8px; }}
+    p {{ font-size: 14px; line-height: 1.5; color: #c9c8d0; }}
+    .btn {{ display: inline-block; background: #f5a623; color: #0a0a0b; font-weight: 600; font-size: 15px; padding: 14px 28px; border-radius: 8px; text-decoration: none; margin: 16px 0 24px; }}
+    .expiry {{ font-size: 12px; color: #55545e; margin-top: 12px; }}
+    .footer {{ font-size: 12px; color: #55545e; border-top: 1px solid #2a2a32; padding-top: 20px; margin-top: 8px; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">BridgeLeads</div>
+    <h1>Reset your password</h1>
+
+    <p>We received a request to reset the password for your BridgeLeads account.
+    Click the button below to choose a new one.</p>
+
+    <a href="{safe_link}" class="btn">Reset Password</a>
+
+    <p class="expiry">This link expires in 30 minutes and can be used once.
+    For your security, resetting your password signs you out of all devices.</p>
+
+    <div class="footer">
+      If you didn't request this, you can safely ignore this email — your
+      password won't change.<br>
+      Contact support@bridgeleads.io if you need help.
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+    text_body = (
+        "We received a request to reset your BridgeLeads password.\n\n"
+        f"Reset your password: {reset_link}\n\n"
+        "This link expires in 30 minutes and can be used once.\n"
+        "For your security, resetting your password signs you out of all devices.\n\n"
+        "If you didn't request this, you can safely ignore this email.\n"
+        "Contact support@bridgeleads.io if you need help."
+    )
+
+    try:
+        resend.Emails.send({
+            "from": settings.EMAIL_FROM,
+            "to": [email],
+            "subject": subject,
+            "html": html_body,
+            "text": text_body,
+        })
+        _logger.info("Password reset email sent to %s", email)
+    except Exception as exc:
+        _logger.error("Failed to send password reset email to %s: %s", email, exc)

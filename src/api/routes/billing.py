@@ -3,14 +3,14 @@
 import stripe
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
+from src.api.deps import get_rls_db
 from src.api.middleware import rate_limit
 from src.config import settings
 from src.db import User, get_db
-from src.api.deps import get_rls_db
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("billing")
@@ -51,45 +51,15 @@ async def activation_funnel(
             detail="days must be between 1 and 365",
         )
 
-    from sqlalchemy import text as sa_text
-
-    # Use raw SQL for the funnel — expresses the intent more clearly
-    # than 5 separate SQLAlchemy expressions.
+    # Cross-tenant aggregate via the SECURITY DEFINER public.activation_funnel()
+    # (migration 029). Under the NOBYPASSRLS bridgeleads_app role this admin
+    # route cannot read across all users directly; the definer function (owned
+    # by a privileged role, EXECUTE granted only to bridgeleads_app) returns
+    # ONLY the funnel counts — no raw cross-tenant rows leak. The % math below
+    # stays in Python.
     result = await db.execute(
-        sa_text("""
-            WITH window_users AS (
-                SELECT id, plan, created_at
-                FROM users
-                WHERE created_at >= NOW() - (:days || ' days')::interval
-                  AND is_active = true
-            )
-            SELECT
-                -- 1. Signups in window
-                (SELECT COUNT(*) FROM window_users) AS signups,
-
-                -- 2. Users who created at least one scraper_config
-                (SELECT COUNT(DISTINCT u.id)
-                 FROM window_users u
-                 JOIN scraper_configs sc ON sc.user_id = u.id) AS first_scraper,
-
-                -- 3. Users who ran at least one scrape job (any status)
-                (SELECT COUNT(DISTINCT u.id)
-                 FROM window_users u
-                 JOIN jobs j ON j.user_id = u.id) AS first_job,
-
-                -- 4. Users whose job produced a downloadable export
-                (SELECT COUNT(DISTINCT u.id)
-                 FROM window_users u
-                 JOIN jobs j ON j.user_id = u.id
-                 WHERE j.export_key IS NOT NULL) AS first_download,
-
-                -- 5. Users who upgraded to a paid plan (any of pro/business/agency)
-                (SELECT COUNT(*)
-                 FROM window_users
-                 WHERE LOWER(plan) IN ('pro', 'business', 'agency')
-                   AND stripe_customer_id IS NOT NULL) AS paid_upgrade
-        """),
-        {"days": str(days)},
+        text("SELECT * FROM public.activation_funnel(:days)"),
+        {"days": days},
     )
     row = result.fetchone()
     if row is None:
@@ -127,7 +97,12 @@ async def activation_funnel(
 @router.get("/referral")
 async def referral_status(
     current_user: CurrentUser,
-    db: AsyncSession = Depends(get_db),
+    # get_rls_db (not get_db): paid_conversions reads the tenant-scoped
+    # referral_events table (policy: referrer_id OR referee_id = GUC). Without
+    # the RLS context, under the cutover role that count returns 0 and the
+    # referral dashboard underreports. The cross-user `users` uniqueness/count
+    # reads here rely on the broad app policy on users, unaffected by the GUC.
+    db: AsyncSession = Depends(get_rls_db),
 ) -> dict:
     """Sprint 7.3: referral program — code, stats, and credit balance.
 
@@ -310,22 +285,77 @@ _PRICE_TO_PLAN: dict[str, tuple[str, int]] = {
 
 # ─── Plans catalog ────────────────────────────────────────────────────────────
 
+_FOUNDING_COUPON_ID = "8mX1xa35"
+_FOUNDING_CACHE_KEY = "founding_offer:8mX1xa35"
+_FOUNDING_CACHE_TTL = 60  # seconds
+
+
+async def _get_founding_offer() -> dict:
+    """Return the founding-member offer status (cached).
+
+    REDTEAM B4: the founding coupon was retrieved from Stripe on EVERY hit of
+    the PUBLIC, unauthenticated /plans and /pricing endpoints, inside a bare
+    `except Exception: pass`. That meant (a) an unauthenticated visitor could
+    drive one synchronous Stripe API call per request (latency + a cheap DoS
+    amplifier against our Stripe rate limits), and (b) any error — including a
+    real Stripe outage — was silently swallowed. This caches the result in
+    Redis for ~60s and narrows the except to stripe.error.StripeError, logged
+    at warning. On any cache/Stripe failure we fall back to the offer being
+    inactive (fail-closed for a promo banner).
+    """
+    founding = {
+        "active": False, "code": "FOUNDING40", "percent_off": 40,
+        "spots_total": 25, "spots_remaining": 0,
+    }
+
+    import json
+
+    import redis.asyncio as aioredis
+    redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+    try:
+        cached = await redis.get(_FOUNDING_CACHE_KEY)
+        if cached is not None:
+            try:
+                return json.loads(cached)
+            except (ValueError, TypeError):
+                pass  # corrupt cache value — recompute below
+
+        try:
+            import stripe
+            stripe.api_key = settings.STRIPE_SECRET_KEY
+            coupon = stripe.Coupon.retrieve(_FOUNDING_COUPON_ID)
+            if coupon.valid:
+                redeemed = coupon.times_redeemed or 0
+                remaining = max(0, (coupon.max_redemptions or 25) - redeemed)
+                founding["active"] = remaining > 0
+                founding["spots_remaining"] = remaining
+        except stripe.error.StripeError as exc:
+            # Coupon may not exist, or Stripe is unreachable — offer inactive.
+            _logger.warning("founding coupon lookup failed: %s", str(exc)[:200])
+
+        # Cache whatever we computed (active or inactive) to absorb the next
+        # ~60s of public traffic without another Stripe round-trip.
+        try:
+            await redis.set(
+                _FOUNDING_CACHE_KEY, json.dumps(founding), ex=_FOUNDING_CACHE_TTL
+            )
+        except Exception as exc:  # noqa: BLE001 — caching is best-effort
+            _logger.warning("founding offer cache write failed: %s", str(exc)[:120])
+    except Exception as exc:  # noqa: BLE001 — Redis down must not 500 a public page
+        _logger.warning("founding offer cache unavailable: %s", str(exc)[:120])
+    finally:
+        try:
+            await redis.aclose()
+        except Exception:  # noqa: BLE001 — best-effort close
+            pass
+
+    return founding
+
+
 @router.get("/plans")
 async def list_plans() -> dict:
     """Return the full plan catalog + founding member offer status."""
-    # Check remaining founding member spots via Stripe coupon
-    founding = {"active": False, "code": "FOUNDING40", "percent_off": 40, "spots_total": 25, "spots_remaining": 0}
-    try:
-        import stripe
-        stripe.api_key = settings.STRIPE_SECRET_KEY
-        coupon = stripe.Coupon.retrieve("8mX1xa35")
-        if coupon.valid:
-            redeemed = coupon.times_redeemed or 0
-            remaining = max(0, (coupon.max_redemptions or 25) - redeemed)
-            founding["active"] = remaining > 0
-            founding["spots_remaining"] = remaining
-    except Exception:
-        pass  # Coupon may not exist, offer is inactive
+    founding = await _get_founding_offer()
     return {"plans": _PLANS, "founding_offer": founding}
 
 
@@ -335,19 +365,7 @@ async def pricing_page() -> dict:
 
     Public endpoint — no auth required. Used by the frontend pricing page.
     """
-    # Check founding member offer
-    founding = {"active": False, "code": "FOUNDING40", "percent_off": 40, "spots_total": 25, "spots_remaining": 0}
-    try:
-        import stripe
-        stripe.api_key = settings.STRIPE_SECRET_KEY
-        coupon = stripe.Coupon.retrieve("8mX1xa35")
-        if coupon.valid:
-            redeemed = coupon.times_redeemed or 0
-            remaining = max(0, (coupon.max_redemptions or 25) - redeemed)
-            founding["active"] = remaining > 0
-            founding["spots_remaining"] = remaining
-    except Exception:
-        pass
+    founding = await _get_founding_offer()
 
     return {
         "plans": _PLANS,
@@ -682,65 +700,25 @@ _REFERRAL_BONUS_CENTS = 2000  # $20 per successful referral
 async def _grant_referral_credit(db: AsyncSession, referee: User) -> None:
     """Credit the referrer $20 when a referred user converts to paid.
 
-    Idempotent: the unique constraint on referral_events.referee_id
-    guarantees each referee can only trigger the bonus once, even if
-    Stripe replays the webhook.
+    Delegates to the SECURITY DEFINER public.grant_referral_credit() (migration
+    029). The Stripe webhook runs with NO per-user RLS context and the referral
+    row spans TWO users (referrer + referee), so under the NOBYPASSRLS
+    bridgeleads_app role the app role cannot write referral_events directly.
+    The function — owned by a privileged role, EXECUTE granted only to
+    bridgeleads_app — resolves the referrer from users.referred_by_user_id,
+    inserts the audit row idempotently (unique(referee_id) → a Stripe replay is
+    a no-op) and increments the referrer's balance atomically. A no-op when the
+    referee has no referrer or the referrer was deleted.
+
+    The prior savepoint/IntegrityError dance is now handled inside the function
+    by ON CONFLICT (referee_id) DO NOTHING, so the enclosing webhook transaction
+    (the plan upgrade flushed by _handle_checkout_completed) is never disturbed.
     """
-    from sqlalchemy.exc import IntegrityError
-
-    from src.db.models import ReferralEvent
-
-    # Fetch the referrer (they may no longer exist if account was
-    # deleted — SET NULL would have already cleared the FK).
-    referrer_res = await db.execute(
-        select(User).where(User.id == referee.referred_by_user_id)
-    )
-    referrer = referrer_res.scalar_one_or_none()
-    if referrer is None:
-        return  # Referrer was deleted between signup and conversion
-
-    # Create the audit-log row inside a SAVEPOINT so that a duplicate
-    # (webhook replay hitting the unique constraint on referee_id)
-    # only rolls back the INSERT, not the enclosing transaction.
-    # Without the savepoint, `db.rollback()` after the IntegrityError
-    # would throw away the plan upgrade and records_limit change that
-    # _handle_checkout_completed just flushed — silently reverting a
-    # paid user to their old plan on every Stripe retry. CRIT-1 from
-    # the Sprint 7.3 code review.
-    event = ReferralEvent(
-        referrer_id=referrer.id,
-        referee_id=referee.id,
-        amount_cents=_REFERRAL_BONUS_CENTS,
-        reason="referee_converted_to_paid",
-    )
-    try:
-        async with db.begin_nested():
-            db.add(event)
-            # flush is implicit at savepoint exit, but being explicit
-            # makes the IntegrityError surface here rather than later
-            await db.flush()
-    except IntegrityError:
-        _logger.info(
-            "referral: duplicate grant ignored referee=%s", referee.id
-        )
-        return
-
-    # Atomic increment on the referrer's balance so concurrent
-    # grants from different referees don't race. Kept outside the
-    # savepoint — if this UPDATE fails, the whole webhook transaction
-    # should roll back (caller will see the exception and Stripe will
-    # retry) because we absolutely cannot have an audit-log row
-    # without a matching balance increment.
-    from sqlalchemy import update as sa_update
     await db.execute(
-        sa_update(User)
-        .where(User.id == referrer.id)
-        .values(referral_credit_cents=User.referral_credit_cents + _REFERRAL_BONUS_CENTS)
+        text("SELECT public.grant_referral_credit(:referee_id)"),
+        {"referee_id": str(referee.id)},
     )
-    await db.flush()
-    _logger.info(
-        "referral: +$20 credit referrer=%s referee=%s", referrer.id, referee.id
-    )
+    _logger.info("referral: grant_referral_credit processed referee=%s", referee.id)
 
 
 async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
@@ -785,7 +763,16 @@ async def _handle_subscription_deleted(data: dict, db: AsyncSession) -> None:
 async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:
     """Send a payment failure notification email via Resend."""
     customer_id = data.get("customer")
-    attempt_count = data.get("attempt_count", 1)
+
+    # REDTEAM B3: clamp the webhook-supplied attempt_count before it flows
+    # into the email body / logs. Stripe normally sends a small integer, but
+    # the value is attacker-influenceable on a forged-but-replayed payload and
+    # was previously passed through unbounded. Coerce to int and bound to
+    # [1, 20]; anything non-numeric falls back to 1.
+    try:
+        attempt_count = max(1, min(int(data.get("attempt_count", 1)), 20))
+    except (TypeError, ValueError):
+        attempt_count = 1
 
     if not customer_id:
         return

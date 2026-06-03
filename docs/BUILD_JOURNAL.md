@@ -19,6 +19,255 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-02 — RLS cutover: Codex HOLISTIC review caught a ship blocker → restructured (commit 3225778)
+
+**The catch:** after all phases were committed, a final cross-phase Codex review (the kind per-phase
+review can't do) found that migrations 030/031 (role-targeted policies + FORCE) would **no-op on the
+first post-merge `alembic upgrade head`** (cutover roles don't exist yet), advance `alembic_version`,
+and then **never re-run when the roles are actually provisioned** — silently skipping the entire policy
+install. Root cause: role-dependent DDL doesn't belong in Alembic's one-shot chain.
+
+**Fix (Codex blueprint):** moved cutover DDL out of Alembic into idempotent operator scripts.
+- 030/031 → no-op placeholders (chain intact).
+- `scripts/apply_rls_cutover_policies.sql` (NEW) — role-targeted policies, hard-fail unless both roles,
+  029 binding backfill, transactional, idempotent.
+- `scripts/apply_rls_force.sql` (NEW) — FORCE, hard-fail unless policies converged + owner BYPASSRLS.
+
+**6 more findings fixed in the same pass:** referral_events app SELECT-only (grant+policy; write is via
+the definer fn); delivered_records/pending/queues system-only (grant/policy aligned); provision REVOKEs +
+verify block (idempotent convergence vs prior over-grants); password_history app SELECT+INSERT not FOR ALL
+(immutable audit rows); FORCE convergence check verifies every table's system policy; worker boot warms
+public_sample_cache; corrected the false "inert under BYPASSRLS" claim (the route CODE is active today —
+only the policies are inert). Codex final: SHIP-READY.
+
+**Lesson:** per-phase Codex review APPROVED every piece; only the holistic "review the whole diff for
+cross-phase gaps" pass caught the migration-consumption blocker. Worth doing on any multi-migration change.
+
+**Canonical cutover order:** `alembic upgrade head` → `provision_rls_roles.sql` →
+`apply_rls_cutover_policies.sql` → repoint connections (staging, RLS_ENFORCE=False) → verify →
+RLS_ENFORCE=True → `apply_rls_force.sql`. All operational; no more code.
+
+---
+
+## 2026-06-02 — RLS cutover CODE COMPLETE: Phases 2c→4 (policies, repoint, FORCE)
+
+**Built / Shipped (continuing the cutover):**
+- **Phase 2c** (`40497ce`): migration 030 — role-targeted policies. Drops the untargeted tenant
+  policies; adds `<t>_app TO bridgeleads_app` (tenant GUC) + `<t>_system FOR ALL TO bridgeleads_system`
+  on every table. referral_events app=SELECT-only (writes via the definer fn). users/county_connectors
+  broad app + system. county_records app shared-read + system all. skip_trace_* system-only. Python
+  role-guard: no-op if neither role exists (CI), RAISE if exactly one, swap if both. Backfills 029
+  bindings. anon/authenticated default-denied.
+- **Phase 2d** (`51655ca`): `test_rls_role_policies.py` — SET LOCAL ROLE bridgeleads_app tenant
+  isolation + bridgeleads_system cross-tenant; skips unless the cutover is applied.
+- **Phase 3** (`a268fd1`): `alembic/env.py` prefers `DATABASE_URL_MIGRATE` (owner/DDL), falls back to
+  `DATABASE_URL_SYNC`; `settings.DATABASE_URL_MIGRATE` added.
+- **Phase 4** (`9893633`): migration 031 — FORCE ROW LEVEL SECURITY on 16 tables, gated on both roles
+  existing + a guard that RAISEs unless the 029 SECURITY DEFINER function owners carry BYPASSRLS.
+
+**Caught & fixed (Codex):** 2c — backfill 029 bindings (roles may be provisioned after 029) + downgrade
+idempotency + restore 025 WITH CHECK. 4 — exact-function guard via `to_regprocedure` (bare proname+LIMIT 1
+could match wrong overload) + ungated downgrade.
+
+**Decided:** referral_events app SELECT-only once writes moved to the definer fn (vs Codex's earlier
+asymmetric-WITH-CHECK, which assumed direct app write). FORCE shipped as an audited migration (not
+manual-only) after the owner-bypass guard — it adds little since app/system aren't table owners, but is
+harmless defence-in-depth.
+
+**Pending / Handoff — NO MORE CODE.** All 11 commits authored + Codex-reviewed (e5d50e8→9893633).
+Remaining = OPERATIONAL per `docs/security/RLS-CUTOVER-RUNBOOK.md`: (1) `scripts/provision_rls_roles.sql`
++ add `DATABASE_URL_MIGRATE` to `.env.example`; (2) deploy staging, run migrations 029/030, repoint
+connections, verify with `RLS_ENFORCE=False`; (3) staging `RLS_ENFORCE=True` + E2E; (4) prod: flip
+`RLS_ENFORCE=True`, run migration 031 (FORCE) — `postgres` owner keeps BYPASSRLS so the definer fns
+survive. Everything inert under today's BYPASSRLS role; nothing deployed.
+
+---
+
+## 2026-06-02 — RLS least-privilege cutover: Phases 0→2b executed (6 commits, Codex-gated)
+
+**Built / Shipped (branch `security/redteam-remediation-2026-06-01`):**
+- **Phase 0** (`e5d50e8`): `scripts/provision_rls_roles.sql` (3-role model: app SELECT/INSERT/UPDATE no-DELETE,
+  system +DELETE on county_records only, owner=DDL) + `RLS-CUTOVER-RUNBOOK.md`. Idempotent, txn-wrapped,
+  password-on-create-only, DDL fail-fast (RAISE not `\quit`). Codex: 2 rounds, 6 findings fixed.
+- **Phase 1** (`a27ff9f`): `after_begin` listener in `session.py` reapplies `app.current_user_id` every
+  transaction (gated on `session.info['rls_user_id']`) so the worker's mid-task commit doesn't strip RLS
+  context under NOBYPASSRLS. `deps.py`+`jobs.py` set the info. Test proves GUC survives a commit. Codex APPROVE.
+- **Phase 2a** (`d5e2fe1`): tenant-table routes set the GUC — `/onboarding`,`/change-password`,`/referral`→
+  `get_rls_db`; `/reset-password`→manual GUC (token-auth). Codex caught reset-password (silent password-reuse
+  regression) in review → fixed.
+- **Phase 2b** (`5efda74`,`06ce1c8`,`de3d40e`): cross-tenant routes via bounded primitives, NOT role elevation.
+  Migration 029: `grant_referral_credit()`+`activation_funnel()` SECURITY DEFINER fns (search_path pinned,
+  schema-qualified, REVOKE PUBLIC+anon+authenticated, EXECUTE app-only) + `public_sample_cache` singleton.
+  Webhook/funnel routes call the fns; a Celery task precomputes the sanitized public sample cache and
+  `/sample` reads it (no live tenant query from an unauth endpoint). Tests for fn idempotency/aggregate.
+
+**Tried / Decided:** Codex vetoed `GRANT bridgeleads_system TO bridgeleads_app` (internet-facing RCE→worker
+role) and broad app policies on results/jobs/scraper_configs (OR with tenant policy → destroys isolation).
+Chose SECURITY DEFINER fns + a precomputed sample table. User chose the THOROUGH cutover over pragmatic.
+
+**Caught & fixed (Codex):** activation-funnel CTE referenced `stripe_customer_id` without selecting it
+(latent runtime error) — fixed in the ported fn. `date_recorded.isoformat()` in the sample task — column is
+String(32), would crash — store verbatim. App role over-granted on worker tables — split into write/read/none
+after verifying the real route surface (Tracerfy webhook dispatches to a worker via `.delay`, so skip-trace
+is worker-only). `county_connectors` needed INSERT (POST /connectors) — caught in self-review.
+
+**Failed / Blocked / Environment:** Codex CLI 400'd for a stretch — root cause was the shared companion
+runtime auto-attaching an `image_generation` tool pinned to nonexistent model `gpt-image-2`; bypass with
+`-c 'tools.image_generation=false'`. Same cause broke the stop-time review gate (disabled it via
+`codex-companion.mjs setup --disable-review-gate`; re-enable when the account-level image tool is fixed).
+
+**Pending / Handoff:** **Phase 2c** = the big migration: role-targeted policies (`TO bridgeleads_app` tenant
+policies; `FOR ALL TO bridgeleads_system` on ALL worker tables — MUST include results/jobs/scraper_configs
+per the 2b-iii dependency; broad `TO bridgeleads_app` on `users`+shared catalogs; asymmetric referral_events
+INSERT `WITH CHECK (referrer_id=GUC)`). Then **2d** isolation tests, **Phase 3** repoint connections (add
+`DATABASE_URL_MIGRATE`; `alembic/env.py` still uses `DATABASE_URL_SYNC`), **Phase 4** flip `RLS_ENFORCE=True`
++ `FORCE ROW LEVEL SECURITY` last. Full plan: `tasks/rls-cutover-todo.md`. Nothing deployed; all inert under
+today's BYPASSRLS role.
+
+---
+
+## 2026-06-02 — SQL-injection audit (Claude × Codex): NO SQLi found; pivoted to DB role least-privilege cutover plan
+
+**Built / Shipped:**
+- Full SQLi audit of the FastAPI/SQLAlchemy/Supabase app on a user request ("search bar wiped the users table").
+  Traced every user-input→DB path. **Verdict: no SQL injection exists.** Everything is parameterized:
+  `text()` with `:named` binds throughout; search uses ORM `ilike(pattern, escape="\\")` (`jobs.py:241`) and
+  static clause-strings with `:q`/`:kw_n` binds (`scrapers.py:477-532`, plus `sanitize_search()`); the f-string
+  INSERT in `tasks.py:463` interpolates only placeholder *tokens* (data → `params`); alembic/scripts f-strings
+  use hardcoded constants only; advisory-lock f-string is a guaranteed `int(md5,16)`. No psycopg/asyncpg raw
+  cursor, no `from_statement`/`literal_column` w/ user data, no dynamic `order_by`/column injection.
+- **Codex independently CONFIRMED** "no SQLi" (read the files itself; also noted `billing.py:58` — `days` bound,
+  int 1-365, safe). Codex then sharpened the real fix (below). Cross-confirmation per codex-collaboration rule.
+- **Real risk = over-privileged role,** not injection: prod connects as a `BYPASSRLS` role (matches today's
+  earlier journal entry + the RLS_ENFORCE landmine). Authored a staged least-privilege cutover:
+  `tasks/rls-cutover-todo.md` + `docs/security/RLS-CUTOVER-RUNBOOK.md` + Phase-0 `scripts/provision_rls_roles.sql`.
+
+**Tried / Decided:** Three-role model (Codex's refinement of my single-restricted-role idea): `bridgeleads_owner`
+(DDL/alembic), `bridgeleads_app` (API: SELECT/INSERT/UPDATE, **no DELETE** — user deletes are soft:
+`jobs.status='cancelled'`, `scraper_configs.active=false`), `bridgeleads_system` (workers: + DELETE on
+`county_records` only, the lone physical delete at `scheduler.py:521`). Rejected blanket-DELETE app role.
+
+**Caught & fixed:** Self-review of the Phase-0 SQL (Codex was rate-limited) caught a missing grant: the API
+**writes** `county_connectors` via `POST /connectors` (`scrapers.py:313`). SELECT-only would have permission-
+denied at Phase 4 — changed to **SELECT + INSERT** on that table.
+
+**Failed / Blocked:** Codex CLI hit its usage limit mid-session (resets ~3:25 PM local) → the Phase-0 Codex
+review gate is DEFERRED, must run before Phase 3 repoints connections. Did NOT fabricate any SQLi "fix" — there
+was nothing to fix; reported that honestly instead.
+
+**Pending / Handoff:** Phases 1-4 await user approval (per phased-execution rule). Open Qs answered: custom roles
+OK; API uses `DATABASE_URL` / workers+alembic share `DATABASE_URL_SYNC` (`alembic/env.py:15`) → Phase 3 adds
+`DATABASE_URL_MIGRATE` for the owner role. Phase 1 is the load-bearing code change (per-transaction GUC reapply
+so `app.current_user_id` survives the mid-task commit; else NOBYPASSRLS breaks `run_scrape_job`).
+
+**Facts learned:** This codebase is genuinely hardened against SQLi (8 prior red-team rounds show). The tenancy
+boundary today is the app-layer `WHERE user_id` filter, NOT RLS — because the role bypasses RLS. The cutover is
+what makes RLS actually load-bearing. `FORCE ROW LEVEL SECURITY` must be the very last step.
+
+---
+
+## 2026-06-02 — CRITICAL: Supabase `rls_disabled_in_public` (county_records PII) — live-fixed + Codex-verified
+
+**Built / Shipped:**
+- Supabase advisor flagged CRITICAL "Table publicly accessible — RLS not enabled." Different surface from the
+  red-team (which audited the FastAPI app): this is Supabase's auto-exposed PostgREST API (anon key in the
+  frontend) where **RLS is the only guard**. A `public` table without RLS is readable/writable by anyone with
+  the project URL + anon key, bypassing the app.
+- **Live audit** (`scripts/check_rls_roles.py`, read-only): both app roles (`DATABASE_URL` async +
+  `DATABASE_URL_SYNC` sync) = `postgres`, `bypassrls=true`. Live, exactly ONE public table had RLS disabled:
+  **`county_records`** (3305 rows of scraped homeowner PII) — RLS was *explicitly* disabled in migration 023
+  (which relied on a write-trigger that does nothing against anon *reads*).
+- **Live hotfix applied** (`scripts/apply_rls_hotfix.py`): `ENABLE ROW LEVEL SECURITY` + a shared-read SELECT
+  policy on `county_records`. **Verified live by role impersonation:** `postgres`(BYPASSRLS)=3305 rows,
+  `anon`=0, `authenticated`=0 → exposure closed, app unaffected.
+- **Permanent migrations:** `027` (ENABLE RLS on the 5 anon-exposed app tables — idempotent, covers the new
+  `skip_trace_meter_events` once 026 deploys) + `028` (the county_records shared-read policy).
+- **Codex** consulted on the plan (consensus: enable RLS, no policy/FORCE = default-deny for anon, safe under
+  BYPASSRLS), then reviewed the build → caught a real **deadlock** (concurrent webhooks locking overlapping
+  users in opposite order in the meter outbox) → fixed with `ORDER BY user_id` deterministic locking.
+
+**Tried / Decided:** enable-RLS-no-policy (not FORCE) for the emergency lockout — default-deny stops anon while
+the BYPASSRLS app is untouched; FORCE/the WITH-CHECK enforcement belongs in the deferred HIGH-2 cutover. The
+county_records SELECT policy denies anon (never sets `app.current_user_id`) yet allows authenticated app
+sessions — forward-compat for the non-bypass cutover, inert today.
+
+**Facts learned:** the app connects as `postgres` (BYPASSRLS, not superuser) on both URLs. Supabase exposes a
+public PostgREST API guarded ONLY by RLS — every `public` table needs RLS even though the app never uses that
+API. `county_records` write-trigger ≠ read protection.
+
+**Pending:** `alembic upgrade head` (applies 025–028) on the next deploy; the live hotfix already covers the
+exposed table so prod is safe meanwhile. county_records *writes* under a future non-bypass role still need the
+HIGH-2 system-role handling.
+
+---
+
+## 2026-06-01 — Claude × Codex adversarial red-team + remediation (branch `security/redteam-remediation-2026-06-01`)
+
+**Built / Shipped** (14 atomic commits on the branch; full register `docs/security/REDTEAM-2026-06-01.md`):
+- **Round 1 — Claude red team:** 6 parallel security-auditor subagents across auth, SSRF, multi-tenancy,
+  exports, billing, infra. ~26 findings, each with a proven exploit.
+- **Round 2 — Codex independent verification:** Codex re-derived every finding from code — **refuted 6**
+  Claude over-claimed (incl. 2 fake "Criticals" → both real but HIGH), and **found 3 Claude missed**
+  (PACS assessor SSRF `N1`, unauth `/scrapers/sample` real-PII leak `N2`, dead connector validation `N3`).
+- **Round 3 — remediation:** Phases 1–5 by Claude directly; Phases 6/7/8 + the A3 reset flow by 4 parallel
+  coder subagents on disjoint files. Fixes (all committed):
+  - Auth: refresh rotation (atomic `consume_once`), change-pw revokes sessions, **new password-reset flow**,
+    register timing parity, lockout-DoS cap (real TTL decay), narrowed `/refresh` except.
+  - SSRF: in-page fetch/XHR egress closed (`base_scraper` route guard validates ALL resource types),
+    model-emitted `evaluate` JS removed, PACS `assessor_url` validated, raw `requests`→`safe_http`,
+    `validate_scraping_target` resolve-by-default + IDNA fail-closed + loopback aliases.
+  - CSV: leading-quote + embedded-tab formula-injection bypasses closed (proven vs 11 payloads) + tests.
+  - Billing: Tracerfy webhook replay/SSRF guard, counter↔meter consistency, **transactional meter outbox**
+    (`SkipTraceMeterEvent`, migration 026, retrying task + 180s beat sweep), coupon caching.
+  - Tenancy: migration 025 adds `WITH CHECK` to RLS write policies + startup hard-fails on a BYPASSRLS
+    role; download-token audience hardened; PII log demoted to `Result.id`.
+  - Infra: XFF rightmost-hop (kill spoof bypass), fail-closed auth rate-limit fallback, CORS origin validation.
+
+**Tried / Decided:**
+- Two independent reviewers with different blind spots is the whole point — kept Claude and Codex passes
+  fully independent in Round 1/2 (Codex never saw Claude's findings before re-deriving them).
+- Billing durability: rejected fire-and-forget meter reporting; chose a **transactional outbox** (intent
+  persisted in the same txn as the counter advance, swept by a beat task) — the only design that survives
+  Stripe-down AND broker-down without double-billing (stable MeterEvent id).
+- Removed the Tracerfy webhook edge dedup entirely — the worker `FOR UPDATE` + status guard is the
+  authoritative idempotency; the edge claim was net-negative (could drop a legit retry).
+- Phased, ≤5 files/phase, atomic commit per phase; subagents on disjoint files to parallelize safely.
+
+**Caught & fixed (the headline):** the Claude×Codex loop caught **~17 bugs in the fixes themselves** across
+**8 Codex review rounds** — refresh-rotation TOCTOU (→ SET NX), XFF trusting spoofable Fly/CF headers on
+Railway, password-change revoking *after* commit, a cosmetic lockout cap, a swallowed Stripe error defeating
+autoretry, an enqueue-failure losing a meter event, a stale second reset link surviving a reset, password
+recovery leaving the API key valid, a fail-open revoke cache, an RLS guard swallowed by the worker
+bootstrap, and — biggest — a **production-outage-class** T2 bug: the hard-fail-on-BYPASSRLS would have made
+the API + workers refuse to boot on the *current* prod role, and a downgraded role would block scrapes/ingest
+(mid-task commit clears the `SET LOCAL` GUC; `system_sync_session` has no tenant context). Findings shrank
+and deepened each round (3→2→3→2→2→1→2) — convergence. Each was re-fixed + re-verified. Two reviewers > one.
+
+**Failed / Blocked:** full integration tests can't run locally (need CI Postgres+Redis; `conftest.py` wires
+real infra) — verified statically (`py_compile` + `ruff` every phase) + pure-function CSV tests + the Codex
+review gate. Local `pytest -k auth` ran against degraded infra (503s from Redis-unavailable revocation, DB
+connection errors) — not logic regressions.
+
+**Pending / Handoff:**
+- **NOT merged to `main`** — branch awaits review/merge.
+- **T2 / `RLS_ENFORCE` — DO NOT enable yet:** default is OFF (advisory log; the API/workers boot normally on
+  today's BYPASSRLS role). The `025` WITH CHECK policies are inert until the role is downgraded. Flip
+  `RLS_ENFORCE=True` ONLY after the deferred HIGH-2 cutover lands (non-BYPASSRLS role + per-transaction GUC
+  reapply in `rls_sync_session` + a system RLS policy for `system_sync_session`) — else scrapes + ingest break.
+  Add `RLS_ENFORCE` to `.env.example` (access-restricted in this session). Run `alembic upgrade head` (025 + 026).
+- **Migration collision:** the older `security/high-2-rls` branch also has a `025_*`; this branch's
+  `025_rls_with_check_write_policies` + `026_add_skip_trace_meter_outbox` chain off `024`. Reconcile before merge.
+- **✅ CONVERGED (2026-06-02):** final Codex review (round 9) over the whole 19-commit diff returned CLEAN —
+  "no discrete, actionable regressions ... that would break existing behavior or undermine the intended
+  fixes." Both reviewers agree. Branch is review-ready (pending the RLS_ENFORCE/`.env.example` handoff above).
+
+**Facts learned:**
+- The codebase was already well-hardened from the prior 2026-06-01 review — remaining bugs were subtle
+  (races, TOCTOU, fail-open ordering, durability), exactly where a second independent model pays off.
+- New `settings` added: `TRUSTED_PROXY_HOPS` (default 1). New tables: `skip_trace_meter_events`.
+
+---
+
 ## 2026-06-01 — Security pack adoption + full review remediation
 
 **Built / Shipped** (all on `main` unless noted; every fix Codex-reviewed):

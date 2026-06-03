@@ -1,10 +1,10 @@
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import NullPool, QueuePool
+from sqlalchemy.pool import NullPool
 
 from src.config import settings
 
@@ -104,14 +104,40 @@ def get_sync_db() -> Session:
 # full-SaaS review for the bug this fixes (H1).
 
 
+# ─── Per-transaction RLS GUC reapply (Phase 1 of the RLS cutover) ───────────
+# ``set_config('app.current_user_id', uid, is_local=true)`` is TRANSACTION
+# scoped — it is cleared on every COMMIT/ROLLBACK. run_scrape_job commits
+# mid-task, so the GUC vanishes and the NEXT transaction on the same session
+# runs with no user context. Today that is masked because the prod role has
+# BYPASSRLS; under the non-BYPASSRLS cutover role it would make RLS block
+# every user-scoped query after the first commit.
+#
+# This after_begin listener re-binds the GUC at the start of EVERY transaction,
+# reading the user_id off ``session.info`` so it survives commits. It is gated
+# on ``session.info['rls_user_id']`` so sessions that intentionally carry no
+# user context (system_sync_session, plain get_db) are untouched — the handler
+# returns immediately for them. set_config(local=true) self-clears at tx end,
+# so no GUC leaks across pooled-connection reuse.
+_RLS_GUC_SQL = text("SELECT set_config('app.current_user_id', :uid, true)")
+
+
+@event.listens_for(Session, "after_begin")
+def _reapply_rls_guc(session: Session, transaction, connection) -> None:
+    uid = session.info.get("rls_user_id")
+    if uid is None:
+        return
+    connection.execute(_RLS_GUC_SQL, {"uid": uid})
+
+
 @contextmanager
 def rls_sync_session(user_id: str) -> Iterator[Session]:
     """Open a sync session with PostgreSQL RLS bound to a specific user.
 
-    Issues ``SELECT set_config('app.current_user_id', :uid, true)``
-    inside the session's implicit transaction so every subsequent
-    query inside this block runs with the USING clause of the RLS
-    policies evaluating against the given user_id.
+    Stores ``user_id`` on ``session.info['rls_user_id']`` so the
+    ``after_begin`` listener re-applies ``app.current_user_id`` on EVERY
+    transaction — surviving the mid-task commits run_scrape_job performs.
+    The explicit set_config below covers the very first transaction
+    immediately (belt-and-suspenders; the listener also fires for it).
 
     Caller must commit/rollback explicitly — this context manager
     only handles open/close so the existing worker code (which
@@ -119,11 +145,9 @@ def rls_sync_session(user_id: str) -> Iterator[Session]:
     not have to change shape.
     """
     session = SyncSessionLocal()
+    session.info["rls_user_id"] = str(user_id)
     try:
-        session.execute(
-            text("SELECT set_config('app.current_user_id', :uid, true)"),
-            {"uid": str(user_id)},
-        )
+        session.execute(_RLS_GUC_SQL, {"uid": str(user_id)})
         yield session
     finally:
         session.close()
@@ -150,6 +174,25 @@ def system_sync_session() -> Iterator[Session]:
         session.close()
 
 
+def _role_status(engine) -> dict | None:
+    """Return {role, bypassrls, is_superuser} for the role ``engine`` connects as.
+
+    None if ``current_user`` cannot be resolved. Shared by check_rls_role_status
+    so it can inspect BOTH the sync engine (workers/alembic, DATABASE_URL_SYNC)
+    and the async engine (FastAPI request traffic, DATABASE_URL).
+    """
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT current_user, rolbypassrls, rolsuper "
+                "FROM pg_roles WHERE rolname = current_user"
+            )
+        ).fetchone()
+    if row is None:
+        return None
+    return {"role": row[0], "bypassrls": bool(row[1]), "is_superuser": bool(row[2])}
+
+
 def check_rls_role_status() -> dict:
     """Report the RLS-relevant properties of the DB connection role.
 
@@ -163,46 +206,105 @@ def check_rls_role_status() -> dict:
     to make the security posture visible in logs. If bypassrls is
     True, the RLS policies defined in the migrations are effectively
     decorative — the app's application-level WHERE user_id filters
-    are the only tenant boundary. This function does NOT raise; it
-    returns the facts so the caller can log a warning and the ops
-    team can plan a role downgrade later. C2 from the full-SaaS
-    review.
+    are the only tenant boundary.
+
+    REDTEAM HIGH T2 (docs/security/REDTEAM-2026-06-01.md): in
+    production this is no longer advisory. If the runtime role
+    bypasses RLS (BYPASSRLS or superuser), the WITH CHECK write
+    policies added in migration 025 are silently skipped and the
+    per-query user_id filter becomes the *only* tenant boundary —
+    one missing WHERE clause leaks across tenants. So when
+    ENVIRONMENT == "production" and the role carries an implicit
+    bypass, this function raises RuntimeError to refuse boot. Outside
+    production it stays advisory (logs only) so local/dev databases —
+    where the connecting role is often the superuser/owner — still
+    start. C2 from the full-SaaS review.
     """
     import logging
 
     log = logging.getLogger("security.rls")
     try:
-        with sync_engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT current_user, rolbypassrls, rolsuper "
-                    "FROM pg_roles WHERE rolname = current_user"
+        sync_info = _role_status(sync_engine)
+        if sync_info is None:
+            log.error("RLS status check: could not resolve current_user (sync engine)")
+            return {"role": None, "bypassrls": None, "is_superuser": None}
+
+        # Collect every role that actually serves traffic. The sync engine
+        # (DATABASE_URL_SYNC: Celery workers + Alembic) is always checked. When
+        # enforcing, the ASYNC engine (DATABASE_URL: FastAPI request traffic)
+        # MUST be verified too — otherwise a non-bypassing sync role lets this
+        # guard pass while the async API still has BYPASSRLS for every request,
+        # if the two URLs point at different roles. (Codex review.)
+        checked = {"sync": sync_info}
+        if settings.RLS_ENFORCE:
+            try:
+                async_as_sync_url = settings.DATABASE_URL.replace(
+                    "+asyncpg", ""
+                ).replace(":6543/", ":5432/")
+                tmp_engine = create_engine(
+                    async_as_sync_url,
+                    poolclass=NullPool,
+                    connect_args={"connect_timeout": 10},
                 )
-            ).fetchone()
-            if row is None:
-                log.error("RLS status check: could not resolve current_user")
-                return {"role": None, "bypassrls": None, "is_superuser": None}
-            role, bypassrls, is_super = row[0], bool(row[1]), bool(row[2])
-            effective_bypass = bypassrls or is_super
-            if effective_bypass:
+                try:
+                    async_info = _role_status(tmp_engine)
+                finally:
+                    tmp_engine.dispose()
+            except Exception as exc:  # noqa: BLE001
+                # Cannot verify the async role while enforcing → fail closed.
+                raise RuntimeError(
+                    f"RLS_ENFORCE: could not verify the async DB role: {exc}"
+                ) from exc
+            if async_info is None:
+                raise RuntimeError(
+                    "RLS_ENFORCE: could not resolve current_user on the async engine"
+                )
+            checked["async"] = async_info
+
+        offenders = {
+            label: info
+            for label, info in checked.items()
+            if info["bypassrls"] or info["is_superuser"]
+        }
+        if offenders:
+            # REDTEAM HIGH T2: a BYPASSRLS/superuser runtime role makes the 025
+            # WITH CHECK write policies (and all RLS) inert, leaving the tenant
+            # boundary to the application WHERE filters alone.
+            #
+            # Enforcement is GATED behind RLS_ENFORCE (default False = advisory
+            # log, today's behavior). We can only HARD-FAIL once the full RLS
+            # cutover is in place — and it is NOT yet: the current prod role HAS
+            # BYPASSRLS and worker paths depend on it (rls_sync_session() sets
+            # app.current_user_id via SET LOCAL, cleared on the mid-task commit
+            # in run_scrape_job; system_sync_session() sets no GUC for legitimate
+            # cross-tenant ingest). Flip RLS_ENFORCE on only after the staged
+            # cutover (role downgrade + per-transaction GUC reapply + a system
+            # RLS policy) — the deferred HIGH-2 work on branch security/high-2-rls.
+            detail = ", ".join(
+                f"{label}={info['role']}(bypassrls={info['bypassrls']},"
+                f"super={info['is_superuser']})"
+                for label, info in offenders.items()
+            )
+            if settings.RLS_ENFORCE:
                 log.error(
-                    "RLS advisory: DB role '%s' has BYPASSRLS=%s SUPERUSER=%s — "
-                    "row-level security policies are NOT enforced. Tenant "
-                    "isolation relies on application WHERE filters only. "
-                    "Plan a role downgrade to remove implicit bypass before "
-                    "scaling multi-tenant traffic.",
-                    role, bypassrls, is_super,
+                    "RLS fail-closed: role(s) bypass RLS while RLS_ENFORCE=on — "
+                    "refusing to start: %s", detail,
                 )
-            else:
-                log.info(
-                    "RLS advisory: DB role '%s' does not bypass RLS — "
-                    "policies are active.", role,
+                raise RuntimeError(
+                    "Refusing to start: DB role(s) bypass RLS while RLS_ENFORCE "
+                    f"is on ({detail}). Connect with non-BYPASSRLS roles."
                 )
-            return {
-                "role": role,
-                "bypassrls": bypassrls,
-                "is_superuser": is_super,
-            }
+            log.error(
+                "RLS advisory: role(s) bypass RLS — policies NOT enforced; tenant "
+                "isolation relies on application WHERE filters only: %s", detail,
+            )
+        else:
+            log.info("RLS advisory: DB role(s) do not bypass RLS — policies active.")
+        return sync_info
+    except RuntimeError:
+        # REDTEAM HIGH T2: the production fail-closed above must
+        # propagate, not be swallowed by the defensive handler below.
+        raise
     except Exception as exc:  # noqa: BLE001 — defensive
         log.warning("RLS status check failed: %s", exc)
         return {"role": None, "bypassrls": None, "is_superuser": None}

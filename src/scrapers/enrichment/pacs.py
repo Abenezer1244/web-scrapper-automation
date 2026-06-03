@@ -17,9 +17,11 @@ tokens posted back to the same URL.
 
 import re
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 
 import requests
 
+from src.api.middleware.security import validate_scraping_target
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.enrichment.pacs")
@@ -48,6 +50,16 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> dict | None:
     if not pacs_url or not owner_name:
         return None
 
+    # N1: pacs_url is DB config (CountyConnector.assessor_url). An operator
+    # could point it at an internal host, or a PACS host could 302 internally.
+    # Validate with resolve=True (DNS-rebinding aware) BEFORE any outbound
+    # request, and refuse plaintext (PACS portals are HTTPS). raise -> caught
+    # by the except below and logged as a failed lookup (returns None).
+    if urlparse(pacs_url).scheme != "https":
+        _logger.warning("PACS lookup refused non-HTTPS assessor_url")
+        return None
+    validate_scraping_target(pacs_url, require_allowlisted=False, resolve=True)
+
     # Island PACS responses run 10-18s on estate-name searches — bumped
     # timeouts + one retry on read timeout recovers ~2x the records
     # that the original 10/12s budget was dropping.
@@ -57,7 +69,12 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> dict | None:
     def _do_request():
         sess = requests.Session()
         sess.headers.update(_HEADERS)
-        r0 = sess.get(pacs_url, timeout=_GET_TIMEOUT)
+        # N1: trust_env=False disables ambient HTTP(S)_PROXY so the request
+        # can't be rerouted off-box after the SSRF check; allow_redirects=False
+        # on both hops so a poisoned 302 can't bounce to an internal/metadata
+        # host. PACS posts back to the same URL — no legitimate redirect.
+        sess.trust_env = False
+        r0 = sess.get(pacs_url, timeout=_GET_TIMEOUT, allow_redirects=False)
         if r0.status_code != 200:
             return None, None
         vs = re.search(r'__VIEWSTATE.*?value="([^"]+)"', r0.text)
@@ -72,7 +89,7 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> dict | None:
             "propertySearchOptions$ownerName": owner_name,
             "propertySearchOptions$search": "Search",
         }
-        r = sess.post(pacs_url, data=data, timeout=_POST_TIMEOUT, allow_redirects=True)
+        r = sess.post(pacs_url, data=data, timeout=_POST_TIMEOUT, allow_redirects=False)
         return sess, r
 
     try:

@@ -379,6 +379,68 @@ class PendingSkipTraceRow(Base):
     submitted_at = Column(DateTime(timezone=True), nullable=True)
 
 
+class SkipTraceMeterEvent(Base):
+    """Transactional outbox for Stripe skip-trace MeterEvents.
+
+    REDTEAM (Codex convergence — meter outbox): the Tracerfy ingest worker
+    advances each user's skip_trace_used_this_month counter AND flips the
+    SkipTraceQueue to "completed" in ONE committed transaction — that
+    completed-status flip is the ingest replay-idempotency anchor, so a
+    replay no-ops and the counter can never re-advance. The Stripe MeterEvent,
+    however, used to be fired AFTER that commit via a fire-and-forget Celery
+    enqueue whose inner Stripe call swallowed every exception (so transient
+    Stripe failures were never retried) and whose enqueue was best-effort (so
+    a broker-down-at-enqueue lost the event with no record to recover from).
+    Either path left usage advanced locally but never billed — permanent
+    under-billing with no recovery anchor.
+
+    The fix is a durable outbox: report_usage_from_webhook INSERTs one row
+    here per billable user inside the SAME transaction that advances the
+    counter and flips the queue status, so the intent-to-bill is committed
+    atomically with the usage it represents. A row stays with
+    reported_at = NULL until report_skip_trace_meter_event successfully fires
+    the Stripe MeterEvent and stamps reported_at. The inline post-commit
+    enqueue is the fast path; the flush_skip_trace_meter_outbox beat task
+    sweeps any rows whose enqueue was lost (broker down / worker crash).
+
+    Idempotency: UNIQUE(tracerfy_queue_id, user_id) + ON CONFLICT DO NOTHING
+    means re-running report_usage_from_webhook can never duplicate outbox
+    rows, and the Stripe identifier is a stable (queue_id, user_id) string so
+    retries and beat-recovery never double-bill.
+
+    System table: written only by workers via system_sync_session() — like
+    skip_trace_queues / county_records it carries NO user RLS policy.
+    """
+
+    __tablename__ = "skip_trace_meter_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "tracerfy_queue_id",
+            "user_id",
+            name="uq_skip_trace_meter_events_queue_user",
+        ),
+    )
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    tracerfy_queue_id = Column(Integer, nullable=False, index=True)
+    user_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    billable_units = Column(Integer, nullable=False)
+    stripe_customer_id = Column(String(255), nullable=True)
+    plan = Column(String(32), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    # NULL until the Stripe MeterEvent is durably reported; the partial index
+    # in migration 026 makes the "unreported" sweep cheap.
+    reported_at = Column(DateTime(timezone=True), nullable=True)
+
+
 # ─── Sprint 7.3: Referral program ────────────────────────────────────────────
 
 

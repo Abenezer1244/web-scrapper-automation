@@ -12,6 +12,7 @@ import requests
 
 from src.config import settings
 from src.utils.logger import setup_logger
+from src.utils.safe_http import safe_get
 
 _logger = setup_logger("scraper.enrichment.national")
 
@@ -54,7 +55,12 @@ def enrich_parcel_national(
         params["path"] = path
 
     try:
-        resp = requests.get(_REGRID_BASE, params=params, timeout=15)
+        # S4: route through safe_http (SSRF defense-in-depth). _REGRID_BASE is
+        # a fixed HTTPS vendor endpoint, but safe_get re-validates with
+        # resolve=True, disables ambient proxy (trust_env=False), and blocks
+        # redirect-to-internal — so a poisoned 302 to a metadata IP can't be
+        # followed. Returns a requests.Response, so handling below is unchanged.
+        resp = safe_get(_REGRID_BASE, params=params, timeout=15)
 
         if resp.status_code == 200:
             data = resp.json()

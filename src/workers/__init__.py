@@ -109,7 +109,29 @@ def _bootstrap_ssrf_allowlist(sender=None, **_kwargs) -> None:
     try:
         from src.db.session import check_rls_role_status
         check_rls_role_status()
-    except Exception as exc:  # noqa: BLE001 — defensive
+    except RuntimeError:
+        # REDTEAM HIGH T2 (Codex convergence P1): production fail-closed. A
+        # BYPASSRLS/superuser runtime role makes the 025 WITH CHECK policies
+        # (and all RLS) inert. check_rls_role_status raises ONLY in that
+        # production case — let it propagate so the WORKER refuses to boot too
+        # (the API lifespan already does), instead of silently running
+        # tenant-unsafe with RLS effectively off. The previous bare
+        # `except Exception` swallowed exactly this guard.
+        raise
+    except Exception as exc:  # noqa: BLE001 — other (advisory) errors must not wedge boot
         logging.getLogger("worker.bootstrap").warning(
             "RLS advisory check skipped at worker boot: %s", exc
+        )
+
+    # RLS cutover Phase 2b: warm the public sample cache so /scrapers/sample is
+    # not empty after a deploy (it now reads the precomputed public_sample_cache
+    # instead of live-querying tenant tables). Best-effort enqueue — the task is
+    # an idempotent singleton upsert, so duplicate runs across workers are
+    # harmless. The hourly beat task keeps it fresh thereafter.
+    try:
+        from src.workers.scheduler import refresh_public_sample_cache
+        refresh_public_sample_cache.delay()
+    except Exception as exc:  # noqa: BLE001 — never wedge boot on a cache warm
+        logging.getLogger("worker.bootstrap").warning(
+            "public_sample_cache warm enqueue skipped at worker boot: %s", exc
         )

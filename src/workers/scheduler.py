@@ -59,6 +59,22 @@ app.conf.beat_schedule = {
         "task": "src.workers.skip_trace_dispatcher.dispatch_pending_skip_trace",
         "schedule": 300.0,  # every 5 minutes
     },
+    "flush-skip-trace-meter-outbox": {
+        # REDTEAM (Codex convergence — meter outbox): recover skip-trace
+        # MeterEvents whose inline post-commit enqueue was lost (broker down /
+        # worker crash). Sweeps skip_trace_meter_events rows still
+        # reported_at IS NULL and re-enqueues report_skip_trace_meter_event.
+        "task": "src.workers.scheduler.flush_skip_trace_meter_outbox",
+        "schedule": 180.0,  # every 3 minutes
+    },
+    "refresh-public-sample-cache": {
+        # RLS cutover Phase 2b: precompute the sanitized landing-page samples
+        # so the public /scrapers/sample endpoint reads a cache row instead of
+        # live-querying tenant tables (results/jobs/scraper_configs). Hourly is
+        # plenty — the landing page tolerates stale-by-an-hour sample rows.
+        "task": "src.workers.scheduler.refresh_public_sample_cache",
+        "schedule": 3600.0,  # every 1 hour
+    },
 }
 
 
@@ -89,6 +105,7 @@ def dispatch_scheduled_jobs() -> None:
         ).scalars().all()
 
         from typing import cast
+
         from src.api.schemas import ScheduleConfigDict
         for config in configs:
             schedule: ScheduleConfigDict = cast(ScheduleConfigDict, config.schedule or {})
@@ -184,9 +201,7 @@ def watchdog_stuck_jobs() -> None:
     Runs every 5 minutes. Re-queues the job for retry up to max_retries times.
     EagleWeb chunked scraping can take 15-20min scrape + 15min DB save = 35min.
     """
-    from sqlalchemy import select
-
-    from sqlalchemy import or_
+    from sqlalchemy import or_, select
 
     from src.db.models import Job
     from src.db.session import system_sync_session
@@ -420,7 +435,7 @@ def expire_trials() -> None:
     """
     from datetime import UTC, datetime
 
-    from sqlalchemy import select, update
+    from sqlalchemy import select
 
     from src.db.models import User
     from src.db.session import SyncSessionLocal
@@ -518,6 +533,119 @@ def purge_old_records() -> None:
         _logger.info("Purged %d records older than %d days", result.rowcount, settings.RECORD_RETENTION_DAYS)
 
 
+# ─── Task: Refresh public sample cache (landing page) ───────────────────────
+
+@app.task(name="src.workers.scheduler.refresh_public_sample_cache")
+def refresh_public_sample_cache() -> None:
+    """Recompute the sanitized landing-page samples + stats into
+    public_sample_cache (RLS cutover Phase 2b).
+
+    The public /scrapers/sample endpoint reads ONLY this precomputed row, so an
+    unauthenticated request never live-queries the tenant tables
+    (results/jobs/scraper_configs) and the API role needs no cross-tenant read
+    policy for it. ALL PII redaction happens HERE, so the cached payload is safe
+    to serve publicly. Runs via system_sync_session (cross-tenant, no RLS user
+    context) — under the cutover the bridgeleads_system FOR ALL policy applies.
+    """
+    import json
+
+    from sqlalchemy import func as sa_func
+    from sqlalchemy import select, text
+
+    from src.db.models import Job, Result, ScraperConfig
+    from src.db.session import system_sync_session
+
+    def _generalize_address(addr: str | None) -> str | None:
+        # Drop the leading street segment; keep city/state/ZIP. 1 part (no
+        # comma) → can't isolate the street safely, so redact. (mirrors N2)
+        if not addr:
+            return None
+        parts = [p.strip() for p in addr.split(",") if p.strip()]
+        return ", ".join(parts[1:]) if len(parts) >= 2 else None
+
+    def _fmt_count(n: int) -> str:
+        if n < 1000:
+            return f"{n}+"
+        if n < 10_000:
+            return f"{round(n / 1000, 1)}K+"
+        return f"{n // 1000:,}K+"
+
+    with system_sync_session() as db:
+        rows = db.execute(
+            select(Result, ScraperConfig.county)
+            .join(Job, Result.job_id == Job.id)
+            .join(ScraperConfig, Job.scraper_config_id == ScraperConfig.id)
+            .where(
+                Job.status == "done",
+                Result.property_address.isnot(None),
+                Result.property_address != "",
+                Result.mailing_address.isnot(None),
+                Result.mailing_address != "",
+            )
+            .order_by(Job.created_at.desc())
+            .limit(5)
+        ).all()
+
+        samples = []
+        for r, county_slug in rows:
+            # Partially anonymize: first name + last initial.
+            name = r.party_name or ""
+            parts = name.split()
+            if len(parts) >= 2:
+                anon_name = f"{parts[0]} {parts[1][0]}."
+            else:
+                anon_name = f"{parts[0][0]}." if parts else "—"
+            samples.append({
+                # date_recorded is String(32) in the model, not a date — store
+                # it verbatim (matches the old inline /sample behavior exactly).
+                "date_recorded": r.date_recorded,
+                "party_name": anon_name,
+                "county": (county_slug or "").title(),
+                "property_address": _generalize_address(r.property_address),
+                "mailing_address": _generalize_address(r.mailing_address),
+                "has_parcel": bool(r.parcel_id),
+            })
+
+        delivered_count = db.execute(
+            select(sa_func.count(Result.id)).where(
+                Result.property_address.isnot(None),
+                Result.property_address != "",
+            )
+        ).scalar() or 0
+
+        counties_active = db.execute(
+            select(sa_func.count(sa_func.distinct(ScraperConfig.county)))
+            .select_from(Result)
+            .join(Job, Result.job_id == Job.id)
+            .join(ScraperConfig, Job.scraper_config_id == ScraperConfig.id)
+            .where(
+                Result.property_address.isnot(None),
+                Result.property_address != "",
+            )
+        ).scalar() or 0
+
+        payload = {
+            "records": samples,
+            "total_scraped": _fmt_count(delivered_count),
+            "counties_active": counties_active,
+            "enrichment_rate": "95%+",
+            "freshness": "Updated daily",
+        }
+
+        # Singleton upsert (id is fixed at 1 by the table default + CHECK).
+        db.execute(
+            text("""
+                INSERT INTO public.public_sample_cache (id, payload, refreshed_at)
+                VALUES (1, CAST(:payload AS jsonb), now())
+                ON CONFLICT (id) DO UPDATE
+                    SET payload = EXCLUDED.payload, refreshed_at = now()
+            """),
+            {"payload": json.dumps(payload)},
+        )
+        db.commit()
+        _logger.info("Refreshed public_sample_cache: %d samples", len(samples))
+
+
 # ─── Task: Onboarding emails (daily at 7 AM PT) ─────────────────────────────
 
 @app.task(name="src.workers.scheduler.send_onboarding_emails")
@@ -585,3 +713,57 @@ def send_onboarding_emails() -> None:
         "Onboarding email check: %d trial users evaluated (day1=%d day3=%d expiry=%d)",
         len(users), day1_sent, day3_sent, expiry_sent,
     )
+
+
+# ─── Task: Flush skip-trace meter outbox (every 3 min) ──────────────────────
+
+@app.task(name="src.workers.scheduler.flush_skip_trace_meter_outbox")
+def flush_skip_trace_meter_outbox() -> None:
+    """Recover skip-trace Stripe MeterEvents whose inline enqueue was lost.
+
+    REDTEAM (Codex convergence — meter outbox): the Tracerfy ingest worker
+    commits a skip_trace_meter_events outbox row per billable user in the same
+    transaction that advances the usage counter, then best-effort enqueues
+    report_skip_trace_meter_event for each. If the broker was down at that
+    instant — or the worker crashed between commit and enqueue — the row sits
+    with reported_at IS NULL and would never be billed. This sweep picks those
+    up and re-enqueues them.
+
+    Runs every ~3 minutes. Only sweeps rows older than 30 seconds so the inline
+    enqueue gets first crack (avoids a duplicate enqueue racing the fast path;
+    the report task is idempotent on reported_at anyway). The report task fires
+    the Stripe MeterEvent with a stable (queue_id, user_id) identifier, so a
+    re-enqueue can neither lose the event nor double-bill.
+    """
+    from sqlalchemy import text
+
+    from src.db.session import system_sync_session
+    from src.workers.tracerfy_ingest import report_skip_trace_meter_event
+
+    with system_sync_session() as db:
+        rows = db.execute(
+            text("""
+                SELECT id
+                FROM skip_trace_meter_events
+                WHERE reported_at IS NULL
+                  AND created_at < NOW() - INTERVAL '30 seconds'
+            """)
+        ).fetchall()
+
+    enqueued = 0
+    for row in rows:
+        try:
+            report_skip_trace_meter_event.delay(str(row.id))
+            enqueued += 1
+        except Exception as exc:  # noqa: BLE001 — broker still down; try next sweep
+            _logger.error(
+                "Outbox sweep: failed to re-enqueue meter report for outbox "
+                "%s: %s — will retry next sweep",
+                row.id, str(exc)[:200],
+            )
+
+    if enqueued:
+        _logger.info(
+            "Skip-trace meter outbox sweep: re-enqueued %d unreported event(s)",
+            enqueued,
+        )

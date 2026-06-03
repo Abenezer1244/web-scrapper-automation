@@ -16,11 +16,10 @@ for the subset that need mailing addresses.
 import asyncio
 import re
 
-import requests as sync_requests
-
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper
 from src.utils.logger import setup_logger
+from src.utils.safe_http import safe_get
 
 _logger = setup_logger("scraper.enrichment.king_assessor")
 
@@ -50,7 +49,10 @@ async def batch_enrich_king_county(
             _logger.info("  HTTP: %d / %d ...", i, len(clean))
 
         try:
-            r = sync_requests.get(
+            # S4: safe_http (SSRF defense-in-depth). Fixed HTTPS eRealProperty
+            # endpoint, but safe_get re-validates (resolve=True), disables
+            # ambient proxy, and refuses redirect-to-internal. Same Response API.
+            r = safe_get(
                 f"{_ERP_URL}{pid}", headers=_HEADERS, timeout=10
             )
             if r.status_code != 200:

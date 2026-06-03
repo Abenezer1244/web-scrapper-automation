@@ -43,21 +43,34 @@ def report_lookups_for_user(
     new_lookups: int,
     queue_id: int,
 ) -> dict:
-    """Increment user counter and report over-quota units to Stripe.
+    """Advance a user's counter (in the caller's txn) and compute Stripe units.
+
+    REDTEAM B2: this function used to db.commit() the counter advance and
+    then call Stripe, swallowing Stripe errors — so a re-entry/replay could
+    re-advance the counter and the counter/meter could diverge. It is now
+    split into two phases tied to the caller's idempotency:
+
+      Phase 1 (here, NO commit): under the row lock the caller already holds,
+      advance skip_trace_used_this_month and compute billable_units. The
+      caller commits this in the SAME transaction that marks the queue
+      "completed"/billed, so a replay (which finds the queue already
+      completed and no-ops before reaching billing — see REDTEAM B1) can
+      never re-advance the counter.
+
+      Phase 2 (report_meter_event_to_stripe, called AFTER the caller's
+      commit): fire the Stripe MeterEvent with a stable (queue_id, user_id)
+      identifier so Stripe dedupes its own retries.
 
     Args:
-        db: SQLAlchemy session (must be in an active transaction)
+        db: SQLAlchemy session (must be in an active transaction OWNED by the
+            caller — this function never commits or rolls back).
         user_id: UUID string of the user whose rows were ingested
         new_lookups: Number of rows in the completed Tracerfy batch that
             were attributable to this user
         queue_id: Tracerfy queue_id for the batch. REQUIRED — used to
             build a stable Stripe MeterEvent identifier so webhook
             replay dedupes on Stripe's side. H12 from the full-SaaS
-            review. Previously had a None default with a runtime
-            ValueError that fired AFTER db.commit(), which would have
-            advanced the user's counter without the matching Stripe
-            event and let a retry double-count. Now enforced at the
-            signature so callers can never reach that path.
+            review.
 
     Returns:
         Dict with keys:
@@ -65,9 +78,10 @@ def report_lookups_for_user(
             quota: the bundled monthly quota for that plan
             used_before: counter value before this ingest
             used_after: counter value after this ingest
-            billable_units: number of units reported to Stripe (0 if all bundled)
-            meter_event_id: Stripe MeterEvent ID if reported, else None
-            error: str if reporting failed (ingest still commits)
+            billable_units: units to report to Stripe (0 if all bundled)
+            stripe_customer_id: customer id for the deferred Stripe call (or None)
+            meter_event_id: always None here — set by phase 2 after commit
+            error: str if the user could not be advanced (no counter change)
     """
     if new_lookups <= 0:
         return {"billable_units": 0, "meter_event_id": None}
@@ -112,7 +126,16 @@ def report_lookups_for_user(
     after_above = max(0, used_after - quota)
     billable_units = after_above - before_above
 
-    # Persist the counter regardless of billing success
+    # REDTEAM B2: advance the counter but do NOT commit here. The caller
+    # (the Tracerfy ingest worker) owns the transaction and commits this
+    # counter advance in the SAME transaction that flips the SkipTraceQueue
+    # row to "completed" under the lock it already holds. Tying the advance
+    # to that once-only status flip means a replayed webhook — which sees
+    # status="completed" and no-ops before reaching billing — can never
+    # re-advance the counter. Committing here (the old H11 behaviour) broke
+    # that coupling and made the counter pumpable on re-entry; it also
+    # committed the counter independently of the Stripe meter call below,
+    # so counter and meter could diverge whenever Stripe errored.
     db.execute(
         text("""
             UPDATE users
@@ -122,25 +145,16 @@ def report_lookups_for_user(
         {"used": used_after, "uid": user_id},
     )
 
-    # H11 (full-SaaS review): commit the counter + release the
-    # SELECT FOR UPDATE row lock BEFORE calling Stripe. Previously
-    # we held the lock for the duration of the Stripe API call
-    # (~500ms per user), which serialized concurrent webhook
-    # ingests for the same user and held DB connections open
-    # during every skip-trace meter report. Committing here also
-    # guarantees the counter increment survives even if Stripe is
-    # down — the next cycle will still see used_this_month
-    # advanced correctly. If the Stripe call fails we log an error
-    # but do not raise, since the counter is already committed
-    # and raising would prompt a meaningless rollback.
-    db.commit()
-
     result = {
         "plan": plan,
         "quota": quota,
         "used_before": used_before,
         "used_after": used_after,
         "billable_units": billable_units,
+        # Carry the customer id so the caller can fire the Stripe meter
+        # event AFTER it commits — we deliberately do not touch the network
+        # while holding the caller's row lock.
+        "stripe_customer_id": user_row.stripe_customer_id,
         "meter_event_id": None,
     }
 
@@ -149,72 +163,136 @@ def report_lookups_for_user(
             "User %s used %d/%d bundled lookups (no overage this batch)",
             user_id[:8], used_after, quota,
         )
-        return result
+
+    return result
+
+
+class _StripeNotConfiguredError(Exception):
+    """Stripe billing is not wired up — a non-retryable skip, not a failure.
+
+    REDTEAM (Codex convergence — meter outbox): distinguished from transient
+    Stripe/network errors so the durable report path can treat "Stripe off"
+    as a terminal no-op (stamp reported_at, stop) while still RAISING on real
+    transient failures so Celery autoretry kicks in.
+    """
+
+
+def report_meter_event_to_stripe(
+    user_id: str,
+    queue_id: int,
+    billable_units: int,
+    stripe_customer_id: str | None,
+    plan: str,
+) -> str | None:
+    """Fire ONE Stripe skip-trace MeterEvent — RAISES on transient failure.
+
+    REDTEAM (Codex convergence — meter outbox): this used to CATCH every
+    Stripe exception and return out["error"] normally. The durable report
+    task relies on autoretry_for=(Exception,), so a swallowed exception acked
+    the task "successful" and a transient Stripe failure was NEVER retried —
+    usage advanced locally but never billed. It now RAISES on any Stripe/
+    network failure so the calling task retries, and only treats genuinely
+    terminal conditions (Stripe not configured, no customer id, nothing to
+    bill) as no-ops via the typed _StripeNotConfiguredError signal / a None return.
+
+    The identifier is the STABLE (queue_id, user_id) string (H12), so a retry
+    — whether Celery autoretry or the outbox beat sweep — re-sends the same
+    identifier and Stripe dedupes server-side: retries never double-bill.
+
+    Returns the MeterEvent identifier on success, or None when there is
+    nothing billable / Stripe is intentionally off (a terminal no-op the
+    caller stamps as reported). Raises on a transient Stripe failure.
+    """
+    if billable_units <= 0:
+        return None
 
     if not _stripe_enabled():
         _logger.warning(
             "Stripe not fully configured — skipping meter event for user %s (%d billable units)",
             user_id[:8], billable_units,
         )
-        result["error"] = "stripe_not_configured"
-        return result
+        raise _StripeNotConfiguredError("stripe_not_configured")
 
-    if not user_row.stripe_customer_id:
-        _logger.warning(
-            "User %s has no stripe_customer_id — skipping meter event (%d billable)",
-            user_id[:8], billable_units,
+    if not stripe_customer_id:
+        # No customer id is a terminal data condition, not a transient fault —
+        # retrying cannot conjure a customer id. Treat as a reported no-op so
+        # the outbox row stops being swept, but surface it loudly.
+        _logger.error(
+            "User %s has no stripe_customer_id — cannot bill %d skip-trace "
+            "overage units (queue %d)",
+            user_id[:8], billable_units, queue_id,
         )
-        result["error"] = "no_customer_id"
-        return result
+        raise _StripeNotConfiguredError("no_customer_id")
 
-    # Report to Stripe. H12 (full-SaaS review): the identifier must
-    # be STABLE across webhook replays so Stripe's own dedup kicks in.
-    # The old identifier included now.isoformat() which changed on
-    # every retry, so a replayed Tracerfy webhook would create a
-    # new MeterEvent and bill the customer twice. queue_id is now
-    # signature-required (see the function definition) so the
-    # identifier is uniquely keyed on (queue_id, user_id) and a
-    # Stripe replay always dedupes.
+    # H12 (full-SaaS review): the identifier must be STABLE across webhook
+    # replays so Stripe's own dedup kicks in. Keyed on (queue_id, user_id)
+    # so a Stripe-side retry of the same overage always dedupes.
     stable_identifier = f"skip_trace_q{queue_id}_u{user_id}"
 
-    try:
-        import stripe
-        stripe.api_key = settings.STRIPE_SECRET_KEY
-        event = stripe.billing.MeterEvent.create(
-            event_name=settings.STRIPE_METER_EVENT_NAME_SKIP_TRACE,
-            payload={
-                "value": str(billable_units),
-                "stripe_customer_id": user_row.stripe_customer_id,
-            },
-            identifier=stable_identifier,
-        )
-        result["meter_event_id"] = event.get("identifier") or event.get("id")
-        _logger.info(
-            "Reported %d skip-trace lookups to Stripe for user %s (plan=%s, over-quota)",
-            billable_units, user_id[:8], plan,
-        )
-    except Exception as exc:
-        _logger.error(
-            "Failed to report meter event for user %s: %s",
-            user_id[:8], str(exc)[:200],
-        )
-        result["error"] = f"stripe_error: {str(exc)[:100]}"
-
-    return result
+    # Any Stripe/network exception propagates — the durable report task's
+    # autoretry_for=(Exception,) retries it, and the stable identifier above
+    # makes that retry idempotent. We do NOT swallow it here.
+    import stripe
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+    event = stripe.billing.MeterEvent.create(
+        event_name=settings.STRIPE_METER_EVENT_NAME_SKIP_TRACE,
+        payload={
+            "value": str(billable_units),
+            "stripe_customer_id": stripe_customer_id,
+        },
+        identifier=stable_identifier,
+    )
+    _logger.info(
+        "Reported %d skip-trace lookups to Stripe for user %s (plan=%s, over-quota)",
+        billable_units, user_id[:8], plan,
+    )
+    return event.get("identifier") or event.get("id")
 
 
 def report_usage_from_webhook(db, queue_id: int) -> dict:
-    """Aggregate per-user usage from a completed Tracerfy batch and report.
+    """Aggregate per-user usage for a completed batch, advance each user's
+    counter, and persist the billable MeterEvents to the outbox — all WITHOUT
+    committing (the caller commits).
 
-    Reads pending_skip_trace_rows for the given Tracerfy queue_id,
-    groups by user_id, and calls report_lookups_for_user for each user.
+    Reads pending_skip_trace_rows for the given Tracerfy queue_id, groups by
+    user_id, and calls report_lookups_for_user for each user. The counter
+    advances land in the CALLER'S transaction (the ingest worker commits them
+    alongside the SkipTraceQueue status flip, per REDTEAM B1).
 
-    Returns a summary dict with per-user billable totals.
+    REDTEAM (Codex convergence — meter outbox): the deferred Stripe MeterEvent
+    used to be returned as in-memory kwargs ("pending_meter_events") that the
+    worker enqueued best-effort AFTER commit. If the broker was down at that
+    instant the event was logged and lost, and because the queue was already
+    "completed" there was no persisted record to recover from → permanent
+    under-billing. Now, for every billable user, we INSERT a SkipTraceMeterEvent
+    outbox row into the SAME db session, so the intent-to-bill commits
+    atomically with the counter advance and queue-status flip. INSERT ... ON
+    CONFLICT (tracerfy_queue_id, user_id) DO NOTHING makes a re-run idempotent
+    on replay. We then query the outbox row ids back (within this txn) and
+    return them so the caller can enqueue report_skip_trace_meter_event by id;
+    any lost enqueue is recovered by the flush_skip_trace_meter_outbox beat
+    task scanning reported_at IS NULL rows.
+
+    The _stripe_enabled() gate stays OFF here: the counter must advance for
+    usage tracking regardless of whether Stripe billing is wired up. The
+    per-user Stripe call is gated inside report_meter_event_to_stripe().
+
+    Returns a dict:
+        queue_id: int
+        users: per-user summary (used_after, billable_units, ...)
+        outbox_ids: list of SkipTraceMeterEvent ids this batch owns, for the
+            caller to enqueue after commit
     """
-    if not _stripe_enabled():
-        _logger.debug("Stripe not enabled — skipping usage report for queue %d", queue_id)
-        return {"skipped": "stripe_not_configured"}
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+    from src.db.models import SkipTraceMeterEvent
+
+    # ORDER BY user_id (Codex review): report_lookups_for_user takes a
+    # SELECT ... FOR UPDATE lock on each user row and the outbox change keeps it
+    # held until the caller's single commit. Two concurrent webhooks whose
+    # batches share users could otherwise lock them in opposite orders (U1→U2
+    # vs U2→U1) and deadlock. Taking the locks in a deterministic ascending
+    # user_id order across all batches makes a deadlock impossible.
     rows = db.execute(
         text("""
             SELECT user_id, COUNT(*) as n
@@ -222,11 +300,12 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
             WHERE tracerfy_queue_id = :qid
               AND status = 'completed'
             GROUP BY user_id
+            ORDER BY user_id
         """),
         {"qid": queue_id},
     ).fetchall()
 
-    summary = {"queue_id": queue_id, "users": []}
+    summary: dict = {"queue_id": queue_id, "users": [], "outbox_ids": []}
     for row in rows:
         result = report_lookups_for_user(
             db, str(row.user_id), row.n, queue_id=queue_id
@@ -236,5 +315,38 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
             "n": row.n,
             **result,
         })
+        if result.get("billable_units", 0) > 0:
+            # Persist the billable MeterEvent to the outbox in THIS txn. ON
+            # CONFLICT DO NOTHING on (tracerfy_queue_id, user_id) means a
+            # replay can't duplicate the row; the existing reported_at on the
+            # surviving row decides whether it still needs to be fired.
+            db.execute(
+                pg_insert(SkipTraceMeterEvent)
+                .values(
+                    tracerfy_queue_id=queue_id,
+                    user_id=str(row.user_id),
+                    billable_units=result["billable_units"],
+                    stripe_customer_id=result.get("stripe_customer_id"),
+                    plan=result.get("plan", ""),
+                )
+                .on_conflict_do_nothing(
+                    index_elements=["tracerfy_queue_id", "user_id"]
+                )
+            )
+
+    # Read back the outbox row ids for this batch within the same txn so the
+    # caller can enqueue them after commit. Querying by queue_id (rather than
+    # relying on INSERT RETURNING) also surfaces rows a prior partial run may
+    # have already inserted, so a retry still recovers them.
+    outbox_rows = db.execute(
+        text("""
+            SELECT id
+            FROM skip_trace_meter_events
+            WHERE tracerfy_queue_id = :qid
+              AND reported_at IS NULL
+        """),
+        {"qid": queue_id},
+    ).fetchall()
+    summary["outbox_ids"] = [str(r.id) for r in outbox_rows]
 
     return summary

@@ -23,11 +23,131 @@ on the queueing change.
 """
 
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
 
+from src.config import settings
 from src.utils.logger import setup_logger
 from src.workers import app
 
 _logger = setup_logger("worker.tracerfy_ingest")
+
+
+@app.task(
+    bind=True,
+    acks_late=True,
+    max_retries=5,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+)
+def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
+    """REDTEAM (Codex convergence — meter outbox): durably report ONE Stripe
+    skip-trace MeterEvent from its outbox row.
+
+    Driven entirely off the persisted ``skip_trace_meter_events`` outbox row
+    (by id) rather than in-memory kwargs, so an event survives broker-down /
+    worker-crash: report_usage_from_webhook commits the row in the same
+    transaction that advances the usage counter, and either this inline
+    enqueue or the ``flush_skip_trace_meter_outbox`` beat sweep delivers it.
+
+    Idempotency:
+      * if ``reported_at`` is already set, this is a no-op (a retry, a
+        duplicate enqueue, or a beat sweep racing the inline enqueue);
+      * the Stripe MeterEvent uses the STABLE ``skip_trace_q{queue}_u{user}``
+        identifier, so even a double-fire dedupes server-side.
+
+    Durability: a transient Stripe/network failure RAISES (it is no longer
+    swallowed), so ``autoretry_for=(Exception,)`` retries with backoff. A
+    terminal condition (Stripe not configured, no customer id, nothing to
+    bill) stamps ``reported_at`` and stops — no pointless retries. After
+    ``max_retries`` a real failure surfaces loudly for ops.
+    """
+    from datetime import UTC, datetime
+
+    from src.api.billing.skip_trace_usage import (
+        _StripeNotConfiguredError,
+        report_meter_event_to_stripe,
+    )
+    from src.db.models import SkipTraceMeterEvent
+    from src.db.session import system_sync_session
+
+    with system_sync_session() as db:
+        row = db.get(SkipTraceMeterEvent, outbox_id)
+        if row is None:
+            _logger.warning(
+                "Skip-trace meter outbox %s: row not found — nothing to report",
+                outbox_id,
+            )
+            return {"outbox_id": outbox_id, "skipped": "not_found"}
+        if row.reported_at is not None:
+            # Already reported by a prior attempt / the inline enqueue / a
+            # beat sweep. Idempotent no-op.
+            return {"outbox_id": outbox_id, "skipped": "already_reported"}
+
+        # Terminal no-ops (_StripeNotConfiguredError) still stamp reported_at so the
+        # row stops being swept; transient Stripe failures propagate to
+        # autoretry. The stable identifier inside makes any retry idempotent.
+        try:
+            report_meter_event_to_stripe(
+                user_id=str(row.user_id),
+                queue_id=row.tracerfy_queue_id,
+                billable_units=row.billable_units,
+                stripe_customer_id=row.stripe_customer_id,
+                plan=row.plan or "",
+            )
+        except _StripeNotConfiguredError as exc:
+            _logger.warning(
+                "Skip-trace meter outbox %s: terminal no-op (%s) — marking "
+                "reported to stop the sweep",
+                outbox_id, exc,
+            )
+
+        row.reported_at = datetime.now(UTC)
+        db.commit()
+
+    return {"outbox_id": outbox_id, "reported": True}
+
+
+def _host_is_tracerfy(download_url: str) -> bool:
+    """REDTEAM B1/T3: confirm a webhook-supplied download_url points at a
+    Tracerfy-owned host before we fetch it server-side.
+
+    The webhook body is shared-secret authenticated, but the secret is a
+    static URL path component — a leaked/guessed secret lets an attacker
+    POST an arbitrary download_url and have our worker fetch it (SSRF).
+    download_tracerfy_csv() already routes through safe_get_following
+    (blocks private/metadata IPs + validates every redirect hop), but it
+    deliberately allows ANY public host. Tracerfy delivers CSVs from its
+    own domain and its DigitalOcean Spaces CDN bucket, so we additionally
+    pin the host to those before trusting the URL.
+
+    Allowed:
+      - the configured TRACERFY_API_BASE_URL host (and its subdomains)
+      - DigitalOcean Spaces CDN buckets owned by Tracerfy
+        (e.g. tracerfy.nyc3.cdn.digitaloceanspaces.com)
+    """
+    try:
+        parts = urlsplit(download_url)
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https"):
+        return False
+    host = (parts.hostname or "").lower()
+    if not host:
+        return False
+
+    api_host = (urlsplit(settings.TRACERFY_API_BASE_URL).hostname or "").lower()
+    if api_host and (host == api_host or host.endswith("." + api_host)):
+        return True
+
+    # DigitalOcean Spaces CDN: bucket name is the leftmost label and must
+    # be Tracerfy's own bucket. Matches "<bucket>.<region>.cdn.digitalocean
+    # spaces.com" and "<bucket>.<region>.digitaloceanspaces.com".
+    if host.endswith(".digitaloceanspaces.com") and host.split(".", 1)[0] == "tracerfy":
+        return True
+
+    return False
 
 
 @app.task(
@@ -54,7 +174,7 @@ def ingest_tracerfy_batch(
     max_retries attempts the task gives up and the batch is marked
     errored on the SkipTraceQueue row so ops can see what happened.
     """
-    from sqlalchemy import and_, select, update
+    from sqlalchemy import select, update
 
     from src.db.models import (
         PendingSkipTraceRow,
@@ -69,6 +189,44 @@ def ingest_tracerfy_batch(
         download_tracerfy_csv,
         ingest_webhook_csv,
     )
+
+    # REDTEAM T3: refuse to fetch a forged/body-supplied download_url that
+    # does not point at a Tracerfy-owned host. Reject BEFORE any DB work or
+    # network fetch so a forged webhook is a cheap, logged no-op.
+    if not _host_is_tracerfy(download_url):
+        _logger.error(
+            "Refusing Tracerfy ingest for queue %d: download_url host not "
+            "Tracerfy-owned (host=%s)",
+            queue_id,
+            (urlsplit(download_url).hostname or "<none>"),
+        )
+        return {"queue_id": queue_id, "skipped": "untrusted_download_host"}
+
+    # REDTEAM (Codex review): cheap pre-check BEFORE any network I/O. A replay
+    # of an already completed/billed/errored batch — or an unknown/forged queue
+    # id that happened to pass the host check — must no-op WITHOUT downloading
+    # the (possibly expired/slow) signed CSV URL. The authoritative guard is
+    # still the SELECT ... FOR UPDATE re-check below (handles the race where the
+    # status flips between this peek and the lock); this only spares the
+    # wasteful/erroring fetch for the common replay/forged case.
+    with system_sync_session() as _precheck:
+        _pre = _precheck.execute(
+            select(SkipTraceQueue.status).where(
+                SkipTraceQueue.tracerfy_queue_id == queue_id
+            )
+        ).first()
+    if _pre is None:
+        _logger.warning(
+            "Tracerfy ingest queue %d: unknown/forged batch id — no-op (pre-download)",
+            queue_id,
+        )
+        return {"queue_id": queue_id, "skipped": "unknown_queue"}
+    if _pre[0] in ("completed", "billed", "errored"):
+        _logger.info(
+            "Tracerfy ingest queue %d: already %s — idempotent no-op (pre-download)",
+            queue_id, _pre[0],
+        )
+        return {"queue_id": queue_id, "skipped": f"already_{_pre[0]}"}
 
     try:
         csv_text = download_tracerfy_csv(download_url)
@@ -94,6 +252,39 @@ def ingest_tracerfy_batch(
     # trace_type, not user). This ingest path legitimately needs
     # to update Result rows across tenants.
     with system_sync_session() as db:
+        # REDTEAM B1: replay/idempotency guard. Lock the SkipTraceQueue row
+        # FOR UPDATE as the FIRST statement so the lock is held through the
+        # ingest + billing + status flip below, all inside this single
+        # transaction (committed once at db.commit()). Replaying a
+        # completed-batch webhook previously re-ran ingest and re-incremented
+        # skip_trace_used_this_month, double-billing the victim. Now a
+        # concurrent replay blocks on this lock, then sees status="completed"
+        # and no-ops; a serial replay sees it immediately. Missing row =
+        # unknown/forged queue id → refuse.
+        queue_row = (
+            db.execute(
+                select(SkipTraceQueue)
+                .where(SkipTraceQueue.tracerfy_queue_id == queue_id)
+                .with_for_update()
+            )
+            .scalars()
+            .first()
+        )
+        if queue_row is None:
+            _logger.warning(
+                "Tracerfy ingest queue %d: no SkipTraceQueue row — refusing "
+                "to process an unknown/forged batch id",
+                queue_id,
+            )
+            return {"queue_id": queue_id, "skipped": "unknown_queue"}
+        if queue_row.status in ("completed", "billed", "errored"):
+            _logger.info(
+                "Tracerfy ingest queue %d: already %s — idempotent no-op",
+                queue_id,
+                queue_row.status,
+            )
+            return {"queue_id": queue_id, "skipped": f"already_{queue_row.status}"}
+
         pending = (
             db.execute(
                 select(PendingSkipTraceRow)
@@ -190,23 +381,59 @@ def ingest_tracerfy_batch(
             )
         )
 
-        db.commit()
-
-        # Report Stripe metered billing for over-quota lookups
-        # (H11 + H12: stable identifier, commit-before-stripe)
+        # REDTEAM B1+B2: advance each user's skip-trace counter HERE, BEFORE
+        # the single db.commit() below, so the counter advance, the pending-
+        # row "completed" flips, and the SkipTraceQueue status="completed"
+        # flip all land in ONE transaction under the queue-row lock taken at
+        # the top of this block. This is the idempotency anchor: a replay of
+        # this batch finds status="completed" and no-ops before reaching this
+        # point, so the counter can never be re-advanced. report_usage_from_
+        # webhook no longer commits or calls Stripe — it INSERTs a durable
+        # SkipTraceMeterEvent outbox row per billable user into THIS same
+        # transaction and returns their ids for us to enqueue AFTER commit.
+        outbox_ids: list[str] = []
         try:
             from src.api.billing.skip_trace_usage import (
                 report_usage_from_webhook,
             )
             billing_summary = report_usage_from_webhook(db, queue_id)
+            outbox_ids = billing_summary.get("outbox_ids", [])
             _logger.info(
                 "Tracerfy ingest queue=%d: %d hits / %d misses / billing=%s",
                 queue_id, hit_count, miss_count, billing_summary,
             )
         except Exception as exc:  # noqa: BLE001 — defensive
+            # A billing-advance failure must roll back the whole ingest so we
+            # never mark the queue completed while leaving counters un-advanced
+            # (which a replay could then never correct). Re-raise to abort the
+            # transaction; Celery will retry, and the retry will re-process
+            # because the queue was never committed as completed.
             _logger.error(
-                "Stripe meter report failed for queue %d: %s",
+                "Skip-trace counter advance failed for queue %d: %s",
                 queue_id, str(exc)[:200],
+            )
+            raise
+
+        # Single atomic commit: ingest + status flip + counter advances.
+        db.commit()
+
+    # REDTEAM (Codex convergence — meter outbox): the billable MeterEvents are
+    # now durably persisted as skip_trace_meter_events outbox rows inside the
+    # committed transaction above, so they can no longer be lost. Enqueue each
+    # by id as a best-effort fast path; if .delay() raises (broker down at this
+    # instant) we only LOG — the flush_skip_trace_meter_outbox beat task sweeps
+    # any row still reported_at IS NULL and re-enqueues it. The report task
+    # no-ops if reported_at is already set and uses a stable (queue_id,
+    # user_id) Stripe identifier, so the event can be neither lost nor
+    # double-billed.
+    for outbox_id in outbox_ids:
+        try:
+            report_skip_trace_meter_event.delay(outbox_id)
+        except Exception as exc:  # noqa: BLE001 — enqueue failure must not fail ingest
+            _logger.error(
+                "Failed to enqueue Stripe meter report for queue %d outbox %s: "
+                "%s — persisted to outbox, beat sweep will recover it",
+                queue_id, outbox_id, str(exc)[:200],
             )
 
     return {

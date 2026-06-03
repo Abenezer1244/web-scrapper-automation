@@ -231,6 +231,7 @@ async def get_results(
     )
     config = config_result.scalar_one_or_none()
     from typing import cast
+
     from src.api.schemas import ScheduleConfigDict
     schedule: ScheduleConfigDict = cast(
         ScheduleConfigDict, (config.schedule or {}) if config else {}
@@ -572,9 +573,9 @@ async def download_export(
     Accepts a short-lived download token (from /export-url) OR an Authorization header.
     The download token is scoped to a specific job, expires in 60s, and is safe for URLs.
     """
-    import requests as sync_requests
     import jwt as jose_jwt
     from jwt.exceptions import InvalidTokenError as JWTError
+
     from src.config import settings as app_settings
 
     # Authenticate: prefer short-lived download token, fall back to Authorization header
@@ -588,15 +589,35 @@ async def download_export(
         raise HTTPException(status_code=401, detail="Authentication required")
 
     try:
-        # Decode WITHOUT aud verification first so we can branch on
-        # purpose + apply the right aud check. pyjwt does not support
-        # "try multiple audiences" natively; the manual check below
-        # enforces aud after we know which kind of token this is.
-        payload = jose_jwt.decode(
+        # REDTEAM LOW T1: do not branch security decisions on a token
+        # whose audience/issuer were never verified. pyjwt cannot "try
+        # multiple audiences" in one call, so we first read the
+        # *unverified* claims (signature NOT trusted) only to learn which
+        # kind of token this is, then RE-DECODE with pyjwt natively
+        # enforcing the exact audience + issuer for that kind. A token
+        # that lies about its purpose to dodge the audience check fails
+        # the strict re-decode below.
+        unverified = jose_jwt.decode(
             auth_token,
             app_settings.SECRET_KEY,
             algorithms=["HS256"],
             options={"verify_exp": True, "verify_aud": False},
+        )
+        is_download_token = unverified.get("purpose") == "download"
+        expected_aud = "bridgeleads-download" if is_download_token else "bridgeleads-api"
+        # Strict decode: pyjwt enforces aud + iss (raises if absent/wrong).
+        payload = jose_jwt.decode(
+            auth_token,
+            app_settings.SECRET_KEY,
+            algorithms=["HS256"],
+            audience=expected_aud,
+            issuer="bridgeleads",
+            options={
+                "verify_exp": True,
+                "verify_aud": True,
+                "verify_iss": True,
+                "require": ["exp", "aud", "iss"],
+            },
         )
         user_id = payload.get("sub")
         if not user_id:
@@ -683,6 +704,10 @@ async def download_export(
     # RLS belt in addition to the explicit user_id filter. This route uses
     # get_db (not get_rls_db) because the user is resolved from a download
     # token rather than the standard dependency, so we set the context here.
+    # Also store it on session.info so the after_begin listener (session.py)
+    # re-applies the GUC if this path ever commits mid-request — consistent
+    # with get_rls_db and forward-safe for the non-BYPASSRLS cutover role.
+    db.sync_session.info["rls_user_id"] = str(user.id)
     await db.execute(
         text("SELECT set_config('app.current_user_id', :uid, true)"),
         {"uid": str(user.id)},
@@ -751,6 +776,6 @@ async def download_export(
         )
     except HTTPException:
         raise
-    except Exception as exc:
+    except Exception:
         _logger.exception("Download error for job %s", job_id)
         raise HTTPException(status_code=500, detail="Download temporarily unavailable")

@@ -25,7 +25,6 @@ matching `Result` rows by (address, city, state), and upsert phone/email.
 
 import hmac
 import secrets as _secrets
-from datetime import UTC, datetime
 
 from fastapi import APIRouter, HTTPException, Request, status
 
@@ -120,13 +119,17 @@ async def tracerfy_webhook(
         payload.get("credits_deducted"),
     )
 
-    # M8 (full-SaaS review): dispatch to Celery instead of
-    # FastAPI BackgroundTasks. The previous BackgroundTask ran
-    # inside the API process after the 200 was returned — if the
-    # API process restarted before CSV parsing completed, the
-    # batch was dropped on the floor because Tracerfy does NOT
-    # retry webhooks. Celery persists the task in Redis and retries
-    # automatically if the worker dies mid-task.
+    # Dispatch the ingest to Celery (M8: durable Redis-backed queue — a
+    # FastAPI BackgroundTask would be lost if the API restarted before CSV
+    # parsing finished, and Tracerfy does NOT reliably retry webhooks).
+    #
+    # No edge dedup here (Codex review): idempotency is owned authoritatively by
+    # the worker, which locks the SkipTraceQueue row (SELECT ... FOR UPDATE) and
+    # no-ops once it is completed/billed, while billing is made durable by the
+    # meter outbox. An earlier Redis SET-NX edge claim was REMOVED because
+    # claiming the key BEFORE the worker validated the delivery let a
+    # forged/malformed first webhook for a real queue_id suppress the genuine
+    # retry for the whole TTL — net-negative versus the worker's DB guard.
     from src.workers.tracerfy_ingest import ingest_tracerfy_batch
     ingest_tracerfy_batch.delay(
         queue_id=queue_id,

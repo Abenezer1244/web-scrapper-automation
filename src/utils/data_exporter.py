@@ -160,7 +160,13 @@ class DataExporter:
         for row in records:
             clean_row = {}
             for k, v in row.items():
-                clean_row[k] = sanitize_for_csv(str(v)) if isinstance(v, str) and v else v
+                # E4: sanitize EVERY string value, not just truthy ones — the
+                # old `and v` skipped "" and the leading-quote/embedded-tab
+                # bypass passed straight through. JSON is a common hand-off
+                # into spreadsheet tools, so the same neutralization applies.
+                # Non-str values (numbers/bools/None) keep their native JSON
+                # type — they cannot carry a formula trigger.
+                clean_row[k] = sanitize_for_csv(v) if isinstance(v, str) else v
             sanitized.append(clean_row)
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(sanitized, f, ensure_ascii=False, indent=2, default=str)

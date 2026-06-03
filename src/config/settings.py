@@ -20,8 +20,16 @@ class Settings(BaseSettings):
     LOGS_DIR: ClassVar[Path] = BASE_DIR / "logs"
 
     # ─── Database ─────────────────────────────────────────────────────────────
+    # RLS cutover (Phase 3) target roles:
+    #   DATABASE_URL       → bridgeleads_app    (FastAPI request traffic)
+    #   DATABASE_URL_SYNC  → bridgeleads_system (Celery workers / scheduler)
+    #   DATABASE_URL_MIGRATE → owner/DDL role, Alembic only (optional; falls back
+    #     to DATABASE_URL_SYNC pre-cutover — see alembic/env.py). Read directly
+    #     by alembic/env.py via os.getenv; declared here for documentation and so
+    #     pydantic-settings does not reject it from the environment.
     DATABASE_URL: str
     DATABASE_URL_SYNC: str
+    DATABASE_URL_MIGRATE: str = ""
 
     # ─── Redis ────────────────────────────────────────────────────────────────
     REDIS_URL: str
@@ -98,6 +106,14 @@ class Settings(BaseSettings):
     # ─── App ──────────────────────────────────────────────────────────────────
     DEBUG: bool = False
     ENVIRONMENT: str = "production"
+    # RLS enforcement gate (REDTEAM T2). Default False = advisory-only: startup
+    # LOGS if the DB role bypasses RLS but still boots (today's behavior — the
+    # production role currently has BYPASSRLS and worker paths depend on it).
+    # Set True ONLY after the staged RLS cutover (non-BYPASSRLS role +
+    # per-transaction GUC reapply + a system RLS policy for system_sync_session,
+    # the deferred HIGH-2 work); with it on, the API + workers REFUSE to boot on
+    # a bypassing role. Enabling it before the cutover WILL break scrapes/ingest.
+    RLS_ENFORCE: bool = False
     FRONTEND_URL: str = "https://bridgeleads.io"
     # Public base URL of THIS API (the host serving /jobs/{id}/download).
     # When set, delivery emails/webhooks send a revocable app download-token
@@ -105,6 +121,10 @@ class Settings(BaseSettings):
     # presigned URL (so delivery keeps working until this is configured).
     API_BASE_URL: str = ""
     ALLOWED_ORIGINS: str = "https://bridgeleads.io,https://app.bridgeleads.io,https://bridgeleads-web.vercel.app"
+    # Number of trusted reverse-proxy hops in front of the API (each appends one
+    # entry to X-Forwarded-For). Railway/Fly = 1. Used by the rate limiter to
+    # take the real client IP from the RIGHT of the XFF chain (rate_limit I1).
+    TRUSTED_PROXY_HOPS: int = 1
 
     # ─── Worker scaling ──────────────────────────────────────────────────────
     WORKER_CONCURRENCY: int = 2
@@ -188,7 +208,21 @@ class Settings(BaseSettings):
     }
 
     def get_allowed_origins(self) -> list[str]:
-        return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
+        # I4: CORS runs with allow_credentials=True, so a wildcard or plaintext
+        # origin would let any site (or a MITM on http) make credentialed
+        # cross-origin calls. Accept ONLY explicit https:// origins; permit
+        # http://localhost / 127.0.0.1 for local dev. A stray "*" or arbitrary
+        # http:// entry is dropped rather than silently widening the allowlist.
+        out: list[str] = []
+        for raw in self.ALLOWED_ORIGINS.split(","):
+            origin = raw.strip()
+            if not origin or origin == "*":
+                continue
+            if origin.startswith("https://") or origin.startswith(
+                ("http://localhost", "http://127.0.0.1")
+            ):
+                out.append(origin)
+        return out
 
     def redis_kwargs(self, decode_responses: bool = True) -> dict:
         """Return kwargs for redis.from_url() with correct SSL config.

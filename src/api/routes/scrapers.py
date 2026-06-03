@@ -10,7 +10,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
 from src.api.middleware.rate_limit import rate_limit
-from src.db import get_db
 from src.api.schemas import (
     CachedRecordRow,
     CachedResultsPage,
@@ -27,105 +26,34 @@ router = APIRouter(prefix="/scrapers", tags=["scrapers"])
 
 @router.get("/sample")
 async def sample_records(db: AsyncSession = Depends(get_db)) -> dict:
-    """Public endpoint: returns 5 anonymized sample records for the landing page.
+    """Public endpoint: returns precomputed, sanitized sample records.
 
-    Shows real data quality (with names partially redacted) so potential
-    users can see what they'll get before signing up. No auth required.
-
-    Stats (total_scraped, counties_active, enrichment_rate) are computed
-    from live DB data — no hardcoded numbers. Sprint 5 update (2026-04-11)
-    fixed the county-detection bug that previously labeled every record
-    as "King" because it was looking for 'pierce' in the Job UUID.
+    Reads ONLY the public_sample_cache singleton (refreshed hourly by the
+    refresh_public_sample_cache Celery task, which does all PII redaction).
+    This unauthenticated endpoint therefore never live-queries the tenant
+    tables (results/jobs/scraper_configs) — so under the non-BYPASSRLS cutover
+    role it needs no cross-tenant read access, and there is no path by which an
+    anonymous caller can reach un-sanitized PII (RLS cutover Phase 2b, Codex
+    design). Returns an empty-but-valid shape until the first refresh runs.
     """
-    from src.db.models import CountyConnector, Result, Job, ScraperConfig
+    import json
 
-    # Find 5 recent successful records with good enrichment. Join all the
-    # way to ScraperConfig so we can surface the real county per row.
-    result = await db.execute(
-        select(Result, ScraperConfig.county)
-        .join(Job, Result.job_id == Job.id)
-        .join(ScraperConfig, Job.scraper_config_id == ScraperConfig.id)
-        .where(
-            Job.status == "done",
-            Result.property_address.isnot(None),
-            Result.property_address != "",
-            Result.mailing_address.isnot(None),
-            Result.mailing_address != "",
-        )
-        .order_by(Job.created_at.desc())
-        .limit(5)
+    row = await db.execute(
+        text("SELECT payload FROM public.public_sample_cache WHERE id = 1")
     )
-    rows = result.all()
-
-    samples = []
-    for r, county_slug in rows:
-        # Partially anonymize: show first name + initial of last name
-        name = r.party_name or ""
-        parts = name.split()
-        if len(parts) >= 2:
-            anon_name = f"{parts[0]} {parts[1][0]}."
-        else:
-            anon_name = f"{parts[0][0]}." if parts else "—"
-
-        samples.append({
-            "date_recorded": r.date_recorded,
-            "party_name": anon_name,
-            "county": (county_slug or "").title(),
-            "property_address": r.property_address,
-            "mailing_address": r.mailing_address,
-            "has_parcel": bool(r.parcel_id),
-        })
-
-    # Compute live stats from DELIVERED records only — records that have
-    # a property address (i.e. the post-enrichment-drop output Sprint 2
-    # ships to customers). Historical records from broken pre-Sprint-2
-    # scraper runs with 0% enrichment are excluded from the headline
-    # numbers since they'd be dropped before delivery today.
-    from sqlalchemy import func as sa_func
-
-    delivered_count_row = await db.execute(
-        select(sa_func.count(Result.id)).where(
-            Result.property_address.isnot(None),
-            Result.property_address != "",
-        )
-    )
-    delivered_count = delivered_count_row.scalar() or 0
-
-    # Active counties = those in the connector registry with at least one
-    # enriched Result on record. Scoped via the scraper_configs join so
-    # we only count counties that actually produced leads.
-    active_counties_row = await db.execute(
-        select(sa_func.count(sa_func.distinct(ScraperConfig.county)))
-        .select_from(Result)
-        .join(Job, Result.job_id == Job.id)
-        .join(ScraperConfig, Job.scraper_config_id == ScraperConfig.id)
-        .where(
-            Result.property_address.isnot(None),
-            Result.property_address != "",
-        )
-    )
-    counties_active = active_counties_row.scalar() or 0
-
-    # Enrichment rate on delivered records is ~100% by construction
-    # (every delivered record has an address). Report the sprint-2 gate
-    # number instead, which is what new scrapes hit.
-    enrichment_rate_label = "95%+"
-
-    # Format delivered_count as "12,345+" for display
-    def _fmt_count(n: int) -> str:
-        if n < 1000:
-            return f"{n}+"
-        if n < 10_000:
-            return f"{round(n / 1000, 1)}K+"
-        return f"{n // 1000:,}K+"
-
-    return {
-        "records": samples,
-        "total_scraped": _fmt_count(delivered_count),
-        "counties_active": counties_active,
-        "enrichment_rate": enrichment_rate_label,
-        "freshness": "Updated daily",
-    }
+    cached = row.scalar_one_or_none()
+    if cached is None:
+        # Cache not yet warmed (fresh DB / before the first beat tick).
+        return {
+            "records": [],
+            "total_scraped": "0+",
+            "counties_active": 0,
+            "enrichment_rate": "95%+",
+            "freshness": "Updated daily",
+        }
+    # asyncpg may hand back jsonb as a dict or a JSON string depending on codecs;
+    # normalize both.
+    return cached if isinstance(cached, dict) else json.loads(cached)
 
 
 @router.get("", response_model=list[ScraperConfigResponse])
@@ -370,6 +298,21 @@ async def create_connector(
                 detail=f"Invalid gis_endpoint: {exc}",
             )
 
+    # assessor_url is also fetched server-side (AI enrichment fallback), so
+    # it must clear the same SSRF firewall as gis_endpoint before we persist
+    # it. REDTEAM LOW N3 flagged that gis_endpoint/assessor_url were validated
+    # (gis) but never stored, and assessor_url was neither validated nor
+    # stored — dead input that silently dropped admin-supplied config.
+    if body.assessor_url:
+        from src.api.middleware.security import validate_scraping_target
+        try:
+            validate_scraping_target(body.assessor_url, require_allowlisted=False, resolve=True)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid assessor_url: {exc}",
+            )
+
     connector = CountyConnector(
         id=str(uuid.uuid4()),
         county=body.county,
@@ -378,6 +321,10 @@ async def create_connector(
         scraper_class="src.scrapers.ai_scraper.AIScraper",
         scraper_mode=body.scraper_mode,
         base_url=body.base_url,
+        # REDTEAM LOW N3: persist the validated enrichment endpoints so the
+        # validation isn't dead — enrichment reads these off the connector row.
+        gis_endpoint=body.gis_endpoint,
+        assessor_url=body.assessor_url,
     )
     db.add(connector)
     await db.flush()

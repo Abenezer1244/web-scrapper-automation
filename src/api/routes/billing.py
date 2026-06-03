@@ -3,7 +3,7 @@
 import stripe
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
@@ -51,45 +51,15 @@ async def activation_funnel(
             detail="days must be between 1 and 365",
         )
 
-    from sqlalchemy import text as sa_text
-
-    # Use raw SQL for the funnel — expresses the intent more clearly
-    # than 5 separate SQLAlchemy expressions.
+    # Cross-tenant aggregate via the SECURITY DEFINER public.activation_funnel()
+    # (migration 029). Under the NOBYPASSRLS bridgeleads_app role this admin
+    # route cannot read across all users directly; the definer function (owned
+    # by a privileged role, EXECUTE granted only to bridgeleads_app) returns
+    # ONLY the funnel counts — no raw cross-tenant rows leak. The % math below
+    # stays in Python.
     result = await db.execute(
-        sa_text("""
-            WITH window_users AS (
-                SELECT id, plan, created_at
-                FROM users
-                WHERE created_at >= NOW() - (:days || ' days')::interval
-                  AND is_active = true
-            )
-            SELECT
-                -- 1. Signups in window
-                (SELECT COUNT(*) FROM window_users) AS signups,
-
-                -- 2. Users who created at least one scraper_config
-                (SELECT COUNT(DISTINCT u.id)
-                 FROM window_users u
-                 JOIN scraper_configs sc ON sc.user_id = u.id) AS first_scraper,
-
-                -- 3. Users who ran at least one scrape job (any status)
-                (SELECT COUNT(DISTINCT u.id)
-                 FROM window_users u
-                 JOIN jobs j ON j.user_id = u.id) AS first_job,
-
-                -- 4. Users whose job produced a downloadable export
-                (SELECT COUNT(DISTINCT u.id)
-                 FROM window_users u
-                 JOIN jobs j ON j.user_id = u.id
-                 WHERE j.export_key IS NOT NULL) AS first_download,
-
-                -- 5. Users who upgraded to a paid plan (any of pro/business/agency)
-                (SELECT COUNT(*)
-                 FROM window_users
-                 WHERE LOWER(plan) IN ('pro', 'business', 'agency')
-                   AND stripe_customer_id IS NOT NULL) AS paid_upgrade
-        """),
-        {"days": str(days)},
+        text("SELECT * FROM public.activation_funnel(:days)"),
+        {"days": days},
     )
     row = result.fetchone()
     if row is None:
@@ -730,65 +700,25 @@ _REFERRAL_BONUS_CENTS = 2000  # $20 per successful referral
 async def _grant_referral_credit(db: AsyncSession, referee: User) -> None:
     """Credit the referrer $20 when a referred user converts to paid.
 
-    Idempotent: the unique constraint on referral_events.referee_id
-    guarantees each referee can only trigger the bonus once, even if
-    Stripe replays the webhook.
+    Delegates to the SECURITY DEFINER public.grant_referral_credit() (migration
+    029). The Stripe webhook runs with NO per-user RLS context and the referral
+    row spans TWO users (referrer + referee), so under the NOBYPASSRLS
+    bridgeleads_app role the app role cannot write referral_events directly.
+    The function — owned by a privileged role, EXECUTE granted only to
+    bridgeleads_app — resolves the referrer from users.referred_by_user_id,
+    inserts the audit row idempotently (unique(referee_id) → a Stripe replay is
+    a no-op) and increments the referrer's balance atomically. A no-op when the
+    referee has no referrer or the referrer was deleted.
+
+    The prior savepoint/IntegrityError dance is now handled inside the function
+    by ON CONFLICT (referee_id) DO NOTHING, so the enclosing webhook transaction
+    (the plan upgrade flushed by _handle_checkout_completed) is never disturbed.
     """
-    from sqlalchemy.exc import IntegrityError
-
-    from src.db.models import ReferralEvent
-
-    # Fetch the referrer (they may no longer exist if account was
-    # deleted — SET NULL would have already cleared the FK).
-    referrer_res = await db.execute(
-        select(User).where(User.id == referee.referred_by_user_id)
-    )
-    referrer = referrer_res.scalar_one_or_none()
-    if referrer is None:
-        return  # Referrer was deleted between signup and conversion
-
-    # Create the audit-log row inside a SAVEPOINT so that a duplicate
-    # (webhook replay hitting the unique constraint on referee_id)
-    # only rolls back the INSERT, not the enclosing transaction.
-    # Without the savepoint, `db.rollback()` after the IntegrityError
-    # would throw away the plan upgrade and records_limit change that
-    # _handle_checkout_completed just flushed — silently reverting a
-    # paid user to their old plan on every Stripe retry. CRIT-1 from
-    # the Sprint 7.3 code review.
-    event = ReferralEvent(
-        referrer_id=referrer.id,
-        referee_id=referee.id,
-        amount_cents=_REFERRAL_BONUS_CENTS,
-        reason="referee_converted_to_paid",
-    )
-    try:
-        async with db.begin_nested():
-            db.add(event)
-            # flush is implicit at savepoint exit, but being explicit
-            # makes the IntegrityError surface here rather than later
-            await db.flush()
-    except IntegrityError:
-        _logger.info(
-            "referral: duplicate grant ignored referee=%s", referee.id
-        )
-        return
-
-    # Atomic increment on the referrer's balance so concurrent
-    # grants from different referees don't race. Kept outside the
-    # savepoint — if this UPDATE fails, the whole webhook transaction
-    # should roll back (caller will see the exception and Stripe will
-    # retry) because we absolutely cannot have an audit-log row
-    # without a matching balance increment.
-    from sqlalchemy import update as sa_update
     await db.execute(
-        sa_update(User)
-        .where(User.id == referrer.id)
-        .values(referral_credit_cents=User.referral_credit_cents + _REFERRAL_BONUS_CENTS)
+        text("SELECT public.grant_referral_credit(:referee_id)"),
+        {"referee_id": str(referee.id)},
     )
-    await db.flush()
-    _logger.info(
-        "referral: +$20 credit referrer=%s referee=%s", referrer.id, referee.id
-    )
+    _logger.info("referral: grant_referral_credit processed referee=%s", referee.id)
 
 
 async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:

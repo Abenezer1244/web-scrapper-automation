@@ -100,8 +100,36 @@ scrapers, get_cached_records, checkout. `/download` resolves identity from token
   current_user — mirrors /download). `/api-key` + `/logout-all` left on get_db (touch only `users`,
   broad policy). Codex caught reset-password in review (silent reuse-check regression) — fixed.
   Files: auth.py, billing.py. py_compile clean.
-- **Phase 2b (code, cross-tenant/webhook):** add an async system DB context; route `/billing/webhook`
-  (Stripe, cross-user referral grant) + `/billing/activation-funnel` (admin analytics) through it.
+- **Phase 2b (cross-tenant/webhook) — REDESIGNED per Codex consult:**
+  Key constraint: the async API process is ONE role (bridgeleads_app); routes don't become system.
+  **REJECTED:** `GRANT bridgeleads_system TO bridgeleads_app` (internet-facing RCE → worker role —
+  punches through the role split) and broad app policies on results/jobs/scraper_configs (OR with
+  tenant policy → destroys isolation for ALL app traffic).
+  **CHOSEN (Codex):**
+  - `/billing/webhook` referral grant → `SECURITY DEFINER` fn `grant_referral_credit(referee_id)`
+    (owner-owned, EXECUTE to app, fixed search_path, no dynamic SQL; derives referrer, inserts
+    referral_events + increments credit atomically). users updates stay direct (broad users policy).
+  - `/billing/activation-funnel` → `SECURITY DEFINER` aggregate fn returning ONLY funnel metrics
+    (admin-gated route calls it; no raw cross-tenant rows exposed).
+  - `/scrapers/sample` → precomputed sanitized sample table refreshed by a Celery worker; public
+    endpoint reads ONLY that table (no live tenant query, no elevation).
+  - Phase 2c policy note: referral_events INSERT policy must be ASYMMETRIC — `WITH CHECK
+    (referrer_id = GUC)`, not the loose 018 `referrer OR referee` read rule.
+  Scope: 1 migration (2 SECURITY DEFINER fns + sample table), 1 worker refresh task, 3 route
+  refactors, tests. SECURITY DEFINER fns are security-sensitive — Codex review mandatory.
+
+  **2b-i ✅ DONE + Codex APPROVE** — migration 029: `public.grant_referral_credit(uuid)` +
+  `public.activation_funnel(int)` SECURITY DEFINER fns (search_path pinned, schema-qualified,
+  REVOKE from PUBLIC + anon + authenticated, EXECUTE to app only) + `public.public_sample_cache`
+  singleton. Role bindings DO-block-guarded (no-op without the roles). Fixed a latent bug:
+  activation funnel's CTE omitted `stripe_customer_id` it referenced → would've errored at runtime.
+  Codex: 3 rounds (Supabase anon/authenticated revoke + schema-qualification).
+  **2b-ii ✅ DONE + Codex APPROVE** — billing.py: `_grant_referral_credit` → calls the definer fn
+  (idempotency/atomic-increment now in-DB via ON CONFLICT); `/activation-funnel` → `SELECT * FROM
+  public.activation_funnel(:days)`. Behavior parity confirmed.
+  **2b-iii (next):** Celery refresh task populates public_sample_cache (sanitized); `/scrapers/sample`
+  reads the cache instead of live-querying results/jobs/scraper_configs.
+  **2b-iv:** tests.
 - **Phase 2c (migration 029, role-targeted policies):** `FOR ALL TO bridgeleads_system USING(true)
   WITH CHECK(true)` on all worker tables; tenant GUC policies `TO bridgeleads_app` on user-scoped
   tables; broad `TO bridgeleads_app` on `users` (auth-bootstrap: register/login/refresh/forgot/reset

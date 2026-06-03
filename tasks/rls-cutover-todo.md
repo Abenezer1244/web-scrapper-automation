@@ -176,13 +176,22 @@ the owner keeps BYPASSRLS (Supabase `postgres` does) or the definer helpers brea
       Deploy staging with `RLS_ENFORCE=False`; confirm boot + full scrape cycle + `bypassrls=False`.
 - [ ] **Gate:** staging healthy for a full scrape cycle → STOP for approval
 
-## Phase 4 — Enforce + FORCE RLS (production, last)
-**Files (≤5):** `settings.py` (flip default), `alembic/versions/0XX_force_rls.py`, runbook
-- [ ] Staging: `RLS_ENFORCE=True`, run full E2E (scrape→enrich→export→deliver) + isolation tests
-- [ ] Production: deploy roles → flip `RLS_ENFORCE=True` → verify boot guard passes
-- [ ] **LAST:** `ALTER TABLE ... FORCE ROW LEVEL SECURITY` on user-scoped tables — only after
-      everything above is green in prod
+## Phase 4 — Enforce + FORCE RLS (production, last) — CODE ✅ Codex APPROVE / DEPLOY ⬜
+**Code done:** migration `031_rls_force_row_level_security.py` — FORCE ROW LEVEL SECURITY on the 16
+policy-bearing tables. Gated: no-op unless both cutover roles exist (CI safety); RAISES unless the
+029 SECURITY DEFINER function owners carry BYPASSRLS (else FORCE would break the definer helpers).
+`RLS_ENFORCE` stays an env flag (NOT a code default) — flipped during deploy.
+- [x] migration 031 (FORCE + owner-bypass guard). Codex: APPROVE (2 rounds).
+- [ ] **MANUAL (staging→prod, LAST):** after Phase 3 is green — `RLS_ENFORCE=True` in staging, run
+      full E2E + isolation tests; then prod: flip `RLS_ENFORCE=True`, verify boot guard, run `alembic
+      upgrade` to 031 (applies FORCE). Owner (`postgres`) keeps BYPASSRLS so the definer fns survive.
 - [ ] **Gate:** Codex final review + Master Security Review (§14) twice-clean → done
+
+---
+## ✅ CUTOVER CODE COMPLETE — all phases authored, Codex-reviewed, committed.
+Commits: e5d50e8(0) a27ff9f(1) d5e2fe1(2a) 5efda74(2b-i/ii) 06ce1c8(2b-iii) de3d40e(2b-iv)
+40497ce(2c) 51655ca(2d) a268fd1(3) + 031(4). Remaining work is OPERATIONAL (provision roles,
+repoint Railway env, staged RLS_ENFORCE flip + FORCE) per the runbook — no more code.
 
 ---
 

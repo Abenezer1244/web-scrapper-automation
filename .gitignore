@@ -138,3 +138,6 @@ _diag_is_pro/
 /*arms*.png
 /diag_*
 /_diag_*
+
+# RLS cutover role passwords (local operator secret — never commit)
+.rls-cutover-secrets

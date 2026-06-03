@@ -59,9 +59,22 @@ SELECT NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_app') AS 
 \else
   \echo '>>> Role bridgeleads_app already exists — password NOT rotated (by design).'
 \endif
--- Re-assert safety flags unconditionally so a pre-existing/altered role can't
--- stay dangerous across reruns (Codex finding #2).
-ALTER ROLE bridgeleads_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+-- Re-assert LOGIN, then VERIFY the protected attributes (do NOT ALTER them):
+-- Supabase's `postgres` admin is NOT a superuser, so it cannot ALTER the
+-- SUPERUSER/BYPASSRLS attributes even to NO ("only roles with SUPERUSER may
+-- alter roles with the SUPERUSER attribute"). CREATE already set them to the
+-- safe defaults, and a non-superuser can never grant SUPERUSER/BYPASSRLS, so
+-- they cannot drift upward — verifying is sufficient and portable. (Discovered
+-- running this live against Supabase.)
+ALTER ROLE bridgeleads_app LOGIN;
+DO $verify_app$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_app'
+               AND (rolsuper OR rolbypassrls)) THEN
+        RAISE EXCEPTION 'bridgeleads_app must be NOSUPERUSER + NOBYPASSRLS';
+    END IF;
+END
+$verify_app$;
 
 GRANT USAGE ON SCHEMA public TO bridgeleads_app;
 
@@ -143,7 +156,17 @@ SELECT NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_system') 
 \else
   \echo '>>> Role bridgeleads_system already exists — password NOT rotated (by design).'
 \endif
-ALTER ROLE bridgeleads_system LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+-- Re-assert LOGIN + VERIFY (not ALTER) the protected attributes — see the
+-- bridgeleads_app note above (Supabase admin is not a superuser).
+ALTER ROLE bridgeleads_system LOGIN;
+DO $verify_sys$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_system'
+               AND (rolsuper OR rolbypassrls)) THEN
+        RAISE EXCEPTION 'bridgeleads_system must be NOSUPERUSER + NOBYPASSRLS';
+    END IF;
+END
+$verify_sys$;
 
 GRANT USAGE ON SCHEMA public TO bridgeleads_system;
 GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO bridgeleads_system;

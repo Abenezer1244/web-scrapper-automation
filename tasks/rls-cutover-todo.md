@@ -189,9 +189,23 @@ policy-bearing tables. Gated: no-op unless both cutover roles exist (CI safety);
 
 ---
 ## ✅ CUTOVER CODE COMPLETE — all phases authored, Codex-reviewed, committed.
-Commits: e5d50e8(0) a27ff9f(1) d5e2fe1(2a) 5efda74(2b-i/ii) 06ce1c8(2b-iii) de3d40e(2b-iv)
-40497ce(2c) 51655ca(2d) a268fd1(3) + 031(4). Remaining work is OPERATIONAL (provision roles,
-repoint Railway env, staged RLS_ENFORCE flip + FORCE) per the runbook — no more code.
+
+**RESTRUCTURED 2026-06-02 (Codex holistic review found a ship blocker):** role-dependent cutover DDL
+must NOT live in Alembic — `alembic upgrade head` runs every deploy and a role-conditional migration
+would no-op (roles absent) + advance the version, never re-running at cutover. So:
+- Migrations 030/031 → **no-op placeholders** (chain intact).
+- `scripts/apply_rls_cutover_policies.sql` (NEW) — authoritative idempotent role-targeted policies,
+  hard-fails unless both roles exist, backfills 029 bindings.
+- `scripts/apply_rls_force.sql` (NEW) — FORCE, hard-fails unless policies converged + owner BYPASSRLS.
+- 7 cross-phase findings fixed: no-op consumption; referral_events app SELECT-only (provision + policy);
+  delivered_records/pending/queues system-only (grant/policy aligned); "inert" claim corrected;
+  provision REVOKEs + verify block (idempotent convergence); password_history app SELECT+INSERT (not
+  FOR ALL); FORCE convergence check verifies every table's system policy.
+- `src/workers/__init__.py` warms public_sample_cache on worker boot (best-effort).
+
+**Canonical cutover order (runbook):** `alembic upgrade head` → `provision_rls_roles.sql` →
+`apply_rls_cutover_policies.sql` → repoint connections (staging, RLS_ENFORCE=False) → verify →
+RLS_ENFORCE=True → `apply_rls_force.sql` (last). All re-runnable, all Codex SHIP-READY.
 
 ---
 

@@ -62,12 +62,27 @@ Make `app.current_user_id` survive the mid-task commit (SQLAlchemy `after_begin`
 listener keyed off the session's user_id), on both async and sync RLS sessions. New test:
 `tests/test_rls_guc_reapply.py`. Without this, Phase 4 breaks `run_scrape_job`.
 
-### Phase 2 — system-role policy carve-out (migration)
-Add to each user-scoped table:
-`USING (user_id = NULLIF(current_setting('app.current_user_id', true),'')::uuid
-        OR current_user = 'bridgeleads_system')` plus matching `WITH CHECK`. This lets
-the NOBYPASSRLS system role do legitimate cross-tenant work without a global bypass.
-Extend `tests/test_rls_isolation.py` for app/system/anon.
+### Phase 2 — code + role-targeted policies
+Code (migrations + routes, run via normal `alembic upgrade head`): per-transaction GUC reapply
+(`session.py`), tenant routes set the GUC (`get_rls_db`), SECURITY DEFINER helpers + sample cache
+(migration 029), and the precomputed `/scrapers/sample`.
+
+The **role-targeted policies** (app per-tenant / system FOR ALL / anon denied) are applied by
+`scripts/apply_rls_cutover_policies.sql` — NOT by an Alembic migration. Migrations 030/031 are
+intentional no-op placeholders: `alembic upgrade head` runs on every deploy, and a role-conditional
+migration would no-op (roles absent) and consume its version before the cutover. The script is
+idempotent and hard-fails unless both roles exist. Tests: `tests/test_rls_role_policies.py`.
+
+### ⚙️ CANONICAL CUTOVER ORDER (Codex)
+```bash
+alembic upgrade head                                   # 029 objects; 030/031 are no-ops
+psql "$ADMIN_DATABASE_URL" -v app_pw=… -v sys_pw=… -f scripts/provision_rls_roles.sql
+psql "$ADMIN_DATABASE_URL" -f scripts/apply_rls_cutover_policies.sql   # role-targeted policies
+# repoint DATABASE_URL→app, DATABASE_URL_SYNC→system, DATABASE_URL_MIGRATE→owner (staging)
+# verify: boot, full scrape cycle, bypassrls=False, RLS tests, /sample warm
+# set RLS_ENFORCE=True (staging → prod)
+psql "$ADMIN_DATABASE_URL" -f scripts/apply_rls_force.sql              # FORCE, last
+```
 
 ### Phase 3 — repoint connections (staging first)
 Set the three connection vars to the new roles:
@@ -84,9 +99,10 @@ Deploy to **staging** with `RLS_ENFORCE=False` (advisory). Confirm boot, a full 
 the startup role-status log shows `bypassrls=False` for the app + system roles.
 
 ### Phase 4 — enforce, then FORCE (production, last)
-Staging `RLS_ENFORCE=True` → full E2E + isolation tests. Then production: deploy roles →
-`RLS_ENFORCE=True` → verify boot guard passes → **last:** `ALTER TABLE ... FORCE ROW
-LEVEL SECURITY` on user-scoped tables.
+Staging `RLS_ENFORCE=True` → full E2E + isolation tests. Then production: `RLS_ENFORCE=True` →
+verify boot guard passes → **last:** run `scripts/apply_rls_force.sql` (FORCE ROW LEVEL SECURITY).
+That script hard-fails unless the policies converged and the SECURITY DEFINER function owners carry
+BYPASSRLS — Supabase `postgres` does, so the definer helpers survive FORCE.
 
 ## Rollback
 

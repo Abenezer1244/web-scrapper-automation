@@ -72,19 +72,56 @@ GRANT SELECT, INSERT, UPDATE ON
     users,              -- register (INSERT), password/profile/plan (UPDATE)
     scraper_configs,    -- create (INSERT), edit + soft-delete (UPDATE)
     jobs,               -- create (INSERT), cancel (UPDATE)
-    user_record_views,  -- INSERT ... ON CONFLICT DO UPDATE (scrapers.py:469)
-    password_history,   -- append on password change (auth.py:550/716)
-    referral_events     -- referral grant on Stripe webhook (billing.py:761)
+    user_record_views   -- INSERT ... ON CONFLICT DO UPDATE (scrapers.py:469)
 TO bridgeleads_app;
 
--- county_connectors: read the registry + INSERT for POST /connectors
--- (scrapers.py:313). No UPDATE/DELETE — connector health/edits run in workers.
-GRANT SELECT, INSERT ON county_connectors TO bridgeleads_app;
+-- SELECT + INSERT (append/read, never UPDATE/DELETE):
+--   county_connectors — read registry + INSERT for POST /connectors (scrapers.py:313)
+--   password_history  — read for reuse-check + append new rows (auth.py); rows are
+--                       immutable audit history, so no UPDATE (Codex cross-phase review).
+GRANT SELECT, INSERT ON county_connectors, password_history TO bridgeleads_app;
 
 -- Read-only: the request path SELECTs these but never writes them.
 -- results + job_logs are written only by Celery workers; county_records is the
 -- shared dedup cache (a migration-023 trigger blocks non-system writes anyway).
-GRANT SELECT ON results, job_logs, county_records TO bridgeleads_app;
+-- referral_events: /referral READS it; the WRITE is done by the SECURITY
+-- DEFINER public.grant_referral_credit() (migration 029, runs as owner).
+GRANT SELECT ON results, job_logs, county_records, referral_events TO bridgeleads_app;
+
+-- Converge to least privilege regardless of any prior (over-)grant: GRANT does
+-- not remove privileges an earlier version of this script handed out, so
+-- explicitly REVOKE everything the app must NOT hold (Codex review). DELETE is
+-- never granted to the app on any table.
+REVOKE DELETE ON users, scraper_configs, jobs, user_record_views FROM bridgeleads_app;
+REVOKE UPDATE, DELETE ON county_connectors, password_history FROM bridgeleads_app;
+REVOKE INSERT, UPDATE, DELETE ON
+    results, job_logs, county_records, referral_events FROM bridgeleads_app;
+REVOKE ALL ON
+    delivered_records, pending_skip_trace_rows, skip_trace_queues,
+    skip_trace_cache, skip_trace_meter_events FROM bridgeleads_app;
+
+-- Hard-fail if the app role still holds any DELETE, or any write on the
+-- read-only / no-app tables — so a stale over-grant cannot survive a rerun.
+DO $verify$
+DECLARE bad int;
+BEGIN
+    SELECT COUNT(*) INTO bad FROM information_schema.role_table_grants
+    WHERE grantee = 'bridgeleads_app'
+      AND (
+        privilege_type = 'DELETE'
+        OR (privilege_type IN ('INSERT', 'UPDATE')
+            AND table_name IN ('results', 'job_logs', 'county_records', 'referral_events'))
+        OR (privilege_type = 'UPDATE'
+            AND table_name IN ('county_connectors', 'password_history'))
+        OR table_name IN ('delivered_records', 'pending_skip_trace_rows',
+                          'skip_trace_queues', 'skip_trace_cache', 'skip_trace_meter_events')
+      );
+    IF bad > 0 THEN
+        RAISE EXCEPTION 'provision_rls_roles: bridgeleads_app still holds % '
+            'disallowed privilege(s) — least-privilege convergence failed', bad;
+    END IF;
+END
+$verify$;
 
 -- Deliberately NOT granted to bridgeleads_app (worker-only, no request-path
 -- access): delivered_records, skip_trace_cache, skip_trace_queues,

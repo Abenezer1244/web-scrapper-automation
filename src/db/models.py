@@ -58,6 +58,10 @@ class User(Base):
         index=True,
     )
     referral_credit_cents = Column(Integer, nullable=False, default=0)
+    # Per-user email notification preferences (settings → Notifications).
+    # Allowlisted boolean keys: job_completed, job_failed, new_records,
+    # usage_alert, payment_failed. Empty dict = service defaults apply.
+    notification_prefs = Column(JSON, nullable=False, default=dict, server_default="{}")
     is_active = Column(Boolean, nullable=False, default=True)
     is_admin = Column(Boolean, nullable=False, default=False)
     # Logout-everywhere / password-reset / account-compromise revocation

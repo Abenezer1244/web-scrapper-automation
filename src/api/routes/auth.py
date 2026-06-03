@@ -24,6 +24,7 @@ from src.api.middleware import BruteForceProtection, audit_log, client_ip, rate_
 from src.api.schemas import (
     ApiKeyResponse,
     ForgotPasswordRequest,
+    NotificationPrefsUpdate,
     PasswordChange,
     ResetPasswordRequest,
     TokenResponse,
@@ -318,6 +319,34 @@ async def refresh_token(
 @router.get("/me", response_model=UserResponse)
 async def me(current_user: CurrentUser) -> UserResponse:
     return UserResponse.model_validate(current_user)
+
+
+@router.put("/notification-preferences", response_model=UserResponse)
+async def update_notification_preferences(
+    body: NotificationPrefsUpdate,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    """Persist the user's email-notification toggles (settings → Notifications).
+
+    Partial update: only the allowlisted keys the client sent are merged into
+    users.notification_prefs (unknown keys are already rejected by the schema's
+    extra='forbid'). The WHERE id == current_user.id filter is the tenant guard
+    — RLS on `users` is permissive under the app role, so the query filter is the
+    real own-row constraint (belt-and-suspenders per the project rules).
+    """
+    result = await db.execute(select(User).where(User.id == current_user.id))
+    user = result.scalar_one()
+    # Reassign a NEW dict so SQLAlchemy marks the JSON column dirty; in-place
+    # mutation of the existing dict would need flag_modified().
+    prefs = dict(user.notification_prefs or {})
+    prefs.update(body.model_dump(exclude_none=True))
+    user.notification_prefs = prefs
+    await db.commit()
+    await db.refresh(user)
+    audit_log(request, "notification_prefs_updated", current_user.id)
+    return UserResponse.model_validate(user)
 
 
 @router.get("/onboarding")

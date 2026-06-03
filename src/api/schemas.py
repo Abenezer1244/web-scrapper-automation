@@ -100,6 +100,7 @@ class UserResponse(BaseModel):
     trial_ends_at: datetime | None = None
     is_trial: bool = False
     trial_days_remaining: int | None = None
+    notification_prefs: dict[str, bool] = {}
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -112,6 +113,20 @@ class UserResponse(BaseModel):
             if remaining > 0:
                 self.is_trial = True
                 self.trial_days_remaining = max(0, int(remaining / 86400))
+
+
+class NotificationPrefsUpdate(BaseModel):
+    """Allowlisted notification toggles. Every field is optional so the client
+    can send a partial update; unknown keys are rejected (extra='forbid') so a
+    caller can't stuff arbitrary data into the JSON column."""
+
+    job_completed: bool | None = None
+    job_failed: bool | None = None
+    new_records: bool | None = None
+    usage_alert: bool | None = None
+    payment_failed: bool | None = None
+
+    model_config = {"extra": "forbid"}
 
 
 class TokenResponse(BaseModel):

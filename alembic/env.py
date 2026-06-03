@@ -44,20 +44,34 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def _run(connection) -> None:
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        compare_type=True,
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
 def run_migrations_online() -> None:
+    # scripts/migrate.py runs migrations under a PostgreSQL advisory lock and
+    # passes its lock-holding connection in via config.attributes["connection"]
+    # so the lock and the migration share ONE backend (see scripts/migrate.py).
+    # When present, run on that connection. Otherwise (a bare `alembic` CLI
+    # invocation) build an engine from sqlalchemy.url as before.
+    connection = config.attributes.get("connection", None)
+    if connection is not None:
+        _run(connection)
+        return
+
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            compare_type=True,
-        )
-        with context.begin_transaction():
-            context.run_migrations()
+        _run(connection)
 
 
 if context.is_offline_mode():

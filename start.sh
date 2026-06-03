@@ -48,15 +48,16 @@ elif [ "$RAILWAY_SERVICE_NAME" = "beat" ]; then
   exec celery -A src.workers beat --loglevel=info --scheduler celery.beat.PersistentScheduler
 else
   echo "Starting API server..."
-  # Run Alembic migrations from the API service only. Worker + beat share
-  # the same DB — running upgrade-head from multiple replicas at once
-  # races; Alembic's own locking will serialize within ONE service but
-  # cross-service races (api + worker booting simultaneously) can deadlock
-  # on long migrations. The API service is the natural single-replica
-  # serializer. If the upgrade fails the deploy fails fast (set -e on the
-  # combined command) instead of starting uvicorn against a stale schema.
-  echo "Running alembic upgrade head..."
-  alembic upgrade head || { echo "alembic upgrade head failed; refusing to start API"; exit 1; }
+  # Run Alembic migrations from the API service only (worker + beat skip this).
+  # The API service runs MULTIPLE replicas and rolling deploys overlap old + new
+  # instances, so two fresh replicas can race the same revision: one wins, the
+  # loser's `UPDATE alembic_version WHERE version=<prev>` matches 0 rows and
+  # Alembic aborts that boot. scripts/migrate.py serializes the runners behind a
+  # PostgreSQL advisory lock (held on a direct, non-pgbouncer connection) so the
+  # losers wait, then run a no-op upgrade and start cleanly. If the upgrade fails
+  # we refuse to start uvicorn instead of serving against a stale schema.
+  echo "Running migrations (advisory-locked)..."
+  python scripts/migrate.py || { echo "migration run failed; refusing to start API"; exit 1; }
   echo "Migrations applied."
   exec uvicorn main:app --host 0.0.0.0 --port "${PORT:-8000}"
 fi

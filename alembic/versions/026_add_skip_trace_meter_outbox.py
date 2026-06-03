@@ -41,6 +41,13 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # Idempotency guard: if the table already exists (e.g. it was created
+    # out-of-band before this revision was stamped — which happened during a
+    # prod RLS cutover where alembic_version was stamped behind the live
+    # schema), treat the migration as already applied. This whole revision is
+    # additive for one table + its indexes, so an existing table means done.
+    if sa.inspect(op.get_bind()).has_table("skip_trace_meter_events"):
+        return
     op.create_table(
         "skip_trace_meter_events",
         sa.Column("id", UUID(as_uuid=False), primary_key=True),

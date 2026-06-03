@@ -135,8 +135,13 @@ scrapers, get_cached_records, checkout. `/download` resolves identity from token
   which needs `FOR ALL TO bridgeleads_system` policies on those tables — those land in **Phase 2c**.
   Works today under BYPASSRLS; **Phase 2c MUST add system policies on results/jobs/scraper_configs
   (+ all worker tables) and MUST precede the Phase 3 role downgrade.**
-  **2b-iv (next):** tests — refresh task warms cache + sanitization; /sample reads cache; definer
-  fns idempotent (referral) + aggregate (funnel).
+  **2b-iv ✅ DONE + Codex APPROVE** — `tests/test_rls_cross_tenant_helpers.py`: grant_referral_credit
+  idempotency (replay = no double-grant) + no-op without referrer + activation_funnel deltas. Real DB,
+  seed-in-txn-rollback (mirrors test_rls_isolation). Route/worker integration → CI/staging.
+
+  **➡️ PHASE 2b COMPLETE.** Commits: 5efda74 (2b-i/ii), 06ce1c8 (2b-iii), + 2b-iv. Next: **Phase 2c**
+  (the big migration — role-targeted tenant/system policies on ALL tables; MUST include
+  `FOR ALL TO bridgeleads_system` on results/jobs/scraper_configs per the 2b-iii dependency).
 - **Phase 2c (migration 029, role-targeted policies):** `FOR ALL TO bridgeleads_system USING(true)
   WITH CHECK(true)` on all worker tables; tenant GUC policies `TO bridgeleads_app` on user-scoped
   tables; broad `TO bridgeleads_app` on `users` (auth-bootstrap: register/login/refresh/forgot/reset

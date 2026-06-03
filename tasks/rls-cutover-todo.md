@@ -150,8 +150,10 @@ scrapers, get_cached_records, checkout. `/download` resolves identity from token
   anon/authenticated default-denied (027 preserved + tightened).
 - Backfills 029 role bindings (in case roles were provisioned after 029). Idempotent up + down.
 - Codex: 2 rounds (backfill + downgrade idempotency + restore 025 WITH CHECK).
-**Phase 2d (next):** rewrite test_rls_isolation.py for the real bridgeleads_app/bridgeleads_system roles
-(the bridgeleads_rls_test role no longer matches role-targeted policies) + app/system/anon assertions.
+**Phase 2d ✅ DONE + Codex APPROVE** — `tests/test_rls_role_policies.py`: SET LOCAL ROLE bridgeleads_app
+(no-GUC=0 rows, GUC=A→only A, GUC=B→only B) + bridgeleads_system reads cross-tenant. Module SKIPS unless
+the cutover is applied (both roles + `results_app` policy) — legacy model stays covered by
+test_rls_isolation.py. **➡️ PHASE 2 COMPLETE** (2a d5e2fe1, 2b 5efda74/06ce1c8/de3d40e, 2c 40497ce, 2d).
 
 ⚠️ **PHASE 4 CAVEAT (Codex):** `FORCE ROW LEVEL SECURITY` makes even the table OWNER subject to policies.
 The SECURITY DEFINER fns (grant_referral_credit/activation_funnel) run as the owner — Phase 4 MUST verify

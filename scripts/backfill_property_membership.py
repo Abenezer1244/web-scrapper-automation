@@ -25,7 +25,11 @@ _log = logging.getLogger("backfill_membership")
 
 
 def run(batch: int) -> None:
-    last_id = ""
+    # results.id is UUID: seed the keyset cursor with the nil UUID (min value),
+    # NOT "" — an empty string raises "invalid input syntax for type uuid" on
+    # the first `r.id > :last_id` query before any row is scanned (Codex review,
+    # found via the Phase 3 twin backfill).
+    last_id = "00000000-0000-0000-0000-000000000000"
     total = 0
     while True:
         with SyncSessionLocal() as db:
@@ -37,7 +41,7 @@ def run(batch: int) -> None:
                     FROM results r
                     JOIN jobs j ON j.id = r.job_id
                     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
-                    WHERE r.id > :last_id
+                    WHERE r.id > CAST(:last_id AS uuid)
                     ORDER BY r.id
                     LIMIT :batch
                     """

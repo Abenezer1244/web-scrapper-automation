@@ -240,6 +240,43 @@ class DeliveredRecord(Base):
     )
 
 
+class PropertyListMembership(Base):
+    """Phase 1: per-(user, record_type, property) rollup that powers Phase 3's
+    cross-list overlap ("on both lists") as an indexed lookup instead of a
+    self-join over results history.
+
+    One row per (user_id, record_type, property_key). STRONG-IDENTITY ONLY:
+    property_key is the post-enrichment sha256(parcel|address) from
+    property_identity.compute_property_key; weak name/date rows are excluded.
+
+    sighting_count is ADVISORY (cumulative scrape observations, not idempotent
+    across job re-runs, never used for billing or correctness). Maintained by
+    _upsert_property_membership in workers/tasks.py; pruned by purge_old_records.
+    """
+
+    __tablename__ = "property_list_membership"
+    __table_args__ = (
+        Index(
+            "ix_property_list_membership_user_key",
+            "user_id",
+            "property_key",
+        ),
+    )
+
+    user_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    record_type = Column(String(64), primary_key=True)
+    property_key = Column(String(64), primary_key=True)
+    parcel_id = Column(String(64), nullable=True)
+    property_address = Column(String(512), nullable=True)
+    sighting_count = Column(Integer, nullable=False, default=1)
+    first_seen_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class CountyConnector(Base):
     __tablename__ = "county_connectors"
 

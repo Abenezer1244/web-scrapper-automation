@@ -122,6 +122,22 @@ def validate_selection(county: str, state: str, doc_types: list[str]) -> tuple[b
     return True, None
 
 
+def selectable_availability(county: str, state: str) -> dict | None:
+    """UI-facing availability for the pre-foreclosure doc-type selector, or None
+    when the county does not support selection (fail-closed / hidden). Excludes
+    internal token maps; returns only what the frontend needs to render options."""
+    a = availability_for(county, state)
+    if a is None or not a.get("supported_for_selection"):
+        return None
+    return {
+        "available": a["available"],
+        "default": a.get("default"),
+        "confidence": a.get("confidence"),
+        "method": a.get("method"),
+        "note": a.get("note"),
+    }
+
+
 def canonical_tokens_for(county: str, state: str, doc_types: list[str]) -> list:
     """Map a validated canonical selection to the scraper's own tokens
     (King search-text str, Pierce checkbox id str, EagleWeb keyword lists)."""

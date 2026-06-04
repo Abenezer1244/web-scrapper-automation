@@ -548,6 +548,10 @@ class ConnectorResponse(BaseModel):
     max_date_range_days: int | None = None  # null = unlimited
     last_checked: datetime | None
     active: bool
+    # Phase 2b: pre-foreclosure doc-type selector metadata (from the capability
+    # registry), present only for counties that support selection. Populated by
+    # the /connectors handler, not the ORM. None = no selector (legacy/hidden).
+    pre_foreclosure_doc_types: dict[str, Any] | None = None
 
     model_config = {"from_attributes": True}
 

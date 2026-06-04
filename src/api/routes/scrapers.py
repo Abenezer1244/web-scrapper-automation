@@ -194,7 +194,16 @@ async def list_connectors(
         )
     query = query.order_by(CountyConnector.state, CountyConnector.county)
     result = await db.execute(query)
-    return [ConnectorResponse.model_validate(c) for c in result.scalars().all()]
+    from src.scrapers.doc_types import selectable_availability
+    out: list[ConnectorResponse] = []
+    for c in result.scalars().all():
+        resp = ConnectorResponse.model_validate(c)
+        # Phase 2b: attach pre-foreclosure doc-type selector metadata from the
+        # capability registry, only where this county supports selection.
+        if "pre_foreclosure" in (c.record_types or []):
+            resp.pre_foreclosure_doc_types = selectable_availability(c.county, c.state)
+        out.append(resp)
+    return out
 
 
 @router.get("/{scraper_id}", response_model=ScraperConfigResponse)

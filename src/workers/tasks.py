@@ -456,6 +456,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     "party_name": _trunc(rec.party_name, 512),
                     "heirs": rec.heirs,
                     "legal_description": rec.legal_description,
+                    "doc_type": _trunc(rec.doc_type, 128),
                     "parcel_id": _trunc(rec.parcel_id, 64),
                     "property_address": _trunc(rec.property_address, 512),
                     "mailing_address": _trunc(rec.mailing_address, 512),
@@ -683,6 +684,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     {c: getattr(res, c) for c in [
                         "date_recorded", "party_name", "heirs", "parcel_id",
                         "property_address", "mailing_address", "legal_description",
+                        "doc_type",
                         # Sprint 4: skip trace fields (may be null on first export
                         # if dispatcher hasn't submitted or webhook hasn't fired)
                         "phone", "phone_type", "email", "skip_trace_status",

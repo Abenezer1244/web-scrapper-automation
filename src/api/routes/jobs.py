@@ -744,6 +744,7 @@ async def download_export(
         fieldnames = [
             "date_recorded", "party_name", "heirs", "parcel_id",
             "property_address", "mailing_address", "legal_description",
+            "doc_type",
             "phone", "phone_type", "email",
         ]
         writer = csv.DictWriter(output, fieldnames=fieldnames)
@@ -757,6 +758,8 @@ async def download_export(
                 "property_address": sanitize_for_csv(r.property_address),
                 "mailing_address": sanitize_for_csv(r.mailing_address),
                 "legal_description": sanitize_for_csv(r.legal_description),
+                # Phase 2a: live download must surface doc_type too (Codex P1)
+                "doc_type": sanitize_for_csv(getattr(r, "doc_type", None)),
                 "phone": sanitize_for_csv(getattr(r, "phone", None)),
                 "phone_type": sanitize_for_csv(getattr(r, "phone_type", None)),
                 "email": sanitize_for_csv(getattr(r, "email", None)),

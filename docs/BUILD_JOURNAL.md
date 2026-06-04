@@ -19,6 +19,20 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-04 — Lead Targeting Phase 2a: surface pre-foreclosure doc_type
+
+**Built (branch `feature/phase2-doc-type`, UNMERGED):** Real `results.doc_type` column (migration **035**, additive nullable, offline-render verified). Carried end-to-end: worker bulk insert, BOTH worker exports + `_COLUMN_ORDER`, **and the live `/jobs/{id}/download` CSV** (which rebuilds from DB, not the stored file — Codex caught this; I'd wrongly assumed it streamed R2). Added `doc_type` to API `ResultRow`. EagleWeb now captures the matched `desc` as `record.doc_type` (was dropped). Commits `c3446fc`..`23322f0` + P1 fix `<download>`.
+
+**Decided (Codex, 584k+848k tokens):** real column not JSON; old rows NULL (no backfill — `CountyRecord.doc_type` isn't safely keyed to `results`); EagleWeb capture placed after filter `continue`s so it applies to matched + `all` paths.
+
+**Failed/Blocked:** Pierce per-record doc_type **DEFERRED** — its `_map_row` can't identify the ARMS doc-type column without live fixture validation; faking it is worse than NULL. No test DB/Playwright here, so DB-roundtrip + live scraper unverified locally (Codex oracle: doc_type flows correctly end-to-end; CI to confirm).
+
+**Caught & fixed:** [P1] `/download` hardcoded fieldnames omitted doc_type (live CSV, separate from worker export) — added to fieldnames+writerow (sanitized); Codex re-confirmed PASS.
+
+**Pending:** Pierce capture (live run); **Phase 2b** = user doc-type selection + code-level capability registry (single source of truth, NOT duplicated into county_connectors) + per-county availability/confidence + `ScrapeOptions` plumbing + King-NOD-hidden + defaults + UI. See `[[project_lead_targeting_milestone]]`.
+
+---
+
 ## 2026-06-04 — Lead Targeting milestone: Phase 1 (property membership foundation)
 
 **Context:** User requested 4 features for King/Pierce/Snohomish/Kitsap: (1) tax filters by amount

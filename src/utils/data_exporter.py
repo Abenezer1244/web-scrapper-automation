@@ -20,6 +20,7 @@ _COLUMN_ORDER = [
     "party_name",
     "heirs",
     "legal_description",
+    "doc_type",
     "parcel_id",
     "property_address",
     "mailing_address",

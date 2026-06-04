@@ -165,6 +165,7 @@ class Result(Base):
     party_name = Column(String(512), nullable=True)
     heirs = Column(Text, nullable=True)
     legal_description = Column(Text, nullable=True)
+    doc_type = Column(String(128), nullable=True)  # Phase 2a: which document produced this lead
     parcel_id = Column(String(64), nullable=True)
     property_address = Column(String(512), nullable=True)
     mailing_address = Column(String(512), nullable=True)

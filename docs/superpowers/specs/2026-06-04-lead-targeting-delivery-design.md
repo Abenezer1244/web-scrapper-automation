@@ -118,7 +118,23 @@ Lay the data foundation that makes Phase 3 overlap correct **and** scalable, wit
 
 ---
 
-## 6. Open Questions / Deferred
+## 6. UI/UX Impact per Phase
+
+Frontend lives in the **sibling repo `bridgeleads-web`** (Next.js 14). Each UI-bearing phase pairs a backend change with frontend work, reusing shipped conventions: four UI states, `getFriendlyError`/`toastError` (`lib/errors.ts`), route error boundaries, onBlur validation, monochrome icons + green accent `#72e3ad`. UI-heavy phases (3, 4) go through the design/UX review skills before build.
+
+| Phase | UI change | What the user sees |
+|---|---|---|
+| **1. Foundation** | **None** | Invisible. No screen changes, no behavior change. |
+| **2. Doc-type (#2)** | Yes (moderate) | Doc-type selector on pre-foreclosure configs (Notice of Default / Trustee Sale / Lis Pendens); per-county availability + confidence labels; new "Doc Type" column in results + export. |
+| **3. Combine + overlap (#4)** | Yes (largest, net-new) | A "Lists/Segments" builder: pick multiple record types, choose **Combine** vs **On both lists**; results view flags overlap ("On 2 lists" badge) + `overlap_count`. New screens — design review first. |
+| **4. Tax filters (#1)** | Yes | Amount-owed + months-delinquent filter inputs (min/max) on tax-delinquent configs; new amount/age columns in results. Filter availability gated per county (King first). |
+| **5. Dialer (#3)** | Yes | "Push to dialer" delivery option in schedule/delivery settings (connect Enzo, pick auto-push list); push status indicators. |
+
+Phase 1 ships with **no frontend work**. First UI lands in Phase 2.
+
+---
+
+## 7. Open Questions / Deferred
 - **Phase 4:** move `delivered_records` claim + billing increment to post-filter/export finalization. Renaming consideration: `Result` (sighting) vs `BillableDelivery` (delivered/billed). Decide at Phase 4.
 - **Phase 4:** confirm Pierce/Snohomish/Kitsap treasurer data sources actually expose amount + age (research spike before committing).
 - **Phase 5:** Enzo API shape (auth, contact/list upload endpoint, rate limits, DNC handling).
@@ -126,7 +142,7 @@ Lay the data foundation that makes Phase 3 overlap correct **and** scalable, wit
 
 ---
 
-## 7. Verification (Phase 1)
+## 8. Verification (Phase 1)
 - Unit tests green (basis classification, membership idempotency, has-both query, backfill).
 - `pytest` full suite green.
 - Manual: run a scrape locally for a config; confirm `property_membership` rows created with correct `record_types`; re-run same config → `sighting_count` increments, no duplicate membership rows, no user-visible change.

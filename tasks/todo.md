@@ -49,4 +49,13 @@
   - **[P2] FIXED:** backfill seeded `last_id=""` for `WHERE id > :last_id`, but `results.id` is UUID → Postgres `invalid input syntax for type uuid: ""` on the first query (backfill dies before scanning). Fixed: seed nil-UUID `00000000-...-0` + explicit `CAST(:last_id AS uuid)`. Re-verified: compile + ruff clean.
   - **⚠️ Same latent bug in the Phase 1 twin `scripts/backfill_property_membership.py:28,40`** (`last_id=""` + `WHERE r.id > :last_id`). Out of 3A scope — flagged to user, one-line fix available.
 
-## 3A status: ✅ BUILT + Codex-reviewed (gate pass, P2 fixed). Awaiting go-ahead for 3B.
+## 3A status: ✅ BUILT + Codex-reviewed (gate pass, P2 fixed). Committed d2513dc.
+## Phase 1 twin backfill UUID-cursor bug: ✅ FIXED (a68dbbf).
+
+## Slice 3B — Intersection export endpoint: ✅ BUILT
+- [x] `schemas.py`: `SegmentIntersectionRequest` (2+ distinct supported types, counties cleaned), `SegmentLeadRow`, `SegmentIntersectionResponse` (identity_strength="strong" — SAYS SO). `SUPPORTED_RECORD_TYPES` canonical set.
+- [x] `src/api/routes/segments.py`: `POST /segments/intersection` (JSON preview, cap 500) + `POST /segments/intersection/export` (CSV, cap 50k). `users_overlap()` → 3-CTE query (candidates → agg(array_agg DISTINCT, count DISTINCT) → ranked(row_number window: contactable→recent→id)) → representative row + matched_record_types + overlap_count. RLS-bound + explicit user_id filter; `sanitize_for_csv` all fields; optional county clause (fixed fragment, bound params).
+- [x] Registered in `src/api/__init__.py` + `main.py`.
+- [x] `tests/test_segments_intersection.py`: 15 pure tests (validation + SQL assembly). DB roundtrip → CI (no test DB here).
+- [x] Key design fidelity: array_agg(DISTINCT) is NOT a window aggregate in PG → split into agg + ranked CTEs. Intersection strong-only and says so.
+- [ ] **Codex review of 3B diff** (next).

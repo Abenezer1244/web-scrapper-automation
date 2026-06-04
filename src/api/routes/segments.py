@@ -1,0 +1,244 @@
+"""Segment routes: Phase 3 combine / overlap lead targeting.
+
+First slice — INTERSECTION ("on both lists"): the properties a user has on ALL
+of 2+ record-type lists (e.g. probate AND pre_foreclosure) — the
+highest-motivation sellers. STRONG-IDENTITY ONLY: overlap is keyed on the
+post-enrichment parcel/address hash (property_key); weak name/date rows are
+excluded by design and the API says so (identity_strength="strong").
+
+Flow (per the Codex-reviewed design):
+  1. users_overlap(user_id, record_types) -> property_keys on ALL selected
+     lists (indexed Phase 1 membership lookup, not a results self-join).
+  2. Join results -> jobs -> scraper_configs on those keys, constrained to the
+     selected record_types (user_id+property_key alone could pull an unrelated
+     newer row), optionally filtered by county.
+  3. Pick ONE representative row per property via a window function
+     (contactable first, then most recent job, then id), and aggregate
+     matched_record_types + overlap_count per property.
+
+Tenant-scoped via RLS (get_rls_db) AND an explicit user_id filter (belt +
+suspenders). All exported fields pass sanitize_for_csv.
+
+Union (inclusive, strong + weak) is a deliberately separate later slice.
+"""
+import csv
+import io
+
+from fastapi import APIRouter, Depends, Request
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.responses import Response
+
+from src.api.auth import CurrentUser
+from src.api.deps import get_rls_db
+from src.api.middleware import rate_limit, sanitize_for_csv
+from src.api.schemas import (
+    SegmentIntersectionRequest,
+    SegmentIntersectionResponse,
+    SegmentLeadRow,
+)
+from src.utils.logger import setup_logger
+
+_logger = setup_logger("api.segments")
+
+router = APIRouter(prefix="/segments", tags=["segments"])
+
+# Representative rows returned in the JSON preview. The CSV export returns the
+# full set up to EXPORT_CAP (defensive bound — intersections are inherently
+# small, but never stream an unbounded result into memory).
+PREVIEW_CAP = 500
+EXPORT_CAP = 50_000
+
+# Final SELECT is assembled with a fixed optional county clause (no user data is
+# interpolated — values are bound params). array_agg(DISTINCT ...) cannot run as
+# a WINDOW aggregate in Postgres, so the per-property aggregate and the
+# representative-row ranking live in two separate CTEs.
+#
+# Overlap is sourced from property_list_membership (the indexed Phase 1 rollup —
+# the design's overlap source) as an inline subquery, NOT materialized into
+# Python: pushing it into SQL keeps the LIMIT bound effective and avoids shipping
+# a full property_key array back into the query (Codex P2). The membership
+# subquery decides overlap county-agnostically; the agg HAVING then re-checks
+# that the intersection STILL holds within the county-filtered candidate scope,
+# so a county filter can't return a property that is only on one list there
+# (Codex P2). :n is the count of distinct selected record types.
+_INTERSECTION_SQL = """
+WITH candidates AS (
+    SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
+           r.mailing_address, r.phone, r.phone_type, r.email, r.property_key,
+           sc.record_type, sc.county, sc.state, j.created_at AS job_created_at
+    FROM results r
+    JOIN jobs j ON j.id = r.job_id
+    JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+    WHERE r.user_id = :uid
+      AND r.property_key IS NOT NULL
+      AND sc.record_type = ANY(:types)
+      AND r.property_key IN (
+          SELECT property_key
+          FROM property_list_membership
+          WHERE user_id = :uid AND record_type = ANY(:types)
+          GROUP BY property_key
+          HAVING count(DISTINCT record_type) = :n
+      )
+      {county_clause}
+),
+agg AS (
+    SELECT property_key,
+           array_agg(DISTINCT record_type ORDER BY record_type) AS matched_record_types,
+           count(DISTINCT record_type) AS overlap_count
+    FROM candidates
+    GROUP BY property_key
+    HAVING count(DISTINCT record_type) = :n
+),
+ranked AS (
+    SELECT c.*,
+           row_number() OVER (
+               PARTITION BY c.property_key
+               ORDER BY (CASE WHEN c.phone IS NOT NULL OR c.email IS NOT NULL
+                              THEN 0 ELSE 1 END),
+                        c.job_created_at DESC NULLS LAST,
+                        c.id DESC
+           ) AS rn
+    FROM candidates c
+)
+SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
+       rk.mailing_address, rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
+       a.matched_record_types, a.overlap_count
+FROM ranked rk
+JOIN agg a ON a.property_key = rk.property_key
+WHERE rk.rn = 1
+ORDER BY a.overlap_count DESC, rk.property_address NULLS LAST, rk.id
+LIMIT :limit
+"""
+
+
+async def _fetch_intersection(
+    db: AsyncSession,
+    user_id: str,
+    record_types: list[str],
+    counties: list[str] | None,
+    limit: int,
+) -> list:
+    """Return representative lead rows for properties on ALL `record_types`.
+
+    Overlap is computed inside the query (membership subquery), so nothing is
+    materialized in Python and `limit` truly bounds the work. Empty list when
+    there is no overlap. `db` is already RLS-bound to the user. `record_types`
+    is pre-validated to a 2+ distinct set, so len() == the distinct-type count.
+    """
+    params: dict = {
+        "uid": user_id,
+        "types": record_types,
+        "n": len(record_types),
+        "limit": limit,
+    }
+    county_clause = ""
+    if counties:
+        county_clause = "AND sc.county = ANY(:counties)"
+        params["counties"] = counties
+
+    sql = text(_INTERSECTION_SQL.format(county_clause=county_clause))
+    result = await db.execute(sql, params)
+    return result.fetchall()
+
+
+@router.post("/intersection", response_model=SegmentIntersectionResponse)
+async def intersection_preview(
+    body: SegmentIntersectionRequest,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_rls_db),
+) -> SegmentIntersectionResponse:
+    """JSON preview of the intersection ('on both lists'), capped at PREVIEW_CAP.
+
+    Strong-identity only — the response says so via identity_strength.
+    """
+    await rate_limit(request, zone="general", identifier=current_user.id)
+
+    # Fetch one extra row to detect truncation without a second count query.
+    rows = await _fetch_intersection(
+        db, str(current_user.id), body.record_types, body.counties, PREVIEW_CAP + 1
+    )
+    truncated = len(rows) > PREVIEW_CAP
+    rows = rows[:PREVIEW_CAP]
+
+    return SegmentIntersectionResponse(
+        record_types=body.record_types,
+        counties=body.counties,
+        property_count=len(rows),
+        truncated=truncated,
+        rows=[
+            SegmentLeadRow(
+                id=str(r.id),
+                date_recorded=r.date_recorded,
+                party_name=r.party_name,
+                parcel_id=r.parcel_id,
+                property_address=r.property_address,
+                mailing_address=r.mailing_address,
+                county=r.county,
+                state=r.state,
+                phone=r.phone,
+                phone_type=r.phone_type,
+                email=r.email,
+                matched_record_types=list(r.matched_record_types or []),
+                overlap_count=r.overlap_count,
+            )
+            for r in rows
+        ],
+    )
+
+
+@router.post("/intersection/export")
+async def intersection_export(
+    body: SegmentIntersectionRequest,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_rls_db),
+) -> Response:
+    """CSV export of the intersection. One representative lead per property,
+    with matched_record_types + overlap_count columns. CSV-injection sanitized.
+    """
+    await rate_limit(request, zone="general", identifier=current_user.id)
+
+    rows = await _fetch_intersection(
+        db, str(current_user.id), body.record_types, body.counties, EXPORT_CAP
+    )
+    if len(rows) >= EXPORT_CAP:
+        _logger.warning(
+            "Intersection export hit EXPORT_CAP=%d for user %s (types=%s) — truncated",
+            EXPORT_CAP, current_user.id, body.record_types,
+        )
+
+    output = io.StringIO()
+    fieldnames = [
+        "matched_record_types", "overlap_count",
+        "party_name", "parcel_id", "property_address", "mailing_address",
+        "county", "state", "date_recorded", "phone", "phone_type", "email",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({
+            "matched_record_types": sanitize_for_csv("; ".join(r.matched_record_types or [])),
+            "overlap_count": r.overlap_count,
+            "party_name": sanitize_for_csv(r.party_name),
+            "parcel_id": sanitize_for_csv(r.parcel_id),
+            "property_address": sanitize_for_csv(r.property_address),
+            "mailing_address": sanitize_for_csv(r.mailing_address),
+            "county": sanitize_for_csv(r.county),
+            "state": sanitize_for_csv(r.state),
+            "date_recorded": sanitize_for_csv(r.date_recorded),
+            "phone": sanitize_for_csv(r.phone),
+            "phone_type": sanitize_for_csv(r.phone_type),
+            "email": sanitize_for_csv(r.email),
+        })
+
+    types_slug = "_".join(body.record_types)[:60]
+    return Response(
+        content=output.getvalue().encode("utf-8"),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="bridgeleads_overlap_{types_slug}.csv"',
+            "Cache-Control": "private, no-store",
+        },
+    )

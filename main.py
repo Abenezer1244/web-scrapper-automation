@@ -11,6 +11,7 @@ from src.api import (
     billing_router,
     jobs_router,
     scrapers_router,
+    segments_router,
     webhooks_router,
 )
 from src.api.middleware import SecurityHeadersMiddleware
@@ -71,6 +72,7 @@ app.include_router(scrapers_router)
 app.include_router(jobs_router)
 app.include_router(billing_router)
 app.include_router(webhooks_router)
+app.include_router(segments_router)
 
 
 # ─── Global exception handler ─────────────────────────────────────────────────

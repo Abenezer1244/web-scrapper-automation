@@ -7,10 +7,13 @@ State machine:
 
 import asyncio
 import json
+import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, TypedDict, Unpack
 
 import redis as sync_redis
+from sqlalchemy import text as sa_text
+from sqlalchemy.exc import OperationalError
 
 if TYPE_CHECKING:
     from src.scrapers.base_scraper import ProgressCallback
@@ -18,6 +21,7 @@ if TYPE_CHECKING:
 from src.config import settings
 from src.utils.logger import setup_logger
 from src.workers import app
+from src.workers.property_identity import compute_property_key as _compute_property_key
 
 _logger = setup_logger("worker.task")
 
@@ -120,6 +124,79 @@ def _set_status(db, job, status: str, **kwargs: Unpack[JobUpdateFields]) -> None
         setattr(job, k, v)
     db.commit()
     db.refresh(job)
+
+
+def _upsert_property_membership(db, rows, user_id: str, record_type: str) -> int:
+    """Phase 1: roll up strong-identity property sightings for cross-list overlap.
+
+    `rows` = post-enrichment Result objects (only .parcel_id / .property_address
+    are read). Pre-aggregates by property_key in Python so a single multi-row
+    INSERT never hits the same conflict key twice ("cannot affect row a second
+    time"). Deadlock-ordered by property_key; retried on serialization/deadlock.
+    Returns the number of distinct strong properties upserted.
+
+    Advisory only: sighting_count is not idempotent across job re-runs. Failures
+    are caller-handled — this never participates in billing.
+    """
+    agg: dict[str, dict] = {}
+    for res in rows:
+        key = _compute_property_key(res.parcel_id, res.property_address)
+        if not key:
+            continue
+        cur = agg.get(key)
+        if cur is None:
+            agg[key] = {
+                "parcel_id": (res.parcel_id or None),
+                "property_address": (res.property_address or None),
+                "count": 1,
+            }
+        else:
+            cur["count"] += 1
+            cur["parcel_id"] = cur["parcel_id"] or res.parcel_id
+            cur["property_address"] = cur["property_address"] or res.property_address
+    if not agg:
+        return 0
+
+    items = sorted(agg.items())  # deterministic lock order (deadlock guard)
+    for i in range(0, len(items), 500):
+        chunk = items[i:i + 500]
+        values_sql = ",".join(
+            f"(:uid_{k}, :rt_{k}, :pk_{k}, :pid_{k}, :addr_{k}, :cnt_{k}, NOW(), NOW())"
+            for k in range(len(chunk))
+        )
+        params: dict = {}
+        for k, (key, v) in enumerate(chunk):
+            params[f"uid_{k}"] = user_id
+            params[f"rt_{k}"] = record_type
+            params[f"pk_{k}"] = key
+            params[f"pid_{k}"] = (v["parcel_id"] or None)
+            params[f"addr_{k}"] = (v["property_address"] or None)
+            params[f"cnt_{k}"] = v["count"]
+        stmt = sa_text(f"""
+            INSERT INTO property_list_membership
+                (user_id, record_type, property_key, parcel_id,
+                 property_address, sighting_count, first_seen_at, last_seen_at)
+            VALUES {values_sql}
+            ON CONFLICT (user_id, record_type, property_key) DO UPDATE SET
+                sighting_count   = property_list_membership.sighting_count + EXCLUDED.sighting_count,
+                first_seen_at    = LEAST(property_list_membership.first_seen_at, EXCLUDED.first_seen_at),
+                last_seen_at     = GREATEST(property_list_membership.last_seen_at, EXCLUDED.last_seen_at),
+                parcel_id        = COALESCE(property_list_membership.parcel_id, EXCLUDED.parcel_id),
+                property_address = COALESCE(property_list_membership.property_address, EXCLUDED.property_address)
+        """)
+        for attempt in range(3):
+            try:
+                db.execute(stmt, params)
+                db.commit()
+                break
+            except OperationalError as exc:
+                db.rollback()
+                # psycopg2 (this stack) exposes SQLSTATE as .pgcode, NOT .sqlstate.
+                pgcode = getattr(getattr(exc, "orig", None), "pgcode", None)
+                if pgcode not in ("40001", "40P01") or attempt == 2:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
+    return len(agg)
 
 
 @app.task(
@@ -348,35 +425,19 @@ def run_scrape_job(self, job_id: str) -> None:
             party_name: str | None = None,
             date_recorded: str | None = None,
         ) -> str | None:
-            """Sprint 6.4: canonical dedup key.
-
-            Primary key: normalized (parcel_id, property_address).
-            Fallback key: normalized (party_name, date_recorded) — used
-            when records have no parcel/address (e.g. pre-foreclosure
-            from AcclaimWeb). Without this fallback, records with no
-            parcel and no address would never deduplicate and show as
-            NEW on every scrape.
-            """
-            parcel = (parcel_id or "").strip().upper().replace("-", "").replace(" ", "")
-            addr = (property_address or "").strip().upper()
-            addr = _re.sub(r"[\.,#]", " ", addr)
-            addr = _re.sub(r"\s+", " ", addr).strip()
-
-            parcel_ok = len(parcel) >= 4 and any(c.isdigit() for c in parcel)
-            addr_ok = len(addr) >= 8 and any(c.isalpha() for c in addr)
-
-            if parcel_ok or addr_ok:
-                key = f"{parcel}|{addr}"
-                return hashlib.sha256(key.encode("utf-8")).hexdigest()
-
-            # Fallback: party_name + date_recorded
+            """Sprint 6.4 dedup key. Strong branch shares normalization with
+            src/workers/property_identity (Phase 1) so the billing dedup_hash
+            and the overlap property_key cannot drift. Fallback unchanged."""
+            strong = _compute_property_key(parcel_id, property_address)
+            if strong is not None:
+                return strong
+            # Fallback: party_name + date_recorded (unchanged)
             name = (party_name or "").strip().upper()
             name = _re.sub(r"\s+", " ", name).strip()
             date = (date_recorded or "").strip()
             if len(name) >= 3 and len(date) >= 6:
                 key = f"NAME:{name}|DATE:{date}"
                 return hashlib.sha256(key.encode("utf-8")).hexdigest()
-
             return None
 
         # Bulk insert using execute + multi-row VALUES (much faster than db.add loop)
@@ -422,7 +483,6 @@ def run_scrape_job(self, job_id: str) -> None:
 
         # Step 1: pull the freshly-inserted results back so we have their
         # Result.id for the first_result_id foreign key
-        from sqlalchemy import text as sa_text
         fresh_rows = db.execute(
             sa_text("""
                 SELECT id, dedup_hash, parcel_id, property_address
@@ -602,31 +662,71 @@ def run_scrape_job(self, job_id: str) -> None:
                 db=db,
             )
 
-        # Re-export CSV with enriched data
-        enriched_file = None
+        # Fetch post-enrichment rows ONCE; reused by re-export AND membership.
         try:
             refreshed = db.execute(
                 select(Result).where(Result.job_id == job_id, Result.user_id == job.user_id)
             ).scalars().all()
-            record_dicts = [
-                {c: getattr(res, c) for c in [
-                    "date_recorded", "party_name", "heirs", "parcel_id",
-                    "property_address", "mailing_address", "legal_description",
-                    # Sprint 4: skip trace fields (may be null on first export
-                    # if dispatcher hasn't submitted or webhook hasn't fired)
-                    "phone", "phone_type", "email", "skip_trace_status",
-                ]}
-                for res in refreshed
-            ]
-            enriched_file = exporter.export(record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt)
-            if object_key:
-                exporter.upload_to_r2(enriched_file, object_key)
-                _logger.info("Re-exported CSV with enriched data")
         except Exception as exc:
-            _logger.warning("CSV re-export failed: %s", str(exc)[:60])
-        finally:
-            if enriched_file:
-                enriched_file.unlink(missing_ok=True)
+            db.rollback()
+            _logger.warning("Job %s: post-enrichment refetch failed: %s", job_id, str(exc)[:120])
+            # Sentinel: None means the refetch FAILED. We skip re-export AND
+            # membership so we neither overwrite the good export with an empty
+            # file nor write partial membership (Codex review).
+            refreshed = None
+
+        # Re-export CSV with enriched data — only if the refetch succeeded.
+        if refreshed is not None:
+            enriched_file = None
+            try:
+                record_dicts = [
+                    {c: getattr(res, c) for c in [
+                        "date_recorded", "party_name", "heirs", "parcel_id",
+                        "property_address", "mailing_address", "legal_description",
+                        # Sprint 4: skip trace fields (may be null on first export
+                        # if dispatcher hasn't submitted or webhook hasn't fired)
+                        "phone", "phone_type", "email", "skip_trace_status",
+                    ]}
+                    for res in refreshed
+                ]
+                enriched_file = exporter.export(record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt)
+                if object_key:
+                    exporter.upload_to_r2(enriched_file, object_key)
+                    _logger.info("Re-exported CSV with enriched data")
+            except Exception as exc:
+                _logger.warning("CSV re-export failed: %s", str(exc)[:60])
+            finally:
+                if enriched_file:
+                    enriched_file.unlink(missing_ok=True)
+
+        # ── PHASE 1: PROPERTY MEMBERSHIP (cross-list overlap rollup) ─────────
+        # Strong-identity rollup keyed (user_id, record_type, property_key),
+        # computed AFTER enrichment so a probate owner resolved to a parcel
+        # overlaps a pre-foreclosure record on the same parcel. Reuses the
+        # `refreshed` post-enrichment rows fetched above. Additive + isolated
+        # from the billing/dedup path. Durable-with-retry: on hard failure we
+        # roll back the poisoned transaction, log, and let
+        # scripts/backfill_property_membership.py heal the gap rather than fail
+        # an already-delivered job (which would re-email).
+        if refreshed:
+            try:
+                _mcount = _upsert_property_membership(
+                    db, refreshed, str(job.user_id), config.record_type
+                )
+                _logger.info("Job %s: property membership upserted %d properties", job_id, _mcount)
+            except Exception as exc:
+                # Clear any failed-transaction state so the subsequent
+                # _set_status(... "done") write can still succeed (Codex review:
+                # the helper only rolls back OperationalError, not e.g.
+                # ProgrammingError/IntegrityError/RLS errors).
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                _logger.error(
+                    "Job %s: property membership upsert FAILED (heal via backfill): %s",
+                    job_id, str(exc)[:200],
+                )
 
         # ── NOW mark done (after enrichment + re-export) ────────────────────
         # record_count reflects unique (non-duplicate) leads — what the user

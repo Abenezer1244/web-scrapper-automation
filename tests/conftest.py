@@ -19,7 +19,7 @@ from sqlalchemy.pool import NullPool
 import src.db.session as _db_session
 from src.api.auth import create_secure_token, hash_password
 from src.config import settings
-from src.db.models import Job, JobLog, Result, ScraperConfig, User
+from src.db.models import Job, JobLog, PropertyListMembership, Result, ScraperConfig, User
 
 # ─── Session-scoped event loop ────────────────────────────────────────────────
 
@@ -74,6 +74,7 @@ async def db() -> AsyncSession:
         # Clean up in FK-safe order; cascade handles children
         await session.execute(delete(JobLog))
         await session.execute(delete(Result))
+        await session.execute(delete(PropertyListMembership))
         await session.execute(delete(Job))
         await session.execute(delete(ScraperConfig))
         await session.execute(delete(User).where(User.email.like("%@test.bridgeleads.io")))

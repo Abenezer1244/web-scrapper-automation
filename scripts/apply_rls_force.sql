@@ -32,7 +32,7 @@ DECLARE
         'pending_skip_trace_rows', 'skip_trace_queues', 'password_history',
         'user_record_views', 'referral_events', 'users', 'county_connectors',
         'county_records', 'skip_trace_cache', 'skip_trace_meter_events',
-        'public_sample_cache'
+        'public_sample_cache', 'property_list_membership'
     ];
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_app')
@@ -84,6 +84,6 @@ $guard$;
 --     'delivered_records','pending_skip_trace_rows','skip_trace_queues',
 --     'password_history','user_record_views','referral_events','users',
 --     'county_connectors','county_records','skip_trace_cache',
---     'skip_trace_meter_events','public_sample_cache']
+--     'skip_trace_meter_events','public_sample_cache','property_list_membership']
 --   LOOP EXECUTE format('ALTER TABLE IF EXISTS public.%I NO FORCE ROW LEVEL SECURITY', t);
 --   END LOOP; END $$;

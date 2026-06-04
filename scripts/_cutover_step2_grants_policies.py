@@ -27,10 +27,12 @@ _GRANTS = [
     "GRANT USAGE ON SCHEMA public TO bridgeleads_app",
     "GRANT SELECT, INSERT, UPDATE ON users, scraper_configs, jobs, user_record_views TO bridgeleads_app",
     "GRANT SELECT, INSERT ON county_connectors, password_history TO bridgeleads_app",
-    "GRANT SELECT ON results, job_logs, county_records, referral_events TO bridgeleads_app",
+    "GRANT SELECT ON results, job_logs, county_records, referral_events, "
+    "property_list_membership TO bridgeleads_app",
     "REVOKE DELETE ON users, scraper_configs, jobs, user_record_views FROM bridgeleads_app",
     "REVOKE UPDATE, DELETE ON county_connectors, password_history FROM bridgeleads_app",
-    "REVOKE INSERT, UPDATE, DELETE ON results, job_logs, county_records, referral_events FROM bridgeleads_app",
+    "REVOKE INSERT, UPDATE, DELETE ON results, job_logs, county_records, referral_events, "
+    "property_list_membership FROM bridgeleads_app",
     "REVOKE ALL ON delivered_records, pending_skip_trace_rows, skip_trace_queues, "
     "skip_trace_cache, skip_trace_meter_events FROM bridgeleads_app",
     "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_app",
@@ -38,6 +40,7 @@ _GRANTS = [
     "GRANT USAGE ON SCHEMA public TO bridgeleads_system",
     "GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO bridgeleads_system",
     "GRANT DELETE ON county_records TO bridgeleads_system",
+    "GRANT DELETE ON property_list_membership TO bridgeleads_system",
     "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_system",
 ]
 
@@ -47,7 +50,8 @@ _VERIFY_APP_GRANTS = """
       AND (
         privilege_type = 'DELETE'
         OR (privilege_type IN ('INSERT','UPDATE')
-            AND table_name IN ('results','job_logs','county_records','referral_events'))
+            AND table_name IN ('results','job_logs','county_records','referral_events',
+                               'property_list_membership'))
         OR (privilege_type = 'UPDATE'
             AND table_name IN ('county_connectors','password_history'))
         OR table_name IN ('delivered_records','pending_skip_trace_rows',

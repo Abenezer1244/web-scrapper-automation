@@ -74,7 +74,7 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         },
     }
 
-    def __init__(self, base_url: str | None = None, county: str = "king", state: str = "WA", record_type: str = "probate"):
+    def __init__(self, base_url: str | None = None, county: str = "king", state: str = "WA", record_type: str = "probate", doc_types: list[str] | None = None):
         super().__init__()
         self._base_url = (base_url or _BASE_URL).rstrip("/")
         self._county = county
@@ -83,6 +83,15 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         # Look up config for the requested record type
         cfg = self.RECORD_TYPE_CONFIG.get(record_type, self.RECORD_TYPE_CONFIG["probate"])
         self.DOC_TYPE_SEARCH_TEXTS = cfg["search_texts"]
+        # Phase 2b: if an explicit pre-foreclosure doc-type selection was made,
+        # narrow to the chosen canonical types' search texts (registry-mapped).
+        # None = legacy (the full cfg search_texts above). Validated at config-create;
+        # an empty/unmappable result falls back to legacy (returns more, never nothing).
+        if doc_types and record_type == "pre_foreclosure":
+            from src.scrapers.doc_types import canonical_tokens_for
+            _tokens = canonical_tokens_for(county, state, doc_types)
+            if _tokens:
+                self.DOC_TYPE_SEARCH_TEXTS = _tokens
         self.DOC_TYPE_LABEL = cfg["label"]
         self.GRANTOR_LABEL = cfg["grantor"]
         self.GRANTEE_LABEL = cfg["grantee"]

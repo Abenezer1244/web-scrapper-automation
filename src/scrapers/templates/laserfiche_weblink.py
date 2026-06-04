@@ -135,16 +135,31 @@ class LaserficheWebLinkScraper(BridgeScraper):
         # Submit search
         try:
             await self.page.locator("input[type='submit'][value='Submit']").click()
-            await self.page.wait_for_timeout(5_000)
-            await self.page.wait_for_load_state("networkidle", timeout=15_000)
+            await self.page.wait_for_timeout(3_000)
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:
+                pass
         except Exception as exc:
             _logger.error("Submit failed: %s", str(exc)[:120])
             return []
 
-        # Check for result count
-        body = await self.page.inner_text("body")
-        count_match = re.search(r"(\d+)\s+Results?", body)
-        total = int(count_match.group(1)) if count_match else 0
+        # Wait for the async PrimeFaces datatable to populate, THEN read the
+        # count. The "N Results" header and the rows load a moment AFTER
+        # networkidle settles, so a single immediate read catches the
+        # datatable's transient "No records found" placeholder and wrongly
+        # bails with total=0 (this silently zeroed every Laserfiche county —
+        # e.g. Cowlitz, which actually has thousands of records in-window).
+        # Poll for the count text, which appears for both populated AND
+        # genuinely-empty ("0 Results") searches.
+        total = 0
+        for _ in range(30):  # up to ~30s
+            body = await self.page.inner_text("body")
+            count_match = re.search(r"(\d+)\s+Results?", body)
+            if count_match:
+                total = int(count_match.group(1))
+                break
+            await self.page.wait_for_timeout(1_000)
         _logger.info("Search returned %d total results", total)
         if total == 0:
             return []

@@ -738,6 +738,9 @@ class EagleWebScraper(BridgeScraper):
                         excludes = _DOC_TYPE_EXCLUDE.get(active_rt, [])
                         if any(neg in doc_upper for neg in excludes):
                             continue  # e.g. "LACK OF PROBATE AFFIDAVIT"
+                    # Phase 2a: capture the document type so it reaches Result/export.
+                    if desc:
+                        record.doc_type = desc.strip()[:128]
                     records.append(record)
 
             _logger.info(

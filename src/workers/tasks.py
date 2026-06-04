@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 from src.config import settings
 from src.utils.logger import setup_logger
 from src.workers import app
+from src.workers.property_identity import compute_property_key as _compute_property_key
 
 _logger = setup_logger("worker.task")
 
@@ -348,35 +349,19 @@ def run_scrape_job(self, job_id: str) -> None:
             party_name: str | None = None,
             date_recorded: str | None = None,
         ) -> str | None:
-            """Sprint 6.4: canonical dedup key.
-
-            Primary key: normalized (parcel_id, property_address).
-            Fallback key: normalized (party_name, date_recorded) — used
-            when records have no parcel/address (e.g. pre-foreclosure
-            from AcclaimWeb). Without this fallback, records with no
-            parcel and no address would never deduplicate and show as
-            NEW on every scrape.
-            """
-            parcel = (parcel_id or "").strip().upper().replace("-", "").replace(" ", "")
-            addr = (property_address or "").strip().upper()
-            addr = _re.sub(r"[\.,#]", " ", addr)
-            addr = _re.sub(r"\s+", " ", addr).strip()
-
-            parcel_ok = len(parcel) >= 4 and any(c.isdigit() for c in parcel)
-            addr_ok = len(addr) >= 8 and any(c.isalpha() for c in addr)
-
-            if parcel_ok or addr_ok:
-                key = f"{parcel}|{addr}"
-                return hashlib.sha256(key.encode("utf-8")).hexdigest()
-
-            # Fallback: party_name + date_recorded
+            """Sprint 6.4 dedup key. Strong branch shares normalization with
+            src/workers/property_identity (Phase 1) so the billing dedup_hash
+            and the overlap property_key cannot drift. Fallback unchanged."""
+            strong = _compute_property_key(parcel_id, property_address)
+            if strong is not None:
+                return strong
+            # Fallback: party_name + date_recorded (unchanged)
             name = (party_name or "").strip().upper()
             name = _re.sub(r"\s+", " ", name).strip()
             date = (date_recorded or "").strip()
             if len(name) >= 3 and len(date) >= 6:
                 key = f"NAME:{name}|DATE:{date}"
                 return hashlib.sha256(key.encode("utf-8")).hexdigest()
-
             return None
 
         # Bulk insert using execute + multi-row VALUES (much faster than db.add loop)

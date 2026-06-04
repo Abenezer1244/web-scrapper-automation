@@ -135,7 +135,7 @@ Lay the data foundation that makes Phase 3 overlap correct **and** scalable, wit
 - Next sequential number **034** (after 033). **Schema-only** — no data backfill in the migration.
 - Run via `scripts/migrate.py` advisory-lock runner, **not** bare `alembic upgrade head` (multi-replica boot race). Reject Supabase `:6543` transaction pooler.
 - **Do NOT apply to production until merged to `main`** (branch-only migration on prod = api crash-loop; see incident memory). Keep `RLS_ENFORCE` as-is.
-- New table gets an RLS policy consistent with existing per-tenant tables (`user_id` filter + forced RLS). Mirror the `delivered_records` policy (migrations 025/031).
+- New table gets an RLS policy consistent with existing per-tenant tables (`user_id` filter + forced RLS). Because Phase 3 reads overlap from the API, grants are modeled on **`results`** (app-readable), not worker-only `delivered_records` — and the table must be registered across all RLS cutover scripts (`provision_rls_roles.sql`, `apply_rls_cutover_policies.sql`, `apply_rls_force.sql`, `_cutover_step2/3`), incl. system DELETE for retention. (Codex plan review, session 019e91bb.)
 
 ---
 

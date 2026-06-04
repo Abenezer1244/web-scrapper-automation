@@ -21,7 +21,7 @@
 | `src/workers/property_identity.py` (new) | Pure functions: normalize parcel/address, decide strong identity, compute `property_key`. Single source of truth shared with `_compute_dedup_hash`. |
 | `src/db/models.py` (modify) | Add `PropertyListMembership` model. |
 | `alembic/versions/034_property_list_membership.py` (new) | Create table + index + RLS policy. Schema only. |
-| `scripts/apply_rls_force.sql` + `scripts/apply_rls_cutover_policies.sql` (modify) | Register new table in the operator RLS arrays so a future FORCE doesn't default-deny it. |
+| `scripts/apply_rls_force.sql`, `scripts/apply_rls_cutover_policies.sql`, `scripts/provision_rls_roles.sql`, `scripts/_cutover_step2_grants_policies.py`, `scripts/_cutover_step3_rehearse.py` (modify) | Register the new table across the RLS cutover machinery (app SELECT + system write/delete), modeled on `results`, so a future FORCE doesn't default-deny it. |
 | `src/workers/tasks.py` (modify) | `_upsert_property_membership()` helper + call it after enrichment; refactor `_compute_dedup_hash` strong branch to use `property_identity`. |
 | `src/workers/membership_query.py` (new) | `async users_overlap()` read helper (proves the data; Phase 3 consumes it). |
 | `src/workers/scheduler.py` (modify) | Extend `purge_old_records` to prune stale membership rows. |
@@ -212,16 +212,16 @@ Expected: PASS
 
 - [ ] **Step 3: Refactor `_compute_dedup_hash`**
 
-In `src/workers/tasks.py`, add near the top-level imports:
+In `src/workers/tasks.py`, add these to the MODULE-TOP imports (Codex: import only what's used; `sa_text`, `time`, `OperationalError` are currently function-local or absent and Task 5 needs them at module level):
 
 ```python
-from src.workers.property_identity import (
-    compute_property_key as _compute_property_key,
-    is_strong_identity as _is_strong_identity,
-    normalize_address as _normalize_address,
-    normalize_parcel as _normalize_parcel,
-)
+import time
+from sqlalchemy import text as sa_text          # hoist: currently only inside run_scrape_job
+from sqlalchemy.exc import OperationalError
+from src.workers.property_identity import compute_property_key as _compute_property_key
 ```
+
+> Verify `sa_text` is not re-imported function-locally in a way that shadows; if `run_scrape_job` has `from sqlalchemy import text as sa_text` inside it, remove that local line so the module-level one is used everywhere.
 
 Replace the body of the nested `_compute_dedup_hash` strong branch so it reuses the helpers (keep the `name_date` fallback exactly as-is):
 
@@ -361,10 +361,11 @@ Schema only. NO data backfill here: scripts/migrate.py runs migrations under a
 rows; a backfill in-migration would brick the deploy. Historical seeding lives
 in scripts/backfill_property_membership.py (offline, best-effort, idempotent).
 
-RLS: ENABLE + a USING policy mirroring delivered_records (migration 018) — reads
-isolate by app.current_user_id; the worker writes for the current job's user_id.
-FORCE is applied out-of-band by scripts/apply_rls_force.sql (this migration just
-registers the table there).
+RLS: ENABLE + a per-tenant USING policy (migration 018 pattern) — reads isolate
+by app.current_user_id. This table is APP-READABLE (Phase 3 reads overlap from
+the API), so role GRANTs are modeled on `results`, not worker-only
+delivered_records; those grants live in the operator RLS scripts (Task 4 Step 2),
+not here. FORCE is applied out-of-band by scripts/apply_rls_force.sql.
 
 Revision ID: 034
 Revises: 033
@@ -421,15 +422,18 @@ def downgrade() -> None:
     op.drop_table("property_list_membership")
 ```
 
-- [ ] **Step 2: Register the table in the operator FORCE script**
+- [ ] **Step 2: Register the table across ALL RLS cutover scripts (Codex: migration policy alone is not enough)**
 
-In `scripts/apply_rls_force.sql`, add `'property_list_membership'` to BOTH the `tbls` array (line ~30) and the commented rollback array (line ~83). This keeps a future `FORCE` from default-denying the new table.
+This table is **app-readable** (Phase 3 reads the overlap from the API), so model its grants on **`results`** — NOT on `delivered_records` (which is worker-only). Concretely, for each file below, find how `results` is registered and add `property_list_membership` the same way; where worker-write + app-read + system-delete differ, follow `results` for the app SELECT and `county_records` for the system DELETE:
 
-- [ ] **Step 3: Register the table in the cutover policy installer**
+- `scripts/apply_rls_force.sql` — add `'property_list_membership'` to the `tbls` array (~line 30) and the commented rollback array (~line 83).
+- `scripts/apply_rls_cutover_policies.sql` — give the table both a `bridgeleads_system` FOR ALL policy (worker writes) and a `bridgeleads_app` SELECT policy (API reads), mirroring `results`.
+- `scripts/provision_rls_roles.sql` — grant `bridgeleads_app` SELECT, `bridgeleads_system` SELECT/INSERT/UPDATE **and DELETE** (DELETE is needed for Task 7 retention; today only `county_records` has system DELETE). Add the table to any worker-only/app-only revoke/verification arrays consistently with `results`.
+- `scripts/_cutover_step2_grants_policies.py` and `scripts/_cutover_step3_rehearse.py` — add `property_list_membership` to whatever table lists they assert/iterate, or the rehearsal will flag it as drifted.
 
-In `scripts/apply_rls_cutover_policies.sql`, find the loop/array that gives each user-scoped table its `bridgeleads_system` FOR ALL policy and add `property_list_membership` next to `delivered_records`. (If the file uses an explicit per-table list, mirror the `delivered_records` entry exactly.)
+> This is the highest-risk part of Phase 1 for the RLS cutover (which is staged, out-of-band, and currently gated by `RLS_ENFORCE=False` — see RLS landmine memory). Have Codex review these script diffs specifically (Task 9 Step 3) and do NOT run the cutover scripts against prod here.
 
-- [ ] **Step 4: Apply the migration locally and verify**
+- [ ] **Step 3: Apply the migration locally and verify**
 
 Run:
 ```bash
@@ -446,10 +450,10 @@ print(e.connect().execute(text(\"SELECT polname FROM pg_policies WHERE tablename
 ```
 Expected: `property_list_membership_user_isolation`.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add alembic/versions/034_property_list_membership.py scripts/apply_rls_force.sql scripts/apply_rls_cutover_policies.sql
+git add alembic/versions/034_property_list_membership.py scripts/apply_rls_force.sql scripts/apply_rls_cutover_policies.sql scripts/provision_rls_roles.sql scripts/_cutover_step2_grants_policies.py scripts/_cutover_step3_rehearse.py
 git commit -m "feat(db): migration 034 property_list_membership + RLS registration
 
 Co-Authored-By: claude-flow <ruv@ruv.net>"
@@ -639,14 +643,17 @@ def _upsert_property_membership(db, rows, user_id: str, record_type: str) -> int
                 break
             except OperationalError as exc:
                 db.rollback()
-                sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
-                if sqlstate not in ("40001", "40P01") or attempt == 2:
+                # psycopg2 (this stack) exposes SQLSTATE as .pgcode, NOT .sqlstate.
+                pgcode = getattr(getattr(exc, "orig", None), "pgcode", None)
+                if pgcode not in ("40001", "40P01") or attempt == 2:
                     raise
                 time.sleep(0.1 * (attempt + 1))
     return len(agg)
 ```
 
-(`sa_text` is already imported in tasks.py as `from sqlalchemy import text as sa_text`; if that import is function-local, hoist it or import `text as sa_text` at module top.)
+> Partial-write note: each chunk commits independently, so if a later chunk raises after retries, earlier chunks are already persisted. That is acceptable — `sighting_count` is advisory and the backfill script (Task 8) is idempotent and heals any gap. The caller (Task 5 Step 5) logs the failure and does NOT fail the delivered job.
+
+(`sa_text`, `time`, and `OperationalError` are now module-top imports from Task 2 Step 3.)
 
 - [ ] **Step 4: Run the upsert tests**
 
@@ -678,7 +685,20 @@ In `src/workers/tasks.py`, immediately AFTER the enriched re-export `try/finally
             )
 ```
 
-Note: `refreshed` is only defined inside the re-export `try`. Hoist its definition so it is always available, e.g. initialize `refreshed = []` before the re-export `try`, and on enrichment/re-export failure fall back to a fresh `db.execute(select(Result)...)` for the job so membership still runs. Keep this change minimal and covered by Step 6's manual check.
+**`refreshed` must be fetched in its own block** (Codex: today it is defined *inside* the re-export `try`, so a re-export failure would leave it missing/empty and membership would silently skip). Restructure so the post-enrichment SELECT happens once, before the re-export, and both re-export and membership reuse it:
+
+```python
+        # Fetch post-enrichment rows ONCE; reused by re-export AND membership.
+        try:
+            refreshed = db.execute(
+                select(Result).where(Result.job_id == job_id, Result.user_id == job.user_id)
+            ).scalars().all()
+        except Exception as exc:
+            db.rollback()
+            _logger.warning("Job %s: post-enrichment refetch failed: %s", job_id, str(exc)[:120])
+            refreshed = []
+```
+Then the existing re-export block builds `record_dicts` from `refreshed` (remove its own inner SELECT), and the membership block below also uses `refreshed`.
 
 - [ ] **Step 6: Manual smoke (local)**
 
@@ -710,9 +730,11 @@ Co-Authored-By: claude-flow <ruv@ruv.net>"
 
 ```python
 # tests/test_property_membership.py  (append)
-import asyncio
+import pytest
 
-def test_overlap_returns_properties_on_both_lists(membership_user):
+
+@pytest.mark.asyncio
+async def test_overlap_returns_properties_on_both_lists(membership_user):
     shared = _Row("1234567890", "123 MAIN ST")
     only_probate = _Row("9990001112", "1 LONE LN")
     with SyncSessionLocal() as db:
@@ -720,9 +742,7 @@ def test_overlap_returns_properties_on_both_lists(membership_user):
         _upsert_property_membership(db, [shared], membership_user, "pre_foreclosure")
 
     from src.workers.membership_query import users_overlap
-    keys = asyncio.get_event_loop().run_until_complete(
-        users_overlap(membership_user, ["probate", "pre_foreclosure"])
-    )
+    keys = await users_overlap(membership_user, ["probate", "pre_foreclosure"])
     from src.workers.property_identity import compute_property_key
     assert keys == {compute_property_key("1234567890", "123 MAIN ST")}
 ```
@@ -740,6 +760,14 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'src.workers.membershi
 
 Phase 3 (combine/overlap) builds its export on these. Kept tenant-scoped and
 indexed: cost is proportional to one user's membership rows, not the table.
+
+RLS: property_list_membership is a tenant table with a USING policy keyed on
+app.current_user_id (migration 034). A plain AsyncSessionLocal() does NOT set
+that GUC, so under enforced RLS it would return zero rows (Codex). We bind the
+session to the user with set_config, the same contract get_rls_db uses in the
+API. Phase 3's API endpoint will call this through its already-RLS-bound
+request session instead; this standalone helper sets the GUC itself so it is
+correct in worker/script contexts too.
 """
 from sqlalchemy import text
 
@@ -754,6 +782,12 @@ async def users_overlap(user_id: str, record_types: list[str]) -> set[str]:
     if len(record_types) < 2:
         return set()
     async with AsyncSessionLocal() as db:
+        # Bind RLS context to this user (no-op when RLS_ENFORCE is off; required
+        # once FORCE is on). Mirrors the app.current_user_id contract in deps.
+        await db.execute(
+            text("SELECT set_config('app.current_user_id', :uid, true)"),
+            {"uid": str(user_id)},
+        )
         rows = await db.execute(
             text(
                 """
@@ -764,10 +798,12 @@ async def users_overlap(user_id: str, record_types: list[str]) -> set[str]:
                 HAVING count(DISTINCT record_type) >= :n
                 """
             ),
-            {"uid": user_id, "types": record_types, "n": len(record_types)},
+            {"uid": str(user_id), "types": record_types, "n": len(record_types)},
         )
         return {r.property_key for r in rows.fetchall()}
 ```
+
+> Executor: confirm the exact GUC-binding call against `src/api/deps.py` `get_rls_db` (it may use `SET LOCAL app.current_user_id = ...` rather than `set_config(...)`). Match whatever that helper does so the contract is identical.
 
 - [ ] **Step 4: Run the test**
 

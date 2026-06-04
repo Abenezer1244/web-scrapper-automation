@@ -529,8 +529,15 @@ def purge_old_records() -> None:
             text("DELETE FROM county_records WHERE created_at < :cutoff"),
             {"cutoff": cutoff},
         )
+        mem = db.execute(
+            text("DELETE FROM property_list_membership WHERE last_seen_at < :cutoff"),
+            {"cutoff": cutoff},
+        )
         db.commit()
-        _logger.info("Purged %d records older than %d days", result.rowcount, settings.RECORD_RETENTION_DAYS)
+        _logger.info(
+            "Purged %d county_records and %d membership rows older than %d days",
+            result.rowcount, mem.rowcount, settings.RECORD_RETENTION_DAYS,
+        )
 
 
 # ─── Task: Refresh public sample cache (landing page) ───────────────────────

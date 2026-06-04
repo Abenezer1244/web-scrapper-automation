@@ -64,37 +64,67 @@ Each phase ships independently and is reviewed by Codex before merge. Detailed d
 ### 4.1 Goal
 Lay the data foundation that makes Phase 3 overlap correct **and** scalable, with **zero user-visible behavior change**.
 
-### 4.2 What ships
-1. **`results.dedup_basis`** — new nullable `VARCHAR(16)` column. Values: `parcel` | `address` | `name_date`. Recorded at insert from the same logic that computes `dedup_hash`. Lets Phase 3 trust only `parcel`/`address` matches for intersection and ignore weak `name_date` coincidences.
-2. **`property_membership`** — new rollup table, one row per `(user_id, dedup_hash)` (same cardinality order as `delivered_records`):
-   - `user_id` (FK, indexed), `dedup_hash`
-   - `dedup_basis` (strongest basis seen for this property)
-   - `record_types` (JSON array of distinct record_types this property has appeared on, for this user)
-   - `job_ids` (JSON array, capped/most-recent N) — for drill-down
+### 4.2 What ships (revised per Codex review — session 019e91a1)
+
+**Key insight that simplifies everything:** a Job is always exactly ONE `record_type` (it runs one `ScraperConfig`). So we never need a bitmask or JSON array of types on a single row — each job contributes rows for its one type. A **normalized** membership table keyed `(user_id, record_type, dedup_hash)` is the clean, fast, race-light shape.
+
+1. **`property_list_membership`** — new normalized table. One row per `(user_id, record_type, dedup_hash)`:
+   - `user_id` (FK, indexed), `record_type` (String), `dedup_hash` (String)
+   - `strong_identity` (bool) — `true` when the hash came from parcel/address, `false` for the `name_date` fallback. Phase 3 intersection trusts only `strong_identity = true`.
    - `sighting_count` (int), `first_seen_at`, `last_seen_at`
-   - `UNIQUE(user_id, dedup_hash)`
-   - Index: `(user_id)` and a GIN/expression index strategy for record_types membership (decide at impl; may store a small int bitmask `record_type_mask` instead of/alongside JSON for fast "has both" filtering — **Codex to weigh in**).
-3. **Incremental maintenance** — inside the existing scrape-time loop that upserts `delivered_records` (`tasks.py:447–519`), upsert `property_membership`: add this job's `record_type` to the array/mask, bump `sighting_count`, update `last_seen_at`, set/keep strongest `dedup_basis`. No new pass over the data; piggybacks the loop already running.
-4. **Backfill migration (one-time, batched)** — populate `dedup_basis` on existing `results`; build `property_membership` from existing `results` + `scraper_configs.record_type`. Runs in batches off the request path.
-5. **Tests** — basis classification, membership upsert idempotency, "has both types" query correctness, backfill correctness.
+   - **`PRIMARY KEY (user_id, record_type, dedup_hash)`** (Codex: best shape for "has both types" intersection)
+   - Supporting index `(user_id, dedup_hash)` for the overlap grouping.
+   - **No** `dedup_basis` column on `results` (Codex #6: not needed for overlap, misleading values, and not worth backfilling 240M rows). The strong/weak distinction lives only here as `strong_identity`.
+
+2. **Incremental maintenance — placed AFTER the fresh-row SELECT (`tasks.py:~426`), processing EVERY fresh row with a `dedup_hash`, independent of `delivered_records` claim** (Codex #2: the rows that *conflict* in `delivered_records` are the overlap signal; gating on `claimed_hashes` would drop exactly what we want). The billing path (`delivered_records` `ON CONFLICT DO NOTHING … RETURNING`, `is_duplicate`, quota) is **left completely untouched** — membership is a separate, additive write so the revenue-critical code is not entangled.
+
+   Upsert SQL is **pre-aggregated by key first** (Codex #3 — a raw multi-row `ON CONFLICT DO UPDATE` errors with `cannot affect row a second time` when one job sees a property twice):
+   ```sql
+   WITH batch AS (
+     SELECT user_id, dedup_hash,
+            COUNT(*)::int AS sightings,
+            MIN(created_at) AS first_seen_at,
+            MAX(created_at) AS last_seen_at
+     FROM results
+     WHERE job_id = :job_id AND user_id = :user_id AND dedup_hash IS NOT NULL
+     GROUP BY user_id, dedup_hash
+   )
+   INSERT INTO property_list_membership
+     (id, user_id, record_type, dedup_hash, strong_identity,
+      sighting_count, first_seen_at, last_seen_at)
+   SELECT gen_random_uuid(), user_id, :record_type, dedup_hash, :strong_identity,
+          sightings, first_seen_at, last_seen_at
+   FROM batch
+   ORDER BY user_id, dedup_hash          -- consistent lock order (Codex #9)
+   ON CONFLICT (user_id, record_type, dedup_hash) DO UPDATE SET
+     sighting_count = property_list_membership.sighting_count + EXCLUDED.sighting_count,
+     last_seen_at   = GREATEST(property_list_membership.last_seen_at, EXCLUDED.last_seen_at);
+   ```
+   `record_type` and `strong_identity` are known at scrape time from the loaded `config` + the hash basis — no join needed for live maintenance. Retry the statement on serialization/deadlock SQLSTATE `40001`/`40P01`.
+
+3. **Schema-only migration (034).** Creates the table + indexes + RLS policy. **No backfill inside the migration** (Codex #8: `scripts/migrate.py` has a ~900s advisory-lock budget; a 240M-row backfill on API boot would brick the deploy).
+
+4. **Separate, optional backfill script** (`scripts/backfill_property_membership.py`) — idempotent, batched, small commits, progress + retry, run manually *after* deploy, off the boot path. **Best-effort by design** (Codex #1): `record_type` was never snapshotted on `results`/`jobs`, so it joins `results → jobs → scraper_configs` using the config's *current* `record_type`; properties whose config changed type, or whose config was deleted, are approximate or skipped. Documented as a known limitation. Forward-only accrual (from launch onward) is the source of truth; backfill is a convenience.
+
+5. **Tests** — `strong_identity` classification; pre-aggregated upsert idempotency (same job re-run bumps count, no PK violation, no double-affect error); same property under two different `record_type`s yields two rows; "has both types" intersection query correctness; concurrent-upsert retry path.
 
 ### 4.3 What does NOT change
 - No change to results page, exports, billing amounts, quota, or scrape output.
-- `is_duplicate` semantics unchanged for now (still "not newly billable"); Phase 3 will *read around* it via the membership table rather than redefining it.
+- `delivered_records` write path, `ON CONFLICT DO NOTHING … RETURNING`, `is_duplicate`, and `billable_count` are **untouched**. Membership is additive and isolated from billing.
 - Billing-claim timing unchanged (deferred to Phase 4, where filters make it necessary).
 
 ### 4.4 Files touched (≤5)
-- `alembic/versions/034_*.py` (new) — add column + table + indexes + batched backfill.
-- `src/db/models.py` — mirror the new column + `PropertyMembership` model.
-- `src/workers/tasks.py` — record `dedup_basis` at insert; upsert `property_membership` in the dedup loop.
-- `tests/test_property_membership.py` (new).
-- (Possibly) `src/scrapers/base_scraper.py` only if basis needs surfacing on `ScrapedRecord` — likely not; basis is derivable server-side.
+- `alembic/versions/034_*.py` (new) — create `property_list_membership` + indexes + RLS policy. Schema only.
+- `src/db/models.py` — add `PropertyListMembership` model.
+- `src/workers/tasks.py` — after the fresh-row SELECT, run the pre-aggregated membership upsert for all fresh rows (with retry). Billing block unchanged.
+- `scripts/backfill_property_membership.py` (new) — offline idempotent backfill.
+- `tests/test_property_list_membership.py` (new).
 
 ### 4.5 Migration safety (per project landmines)
-- Next sequential number **034** (after 033).
+- Next sequential number **034** (after 033). **Schema-only** — no data backfill in the migration.
 - Run via `scripts/migrate.py` advisory-lock runner, **not** bare `alembic upgrade head` (multi-replica boot race). Reject Supabase `:6543` transaction pooler.
 - **Do NOT apply to production until merged to `main`** (branch-only migration on prod = api crash-loop; see incident memory). Keep `RLS_ENFORCE` as-is.
-- New table needs an RLS policy consistent with existing per-tenant tables (`user_id` filter + forced RLS). Mirror `delivered_records` policy.
+- New table gets an RLS policy consistent with existing per-tenant tables (`user_id` filter + forced RLS). Mirror the `delivered_records` policy (migrations 025/031).
 
 ---
 
@@ -103,18 +133,18 @@ Lay the data foundation that makes Phase 3 overlap correct **and** scalable, wit
 **Worst-case sizing:** 5,000 active users × ~2,000 new leads/month × 24 months ≈ **240M `results` rows.** Postgres handles this with existing indexes; `purge_old_records` bounds it.
 
 **Phase 1 additions:**
-- `results.dedup_basis`: ~10 bytes/row. Negligible.
-- `property_membership`: one row per unique property per user — strictly smaller than `delivered_records`, far smaller than `results`. Same retention treatment.
+- No new column on `results` (basis lives on the rollup as `strong_identity`).
+- `property_list_membership`: one row per `(user_id, record_type, dedup_hash)`. Bounded by *unique properties per user per type* — far smaller than `results`. Same retention treatment.
 
 **Hot-path cost:**
-- Membership upsert runs inside the loop that already upserts `delivered_records` → **no new scan**, amortized into existing scrape work (background Celery, not user-facing).
-- Phase 3 "on both lists" = indexed lookup on `property_membership` filtered by `user_id` + record-type membership (mask or GIN). **Constant-time regardless of user history size.** This is the entire reason the rollup exists.
+- Membership upsert is one extra pre-aggregated `INSERT … ON CONFLICT` over the current job's fresh rows — added to background Celery scrape work, never on a user-facing request. It reuses the fresh-row set already SELECTed for dedup, so no extra scan of history.
+- Phase 3 "on both lists" = `SELECT dedup_hash FROM property_list_membership WHERE user_id = :u AND record_type IN (:a,:b) AND strong_identity GROUP BY dedup_hash HAVING count(*) >= 2`. Tenant-scoped, served by `PRIMARY KEY (user_id, record_type, dedup_hash)` + `(user_id, dedup_hash)`. Cost scales with *one user's* membership rows, not the global table.
 
-**Anti-pattern avoided:** computing intersection live via self-join over a user's full `results` history. At scale that is a per-click scan of 10k–100k+ rows. The rollup converts it to an indexed read.
+**Anti-pattern avoided:** computing intersection live via self-join over a user's full `results` history. At scale that is a per-click scan of 10k–100k+ rows. The rollup converts it to a tenant-local indexed read.
 
-**Cross-tenant isolation:** every new query filters `user_id`; new table gets forced RLS. One user's volume never touches another's.
+**Cross-tenant isolation:** every query filters `user_id`; new table gets forced RLS. One user's volume never touches another's.
 
-**Codex to review for scale specifically:** mask-vs-JSON for record-type membership, index choice, backfill batch size, lock behavior of the membership upsert under concurrent jobs for the same user.
+**Concurrency (Codex #9):** two jobs for the same user touching overlapping hashes serialize on row locks; consistent `ORDER BY (user_id, dedup_hash)` + bounded chunks avoid deadlock, with retry on `40001`/`40P01`. Because each job writes its own `record_type` partition of the PK, same-user different-type jobs rarely contend on the same row at all.
 
 ---
 
@@ -143,8 +173,8 @@ Phase 1 ships with **no frontend work**. First UI lands in Phase 2.
 ---
 
 ## 8. Verification (Phase 1)
-- Unit tests green (basis classification, membership idempotency, has-both query, backfill).
+- Unit tests green: `strong_identity` classification; pre-aggregated upsert idempotency (re-run bumps count, no double-affect error); same property under two `record_type`s = two rows; "has both types" intersection query; concurrent-upsert retry path.
 - `pytest` full suite green.
-- Manual: run a scrape locally for a config; confirm `property_membership` rows created with correct `record_types`; re-run same config → `sighting_count` increments, no duplicate membership rows, no user-visible change.
+- Manual: run a scrape locally for a config; confirm `property_list_membership` rows created with the job's `record_type`; re-run same config → `sighting_count` increments, no PK violation; run a *second* config of a different type that hits the same property → second row appears and the "has both" query returns it; confirm results page / billing / exports unchanged.
 - Codex diff review = PASS (no P1) before merge. Any Critical/High from Claude or Codex = NO-GO.
-- Migration applied only after merge to `main`, via `scripts/migrate.py`.
+- **Deploy order:** merge to `main` → schema migration 034 runs via `scripts/migrate.py` → run `scripts/backfill_property_membership.py` manually off the boot path (optional, best-effort). Forward accrual works immediately regardless of backfill.

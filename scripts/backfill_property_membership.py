@@ -1,7 +1,10 @@
 """Best-effort historical backfill for property_list_membership (Phase 1).
 
-Run MANUALLY after migration 034 is applied — never on API boot. Idempotent
-(re-runnable), batched, small commits. Best-effort by design: record_type was
+Run MANUALLY after migration 034 is applied — never on API boot. Re-runnable
+(safe: PK + ON CONFLICT never create duplicate rows), batched, small commits.
+NOTE: re-running re-adds to the advisory `sighting_count` (NOT idempotent — by
+design, since sighting_count is advisory and never used for billing or overlap
+correctness). Best-effort by design: record_type was
 never snapshotted on results/jobs, so it joins results -> jobs -> scraper_configs
 and uses the config's CURRENT record_type. Properties whose config changed type
 or was deleted are approximate or skipped. Forward accrual (workers/tasks.py) is

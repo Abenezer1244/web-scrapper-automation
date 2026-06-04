@@ -670,30 +670,34 @@ def run_scrape_job(self, job_id: str) -> None:
         except Exception as exc:
             db.rollback()
             _logger.warning("Job %s: post-enrichment refetch failed: %s", job_id, str(exc)[:120])
-            refreshed = []
+            # Sentinel: None means the refetch FAILED. We skip re-export AND
+            # membership so we neither overwrite the good export with an empty
+            # file nor write partial membership (Codex review).
+            refreshed = None
 
-        # Re-export CSV with enriched data
-        enriched_file = None
-        try:
-            record_dicts = [
-                {c: getattr(res, c) for c in [
-                    "date_recorded", "party_name", "heirs", "parcel_id",
-                    "property_address", "mailing_address", "legal_description",
-                    # Sprint 4: skip trace fields (may be null on first export
-                    # if dispatcher hasn't submitted or webhook hasn't fired)
-                    "phone", "phone_type", "email", "skip_trace_status",
-                ]}
-                for res in refreshed
-            ]
-            enriched_file = exporter.export(record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt)
-            if object_key:
-                exporter.upload_to_r2(enriched_file, object_key)
-                _logger.info("Re-exported CSV with enriched data")
-        except Exception as exc:
-            _logger.warning("CSV re-export failed: %s", str(exc)[:60])
-        finally:
-            if enriched_file:
-                enriched_file.unlink(missing_ok=True)
+        # Re-export CSV with enriched data — only if the refetch succeeded.
+        if refreshed is not None:
+            enriched_file = None
+            try:
+                record_dicts = [
+                    {c: getattr(res, c) for c in [
+                        "date_recorded", "party_name", "heirs", "parcel_id",
+                        "property_address", "mailing_address", "legal_description",
+                        # Sprint 4: skip trace fields (may be null on first export
+                        # if dispatcher hasn't submitted or webhook hasn't fired)
+                        "phone", "phone_type", "email", "skip_trace_status",
+                    ]}
+                    for res in refreshed
+                ]
+                enriched_file = exporter.export(record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt)
+                if object_key:
+                    exporter.upload_to_r2(enriched_file, object_key)
+                    _logger.info("Re-exported CSV with enriched data")
+            except Exception as exc:
+                _logger.warning("CSV re-export failed: %s", str(exc)[:60])
+            finally:
+                if enriched_file:
+                    enriched_file.unlink(missing_ok=True)
 
         # ── PHASE 1: PROPERTY MEMBERSHIP (cross-list overlap rollup) ─────────
         # Strong-identity rollup keyed (user_id, record_type, property_key),
@@ -701,18 +705,28 @@ def run_scrape_job(self, job_id: str) -> None:
         # overlaps a pre-foreclosure record on the same parcel. Reuses the
         # `refreshed` post-enrichment rows fetched above. Additive + isolated
         # from the billing/dedup path. Durable-with-retry: on hard failure we
-        # log and let scripts/backfill_property_membership.py heal the gap
-        # rather than fail an already-delivered job (which would re-email).
-        try:
-            _mcount = _upsert_property_membership(
-                db, refreshed, str(job.user_id), config.record_type
-            )
-            _logger.info("Job %s: property membership upserted %d properties", job_id, _mcount)
-        except Exception as exc:
-            _logger.error(
-                "Job %s: property membership upsert FAILED (heal via backfill): %s",
-                job_id, str(exc)[:200],
-            )
+        # roll back the poisoned transaction, log, and let
+        # scripts/backfill_property_membership.py heal the gap rather than fail
+        # an already-delivered job (which would re-email).
+        if refreshed:
+            try:
+                _mcount = _upsert_property_membership(
+                    db, refreshed, str(job.user_id), config.record_type
+                )
+                _logger.info("Job %s: property membership upserted %d properties", job_id, _mcount)
+            except Exception as exc:
+                # Clear any failed-transaction state so the subsequent
+                # _set_status(... "done") write can still succeed (Codex review:
+                # the helper only rolls back OperationalError, not e.g.
+                # ProgrammingError/IntegrityError/RLS errors).
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                _logger.error(
+                    "Job %s: property membership upsert FAILED (heal via backfill): %s",
+                    job_id, str(exc)[:200],
+                )
 
         # ── NOW mark done (after enrichment + re-export) ────────────────────
         # record_count reflects unique (non-duplicate) leads — what the user

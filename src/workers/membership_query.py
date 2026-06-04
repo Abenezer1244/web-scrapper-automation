@@ -21,7 +21,11 @@ async def users_overlap(user_id: str, record_types: list[str]) -> set[str]:
     (the "on both lists" intersection). Strong-identity rows only — the table
     holds nothing else.
     """
-    if len(record_types) < 2:
+    # Dedupe + drop empties: HAVING count(DISTINCT record_type) >= :n is only
+    # correct against UNIQUE types — ["probate","probate"] must not demand 2
+    # distinct matches (Codex review).
+    types = sorted({t for t in record_types if t})
+    if len(types) < 2:
         return set()
     async with AsyncSessionLocal() as db:
         # Bind RLS context to this user (no-op when RLS_ENFORCE is off; required
@@ -40,6 +44,6 @@ async def users_overlap(user_id: str, record_types: list[str]) -> set[str]:
                 HAVING count(DISTINCT record_type) >= :n
                 """
             ),
-            {"uid": str(user_id), "types": record_types, "n": len(record_types)},
+            {"uid": str(user_id), "types": types, "n": len(types)},
         )
         return {r.property_key for r in rows.fetchall()}

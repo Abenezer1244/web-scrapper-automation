@@ -373,7 +373,7 @@ def run_scrape_job(self, job_id: str) -> None:
             _SCRAPE_TIMEOUT = 1800  # 30 minutes
             records = asyncio.run(
                 asyncio.wait_for(
-                    _run_scraper(scraper_class, date_from, date_to, r, job_id, _on_progress, record_type=matched_record_type),
+                    _run_scraper(scraper_class, date_from, date_to, r, job_id, _on_progress, record_type=matched_record_type, doc_types=config.doc_types),
                     timeout=_SCRAPE_TIMEOUT,
                 )
             )
@@ -819,18 +819,22 @@ async def _run_scraper(
     job_id: str,
     on_progress: "ProgressCallback | None" = None,
     record_type: str | None = None,
+    doc_types: list | None = None,
 ):
     """Run the async scraper and stream progress logs back to Redis."""
-    # Pass record_type if the scraper accepts it — template/AI scrapers may not
+    # Pass record_type / doc_types ONLY to scrapers whose constructor accepts
+    # them (template/AI/partial scrapers may not). doc_types=None means legacy
+    # behavior — we never pass it unless an explicit selection exists.
     import inspect
     kwargs = {}
-    if record_type:
-        try:
-            sig = inspect.signature(scraper_class)
-            if "record_type" in sig.parameters:
-                kwargs["record_type"] = record_type
-        except (ValueError, TypeError):
-            pass
+    try:
+        params = inspect.signature(scraper_class).parameters
+    except (ValueError, TypeError):
+        params = {}
+    if record_type and "record_type" in params:
+        kwargs["record_type"] = record_type
+    if doc_types and "doc_types" in params:
+        kwargs["doc_types"] = doc_types
     async with scraper_class(**kwargs) as scraper:
         if on_progress:
             scraper.on_progress = on_progress

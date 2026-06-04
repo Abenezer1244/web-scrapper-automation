@@ -102,6 +102,10 @@ class ScraperConfig(Base):
     enrichment = Column(JSON, nullable=False, default=list)
     schedule = Column(JSON, nullable=False, default=dict)
     deliver = Column(JSON, nullable=False, default=dict)
+    # Phase 2b: optional pre-foreclosure document-type selection (canonical
+    # tokens, validated against the capability registry). NULL = legacy behavior
+    # (today's full output); a non-empty list NARROWS to the chosen types.
+    doc_types = Column(JSON, nullable=True)
     skip_trace_enabled = Column(Boolean, nullable=False, default=False)
     active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

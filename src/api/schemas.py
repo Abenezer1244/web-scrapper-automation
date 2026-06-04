@@ -273,6 +273,11 @@ class ScraperConfigCreate(BaseModel):
     # Sprint 4: skip trace opt-in. Default False to avoid accidental
     # charges. Backend rejects with 402 if the user's plan is 'starter'.
     skip_trace_enabled: bool = False
+    # Phase 2b: optional pre-foreclosure document-type selection. SHAPE ONLY
+    # here — the canonical-value + per-county availability check lives in the
+    # route (so we don't import scraper code into schemas). None = legacy/full
+    # output; a non-empty list narrows. Bounded to prevent abuse.
+    doc_types: list[str] | None = Field(default=None, max_length=10)
 
     @field_validator("state")
     @classmethod
@@ -300,6 +305,7 @@ class ScraperConfigResponse(BaseModel):
     schedule: dict[str, Any] | Any
     deliver: dict[str, Any] | Any
     skip_trace_enabled: bool = False
+    doc_types: list[str] | None = None  # Phase 2b: pre-foreclosure doc-type selection (None = legacy)
     active: bool
     created_at: datetime
     updated_at: datetime
@@ -542,6 +548,10 @@ class ConnectorResponse(BaseModel):
     max_date_range_days: int | None = None  # null = unlimited
     last_checked: datetime | None
     active: bool
+    # Phase 2b: pre-foreclosure doc-type selector metadata (from the capability
+    # registry), present only for counties that support selection. Populated by
+    # the /connectors handler, not the ORM. None = no selector (legacy/hidden).
+    pre_foreclosure_doc_types: dict[str, Any] | None = None
 
     model_config = {"from_attributes": True}
 

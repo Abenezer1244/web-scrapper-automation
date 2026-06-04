@@ -1,6 +1,6 @@
 """Phase 2a: doc_type is part of the export column order + ScrapedRecord shape."""
-from src.utils.data_exporter import _COLUMN_ORDER
 from src.scrapers.base_scraper import ScrapedRecord
+from src.utils.data_exporter import _COLUMN_ORDER
 
 
 def test_doc_type_in_export_column_order_right_after_legal_description():

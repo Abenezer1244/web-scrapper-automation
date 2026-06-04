@@ -427,7 +427,8 @@ class EagleWebScraper(BridgeScraper):
             try:
                 async with self.page.expect_navigation(
                     url="**/docSearchResults*",
-                    timeout=120_000,  # 2 min — large date ranges take time
+                    timeout=30_000,  # working installs redirect in seconds; the
+                    # form.submit() fallback below backs up any slow click.
                     wait_until="domcontentloaded",
                 ):
                     await submit.last.click()
@@ -436,7 +437,7 @@ class EagleWebScraper(BridgeScraper):
                 # expect_navigation timed out on POST page.
                 # Poll for the results link or URL change (server is processing).
                 _logger.info("Navigation timeout on POST, polling for results...")
-                for poll in range(30):  # 30 x 5s = 150s max
+                for poll in range(12):  # up to 60s
                     await self.page.wait_for_timeout(5_000)
                     # Check if redirected
                     if "Results" in self.page.url or "results" in self.page.url:
@@ -449,6 +450,40 @@ class EagleWebScraper(BridgeScraper):
                         await results_link.first.click()
                         await self.page.wait_for_timeout(3_000)
                         break
+                    # Some installs (e.g. Spokane) never auto-redirect on click —
+                    # they stick on the intermediate docSearchPOST.jsp. Stop
+                    # polling early and let the form.submit() fallback handle it.
+                    if poll >= 1 and "docSearchPOST" in self.page.url:
+                        _logger.info("Stuck on docSearchPOST after %ds; using form.submit() fallback", (poll+1)*5)
+                        break
+
+            # Fallback: if a button click never reached the results page, submit
+            # the form directly. form.submit() follows the POST→redirect chain
+            # (per this method's documented design) where a click can stick on
+            # docSearchPOST.jsp. Guarded to fire ONLY while stuck on the search
+            # POST/form pages (never on a results page or any other page), so
+            # counties that redirect on click are unaffected and we never submit
+            # an unrelated form.
+            _url = self.page.url
+            stuck_on_search = ("docSearchResults" not in _url) and (
+                "docSearchPOST" in _url or "docSearch.jsp" in _url
+            )
+            if stuck_on_search:
+                _logger.info("Not on results (url=%s); retrying via form.submit()", _url)
+                try:
+                    async with self.page.expect_navigation(
+                        url="**/docSearchResults*", timeout=60_000, wait_until="domcontentloaded"
+                    ):
+                        await self.page.evaluate(
+                            """() => {
+                                const btn = document.querySelector('input[type=submit][value=Search]');
+                                const form = (btn && btn.form) || document.querySelector('form');
+                                if (form) form.submit();
+                            }"""
+                        )
+                    _logger.info("form.submit() reached results: %s", self.page.url)
+                except Exception:
+                    _logger.info("form.submit() fallback did not reach results: %s", self.page.url)
 
             await self.page.wait_for_timeout(2_000)
             _logger.info("Final page: %s", self.page.url)

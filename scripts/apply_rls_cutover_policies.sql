@@ -92,6 +92,18 @@ DROP POLICY IF EXISTS results_system ON public.results;
 CREATE POLICY results_system ON public.results
     FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
 
+-- ── property_list_membership: app only READS (Phase 3 overlap rollup) → app
+--    FOR SELECT; system FOR ALL (worker rollup + retention prune). Modeled on
+--    results (app-readable tenant table), per migration 034. ──────────────────
+DROP POLICY IF EXISTS property_list_membership_user_isolation ON public.property_list_membership;
+DROP POLICY IF EXISTS property_list_membership_app ON public.property_list_membership;
+CREATE POLICY property_list_membership_app ON public.property_list_membership
+    FOR SELECT TO bridgeleads_app
+    USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
+DROP POLICY IF EXISTS property_list_membership_system ON public.property_list_membership;
+CREATE POLICY property_list_membership_system ON public.property_list_membership
+    FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
+
 -- ── job_logs: app FOR SELECT via parent job; system FOR ALL ─────────────────
 DROP POLICY IF EXISTS job_logs_via_job ON public.job_logs;
 DROP POLICY IF EXISTS job_logs_app ON public.job_logs;

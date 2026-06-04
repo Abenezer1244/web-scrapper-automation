@@ -61,3 +61,17 @@ def test_canonical_tokens_pierce_maps_to_checkbox_ids():
 def test_canonical_tokens_king_maps_to_search_text():
     toks = canonical_tokens_for("king", "wa", ["notice_of_trustee_sale"])
     assert toks == ["notice of trustee sale"]
+
+
+def test_validate_rejects_hidden_eagleweb_county():
+    # Kitsap (EagleWeb) is not yet supported_for_selection -> reject (Codex P2).
+    ok, err = validate_selection("kitsap", "wa", ["notice_of_default"])
+    assert ok is False and err is not None
+
+
+def test_canonical_tokens_all_or_nothing_on_unmapped():
+    # Any unmapped/stale type -> [] so the scraper falls back to legacy, never a
+    # wrongly-partial-narrowed set (Codex P2).
+    assert canonical_tokens_for("pierce", "wa", ["notice_of_default", "foreclosure"]) == []
+    # fully-mapped selection still narrows correctly
+    assert set(canonical_tokens_for("pierce", "wa", ["notice_of_default", "lis_pendens"])) == {"187", "146"}

@@ -112,7 +112,7 @@ def validate_selection(county: str, state: str, doc_types: list[str]) -> tuple[b
     """True if every selected canonical type is available for this county.
     An empty list is INVALID (None means legacy/all — empty means nothing)."""
     a = availability_for(county, state)
-    if a is None:
+    if a is None or not a.get("supported_for_selection"):
         return False, f"{county}, {state} does not support pre-foreclosure document-type selection"
     if not doc_types:
         return False, "doc_types must contain at least one document type (omit the field for default behavior)"
@@ -144,11 +144,15 @@ def canonical_tokens_for(county: str, state: str, doc_types: list[str]) -> list:
     a = availability_for(county, state)
     if a is None:
         return []
+    tokens = a["tokens"]
     out: list = []
     for d in doc_types:
-        tok = a["tokens"].get(d)
+        tok = tokens.get(d)
         if tok is None:
-            continue
+            # All-or-nothing: a stale/unmapped type means we cannot trust the
+            # narrowed set, so return [] → the scraper falls back to its full
+            # legacy set (returns more, never a wrongly-shrunk list). Codex P2.
+            return []
         if isinstance(tok, list):
             out.extend(tok)
         else:

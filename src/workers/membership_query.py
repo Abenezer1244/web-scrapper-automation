@@ -20,6 +20,11 @@ async def users_overlap(user_id: str, record_types: list[str]) -> set[str]:
     """Return the set of property_keys this user has on ALL of `record_types`
     (the "on both lists" intersection). Strong-identity rows only — the table
     holds nothing else.
+
+    `record_types` is deduped first. Overlap requires 2+ DISTINCT lists, so a
+    single distinct type (incl. ["probate", "probate"]) returns an empty set by
+    definition — a list does not "overlap" itself. Callers wanting all rows of
+    one list should query the membership table directly, not this helper.
     """
     # Dedupe + drop empties: HAVING count(DISTINCT record_type) >= :n is only
     # correct against UNIQUE types — ["probate","probate"] must not demand 2

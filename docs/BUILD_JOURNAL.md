@@ -19,6 +19,25 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-04 — Lead Targeting Phase 2b (backend): choose pre-foreclosure doc type
+
+**Built (branch `feature/phase2b-doc-type-select`, UNMERGED, 28 no-DB tests pass):** Users can select which pre-foreclosure document(s) a config scrapes.
+- Capability registry `src/scrapers/doc_types.py` — SINGLE SOURCE OF TRUTH: canonical vocab, per-county availability (fail-closed), normalize, validate_selection, canonical_tokens_for (all-or-nothing), selectable_availability.
+- `scraper_configs.doc_types` JSON col (migration **036**, additive nullable).
+- Create-route validation via registry (NOT Pydantic): pre_foreclosure-only, available-only, `[]`=422, `None` ok, rejects hidden EagleWeb counties.
+- King/Pierce constructors honor selection (`canonical_tokens_for` → search_text / checkbox-id subset), plumbed through `_run_scraper` constructor introspection.
+- `/connectors` exposes `pre_foreclosure_doc_types` (King/Pierce only).
+
+**THE invariant (Codex):** `doc_types=None` = today's EXACT output (King NOTS, Pierce ALL 4, EagleWeb unchanged). `_run_scraper` never passes doc_types when None → zero shrink for existing users. Selection only narrows. Verified by construct-level tests (Pierce None→4 ids, NOD+LisPendens→[187,146]).
+
+**Decided:** constructor-param plumbing (not a new scrape() contract); EagleWeb kept `supported_for_selection=False` (hidden) until per-county coverage verified (Codex: don't assume 16 counties share one truth); no update endpoint exists so validation is create-time + defensive all-or-nothing at scrape-time.
+
+**Caught & fixed (Codex full-diff PASS, no P1):** [P2] validate_selection didn't reject hidden counties → now does; [P2] canonical_tokens_for partial-narrowed on stale/unmapped types → now all-or-nothing (falls back to legacy). Both re-confirmed PASS.
+
+**Pending:** Task 7 = doc-type selector UI in frontend repo `bridgeleads-web` (separate, unverifiable here). EagleWeb selection (hidden). Pierce per-record doc_type capture (from 2a, needs live ARMS run). See `[[project_lead_targeting_milestone]]`.
+
+---
+
 ## 2026-06-04 — Lead Targeting Phase 2a: surface pre-foreclosure doc_type
 
 **Built (branch `feature/phase2-doc-type`, UNMERGED):** Real `results.doc_type` column (migration **035**, additive nullable, offline-render verified). Carried end-to-end: worker bulk insert, BOTH worker exports + `_COLUMN_ORDER`, **and the live `/jobs/{id}/download` CSV** (which rebuilds from DB, not the stored file — Codex caught this; I'd wrongly assumed it streamed R2). Added `doc_type` to API `ResultRow`. EagleWeb now captures the matched `desc` as `record.doc_type` (was dropped). Commits `c3446fc`..`23322f0` + P1 fix `<download>`.

@@ -1,6 +1,4 @@
 """Phase 2b: canonical doc-type registry — pure, no DB/scraper."""
-import pytest
-
 from src.scrapers.doc_types import (
     CANONICAL_DOC_TYPES,
     availability_for,

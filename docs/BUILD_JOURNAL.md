@@ -19,6 +19,62 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-03 — Migration boot-race fixed: advisory lock serializes Alembic across API replicas (commit 48e5482)
+
+**Context:** Resumed after a laptop power-loss mid-session (prior chat context gone). Reconstructed
+state from git/journal/memory — nothing lost: `main` was clean and in sync, the migration-033
+cherry-pick (`a3681cc`) was already committed, pushed, and deployed. Asked to verify deploy health.
+
+**Built / Shipped:** A Postgres-advisory-lock wrapper that serializes `alembic upgrade head` across
+the multiple Railway `api` replicas.
+- `scripts/migrate.py` (NEW) — acquires a session-level `pg_try_advisory_lock(0x424C, 1)` and runs
+  Alembic **in-process on the SAME connection** via `cfg.attributes["connection"]`. URL is validated
+  session-capable (rejects the Supabase `:6543` transaction pooler). Bounded jittered wait (900s),
+  fail-closed on timeout. `48e5482`
+- `alembic/env.py` — honors `config.attributes["connection"]` (shared-connection recipe); bare
+  `alembic` CLI still works via the engine fallback.
+- `start.sh` — API branch runs `python scripts/migrate.py` instead of bare `alembic upgrade head`.
+
+**The bug it fixes (confirmed live in prod logs):** the `api` service runs MULTIPLE replicas and
+rolling deploys overlap; both run migrations on boot. On the 032→033 deploy two replicas raced the
+same revision — one won, the loser's `UPDATE alembic_version WHERE version='032'` matched 0 rows →
+`ERROR ... expected to match one row ... 0 found` → `FAILED ... refusing to start API`. Self-healed
+only by Railway retry + transactional DDL. **Migration 033 uses `CREATE INDEX CONCURRENTLY` in an
+`autocommit_block`** — the non-atomic case where a racing replica can leave a half-built INVALID index.
+
+**Proof it works:** post-deploy `api` logs show one replica `migrate: lock acquired` while the other
+logs `migrate: migration lock held by another replica; waiting...` then proceeds after release. Zero
+`0 found`, zero `FAILED`. Both booted to `Uvicorn running`; `/health` → 200.
+
+**Tried / Decided:** Consulted Codex on whether this was worth fixing — both AIs agreed
+safe-now-but-fragile; advisory lock = best effort/payoff vs a single-run release step (Railway has no
+native release phase, deferred as the cleaner long-term fix). Chose the two-int `(classid, objid)` lock
+form so it cannot collide with `daily_scrape.py`'s single-bigint per-county locks.
+
+**Caught & fixed (Codex, 2 rounds — both Highs were in MY first draft):**
+- HIGH: original `:6543→:5432` string-replace was not a safe "force direct" contract — on Supabase,
+  pooler vs direct differ by HOST not just port. Replaced with explicit session-capability validation
+  (unit-tested 7 URL shapes).
+- HIGH: original draft held the lock on a parent connection while alembic ran in a **subprocess** on a
+  different connection → a dropped lock connection orphans the lock mid-migration. Fixed by running
+  alembic in-process on the lock-holding connection.
+- MED: "migrations stay atomic" comment was over-broad (033's `autocommit_block` is intentionally
+  non-atomic). Corrected.
+
+**Pending / Handoff:** (Low) move migrations to a single release/deploy step instead of
+every-API-replica-on-boot; (Low) bare `alembic` CLI bypasses the lock + URL validation — don't run
+manual migrations against `:6543`. Other open threads untouched: `security/redteam-remediation-2026-06-01`
+(19 commits, unmerged), HIGH-2 RLS cutover.
+
+**Facts learned:** prod `DATABASE_URL_MIGRATE` = `aws-0-us-west-2.pooler.supabase.com:5432` (Supavisor
+SESSION mode) — already set, so migrations run session-mode (advisory-lock safe); `DATABASE_URL` (async)
+is the `:6543` transaction pooler. Session-level advisory locks are UNSAFE through transaction pooling.
+A session advisory lock survives `commit()` and Alembic's per-migration transactions on the same
+connection, and auto-releases when the connection/process dies (crash-safe). Codex CLI session resume
+(`codex exec resume <id>`) did NOT persist here (`thread not found`) — start a fresh consult instead.
+
+---
+
 ## 2026-06-02 — RLS cutover: Codex HOLISTIC review caught a ship blocker → restructured (commit 3225778)
 
 **The catch:** after all phases were committed, a final cross-phase Codex review (the kind per-phase

@@ -19,6 +19,97 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-04 — Lead Targeting milestone: Phase 1 (property membership foundation)
+
+**Context:** User requested 4 features for King/Pierce/Snohomish/Kitsap: (1) tax filters by amount
+owed + months delinquent, (2) pre-foreclosure doc-type control (NOD>NOTS>Lis Pendens), (3) automate
+scrape→skip-trace→Enzo dialer, (4) combine lists (union) + overlap/intersection (probate ∩
+pre-foreclosure). Brainstormed, brought Codex in heavily, decomposed into a **5-phase milestone**.
+
+**Built / Shipped (branch `feature/lead-targeting-delivery`, UNMERGED, no prod contact):**
+- Spec `docs/superpowers/specs/2026-06-04-lead-targeting-delivery-design.md` + Phase-1 plan
+  `docs/superpowers/plans/2026-06-04-phase1-property-membership.md`.
+- **Phase 1 code** (8 task commits `a77630a`..`7d49724`, fixes `5fbfc69`+docstring): new
+  `src/workers/property_identity.py` (shared strong-identity hash), `_compute_dedup_hash` refactored
+  to use it (behavior-preserving, lockstep test), `PropertyListMembership` model + migration **034**
+  (schema-only + RLS USING policy, app-readable→registered across all RLS cutover scripts modeled on
+  `results`), `_upsert_property_membership` in `tasks.py` (post-enrichment, pre-aggregated upsert,
+  pgcode retry, billing path untouched), `membership_query.users_overlap`, purge retention,
+  `scripts/backfill_property_membership.py` (offline best-effort).
+
+**Tried / Decided:** Overlap identity must be **post-enrichment + strong-only** (parcel/address) or
+probate (name-keyed) never matches pre-foreclosure (parcel-keyed) — the flagship case. Normalized
+table keyed (user_id, record_type, property_key) — no bitmask/JSON (a job is one record_type).
+`is_duplicate`/`delivered_records` left untouched; membership additive + isolated from billing.
+
+**Failed / Blocked:** No safe test DB locally (`.env` = PRODUCTION Supabase, Docker not running).
+Per user, built all code + ran only no-DB checks (9 pure unit tests pass, py_compile/ruff clean);
+**DB-backed tests (`tests/test_property_membership.py`) + migration 034 must run in CI / a dedicated
+test DB — NOT applied to prod, NOT merged.**
+
+**Caught & fixed (Codex, 4 deep passes ~3M tokens):** is_duplicate hiding overlap; pre-enrichment
+identity miss; `ON CONFLICT` double-affect (pre-aggregate); psycopg2 `pgcode` not `sqlstate`;
+function-local `sa_text` NameError; RLS grants incomplete (app SELECT + system DELETE); refetch
+failure overwriting export with empty file (P1); membership failure poisoning the session before
+`done` (P1); backfill idempotency claim; `users_overlap` dedupe.
+
+**Pending / Handoff:** Run DB tests + migration 034 in CI/test DB → merge to `main` → apply
+migration via `scripts/migrate.py` → run backfill manually. Then Phase 2 (doc-type, first UI).
+See `[[project_lead_targeting_milestone]]` memory.
+
+**Facts learned:** `deps.get_rls_db` binds tenant via `set_config('app.current_user_id', :uid, true)`;
+`delivered_records` is worker-only RLS but membership is app-readable (modeled on `results`).
+
+---
+
+## 2026-06-03 — Live all-county scraper audit + 2 fixes (cowlitz, spokane)
+
+**Context:** Asked to live-test every county over a 3-month window, one by one, driven through the
+real bridgeleads.io UI with visible Playwright Chromium, fix any failures, Codex verifying each.
+
+**Built / Shipped:**
+- Audit harness (`scripts/`, untracked): `ui_county_audit.py` (drives the real UI wizard
+  state→county→record-type→Continue×3→Test run→/live, polls API for completion; `--resume`),
+  `saas_county_audit.py` (API path, authoritative), `live_county_audit.py` (local visible-Chromium,
+  subprocess-per-combo), plus `probe_cowlitz_live.py` / `probe_spokane_dump.py` /
+  `probe_spokane_formsubmit.py` diagnostics.
+- **cowlitz fix** (`693e563`, `src/scrapers/templates/laserfiche_weblink.py`): poll ~30s for the
+  Laserfiche "N Results" count instead of one early read. Was 0 → 44 records (local-verified).
+- **spokane fix** (`b2dabd0`, `src/scrapers/templates/eagleweb.py`): `form.submit()` fallback that
+  fires only while stuck on `docSearchPOST.jsp`; primary click timeout 120s→30s; early poll-break.
+  Jefferson no-regression (128 records via normal click path).
+
+**Result:** 23 PASS (King ×5, Pierce ×4, Clark, Skagit, Kitsap, Okanogan, Island 154, Jefferson 116,
+Grant, Douglas, Clallam, Thurston).
+
+**Tried / Decided:** Started building a local visible-Chromium audit, then user clarified "live
+chromium" = the engine ON the SaaS → pivoted to driving the real UI + real Railway jobs. Score
+PASS on results `total` (incl. dedup rows), NOT `record_count`(new), or already-scraped windows
+read as false EMPTY.
+
+**Failed / Blocked:**
+- **⚠️ SPOKANE = Cloudflare bot protection.** `recording.spokanecounty.org` intermittently serves a
+  "Performing security verification" interstitial. The submit fix recovers unblocked chunks but
+  Cloudflare is the deeper blocker — NOT solved. Deliberately did not build bot-evasion. Needs a
+  pacing/proxy strategy or accept partial coverage.
+- Codex's root-cause hypotheses were WRONG twice (cowlitz column-offset; spokane volume). Live repro
+  with visible Chromium refuted both — reproduce before trusting a hypothesis.
+
+**Caught & fixed (in review before shipping):** Codex review of the harness fixed 4 issues
+(resume dedup, WA-option check, coverage sentinel, job timeout). Codex review of the eagleweb fix →
+hardened the fallback's form guard (only fire on the POST/search page, never an unrelated form).
+
+**Pending / Handoff:** Prod re-verify of cowlitz/spokane post-deploy (in progress). 7 EMPTYs
+(pre_foreclosure/secondary types in small counties — likely genuinely empty, unverified). whatcom
+flaky-but-functional. UI harness: NextAuth session drops on long runs (API re-login likely
+invalidates the shared admin session) → caused thurston/whatcom UI false-errors.
+
+**Facts learned:** Laserfiche results are an async PrimeFaces datatable (read count AFTER it loads).
+EagleWeb: click-submit can stick on docSearchPOST.jsp; form.submit() follows the redirect. Spokane
+is Cloudflare-gated. Degraded-health counties aren't clickable in the UI wizard (healthy-only).
+
+---
+
 ## 2026-06-03 — Migration boot-race fixed: advisory lock serializes Alembic across API replicas (commit 48e5482)
 
 **Context:** Resumed after a laptop power-loss mid-session (prior chat context gone). Reconstructed

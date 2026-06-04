@@ -191,7 +191,7 @@ Phase 1 ships with **no frontend work**. First UI lands in Phase 2.
 ---
 
 ## 8. Verification (Phase 1)
-- Unit tests green: `strong_identity` classification; pre-aggregated upsert idempotency (re-run bumps count, no double-affect error); same property under two `record_type`s = two rows; "has both types" intersection query; concurrent-upsert retry path.
+- Unit tests green: per-row strong/weak classification (only strong tracked); pre-aggregated upsert handles a repeated key with no double-affect error; `first_seen` LEAST / `last_seen` GREATEST on re-run; same property under two `record_type`s = two rows; probate-enriched-to-parcel overlaps pre-foreclosure on same parcel; "has both types" intersection query; whole-job retry keeps one row per key; concurrent-upsert retry path; retention prune.
 - `pytest` full suite green.
 - Manual: run a scrape locally for a config; confirm `property_list_membership` rows created (strong-identity only) with the job's `record_type`; re-run same config → `first_seen` stable, `last_seen` advances, no PK violation; run a *second* config of a different type that hits the same property (incl. a probate config whose owner enriches to a pre-foreclosure parcel) → second row appears and the "has both" query returns it; confirm results page / billing / exports unchanged.
 - Codex diff review = PASS (no P1) before merge. Any Critical/High from Claude or Codex = NO-GO.

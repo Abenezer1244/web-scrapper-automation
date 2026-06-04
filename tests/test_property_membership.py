@@ -88,3 +88,17 @@ def test_same_property_two_record_types_two_rows(membership_user):
         _upsert_property_membership(db, row, membership_user, "probate")
         _upsert_property_membership(db, row, membership_user, "pre_foreclosure")
         assert _count(db, membership_user) == 2
+
+
+@pytest.mark.asyncio
+async def test_overlap_returns_properties_on_both_lists(membership_user):
+    shared = _Row("1234567890", "123 MAIN ST")
+    only_probate = _Row("9990001112", "1 LONE LN")
+    with SyncSessionLocal() as db:
+        _upsert_property_membership(db, [shared, only_probate], membership_user, "probate")
+        _upsert_property_membership(db, [shared], membership_user, "pre_foreclosure")
+
+    from src.workers.membership_query import users_overlap
+    keys = await users_overlap(membership_user, ["probate", "pre_foreclosure"])
+    from src.workers.property_identity import compute_property_key
+    assert keys == {compute_property_key("1234567890", "123 MAIN ST")}

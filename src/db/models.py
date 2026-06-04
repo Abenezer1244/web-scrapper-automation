@@ -13,6 +13,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -187,10 +188,19 @@ class Result(Base):
     dedup_hash = Column(String(64), nullable=True, index=True)
     is_duplicate = Column(Boolean, nullable=False, default=False)
     raw_html_hash = Column(String(32), nullable=True, index=True)
+    # Phase 3 (migration 037): post-enrichment sha256(parcel|address), the SAME
+    # key property_list_membership stores (property_identity.compute_property_key).
+    # NULL for weak-identity rows. Lets the combine/overlap export join overlap
+    # property_keys back to full Result rows. dedup_hash is PRE-enrichment and
+    # can differ, so it cannot serve this join.
+    property_key = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     # PERF (migration 033): get_results filters job_id + user_id, aggregates
     # by is_duplicate, and orders by (is_duplicate, created_at).
+    # Phase 3 (migration 037): partial index for the intersection export join
+    # (WHERE user_id = :uid AND property_key = ANY(:keys)); null keys never
+    # queried, so the index excludes them.
     __table_args__ = (
         Index(
             "ix_results_job_user_dup_created",
@@ -198,6 +208,12 @@ class Result(Base):
             "user_id",
             "is_duplicate",
             "created_at",
+        ),
+        Index(
+            "ix_results_user_property_key",
+            "user_id",
+            "property_key",
+            postgresql_where=text("property_key IS NOT NULL"),
         ),
     )
 

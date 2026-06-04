@@ -438,6 +438,7 @@ class ResultRow(BaseModel):
     party_name: str | None
     heirs: str | None
     legal_description: str | None
+    doc_type: str | None = None
     parcel_id: str | None
     property_address: str | None
     mailing_address: str | None

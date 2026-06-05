@@ -19,6 +19,29 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-04 — Lead Targeting Phase 3 (first slice): combine/overlap — intersection export
+
+**Built (branch `feature/phase3-combine-overlap`, 3 commits, 31 no-DB tests pass):** the "on both lists" feature — properties a user has on 2+ record-type lists (e.g. probate ∩ pre_foreclosure), the highest-motivation sellers.
+- **3A `d2513dc`** — `Result.property_key` join key. Migration **037** (additive nullable + PARTIAL index `(user_id, property_key) WHERE property_key IS NOT NULL`). `_write_result_property_keys` stamps the strong-identity key (reuses `compute_property_key`) on a job's post-enrichment rows, BEFORE the membership upsert, in its OWN isolated txn (bulk `UPDATE … FROM (VALUES …)` by id, idempotent via `property_key IS NULL`). Offline `scripts/backfill_result_property_key.py` (keyset by id, all computable rows incl is_duplicate).
+- **3B `fa132c1`** — `POST /segments/intersection` (JSON preview, cap 500) + `/export` (CSV, cap 50k). Overlap computed IN-SQL from `property_list_membership` (indexed Phase 1 rollup) as a subquery; 3 CTEs (candidates → agg(`array_agg DISTINCT` + `count DISTINCT`, NOT a window aggregate in PG) → ranked(`row_number`: contactable→recent-job→id)) → one representative row/property + `matched_record_types` + `overlap_count`. Strong-identity only and SAYS SO (`identity_strength="strong"`). Tenant-scoped (RLS + explicit `user_id`), `sanitize_for_csv` all fields, rate-limited.
+
+**Tried / Decided:** Followed the committed Codex-reviewed design (use membership as the indexed overlap source, not a results self-join). Codex plan-consult shaped 3A: bulk UPDATE (NOT ORM attribute-set — autoflush could push writes early / poison the shared session before the membership commit), key-write before membership (so 3B never sees overlap w/o joinable rows), partial index, backfill ALL rows. Rejected `CREATE INDEX CONCURRENTLY` (can't run in the advisory-lock migrate txn; results ~277K = sub-second plain index, matches 033/034 precedent). Replaced a closed `SUPPORTED_RECORD_TYPES` enum with shape validation — record types are DB-driven/open-ended, matching the existing `bound_record_types` convention.
+
+**Caught & fixed (Codex reviewed every commit):**
+- 3A [P2]: backfill seeded `last_id=""` for `WHERE id > :last_id` but `results.id` is UUID → Postgres `invalid input syntax for type uuid: ""` crashes the first query. Fixed: nil-UUID seed + `CAST(:last_id AS uuid)`.
+- **Same latent bug in the Phase 1 twin** `backfill_property_membership.py` → fixed in `a68dbbf`.
+- 3B [P2×2]: (a) county filter could return a property only on ONE list in-scope as an "intersection" → added `agg HAVING count(DISTINCT record_type)=:n`; (b) all overlap keys materialized into Python before LIMIT applied → pushed overlap into a membership subquery (no key array, LIMIT bounds in-query).
+- 3B [P2]: closed enum rejected `death_certificate` (real King type) → shape validation.
+- Final Codex review: CLEAN ("tenant-scoped, validated, and bounded as intended").
+
+**Failed / Blocked:** No local test DB / Playwright (standing constraint) → window-function ranking + the results↔membership join correctness are verified by Codex + unit tests + deferred to CI roundtrip, not run here.
+
+**Pending / Handoff:** inclusive UNION export (strong+weak rows, `identity_strength` column); segment-builder UI (frontend repo `bridgeleads-web`); saved `Segment` model + scheduled combined delivery (Phase 5). **Migration 037 is branch-only — do NOT apply to prod until merged to main** (migration/branch landmine). Run the two backfills offline post-merge.
+
+**Facts learned:** (1) Postgres does NOT allow `array_agg(DISTINCT …) OVER (…)` — DISTINCT window aggregates are unimplemented; split into a GROUP BY agg CTE. (2) UUID keyset pagination must seed the nil UUID, never `""`. (3) Record types are DB-driven (`county_connectors.record_types`), so `death_certificate` and future slugs exist beyond CLAUDE.md's documented 6 — never hardcode a closed set. See `[[project_lead_targeting_milestone]]`.
+
+---
+
 ## 2026-06-04 — Lead Targeting Phase 2b (backend): choose pre-foreclosure doc type
 
 **Built (branch `feature/phase2b-doc-type-select`, UNMERGED, 28 no-DB tests pass):** Users can select which pre-foreclosure document(s) a config scrapes.

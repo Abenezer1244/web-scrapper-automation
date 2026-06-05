@@ -58,4 +58,19 @@
 - [x] Registered in `src/api/__init__.py` + `main.py`.
 - [x] `tests/test_segments_intersection.py`: 15 pure tests (validation + SQL assembly). DB roundtrip → CI (no test DB here).
 - [x] Key design fidelity: array_agg(DISTINCT) is NOT a window aggregate in PG → split into agg + ranked CTEs. Intersection strong-only and says so.
-- [ ] **Codex review of 3B diff** (next).
+- [x] **Codex review of 3B diff** — iterated to clean. Round 1 (gate pass) caught 2 P2: (1) county filter could return non-intersections → added `agg HAVING count(DISTINCT)=:n`; (2) keys materialized in Python before LIMIT → pushed overlap into a membership subquery (no Python key array, LIMIT bounds in-query, still membership-sourced per design). Round 2 caught 1 P2: closed `SUPPORTED_RECORD_TYPES` rejected `death_certificate` → replaced with shape validation (slug regex), matching the DB-driven `bound_record_types` convention. **Round 3: CLEAN** ("tenant-scoped, validated, bounded").
+
+## ✅ Phase 3 first slice DONE — review
+
+**Shipped (branch `feature/phase3-combine-overlap`):** intersection ("on both lists") export.
+- 3A `d2513dc`: `Result.property_key` (migration 037, partial index) + post-enrichment stamp + offline backfill.
+- twin `a68dbbf`: fixed identical UUID-cursor crash in Phase 1 membership backfill.
+- 3B `fa132c1`: `POST /segments/intersection` (JSON preview) + `/export` (CSV); membership-sourced overlap computed in-SQL, representative row via window fn, `matched_record_types` + `overlap_count`, strong-identity-only (says so), tenant-scoped + CSV-sanitized + rate-limited.
+
+**Verification:** 31 tests pass (17 new segment + 9 identity + 5 membership); ruff clean on all new files; `alembic heads` linear at 037; app builds with both routes registered. No DB roundtrip locally (constraint) → window-rank/overlap correctness deferred to CI.
+
+**Security (non-negotiables):** every query filters `user_id` (explicit + RLS belt/suspenders; configs/jobs reached only via this user's results); `sanitize_for_csv` on all exported fields; Pydantic-validated input; rate-limited; no secrets; global handler returns ref-id not stack trace. Codex confirmed clean.
+
+**Codex worked every step:** plan consult (adopted bulk-UPDATE/order/partial-index/backfill-all), 3A review (1 P2 fixed), 3B review (3 P2 fixed across 2 rounds, final clean).
+
+**Pending / later slices (NOT built):** inclusive UNION export (strong+weak, `identity_strength`); segment-builder UI (frontend repo); saved `Segment` model + scheduled combined delivery (Phase 5). Migration 037 is branch-only — do NOT apply to prod until merged to main (see migration/branch landmine).

@@ -19,6 +19,28 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-05 — Lead Targeting Phase 5 (5B): generic "push to any dialer" (Enzo dropped)
+
+**Decision:** dropped Enzo as the integration target (newest vendor, no public API/pricing/reviews = worst first integration; web-researched). Built a **vendor-agnostic push** instead — works with any dialer via its inbound webhook / Zapier catch-hook. Zero lock-in; matches the PRD's "integrate, don't build a dialer" stance.
+
+**Built (branch `feature/phase5-dialer`, UNMERGED, commit `c8b3ed9`, 107 tests pass, Codex CLEAN after 8 review rounds):**
+- `DeliverConfig.dialer_webhook_url` + `dialer_webhook_secret` (separate from the job-summary webhook; shared https/secret validators extracted; gated Business+ in `create_scraper` alongside `webhook_url`).
+- `webhook_delivery.build_dialer_push_payload`: event `leads.dialer_ready`, `schema_version`, stable `batch.id` + per-lead `external_id` (retry-safe consumer dedup), `dnc_scrubbed:false` + per-lead `dnc_status`, flattened scraper fields, `lead_count`/`total_dialer_ready_count`/`truncated`, HMAC-signed, cap 500. `deliver_job_webhook` reused as the transport (SSRF re-validate, HMAC, retry, non-fatal) + now **redacts the receiver response body for dialer events** (PII echo risk).
+- **DEFERRED trigger** (`scheduler.dialer_push_sweep`, beat every 5 min, migration **039** `Job.dialer_pushed_at`): pushes a job's dialer-ready leads only once its **async skip-trace has SETTLED**, claimed durably **before** publish (at-most-once).
+
+**Codex caught (8 rounds — async + TCPA are subtle):**
+- P1: push at scrape completion missed async skip-trace leads → moved to a settled-gated sweep.
+- P1: strict `phone_dnc_flag IS FALSE` matched NOTHING (Tracerfy leaves DNC NULL) → use not-known-DNC + honest `dnc_status`/`dnc_scrubbed:false` labeling; dialer does the authoritative scrub.
+- P2s: plan gate for dialer URL; `FOR UPDATE`/atomic-claim race; exclude `is_duplicate`; settle on the pending QUEUE not `Result.skip_trace_status` (errored rows leave Result stuck); time-bound only **submitted** rows (queued = backlog, never age out); re-check entitlement at push time (downgrade); claim durable before publish; redact response PII.
+
+**⚠️ COMPLIANCE — decision for the user (surfaced, not silently decided):** BridgeLeads has **no DNC data feed** (`phone_dnc_flag` is always NULL). So "dialer-ready" = valid phone + not-KNOWN-DNC, and the **receiving dialer is the DNC/TCPA compliance layer** (industry standard; the payload says `dnc_scrubbed:false`). If BridgeLeads-side DNC scrubbing is required, that's a separate feature needing a DNC data source.
+
+**Pending / Handoff:** merge Phase 5 (migration 039 deploy-order note like 038); "push to dialer" config UI (frontend); optional native per-dialer connectors (CallTools/BatchDialer/PhoneBurner) only on real demand + API docs; run all offline backfills. See `[[project_lead_targeting_milestone]]`.
+
+**Facts learned:** (1) async skip-trace means any "use the phone" feature must trigger AFTER skip-trace settles, not at scrape completion. (2) The system never populates DNC — strict DNC filters silently match nothing. (3) Reviewer oscillation (strict-vs-functional DNC) was the signal that the real issue was a missing data source / product decision, not a code bug.
+
+---
+
 ## 2026-06-05 — Lead Targeting Phase 5 (dialer-ready foundation) + Phase 4 merged to prod
 
 **Shipped to prod:** Phase 4 (King tax filters) merged to main + pushed (`76c9e77`), deploy healthy (health 200), migration 038 applied on boot. Run `backfill_result_tax_fields.py` offline (pending).

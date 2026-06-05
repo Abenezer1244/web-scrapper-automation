@@ -19,6 +19,45 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-05 — Lead Targeting Phase 3 (slice 3C): inclusive UNION ("combine") export
+
+**Built (branch `feature/phase3-combine-overlap`, commit `6e42182`, 13 new tests; 44 Phase-3 tests pass):** the other half of combine/overlap — merge selected record-type lists into ONE deduped export, NEVER dropping weak leads.
+- `POST /segments/union` (JSON preview) + `/union/export` (CSV with `identity_strength` column). 1+ distinct types (union of one list still dedupes it across counties/jobs).
+- **Dedup bucket** `COALESCE(property_key, dedup_hash, 'id:'||id)`: strong rows dedupe by property_key, weak by dedup_hash (name|date), rows with neither stand alone. NO `pk:`/`dh:` prefix — so an un-backfilled strong row (whose strong hash still lives in dedup_hash) coalesces by hash VALUE with a backfilled row (Codex). `identity_strength` per-bucket via `bool_or(property_key IS NOT NULL)`.
+- **Ranking** (Codex P2): contactable FIRST → is_duplicate → recent job → id. Contactable-first so a bucket never drops an available phone/email by preferring an older non-duplicate row over a newer skip-traced duplicate; matches intersection. NEVER filters is_duplicate=false (would drop a lead whose only row is a dup).
+- No membership (union = direct per-user results scan by record_type). Explicit `j.user_id`/`sc.user_id` tenant predicates (retro-added to intersection too). `sanitize_for_csv` all fields incl identity_strength.
+
+**Codex (consult + 2 reviews):** consult shaped the bucket/ranking design; review caught the is_duplicate-vs-contactable ordering (reversed it). Final review CLEAN. Notably Codex's diff-review reversed its own consult advice ("is_duplicate first") once it reasoned through the skip-traced-duplicate scenario — took the better take.
+
+**Documented caveats (not hidden — Codex):** (1) dedup_hash is PRE-enrichment, property_key POST — un-backfilled strong rows whose enrichment changed parcel/addr can split/mislabel until `backfill_result_property_key.py` runs (forward rows always correct; backfill is a precondition for full accuracy). (2) weak dedup is name|date, not property identity → weak buckets merge same-name/date leads across types (intended, mirrors existing system dedup); overlap_count not overclaimed for weak rows. (3) county filter is county-only (WA-only data today; county names collide across states — revisit if multi-state).
+
+**Pending:** segment-builder UI (frontend repo); saved `Segment` + scheduled delivery (Phase 5); optional `(user_id, dedup_hash) WHERE dedup_hash IS NOT NULL` index if heavy-user union scans surface. Migration 037 still branch-only. See `[[project_lead_targeting_milestone]]`.
+
+---
+
+## 2026-06-04 — Lead Targeting Phase 3 (first slice): combine/overlap — intersection export
+
+**Built (branch `feature/phase3-combine-overlap`, 3 commits, 31 no-DB tests pass):** the "on both lists" feature — properties a user has on 2+ record-type lists (e.g. probate ∩ pre_foreclosure), the highest-motivation sellers.
+- **3A `d2513dc`** — `Result.property_key` join key. Migration **037** (additive nullable + PARTIAL index `(user_id, property_key) WHERE property_key IS NOT NULL`). `_write_result_property_keys` stamps the strong-identity key (reuses `compute_property_key`) on a job's post-enrichment rows, BEFORE the membership upsert, in its OWN isolated txn (bulk `UPDATE … FROM (VALUES …)` by id, idempotent via `property_key IS NULL`). Offline `scripts/backfill_result_property_key.py` (keyset by id, all computable rows incl is_duplicate).
+- **3B `fa132c1`** — `POST /segments/intersection` (JSON preview, cap 500) + `/export` (CSV, cap 50k). Overlap computed IN-SQL from `property_list_membership` (indexed Phase 1 rollup) as a subquery; 3 CTEs (candidates → agg(`array_agg DISTINCT` + `count DISTINCT`, NOT a window aggregate in PG) → ranked(`row_number`: contactable→recent-job→id)) → one representative row/property + `matched_record_types` + `overlap_count`. Strong-identity only and SAYS SO (`identity_strength="strong"`). Tenant-scoped (RLS + explicit `user_id`), `sanitize_for_csv` all fields, rate-limited.
+
+**Tried / Decided:** Followed the committed Codex-reviewed design (use membership as the indexed overlap source, not a results self-join). Codex plan-consult shaped 3A: bulk UPDATE (NOT ORM attribute-set — autoflush could push writes early / poison the shared session before the membership commit), key-write before membership (so 3B never sees overlap w/o joinable rows), partial index, backfill ALL rows. Rejected `CREATE INDEX CONCURRENTLY` (can't run in the advisory-lock migrate txn; results ~277K = sub-second plain index, matches 033/034 precedent). Replaced a closed `SUPPORTED_RECORD_TYPES` enum with shape validation — record types are DB-driven/open-ended, matching the existing `bound_record_types` convention.
+
+**Caught & fixed (Codex reviewed every commit):**
+- 3A [P2]: backfill seeded `last_id=""` for `WHERE id > :last_id` but `results.id` is UUID → Postgres `invalid input syntax for type uuid: ""` crashes the first query. Fixed: nil-UUID seed + `CAST(:last_id AS uuid)`.
+- **Same latent bug in the Phase 1 twin** `backfill_property_membership.py` → fixed in `a68dbbf`.
+- 3B [P2×2]: (a) county filter could return a property only on ONE list in-scope as an "intersection" → added `agg HAVING count(DISTINCT record_type)=:n`; (b) all overlap keys materialized into Python before LIMIT applied → pushed overlap into a membership subquery (no key array, LIMIT bounds in-query).
+- 3B [P2]: closed enum rejected `death_certificate` (real King type) → shape validation.
+- Final Codex review: CLEAN ("tenant-scoped, validated, and bounded as intended").
+
+**Failed / Blocked:** No local test DB / Playwright (standing constraint) → window-function ranking + the results↔membership join correctness are verified by Codex + unit tests + deferred to CI roundtrip, not run here.
+
+**Pending / Handoff:** inclusive UNION export (strong+weak rows, `identity_strength` column); segment-builder UI (frontend repo `bridgeleads-web`); saved `Segment` model + scheduled combined delivery (Phase 5). **Migration 037 is branch-only — do NOT apply to prod until merged to main** (migration/branch landmine). Run the two backfills offline post-merge.
+
+**Facts learned:** (1) Postgres does NOT allow `array_agg(DISTINCT …) OVER (…)` — DISTINCT window aggregates are unimplemented; split into a GROUP BY agg CTE. (2) UUID keyset pagination must seed the nil UUID, never `""`. (3) Record types are DB-driven (`county_connectors.record_types`), so `death_certificate` and future slugs exist beyond CLAUDE.md's documented 6 — never hardcode a closed set. See `[[project_lead_targeting_milestone]]`.
+
+---
+
 ## 2026-06-04 — Lead Targeting Phase 2b (backend): choose pre-foreclosure doc type
 
 **Built (branch `feature/phase2b-doc-type-select`, UNMERGED, 28 no-DB tests pass):** Users can select which pre-foreclosure document(s) a config scrapes.

@@ -1,62 +1,84 @@
-# Red-Team Remediation — Claude × Codex — 2026-06-01
+# Phase 3 — Combine + Overlap (build)
 
-Full register + reconciled verdicts: `docs/security/REDTEAM-2026-06-01.md`.
-Scope (user-approved): fix **everything** — HIGH + MEDIUM + LOW. RLS: add WITH CHECK + fail-closed startup. N2: kill PII leak.
-Rule: ≤5 files/phase · py_compile after each · atomic commit per phase · Codex re-verifies the full diff at the end.
+**Branch:** `feature/phase3-combine-overlap`. **Migration head:** 036 → next 037.
+**Design:** `docs/superpowers/plans/2026-06-04-phase3-combine-overlap.md` (Codex-reviewed).
+**Goal of first slice:** ship **intersection** ("on both lists") export — strong-identity only.
 
-## Phase 1 — Auth (HIGH A1, A2; MED A4; LOW A5, A6)  · routes/auth.py, auth_hardening.py
-- [ ] A1 — rotate refresh tokens (blacklist consumed jti on /refresh)
-- [ ] A2 — change_password revokes all sessions (revoke_all_for_user)
-- [ ] A4 — /register constant-time: burn bcrypt on duplicate-email branch
-- [ ] A5 — narrow /refresh except to InvalidTokenError only
-- [ ] A6 — cap email-driven lockout (anti targeted-DoS); IP keeps full escalation
+## Foundation (verified, Phase 1 live)
+- `property_identity.compute_property_key(parcel, addr)` → sha256(parcel|addr) or None (weak).
+- `membership_query.users_overlap(user_id, types)` → property_keys on ALL ≥2 distinct types.
+- `_upsert_property_membership` in tasks.py writes membership from post-enrichment `refreshed` rows.
+- `Result` has NO `property_key` and NO `record_type`/`county` (those live on ScraperConfig via Job).
+- Export/CSV pattern: `download_export` in jobs.py — `sanitize_for_csv` per field, `Response(text/csv)`.
+- RLS: `get_rls_db` sets `app.current_user_id`; membership + results tables have USING policies.
 
-## Phase 2 — Password reset flow (MED A3)  · routes/auth.py, schemas.py, delivery.py
-- [ ] A3 — /auth/forgot-password (enumeration-safe 200) + /auth/reset-password (single-use token, revoke_all_for_user)
+## Slice 3A — `Result.property_key` data foundation (≤5 files)
+- [ ] Migration **037**: `results.property_key` `String(64)` nullable + index `(user_id, property_key)`. Additive, no backfill in-migration.
+- [ ] `models.py`: add `property_key` column to `Result` + index in `__table_args__`.
+- [ ] `tasks.py`: populate `property_key` on the post-enrichment `refreshed` rows in the SAME loop as membership (reuse `_compute_property_key`), persist before/with the membership upsert. Failure-isolated like membership.
+- [ ] `scripts/backfill_result_property_key.py`: offline, best-effort, batched, idempotent (mirror Phase 1 backfill; keyset by `r.id`).
+- [ ] Verify: `python -c` compile, `alembic upgrade` dry logic review (no test DB here → Codex-verify + CI roundtrip).
+- [ ] **Codex review of 3A diff** → reconcile → commit.
 
-## Phase 3 — Rate-limit / CORS (HIGH I1; MED I2; LOW I4)  · rate_limit.py, main.py, settings.py
-- [ ] I1 — trust rightmost XFF hop; prefer Fly/CF single-value headers
-- [ ] I2 — fail-closed in-process fallback bucket for `auth` zone on RedisError
-- [ ] I4 — reject `*` / non-https origins in get_allowed_origins()
+## Slice 3B — Intersection export endpoint (after 3A approved)
+- [ ] `schemas.py`: request `{record_types:[...], counties?:[...]}`, response columns incl. `matched_record_types`, `overlap_count`.
+- [ ] New route (e.g. `src/api/routes/segments.py`): POST intersection preview/export.
+  - `users_overlap(record_types)` → property_keys.
+  - Join `results r → jobs j → scraper_configs sc` on `r.property_key = ANY(keys)`, `sc.record_type = ANY(types)`, optional `sc.county = ANY(counties)`, `r.user_id = :uid`.
+  - Representative row via ONE window function: rank by phone/email present, most recent job, `r.id` tiebreak.
+  - `array_agg(DISTINCT sc.record_type)` → `matched_record_types`; `overlap_count`.
+  - Tenant-scoped (RLS), `sanitize_for_csv` all fields, reuse CSV `Response` pattern.
+- [ ] Register router in `main.py`.
+- [ ] Tests: window-rank / overlap logic; DB roundtrip in CI.
+- [ ] **Codex review of 3B diff** → reconcile → commit.
 
-## Phase 4 — Exports / CSV injection (HIGH E1; MED E3; LOW E4)  · security.py, data_exporter.py, tests
-- [ ] E1 — de-quote/de-space before formula-prefix test in sanitize_for_csv
-- [ ] E3 — strip TAB in clean_text
-- [ ] E4 — to_json: sanitize unconditionally (incl. non-str)
-- [ ] tests — leading-quote + embedded-tab + non-str payloads
+## Constraints
+- No test DB / Playwright locally → build + Codex-verify + CI roundtrip.
+- Migration 037 additive nullable = low risk. Merge → deploys on boot (advisory-lock migrate).
+- Intersection = strong-only and SAY SO in API. Union (later slice) = inclusive.
 
-## Phase 5 — Browser / AI SSRF (HIGH S1, S2)  · base_scraper.py, navigator.py, paginator.py
-- [ ] S1 — route guard validates ALL resource types (fetch/xhr), not just document
-- [ ] S2 — drop/strictly-gate model-emitted `evaluate` JS
+## Codex collaboration log
+- **Consulted on 3A plan (session 19011 follow-up). Reconciled — adopted all:**
+  - (A) Persist via explicit **bulk UPDATE by id in its own transaction**; do NOT mutate the `refreshed` ORM objects (autoflush could push writes early / poison the shared session before the membership commit).
+  - (B) Order: **CSV re-export → property_key write → membership upsert** (so 3B never sees membership without joinable result rows; both still failure-isolated, never fail a delivered job).
+  - (C) Backfill **ALL** rows incl `is_duplicate=true` (property_key = identity, not visibility); skip only weak (`compute_property_key` → None).
+  - (D) Use a **partial index** `(user_id, property_key) WHERE property_key IS NOT NULL` (smaller, null identities never queried).
+  - (E) Live write `WHERE id=:id AND property_key IS NULL` (idempotent, never clobber). Log counts (computed/null/updated/failed). Backfill: keyset by id, batch commits, select only id/parcel/address. ResultRow schema is explicit → no API leak (verified). RLS: backfill mirrors Phase 1 (runtime role bypasses RLS).
+  - **Decision (CONCURRENTLY):** Codex suggested `CREATE INDEX CONCURRENTLY`. REJECTED for this migration — it can't run inside the advisory-lock transaction `scripts/migrate.py` uses, and `results` is ~277K rows (precedent: migrations 033/034 added results indexes with a plain `op.create_index`). Plain index = brief lock, sub-second at this scale.
+- **Codex review of 3A diff (gpt-5.5, `codex review --base HEAD~1`): GATE PASS** (no P1; one P2). "Live schema and worker changes are mostly sound."
+  - **[P2] FIXED:** backfill seeded `last_id=""` for `WHERE id > :last_id`, but `results.id` is UUID → Postgres `invalid input syntax for type uuid: ""` on the first query (backfill dies before scanning). Fixed: seed nil-UUID `00000000-...-0` + explicit `CAST(:last_id AS uuid)`. Re-verified: compile + ruff clean.
+  - **⚠️ Same latent bug in the Phase 1 twin `scripts/backfill_property_membership.py:28,40`** (`last_id=""` + `WHERE r.id > :last_id`). Out of 3A scope — flagged to user, one-line fix available.
 
-## Phase 6 — Outbound-fetch SSRF (MED N1; LOW S4, S5, N3)  · pacs.py, security.py, county_gis.py, scrapers/*
-- [ ] N1 — assessor_url via validate_scraping_target(resolve=True) + safe_http
-- [ ] S4 — remaining raw requests.* through safe_http
-- [ ] S5 — resolve=True default + IDNA fail-closed + loopback aliases
-- [ ] N3 — persist validated gis_endpoint/assessor_url or drop from API
+## 3A status: ✅ BUILT + Codex-reviewed (gate pass, P2 fixed). Committed d2513dc.
+## Phase 1 twin backfill UUID-cursor bug: ✅ FIXED (a68dbbf).
 
-## Phase 7 — Billing / webhook idempotency (HIGH T3, B1; MED B2; LOW B3, B4)  · webhooks.py, tracerfy_ingest.py, skip_trace_usage.py, billing.py, delivery.py
-- [ ] B1/T3 — queue_id idempotency + edge SET NX; don't trust body download_url
-- [ ] B2 — tie counter advance to UNIQUE(queue_id,user_id) meter record
-- [ ] B3 — clamp attempt_count
-- [ ] B4 — cache coupon lookup; narrow except
+## Slice 3B — Intersection export endpoint: ✅ BUILT
+- [x] `schemas.py`: `SegmentIntersectionRequest` (2+ distinct supported types, counties cleaned), `SegmentLeadRow`, `SegmentIntersectionResponse` (identity_strength="strong" — SAYS SO). `SUPPORTED_RECORD_TYPES` canonical set.
+- [x] `src/api/routes/segments.py`: `POST /segments/intersection` (JSON preview, cap 500) + `POST /segments/intersection/export` (CSV, cap 50k). `users_overlap()` → 3-CTE query (candidates → agg(array_agg DISTINCT, count DISTINCT) → ranked(row_number window: contactable→recent→id)) → representative row + matched_record_types + overlap_count. RLS-bound + explicit user_id filter; `sanitize_for_csv` all fields; optional county clause (fixed fragment, bound params).
+- [x] Registered in `src/api/__init__.py` + `main.py`.
+- [x] `tests/test_segments_intersection.py`: 15 pure tests (validation + SQL assembly). DB roundtrip → CI (no test DB here).
+- [x] Key design fidelity: array_agg(DISTINCT) is NOT a window aggregate in PG → split into agg + ranked CTEs. Intersection strong-only and says so.
+- [x] **Codex review of 3B diff** — iterated to clean. Round 1 (gate pass) caught 2 P2: (1) county filter could return non-intersections → added `agg HAVING count(DISTINCT)=:n`; (2) keys materialized in Python before LIMIT → pushed overlap into a membership subquery (no Python key array, LIMIT bounds in-query, still membership-sourced per design). Round 2 caught 1 P2: closed `SUPPORTED_RECORD_TYPES` rejected `death_certificate` → replaced with shape validation (slug regex), matching the DB-driven `bound_record_types` convention. **Round 3: CLEAN** ("tenant-scoped, validated, bounded").
 
-## Phase 8 — Tenancy / RLS / PII (HIGH T2; MED I3, N2; LOW T1)  · new migration, session.py, scrapers.py, jobs.py, tasks.py
-- [ ] T2 — migration WITH CHECK + fail-closed startup on BYPASSRLS role
-- [ ] N2 — /scrapers/sample static fixtures / redact addresses
-- [ ] I3 — log result id, not party_name
-- [ ] T1 — decode download token with explicit audience
+## ✅ Phase 3 first slice DONE — review
 
-All 8 phases ✅ implemented + committed (12 commits on `security/redteam-remediation-2026-06-01`).
-Phases 1–5 by Claude directly; Phases 6/7/8/2 by 4 parallel subagents (disjoint files).
+**Shipped (branch `feature/phase3-combine-overlap`):** intersection ("on both lists") export.
+- 3A `d2513dc`: `Result.property_key` (migration 037, partial index) + post-enrichment stamp + offline backfill.
+- twin `a68dbbf`: fixed identical UUID-cursor crash in Phase 1 membership backfill.
+- 3B `fa132c1`: `POST /segments/intersection` (JSON preview) + `/export` (CSV); membership-sourced overlap computed in-SQL, representative row via window fn, `matched_record_types` + `overlap_count`, strong-identity-only (says so), tenant-scoped + CSV-sanitized + rate-limited.
 
-## Round 3 verify
-- [x] py_compile + ruff clean every phase; CSV sanitizer proven vs 11 payloads
-- [x] Codex review × multiple rounds — caught 4 bugs in Claude's fixes (I1,A1,A2,A6) + 3 in subagent code (webhook dedup, reset timing, reset reuse-policy); all fixed
-- [x] Codex `codex review` over full diff; reconciled; convergence re-review running
-- [ ] Update REDTEAM register statuses to ✅; BUILD_JOURNAL entry (after convergence verdict)
+**Verification:** 31 tests pass (17 new segment + 9 identity + 5 membership); ruff clean on all new files; `alembic heads` linear at 037; app builds with both routes registered. No DB roundtrip locally (constraint) → window-rank/overlap correctness deferred to CI.
 
-## Review
-Cross-verification (Claude×Codex) caught **7 total bugs in the fixes themselves** across 3 Codex
-rounds — the core value of two independent reviewers. Integration tests need CI Postgres+Redis.
-T2 needs the Supabase runtime role confirmed `NOBYPASSRLS` for the RLS belt to engage.
+**Security (non-negotiables):** every query filters `user_id` (explicit + RLS belt/suspenders; configs/jobs reached only via this user's results); `sanitize_for_csv` on all exported fields; Pydantic-validated input; rate-limited; no secrets; global handler returns ref-id not stack trace. Codex confirmed clean.
+
+**Codex worked every step:** plan consult (adopted bulk-UPDATE/order/partial-index/backfill-all), 3A review (1 P2 fixed), 3B review (3 P2 fixed across 2 rounds, final clean).
+
+## Slice 3C — Inclusive UNION ("combine") export: ✅ BUILT (`6e42182`)
+- `POST /segments/union` (JSON preview) + `/union/export` (CSV + `identity_strength` col). 1+ distinct types.
+- Dedup bucket `COALESCE(property_key, dedup_hash, 'id:'||id)`: strong→property_key, weak→dedup_hash, neither→singleton. NO pk:/dh: prefix (un-backfilled strong row coalesces by hash value — Codex). `identity_strength` per-bucket via `bool_or(property_key IS NOT NULL)`.
+- Ranking: **contactable FIRST** → is_duplicate → recent → id (Codex P2: contactable-first so we never drop available phone/email; matches intersection). Never filters is_duplicate=false (would drop a lead).
+- No membership (union = direct results scan). Explicit `j.user_id`/`sc.user_id` predicates (added to intersection too).
+- 13 union tests. Codex review: 1 P2 (ranking order) fixed → **final CLEAN**.
+- **Documented caveat (not hidden):** dedup_hash is PRE-enrichment, property_key POST — un-backfilled strong rows whose enrichment changed parcel/addr can split/mislabel until `backfill_result_property_key.py` runs. Weak dedup is name|date (not property) → weak buckets merge same-name/date across types (intended; overlap_count not overclaimed for weak).
+
+**Pending / later slices (NOT built):** segment-builder UI (frontend repo `bridgeleads-web`); saved `Segment` model + scheduled combined delivery (Phase 5); optional perf index `(user_id, dedup_hash) WHERE dedup_hash IS NOT NULL` if heavy-user union scans show up. Migration 037 is branch-only — do NOT apply to prod until merged to main (migration/branch landmine). Run BOTH backfills offline post-merge.

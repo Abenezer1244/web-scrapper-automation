@@ -1,3 +1,4 @@
+import re
 from datetime import UTC, datetime
 from typing import Any, TypedDict
 from urllib.parse import urlparse
@@ -585,3 +586,120 @@ class CachedResultsPage(BaseModel):
     page: int
     page_size: int
     items: list[CachedRecordRow]
+
+
+# ─── Segments: combine / overlap (Phase 3) ────────────────────────────────────
+
+# Record types are DB-driven (county_connectors.record_types) and open-ended —
+# new connectors add new slugs (e.g. death_certificate). So segment requests are
+# validated by SHAPE, not against a closed enum, matching ConnectorCreate's
+# bound_record_types convention; an unknown slug simply yields no overlap rather
+# than a 422 for a type the system actually supports (Codex review).
+_RECORD_TYPE_SLUG = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+class SegmentIntersectionRequest(BaseModel):
+    """Intersection ('on both lists'): properties a user has on ALL of the
+    selected record-type lists. STRONG-IDENTITY ONLY (parcel/address match);
+    weak name/date rows are excluded by design (see property_identity).
+
+    record_types must be 2+ distinct slugs — a single list cannot 'overlap'
+    itself. counties is an optional lowercase filter.
+    """
+    record_types: list[str] = Field(min_length=2, max_length=10)
+    counties: list[str] | None = Field(default=None, max_length=100)
+
+    @field_validator("record_types")
+    @classmethod
+    def validate_record_types(cls, v: list[str]) -> list[str]:
+        cleaned = sorted({t.strip().lower() for t in v if t and t.strip()})
+        if len(cleaned) < 2:
+            raise ValueError("intersection requires at least 2 distinct record types")
+        bad = [t for t in cleaned if not _RECORD_TYPE_SLUG.match(t)]
+        if bad:
+            raise ValueError(f"invalid record_type value(s): {', '.join(bad)}")
+        return cleaned
+
+    @field_validator("counties")
+    @classmethod
+    def clean_counties(cls, v: list[str] | None) -> list[str] | None:
+        if not v:
+            return None
+        cleaned = sorted({c.strip().lower() for c in v if c and c.strip()})
+        if any(len(c) > 64 for c in cleaned):
+            raise ValueError("invalid county value")
+        return cleaned or None
+
+
+class SegmentLeadRow(BaseModel):
+    """One representative lead per dedup bucket (best row chosen by the window
+    function). `identity_strength` is "strong" for intersection (always) and
+    per-row for union (strong = parcel/address match, weak = name/date)."""
+    id: str
+    date_recorded: str | None = None
+    party_name: str | None = None
+    parcel_id: str | None = None
+    property_address: str | None = None
+    mailing_address: str | None = None
+    county: str | None = None
+    state: str | None = None
+    phone: str | None = None
+    phone_type: str | None = None
+    email: str | None = None
+    matched_record_types: list[str]
+    overlap_count: int
+    identity_strength: str = "strong"
+
+
+class SegmentIntersectionResponse(BaseModel):
+    mode: str = "intersection"
+    # SAY SO (design): intersection is strong-identity only.
+    identity_strength: str = "strong"
+    record_types: list[str]
+    counties: list[str] | None = None
+    property_count: int
+    truncated: bool = False  # preview cap reached — export for the full set
+    rows: list[SegmentLeadRow]
+
+
+class SegmentUnionRequest(BaseModel):
+    """Union ('combine'): every lead a user has on ANY of the selected
+    record-type lists, merged into one INCLUSIVE deduped set — strong rows
+    deduped by property_key, weak rows by dedup_hash, rows with neither kept as
+    singletons. NO lead is ever silently dropped (contrast intersection, which
+    is strong-only). 1+ distinct slug (combining one list just dedupes it across
+    counties/jobs). counties is an optional lowercase filter.
+    """
+    record_types: list[str] = Field(min_length=1, max_length=10)
+    counties: list[str] | None = Field(default=None, max_length=100)
+
+    @field_validator("record_types")
+    @classmethod
+    def validate_record_types(cls, v: list[str]) -> list[str]:
+        cleaned = sorted({t.strip().lower() for t in v if t and t.strip()})
+        if len(cleaned) < 1:
+            raise ValueError("union requires at least 1 record type")
+        bad = [t for t in cleaned if not _RECORD_TYPE_SLUG.match(t)]
+        if bad:
+            raise ValueError(f"invalid record_type value(s): {', '.join(bad)}")
+        return cleaned
+
+    @field_validator("counties")
+    @classmethod
+    def clean_counties(cls, v: list[str] | None) -> list[str] | None:
+        if not v:
+            return None
+        cleaned = sorted({c.strip().lower() for c in v if c and c.strip()})
+        if any(len(c) > 64 for c in cleaned):
+            raise ValueError("invalid county value")
+        return cleaned or None
+
+
+class SegmentUnionResponse(BaseModel):
+    mode: str = "union"
+    # Mixed identity — per-row identity_strength on each lead (not segment-level).
+    record_types: list[str]
+    counties: list[str] | None = None
+    lead_count: int
+    truncated: bool = False  # preview cap reached — export for the full set
+    rows: list[SegmentLeadRow]

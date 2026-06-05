@@ -199,6 +199,62 @@ def _upsert_property_membership(db, rows, user_id: str, record_type: str) -> int
     return len(agg)
 
 
+def _write_result_property_keys(db, rows, user_id: str) -> tuple[int, int]:
+    """Phase 3: stamp results.property_key on post-enrichment rows.
+
+    property_key is the SAME strong-identity key membership stores
+    (compute_property_key) — it lets the combine/overlap export join overlap
+    property_keys back to full Result rows. Computed here, in the same
+    post-enrichment spot as the membership rollup, so enrichment-resolved
+    parcels/addresses are reflected.
+
+    `rows` = post-enrichment Result objects (only .id / .parcel_id /
+    .property_address are read). We do NOT mutate the ORM objects — an
+    attribute-set would make the shared session dirty and a stray autoflush
+    could push writes before the membership block commits, or poison the
+    session on error (Codex review). Instead: an explicit bulk UPDATE by id in
+    its OWN transaction, idempotent via `property_key IS NULL` (never clobbers a
+    value, safe on task retry). Returns (updated_count, weak_skipped_count).
+
+    Failure-isolated by the caller (like membership): on hard failure we never
+    fail an already-delivered job; scripts/backfill_result_property_key.py heals.
+    """
+    pairs: list[tuple[str, str]] = []
+    weak = 0
+    for res in rows:
+        key = _compute_property_key(res.parcel_id, res.property_address)
+        if not key:
+            weak += 1
+            continue
+        pairs.append((str(res.id), key))
+    if not pairs:
+        return (0, weak)
+
+    updated = 0
+    for i in range(0, len(pairs), 500):
+        chunk = pairs[i:i + 500]
+        values_sql = ",".join(f"(:id_{k}, :pk_{k})" for k in range(len(chunk)))
+        params: dict = {"uid": user_id}
+        for k, (rid, key) in enumerate(chunk):
+            params[f"id_{k}"] = rid
+            params[f"pk_{k}"] = key
+        # UPDATE ... FROM (VALUES ...) — one statement per chunk (no N+1).
+        # data.id::uuid casts the bound text to the column type. The
+        # property_key IS NULL guard makes this idempotent on re-run.
+        stmt = sa_text(f"""
+            UPDATE results
+            SET property_key = data.pk
+            FROM (VALUES {values_sql}) AS data(id, pk)
+            WHERE results.id = data.id::uuid
+              AND results.user_id = :uid
+              AND results.property_key IS NULL
+        """)
+        res_proxy = db.execute(stmt, params)
+        db.commit()
+        updated += res_proxy.rowcount or 0
+    return (updated, weak)
+
+
 @app.task(
     name="src.workers.tasks.run_scrape_job",
     bind=True,
@@ -700,6 +756,30 @@ def run_scrape_job(self, job_id: str) -> None:
             finally:
                 if enriched_file:
                     enriched_file.unlink(missing_ok=True)
+
+        # ── PHASE 3: RESULT.property_key (combine/overlap join key) ──────────
+        # Stamp the strong-identity key on this job's rows BEFORE the membership
+        # upsert (Codex order): if membership ever succeeded while this failed,
+        # 3B would see overlap with no joinable result rows. Both are isolated
+        # and never fail a delivered job; the backfill script heals any gap.
+        if refreshed:
+            try:
+                _pk_updated, _pk_weak = _write_result_property_keys(
+                    db, refreshed, str(job.user_id)
+                )
+                _logger.info(
+                    "Job %s: property_key stamped on %d rows (%d weak-identity skipped)",
+                    job_id, _pk_updated, _pk_weak,
+                )
+            except Exception as exc:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                _logger.error(
+                    "Job %s: property_key write FAILED (heal via backfill): %s",
+                    job_id, str(exc)[:200],
+                )
 
         # ── PHASE 1: PROPERTY MEMBERSHIP (cross-list overlap rollup) ─────────
         # Strong-identity rollup keyed (user_id, record_type, property_key),

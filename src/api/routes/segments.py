@@ -36,6 +36,8 @@ from src.api.schemas import (
     SegmentIntersectionRequest,
     SegmentIntersectionResponse,
     SegmentLeadRow,
+    SegmentUnionRequest,
+    SegmentUnionResponse,
 )
 from src.utils.logger import setup_logger
 
@@ -68,8 +70,8 @@ WITH candidates AS (
            r.mailing_address, r.phone, r.phone_type, r.email, r.property_key,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at
     FROM results r
-    JOIN jobs j ON j.id = r.job_id
-    JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+    JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid
+    JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
     WHERE r.user_id = :uid
       AND r.property_key IS NOT NULL
       AND sc.record_type = ANY(:types)
@@ -108,6 +110,75 @@ FROM ranked rk
 JOIN agg a ON a.property_key = rk.property_key
 WHERE rk.rn = 1
 ORDER BY a.overlap_count DESC, rk.property_address NULLS LAST, rk.id
+LIMIT :limit
+"""
+
+# UNION ("combine"): every lead on ANY selected record type, merged + deduped,
+# NEVER dropping weak leads (contrast intersection). No membership — union is a
+# direct per-user results scan filtered by record_type. Dedup bucket:
+#   COALESCE(property_key, dedup_hash, 'id:'||id) — strong rows dedupe by
+#   property_key; weak rows fall back to dedup_hash (name|date); rows with
+#   neither stand alone by id. NO prefix on the hash branches so a strong row
+#   whose property_key was not yet backfilled (it still carries the strong hash
+#   in dedup_hash) coalesces with a backfilled row for the same property by hash
+#   VALUE (Codex). identity_strength is per-bucket via bool_or(property_key IS
+#   NOT NULL): a bucket is strong iff some row proves strong identity.
+#
+# CAVEAT (documented, not hidden — Codex): dedup_hash is PRE-enrichment and
+# property_key is POST-enrichment, so for strong rows where enrichment changed
+# the parcel/address, an un-backfilled historical row (property_key NULL) can
+# still split from / mislabel vs a backfilled row. Run
+# scripts/backfill_result_property_key.py for fully accurate union; forward rows
+# are always correct. Weak dedup is name|date (not property identity), so weak
+# buckets can merge same-name/date leads across types — intended, do not
+# overclaim overlap_count for weak rows.
+_UNION_SQL = """
+WITH candidates AS (
+    SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
+           r.mailing_address, r.phone, r.phone_type, r.email,
+           r.property_key, r.is_duplicate,
+           sc.record_type, sc.county, sc.state, j.created_at AS job_created_at,
+           COALESCE(r.property_key, r.dedup_hash, 'id:' || r.id::text) AS bucket
+    FROM results r
+    JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid
+    JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
+    WHERE r.user_id = :uid
+      AND sc.record_type = ANY(:types)
+      {county_clause}
+),
+agg AS (
+    SELECT bucket,
+           array_agg(DISTINCT record_type ORDER BY record_type) AS matched_record_types,
+           count(DISTINCT record_type) AS overlap_count,
+           CASE WHEN bool_or(property_key IS NOT NULL) THEN 'strong' ELSE 'weak' END
+               AS identity_strength
+    FROM candidates
+    GROUP BY bucket
+),
+ranked AS (
+    SELECT c.*,
+           row_number() OVER (
+               PARTITION BY c.bucket
+               -- Contactable FIRST so we never drop an available phone/email by
+               -- preferring an older non-duplicate row that was never skip-traced
+               -- over a newer duplicate that has contact data (Codex); matches
+               -- the intersection ranking. is_duplicate only breaks ties among
+               -- equally-contactable rows (prefer the original lead).
+               ORDER BY (CASE WHEN c.phone IS NOT NULL OR c.email IS NOT NULL
+                              THEN 0 ELSE 1 END),
+                        c.is_duplicate ASC,
+                        c.job_created_at DESC NULLS LAST,
+                        c.id DESC
+           ) AS rn
+    FROM candidates c
+)
+SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
+       rk.mailing_address, rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
+       a.matched_record_types, a.overlap_count, a.identity_strength
+FROM ranked rk
+JOIN agg a ON a.bucket = rk.bucket
+WHERE rk.rn = 1
+ORDER BY a.overlap_count DESC, a.identity_strength, rk.property_address NULLS LAST, rk.id
 LIMIT :limit
 """
 
@@ -239,6 +310,133 @@ async def intersection_export(
         media_type="text/csv",
         headers={
             "Content-Disposition": f'attachment; filename="bridgeleads_overlap_{types_slug}.csv"',
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
+async def _fetch_union(
+    db: AsyncSession,
+    user_id: str,
+    record_types: list[str],
+    counties: list[str] | None,
+    limit: int,
+) -> list:
+    """Return one representative deduped lead per bucket across `record_types`.
+
+    Inclusive: strong rows deduped by property_key, weak by dedup_hash, neither
+    kept as singletons — no lead dropped. `db` is RLS-bound to the user.
+    """
+    params: dict = {"uid": user_id, "types": record_types, "limit": limit}
+    county_clause = ""
+    if counties:
+        county_clause = "AND sc.county = ANY(:counties)"
+        params["counties"] = counties
+
+    sql = text(_UNION_SQL.format(county_clause=county_clause))
+    result = await db.execute(sql, params)
+    return result.fetchall()
+
+
+def _union_rows(rows: list) -> list[SegmentLeadRow]:
+    return [
+        SegmentLeadRow(
+            id=str(r.id),
+            date_recorded=r.date_recorded,
+            party_name=r.party_name,
+            parcel_id=r.parcel_id,
+            property_address=r.property_address,
+            mailing_address=r.mailing_address,
+            county=r.county,
+            state=r.state,
+            phone=r.phone,
+            phone_type=r.phone_type,
+            email=r.email,
+            matched_record_types=list(r.matched_record_types or []),
+            overlap_count=r.overlap_count,
+            identity_strength=r.identity_strength,
+        )
+        for r in rows
+    ]
+
+
+@router.post("/union", response_model=SegmentUnionResponse)
+async def union_preview(
+    body: SegmentUnionRequest,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_rls_db),
+) -> SegmentUnionResponse:
+    """JSON preview of the combined ('union') deduped lead set, capped at
+    PREVIEW_CAP. Inclusive — each row carries its identity_strength."""
+    await rate_limit(request, zone="general", identifier=current_user.id)
+
+    rows = await _fetch_union(
+        db, str(current_user.id), body.record_types, body.counties, PREVIEW_CAP + 1
+    )
+    truncated = len(rows) > PREVIEW_CAP
+    rows = rows[:PREVIEW_CAP]
+
+    return SegmentUnionResponse(
+        record_types=body.record_types,
+        counties=body.counties,
+        lead_count=len(rows),
+        truncated=truncated,
+        rows=_union_rows(rows),
+    )
+
+
+@router.post("/union/export")
+async def union_export(
+    body: SegmentUnionRequest,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_rls_db),
+) -> Response:
+    """CSV export of the combined ('union') deduped lead set. Adds an
+    identity_strength column (strong|weak). CSV-injection sanitized."""
+    await rate_limit(request, zone="general", identifier=current_user.id)
+
+    rows = await _fetch_union(
+        db, str(current_user.id), body.record_types, body.counties, EXPORT_CAP
+    )
+    if len(rows) >= EXPORT_CAP:
+        _logger.warning(
+            "Union export hit EXPORT_CAP=%d for user %s (types=%s) — truncated",
+            EXPORT_CAP, current_user.id, body.record_types,
+        )
+
+    output = io.StringIO()
+    fieldnames = [
+        "identity_strength", "matched_record_types", "overlap_count",
+        "party_name", "parcel_id", "property_address", "mailing_address",
+        "county", "state", "date_recorded", "phone", "phone_type", "email",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({
+            "identity_strength": sanitize_for_csv(r.identity_strength),
+            "matched_record_types": sanitize_for_csv("; ".join(r.matched_record_types or [])),
+            "overlap_count": r.overlap_count,
+            "party_name": sanitize_for_csv(r.party_name),
+            "parcel_id": sanitize_for_csv(r.parcel_id),
+            "property_address": sanitize_for_csv(r.property_address),
+            "mailing_address": sanitize_for_csv(r.mailing_address),
+            "county": sanitize_for_csv(r.county),
+            "state": sanitize_for_csv(r.state),
+            "date_recorded": sanitize_for_csv(r.date_recorded),
+            "phone": sanitize_for_csv(r.phone),
+            "phone_type": sanitize_for_csv(r.phone_type),
+            "email": sanitize_for_csv(r.email),
+        })
+
+    types_slug = "_".join(body.record_types)[:60]
+    return Response(
+        content=output.getvalue().encode("utf-8"),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="bridgeleads_combined_{types_slug}.csv"',
             "Cache-Control": "private, no-store",
         },
     )

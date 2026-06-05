@@ -73,4 +73,12 @@
 
 **Codex worked every step:** plan consult (adopted bulk-UPDATE/order/partial-index/backfill-all), 3A review (1 P2 fixed), 3B review (3 P2 fixed across 2 rounds, final clean).
 
-**Pending / later slices (NOT built):** inclusive UNION export (strong+weak, `identity_strength`); segment-builder UI (frontend repo); saved `Segment` model + scheduled combined delivery (Phase 5). Migration 037 is branch-only — do NOT apply to prod until merged to main (see migration/branch landmine).
+## Slice 3C — Inclusive UNION ("combine") export: ✅ BUILT (`6e42182`)
+- `POST /segments/union` (JSON preview) + `/union/export` (CSV + `identity_strength` col). 1+ distinct types.
+- Dedup bucket `COALESCE(property_key, dedup_hash, 'id:'||id)`: strong→property_key, weak→dedup_hash, neither→singleton. NO pk:/dh: prefix (un-backfilled strong row coalesces by hash value — Codex). `identity_strength` per-bucket via `bool_or(property_key IS NOT NULL)`.
+- Ranking: **contactable FIRST** → is_duplicate → recent → id (Codex P2: contactable-first so we never drop available phone/email; matches intersection). Never filters is_duplicate=false (would drop a lead).
+- No membership (union = direct results scan). Explicit `j.user_id`/`sc.user_id` predicates (added to intersection too).
+- 13 union tests. Codex review: 1 P2 (ranking order) fixed → **final CLEAN**.
+- **Documented caveat (not hidden):** dedup_hash is PRE-enrichment, property_key POST — un-backfilled strong rows whose enrichment changed parcel/addr can split/mislabel until `backfill_result_property_key.py` runs. Weak dedup is name|date (not property) → weak buckets merge same-name/date across types (intended; overlap_count not overclaimed for weak).
+
+**Pending / later slices (NOT built):** segment-builder UI (frontend repo `bridgeleads-web`); saved `Segment` model + scheduled combined delivery (Phase 5); optional perf index `(user_id, dedup_hash) WHERE dedup_hash IS NOT NULL` if heavy-user union scans show up. Migration 037 is branch-only — do NOT apply to prod until merged to main (migration/branch landmine). Run BOTH backfills offline post-merge.

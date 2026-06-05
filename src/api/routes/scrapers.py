@@ -117,8 +117,13 @@ async def create_scraper(
         if not ok:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=err)
 
-    # Business+ feature gating
-    if body.deliver.webhook_url and current_user.plan not in BUSINESS_FEATURES_PLANS:
+    # Business+ feature gating. Phase 5: the dialer push is a second outbound
+    # destination that POSTs lead PII, so it carries the SAME entitlement as the
+    # job-summary webhook — gate both, or a lower plan could exfiltrate PII via
+    # dialer_webhook_url (Codex).
+    if (
+        body.deliver.webhook_url or body.deliver.dialer_webhook_url
+    ) and current_user.plan not in BUSINESS_FEATURES_PLANS:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail="Webhook delivery requires a Business or Agency plan",

@@ -278,9 +278,12 @@ async def get_results(
     for cond in tax_conditions:
         base_query = base_query.where(cond)
 
-    # Phase 5: dialer-ready filter (valid phone + confirmed not-DNC).
+    # Phase 5: dialer-ready filter (valid phone + not known-DNC). Uses
+    # include_unknown_dnc=True because skip-trace leaves phone_dnc_flag NULL
+    # (no DNC feed); a strict IS-FALSE would hide every skip-traced phone. The
+    # dialer does the authoritative DNC scrub.
     if dialer_ready:
-        for cond in dialer_ready_conditions():
+        for cond in dialer_ready_conditions(include_unknown_dnc=True):
             base_query = base_query.where(cond)
 
     count_result = await db.execute(
@@ -799,9 +802,11 @@ async def download_export(
         )
         for cond in tax_conditions:
             dl_query = dl_query.where(cond)
-        # Phase 5: dialer-ready filter (same view/export semantics).
+        # Phase 5: dialer-ready filter (not known-DNC; matches get_results +
+        # the push — strict IS-FALSE would hide skip-traced phones whose DNC is
+        # NULL; the dialer scrubs DNC).
         if dialer_ready:
-            for cond in dialer_ready_conditions():
+            for cond in dialer_ready_conditions(include_unknown_dnc=True):
                 dl_query = dl_query.where(cond)
         # Any active filter -> an empty result is "no matches", not an empty job.
         any_filter_active = bool(tax_conditions) or dialer_ready

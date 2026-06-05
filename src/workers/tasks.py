@@ -936,6 +936,12 @@ def run_scrape_job(self, job_id: str) -> None:
                     db=db,
                 )
 
+        # ── PHASE 5: DIALER PUSH ──────────────────────────────────────────────
+        # NOT triggered here. Skip-trace is async (cache-miss rows are filled in
+        # later by the Tracerfy webhook), so a push at scrape completion would
+        # miss exactly the leads we want (Codex). The dialer push runs in
+        # workers/scheduler.dialer_push_sweep once a job's skip-trace has SETTLED.
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 

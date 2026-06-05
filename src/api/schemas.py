@@ -152,6 +152,34 @@ class ScheduleConfig(BaseModel):
     date_to: str | None = Field(default=None, max_length=32)
 
 
+def _validate_https_webhook_url(v: str | None) -> str | None:
+    """Structural validation only — HTTPS scheme + a real host + length.
+    The authoritative SSRF check (DNS resolution against blocked IP ranges)
+    runs in the worker via validate_outbound_webhook() immediately before the
+    POST, so a config save never depends on live DNS and a host that rebinds
+    after save is still caught."""
+    if v is None or v == "":
+        return None
+    if len(v) > 2000:
+        raise ValueError("webhook url too long (max 2000 chars)")
+    parsed = urlparse(v)
+    if parsed.scheme != "https":
+        raise ValueError("webhook url must use https://")
+    if not parsed.hostname:
+        raise ValueError("webhook url must include a host")
+    return v
+
+
+def _validate_webhook_secret(v: str | None) -> str | None:
+    if v is None or v == "":
+        return None
+    if len(v) < 24:
+        raise ValueError("webhook secret must be at least 24 characters")
+    if len(v) > 256:
+        raise ValueError("webhook secret too long (max 256 chars)")
+    return v
+
+
 class DeliverConfig(BaseModel):
     emails: list[EmailStr] = Field(default_factory=list, max_length=10)
     formats: list[str] = Field(default=["csv"], max_length=5)  # csv | excel | json (one or more)
@@ -162,6 +190,12 @@ class DeliverConfig(BaseModel):
     # using sha256(secret, canonical_json_payload). Empty = unsigned
     # (relies on URL secrecy alone). Min 24 chars when set.
     webhook_secret: str | None = None
+    # Phase 5: generic "push to any dialer". SEPARATE from webhook_url — this
+    # pushes dialer-ready LEAD ROWS (valid phone + not-DNC) to the user's dialer
+    # / Zapier catch-hook, not a job summary. Its own secret (no fallback to
+    # webhook_secret). Same HTTPS + SSRF-at-send-time guarantees.
+    dialer_webhook_url: str | None = None
+    dialer_webhook_secret: str | None = None
 
     @field_validator("emails")
     @classmethod
@@ -177,35 +211,15 @@ class DeliverConfig(BaseModel):
             raise ValueError("invalid format value")
         return v
 
-    @field_validator("webhook_url")
+    @field_validator("webhook_url", "dialer_webhook_url")
     @classmethod
     def webhook_url_format(cls, v: str | None) -> str | None:
-        # Structural validation only — HTTPS scheme + a real host + length.
-        # The authoritative SSRF check (DNS resolution against blocked IP
-        # ranges) runs in the worker via validate_outbound_webhook()
-        # immediately before the POST, so a config save never depends on
-        # live DNS and a host that rebinds after save is still caught.
-        if v is None or v == "":
-            return None
-        if len(v) > 2000:
-            raise ValueError("webhook_url too long (max 2000 chars)")
-        parsed = urlparse(v)
-        if parsed.scheme != "https":
-            raise ValueError("webhook_url must use https://")
-        if not parsed.hostname:
-            raise ValueError("webhook_url must include a host")
-        return v
+        return _validate_https_webhook_url(v)
 
-    @field_validator("webhook_secret")
+    @field_validator("webhook_secret", "dialer_webhook_secret")
     @classmethod
     def webhook_secret_length(cls, v: str | None) -> str | None:
-        if v is None or v == "":
-            return None
-        if len(v) < 24:
-            raise ValueError("webhook_secret must be at least 24 characters")
-        if len(v) > 256:
-            raise ValueError("webhook_secret too long (max 256 chars)")
-        return v
+        return _validate_webhook_secret(v)
 
 
 class FieldsConfig(BaseModel):
@@ -260,6 +274,8 @@ class DeliverConfigDict(TypedDict, total=False):
     formats: list[str]       # subset of: csv, excel, json
     webhook_url: str | None
     webhook_secret: str | None
+    dialer_webhook_url: str | None       # Phase 5: generic dialer push
+    dialer_webhook_secret: str | None
 
 
 class ScraperConfigCreate(BaseModel):

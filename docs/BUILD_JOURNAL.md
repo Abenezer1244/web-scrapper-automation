@@ -19,6 +19,30 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-05 — Lead Targeting Phase 4 (King tax filters) + Phase 3 merged to prod
+
+**Shipped to prod:** Phase 3 (combine/overlap) merged to main + pushed (`827040c`), deploy healthy (api.bridgeleads.io/health 200), migration 037 applied on boot. Both backfills (`backfill_result_property_key.py`, `backfill_property_membership.py`) still to run offline.
+
+**Built Phase 4 backend (branch `feature/phase4-tax-filters` off main, UNMERGED, 29 Phase-4 tests / 68 total pass, Codex CLEAN):** filter `tax_delinquent` leads by amount owed + time delinquent. KING FIRST (only King's Socrata feed has structured $ + tax year).
+- **4A `7f6f88a`** — migration **038**: `results.delinquent_amount NUMERIC(12,2)` + `delinquent_bill_year INTEGER` + 2 partial indexes. `_extract_tax_fields` (workers/tasks.py): SOURCE-GATED (King tax_delinquent only), coerced (`Decimal(str(v))`, quantized, reject negative/NaN/absurd; bill_year 1900..now+1) — every non-King row stays NULL. Populated at insert; offline `backfill_result_tax_fields.py` reuses the same extractor.
+- **4B `b9c048b`→`f86f6e0`** — VIEW/EXPORT filter (user chose option B: no billing change). `src/api/tax_filters.py` (pure): months↔bill_year math (King bills ~01/01/year → derive months at query time, never stale) + SQLAlchemy predicates (NULL structured rows never match a set filter). Wired into `get_results` (view), `download_export` (export), and `export-url` (carries params through the in-app flow). `delinquent_amount`/`delinquent_bill_year` surfaced in `ResultRow` + CSV.
+
+**Tried / Decided:** Codex consult recommended shipping 4A + option-B view-filter FIRST, deferring scrape-time filtering + the post-filter billing redesign (option A, the spec's eventual goal, HIGH risk). User confirmed option B. Stored `bill_year` (stable), not a volatile "months" value. Source-gated extraction (not "if keys present") so a future scraper reusing those key names can't silently poison the filter columns.
+
+**Caught & fixed (Codex reviewed every commit — 4 review rounds on 4B):**
+- 4A [P2]: worker writes 038 columns but workers don't run migrations → deploy-order race. DOCUMENTED (not coded around): same pattern as Phase 2a `doc_type`, self-healing via Celery `max_retries=3`. Merge-time note: API applies 038 before workers steady-state.
+- 4B [P2]: empty FILTERED export returned header-CSV even for a genuinely-empty job → added unfiltered existence check (404 preserved for empty job, header-CSV only when rows exist but none match).
+- 4B [P2]: `export-url` (in-app flow) dropped the filter params → unfiltered download. Threaded params through.
+- 4B [P3]: filtered `total==0` triggered the "previous job" empty-scrape suggestion → gated off when a tax filter is active.
+
+**Failed / Blocked:** non-King tax sourcing (Pierce/Snohomish/Kitsap have NO structured amount/age — recorder keyword matches only) is a separate research spike, NOT done. Scrape-time filter + billing redesign deferred.
+
+**Pending / Handoff:** merge Phase 4 to main (then run `backfill_result_tax_fields.py` offline; deploy-order note applies); tax-filter UI (frontend `bridgeleads-web`); non-King tax data spike; Phase 5 (Enzo dialer push). See `[[project_lead_targeting_milestone]]`.
+
+**Facts learned:** (1) workers skip migrations (`start.sh`) → any new column the worker writes is subject to a deploy-window race healed by Celery retry. (2) For King tax, "months delinquent" is a derived product metric off `bill_year` (bills issue ~Jan 1), not tax-law truth — don't overclaim exact duration. (3) View-filters that change `total` can leak into downstream empty-state logic (previous-job suggestion) — audit those when adding filters.
+
+---
+
 ## 2026-06-05 — Lead Targeting Phase 3 (slice 3C): inclusive UNION ("combine") export
 
 **Built (branch `feature/phase3-combine-overlap`, commit `6e42182`, 13 new tests; 44 Phase-3 tests pass):** the other half of combine/overlap — merge selected record-type lists into ONE deduped export, NEVER dropping weak leads.

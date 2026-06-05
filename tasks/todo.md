@@ -33,7 +33,14 @@
 - [x] `download_export`: same params → filtered export; empty filtered set returns header-only CSV (not 404, which stays for genuinely-empty jobs). Added `delinquent_amount` + `delinquent_bill_year` CSV columns.
 - [x] `ResultRow`: surfaced `delinquent_amount`/`delinquent_bill_year`.
 - [x] Inclusive bounds; non-King-tax rows (NULL cols) never match a set filter. 12 filter tests (29 Phase-4 total).
-- [ ] Codex review of 4B (next). UI gating (show inputs only for King tax configs) = frontend repo.
+- [x] Codex review of 4B — 3 P2 + 1 P3 caught + fixed across rounds → **final CLEAN**. UI gating (show inputs only for King tax configs) = frontend repo.
+
+## ✅ Phase 4 backend (King tax filters) DONE — review
+**Branch `feature/phase4-tax-filters` (off main), commits `7f6f88a` (4A) + `b9c048b`/`f86f6e0` (4B). 29 Phase-4 tests; 68 total pass; Codex CLEAN.**
+- 4A: migration 038 `results.delinquent_amount`/`delinquent_bill_year` + partial indexes; source-gated `_extract_tax_fields` populated at insert; offline backfill. Codex P2 = documented deploy-order note (self-healing via Celery retry).
+- 4B (option B, view/export, no billing change): `tax_filters.py` (months↔bill_year math + predicates); filters on `get_results` + `download_export` + `export-url` (carries params through the in-app flow); `delinquent_amount`/`delinquent_bill_year` surfaced in `ResultRow` + CSV. Codex fixes: empty-filtered export ≠ 404-empty-job; export-url drops filters; previous-job suggestion gated when filtered.
+
+**MERGE-TIME (when Phase 4 ships):** API applies 038 on boot before workers steady-state (deploy-order note); run `backfill_result_tax_fields.py` offline post-merge. **Pending:** tax-filter UI (frontend); non-King tax sourcing research spike (Pierce/Snohomish/Kitsap have no structured amount/age); scrape-time filter + billing redesign (option A, deferred). Then Phase 5 (Enzo dialer).
 
 ## DECISION FOR USER (before 4B): where does the filter apply + billing?
 - **(B, Codex-recommended)** view/export filter — scrape/bill everything, filter what's shown/exported. Low risk, no billing change. User pays for all scraped.

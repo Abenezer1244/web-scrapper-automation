@@ -218,10 +218,13 @@ async def get_results(
     # VIEW filter only — narrows what's shown, does not change scraping/billing.
     # Set filters exclude rows without structured tax data (every non-King-tax
     # row), since NULL never satisfies the comparison.
-    min_amount: float | None = Query(None, ge=0),
-    max_amount: float | None = Query(None, ge=0),
-    min_months: int | None = Query(None, ge=0),
-    max_months: int | None = Query(None, ge=0),
+    min_amount: float | None = Query(None, ge=0, le=100_000_000),
+    max_amount: float | None = Query(None, ge=0, le=100_000_000),
+    # Bounded (Codex security): an unbounded months value produces an
+    # out-of-int4 bill_year comparison bound -> Postgres "integer out of range"
+    # error / log churn. 1200 months = 100y, safely above any real delinquency.
+    min_months: int | None = Query(None, ge=0, le=1200),
+    max_months: int | None = Query(None, ge=0, le=1200),
     # Phase 5: dialer-ready filter (valid phone + confirmed not-DNC). VIEW filter.
     dialer_ready: bool = Query(False),
 ) -> ResultsPage:
@@ -567,10 +570,13 @@ async def get_export_url(
     # Phase 4: carry the tax view-filters through so the in-app export flow
     # (export-url -> download) produces a CSV that matches the filtered view,
     # rather than silently downloading the unfiltered set (Codex).
-    min_amount: float | None = Query(None, ge=0),
-    max_amount: float | None = Query(None, ge=0),
-    min_months: int | None = Query(None, ge=0),
-    max_months: int | None = Query(None, ge=0),
+    min_amount: float | None = Query(None, ge=0, le=100_000_000),
+    max_amount: float | None = Query(None, ge=0, le=100_000_000),
+    # Bounded (Codex security): an unbounded months value produces an
+    # out-of-int4 bill_year comparison bound -> Postgres "integer out of range"
+    # error / log churn. 1200 months = 100y, safely above any real delinquency.
+    min_months: int | None = Query(None, ge=0, le=1200),
+    max_months: int | None = Query(None, ge=0, le=1200),
     dialer_ready: bool = Query(False),  # Phase 5: carry dialer filter through too
 ) -> dict:
     """Return a short-lived download URL for the job's CSV export.
@@ -625,10 +631,13 @@ async def download_export(
     db: AsyncSession = Depends(get_db),
     # Phase 4: same tax view-filters as get_results so the export matches the
     # filtered view exactly. Optional; absent = full export (unchanged behavior).
-    min_amount: float | None = Query(None, ge=0),
-    max_amount: float | None = Query(None, ge=0),
-    min_months: int | None = Query(None, ge=0),
-    max_months: int | None = Query(None, ge=0),
+    min_amount: float | None = Query(None, ge=0, le=100_000_000),
+    max_amount: float | None = Query(None, ge=0, le=100_000_000),
+    # Bounded (Codex security): an unbounded months value produces an
+    # out-of-int4 bill_year comparison bound -> Postgres "integer out of range"
+    # error / log churn. 1200 months = 100y, safely above any real delinquency.
+    min_months: int | None = Query(None, ge=0, le=1200),
+    max_months: int | None = Query(None, ge=0, le=1200),
     dialer_ready: bool = Query(False),
 ):
     """Stream the CSV export directly from R2.

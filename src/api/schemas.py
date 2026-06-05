@@ -338,10 +338,21 @@ class ScraperConfigResponse(BaseModel):
         # defaults on read without a migration.
         if not isinstance(self.deliver, dict):
             self.deliver = {}
+        else:
+            # Shallow-copy so the redaction below never mutates the ORM-attached
+            # JSON dict (defensive — GETs don't commit, but don't risk it).
+            self.deliver = dict(self.deliver)
         self.deliver.setdefault("formats", ["csv"])
         self.deliver.setdefault("emails", [])
         self.deliver.setdefault("webhook_url", None)
-        self.deliver.setdefault("webhook_secret", None)
+        # Security (Codex): HMAC secrets are WRITE-ONLY — never return them. A
+        # stolen frontend token / XSS could otherwise read them and forge signed
+        # webhook/dialer payloads. Expose only presence flags so the UI can show
+        # "secret set" without leaking the value.
+        self.deliver["webhook_secret_set"] = bool(self.deliver.get("webhook_secret"))
+        self.deliver["dialer_webhook_secret_set"] = bool(self.deliver.get("dialer_webhook_secret"))
+        self.deliver.pop("webhook_secret", None)
+        self.deliver.pop("dialer_webhook_secret", None)
         # Also normalize fields / enrichment / schedule defensively
         if isinstance(self.fields, list):
             self.fields = dict.fromkeys(self.fields, True)

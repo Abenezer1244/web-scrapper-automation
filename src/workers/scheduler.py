@@ -849,7 +849,17 @@ def dialer_push_sweep() -> None:
     with system_sync_session() as db:
         candidates = db.execute(
             select(Job, ScraperConfig)
-            .join(ScraperConfig, ScraperConfig.id == Job.scraper_config_id)
+            # Owner-match in the join (Codex security, defense-in-depth): the DB
+            # doesn't enforce job.user_id == config.user_id, and this sweep runs
+            # in a system session that bypasses RLS — without this, a malformed
+            # job (user A) pointing at user B's config could push A's lead PII to
+            # B's dialer_webhook_url. The job-create path already enforces it; this
+            # closes the gap if a bad row ever exists.
+            .join(
+                ScraperConfig,
+                (ScraperConfig.id == Job.scraper_config_id)
+                & (ScraperConfig.user_id == Job.user_id),
+            )
             # Re-check entitlement at push time against the owner's CURRENT plan:
             # the dialer push is a Business+ feature, and a user who configured it
             # then downgraded must NOT keep pushing lead PII (Codex). Gating in SQL

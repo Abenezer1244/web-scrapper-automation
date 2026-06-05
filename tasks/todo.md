@@ -1,3 +1,10 @@
+# Security hardening (Codex adversarial review, Phases 3-5) — branch `security/phase3-5-hardening`
+**User: "security is priority."** Ran Codex adversarial security pass over `b78d698..main` (full milestone). CLEAN on: tenant isolation (segments/tax/dialer all user_id-scoped), SQL injection (params bound; county_clause is a fixed toggle), CSV injection (all fields sanitized/numeric), SSRF (validate_outbound_webhook + redirects off + redacted), PII-in-logs (host-only, response redacted). **3 findings fixed:**
+- [x] **Medium** — unbounded `min/max_months` → out-of-int4 bill_year bound = DB error/DoS. Added `le=1200` (months) + `le=100_000_000` (amount) on all 3 endpoints (get_results/download/export-url).
+- [x] **Medium** — dialer sweep joined ScraperConfig by id only (DB doesn't enforce job.user_id==config.user_id; system session bypasses RLS) → added `ScraperConfig.user_id == Job.user_id` owner-match to the join (defense-in-depth vs cross-tenant PII push).
+- [x] **Low** (pre-existing, widened by P5) — config responses returned `webhook_secret`/`dialer_webhook_secret` → made WRITE-ONLY in `ScraperConfigResponse` (presence flags `*_secret_set`, secrets popped). +3 regression tests.
+- [ ] Codex re-review of the hardening → merge.
+
 # Phase 5 — Dialer push (Enzo)
 
 **Branch:** `feature/phase5-dialer` off `main`. **Spec:** §Phase 5 — "Generic delivery-connector abstraction; Enzo API connector; push skip-traced + valid-phone + non-DNC rows."

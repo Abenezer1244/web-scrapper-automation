@@ -27,10 +27,13 @@
 ## 4A status: ✅ BUILT + Codex-reviewed (gate pass). Committed c6bd358. 17 tests pass.
 - **Codex [P2] — deploy-order race (DOCUMENTED, not coded around):** workers don't run migrations; a worker restarting with this code before the API applies 038 would hit undefined-column. Same pattern as Phase 2a `doc_type` (shipped fine) + self-healing via Celery `max_retries=3`/30s. **MERGE-TIME REQUIREMENT:** API applies 038 on boot before workers reach steady state; transient worker failures retry and heal. Not merged yet → no current risk.
 
-## Slice 4B — view/export tax filter + UI gating (AFTER user decides billing placement)
-- [ ] Filter inputs (min/max amount, min/max months) applied at the results view / export layer (option B), gated to King structured tax results. Null rows never match. Inclusive bounds. Server date for age cutoff.
-- [ ] Per-county availability surfaced (only King supports structured tax filters).
-- [ ] Tests + Codex review.
+## Slice 4B — view/export tax filter: ✅ BUILT (user chose option B — view/export, no billing change)
+- [x] `src/api/tax_filters.py` (pure, tested): `bill_year_bounds_for_months` (months↔bill_year, server date) + `build_tax_conditions` (SQLAlchemy predicates; NULL rows excluded when a filter is set).
+- [x] `get_results`: query params min/max_amount + min/max_months → ANDed into the paginated view query (`total`+`items` reflect filter; job-level scrape stats stay unfiltered).
+- [x] `download_export`: same params → filtered export; empty filtered set returns header-only CSV (not 404, which stays for genuinely-empty jobs). Added `delinquent_amount` + `delinquent_bill_year` CSV columns.
+- [x] `ResultRow`: surfaced `delinquent_amount`/`delinquent_bill_year`.
+- [x] Inclusive bounds; non-King-tax rows (NULL cols) never match a set filter. 12 filter tests (29 Phase-4 total).
+- [ ] Codex review of 4B (next). UI gating (show inputs only for King tax configs) = frontend repo.
 
 ## DECISION FOR USER (before 4B): where does the filter apply + billing?
 - **(B, Codex-recommended)** view/export filter — scrape/bill everything, filter what's shown/exported. Low risk, no billing change. User pays for all scraped.

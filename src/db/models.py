@@ -9,6 +9,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -194,6 +195,12 @@ class Result(Base):
     # property_keys back to full Result rows. dedup_hash is PRE-enrichment and
     # can differ, so it cannot serve this join.
     property_key = Column(String(64), nullable=True)
+    # Phase 4 (migration 038): structured tax-delinquency fields for amount/age
+    # filtering. Populated SOURCE-GATED (King Socrata tax_delinquent only);
+    # other counties' tax rows stay NULL and never match a filter. bill_year is
+    # stored (stable); "months delinquent" is derived at query time from it.
+    delinquent_amount = Column(Numeric(12, 2), nullable=True)
+    delinquent_bill_year = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     # PERF (migration 033): get_results filters job_id + user_id, aggregates
@@ -214,6 +221,19 @@ class Result(Base):
             "user_id",
             "property_key",
             postgresql_where=text("property_key IS NOT NULL"),
+        ),
+        # Phase 4 (migration 038): per-job tax filters over non-null structured rows.
+        Index(
+            "ix_results_job_delinquent_amount",
+            "job_id",
+            "delinquent_amount",
+            postgresql_where=text("delinquent_amount IS NOT NULL"),
+        ),
+        Index(
+            "ix_results_job_delinquent_year",
+            "job_id",
+            "delinquent_bill_year",
+            postgresql_where=text("delinquent_bill_year IS NOT NULL"),
         ),
     )
 

@@ -9,6 +9,7 @@ import asyncio
 import json
 import time
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, TypedDict, Unpack
 
 import redis as sync_redis
@@ -253,6 +254,47 @@ def _write_result_property_keys(db, rows, user_id: str) -> tuple[int, int]:
         db.commit()
         updated += res_proxy.rowcount or 0
     return (updated, weak)
+
+
+def _extract_tax_fields(
+    enrichment_data, record_type: str
+) -> tuple[Decimal | None, int | None]:
+    """Phase 4: SOURCE-GATED structured tax fields for amount/age filtering.
+
+    Returns (delinquent_amount, bill_year). ONLY King's Socrata tax_delinquent
+    rows carry trustworthy structured data, so anything else returns
+    (None, None) and never matches a tax filter — a generic "if the keys exist"
+    extraction would mis-populate any future scraper that reuses those key names
+    with a different meaning (Codex). Values are coerced + bounded so a malformed
+    scrape can't poison the filter columns. Raw enrichment_data is untouched.
+    """
+    if record_type != "tax_delinquent" or not isinstance(enrichment_data, dict):
+        return (None, None)
+    if enrichment_data.get("source") != "king_county_delinquent_taxes":
+        return (None, None)
+
+    amount: Decimal | None = None
+    raw_amt = enrichment_data.get("delinquent_amount")
+    if raw_amt is not None:
+        try:
+            # Decimal(str(...)) — never Decimal(float) (binary-float drift).
+            d = Decimal(str(raw_amt)).quantize(Decimal("0.01"))
+            if d.is_finite() and Decimal("0") <= d <= Decimal("99999999.99"):
+                amount = d
+        except (InvalidOperation, ValueError, TypeError):
+            amount = None
+
+    year: int | None = None
+    raw_year = enrichment_data.get("bill_year")
+    if raw_year not in (None, ""):
+        try:
+            y = int(str(raw_year).strip())
+            if 1900 <= y <= datetime.now(UTC).year + 1:
+                year = y
+        except (ValueError, TypeError):
+            year = None
+
+    return (amount, year)
 
 
 @app.task(
@@ -503,8 +545,13 @@ def run_scrape_job(self, job_id: str) -> None:
         total_rows_inserted = 0
         for i in range(0, len(records), batch_size):
             batch = records[i:i + batch_size]
-            rows = [
-                {
+            rows = []
+            for rec in batch:
+                # Phase 4: structured tax fields (King tax_delinquent only).
+                _tax_amount, _tax_bill_year = _extract_tax_fields(
+                    rec.enrichment_data, config.record_type
+                )
+                rows.append({
                     "id": str(_uuid.uuid4()),
                     "job_id": job_id,
                     "user_id": job.user_id,
@@ -522,9 +569,10 @@ def run_scrape_job(self, job_id: str) -> None:
                     # resolved in the post-insert dedup scan below
                     "dedup_hash": _compute_dedup_hash(rec.parcel_id, rec.property_address, rec.party_name, rec.date_recorded),
                     "is_duplicate": False,
-                }
-                for rec in batch
-            ]
+                    # Phase 4: NULL for everything except King structured tax rows.
+                    "delinquent_amount": _tax_amount,
+                    "delinquent_bill_year": _tax_bill_year,
+                })
             db.execute(sa_insert(Result), rows)
             db.commit()
             total_rows_inserted += len(rows)

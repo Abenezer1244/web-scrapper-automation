@@ -459,6 +459,10 @@ class ResultRow(BaseModel):
     skip_trace_status: str = "not_attempted"  # not_attempted|queued|submitted|hit|miss|errored
     skip_trace_attempted_at: datetime | None = None
     is_duplicate: bool = False
+    # Phase 4: structured tax-delinquency fields (King tax_delinquent only; NULL
+    # elsewhere). Surfaced so the results view can show + filter by them.
+    delinquent_amount: float | None = None
+    delinquent_bill_year: int | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

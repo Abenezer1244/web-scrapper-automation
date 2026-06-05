@@ -16,6 +16,7 @@ from src.api.auth import CurrentUser
 from src.api.deps import get_db, get_rls_db
 from src.api.middleware import audit_log, rate_limit, sanitize_for_csv, sanitize_search
 from src.api.schemas import JobCreate, JobResponse, LogLine, ResultRow, ResultsPage
+from src.api.tax_filters import build_tax_conditions
 from src.config import settings
 from src.config.constants import CANCELLABLE_STATUSES, PRIORITY_QUEUE_PLANS
 from src.db import CountyConnector, Job, JobLog, Result, ScraperConfig, User
@@ -212,6 +213,14 @@ async def get_results(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     q: str | None = Query(None, max_length=100),
+    # Phase 4: tax-delinquent view filters (amount owed + months delinquent).
+    # VIEW filter only — narrows what's shown, does not change scraping/billing.
+    # Set filters exclude rows without structured tax data (every non-King-tax
+    # row), since NULL never satisfies the comparison.
+    min_amount: float | None = Query(None, ge=0),
+    max_amount: float | None = Query(None, ge=0),
+    min_months: int | None = Query(None, ge=0),
+    max_months: int | None = Query(None, ge=0),
 ) -> ResultsPage:
     # Rate-limit before the (expensive, multi-query) read to prevent DB-amplification DoS.
     await rate_limit(request, zone="general", identifier=current_user.id)
@@ -254,6 +263,17 @@ async def get_results(
             | Result.parcel_id.ilike(pattern, escape="\\")
             | Result.property_address.ilike(pattern, escape="\\")
         )
+
+    # Phase 4: tax filters (amount owed / months delinquent). Applied to the
+    # paginated view query so `total` + `items` reflect the filter; the job-level
+    # scrape stats below (enriched/parcel/dedup counts) intentionally stay
+    # unfiltered (they describe the scrape, not the current filter view).
+    from datetime import UTC, datetime
+    tax_conditions = build_tax_conditions(
+        min_amount, max_amount, min_months, max_months, datetime.now(UTC).date()
+    )
+    for cond in tax_conditions:
+        base_query = base_query.where(cond)
 
     count_result = await db.execute(
         select(func.count()).select_from(base_query.subquery())
@@ -336,7 +356,11 @@ async def get_results(
     # Searches across ALL scraper configs for the same county+type,
     # not just the same config_id.
     previous_job_id = None
-    if total == 0 and config:
+    # Skip the empty-scrape "previous job" suggestion when a tax filter is
+    # active: total==0 then means "no rows matched the filter", NOT "the job
+    # scraped nothing", and the prior job wasn't checked against the same filter
+    # so suggesting it would be misleading (Codex).
+    if total == 0 and config and not tax_conditions:
         # Find all config IDs for same county/state/record_type
         sibling_configs = await db.execute(
             select(ScraperConfig.id).where(
@@ -529,6 +553,13 @@ async def get_export_url(
     job_id: str,
     user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
+    # Phase 4: carry the tax view-filters through so the in-app export flow
+    # (export-url -> download) produces a CSV that matches the filtered view,
+    # rather than silently downloading the unfiltered set (Codex).
+    min_amount: float | None = Query(None, ge=0),
+    max_amount: float | None = Query(None, ge=0),
+    min_months: int | None = Query(None, ge=0),
+    max_months: int | None = Query(None, ge=0),
 ) -> dict:
     """Return a short-lived download URL for the job's CSV export.
 
@@ -558,7 +589,18 @@ async def get_export_url(
     from src.api.download_tokens import mint_download_token
     download_token = mint_download_token(str(user.id), job_id, ttl_seconds=60)
 
-    return {"url": f"/jobs/{job_id}/download?token={download_token}"}
+    # Append any active tax filters so the download matches the filtered view.
+    from urllib.parse import urlencode
+    query: dict = {"token": download_token}
+    for key, val in (
+        ("min_amount", min_amount),
+        ("max_amount", max_amount),
+        ("min_months", min_months),
+        ("max_months", max_months),
+    ):
+        if val is not None:
+            query[key] = val
+    return {"url": f"/jobs/{job_id}/download?{urlencode(query)}"}
 
 
 @router.get("/{job_id}/download", tags=["jobs"])
@@ -567,6 +609,12 @@ async def download_export(
     token: str = Query(default=""),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
+    # Phase 4: same tax view-filters as get_results so the export matches the
+    # filtered view exactly. Optional; absent = full export (unchanged behavior).
+    min_amount: float | None = Query(None, ge=0),
+    max_amount: float | None = Query(None, ge=0),
+    min_months: int | None = Query(None, ge=0),
+    max_months: int | None = Query(None, ge=0),
 ):
     """Stream the CSV export directly from R2.
 
@@ -728,13 +776,37 @@ async def download_export(
     try:
         # RLS context already set above (before the Job ownership read).
         # Generate CSV directly from database results
-        results_query = await db.execute(
-            select(Result).where(Result.job_id == job_id, Result.user_id == user.id)
+        from datetime import UTC, datetime
+        dl_query = select(Result).where(Result.job_id == job_id, Result.user_id == user.id)
+        # Phase 4: apply the SAME tax view-filters as get_results so the export
+        # matches the filtered view. Track whether a filter is active so an
+        # empty filtered set returns a header-only CSV (a valid "no matches")
+        # rather than the 404 used for a genuinely empty job.
+        tax_conditions = build_tax_conditions(
+            min_amount, max_amount, min_months, max_months, datetime.now(UTC).date()
         )
+        for cond in tax_conditions:
+            dl_query = dl_query.where(cond)
+        tax_filter_active = bool(tax_conditions)
+
+        results_query = await db.execute(dl_query)
         records = results_query.scalars().all()
 
         if not records:
-            raise HTTPException(status_code=404, detail="No records found for this job")
+            # A genuinely empty job still 404s (existing contract). With a filter
+            # active the filtered query can't tell "no matches" from "empty job",
+            # so check unfiltered existence: rows exist but none matched -> a
+            # valid header-only CSV; no rows at all -> 404 (Codex).
+            job_has_any = False
+            if tax_filter_active:
+                exists_row = await db.execute(
+                    select(Result.id)
+                    .where(Result.job_id == job_id, Result.user_id == user.id)
+                    .limit(1)
+                )
+                job_has_any = exists_row.scalar_one_or_none() is not None
+            if not job_has_any:
+                raise HTTPException(status_code=404, detail="No records found for this job")
 
         # Build CSV in memory — includes skip trace fields (phone, email)
         # when available. The download always reads LIVE from the DB, so
@@ -745,11 +817,14 @@ async def download_export(
             "date_recorded", "party_name", "heirs", "parcel_id",
             "property_address", "mailing_address", "legal_description",
             "doc_type",
+            # Phase 4: structured tax columns (King tax_delinquent; blank elsewhere)
+            "delinquent_amount", "delinquent_bill_year",
             "phone", "phone_type", "email",
         ]
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
         for r in records:
+            _amt = getattr(r, "delinquent_amount", None)
             writer.writerow({
                 "date_recorded": sanitize_for_csv(r.date_recorded),
                 "party_name": sanitize_for_csv(r.party_name),
@@ -760,6 +835,9 @@ async def download_export(
                 "legal_description": sanitize_for_csv(r.legal_description),
                 # Phase 2a: live download must surface doc_type too (Codex P1)
                 "doc_type": sanitize_for_csv(getattr(r, "doc_type", None)),
+                # Phase 4: numeric/int — render plainly, no CSV-injection surface.
+                "delinquent_amount": "" if _amt is None else f"{_amt}",
+                "delinquent_bill_year": getattr(r, "delinquent_bill_year", None) or "",
                 "phone": sanitize_for_csv(getattr(r, "phone", None)),
                 "phone_type": sanitize_for_csv(getattr(r, "phone_type", None)),
                 "email": sanitize_for_csv(getattr(r, "email", None)),

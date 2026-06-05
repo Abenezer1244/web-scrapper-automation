@@ -19,6 +19,23 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-05 — Lead Targeting Phase 5 (dialer-ready foundation) + Phase 4 merged to prod
+
+**Shipped to prod:** Phase 4 (King tax filters) merged to main + pushed (`76c9e77`), deploy healthy (health 200), migration 038 applied on boot. Run `backfill_result_tax_fields.py` offline (pending).
+
+**Built Phase 5 foundation (branch `feature/phase5-dialer` off main, UNMERGED, 4 tests / 72 total pass, Codex CLEAN first pass):** the Enzo-INDEPENDENT half of "push leads into a dialer".
+- **5A `2609ddb`** — `src/api/dialer_filters.py` (pure): `dialer_ready_conditions(include_unknown_dnc=False)` → valid phone (`phone IS NOT NULL AND trim<>''`) + **TCPA-safe DNC (`phone_dnc_flag IS FALSE` — unknown/NULL excluded, per FTC TSR)**. `include_unknown_dnc=True` gives the looser "candidate" set (`IS NOT TRUE`). Provenance-agnostic (NO skip_trace gate — a valid phone from any source qualifies; the future Enzo task can add `='hit'`). Exposed as `dialer_ready=true` view/export param on `get_results` + `download_export` + `export-url` (threaded through the in-app flow proactively, applying the 4B lesson). Users can export dialer-ready CSVs to ANY dialer today (matches the PRD "integrate, don't build a dialer" stance).
+
+**Tried / Decided:** Codex consult confirmed: ship the dialer-ready SELECTION now (real, valuable, Enzo-independent), but do NOT build Enzo tables/DTOs/fake clients/tasks — speculative without the API docs. Reuse `webhook_delivery.py`'s outbound pattern (SSRF allowlist, HMAC, Celery retry) as the connector model, but Enzo needs a dedicated connector, not a generic webhook. DNC: chose the compliance-SAFE default (`IS FALSE`) over including unknown-DNC — TCPA non-negotiable; looser "candidate" mode is an explicit opt-in (function supports it; API exposes only the safe default for now).
+
+**BLOCKED — Slice 5B (the actual Enzo connector):** spec says Enzo API docs/credentials are "supplied at Phase 5" — NOT provided. Cannot build a real connector against an unknown API (no mock code). Need from user: base URL + env, auth (key/OAuth/HMAC/bearer + refresh), endpoint(s) (create/update contact, add to list/campaign, bulk import), payload schema (required fields, phone format, lead IDs), rate limits + batching, idempotency/upsert (external ID, dup handling), DNC/consent source of truth (Enzo vs us), campaign/list model, error contract (retryable vs terminal), audit/PII-redaction/retention, status callback.
+
+**Pending / Handoff:** merge Phase 5 foundation; obtain Enzo API docs/creds → build 5B connector + push task; "push to dialer" delivery option (UI = frontend); run `backfill_result_tax_fields.py` offline. Earlier milestone follow-ups still open: P3/P4 UI (frontend), non-King tax data spike, Phase-1/3 backfills offline. See `[[project_lead_targeting_milestone]]`.
+
+**Facts learned:** (1) TCPA/FTC TSR: "dialer-ready" must mean DNC-confirmed-FALSE, not merely not-known-DNC — unknown DNC is not callable. (2) The view/export filter pattern (params on get_results + download_export + export-url, empty≠404, gate previous-job suggestion) is now reused 3×; it's the project's standard "filter what's shown/exported" shape.
+
+---
+
 ## 2026-06-05 — Lead Targeting Phase 4 (King tax filters) + Phase 3 merged to prod
 
 **Shipped to prod:** Phase 3 (combine/overlap) merged to main + pushed (`827040c`), deploy healthy (api.bridgeleads.io/health 200), migration 037 applied on boot. Both backfills (`backfill_result_property_key.py`, `backfill_property_membership.py`) still to run offline.

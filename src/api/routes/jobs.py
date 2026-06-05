@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
 from src.api.deps import get_db, get_rls_db
+from src.api.dialer_filters import dialer_ready_conditions
 from src.api.middleware import audit_log, rate_limit, sanitize_for_csv, sanitize_search
 from src.api.schemas import JobCreate, JobResponse, LogLine, ResultRow, ResultsPage
 from src.api.tax_filters import build_tax_conditions
@@ -221,6 +222,8 @@ async def get_results(
     max_amount: float | None = Query(None, ge=0),
     min_months: int | None = Query(None, ge=0),
     max_months: int | None = Query(None, ge=0),
+    # Phase 5: dialer-ready filter (valid phone + confirmed not-DNC). VIEW filter.
+    dialer_ready: bool = Query(False),
 ) -> ResultsPage:
     # Rate-limit before the (expensive, multi-query) read to prevent DB-amplification DoS.
     await rate_limit(request, zone="general", identifier=current_user.id)
@@ -274,6 +277,14 @@ async def get_results(
     )
     for cond in tax_conditions:
         base_query = base_query.where(cond)
+
+    # Phase 5: dialer-ready filter (valid phone + not known-DNC). Uses
+    # include_unknown_dnc=True because skip-trace leaves phone_dnc_flag NULL
+    # (no DNC feed); a strict IS-FALSE would hide every skip-traced phone. The
+    # dialer does the authoritative DNC scrub.
+    if dialer_ready:
+        for cond in dialer_ready_conditions(include_unknown_dnc=True):
+            base_query = base_query.where(cond)
 
     count_result = await db.execute(
         select(func.count()).select_from(base_query.subquery())
@@ -356,11 +367,11 @@ async def get_results(
     # Searches across ALL scraper configs for the same county+type,
     # not just the same config_id.
     previous_job_id = None
-    # Skip the empty-scrape "previous job" suggestion when a tax filter is
+    # Skip the empty-scrape "previous job" suggestion when ANY view filter is
     # active: total==0 then means "no rows matched the filter", NOT "the job
     # scraped nothing", and the prior job wasn't checked against the same filter
     # so suggesting it would be misleading (Codex).
-    if total == 0 and config and not tax_conditions:
+    if total == 0 and config and not tax_conditions and not dialer_ready:
         # Find all config IDs for same county/state/record_type
         sibling_configs = await db.execute(
             select(ScraperConfig.id).where(
@@ -560,6 +571,7 @@ async def get_export_url(
     max_amount: float | None = Query(None, ge=0),
     min_months: int | None = Query(None, ge=0),
     max_months: int | None = Query(None, ge=0),
+    dialer_ready: bool = Query(False),  # Phase 5: carry dialer filter through too
 ) -> dict:
     """Return a short-lived download URL for the job's CSV export.
 
@@ -600,6 +612,8 @@ async def get_export_url(
     ):
         if val is not None:
             query[key] = val
+    if dialer_ready:
+        query["dialer_ready"] = "true"
     return {"url": f"/jobs/{job_id}/download?{urlencode(query)}"}
 
 
@@ -615,6 +629,7 @@ async def download_export(
     max_amount: float | None = Query(None, ge=0),
     min_months: int | None = Query(None, ge=0),
     max_months: int | None = Query(None, ge=0),
+    dialer_ready: bool = Query(False),
 ):
     """Stream the CSV export directly from R2.
 
@@ -787,7 +802,14 @@ async def download_export(
         )
         for cond in tax_conditions:
             dl_query = dl_query.where(cond)
-        tax_filter_active = bool(tax_conditions)
+        # Phase 5: dialer-ready filter (not known-DNC; matches get_results +
+        # the push — strict IS-FALSE would hide skip-traced phones whose DNC is
+        # NULL; the dialer scrubs DNC).
+        if dialer_ready:
+            for cond in dialer_ready_conditions(include_unknown_dnc=True):
+                dl_query = dl_query.where(cond)
+        # Any active filter -> an empty result is "no matches", not an empty job.
+        any_filter_active = bool(tax_conditions) or dialer_ready
 
         results_query = await db.execute(dl_query)
         records = results_query.scalars().all()
@@ -798,7 +820,7 @@ async def download_export(
             # so check unfiltered existence: rows exist but none matched -> a
             # valid header-only CSV; no rows at all -> 404 (Codex).
             job_has_any = False
-            if tax_filter_active:
+            if any_filter_active:
                 exists_row = await db.execute(
                     select(Result.id)
                     .where(Result.job_id == job_id, Result.user_id == user.id)

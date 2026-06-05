@@ -129,6 +129,85 @@ def build_webhook_payload(
     return payload
 
 
+# Phase 5: generic dialer push. Cap leads per POST conservatively — dialer-ready
+# rows are wide (name/phone/email/addresses) and Zapier/dialer webhook bodies
+# have size limits. `truncated` + `total_dialer_ready_count` tell the consumer
+# how much was held back; the full set stays available via the normal export.
+DIALER_PUSH_CAP = 500
+_DIALER_SCHEMA_VERSION = "2026-06-05.dialer_ready.v1"
+
+
+def build_dialer_push_payload(
+    job_id: str,
+    scraper_config_id: str,
+    scraper_name: str,
+    county: str,
+    state: str,
+    record_type: str,
+    leads: list[dict],
+    total_dialer_ready_count: int,
+    webhook_secret: str | None,
+) -> dict:
+    """Build the dialer-push payload — dialer-ready LEAD ROWS for a dialer/Zapier.
+
+    `leads` is the ALREADY-capped, dialer-ready list (each a flat dict with id +
+    contact fields). Each lead gets a stable `external_id` (and the scraper's
+    county/state/record_type flattened in) so a consumer can create/dedupe
+    contacts; `batch.id` is the stable per-job batch key for retry-safe dedup
+    (the per-attempt id is the X-BridgeLeads-Delivery header, NOT this). PII
+    (phone/email) travels in the body — the caller guarantees HTTPS + SSRF guard
+    + a per-user destination, and the transport logs host only.
+    """
+    now = datetime.now(UTC)
+    enriched: list[dict] = []
+    for ld in leads:
+        rid = str(ld.get("id"))
+        # Honest DNC labeling (Codex): BridgeLeads has no DNC feed, so a row is
+        # "clear" only when phone_dnc_flag is explicitly False; NULL = "unknown".
+        # We exclude KNOWN-DNC upstream but never claim an unknown number is
+        # confirmed callable — the consumer/dialer must scrub (see dnc_scrubbed).
+        dnc = ld.get("phone_dnc_flag")
+        dnc_status = "clear" if dnc is False else ("dnc" if dnc is True else "unknown")
+        enriched.append({
+            "external_id": f"bridgeleads:result:{rid}",
+            "id": rid,
+            "party_name": ld.get("party_name"),
+            "phone": ld.get("phone"),
+            "phone_type": ld.get("phone_type"),
+            "dnc_status": dnc_status,
+            "email": ld.get("email"),
+            "property_address": ld.get("property_address"),
+            "mailing_address": ld.get("mailing_address"),
+            "county": county,
+            "state": state,
+            "record_type": record_type,
+        })
+
+    payload = {
+        "event": "leads.dialer_ready",
+        "schema_version": _DIALER_SCHEMA_VERSION,
+        "delivered_at": now.isoformat(),
+        # BridgeLeads does NOT scrub the DNC registry — leads carry valid phones
+        # that are not KNOWN-DNC, but unknown-DNC numbers are included. The
+        # receiving dialer is the authoritative DNC/TCPA compliance layer.
+        "dnc_scrubbed": False,
+        "batch": {"id": f"job:{job_id}:dialer-ready:v1", "job_id": job_id},
+        "scraper": {
+            "id": scraper_config_id,
+            "name": scraper_name,
+            "county": county,
+            "state": state,
+            "record_type": record_type,
+        },
+        "lead_count": len(enriched),
+        "total_dialer_ready_count": total_dialer_ready_count,
+        "truncated": total_dialer_ready_count > len(enriched),
+        "leads": enriched,
+    }
+    payload["signature"] = _sign_payload(payload, webhook_secret)
+    return payload
+
+
 @app.task(
     name="src.workers.webhook_delivery.deliver_job_webhook",
     bind=True,
@@ -156,6 +235,14 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
     """
     attempt = self.request.retries + 1
     host = urlparse(webhook_url).hostname or "?"
+    # Phase 5: dialer pushes carry lead PII in the request body. A rejecting
+    # endpoint may echo the submitted fields back in its response, so we must NOT
+    # log or persist (Celery result backend) the response body for these events
+    # (Codex). Redact it to a status-only marker.
+    _redact_response = payload.get("event") == "leads.dialer_ready"
+
+    def _excerpt(text: str) -> str:
+        return "<redacted: dialer push>" if _redact_response else text[:500]
 
     # SSRF guard (authoritative): re-validate the destination immediately
     # before the POST so a host that rebinds to a private/metadata IP after
@@ -226,7 +313,7 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
     if resp.status_code >= 400:
         _logger.warning(
             "Webhook %s delivery %d: %d %s",
-            job_id[:8], attempt, resp.status_code, resp.text[:200],
+            job_id[:8], attempt, resp.status_code, _excerpt(resp.text),
         )
         if attempt >= _MAX_RETRIES + 1:
             # Final failure — log + return without raising so the job
@@ -239,12 +326,17 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
             return {
                 "status": "failed",
                 "status_code": resp.status_code,
-                "response_excerpt": resp.text[:500],
+                "response_excerpt": _excerpt(resp.text),
                 "attempts": attempt,
             }
-        # Retry via Celery's mechanism
+        # Retry via Celery's mechanism. The exc message reaches logs + the result
+        # backend, so keep the body out of it for dialer pushes.
+        retry_detail = (
+            f"HTTP {resp.status_code}" if _redact_response
+            else f"HTTP {resp.status_code}: {resp.text[:200]}"
+        )
         raise self.retry(
-            exc=Exception(f"HTTP {resp.status_code}: {resp.text[:200]}"),
+            exc=Exception(retry_detail),
             countdown=_BACKOFF_BASE * (5 ** self.request.retries),
         )
 
@@ -255,6 +347,6 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
     return {
         "status": "delivered",
         "status_code": resp.status_code,
-        "response_excerpt": resp.text[:500],
+        "response_excerpt": _excerpt(resp.text),
         "attempts": attempt,
     }

@@ -67,6 +67,14 @@ app.conf.beat_schedule = {
         "task": "src.workers.scheduler.flush_skip_trace_meter_outbox",
         "schedule": 180.0,  # every 3 minutes
     },
+    "dialer-push-sweep": {
+        # Phase 5: push dialer-ready leads for jobs whose async skip-trace has
+        # SETTLED (can't push at scrape completion — cache-miss phones arrive
+        # later via the Tracerfy webhook). Claims each job once via
+        # Job.dialer_pushed_at. No-op when no config has a dialer_webhook_url.
+        "task": "src.workers.scheduler.dialer_push_sweep",
+        "schedule": 300.0,  # every 5 minutes
+    },
     "refresh-public-sample-cache": {
         # RLS cutover Phase 2b: precompute the sanitized landing-page samples
         # so the public /scrapers/sample endpoint reads a cache row instead of
@@ -774,3 +782,190 @@ def flush_skip_trace_meter_outbox() -> None:
             "Skip-trace meter outbox sweep: re-enqueued %d unreported event(s)",
             enqueued,
         )
+
+
+# ─── Task: Dialer push sweep (Phase 5) ───────────────────────────────────────
+
+@app.task(name="src.workers.scheduler.dialer_push_sweep")
+def dialer_push_sweep() -> None:
+    """Push dialer-ready leads for done jobs whose skip-trace has SETTLED.
+
+    Deferred from scrape completion on purpose: skip-trace is async — cache-miss
+    rows are marked queued/submitted and their phone/DNC are filled in later by
+    the Tracerfy webhook, so a push at completion would miss exactly the leads
+    we want (Codex). A job is "settled" when no Result of it is still
+    queued/submitted. Each job is claimed once via Job.dialer_pushed_at, so even
+    a job with zero dialer-ready leads is evaluated only once. Reuses
+    deliver_job_webhook (SSRF re-validate, HMAC, retry, non-fatal). No-op when no
+    config has a dialer_webhook_url.
+    """
+    from sqlalchemy import and_, func, or_, select, update
+
+    from src.api.dialer_filters import dialer_ready_conditions
+    from src.config.constants import BUSINESS_FEATURES_PLANS
+    from src.db.models import Job, PendingSkipTraceRow, Result, ScraperConfig, User
+    from src.db.session import system_sync_session
+    from src.workers.webhook_delivery import (
+        DIALER_PUSH_CAP,
+        build_dialer_push_payload,
+        deliver_job_webhook,
+    )
+
+    _BATCH = 50
+    # Jobs still waiting on async skip-trace. Base "settled" on the pending QUEUE
+    # (the authoritative async-work tracker), NOT Result.skip_trace_status: when
+    # Tracerfy submission errors, the dispatcher marks the pending row 'errored'
+    # but leaves Result 'queued', so a Result-based check would NEVER settle that
+    # job (Codex). queued/submitted = in-flight; completed/errored = terminal.
+    #
+    # Settlement nuance (Codex), queued vs submitted differ:
+    #  - 'queued' rows are local dispatcher backlog — the dispatcher WILL process
+    #    them even if it's down/backlogged for a while, so they ALWAYS block
+    #    settlement until they leave the queue. Aging them out would claim the
+    #    job before the phones exist, and it would never push again.
+    #  - 'submitted' rows are in-flight at Tracerfy and CAN get stuck if the
+    #    completed CSV omits them; those age out past the cutoff so a wedged row
+    #    can't block the push forever. Age by submitted_at (COALESCE to
+    #    enqueued_at only as a defensive fallback for a NULL submitted_at).
+    _stale_cutoff = datetime.now(UTC) - timedelta(hours=12)
+    _submitted_age = func.coalesce(
+        PendingSkipTraceRow.submitted_at, PendingSkipTraceRow.enqueued_at
+    )
+    unsettled = (
+        select(PendingSkipTraceRow.id)
+        .where(
+            PendingSkipTraceRow.job_id == Job.id,
+            or_(
+                PendingSkipTraceRow.status == "queued",
+                and_(
+                    PendingSkipTraceRow.status == "submitted",
+                    _submitted_age >= _stale_cutoff,
+                ),
+            ),
+        )
+        .exists()
+    )
+
+    with system_sync_session() as db:
+        candidates = db.execute(
+            select(Job, ScraperConfig)
+            .join(ScraperConfig, ScraperConfig.id == Job.scraper_config_id)
+            # Re-check entitlement at push time against the owner's CURRENT plan:
+            # the dialer push is a Business+ feature, and a user who configured it
+            # then downgraded must NOT keep pushing lead PII (Codex). Gating in SQL
+            # also keeps downgraded users' jobs out of the candidate set entirely.
+            .join(User, User.id == Job.user_id)
+            .where(
+                Job.status == "done",
+                Job.dialer_pushed_at.is_(None),
+                User.plan.in_(BUSINESS_FEATURES_PLANS),
+                # ->> returns NULL for missing key or non-text; works for JSON/JSONB.
+                ScraperConfig.deliver.op("->>")("dialer_webhook_url").isnot(None),
+                ScraperConfig.deliver.op("->>")("dialer_webhook_url") != "",
+                ~unsettled,
+            )
+            .limit(_BATCH)
+        ).all()
+
+        pushed = 0
+        for job, config in candidates:
+            deliver = config.deliver or {}
+            url = deliver.get("dialer_webhook_url")
+            if not url:
+                continue  # defensive: SQL filter should already guarantee this
+            # DURABLE CLAIM BEFORE PUBLISH (at-most-once): atomically stamp
+            # dialer_pushed_at from NULL and COMMIT before enqueuing. This both
+            # serializes concurrent sweeps (only one UPDATE flips NULL->now) and
+            # closes the publish-before-commit window — if we enqueued first and
+            # then crashed pre-commit, the next sweep would re-push (Codex). A
+            # lost push after a successful claim is recoverable via manual export;
+            # a duplicate dialer import is not, so claim-first is the safe order.
+            claimed = db.execute(
+                update(Job)
+                .where(Job.id == job.id, Job.dialer_pushed_at.is_(None))
+                .values(dialer_pushed_at=datetime.now(UTC))
+            ).rowcount
+            db.commit()
+            if not claimed:
+                continue  # another sweep claimed it first
+            try:
+                # NOT-known-DNC (include_unknown_dnc=True): skip-trace populates
+                # phone but leaves phone_dnc_flag NULL (Tracerfy returns no DNC),
+                # so a strict `IS FALSE` would match nothing and the feature would
+                # push zero leads (Codex). The destination dialer performs the
+                # authoritative DNC scrub; this excludes only KNOWN-DNC numbers
+                # and is forward-safe if DNC data is added later.
+                conds = dialer_ready_conditions(include_unknown_dnc=True)
+                # Exclude cross-job duplicates: a recurring scrape re-finds an
+                # already-delivered lead and stores it is_duplicate=true; pushing
+                # it (with a NEW result id as external_id) would re-import the same
+                # contact every run (Codex). Push only fresh leads.
+                conds = [*conds, Result.is_duplicate.is_(False)]
+                total = db.execute(
+                    select(func.count()).select_from(Result).where(
+                        Result.job_id == job.id, Result.user_id == job.user_id, *conds
+                    )
+                ).scalar_one()
+                if total > 0:
+                    rows = db.execute(
+                        select(Result)
+                        .where(Result.job_id == job.id, Result.user_id == job.user_id, *conds)
+                        .order_by(Result.id)  # deterministic before LIMIT
+                        .limit(DIALER_PUSH_CAP)
+                    ).scalars().all()
+                    leads = [
+                        {
+                            "id": row.id,
+                            "party_name": row.party_name,
+                            "phone": row.phone,
+                            "phone_type": row.phone_type,
+                            "phone_dnc_flag": row.phone_dnc_flag,
+                            "email": row.email,
+                            "property_address": row.property_address,
+                            "mailing_address": row.mailing_address,
+                        }
+                        for row in rows
+                    ]
+                    payload = build_dialer_push_payload(
+                        job_id=str(job.id),
+                        scraper_config_id=str(config.id),
+                        scraper_name=config.name,
+                        county=config.county,
+                        state=config.state,
+                        record_type=config.record_type,
+                        leads=leads,
+                        total_dialer_ready_count=total,
+                        webhook_secret=deliver.get("dialer_webhook_secret"),
+                    )
+                    deliver_job_webhook.delay(str(job.id), url, payload)
+                    pushed += 1
+                    _logger.info(
+                        "Dialer push queued for job %s: %d of %d dialer-ready leads",
+                        job.id, len(leads), total,
+                    )
+                # Already claimed+committed above. A 0-lead job stays claimed so
+                # it isn't re-evaluated every sweep forever.
+            except Exception as exc:  # noqa: BLE001 — one bad job must not stall the sweep
+                # The enqueue is the LAST step in the try and only raises BEFORE
+                # the message is sent, so reaching here means nothing was pushed.
+                # Un-claim (dialer_pushed_at back to NULL) so a transient error
+                # retries next sweep — without reopening the duplicate-push window
+                # (a crash here leaves the claim set, which is the safe direction).
+                # Never log the URL (token risk) or lead PII — message only.
+                try:
+                    db.rollback()
+                    db.execute(
+                        update(Job)
+                        .where(Job.id == job.id)
+                        .values(dialer_pushed_at=None)
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                _logger.warning(
+                    "Dialer push sweep: job %s failed (will retry next sweep): %s",
+                    job.id, str(exc)[:200],
+                )
+
+        if pushed:
+            _logger.info("Dialer push sweep: enqueued %d job push(es)", pushed)

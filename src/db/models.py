@@ -149,6 +149,11 @@ class Job(Base):
     started_at = Column(DateTime(timezone=True), nullable=True)
     finished_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # Phase 5 (migration 039): set once the dialer-push sweep has handled this
+    # job (after skip-trace settles). NULL = not yet evaluated; the sweep claims
+    # only done jobs with a dialer_webhook_url whose skip-trace is settled and
+    # this is NULL, so each job is pushed at most once.
+    dialer_pushed_at = Column(DateTime(timezone=True), nullable=True)
 
     # PERF (migration 033): list_jobs filters user_id and orders by created_at.
     __table_args__ = (

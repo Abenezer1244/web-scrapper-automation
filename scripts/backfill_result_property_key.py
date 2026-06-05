@@ -27,6 +27,8 @@ from src.db.session import SyncSessionLocal
 from src.workers.property_identity import compute_property_key
 
 logging.basicConfig(level=logging.INFO)
+# Silence SQLAlchemy per-statement echo — bulk backfill runs many statements.
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 _log = logging.getLogger("backfill_result_property_key")
 
 
@@ -59,23 +61,35 @@ def run(batch: int) -> None:
             if not rows:
                 break
             last_id = str(rows[-1].id)
+            # ONE bulk UPDATE per batch via a VALUES join (mirrors the live
+            # _write_result_property_keys) — per-row UPDATEs over a remote prod
+            # connection cost a round-trip each (~hours for the whole table).
+            pairs: list[tuple[str, str]] = []
             for row in rows:
                 scanned += 1
                 key = compute_property_key(row.parcel_id, row.property_address)
                 if not key:
                     weak += 1
                     continue
+                pairs.append((str(row.id), key))
+            if pairs:
+                values_sql = ",".join(f"(:id_{i}, :pk_{i})" for i in range(len(pairs)))
+                params: dict = {}
+                for i, (rid, key) in enumerate(pairs):
+                    params[f"id_{i}"] = rid
+                    params[f"pk_{i}"] = key
                 db.execute(
                     text(
-                        """
+                        f"""
                         UPDATE results
-                        SET property_key = :pk
-                        WHERE id = :id AND property_key IS NULL
+                        SET property_key = data.pk
+                        FROM (VALUES {values_sql}) AS data(id, pk)
+                        WHERE results.id = data.id::uuid AND results.property_key IS NULL
                         """
                     ),
-                    {"pk": key, "id": str(row.id)},
+                    params,
                 )
-                updated += 1
+                updated += len(pairs)
             db.commit()
             _log.info(
                 "scanned %d (updated %d, weak %d) — through id %s",

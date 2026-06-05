@@ -21,6 +21,8 @@ from src.db.session import SyncSessionLocal
 from src.workers.property_identity import compute_property_key
 
 logging.basicConfig(level=logging.INFO)
+# Silence SQLAlchemy per-statement echo — bulk backfill runs many statements.
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 _log = logging.getLogger("backfill_membership")
 
 
@@ -62,22 +64,39 @@ def run(batch: int) -> None:
                     agg[k] = {"parcel_id": row.parcel_id, "property_address": row.property_address, "count": 1}
                 else:
                     cur["count"] += 1
-            for (uid, rt, key), v in sorted(agg.items()):
+            # Chunked multi-row upsert (mirrors live _upsert_property_membership)
+            # — per-key INSERTs over a remote prod connection cost a round-trip
+            # each. Pre-aggregated by key in `agg`, so no key repeats within a
+            # chunk (avoids "cannot affect row a second time").
+            items = sorted(agg.items())
+            for i in range(0, len(items), 500):
+                chunk = items[i:i + 500]
+                values_sql = ",".join(
+                    f"(:uid_{k}, :rt_{k}, :pk_{k}, :pid_{k}, :addr_{k}, :cnt_{k}, NOW(), NOW())"
+                    for k in range(len(chunk))
+                )
+                params: dict = {}
+                for k, ((uid, rt, key), v) in enumerate(chunk):
+                    params[f"uid_{k}"] = uid
+                    params[f"rt_{k}"] = rt
+                    params[f"pk_{k}"] = key
+                    params[f"pid_{k}"] = v["parcel_id"]
+                    params[f"addr_{k}"] = v["property_address"]
+                    params[f"cnt_{k}"] = v["count"]
                 db.execute(
                     text(
-                        """
+                        f"""
                         INSERT INTO property_list_membership
                             (user_id, record_type, property_key, parcel_id,
                              property_address, sighting_count, first_seen_at, last_seen_at)
-                        VALUES (:uid, :rt, :pk, :pid, :addr, :cnt, NOW(), NOW())
+                        VALUES {values_sql}
                         ON CONFLICT (user_id, record_type, property_key) DO UPDATE SET
                             sighting_count = property_list_membership.sighting_count + EXCLUDED.sighting_count,
                             parcel_id = COALESCE(property_list_membership.parcel_id, EXCLUDED.parcel_id),
                             property_address = COALESCE(property_list_membership.property_address, EXCLUDED.property_address)
                         """
                     ),
-                    {"uid": uid, "rt": rt, "pk": key,
-                     "pid": v["parcel_id"], "addr": v["property_address"], "cnt": v["count"]},
+                    params,
                 )
             db.commit()
             total += len(rows)

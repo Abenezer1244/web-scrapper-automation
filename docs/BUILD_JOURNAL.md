@@ -19,6 +19,21 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-05 — Phase 4 tax-filter UI (frontend) + Phase 3-5 security hardening
+
+**Frontend (branch `feature/phase4-tax-filters-ui` in sibling repo `bridgeleads-web`, UNMERGED/UNDEPLOYED, tsc clean, Codex-clean):** tax-delinquent filter UI on the results view (`app/(dashboard)/results/[id]/page.tsx`). Amount-owed + months-delinquent min/max inputs (debounced) wired to the params the backend already accepts (get_results + download + export-url via `lib/api.ts`). Gated on the **presence of structured tax data** (latched `hasTaxData` = the King-tax gate, since `delinquent_amount` is null elsewhere) so it survives a too-narrow filter returning 0 rows. Codex caught: filtered-empty showed the "all duplicates" notice (gated it on `!taxFilterActive && !search` + a filter-specific empty message); export honors tax filters but not search (deliberate: filters = lead-selection controls in the deliverable, search = view-only find — documented). ESLint not configured in that repo; tsc is the gate.
+
+**Security hardening (branch merged to main `8e1586f`, no migration):** ran a **Codex adversarial security pass** over the whole milestone (`b78d698..main`). CLEAN: tenant isolation (segments/tax/dialer all user_id-scoped), SQL injection (params bound; county_clause a fixed toggle), CSV injection (sanitized/numeric), SSRF (validate_outbound_webhook + redirects off + redacted), PII-in-logs (host-only + response redacted). Fixed 3 findings:
+- **Medium** — unbounded `min/max_months` produced an out-of-int4 `bill_year` bound → Postgres "integer out of range" / log churn (cheap DoS). Added `le=1200` (months) + `le=100_000_000` (amount) on get_results + download_export + export-url.
+- **Medium** — dialer sweep joined ScraperConfig by id only (DB doesn't enforce job.user_id==config.user_id; sweep is a system session that bypasses RLS) → added `ScraperConfig.user_id == Job.user_id` owner-match (defense-in-depth vs cross-tenant PII push).
+- **Low** (pre-existing, P5 widened) — config responses echoed `webhook_secret`/`dialer_webhook_secret` → made WRITE-ONLY in `ScraperConfigResponse` (presence flags `*_secret_set`; secrets popped). +3 regression tests. Deploy healthy (200).
+
+**Pending / Handoff:** **deploy decision for the frontend** (push `feature/phase4-tax-filters-ui` → master = Vercel auto-deploy); remaining phase UIs (2b doc-type, 3 segments [design review first], 5 dialer settings); non-King tax data spike; run offline backfills (property_key, membership, tax_fields). See `[[project_lead_targeting_milestone]]`.
+
+**Facts learned:** the "filtered total==0 ≠ empty job/all-duplicates" trap recurs in BOTH backend (previous-job suggestion) and frontend (empty-state notice) whenever a filter changes `total` — audit empty-state logic on every new filter. Secrets in JSON-column config dicts get echoed by wholesale `deliver` responses — redact on read.
+
+---
+
 ## 2026-06-05 — Lead Targeting Phase 5 (5B): generic "push to any dialer" (Enzo dropped)
 
 **Decision:** dropped Enzo as the integration target (newest vendor, no public API/pricing/reviews = worst first integration; web-researched). Built a **vendor-agnostic push** instead — works with any dialer via its inbound webhook / Zapier catch-hook. Zero lock-in; matches the PRD's "integrate, don't build a dialer" stance.

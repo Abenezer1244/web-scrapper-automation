@@ -93,6 +93,21 @@ def test_deliver_one_rejects_host_outside_allowlist():
     assert row.vendor_response_code is None  # never attempted
 
 
+def test_deliver_config_requires_phoneburner_creds_when_selected():
+    from src.api.schemas import DeliverConfig
+
+    # Valid: both creds present.
+    DeliverConfig(dialer_type="phoneburner", phoneburner_access_token="tok", phoneburner_owner_id="42")
+    # Rejected up front (Codex P2): selected but missing a credential.
+    with pytest.raises(ValueError, match="requires phoneburner"):
+        DeliverConfig(dialer_type="phoneburner", phoneburner_owner_id="42")
+    with pytest.raises(ValueError, match="requires phoneburner"):
+        DeliverConfig(dialer_type="phoneburner", phoneburner_access_token="tok")
+    # Generic / unset never requires these creds.
+    DeliverConfig(dialer_type=None)
+    DeliverConfig(dialer_type="generic_webhook", dialer_webhook_url="https://x.example/y")
+
+
 def test_extract_contact_id_pulls_only_id_never_body():
     r = Response()
     r.status_code = 200

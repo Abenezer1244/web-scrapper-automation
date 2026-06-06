@@ -132,6 +132,7 @@ def process_dialer_outbox(job_id: str) -> None:
             if result is None:
                 row.status = "failed"
                 row.last_error = "result row missing"
+                db.commit()
                 continue
 
             lead = {
@@ -161,11 +162,16 @@ def process_dialer_outbox(job_id: str) -> None:
             except Exception as exc:  # noqa: BLE001 — one bad row must not stall the chunk
                 row.status = "failed"
                 row.last_error = f"build error: {str(exc)[:180]}"
+                db.commit()
                 continue
 
             _deliver_one(connector, req, row)
-
-        db.commit()
+            # COMMIT THIS ROW'S OUTCOME BEFORE THE NEXT EXTERNAL POST (Codex P2):
+            # if the worker is killed / the task is redelivered after a successful
+            # POST, the row is already durably 'delivered' so the next drain/replay
+            # won't re-POST it and duplicate a PhoneBurner contact. Per-row commit
+            # is the at-most-once-per-contact guarantee (the chunk is small).
+            db.commit()
 
         # More pending? Continue draining in a fresh task (bounded chunks).
         remaining = db.execute(

@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from typing import Any, TypedDict
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -258,6 +258,18 @@ class DeliverConfig(BaseModel):
     @classmethod
     def webhook_secret_length(cls, v: str | None) -> str | None:
         return _validate_webhook_secret(v)
+
+    @model_validator(mode="after")
+    def require_connector_credentials(self) -> "DeliverConfig":
+        # Reject an unusable native-dialer config up front (Codex) rather than
+        # accepting it and failing every job's contacts later in the outbox.
+        if self.dialer_type == "phoneburner":
+            if not self.phoneburner_access_token or not self.phoneburner_owner_id:
+                raise ValueError(
+                    "dialer_type 'phoneburner' requires phoneburner_access_token "
+                    "and phoneburner_owner_id"
+                )
+        return self
 
 
 class FieldsConfig(BaseModel):

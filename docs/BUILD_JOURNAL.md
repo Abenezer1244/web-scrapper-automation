@@ -19,6 +19,51 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-06 (pm) — Duplicate leads: stop re-enriching + re-skip-tracing (cost/PII fix)
+
+**Built / Shipped:** `6a2f343` (main, deployed). User noticed a `since_last_run` re-scrape (192 records,
+0 new / 192 duplicates) still ran full enrichment + skip-trace ("0 cache hits, 167 queued" ≈ $13 paid Tracerfy
+on already-known leads). Root cause: dedup is delivery/billing-only; `_run_inline_enrichment` (missing-address)
+and `_enqueue_skip_trace_rows` (status='not_attempted') run on ALL fresh rows and never exclude duplicates,
+with no cross-job reuse.
+
+- **Fix A** — `_reuse_enrichment_for_duplicates()` runs first in `_run_inline_enrichment`: a static, tenant-scoped
+  `UPDATE results … FROM delivered_records dr JOIN results ro ON ro.id=dr.first_result_id` that copies
+  address/mailing/tax + settled skip-trace from the originally-delivered Result onto this job's duplicate rows.
+  The existing selectors then skip them (address present → no GIS; status settled → no Tracerfy). Fill-missing
+  COALESCE; skip-trace PII copied only when prior hit/miss within 90d TTL onto a not_attempted row. Non-fatal
+  (rollback + fall through to full enrichment on error).
+- **Fix B** — skip-trace cache cross-job 0-hits: WRITE keyed off Tracerfy's echoed (USPS-standardized) address
+  while READ keyed off our GIS address → never matched. Now WRITE keys off the matched pending-row address (= read
+  source). Also stopped truncating `property_address`/`mail_address` to 128 (cols are 512) — that corrupted the key.
+
+**Tried / Decided:** Codex consult BEFORE coding (security-first) shaped the design: tenant isolation on every
+join leg (worker uses the system session → explicit user_id filter is the boundary, not RLS), fill-missing not
+overwrite, settled-only TTL copy. Chose copy-from-prior over skip-entirely so the duplicate's CSV stays populated.
+
+**Caught & fixed (Codex, 3 review rounds — TWO P1s):** (1) gating on `parcel_id IS NOT NULL` was insufficient —
+a weak NAME|DATE fallback hash with a non-null placeholder parcel could copy PII across unrelated same-name/date
+records → fixed by reusing ONLY rows whose `dedup_hash` equals the recomputed strong `compute_property_key`.
+(2) a placeholder parcel that PASSES `is_strong_identity` (all-zeros `000000`, single repeated char) + no address
+→ unrelated homeowners share one strong-looking hash → still cross-copies PII → fixed with an explicit guard:
+reuse only when a specific address anchors identity OR the parcel is non-placeholder (len≥4, has digit, >1 distinct
+char, not a junk token). Final Codex review CLEAN.
+
+**Failed / Blocked:** worker tests 10/12 — the 2 failures (`test_watchdog_*`) are pre-existing kombu/Celery-broker
+connection errors (no Redis in test env), unrelated. Codex review timed out once at 320s (retried at 540s/medium).
+
+**Facts learned:** (1) dedup_hash has a STRONG branch (`compute_property_key` = parcel|address, shared with the
+overlap property_key) and a WEAK fallback (`NAME|DATE`); both are opaque sha256 so you must RECOMPUTE the strong
+key to tell them apart. (2) `is_strong_identity` accepts any parcel with len≥4 + a digit, so junk parcels
+(`000000`) pass — guard PII reuse explicitly. (3) `SkipTraceCache` is GLOBAL (address-only key, no user_id) —
+cross-tenant PII reuse by design; flagged for the user. (4) `_enqueue_skip_trace_rows` was truncating the 512-col
+`property_address` to 128, silently corrupting the skip-trace cache key.
+
+**Pending / Handoff:** ⚠️ **user decision: make `SkipTraceCache` per-`(user_id, address)`?** (stronger isolation vs
+multiplied Tracerfy spend). User to verify a re-scrape now logs "Reused prior enrichment for N" + far fewer queued.
+
+---
+
 ## 2026-06-06 (pm) — Frontend shadcn rollout: 6 screens migrated + shipped
 
 **Built / Shipped:** Continued the shadcn rollout from `/segments` (the reference) across the 6 remaining

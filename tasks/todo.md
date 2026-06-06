@@ -146,6 +146,41 @@ partial-success silent loss). Refined scope to bound blast radius:
 
 ---
 
+# Enrichment/skip-trace dedup-reuse + cache fix (2026-06-06) — IN PROGRESS
+
+**Problem (user-reported, confirmed in code):** a `since_last_run` re-scrape inserts fresh `Result` rows
+(192), dedup flags all `is_duplicate=true` (0 new), but enrichment + skip-trace key off "row missing field"
+and run on ALL fresh rows — so duplicates get RE-enriched (GIS/PACS/King) and RE-skip-traced (paid Tracerfy,
+"0 cache hits, 167 queued" ≈ $13). Dedup is delivery/billing-only; it never short-circuits enrichment.
+
+**Root causes:** (1) no cross-job reuse — `_run_inline_enrichment`/`_enqueue_skip_trace_rows` never copy the
+prior enriched Result. (2) skip-trace cache miss: WRITE keys off Tracerfy's echoed address
+(`tracerfy_ingest.py:325`), READ keys off our GIS address (`tasks.py:1246`) — `address_cache_key` strips
+punct/case but NOT USPS expansion (St→STREET), so a standardized echo ≠ our string → miss on re-run.
+
+**Fix A — duplicate reuse (tasks.py), tenant-scoped:** in ENRICHING, before GIS/skip-trace, for this job's
+`is_duplicate` rows JOIN `delivered_records (user_id=job.user_id, dedup_hash)` → `first_result_id` → prior
+`Result (user_id=job.user_id)`; COPY property_address/mailing_address/parcel_id/enrichment_data/
+delinquent_amount+year unconditionally, and phone/phone_type/phone_dnc_flag/email/skip_trace_status/attempted_at
+ONLY when prior `skip_trace_status IN ('hit','miss')` (settled) AND within 90d (SKIP_TRACE_CACHE_DAYS). Existing
+selectors then auto-skip them (address present → no GIS; status≠not_attempted → no Tracerfy). Fallback: if prior
+lacks address/unsettled, duplicate flows through normal path. **SECURITY: every join leg filtered by
+job.user_id (no cross-tenant copy = no IDOR); worker uses system session so the explicit user_id filter is the guard.**
+
+**Fix B — cache key consistency (tracerfy_ingest.py):** write the cache keyed off the PENDING row's address
+(`matches[0].property_address/city/state`, = what READ uses), not Tracerfy's echoed `csv_row` address →
+write key == read key by construction → cross-job hits even when Tracerfy standardizes the street.
+
+**Workflow:** Codex consult (pre-build, security) → build → Codex review + Master Security Review (§14) → deploy.
+- [x] Codex consult on design — caught: weak-hash PII risk, fill-missing, settled-only TTL, FixB truncation bug, **global SkipTraceCache (no user_id)** finding
+- [x] Implemented Fix A (`_reuse_enrichment_for_duplicates`) + Fix B (cache key + 512-trunc) — commit `6a2f343`, deployed to main
+- [x] compile + ruff clean (baseline 5, +0); worker tests 10/12 (2 pre-existing watchdog/kombu broker fails, unrelated)
+- [x] **3 Codex review rounds** — caught + fixed TWO P1s: (1) weak NAME|DATE hash → fixed via recompute-strong-key==dedup_hash gate; (2) placeholder parcel (all-zeros/junk passes is_strong_identity) → fixed via address-anchor-or-non-placeholder-parcel guard. Final review CLEAN.
+- [ ] ⚠️ **OPEN finding (pre-existing, user decision):** `SkipTraceCache` is GLOBAL (keyed by address only, no `user_id`) → one tenant's skip-trace phone/email is served to another tenant who scrapes the same address. Intentional vendor-cache cost-saver, but a cross-tenant PII-reuse concern. Per-user cache would multiply Tracerfy spend. NOT changed — surfaced for the user.
+- [ ] User verify on a re-run: log should show "Reused prior enrichment for N duplicate leads" + far fewer Tracerfy queued.
+
+---
+
 # Frontend shadcn rollout — continuation (2026-06-06)
 
 Repo: sibling `Desktop/bridgeleads-web`. Reference screen = `/segments` (clean shadcn + `.impeccable.md` DNA).

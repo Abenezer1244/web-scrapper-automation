@@ -44,34 +44,50 @@ Source: Snohomish "Current Tax List" — `…/DocumentCenter/View/149173/snohomi
 
 ## Plan (phased, ≤5 files/phase, TDD, verify each)
 
-### Phase A — safe_http size-capped download + settings  (3 files)
-- [ ] `src/config/settings.py` + `.env.example`: add `MAX_DOWNLOAD_BYTES` (default 262144000 = 250 MB).
-- [ ] `src/utils/safe_http.py`: add `safe_download_to_file(url, dest, *, max_bytes, require_allowlisted,
-      require_https=True, follow_redirects=True, ...)` — per-hop validate, stream, byte-cap abort+raise,
-      assert 200 + non-empty.
-- [ ] `tests/test_safe_http_download.py` — cap enforcement, non-200 raise, empty raise (real local temp I/O).
+### Phase A — safe_http size-capped download + settings  ✅ (commit ae8e61b)
+- [x] `settings.py` + `.env.example`: `MAX_DOWNLOAD_BYTES` default 100 MB (104857600) — Codex-lowered from 250.
+- [x] `safe_http.py`: `safe_download_to_file()` per-hop validate, stream, byte-cap abort, assert 200 + non-empty;
+      cap logic extracted to pure `_stream_capped()`.
+- [x] Tests in `test_safe_http.py` (mirrors src): 11 new — SSRF/https/cap-arg guards + `_stream_capped` real-I/O.
 
-### Phase B — Snohomish scraper  (1 file + tests)
-- [ ] `src/scrapers/snohomish_wa_tax_delinquent.py` — `SnohomishWATaxDelinquentScraper(BridgeScraper)`:
-      module-top `add_scrape_domain`, landing-page link discovery, capped download to temp,
-      stream-parse pipe rows, filter (14-digit + year<current + owed>0), aggregate per parcel,
-      emit ScrapedRecord with source-tagged enrichment_data. Canary raise on 0 rows.
-- [ ] `tests/test_snohomish_tax.py` — real fixture (slice of the live file in repo), parse/aggregate/filter,
-      CSV-injection owner (`=cmd`) neutralized, `_extract_tax_fields` returns non-None Decimal+year.
+### Phase B — Snohomish scraper  ✅ (commit 8fc1c12)
+- [x] `snohomish_wa_tax_delinquent.py` — pure-HTTP scraper; landing-link resolver (excludes desc twin);
+      capped temp download + finally-cleanup; stream-parse; filter (14-digit + year<as_of + owed>0);
+      per-parcel aggregate (sum owed, min year); year-level enrichment detail; structural-validation canary.
+- [x] `tests/test_snohomish_tax.py` — 8 tests on REAL captured rows: multi-year aggregation, exclusions,
+      malformed counting, link selection + id-rotation + no-link-raises.
 
-### Phase C — wire-up: source gate + registry + migration  (3 files)
-- [ ] `src/workers/tasks.py` — widen `_extract_tax_fields` gate to a frozenset of trusted sources
-      (add `snohomish_county_delinquent_taxes`).
-- [ ] `src/scrapers/registry.py` — add module to `_ALLOWED_SCRAPER_MODULES`.
-- [ ] `alembic/versions/040_*.py` — INSERT `county_connectors` row (snohomish/wa/tax_delinquent, manual,
-      base_url = stable landing page). Idempotent guard.
+### Phase C — wire-up: source gate + registry + migration  ✅ (commit 34b06b8)
+- [x] `tasks.py` — `_extract_tax_fields` gate → `_TRUSTED_TAX_SOURCES` frozenset (King + Snohomish).
+- [x] `registry.py` — module added to `_ALLOWED_SCRAPER_MODULES`.
+- [x] `alembic/versions/040_*.py` — idempotent `county_connectors` INSERT; base_url = stable landing page.
+- [x] +4 gate tests (Snohomish string-amount/int-year trusted; lookalike source ignored).
 
 ### Phase D — verify + Codex review + ship
-- [ ] `python -m py_compile` / ruff / pytest (no-DB tests green).
-- [ ] Security Master Review (§14) on the diff.
-- [ ] **Codex review the diff** (review + challenge). Critical/High from either = NO-GO.
-- [ ] Live Railway smoke (scrape Snohomish tax_delinquent, confirm rows + delinquent_amount populated).
+- [x] py_compile / ruff (my files clean; tasks.py+registry.py pre-existing errors = on main, out of scope) /
+      pytest (50 touched tests green; full suite collects 334, no import breakage).
+- [~] Security Master Review (§14) on the diff — self-review below.
+- [~] **Codex review the diff** (`codex review --base main`) — RUNNING. Critical/High from either = NO-GO.
+- [ ] Live Railway smoke (scrape Snohomish tax_delinquent, confirm rows + delinquent_amount populated) — needs deploy.
 - [ ] Merge to main (migration 040 deploy-order note), update BUILD_JOURNAL + memory.
+
+## Security self-review (Master §14, BridgeLeads non-negotiables)
+- **SSRF:** download host fixed county-gov (`add_scrape_domain` at module top + base_url host seeds allowlist);
+  `safe_download_to_file` revalidates EVERY hop (`resolve=True`), `require_allowlisted=True`, `require_https=True`,
+  refuses scheme downgrade; landing fetch via `safe_get(require_allowlisted=True)`. ✅
+- **DoS/OOM:** hard byte cap (`MAX_DOWNLOAD_BYTES`) + early Content-Length reject + stream-to-disk + per-parcel
+  aggregate (never 325K rows in RAM). ✅
+- **CSV injection:** owner/situs/mailing → first-class `ScrapedRecord` cols (export `sanitize_for_csv` covers);
+  nothing surfaced raw from `enrichment_data`. ✅
+- **Tenant isolation:** no new queries; insert path keeps existing `user_id=job.user_id`; source-gate purely
+  transforms enrichment_data. ✅
+- **Source-gate trust:** frozenset exact-match; lookalike/untrusted sources ignored (tested); bounds/Decimal intact. ✅
+- **Silent-empty / wrong-file:** structural validation (17-field, malformed-ratio) + zero-parcel canary → FAIL loudly,
+  no silent-swallow. ✅
+- **Secrets:** none added (public county data, no auth). ✅
+- **Error leakage:** failures raise clean `RuntimeError`/`ValueError` (operator messages, no raw URL/stack to client;
+  worker FAILED path attaches reference id as today). ✅
+- **TCPA/DNC:** scraper emits no phones; `phone_dnc_flag` stays NULL → excluded from default dialer-ready set. ✅
 
 ## Pre-code gate
 - [x] **Consult Codex on this approach** (session `019e9b22…`) — DONE. Approach sound, no architectural change.

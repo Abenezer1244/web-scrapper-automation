@@ -1,59 +1,93 @@
-# Security hardening (Codex adversarial review, Phases 3-5) — branch `security/phase3-5-hardening`
-**User: "security is priority."** Ran Codex adversarial security pass over `b78d698..main` (full milestone). CLEAN on: tenant isolation (segments/tax/dialer all user_id-scoped), SQL injection (params bound; county_clause is a fixed toggle), CSV injection (all fields sanitized/numeric), SSRF (validate_outbound_webhook + redirects off + redacted), PII-in-logs (host-only, response redacted). **3 findings fixed:**
-- [x] **Medium** — unbounded `min/max_months` → out-of-int4 bill_year bound = DB error/DoS. Added `le=1200` (months) + `le=100_000_000` (amount) on all 3 endpoints (get_results/download/export-url).
-- [x] **Medium** — dialer sweep joined ScraperConfig by id only (DB doesn't enforce job.user_id==config.user_id; system session bypasses RLS) → added `ScraperConfig.user_id == Job.user_id` owner-match to the join (defense-in-depth vs cross-tenant PII push).
-- [x] **Low** (pre-existing, widened by P5) — config responses returned `webhook_secret`/`dialer_webhook_secret` → made WRITE-ONLY in `ScraperConfigResponse` (presence flags `*_secret_set`, secrets popped). +3 regression tests.
-- [ ] Codex re-review of the hardening → merge.
+# Post-Milestone Build — Snohomish Tax Scraper (Thread 1 of 3)
 
-# Phase 5 — Dialer push (Enzo)
+Direction (user): do all 3 post-milestone threads **one-by-one**, **Codex-verifies each**,
+via a **dynamic workflow**, **security is priority**.
+Order: (1) Snohomish tax scraper → (2) DNC scrubbing → (3) native dialer connectors.
 
-**Branch:** `feature/phase5-dialer` off `main`. **Spec:** §Phase 5 — "Generic delivery-connector abstraction; Enzo API connector; push skip-traced + valid-phone + non-DNC rows."
+## Research + security review — DONE (dynamic workflow `wf_0e4598c4-344`, salvaged)
+- Snohomish research + adversarial security review COMPLETE (verdict GO-WITH-FIXES).
+- Native-dialer-connectors research + security COMPLETE (thread 3, parked).
+- DNC research agent ran away (1h45m) → killed; DNC was predicted blocked-on-decision anyway (thread 2).
 
-## BLOCKER (spec line 23 + 188): Enzo API docs/credentials are "supplied at Phase 5" — NOT yet provided.
-Cannot build the real Enzo connector (no mock code in this prod project). Built the Enzo-INDEPENDENT foundation; requesting Enzo specifics from the user.
+## LIVE FILE INVESTIGATION — DONE (the required precondition)
+Source: Snohomish "Current Tax List" — `…/DocumentCenter/View/149173/snohomish_tax_data_totals`
+(linked off `…/5568/Treasurer-Public-Records`, updated monthly, **doc-ID rotates**).
+- **Pipe-delimited `.txt`, NO header row, 17 cols, 325,043 rows, 44.7 MB**, UTF-8 BOM, `\r\n`.
+- **No HTTP redirect** (direct 200) — disproves the security review's "302" High.
+- Columns: `0`=parcel/account, **`1`=tax/bill YEAR**, `2`=situs addr, `4`=situs city, `5`=st, `6`=zip,
+  `7`=owner, `10/11/12`=mailing city/st/zip, `13`=as-of date, `14`=total annual,
+  `15`=half installment, **`16`=amount owed/balance**.
+- `parcel len`: 304,477 are **14-digit real property** (target) + 20,566 7-digit personal-property (exclude).
+- **Delinquent set = 14-digit parcel AND `year < current` AND `owed(col16) > 0` → 10,548 accounts.**
+  col16==col15 for all 10,548; col16==col14 for 8,948. Amounts already clean numerics (no `$`/commas).
+- A parcel can recur across years → **aggregate per parcel: sum owed, MIN(year)=oldest=most months delinquent.**
 
-## Verified facts
-- Result skip-trace fields: phone, phone_type (Mobile|Landline|VoIP), phone_dnc_flag (Boolean nullable), email, skip_trace_status (not_attempted|queued|submitted|hit|miss|errored).
-- Existing generic outbound push: `src/workers/webhook_delivery.py` (SSRF-validated `validate_outbound_webhook`, HMAC-signed, Celery autoretry) — reuse its IDEAS for the Enzo connector, but Enzo needs a dedicated connector, not a generic webhook (Codex).
-- PRD stance: do NOT build a dialer engine; integrate/push to existing dialers (TCPA-regulated).
+## Mapping to existing Phase 4 infra (ZERO API/UI/migration-column change)
+- `delinquent_amount` ← sum(col16) per parcel
+- `delinquent_bill_year` ← min(col1) per parcel (true tax year, King Jan-1 semantic family → months filter works)
+- `party_name` ← owner (col7); `property_address` ← situs (col2 + city/st/zip); `mailing_address` ← mailing
+- `enrichment_data.source` = `"snohomish_county_delinquent_taxes"` (gates `_extract_tax_fields`)
 
-## Codex consult (done) — reconciled
-- Valid phone = `phone IS NOT NULL AND trim(phone) <> ''`; phone-type-agnostic.
-- **DNC (TCPA/FTC TSR): `dialer_ready` = `phone_dnc_flag IS FALSE`** — unknown/NULL DNC EXCLUDED (don't call un-verified numbers). Looser "candidate" set (unknown allowed) = explicit opt-in, named honestly.
-- Do NOT gate on skip_trace_status in the reusable predicate (valid phone from any source qualifies); the Enzo task can add `='hit'` itself.
-- Do NOT build Enzo tables/DTOs/fake clients/tasks (speculative without docs).
+## Security fixes folded in (from adversarial review + live facts)
+- [HIGH-confirmed] **44.7 MB download → worker OOM.** Add size-capped STREAMING download helper to
+  `safe_http.py` (stream=True, per-hop SSRF revalidate, abort > `Settings.MAX_DOWNLOAD_BYTES`), write to
+  temp file, parse line-by-line, filter delinquent in the loop. NEVER materialize 325K rows in RAM.
+- [HIGH-downgraded] redirect → none live, but helper still follows+revalidates per hop (future-proof).
+- [HIGH-resolved] months semantic → real bill-year col exists; populate directly, do NOT synthesize from CoD PDFs.
+- [MED] **doc-ID rotation** → connector base_url = stable landing page; scraper parses the current
+  "Current Tax List" link (exclude the "description of the fields" anchor) before download.
+- [MED] **canary** → 0 delinquent rows parsed ⇒ raise (job FAILS loudly), never silent-empty.
+- [LOW] all human fields → first-class `ScrapedRecord` cols (exporter `sanitize_for_csv`); none raw from enrichment_data.
+- [LOW] errors → reference-id/clean operator message on download/parse failure; no silent-swallow (the
+  `_run_inline_enrichment` landmine); fail loudly.
+- SSRF allowlist: `add_scrape_domain("www.snohomishcountywa.gov")` at module top (worker importlib picks it up).
 
-## Slice 5A — dialer-ready lead selection (Enzo-independent): ✅ BUILT
-- [x] `src/api/dialer_filters.py` (pure, tested): `dialer_ready_conditions(include_unknown_dnc=False)` — valid phone + (TCPA-safe `dnc IS FALSE` default | opt-in `dnc IS NOT TRUE` candidate).
-- [x] `dialer_ready=true` view/export param on `get_results` + `download_export` + `export-url` (threaded through in-app flow — 4B lesson). Empty filtered ≠ 404 empty-job; previous-job suggestion gated when filtered.
-- [x] 4 predicate tests. (phone/dnc/skip-trace cols already in ResultRow.)
-- [ ] Codex review → commit.
+## Plan (phased, ≤5 files/phase, TDD, verify each)
 
-## DECISION (user, 2026-06-05): DROP Enzo. Build GENERIC "push to any dialer" instead.
-Enzo = newest vendor, no public API/pricing, fewest reviews = worst first integration. Generic webhook/Zapier push works with ALL dialers, zero vendor lock, unblocks the full scrape→skip-trace→push automation now. Matches PRD ("integrate via Zapier").
+### Phase A — safe_http size-capped download + settings  (3 files)
+- [ ] `src/config/settings.py` + `.env.example`: add `MAX_DOWNLOAD_BYTES` (default 262144000 = 250 MB).
+- [ ] `src/utils/safe_http.py`: add `safe_download_to_file(url, dest, *, max_bytes, require_allowlisted,
+      require_https=True, follow_redirects=True, ...)` — per-hop validate, stream, byte-cap abort+raise,
+      assert 200 + non-empty.
+- [ ] `tests/test_safe_http_download.py` — cap enforcement, non-200 raise, empty raise (real local temp I/O).
 
-## Slice 5B — generic dialer push: ✅ BUILT (Codex-consulted)
-- [x] `DeliverConfig`: `dialer_webhook_url` + `dialer_webhook_secret` (separate from job-summary webhook; shared https/secret validators extracted; no secret fallback). Added to `DeliverConfigDict`.
-- [x] `webhook_delivery.py`: `build_dialer_push_payload` — event `leads.dialer_ready`, `schema_version`, stable `batch.id`, per-lead `external_id` (retry-safe dedup), flattened scraper fields, `lead_count`/`total_dialer_ready_count`/`truncated`, HMAC-signed. Cap `DIALER_PUSH_CAP=500` (wide rows). Reuses `_sign_payload`.
-- [x] `tasks.py` completion path: if `dialer_webhook_url` set → sync `select(Result).where(job_id,user_id, *dialer_ready_conditions()).order_by(id).limit(500)` + unbounded total count → build payload → **reuse `deliver_job_webhook.delay`** (SSRF re-validate, HMAC, retry, non-fatal). Host-only logging (no URL/PII). Skips cleanly when 0 dialer-ready.
-- [x] 7 payload tests (shape/external_id/batch/truncation/HMAC) + 4 eligibility tests. Builds; ruff clean (no new findings).
-- [x] Codex review → **FAIL (P1 + P2), both fixed:**
-  - **[P1] timing:** skip-trace is async (cache-miss phone/DNC arrive later via Tracerfy webhook), so pushing at scrape completion missed those leads with no later send. **FIX:** removed the scrape-completion trigger; added a deferred **`dialer_push_sweep`** beat task (every 5 min) that pushes only when a job's skip-trace has SETTLED (no Result still queued/submitted), claimed once via `Job.dialer_pushed_at` (migration **039**). Reuses `deliver_job_webhook`.
-  - **[P2] entitlement:** `create_scraper` gated `webhook_url` but not `dialer_webhook_url` → lower plan could push PII. **FIX:** gate both for Business+.
-- [x] Codex re-review → **FAIL again (P1 + P2), both fixed:**
-  - **[P1] DNC-NULL:** Tracerfy populates phone but leaves `phone_dnc_flag NULL`, so strict `IS FALSE` matched NOTHING → feature pushed zero leads. **FIX:** push (and the 5A view/export filter) use `include_unknown_dnc=True` (exclude only KNOWN-DNC); the **destination dialer does the authoritative DNC scrub** (industry standard), forward-safe if a DNC feed is added. **⚠️ COMPLIANCE NOTE for user:** BridgeLeads does NOT currently scrub DNC (no feed populates the flag); dialer-ready = valid phone + not-known-DNC, dialer is the DNC compliance layer.
-  - **[P2] race:** non-atomic claim could double-push. **FIX:** `SELECT ... FOR UPDATE SKIP LOCKED (of=Job)` on the candidate query.
-- [x] Codex re-review #2 → **PASS (no P1); 2 P2 fixed:** (1) settled-check now based on `PendingSkipTraceRow` in-flight (queued/submitted) not `Result.skip_trace_status` — errored Tracerfy submissions leave Result stuck 'queued' but the pending row goes 'errored'=terminal, so the job now settles + pushes. (2) `deliver_job_webhook` redacts the receiver response body for `leads.dialer_ready` events (PII could be echoed back into logs/result-backend).
-- [x] Codex reviews #3-#5 — converging; fixed: dup-exclusion (`is_duplicate=False` in push); stale-submitted settlement (time-bound, then `COALESCE(submitted_at, enqueued_at)` aging); **entitlement re-check at push time** (join User, current plan ∈ Business+); **honest DNC labeling** (per-lead `dnc_status` clear|unknown|dnc + payload `dnc_scrubbed:false`) — keeps the feature functional (DNC always NULL → strict pushes nothing) while NOT mislabeling; dialer is the DNC scrub layer (PRD: integrate w/ dialers).
-  - **⚠️ COMPLIANCE DECISION FOR USER:** Codex oscillates strict-DNC vs functional. Root cause: BridgeLeads has NO DNC feed (phone_dnc_flag always NULL). Resolution per PRD (integrate w/ TCPA-compliant dialers that scrub): push not-known-DNC + label honestly. If you want BridgeLeads-side DNC scrubbing, that's a separate feature (needs a DNC data source).
-- [ ] Final Codex review → present to user.
+### Phase B — Snohomish scraper  (1 file + tests)
+- [ ] `src/scrapers/snohomish_wa_tax_delinquent.py` — `SnohomishWATaxDelinquentScraper(BridgeScraper)`:
+      module-top `add_scrape_domain`, landing-page link discovery, capped download to temp,
+      stream-parse pipe rows, filter (14-digit + year<current + owed>0), aggregate per parcel,
+      emit ScrapedRecord with source-tagged enrichment_data. Canary raise on 0 rows.
+- [ ] `tests/test_snohomish_tax.py` — real fixture (slice of the live file in repo), parse/aggregate/filter,
+      CSV-injection owner (`=cmd`) neutralized, `_extract_tax_fields` returns non-None Decimal+year.
 
-**Codex consult reconciled:** reuse the task as-is (payload-agnostic); inline capped leads (500) not download URL; per-lead external_id + batch id; total_dialer_ready_count + truncated; schema_version; deterministic ORDER BY id; separate secret; strict host-only/no-PII logging; no skip_trace gate (valid phone + dnc IS FALSE).
+### Phase C — wire-up: source gate + registry + migration  (3 files)
+- [ ] `src/workers/tasks.py` — widen `_extract_tax_fields` gate to a frozenset of trusted sources
+      (add `snohomish_county_delinquent_taxes`).
+- [ ] `src/scrapers/registry.py` — add module to `_ALLOWED_SCRAPER_MODULES`.
+- [ ] `alembic/versions/040_*.py` — INSERT `county_connectors` row (snohomish/wa/tax_delinquent, manual,
+      base_url = stable landing page). Idempotent guard.
 
-## Slice 5C — native per-dialer connectors (FUTURE, optional, demand-gated):
-- Only if a paying customer needs deep integration AND supplies API docs. Candidates by API maturity/reach: CallTools, BatchDialer, PhoneBurner. NOT Enzo unless specifically demanded + docs supplied.
-- API base URL + env (prod/sandbox); auth (key/OAuth/HMAC/bearer + refresh); endpoint(s) (create/update contact, add to list/campaign, bulk import); payload schema (required fields, phone format, lead IDs/metadata); rate limits + batching; idempotency/upsert (external ID, dup handling); DNC/consent source of truth (Enzo vs BridgeLeads); campaign/list model; error contract (retryable vs terminal); audit/PII-redaction/retention; status callback/webhook.
-- Then: dedicated Enzo connector (reuse webhook_delivery patterns: SSRF allowlist, retries, signed/auditable payload, idempotency) + push task selecting dialer-ready (+ optionally skip-traced) leads. "Push to dialer" delivery option (UI = frontend).
+### Phase D — verify + Codex review + ship
+- [ ] `python -m py_compile` / ruff / pytest (no-DB tests green).
+- [ ] Security Master Review (§14) on the diff.
+- [ ] **Codex review the diff** (review + challenge). Critical/High from either = NO-GO.
+- [ ] Live Railway smoke (scrape Snohomish tax_delinquent, confirm rows + delinquent_amount populated).
+- [ ] Merge to main (migration 040 deploy-order note), update BUILD_JOURNAL + memory.
 
-## DECISION surfaced to user
-- DNC default = TCPA-safe (`dnc IS FALSE`). Want a looser opt-in "candidate" mode (include unknown-DNC) exposed via the API too? (Function supports it; API currently exposes only the safe default.)
+## Pre-code gate
+- [x] **Consult Codex on this approach** (session `019e9b22…`) — DONE. Approach sound, no architectural change.
+  Reconciled refinements folded in (all adopted):
+  - **Structural validation (not just zero-row canary):** expect 17 pipe-fields/row, col1 = 4-digit year;
+    track malformed-row count, FAIL if malformed-rate high OR expected structure missing → catches the
+    "county swapped the file, we parse the WRONG file but nonzero" silent failure (Codex's #1 prod risk).
+  - **Year granularity in enrichment_data:** `delinquent_years[]`, `delinquent_year_count`, `oldest_tax_year`,
+    `as_of_date` (col13) — audit/debug, don't collapse to just sum+min.
+  - **bill_year is APPROXIMATE** (WA halves due Apr30/Oct31, not Jan1): keep `min(year)` for King-compat,
+    document as approximation (both reviewers agree it's acceptable; same semantic family as King).
+  - **MAX_DOWNLOAD_BYTES default = 100 MB** (104857600), not 250 MB — 512 MB worker under concurrency.
+  - **Temp file:** `NamedTemporaryFile(delete=False)` + guaranteed `finally` unlink (Windows handle care).
+  - **Test matrix:** parser/aggregation fixture; landing-link selection excludes "description of the fields"
+    anchor; `_extract_tax_fields` IGNORES non-allowlisted source even with tax-looking fields; end-to-end
+    source-string → both columns populated. + INFO metrics (bytes, rows, malformed, delinquent, parcels, oldest yr, total $).
+
+## Review
+(to fill in at the end)

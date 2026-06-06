@@ -137,6 +137,12 @@ class Settings(BaseSettings):
     DEFAULT_TIMEOUT: int = 30
     MAX_RETRIES: int = 3
     POLITE_DELAY_MS: int = 300
+    # Hard ceiling for a single server-side file download (safe_download_to_file).
+    # Bounds memory/disk/network DoS from an oversized or hostile response — the
+    # worker runs ~512 MB alongside Chromium, and several jobs can stream at once.
+    # Default 100 MB: ~2x the largest known county bulk file (Snohomish tax list
+    # ~45 MB) with growth headroom. A response exceeding this aborts and raises.
+    MAX_DOWNLOAD_BYTES: int = 104857600  # 100 * 1024 * 1024
 
     # ─── AI Extraction (Claude API) ───────────────────────────────────────────
     ANTHROPIC_API_KEY: str = ""

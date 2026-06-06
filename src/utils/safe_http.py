@@ -120,3 +120,109 @@ def safe_get_following(
             continue
         return resp
     raise ValueError("Too many redirects")
+
+
+def safe_download_to_file(
+    url: str,
+    dest_path: str,
+    *,
+    max_bytes: int,
+    require_allowlisted: bool = False,
+    require_https: bool = True,
+    follow_redirects: bool = True,
+    headers: dict | None = None,
+    timeout: int = 30,
+    max_redirects: int = 5,
+    chunk_size: int = 65536,
+) -> int:
+    """Stream a server-side download to ``dest_path`` with an SSRF guard and a
+    hard byte cap. Returns the number of bytes written.
+
+    Unlike ``safe_get`` / ``safe_get_following`` (which materialize the whole
+    body in a ``requests.Response`` in RAM), this writes chunks straight to disk
+    and ABORTS once the running total exceeds ``max_bytes`` — so a multi-hundred-MB
+    or hostile response can't OOM a memory-constrained worker. Every hop (initial
+    URL AND each redirect ``Location``) is re-validated with ``resolve=True``, so
+    a validated public URL can't bounce to an internal/metadata host.
+
+    Args:
+        url: absolute URL to fetch.
+        dest_path: file path to stream bytes into (caller owns creation/cleanup).
+        max_bytes: hard ceiling; a response exceeding this raises ``ValueError``
+            (pass ``Settings.MAX_DOWNLOAD_BYTES``).
+        require_allowlisted: also require each hop's host be on the scrape allowlist.
+        require_https: refuse a plaintext/scheme-downgraded hop (default True).
+        follow_redirects: if False, any 3xx raises instead of being followed.
+
+    Raises:
+        ValueError: blocked hop, scheme downgrade, disallowed/too-many redirects,
+            non-200 status, declared-or-streamed size over ``max_bytes``, or an
+            empty body. The caller is responsible for removing a partial file.
+    """
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+
+    current = url
+    resp = None
+    for _ in range(max_redirects + 1):
+        if require_https and urlparse(current).scheme != "https":
+            raise ValueError("HTTPS required for this download")
+        validate_scraping_target(current, require_allowlisted=require_allowlisted, resolve=True)
+        resp = _SESSION.get(
+            current,
+            headers=headers,
+            timeout=timeout,
+            stream=True,
+            allow_redirects=False,
+        )
+        if resp.status_code in _REDIRECT_CODES:
+            location = resp.headers.get("Location")
+            resp.close()  # release the pooled connection before the next hop
+            if not location:
+                raise ValueError("Redirect response carried no Location header")
+            if not follow_redirects:
+                raise ValueError("Refusing to follow a redirect for this download")
+            current = urljoin(current, location)
+            continue
+        break
+    else:
+        raise ValueError("Too many redirects")
+
+    try:
+        if resp.status_code != 200:
+            raise ValueError(f"Download failed: HTTP {resp.status_code}")
+
+        # Early reject when the server declares an oversized body (saves bandwidth);
+        # the streaming cap below still enforces the limit for chunked/unknown sizes.
+        declared = resp.headers.get("Content-Length")
+        if declared and declared.isdigit() and int(declared) > max_bytes:
+            raise ValueError(
+                f"Download too large: declared {declared} bytes > cap {max_bytes}"
+            )
+
+        total = _stream_capped(resp.iter_content(chunk_size), dest_path, max_bytes)
+    finally:
+        resp.close()
+
+    if total == 0:
+        raise ValueError("Download produced an empty file")
+    return total
+
+
+def _stream_capped(chunks, dest_path: str, max_bytes: int) -> int:
+    """Write an iterable of byte chunks to ``dest_path``, aborting past ``max_bytes``.
+
+    Pure (no network/SSRF) so the size-cap behaviour is unit-testable directly.
+    Raises ``ValueError`` the moment the running total exceeds ``max_bytes`` — the
+    partial file is left on disk for the caller to clean up.
+    """
+    total = 0
+    with open(dest_path, "wb") as fh:
+        for chunk in chunks:
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"Download exceeded size cap of {max_bytes} bytes")
+            fh.write(chunk)
+    return total

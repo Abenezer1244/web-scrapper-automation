@@ -805,11 +805,8 @@ def dialer_push_sweep() -> None:
     from src.config.constants import BUSINESS_FEATURES_PLANS
     from src.db.models import Job, PendingSkipTraceRow, Result, ScraperConfig, User
     from src.db.session import system_sync_session
-    from src.workers.webhook_delivery import (
-        DIALER_PUSH_CAP,
-        build_dialer_push_payload,
-        deliver_job_webhook,
-    )
+    from src.workers.dialer_connectors import get_connector
+    from src.workers.webhook_delivery import DIALER_PUSH_CAP, deliver_job_webhook
 
     _BATCH = 50
     # Jobs still waiting on async skip-trace. Base "settled" on the pending QUEUE
@@ -936,18 +933,24 @@ def dialer_push_sweep() -> None:
                         }
                         for row in rows
                     ]
-                    payload = build_dialer_push_payload(
-                        job_id=str(job.id),
-                        scraper_config_id=str(config.id),
-                        scraper_name=config.name,
-                        county=config.county,
-                        state=config.state,
-                        record_type=config.record_type,
-                        leads=leads,
-                        total_dialer_ready_count=total,
-                        webhook_secret=deliver.get("dialer_webhook_secret"),
-                    )
-                    deliver_job_webhook.delay(str(job.id), url, payload)
+                    # Dispatch via the dialer connector seam (Thread 3). For the
+                    # generic webhook this builds the exact same payload + URL as
+                    # before (locked by tests/test_dialer_connector_base.py) and
+                    # enqueues one delivery — byte-identical to the prior path.
+                    connector = get_connector(deliver.get("dialer_type"))
+                    job_meta = {
+                        "job_id": str(job.id),
+                        "scraper_config_id": str(config.id),
+                        "scraper_name": config.name,
+                        "county": config.county,
+                        "state": config.state,
+                        "record_type": config.record_type,
+                        "total_dialer_ready_count": total,
+                        "dialer_webhook_url": url,
+                        "dialer_webhook_secret": deliver.get("dialer_webhook_secret"),
+                    }
+                    for req in connector.build_requests(leads, job_meta):
+                        deliver_job_webhook.delay(str(job.id), req["url"], req["payload"])
                     pushed += 1
                     _logger.info(
                         "Dialer push queued for job %s: %d of %d dialer-ready leads",

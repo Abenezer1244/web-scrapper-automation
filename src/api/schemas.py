@@ -196,6 +196,20 @@ class DeliverConfig(BaseModel):
     # webhook_secret). Same HTTPS + SSRF-at-send-time guarantees.
     dialer_webhook_url: str | None = None
     dialer_webhook_secret: str | None = None
+    # Thread 3: which dialer connector handles the push. None = the shipped
+    # generic webhook/Zapier connector. Validated against the server-side
+    # allowlist so an arbitrary string can never reach connector dispatch.
+    dialer_type: str | None = None
+
+    @field_validator("dialer_type")
+    @classmethod
+    def dialer_type_allowlisted(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        from src.config.constants import REGISTERED_DIALER_VENDOR_IDS
+        if v not in REGISTERED_DIALER_VENDOR_IDS:
+            raise ValueError(f"Unknown dialer_type: {v!r}")
+        return v
 
     @field_validator("emails")
     @classmethod
@@ -276,6 +290,7 @@ class DeliverConfigDict(TypedDict, total=False):
     webhook_secret: str | None
     dialer_webhook_url: str | None       # Phase 5: generic dialer push
     dialer_webhook_secret: str | None
+    dialer_type: str | None              # Thread 3: dialer connector id (None = generic)
 
 
 class ScraperConfigCreate(BaseModel):

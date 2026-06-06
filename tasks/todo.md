@@ -143,3 +143,82 @@ partial-success silent loss). Refined scope to bound blast radius:
   (no-mock rule). Surfaced to user.
 - **Thread 3 — native dialer connectors:** research done, DEMAND-GATED. Smallest useful step = the
   DialerConnector abstraction seam + ONE reference connector, built when a paying customer names a dialer.
+
+---
+
+# Frontend shadcn rollout — continuation (2026-06-06)
+
+Repo: sibling `Desktop/bridgeleads-web`. Reference screen = `/segments` (clean shadcn + `.impeccable.md` DNA).
+Already migrated: `/segments`, `/results`. **Do NOT touch** (polished/complex, prior decision): `/dashboard` (806L),
+`/scrapers/new` wizard (1768L). User picked **all 6 remaining**: `/deliver`, `/login`, `/register`,
+`/admin/funnel`, `/admin/connectors`, `/results/[id]`.
+
+**Method (per CLAUDE.md):** phased, ≤5 files/phase, `tsc --noEmit` + `next build` green + Codex review each
+phase, user approval between phases. Step-0 dead-code cleanup before any >300L structural refactor.
+
+### Cross-cutting decisions (settle before Phase 1)
+- **D1 — Tokens:** namespaces already reconciled in `globals.css` — `--color-amber` = emerald `#10b981`/`#34d399`,
+  `--color-text-primary: var(--foreground)`, `--primary: #10b981`. So migrate `style={{var(--color-*)}}` →
+  Tailwind token classes (`text-foreground`, `text-muted-foreground`, `bg-card`, `border-border`, `text-primary`).
+  **No brand-color change** — colors are already emerald via aliases.
+- **D2 — Empty/Error states:** KEEP the established four-state convention components (`ErrorState`,
+  `EmptyIllustration` — memory `project_frontend_ui_state_conventions`); don't rip working ones out for shadcn
+  `Empty`. New/blank states may use shadcn `Empty` like `/segments`. Consistency *within* a screen > across.
+- **D3 — Banned decoration:** remove `.impeccable`-banned bits while migrating — radial-glow gradient on
+  `/login` (+ `/register`), any accent border-stripes, gradient text. Emerald stays RARE (primary action / live state).
+- **D4 — base-nova = Base UI, not Radix:** ToggleGroup/Select APIs differ (value always array, no `type`).
+  Prefer Button-based toggles + `native-select`/`select` carefully (memory + prior /segments choice).
+
+### Phase 1 — `/deliver` (173L, 1 file) — safest user-facing win ✅ DONE (uncommitted)
+- [x] Mapped inline-styled cards/badges → shadcn `Card`/`Badge` + token classes; dropped framer-motion + rainbow format colors (signal-over-decoration); neutral badges (emerald rare)
+- [x] Kept `ErrorState`/`EmptyIllustration` (D2); kept react-query loading/error/empty/data four states; preserved `hasDestination` dialer/PhoneBurner logic
+- [x] `tsc --noEmit` clean + `next build` green (lint incl.) → Codex review PASS (no findings) — awaiting commit/deploy decision
+
+### Phase 2 — Auth `/login` (203L) + `/register` (422L), 2 files ✅ DONE (`5dac4ab`, deployed)
+- [x] `input-base` → `Input` (h-10); `.btn-amber` → `Button` (full-width h-11); `<label>` → `Label`
+- [x] Terms checkbox → Base UI `Checkbox` via RHF `Controller` (checked/onCheckedChange); links `stopPropagation` so opening Terms/Privacy doesn't toggle consent
+- [x] Removed banned radial-glow + card glow shadow + framer-motion. Brand emerald kept BRIGHT via `var(--color-amber)` (not `--primary`, which is dull `#065f46` in dark) — buttons use default `bg-primary` like /segments
+- [x] PRESERVED: onBlur, autofocus, noValidate, server-error block, password checklist, Suspense/useSearchParams referral; added `aria-invalid`/`aria-describedby`
+- [x] `tsc` clean + `next build` green (login+register still static) → Codex review PASS (no P1, Controller flow verified)
+
+### Phase 3 — Admin `/funnel` (264L) + `/connectors` (394L), 2 files ✅ DONE (`25c5042`, deployed)
+- [x] funnel: window toggle → Button-toggles (aria-pressed); tokens; error → destructive; DM Mono numbers; emerald reserved for data bars (key data point)
+- [x] connectors: btn-amber/ghost → Button, inputs → Input, labels → Label, AI/Manual chips → Badge (Manual neutral), skeletons → Skeleton, record-type pills → Button-toggles. **Fixed latent bug**: degraded health dot used `--color-amber` (=emerald) → now explicit emerald/amber/red-500 + title/aria-label. Mutation/gating/grouping behavior-identical
+- [x] `tsc` clean + `next build` green (both static) → Codex review PASS (no P1)
+
+### Phase 4 — `/results/[id]` (1186L, 1 file) — highest value, biggest risk; LAST
+**REVISED after full read + Codex re-consult (session `019e9e79`):** table is coupled to framer-motion
+(`motion.tbody className="contents"`, `motion.tr` variants, `layoutId` pagination/format pills) + a custom
+sticky-blur `<thead>` in a `max-h-[calc(100vh-340px)]` scroll container. **Codex AGREES: do NOT import the
+shadcn `Table` component** (its own `overflow-x-auto` double-wraps; `TableBody` would drop motion / risk
+invalid nested tbody). Migrate IN PLACE instead — same design result, far lower regression risk. User QAs on deploy.
+- [x] STEP 0 (`6a6df82`): removed dead no-op `useEffect`. `selectedFormat` confirmed **backend-dead** — LEFT + FLAGGED in commit msg (removing the pill is a product call)
+- [x] Migration (`54b16f3`): `.input-base` → `Input` (search + 4 tax + a11y ids), `.btn-amber`/`.btn-ghost` → `Button`, tax `<label>` → `Label`, h1 → serif; **REMOVED banned 3px green left-hover stripe**; "Old" badge → neutral muted (New stays emerald). NO shadcn Table component (Codex-confirmed wrong fit)
+- [x] PRESERVED (Codex-verified intact): scroll container, motion.tbody/.tr + expansion, layoutId motion, setPage(1), hasTaxData gate, export-tax-not-search, stopPropagation, colSpan={7}, is_duplicate opacity, search ref
+- [x] `tsc` clean + `next build` green → Codex review PASS (no P1, all 10 landmines intact). ⏳ **user QA on Vercel deploy pending** (search/tax/export/expand/copy/mailto/pagination)
+
+---
+
+## Review — Frontend shadcn rollout COMPLETE ✅ (all 6 screens, 5 commits, deployed)
+**Shipped to `master` → Vercel (frontend auto-deploys):**
+- `f125202` Phase 1 `/deliver` · `5dac4ab` Phase 2 `/login`+`/register` · `25c5042` Phase 3 admin `/funnel`+`/connectors` · `6a6df82`+`54b16f3` Phase 4 `/results/[id]`
+- Every phase: `tsc --noEmit` clean + `next build` green + **Codex diff review (no P1/no regressions)** before push.
+- Pre-implementation **Codex consult** pressure-tested the plan; a 2nd Codex consult re-scoped Phase 4 (no Table component) after the full read.
+**Key decisions:** D1 tokens already reconciled (`--color-amber`=emerald) → mechanical. D2 kept `ErrorState`/`EmptyIllustration`. D3 removed banned glow (auth) + accent hover-stripe (results). D4 Base-UI (not Radix) → Controller for Checkbox, Button-toggles not ToggleGroup. Brand emerald kept BRIGHT via `var(--color-amber)` (—primary is dull `#065f46` in dark); buttons use default `bg-primary` like /segments.
+**Bonus fixes:** connector "degraded" health dot (was emerald via the `--color-amber` rename) → explicit emerald/amber/red + a11y title; +aria on auth/results inputs.
+**Untouched by design:** `/dashboard` (806L), `/scrapers/new` wizard (1768L) — polished, rebuild = downgrade/risk.
+**Follow-ups — RESOLVED ("do all yourself"):**
+- ✅ **Format pill: REMOVED** (`f03861e`). Backend `/jobs/{id}/download` (jobs.py) is CSV-only (builds via `csv.DictWriter`, `media_type text/csv`, no `format` param) → the pill was decorative. Removed pill + `selectedFormat` state + `FORMAT_LABELS`; relabeled "Download CSV". Real multi-format in-app export = separate backend feature (needs xlsx injection hardening) — out of scope. tsc/build green, Codex clean.
+- ✅ **Public-screen QA DONE myself** on the live deploy (`bridgeleads.io`, headless Chromium, **12/12 passed**): `/login` (2 Inputs/Button/Labels, no glow, onBlur+aria-invalid+error-id) and `/register` (form mounts past Suspense, 3 Inputs, **Base-UI Checkbox toggles via Controller**, live password checklist, Terms link, no glow, **0 console errors**). Confirmed migrated markup served in prod; no banned `radial-gradient`.
+- ✅ All 4 gated routes deploy healthy (`307` auth-redirect, no 500): `/deliver`, `/admin/funnel`, `/admin/connectors`, `/results/[id]`.
+- ✅ **GATED-screen QA DONE** (user-supplied account, headed Chromium, live — **15/16**): `/deliver` (132 shadcn Cards+Badges), `/admin/connectors` (full agency view: 25 Badges + 25 health dots **with a11y `title`**, Add-county form Inputs + Button-toggles), `/results/[id]` on a REAL result (`9f4e31a0…`: **"Download CSV"** confirms pill removed, search Input, **banned 3px stripe absent**, **search debounce updates table**, **row-expand works**). The 1 non-pass = 5 `next-auth` "Failed to fetch" session-fetch console errors — UNRELATED to the migration (auth untouched; migrated UI produced 0 errors), transient navigation noise.
+- ✅ **`/admin/funnel` — REAL BUG FOUND + FIXED + live-QA'd** (`48d07b4`). The account IS `is_admin:true` server-side (verified via live `/auth/me`), but `lib/auth.ts` never threaded `is_admin` through authorize→jwt→session → `session.user.is_admin` was ALWAYS undefined → the funnel gated out **every** admin in prod. Fix: thread `is_admin` (strict `===true`, fail-closed) all 3 hops + augment next-auth types + gate the query `enabled:!!session && isAdmin` (Codex hardening: no 403-fetch for non-admins). Codex consult (design) + Codex review both clean. **Re-QA on deploy: 5/5** — admin passes gate, data view renders, window toggles flip aria-pressed, step rows + conversion cards render.
+- ✅ **The 5 `next-auth` "Failed to fetch" — diagnosed BENIGN (no fix, Codex-agreed).** Controlled repro: idle 14s on one page = **0 console errors**; the errors only appear during rapid `goto()` navigation as `net::ERR_ABORTED` on in-flight `/api/auth/session` (same as react-query API calls) — navigation cancels them. Test artifact, not a defect; real users don't hit it and the session already works.
+
+## Both post-rollout gaps RESOLVED (2026-06-06) — 6 commits total this session
+`f125202`,`5dac4ab`,`25c5042`,`6a6df82`,`54b16f3`,`f03861e` (rollout + pill) + `48d07b4` (is_admin fix). All Codex-gated, deployed, live-QA'd.
+- (optional, deferred) standardize empties on shadcn `Empty`; finish the invisible inline-`var`→class sweep on `/results/[id]` cells (renders identically today).
+
+### Status
+- [x] Codex pressure-test of THIS plan (pre-implementation, mandatory) — DONE (session `019e9e44`, 333k tok). Verdict: directionally sound; Phase 2 + 4 NOT purely mechanical (checkbox=Base UI, results table behavior-heavy). Refinements folded into Phases 2 & 4 above. No disagreements with the plan.
+- [ ] User approval of plan + phasing — pending

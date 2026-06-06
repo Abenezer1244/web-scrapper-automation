@@ -19,6 +19,93 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-06 (pm) — Frontend shadcn rollout: 6 screens migrated + shipped
+
+**Built / Shipped:** Continued the shadcn rollout from `/segments` (the reference) across the 6 remaining
+un-polished screens, in 4 Codex-gated phases, all merged to `master` + auto-deployed (Vercel). Repo = sibling
+`bridgeleads-web`. Commits: `f125202` P1 `/deliver` · `5dac4ab` P2 `/login`+`/register` · `25c5042` P3 admin
+`/funnel`+`/connectors` · `6a6df82`+`54b16f3` P4 `/results/[id]`. Every phase passed `tsc --noEmit` + `next build`
++ a **Codex diff review (no P1, no regressions)** before push.
+
+**Tried / Decided:** Pre-implementation **Codex consult** pressure-tested the plan (session `019e9e44`): confirmed
+directionally sound but flagged P2 + P4 are NOT purely mechanical. Key calls — D1: token namespaces already
+reconciled in `globals.css` (`--color-amber`=emerald `#10b981`/`#34d399`, `--color-text-primary:var(--foreground)`)
+so this was mechanical token-rename + primitive-swap, **no brand-color change**. D2: kept the established
+`ErrorState`/`EmptyIllustration` four-state components (didn't rip out for shadcn `Empty`). D3: removed
+`.impeccable`-banned decoration (auth radial-glow + card glow shadow; the results accent hover-stripe). D4:
+base-nova = **Base UI not Radix** → Terms checkbox bound via RHF `Controller` (not `register`), Button-based
+toggles (not ToggleGroup). Brand emerald kept **bright** via `var(--color-amber)` because `--primary` is
+intentionally dull (`#065f46`) in dark — but buttons use default `bg-primary` to match the /segments reference.
+
+**Phase 4 re-scope (the important decision):** after reading all 1186 lines, a **2nd Codex consult**
+(`019e9e79`) confirmed: do **NOT** import the shadcn `Table` component into `/results/[id]`. The table is
+coupled to framer-motion (`motion.tbody className="contents"`, `motion.tr` variants, `layoutId` pagination +
+format pills) and a custom sticky-blur `<thead>` in a `max-h-[calc(100vh-340px)]` scroll container — shadcn
+`Table`'s own `overflow-x-auto` would double-wrap it and `TableBody` would drop the motion / risk invalid
+nested tbody. Migrated **in place** instead (form controls → primitives, removed banned stripe, neutral "Old"
+badge) preserving the full Codex landmine list (scroll container, motion, `setPage(1)`, latched `hasTaxData`,
+export-tax-not-search, `stopPropagation`, `colSpan={7}`, `is_duplicate` opacity). Same design result, far lower risk.
+
+**Caught & fixed:** connector "degraded" **health dot was rendering emerald** (identical to "healthy") — a latent
+bug from the earlier `--color-amber`→emerald rename; replaced with explicit emerald/amber/red-500 + `title`/aria
+(never signal with color alone). Added `aria-invalid`/`aria-describedby` on auth + tax inputs.
+
+**Failed / Blocked:** `/results/[id]` cannot be QA'd headlessly (no creds + needs a real result set). User
+chose "ship + I QA on deploy." `tsc`+`build`+Codex are green but **don't** cover its coupled runtime behaviors —
+manual browser QA of search/tax/export/expand/copy/mailto/pagination is the outstanding gate. `codex review --base`
+flag is unsupported in the installed CLI (dropped it; default-diff review works). Direct `eslint` fails (project
+uses Next eslintrc, not flat config) → lint runs via `next build`.
+
+**Facts learned:** (1) Two emeralds coexist by design — `--primary` (fill, dull in dark `#065f46`) vs
+`--color-amber`/`--color-green` (bright accent text/icons, `#34d399` dark); use primary for button FILLS,
+the bright vars for accent TEXT on dark. (2) `components/ui/input.tsx` wraps Base UI input and forwards ref →
+RHF `register()` + `useRef` bind fine; `checkbox.tsx` is Base UI (no native input) → needs `Controller`.
+(3) shadcn `Input` default is `h-8` (too compact for forms → `h-10`); `Table` self-wraps `overflow-x-auto`.
+(4) `/results/[id]` format pill is **backend-dead** (`getExportUrl` ignores `selectedFormat`).
+
+**Follow-up resolution (same session, "do all yourself"):**
+- **Format pill REMOVED** (`f03861e`): confirmed backend `/jobs/{id}/download` is CSV-only (`csv.DictWriter`,
+  `text/csv`, no `format` param) so the CSV/Excel/JSON pill was purely decorative. Removed pill + `selectedFormat`
+  + `FORMAT_LABELS`; relabeled "Download CSV". Chose remove over wire (multi-format = separate backend feature
+  needing xlsx formula-injection hardening beyond `sanitize_for_csv`). tsc/build green, Codex clean.
+- **Public-screen QA done myself** via headless Chromium against `bridgeleads.io` — **12/12 passed**: `/login`
+  (Inputs/Button/Labels, no glow, onBlur+aria-invalid) + `/register` (mounts past Suspense, **Base-UI Checkbox
+  toggles via Controller in prod**, live password checklist, no glow, **0 console errors**). All 4 gated routes
+  return `307` auth-redirect (healthy, no 500). QA script: `%TEMP%/claude/qa_auth.py`.
+- **Hard blocker:** interactive QA of GATED screens' authed content (`/deliver`, admin `/funnel`+`/connectors`,
+  `/results/[id]` table behaviors) needs a real session + data + admin — a throwaway signup has no jobs/scrapers
+  and isn't admin. Needs a user-supplied test login to finish.
+
+- **Gated-screen QA DONE** (user-supplied account, headed Chromium, live — **15/16**): `/deliver` 132 shadcn
+  Cards+Badges; `/admin/connectors` full agency view (25 Badges + 25 health dots WITH the a11y `title` fix, Add
+  form Inputs + Button-toggles); `/results/[id]` on a real result — **"Download CSV"** (pill removal confirmed),
+  search Input, **banned 3px stripe absent**, **search debounce updates table**, **row-expand works**. The 1
+  non-pass = 5 `next-auth` "Failed to fetch" session-fetch console errors, UNRELATED to the migration (auth
+  untouched; migrated UI = 0 errors). `/admin/funnel` data view unverified: account is agency but not `is_admin`,
+  so it correctly showed the "Admin access required" gate.
+
+**Post-QA gap work (same session, Codex-driven):**
+- **REAL BUG FIXED — admin gate (`48d07b4`):** the funnel-QA gap turned out to be a production bug, not a data
+  gap. The account IS `is_admin:true` server-side (verified via live `/auth/me`), but `lib/auth.ts` never threaded
+  `is_admin` through authorize→jwt→session, so `session.user.is_admin` was ALWAYS undefined → `/admin/funnel`
+  gated out EVERY admin. Fixed: thread `is_admin` (strict `===true`, fail-closed) all 3 hops + augment
+  `types/next-auth.d.ts` + gate the query `enabled:!!session && isAdmin` (Codex hardening — no pointless 403 fetch
+  for non-admins). UI gate only; backend `/billing/activation-funnel` independently enforces; value is
+  server-sourced + sealed in the Auth.js-signed JWT (unforgeable). Codex consult (design) + Codex review clean.
+  Re-QA on deploy: 5/5 — admin passes gate, data view + window toggles + step rows + conversion cards all render.
+- **`next-auth` "Failed to fetch" — diagnosed BENIGN (no fix, Codex-agreed):** controlled repro showed idle-14s =
+  0 console errors; the errors only occur during rapid `goto()` navigation (`net::ERR_ABORTED` on in-flight
+  `/api/auth/session`, same as the react-query API calls). Navigation cancels in-flight fetches — test artifact,
+  not a defect.
+- **Facts learned:** next-auth v5 only carries what the jwt/session callbacks explicitly copy — any new
+  `/auth/me` field (is_admin, etc.) MUST be threaded authorize→jwt→session AND declared in `types/next-auth.d.ts`
+  or it's silently undefined client-side. `plan` was threaded; `is_admin` was the one that got missed.
+
+**Pending / Handoff:** optional DS pass (standardize empties on shadcn `Empty`; invisible inline-`var`→class sweep
+on results cells). Untouched by design: `/dashboard`, `/scrapers/new` wizard. **Rollout + both gaps DONE + live-QA'd.**
+
+---
+
 ## 2026-06-06 — Full endpoint security audit (45 endpoints) + frontend shadcn library
 
 **Built / Shipped:** (1) Security audit of ALL 45 API endpoints + fixes (merge `cdb6c0f`, deployed,

@@ -43,6 +43,39 @@ class TestSourceGating:
         assert _extract_tax_fields("oops", "tax_delinquent") == (None, None)
 
 
+class TestSnohomishSource:
+    """The widened source allowlist must trust Snohomish's exact emitted shape
+    (delinquent_amount as a Decimal STRING, bill_year as an int) and nothing else."""
+
+    def _snoho(self, **over):
+        # Mirrors what SnohomishWATaxDelinquentScraper writes per parcel.
+        base = {
+            "source": "snohomish_county_delinquent_taxes",
+            "delinquent_amount": "10464.62",  # str(Decimal) — no float drift
+            "bill_year": 2024,
+        }
+        base.update(over)
+        return base
+
+    def test_snohomish_string_amount_and_int_year_extract(self):
+        amt, yr = _extract_tax_fields(self._snoho(), "tax_delinquent")
+        assert amt == Decimal("10464.62")
+        assert yr == 2024
+
+    def test_snohomish_only_for_tax_record_type(self):
+        assert _extract_tax_fields(self._snoho(), "probate") == (None, None)
+
+    def test_lookalike_source_still_ignored(self):
+        # A scraper that copied the field names but isn't on the allowlist must
+        # NOT have its tax fields trusted (the whole point of source-gating).
+        ed = {
+            "source": "some_other_county_taxes",
+            "delinquent_amount": "10464.62",
+            "bill_year": 2024,
+        }
+        assert _extract_tax_fields(ed, "tax_delinquent") == (None, None)
+
+
 class TestCoercion:
     def test_string_amount_quantized(self):
         amt, _ = _extract_tax_fields(_king(delinquent_amount="500"), "tax_delinquent")

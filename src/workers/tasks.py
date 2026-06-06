@@ -256,21 +256,34 @@ def _write_result_property_keys(db, rows, user_id: str) -> tuple[int, int]:
     return (updated, weak)
 
 
+# Scrapers whose tax_delinquent rows carry trustworthy structured
+# delinquent_amount + bill_year (the only sources _extract_tax_fields trusts).
+# Adding a county = add its exact source string here AFTER confirming the scraper
+# emits a real bill year + a clean owed amount. NEVER widen this to a generic
+# "if the keys exist" check — that would mis-populate any scraper reusing the
+# key names with a different meaning (Codex).
+_TRUSTED_TAX_SOURCES = frozenset({
+    "king_county_delinquent_taxes",        # King — Socrata API
+    "snohomish_county_delinquent_taxes",   # Snohomish — Treasurer bulk Current Tax List
+})
+
+
 def _extract_tax_fields(
     enrichment_data, record_type: str
 ) -> tuple[Decimal | None, int | None]:
     """Phase 4: SOURCE-GATED structured tax fields for amount/age filtering.
 
-    Returns (delinquent_amount, bill_year). ONLY King's Socrata tax_delinquent
-    rows carry trustworthy structured data, so anything else returns
-    (None, None) and never matches a tax filter — a generic "if the keys exist"
-    extraction would mis-populate any future scraper that reuses those key names
-    with a different meaning (Codex). Values are coerced + bounded so a malformed
-    scrape can't poison the filter columns. Raw enrichment_data is untouched.
+    Returns (delinquent_amount, bill_year). ONLY scrapers in
+    ``_TRUSTED_TAX_SOURCES`` carry trustworthy structured data, so anything else
+    returns (None, None) and never matches a tax filter — a generic "if the keys
+    exist" extraction would mis-populate any future scraper that reuses those key
+    names with a different meaning (Codex). Values are coerced + bounded so a
+    malformed scrape can't poison the filter columns. Raw enrichment_data is
+    untouched.
     """
     if record_type != "tax_delinquent" or not isinstance(enrichment_data, dict):
         return (None, None)
-    if enrichment_data.get("source") != "king_county_delinquent_taxes":
+    if enrichment_data.get("source") not in _TRUSTED_TAX_SOURCES:
         return (None, None)
 
     amount: Decimal | None = None

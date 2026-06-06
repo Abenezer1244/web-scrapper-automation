@@ -615,3 +615,61 @@ class ReferralEvent(Base):
     reason = Column(String(64), nullable=False)
     # e.g. "referee_converted_to_paid"
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class DialerDelivery(Base):
+    """Per-contact outbox for native dialer connectors (Thread 3).
+
+    The generic webhook push is a single batch POST, but bulk-less native dialers
+    (e.g. PhoneBurner) require one POST per contact, so partial success is the norm
+    (some delivered, some rate-limited/401). The job-level Job.dialer_pushed_at
+    claim only means "outbox materialized" — durable per-contact state lives here so
+    a replay re-sends ONLY the rows that aren't 'delivered', never re-pushing a
+    contact that already landed (Codex).
+
+    Materialized by dialer_push_sweep (one row per dialer-ready lead) and drained in
+    bounded chunks by process_dialer_outbox. Credentials are NEVER stored here — the
+    processor re-reads them from the scraper_config at send time.
+    """
+
+    __tablename__ = "dialer_deliveries"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    job_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    result_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("results.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    scraper_config_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("scraper_configs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    vendor_id = Column(String(32), nullable=False)
+    # pending | delivered | failed
+    status = Column(String(16), nullable=False, default="pending", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    last_error = Column(String(256), nullable=True)
+    vendor_response_code = Column(Integer, nullable=True)
+    vendor_contact_id = Column(String(128), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    delivered_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        # One outbox row per (job, result) — idempotent materialization; a re-run
+        # sweep can ON CONFLICT DO NOTHING instead of duplicating contacts.
+        UniqueConstraint("job_id", "result_id", name="uq_dialer_delivery_job_result"),
+        # The chunk drain + replay both scan pending/failed rows for a job.
+        Index("ix_dialer_deliveries_job_status", "job_id", "status"),
+    )

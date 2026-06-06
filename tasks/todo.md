@@ -105,6 +105,23 @@ Source: Snohomish "Current Tax List" — `…/DocumentCenter/View/149173/snohomi
     anchor; `_extract_tax_fields` IGNORES non-allowlisted source even with tax-looking fields; end-to-end
     source-string → both columns populated. + INFO metrics (bytes, rows, malformed, delinquent, parcels, oldest yr, total $).
 
+# Thread 3 — Dialer connectors (full build, user-approved). Codex design consult done (session 019e9b22 follow-up).
+Codex raised the bar: per-contact OUTBOX is required (PhoneBurner has no bulk endpoint → 500 POSTs →
+partial-success silent loss). Refined scope to bound blast radius:
+- **Phase A ✅ (c0943d4):** connector seam (ABC + GenericWebhookConnector byte-identical + dialer_type
+  discriminator + sweep dispatch). 7 tests. No transport change.
+- **Phase B (vendor-only outbox — generic path UNTOUCHED):** `dialer_delivery` outbox table (migration 041:
+  id, job_id, result_id, user_id, scraper_config_id, vendor_id, status[pending|delivered|failed],
+  attempts, last_error, vendor_response_code, vendor_contact_id, created_at, delivered_at). Sweep: for a
+  VENDOR dialer_type, claim job → INSERT one outbox row per lead → enqueue chunked processor; GENERIC stays
+  on the existing deliver_job_webhook path (no billing-path change). New `process_dialer_outbox` task:
+  re-reads config from DB (owner-match ScraperConfig.user_id==Job.user_id + Result.user_id), builds vendor
+  request via connector, POST host-allowlisted + response redacted, updates per-row status/last_error;
+  creds built at send time (never a task arg). Replay endpoint (user_id-scoped) resets failed→pending.
+  NOTE: generic catch-hook-URL-in-args is PRE-EXISTING status quo, not regressed; hardening it = documented follow-up.
+- **Phase C:** PhoneBurner connector (contact-creation ONLY, host allowlist www.phoneburner.com, OAuth
+  Bearer + owner_id from deliver config, extra=forbid + token validators). Live smoke needs user creds.
+
 ## Review — Thread 1 (Snohomish) SHIPPED + LIVE ✅
 - Merged to main (`9a70bab`), pushed, deployed — health 200 (migration 040 applied on boot).
 - **Live smoke against the real source:** 44.7 MB / 325,043 rows / 0 malformed → 10,548 delinquent rows →

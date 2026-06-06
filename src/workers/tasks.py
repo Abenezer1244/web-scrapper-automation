@@ -999,12 +999,142 @@ async def _run_scraper(
     return records
 
 
+def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
+    """Copy enrichment + settled skip-trace from the originally-delivered Result
+    onto THIS job's is_duplicate rows, so a re-scrape of already-seen leads does
+    not re-hit county GIS or re-pay Tracerfy. Returns the number of rows updated.
+
+    Runs first in the ENRICHING phase: once a duplicate row has an address +
+    settled skip-trace status copied in, the existing selectors below skip it
+    (GIS needs a missing address; skip-trace needs status='not_attempted').
+
+    SECURITY (multi-tenant): every join leg is filtered by job.user_id. The
+    worker runs on the SYSTEM db session (which is not constrained by RLS), so
+    this explicit user_id filter — not RLS — is the tenant boundary; it makes a
+    cross-tenant copy impossible. Reuse is gated to PROVABLY-STRONG identity:
+    we recompute compute_property_key(parcel_id, property_address) per candidate
+    and reuse ONLY rows whose dedup_hash IS that strong key — so the hash must
+    have come from the parcel/address branch, never the weak NAME|DATE fallback.
+    A blank/placeholder parcel ('', 'N/A', whitespace) makes compute_property_key
+    return None (is_strong_identity=False), so it can't match and is excluded;
+    `parcel_id IS NOT NULL` alone was insufficient (Codex P1). Thus one
+    homeowner's PII can never be copied onto an unrelated record that merely
+    shares a name + filing date. Address/source fields are FILL-MISSING (COALESCE
+    current-first — never clobber a fresh scrape/GIS value); skip-trace PII is
+    copied only from a SETTLED (hit/miss) prior trace within the 90-day cache
+    TTL, onto a row that has not itself been attempted.
+    """
+    from sqlalchemy import text as _sa_text
+
+    from src.workers.property_identity import normalize_address, normalize_parcel
+
+    uid = str(job.user_id)
+
+    # Placeholder/junk parcels (all-zeros, a single repeated char, <4 chars, no
+    # digit, or known junk tokens) pass is_strong_identity but are NOT a real
+    # property identity — unrelated homeowners can share one, so reusing PII
+    # across them would leak phone/email (Codex P1). Only safe to ignore the
+    # parcel when a SPECIFIC address anchors the identity instead.
+    _PARCEL_JUNK = {"NA", "NONE", "NULL", "UNKNOWN", "NOPARCEL", "PENDING", "TBD", "TEST"}
+
+    def _reusable(parcel_id, property_address, dedup_hash) -> bool:
+        # 1) must be the STRONG (parcel|address) hash, never weak NAME|DATE.
+        if _compute_property_key(parcel_id, property_address) != dedup_hash:
+            return False
+        # 2) a specific address makes the identity safe regardless of parcel.
+        addr = normalize_address(property_address)
+        if len(addr) >= 8 and any(c.isalpha() for c in addr):
+            return True
+        # 3) no real address -> identity rests on the parcel alone; reject junk.
+        p = normalize_parcel(parcel_id)
+        if (
+            len(p) < 4
+            or len(set(p)) <= 1          # all-zeros / single repeated char
+            or p.lstrip("0") == ""
+            or not any(c.isdigit() for c in p)
+            or p in _PARCEL_JUNK
+        ):
+            return False
+        return True
+
+    # Strong-identity gate: recompute per candidate (tenant-scoped to this job +
+    # user) and keep ONLY rows that are safe to reuse.
+    candidates = db.execute(
+        _sa_text(
+            "SELECT id, parcel_id, property_address, dedup_hash FROM results "
+            "WHERE job_id = CAST(:jid AS uuid) AND user_id = CAST(:uid AS uuid) "
+            "AND is_duplicate = true AND dedup_hash IS NOT NULL"
+        ),
+        {"jid": job_id, "uid": uid},
+    ).fetchall()
+    strong_ids = [
+        str(row.id)
+        for row in candidates
+        if _reusable(row.parcel_id, row.property_address, row.dedup_hash)
+    ]
+    if not strong_ids:
+        return 0
+
+    ttl = int(getattr(settings, "SKIP_TRACE_CACHE_DAYS", 90))
+    # Fully-STATIC SQL — no string interpolation at all (the settled-reuse
+    # predicate is written out per skip-trace column) and every value is a bound
+    # parameter (:ids, :uid, :ttl), so there is no injection surface. Membership
+    # is restricted to the Python-verified strong_ids; skip-trace PII is copied
+    # only from a SETTLED (hit/miss) prior trace inside the TTL window, onto a
+    # row that has not itself been attempted.
+    sql = """
+        UPDATE results AS rn SET
+            property_address     = COALESCE(rn.property_address, ro.property_address),
+            mailing_address      = COALESCE(rn.mailing_address, ro.mailing_address),
+            delinquent_amount    = COALESCE(rn.delinquent_amount, ro.delinquent_amount),
+            delinquent_bill_year = COALESCE(rn.delinquent_bill_year, ro.delinquent_bill_year),
+            phone = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' THEN ro.phone ELSE rn.phone END,
+            phone_type = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' THEN ro.phone_type ELSE rn.phone_type END,
+            phone_dnc_flag = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' THEN ro.phone_dnc_flag ELSE rn.phone_dnc_flag END,
+            email = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' THEN ro.email ELSE rn.email END,
+            skip_trace_status = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' THEN ro.skip_trace_status ELSE rn.skip_trace_status END,
+            skip_trace_attempted_at = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' THEN ro.skip_trace_attempted_at ELSE rn.skip_trace_attempted_at END
+        FROM delivered_records dr
+        JOIN results ro
+          ON ro.id = dr.first_result_id
+         AND ro.user_id = CAST(:uid AS uuid)
+        WHERE rn.id = ANY(CAST(:ids AS uuid[]))
+          AND rn.user_id = CAST(:uid AS uuid)
+          AND dr.user_id = CAST(:uid AS uuid)
+          AND dr.dedup_hash = rn.dedup_hash
+          AND rn.id <> dr.first_result_id
+    """
+    result = db.execute(_sa_text(sql), {"ids": strong_ids, "uid": uid, "ttl": ttl})
+    db.commit()
+    return result.rowcount or 0
+
+
 def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
     """Run GIS + King County enrichment inline (before job marks done)."""
     from sqlalchemy import func
     from sqlalchemy import select as sa_select
 
     from src.db.models import Result
+
+    # Reuse prior enrichment for duplicate leads BEFORE any external lookup, so a
+    # re-scrape of already-seen records doesn't re-hit county GIS or re-pay
+    # Tracerfy. Non-fatal: on any failure we roll back and fall through to the
+    # normal full-enrichment path (correctness over the cost optimization).
+    try:
+        reused = _reuse_enrichment_for_duplicates(db, job, job_id)
+        if reused:
+            _publish_log(
+                r, job_id, "info",
+                f"Reused prior enrichment for {reused} duplicate leads "
+                "(skipped re-lookup + skip-trace charge)",
+                db=db,
+            )
+    except Exception as exc:
+        _logger.warning("Duplicate enrichment reuse skipped: %s", str(exc)[:160])
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
     all_results = db.execute(
         sa_select(Result).where(Result.job_id == job_id, Result.user_id == job.user_id)
@@ -1273,18 +1403,26 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
             def _trunc128(v: str | None) -> str | None:
                 return v[:128] if v and len(v) > 128 else v
 
+            # property_address + mail_address columns are VARCHAR(512); truncating
+            # them to 128 (a) corrupts the skip-trace cache key (the read path in
+            # _enqueue hashes the FULL Result.property_address, so a 128-truncated
+            # write key would never match -> re-paid traces) and (b) drops real
+            # mailing data sent to Tracerfy. Truncate to the actual column width.
+            def _trunc512(v: str | None) -> str | None:
+                return v[:512] if v and len(v) > 512 else v
+
             try:
                 pending = PendingSkipTraceRow(
                     job_id=payload["job_id"],
                     result_id=payload["result_id"],
                     user_id=payload["user_id"],
-                    property_address=_trunc128(payload["property_address"]),
+                    property_address=_trunc512(payload["property_address"]),
                     city=_trunc128(payload["city"]),
                     state=_trunc128(payload["state"]),
                     zip=_trunc128(payload["zip"]),
                     first_name=_trunc128(payload["first_name"]),
                     last_name=_trunc128(payload["last_name"]),
-                    mail_address=_trunc128(payload["mail_address"]),
+                    mail_address=_trunc512(payload["mail_address"]),
                     mail_city=_trunc128(payload["mail_city"]),
                     mail_state=_trunc128(payload["mail_state"]),
                     mail_zip=_trunc128(payload["mail_zip"]),

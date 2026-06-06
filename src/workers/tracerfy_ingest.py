@@ -321,11 +321,19 @@ def ingest_tracerfy_batch(
             else:
                 miss_count += 1
 
-            # Cache the result for 90-day reuse (Sprint 4)
+            # Cache the result for 90-day reuse (Sprint 4).
+            # Key off OUR canonical pending-row address (the same fields the READ
+            # path in tasks._enqueue_skip_trace_rows hashes), NOT Tracerfy's echoed
+            # csv_row address. Tracerfy may USPS-standardize the street (e.g.
+            # "St" -> "STREET"), which address_cache_key does NOT collapse, so a
+            # csv-keyed write would never match our GIS address on a later run ->
+            # 0 cache hits -> the same lead re-paid every scrape. pending_by_key
+            # groups by (address, city, state), so all `matches` share this key.
+            _pend = matches[0]
             cache_key = address_cache_key(
-                csv_row.get("address") or "",
-                csv_row.get("city") or "",
-                csv_row.get("state") or "",
+                _pend.property_address or "",
+                _pend.city or "",
+                _pend.state or "",
             )
             existing_cache = db.get(SkipTraceCache, cache_key)
             if existing_cache:

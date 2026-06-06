@@ -32,6 +32,13 @@ _ZONES: dict[str, tuple[int, int]] = {
     # for both while still blocking attackers who spray invalid
     # signatures to burn CPU on HMAC verification.
     "webhook": (120, 60),
+    # Endpoints that make an OUTBOUND Stripe API call per request
+    # (/billing/subscription, /checkout, /portal). Tighter than `general` and
+    # fail-CLOSED (see _FALLBACK_ZONES): each call spends the operator's Stripe
+    # quota and can spam Customer/Checkout objects, so a stolen JWT looping these
+    # — even during a Redis outage — must stay throttled. 10/min per user is ample
+    # for legitimate upgrade/manage flows (Codex security cross-check).
+    "stripe": (10, 60),
 }
 
 _redis_client: aioredis.Redis | None = None
@@ -107,7 +114,7 @@ def client_ip(request: Request) -> str:
 # but enough to stop a single worker from accepting unlimited auth/webhook
 # attempts during an incident. Other zones still fail fully open (availability
 # over abuse-resistance is the right trade for non-security paths).
-_FALLBACK_ZONES = frozenset({"auth", "webhook"})
+_FALLBACK_ZONES = frozenset({"auth", "webhook", "stripe"})
 _fallback_hits: dict[str, list[float]] = {}
 
 

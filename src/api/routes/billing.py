@@ -96,6 +96,7 @@ async def activation_funnel(
 
 @router.get("/referral")
 async def referral_status(
+    request: Request,
     current_user: CurrentUser,
     # get_rls_db (not get_db): paid_conversions reads the tenant-scoped
     # referral_events table (policy: referrer_id OR referee_id = GUC). Without
@@ -118,6 +119,7 @@ async def referral_status(
     before migration 017) get one generated on first call so the
     endpoint is always safe to hit.
     """
+    await rate_limit(request, zone="general", identifier=current_user.id)
     from sqlalchemy import func as sa_func
 
     from src.db.models import ReferralEvent
@@ -169,6 +171,7 @@ async def referral_status(
 
 @router.get("/skip-trace-usage")
 async def skip_trace_usage(
+    request: Request,
     current_user: CurrentUser,
 ) -> dict:
     """Return the user's skip-trace lookup usage + bundled quota.
@@ -177,6 +180,7 @@ async def skip_trace_usage(
     overage estimate. Values are read from the cached counter on the
     User row — no external calls.
     """
+    await rate_limit(request, zone="general", identifier=current_user.id)
     plan = (current_user.plan or "starter").lower()
     quota = settings.SKIP_TRACE_BUNDLED_QUOTAS.get(plan, 0)
     used = current_user.skip_trace_used_this_month or 0
@@ -404,8 +408,9 @@ async def pricing_page() -> dict:
 # ─── Usage ────────────────────────────────────────────────────────────────────
 
 @router.get("/usage")
-async def get_usage(current_user: CurrentUser) -> dict:
+async def get_usage(request: Request, current_user: CurrentUser) -> dict:
     """Return current plan, record usage, and limit for the settings page."""
+    await rate_limit(request, zone="general", identifier=current_user.id)
     limit = current_user.records_limit
     used = current_user.records_used
     return {
@@ -420,8 +425,9 @@ async def get_usage(current_user: CurrentUser) -> dict:
 # ─── Subscription status ──────────────────────────────────────────────────────
 
 @router.get("/subscription")
-async def get_subscription(current_user: CurrentUser) -> dict:
+async def get_subscription(request: Request, current_user: CurrentUser) -> dict:
     """Return the user's active Stripe subscription details, if any."""
+    await rate_limit(request, zone="stripe", identifier=current_user.id)
     if not current_user.stripe_customer_id:
         return {"status": "none", "plan": current_user.plan}
 
@@ -464,11 +470,15 @@ class CheckoutRequest(BaseModel):
 
 @router.post("/checkout")
 async def create_checkout(
+    request: Request,
     body: CheckoutRequest,
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> dict:
     """Create a Stripe Checkout session to upgrade the user's plan."""
+    # Tighter cap than a plain read: each call hits Stripe (Customer + Checkout
+    # Session creation), so loop-abuse spams Stripe + the operator's quota.
+    await rate_limit(request, zone="stripe", identifier=current_user.id)
     price_or_product_id = body.price_id
 
     # Resolve Product ID → Price ID first (sourced from env vars via settings)
@@ -537,8 +547,9 @@ async def create_checkout(
 # ─── Customer portal ──────────────────────────────────────────────────────────
 
 @router.post("/portal")
-async def customer_portal(current_user: CurrentUser) -> dict:
+async def customer_portal(request: Request, current_user: CurrentUser) -> dict:
     """Return a Stripe Customer Portal URL for managing subscriptions."""
+    await rate_limit(request, zone="stripe", identifier=current_user.id)
     if not current_user.stripe_customer_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

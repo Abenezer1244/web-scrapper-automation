@@ -19,6 +19,50 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-06 — Full endpoint security audit (45 endpoints) + frontend shadcn library
+
+**Built / Shipped:** (1) Security audit of ALL 45 API endpoints + fixes (merge `cdb6c0f`, deployed,
+health 200). (2) Full shadcn/ui library into the frontend + `/segments` rebuilt as the reference screen.
+
+**Security audit (the priority):** parallel per-file agents (one per route file) + **Codex independent
+cross-check** + Codex diff-review gate. **No Critical, no missed High** — both reviewers confirmed the
+multi-tenant core is solid: no IDOR (job_id/config_id/scraper_id all owner-scoped incl. the new
+dialer-replay), no SQLi (segments binds `ANY(:types)`), Stripe webhook signature sound, no
+mass-assignment (plan/is_admin/user_id never in request bodies). Fixed the 7 Highs:
+- `billing.py`: 6 unthrottled endpoints rate-limited. The 3 outbound-Stripe ones
+  (/subscription,/checkout,/portal) use a NEW `stripe` zone (10/min/user) added to `_FALLBACK_ZONES`
+  so it **fails CLOSED** — a stolen JWT can't loop them to drain Stripe quota even during a Redis
+  outage (Codex refined my first pass, which used the fail-open `general` zone).
+- `webhooks.py`: Tracerfy secret was in the URL PATH (leaks to access logs). Added preferred
+  header-auth `POST /webhooks/tracerfy` (`X-Tracerfy-Webhook-Secret`); kept legacy path route +
+  header-first so live skip-trace ingestion doesn't break during migration.
+- Report: `docs/security/ENDPOINT-AUDIT-2026-06-06.md` (+ Medium follow-ups + ops migration steps).
+
+**Frontend:** pulled the FULL shadcn registry (46 components → 60 total in components/ui/) on the
+existing base-nova theme; existing customized primitives preserved (skip-on-exists). 2 integration
+fixes (Skeleton accepts div attrs; calendar uses react-day-picker@10 `month_grid`). Rebuilt `/segments`
+(Lists) on shadcn Button/Badge/Table/Empty per `.impeccable.md` design context (created this session
+via `/impeccable teach`). All Codex-clean, tsc + next build green, shipped to master.
+
+**Tried / Decided:** Established `.impeccable.md` design context (confident & in-control, emerald/PT-Serif
+DNA, anti-AI-slop). DECIDED NOT to blanket-rebuild already-polished screens (dashboard 804L, wizard
+~1700L) — shadcn-for-its-own-sake would downgrade them + risk the live app; reserve rebuilds for plain
+screens + new work. base-nova is **Base UI** (`@base-ui/react`), NOT Radix — ToggleGroup etc. have
+non-standard APIs (value is always array, no `type` prop); used Button-based toggles in /segments instead.
+
+**Failed / Blocked:** none this session. OPS pending: migrate Tracerfy to the header webhook + rotate
+`TRACERFY_WEBHOOK_SECRET` (then drop the legacy path route).
+
+**Facts learned:** (1) app role uses PER-TABLE grants + a convergence guard; system role has ALL-TABLES
+— so worker-only tables dodge the RLS-grant landmine. (2) rate_limit zones: `general` fails OPEN,
+`auth`/`webhook`/`stripe` fail CLOSED (`_FALLBACK_ZONES`). (3) base-nova = Base UI, not Radix.
+(4) `/impeccable` design context lives in `bridgeleads-web/.impeccable.md`.
+
+**Pending / Handoff:** UI screen-by-screen rollout (with Codex per screen) — /segments done; dashboard +
+others pending (user wants all, I flagged polished-screen risk). Tracerfy webhook ops migration.
+
+---
+
 ## 2026-06-05 — Post-milestone Threads 2 & 3: DNC (deferred) + dialer connectors (built)
 
 **Built / Shipped:** Native dialer connectors (Thread 3) on `feature/dialer-connectors` (6 commits,

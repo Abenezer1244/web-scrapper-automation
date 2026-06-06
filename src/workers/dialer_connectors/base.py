@@ -36,6 +36,18 @@ class DialerConnector(ABC):
     # All dialer connectors transmit contact PII (name/phone/email) to a third
     # party, so the transport must redact vendor response bodies for all of them.
     carries_pii: bool = True
+    # Generic webhook = ONE batch POST on the existing deliver_job_webhook path.
+    # A bulk-less native vendor (no batch endpoint) sets uses_outbox=True so the
+    # sweep materializes a per-contact dialer_deliveries row per lead and the
+    # process_dialer_outbox transport drains them one POST at a time with durable
+    # per-row replay (Codex: partial success is the norm without a bulk endpoint).
+    uses_outbox: bool = False
+    # Hardcoded HTTPS host allowlist for a native vendor's fixed endpoint. The
+    # transport asserts every built request URL's host is in here, so a typo'd
+    # default or future config-driven base_url can't ship PII + a bearer token to
+    # an arbitrary host. Empty for the generic connector (user picks the URL,
+    # guarded by validate_outbound_webhook instead).
+    ALLOWED_HOSTS: frozenset[str] = frozenset()
 
     @abstractmethod
     def validate_config(self, deliver: dict) -> None:
@@ -74,6 +86,9 @@ def get_connector(vendor_id: str | None) -> DialerConnector:
     if vid == "generic_webhook":
         from src.workers.dialer_connectors.generic_webhook import GenericWebhookConnector
         return GenericWebhookConnector()
+    if vid == "phoneburner":
+        from src.workers.dialer_connectors.phoneburner import PhoneBurnerConnector
+        return PhoneBurnerConnector()
 
     # Should be unreachable: a value in REGISTERED_DIALER_VENDOR_IDS with no
     # dispatch arm means the allowlist and the registry drifted.

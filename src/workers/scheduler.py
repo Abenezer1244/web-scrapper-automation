@@ -786,6 +786,40 @@ def flush_skip_trace_meter_outbox() -> None:
 
 # ─── Task: Dialer push sweep (Phase 5) ───────────────────────────────────────
 
+def _materialize_dialer_outbox(db, job, config, vendor_id: str, leads: list[dict]) -> None:
+    """Idempotently INSERT one pending dialer_deliveries row per lead.
+
+    ON CONFLICT DO NOTHING on UNIQUE(job_id, result_id) so a re-run sweep (or a
+    crash-retry) never duplicates a contact. No credentials are stored — only the
+    routing keys the outbox transport needs to re-read config + result at send time.
+    """
+    from uuid import uuid4
+
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    from src.db.models import DialerDelivery
+
+    if not leads:
+        return
+    rows = [
+        {
+            "id": str(uuid4()),
+            "job_id": job.id,
+            "result_id": ld["id"],
+            "user_id": job.user_id,
+            "scraper_config_id": config.id,
+            "vendor_id": vendor_id,
+            "status": "pending",
+        }
+        for ld in leads
+    ]
+    db.execute(
+        pg_insert(DialerDelivery)
+        .values(rows)
+        .on_conflict_do_nothing(constraint="uq_dialer_delivery_job_result")
+    )
+
+
 @app.task(name="src.workers.scheduler.dialer_push_sweep")
 def dialer_push_sweep() -> None:
     """Push dialer-ready leads for done jobs whose skip-trace has SETTLED.
@@ -806,6 +840,7 @@ def dialer_push_sweep() -> None:
     from src.db.models import Job, PendingSkipTraceRow, Result, ScraperConfig, User
     from src.db.session import system_sync_session
     from src.workers.dialer_connectors import get_connector
+    from src.workers.dialer_outbox import process_dialer_outbox
     from src.workers.webhook_delivery import DIALER_PUSH_CAP, deliver_job_webhook
 
     _BATCH = 50
@@ -866,9 +901,21 @@ def dialer_push_sweep() -> None:
                 Job.status == "done",
                 Job.dialer_pushed_at.is_(None),
                 User.plan.in_(BUSINESS_FEATURES_PLANS),
-                # ->> returns NULL for missing key or non-text; works for JSON/JSONB.
-                ScraperConfig.deliver.op("->>")("dialer_webhook_url").isnot(None),
-                ScraperConfig.deliver.op("->>")("dialer_webhook_url") != "",
+                # A dialer-push candidate has EITHER a generic webhook URL OR a
+                # native vendor dialer_type (e.g. phoneburner, which has no URL —
+                # it pushes from the outbox). ->> returns NULL for a missing key.
+                or_(
+                    and_(
+                        ScraperConfig.deliver.op("->>")("dialer_webhook_url").isnot(None),
+                        ScraperConfig.deliver.op("->>")("dialer_webhook_url") != "",
+                    ),
+                    and_(
+                        ScraperConfig.deliver.op("->>")("dialer_type").isnot(None),
+                        ScraperConfig.deliver.op("->>")("dialer_type").notin_(
+                            ("", "generic_webhook")
+                        ),
+                    ),
+                ),
                 ~unsettled,
             )
             .limit(_BATCH)
@@ -877,8 +924,11 @@ def dialer_push_sweep() -> None:
         pushed = 0
         for job, config in candidates:
             deliver = config.deliver or {}
+            connector = get_connector(deliver.get("dialer_type"))
             url = deliver.get("dialer_webhook_url")
-            if not url:
+            # The generic webhook connector needs a destination URL; outbox vendors
+            # (e.g. phoneburner) push from the dialer_deliveries outbox and have none.
+            if not connector.uses_outbox and not url:
                 continue  # defensive: SQL filter should already guarantee this
             # DURABLE CLAIM BEFORE PUBLISH (at-most-once): atomically stamp
             # dialer_pushed_at from NULL and COMMIT before enqueuing. This both
@@ -933,28 +983,37 @@ def dialer_push_sweep() -> None:
                         }
                         for row in rows
                     ]
-                    # Dispatch via the dialer connector seam (Thread 3). For the
-                    # generic webhook this builds the exact same payload + URL as
-                    # before (locked by tests/test_dialer_connector_base.py) and
-                    # enqueues one delivery — byte-identical to the prior path.
-                    connector = get_connector(deliver.get("dialer_type"))
-                    job_meta = {
-                        "job_id": str(job.id),
-                        "scraper_config_id": str(config.id),
-                        "scraper_name": config.name,
-                        "county": config.county,
-                        "state": config.state,
-                        "record_type": config.record_type,
-                        "total_dialer_ready_count": total,
-                        "dialer_webhook_url": url,
-                        "dialer_webhook_secret": deliver.get("dialer_webhook_secret"),
-                    }
-                    for req in connector.build_requests(leads, job_meta):
-                        deliver_job_webhook.delay(str(job.id), req["url"], req["payload"])
+                    # Dispatch via the dialer connector seam (Thread 3).
+                    if connector.uses_outbox:
+                        # Native bulk-less vendor: materialize one durable outbox row
+                        # per lead (idempotent via UNIQUE(job_id,result_id)), then
+                        # drain via process_dialer_outbox — durable per-contact state
+                        # + replay. Credentials are NOT touched here; the transport
+                        # re-reads them from the DB at send time.
+                        _materialize_dialer_outbox(db, job, config, connector.VENDOR_ID, leads)
+                        db.commit()
+                        process_dialer_outbox.delay(str(job.id))
+                    else:
+                        # Generic webhook: builds the exact same payload + URL as
+                        # before (locked by tests/test_dialer_connector_base.py) and
+                        # enqueues one delivery — byte-identical to the prior path.
+                        job_meta = {
+                            "job_id": str(job.id),
+                            "scraper_config_id": str(config.id),
+                            "scraper_name": config.name,
+                            "county": config.county,
+                            "state": config.state,
+                            "record_type": config.record_type,
+                            "total_dialer_ready_count": total,
+                            "dialer_webhook_url": url,
+                            "dialer_webhook_secret": deliver.get("dialer_webhook_secret"),
+                        }
+                        for req in connector.build_requests(leads, job_meta):
+                            deliver_job_webhook.delay(str(job.id), req["url"], req["payload"])
                     pushed += 1
                     _logger.info(
-                        "Dialer push queued for job %s: %d of %d dialer-ready leads",
-                        job.id, len(leads), total,
+                        "Dialer push queued for job %s: %d of %d dialer-ready leads (%s)",
+                        job.id, len(leads), total, connector.VENDOR_ID,
                     )
                 # Already claimed+committed above. A 0-lead job stays claimed so
                 # it isn't re-evaluated every sweep forever.

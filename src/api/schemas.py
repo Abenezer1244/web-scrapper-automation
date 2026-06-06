@@ -200,6 +200,11 @@ class DeliverConfig(BaseModel):
     # generic webhook/Zapier connector. Validated against the server-side
     # allowlist so an arbitrary string can never reach connector dispatch.
     dialer_type: str | None = None
+    # Thread 3: PhoneBurner native connector credentials (used when
+    # dialer_type == "phoneburner"). The access token is a secret — write-only in
+    # responses (redacted in ScraperConfigResponse, like the HMAC secrets).
+    phoneburner_access_token: str | None = None
+    phoneburner_owner_id: str | None = None
 
     @field_validator("dialer_type")
     @classmethod
@@ -210,6 +215,25 @@ class DeliverConfig(BaseModel):
         if v not in REGISTERED_DIALER_VENDOR_IDS:
             raise ValueError(f"Unknown dialer_type: {v!r}")
         return v
+
+    @field_validator("phoneburner_access_token")
+    @classmethod
+    def validate_pb_token(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if not v.strip() or len(v) > 4096 or any(c in v for c in "\r\n\t"):
+            raise ValueError("phoneburner_access_token is empty or malformed")
+        return v
+
+    @field_validator("phoneburner_owner_id")
+    @classmethod
+    def validate_pb_owner(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s or len(s) > 64 or any(c in s for c in "\r\n\t"):
+            raise ValueError("phoneburner_owner_id is empty or malformed")
+        return s
 
     @field_validator("emails")
     @classmethod
@@ -291,6 +315,8 @@ class DeliverConfigDict(TypedDict, total=False):
     dialer_webhook_url: str | None       # Phase 5: generic dialer push
     dialer_webhook_secret: str | None
     dialer_type: str | None              # Thread 3: dialer connector id (None = generic)
+    phoneburner_access_token: str | None  # Thread 3: PhoneBurner OAuth token (write-only)
+    phoneburner_owner_id: str | None
 
 
 class ScraperConfigCreate(BaseModel):
@@ -366,8 +392,11 @@ class ScraperConfigResponse(BaseModel):
         # "secret set" without leaking the value.
         self.deliver["webhook_secret_set"] = bool(self.deliver.get("webhook_secret"))
         self.deliver["dialer_webhook_secret_set"] = bool(self.deliver.get("dialer_webhook_secret"))
+        # Thread 3: the PhoneBurner OAuth token is a credential — write-only too.
+        self.deliver["phoneburner_access_token_set"] = bool(self.deliver.get("phoneburner_access_token"))
         self.deliver.pop("webhook_secret", None)
         self.deliver.pop("dialer_webhook_secret", None)
+        self.deliver.pop("phoneburner_access_token", None)
         # Also normalize fields / enrichment / schedule defensively
         if isinstance(self.fields, list):
             self.fields = dict.fromkeys(self.fields, True)

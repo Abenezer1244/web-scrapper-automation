@@ -238,7 +238,10 @@ def parse_tax_list(lines, *, fallback_year: int) -> tuple[list[ScrapedRecord], d
         rec.mailing_address = entry["mailing"]
         rec.legal_description = parcel
         rec.date_recorded = f"01/01/{bill_year}"
-        rec.doc_type = "tax_delinquent"
+        # doc_type left None (like King tax rows): the daily-cache records filter
+        # for tax_delinquent matches `doc_type IS NULL` OR keyword ILIKE patterns
+        # ("TAX DELINQUENT", ...); the slug "tax_delinquent" would match neither
+        # and hide these rows from /scrapers/{id}/records (Codex P2).
         rec.enrichment_data = {
             "source": _SOURCE,
             # Source-gated structured tax fields read by _extract_tax_fields.

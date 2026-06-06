@@ -80,7 +80,9 @@ def test_parse_single_year_amount_and_fields():
     # pipeline's sanitize_for_csv covers these — never raw-from-enrichment).
     assert cissna.party_name == "CISSNA RICHARD C/KATHRYN A"
     assert "SNOHOMISH" in cissna.property_address
-    assert cissna.doc_type == "tax_delinquent"
+    # doc_type stays None (like King tax) so the cached-records filter's
+    # `doc_type IS NULL` branch keeps these rows visible (Codex P2).
+    assert cissna.doc_type is None
 
 
 def test_parse_counts_malformed_rows():

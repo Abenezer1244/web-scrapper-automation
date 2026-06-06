@@ -42,28 +42,18 @@ def _constant_time_eq(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
 
 
-@router.post("/tracerfy/{provided_secret}", status_code=status.HTTP_200_OK)
-async def tracerfy_webhook(
-    provided_secret: str,
-    request: Request,
-) -> dict:
-    """Receive Tracerfy batch completion webhook.
+# Preferred auth: the secret travels in this header, NOT the URL path (a path
+# secret leaks into access logs / Referer — Codex security cross-check). The
+# legacy path route below stays until Tracerfy is reconfigured to this header.
+_SECRET_HEADER = "X-Tracerfy-Webhook-Secret"
 
-    Auth: constant-time compare of the URL path secret against
-    TRACERFY_WEBHOOK_SECRET.
 
-    Processing: queue a background task to download the CSV and ingest
-    it, so we return 200 to Tracerfy immediately (their retry semantics
-    are unknown, and we don't want to hold the connection open for a
-    large CSV parse).
+def _verify_tracerfy_secret(provided: str | None) -> None:
+    """Constant-time check of a provided secret against TRACERFY_WEBHOOK_SECRET.
+
+    Raises 503 if the server has no secret configured, 401 if the provided
+    secret is missing or wrong. Never logs the provided value.
     """
-    # C5 (full-SaaS review): rate-limit BEFORE the secret comparison
-    # so a brute-force loop hitting invalid secrets gets 429'd
-    # quickly. Legitimate Tracerfy deliveries fire once per batch
-    # completion — minutes apart — so the 120/min cap is far above
-    # any normal traffic.
-    await rate_limit(request, zone="webhook")
-
     expected = settings.TRACERFY_WEBHOOK_SECRET
     if not expected:
         _logger.error("Tracerfy webhook hit but TRACERFY_WEBHOOK_SECRET is unset")
@@ -71,15 +61,19 @@ async def tracerfy_webhook(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Skip trace webhook not configured",
         )
-
-    if not _constant_time_eq(provided_secret, expected):
-        # Don't log the provided secret — could be an attack probe
-        _logger.warning("Tracerfy webhook received with invalid secret (len=%d)", len(provided_secret))
+    if not provided or not _constant_time_eq(provided, expected):
+        _logger.warning(
+            "Tracerfy webhook received with invalid secret (len=%d)", len(provided or "")
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid webhook secret",
         )
 
+
+async def _process_tracerfy_webhook(request: Request) -> dict:
+    """Parse + validate the Tracerfy body and dispatch ingest. Auth is the
+    caller's responsibility (done before this is invoked)."""
     try:
         payload = await request.json()
     except Exception as exc:
@@ -140,6 +134,37 @@ async def tracerfy_webhook(
 
     return {"received": True, "queue_id": queue_id}
 
+
+@router.post("/tracerfy", status_code=status.HTTP_200_OK)
+async def tracerfy_webhook(request: Request) -> dict:
+    """Receive Tracerfy batch completion webhook (PREFERRED).
+
+    Auth: constant-time compare of the `X-Tracerfy-Webhook-Secret` header against
+    TRACERFY_WEBHOOK_SECRET — keeps the secret out of the URL (and out of access
+    logs / Referer). Configure Tracerfy to POST here with that header.
+    """
+    # Rate-limit BEFORE the secret compare so a brute-force loop hitting invalid
+    # secrets is 429'd quickly (legitimate deliveries fire minutes apart).
+    await rate_limit(request, zone="webhook")
+    _verify_tracerfy_secret(request.headers.get(_SECRET_HEADER))
+    return await _process_tracerfy_webhook(request)
+
+
+@router.post("/tracerfy/{provided_secret}", status_code=status.HTTP_200_OK)
+async def tracerfy_webhook_legacy(provided_secret: str, request: Request) -> dict:
+    """LEGACY: secret in the URL path. Deprecated — the path secret leaks into
+    access logs. Migrate Tracerfy to `POST /webhooks/tracerfy` with the
+    `X-Tracerfy-Webhook-Secret` header, rotate TRACERFY_WEBHOOK_SECRET, then this
+    route can be removed.
+
+    Header-first (Codex): if the header is present it is authoritative — a wrong
+    header is rejected even if the path secret is right. Current Tracerfy traffic
+    sends no header, so this branch is inert until migration.
+    """
+    await rate_limit(request, zone="webhook")
+    header_secret = request.headers.get(_SECRET_HEADER)
+    _verify_tracerfy_secret(header_secret if header_secret is not None else provided_secret)
+    return await _process_tracerfy_webhook(request)
 
 
 def generate_webhook_secret() -> str:

@@ -110,6 +110,11 @@ Codex raised the bar: per-contact OUTBOX is required (PhoneBurner has no bulk en
 partial-success silent loss). Refined scope to bound blast radius:
 - **Phase A ✅ (c0943d4):** connector seam (ABC + GenericWebhookConnector byte-identical + dialer_type
   discriminator + sweep dispatch). 7 tests. No transport change.
+- **Phase B foundation ✅ `fd06201`** (model + migration 041). **Phase B/C ✅ `fd677f0`:** process_dialer_outbox
+  transport (creds re-read at send time, host allowlist, owner-match, response redaction, per-row state) +
+  sweep vendor branch + materialize helper + replay endpoint + PhoneBurner connector + DeliverConfig creds
+  (token write-only) + 17 tests. 4 HIGH fixes implemented. **Codex review of full Thread 3 diff: RUNNING.**
+  Remaining: live smoke (needs user PhoneBurner creds). _Original Phase B/C scope below:_
 - **Phase B (vendor-only outbox — generic path UNTOUCHED):** `dialer_delivery` outbox table (migration 041:
   id, job_id, result_id, user_id, scraper_config_id, vendor_id, status[pending|delivered|failed],
   attempts, last_error, vendor_response_code, vendor_contact_id, created_at, delivered_at). Sweep: for a

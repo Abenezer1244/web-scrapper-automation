@@ -105,5 +105,19 @@ Source: Snohomish "Current Tax List" — `…/DocumentCenter/View/149173/snohomi
     anchor; `_extract_tax_fields` IGNORES non-allowlisted source even with tax-looking fields; end-to-end
     source-string → both columns populated. + INFO metrics (bytes, rows, malformed, delinquent, parcels, oldest yr, total $).
 
-## Review
-(to fill in at the end)
+## Review — Thread 1 (Snohomish) SHIPPED + LIVE ✅
+- Merged to main (`9a70bab`), pushed, deployed — health 200 (migration 040 applied on boot).
+- **Live smoke against the real source:** 44.7 MB / 325,043 rows / 0 malformed → 10,548 delinquent rows →
+  **4,269 parcels, all with delinquent_amount + bill_year**, $16.3 M total owed. Multi-year aggregation
+  confirmed (VERIZON 2023+2024+2025 = $2,376.01). ZERO API/UI/migration-column change.
+- Codex consult (pre-build) + Codex diff review (1 P2 found + fixed, no Critical/High). 58 tests, ruff-clean.
+- Prod-API connector check blocked by permission classifier (not in deploy scope) — health-200 +
+  idempotent migration + live smoke stand as proof.
+
+## Next threads (2 & 3)
+- **Thread 2 — DNC scrubbing:** BLOCKED-ON-DECISION (legal/vendor). Needs: can BridgeLeads scrub the
+  federal DNC registry + pass the flag to customers, or is that the customer's SAN/responsibility? Which
+  vendor (DNC.com / Contact Center Compliance / etc.) + budget? No real DNC source ⇒ nothing to build
+  (no-mock rule). Surfaced to user.
+- **Thread 3 — native dialer connectors:** research done, DEMAND-GATED. Smallest useful step = the
+  DialerConnector abstraction seam + ONE reference connector, built when a paying customer names a dialer.

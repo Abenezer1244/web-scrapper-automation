@@ -19,6 +19,64 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-05 — Post-milestone Thread 1/3: Snohomish tax-delinquent scraper (SHIPPED + LIVE)
+
+**Built / Shipped:** Snohomish County WA tax-delinquent scraper, extending the shipped Phase 4
+tax filters (amount owed + months delinquent) from King to a 2nd county. Merged to main + deployed
+(merge `9a70bab`, migration 040 applied on boot, health 200). Five commits on
+`feature/snohomish-tax-delinquent`:
+- `ae8e61b` **Phase A** — `safe_download_to_file()` in `src/utils/safe_http.py`: SSRF-revalidated
+  per-redirect-hop, streams to disk, aborts past `Settings.MAX_DOWNLOAD_BYTES` (new, 100 MB) so a
+  45 MB county file can't OOM the 512 MB worker. Cap logic in pure `_stream_capped()` for real-I/O tests.
+- `8fc1c12` **Phase B** — `src/scrapers/snohomish_wa_tax_delinquent.py`: pure-HTTP (no browser).
+  Resolves the monthly-rotating "Current Tax List" link off the stable landing page (excludes the
+  same-named "description of the fields" twin), streams the pipe-delimited bulk file, aggregates
+  PER PARCEL (sum owed across delinquent years, oldest year = bill_year). Structural-validation
+  canary (17-field shape + malformed-ratio + zero-parcel) fails loudly on a wrong/changed file.
+- `34b06b8` **Phase C** — `_extract_tax_fields` source gate widened to a `_TRUSTED_TAX_SOURCES`
+  frozenset (King + Snohomish); registry allowlist; migration 040 (idempotent connector INSERT,
+  base_url = stable landing page so the SSRF allowlist seeds + the scraper resolves the file link).
+- `0761e75` **Codex P2 fix** — leave `doc_type` NULL (like King tax) so the cached-records filter's
+  `doc_type IS NULL` branch keeps rows visible; the slug `tax_delinquent` matched neither that nor
+  the keyword ILIKE patterns.
+
+**Live smoke (real source, prod code path):** 44.7 MB, 325,043 rows, 0 malformed, 10,548 delinquent
+rows → **4,269 unique parcels, every one with `delinquent_amount` + `bill_year`**, $16.3 M total owed.
+Multi-year aggregation confirmed (VERIZON $2,376.01 across 2023+2024+2025). ZERO API/UI/migration-column
+change — the existing Phase 4 columns/filters/UI light up data-driven.
+
+**Tried / Decided:** Dynamic workflow (3 threads × research + adversarial security review) to scope the
+work. Codex consult BEFORE coding (approach sound, 6 refinements folded: structural validation beyond
+zero-row, year-level enrichment detail, 100 MB cap not 250, temp-file discipline, fuller test matrix).
+Chose the bulk Treasurer "Current Tax List" (real bill-year column) over the scanned Certificate-of-
+Delinquency PDFs (security reviewer flagged synthesizing bill_year from CoD membership as a months-filter
+semantic bug — foreclosure-entry year ≠ bill year). bill_year is an accepted approximation (WA halves due
+Apr/Oct, King treats bill_year ≈ Jan 1; same family). Personal-property (7-digit) accounts excluded.
+
+**Failed / Blocked:** The DNC-scrubbing research agent (Thread 2) ran away ~1h45m (endless web searches) →
+killed; salvaged the other two threads. The prod-API connector check via admin login was (correctly)
+blocked by the permission classifier — not covered by the deploy approval; relied on health-200 +
+idempotent-migration as proof instead.
+
+**Caught & fixed:** Codex diff review found 1 P2 (doc_type slug hides rows from cached-records endpoint) —
+fixed by mirroring King's NULL. No Critical/High from either reviewer.
+
+**Facts learned:** (1) Snohomish "Current Tax List" = pipe-delimited `.txt`, NO header, 17 cols, ~45 MB,
+325 K rows, DocumentCenter doc-ID ROTATES monthly (parse the landing page, never hard-code the id); the
+"description of the fields" link is actually a same-named prior-month data dump, not a description.
+(2) Delinquent = 14-digit parcel AND tax-year < as-of-year (col 13) AND owed (col 16) > 0; col 16 = balance,
+col 15 = half, col 14 = total annual. (3) `safe_get`/`safe_get_following` materialize the whole body in RAM
+— for big files use the new `safe_download_to_file`. (4) Adding a tax county = scraper + one line in
+`_TRUSTED_TAX_SOURCES` + registry allowlist + a connector migration; columns already exist (038).
+
+**Pending / Handoff:** Thread 2 (DNC scrubbing) — needs a legal/vendor DECISION (can BridgeLeads scrub
+the federal DNC registry and pass the flag to customers, or is that the customer's SAN/responsibility?);
+no real DNC source = nothing to build yet (no-mock rule). Thread 3 (native dialer connectors) — research
+done, demand-gated (build the abstraction seam + 1 reference connector when a customer names their dialer).
+Next non-King tax county = Snohomish is done; Pierce (per-parcel only) / Kitsap (foreclosure PDFs) remain weak.
+
+---
+
 ## 2026-06-06 — MILESTONE COMPLETE: frontend P2b/P3/P5 UI + backfills run + bulk-optimized
 
 **Lead-Targeting & Delivery milestone is now fully shipped — all backend (P1-P5), all frontend UI, security hardening, and historical backfills are live.**

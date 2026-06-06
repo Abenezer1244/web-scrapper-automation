@@ -19,6 +19,25 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-06 — MILESTONE COMPLETE: frontend P2b/P3/P5 UI + backfills run + bulk-optimized
+
+**Lead-Targeting & Delivery milestone is now fully shipped — all backend (P1-P5), all frontend UI, security hardening, and historical backfills are live.**
+
+**Frontend (all merged to `bridgeleads-web` master → Vercel; each Codex-reviewed to clean):**
+- **P5 dialer settings** (`76e4cda`): `dialer_webhook_url` field in the config wizard delivery step (Business+), with proper `new URL()` https validation (not a prefix regex), an invalid-submit toast + inline field errors, and the dialer hook shown on the Deliver page. Codex caught 4 across rounds (test-run bypass, silent save, weak regex, missing delivery display).
+- **P2b doc-type selector** (`9e5100e`): pre-foreclosure document-type checkboxes on the Record-type step, gated on `connector.pre_foreclosure_doc_types` (King/Pierce); selection flows into `doc_types` on both payloads; empty = omit (backend rejects `[]`); reset only on actual type change (Codex P3).
+- **P3 Lists/Segments builder** (`421ec68`): net-new `/segments` screen — record-type chips, "On both lists" (intersection ≥2) vs "Combine" (union ≥1) toggle, Build → preview table with an "On N lists" overlap badge (+ weak tag), Export CSV. New `getSegmentIntersection/Union` + `exportSegment` (POST+blob) in lib/api.ts; types match the REAL backend shapes (no pagination). Codex caught 5 (death_certificate omitted, stale-criteria export, in-flight race, failed-build-shown-as-empty) — all fixed.
+
+**Dynamic workflow:** used the Workflow tool (2 parallel Explore agents) to produce build-ready, integration-aware plans for P2b + P3 before building — fast parallel research, then I built + Codex-gated each (agents didn't mutate the repo).
+
+**Backfills (prod, bulk-optimized `084631a`):** property_key=160,011 / tax=58,269 / membership=29,091. Per-row over remote prod was ~4h → bulk `UPDATE…FROM(VALUES)` = minutes. Gotchas: run with `PYTHONPATH=.`; the supabase pooler had a transient DNS blip (idempotent re-run fixed it); silence SQLAlchemy echo.
+
+**Facts learned:** (1) the four-states discipline (loading/error/empty/data) keeps biting — a failed build must not render as "empty"; the filtered-`total==0` ≠ empty-job trap recurs on every new filter. (2) Record types are DB-driven — never hardcode a closed list without `death_certificate`. (3) On-demand async UIs need stale-response guards (disable criteria while loading). (4) Webhook secrets in JSON-column configs leak via wholesale responses — redact on read.
+
+**Remaining (post-milestone, optional):** Snohomish tax scraper (best non-King candidate per the spike); native per-dialer connectors (demand-gated); BridgeLeads-side DNC scrubbing (needs a DNC data source — currently the dialer scrubs). See `[[project_lead_targeting_milestone]]`.
+
+---
+
 ## 2026-06-05 — Phase 4 tax-filter UI (frontend) + Phase 3-5 security hardening
 
 **Frontend (branch `feature/phase4-tax-filters-ui` in sibling repo `bridgeleads-web`, UNMERGED/UNDEPLOYED, tsc clean, Codex-clean):** tax-delinquent filter UI on the results view (`app/(dashboard)/results/[id]/page.tsx`). Amount-owed + months-delinquent min/max inputs (debounced) wired to the params the backend already accepts (get_results + download + export-url via `lib/api.ts`). Gated on the **presence of structured tax data** (latched `hasTaxData` = the King-tax gate, since `delinquent_amount` is null elsewhere) so it survives a too-narrow filter returning 0 rows. Codex caught: filtered-empty showed the "all duplicates" notice (gated it on `!taxFilterActive && !search` + a filter-specific empty message); export honors tax filters but not search (deliberate: filters = lead-selection controls in the deliverable, search = view-only find — documented). ESLint not configured in that repo; tsc is the gate.

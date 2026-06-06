@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from typing import Any, TypedDict
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -196,6 +196,44 @@ class DeliverConfig(BaseModel):
     # webhook_secret). Same HTTPS + SSRF-at-send-time guarantees.
     dialer_webhook_url: str | None = None
     dialer_webhook_secret: str | None = None
+    # Thread 3: which dialer connector handles the push. None = the shipped
+    # generic webhook/Zapier connector. Validated against the server-side
+    # allowlist so an arbitrary string can never reach connector dispatch.
+    dialer_type: str | None = None
+    # Thread 3: PhoneBurner native connector credentials (used when
+    # dialer_type == "phoneburner"). The access token is a secret — write-only in
+    # responses (redacted in ScraperConfigResponse, like the HMAC secrets).
+    phoneburner_access_token: str | None = None
+    phoneburner_owner_id: str | None = None
+
+    @field_validator("dialer_type")
+    @classmethod
+    def dialer_type_allowlisted(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        from src.config.constants import REGISTERED_DIALER_VENDOR_IDS
+        if v not in REGISTERED_DIALER_VENDOR_IDS:
+            raise ValueError(f"Unknown dialer_type: {v!r}")
+        return v
+
+    @field_validator("phoneburner_access_token")
+    @classmethod
+    def validate_pb_token(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if not v.strip() or len(v) > 4096 or any(c in v for c in "\r\n\t"):
+            raise ValueError("phoneburner_access_token is empty or malformed")
+        return v
+
+    @field_validator("phoneburner_owner_id")
+    @classmethod
+    def validate_pb_owner(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s or len(s) > 64 or any(c in s for c in "\r\n\t"):
+            raise ValueError("phoneburner_owner_id is empty or malformed")
+        return s
 
     @field_validator("emails")
     @classmethod
@@ -220,6 +258,18 @@ class DeliverConfig(BaseModel):
     @classmethod
     def webhook_secret_length(cls, v: str | None) -> str | None:
         return _validate_webhook_secret(v)
+
+    @model_validator(mode="after")
+    def require_connector_credentials(self) -> "DeliverConfig":
+        # Reject an unusable native-dialer config up front (Codex) rather than
+        # accepting it and failing every job's contacts later in the outbox.
+        if self.dialer_type == "phoneburner":
+            if not self.phoneburner_access_token or not self.phoneburner_owner_id:
+                raise ValueError(
+                    "dialer_type 'phoneburner' requires phoneburner_access_token "
+                    "and phoneburner_owner_id"
+                )
+        return self
 
 
 class FieldsConfig(BaseModel):
@@ -276,6 +326,9 @@ class DeliverConfigDict(TypedDict, total=False):
     webhook_secret: str | None
     dialer_webhook_url: str | None       # Phase 5: generic dialer push
     dialer_webhook_secret: str | None
+    dialer_type: str | None              # Thread 3: dialer connector id (None = generic)
+    phoneburner_access_token: str | None  # Thread 3: PhoneBurner OAuth token (write-only)
+    phoneburner_owner_id: str | None
 
 
 class ScraperConfigCreate(BaseModel):
@@ -351,8 +404,11 @@ class ScraperConfigResponse(BaseModel):
         # "secret set" without leaking the value.
         self.deliver["webhook_secret_set"] = bool(self.deliver.get("webhook_secret"))
         self.deliver["dialer_webhook_secret_set"] = bool(self.deliver.get("dialer_webhook_secret"))
+        # Thread 3: the PhoneBurner OAuth token is a credential — write-only too.
+        self.deliver["phoneburner_access_token_set"] = bool(self.deliver.get("phoneburner_access_token"))
         self.deliver.pop("webhook_secret", None)
         self.deliver.pop("dialer_webhook_secret", None)
+        self.deliver.pop("phoneburner_access_token", None)
         # Also normalize fields / enrichment / schedule defensively
         if isinstance(self.fields, list):
             self.fields = dict.fromkeys(self.fields, True)

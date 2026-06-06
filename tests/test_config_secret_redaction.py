@@ -47,3 +47,23 @@ def test_no_secret_value_anywhere_in_serialized_response():
     r = _resp({"webhook_url": "https://x", "webhook_secret": secret})
     # Full model dump must not contain the secret string anywhere.
     assert secret not in str(r.model_dump())
+
+
+def test_phoneburner_token_is_write_only():
+    # Thread 3: the PhoneBurner OAuth token is a credential — same treatment.
+    token = "pbtok_" + "q" * 30
+    r = _resp({
+        "dialer_type": "phoneburner",
+        "phoneburner_owner_id": "4242",
+        "phoneburner_access_token": token,
+    })
+    assert "phoneburner_access_token" not in r.deliver
+    assert r.deliver["phoneburner_access_token_set"] is True
+    # owner_id is not a secret — preserved so the UI can show it.
+    assert r.deliver["phoneburner_owner_id"] == "4242"
+    assert token not in str(r.model_dump())
+
+
+def test_phoneburner_token_flag_false_when_unset():
+    r = _resp({"dialer_type": "phoneburner", "phoneburner_owner_id": "1"})
+    assert r.deliver["phoneburner_access_token_set"] is False

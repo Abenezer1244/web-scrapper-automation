@@ -77,6 +77,15 @@ PRIORITY_QUEUE_PLANS: frozenset[str] = frozenset({Plan.BUSINESS.value, Plan.AGEN
 # with the plan).
 BUSINESS_FEATURES_PLANS: frozenset[str] = frozenset({Plan.BUSINESS.value, Plan.AGENCY.value})
 
+# Registered dialer-push connector ids (the `deliver.dialer_type` discriminator).
+# Lives here (not in src.workers) so the API schema layer can validate the value
+# WITHOUT importing the Celery app. A connector module must be registered AND its
+# id listed here; the dialer_connectors registry asserts the two stay in sync.
+# "generic_webhook" = the shipped vendor-agnostic webhook/Zapier push.
+# "phoneburner" = native PhoneBurner connector (per-contact outbox transport).
+REGISTERED_DIALER_VENDOR_IDS: frozenset[str] = frozenset({"generic_webhook", "phoneburner"})
+DEFAULT_DIALER_VENDOR_ID = "generic_webhook"
+
 # Plans allowed to opt into the metered per-job `skip_trace_enabled`
 # add-on ($0.08/lookup). Available to Pro and above.
 SKIP_TRACE_ADDON_PLANS: frozenset[str] = frozenset({

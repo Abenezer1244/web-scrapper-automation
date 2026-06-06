@@ -19,6 +19,54 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-05 — Post-milestone Threads 2 & 3: DNC (deferred) + dialer connectors (built)
+
+**Built / Shipped:** Native dialer connectors (Thread 3) on `feature/dialer-connectors` (6 commits,
+31 dialer tests, Codex review clean after 2 P2 fixes). Merged to main + deployed (migration 041).
+- **`c0943d4` seam:** `src/workers/dialer_connectors/` — `DialerConnector` ABC + `GenericWebhookConnector`
+  wrapping `build_dialer_push_payload` BYTE-IDENTICAL (locked by a regression test) + `deliver.dialer_type`
+  discriminator (validated vs `REGISTERED_DIALER_VENDOR_IDS` in `constants.py`, kept out of `src.workers`
+  so the API schema validates without importing Celery; `get_connector` lazy-imports).
+- **`fd06201` outbox:** `DialerDelivery` model + migration 041 `dialer_deliveries` (per-contact state).
+  Worker/system-only like `delivered_records` — NOT app-granted (app uses per-table grants; system has
+  ALL-TABLES), so the replay endpoint uses the system session + explicit user_id filter, NO RLS-cutover change.
+- **`fd677f0` transport + `97c96ef` P2:** `process_dialer_outbox` (chunked drain, per-row commit BEFORE
+  next POST = at-most-once-per-contact, creds re-read from DB at send time, owner-match, host allowlist,
+  response redaction) + sweep VENDOR branch (`_materialize_dialer_outbox` ON CONFLICT) + replay endpoint +
+  PhoneBurner connector (contact-creation ONLY, host-pinned, OAuth, token write-only) + `DeliverConfig`
+  model_validator requiring creds when `dialer_type=phoneburner`.
+
+**Tried / Decided:** Codex design consult RAISED the bar — a single error column was wrong; PhoneBurner has
+no bulk endpoint (500 leads = 500 POSTs → partial-success silent loss), so a per-contact OUTBOX with replay
+is required. Scoped Phase B vendor-only: the GENERIC webhook path is UNTOUCHED (its catch-hook-URL-in-args
+is pre-existing status quo, not regressed). Merged with PhoneBurner DORMANT (no user has dialer_type=phoneburner),
+so the deploy is low-risk; the generic path is byte-identical.
+
+**Thread 2 (DNC) — DEFERRED after research** (`docs/dnc_scrubbing_spike.md`): TCPA liability is the CALLER's
+(the customer), not the lead-gen platform, so DNC scrubbing is a value-add, not a compliance gap. The federal
+registry is per-SAN + non-redistributable; the buildable path is a commercial scrub API (DNC.com) gated on a
+vendor account + budget. Current model (phone_dnc_flag NULL → dialer scrubs) is legally defensible as-is.
+
+**Failed / Blocked:** PhoneBurner live smoke is BLOCKED on user OAuth creds (no-mock) — the connector's exact
+field names come from public docs and need confirmation against the live API on first smoke. The earlier DNC
+research agent ran away (killed). A prod-API connector check was blocked by the permission classifier.
+
+**Caught & fixed:** Codex P2 ×2 — (1) outbox committed once per chunk → a crash after a successful POST left
+rows 'pending' → duplicate contacts on replay; fixed with per-row commit. (2) DeliverConfig accepted
+dialer_type=phoneburner without creds → jobs failed later; fixed with a model_validator.
+
+**Facts learned:** (1) The app role (`bridgeleads_app`) uses PER-TABLE grants (+ a convergence guard that
+revokes over-grants), so a new app-readable table needs registration in `provision_rls_roles.sql`; the system
+role has ALL-TABLES grant, so worker-only tables work without RLS-script changes — make new worker tables
+system-only + explicit-user_id-filtered to dodge the RLS landmine. (2) `safe_get`/`safe_get_following` load
+the whole body in RAM; bulk downloads use the new `safe_download_to_file`. (3) Keep vendor credentials OUT of
+Celery task args (they serialize into the Redis broker/result backend) — re-read from DB at send time.
+
+**Pending / Handoff:** PhoneBurner live smoke (needs user OAuth token + owner_id, supplied via env/app config
+not chat). Other dialers (BatchDialer/CallTools/Mojo) demand-gated. DNC scrubbing gated on a vendor decision.
+
+---
+
 ## 2026-06-05 — Post-milestone Thread 1/3: Snohomish tax-delinquent scraper (SHIPPED + LIVE)
 
 **Built / Shipped:** Snohomish County WA tax-delinquent scraper, extending the shipped Phase 4

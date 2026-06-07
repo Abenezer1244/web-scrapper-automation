@@ -146,6 +146,34 @@ partial-success silent loss). Refined scope to bound blast radius:
 
 ---
 
+# Multi-contact: 3 phones + 3 emails per lead (2026-06-07) — IN PROGRESS
+
+**Goal (user):** display up to 3 phones + 3 emails per person. Data ALREADY returned by Tracerfy
+(`Mobile-1..5`, `Landline-1..3`, `primary_phone`, `Email-1..5`) but we keep only the single best today
+(`pick_best_phone`/`pick_best_email` → `Result.phone`/`.email`). No extra Tracerfy cost — just stop discarding.
+
+**Design (backward-compat first):** ADD `Result.phones` (JSON `[{number,type}]`) + `Result.emails` (JSON `[str]`),
+top-3 each. KEEP single `phone`/`phone_type`/`email` = primary (phones[0]/emails[0]) so dialer push, CSV export,
+Lists/segments, skip-trace cache + reuse all keep working unchanged. Migration 042 (down_revision 041; head
+confirmed 041). Also add `phones`/`emails` JSON to `skip_trace_cache` so cache-hit rows populate arrays too.
+
+- **Phase 1 (backend data):** migration 042 (`results` + `skip_trace_cache` new JSON cols) + `skip_trace.py`
+  `pick_phones(row,3)`/`pick_emails(row,3)` (mobiles→primary→landlines; dedup) + `tracerfy_ingest.py` set arrays +
+  cache them + `tasks.py` (`_reuse_enrichment_for_duplicates` copies arrays when settled; `_enqueue` cache-hit copies arrays)
+- **Phase 2 (backend API/export):** `schemas.py` ResultRow + `jobs.py` results serialization + download CSV (add phone_2/3, email_2/3; keep primary phone/email)
+- **Phase 3 (frontend `bridgeleads-web`):** `/results/[id]` PhoneCell/EmailCell render up to 3 (+copy each) w/ fallback to single; types + api
+- **Workflow:** Codex design consult (PII/migration/back-compat) → build phased → Codex review + Master Security Review (PII) → deploy.
+
+### STATUS — ✅ ALL 3 PHASES SHIPPED + DEPLOYED (2026-06-07)
+- [x] Codex design consult (sound; guardrails: nullable JSON/no server_default, best-pickers as wrappers, dedup by normalized digits, copy arrays under same settled gate, sanitize CSV, type ResultRow narrowly)
+- [x] **Phase 1** `f0d882e` (backend data) — migration 042 applied on boot (health 200). Codex consult + 2 review rounds (P2: primary-phone drift fixed → phones[0] == legacy pick_best_phone exactly). Pickers unit-tested.
+- [x] **Phase 2** `34b5de3` (API + CSV) — ResultRow phones/emails + phone_2/3,email_2/3 columns. Codex 2 P2s fixed (malformed-JSON robustness: before-validators + CSV shape guards). API confirmed serving the fields (null for pre-Phase-1 rows).
+- [x] **Phase 3** `229e001` (frontend → Vercel) — PhoneCell/EmailCell up to 3 + per-line copy, fallback to single, stopPropagation preserved. Codex clean.
+- [ ] ⏳ **OPTIONAL live verify**: fresh scrape (post-Phase-1) → confirm 3-phone arrays populate + display (Tracerfy now funded). Not run to avoid extra credit spend; user can request.
+- Backward-compat held: scalar phone/email unchanged (= phones[0]/emails[0]); dialer/export/segments/cache/reuse untouched. **Segments** still shows the primary only (optional future follow-up).
+
+---
+
 # Enrichment/skip-trace dedup-reuse + cache fix (2026-06-06) — IN PROGRESS
 
 **Problem (user-reported, confirmed in code):** a `since_last_run` re-scrape inserts fresh `Result` rows

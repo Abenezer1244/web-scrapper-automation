@@ -19,6 +19,42 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-07 — Multi-contact: up to 3 phones + 3 emails per lead (3 phases, shipped)
+
+**Built / Shipped:** user request — surface 2-3 phones/emails per person. Tracerfy already returns up to 5
+mobiles / 3 landlines / 5 emails per hit (`pick_best_phone`/`pick_best_email` kept only the single best);
+this captures + displays 3 of each at NO extra Tracerfy cost. 3 Codex-gated phases:
+- **Phase 1** `f0d882e` (data): `skip_trace.py` `pick_phones`/`pick_emails` (mobiles→primary→landlines, dedup
+  by normalized digits); `pick_best_*` now thin wrappers so `phones[0]/emails[0]` == legacy primary EXACTLY.
+  Migration 042 (additive nullable JSON `results.phones/emails` + `skip_trace_cache.phones/emails`, no backfill,
+  down_rev 041 — confirmed single head). `tracerfy_ingest` writes arrays + caches them; `tasks.py` reuse copies
+  arrays under the SAME settled/strong-identity/TTL gate as scalar PII; cache-hit path copies cached arrays.
+- **Phase 2** `34b5de3` (API/CSV): `ResultRow` gains `phones: list[PhoneContact]|None` + `emails`; download CSV
+  adds `phone_2/3`,`email_2/3` (sanitized). Before-validators + CSV shape-guards tolerate malformed/legacy JSON.
+- **Phase 3** `229e001` (frontend → Vercel): PhoneCell/EmailCell render up to 3 (per-line copy / mailto),
+  fall back to the single value, preserve status states + stopPropagation.
+
+**Tried / Decided:** Codex design consult chose JSON arrays over scalar phone_2/3 cols or a contacts table
+(display-only, capped, no querying). Backward-compat first: scalar phone/email stay the PRIMARY (= [0]) so
+dialer push / CSV / segments / cache / reuse are byte-identical and untouched.
+
+**Caught & fixed (Codex, 4 P2s across phases):** (P1-class avoided) — (1) primary-phone DRIFT: making
+`pick_best_phone` a wrapper over the mobiles-first list would change the scalar when Mobile-1 empty + Mobile-2
+present → fixed so phones[0] replicates the legacy Mobile-1→primary→Landline-1 order exactly. (2)+(3) malformed
+contact JSON could 500 the results page / CSV download → before-validators + isinstance guards. All filter to ≤3.
+
+**Failed / Blocked:** none. Live verify of populated arrays deferred (needs a fresh post-Phase-1 scrape; avoided
+extra Tracerfy spend after this session's many test runs). API confirmed serving phones/emails (null pre-Phase-1).
+
+**Facts learned:** Tracerfy CSV cols = Mobile-1..5 / Landline-1..3 / primary_phone / Email-1..5 (title-dash) or
+mobile_1.. (snake); `ingest_webhook_csv` is the raw→{phone,email,...} mapping layer (the place to add arrays).
+Result/cache use `model_validate`(from_attributes) so adding ORM cols + schema fields auto-flows to the API.
+
+**Pending / Handoff:** optional — live verify 3-phone arrays on a fresh scrape; extend `/segments` to show
+secondary contacts too (currently primary-only). DNC Scrub (1 credit/phone via Tracerfy) still a roadmap option.
+
+---
+
 ## 2026-06-07 — "Tracerfy not working" diagnosed: account out of credits (402) + made it self-heal
 
 **Diagnosed (live, admin acct + `railway logs`):** skip-trace traces had been stuck at `queued` for a day with

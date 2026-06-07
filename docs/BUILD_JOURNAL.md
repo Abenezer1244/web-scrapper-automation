@@ -19,6 +19,37 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-07 — "Tracerfy not working" diagnosed: account out of credits (402) + made it self-heal
+
+**Diagnosed (live, admin acct + `railway logs`):** skip-trace traces had been stuck at `queued` for a day with
+0 phones. Walked it: dedup-reuse fix CONFIRMED WORKING in prod (job `c5105baf`: "Reused prior enrichment for 159
+duplicate leads", GIS lookups 192→68). Then chased Tracerfy: worker `WORKER_QUEUES` already includes `celery`
+(I initially suspected the queue wasn't consumed — WRONG, verified via `railway run … printenv`), dispatcher runs
+every 5 min and SUCCEEDS but `submitted_rows: 0`. Caught the cause live at the next tick:
+`Tracerfy returned 402: "Insufficient credits for normal/advanced trace…"`. **ROOT CAUSE = the Tracerfy account
+is empty (402). Not code, not queue, not webhook, not token.** ACTION: add credits at tracerfy.com.
+
+**Built / Shipped (`359873a`):** the dispatcher treated 402 as a permanent error → marked rows `errored` →
+silently dropped traces during any no-credit window, Result rows stuck `queued` forever. Fix: treat 402
+"insufficient credit" like 429 — back off + RETURN, leave rows `queued` so a later tick auto-submits once funded;
+distinct ERROR log so it fails loudly. Also advance Result `queued`→`submitted` on successful submit (ingest
+matches by result_id not status; reuse copies only hit/miss; UI renders 'submitted' as "Processing"). Codex
+review clean; compile + ruff clean; no schema change.
+
+**Failed / Blocked:** `railway variables --json/--kv` is blocked by the permission classifier (dumps all secrets);
+used `railway run -- printenv <ONE_VAR>` for the single non-secret value instead. The ~334 rows already `errored`
+during the no-credit window won't auto-recover — re-scrape those leads after funding (fresh rows queue + submit).
+
+**Facts learned:** Tracerfy 402 = out of credits (per-trace-type credit cost: normal cheaper, advanced ~2/row).
+`start.sh` default WORKER_QUEUES omits `celery`, but Railway worker env overrides it to include celery (so the
+beat-scheduled dispatch/webhook-delivery/scheduled-scrapes DO run). Diagnosing prod: `railway status` (linked
+project/env/service), `railway logs --service worker | grep`, `railway run --service worker -- printenv VAR`.
+
+**Pending / Handoff:** ⚠️ **USER: add credits to the Tracerfy account** (the actual fix) + re-scrape the leads
+whose traces errored during the empty window. Then skip-trace + the reuse/cache savings fully light up.
+
+---
+
 ## 2026-06-06 (pm) — Duplicate leads: stop re-enriching + re-skip-tracing (cost/PII fix)
 
 **Built / Shipped:** `6a2f343` (main, deployed). User noticed a `since_last_run` re-scrape (192 records,

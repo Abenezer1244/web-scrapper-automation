@@ -315,7 +315,12 @@ def ingest_tracerfy_batch(
 
             phone = csv_row.get("phone")
             email = csv_row.get("email")
-            is_hit = bool(phone or email)
+            # Multi-contact: up to 3 each (ingest_webhook_csv built these from
+            # Mobile-1..5 / Landline-1..3 / Email-1..5). phone/email above are
+            # the primary (phones[0]/emails[0]).
+            phones = csv_row.get("phones") or []
+            emails = csv_row.get("emails") or []
+            is_hit = bool(phones or emails)
             if is_hit:
                 hit_count += 1
             else:
@@ -340,6 +345,8 @@ def ingest_tracerfy_batch(
                 existing_cache.phone = phone
                 existing_cache.phone_type = csv_row.get("phone_type")
                 existing_cache.email = email
+                existing_cache.phones = phones
+                existing_cache.emails = emails
                 existing_cache.fetched_at = now
             else:
                 db.add(
@@ -349,6 +356,8 @@ def ingest_tracerfy_batch(
                         phone_type=csv_row.get("phone_type"),
                         phone_dnc_flag=None,
                         email=email,
+                        phones=phones,
+                        emails=emails,
                         raw_response=csv_row.get("raw"),
                         fetched_at=now,
                     )
@@ -366,6 +375,8 @@ def ingest_tracerfy_batch(
                         phone=phone,
                         phone_type=csv_row.get("phone_type"),
                         email=email,
+                        phones=phones,
+                        emails=emails,
                         skip_trace_status="hit" if is_hit else "miss",
                         skip_trace_attempted_at=now,
                     )

@@ -379,57 +379,102 @@ def _parse_tracerfy_csv(csv_text: str) -> list[dict]:
     return list(reader)
 
 
-def pick_best_phone(row: dict) -> tuple[str | None, str | None]:
-    """Return (phone, phone_type) preferring mobile > primary > landline.
+def _phone_digits(p: str | None) -> str:
+    """Last-10 national digits of a phone, for de-duping the same number that
+    appears under multiple Tracerfy columns. Returns '' if not enough digits."""
+    d = re.sub(r"\D", "", p or "")
+    return d[-10:] if len(d) >= 10 else d
 
-    Tracerfy returns up to 5 mobiles and 3 landlines plus a primary_phone.
-    For cold-call use, mobile is strictly better than landline (higher
-    answer rate, SMS-capable). We pick in this order:
-      1. Mobile-1 (first mobile)
-      2. primary_phone if it's Mobile
-      3. primary_phone (any type)
-      4. Landline-1
 
-    Column naming: Tracerfy's JSON API docs show ``mobile_1`` / ``landline_1``
-    (snake_case) but the actual CSV delivered via webhook uses
-    ``Mobile-1`` / ``Landline-1`` (title-case with dash separator). We
-    handle both for safety.
+def pick_phones(row: dict, n: int = 3) -> list[dict]:
+    """Return up to n DISTINCT phones as [{"number", "type"}], best-first.
+
+    Tracerfy returns up to 5 mobiles + 3 landlines + a primary_phone. For
+    cold-call/SMS use mobile beats landline, so the order is:
+      Mobile-1..5 → primary_phone (if not a dup of a mobile) → Landline-1..3.
+    Dedups by normalized digits but preserves the original display value.
+    Column naming: the JSON API docs show ``mobile_1``/``landline_1`` (snake)
+    but the webhook CSV uses ``Mobile-1``/``Landline-1`` (title-dash) — accept both.
     """
-    def _get(row: dict, *keys: str) -> str:
+    def _get(*keys: str) -> str:
         for k in keys:
             v = row.get(k)
             if v and str(v).strip():
                 return str(v).strip()
         return ""
 
-    mobile_1 = _get(row, "Mobile-1", "mobile_1")
-    if mobile_1:
-        return mobile_1, "Mobile"
+    primary_num = _get("primary_phone")
+    primary_type = _get("primary_phone_type") or None
+    m1 = _get("Mobile-1", "mobile_1")
+    l1 = _get("Landline-1", "landline_1")
 
-    primary = _get(row, "primary_phone")
-    primary_type = _get(row, "primary_phone_type") or None
-    if primary:
-        return primary, primary_type
+    # phones[0] MUST equal the legacy pick_best_phone exactly (Mobile-1 ->
+    # primary_phone -> Landline-1, checking Mobile-1 *specifically*, never a
+    # later mobile column) so the scalar `phone` used by dialer/export/cache
+    # does not drift. Extras then follow in mobile -> primary -> landline order.
+    legacy: tuple[str, str | None] | None = None
+    if m1:
+        legacy = (m1, "Mobile")
+    elif primary_num:
+        legacy = (primary_num, primary_type)
+    elif l1:
+        legacy = (l1, "Landline")
 
-    landline_1 = _get(row, "Landline-1", "landline_1")
-    if landline_1:
-        return landline_1, "Landline"
+    candidates: list[tuple[str, str | None]] = []
+    if legacy:
+        candidates.append(legacy)
+    for i in range(1, 6):
+        m = _get(f"Mobile-{i}", f"mobile_{i}")
+        if m:
+            candidates.append((m, "Mobile"))
+    if primary_num:
+        candidates.append((primary_num, primary_type))
+    for i in range(1, 4):
+        ll = _get(f"Landline-{i}", f"landline_{i}")
+        if ll:
+            candidates.append((ll, "Landline"))
 
-    return None, None
+    out: list[dict] = []
+    seen: set[str] = set()
+    for number, ptype in candidates:
+        key = _phone_digits(number)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append({"number": number, "type": ptype})
+        if len(out) >= n:
+            break
+    return out
+
+
+def pick_emails(row: dict, n: int = 3) -> list[str]:
+    """Return up to n DISTINCT emails (Email-1..5 / email_1..5), best-first,
+    deduped case-insensitively (original case preserved)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for i in range(1, 6):
+        for key in (f"Email-{i}", f"email_{i}"):
+            v = (row.get(key) or "").strip()
+            if v and v.lower() not in seen:
+                seen.add(v.lower())
+                out.append(v)
+                break
+        if len(out) >= n:
+            break
+    return out
+
+
+def pick_best_phone(row: dict) -> tuple[str | None, str | None]:
+    """Primary phone = the first of pick_phones() — a thin wrapper so the
+    single-column value can never drift from phones[0]."""
+    ps = pick_phones(row, 1)
+    return (ps[0]["number"], ps[0]["type"]) if ps else (None, None)
 
 
 def pick_best_email(row: dict) -> str | None:
-    """Return the first non-empty Email-1..5.
-
-    Tracerfy's CSV uses ``Email-1`` / ``Email-2`` / ... (title-case, dash).
-    The JSON API docs showed ``email_1`` (snake_case) — we handle both.
-    """
-    for i in range(1, 6):
-        for key in (f"Email-{i}", f"email_{i}"):
-            val = (row.get(key) or "").strip()
-            if val:
-                return val
-    return None
+    """Primary email = the first of pick_emails() (wrapper; see pick_best_phone)."""
+    es = pick_emails(row, 1)
+    return es[0] if es else None
 
 
 def ingest_webhook_csv(csv_text: str) -> list[dict]:
@@ -449,8 +494,14 @@ def ingest_webhook_csv(csv_text: str) -> list[dict]:
     rows = _parse_tracerfy_csv(csv_text)
     out: list[dict] = []
     for row in rows:
-        phone, phone_type = pick_best_phone(row)
-        email = pick_best_email(row)
+        # Multi-contact: up to 3 each. The single phone/email stay the PRIMARY
+        # (phones[0]/emails[0]) so every existing consumer (.phone/.email:
+        # dialer push, CSV export, segments, cache, reuse) is unchanged.
+        phones = pick_phones(row, 3)
+        emails = pick_emails(row, 3)
+        phone = phones[0]["number"] if phones else None
+        phone_type = phones[0]["type"] if phones else None
+        email = emails[0] if emails else None
         out.append({
             "address": (row.get("address") or "").strip(),
             "city": (row.get("city") or "").strip(),
@@ -458,7 +509,9 @@ def ingest_webhook_csv(csv_text: str) -> list[dict]:
             "phone": phone,
             "phone_type": phone_type,
             "email": email,
-            "hit": bool(phone or email),
+            "phones": phones,
+            "emails": emails,
+            "hit": bool(phones or emails),
             "raw": row,
         })
 

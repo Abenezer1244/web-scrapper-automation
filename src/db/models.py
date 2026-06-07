@@ -188,6 +188,11 @@ class Result(Base):
     phone_type = Column(String(16), nullable=True)  # Mobile | Landline | VoIP
     phone_dnc_flag = Column(Boolean, nullable=True)
     email = Column(String(255), nullable=True)
+    # Multi-contact (up to 3). The scalar phone/email above stay the PRIMARY
+    # (= phones[0]/emails[0]) for all existing consumers; these add the extras
+    # for display. NULL = legacy/not-yet-traced; [] = traced, none found.
+    phones = Column(JSON, nullable=True)  # [{"number": str, "type": str|None}]
+    emails = Column(JSON, nullable=True)  # [str]
     skip_trace_status = Column(String(16), nullable=False, default="not_attempted")
     skip_trace_attempted_at = Column(DateTime(timezone=True), nullable=True)
     # Sprint 6.4: cross-job deduplication
@@ -420,6 +425,10 @@ class SkipTraceCache(Base):
     phone_type = Column(String(16), nullable=True)
     phone_dnc_flag = Column(Boolean, nullable=True)
     email = Column(String(255), nullable=True)
+    # Multi-contact cache (up to 3), mirrors Result.phones/emails so a cache-hit
+    # also populates the extras. NULL for pre-existing cache rows.
+    phones = Column(JSON, nullable=True)  # [{"number": str, "type": str|None}]
+    emails = Column(JSON, nullable=True)  # [str]
     raw_response = Column(JSON, nullable=True)
     fetched_at = Column(
         DateTime(timezone=True),

@@ -44,7 +44,7 @@ def dispatch_pending_skip_trace() -> dict:
 
     from sqlalchemy import and_, select, update
 
-    from src.db.models import PendingSkipTraceRow, SkipTraceQueue
+    from src.db.models import PendingSkipTraceRow, Result, SkipTraceQueue
     from src.db.session import system_sync_session
     from src.scrapers.enrichment.skip_trace import TracerfyError, submit_batch
 
@@ -86,20 +86,44 @@ def dispatch_pending_skip_trace() -> dict:
                 try:
                     response = submit_batch(payload_rows, trace_type=trace_type)
                 except TracerfyError as exc:
-                    # On rate-limit (429) we stop this tick entirely — Beat
-                    # will retry in 5 min. On other errors, mark these rows
-                    # errored so they don't block future ticks indefinitely.
+                    # RETRYABLE conditions must NOT permanently error the rows:
+                    # back off and leave them 'queued' so a later tick auto-submits
+                    # once the condition clears. Two retryable cases:
+                    #   • 429 rate-limit — Beat retries in 5 min.
+                    #   • 402 insufficient credits — the Tracerfy account is empty;
+                    #     rows must wait (NOT be killed) so they flow the moment it
+                    #     is topped up. Marking them 'errored' here is what silently
+                    #     dropped traces during a no-credit window before this fix.
+                    # Only a genuine bad-batch error marks rows 'errored'.
                     msg = str(exc)
                     errors.append(msg)
                     _logger.warning("Tracerfy submit failed: %s", msg[:200])
-                    if "429" in msg or "rate limit" in msg.lower():
-                        _logger.info("Rate-limited, backing off until next tick")
+                    msg_l = msg.lower()
+                    if "429" in msg or "rate limit" in msg_l:
+                        _logger.warning(
+                            "Tracerfy rate-limited (429) — backing off; %d %s rows "
+                            "stay queued for the next tick", len(rows), trace_type,
+                        )
                         return {
                             "submitted_batches": submitted_batches,
                             "submitted_rows": submitted_rows,
                             "errors": errors,
+                            "deferred": "rate_limited",
                         }
-                    # Non-rate-limit error: mark batch errored + continue
+                    if "402" in msg or "insufficient credit" in msg_l:
+                        _logger.error(
+                            "Tracerfy OUT OF CREDITS (402) — add credits at tracerfy.com. "
+                            "%d %s rows stay queued and will auto-submit once funded.",
+                            len(rows), trace_type,
+                        )
+                        return {
+                            "submitted_batches": submitted_batches,
+                            "submitted_rows": submitted_rows,
+                            "errors": errors,
+                            "deferred": "out_of_credits",
+                        }
+                    # Genuine non-retryable error: mark batch errored so it does
+                    # not block future ticks indefinitely.
                     db.execute(
                         update(PendingSkipTraceRow)
                         .where(PendingSkipTraceRow.id.in_([r.id for r in rows]))
@@ -137,6 +161,20 @@ def dispatch_pending_skip_trace() -> dict:
                         tracerfy_queue_id=queue_id,
                         submitted_at=now,
                     )
+                )
+                # Advance the matching Result rows 'queued' -> 'submitted' so the
+                # status reflects "sent to Tracerfy, awaiting webhook" instead of
+                # sitting at 'queued' (which reads as "not yet sent" — misleading
+                # for ops). The webhook ingest matches by result_id (not status),
+                # so hit/miss reconciliation is unaffected; the UI already renders
+                # 'submitted' the same as 'queued' ("Processing").
+                db.execute(
+                    update(Result)
+                    .where(
+                        Result.id.in_([r.result_id for r in rows]),
+                        Result.skip_trace_status == "queued",
+                    )
+                    .values(skip_trace_status="submitted")
                 )
                 db.commit()
 

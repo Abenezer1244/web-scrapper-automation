@@ -522,6 +522,12 @@ class JobResponse(BaseModel):
             self.progress_label = "Connecting to county portal..."
 
 
+class PhoneContact(BaseModel):
+    """One skip-traced phone. ``type`` is Mobile|Landline|VoIP|null."""
+    number: str
+    type: str | None = None
+
+
 class ResultRow(BaseModel):
     id: str
     date_recorded: str | None
@@ -539,6 +545,10 @@ class ResultRow(BaseModel):
     phone_type: str | None = None
     phone_dnc_flag: bool | None = None
     email: str | None = None
+    # Multi-contact: up to 3 each. phone/email above remain the primary
+    # (= phones[0]/emails[0]); these surface the extras for display.
+    phones: list[PhoneContact] | None = None
+    emails: list[str] | None = None
     skip_trace_status: str = "not_attempted"  # not_attempted|queued|submitted|hit|miss|errored
     skip_trace_attempted_at: datetime | None = None
     is_duplicate: bool = False
@@ -550,6 +560,31 @@ class ResultRow(BaseModel):
 
     model_config = {"from_attributes": True}
 
+    @field_validator("phones", mode="before")
+    @classmethod
+    def _clean_phones(cls, v: Any) -> Any:
+        # Tolerate legacy/malformed JSON so one bad contact can't 500 the whole
+        # authorized results page. Keep only {number:str} entries, cap at 3.
+        if not isinstance(v, list):
+            return None
+        out: list[dict] = []
+        for item in v:
+            if isinstance(item, dict):
+                num = item.get("number")
+                if isinstance(num, str) and num.strip():
+                    typ = item.get("type")
+                    out.append({"number": num.strip(), "type": typ if isinstance(typ, str) else None})
+            if len(out) >= 3:
+                break
+        return out
+
+    @field_validator("emails", mode="before")
+    @classmethod
+    def _clean_emails(cls, v: Any) -> Any:
+        if not isinstance(v, list):
+            return None
+        return [e.strip() for e in v if isinstance(e, str) and e.strip()][:3]
+
     def model_post_init(self, __context: Any) -> None:
         # Sanitize HTML entities from all string fields before API response
         for field in ("property_address", "mailing_address", "party_name", "heirs", "legal_description"):
@@ -557,6 +592,12 @@ class ResultRow(BaseModel):
             if val and isinstance(val, str):
                 cleaned = val.replace("&nbsp;", "").replace("&amp;", "&").strip()
                 object.__setattr__(self, field, cleaned if cleaned else None)
+        # Defensive cap: never expose more than 3 contacts even if a row somehow
+        # stored more (the workers already cap at 3).
+        if self.phones and len(self.phones) > 3:
+            object.__setattr__(self, "phones", self.phones[:3])
+        if self.emails and len(self.emails) > 3:
+            object.__setattr__(self, "emails", self.emails[:3])
 
 
 class ResultsPage(BaseModel):

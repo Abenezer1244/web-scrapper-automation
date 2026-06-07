@@ -844,6 +844,23 @@ async def download_export(
         # phone/email appear as soon as the skip trace dispatcher completes,
         # even if the original export was uploaded before skip trace ran.
         output = io.StringIO()
+
+        # Multi-contact: phone/email are the primary; phone_2/3 + email_2/3 are
+        # the extras from the phones/emails JSON arrays (each value still goes
+        # through sanitize_for_csv — never bypass it for JSON extraction).
+        def _nth_phone(rec, i: int) -> str | None:
+            ps = getattr(rec, "phones", None)
+            if not isinstance(ps, list) or i >= len(ps) or not isinstance(ps[i], dict):
+                return None
+            num = ps[i].get("number")
+            return num if isinstance(num, str) else None
+
+        def _nth_email(rec, i: int) -> str | None:
+            es = getattr(rec, "emails", None)
+            if not isinstance(es, list) or i >= len(es) or not isinstance(es[i], str):
+                return None
+            return es[i]
+
         fieldnames = [
             "date_recorded", "party_name", "heirs", "parcel_id",
             "property_address", "mailing_address", "legal_description",
@@ -851,6 +868,8 @@ async def download_export(
             # Phase 4: structured tax columns (King tax_delinquent; blank elsewhere)
             "delinquent_amount", "delinquent_bill_year",
             "phone", "phone_type", "email",
+            # Multi-contact extras (up to 3 total)
+            "phone_2", "phone_3", "email_2", "email_3",
         ]
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
@@ -872,6 +891,10 @@ async def download_export(
                 "phone": sanitize_for_csv(getattr(r, "phone", None)),
                 "phone_type": sanitize_for_csv(getattr(r, "phone_type", None)),
                 "email": sanitize_for_csv(getattr(r, "email", None)),
+                "phone_2": sanitize_for_csv(_nth_phone(r, 1)),
+                "phone_3": sanitize_for_csv(_nth_phone(r, 2)),
+                "email_2": sanitize_for_csv(_nth_email(r, 1)),
+                "email_3": sanitize_for_csv(_nth_email(r, 2)),
             })
 
         csv_bytes = output.getvalue().encode("utf-8")

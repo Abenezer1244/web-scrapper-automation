@@ -52,11 +52,22 @@ itself still used `ssl.CERT_NONE`** (the biggest miss — settings.py alone didn
 **Failed / Blocked:** `.env.example` reads blocked by harness env-file protection — appended the two
 new `REDIS_SSL_*` keys via PowerShell write instead.
 
+**Committed on branch `security/checklist-h4-m2-m1`:** audit `7f10adf`, H4 `ec857f9`, M2 `fe3976b`,
+M1 `87150bf`. Then **H2 MFA Phases 1-2**: P1 `d9ccd1a` (migration 043 users.mfa_* + mfa_backup_codes
+table w/ RLS; `src/utils/crypto.py` Fernet field-encryption keyed from FIELD_ENCRYPTION_KEY/HKDF —
+shared with H3; pyotp+cryptography pinned). P2 `8150477` (`src/utils/mfa.py` TOTP + HMAC backup codes;
+`/auth/mfa/status|setup|enable|disable`; FOR UPDATE on user row, per-user throttle, revoke-on-enable).
+Each Codex-reviewed; Codex caught the missing RLS on the new tenant table (H2-P1) + the
+enrollment race (H2-P2 High) — both fixed.
+
 **Pending / Handoff:** (1) **USER must rotate the live `admin@bridgeleads.io` password** + set
 `BRIDGELEADS_ADMIN_PASSWORD`/`BRIDGELEADS_FIXTURE_PASSWORD` env. (2) **Verify Redis still connects with
-CERT_REQUIRED in Railway** on deploy — escape hatch `REDIS_SSL_CERT_REQS=none` if it fails. (3) Nothing
-committed yet. (4) Remaining Highs: **H2 MFA, H3 PII-at-rest encryption, H1 RLS enforcement** (the
-prod-boot landmine — do last, with full smoke test).
+CERT_REQUIRED in Railway** on deploy — escape hatch `REDIS_SSL_CERT_REQS=none` if it fails. (3) Branch
+unpushed — verify Redis on deploy BEFORE merging to main (auto-deploys). (4) **H2 remaining: P3 login
+MFA challenge + next-auth 2-step frontend (riskiest — login-contract change), P4 session hardening, P5
+admin-enforced + break-glass.** Then **H3 PII-at-rest** (use `src/utils/crypto.py`), then **H1 RLS
+enforcement** (prod-boot landmine; cutover must add a `users` self-row policy — RLS is enabled on
+`users` with NO policy today, found during H2).
 
 **Facts learned:** `auth_hardening.py`/`rate_limit.py` use `logging.getLogger` directly, NOT
 `setup_logger` → the redaction filter never ran there. `billing.py` rediss:// clients already verified

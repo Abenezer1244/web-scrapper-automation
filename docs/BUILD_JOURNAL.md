@@ -44,11 +44,16 @@ now correctly ` / `-separated (`BOYLE DAVID E / QUALITY LOAN SERVICE CORP`).
 present; party_name is only the weak fallback for parcel-less records. King NTS = all parceled → dedup
 unaffected. Only parcel-less records re-dedup on next scrape (minority).
 
+**Pierce — investigated, NO bug (correction):** initially suspected Pierce had the same concatenation, but
+raw-cell capture + a 2000-row scan disproved it. `SULLIVAN NANETTEMATTHEWS JOAN DEMETRICE` is a **KING**
+record (probate/death_cert), not Pierce — I misattributed it from a cross-county skip-trace sample. Pierce's
+ARMS cell holds the primary grantor in one `lblTor` span and shows extra owners as a `<b>(+)</b>`
+"More Names Indicator" (not concatenated full names); `_parse_name_cell`'s `[R]`/`[E]` regex handles it
+correctly. 0/2000 Pierce names showed concatenation. Only nit: `(+)` lacks a leading space
+(`GILBERT BARBARA(+)`) — cosmetic, left as-is (no risky change to a non-bug).
+
 **Pending / Handoff:**
-- **Pierce** has the same symptom (`SULLIVAN NANETTEMATTHEWS JOAN DEMETRICE`) via `_parse_name_cell`'s
-  `child.get_text(strip=True)` (no separator). NOT yet fixed — its `[R]`/`[E]` marker regex makes a blind
-  change risky; capturing its raw cell HTML first. Phase 2.
-- **Phase 2 (Codex-recommended):** skip-trace should pick the FIRST owner for a cheaper NORMAL trace
+- **Phase 2 (Codex-recommended, optional):** skip-trace should pick the FIRST owner for a cheaper NORMAL trace
   (1 credit) when it parses confidently as a person, instead of address-only ADVANCED (2 credits); audit
   other templates (EagleWeb/AcclaimWeb/Tyler/Fidlar/Laserfiche) for the same `get_text()`-no-separator bug.
 

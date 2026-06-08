@@ -3,6 +3,7 @@
 import asyncio
 import functools
 import hashlib
+import html
 import json
 import re
 from dataclasses import dataclass, field
@@ -23,6 +24,47 @@ from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
 
 _logger = setup_logger("scraper.base")
+
+
+# ─── Party-name normalization ────────────────────────────────────────────────
+# Recorder portals stack multiple parties (co-owners, or borrower + trustee)
+# inside ONE name cell, separated by structural markup — LandmarkWeb uses
+# `<div class='nameSeperator'></div>` (sic), others use `<br>`. Blanket tag
+# stripping (`re.sub(r'<[^>]+>', '', s)`) deletes those with NO replacement, so
+# the names collapse together: "BOYLE DAVID E" + "QUALITY LOAN SERVICE CORP"
+# becomes "BOYLE DAVID EQUALITY LOAN SERVICE CORP". That corrupts the displayed
+# party_name and degrades skip-trace matching. `normalize_party_text` converts
+# the structural boundaries to " / " BEFORE removing the remaining inline tags.
+_NAME_SEPARATOR_RE = re.compile(r"(?i)<div[^>]*\bnameSeperator\b[^>]*>\s*</div>")
+_BR_RE = re.compile(r"(?i)<br\s*/?>")
+_TAG_RE = re.compile(r"<[^>]+>")
+_LANDMARK_PREFIX_RE = re.compile(r"(?i)(?:nobreak_|unclickable_)")
+_MULTI_DELIM_RE = re.compile(r"\s*/\s*(?:/\s*)+")
+_WS_RE = re.compile(r"\s+")
+
+
+def normalize_party_text(raw: str | None) -> str:
+    """Clean an HTML party/name cell to text, preserving multi-owner boundaries
+    as ' / '.
+
+    Converts the structural party separators (LandmarkWeb's nameSeperator div and
+    `<br>`) to " / ", THEN strips remaining inline tags with no separator (so a
+    name wrapped in inline markup like ``MA<b>RRS</b>`` is not split mid-token).
+    Decodes HTML entities, drops LandmarkWeb CSS-class prefixes baked into cell
+    text, and collapses whitespace / repeated and stray delimiters.
+    """
+    if not raw:
+        return ""
+    s = str(raw)
+    s = _NAME_SEPARATOR_RE.sub(" / ", s)
+    s = _BR_RE.sub(" / ", s)
+    s = _TAG_RE.sub("", s)
+    s = html.unescape(s)
+    s = _LANDMARK_PREFIX_RE.sub("", s)
+    s = _WS_RE.sub(" ", s).strip()
+    s = _MULTI_DELIM_RE.sub(" / ", s)
+    s = re.sub(r"^\s*/\s*|\s*/\s*$", "", s)
+    return s.strip()
 
 
 class ProgressCallback(Protocol):

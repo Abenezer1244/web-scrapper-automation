@@ -24,7 +24,7 @@ import re
 from datetime import datetime, timedelta
 
 from src.api.middleware.security import add_scrape_domain
-from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord, normalize_party_text
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.king_wa_probate")
@@ -797,8 +797,11 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                 cleaned = _re.sub(r'^(nobreak_|unclickable_)\s*', '', cleaned)
                 return cleaned
 
-            grantor = strip_html(row.get("5", ""))
-            grantee = strip_html(row.get("6", ""))
+            # Party names: use the shared normalizer so stacked owners separated
+            # by <div class='nameSeperator'></div> stay split (" / ") instead of
+            # concatenating ("BOYLE DAVID E" + "QUALITY LOAN..." -> "...EQUALITY").
+            grantor = normalize_party_text(row.get("5", ""))
+            grantee = normalize_party_text(row.get("6", ""))
             date_str = strip_html(row.get("7", ""))
             doc_type = strip_html(row.get("8", ""))
             rec_num = strip_html(row.get("12", ""))
@@ -866,9 +869,14 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                         if (cells.length < 8) continue;
 
                         const get = (idx) => cells[idx] ? cells[idx].textContent.trim() : '';
+                        // Party cells: return innerHTML so the structural
+                        // <div class='nameSeperator'></div> survives to Python's
+                        // normalize_party_text(). textContent would collapse
+                        // stacked owners in-browser before we can split them.
+                        const getHtml = (idx) => cells[idx] ? cells[idx].innerHTML.trim() : '';
 
-                        const grantor = get(COL.grantor);
-                        const grantee = get(COL.grantee);
+                        const grantor = getHtml(COL.grantor);
+                        const grantee = getHtml(COL.grantee);
                         const dateStr = get(COL.date);
                         const docType = get(COL.docType);
                         const recNum = get(COL.recNum);
@@ -959,13 +967,13 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                     if date_match:
                         record.date_recorded = date_match.group(1)
 
-                # Grantor = deceased person
-                grantor = (item.get("grantor") or "").strip()
+                # Grantor = deceased person (normalize stacked owners -> " / ")
+                grantor = normalize_party_text(item.get("grantor") or "")
                 if grantor:
                     record.party_name = grantor
 
                 # Grantee = heir/family inheriting the property
-                grantee = (item.get("grantee") or "").strip()
+                grantee = normalize_party_text(item.get("grantee") or "")
                 if grantee:
                     record.heirs = grantee
 

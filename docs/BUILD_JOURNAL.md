@@ -19,6 +19,39 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-08 — Multi-owner party_name de-concatenation (King; Pierce pending)
+
+**Built / Shipped (uncommitted):** user noticed skip-traced leads' party_name like
+`MARRS DONALD EMARRS BRENDA M` — two owners concatenated with no separator, polluting display +
+degrading skip-trace matching.
+
+**Root cause (verified via live raw capture):** King/LandmarkWeb stacks multiple parties in one cell
+separated by `<div class='nameSeperator'></div>` (sic). The extractor's blanket
+`re.sub(r'<[^>]+>', '', s)` deleted the separator with NO replacement →
+`BOYLE DAVID E<div..></div>QUALITY LOAN SERVICE CORP` collapsed to `BOYLE DAVID EQUALITY LOAN...`.
+(The missing space between "E" and the next name is the tell.)
+
+**Fix (King, Codex-designed):** new shared `normalize_party_text()` in `base_scraper.py` — converts the
+nameSeperator div + `<br>` to ` / ` BEFORE stripping remaining inline tags (so `MA<b>RRS</b>` is NOT
+split mid-token), decodes entities, drops LandmarkWeb `nobreak_`/`unclickable_` css-prefixes, collapses
+whitespace + repeated/stray delimiters. Wired into King's grantor/grantee in BOTH the JSON path and the
+DOM-fallback JS path. **Codex review caught a P2:** the DOM JS read `textContent` (collapses the div
+in-browser before Python sees it) → fixed by reading `innerHTML` for the party cells. Tests:
+`tests/test_party_name_normalize.py` (19, exact captured examples). Live: 25/61 multi-owner King names
+now correctly ` / `-separated (`BOYLE DAVID E / QUALITY LOAN SERVICE CORP`).
+
+**Dedup blast radius (verified safe):** `_compute_dedup_hash` uses the STRONG parcel|address key when
+present; party_name is only the weak fallback for parcel-less records. King NTS = all parceled → dedup
+unaffected. Only parcel-less records re-dedup on next scrape (minority).
+
+**Pending / Handoff:**
+- **Pierce** has the same symptom (`SULLIVAN NANETTEMATTHEWS JOAN DEMETRICE`) via `_parse_name_cell`'s
+  `child.get_text(strip=True)` (no separator). NOT yet fixed — its `[R]`/`[E]` marker regex makes a blind
+  change risky; capturing its raw cell HTML first. Phase 2.
+- **Phase 2 (Codex-recommended):** skip-trace should pick the FIRST owner for a cheaper NORMAL trace
+  (1 credit) when it parses confidently as a person, instead of address-only ADVANCED (2 credits); audit
+  other templates (EagleWeb/AcclaimWeb/Tyler/Fidlar/Laserfiche) for the same `get_text()`-no-separator bug.
+
 ## 2026-06-07 — Pierce pre-foreclosure (same alias footgun) + pre-foreclosure doc-type SELECTOR UI bug
 
 **Built / Shipped (uncommitted):** user: "check same for pierce + check the UI for both King & Pierce

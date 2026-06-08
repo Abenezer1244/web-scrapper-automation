@@ -83,12 +83,28 @@ async def _process_tracerfy_webhook(request: Request) -> dict:
             detail="Invalid JSON body",
         )
 
+    # A non-object JSON body (array/string/number) would 500 on payload.get(...)
+    # below — reject it as a 400 first (Codex M2 review).
+    if not isinstance(payload, dict):
+        _logger.warning(
+            "Tracerfy webhook body is %s, not a JSON object", type(payload).__name__
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid JSON body",
+        )
+
     queue_id = payload.get("id")
     download_url = payload.get("download_url")
     pending = payload.get("pending", True)
 
     if queue_id is None or not isinstance(queue_id, int):
-        _logger.warning("Tracerfy webhook missing or non-int 'id': %s", payload)
+        # Log only the payload KEYS, never the full body — it can carry a
+        # signed download_url whose token is a secret (M2).
+        _logger.warning(
+            "Tracerfy webhook missing or non-int 'id'; payload keys=%s",
+            sorted(payload.keys()) if isinstance(payload, dict) else type(payload).__name__,
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Missing queue id",

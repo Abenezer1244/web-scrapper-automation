@@ -35,6 +35,7 @@ from src.api.schemas import (
 from src.api.deps import get_rls_db
 from src.config import settings
 from src.db import User, get_db  # noqa: F401 (User used in Annotated type)
+from src.utils.logger import email_fingerprint
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -233,7 +234,11 @@ async def login(
 
     if not user or not password_ok:
         await BruteForceProtection.record_failure(ip, body.email)
-        audit_log(request, "login_failure", detail=f"email={body.email}")
+        # PII (M2): log a stable email FINGERPRINT, never the plaintext address.
+        # Lets ops correlate repeated attempts on the same account (same fp)
+        # without an enumerable email in the audit log. HMAC-keyed (not a bare
+        # hash) so the logs can't be brute-forced against a known email list.
+        audit_log(request, "login_failure", detail=f"email_fp={email_fingerprint(body.email)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",

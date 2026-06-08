@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import logging
 import re
 from datetime import datetime
@@ -5,6 +7,22 @@ from datetime import datetime
 import colorlog
 
 from src.config import settings
+
+
+def email_fingerprint(email: str | None) -> str:
+    """Return a stable, non-reversible fingerprint of an email for logs.
+
+    PII (M2): lets ops correlate repeated activity on the same account
+    (identical fingerprint) without putting an enumerable plaintext address —
+    or a dictionary-checkable bare hash — in the logs. Keyed HMAC with the
+    server SECRET_KEY so an attacker with the logs can't brute a known email
+    list against it.
+    """
+    if not email:
+        return "none"
+    key = (settings.SECRET_KEY or "bridgeleads-log-pepper").encode()
+    msg = email.strip().lower().encode()
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()[:12]
 
 # ─── Secret redaction (defense-in-depth) ─────────────────────────────────────
 # Last-line scrub so a stray log call can't leak a credential to console/file/
@@ -19,7 +37,40 @@ _SECRET_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"(?i)\bsk[_-][A-Za-z0-9_\-]{16,}"), "[REDACTED_KEY]"),  # sk-..., sk_live_..., sk_test_...
     (re.compile(r"(?i)((?:set-)?cookie\s*[:=]\s*).+"), r"\1[REDACTED]"),  # Cookie / Set-Cookie header value
     (re.compile(r"(?i)(https?://)[^/\s:@]+:[^/\s:@]+@"), r"\1[REDACTED]@"),  # basic-auth creds in URL
+    # PII (M2): mask the local-part of any email so logs can't be used to
+    # enumerate accounts or harvest contacts; keep the first char + domain so
+    # delivery/ops logs stay debuggable (e.g. "j***@gmail.com").
+    (re.compile(r"(?i)([A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]*(@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"), r"\1***\2"),
+    # PII (M2): redact a phone number ONLY when it follows a `phone`-ish label
+    # (phone=, "phone":, primary_phone=, phone_number=, 'phone': '...'). A bare
+    # 10-digit redaction is unsafe here — county parcel IDs are 10 digits and
+    # appear all over scraper logs, so the label is required. The value matcher
+    # allows internal spaces/punctuation ("+1 (253) 261-1057") but stops at a
+    # non-numeric token so it never eats the following field.
+    (re.compile(
+        r"(?i)((?:primary_|mobile_|cell_|home_|work_|landline_)?phone(?:_number)?[\"']?\s*[:=]\s*[\"']?)"
+        r"\+?[\d().\-]+(?:[ \t][\d().\-]+){0,4}"
+    ), r"\1[REDACTED_PHONE]"),
 ]
+
+
+def install_global_redaction() -> None:
+    """Best-effort: attach the redaction filter to the root + uvicorn loggers.
+
+    setup_logger() already filters its own handlers, but modules that use
+    ``logging.getLogger(...)`` directly (e.g. middleware) bypass that. Adding
+    the filter at the logger level here scrubs records emitted directly to
+    those loggers; the per-source fingerprinting remains the primary defense
+    for PII. Idempotent — safe to call more than once.
+    """
+    names = [None, "uvicorn", "uvicorn.error", "uvicorn.access", "security"]
+    for name in names:
+        lg = logging.getLogger(name) if name else logging.getLogger()
+        if _redaction_filter not in lg.filters:
+            lg.addFilter(_redaction_filter)
+        for handler in lg.handlers:
+            if _redaction_filter not in handler.filters:
+                handler.addFilter(_redaction_filter)
 
 
 class _RedactionFilter(logging.Filter):

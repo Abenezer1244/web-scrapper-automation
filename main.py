@@ -113,6 +113,12 @@ class _StripTokenFilter(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(_StripTokenFilter())
 
+# PII/secret redaction backstop for loggers created via logging.getLogger()
+# (middleware, etc.) that bypass setup_logger()'s per-handler filter.
+from src.utils.logger import install_global_redaction
+
+install_global_redaction()
+
 
 # ─── Health check ─────────────────────────────────────────────────────────────
 

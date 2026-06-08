@@ -7,6 +7,7 @@ import redis.exceptions as redis_exceptions
 from fastapi import HTTPException, status
 
 from src.config import settings
+from src.utils.logger import email_fingerprint
 
 _logger = logging.getLogger("security.auth_hardening")
 
@@ -352,8 +353,8 @@ class BruteForceProtection:
                     )
         except redis_exceptions.RedisError as exc:
             _logger.warning(
-                "BruteForceProtection.check fail-open: Redis error for ip=%s email=%s: %s",
-                ip, email, exc,
+                "BruteForceProtection.check fail-open: Redis error for ip=%s email_fp=%s: %s",
+                ip, email_fingerprint(email), exc,
             )
             return
 
@@ -400,8 +401,8 @@ class BruteForceProtection:
                     email_failures = count
         except redis_exceptions.RedisError as exc:
             _logger.warning(
-                "BruteForceProtection.record_failure skipped (Redis error) ip=%s email=%s: %s",
-                ip, email, exc,
+                "BruteForceProtection.record_failure skipped (Redis error) ip=%s email_fp=%s: %s",
+                ip, email_fingerprint(email), exc,
             )
             return
 
@@ -416,8 +417,8 @@ class BruteForceProtection:
                     return
             except redis_exceptions.RedisError as exc:
                 _logger.warning(
-                    "Lockout notification dedup check failed (Redis error) email=%s: %s",
-                    email, exc,
+                    "Lockout notification dedup check failed (Redis error) email_fp=%s: %s",
+                    email_fingerprint(email), exc,
                 )
                 return
             try:
@@ -434,8 +435,8 @@ class BruteForceProtection:
                     # stopped firing in production.
                     import logging
                     logging.getLogger("auth.lockout").warning(
-                        "Lockout notification failed for %s: %s",
-                        email, str(notify_exc)[:200],
+                        "Lockout notification failed for email_fp=%s: %s",
+                        email_fingerprint(email), str(notify_exc)[:200],
                     )
 
     @staticmethod
@@ -454,6 +455,6 @@ class BruteForceProtection:
             )
         except redis_exceptions.RedisError as exc:
             _logger.warning(
-                "BruteForceProtection.clear skipped (Redis error) ip=%s email=%s: %s",
-                ip, email, exc,
+                "BruteForceProtection.clear skipped (Redis error) ip=%s email_fp=%s: %s",
+                ip, email_fingerprint(email), exc,
             )

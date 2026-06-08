@@ -1,3 +1,70 @@
+# H2 Phase 5 — Admin MFA enforcement + step-up + break-glass — PLAN (implement in a fresh session)
+
+**Decisions (owner):** FORCE-ENROLL + STEP-UP; BOTH break-glass mechanisms (operator script + in-app
+break-glass codes); **implement in a fresh `/clear` session from this plan.**
+
+**Codex consult done (2026-06-08, high effort).** Recommended design below. **Codex flagged a CRITICAL
+pre-existing bug that is Step 0.**
+
+## ⚠️ STEP 0 — CRITICAL pre-req (fix BEFORE amr; arguably ship standalone first)
+**Refresh tokens are valid access tokens.** `create_refresh_token` (src/api/auth.py:68) sets
+`aud="bridgeleads-api"` (same as access) and `purpose="refresh"`, but `decode_secure_token` only pins
+aud and `get_current_user` never checks `purpose`. So a 7-day refresh token authenticates ANY request.
+Today that's a latent priv/longevity bug; with P5 it becomes a 7-day **MFA-backed** bearer.
+- **Fix:** give refresh tokens a DISTINCT audience (`bridgeleads-refresh`) OR make `get_current_user`
+  reject `payload.get("purpose") == "refresh"`. Add `purpose="access"` to access tokens. `/auth/refresh`
+  must still accept only refresh-purpose tokens (it decodes via `decode_secure_token` today — verify it
+  pins refresh purpose after the change). Add a test: a refresh token is rejected by `/auth/me`.
+
+## Step A — amr/auth_time + AuthContext
+- `create_secure_token(user_id, amr=["pwd"], auth_time=now)` + `purpose="access"`;
+  `create_refresh_token(user_id, amr=["pwd"], auth_time=now)`. login/register → `["pwd"]`; login_mfa →
+  `["pwd","mfa"]`; auth_time=now.
+- `/auth/refresh`: sanitize amr (intersect `{pwd,mfa,break_glass}`, default `["pwd"]` for old tokens),
+  copy amr + auth_time UNCHANGED into both new tokens. **Never add `mfa` on refresh** (no escalation);
+  never drop it (no silent downgrade).
+- **AuthContext (Codex's pick over request.state / ORM attrs / re-decode):** new `get_auth_context()`
+  decodes once → `{user, auth_method: "jwt"|"api_key", amr, auth_time, jti, payload}`. `get_current_user`
+  becomes a thin wrapper returning `ctx.user` (keeps all existing `CurrentUser` deps working).
+
+## Step B — admin enforcement dependencies
+- `require_admin(ctx)`: non-admin → **404** (endpoint hiding, matches current behavior); admin with
+  `mfa_enabled=False` → **403 `admin_mfa_enrollment_required`**.
+- `require_admin_mfa(ctx)` (step-up): `require_admin` AND `auth_method=="jwt"` AND `"mfa" in amr` AND
+  **auth_time fresh (< 15 min)** → else **403 `admin_mfa_step_up_required`**. **API-key sessions always
+  fail step-up** (no amr/auth_time).
+- Apply to the 2 existing admin endpoints: `billing.py:~23` (activation-funnel) + `scrapers.py:~255`
+  (connector creation). Replace inline `is_admin` checks with the dependency (Codex HIGH: inline checks
+  will drift). Frontend: do NOT hide Settings behind an admin-gated 403 (no-MFA admin must reach enroll).
+
+## Step C — break-glass (BOTH)
+- **New table `mfa_break_glass_codes`** (migration 045 — NOT reuse MfaBackupCode): `user_id, code_hash,
+  batch_id, created_by, created_reason, expires_at, used_at, used_ip, used_user_agent, revoked_at`.
+- `scripts/reset_user_mfa.py` (railway run): clear MFA (enabled/secret/counter) + delete backup codes +
+  revoke sessions + audit. Operator-authenticated by Railway DB/env access.
+- `scripts/generate_break_glass.py` (railway run): generate N high-entropy codes, store hashes, print
+  once. Uses the `scripts/_creds.py` env pattern.
+- **Redemption:** through the existing challenge flow (password already verified) — single-use atomic
+  consume, rate-limited, revoke sessions+API key on success, LOUD audit. Resulting token
+  `amr=["pwd","mfa","break_glass"]`; block destructive admin ops until normal TOTP re-enrolled OR allow
+  only a 5-min emergency window.
+
+## Minimum safe slice (if cutting scope)
+Step 0 + Step A + AuthContext + `require_admin`/`require_admin_mfa` + apply to the 2 endpoints + reject
+API keys for step-up + the operator reset script. **Defer in-app break-glass codes.** Do NOT ship admin
+enforcement without Step 0.
+
+## Severity flags from Codex
+- **CRITICAL:** refresh-token-as-access (Step 0). **HIGH:** sparse inline admin checks → central dep.
+  **HIGH:** API-key has no amr → must reject for step-up.
+
+## Tests to write
+refresh token rejected by /auth/me; amr=["pwd"] vs ["pwd","mfa"]; refresh preserves amr+auth_time and
+never adds mfa; require_admin 403 for no-MFA admin; require_admin_mfa 403 for API-key + stale auth_time +
+pwd-only session, 200 for fresh mfa session; break-glass single-use + audit; operator reset clears MFA.
+
+---
+
 # H2 Phase 4 — Session hardening (TOTP replay) — SCOPED: TOTP-replay only (amr→P5)
 
 **Goal:** Close the TOTP-replay window deferred from P3, and stamp the auth method

@@ -91,6 +91,34 @@ class ResetPasswordRequest(BaseModel):
         return _validate_password_rules(v)
 
 
+class MfaSetupResponse(BaseModel):
+    """POST /auth/mfa/setup — returns the new TOTP secret (manual entry) and an
+    otpauth:// provisioning URI for QR. Shown once; not yet enabled."""
+    secret: str
+    provisioning_uri: str
+
+
+class MfaEnableRequest(BaseModel):
+    """Confirm enrollment with a current TOTP code from the authenticator."""
+    code: str = Field(min_length=6, max_length=10)
+
+
+class MfaEnableResponse(BaseModel):
+    """One-time backup codes, shown exactly once at enable time."""
+    backup_codes: list[str]
+
+
+class MfaDisableRequest(BaseModel):
+    """Disabling MFA requires the password AND a second factor (TOTP or a
+    backup code) — knowledge of the password alone must not remove MFA."""
+    password: str = Field(max_length=72)
+    code: str = Field(min_length=6, max_length=20)
+
+
+class MfaStatusResponse(BaseModel):
+    enabled: bool
+
+
 class UserResponse(BaseModel):
     id: str
     email: str

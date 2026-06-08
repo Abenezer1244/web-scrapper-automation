@@ -7,7 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from pydantic import BaseModel
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import (
@@ -24,6 +24,11 @@ from src.api.middleware import BruteForceProtection, audit_log, client_ip, rate_
 from src.api.schemas import (
     ApiKeyResponse,
     ForgotPasswordRequest,
+    MfaDisableRequest,
+    MfaEnableRequest,
+    MfaEnableResponse,
+    MfaSetupResponse,
+    MfaStatusResponse,
     NotificationPrefsUpdate,
     PasswordChange,
     ResetPasswordRequest,
@@ -595,6 +600,171 @@ async def change_password(
     user.api_key_hash = None
     await db.commit()
     audit_log(request, "password_changed", current_user.id)
+
+
+# ─── MFA (H2): TOTP enrollment ────────────────────────────────────────────────
+# Phase 2 = AUTHENTICATED enrollment only. The login MFA challenge (Phase 3) is
+# not wired yet, so enabling MFA here does not yet gate /login — it provisions
+# the encrypted secret + backup codes and revokes existing sessions.
+# mfa_secret_encrypted holds a Fernet token (src/utils/crypto), never the raw
+# secret. mfa_backup_codes rows are written under the RLS session with an
+# explicit user_id filter. revoke_all_for_user mirrors change-password's
+# fail-safe ordering (revoke before commit; 503 on Redis failure).
+
+@router.get("/mfa/status", response_model=MfaStatusResponse)
+async def mfa_status(current_user: CurrentUser) -> MfaStatusResponse:
+    """Whether the current user has MFA enabled (for settings UI)."""
+    return MfaStatusResponse(enabled=bool(current_user.mfa_enabled))
+
+
+@router.post("/mfa/setup", response_model=MfaSetupResponse)
+async def mfa_setup(
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_rls_db),
+) -> MfaSetupResponse:
+    """Generate a TOTP secret, store it encrypted (NOT yet enabled), and return
+    the secret + otpauth URI. Re-calling before enable rotates the pending secret."""
+    await rate_limit(request, zone="auth")
+    from src.utils.crypto import encrypt_field
+    from src.utils.mfa import generate_totp_secret, totp_provisioning_uri
+
+    # FOR UPDATE: serialize concurrent setup/enable/disable for this user so a
+    # race can't leave mfa_enabled=true with a mismatched secret or duplicate
+    # backup-code sets (Codex H2-P2 review).
+    user = (
+        await db.execute(select(User).where(User.id == current_user.id).with_for_update())
+    ).scalar_one()
+    if user.mfa_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="MFA is already enabled. Disable it first to re-enroll.",
+        )
+    secret = generate_totp_secret()
+    user.mfa_secret_encrypted = encrypt_field(secret)
+    await db.commit()
+    audit_log(request, "mfa_setup", current_user.id)
+    return MfaSetupResponse(
+        secret=secret,
+        provisioning_uri=totp_provisioning_uri(secret, user.email),
+    )
+
+
+@router.post("/mfa/enable", response_model=MfaEnableResponse)
+async def mfa_enable(
+    body: MfaEnableRequest,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_rls_db),
+) -> MfaEnableResponse:
+    """Verify a TOTP code against the pending secret, enable MFA, return backup
+    codes ONCE, and revoke all existing sessions (force a fresh login)."""
+    await rate_limit(request, zone="auth")
+    # Per-user throttle (not just per-IP): caps TOTP guessing across rotating IPs.
+    await rate_limit(request, zone="auth", identifier=f"mfa-user:{current_user.id}")
+    from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
+    from src.db.models import MfaBackupCode
+    from src.utils.crypto import decrypt_field
+    from src.utils.mfa import generate_backup_codes, verify_totp
+    import redis.exceptions as _redis_exceptions
+
+    user = (
+        await db.execute(select(User).where(User.id == current_user.id).with_for_update())
+    ).scalar_one()
+    if user.mfa_enabled:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="MFA is already enabled.")
+    if not user.mfa_secret_encrypted:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No pending MFA setup. Call /auth/mfa/setup first.",
+        )
+    try:
+        secret = decrypt_field(user.mfa_secret_encrypted)
+    except Exception:
+        user.mfa_secret_encrypted = None
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MFA setup is invalid; please restart enrollment.",
+        )
+    if not verify_totp(secret, body.code):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid MFA code.")
+
+    plaintext_codes, hashes = generate_backup_codes()
+    # Replace any prior codes (explicit user_id filter; RLS context also set).
+    await db.execute(delete(MfaBackupCode).where(MfaBackupCode.user_id == current_user.id))
+    for h in hashes:
+        db.add(MfaBackupCode(user_id=current_user.id, code_hash=h))
+    user.mfa_enabled = True
+    user.mfa_enrolled_at = datetime.now(UTC)
+
+    # Revoke BEFORE commit (fail-safe, mirrors change-password): if revoke
+    # fails we 503 with MFA NOT enabled; pre-MFA refresh tokens must not survive.
+    try:
+        await TokenBlacklist.revoke_all_for_user(current_user.id)
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
+    user.api_key_hash = None
+    await db.commit()
+    audit_log(request, "mfa_enabled", current_user.id)
+    return MfaEnableResponse(backup_codes=plaintext_codes)
+
+
+@router.post("/mfa/disable", status_code=status.HTTP_204_NO_CONTENT)
+async def mfa_disable(
+    body: MfaDisableRequest,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_rls_db),
+) -> None:
+    """Disable MFA. Requires the password AND a valid second factor (TOTP or an
+    unused backup code) — password alone must not remove MFA."""
+    await rate_limit(request, zone="auth")
+    # Per-user throttle (not just per-IP): caps 2nd-factor guessing across IPs
+    # even after the password check passes.
+    await rate_limit(request, zone="auth", identifier=f"mfa-user:{current_user.id}")
+    from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
+    from src.db.models import MfaBackupCode
+    from src.utils.crypto import decrypt_field
+    from src.utils.mfa import verify_backup_code_hash, verify_totp
+    import redis.exceptions as _redis_exceptions
+
+    user = (
+        await db.execute(select(User).where(User.id == current_user.id).with_for_update())
+    ).scalar_one()
+    if not user.mfa_enabled:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="MFA is not enabled.")
+    if not verify_password(body.password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password is incorrect.")
+
+    # Second factor: TOTP, else an unused backup code.
+    ok = False
+    if user.mfa_secret_encrypted:
+        try:
+            ok = verify_totp(decrypt_field(user.mfa_secret_encrypted), body.code)
+        except Exception:
+            ok = False
+    if not ok:
+        unused = (await db.execute(
+            select(MfaBackupCode).where(
+                MfaBackupCode.user_id == current_user.id,
+                MfaBackupCode.used_at.is_(None),
+            )
+        )).scalars().all()
+        ok = any(verify_backup_code_hash(body.code, c.code_hash) for c in unused)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid MFA code.")
+
+    user.mfa_enabled = False
+    user.mfa_secret_encrypted = None
+    user.mfa_enrolled_at = None
+    await db.execute(delete(MfaBackupCode).where(MfaBackupCode.user_id == current_user.id))
+    try:
+        await TokenBlacklist.revoke_all_for_user(current_user.id)
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
+    await db.commit()
+    audit_log(request, "mfa_disabled", current_user.id)
 
 
 @router.post("/forgot-password", status_code=status.HTTP_200_OK)

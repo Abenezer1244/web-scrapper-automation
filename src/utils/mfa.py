@@ -9,6 +9,7 @@ stored on User.mfa_secret_encrypted; this module only deals with the plaintext
 secret in memory during setup/verify.
 """
 
+import base64
 import hashlib
 import hmac
 import secrets
@@ -71,12 +72,20 @@ def verify_backup_code_hash(code: str, stored_hash: str) -> bool:
 
 def generate_backup_codes(n: int = _BACKUP_CODE_COUNT) -> tuple[list[str], list[str]]:
     """Return (plaintext_codes, hashes). Plaintext is shown to the user ONCE;
-    only the hashes are persisted. Format: 'xxxxx-xxxxx' (10 hex chars)."""
+    only the hashes are persisted.
+
+    Each code is 80 bits of entropy (10 random bytes) — well above the ~40-bit
+    code the first cut used — base32-encoded into 16 user-typeable chars grouped
+    as 'xxxx-xxxx-xxxx-xxxx'. base32 (A-Z2-7) is case-insensitive and avoids
+    ambiguous hex/decimal; _normalize_backup_code lowercases + strips dashes so
+    user formatting doesn't matter on verify.
+    """
     plaintext: list[str] = []
     hashes: list[str] = []
     for _ in range(n):
-        raw = secrets.token_hex(5)  # 10 hex chars, ~40 bits
-        code = f"{raw[:5]}-{raw[5:]}"
+        # 10 bytes -> 16 base32 chars (no padding) = 80 bits.
+        b32 = base64.b32encode(secrets.token_bytes(10)).decode("ascii").rstrip("=").lower()
+        code = "-".join(b32[i:i + 4] for i in range(0, len(b32), 4))
         plaintext.append(code)
         hashes.append(hash_backup_code(code))
     return plaintext, hashes

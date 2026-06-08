@@ -112,7 +112,8 @@ class MfaDisableRequest(BaseModel):
     """Disabling MFA requires the password AND a second factor (TOTP or a
     backup code) — knowledge of the password alone must not remove MFA."""
     password: str = Field(max_length=72)
-    code: str = Field(min_length=6, max_length=20)
+    # 6-digit TOTP or an 80-bit base32 backup code 'xxxx-xxxx-xxxx-xxxx' (19 chars).
+    code: str = Field(min_length=6, max_length=32)
 
 
 class MfaStatusResponse(BaseModel):

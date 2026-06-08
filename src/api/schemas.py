@@ -120,6 +120,14 @@ class MfaStatusResponse(BaseModel):
     enabled: bool
 
 
+class MfaLoginRequest(BaseModel):
+    """POST /auth/login/mfa — redeem the login MFA challenge. `mfa_token` is the
+    short-lived challenge token returned by /auth/login when MFA is enabled;
+    `code` is a 6-digit TOTP or an 80-bit base32 backup code."""
+    mfa_token: str = Field(max_length=4096)  # bound — a JWT is ~hundreds of bytes
+    code: str = Field(min_length=6, max_length=32)
+
+
 class UserResponse(BaseModel):
     id: str
     email: str
@@ -164,6 +172,25 @@ class TokenResponse(BaseModel):
     refresh_token: str | None = None
     token_type: str = "bearer"
     expires_in: int = 3600
+
+
+class LoginResponse(BaseModel):
+    """POST /auth/login (and /auth/login/mfa) response. Two mutually exclusive
+    shapes, discriminated by `mfa_required`:
+    - mfa_required=False → login complete: access_token + refresh_token are
+      ALWAYS populated. This is the only shape a non-MFA account ever sees, so
+      the prior no-MFA runtime contract is unchanged.
+    - mfa_required=True → password OK but MFA enabled: access_token/refresh_token
+      are null and a short-lived mfa_token is returned to redeem at
+      POST /auth/login/mfa.
+    The fields are Optional (vs TokenResponse's required access_token) only to
+    model the challenge shape — clients must branch on mfa_required."""
+    access_token: str | None = None
+    refresh_token: str | None = None
+    token_type: str = "bearer"
+    expires_in: int = 3600
+    mfa_required: bool = False
+    mfa_token: str | None = None
 
 
 class ApiKeyResponse(BaseModel):

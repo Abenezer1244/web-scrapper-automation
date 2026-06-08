@@ -7,7 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from pydantic import BaseModel
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import (
@@ -20,13 +20,16 @@ from src.api.auth import (
     require_plan,
     verify_password,
 )
+from src.api.deps import get_rls_db
 from src.api.middleware import BruteForceProtection, audit_log, client_ip, rate_limit
 from src.api.schemas import (
     ApiKeyResponse,
     ForgotPasswordRequest,
+    LoginResponse,
     MfaDisableRequest,
     MfaEnableRequest,
     MfaEnableResponse,
+    MfaLoginRequest,
     MfaSetupResponse,
     MfaStatusResponse,
     NotificationPrefsUpdate,
@@ -37,7 +40,6 @@ from src.api.schemas import (
     UserRegister,
     UserResponse,
 )
-from src.api.deps import get_rls_db
 from src.config import settings
 from src.db import User, get_db  # noqa: F401 (User used in Annotated type)
 from src.utils.logger import email_fingerprint
@@ -108,6 +110,115 @@ def _decode_reset_token(token: str) -> dict:
         # Right audience but wrong purpose — treat as an invalid reset token.
         raise jwt.InvalidTokenError("not a reset token")
     return payload
+
+
+# ─── H2-P3: MFA login-challenge token (stateless) ─────────────────────────────
+# Issued by /auth/login after a CORRECT password when the account has MFA
+# enabled. It carries NO access privilege — it only proves "the password step
+# was passed for this user" and must be redeemed at /auth/login/mfa together
+# with a valid 2nd factor. Like the reset token it uses the app SECRET_KEY/HS256
+# under a DISTINCT audience so the token families cannot cross over:
+#   - an access token (aud="bridgeleads-api") cannot redeem an MFA challenge
+#     (_decode_mfa_challenge_token pins aud="bridgeleads-mfa"), and
+#   - a challenge token cannot authenticate an API request (get_current_user's
+#     decode_secure_token pins aud="bridgeleads-api").
+# Short-lived (~5 min): long enough to type a code, short enough to bound replay
+# of the challenge itself. The per-user rate limiter on /auth/login/mfa caps how
+# many 2nd-factor guesses a single challenge (or rotating challenges) can drive.
+
+_MFA_CHALLENGE_PURPOSE = "mfa_challenge"
+_MFA_CHALLENGE_AUDIENCE = "bridgeleads-mfa"
+_MFA_CHALLENGE_ISSUER = "bridgeleads"
+_MFA_CHALLENGE_ALGORITHM = "HS256"
+_MFA_CHALLENGE_EXPIRE_SECONDS = 5 * 60  # ~5 minutes
+
+
+def _mint_mfa_challenge_token(user_id: str) -> str:
+    """Mint a short-lived MFA login-challenge JWT (H2-P3). No access privilege."""
+    import jwt
+
+    now = int(time.time())
+    payload = {
+        "sub": user_id,
+        "jti": str(uuid.uuid4()),
+        "iss": _MFA_CHALLENGE_ISSUER,
+        "aud": _MFA_CHALLENGE_AUDIENCE,
+        "purpose": _MFA_CHALLENGE_PURPOSE,
+        "iat": now,
+        "exp": now + _MFA_CHALLENGE_EXPIRE_SECONDS,
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=_MFA_CHALLENGE_ALGORITHM)
+
+
+def _decode_mfa_challenge_token(token: str) -> dict:
+    """Decode + verify an MFA challenge JWT. Raises jwt.InvalidTokenError.
+
+    Pins audience/issuer (so a session token can't be used here) and checks
+    purpose=="mfa_challenge". Caller catches jwt.InvalidTokenError ONLY and maps
+    it to a generic 401 — any non-JWT error must surface, not be masked.
+    """
+    import jwt
+
+    payload = jwt.decode(
+        token,
+        settings.SECRET_KEY,
+        algorithms=[_MFA_CHALLENGE_ALGORITHM],
+        audience=_MFA_CHALLENGE_AUDIENCE,
+        issuer=_MFA_CHALLENGE_ISSUER,
+        options={"verify_exp": True},
+    )
+    if payload.get("purpose") != _MFA_CHALLENGE_PURPOSE:
+        raise jwt.InvalidTokenError("not an mfa challenge token")
+    return payload
+
+
+async def _consume_second_factor(db: AsyncSession, user: User, code: str) -> bool:
+    """Verify a login 2nd factor for `user`. Returns True iff valid.
+
+    Order: TOTP first (no state change), else an UNUSED backup code consumed
+    ATOMICALLY. The backup-code consume is a single conditional UPDATE guarded by
+    `used_at IS NULL`, so two concurrent logins cannot both spend the same code
+    (Codex H2-P3): the matching row is burned exactly once. Caller commits on a
+    True return; on False nothing was changed (0 rows matched) and the session
+    rolls back.
+
+    NOTE (H2-P3, deferred to P4): TOTP replay within the pyotp ±1 (~90s) window
+    is NOT prevented here — there is no last-counter tracking yet. Acceptable
+    under mandatory TLS + the per-user rate limiter; do not advertise this MFA as
+    replay-resistant until P4 adds counter tracking.
+    """
+    from src.db.models import MfaBackupCode
+    from src.utils.crypto import decrypt_field
+    from src.utils.mfa import hash_backup_code, verify_totp
+
+    cleaned = (code or "").strip()
+
+    # 1) TOTP — consumes nothing.
+    if user.mfa_secret_encrypted:
+        try:
+            if verify_totp(decrypt_field(user.mfa_secret_encrypted), cleaned):
+                return True
+        except Exception:
+            # A corrupt/rotated secret must not 500 the login; fall through to
+            # backup codes so a user is never hard-locked by a decrypt failure.
+            pass
+
+    # 2) Backup code — atomic single-use consume. Look up by the keyed HMAC
+    # digest (deterministic, same normalization as enrollment) and burn the row
+    # in one statement; `RETURNING id` is non-empty iff a still-unused code
+    # matched. Equality on the HMAC digest leaks nothing about the raw code.
+    code_hash = hash_backup_code(cleaned)
+    result = await db.execute(
+        update(MfaBackupCode)
+        .where(
+            MfaBackupCode.user_id == user.id,
+            MfaBackupCode.code_hash == code_hash,
+            MfaBackupCode.used_at.is_(None),
+        )
+        .values(used_at=datetime.now(UTC))
+        .returning(MfaBackupCode.id)
+    )
+    return result.scalar_one_or_none() is not None
 
 
 @router.get("/config")
@@ -218,12 +329,12 @@ async def register(
     return TokenResponse(access_token=token, refresh_token=refresh)
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=LoginResponse)
 async def login(
     body: UserLogin,
     request: Request,
     db: AsyncSession = Depends(get_db),
-) -> TokenResponse:
+) -> LoginResponse:
     await rate_limit(request, zone="auth")
 
     ip = client_ip(request)
@@ -249,11 +360,135 @@ async def login(
             detail="Invalid credentials",
         )
 
+    # Password is correct. If MFA is enabled, login is NOT complete: issue a
+    # short-lived challenge token and require a 2nd factor at /auth/login/mfa.
+    # We deliberately do NOT clear the brute-force counter here — a password-only
+    # success is not a completed login (Codex H2-P3), and we do NOT issue any
+    # access/refresh token in this branch.
+    if user.mfa_enabled:
+        # Per-user limiter (not just per-IP): caps an attacker who already knows
+        # the password from farming challenge tokens across rotating IPs. This
+        # is a SEPARATE bucket from the verify limiter (mfa-verify:) so that
+        # challenge-issuance traffic cannot exhaust the real user's ability to
+        # submit a code (Codex H2-P3 review).
+        await rate_limit(request, zone="auth", identifier=f"mfa-issue:{user.id}")
+        audit_log(request, "mfa_challenge", user.id)
+        return LoginResponse(
+            mfa_required=True,
+            mfa_token=_mint_mfa_challenge_token(user.id),
+        )
+
     await BruteForceProtection.clear(ip, body.email)
     token = create_secure_token(user.id)
     refresh = create_refresh_token(user.id)
     audit_log(request, "login_success", user.id)
-    return TokenResponse(access_token=token, refresh_token=refresh)
+    return LoginResponse(access_token=token, refresh_token=refresh)
+
+
+@router.post("/login/mfa", response_model=LoginResponse)
+async def login_mfa(
+    body: MfaLoginRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> LoginResponse:
+    """Redeem the login MFA challenge (H2-P3): validate the short-lived challenge
+    token from /auth/login, verify the 2nd factor, and — only on success — issue
+    the real session tokens. The challenge token proves the password step was
+    passed; it carries no access privilege on its own."""
+    await rate_limit(request, zone="auth")
+    import jwt
+    import redis.exceptions as _redis_exceptions
+
+    from src.api.middleware.auth_hardening import (
+        TokenBlacklist,
+        revocation_unavailable_503,
+    )
+
+    try:
+        payload = _decode_mfa_challenge_token(body.mfa_token)
+    except jwt.InvalidTokenError:
+        # Expired / wrong-audience / wrong-purpose / tampered → generic 401.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired MFA challenge.",
+        )
+    user_id = payload.get("sub")
+    jti = payload.get("jti", "")
+    issued_at = payload.get("iat", 0)
+
+    # Per-user VERIFY limiter caps 2nd-factor guessing across rotating IPs. A bad
+    # code is deliberately NOT fed into the password (ip,email) brute-force
+    # bucket: that would let a password-knowing attacker DoS-lock the real user
+    # and would conflate password compromise with MFA guessing. Kept separate
+    # from the mfa-issue: bucket so challenge farming can't exhaust it (Codex).
+    await rate_limit(request, zone="auth", identifier=f"mfa-verify:{user_id}")
+
+    # The challenge subject was cryptographically proven (correct password) at
+    # /auth/login, so we can safely bind the RLS context to it BEFORE any query.
+    # This makes the User lookup and the backup-code consume correct under a
+    # future RLS-enforce cutover (H1) — where an unset app.current_user_id would
+    # otherwise match zero rows — without depending on a runtime RLS bypass
+    # (Codex H2-P3). Harmless while the role still bypasses RLS.
+    db.sync_session.info["rls_user_id"] = str(user_id)
+    await db.execute(
+        text("SELECT set_config('app.current_user_id', :uid, true)"),
+        {"uid": str(user_id)},
+    )
+
+    # Revocation gate (P1): a challenge minted BEFORE a password change /
+    # password reset / logout-all must not be redeemable, even inside its 5-min
+    # window. Mirrors get_current_user — fail CLOSED (503) if Redis is down so we
+    # never issue a session we can't prove is un-revoked.
+    try:
+        if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired MFA challenge.",
+            )
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
+
+    result = await db.execute(select(User).where(User.id == user_id, User.is_active))
+    user = result.scalar_one_or_none()
+    if user is None or not user.mfa_enabled:
+        # Token valid but the user vanished / disabled MFA in the meantime.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired MFA challenge.",
+        )
+
+    if not await _consume_second_factor(db, user, body.code):
+        # Nothing was consumed (0 rows matched); the session rolls back on raise.
+        audit_log(request, "mfa_failure", user.id)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication code.",
+        )
+
+    # Replay gate (P2): burn the challenge jti exactly once so a stolen/phished
+    # challenge + one valid code cannot mint repeated sessions within the window.
+    # consume_once is atomic (Redis SET NX) and raises on Redis error → 503
+    # (fail closed). A wrong code above never reaches here, so a single typo does
+    # not burn the challenge — retries (rate-limited) are still allowed.
+    try:
+        claimed = await TokenBlacklist.consume_once(jti, _MFA_CHALLENGE_EXPIRE_SECONDS)
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
+    if not claimed:
+        # Challenge already redeemed (replay or a concurrent winner).
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired MFA challenge.",
+        )
+
+    # 2nd factor good and challenge claimed — commit any backup-code consumption,
+    # then complete login.
+    await db.commit()
+    await BruteForceProtection.clear(client_ip(request), user.email)
+    token = create_secure_token(user.id)
+    refresh = create_refresh_token(user.id)
+    audit_log(request, "login_success", user.id)
+    return LoginResponse(access_token=token, refresh_token=refresh)
 
 
 class RefreshRequest(BaseModel):
@@ -662,11 +897,12 @@ async def mfa_enable(
     await rate_limit(request, zone="auth")
     # Per-user throttle (not just per-IP): caps TOTP guessing across rotating IPs.
     await rate_limit(request, zone="auth", identifier=f"mfa-user:{current_user.id}")
+    import redis.exceptions as _redis_exceptions
+
     from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
     from src.db.models import MfaBackupCode
     from src.utils.crypto import decrypt_field
     from src.utils.mfa import generate_backup_codes, verify_totp
-    import redis.exceptions as _redis_exceptions
 
     user = (
         await db.execute(select(User).where(User.id == current_user.id).with_for_update())
@@ -723,11 +959,12 @@ async def mfa_disable(
     # Per-user throttle (not just per-IP): caps 2nd-factor guessing across IPs
     # even after the password check passes.
     await rate_limit(request, zone="auth", identifier=f"mfa-user:{current_user.id}")
+    import redis.exceptions as _redis_exceptions
+
     from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
     from src.db.models import MfaBackupCode
     from src.utils.crypto import decrypt_field
     from src.utils.mfa import verify_backup_code_hash, verify_totp
-    import redis.exceptions as _redis_exceptions
 
     user = (
         await db.execute(select(User).where(User.id == current_user.id).with_for_update())

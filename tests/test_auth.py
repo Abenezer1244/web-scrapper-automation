@@ -1,4 +1,8 @@
 """Tests for authentication: register, login, JWT, brute-force, API keys."""
+import asyncio
+import uuid
+
+import pyotp
 from httpx import AsyncClient
 
 from src.db.models import User
@@ -187,3 +191,183 @@ async def test_api_key_authenticates_requests(client: AsyncClient, business_user
     resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {api_key}"})
     assert resp.status_code == 200
     assert resp.json()["email"] == business_user.email
+
+
+# ─── MFA login challenge (H2-P3) ──────────────────────────────────────────────
+# Real end-to-end: enrollment goes through the public /auth/mfa/* endpoints with
+# codes computed by pyotp (no mocks). Login is exercised as the two-step
+# challenge → verify flow the frontend drives.
+
+def _mfa_email() -> str:
+    return f"mfa_{uuid.uuid4().hex[:8]}@test.bridgeleads.io"
+
+
+def _clear_auth_limits(redis_client) -> None:
+    """Reset per-IP/per-user auth rate-limit + brute-force counters. The suite
+    shares a single test-client IP, so without this the auth zone (10/min) and
+    brute-force buckets accumulate across MFA tests and cause spurious 429s."""
+    for pattern in ("rl:auth:*", "bf:*"):
+        for key in redis_client.scan_iter(pattern):
+            redis_client.delete(key)
+
+
+async def _register_and_enable_mfa(client: AsyncClient, redis_client, email: str,
+                                   password: str = "SecurePass1!") -> tuple[str, list[str]]:
+    """Enroll MFA for a fresh user via the real endpoints. Returns
+    (totp_secret, backup_codes)."""
+    _clear_auth_limits(redis_client)
+    reg = await client.post("/auth/register", json={"email": email, "password": password})
+    assert reg.status_code == 201, reg.text
+    headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
+
+    setup = await client.post("/auth/mfa/setup", headers=headers)
+    assert setup.status_code == 200, setup.text
+    secret = setup.json()["secret"]
+
+    enable = await client.post(
+        "/auth/mfa/enable", headers=headers, json={"code": pyotp.TOTP(secret).now()},
+    )
+    assert enable.status_code == 200, enable.text
+    return secret, enable.json()["backup_codes"]
+
+
+async def test_login_without_mfa_has_no_challenge(client: AsyncClient, redis_client):
+    _clear_auth_limits(redis_client)
+    email = _mfa_email()
+    await client.post("/auth/register", json={"email": email, "password": "SecurePass1!"})
+    resp = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["access_token"]
+    assert data["mfa_required"] is False
+    assert data["mfa_token"] is None
+
+
+async def test_login_with_mfa_returns_challenge(client: AsyncClient, redis_client):
+    email = _mfa_email()
+    await _register_and_enable_mfa(client, redis_client, email)
+    _clear_auth_limits(redis_client)
+
+    resp = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["mfa_required"] is True
+    assert data["mfa_token"]
+    assert data["access_token"] is None  # no session until the 2nd factor passes
+
+    # The challenge token must NOT authenticate an API request (distinct audience).
+    me = await client.get("/auth/me", headers={"Authorization": f"Bearer {data['mfa_token']}"})
+    assert me.status_code == 401
+
+
+async def test_login_mfa_totp_completes_login(client: AsyncClient, redis_client):
+    email = _mfa_email()
+    secret, _ = await _register_and_enable_mfa(client, redis_client, email)
+    _clear_auth_limits(redis_client)
+
+    challenge = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
+    mfa_token = challenge.json()["mfa_token"]
+
+    resp = await client.post(
+        "/auth/login/mfa", json={"mfa_token": mfa_token, "code": pyotp.TOTP(secret).now()},
+    )
+    assert resp.status_code == 200, resp.text
+    access = resp.json()["access_token"]
+    assert access
+    me = await client.get("/auth/me", headers={"Authorization": f"Bearer {access}"})
+    assert me.status_code == 200
+    assert me.json()["email"] == email
+
+
+async def test_login_mfa_wrong_code_rejected(client: AsyncClient, redis_client):
+    email = _mfa_email()
+    await _register_and_enable_mfa(client, redis_client, email)
+    _clear_auth_limits(redis_client)
+
+    challenge = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
+    resp = await client.post(
+        "/auth/login/mfa", json={"mfa_token": challenge.json()["mfa_token"], "code": "000000"},
+    )
+    assert resp.status_code == 401
+    assert "code" in resp.json()["detail"].lower()
+
+
+async def test_login_mfa_backup_code_single_use(client: AsyncClient, redis_client):
+    email = _mfa_email()
+    _, backup_codes = await _register_and_enable_mfa(client, redis_client, email)
+    code = backup_codes[0]
+
+    # First use of the backup code completes login.
+    _clear_auth_limits(redis_client)
+    ch1 = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
+    r1 = await client.post("/auth/login/mfa", json={"mfa_token": ch1.json()["mfa_token"], "code": code})
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["access_token"]
+
+    # Re-using the SAME backup code must fail — it was consumed atomically.
+    _clear_auth_limits(redis_client)
+    ch2 = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
+    r2 = await client.post("/auth/login/mfa", json={"mfa_token": ch2.json()["mfa_token"], "code": code})
+    assert r2.status_code == 401
+
+
+async def test_login_mfa_backup_code_concurrent_single_use(client: AsyncClient, redis_client):
+    # Codex H2-P3: the atomic conditional UPDATE must let exactly ONE of two
+    # concurrent redemptions of the same backup code win. Each request carries a
+    # DISTINCT challenge token (different jti) so the race is purely on the
+    # backup-code row, not the replay gate. Each request gets its own DB session
+    # / connection, so this exercises a real two-transaction race.
+    email = _mfa_email()
+    _, backup_codes = await _register_and_enable_mfa(client, redis_client, email)
+    code = backup_codes[0]
+
+    _clear_auth_limits(redis_client)
+    ch_a = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
+    ch_b = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
+
+    r_a, r_b = await asyncio.gather(
+        client.post("/auth/login/mfa", json={"mfa_token": ch_a.json()["mfa_token"], "code": code}),
+        client.post("/auth/login/mfa", json={"mfa_token": ch_b.json()["mfa_token"], "code": code}),
+    )
+    statuses = sorted([r_a.status_code, r_b.status_code])
+    # Exactly one success, one rejection — never two sessions from one code.
+    assert statuses == [200, 401], statuses
+
+
+async def test_login_mfa_invalid_challenge_token_rejected(client: AsyncClient, redis_client):
+    _clear_auth_limits(redis_client)
+    resp = await client.post("/auth/login/mfa", json={"mfa_token": "not.a.jwt", "code": "123456"})
+    assert resp.status_code == 401
+
+
+async def test_access_token_cannot_redeem_mfa_challenge(client: AsyncClient, redis_client):
+    # A session access token must not be redeemable as an MFA challenge token —
+    # the two token families pin different audiences.
+    _clear_auth_limits(redis_client)
+    email = _mfa_email()
+    reg = await client.post("/auth/register", json={"email": email, "password": "SecurePass1!"})
+    access = reg.json()["access_token"]
+    resp = await client.post("/auth/login/mfa", json={"mfa_token": access, "code": "123456"})
+    assert resp.status_code == 401
+
+
+async def test_bad_mfa_code_does_not_lock_password_bucket(client: AsyncClient, redis_client):
+    # Codex H2-P3: a wrong 2nd factor must NOT feed the password (ip,email)
+    # brute-force lockout, else a password-knowing attacker could DoS-lock the
+    # real user. Send MORE bad MFA attempts than the password lockout threshold
+    # (5) — if they were wrongly counted, the next /auth/login would 429-lock.
+    # A wrong code also must NOT consume the challenge, so one token is reused.
+    email = _mfa_email()
+    await _register_and_enable_mfa(client, redis_client, email)
+    _clear_auth_limits(redis_client)
+
+    challenge = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
+    mfa_token = challenge.json()["mfa_token"]
+    for _ in range(6):  # > brute-force threshold of 5 password failures
+        bad = await client.post("/auth/login/mfa", json={"mfa_token": mfa_token, "code": "000000"})
+        assert bad.status_code == 401
+
+    # Password path must still be open: a challenge is issued, not a 429 lockout.
+    again = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
+    assert again.status_code == 200
+    assert again.json()["mfa_required"] is True

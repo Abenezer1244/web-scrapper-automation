@@ -19,6 +19,59 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-07 — King NTS scraper: fix misleading aliases (record_type footgun)
+
+**Built / Shipped (uncommitted):** user asked to scrape King County pre-foreclosure / Notice of
+Trustee Sale and "see the result." Root-caused a latent bug, fixed it, proved NTS works live.
+- `src/scrapers/king_wa_probate.py`: the 4 names at the bottom (`KingWaProbateScraper`,
+  `LandmarkWebDeathCertScraper`, `KingWaPreForeclosureScraper`, `KingWaDivorceScraper`) were **bare
+  aliases** to `KingCountyLandmarkWebScraper`, whose `__init__` defaults `record_type="probate"`. So
+  `KingWaPreForeclosureScraper()` silently scraped **death certificates**, not NTS. Converted all 4
+  to thin **subclasses with explicit signatures** (`base_url,county,state,record_type=<pinned>,doc_types`)
+  that pin the correct default `record_type` but still expose `record_type`+`doc_types` to
+  `inspect.signature` (the worker's gating in `_run_scraper`).
+- `scripts/test_king_preforeclosure.py`: was calling `KingWaPreForeclosureScraper()` no-args (the bug);
+  now passes `doc_types=["notice_of_trustee_sale"]` (the only pre-foreclosure type King exposes).
+- `tests/test_king_scraper_aliases.py` (new, 11 tests, no network): locks signatures + that no-arg
+  construction resolves the named record type; catches the original bug without captcha/live scraping.
+
+**Proof:** ran `railway run --service worker python scripts/test_king_preforeclosure.py` (prod env →
+2Captcha solves King's reCAPTCHA). Result: **364 NOTICE OF TRUSTEE SALE records, all with parcel IDs**
+(180-day window), each with borrower / lender / parcel. Matches prior audit (`king|pre_foreclosure|PASS|177`).
+
+**Tried / Decided:** First local run returned 0 — NOT a code bug. Local has no `CAPTCHA_API_KEY`, so
+King keeps the doc-type form locked → tab-click fails → goto fallback → form never loads. Prod is healthy
+(today's death-cert run + the NTS run above). Codex (consult) pressure-tested the fix: use explicit
+constructor signatures, NOT bare `**kwargs` (avoids `TypeError: multiple values for 'county'` and keeps
+`doc_types` visible to `inspect.signature`); verified all 4 `record_type` keys exist in `RECORD_TYPE_CONFIG`.
+Subclassing also auto-fixes the same latent bug in `test_king_death_cert.py` + `test_king_preforeclosure_divorce.py`.
+
+**Verified:** prod path unaffected — live King connector points at the BASE class (migration 010) and the
+worker passes `record_type`/`doc_types` explicitly; migration `getattr(...)` of all 4 names still resolves
+(subclasses keep them importable). py_compile + 11/11 tests + ruff clean on changed files. Codex diff review:
+"the scraper alias change itself looks reasonable" (no findings on my code).
+
+**Failed / Blocked:** none for the fix itself.
+
+**Caught & fixed (follow-up, same session — user asked to do a/b/c):**
+- **(b) Fixed the pre-existing `submit_btn` retry bug** (`king_wa_probate.py`): the "Invalid Captcha" branch
+  of `_submit_search` called `submit_btn.first.click()` (NameError, masked by try/except → 0 rows). Extracted
+  the two-POST search into `_execute_document_search(form_data, token)`; both the initial submit and the
+  post-captcha retry now re-issue the fetch sequence (data comes from the JSON endpoint, not a button).
+- **Codex review (P2) caught a real flaw in my retry fix:** `_ensure_captcha_token()` solved a fresh token
+  but never stored `self._captcha_token`, so the retry POST would reuse the just-invalidated token. Fixed by
+  persisting `self._captcha_token = token` in `_ensure_captcha_token` (also makes the initial submit use a
+  fresh per-call token). ruff clean, 11/11 tests pass.
+- **(c) Neutralized untracked ruflo/gstack tooling** (stays untracked/local, like all `.claude/helpers/*`):
+  `.claude/helpers/auto-commit.sh` now defaults `AUTO_PUSH=false` (was `true` → implicit push after
+  `git add -A` could leak local state/secrets); `.claude/helpers/pre-commit` no longer swallows failures
+  (`|| echo`/`|| true` removed → test/validation failures now block the commit; the optional claude-flow
+  validator only runs when actually installed so a missing tool can't block commits).
+
+**Facts learned:** King's recorder only exposes **Notice of Trustee Sale** for pre-foreclosure (no NOD —
+WA non-judicial foreclosure rarely records NOD). `railway run --service worker <script>` runs the browser
+locally but with prod env vars, which is the cheapest way to exercise captcha-gated scrapers off-Railway.
+
 ## 2026-06-07 — Multi-contact: up to 3 phones + 3 emails per lead (3 phases, shipped)
 
 **Built / Shipped:** user request — surface 2-3 phones/emails per person. Tracerfy already returns up to 5

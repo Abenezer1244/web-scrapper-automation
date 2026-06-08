@@ -577,6 +577,11 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
             from src.scrapers.enrichment.captcha import solve_recaptcha
             token = await solve_recaptcha(self._base_url, sitekey)
             if token:
+                # Persist the freshly-solved token so the direct-fetch submit
+                # (and the post-invalid-captcha retry) send THIS token in the
+                # POST body. Without this, a retry after invalidate_token() would
+                # reuse the stale/invalidated token and keep failing.
+                self._captcha_token = token
                 await self.page.evaluate("""
                     (token) => {
                         // Set textarea
@@ -620,44 +625,14 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                 };
             }""")
 
-            # Direct AJAX call with token baked into the POST body
-            # Step 1: POST DocumentTypeSearch (initial search, sets server state)
-            await self.page.evaluate(f"""async () => {{
-                await fetch('/LandmarkWeb/Search/DocumentTypeSearch', {{
-                    method: 'POST',
-                    headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
-                    body: new URLSearchParams({{
-                        doctype: '{form_data["doctype"]}',
-                        beginDate: '{form_data["beginDate"]}',
-                        endDate: '{form_data["endDate"]}',
-                        recordCount: '0',
-                        exclude: 'false',
-                        ReturnIndexGroups: 'false',
-                        townName: '',
-                        mobileHomesOnly: 'false',
-                        'g-recaptcha-response': '{token}',
-                    }}).toString(),
-                }});
-            }}""")
-
-            # Step 2: POST GetSearchResults (DataTables JSON data source)
-            # This is the REAL data endpoint that returns JSON with all records.
-            # DocumentTypeSearch just sets server state; GetSearchResults returns data.
-            json_data = await self.page.evaluate("""async () => {
-                const resp = await fetch('/LandmarkWeb/Search/GetSearchResults', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: 'draw=1&start=0&length=1000',
-                });
-                return await resp.json();
-            }""")
-
-            total = json_data.get("recordsTotal", 0)
+            json_data = await self._execute_document_search(form_data, token)
             data_rows = json_data.get("data", [])
-            _logger.info("GetSearchResults: %d total, %d rows returned", total, len(data_rows))
-
-            # Store JSON data for extraction — inject as a JS global
-            # so _extract_results_page can read it without DOM parsing
+            _logger.info(
+                "GetSearchResults: %d total, %d rows returned",
+                json_data.get("recordsTotal", 0), len(data_rows),
+            )
+            # Store JSON data for extraction — _extract_page reads this directly
+            # without DOM parsing.
             self._json_results = data_rows
 
             # Wait for AJAX results to load (spinner appears then disappears)
@@ -680,7 +655,10 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
             except Exception:
                 await self.page.wait_for_timeout(10_000)
 
-            # Check for captcha error
+            # Check for captcha error — on failure, solve a fresh token and
+            # re-issue the SAME fetch sequence. The records come from the JSON
+            # endpoint (self._json_results), not from clicking a submit button,
+            # so the retry must re-run the fetches, not a DOM click.
             captcha_error = await self.page.evaluate("""
                 (() => {
                     const body = document.body.innerText || '';
@@ -695,28 +673,62 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                     "() => document.querySelector('[data-sitekey]')?.getAttribute('data-sitekey') || ''"
                 ))
                 await self._ensure_captcha_token()
-                await submit_btn.first.click()
-                _logger.info("Retrying submit after captcha...")
-                try:
-                    await self.page.wait_for_function(
-                        """() => {
-                            const sr = document.querySelector('#searchResults');
-                            if (!sr) return false;
-                            const html = sr.innerHTML;
-                            if (html.includes('ajax-loader') || html.includes('LOADING')) return false;
-                            return html.includes('<table') ||
-                                   html.toLowerCase().includes('no results');
-                        }""",
-                        timeout=60_000,
-                    )
-                except Exception:
-                    await self.page.wait_for_timeout(10_000)
+                fresh_token = getattr(self, "_captcha_token", "") or ""
+                retry_data = await self._execute_document_search(form_data, fresh_token)
+                retry_rows = retry_data.get("data", [])
+                _logger.info(
+                    "Retry GetSearchResults: %d total, %d rows returned",
+                    retry_data.get("recordsTotal", 0), len(retry_rows),
+                )
+                # Keep whichever attempt actually returned rows.
+                if retry_rows:
+                    self._json_results = retry_rows
 
             _logger.info("Results page ready")
             await self.page.wait_for_timeout(2000)
 
         except Exception as exc:
             _logger.warning("Submit error: %s", str(exc)[:120])
+
+    async def _execute_document_search(self, form_data: dict, token: str) -> dict:
+        """Run the two-step DocumentType search via direct AJAX fetch; return the
+        GetSearchResults JSON.
+
+        Step 1 (DocumentTypeSearch) sets server-side search state and carries the
+        reCAPTCHA token; Step 2 (GetSearchResults) returns the DataTables JSON the
+        extractor consumes. Shared by the initial submit and the post-captcha
+        retry so both inject a valid token. Both fetches are same-origin relative
+        paths (no user-supplied URL → no SSRF surface).
+        """
+        # Step 1: POST DocumentTypeSearch (sets server state, carries captcha token)
+        await self.page.evaluate(f"""async () => {{
+            await fetch('/LandmarkWeb/Search/DocumentTypeSearch', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+                body: new URLSearchParams({{
+                    doctype: '{form_data["doctype"]}',
+                    beginDate: '{form_data["beginDate"]}',
+                    endDate: '{form_data["endDate"]}',
+                    recordCount: '0',
+                    exclude: 'false',
+                    ReturnIndexGroups: 'false',
+                    townName: '',
+                    mobileHomesOnly: 'false',
+                    'g-recaptcha-response': '{token}',
+                }}).toString(),
+            }});
+        }}""")
+
+        # Step 2: POST GetSearchResults (DataTables JSON data source) — the REAL
+        # data endpoint that returns JSON with all records.
+        return await self.page.evaluate("""async () => {
+            const resp = await fetch('/LandmarkWeb/Search/GetSearchResults', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: 'draw=1&start=0&length=1000',
+            });
+            return await resp.json();
+        }""")
 
     # ─── Extraction ──────────────────────────────────────────────────────────
 
@@ -1003,13 +1015,48 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         return False
 
 
-# ─── Backward-compatible aliases ─────────────────────────────────────────────
-# Old code may reference these class names — they all resolve to the base class
-# which now accepts record_type in constructor.
-LandmarkWebDeathCertScraper = KingCountyLandmarkWebScraper
-KingWaProbateScraper = KingCountyLandmarkWebScraper
-KingWaPreForeclosureScraper = KingCountyLandmarkWebScraper
-KingWaDivorceScraper = KingCountyLandmarkWebScraper
+# ─── Record-type-pinned subclasses ───────────────────────────────────────────
+# These were previously bare aliases to the base class (which defaults to
+# record_type="probate"). That made the names lie: KingWaPreForeclosureScraper()
+# with no args actually scraped death certificates. They are now thin subclasses
+# that pin the correct default record_type so the name matches the behavior.
+#
+# Production is unaffected: the live King connector points at the base class
+# KingCountyLandmarkWebScraper and the worker passes record_type/doc_types
+# explicitly (src/workers/tasks.py). Alembic migrations 006/009/010 reference
+# these names as string literals (getattr / SQL), so the names must keep
+# existing as importable module attributes — subclasses preserve that.
+#
+# Constructors mirror the base signature explicitly (no bare **kwargs) so that:
+#   1. inspect.signature() in _run_scraper still sees record_type AND doc_types
+#      and forwards an explicit selection (e.g. a doc-type narrowing).
+#   2. passing county=/state= can never collide into "multiple values for ...".
+class KingWaProbateScraper(KingCountyLandmarkWebScraper):
+    def __init__(self, base_url=None, county="king", state="WA",
+                 record_type="probate", doc_types=None):
+        super().__init__(base_url=base_url, county=county, state=state,
+                         record_type=record_type, doc_types=doc_types)
+
+
+class LandmarkWebDeathCertScraper(KingCountyLandmarkWebScraper):
+    def __init__(self, base_url=None, county="king", state="WA",
+                 record_type="death_certificate", doc_types=None):
+        super().__init__(base_url=base_url, county=county, state=state,
+                         record_type=record_type, doc_types=doc_types)
+
+
+class KingWaPreForeclosureScraper(KingCountyLandmarkWebScraper):
+    def __init__(self, base_url=None, county="king", state="WA",
+                 record_type="pre_foreclosure", doc_types=None):
+        super().__init__(base_url=base_url, county=county, state=state,
+                         record_type=record_type, doc_types=doc_types)
+
+
+class KingWaDivorceScraper(KingCountyLandmarkWebScraper):
+    def __init__(self, base_url=None, county="king", state="WA",
+                 record_type="divorce", doc_types=None):
+        super().__init__(base_url=base_url, county=county, state=state,
+                         record_type=record_type, doc_types=doc_types)
 
 
 # ─── Other LandmarkWeb counties ─────────────────────────────────────────────

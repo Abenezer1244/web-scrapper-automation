@@ -52,10 +52,21 @@ ARMS cell holds the primary grantor in one `lblTor` span and shows extra owners 
 correctly. 0/2000 Pierce names showed concatenation. Only nit: `(+)` lacks a leading space
 (`GILBERT BARBARA(+)`) — cosmetic, left as-is (no risky change to a non-bug).
 
+**Phase 2 — DONE (skip-trace owner selection):** `build_pending_row_payload` (`skip_trace.py`) now uses a new
+`select_traceable_owner()` instead of `split_name`+`classify_grantor_as_entity`. It splits multi-owner
+party_name on ` / `, ranks candidates (comma `LAST, FIRST` > 2-token `LAST FIRST` > `LAST FIRST initials/
+suffixes`), skips entities/estates/trusts/heirs/attorney, and returns a confident person → NORMAL trace
+(1 credit, name+address); else (None,None) → ADVANCED (2 credits, address-only). New WA-recorder parser
+`_parse_wa_recorder_person` (does NOT touch the conservative shared `split_name` — Codex). Wins: picks the
+clean person beside an entity trustee/bank (`BOYLE DAVID E / QUALITY LOAN SERVICE CORP`→normal as
+BOYLE/DAVID); recovers `LAST FIRST M` 3-token names that were ALL advanced before → cheaper + name-based.
+Conservative (Codex): rejects `FIRST M LAST` (STEPHEN P MYERS) + ambiguous 3-full-token (JONES PRESTON
+JANET) → advanced, because wrong-person on a cold-call (TCPA/DNC) costs more than 1 credit. Tests
+`tests/test_select_traceable_owner.py` (18). King party_name fix DEPLOYED (pushed `141015e`).
+
 **Pending / Handoff:**
-- **Phase 2 (Codex-recommended, optional):** skip-trace should pick the FIRST owner for a cheaper NORMAL trace
-  (1 credit) when it parses confidently as a person, instead of address-only ADVANCED (2 credits); audit
-  other templates (EagleWeb/AcclaimWeb/Tyler/Fidlar/Laserfiche) for the same `get_text()`-no-separator bug.
+- **Phase 3 (optional):** audit other templates (EagleWeb/AcclaimWeb/Tyler/Fidlar/Laserfiche) for the same
+  `get_text()`-no-separator / blanket-tag-strip concatenation King had. Pierce confirmed clean.
 
 ## 2026-06-07 — Pierce pre-foreclosure (same alias footgun) + pre-foreclosure doc-type SELECTOR UI bug
 

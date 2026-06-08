@@ -70,6 +70,8 @@ _ENTITY_TOKENS = {
     "EXEC", "EXECUTOR", "EXECUTRIX",
     "ADMIN", "ADMINISTRATOR",
     "PR",  # Personal Representative
+    # Estate/proxy descriptors — not a directly-traceable living owner.
+    "HEIRS", "ATTORNEY", "ATTY",
 }
 
 
@@ -176,6 +178,89 @@ def split_name(full_name: str | None) -> tuple[str | None, str | None]:
     if len(tokens) == 2:
         return tokens[1], tokens[0]
     return None, None
+
+
+# Name-suffix tokens that legitimately trail a person name, so "SMITH JOHN JR"
+# is still a confident person parse (last=SMITH, first=JOHN).
+_PERSON_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
+
+
+def _is_initial_or_suffix(token: str) -> bool:
+    """True if a token is a middle initial ('H', 'A.') or a name suffix
+    ('JR', 'III'). Used to confirm a 'LAST FIRST ...' name where every token
+    after FIRST is just an initial/suffix (so the order is unambiguous)."""
+    t = token.rstrip(".").upper()
+    return len(t) == 1 or t in _PERSON_SUFFIXES
+
+
+def _parse_wa_recorder_person(owner: str | None) -> tuple[str | None, str | None]:
+    """Best-effort (first, last) for ONE owner segment using the WA recorder
+    'LAST FIRST [MIDDLE]' convention. Returns (None, None) unless it parses as a
+    confident person.
+
+    This is intentionally NOT a general name splitter — it assumes WA recorder
+    ordering (LandmarkWeb/ARMS), so it is only called from select_traceable_owner
+    on recorder party_name data. split_name() stays conservative for other
+    callers (e.g. non-WA), per Codex review.
+    """
+    if not owner:
+        return None, None
+    name = owner.strip()
+    if not name or classify_grantor_as_entity(name):
+        return None, None
+    if "," in name:  # "LAST, FIRST [MIDDLE]"
+        last, _, rest = name.partition(",")
+        first = rest.strip().split()[0] if rest.strip() else None
+        return (first or None), (last.strip() or None)
+    tokens = name.split()
+    # WA "LAST FIRST [initials/suffixes]": confident only when every token after
+    # FIRST is a middle-initial or suffix ("WALKER WILLIAM H III", "BAUS DONALD
+    # L"). This rejects "STEPHEN P MYERS" (FIRST M LAST) because the trailing
+    # token isn't an initial/suffix -> ambiguous -> advanced.
+    if len(tokens) >= 2 and all(_is_initial_or_suffix(t) for t in tokens[2:]):
+        return tokens[1], tokens[0]
+    return None, None
+
+
+def _owner_confidence(owner: str) -> int:
+    """Rank one owner segment as a person-name candidate (higher = more
+    confident). -1 = not usable as a person (entity, estate, or ambiguous)."""
+    n = owner.strip()
+    if not n or classify_grantor_as_entity(n):
+        return -1
+    if "," in n:
+        return 3
+    tokens = n.split()
+    if len(tokens) == 2:
+        return 2
+    if len(tokens) >= 3 and all(_is_initial_or_suffix(t) for t in tokens[2:]):
+        return 1
+    return -1
+
+
+def select_traceable_owner(party_name: str | None) -> tuple[str | None, str | None]:
+    """Choose the highest-confidence PERSON owner from a (possibly multi-owner,
+    ' / '-separated) party_name for a Tracerfy NORMAL trace (name + address).
+
+    Returns (first, last) for a confident person, else (None, None) so the caller
+    falls back to ADVANCED (address-only). Conservative by design (Codex review):
+    for cold-outreach data, accuracy/compliance beats the 1-credit saving, so
+    entities, estates/trusts, and ambiguous 3+-full-token names yield no
+    candidate. Owners are ranked (comma 'LAST, FIRST' > 2-token 'LAST FIRST' >
+    3-token-with-initial/suffix) so a clean person beside an entity trustee/bank
+    (e.g. "BOYLE DAVID E / QUALITY LOAN SERVICE CORP") is still found.
+    """
+    if not party_name:
+        return None, None
+    owners = [o.strip() for o in party_name.split(" / ") if o.strip()] or [party_name.strip()]
+    best, best_rank = None, 0
+    for o in owners:
+        r = _owner_confidence(o)
+        if r > best_rank:
+            best, best_rank = o, r
+    if best is None:
+        return None, None
+    return _parse_wa_recorder_person(best)
 
 
 def looks_like_non_personal_party_name(name: str | None) -> bool:
@@ -585,12 +670,14 @@ def build_pending_row_payload(result) -> dict | None:
     if looks_like_non_personal_party_name(result.party_name):
         return None
 
-    first_name, last_name = split_name(result.party_name)
-    is_entity = classify_grantor_as_entity(result.party_name)
-
-    # Advanced trace also handles missing names, so we route to advanced
-    # if either (a) the grantor is an entity or (b) we can't split the name.
-    trace_type = "advanced" if (is_entity or not (first_name and last_name)) else "normal"
+    # Phase 2: pick the highest-confidence PERSON owner (handles multi-owner
+    # " / " names, picking the clean person beside an entity trustee/bank, and
+    # WA "LAST FIRST M" 3-token names). Normal trace (1 credit, name+address)
+    # only when confident; otherwise advanced (2 credits, address-only) lets
+    # Tracerfy find the owner. Conservative by design — accuracy/compliance over
+    # the credit saving for cold outreach.
+    first_name, last_name = select_traceable_owner(result.party_name)
+    trace_type = "normal" if (first_name and last_name) else "advanced"
 
     # Parse property_address into street / city / state if possible.
     # Many of our scrapers concatenate "STREET, CITY, ST ZIP" in one field.
@@ -616,8 +703,9 @@ def build_pending_row_payload(result) -> dict | None:
         "city": parsed["city"],
         "state": parsed["state"],
         "zip": parsed["zip"],
-        "first_name": first_name if not is_entity else None,
-        "last_name": last_name if not is_entity else None,
+        # Already None unless select_traceable_owner found a confident person.
+        "first_name": first_name,
+        "last_name": last_name,
         "mail_address": None,  # populated below if mailing_address differs
         "mail_city": None,
         "mail_state": None,

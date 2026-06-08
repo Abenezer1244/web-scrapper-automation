@@ -19,6 +19,65 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-08 — H2 MFA Phase 3: login challenge + frontend
+
+**Built / Shipped:** MFA now actually gates login, end-to-end, across both repos.
+- **3a backend** (`3539d2e`, branch `security/checklist-h4-m2-m1`): challenge-token model. `/auth/login`
+  returns a short-lived signed **MFA challenge token** (`aud=bridgeleads-mfa`, `purpose=mfa_challenge`,
+  300s, co-located with the reset-token family in `routes/auth.py`) when `mfa_enabled` — no session, no
+  brute-force clear. New `POST /auth/login/mfa` redeems `{mfa_token, code}` → `_consume_second_factor`
+  (TOTP, else **atomic** backup-code consume `UPDATE … WHERE used_at IS NULL RETURNING id`) → issues
+  the session. `LoginResponse` (optional tokens + `mfa_required` + `mfa_token`), `MfaLoginRequest`. 10
+  real-flow tests incl. a concurrent `asyncio.gather` race + a >threshold no-lockout test.
+- **3b frontend login** (`49d37a7`, bridgeleads-web master): 2-step login page (password → 6-digit
+  `InputOTP` + backup-code text mode). "Token adoption" — page calls the backend directly
+  (`loginStart`/`loginVerify`, raw fetch not `apiFetch`), then `signIn({accessToken})` purely to
+  materialise the Auth.js session; `authorize()` validates the access token via `/auth/me`.
+- **3c frontend enrollment** (uncommitted): `components/settings/security-tab.tsx` (extracted) + a
+  Security tab. Enable: setup → `QRCodeSVG` + copyable secret → verify → one-time backup codes. Disable:
+  password + 2nd factor. `qrcode.react@^4.2.0` (SBOM clean: zero runtime deps).
+
+**Tried / Decided:** Codex's pre-build consult **upgraded the architecture** from "overload `/auth/login`
+with an optional `mfa_code` + resend password" to the explicit **challenge-token + dedicated verify
+endpoint** (password never resent; clean home for rate-limit/expire/audit). Doctrine: docs silent →
+Codex wins. Bucket split `mfa-issue:{id}` vs `mfa-verify:{id}` so challenge farming can't exhaust the
+verify budget; bad MFA codes are NOT fed into the password brute-force bucket (no DoS-lockout of the
+real user). TOTP replay (±90s) deferred to P4 (documented inline). Extracted SecurityTab rather than
+inline the 1330-line settings page.
+
+**Caught & fixed (Codex review gate, before shipping — NO-GO on any Crit/High):**
+- 3a R1: **P1** stale challenge survived revocation → `is_revoked_by_user_logout_all(iat)` gate;
+  **P2** replay (jti never burned) → `consume_once` on success; **P2** backup-code RLS posture → bind
+  `app.current_user_id` to the proven challenge subject; **P2** bucket conflation. R2 CLEAN.
+- 3b R1: 3×P2 (double-submit, stale-response-after-back-out, backend-text leak) + 3×P3 → fixed via sync
+  in-flight ref + gen/mounted guards + fixed safe 401 copy + 6-digit gate + `!result.ok`. R3 residual
+  (session established if you navigate away mid-`signIn`) **accepted as not-a-defect** (valid 2FA already
+  submitted; user ratified).
+- 3c R1: **P1** — enable revokes the session, so a background-query 401→`signOut` could destroy the
+  one-time backup-code screen before the user saved them. Fixed over 4 rounds: suppress `apiFetch`'s
+  signOut-on-401 (armed in `onMutate`, unconditional unmount reset), render codes before any
+  query-driven branch, disable `mfa-status` while codes show, `setQueryData({enabled:true})`, and
+  thread HTTP `status` onto thrown errors so a real expiry-during-enable still redirects. R4 CLEAN.
+
+**Failed / Blocked:** Could NOT run the pytest integration suite locally — the only configured
+`DATABASE_URL` is **production Supabase** and the `db` fixture does unconditional table-wipes; running
+it would nuke prod. No local Postgres/Redis/docker available. Backend verified via py_compile + ruff +
+app-build + direct token-separation execution; full suite must run in CI. (This also re-confirmed
+migration 043 isn't on main/prod yet.)
+
+**Pending / Handoff:** P4 session hardening (TOTP last-counter replay), P5 admin MFA enforcement +
+break-glass, H1 `users` RLS self-row policy (keep `RLS_ENFORCE=False`). **Deploy ordering:** 043 must
+land on prod (alembic-on-boot) before the frontend MFA UI is meaningful; don't push frontend master
+ahead of the backend MFA deploy.
+
+**Facts learned:** both `/auth/mfa/enable` AND `/auth/mfa/disable` revoke ALL sessions server-side, so
+both frontend flows must end in an intentional `signOut`, never a cache refetch (it 401s). Auth.js v5
+`signIn` has no AbortSignal. The settings page runs ~6 authenticated queries with 30s stale +
+refetch-on-focus — any "show a secret once then session dies" flow there must globally suppress the
+401→signOut redirect or the secret is lost on focus-refetch.
+
+---
+
 ## 2026-06-08 — 24-item security checklist audit + H4/M2/M1 fixes (uncommitted)
 
 **Built / Shipped (uncommitted):** Full-stack audit against a 24-control backend security

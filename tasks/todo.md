@@ -78,21 +78,63 @@ app builds + both routes registered; token audience-separation proven via direct
 `DATABASE_URL` is **production** and the `db` fixture does unconditional table-wipes; tests must run
 in CI (dedicated test DB) or against a local throwaway Postgres+Redis.
 
-## Phase 3b — Frontend login challenge  (≤4 files, repo: bridgeleads-web)
+## Phase 3b — Frontend login challenge  ✅ DONE (Codex 3 rounds; tsc clean)
 
-- [ ] `lib/auth.ts`: add token-adoption branch to `authorize()` (accessToken only; keep password branch).
-- [ ] `lib/api.ts`: `loginStart(email,password)` + `loginVerify(mfaToken,code)` → typed `LoginResponse`.
-- [ ] `app/(auth)/login/page.tsx`: 2-step state machine (password → code) using existing `InputOTP`;
-      match register's RHF + error/loader patterns; "use a backup code" affordance.
-- [ ] `types/next-auth.d.ts`: allow `accessToken` on the authorize input if needed.
+- [x] `lib/auth.ts`: token-adoption branch in `authorize()` (accessToken-only via shared `buildUser`,
+      validated by `/auth/me`; password branch kept + returns null when `mfa_required`).
+- [x] `lib/api.ts`: `LoginResponse` type, `LoginError`, `loginStart` / `loginVerify` (raw fetch, NOT
+      apiFetch — no signOut-on-401).
+- [x] `app/(auth)/login/page.tsx`: 2-step (password → code) with `InputOTP` (TOTP) + backup-code text
+      mode; matches register RHF/error/loader patterns.
+- [x] `types/next-auth.d.ts`: no change needed — `accessToken` declared on the provider `credentials`.
 
-## Phase 3c — Frontend MFA enrollment (Security settings tab)  (≤4 files, repo: bridgeleads-web)
+**Codex gate:** R1 found 3×P2 + 3×P3 (no MFA bypass) → fixed → R2: 5/6 resolved, 1×P2 partial
+(unmount race) → fixed (mounted ref) → R3: residual sub-second window where signIn completes after
+unmount. **Accepted with documented reasoning** (not a defect: runs only after valid password + 2nd
+factor, so establishing the session is the correct auth outcome; signIn has no AbortSignal; UI effects
+are guarded). Fixes: sync in-flight ref (no double-redeem), gen-guard + mounted-ref (no stale
+adopt/navigate), fixed safe 401 copy (no backend-text leak / no regex), 6-digit TOTP gate,
+`!result.ok` check.
 
-- [ ] `lib/api.ts`: `getMfaStatus`, `mfaSetup`, `mfaEnable`, `mfaDisable`.
-- [ ] `app/(dashboard)/settings/page.tsx`: add **Security** tab — status, QR (otpauth URI) + manual
-      secret, code-to-enable, one-time backup-codes display, disable (password + code).
-- [ ] QR rendering: use existing dep if present, else render secret + provisioning URI as copyable text
-      (decide during impl — no new heavy dep without SBOM check).
+**Verification:** `npx tsc --noEmit` clean ✅. ESLint NOT configured in bridgeleads-web (no config/dep/
+script) → type safety via tsc only. ⚠️ user to confirm acceptance of the documented R3 residual.
+
+## Phase 3c — Frontend MFA enrollment (Security settings tab)  ✅ DONE (Codex 4 rounds; tsc clean)
+
+- [x] `lib/api.ts`: `getMfaStatus` / `mfaSetup` / `mfaEnable` / `mfaDisable` + types; `apiFetch` thrown
+      errors now carry `status`; `setSuppressSignOutOn401` escape-hatch.
+- [x] `components/settings/security-tab.tsx` (NEW, extracted to keep the 1330-line page small): enable
+      flow (setup → QRCodeSVG + copyable secret → 6-digit verify → one-time backup codes) + disable
+      flow (password + TOTP/backup code). Wired into `settings/page.tsx` (Security tab, 3-line change).
+- [x] QR: `qrcode.react@^4.2.0` — SBOM clean (zero runtime deps, React-19 peer, 115KB, maintained).
+
+**Codex gate:** R1 found **1×P1** (backup codes destroyed by a background-query 401→signOut after
+enable revokes the session) → fixed → R2 found TOCTOU residual → fixed → R3 found an enable-own-401
+P3 → fixed → **R4 CLEAN**. Final mechanism: enable revokes the session, so `apiFetch`'s signOut-on-401
+is suppressed (armed in `onMutate`, reset on unmount/error), backup codes render before any
+query-driven branch, `mfa-status` is disabled while codes show, cache is set `{enabled:true}`, and a
+real 401 during enable redirects to /login. Both enable AND disable end in an intentional `signOut`
+(backend revokes sessions on both).
+
+**Verification:** `npx tsc --noEmit` clean ✅. (No ESLint in bridgeleads-web.)
+
+---
+
+## Review (H2 Phase 3 complete)
+
+**Shipped:** MFA now gates login end-to-end. Backend challenge-token flow (3a, committed `3539d2e`),
+frontend 2-step login challenge (3b, committed `49d37a7`), and the Security settings enrollment tab
+(3c). Every phase passed a Codex review gate (NO-GO on any Crit/High) — 3a: 1P1+3P2 fixed; 3b:
+3P2+3P3 fixed (+1 documented-accept); 3c: 1P1 fixed across 4 rounds. tsc/ruff/py_compile all clean.
+
+**Deferred (later phases, per checklist):** P4 session hardening (TOTP replay last-counter — documented
+inline); P5 admin MFA enforcement + break-glass; H1 `users` RLS self-row policy (the login-SELECT
+landmine — keep `RLS_ENFORCE=False`).
+
+**⚠️ Ops note for deploy:** migration 043 (MFA columns) is on this branch, NOT on main/prod yet — the
+backend won't have the columns until 043 is applied at deploy (alembic-on-boot). The frontend Security
+tab + login challenge are inert until the backend is live with MFA. Don't push frontend master ahead
+of the backend deploy or enrolled users could be half-broken (there are none yet).
 
 ---
 

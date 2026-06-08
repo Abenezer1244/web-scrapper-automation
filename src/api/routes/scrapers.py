@@ -199,14 +199,15 @@ async def list_connectors(
         )
     query = query.order_by(CountyConnector.state, CountyConnector.county)
     result = await db.execute(query)
-    from src.scrapers.doc_types import selectable_availability
+    from src.scrapers.doc_types import selectable_doc_type_labels
     out: list[ConnectorResponse] = []
     for c in result.scalars().all():
         resp = ConnectorResponse.model_validate(c)
-        # Phase 2b: attach pre-foreclosure doc-type selector metadata from the
-        # capability registry, only where this county supports selection.
+        # Phase 2b: attach the pre-foreclosure doc-type selector options as a
+        # {canonical_token: human_label} map — the exact shape the frontend
+        # checkbox selector renders. Only where this county supports selection.
         if "pre_foreclosure" in (c.record_types or []):
-            resp.pre_foreclosure_doc_types = selectable_availability(c.county, c.state)
+            resp.pre_foreclosure_doc_types = selectable_doc_type_labels(c.county, c.state)
         out.append(resp)
     return out
 

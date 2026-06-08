@@ -19,6 +19,45 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-07 — Pierce pre-foreclosure (same alias footgun) + pre-foreclosure doc-type SELECTOR UI bug
+
+**Built / Shipped (uncommitted):** user: "check same for pierce + check the UI for both King & Pierce
+pre-foreclosure." Two real bugs found and fixed.
+- **Pierce had the identical alias footgun** (`pierce_wa_probate.py`): `PierceWAPreForeclosureScraper`,
+  `PierceWAProbateScraper`, `PierceWADivorceScraper` were bare aliases to `PierceWAARMSScraper` (default
+  `record_type="probate"`) → `PierceWAPreForeclosureScraper()` scraped probate. Converted to pinned
+  subclasses mirroring Pierce's `(record_type, doc_types)` signature. Added `tests/test_pierce_scraper_aliases.py`
+  (11 tests) + `scripts/test_pierce_preforeclosure.py`.
+- **UI doc-type SELECTOR was broken for BOTH counties** (`/connectors` endpoint): the frontend
+  (`bridgeleads-web/app/(dashboard)/scrapers/new/page.tsx`) renders `pre_foreclosure_doc_types` as a
+  `{token: label}` checkbox map (`Object.entries(...).map(([token,label])...)`), and its TS type is
+  `Record<string,string>`. But the backend was assigning `selectable_availability()` which returns a
+  METADATA object `{available, default, confidence, method, note}`. So the selector would render bogus
+  "available/default/confidence/method/note" checkboxes and submit `doc_types` the backend rejects.
+  Fix (backend-only — frontend was already correct): added `CANONICAL_DOC_TYPE_LABELS` +
+  `selectable_doc_type_labels()` in `doc_types.py` returning `{token: human_label}`; route now uses it.
+  King → `{notice_of_trustee_sale:"Notice of Trustee Sale"}`; Pierce → 4 labeled types; Kitsap/EagleWeb → null
+  (correctly hidden). Added `tests/test_doc_type_labels.py` (5 tests).
+
+**Verified:** 27 tests pass (11 King + 11 Pierce + 5 label), ruff clean on all changed files. King happy-path
+re-confirmed post-`_submit_search`-refactor: still 364 NTS records. Codex review: "tracked Python changes look
+consistent" (no findings on my code).
+
+**Failed / Blocked:** none.
+
+**Pending / Handoff:**
+- **Pre-existing S608** ruff warning at `scrapers.py:462` (records query string-concat; uses bound params +
+  controlled `extra_where`) — NOT my diff.
+- **Codex flagged another pre-existing untracked helper:** `.claude/helpers/github-safe.js:80-83` shells out
+  via `execSync` with joined args (shell-injection if used on PR/issue titles) — use argv `spawnFileSync`.
+  Not committed (untracked local tooling).
+- Live Pierce record count + headed Chromium demo on both counties: in progress.
+
+**Facts learned:** `selectable_availability()` (metadata) and `selectable_doc_type_labels()` (UI map) are now
+distinct — the route MUST use the labels helper; the metadata object is not renderable by the UI selector.
+Pierce exposes all 4 pre-foreclosure types (NOD/NoF/LisPendens/NTS via ARMS checkbox ids 187/188/146/324);
+King exposes only NTS.
+
 ## 2026-06-07 — King NTS scraper: fix misleading aliases (record_type footgun)
 
 **Built / Shipped (uncommitted):** user asked to scrape King County pre-foreclosure / Notice of

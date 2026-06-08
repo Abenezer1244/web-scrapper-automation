@@ -19,6 +19,16 @@ CANONICAL_DOC_TYPES = [
     "foreclosure",
 ]
 
+# Human-readable label per canonical token — the display text the frontend
+# doc-type selector shows next to each checkbox.
+CANONICAL_DOC_TYPE_LABELS = {
+    "notice_of_default": "Notice of Default",
+    "notice_of_trustee_sale": "Notice of Trustee Sale",
+    "lis_pendens": "Lis Pendens",
+    "notice_of_foreclosure": "Notice of Foreclosure",
+    "foreclosure": "Foreclosure",
+}
+
 # Raw-string -> canonical. Longest/most-specific patterns first.
 _NORMALIZE = [
     ("notice of trustee", "notice_of_trustee_sale"),
@@ -135,6 +145,24 @@ def selectable_availability(county: str, state: str) -> dict | None:
         "confidence": a.get("confidence"),
         "method": a.get("method"),
         "note": a.get("note"),
+    }
+
+
+def selectable_doc_type_labels(county: str, state: str) -> dict[str, str] | None:
+    """{canonical_token: human_label} for the pre-foreclosure doc types a county
+    exposes for selection, or None if it doesn't support selection.
+
+    This is the EXACT shape the frontend doc-type checkbox selector consumes
+    (it renders Object.entries() as token->label). Do not return the richer
+    `selectable_availability` metadata object here — the UI iterates the dict as
+    a token->label map, so metadata keys would render as bogus checkboxes.
+    """
+    a = availability_for(county, state)
+    if a is None or not a.get("supported_for_selection"):
+        return None
+    return {
+        t: CANONICAL_DOC_TYPE_LABELS.get(t, t.replace("_", " ").title())
+        for t in a["available"]
     }
 
 

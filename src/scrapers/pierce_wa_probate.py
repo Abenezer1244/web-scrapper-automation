@@ -538,8 +538,31 @@ class PierceWAARMSScraper(BridgeScraper):
         return party_name, heirs
 
 
-# ─── Backward-compatible aliases ─────────────────────────────────────────────
-# All resolve to the base class which accepts record_type in constructor.
-PierceWAProbateScraper = PierceWAARMSScraper
-PierceWAPreForeclosureScraper = PierceWAARMSScraper
-PierceWADivorceScraper = PierceWAARMSScraper
+# ─── Record-type-pinned subclasses ───────────────────────────────────────────
+# These were previously bare aliases to PierceWAARMSScraper (which defaults to
+# record_type="probate"), so PierceWAPreForeclosureScraper() with no args
+# actually scraped probate. They are now thin subclasses that pin the correct
+# default record_type so the name matches the behavior.
+#
+# Production is unaffected: the live Pierce connector points at the base class
+# PierceWAARMSScraper (migration 010) and the worker passes record_type/doc_types
+# explicitly (src/workers/tasks.py). Alembic migrations 001/010 reference these
+# names as string literals (getattr / SQL), so the names must keep existing as
+# importable module attributes — subclasses preserve that.
+#
+# Signatures mirror the base constructor (record_type, doc_types) so inspect.
+# signature() in _run_scraper still sees both and forwards an explicit doc-type
+# selection (Pierce's ARMS checkbox narrowing).
+class PierceWAProbateScraper(PierceWAARMSScraper):
+    def __init__(self, record_type: str = "probate", doc_types: list[str] | None = None):
+        super().__init__(record_type=record_type, doc_types=doc_types)
+
+
+class PierceWAPreForeclosureScraper(PierceWAARMSScraper):
+    def __init__(self, record_type: str = "pre_foreclosure", doc_types: list[str] | None = None):
+        super().__init__(record_type=record_type, doc_types=doc_types)
+
+
+class PierceWADivorceScraper(PierceWAARMSScraper):
+    def __init__(self, record_type: str = "divorce", doc_types: list[str] | None = None):
+        super().__init__(record_type=record_type, doc_types=doc_types)

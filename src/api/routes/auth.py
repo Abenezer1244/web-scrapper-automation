@@ -14,6 +14,7 @@ from src.api.auth import (
     CurrentUser,
     create_refresh_token,
     create_secure_token,
+    decode_refresh_token,
     decode_secure_token,
     generate_api_key,
     hash_password,
@@ -530,7 +531,7 @@ async def refresh_token(
     await rate_limit(request, zone="auth")
     from jwt.exceptions import InvalidTokenError
     try:
-        payload = decode_secure_token(body.refresh_token)
+        payload = decode_refresh_token(body.refresh_token)
     except InvalidTokenError:
         # A5: catch ONLY the JWT error. `decode_secure_token` performs no
         # infra I/O, so an operational error (e.g. a SECRET_KEY rotation

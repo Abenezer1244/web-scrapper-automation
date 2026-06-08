@@ -97,6 +97,71 @@ async def test_login_unknown_email_same_generic_error(client: AsyncClient):
     assert "invalid" in resp.json()["detail"].lower()
 
 
+# ─── Refresh-token isolation (CRITICAL: refresh tokens must NOT be access tokens)
+
+async def test_refresh_token_cannot_authenticate_requests(client: AsyncClient):
+    reg = await client.post("/auth/register", json={
+        "email": "refresh_iso@test.bridgeleads.io", "password": "SecurePass1!",
+    })
+    refresh = reg.json()["refresh_token"]
+    assert refresh
+    # A 7-day refresh token must be useless as a bearer on a normal endpoint.
+    resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {refresh}"})
+    assert resp.status_code == 401
+
+
+async def test_refresh_endpoint_rotates_and_new_access_works(client: AsyncClient):
+    reg = await client.post("/auth/register", json={
+        "email": "refresh_rot@test.bridgeleads.io", "password": "SecurePass1!",
+    })
+    r = await client.post("/auth/refresh", json={"refresh_token": reg.json()["refresh_token"]})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # New access token works...
+    me = await client.get("/auth/me", headers={"Authorization": f"Bearer {data['access_token']}"})
+    assert me.status_code == 200
+    assert me.json()["email"] == "refresh_rot@test.bridgeleads.io"
+    # ...but the new refresh token still can't authenticate.
+    bad = await client.get("/auth/me", headers={"Authorization": f"Bearer {data['refresh_token']}"})
+    assert bad.status_code == 401
+
+
+async def test_access_token_cannot_be_used_to_refresh(client: AsyncClient):
+    reg = await client.post("/auth/register", json={
+        "email": "refresh_xacc@test.bridgeleads.io", "password": "SecurePass1!",
+    })
+    r = await client.post("/auth/refresh", json={"refresh_token": reg.json()["access_token"]})
+    assert r.status_code == 401
+
+
+async def test_legacy_refresh_token_rejected_as_access(client: AsyncClient):
+    # A refresh token minted under the OLD shared audience (aud=bridgeleads-api,
+    # purpose=refresh) passes the access-audience pin, so the purpose BELT in
+    # get_current_user is what must reject it — this is the 7-day migration risk
+    # (already-issued refresh tokens authenticating) the fix neutralizes.
+    import jwt as _jwt
+
+    from src.api.auth import _ACCESS_AUDIENCE, _ALGORITHM, _ISSUER
+    from src.config import settings
+
+    now = int(time.time())
+    legacy = _jwt.encode(
+        {
+            "sub": str(uuid.uuid4()),
+            "jti": str(uuid.uuid4()),
+            "iss": _ISSUER,
+            "aud": _ACCESS_AUDIENCE,  # old shared audience
+            "purpose": "refresh",
+            "iat": now,
+            "exp": now + 3600,
+        },
+        settings.SECRET_KEY,
+        algorithm=_ALGORITHM,
+    )
+    resp = await client.get("/auth/me", headers={"Authorization": f"Bearer {legacy}"})
+    assert resp.status_code == 401
+
+
 # ─── /auth/me ─────────────────────────────────────────────────────────────────
 
 async def test_get_me_with_valid_token(client: AsyncClient, starter_user: User, starter_token: str):

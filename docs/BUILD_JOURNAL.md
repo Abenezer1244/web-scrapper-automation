@@ -19,6 +19,42 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-08 — CRITICAL fix: refresh tokens were valid access tokens
+
+**Built / Shipped (uncommitted):** Codex flagged this during the H2-P5 design consult. `create_refresh_token`
+minted a 7-day JWT with `aud="bridgeleads-api"` — the SAME audience as access tokens — and
+`get_current_user` never checked `purpose`, so **a refresh token authenticated any API endpoint**, not
+just `/auth/refresh`. Live pre-existing vuln; also P5's Step 0 (an `amr=["pwd","mfa"]` refresh token
+would have been a 7-day MFA bearer).
+- **Fix (src/api/auth.py):** distinct audiences — access `bridgeleads-api` + `purpose="access"`, refresh
+  `bridgeleads-refresh` + `purpose="refresh"`. `decode_secure_token` pins the access audience (refresh
+  tokens now fail the JWT audience check on the auth path). New `decode_refresh_token` pins the refresh
+  audience + purpose; `/auth/refresh` uses it. **Belt:** `get_current_user` also rejects
+  `purpose=="refresh"` — this neutralizes ALREADY-ISSUED legacy refresh tokens (old shared audience)
+  during their remaining 7-day life, which the audience split alone would NOT catch.
+- **Tests:** refresh token rejected by /auth/me; /auth/refresh still rotates + new access works + new
+  refresh still rejected; access token can't refresh; legacy-shaped (old-aud) refresh token rejected.
+
+**Tried / Decided:** audience split is the clean future gate (JWT-lib-enforced); the purpose belt is
+required for the migration window (legacy tokens keep the old aud). Codex review: code path CLEAN, no
+P1/P2; only P3 was "the legacy belt isn't tested" → added that test.
+
+**Failed / Blocked:** integration tests CI-only (prod-DB constraint); verified via py_compile + ruff +
+app-build + direct token-decode execution (incl. crafting a legacy-aud token and confirming the belt).
+
+**Caught & fixed:** the audience split alone leaves a 7-day hole for already-issued refresh tokens →
+added the `purpose=="refresh"` belt in get_current_user.
+
+**Pending / Handoff:** after deploy, existing old-aud refresh tokens can no longer refresh → affected
+clients re-login (frontend/next-auth does NOT use /auth/refresh, so no frontend impact). This is now
+DONE (was P5 Step 0) — the fresh P5 session can build amr/auth_time on top safely.
+
+**Facts learned:** distinct JWT audiences are enforced by the library at decode time, but they only
+protect tokens minted AFTER the change; a `purpose` belt is needed to retire in-flight tokens that
+carry the old audience.
+
+---
+
 ## 2026-06-08 — H2 MFA Phase 4: TOTP replay prevention
 
 **Built / Shipped (uncommitted, branch `security/checklist-h4-m2-m1`):** closed the TOTP-replay window

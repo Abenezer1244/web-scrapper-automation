@@ -6,9 +6,9 @@ import time
 import uuid
 from typing import Annotated
 
+import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-import jwt
 from jwt.exceptions import InvalidTokenError as JWTError
 from passlib.context import CryptContext
 from sqlalchemy import select
@@ -49,6 +49,15 @@ def hash_api_key(raw: str) -> str:
 _ALGORITHM = "HS256"
 _ACCESS_TOKEN_EXPIRE_SECONDS = 3600  # 1 hour
 _REFRESH_TOKEN_EXPIRE_SECONDS = 7 * 24 * 3600  # 7 days
+_ISSUER = "bridgeleads"
+# Access and refresh tokens carry DISTINCT audiences so a refresh token cannot
+# authenticate a normal request: decode_secure_token (the auth path) pins the
+# access audience, so a refresh token fails the JWT audience check. Belt: access
+# tokens are tagged purpose="access" and get_current_user rejects
+# purpose="refresh" — this neutralizes any LEGACY refresh token still carrying
+# the old shared audience during its remaining lifetime.
+_ACCESS_AUDIENCE = "bridgeleads-api"
+_REFRESH_AUDIENCE = "bridgeleads-refresh"
 
 
 def create_secure_token(user_id: str) -> str:
@@ -57,8 +66,9 @@ def create_secure_token(user_id: str) -> str:
     payload = {
         "sub": user_id,
         "jti": str(uuid.uuid4()),
-        "iss": "bridgeleads",
-        "aud": "bridgeleads-api",
+        "iss": _ISSUER,
+        "aud": _ACCESS_AUDIENCE,
+        "purpose": "access",
         "iat": now,
         "exp": now + _ACCESS_TOKEN_EXPIRE_SECONDS,
     }
@@ -66,13 +76,17 @@ def create_secure_token(user_id: str) -> str:
 
 
 def create_refresh_token(user_id: str) -> str:
-    """Create a signed refresh JWT (7 days) for obtaining new access tokens."""
+    """Create a signed refresh JWT (7 days), usable ONLY at /auth/refresh.
+
+    Scoped to the refresh audience so it cannot authenticate normal requests
+    (decode_secure_token pins the access audience).
+    """
     now = int(time.time())
     payload = {
         "sub": user_id,
         "jti": str(uuid.uuid4()),
-        "iss": "bridgeleads",
-        "aud": "bridgeleads-api",
+        "iss": _ISSUER,
+        "aud": _REFRESH_AUDIENCE,
         "purpose": "refresh",
         "iat": now,
         "exp": now + _REFRESH_TOKEN_EXPIRE_SECONDS,
@@ -81,15 +95,37 @@ def create_refresh_token(user_id: str) -> str:
 
 
 def decode_secure_token(token: str) -> dict:
-    """Decode and validate a JWT. Raises JWTError on failure."""
+    """Decode and validate an ACCESS JWT. Raises JWTError on failure.
+
+    Pins the access audience, so a refresh token (refresh audience) is rejected.
+    """
     return jwt.decode(
         token,
         settings.SECRET_KEY,
         algorithms=[_ALGORITHM],
-        audience="bridgeleads-api",
-        issuer="bridgeleads",
+        audience=_ACCESS_AUDIENCE,
+        issuer=_ISSUER,
         options={"verify_exp": True},
     )
+
+
+def decode_refresh_token(token: str) -> dict:
+    """Decode and validate a REFRESH JWT (for /auth/refresh). Raises JWTError.
+
+    Pins the refresh audience + purpose so an access token cannot be exchanged
+    for new tokens here, and the same token cannot authenticate elsewhere.
+    """
+    payload = jwt.decode(
+        token,
+        settings.SECRET_KEY,
+        algorithms=[_ALGORITHM],
+        audience=_REFRESH_AUDIENCE,
+        issuer=_ISSUER,
+        options={"verify_exp": True},
+    )
+    if payload.get("purpose") != "refresh":
+        raise JWTError("not a refresh token")
+    return payload
 
 
 # ─── FastAPI auth dependency ──────────────────────────────────────────────────
@@ -150,6 +186,12 @@ async def get_current_user(
     except JWTError:
         raise _CREDENTIALS_EXCEPTION
 
+    # A refresh token must never authenticate a request. New refresh tokens are
+    # already rejected above by the audience pin; this also catches any LEGACY
+    # refresh token minted under the old shared audience, for its lifetime.
+    if payload.get("purpose") == "refresh":
+        raise _CREDENTIALS_EXCEPTION
+
     user_id: str = payload.get("sub", "")
     jti: str = payload.get("jti", "")
     issued_at: int = payload.get("iat", 0)
@@ -165,6 +207,7 @@ async def get_current_user(
     # temporarily down" from a normal 401 ("your credentials are
     # invalid") and avoid forcing a re-login on a transient outage.
     import redis.exceptions as _redis_exceptions
+
     from src.api.middleware.auth_hardening import revocation_unavailable_503
     try:
         if await TokenBlacklist.is_blacklisted(jti):

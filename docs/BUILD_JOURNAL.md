@@ -19,6 +19,47 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-08 — H2 MFA Phase 4: TOTP replay prevention
+
+**Built / Shipped (uncommitted, branch `security/checklist-h4-m2-m1`):** closed the TOTP-replay window
+deferred from P3. Migration **044** adds `users.mfa_last_totp_counter BIGINT NULL`. New
+`verify_totp_counter()` (`src/utils/mfa.py`) returns the matched 30s timestep counter. Login's
+`_consume_second_factor` TOTP branch now does an **atomic guarded advance**: `UPDATE users SET
+mfa_last_totp_counter=:c WHERE id=:id AND mfa_enabled IS TRUE AND mfa_secret_encrypted IS NOT NULL AND
+(mfa_last_totp_counter IS NULL OR < :c) RETURNING id` — a code works exactly once; a replay advances 0
+rows and is rejected with no backup-code fallback. `/mfa/enable` seeds the counter from the enrollment
+code (can't be replayed into the first login); `/mfa/disable` is now replay-aware (counter > last,
+FOR-UPDATE-locked in-Python compare) and clears the counter. amr/auth_time claims deferred to P5
+(Codex's rec — inert until consumed).
+
+**Tried / Decided:** return the SINGLE matched counter (not max-of-window) → no advance-too-far lockout;
+on the ~1e-6 collision, prefer the highest (replay-safe). Seeding at enable is the documented trade-off
+(a login in the same 30s window as enrollment is rejected — "wait for next code"; enable revokes
+sessions so re-login is normally a fresh code anyway). Pre-build Codex consult upgraded nothing major;
+confirmed the atomic-UPDATE approach and flagged the seeding UX + enable/disable consistency.
+
+**Caught & fixed (Codex review gate, 3 rounds, before shipping):** R1 — seeding broke the existing
+`test_login_mfa_totp_completes_login` (logged in with the just-enrolled `.now()` code) → fixed to use
+counter+1; `/mfa/disable` used plain `verify_totp` so a login-consumed TOTP could be replayed to tear
+MFA down → made disable counter-aware. R2 — **NEW P2:** a `/login/mfa` that loaded the old secret
+before `/mfa/disable` could, after disable cleared state + committed, run its counter UPDATE (now NULL),
+advance, and mint a session POST-disable → fixed by adding `mfa_enabled`/`mfa_secret_encrypted` guards
+to the UPDATE WHERE, making it the single atomic gate. R3 CLEAN.
+
+**Failed / Blocked:** same as P3 — integration tests can't run locally (prod-only DATABASE_URL +
+destructive fixture); verified via py_compile + ruff + app-build + a direct `verify_totp_counter`
+execution check. Full suite runs in CI.
+
+**Pending / Handoff:** P5 (admin MFA enforcement + break-glass + amr/auth_time), H3 (PII-at-rest), H1
+(RLS, last). **Deploy:** migration 044 is branch-only — applies on prod via alembic-on-boot at deploy.
+
+**Facts learned:** a TOTP code maps to exactly one 30s counter, so single-counter return is correct and
+lockout-free. Concurrency on a shared `users` row needs the state guard IN the conditional UPDATE (not a
+prior SELECT check) — a TOCTOU between the unlocked SELECT in `login_mfa` and the row-locked UPDATE is
+real once a concurrent writer (`/mfa/disable`) clears the gating columns.
+
+---
+
 ## 2026-06-08 — H2 MFA Phase 3: login challenge + frontend
 
 **Built / Shipped:** MFA now actually gates login, end-to-end, across both repos.

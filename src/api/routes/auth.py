@@ -7,7 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from pydantic import BaseModel
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import delete, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import (
@@ -175,33 +175,58 @@ def _decode_mfa_challenge_token(token: str) -> dict:
 async def _consume_second_factor(db: AsyncSession, user: User, code: str) -> bool:
     """Verify a login 2nd factor for `user`. Returns True iff valid.
 
-    Order: TOTP first (no state change), else an UNUSED backup code consumed
-    ATOMICALLY. The backup-code consume is a single conditional UPDATE guarded by
-    `used_at IS NULL`, so two concurrent logins cannot both spend the same code
-    (Codex H2-P3): the matching row is burned exactly once. Caller commits on a
-    True return; on False nothing was changed (0 rows matched) and the session
-    rolls back.
+    Order: TOTP first, else an UNUSED backup code. Both are single-use and
+    consumed ATOMICALLY so two concurrent logins can never both succeed on the
+    same factor (Codex H2-P3/P4). Caller commits on a True return; on False
+    nothing is changed (0 rows matched) and the session rolls back.
 
-    NOTE (H2-P3, deferred to P4): TOTP replay within the pyotp ±1 (~90s) window
-    is NOT prevented here — there is no last-counter tracking yet. Acceptable
-    under mandatory TLS + the per-user rate limiter; do not advertise this MFA as
-    replay-resistant until P4 adds counter tracking.
+    TOTP replay (H2-P4): a code is valid for the pyotp ±1 (~90s) window, so we
+    record the matched 30s timestep counter and advance `mfa_last_totp_counter`
+    with a conditional UPDATE (`... < :counter`). A code thus works exactly once:
+    the second use (or a concurrent loser) advances 0 rows and is rejected. A
+    matched-but-replayed TOTP returns False WITHOUT falling through to backup
+    codes (it is a TOTP, not a backup code).
     """
     from src.db.models import MfaBackupCode
     from src.utils.crypto import decrypt_field
-    from src.utils.mfa import hash_backup_code, verify_totp
+    from src.utils.mfa import hash_backup_code, verify_totp_counter
 
     cleaned = (code or "").strip()
 
-    # 1) TOTP — consumes nothing.
+    # 1) TOTP — single-use via an atomic counter advance.
     if user.mfa_secret_encrypted:
         try:
-            if verify_totp(decrypt_field(user.mfa_secret_encrypted), cleaned):
-                return True
+            counter = verify_totp_counter(decrypt_field(user.mfa_secret_encrypted), cleaned)
         except Exception:
             # A corrupt/rotated secret must not 500 the login; fall through to
             # backup codes so a user is never hard-locked by a decrypt failure.
-            pass
+            counter = None
+        if counter is not None:
+            # Advance only if strictly newer than what we've already consumed.
+            # WHERE uses the DB column (not user.mfa_last_totp_counter from a
+            # stale prior SELECT) so concurrent same-code logins serialize on the
+            # row and exactly one wins (Codex H2-P4). The mfa_enabled +
+            # mfa_secret_encrypted guards make this UPDATE the single atomic gate:
+            # if /mfa/disable committed between our SELECT and this UPDATE, the
+            # row no longer matches and a stale challenge cannot mint a session
+            # against a just-disabled account (Codex H2-P4 round 2).
+            advanced = await db.execute(
+                update(User)
+                .where(
+                    User.id == user.id,
+                    User.mfa_enabled.is_(True),
+                    User.mfa_secret_encrypted.is_not(None),
+                    or_(
+                        User.mfa_last_totp_counter.is_(None),
+                        User.mfa_last_totp_counter < counter,
+                    ),
+                )
+                .values(mfa_last_totp_counter=counter)
+                .returning(User.id)
+            )
+            # A matched TOTP that did not advance is a replay (or the account was
+            # disabled mid-flight) → reject; do NOT try it as a backup code.
+            return advanced.scalar_one_or_none() is not None
 
     # 2) Backup code — atomic single-use consume. Look up by the keyed HMAC
     # digest (deterministic, same normalization as enrollment) and burn the row
@@ -902,7 +927,7 @@ async def mfa_enable(
     from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
     from src.db.models import MfaBackupCode
     from src.utils.crypto import decrypt_field
-    from src.utils.mfa import generate_backup_codes, verify_totp
+    from src.utils.mfa import generate_backup_codes, verify_totp_counter
 
     user = (
         await db.execute(select(User).where(User.id == current_user.id).with_for_update())
@@ -923,8 +948,13 @@ async def mfa_enable(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="MFA setup is invalid; please restart enrollment.",
         )
-    if not verify_totp(secret, body.code):
+    enroll_counter = verify_totp_counter(secret, body.code)
+    if enroll_counter is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid MFA code.")
+    # Seed the replay counter with the enrollment code's timestep (H2-P4) so the
+    # very code used to enable MFA cannot be replayed for the first login — the
+    # forced re-login (sessions are revoked just below) will use a fresh code.
+    user.mfa_last_totp_counter = enroll_counter
 
     plaintext_codes, hashes = generate_backup_codes()
     # Replace any prior codes (explicit user_id filter; RLS context also set).
@@ -964,7 +994,7 @@ async def mfa_disable(
     from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
     from src.db.models import MfaBackupCode
     from src.utils.crypto import decrypt_field
-    from src.utils.mfa import verify_backup_code_hash, verify_totp
+    from src.utils.mfa import verify_backup_code_hash, verify_totp_counter
 
     user = (
         await db.execute(select(User).where(User.id == current_user.id).with_for_update())
@@ -974,13 +1004,20 @@ async def mfa_disable(
     if not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password is incorrect.")
 
-    # Second factor: TOTP, else an unused backup code.
+    # Second factor: TOTP, else an unused backup code. The TOTP must be REPLAY-
+    # FRESH (counter strictly newer than the last consumed) — disabling MFA is a
+    # sensitive 2nd-factor check, so a TOTP already used at login can't be
+    # replayed to tear MFA down (Codex H2-P4). The row is FOR UPDATE-locked, so
+    # the in-Python counter compare is race-safe (no concurrent writer).
     ok = False
     if user.mfa_secret_encrypted:
         try:
-            ok = verify_totp(decrypt_field(user.mfa_secret_encrypted), body.code)
+            counter = verify_totp_counter(decrypt_field(user.mfa_secret_encrypted), body.code)
         except Exception:
-            ok = False
+            counter = None
+        if counter is not None and counter > (user.mfa_last_totp_counter or -1):
+            user.mfa_last_totp_counter = counter
+            ok = True
     if not ok:
         unused = (await db.execute(
             select(MfaBackupCode).where(
@@ -995,6 +1032,9 @@ async def mfa_disable(
     user.mfa_enabled = False
     user.mfa_secret_encrypted = None
     user.mfa_enrolled_at = None
+    # Clear the replay counter so a future re-enrollment starts clean (it would
+    # be re-seeded by /mfa/enable anyway, but don't leave stale state).
+    user.mfa_last_totp_counter = None
     await db.execute(delete(MfaBackupCode).where(MfaBackupCode.user_id == current_user.id))
     try:
         await TokenBlacklist.revoke_all_for_user(current_user.id)

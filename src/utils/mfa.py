@@ -13,6 +13,7 @@ import base64
 import hashlib
 import hmac
 import secrets
+import time
 
 import pyotp
 
@@ -23,6 +24,7 @@ _BACKUP_CODE_COUNT = 10
 # TOTP verify window: accept the adjacent 30s steps (±30s) to tolerate clock
 # skew between the user's authenticator and the server.
 _TOTP_VALID_WINDOW = 1
+_TOTP_INTERVAL = 30  # RFC 6238 default step (pyotp default)
 
 
 def generate_totp_secret() -> str:
@@ -48,6 +50,35 @@ def verify_totp(secret: str, code: str) -> bool:
         return pyotp.TOTP(secret).verify(cleaned, valid_window=_TOTP_VALID_WINDOW)
     except Exception:
         return False
+
+
+def verify_totp_counter(secret: str, code: str) -> int | None:
+    """Like verify_totp but returns the 30s timestep COUNTER the code matches
+    (for replay tracking, H2-P4), or None if invalid.
+
+    A TOTP code maps to exactly one counter, so the caller can record it and
+    reject any future code whose counter is not strictly greater (single-use).
+    We scan the ±1 window from HIGHEST counter down and return the first match:
+    in the astronomically rare event one 6-digit code collides across adjacent
+    counters, advancing to the highest is the replay-safe choice (Codex H2-P4).
+    Constant-time compare so a near-miss code can't be distinguished by timing.
+    """
+    if not secret or not code:
+        return None
+    cleaned = code.strip().replace(" ", "")
+    if not cleaned.isdigit():
+        return None
+    try:
+        totp = pyotp.TOTP(secret)
+        now = int(time.time())
+        current = now // _TOTP_INTERVAL
+        for counter in range(current + _TOTP_VALID_WINDOW, current - _TOTP_VALID_WINDOW - 1, -1):
+            candidate = totp.at(counter * _TOTP_INTERVAL)
+            if hmac.compare_digest(candidate, cleaned):
+                return counter
+        return None
+    except Exception:
+        return None
 
 
 def _pepper() -> bytes:

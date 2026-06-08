@@ -2,6 +2,7 @@ import uuid
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     Column,
     Date,
@@ -80,6 +81,9 @@ class User(Base):
     mfa_enabled = Column(Boolean, nullable=False, default=False, server_default=text("false"))
     mfa_secret_encrypted = Column(Text, nullable=True)
     mfa_enrolled_at = Column(DateTime(timezone=True), nullable=True)
+    # Highest TOTP 30s timestep counter already consumed at login (H2-P4). Login
+    # advances it atomically so a code can't be replayed inside pyotp's ±1 window.
+    mfa_last_totp_counter = Column(BigInteger, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

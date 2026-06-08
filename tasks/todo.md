@@ -1,3 +1,57 @@
+# H2 Phase 4 — Session hardening (TOTP replay) — SCOPED: TOTP-replay only (amr→P5)
+
+**Goal:** Close the TOTP-replay window deferred from P3, and stamp the auth method
+(`amr`) into issued tokens so P5 can enforce MFA on sensitive actions.
+
+## Proposed design (pre-Codex)
+- **Migration 044:** `users.mfa_last_totp_counter BIGINT NULL` (additive; safe).
+- **`src/utils/mfa.py`:** add `verify_totp_counter(secret, code) -> int | None` — returns the unique
+  30s timestep counter whose code matches (scan ±1 window, constant-time compare). Each code maps to
+  one counter, so returning it (not "max of window") avoids the advance-too-far lockout.
+- **`_consume_second_factor` (login_mfa):** TOTP branch → `verify_totp_counter`; if matched, **atomic
+  replay-guarded advance**: `UPDATE users SET mfa_last_totp_counter=:c WHERE id=:id AND
+  (mfa_last_totp_counter IS NULL OR mfa_last_totp_counter < :c) RETURNING id`. 0 rows = replay or a
+  concurrent loser → reject (do NOT fall through to backup codes). Keep enable/disable on plain
+  `verify_totp` (authenticated, first-use / password-gated).
+- **amr claims:** `create_secure_token`/`create_refresh_token` gain `amr` param; login + register emit
+  `["pwd"]`, login_mfa emits `["pwd","mfa"]`; `/auth/refresh` propagates `amr` from the refresh token.
+- **Tests:** replay rejected (same code twice → 2nd 401); newer code accepted after advance; amr =
+  `["pwd","mfa"]` after MFA login vs `["pwd"]` non-MFA; refresh preserves amr.
+
+## Risks to pressure-test with Codex
+- Atomic counter advance under concurrency (two logins, same code → exactly one wins?).
+- Lockout: does advancing last_counter ever reject a legit *next* code? (Single-counter return should avoid it.)
+- Should enable/disable also be replay-tracked, or is leaving them on verify_totp acceptable?
+- amr threading through refresh — any token-family / aud pitfalls.
+
+## STATUS: ✅ DONE (Codex 3 rounds; py_compile/ruff/app-build clean) — UNCOMMITTED
+**Shipped:** migration 044 (`users.mfa_last_totp_counter BIGINT NULL`) + model column; `verify_totp_counter`
+(`src/utils/mfa.py`); `_consume_second_factor` TOTP branch → atomic guarded advance
+(`UPDATE users SET mfa_last_totp_counter=:c WHERE id AND mfa_enabled AND secret NOT NULL AND
+(col IS NULL OR col<:c) RETURNING id`); `mfa_enable` seeds the counter from the enrollment code;
+`mfa_disable` is now replay-aware (counter>last, FOR-UPDATE-locked) + clears the counter. 3 new tests
+(replay rejected, concurrent single-use, enrollment-code-can't-login) + fixed the existing
+TOTP-completes test to use a counter+1 code.
+**Codex gate:** R1 no P1, 2×P2 (seeding broke a test → fixed; disable not replay-guarded → fixed) + 1×P3.
+R2 found a NEW P2 (concurrent disable-vs-login could mint a session post-disable) → fixed with the
+`mfa_enabled`/secret WHERE guards. **R3 CLEAN.**
+**Trade-off (documented):** seeding means a login within the same 30s window as enrollment is rejected
+("wait for next code") — accepted; enable revokes sessions so re-login is usually a fresh code anyway.
+**⚠️ migration 044 is branch-only — not on prod; applies at deploy (alembic-on-boot).**
+
+## Codex consult: DONE — design sound, 0 Crit/High. Reconciled:
+- Atomic UPDATE race-safe; `WHERE` MUST use the DB column (not Python-read counter). 0 rows → reject,
+  no backup fallback.
+- Return the matched counter (not max-of-window) → no lockout; on rare collision prefer HIGHEST match.
+- **Initialize `mfa_last_totp_counter` at `/auth/mfa/enable`** (from the verified enrollment code) so it
+  can't be replayed into the first login. (enable already revokes sessions → re-login uses a fresh code.)
+- RLS GUC already bound in `login_mfa` before `_consume_second_factor` → put the UPDATE in that txn.
+- amr: signed JWT can't be forged, but sanitize on refresh (subset of {pwd,mfa}, default `["pwd"]` for
+  old tokens). amr = session-strength, NOT freshness; step-up needs `auth_time` max-age (P5 concern).
+- **Codex rec: do TOTP-replay now; defer amr to P5** (where it's consumed) unless done fully w/ tests.
+
+---
+
 # H2 Phase 3 — MFA Login Challenge + Frontend
 
 **Goal:** Make the TOTP MFA built in Phases 1–2 actually gate login, and give users a UI to

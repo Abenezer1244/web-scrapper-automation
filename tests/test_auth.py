@@ -1,11 +1,13 @@
 """Tests for authentication: register, login, JWT, brute-force, API keys."""
 import asyncio
+import time
 import uuid
 
 import pyotp
 from httpx import AsyncClient
 
 from src.db.models import User
+from src.utils.mfa import _TOTP_INTERVAL
 
 # ─── Register ─────────────────────────────────────────────────────────────────
 
@@ -268,8 +270,11 @@ async def test_login_mfa_totp_completes_login(client: AsyncClient, redis_client)
     challenge = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
     mfa_token = challenge.json()["mfa_token"]
 
+    # Use a code NEWER than the enrollment-seeded counter (H2-P4): the exact
+    # enrollment code is rejected as a replay, so the first login uses counter+1.
+    code = pyotp.TOTP(secret).at((int(time.time()) // _TOTP_INTERVAL + 1) * _TOTP_INTERVAL)
     resp = await client.post(
-        "/auth/login/mfa", json={"mfa_token": mfa_token, "code": pyotp.TOTP(secret).now()},
+        "/auth/login/mfa", json={"mfa_token": mfa_token, "code": code},
     )
     assert resp.status_code == 200, resp.text
     access = resp.json()["access_token"]
@@ -371,3 +376,74 @@ async def test_bad_mfa_code_does_not_lock_password_bucket(client: AsyncClient, r
     again = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
     assert again.status_code == 200
     assert again.json()["mfa_required"] is True
+
+
+# ─── TOTP replay prevention (H2-P4) ───────────────────────────────────────────
+# Codes are computed for SPECIFIC 30s counters (not pyotp .now()) so the tests
+# are deterministic across 30s boundaries. Enrollment seeds mfa_last_totp_counter
+# to the enrollment code's counter (≤ now), so a code for counter now+1 is always
+# strictly-newer AND inside pyotp's ±1 window.
+
+async def _verify_mfa(client: AsyncClient, redis_client, email: str, code: str,
+                      password: str = "SecurePass1!"):
+    """Fresh challenge → redeem `code` at /auth/login/mfa. Returns the response."""
+    _clear_auth_limits(redis_client)
+    challenge = await client.post("/auth/login", json={"email": email, "password": password})
+    return await client.post(
+        "/auth/login/mfa",
+        json={"mfa_token": challenge.json()["mfa_token"], "code": code},
+    )
+
+
+async def test_login_mfa_totp_replay_rejected(client: AsyncClient, redis_client):
+    email = _mfa_email()
+    secret, _ = await _register_and_enable_mfa(client, redis_client, email)
+    totp = pyotp.TOTP(secret)
+    # Counter strictly newer than the seeded enrollment counter, still in-window.
+    code = totp.at((int(time.time()) // _TOTP_INTERVAL + 1) * _TOTP_INTERVAL)
+
+    first = await _verify_mfa(client, redis_client, email, code)
+    assert first.status_code == 200, first.text
+    assert first.json()["access_token"]
+
+    # Same code again → replay; rejected (and NOT treated as a backup code).
+    replay = await _verify_mfa(client, redis_client, email, code)
+    assert replay.status_code == 401
+
+
+async def test_login_mfa_totp_concurrent_single_use(client: AsyncClient, redis_client):
+    # Two concurrent redemptions of the SAME TOTP code (distinct challenges) —
+    # the atomic counter advance must let exactly one win.
+    email = _mfa_email()
+    secret, _ = await _register_and_enable_mfa(client, redis_client, email)
+    totp = pyotp.TOTP(secret)
+    code = totp.at((int(time.time()) // _TOTP_INTERVAL + 1) * _TOTP_INTERVAL)
+
+    _clear_auth_limits(redis_client)
+    ch_a = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
+    ch_b = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
+    r_a, r_b = await asyncio.gather(
+        client.post("/auth/login/mfa", json={"mfa_token": ch_a.json()["mfa_token"], "code": code}),
+        client.post("/auth/login/mfa", json={"mfa_token": ch_b.json()["mfa_token"], "code": code}),
+    )
+    assert sorted([r_a.status_code, r_b.status_code]) == [200, 401]
+
+
+async def test_enrollment_totp_code_cannot_be_replayed_at_login(client: AsyncClient, redis_client):
+    # The exact TOTP code used to ENABLE MFA must not also work for the first
+    # login — enable seeds mfa_last_totp_counter with that code's counter.
+    email = _mfa_email()
+    _clear_auth_limits(redis_client)
+    reg = await client.post("/auth/register", json={"email": email, "password": "SecurePass1!"})
+    headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
+    secret = (await client.post("/auth/mfa/setup", headers=headers)).json()["secret"]
+
+    enroll_counter = int(time.time()) // _TOTP_INTERVAL
+    enroll_code = pyotp.TOTP(secret).at(enroll_counter * _TOTP_INTERVAL)
+    enable = await client.post("/auth/mfa/enable", headers=headers, json={"code": enroll_code})
+    assert enable.status_code == 200, enable.text
+
+    # Same enrollment code at login → rejected (replay of the seeded counter, or
+    # out-of-window — either way never a valid login).
+    resp = await _verify_mfa(client, redis_client, email, enroll_code)
+    assert resp.status_code == 401

@@ -20,7 +20,11 @@ import re
 from datetime import datetime, timedelta
 
 from src.api.middleware.security import add_scrape_domain
-from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.base_scraper import (
+    BridgeScraper,
+    ScrapedRecord,
+    normalize_party_text,
+)
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.ava_fidlar")
@@ -285,11 +289,16 @@ class AvaFidlarScraper(BridgeScraper):
                     if not matched:
                         continue
 
-                grantor = (item.get("grantor") or "").strip()
+                # Normalize party text: decodes entities and keeps stacked
+                # owners split as " / " instead of concatenating. AVA's results
+                # are parsed from innerText (already flattened), so this is
+                # primarily defensive/entity-decoding hardening consistent with
+                # the King connector; it is safe on plain text.
+                grantor = normalize_party_text(item.get("grantor") or "")
                 if grantor:
                     record.party_name = grantor
 
-                grantee = (item.get("grantee") or "").strip()
+                grantee = normalize_party_text(item.get("grantee") or "")
                 if grantee:
                     record.heirs = grantee
 

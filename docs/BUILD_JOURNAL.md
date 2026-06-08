@@ -64,9 +64,33 @@ Conservative (Codex): rejects `FIRST M LAST` (STEPHEN P MYERS) + ambiguous 3-ful
 JANET) → advanced, because wrong-person on a cold-call (TCPA/DNC) costs more than 1 credit. Tests
 `tests/test_select_traceable_owner.py` (18). King party_name fix DEPLOYED (pushed `141015e`).
 
+**Phase 3 — DONE (all remaining scrapers audited, 3 parallel sub-agents):** applied the same
+`normalize_party_text()` + `innerHTML`-not-`textContent` pattern to every scraper that parses owner names
+from HTML. **Fixed (8 files):**
+- CONFIRMED offenders (textContent / per-cell flatten → real concatenation): `clark_wa.py` (LandmarkWeb,
+  same nameSeperator as King), `templates/landmarkweb.py` (generic LandmarkWeb), `templates/acclaimweb.py`
+  (3 DOM-`textContent` fallback paths; Kendo JSON paths defensive), `templates/laserfiche_weblink.py`
+  (per-`<td>` textContent), `templates/eagleweb.py` (Kitsap/Thurston/Grant/etc — Grantor/Grantee regex now
+  runs on `normalize_party_text(summary innerHTML)` AND the CAPTURED group is re-normalized so a field-
+  boundary `<br>`→" /" can't trail the value — Codex P2 fix).
+- DEFENSIVE (safe no-op if no stacking): `templates/skagit_recording.py`, `templates/ava_fidlar.py`
+  (parses `innerText`, no per-cell HTML to recover — normalize wrap + entity-decode only).
+**Left unchanged (NOT the bug class, verified):**
+- `whatcom_wa.py` — agent initially "fixed" it, but it uses `card.innerText` which PRESERVES `<br>` as a
+  newline (→ space after `\s+` collapse), so owners were already space-separated, never concatenated. The
+  over-fix (innerHTML+normalize on the whole card) risked a trailing " /" and lost-whitespace stop failures
+  (Codex P2) → **reverted to original**. Not a bug.
+- `templates/tyler_selfservice.py` (splits owners by newline + joins ", " — already preserves boundaries);
+  `snohomish_wa_tax_delinquent.py` (`entry["owner"]` from a pipe-delimited Treasurer file field, not HTML);
+  the synthetic-party_name builders (king/pierce code_violation, king/snoho tax_delinquent).
+Verified: py_compile + imports OK on all changed files; eagleweb fix functionally simulated (owners kept,
+no trailing " /"); no NEW ruff errors (all findings pre-existing: asyncio/datetime unused, W605 JS regex,
+E402, sha1, zip). LESSON: `innerText` preserves block/`<br>` separators (safe); `textContent` does not
+(concatenates) — only textContent/per-cell-flatten paths were real offenders.
+
 **Pending / Handoff:**
-- **Phase 3 (optional):** audit other templates (EagleWeb/AcclaimWeb/Tyler/Fidlar/Laserfiche) for the same
-  `get_text()`-no-separator / blanket-tag-strip concatenation King had. Pierce confirmed clean.
+- Live-verify the non-King fixed counties produce ` / `-separated multi-owner names on a real scrape
+  (King already proven; others verified by code + the shared 19 normalize tests).
 
 ## 2026-06-07 — Pierce pre-foreclosure (same alias footgun) + pre-foreclosure doc-type SELECTOR UI bug
 

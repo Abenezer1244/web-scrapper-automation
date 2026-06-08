@@ -18,7 +18,7 @@ Volume: ~486 records in 7 days (all types), ~130k population county.
 import re
 
 from src.api.middleware.security import add_scrape_domain
-from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord, normalize_party_text
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.skagit")
@@ -247,8 +247,12 @@ class SkagitRecordingScraper(BridgeScraper):
                     if (cells.length < 8) continue;
                     // Cell 3 has combined: FileNumber\nDate\nDocType
                     const cell3 = (cells[3] || {}).textContent || '';
-                    const grantor = (cells[4] || {}).textContent?.trim() || '';
-                    const grantee = (cells[5] || {}).textContent?.trim() || '';
+                    // Party cells: read innerHTML so structural separators
+                    // (e.g. <br> between co-grantors) survive to Python's
+                    // normalize_party_text(). textContent would collapse
+                    // stacked parties in-browser before we can split them.
+                    const grantor = (cells[4] || {}).innerHTML?.trim() || '';
+                    const grantee = (cells[5] || {}).innerHTML?.trim() || '';
                     const comment = (cells[7] || {}).textContent?.trim() || '';
                     const legal = (cells[8] || {}).textContent?.trim() || '';
                     const parcelCell = (cells[9] || {}).textContent?.trim() || '';
@@ -292,13 +296,13 @@ class SkagitRecordingScraper(BridgeScraper):
                     if file_num:
                         record.enrichment_data["instrument_number"] = file_num
 
-                # Grantor → party_name
-                grantor = item.get("grantor", "").strip()
+                # Grantor → party_name (normalize stacked parties -> " / ")
+                grantor = normalize_party_text(item.get("grantor"))
                 if grantor:
                     record.party_name = grantor
 
-                # Grantee → heirs
-                grantee = item.get("grantee", "").strip()
+                # Grantee → heirs (normalize stacked parties -> " / ")
+                grantee = normalize_party_text(item.get("grantee"))
                 if grantee:
                     record.heirs = grantee
 

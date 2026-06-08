@@ -19,7 +19,11 @@ import re
 from datetime import datetime, timedelta
 
 from src.api.middleware.security import add_scrape_domain
-from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.base_scraper import (
+    BridgeScraper,
+    ScrapedRecord,
+    normalize_party_text,
+)
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.acclaimweb")
@@ -635,8 +639,12 @@ class AcclaimWebScraper(BridgeScraper):
                                 instrument: (cells[0] || {}).textContent?.trim() || '',
                                 date_recorded: (cells[1] || {}).textContent?.trim() || '',
                                 doc_type: (cells[2] || {}).textContent?.trim() || '',
-                                grantor: (cells[3] || {}).textContent?.trim() || '',
-                                grantee: (cells[4] || {}).textContent?.trim() || '',
+                                // Party cells: return innerHTML so structural
+                                // separators (<br>/<div>) between stacked owners
+                                // survive to Python's normalize_party_text().
+                                // textContent would concatenate co-owners.
+                                grantor: (cells[3] || {}).innerHTML?.trim() || '',
+                                grantee: (cells[4] || {}).innerHTML?.trim() || '',
                                 legal: (cells[5] || {}).textContent?.trim() || '',
                                 parcel: '',
                             };
@@ -686,12 +694,18 @@ class AcclaimWebScraper(BridgeScraper):
                             if (cells.length < 3) return null;
                             const getCell = k => best.colMap[k] != null && cells[best.colMap[k]]
                                 ? (cells[best.colMap[k]].textContent || '').trim() : '';
+                            // Party cells: read innerHTML so structural separators
+                            // (<br>/<div>) between stacked owners survive to
+                            // Python's normalize_party_text(). textContent would
+                            // concatenate co-owners.
+                            const getCellHtml = k => best.colMap[k] != null && cells[best.colMap[k]]
+                                ? (cells[best.colMap[k]].innerHTML || '').trim() : '';
                             const r = {
                                 instrument: getCell('instrument'),
                                 date_recorded: getCell('date_recorded'),
                                 doc_type: getCell('doc_type'),
-                                grantor: getCell('grantor'),
-                                grantee: getCell('grantee'),
+                                grantor: getCellHtml('grantor'),
+                                grantee: getCellHtml('grantee'),
                                 legal: getCell('legal'),
                                 parcel: '',
                             };
@@ -725,8 +739,10 @@ class AcclaimWebScraper(BridgeScraper):
                                 instrument: (cells[4] || {}).textContent?.trim() || '',
                                 date_recorded: (cells[5] || {}).textContent?.trim() || '',
                                 doc_type: (cells[7] || {}).textContent?.trim() || '',
-                                grantor: (cells[2] || {}).textContent?.trim() || '',
-                                grantee: (cells[3] || {}).textContent?.trim() || '',
+                                // Party cells: innerHTML so stacked-owner
+                                // separators survive to normalize_party_text().
+                                grantor: (cells[2] || {}).innerHTML?.trim() || '',
+                                grantee: (cells[3] || {}).innerHTML?.trim() || '',
                                 legal: (cells[8] || {}).textContent?.trim() || '',
                                 parcel: '',
                             };
@@ -785,8 +801,14 @@ class AcclaimWebScraper(BridgeScraper):
 
                 record.doc_type = doc_type if doc_type else None
 
-                grantor = item.get("grantor", "").strip()
-                grantee = item.get("grantee", "").strip()
+                # Normalize party cells: stacked owners separated by structural
+                # markup (<br>/<div>) in the source cell stay split as " / "
+                # instead of concatenating ("SMITH JOHN" + "ACME BANK" ->
+                # "SMITH JOHNACME BANK"). Safe on plain text (Kendo dataSource
+                # values pass through unchanged) and on HTML (DOM-fallback cells
+                # now carry innerHTML).
+                grantor = normalize_party_text(item.get("grantor", ""))
+                grantee = normalize_party_text(item.get("grantee", ""))
 
                 # Person-vs-company heuristic. For pre-foreclosure the
                 # homeowner can show up as either grantor or grantee

@@ -16,7 +16,11 @@ Lewis, Lincoln, Mason, Okanogan, Pacific, Spokane, Stevens, Thurston, Whitman
 """
 
 from src.api.middleware.security import add_scrape_domain
-from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.base_scraper import (
+    BridgeScraper,
+    ScrapedRecord,
+    normalize_party_text,
+)
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
 
@@ -581,6 +585,15 @@ class EagleWebScraper(BridgeScraper):
                         if (cells.length < 2) continue;
                         const desc = cells[0].textContent.trim();
                         const summary = cells[1].textContent.trim();
+                        // Party names (Grantor/Grantee) live inside this summary
+                        // cell and can stack multiple co-owners separated by
+                        // structural markup (<br>, nameSeperator). textContent
+                        // collapses those to a space, concatenating distinct
+                        // owners. Capture innerHTML too so the Python side can
+                        // run normalize_party_text() (separators -> " / ") before
+                        // the Grantor/Grantee regex. summary stays flat for the
+                        // date / parcel / legal-description parsing.
+                        const summaryHtml = cells[1].innerHTML.trim();
                         if (!desc || desc.length < 3) continue;
                         // Skip rows that are scripts or navigation (no date pattern)
                         if (desc.includes('function ') || desc.includes('var ')) continue;
@@ -594,7 +607,7 @@ class EagleWebScraper(BridgeScraper):
                         if (headerMap.parcel !== undefined && cells[headerMap.parcel]) {
                             parcel = cells[headerMap.parcel].textContent.trim();
                         }
-                        results.push({desc, summary, detailHref, parcel});
+                        results.push({desc, summary, summaryHtml, detailHref, parcel});
                     }
                     return results;
                 })()
@@ -613,6 +626,12 @@ class EagleWebScraper(BridgeScraper):
             for item in raw:
                 desc = item.get("desc", "")
                 summary = item.get("summary", "")
+                # Separator-preserving copy of the summary cell: structural
+                # markup (<br>, nameSeperator) that stacks multiple co-owners in
+                # the Grantor/Grantee portion becomes " / " instead of being
+                # collapsed to a space. Falls back to the flat summary if no HTML
+                # was captured. Date / parcel / legal parsing still uses `summary`.
+                party_summary = normalize_party_text(item.get("summaryHtml", "")) or summary
                 detail_href = item.get("detailHref", "")
                 table_parcel = item.get("parcel", "").strip()
 
@@ -641,15 +660,20 @@ class EagleWebScraper(BridgeScraper):
                 # because probate records often have no Grantee: label.
                 _LEGAL_STOP = r"(?:Grantee:|Legal[:\s]|Subdivision|Section\s*:|Section\s+\d|Lot\s+\d|Block\s+\d|Parcel[:\s]|Plat\s|Tract\s|$)"
 
-                # Parse Grantor
-                grantor_match = re.search(r"Grantor:\s*(.+?)" + _LEGAL_STOP, summary, re.DOTALL)
+                # Parse Grantor (from the separator-preserving party_summary so
+                # stacked co-owners keep their " / " boundary). Re-run
+                # normalize_party_text on the CAPTURED field so the field-boundary
+                # delimiter that may trail the value (e.g. a "<br>" between the
+                # Grantor and Grantee fields became " / ") is trimmed — without
+                # this the value could end in a stray " /" (Codex review).
+                grantor_match = re.search(r"Grantor:\s*(.+?)" + _LEGAL_STOP, party_summary, re.DOTALL)
                 if grantor_match:
-                    record.party_name = grantor_match.group(1).strip().rstrip(",")
+                    record.party_name = normalize_party_text(grantor_match.group(1)).rstrip(",")
 
                 # Parse Grantee
-                grantee_match = re.search(r"Grantee:\s*(.+?)(?:Grantor:|" + _LEGAL_STOP[4:], summary, re.DOTALL)
+                grantee_match = re.search(r"Grantee:\s*(.+?)(?:Grantor:|" + _LEGAL_STOP[4:], party_summary, re.DOTALL)
                 if grantee_match:
-                    grantee = grantee_match.group(1).strip().rstrip(",").rstrip(".")
+                    grantee = normalize_party_text(grantee_match.group(1)).rstrip(",").rstrip(".")
                     if grantee:
                         record.heirs = grantee
 

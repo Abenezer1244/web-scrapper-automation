@@ -21,7 +21,11 @@ Volume reference (Cowlitz 2026-04-12):
 import re
 
 from src.api.middleware.security import add_scrape_domain
-from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.base_scraper import (
+    BridgeScraper,
+    ScrapedRecord,
+    normalize_party_text,
+)
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.laserfiche")
@@ -316,6 +320,12 @@ class LaserficheWebLinkScraper(BridgeScraper):
                     if (cells.length < 6) continue;
                     // Extract text from each cell
                     const vals = Array.from(cells).map(c => (c.textContent || '').trim());
+                    // Party cells (grantor/grantee) can stack multiple co-owners
+                    // separated by structural markup (<br>, nameSeperator). Read
+                    // their innerHTML so those separators survive into
+                    // normalize_party_text() on the Python side — textContent
+                    // would collapse "OWNER A" + "OWNER B" into one token.
+                    const htmlOf = (i) => cells[i] ? (cells[i].innerHTML || '').trim() : '';
                     // Look for a date in position 2 (MM/DD/YYYY or M/D/YYYY)
                     const dateVal = vals[2] || '';
                     if (!/\\d{1,2}\\/\\d{1,2}\\/\\d{4}/.test(dateVal)) continue;
@@ -325,8 +335,8 @@ class LaserficheWebLinkScraper(BridgeScraper):
                         doc_type: vals[3] || '',
                         volume: vals[4] || '',
                         page_num: vals[5] || '',
-                        grantor: vals[6] || '',
-                        grantee: vals[7] || '',
+                        grantor: htmlOf(6),
+                        grantee: htmlOf(7),
                         parcel: vals[8] || '',
                     });
                 }
@@ -342,12 +352,13 @@ class LaserficheWebLinkScraper(BridgeScraper):
                 # Doc type
                 doc_type = item.get("doc_type", "").strip()
                 record.doc_type = doc_type if doc_type else None
-                # Grantor → party_name
-                grantor = item.get("grantor", "").strip()
+                # Grantor → party_name (HTML from the cell — normalize so
+                # stacked co-owners keep their " / " boundary).
+                grantor = normalize_party_text(item.get("grantor", ""))
                 if grantor:
                     record.party_name = grantor
                 # Grantee → heirs
-                grantee = item.get("grantee", "").strip()
+                grantee = normalize_party_text(item.get("grantee", ""))
                 if grantee:
                     record.heirs = grantee
                 # Parcel

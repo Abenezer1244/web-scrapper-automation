@@ -20,7 +20,7 @@ import re
 from datetime import datetime, timedelta
 
 from src.api.middleware.security import add_scrape_domain
-from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord, normalize_party_text
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.landmarkweb")
@@ -386,8 +386,12 @@ class LandmarkWebScraper(BridgeScraper):
                             if (/record.*#|recording.*#|instrument/i.test(header)) data.instrument = text;
                             else if (/record.*date|date.*record/i.test(header)) data.date_recorded = text;
                             else if (/doc.*type|document.*type|type/i.test(header)) data.doc_type = text;
-                            else if (/grantor|direct/i.test(header)) data.grantor = text;
-                            else if (/grantee|indirect/i.test(header)) data.grantee = text;
+                            // Party cells: read innerHTML so the structural
+                            // <div class='nameSeperator'></div> survives to Python's
+                            // normalize_party_text(). textContent would collapse
+                            // stacked co-owners in-browser before we can split them.
+                            else if (/grantor|direct/i.test(header)) data.grantor = (cell.innerHTML || '').trim();
+                            else if (/grantee|indirect/i.test(header)) data.grantee = (cell.innerHTML || '').trim();
                             else if (/legal/i.test(header)) data.legal = text;
                             else if (/parcel|apn/i.test(header)) data.parcel = text;
                             else if (!data.instrument && i === 0) data.instrument = text;
@@ -440,11 +444,12 @@ class LandmarkWebScraper(BridgeScraper):
                     if not matched:
                         continue
 
-                grantor = (item.get("grantor") or "").strip()
+                # Party names: normalize stacked owners (nameSeperator div) -> " / "
+                grantor = normalize_party_text(item.get("grantor"))
                 if grantor:
                     record.party_name = grantor
 
-                grantee = (item.get("grantee") or "").strip()
+                grantee = normalize_party_text(item.get("grantee"))
                 if grantee:
                     record.heirs = grantee
 

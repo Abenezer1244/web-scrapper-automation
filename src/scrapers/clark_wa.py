@@ -22,7 +22,7 @@ import re
 from datetime import datetime, timedelta
 
 from src.api.middleware.security import add_scrape_domain
-from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord, normalize_party_text
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.clark_wa")
@@ -298,9 +298,13 @@ class ClarkWAScraper(BridgeScraper):
                         if (!legal || t.includes('PID')) legal = t;
                     }
                 }
-                // Known positions (from Clark's structure)
-                if (cells[5]) grantor = cells[5].textContent.trim();
-                if (cells[6]) grantee = cells[6].textContent.trim();
+                // Known positions (from Clark's structure).
+                // Party cells: read innerHTML so the structural
+                // <div class='nameSeperator'></div> survives to Python's
+                // normalize_party_text(). textContent would collapse
+                // stacked co-owners in-browser before we can split them.
+                if (cells[5]) grantor = cells[5].innerHTML.trim();
+                if (cells[6]) grantee = cells[6].innerHTML.trim();
                 if (cells[7]) dateStr = dateStr || cells[7].textContent.trim();
                 if (cells[8]) docType = cells[8].textContent.trim();
                 if (cells[12]) recNum = cells[12].textContent.trim();
@@ -354,8 +358,9 @@ class ClarkWAScraper(BridgeScraper):
 
             record = ScrapedRecord()
             record.parcel_id = pid_match.group(1) if pid_match else None
-            record.party_name = (item.get("grantor") or "").strip()
-            record.heirs = (item.get("grantee") or "").strip()
+            # Party names: normalize stacked owners (nameSeperator div) -> " / "
+            record.party_name = normalize_party_text(item.get("grantor"))
+            record.heirs = normalize_party_text(item.get("grantee"))
             record.doc_type = (item.get("docType") or "").strip()
             record.legal_description = (item.get("recNum") or "").strip()
 

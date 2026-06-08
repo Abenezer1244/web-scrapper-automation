@@ -315,7 +315,7 @@ async def _get_founding_offer() -> dict:
     import json
 
     import redis.asyncio as aioredis
-    redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+    redis = aioredis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
     try:
         cached = await redis.get(_FOUNDING_CACHE_KEY)
         if cached is not None:
@@ -609,7 +609,7 @@ async def stripe_webhook(
     # the full-SaaS review. Stripe retries for up to 3 days, so we
     # keep the TTL at 3 days to cover the full retry window.
     import redis.asyncio as aioredis
-    redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+    redis = aioredis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
     try:
         event_id = event.get("id", "")
         if event_id:

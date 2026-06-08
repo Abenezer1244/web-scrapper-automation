@@ -33,6 +33,11 @@ class Settings(BaseSettings):
 
     # ─── Redis ────────────────────────────────────────────────────────────────
     REDIS_URL: str
+    # SECURITY (M1): verify the Redis server's TLS certificate by default.
+    # Overridable via env ONLY for a deployment whose broker presents a
+    # non-publicly-trusted cert. "none" disables MITM protection — avoid.
+    REDIS_SSL_CERT_REQS: str = "required"
+    REDIS_SSL_CA_CERTS: str = ""  # optional explicit CA bundle path
 
     # ─── Security ─────────────────────────────────────────────────────────────
     SECRET_KEY: str
@@ -233,19 +238,35 @@ class Settings(BaseSettings):
     def redis_kwargs(self, decode_responses: bool = True) -> dict:
         """Return kwargs for redis.from_url() with correct SSL config.
 
-        Upstash Redis uses custom TLS certificates not in the system CA store.
-        This is the single place where ssl_cert_reqs is configured.
+        SECURITY (M1): for rediss:// we VERIFY the server certificate. The
+        broker holds the JWT blacklist + brute-force/rate-limit counters, so a
+        MITM on the Redis link could undermine auth — cert verification closes
+        that. Upstash presents a publicly-trusted certificate (the billing.py
+        rediss:// clients already connect with redis-py's default "required"
+        and work in prod), so we pin ssl_cert_reqs="required" and point at
+        certifi's CA bundle so validation succeeds regardless of the
+        container's system CA store. REDIS_SSL_CERT_REQS is an env-only escape
+        hatch (set "none") in case a future broker uses a private cert chain.
 
         NOTE: redis-py's SSL context builder accepts the STRING
-        "none" (and "required" / "optional") here — not the
-        ssl.CERT_NONE integer constant. Passing ssl.CERT_NONE
-        directly crashes at connect time with
-        "RedisSSLContext object has no attribute cert_reqs".
-        Reverted from L5 after it took down register/login in prod.
+        "none"/"optional"/"required" here — NOT the ssl.CERT_NONE integer
+        constant, which crashes at connect with "RedisSSLContext object has no
+        attribute cert_reqs" (the L5 prod outage). Keep these as strings.
         """
         kwargs: dict = {"decode_responses": decode_responses}
         if self.REDIS_URL.startswith("rediss://"):
-            kwargs["ssl_cert_reqs"] = "none"
+            kwargs["ssl_cert_reqs"] = self.REDIS_SSL_CERT_REQS
+            # Only attach a CA bundle when actually verifying.
+            if self.REDIS_SSL_CERT_REQS != "none":
+                ca = self.REDIS_SSL_CA_CERTS
+                if not ca:
+                    try:
+                        import certifi
+                        ca = certifi.where()
+                    except Exception:
+                        ca = ""
+                if ca:
+                    kwargs["ssl_ca_certs"] = ca
         return kwargs
 
     def ensure_dirs(self) -> None:

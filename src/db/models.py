@@ -74,6 +74,12 @@ class User(Base):
     # rate-limited or unreachable — see the Phase 0 Codex adversarial
     # review of the auth fail-closed posture.
     revoked_at = Column(DateTime(timezone=True), nullable=True)
+    # MFA (H2): TOTP. mfa_secret_encrypted holds a Fernet token of the TOTP
+    # secret (src/utils/crypto.py) — never the raw secret. Backup codes live in
+    # the mfa_backup_codes table. mfa_enabled gates the login MFA challenge.
+    mfa_enabled = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    mfa_secret_encrypted = Column(Text, nullable=True)
+    mfa_enrolled_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -88,6 +94,23 @@ class PasswordHistory(Base):
     id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
     user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class MfaBackupCode(Base):
+    """One-time MFA backup codes (H2).
+
+    Stored as keyed HMAC-SHA256 hex digests, never plaintext. Each code is
+    consumed atomically (``used_at`` set under a row lock) so the same code
+    can't be replayed or used concurrently. Codes are shown to the user exactly
+    once, at enable time.
+    """
+    __tablename__ = "mfa_backup_codes"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    code_hash = Column(String(64), nullable=False)  # HMAC-SHA256 hex digest
+    used_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 

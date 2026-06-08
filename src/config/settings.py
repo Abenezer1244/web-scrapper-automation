@@ -41,6 +41,35 @@ class Settings(BaseSettings):
 
     # ─── Security ─────────────────────────────────────────────────────────────
     SECRET_KEY: str
+    # Field-level encryption key for sensitive DB columns (MFA TOTP secret now;
+    # H3 PII later). One or more urlsafe-base64 Fernet keys, comma-separated
+    # (first = encrypt, all = decrypt, for rotation). Generate:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # If blank, src/utils/crypto.py derives a key from SECRET_KEY via HKDF
+    # (works out-of-the-box; provision a dedicated key to decouple from JWT
+    # signing + enable rotation).
+    FIELD_ENCRYPTION_KEY: str = ""
+
+    @field_validator("FIELD_ENCRYPTION_KEY")
+    @classmethod
+    def field_encryption_key_must_be_valid(cls, v: str) -> str:
+        """Fail fast at config load on a malformed key, rather than at the first
+        encrypt/decrypt call. Blank is allowed (HKDF-from-SECRET_KEY fallback)."""
+        raw = (v or "").strip()
+        if not raw:
+            return v
+        from cryptography.fernet import Fernet
+        for key in (k.strip() for k in raw.split(",") if k.strip()):
+            try:
+                Fernet(key)
+            except Exception as exc:
+                raise ValueError(
+                    "FIELD_ENCRYPTION_KEY contains an invalid Fernet key "
+                    "(need urlsafe-base64 32-byte key(s), comma-separated). "
+                    "Generate: python -c \"from cryptography.fernet import Fernet; "
+                    "print(Fernet.generate_key().decode())\""
+                ) from exc
+        return v
 
     @field_validator("SECRET_KEY")
     @classmethod

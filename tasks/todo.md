@@ -6,6 +6,7 @@ break-glass codes); **implement in a fresh `/clear` session from this plan.**
 **Codex consult done (2026-06-08, high effort).** Recommended design below. **Codex flagged a CRITICAL
 pre-existing bug that is Step 0.**
 
+## ✅ STEP 0 — DONE (committed `434d440`, standalone). Details below kept for context.
 ## ⚠️ STEP 0 — CRITICAL pre-req (fix BEFORE amr; arguably ship standalone first)
 **Refresh tokens are valid access tokens.** `create_refresh_token` (src/api/auth.py:68) sets
 `aud="bridgeleads-api"` (same as access) and `purpose="refresh"`, but `decode_secure_token` only pins

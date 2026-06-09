@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.auth import CurrentUser
+from src.api.auth import CurrentUser, require_admin_mfa
 from src.api.deps import get_rls_db
 from src.api.middleware.rate_limit import rate_limit
 from src.api.schemas import (
@@ -252,7 +252,12 @@ async def delete_scraper(
 # ─── Admin: County connector management ──────────────────────────────────────
 
 
-@router.post("/connectors", response_model=ConnectorResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/connectors",
+    response_model=ConnectorResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin_mfa)],
+)
 async def create_connector(
     body: ConnectorCreate,
     current_user: CurrentUser,
@@ -260,17 +265,17 @@ async def create_connector(
 ) -> ConnectorResponse:
     """Add a new county connector. Agency plan only.
 
+    Access (H2-P5): require_admin_mfa gates this route. Creating a connector is a
+    state-changing admin op (it registers a new SSRF-allowlisted scrape target),
+    so it demands a STEP-UP session — admin + enrolled MFA + a fresh, MFA-backed
+    JWT (not an API key). Non-admins get 404; un-enrolled admins get 403
+    admin_mfa_enrollment_required; a stale or non-MFA session gets 403
+    admin_mfa_step_up_required. The inline is_admin check is gone — central
+    dependency so the gate can't drift per-endpoint (Codex HIGH).
+
     For AI-mode connectors, no Python scraper code is needed — just provide
     the county portal URL and Claude handles the rest.
     """
-    # Admin-only: return 404 (not 403) to non-admins so the endpoint's
-    # existence isn't confirmed to non-admin callers (enumeration defense).
-    if not current_user.is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Not found",
-        )
-
     # Check for duplicate
     result = await db.execute(
         select(CountyConnector).where(

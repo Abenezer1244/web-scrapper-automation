@@ -20,17 +20,36 @@ app = Celery(
 
 # Upstash Redis uses TLS (rediss://) — kombu needs explicit SSL config.
 #
-# Why the INT constant here, but the STRING "none" in settings.redis_kwargs():
-# the Celery/Kombu broker+backend path uses SYNC redis-py (kombu's redis
-# transport builds a redis.SSLConnection; Celery's result backend normalizes
-# both forms), and sync redis-py 5.2.1 accepts BOTH ssl.CERT_NONE and "none".
-# The direct app client uses redis.asyncio.from_url, whose RedisSSLContext
-# crashes on the int ("no attribute cert_reqs") — that's the prod outage
-# redis_kwargs() documents, and it does NOT apply to this sync worker path.
-# Do not "unify" these to the string without a live-broker smoke test; the int
-# is the form proven in production here. (Verified vs kombu 5.4 / redis-py 5.2.1.)
+# SECURITY (M1): VERIFY the broker certificate. This transport carries every
+# task payload (scrape results, skip-trace data, dialer pushes), so an
+# unverified TLS link is a MITM surface. Upstash presents a publicly-trusted
+# cert, so CERT_REQUIRED + certifi's CA bundle validates it. Mirrors
+# settings.redis_kwargs() and honors the same REDIS_SSL_CERT_REQS escape hatch.
+#
+# Why the ssl.* INT constants here, but the STRING form in redis_kwargs(): the
+# Celery/Kombu broker+backend path uses SYNC redis-py (kombu builds a
+# redis.SSLConnection) which takes the ssl module constants. The direct app
+# client uses redis.asyncio.from_url, whose RedisSSLContext crashes on the int
+# ("no attribute cert_reqs") and needs the string — that asymmetry is real, do
+# not unify the two forms. (kombu 5.4 / redis-py 5.2.1.)
 if settings.REDIS_URL.startswith("rediss://"):
-    _ssl_opts = {"ssl_cert_reqs": ssl.CERT_NONE}
+    try:
+        import certifi
+        _ca_default = certifi.where()
+    except Exception:
+        _ca_default = ""
+    if settings.REDIS_SSL_CERT_REQS == "none":
+        import logging
+        logging.getLogger("worker.bootstrap").warning(
+            "REDIS broker TLS cert verification is DISABLED "
+            "(REDIS_SSL_CERT_REQS=none) — MITM protection off on the broker."
+        )
+        _ssl_opts = {"ssl_cert_reqs": ssl.CERT_NONE}
+    else:
+        _ssl_opts = {"ssl_cert_reqs": ssl.CERT_REQUIRED}
+        _ca = settings.REDIS_SSL_CA_CERTS or _ca_default
+        if _ca:
+            _ssl_opts["ssl_ca_certs"] = _ca
     app.conf.broker_use_ssl = _ssl_opts
     app.conf.redis_backend_use_ssl = _ssl_opts
 

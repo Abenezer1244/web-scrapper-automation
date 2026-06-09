@@ -19,6 +19,270 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-08 — H2 Phase 5: admin MFA enforcement + step-up + break-glass
+
+**Built / Shipped (committed):** the full P5 stack on `security/checklist-h4-m2-m1`, one Codex-gated
+commit per step.
+- **Step A (`9278a39`):** `amr` + `auth_time` JWT claims. `_sanitize_amr` (subset of
+  {pwd,mfa,break_glass}, legacy/garbage→["pwd"]), strict `_coerce_auth_time` (rejects bool/float/str).
+  `AuthContext` + `get_auth_context` (decode-once); `get_current_user` is now a thin wrapper so every
+  existing `CurrentUser`/`get_rls_db` dep is untouched. login_mfa→["pwd","mfa"], register/pwd-login→
+  ["pwd"], `/auth/refresh` copies amr+auth_time UNCHANGED (never adds/drops mfa; missing auth_time→0).
+  API-key sessions: amr=[]/auth_time=None. 31 pure tests (`tests/test_token_amr.py`).
+- **Step B (`0612e08`):** `require_admin` (non-admin→404 hidden; admin+no-MFA→403
+  `admin_mfa_enrollment_required`) and `require_admin_mfa` (step-up: jwt + "mfa" in amr + auth_time fresh
+  15min, both-sided; API-key always fails). Applied: `/billing/activation-funnel`→require_admin (read,
+  + pre-gate IP limiter), `POST /scrapers/connectors`→require_admin_mfa (write). Inline is_admin checks
+  removed. 13 pure tests (`tests/test_admin_mfa_deps.py`).
+- **Step C1 (`a00e2a7`):** migration 045 `mfa_break_glass_codes` + model; `generate_break_glass_codes`
+  (128-bit, `bg-` format, same keyed-HMAC as backup codes); operator scripts `reset_user_mfa.py`
+  (revoke-first fail-safe) + `generate_break_glass.py` (revokes prior, prints once). 6 tests.
+- **Step C2 (`d725ee3`):** `POST /auth/login/break-glass` — RECOVERY-ONLY redemption. Consumes a code
+  atomically, clears MFA to un-enrolled, revokes all sessions + API key, burns sibling+backup codes,
+  mints a degraded `amr=["pwd","break_glass"]` session that can NEVER pass admin step-up. `revoke_all_
+  for_user` now returns its revoke instant. 7 CI-only integration tests (`tests/test_break_glass_login.py`).
+
+**Tried / Decided:** owner picked FORCE-ENROLL + step-up + BOTH break-glass mechanisms, RECOVERY-ONLY
+(break-glass session has no "mfa" amr). Connector-creation = step-up (write), funnel = enroll-only
+(read) — Codex-endorsed split. Mid-session the user asked "should RLS be on everywhere?" → answered:
+RLS is enabled but NOT enforced (app runs BYPASSRLS); cutover (H1) deferred as the prod-boot landmine,
+keep building. User chose continue.
+
+**Failed / Blocked:** the same-second-revoke problem ate ~4 Codex rounds in C2. Approaches rejected:
+(a) mint break-glass token with `iat=now+1` → **PyJWT rejects future iat** (ImmatureSignatureError); (b)
+revoke at `now-1` → leaves a same-second pre-existing token alive; (c) stamp revoked_at via DB
+`clock_timestamp()` → cross-clock skew vs API-minted iat. **Winner:** revoke at `now` (single API clock,
+captured right before the write, returned to caller), then WAIT until the wall clock passes that second,
+then mint a normal `iat=now` (>revoke_ts, not future). Fail-closed 503 if the clock never advances.
+
+**Caught & fixed (Codex gates):** A — refresh minted a FRESH "now" for an mfa token with missing
+auth_time (silent step-up bypass) + bool⊂int. B — funnel probes un-rate-limited after gating moved to a
+dep + future auth_time stayed fresh. C1 — reset script swallowed Postgres revoke failures (then even
+RedisError, defeating fail-closed) → revoke-first, any-failure=exit-3. C2 — schema cap 32<35-char codes;
+the 4-round same-second saga above.
+
+**Pending / Handoff:**
+- **H1-CUTOVER TODO (tracked in `provision_rls_roles.sql` + migration 045):** at RLS-enforce,
+  `bridgeleads_app` needs grants on `mfa_backup_codes` (043, pre-existing gap) + `mfa_break_glass_codes`,
+  reconciled with the script's no-app-DELETE invariant. Harmless today (RLS_ENFORCE=False/BYPASSRLS).
+- **Frontend break-glass affordance** (a "use a recovery code" link on the OTP step) — not in P5 backend scope.
+- **✅ FIXED this session (`ea9912a`):** `mfa_enable`/`mfa_disable` held a `with_for_update()` lock on
+  the users row then called `revoke_all_for_user`, whose own `async_engine.begin()` (NullPool = separate
+  connection) blocked on that lock while the request coroutine awaited it → app-level deadlock/hang.
+  Codex confirmed HIGH. Fix = in-session revoke: new `TokenBlacklist.update_revoke_cache` + stamp
+  `revoked_at` on the locked session, Redis-before-commit (503→rollback, fail-safe). **Codex diff-gate
+  CLOSED (`832f208`):** re-review found 2 follow-ups — [P1] update_revoke_cache SETEX-fail/DEL-ok was
+  unsafe pre-commit (cleared cache + concurrent reader backfills stale revoked_at, survives past commit)
+  → now ALWAYS raises on SETEX failure; [P2] mfa_disable didn't clear api_key_hash (API-key path ignores
+  revoked_at) → now cleared. Re-review CLEAN.
+- **Shipped via PRs (both Codex-gated CLEAN):** backend `web-scrapper-automation#13` (whole branch, ready
+  for merge — see operator prereqs below); frontend `bridgeleads-web#2` (DRAFT — break-glass recovery-code
+  UI on the login MFA step; HOLD until #13 deploys or it 404s in prod; Codex gate CLEAN).
+- **Accepted P2 (C2):** row-lock-wait can widen the revoke capture window; not closed via SELECT FOR
+  UPDATE (would deadlock the mfa_enable/disable flows above). Robust fix = token-version revocation.
+- migrations 044 + 045 are branch-only (apply at deploy via alembic-on-boot).
+
+**Facts learned:** PyJWT rejects future `iat`. `is_revoked_by_user_logout_all` uses `issued_at <=
+revoke_time` at whole-second precision (same-second login may need a retry) — so a same-request
+revoke+mint must wait a second. FastAPI dependency caching = `get_auth_context` decodes once even when
+both `get_current_user` and `require_admin*` depend on it. The Bash tool here is `/usr/bin/bash`, so
+`@'...'@` PowerShell here-strings + apostrophes in commit messages break it — use `git commit -F`.
+
+---
+
+## 2026-06-08 — CRITICAL fix: refresh tokens were valid access tokens
+
+**Built / Shipped (uncommitted):** Codex flagged this during the H2-P5 design consult. `create_refresh_token`
+minted a 7-day JWT with `aud="bridgeleads-api"` — the SAME audience as access tokens — and
+`get_current_user` never checked `purpose`, so **a refresh token authenticated any API endpoint**, not
+just `/auth/refresh`. Live pre-existing vuln; also P5's Step 0 (an `amr=["pwd","mfa"]` refresh token
+would have been a 7-day MFA bearer).
+- **Fix (src/api/auth.py):** distinct audiences — access `bridgeleads-api` + `purpose="access"`, refresh
+  `bridgeleads-refresh` + `purpose="refresh"`. `decode_secure_token` pins the access audience (refresh
+  tokens now fail the JWT audience check on the auth path). New `decode_refresh_token` pins the refresh
+  audience + purpose; `/auth/refresh` uses it. **Belt:** `get_current_user` also rejects
+  `purpose=="refresh"` — this neutralizes ALREADY-ISSUED legacy refresh tokens (old shared audience)
+  during their remaining 7-day life, which the audience split alone would NOT catch.
+- **Tests:** refresh token rejected by /auth/me; /auth/refresh still rotates + new access works + new
+  refresh still rejected; access token can't refresh; legacy-shaped (old-aud) refresh token rejected.
+
+**Tried / Decided:** audience split is the clean future gate (JWT-lib-enforced); the purpose belt is
+required for the migration window (legacy tokens keep the old aud). Codex review: code path CLEAN, no
+P1/P2; only P3 was "the legacy belt isn't tested" → added that test.
+
+**Failed / Blocked:** integration tests CI-only (prod-DB constraint); verified via py_compile + ruff +
+app-build + direct token-decode execution (incl. crafting a legacy-aud token and confirming the belt).
+
+**Caught & fixed:** the audience split alone leaves a 7-day hole for already-issued refresh tokens →
+added the `purpose=="refresh"` belt in get_current_user.
+
+**Pending / Handoff:** after deploy, existing old-aud refresh tokens can no longer refresh → affected
+clients re-login (frontend/next-auth does NOT use /auth/refresh, so no frontend impact). This is now
+DONE (was P5 Step 0) — the fresh P5 session can build amr/auth_time on top safely.
+
+**Facts learned:** distinct JWT audiences are enforced by the library at decode time, but they only
+protect tokens minted AFTER the change; a `purpose` belt is needed to retire in-flight tokens that
+carry the old audience.
+
+---
+
+## 2026-06-08 — H2 MFA Phase 4: TOTP replay prevention
+
+**Built / Shipped (uncommitted, branch `security/checklist-h4-m2-m1`):** closed the TOTP-replay window
+deferred from P3. Migration **044** adds `users.mfa_last_totp_counter BIGINT NULL`. New
+`verify_totp_counter()` (`src/utils/mfa.py`) returns the matched 30s timestep counter. Login's
+`_consume_second_factor` TOTP branch now does an **atomic guarded advance**: `UPDATE users SET
+mfa_last_totp_counter=:c WHERE id=:id AND mfa_enabled IS TRUE AND mfa_secret_encrypted IS NOT NULL AND
+(mfa_last_totp_counter IS NULL OR < :c) RETURNING id` — a code works exactly once; a replay advances 0
+rows and is rejected with no backup-code fallback. `/mfa/enable` seeds the counter from the enrollment
+code (can't be replayed into the first login); `/mfa/disable` is now replay-aware (counter > last,
+FOR-UPDATE-locked in-Python compare) and clears the counter. amr/auth_time claims deferred to P5
+(Codex's rec — inert until consumed).
+
+**Tried / Decided:** return the SINGLE matched counter (not max-of-window) → no advance-too-far lockout;
+on the ~1e-6 collision, prefer the highest (replay-safe). Seeding at enable is the documented trade-off
+(a login in the same 30s window as enrollment is rejected — "wait for next code"; enable revokes
+sessions so re-login is normally a fresh code anyway). Pre-build Codex consult upgraded nothing major;
+confirmed the atomic-UPDATE approach and flagged the seeding UX + enable/disable consistency.
+
+**Caught & fixed (Codex review gate, 3 rounds, before shipping):** R1 — seeding broke the existing
+`test_login_mfa_totp_completes_login` (logged in with the just-enrolled `.now()` code) → fixed to use
+counter+1; `/mfa/disable` used plain `verify_totp` so a login-consumed TOTP could be replayed to tear
+MFA down → made disable counter-aware. R2 — **NEW P2:** a `/login/mfa` that loaded the old secret
+before `/mfa/disable` could, after disable cleared state + committed, run its counter UPDATE (now NULL),
+advance, and mint a session POST-disable → fixed by adding `mfa_enabled`/`mfa_secret_encrypted` guards
+to the UPDATE WHERE, making it the single atomic gate. R3 CLEAN.
+
+**Failed / Blocked:** same as P3 — integration tests can't run locally (prod-only DATABASE_URL +
+destructive fixture); verified via py_compile + ruff + app-build + a direct `verify_totp_counter`
+execution check. Full suite runs in CI.
+
+**Pending / Handoff:** P5 (admin MFA enforcement + break-glass + amr/auth_time), H3 (PII-at-rest), H1
+(RLS, last). **Deploy:** migration 044 is branch-only — applies on prod via alembic-on-boot at deploy.
+
+**Facts learned:** a TOTP code maps to exactly one 30s counter, so single-counter return is correct and
+lockout-free. Concurrency on a shared `users` row needs the state guard IN the conditional UPDATE (not a
+prior SELECT check) — a TOCTOU between the unlocked SELECT in `login_mfa` and the row-locked UPDATE is
+real once a concurrent writer (`/mfa/disable`) clears the gating columns.
+
+---
+
+## 2026-06-08 — H2 MFA Phase 3: login challenge + frontend
+
+**Built / Shipped:** MFA now actually gates login, end-to-end, across both repos.
+- **3a backend** (`3539d2e`, branch `security/checklist-h4-m2-m1`): challenge-token model. `/auth/login`
+  returns a short-lived signed **MFA challenge token** (`aud=bridgeleads-mfa`, `purpose=mfa_challenge`,
+  300s, co-located with the reset-token family in `routes/auth.py`) when `mfa_enabled` — no session, no
+  brute-force clear. New `POST /auth/login/mfa` redeems `{mfa_token, code}` → `_consume_second_factor`
+  (TOTP, else **atomic** backup-code consume `UPDATE … WHERE used_at IS NULL RETURNING id`) → issues
+  the session. `LoginResponse` (optional tokens + `mfa_required` + `mfa_token`), `MfaLoginRequest`. 10
+  real-flow tests incl. a concurrent `asyncio.gather` race + a >threshold no-lockout test.
+- **3b frontend login** (`49d37a7`, bridgeleads-web master): 2-step login page (password → 6-digit
+  `InputOTP` + backup-code text mode). "Token adoption" — page calls the backend directly
+  (`loginStart`/`loginVerify`, raw fetch not `apiFetch`), then `signIn({accessToken})` purely to
+  materialise the Auth.js session; `authorize()` validates the access token via `/auth/me`.
+- **3c frontend enrollment** (uncommitted): `components/settings/security-tab.tsx` (extracted) + a
+  Security tab. Enable: setup → `QRCodeSVG` + copyable secret → verify → one-time backup codes. Disable:
+  password + 2nd factor. `qrcode.react@^4.2.0` (SBOM clean: zero runtime deps).
+
+**Tried / Decided:** Codex's pre-build consult **upgraded the architecture** from "overload `/auth/login`
+with an optional `mfa_code` + resend password" to the explicit **challenge-token + dedicated verify
+endpoint** (password never resent; clean home for rate-limit/expire/audit). Doctrine: docs silent →
+Codex wins. Bucket split `mfa-issue:{id}` vs `mfa-verify:{id}` so challenge farming can't exhaust the
+verify budget; bad MFA codes are NOT fed into the password brute-force bucket (no DoS-lockout of the
+real user). TOTP replay (±90s) deferred to P4 (documented inline). Extracted SecurityTab rather than
+inline the 1330-line settings page.
+
+**Caught & fixed (Codex review gate, before shipping — NO-GO on any Crit/High):**
+- 3a R1: **P1** stale challenge survived revocation → `is_revoked_by_user_logout_all(iat)` gate;
+  **P2** replay (jti never burned) → `consume_once` on success; **P2** backup-code RLS posture → bind
+  `app.current_user_id` to the proven challenge subject; **P2** bucket conflation. R2 CLEAN.
+- 3b R1: 3×P2 (double-submit, stale-response-after-back-out, backend-text leak) + 3×P3 → fixed via sync
+  in-flight ref + gen/mounted guards + fixed safe 401 copy + 6-digit gate + `!result.ok`. R3 residual
+  (session established if you navigate away mid-`signIn`) **accepted as not-a-defect** (valid 2FA already
+  submitted; user ratified).
+- 3c R1: **P1** — enable revokes the session, so a background-query 401→`signOut` could destroy the
+  one-time backup-code screen before the user saved them. Fixed over 4 rounds: suppress `apiFetch`'s
+  signOut-on-401 (armed in `onMutate`, unconditional unmount reset), render codes before any
+  query-driven branch, disable `mfa-status` while codes show, `setQueryData({enabled:true})`, and
+  thread HTTP `status` onto thrown errors so a real expiry-during-enable still redirects. R4 CLEAN.
+
+**Failed / Blocked:** Could NOT run the pytest integration suite locally — the only configured
+`DATABASE_URL` is **production Supabase** and the `db` fixture does unconditional table-wipes; running
+it would nuke prod. No local Postgres/Redis/docker available. Backend verified via py_compile + ruff +
+app-build + direct token-separation execution; full suite must run in CI. (This also re-confirmed
+migration 043 isn't on main/prod yet.)
+
+**Pending / Handoff:** P4 session hardening (TOTP last-counter replay), P5 admin MFA enforcement +
+break-glass, H1 `users` RLS self-row policy (keep `RLS_ENFORCE=False`). **Deploy ordering:** 043 must
+land on prod (alembic-on-boot) before the frontend MFA UI is meaningful; don't push frontend master
+ahead of the backend MFA deploy.
+
+**Facts learned:** both `/auth/mfa/enable` AND `/auth/mfa/disable` revoke ALL sessions server-side, so
+both frontend flows must end in an intentional `signOut`, never a cache refetch (it 401s). Auth.js v5
+`signIn` has no AbortSignal. The settings page runs ~6 authenticated queries with 30s stale +
+refetch-on-focus — any "show a secret once then session dies" flow there must globally suppress the
+401→signOut redirect or the secret is lost on focus-refetch.
+
+---
+
+## 2026-06-08 — 24-item security checklist audit + H4/M2/M1 fixes (uncommitted)
+
+**Built / Shipped (uncommitted):** Full-stack audit against a 24-control backend security
+checklist, cross-checked Claude (6 parallel agents) × Codex (independent pass). Report:
+`docs/security/SECURITY_CHECKLIST_AUDIT_2026-06-08.md`. Verdict: 9 COVERED, 11 PARTIAL, 1 MISSING,
+2 N/A — **0 Critical, 4 High, 8 Medium**. Then fixed 3 findings one-by-one, each Codex-reviewed:
+
+- **H4 (admin cred hygiene):** removed hardcoded creds from **18** dev/audit scripts (grep sweep
+  found 18, not the 8 first reported — rest hid behind Playwright `.fill()`, inline `"password":`
+  dicts, `os.environ.get(default=…)`). New `scripts/_creds.py` (`admin_creds`/`fixture_creds`/
+  `test_password`, env-sourced). `.gitignore` now covers `.env.*`. **Verified the real admin password
+  was NEVER in git** (`git log -S` empty) — corrected Claude's agent's false-Critical "in git history."
+- **M2 (PII in logs):** `email_fingerprint()` HMAC; `login_failure` + all 5 `auth_hardening` Redis-error
+  logs now fingerprint email (those use `getLogger`, bypassed the filter); email-mask + labeled-phone
+  redaction patterns; webhook logs keys-not-body; skip_trace download error drops the signed-URL
+  (`from None`). `main.py` installs a global redaction backstop.
+- **M1 (Redis TLS):** `ssl_cert_reqs` `none`→`required` + certifi CA bundle, env escape hatch
+  (`REDIS_SSL_CERT_REQS`); fixed the **Celery broker/backend** (`workers/__init__.py`, still
+  `ssl.CERT_NONE`) and 2 call sites bypassing `redis_kwargs()`. All 8 Redis `from_url` sites now consistent.
+
+**Tried / Decided:** phone redaction is LABELED-only (`phone=`) on purpose — a bare 10-digit regex
+would clobber county parcel IDs in scraper logs. Email masked (local-part) not dropped, to keep ops
+logs usable. M1 kept the ssl.* INT constants for the Celery/kombu path (string form crashes
+`redis.asyncio` — the documented L5 outage); only flipped NONE→REQUIRED.
+
+**Caught & fixed (Codex, before shipping):** false-Critical git-history claim (disproven); the
+filter only covers `setup_logger` handlers (→ source-level fingerprinting); a 5th raw-email log in
+`clear()`; `__cause__` traceback could still print the signed URL (→ `from None`); **the Celery broker
+itself still used `ssl.CERT_NONE`** (the biggest miss — settings.py alone didn't fix M1).
+
+**Failed / Blocked:** `.env.example` reads blocked by harness env-file protection — appended the two
+new `REDIS_SSL_*` keys via PowerShell write instead.
+
+**Committed on branch `security/checklist-h4-m2-m1`:** audit `7f10adf`, H4 `ec857f9`, M2 `fe3976b`,
+M1 `87150bf`. Then **H2 MFA Phases 1-2**: P1 `d9ccd1a` (migration 043 users.mfa_* + mfa_backup_codes
+table w/ RLS; `src/utils/crypto.py` Fernet field-encryption keyed from FIELD_ENCRYPTION_KEY/HKDF —
+shared with H3; pyotp+cryptography pinned). P2 `8150477` (`src/utils/mfa.py` TOTP + HMAC backup codes;
+`/auth/mfa/status|setup|enable|disable`; FOR UPDATE on user row, per-user throttle, revoke-on-enable).
+Each Codex-reviewed; Codex caught the missing RLS on the new tenant table (H2-P1) + the
+enrollment race (H2-P2 High) — both fixed.
+
+**Pending / Handoff:** (1) **USER must rotate the live `admin@bridgeleads.io` password** + set
+`BRIDGELEADS_ADMIN_PASSWORD`/`BRIDGELEADS_FIXTURE_PASSWORD` env. (2) **Verify Redis still connects with
+CERT_REQUIRED in Railway** on deploy — escape hatch `REDIS_SSL_CERT_REQS=none` if it fails. (3) Branch
+unpushed — verify Redis on deploy BEFORE merging to main (auto-deploys). (4) **H2 remaining: P3 login
+MFA challenge + next-auth 2-step frontend (riskiest — login-contract change), P4 session hardening, P5
+admin-enforced + break-glass.** Then **H3 PII-at-rest** (use `src/utils/crypto.py`), then **H1 RLS
+enforcement** (prod-boot landmine; cutover must add a `users` self-row policy — RLS is enabled on
+`users` with NO policy today, found during H2).
+
+**Facts learned:** `auth_hardening.py`/`rate_limit.py` use `logging.getLogger` directly, NOT
+`setup_logger` → the redaction filter never ran there. `billing.py` rediss:// clients already verified
+certs by default and worked in prod → proof Upstash uses public certs (the "custom CA" comment was
+wrong). Celery `broker_use_ssl` wants `ssl.*` int constants; `redis.asyncio.from_url` wants the string.
+
+---
+
 ## 2026-06-08 — Multi-owner party_name de-concatenation (King; Pierce pending)
 
 **Built / Shipped (uncommitted):** user noticed skip-traced leads' party_name like

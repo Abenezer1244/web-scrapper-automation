@@ -20,6 +20,8 @@ python-dotenv==1.0.1
 PyJWT[crypto]==2.9.0
 bcrypt==4.2.1
 passlib[bcrypt]==1.7.4
+pyotp==2.9.0                 # TOTP (MFA, H2)
+cryptography==43.0.0         # Fernet field encryption (MFA secret; H3 PII later) — was transitive via PyJWT
 
 # Task queue
 celery[redis]==5.4.0

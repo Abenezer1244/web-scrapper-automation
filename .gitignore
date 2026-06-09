@@ -27,8 +27,10 @@ wheels/
 .venv/
 venv/
 
-# Environment variables
+# Environment variables (all variants; keep the documented example tracked)
 .env
+.env.*
+!.env.example
 
 # IDE
 .vscode/

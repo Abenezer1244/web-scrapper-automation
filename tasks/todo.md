@@ -1,287 +1,346 @@
-# Post-Milestone Build — Snohomish Tax Scraper (Thread 1 of 3)
+# H2 Phase 5 — Admin MFA enforcement + step-up + break-glass — PLAN (implement in a fresh session)
 
-Direction (user): do all 3 post-milestone threads **one-by-one**, **Codex-verifies each**,
-via a **dynamic workflow**, **security is priority**.
-Order: (1) Snohomish tax scraper → (2) DNC scrubbing → (3) native dialer connectors.
+**Decisions (owner):** FORCE-ENROLL + STEP-UP; BOTH break-glass mechanisms (operator script + in-app
+break-glass codes); **implement in a fresh `/clear` session from this plan.**
 
-## Research + security review — DONE (dynamic workflow `wf_0e4598c4-344`, salvaged)
-- Snohomish research + adversarial security review COMPLETE (verdict GO-WITH-FIXES).
-- Native-dialer-connectors research + security COMPLETE (thread 3, parked).
-- DNC research agent ran away (1h45m) → killed; DNC was predicted blocked-on-decision anyway (thread 2).
+**Codex consult done (2026-06-08, high effort).** Recommended design below. **Codex flagged a CRITICAL
+pre-existing bug that is Step 0.**
 
-## LIVE FILE INVESTIGATION — DONE (the required precondition)
-Source: Snohomish "Current Tax List" — `…/DocumentCenter/View/149173/snohomish_tax_data_totals`
-(linked off `…/5568/Treasurer-Public-Records`, updated monthly, **doc-ID rotates**).
-- **Pipe-delimited `.txt`, NO header row, 17 cols, 325,043 rows, 44.7 MB**, UTF-8 BOM, `\r\n`.
-- **No HTTP redirect** (direct 200) — disproves the security review's "302" High.
-- Columns: `0`=parcel/account, **`1`=tax/bill YEAR**, `2`=situs addr, `4`=situs city, `5`=st, `6`=zip,
-  `7`=owner, `10/11/12`=mailing city/st/zip, `13`=as-of date, `14`=total annual,
-  `15`=half installment, **`16`=amount owed/balance**.
-- `parcel len`: 304,477 are **14-digit real property** (target) + 20,566 7-digit personal-property (exclude).
-- **Delinquent set = 14-digit parcel AND `year < current` AND `owed(col16) > 0` → 10,548 accounts.**
-  col16==col15 for all 10,548; col16==col14 for 8,948. Amounts already clean numerics (no `$`/commas).
-- A parcel can recur across years → **aggregate per parcel: sum owed, MIN(year)=oldest=most months delinquent.**
+## ✅ STEP 0 — DONE (committed `434d440`, standalone). Details below kept for context.
+## ⚠️ STEP 0 — CRITICAL pre-req (fix BEFORE amr; arguably ship standalone first)
+**Refresh tokens are valid access tokens.** `create_refresh_token` (src/api/auth.py:68) sets
+`aud="bridgeleads-api"` (same as access) and `purpose="refresh"`, but `decode_secure_token` only pins
+aud and `get_current_user` never checks `purpose`. So a 7-day refresh token authenticates ANY request.
+Today that's a latent priv/longevity bug; with P5 it becomes a 7-day **MFA-backed** bearer.
+- **Fix:** give refresh tokens a DISTINCT audience (`bridgeleads-refresh`) OR make `get_current_user`
+  reject `payload.get("purpose") == "refresh"`. Add `purpose="access"` to access tokens. `/auth/refresh`
+  must still accept only refresh-purpose tokens (it decodes via `decode_secure_token` today — verify it
+  pins refresh purpose after the change). Add a test: a refresh token is rejected by `/auth/me`.
 
-## Mapping to existing Phase 4 infra (ZERO API/UI/migration-column change)
-- `delinquent_amount` ← sum(col16) per parcel
-- `delinquent_bill_year` ← min(col1) per parcel (true tax year, King Jan-1 semantic family → months filter works)
-- `party_name` ← owner (col7); `property_address` ← situs (col2 + city/st/zip); `mailing_address` ← mailing
-- `enrichment_data.source` = `"snohomish_county_delinquent_taxes"` (gates `_extract_tax_fields`)
+## ✅ STEP A — DONE (Codex round-2 CLEAN; UNCOMMITTED). py_compile + ruff clean; 31 pure tests pass.
+**Shipped:** `create_secure_token`/`create_refresh_token` gained `amr`+`auth_time` params (access also
+already `purpose="access"`); `_sanitize_amr` (subset of {pwd,mfa,break_glass}, legacy→["pwd"]);
+`_coerce_auth_time` (STRICT — rejects bool/float/str). `AuthContext` dataclass + `get_auth_context`
+(decode-once: API-key→amr=[]/auth_time=None; jwt→sanitized amr/coerced auth_time); `get_current_user`
+now a thin wrapper (FastAPI dep-cache = single decode). Routes: register/login→["pwd"], login_mfa→
+["pwd","mfa"], `/auth/refresh` copies amr+auth_time UNCHANGED (never adds/drops mfa).
+`tests/test_token_amr.py` (31 pure tests, no DB). `CurrentAuth` type alias added.
+**Codex gate:** R1 [P1] (refresh minted FRESH "now" for an mfa token w/ missing/garbage auth_time →
+silent step-up-passing session) + [P3] (bool⊂int). FIXED: refresh substitutes 0 (stale epoch) not None;
+`_coerce_auth_time` rejects bool. **R2 CLEAN.**
 
-## Security fixes folded in (from adversarial review + live facts)
-- [HIGH-confirmed] **44.7 MB download → worker OOM.** Add size-capped STREAMING download helper to
-  `safe_http.py` (stream=True, per-hop SSRF revalidate, abort > `Settings.MAX_DOWNLOAD_BYTES`), write to
-  temp file, parse line-by-line, filter delinquent in the loop. NEVER materialize 325K rows in RAM.
-- [HIGH-downgraded] redirect → none live, but helper still follows+revalidates per hop (future-proof).
-- [HIGH-resolved] months semantic → real bill-year col exists; populate directly, do NOT synthesize from CoD PDFs.
-- [MED] **doc-ID rotation** → connector base_url = stable landing page; scraper parses the current
-  "Current Tax List" link (exclude the "description of the fields" anchor) before download.
-- [MED] **canary** → 0 delinquent rows parsed ⇒ raise (job FAILS loudly), never silent-empty.
-- [LOW] all human fields → first-class `ScrapedRecord` cols (exporter `sanitize_for_csv`); none raw from enrichment_data.
-- [LOW] errors → reference-id/clean operator message on download/parse failure; no silent-swallow (the
-  `_run_inline_enrichment` landmine); fail loudly.
-- SSRF allowlist: `add_scrape_domain("www.snohomishcountywa.gov")` at module top (worker importlib picks it up).
+## Step A — amr/auth_time + AuthContext  (original plan below)
+- `create_secure_token(user_id, amr=["pwd"], auth_time=now)` + `purpose="access"`;
+  `create_refresh_token(user_id, amr=["pwd"], auth_time=now)`. login/register → `["pwd"]`; login_mfa →
+  `["pwd","mfa"]`; auth_time=now.
+- `/auth/refresh`: sanitize amr (intersect `{pwd,mfa,break_glass}`, default `["pwd"]` for old tokens),
+  copy amr + auth_time UNCHANGED into both new tokens. **Never add `mfa` on refresh** (no escalation);
+  never drop it (no silent downgrade).
+- **AuthContext (Codex's pick over request.state / ORM attrs / re-decode):** new `get_auth_context()`
+  decodes once → `{user, auth_method: "jwt"|"api_key", amr, auth_time, jti, payload}`. `get_current_user`
+  becomes a thin wrapper returning `ctx.user` (keeps all existing `CurrentUser` deps working).
 
-## Plan (phased, ≤5 files/phase, TDD, verify each)
+## ✅ STEP B — DONE (Codex round-2 CLEAN; UNCOMMITTED). py_compile + ruff clean; 44 pure tests pass.
+**Shipped:** `require_admin` (non-admin→404 hidden; admin+mfa_enabled=False→403 `admin_mfa_enrollment_required`)
+and `require_admin_mfa` (layers on require_admin: auth_method=="jwt" AND "mfa" in amr AND auth_time fresh
+[15min window, both-sided: stale>900s OR future<-60s skew → fail]; API-key always fails). `RequireAdmin`/
+`RequireAdminMfa` aliases. Applied: `billing.py /activation-funnel` → `require_admin` (read-only, enroll-
+only) with new IP-keyed `_rate_limit_activation_funnel` dep FIRST (before gate); `scrapers.py POST
+/connectors` → `require_admin_mfa` (state-changing, registers SSRF target → step-up). Inline is_admin
+checks removed (central dep, Codex HIGH: won't drift). `tests/test_admin_mfa_deps.py` (13 tests).
+**Codex gate:** R1 0 P1, [P2] funnel probes un-rate-limited after gate moved to dep (no global limiter) +
+[P3] future auth_time stayed fresh. FIXED: pre-gate IP limiter + both-sided freshness. **R2 CLEAN.**
+**Decision (Codex-endorsed):** funnel=enroll-only (read), connector=step-up (write). Dropped now-unused
+current_user/request params from funnel body.
 
-### Phase A — safe_http size-capped download + settings  ✅ (commit ae8e61b)
-- [x] `settings.py` + `.env.example`: `MAX_DOWNLOAD_BYTES` default 100 MB (104857600) — Codex-lowered from 250.
-- [x] `safe_http.py`: `safe_download_to_file()` per-hop validate, stream, byte-cap abort, assert 200 + non-empty;
-      cap logic extracted to pure `_stream_capped()`.
-- [x] Tests in `test_safe_http.py` (mirrors src): 11 new — SSRF/https/cap-arg guards + `_stream_capped` real-I/O.
+## Step B — admin enforcement dependencies  (original plan below)
+- `require_admin(ctx)`: non-admin → **404** (endpoint hiding, matches current behavior); admin with
+  `mfa_enabled=False` → **403 `admin_mfa_enrollment_required`**.
+- `require_admin_mfa(ctx)` (step-up): `require_admin` AND `auth_method=="jwt"` AND `"mfa" in amr` AND
+  **auth_time fresh (< 15 min)** → else **403 `admin_mfa_step_up_required`**. **API-key sessions always
+  fail step-up** (no amr/auth_time).
+- Apply to the 2 existing admin endpoints: `billing.py:~23` (activation-funnel) + `scrapers.py:~255`
+  (connector creation). Replace inline `is_admin` checks with the dependency (Codex HIGH: inline checks
+  will drift). Frontend: do NOT hide Settings behind an admin-gated 403 (no-MFA admin must reach enroll).
 
-### Phase B — Snohomish scraper  ✅ (commit 8fc1c12)
-- [x] `snohomish_wa_tax_delinquent.py` — pure-HTTP scraper; landing-link resolver (excludes desc twin);
-      capped temp download + finally-cleanup; stream-parse; filter (14-digit + year<as_of + owed>0);
-      per-parcel aggregate (sum owed, min year); year-level enrichment detail; structural-validation canary.
-- [x] `tests/test_snohomish_tax.py` — 8 tests on REAL captured rows: multi-year aggregation, exclusions,
-      malformed counting, link selection + id-rotation + no-link-raises.
+## ⏳ STEP C — IN PROGRESS. Decisions: FULL break-glass; RECOVERY-ONLY (break-glass session amr=
+## ["pwd","break_glass"], NO "mfa" → can never pass require_admin_mfa). RLS-enforce stays OFF (user
+## confirmed continue; H1 cutover deferred — grant gap tracked in provision_rls_roles.sql + 045).
 
-### Phase C — wire-up: source gate + registry + migration  ✅ (commit 34b06b8)
-- [x] `tasks.py` — `_extract_tax_fields` gate → `_TRUSTED_TAX_SOURCES` frozenset (King + Snohomish).
-- [x] `registry.py` — module added to `_ALLOWED_SCRAPER_MODULES`.
-- [x] `alembic/versions/040_*.py` — idempotent `county_connectors` INSERT; base_url = stable landing page.
-- [x] +4 gate tests (Snohomish string-amount/int-year trusted; lookalike source ignored).
+### ✅ C1 — DONE (Codex round-3 CLEAN; UNCOMMITTED). compile+ruff clean; 50 pure tests pass.
+**Shipped:** migration 045 `mfa_break_glass_codes` (id,user_id,code_hash,batch_id,created_by,
+created_reason,expires_at,used_at/used_ip/used_user_agent,revoked_at; RLS mirrors 043). Model
+`MfaBreakGlassCode`. `generate_break_glass_codes` (128-bit, `bg-` format, same keyed-HMAC as backup
+codes). Operator scripts (railway run): `reset_user_mfa.py` (revoke-FIRST fail-safe → clear MFA + delete
+backup+break-glass codes; any revoke failure = exit 3, nothing cleared) + `generate_break_glass.py`
+(revokes prior unused by default, prints once to stdout only, FOR UPDATE). `tests/test_break_glass.py` (6).
+**Codex gate:** R1 [P1] reset swallowed ALL revoke exceptions + [P2] cutover grant gap. R2: P1 partial
+(swallowing RedisError still defeats fail-closed) + P2 accepted-deferred. R3 CLEAN (revoke-first, any
+failure=exit 3). **H1-CUTOVER TODO recorded:** bridgeleads_app needs grants on mfa_backup_codes (043,
+pre-existing gap) + mfa_break_glass_codes — blocked on reconciling app-DELETE vs the script's no-DELETE
+invariant. Harmless today (RLS_ENFORCE=False/BYPASSRLS).
 
-### Phase D — verify + Codex review + ship
-- [x] py_compile / ruff (my files clean; tasks.py+registry.py pre-existing errors = on main, out of scope) /
-      pytest (50 touched tests green; full suite collects 334, no import breakage).
-- [~] Security Master Review (§14) on the diff — self-review below.
-- [~] **Codex review the diff** (`codex review --base main`) — RUNNING. Critical/High from either = NO-GO.
-- [ ] Live Railway smoke (scrape Snohomish tax_delinquent, confirm rows + delinquent_amount populated) — needs deploy.
-- [ ] Merge to main (migration 040 deploy-order note), update BUILD_JOURNAL + memory.
+### ✅ C2 — DONE (Codex round-5; no Crit/High; 1 documented-accepted P2). compile+ruff clean; 51 pure tests.
+**Shipped:** `POST /auth/login/break-glass` (reuses the 5-min challenge token). Flow: IP limit → decode →
+per-user `mfa-breakglass:{id}` limit → RLS bind → revocation gate (503 fail-closed) → load user
+(active+mfa_enabled) → ATOMIC consume (UPDATE...RETURNING, unused/unrevoked/unexpired) → burn jti →
+revoke_all_for_user → recovery txn (clear MFA + delete backup + revoke sibling break-glass + clear API key)
+→ commit → WAIT for clock to pass revoke second → mint DEGRADED session `amr=["pwd","break_glass"]` (NO
+"mfa"). `BreakGlassLoginRequest` schema (code max_length=64). `revoke_all_for_user` now RETURNS the
+revoke datetime (single API clock w/ JWT iat). `tests/test_break_glass_login.py` (7 CI-only integration tests).
+**Codex gate (5 rounds):** R1 [P1] schema cap 32<35 + [P1] now-1 missed same-second tokens. R2 [P1] stale
+early `now` capture. R3 [P1] Python pre-write capture window + [P3] wait-loop fell through. R4 [P2]
+clock_timestamp introduced cross-clock skew. R5 [P2 ACCEPTED] row-lock-wait extends capture window —
+NOT fixed via SELECT FOR UPDATE because mfa_enable/disable call revoke_all_for_user while holding a users
+FOR UPDATE lock → would deadlock; inherent timestamp-precision limit, robust fix = token-versioning (separate).
+**Same-second-revoke solved:** revoke at now (catches same-second sessions), WAIT until clock>revoke_ts, mint
+iat=now (no future iat — PyJWT rejects future iat). fail-closed 503 if clock never advances.
+**⚠️ NOTE for user:** pre-existing concern observed — mfa_enable/mfa_disable call revoke_all_for_user while
+holding a `with_for_update()` lock on the users row; the separate-txn UPDATE inside contends with that lock.
+Apparently works in prod but worth verifying (NOT introduced by P5). **Frontend break-glass affordance =
+follow-up (not in P5 backend scope).**
 
-## Security self-review (Master §14, BridgeLeads non-negotiables)
-- **SSRF:** download host fixed county-gov (`add_scrape_domain` at module top + base_url host seeds allowlist);
-  `safe_download_to_file` revalidates EVERY hop (`resolve=True`), `require_allowlisted=True`, `require_https=True`,
-  refuses scheme downgrade; landing fetch via `safe_get(require_allowlisted=True)`. ✅
-- **DoS/OOM:** hard byte cap (`MAX_DOWNLOAD_BYTES`) + early Content-Length reject + stream-to-disk + per-parcel
-  aggregate (never 325K rows in RAM). ✅
-- **CSV injection:** owner/situs/mailing → first-class `ScrapedRecord` cols (export `sanitize_for_csv` covers);
-  nothing surfaced raw from `enrichment_data`. ✅
-- **Tenant isolation:** no new queries; insert path keeps existing `user_id=job.user_id`; source-gate purely
-  transforms enrichment_data. ✅
-- **Source-gate trust:** frozenset exact-match; lookalike/untrusted sources ignored (tested); bounds/Decimal intact. ✅
-- **Silent-empty / wrong-file:** structural validation (17-field, malformed-ratio) + zero-parcel canary → FAIL loudly,
-  no silent-swallow. ✅
-- **Secrets:** none added (public county data, no auth). ✅
-- **Error leakage:** failures raise clean `RuntimeError`/`ValueError` (operator messages, no raw URL/stack to client;
-  worker FAILED path attaches reference id as today). ✅
-- **TCPA/DNC:** scraper emits no phones; `phone_dnc_flag` stays NULL → excluded from default dialer-ready set. ✅
+## ✅ H2 PHASE 5 COMPLETE (Step 0 + A + B + C1 + C2). See per-step blocks above.
 
-## Pre-code gate
-- [x] **Consult Codex on this approach** (session `019e9b22…`) — DONE. Approach sound, no architectural change.
-  Reconciled refinements folded in (all adopted):
-  - **Structural validation (not just zero-row canary):** expect 17 pipe-fields/row, col1 = 4-digit year;
-    track malformed-row count, FAIL if malformed-rate high OR expected structure missing → catches the
-    "county swapped the file, we parse the WRONG file but nonzero" silent failure (Codex's #1 prod risk).
-  - **Year granularity in enrichment_data:** `delinquent_years[]`, `delinquent_year_count`, `oldest_tax_year`,
-    `as_of_date` (col13) — audit/debug, don't collapse to just sum+min.
-  - **bill_year is APPROXIMATE** (WA halves due Apr30/Oct31, not Jan1): keep `min(year)` for King-compat,
-    document as approximation (both reviewers agree it's acceptable; same semantic family as King).
-  - **MAX_DOWNLOAD_BYTES default = 100 MB** (104857600), not 250 MB — 512 MB worker under concurrency.
-  - **Temp file:** `NamedTemporaryFile(delete=False)` + guaranteed `finally` unlink (Windows handle care).
-  - **Test matrix:** parser/aggregation fixture; landing-link selection excludes "description of the fields"
-    anchor; `_extract_tax_fields` IGNORES non-allowlisted source even with tax-looking fields; end-to-end
-    source-string → both columns populated. + INFO metrics (bytes, rows, malformed, delinquent, parcels, oldest yr, total $).
+## Step C — break-glass (BOTH)  (original plan below)
+- **New table `mfa_break_glass_codes`** (migration 045 — NOT reuse MfaBackupCode): `user_id, code_hash,
+  batch_id, created_by, created_reason, expires_at, used_at, used_ip, used_user_agent, revoked_at`.
+- `scripts/reset_user_mfa.py` (railway run): clear MFA (enabled/secret/counter) + delete backup codes +
+  revoke sessions + audit. Operator-authenticated by Railway DB/env access.
+- `scripts/generate_break_glass.py` (railway run): generate N high-entropy codes, store hashes, print
+  once. Uses the `scripts/_creds.py` env pattern.
+- **Redemption:** through the existing challenge flow (password already verified) — single-use atomic
+  consume, rate-limited, revoke sessions+API key on success, LOUD audit. Resulting token
+  `amr=["pwd","mfa","break_glass"]`; block destructive admin ops until normal TOTP re-enrolled OR allow
+  only a 5-min emergency window.
 
-# Thread 3 — Dialer connectors (full build, user-approved). Codex design consult done (session 019e9b22 follow-up).
-Codex raised the bar: per-contact OUTBOX is required (PhoneBurner has no bulk endpoint → 500 POSTs →
-partial-success silent loss). Refined scope to bound blast radius:
-- **Phase A ✅ (c0943d4):** connector seam (ABC + GenericWebhookConnector byte-identical + dialer_type
-  discriminator + sweep dispatch). 7 tests. No transport change.
-- **Phase B foundation ✅ `fd06201`** (model + migration 041). **Phase B/C ✅ `fd677f0`:** process_dialer_outbox
-  transport (creds re-read at send time, host allowlist, owner-match, response redaction, per-row state) +
-  sweep vendor branch + materialize helper + replay endpoint + PhoneBurner connector + DeliverConfig creds
-  (token write-only) + 17 tests. 4 HIGH fixes implemented. **Codex review of full Thread 3 diff: RUNNING.**
-  Remaining: live smoke (needs user PhoneBurner creds). _Original Phase B/C scope below:_
-- **Phase B (vendor-only outbox — generic path UNTOUCHED):** `dialer_delivery` outbox table (migration 041:
-  id, job_id, result_id, user_id, scraper_config_id, vendor_id, status[pending|delivered|failed],
-  attempts, last_error, vendor_response_code, vendor_contact_id, created_at, delivered_at). Sweep: for a
-  VENDOR dialer_type, claim job → INSERT one outbox row per lead → enqueue chunked processor; GENERIC stays
-  on the existing deliver_job_webhook path (no billing-path change). New `process_dialer_outbox` task:
-  re-reads config from DB (owner-match ScraperConfig.user_id==Job.user_id + Result.user_id), builds vendor
-  request via connector, POST host-allowlisted + response redacted, updates per-row status/last_error;
-  creds built at send time (never a task arg). Replay endpoint (user_id-scoped) resets failed→pending.
-  NOTE: generic catch-hook-URL-in-args is PRE-EXISTING status quo, not regressed; hardening it = documented follow-up.
-- **Phase C:** PhoneBurner connector (contact-creation ONLY, host allowlist www.phoneburner.com, OAuth
-  Bearer + owner_id from deliver config, extra=forbid + token validators). Live smoke needs user creds.
+## Minimum safe slice (if cutting scope)
+Step 0 + Step A + AuthContext + `require_admin`/`require_admin_mfa` + apply to the 2 endpoints + reject
+API keys for step-up + the operator reset script. **Defer in-app break-glass codes.** Do NOT ship admin
+enforcement without Step 0.
 
-## Review — Thread 1 (Snohomish) SHIPPED + LIVE ✅
-- Merged to main (`9a70bab`), pushed, deployed — health 200 (migration 040 applied on boot).
-- **Live smoke against the real source:** 44.7 MB / 325,043 rows / 0 malformed → 10,548 delinquent rows →
-  **4,269 parcels, all with delinquent_amount + bill_year**, $16.3 M total owed. Multi-year aggregation
-  confirmed (VERIZON 2023+2024+2025 = $2,376.01). ZERO API/UI/migration-column change.
-- Codex consult (pre-build) + Codex diff review (1 P2 found + fixed, no Critical/High). 58 tests, ruff-clean.
-- Prod-API connector check blocked by permission classifier (not in deploy scope) — health-200 +
-  idempotent migration + live smoke stand as proof.
+## Severity flags from Codex
+- **CRITICAL:** refresh-token-as-access (Step 0). **HIGH:** sparse inline admin checks → central dep.
+  **HIGH:** API-key has no amr → must reject for step-up.
 
-## Next threads (2 & 3)
-- **Thread 2 — DNC scrubbing:** BLOCKED-ON-DECISION (legal/vendor). Needs: can BridgeLeads scrub the
-  federal DNC registry + pass the flag to customers, or is that the customer's SAN/responsibility? Which
-  vendor (DNC.com / Contact Center Compliance / etc.) + budget? No real DNC source ⇒ nothing to build
-  (no-mock rule). Surfaced to user.
-- **Thread 3 — native dialer connectors:** research done, DEMAND-GATED. Smallest useful step = the
-  DialerConnector abstraction seam + ONE reference connector, built when a paying customer names a dialer.
+## Tests to write
+refresh token rejected by /auth/me; amr=["pwd"] vs ["pwd","mfa"]; refresh preserves amr+auth_time and
+never adds mfa; require_admin 403 for no-MFA admin; require_admin_mfa 403 for API-key + stale auth_time +
+pwd-only session, 200 for fresh mfa session; break-glass single-use + audit; operator reset clears MFA.
 
 ---
 
-# Multi-contact: 3 phones + 3 emails per lead (2026-06-07) — IN PROGRESS
+# H2 Phase 4 — Session hardening (TOTP replay) — SCOPED: TOTP-replay only (amr→P5)
 
-**Goal (user):** display up to 3 phones + 3 emails per person. Data ALREADY returned by Tracerfy
-(`Mobile-1..5`, `Landline-1..3`, `primary_phone`, `Email-1..5`) but we keep only the single best today
-(`pick_best_phone`/`pick_best_email` → `Result.phone`/`.email`). No extra Tracerfy cost — just stop discarding.
+**Goal:** Close the TOTP-replay window deferred from P3, and stamp the auth method
+(`amr`) into issued tokens so P5 can enforce MFA on sensitive actions.
 
-**Design (backward-compat first):** ADD `Result.phones` (JSON `[{number,type}]`) + `Result.emails` (JSON `[str]`),
-top-3 each. KEEP single `phone`/`phone_type`/`email` = primary (phones[0]/emails[0]) so dialer push, CSV export,
-Lists/segments, skip-trace cache + reuse all keep working unchanged. Migration 042 (down_revision 041; head
-confirmed 041). Also add `phones`/`emails` JSON to `skip_trace_cache` so cache-hit rows populate arrays too.
+## Proposed design (pre-Codex)
+- **Migration 044:** `users.mfa_last_totp_counter BIGINT NULL` (additive; safe).
+- **`src/utils/mfa.py`:** add `verify_totp_counter(secret, code) -> int | None` — returns the unique
+  30s timestep counter whose code matches (scan ±1 window, constant-time compare). Each code maps to
+  one counter, so returning it (not "max of window") avoids the advance-too-far lockout.
+- **`_consume_second_factor` (login_mfa):** TOTP branch → `verify_totp_counter`; if matched, **atomic
+  replay-guarded advance**: `UPDATE users SET mfa_last_totp_counter=:c WHERE id=:id AND
+  (mfa_last_totp_counter IS NULL OR mfa_last_totp_counter < :c) RETURNING id`. 0 rows = replay or a
+  concurrent loser → reject (do NOT fall through to backup codes). Keep enable/disable on plain
+  `verify_totp` (authenticated, first-use / password-gated).
+- **amr claims:** `create_secure_token`/`create_refresh_token` gain `amr` param; login + register emit
+  `["pwd"]`, login_mfa emits `["pwd","mfa"]`; `/auth/refresh` propagates `amr` from the refresh token.
+- **Tests:** replay rejected (same code twice → 2nd 401); newer code accepted after advance; amr =
+  `["pwd","mfa"]` after MFA login vs `["pwd"]` non-MFA; refresh preserves amr.
 
-- **Phase 1 (backend data):** migration 042 (`results` + `skip_trace_cache` new JSON cols) + `skip_trace.py`
-  `pick_phones(row,3)`/`pick_emails(row,3)` (mobiles→primary→landlines; dedup) + `tracerfy_ingest.py` set arrays +
-  cache them + `tasks.py` (`_reuse_enrichment_for_duplicates` copies arrays when settled; `_enqueue` cache-hit copies arrays)
-- **Phase 2 (backend API/export):** `schemas.py` ResultRow + `jobs.py` results serialization + download CSV (add phone_2/3, email_2/3; keep primary phone/email)
-- **Phase 3 (frontend `bridgeleads-web`):** `/results/[id]` PhoneCell/EmailCell render up to 3 (+copy each) w/ fallback to single; types + api
-- **Workflow:** Codex design consult (PII/migration/back-compat) → build phased → Codex review + Master Security Review (PII) → deploy.
+## Risks to pressure-test with Codex
+- Atomic counter advance under concurrency (two logins, same code → exactly one wins?).
+- Lockout: does advancing last_counter ever reject a legit *next* code? (Single-counter return should avoid it.)
+- Should enable/disable also be replay-tracked, or is leaving them on verify_totp acceptable?
+- amr threading through refresh — any token-family / aud pitfalls.
 
-### STATUS — ✅ ALL 3 PHASES SHIPPED + DEPLOYED (2026-06-07)
-- [x] Codex design consult (sound; guardrails: nullable JSON/no server_default, best-pickers as wrappers, dedup by normalized digits, copy arrays under same settled gate, sanitize CSV, type ResultRow narrowly)
-- [x] **Phase 1** `f0d882e` (backend data) — migration 042 applied on boot (health 200). Codex consult + 2 review rounds (P2: primary-phone drift fixed → phones[0] == legacy pick_best_phone exactly). Pickers unit-tested.
-- [x] **Phase 2** `34b5de3` (API + CSV) — ResultRow phones/emails + phone_2/3,email_2/3 columns. Codex 2 P2s fixed (malformed-JSON robustness: before-validators + CSV shape guards). API confirmed serving the fields (null for pre-Phase-1 rows).
-- [x] **Phase 3** `229e001` (frontend → Vercel) — PhoneCell/EmailCell up to 3 + per-line copy, fallback to single, stopPropagation preserved. Codex clean.
-- [ ] ⏳ **OPTIONAL live verify**: fresh scrape (post-Phase-1) → confirm 3-phone arrays populate + display (Tracerfy now funded). Not run to avoid extra credit spend; user can request.
-- Backward-compat held: scalar phone/email unchanged (= phones[0]/emails[0]); dialer/export/segments/cache/reuse untouched. **Segments** still shows the primary only (optional future follow-up).
+## STATUS: ✅ DONE (Codex 3 rounds; py_compile/ruff/app-build clean) — UNCOMMITTED
+**Shipped:** migration 044 (`users.mfa_last_totp_counter BIGINT NULL`) + model column; `verify_totp_counter`
+(`src/utils/mfa.py`); `_consume_second_factor` TOTP branch → atomic guarded advance
+(`UPDATE users SET mfa_last_totp_counter=:c WHERE id AND mfa_enabled AND secret NOT NULL AND
+(col IS NULL OR col<:c) RETURNING id`); `mfa_enable` seeds the counter from the enrollment code;
+`mfa_disable` is now replay-aware (counter>last, FOR-UPDATE-locked) + clears the counter. 3 new tests
+(replay rejected, concurrent single-use, enrollment-code-can't-login) + fixed the existing
+TOTP-completes test to use a counter+1 code.
+**Codex gate:** R1 no P1, 2×P2 (seeding broke a test → fixed; disable not replay-guarded → fixed) + 1×P3.
+R2 found a NEW P2 (concurrent disable-vs-login could mint a session post-disable) → fixed with the
+`mfa_enabled`/secret WHERE guards. **R3 CLEAN.**
+**Trade-off (documented):** seeding means a login within the same 30s window as enrollment is rejected
+("wait for next code") — accepted; enable revokes sessions so re-login is usually a fresh code anyway.
+**⚠️ migration 044 is branch-only — not on prod; applies at deploy (alembic-on-boot).**
 
----
-
-# Enrichment/skip-trace dedup-reuse + cache fix (2026-06-06) — IN PROGRESS
-
-**Problem (user-reported, confirmed in code):** a `since_last_run` re-scrape inserts fresh `Result` rows
-(192), dedup flags all `is_duplicate=true` (0 new), but enrichment + skip-trace key off "row missing field"
-and run on ALL fresh rows — so duplicates get RE-enriched (GIS/PACS/King) and RE-skip-traced (paid Tracerfy,
-"0 cache hits, 167 queued" ≈ $13). Dedup is delivery/billing-only; it never short-circuits enrichment.
-
-**Root causes:** (1) no cross-job reuse — `_run_inline_enrichment`/`_enqueue_skip_trace_rows` never copy the
-prior enriched Result. (2) skip-trace cache miss: WRITE keys off Tracerfy's echoed address
-(`tracerfy_ingest.py:325`), READ keys off our GIS address (`tasks.py:1246`) — `address_cache_key` strips
-punct/case but NOT USPS expansion (St→STREET), so a standardized echo ≠ our string → miss on re-run.
-
-**Fix A — duplicate reuse (tasks.py), tenant-scoped:** in ENRICHING, before GIS/skip-trace, for this job's
-`is_duplicate` rows JOIN `delivered_records (user_id=job.user_id, dedup_hash)` → `first_result_id` → prior
-`Result (user_id=job.user_id)`; COPY property_address/mailing_address/parcel_id/enrichment_data/
-delinquent_amount+year unconditionally, and phone/phone_type/phone_dnc_flag/email/skip_trace_status/attempted_at
-ONLY when prior `skip_trace_status IN ('hit','miss')` (settled) AND within 90d (SKIP_TRACE_CACHE_DAYS). Existing
-selectors then auto-skip them (address present → no GIS; status≠not_attempted → no Tracerfy). Fallback: if prior
-lacks address/unsettled, duplicate flows through normal path. **SECURITY: every join leg filtered by
-job.user_id (no cross-tenant copy = no IDOR); worker uses system session so the explicit user_id filter is the guard.**
-
-**Fix B — cache key consistency (tracerfy_ingest.py):** write the cache keyed off the PENDING row's address
-(`matches[0].property_address/city/state`, = what READ uses), not Tracerfy's echoed `csv_row` address →
-write key == read key by construction → cross-job hits even when Tracerfy standardizes the street.
-
-**Workflow:** Codex consult (pre-build, security) → build → Codex review + Master Security Review (§14) → deploy.
-- [x] Codex consult on design — caught: weak-hash PII risk, fill-missing, settled-only TTL, FixB truncation bug, **global SkipTraceCache (no user_id)** finding
-- [x] Implemented Fix A (`_reuse_enrichment_for_duplicates`) + Fix B (cache key + 512-trunc) — commit `6a2f343`, deployed to main
-- [x] compile + ruff clean (baseline 5, +0); worker tests 10/12 (2 pre-existing watchdog/kombu broker fails, unrelated)
-- [x] **3 Codex review rounds** — caught + fixed TWO P1s: (1) weak NAME|DATE hash → fixed via recompute-strong-key==dedup_hash gate; (2) placeholder parcel (all-zeros/junk passes is_strong_identity) → fixed via address-anchor-or-non-placeholder-parcel guard. Final review CLEAN.
-- [ ] ⚠️ **OPEN finding (pre-existing, user decision):** `SkipTraceCache` is GLOBAL (keyed by address only, no `user_id`) → one tenant's skip-trace phone/email is served to another tenant who scrapes the same address. Intentional vendor-cache cost-saver, but a cross-tenant PII-reuse concern. Per-user cache would multiply Tracerfy spend. NOT changed — surfaced for the user.
-- [ ] User verify on a re-run: log should show "Reused prior enrichment for N duplicate leads" + far fewer Tracerfy queued.
+## Codex consult: DONE — design sound, 0 Crit/High. Reconciled:
+- Atomic UPDATE race-safe; `WHERE` MUST use the DB column (not Python-read counter). 0 rows → reject,
+  no backup fallback.
+- Return the matched counter (not max-of-window) → no lockout; on rare collision prefer HIGHEST match.
+- **Initialize `mfa_last_totp_counter` at `/auth/mfa/enable`** (from the verified enrollment code) so it
+  can't be replayed into the first login. (enable already revokes sessions → re-login uses a fresh code.)
+- RLS GUC already bound in `login_mfa` before `_consume_second_factor` → put the UPDATE in that txn.
+- amr: signed JWT can't be forged, but sanitize on refresh (subset of {pwd,mfa}, default `["pwd"]` for
+  old tokens). amr = session-strength, NOT freshness; step-up needs `auth_time` max-age (P5 concern).
+- **Codex rec: do TOTP-replay now; defer amr to P5** (where it's consumed) unless done fully w/ tests.
 
 ---
 
-# Frontend shadcn rollout — continuation (2026-06-06)
+# H2 Phase 3 — MFA Login Challenge + Frontend
 
-Repo: sibling `Desktop/bridgeleads-web`. Reference screen = `/segments` (clean shadcn + `.impeccable.md` DNA).
-Already migrated: `/segments`, `/results`. **Do NOT touch** (polished/complex, prior decision): `/dashboard` (806L),
-`/scrapers/new` wizard (1768L). User picked **all 6 remaining**: `/deliver`, `/login`, `/register`,
-`/admin/funnel`, `/admin/connectors`, `/results/[id]`.
+**Goal:** Make the TOTP MFA built in Phases 1–2 actually gate login, and give users a UI to
+(a) pass the MFA challenge at sign-in and (b) enroll/disable MFA from settings.
 
-**Method (per CLAUDE.md):** phased, ≤5 files/phase, `tsc --noEmit` + `next build` green + Codex review each
-phase, user approval between phases. Step-0 dead-code cleanup before any >300L structural refactor.
-
-### Cross-cutting decisions (settle before Phase 1)
-- **D1 — Tokens:** namespaces already reconciled in `globals.css` — `--color-amber` = emerald `#10b981`/`#34d399`,
-  `--color-text-primary: var(--foreground)`, `--primary: #10b981`. So migrate `style={{var(--color-*)}}` →
-  Tailwind token classes (`text-foreground`, `text-muted-foreground`, `bg-card`, `border-border`, `text-primary`).
-  **No brand-color change** — colors are already emerald via aliases.
-- **D2 — Empty/Error states:** KEEP the established four-state convention components (`ErrorState`,
-  `EmptyIllustration` — memory `project_frontend_ui_state_conventions`); don't rip working ones out for shadcn
-  `Empty`. New/blank states may use shadcn `Empty` like `/segments`. Consistency *within* a screen > across.
-- **D3 — Banned decoration:** remove `.impeccable`-banned bits while migrating — radial-glow gradient on
-  `/login` (+ `/register`), any accent border-stripes, gradient text. Emerald stays RARE (primary action / live state).
-- **D4 — base-nova = Base UI, not Radix:** ToggleGroup/Select APIs differ (value always array, no `type`).
-  Prefer Button-based toggles + `native-select`/`select` carefully (memory + prior /segments choice).
-
-### Phase 1 — `/deliver` (173L, 1 file) — safest user-facing win ✅ DONE (uncommitted)
-- [x] Mapped inline-styled cards/badges → shadcn `Card`/`Badge` + token classes; dropped framer-motion + rainbow format colors (signal-over-decoration); neutral badges (emerald rare)
-- [x] Kept `ErrorState`/`EmptyIllustration` (D2); kept react-query loading/error/empty/data four states; preserved `hasDestination` dialer/PhoneBurner logic
-- [x] `tsc --noEmit` clean + `next build` green (lint incl.) → Codex review PASS (no findings) — awaiting commit/deploy decision
-
-### Phase 2 — Auth `/login` (203L) + `/register` (422L), 2 files ✅ DONE (`5dac4ab`, deployed)
-- [x] `input-base` → `Input` (h-10); `.btn-amber` → `Button` (full-width h-11); `<label>` → `Label`
-- [x] Terms checkbox → Base UI `Checkbox` via RHF `Controller` (checked/onCheckedChange); links `stopPropagation` so opening Terms/Privacy doesn't toggle consent
-- [x] Removed banned radial-glow + card glow shadow + framer-motion. Brand emerald kept BRIGHT via `var(--color-amber)` (not `--primary`, which is dull `#065f46` in dark) — buttons use default `bg-primary` like /segments
-- [x] PRESERVED: onBlur, autofocus, noValidate, server-error block, password checklist, Suspense/useSearchParams referral; added `aria-invalid`/`aria-describedby`
-- [x] `tsc` clean + `next build` green (login+register still static) → Codex review PASS (no P1, Controller flow verified)
-
-### Phase 3 — Admin `/funnel` (264L) + `/connectors` (394L), 2 files ✅ DONE (`25c5042`, deployed)
-- [x] funnel: window toggle → Button-toggles (aria-pressed); tokens; error → destructive; DM Mono numbers; emerald reserved for data bars (key data point)
-- [x] connectors: btn-amber/ghost → Button, inputs → Input, labels → Label, AI/Manual chips → Badge (Manual neutral), skeletons → Skeleton, record-type pills → Button-toggles. **Fixed latent bug**: degraded health dot used `--color-amber` (=emerald) → now explicit emerald/amber/red-500 + title/aria-label. Mutation/gating/grouping behavior-identical
-- [x] `tsc` clean + `next build` green (both static) → Codex review PASS (no P1)
-
-### Phase 4 — `/results/[id]` (1186L, 1 file) — highest value, biggest risk; LAST
-**REVISED after full read + Codex re-consult (session `019e9e79`):** table is coupled to framer-motion
-(`motion.tbody className="contents"`, `motion.tr` variants, `layoutId` pagination/format pills) + a custom
-sticky-blur `<thead>` in a `max-h-[calc(100vh-340px)]` scroll container. **Codex AGREES: do NOT import the
-shadcn `Table` component** (its own `overflow-x-auto` double-wraps; `TableBody` would drop motion / risk
-invalid nested tbody). Migrate IN PLACE instead — same design result, far lower regression risk. User QAs on deploy.
-- [x] STEP 0 (`6a6df82`): removed dead no-op `useEffect`. `selectedFormat` confirmed **backend-dead** — LEFT + FLAGGED in commit msg (removing the pill is a product call)
-- [x] Migration (`54b16f3`): `.input-base` → `Input` (search + 4 tax + a11y ids), `.btn-amber`/`.btn-ghost` → `Button`, tax `<label>` → `Label`, h1 → serif; **REMOVED banned 3px green left-hover stripe**; "Old" badge → neutral muted (New stays emerald). NO shadcn Table component (Codex-confirmed wrong fit)
-- [x] PRESERVED (Codex-verified intact): scroll container, motion.tbody/.tr + expansion, layoutId motion, setPage(1), hasTaxData gate, export-tax-not-search, stopPropagation, colSpan={7}, is_duplicate opacity, search ref
-- [x] `tsc` clean + `next build` green → Codex review PASS (no P1, all 10 landmines intact). ⏳ **user QA on Vercel deploy pending** (search/tax/export/expand/copy/mailto/pagination)
+Backend enrollment endpoints already exist (`/auth/mfa/setup|enable|disable|status`); the secret is
+Fernet-encrypted; backup codes are 80-bit HMAC-hashed. What's missing: `/auth/login` ignores
+`mfa_enabled`, and there is no frontend for either the challenge or enrollment.
 
 ---
 
-## Review — Frontend shadcn rollout COMPLETE ✅ (all 6 screens, 5 commits, deployed)
-**Shipped to `master` → Vercel (frontend auto-deploys):**
-- `f125202` Phase 1 `/deliver` · `5dac4ab` Phase 2 `/login`+`/register` · `25c5042` Phase 3 admin `/funnel`+`/connectors` · `6a6df82`+`54b16f3` Phase 4 `/results/[id]`
-- Every phase: `tsc --noEmit` clean + `next build` green + **Codex diff review (no P1/no regressions)** before push.
-- Pre-implementation **Codex consult** pressure-tested the plan; a 2nd Codex consult re-scoped Phase 4 (no Table component) after the full read.
-**Key decisions:** D1 tokens already reconciled (`--color-amber`=emerald) → mechanical. D2 kept `ErrorState`/`EmptyIllustration`. D3 removed banned glow (auth) + accent hover-stripe (results). D4 Base-UI (not Radix) → Controller for Checkbox, Button-toggles not ToggleGroup. Brand emerald kept BRIGHT via `var(--color-amber)` (—primary is dull `#065f46` in dark); buttons use default `bg-primary` like /segments.
-**Bonus fixes:** connector "degraded" health dot (was emerald via the `--color-amber` rename) → explicit emerald/amber/red + a11y title; +aria on auth/results inputs.
-**Untouched by design:** `/dashboard` (806L), `/scrapers/new` wizard (1768L) — polished, rebuild = downgrade/risk.
-**Follow-ups — RESOLVED ("do all yourself"):**
-- ✅ **Format pill: REMOVED** (`f03861e`). Backend `/jobs/{id}/download` (jobs.py) is CSV-only (builds via `csv.DictWriter`, `media_type text/csv`, no `format` param) → the pill was decorative. Removed pill + `selectedFormat` state + `FORMAT_LABELS`; relabeled "Download CSV". Real multi-format in-app export = separate backend feature (needs xlsx injection hardening) — out of scope. tsc/build green, Codex clean.
-- ✅ **Public-screen QA DONE myself** on the live deploy (`bridgeleads.io`, headless Chromium, **12/12 passed**): `/login` (2 Inputs/Button/Labels, no glow, onBlur+aria-invalid+error-id) and `/register` (form mounts past Suspense, 3 Inputs, **Base-UI Checkbox toggles via Controller**, live password checklist, Terms link, no glow, **0 console errors**). Confirmed migrated markup served in prod; no banned `radial-gradient`.
-- ✅ All 4 gated routes deploy healthy (`307` auth-redirect, no 500): `/deliver`, `/admin/funnel`, `/admin/connectors`, `/results/[id]`.
-- ✅ **GATED-screen QA DONE** (user-supplied account, headed Chromium, live — **15/16**): `/deliver` (132 shadcn Cards+Badges), `/admin/connectors` (full agency view: 25 Badges + 25 health dots **with a11y `title`**, Add-county form Inputs + Button-toggles), `/results/[id]` on a REAL result (`9f4e31a0…`: **"Download CSV"** confirms pill removed, search Input, **banned 3px stripe absent**, **search debounce updates table**, **row-expand works**). The 1 non-pass = 5 `next-auth` "Failed to fetch" session-fetch console errors — UNRELATED to the migration (auth untouched; migrated UI produced 0 errors), transient navigation noise.
-- ✅ **`/admin/funnel` — REAL BUG FOUND + FIXED + live-QA'd** (`48d07b4`). The account IS `is_admin:true` server-side (verified via live `/auth/me`), but `lib/auth.ts` never threaded `is_admin` through authorize→jwt→session → `session.user.is_admin` was ALWAYS undefined → the funnel gated out **every** admin in prod. Fix: thread `is_admin` (strict `===true`, fail-closed) all 3 hops + augment next-auth types + gate the query `enabled:!!session && isAdmin` (Codex hardening: no 403-fetch for non-admins). Codex consult (design) + Codex review both clean. **Re-QA on deploy: 5/5** — admin passes gate, data view renders, window toggles flip aria-pressed, step rows + conversion cards render.
-- ✅ **The 5 `next-auth` "Failed to fetch" — diagnosed BENIGN (no fix, Codex-agreed).** Controlled repro: idle 14s on one page = **0 console errors**; the errors only appear during rapid `goto()` navigation as `net::ERR_ABORTED` on in-flight `/api/auth/session` (same as react-query API calls) — navigation cancels them. Test artifact, not a defect; real users don't hit it and the session already works.
+## Design decision — RECONCILED with Codex (challenge-token model)
 
-## Both post-rollout gaps RESOLVED (2026-06-06) — 6 commits total this session
-`f125202`,`5dac4ab`,`25c5042`,`6a6df82`,`54b16f3`,`f03861e` (rollout + pill) + `48d07b4` (is_admin fix). All Codex-gated, deployed, live-QA'd.
-- (optional, deferred) standardize empties on shadcn `Empty`; finish the invisible inline-`var`→class sweep on `/results/[id]` cells (renders identically today).
+next-auth Credentials `authorize()` is one-shot. A password→code two-step flow doesn't fit one
+call, and v5's custom-error channel is version-fragile. **Codex review (medium, consult) upgraded the
+design**: model the MFA challenge **explicitly** with a short-lived challenge token + a dedicated
+verify endpoint, rather than overloading `/auth/login` with an optional `mfa_code` + resending the
+password. Cleaner home for rate-limit/expire/audit; password never resent. Doctrine: docs silent → Codex wins.
 
-### Status
-- [x] Codex pressure-test of THIS plan (pre-implementation, mandatory) — DONE (session `019e9e44`, 333k tok). Verdict: directionally sound; Phase 2 + 4 NOT purely mechanical (checkbox=Base UI, results table behavior-heavy). Refinements folded into Phases 2 & 4 above. No disagreements with the plan.
-- [ ] User approval of plan + phasing — pending
+**Backend (two endpoints):**
+1. `POST /auth/login {email,password}` — password check unchanged. If `user.mfa_enabled` →
+   per-user rate-limit (`mfa-user:{id}`), issue a **short-lived signed MFA challenge token**
+   (`purpose="mfa_challenge"`, `sub=user_id`, distinct `aud`, ~5 min exp, NO access privilege),
+   return `LoginResponse(mfa_required=True, mfa_token=...)`. Do NOT clear brute-force, do NOT issue
+   access/refresh. Audit `mfa_challenge`. If not enabled → issue tokens as today.
+2. `POST /auth/login/mfa {mfa_token, code}` — decode+validate challenge token (purpose/aud/exp/sub);
+   per-user rate-limit (`mfa-user:{sub}`); verify 2nd factor (TOTP, else **atomic** backup-code
+   consume); on fail → audit `mfa_failure` + 401 (NO password-bucket `record_failure`); on success →
+   `BruteForceProtection.clear(ip, user.email)`, issue access+refresh, audit `login_success`.
+
+**Frontend ("token adoption" — next-auth only materializes the session):**
+1. Login page POSTs `/auth/login` **directly** via `lib/api` (not `signIn`).
+   - `401` → bad creds. `{mfa_required, mfa_token}` → store token, show OTP step.
+   - `{access_token}` → `signIn("credentials",{accessToken, redirect:false})` → dashboard.
+2. OTP step POSTs `/auth/login/mfa {mfa_token, code}` → `{access_token}` → `signIn` → dashboard.
+   (Password is NOT resent — only the challenge token is.)
+3. `authorize()` gains a **token-adoption branch**: `credentials.accessToken` present → validate via
+   `GET /auth/me` → build session user. **Only ever accept accessToken, never refresh.** Keep the
+   existing password branch (register auto-login uses it).
+
+**Codex-driven invariants (security):**
+- Bad MFA code does NOT feed the password `(ip,email)` brute-force/lockout bucket (avoids
+  password-knowing attacker DoS-locking the real user + avoids conflating password vs MFA compromise).
+  Per-user `mfa-user:{id}` rate limiter caps TOTP guessing across rotating IPs + `mfa_required` farming.
+- Backup-code single-use is **atomic**: `UPDATE mfa_backup_codes SET used_at=now() WHERE user_id=:u
+  AND code_hash=:h AND used_at IS NULL RETURNING id` — valid iff exactly one row updated (fixes both
+  the async race Codex flagged AND the pre-existing "never marked used" gap).
+- accessToken: never logged, never in URLs/errors; Auth.js CSRF stays on; refresh token never adopted.
+- TOTP replay (±1/90s window) NOT prevented in P3 → deferred to P4 (Codex agreed: acceptable under
+  TLS + per-user rate-limit, do not claim replay-resistant). Documented inline.
+
+---
+
+## Phase 3a — Backend login challenge  ✅ DONE (Codex round-2 CLEAN)
+
+- [x] MFA challenge-token helpers — put in `src/api/routes/auth.py` (co-located with the existing
+      reset-token family, not `src/api/auth.py`): `_mint_mfa_challenge_token` /
+      `_decode_mfa_challenge_token` (`aud="bridgeleads-mfa"`, `purpose="mfa_challenge"`, 300s exp).
+- [x] `src/api/schemas.py`: `LoginResponse` (optional tokens + `mfa_required` + `mfa_token`) +
+      `MfaLoginRequest`.
+- [x] `src/api/routes/auth.py`: `/auth/login` challenge branch (`response_model=LoginResponse`);
+      `POST /auth/login/mfa`; `_consume_second_factor` (TOTP, else atomic conditional-UPDATE consume).
+- [x] `tests/test_auth.py`: 10 real-flow tests incl. concurrent race + >threshold no-lockout.
+
+**Codex gate:** round 1 found 1×P1 + 3×P2 + 2×P3 → ALL FIXED → round 2 CLEAN.
+- P1 revocation: `/auth/login/mfa` rejects challenges minted ≤ `revoked_at` (logout-all / pwd change),
+  fail-closed 503 on Redis down.
+- P2 bucket split: `mfa-issue:{id}` (login) vs `mfa-verify:{id}` (verify) — challenge farming can't
+  exhaust the user's verify budget.
+- P2 replay: challenge `jti` burned via `consume_once` on success (wrong code never burns it).
+- P2 RLS: bind `app.current_user_id` to the proven challenge subject before SELECT/UPDATE → correct
+  under a future RLS-enforce cutover.
+- P3: schema docstring corrected; added concurrent `asyncio.gather` race test + 6-attempt no-lockout.
+
+**Verification:** `py_compile` OK; `ruff` clean (also fixed 2 pre-existing I001 in the file);
+app builds + both routes registered; token audience-separation proven via direct exec
+(access↔challenge↔reset cross-rejection). ⚠️ Integration tests NOT run locally — only configured
+`DATABASE_URL` is **production** and the `db` fixture does unconditional table-wipes; tests must run
+in CI (dedicated test DB) or against a local throwaway Postgres+Redis.
+
+## Phase 3b — Frontend login challenge  ✅ DONE (Codex 3 rounds; tsc clean)
+
+- [x] `lib/auth.ts`: token-adoption branch in `authorize()` (accessToken-only via shared `buildUser`,
+      validated by `/auth/me`; password branch kept + returns null when `mfa_required`).
+- [x] `lib/api.ts`: `LoginResponse` type, `LoginError`, `loginStart` / `loginVerify` (raw fetch, NOT
+      apiFetch — no signOut-on-401).
+- [x] `app/(auth)/login/page.tsx`: 2-step (password → code) with `InputOTP` (TOTP) + backup-code text
+      mode; matches register RHF/error/loader patterns.
+- [x] `types/next-auth.d.ts`: no change needed — `accessToken` declared on the provider `credentials`.
+
+**Codex gate:** R1 found 3×P2 + 3×P3 (no MFA bypass) → fixed → R2: 5/6 resolved, 1×P2 partial
+(unmount race) → fixed (mounted ref) → R3: residual sub-second window where signIn completes after
+unmount. **Accepted with documented reasoning** (not a defect: runs only after valid password + 2nd
+factor, so establishing the session is the correct auth outcome; signIn has no AbortSignal; UI effects
+are guarded). Fixes: sync in-flight ref (no double-redeem), gen-guard + mounted-ref (no stale
+adopt/navigate), fixed safe 401 copy (no backend-text leak / no regex), 6-digit TOTP gate,
+`!result.ok` check.
+
+**Verification:** `npx tsc --noEmit` clean ✅. ESLint NOT configured in bridgeleads-web (no config/dep/
+script) → type safety via tsc only. ⚠️ user to confirm acceptance of the documented R3 residual.
+
+## Phase 3c — Frontend MFA enrollment (Security settings tab)  ✅ DONE (Codex 4 rounds; tsc clean)
+
+- [x] `lib/api.ts`: `getMfaStatus` / `mfaSetup` / `mfaEnable` / `mfaDisable` + types; `apiFetch` thrown
+      errors now carry `status`; `setSuppressSignOutOn401` escape-hatch.
+- [x] `components/settings/security-tab.tsx` (NEW, extracted to keep the 1330-line page small): enable
+      flow (setup → QRCodeSVG + copyable secret → 6-digit verify → one-time backup codes) + disable
+      flow (password + TOTP/backup code). Wired into `settings/page.tsx` (Security tab, 3-line change).
+- [x] QR: `qrcode.react@^4.2.0` — SBOM clean (zero runtime deps, React-19 peer, 115KB, maintained).
+
+**Codex gate:** R1 found **1×P1** (backup codes destroyed by a background-query 401→signOut after
+enable revokes the session) → fixed → R2 found TOCTOU residual → fixed → R3 found an enable-own-401
+P3 → fixed → **R4 CLEAN**. Final mechanism: enable revokes the session, so `apiFetch`'s signOut-on-401
+is suppressed (armed in `onMutate`, reset on unmount/error), backup codes render before any
+query-driven branch, `mfa-status` is disabled while codes show, cache is set `{enabled:true}`, and a
+real 401 during enable redirects to /login. Both enable AND disable end in an intentional `signOut`
+(backend revokes sessions on both).
+
+**Verification:** `npx tsc --noEmit` clean ✅. (No ESLint in bridgeleads-web.)
+
+---
+
+## Review (H2 Phase 3 complete)
+
+**Shipped:** MFA now gates login end-to-end. Backend challenge-token flow (3a, committed `3539d2e`),
+frontend 2-step login challenge (3b, committed `49d37a7`), and the Security settings enrollment tab
+(3c). Every phase passed a Codex review gate (NO-GO on any Crit/High) — 3a: 1P1+3P2 fixed; 3b:
+3P2+3P3 fixed (+1 documented-accept); 3c: 1P1 fixed across 4 rounds. tsc/ruff/py_compile all clean.
+
+**Deferred (later phases, per checklist):** P4 session hardening (TOTP replay last-counter — documented
+inline); P5 admin MFA enforcement + break-glass; H1 `users` RLS self-row policy (the login-SELECT
+landmine — keep `RLS_ENFORCE=False`).
+
+**⚠️ Ops note for deploy:** migration 043 (MFA columns) is on this branch, NOT on main/prod yet — the
+backend won't have the columns until 043 is applied at deploy (alembic-on-boot). The frontend Security
+tab + login challenge are inert until the backend is live with MFA. Don't push frontend master ahead
+of the backend deploy or enrolled users could be half-broken (there are none yet).
+
+---
+
+## Out of scope (later phases, per checklist)
+- P4 session hardening (TOTP replay/last-counter, session pinning).
+- P5 admin MFA enforcement + break-glass.
+- H1 `users` RLS self-row policy (login `SELECT` landmine) — tracked separately; do NOT enable
+  `RLS_ENFORCE` here.
+
+## Risks / open questions
+- TOTP replay within the ±1 window is **not** prevented in P3 (deferred to P4) — document inline.
+- `/auth/login` response shape change (`LoginResponse`) must keep the no-MFA client contract intact
+  (`access_token` still present) — register + any other caller unaffected.
+
+## Codex consult (pre-build, per .claude/rules/codex-collaboration.md)
+Consult run 2026-06-08 (medium, 24.4k tok). Verdict: design viable; **2 items pulled into P3**:
+(1) backup-code row race → atomic conditional UPDATE; (2) separate MFA attempt limiter (no
+password-bucket conflation). **Architecture upgraded** to explicit challenge-token + dedicated
+`/auth/login/mfa` (was: overloaded `/auth/login` + optional `mfa_code`). TOTP replay tracking
+confirmed deferrable to P4 under TLS + rate-limit. All folded into the design above.
+
+## Review
+_(to be filled at end)_

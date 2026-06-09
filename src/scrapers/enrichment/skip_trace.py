@@ -636,7 +636,14 @@ def download_tracerfy_csv(download_url: str) -> str:
     except ValueError as exc:
         raise TracerfyError(f"Refusing to download from disallowed URL: {exc}") from exc
     except requests.RequestException as exc:
-        raise TracerfyError(f"Failed to download Tracerfy CSV: {exc}") from exc
+        # M2: never interpolate the requests exception — its string embeds the
+        # full URL, and the Tracerfy CDN download_url carries a signed token
+        # (X-Amz-* style) that must not reach logs. Surface the type only, and
+        # use `from None` so a downstream traceback (Celery autoretry) can't
+        # print the original exception's URL via the __cause__ chain.
+        raise TracerfyError(
+            f"Failed to download Tracerfy CSV: {type(exc).__name__}"
+        ) from None
 
     if resp.status_code != 200:
         raise TracerfyError(f"Tracerfy CSV download returned {resp.status_code}")

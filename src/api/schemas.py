@@ -91,6 +91,52 @@ class ResetPasswordRequest(BaseModel):
         return _validate_password_rules(v)
 
 
+class MfaSetupResponse(BaseModel):
+    """POST /auth/mfa/setup — returns the new TOTP secret (manual entry) and an
+    otpauth:// provisioning URI for QR. Shown once; not yet enabled."""
+    secret: str
+    provisioning_uri: str
+
+
+class MfaEnableRequest(BaseModel):
+    """Confirm enrollment with a current TOTP code from the authenticator."""
+    code: str = Field(min_length=6, max_length=10)
+
+
+class MfaEnableResponse(BaseModel):
+    """One-time backup codes, shown exactly once at enable time."""
+    backup_codes: list[str]
+
+
+class MfaDisableRequest(BaseModel):
+    """Disabling MFA requires the password AND a second factor (TOTP or a
+    backup code) — knowledge of the password alone must not remove MFA."""
+    password: str = Field(max_length=72)
+    # 6-digit TOTP or an 80-bit base32 backup code 'xxxx-xxxx-xxxx-xxxx' (19 chars).
+    code: str = Field(min_length=6, max_length=32)
+
+
+class MfaStatusResponse(BaseModel):
+    enabled: bool
+
+
+class MfaLoginRequest(BaseModel):
+    """POST /auth/login/mfa — redeem the login MFA challenge. `mfa_token` is the
+    short-lived challenge token returned by /auth/login when MFA is enabled;
+    `code` is a 6-digit TOTP or an 80-bit base32 backup code."""
+    mfa_token: str = Field(max_length=4096)  # bound — a JWT is ~hundreds of bytes
+    code: str = Field(min_length=6, max_length=32)
+
+
+class BreakGlassLoginRequest(BaseModel):
+    """POST /auth/login/break-glass — redeem an operator-issued break-glass code.
+    Reuses the /auth/login challenge token; `code` is a 128-bit 'bg-' code which
+    renders as 35 chars ('bg-' + 26 base32 chars grouped by dashes), so it needs a
+    larger cap than MfaLoginRequest's 32 (Codex)."""
+    mfa_token: str = Field(max_length=4096)
+    code: str = Field(min_length=6, max_length=64)
+
+
 class UserResponse(BaseModel):
     id: str
     email: str
@@ -135,6 +181,25 @@ class TokenResponse(BaseModel):
     refresh_token: str | None = None
     token_type: str = "bearer"
     expires_in: int = 3600
+
+
+class LoginResponse(BaseModel):
+    """POST /auth/login (and /auth/login/mfa) response. Two mutually exclusive
+    shapes, discriminated by `mfa_required`:
+    - mfa_required=False → login complete: access_token + refresh_token are
+      ALWAYS populated. This is the only shape a non-MFA account ever sees, so
+      the prior no-MFA runtime contract is unchanged.
+    - mfa_required=True → password OK but MFA enabled: access_token/refresh_token
+      are null and a short-lived mfa_token is returned to redeem at
+      POST /auth/login/mfa.
+    The fields are Optional (vs TokenResponse's required access_token) only to
+    model the challenge shape — clients must branch on mfa_required."""
+    access_token: str | None = None
+    refresh_token: str | None = None
+    token_type: str = "bearer"
+    expires_in: int = 3600
+    mfa_required: bool = False
+    mfa_token: str | None = None
 
 
 class ApiKeyResponse(BaseModel):

@@ -66,7 +66,9 @@ def _now() -> datetime:
 
 
 def _redis() -> sync_redis.Redis:
-    return sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
+    # M1: go through redis_kwargs() so this client also verifies the broker
+    # TLS cert (ssl_cert_reqs + CA bundle), not just decode_responses.
+    return sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
 
 
 def _publish_log(r: sync_redis.Redis, job_id: str, level: str, message: str, db=None) -> None:

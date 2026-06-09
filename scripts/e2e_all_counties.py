@@ -17,6 +17,8 @@ import uuid
 
 import requests
 
+from _creds import test_password
+
 API_URL = "https://api.bridgeleads.io"
 POLL_INTERVAL = 30  # seconds between status checks
 MAX_WAIT = 3600  # max seconds to wait for a single job (60 min)
@@ -34,7 +36,7 @@ def api(method: str, path: str, token: str = None, json_data: dict = None) -> re
 def register() -> tuple[str, str]:
     """Register a new test account. Returns (token, user_id)."""
     email = f"e2e_allcounties_{uuid.uuid4().hex[:8]}@bridgeleads.io"
-    password = "E2eTest!2026secure"
+    password = test_password()
     print(f"[REGISTER] {email}")
 
     resp = api("POST", "/auth/register", json_data={"email": email, "password": password})

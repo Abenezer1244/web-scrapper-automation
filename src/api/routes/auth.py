@@ -1189,13 +1189,20 @@ async def mfa_enable(
     user.mfa_enabled = True
     user.mfa_enrolled_at = datetime.now(UTC)
 
-    # Revoke BEFORE commit (fail-safe, mirrors change-password): if revoke
-    # fails we 503 with MFA NOT enabled; pre-MFA refresh tokens must not survive.
+    # Revoke ALL sessions so pre-MFA tokens can't survive enrollment. This row is
+    # FOR UPDATE-locked on THIS request's connection, so we must NOT call
+    # revoke_all_for_user here — its separate NullPool connection would block on
+    # our held lock and deadlock the request (Codex HIGH). Instead stamp
+    # revoked_at IN this transaction (same connection, no contention) and update
+    # the Redis cache BEFORE commit: a cache failure 503s and rolls back, leaving
+    # MFA NOT enabled (fail-safe, mirrors the prior revoke-before-commit intent).
+    now = datetime.now(UTC)
+    user.revoked_at = now
+    user.api_key_hash = None
     try:
-        await TokenBlacklist.revoke_all_for_user(current_user.id)
+        await TokenBlacklist.update_revoke_cache(current_user.id, now)
     except _redis_exceptions.RedisError:
         raise revocation_unavailable_503()
-    user.api_key_hash = None
     await db.commit()
     audit_log(request, "mfa_enabled", current_user.id)
     return MfaEnableResponse(backup_codes=plaintext_codes)
@@ -1261,8 +1268,14 @@ async def mfa_disable(
     # be re-seeded by /mfa/enable anyway, but don't leave stale state).
     user.mfa_last_totp_counter = None
     await db.execute(delete(MfaBackupCode).where(MfaBackupCode.user_id == current_user.id))
+    # In-session revoke (this users row is FOR UPDATE-locked on our connection —
+    # calling revoke_all_for_user would deadlock on a second NullPool connection;
+    # Codex HIGH). Stamp revoked_at in this txn + update the cache before commit,
+    # 503-and-rollback on cache failure (MFA stays enabled — fail-safe).
+    now = datetime.now(UTC)
+    user.revoked_at = now
     try:
-        await TokenBlacklist.revoke_all_for_user(current_user.id)
+        await TokenBlacklist.update_revoke_cache(current_user.id, now)
     except _redis_exceptions.RedisError:
         raise revocation_unavailable_503()
     await db.commit()

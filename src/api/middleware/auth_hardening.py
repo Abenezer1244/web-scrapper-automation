@@ -218,6 +218,44 @@ class TokenBlacklist:
         return now
 
     @staticmethod
+    async def update_revoke_cache(user_id: str, now: datetime) -> None:
+        """Write ONLY the Redis revoke cache for an IN-SESSION revoke.
+
+        For callers that already hold a `SELECT ... FOR UPDATE` lock on the users
+        row (mfa_enable / mfa_disable): they stamp `users.revoked_at` on their OWN
+        transaction/connection and commit it atomically with their change, then
+        call this for the cache. They must NOT call revoke_all_for_user — its
+        separate NullPool connection would block forever on the held row lock
+        (the request coroutine is suspended awaiting that very UPDATE → app-level
+        deadlock; Codex HIGH).
+
+        Call this BEFORE the caller commits and 503 on failure: a cache that
+        can't be made consistent rolls the whole change back, leaving the account
+        unchanged (fail-closed, mirrors revoke_all_for_user). SETEX writes the new
+        watermark; if SETEX fails we DEL so a stale positive can't mask the
+        about-to-commit revoke (the next read falls through to the DB). Only if
+        BOTH fail do we raise.
+        """
+        key = f"{TokenBlacklist._USER_REVOKE_PREFIX}{user_id}"
+        try:
+            r = _get_redis()
+            await r.setex(
+                key, TokenBlacklist._REVOKE_CACHE_TTL_SECONDS, str(int(now.timestamp())),
+            )
+        except redis_exceptions.RedisError as exc:
+            _logger.warning(
+                "update_revoke_cache: SETEX failed; DEL to invalidate stale cache: %s", exc,
+            )
+            try:
+                await _get_redis().delete(key)
+            except redis_exceptions.RedisError as del_exc:
+                _logger.error(
+                    "update_revoke_cache: BOTH SETEX and DEL failed; failing "
+                    "closed for user %s: %s", user_id, del_exc,
+                )
+                raise
+
+    @staticmethod
     async def get_user_revoke_time(user_id: str) -> int:
         """Return the epoch timestamp at which all tokens for this user were revoked (0 if never).
 

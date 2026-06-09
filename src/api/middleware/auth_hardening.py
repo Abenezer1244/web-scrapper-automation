@@ -230,11 +230,20 @@ class TokenBlacklist:
         deadlock; Codex HIGH).
 
         Call this BEFORE the caller commits and 503 on failure: a cache that
-        can't be made consistent rolls the whole change back, leaving the account
-        unchanged (fail-closed, mirrors revoke_all_for_user). SETEX writes the new
-        watermark; if SETEX fails we DEL so a stale positive can't mask the
-        about-to-commit revoke (the next read falls through to the DB). Only if
-        BOTH fail do we raise.
+        can't be written rolls the whole change back, leaving the account
+        unchanged (fail-closed).
+
+        ALWAYS raise on a SETEX failure (Codex). Unlike revoke_all_for_user — which
+        commits the new users.revoked_at to the DB FIRST and only then touches
+        Redis — this runs while the caller's new revoked_at is still UNCOMMITTED.
+        So we must NOT treat a DEL as a success path: a cleared cache lets a
+        concurrent token check fall through to the DB, read the OLD revoked_at,
+        and backfill that stale positive value; after the caller commits the newer
+        revoked_at the cache still serves the old one until TTL, letting tokens
+        issued after the old revoke survive (fail-open). The DEL here is only
+        best-effort cleanup; we re-raise regardless so the caller 503s and rolls
+        back (revoked_at reverts to the old value, consistent with whatever the
+        cache holds).
         """
         key = f"{TokenBlacklist._USER_REVOKE_PREFIX}{user_id}"
         try:
@@ -243,17 +252,15 @@ class TokenBlacklist:
                 key, TokenBlacklist._REVOKE_CACHE_TTL_SECONDS, str(int(now.timestamp())),
             )
         except redis_exceptions.RedisError as exc:
-            _logger.warning(
-                "update_revoke_cache: SETEX failed; DEL to invalidate stale cache: %s", exc,
+            _logger.error(
+                "update_revoke_cache: SETEX failed; failing closed (best-effort "
+                "DEL cleanup) for user %s: %s", user_id, exc,
             )
             try:
                 await _get_redis().delete(key)
-            except redis_exceptions.RedisError as del_exc:
-                _logger.error(
-                    "update_revoke_cache: BOTH SETEX and DEL failed; failing "
-                    "closed for user %s: %s", user_id, del_exc,
-                )
-                raise
+            except redis_exceptions.RedisError:
+                pass
+            raise
 
     @staticmethod
     async def get_user_revoke_time(user_id: str) -> int:

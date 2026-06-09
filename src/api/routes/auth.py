@@ -1271,9 +1271,15 @@ async def mfa_disable(
     # In-session revoke (this users row is FOR UPDATE-locked on our connection —
     # calling revoke_all_for_user would deadlock on a second NullPool connection;
     # Codex HIGH). Stamp revoked_at in this txn + update the cache before commit,
-    # 503-and-rollback on cache failure (MFA stays enabled — fail-safe).
+    # 503-and-rollback on cache failure (MFA stays enabled — fail-safe). Also
+    # clear the API key: revoke_all stamps revoked_at which the JWT path checks,
+    # but the API-key path never consults revoked_at, so a disable that did not
+    # clear it would leave one live credential behind (Codex). Mirrors mfa_enable
+    # + logout-all + change/reset-password: a sensitive MFA state change kills
+    # every credential; the user re-issues via POST /api-key.
     now = datetime.now(UTC)
     user.revoked_at = now
+    user.api_key_hash = None
     try:
         await TokenBlacklist.update_revoke_cache(current_user.id, now)
     except _redis_exceptions.RedisError:

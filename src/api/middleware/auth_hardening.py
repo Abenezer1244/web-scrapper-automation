@@ -8,6 +8,7 @@ import redis.exceptions as redis_exceptions
 from fastapi import HTTPException, status
 
 from src.config import settings
+from src.utils.crypto import blind_index
 from src.utils.logger import email_fingerprint
 
 _logger = logging.getLogger("security.auth_hardening")
@@ -415,8 +416,14 @@ class BruteForceProtection:
         is preferable to a full auth outage.
         """
         r = _get_redis()
+        # H3: key on a FULL-LENGTH keyed HMAC of the email (blind_index, 64 hex),
+        # never the plaintext — no enumerable address in a Redis key, and no
+        # cross-account collision (the 12-char email_fingerprint is for LOGS only).
+        # blind_index normalizes (casefold), so the bucket is case-insensitive. The
+        # same key is used by record_failure/clear so the three stay consistent.
+        ekey = blind_index(email)
         try:
-            for key_suffix in [f"ip:{ip}", f"email:{email}"]:
+            for key_suffix in [f"ip:{ip}", f"email:{ekey}"]:
                 key = f"{BruteForceProtection._KEY_PREFIX}{key_suffix}"
                 val = await r.get(key)
                 failures = int(val) if val else 0
@@ -455,6 +462,7 @@ class BruteForceProtection:
         user out indefinitely.
         """
         r = _get_redis()
+        ekey = blind_index(email)  # H3: full-length keyed HMAC, never plaintext email
         email_failures = 0
         try:
             # A6: the IP counter persists 24h (punish a single attacking
@@ -467,7 +475,7 @@ class BruteForceProtection:
             # window after the last failed attempt.
             for key_suffix, ttl in [
                 (f"ip:{ip}", 24 * 3600),
-                (f"email:{email}", BruteForceProtection._EMAIL_LOCKOUT_CAP_SECONDS),
+                (f"email:{ekey}", BruteForceProtection._EMAIL_LOCKOUT_CAP_SECONDS),
             ]:
                 key = f"{BruteForceProtection._KEY_PREFIX}{key_suffix}"
                 pipe = r.pipeline(transaction=True)
@@ -486,7 +494,7 @@ class BruteForceProtection:
 
         # Send lockout notification once when threshold is first crossed
         if email_failures == BruteForceProtection._NOTIFY_THRESHOLD:
-            dedup_key = f"{BruteForceProtection._KEY_PREFIX}notified:{email}"
+            dedup_key = f"{BruteForceProtection._KEY_PREFIX}notified:{ekey}"
             try:
                 already_sent = await r.get(dedup_key)
                 if not already_sent:
@@ -526,10 +534,11 @@ class BruteForceProtection:
         could not be cleared would be a worse user experience.
         """
         r = _get_redis()
+        ekey = blind_index(email)  # H3: must match check()/record_failure()
         try:
             await r.delete(
                 f"{BruteForceProtection._KEY_PREFIX}ip:{ip}",
-                f"{BruteForceProtection._KEY_PREFIX}email:{email}",
+                f"{BruteForceProtection._KEY_PREFIX}email:{ekey}",
             )
         except redis_exceptions.RedisError as exc:
             _logger.warning(

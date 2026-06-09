@@ -18,7 +18,13 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import DeclarativeBase, relationship
+from sqlalchemy.orm import DeclarativeBase, relationship, validates
+
+from src.db.encrypted_types import EncryptedJSON, EncryptedString
+
+# src.utils.crypto.blind_index is imported LAZILY inside the @validates hook below
+# (not at module top level) so that importing models — which alembic/env.py does
+# for every command — does not pull in Settings via crypto.
 
 
 class Base(DeclarativeBase):
@@ -34,6 +40,13 @@ class User(Base):
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
     email = Column(String(255), unique=True, nullable=False, index=True)
+    # H3 blind index: deterministic HMAC of the normalized email (crypto.blind_index,
+    # keyed by the dedicated stable BLIND_INDEX_KEY). The searchable lookup key once
+    # `email` is encrypted — equality lookups + the uniqueness constraint move here
+    # (Fernet is non-deterministic, so the email column can't carry either). Added
+    # nullable in P4 and dual-written via @validates below; promoted to NOT NULL +
+    # UNIQUE in P5 after the backfill populates every row.
+    email_hmac = Column(String(64), nullable=True, index=True)
     password_hash = Column(String(255), nullable=False)
     api_key_hash = Column(String(64), nullable=True, index=True)
     plan = Column(String(32), nullable=False, default="starter")
@@ -86,6 +99,19 @@ class User(Base):
     mfa_last_totp_counter = Column(BigInteger, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    @validates("email")
+    def _sync_email_hmac(self, _key, value):
+        """Single choke point keeping email_hmac in lockstep with email.
+
+        Fires on any Python-side set of `email` (User(email=...) or user.email =
+        x), so a new or updated user always gets the matching blind index. Does
+        NOT fire on ORM load from the DB, so a row's stored hash is preserved on
+        read. This is the only place email_hmac is computed — it cannot drift.
+        """
+        from src.utils.crypto import blind_index
+        self.email_hmac = blind_index(value) if value is not None else None
+        return value
 
     scraper_configs = relationship("ScraperConfig", back_populates="user", cascade="all, delete-orphan")
     jobs = relationship("Job", back_populates="user", cascade="all, delete-orphan")
@@ -241,15 +267,17 @@ class Result(Base):
     # Skip trace (Sprint 4, Tracerfy): populated asynchronously by the
     # skip-trace dispatcher + webhook ingest. Status transitions:
     # not_attempted → queued → submitted → hit | miss | errored.
-    phone = Column(String(32), nullable=True)
+    # H3: encrypted at rest (EncryptedString/EncryptedJSON over TEXT, migration
+    # 046). Display-only PII — never a SQL filter/join/dedup key.
+    phone = Column(EncryptedString, nullable=True)
     phone_type = Column(String(16), nullable=True)  # Mobile | Landline | VoIP
     phone_dnc_flag = Column(Boolean, nullable=True)
-    email = Column(String(255), nullable=True)
+    email = Column(EncryptedString, nullable=True)
     # Multi-contact (up to 3). The scalar phone/email above stay the PRIMARY
     # (= phones[0]/emails[0]) for all existing consumers; these add the extras
     # for display. NULL = legacy/not-yet-traced; [] = traced, none found.
-    phones = Column(JSON, nullable=True)  # [{"number": str, "type": str|None}]
-    emails = Column(JSON, nullable=True)  # [str]
+    phones = Column(EncryptedJSON, nullable=True)  # [{"number": str, "type": str|None}]
+    emails = Column(EncryptedJSON, nullable=True)  # [str]
     skip_trace_status = Column(String(16), nullable=False, default="not_attempted")
     skip_trace_attempted_at = Column(DateTime(timezone=True), nullable=True)
     # Sprint 6.4: cross-job deduplication
@@ -478,15 +506,18 @@ class SkipTraceCache(Base):
     __tablename__ = "skip_trace_cache"
 
     address_hash = Column(String(64), primary_key=True)
-    phone = Column(String(32), nullable=True)
+    # H3: encrypted at rest (migration 046). address_hash stays plaintext — it is
+    # a non-PII SHA-256 cache key, not the address itself.
+    phone = Column(EncryptedString, nullable=True)
     phone_type = Column(String(16), nullable=True)
     phone_dnc_flag = Column(Boolean, nullable=True)
-    email = Column(String(255), nullable=True)
+    email = Column(EncryptedString, nullable=True)
     # Multi-contact cache (up to 3), mirrors Result.phones/emails so a cache-hit
     # also populates the extras. NULL for pre-existing cache rows.
-    phones = Column(JSON, nullable=True)  # [{"number": str, "type": str|None}]
-    emails = Column(JSON, nullable=True)  # [str]
-    raw_response = Column(JSON, nullable=True)
+    phones = Column(EncryptedJSON, nullable=True)  # [{"number": str, "type": str|None}]
+    emails = Column(EncryptedJSON, nullable=True)  # [str]
+    # Full Tracerfy provider payload — contains all phones/emails, so encrypted.
+    raw_response = Column(EncryptedJSON, nullable=True)
     fetched_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),

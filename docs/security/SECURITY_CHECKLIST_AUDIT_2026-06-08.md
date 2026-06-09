@@ -52,9 +52,13 @@
 - ✅ **M2** PII in logs — FIXED (Codex-clean).
 - ✅ **M1** Redis/Celery TLS verification — FIXED (Codex-clean). Verify Redis connects on Railway deploy.
 - 🔶 **H2** MFA — Phases 1–2 DONE + committed (schema/crypto `d9ccd1a`; enrollment endpoints `8150477`), Codex-clean. Remaining: P3 login challenge + frontend, P4 session hardening, P5 admin enforcement + break-glass.
-- ⏳ **H3** PII encryption at rest (use `src/utils/crypto.py`) · **H1** RLS enforcement — remaining.
+- 🔶 **H3** PII encryption at rest — **BUILT (2026-06-09), code-complete, UNMERGED.** Split into two
+  deploy stages: `security/h3-pii-encryption` (contact PII + additive User.email blind index) +
+  `security/h3-email-cutover` (User.email cutover). Remaining = 2 Codex gates + staged deploy. See
+  `tasks/BACKLOG.md` §1 + the H3 spec.
+- ⏳ **H1** RLS enforcement — remaining (DO LAST).
   - H1 note (found during H2): `users` has RLS enabled but **no self-row policy** (027) — under enforcement every `select(User)` (incl. login + MFA `FOR UPDATE`) fails. H1 cutover must add a `users` self-row policy + the `mfa_backup_codes` system grant.
-- ⏳ M3 dep CVE scanning · M4 DDoS · M5 DB/Redis firewall · M6 alerting · M7 audit trail · M8 raw-requests SSRF.
+- ⏳ M3 dep CVE scanning · M4 DDoS · M5 DB/Redis firewall · M6 alerting · M7 audit trail · M8 raw-requests SSRF. **All remaining — see `tasks/BACKLOG.md` §2.**
 
 > Per the Codex-collaboration gate, any High in either reviewer = NO-GO for a clean bill until resolved. Four Highs → fix list below.
 

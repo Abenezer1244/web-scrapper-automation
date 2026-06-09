@@ -20,6 +20,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, relationship
 
+from src.db.encrypted_types import EncryptedJSON, EncryptedString
+
 
 class Base(DeclarativeBase):
     pass
@@ -241,15 +243,17 @@ class Result(Base):
     # Skip trace (Sprint 4, Tracerfy): populated asynchronously by the
     # skip-trace dispatcher + webhook ingest. Status transitions:
     # not_attempted → queued → submitted → hit | miss | errored.
-    phone = Column(String(32), nullable=True)
+    # H3: encrypted at rest (EncryptedString/EncryptedJSON over TEXT, migration
+    # 046). Display-only PII — never a SQL filter/join/dedup key.
+    phone = Column(EncryptedString, nullable=True)
     phone_type = Column(String(16), nullable=True)  # Mobile | Landline | VoIP
     phone_dnc_flag = Column(Boolean, nullable=True)
-    email = Column(String(255), nullable=True)
+    email = Column(EncryptedString, nullable=True)
     # Multi-contact (up to 3). The scalar phone/email above stay the PRIMARY
     # (= phones[0]/emails[0]) for all existing consumers; these add the extras
     # for display. NULL = legacy/not-yet-traced; [] = traced, none found.
-    phones = Column(JSON, nullable=True)  # [{"number": str, "type": str|None}]
-    emails = Column(JSON, nullable=True)  # [str]
+    phones = Column(EncryptedJSON, nullable=True)  # [{"number": str, "type": str|None}]
+    emails = Column(EncryptedJSON, nullable=True)  # [str]
     skip_trace_status = Column(String(16), nullable=False, default="not_attempted")
     skip_trace_attempted_at = Column(DateTime(timezone=True), nullable=True)
     # Sprint 6.4: cross-job deduplication
@@ -478,15 +482,18 @@ class SkipTraceCache(Base):
     __tablename__ = "skip_trace_cache"
 
     address_hash = Column(String(64), primary_key=True)
-    phone = Column(String(32), nullable=True)
+    # H3: encrypted at rest (migration 046). address_hash stays plaintext — it is
+    # a non-PII SHA-256 cache key, not the address itself.
+    phone = Column(EncryptedString, nullable=True)
     phone_type = Column(String(16), nullable=True)
     phone_dnc_flag = Column(Boolean, nullable=True)
-    email = Column(String(255), nullable=True)
+    email = Column(EncryptedString, nullable=True)
     # Multi-contact cache (up to 3), mirrors Result.phones/emails so a cache-hit
     # also populates the extras. NULL for pre-existing cache rows.
-    phones = Column(JSON, nullable=True)  # [{"number": str, "type": str|None}]
-    emails = Column(JSON, nullable=True)  # [str]
-    raw_response = Column(JSON, nullable=True)
+    phones = Column(EncryptedJSON, nullable=True)  # [{"number": str, "type": str|None}]
+    emails = Column(EncryptedJSON, nullable=True)  # [str]
+    # Full Tracerfy provider payload — contains all phones/emails, so encrypted.
+    raw_response = Column(EncryptedJSON, nullable=True)
     fetched_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),

@@ -29,6 +29,12 @@ def dialer_ready_conditions(include_unknown_dnc: bool = False) -> list:
     include_unknown_dnc=True ("candidate" set): allow NULL DNC (exclude only
     KNOWN-DNC). Caller must opt in deliberately and label it honestly.
     """
+    # H3: Result.phone is encrypted at rest, so this predicate runs over the
+    # stored value (fe1: ciphertext) at SQL time. That stays correct: a real
+    # phone is non-empty ciphertext (passes trim != ''), blanks are normalized to
+    # NULL (EncryptedString bind + backfill), and any legacy empty-string row not
+    # yet backfilled is still correctly excluded by trim != ''. No SQL match is
+    # ever made on the phone VALUE here — only presence/non-emptiness.
     conditions = [
         Result.phone.is_not(None),
         func.trim(Result.phone) != "",

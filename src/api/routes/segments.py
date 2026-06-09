@@ -23,6 +23,7 @@ Union (inclusive, strong + weak) is a deliberately separate later slice.
 """
 import csv
 import io
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import text
@@ -39,6 +40,7 @@ from src.api.schemas import (
     SegmentUnionRequest,
     SegmentUnionResponse,
 )
+from src.utils.crypto import decrypt_field
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("api.segments")
@@ -183,6 +185,29 @@ LIMIT :limit
 """
 
 
+def _decrypt_pii_rows(rows: list) -> list:
+    """Decrypt the encrypted phone/email columns of a raw-SQL result.
+
+    The segment queries are raw ``text()`` so the ``EncryptedString`` type does
+    NOT run — ``phone``/``email`` come back as ``fe1:`` ciphertext. Decrypt them
+    here, centrally, so every consumer (preview + export, intersection + union)
+    receives plaintext and none can forget. Returns ``SimpleNamespace`` rows so
+    existing attribute access (``r.phone``, ``r.party_name``, ...) is unchanged.
+    ``party_name``/addresses are out of H3 scope (plaintext) and pass through.
+    The contactability ranking + ``ORDER BY`` already ran in SQL over ciphertext,
+    which is correct (ciphertext is non-NULL; blanks were normalized to NULL).
+    """
+    out = []
+    for r in rows:
+        data = dict(r._mapping)
+        if data.get("phone") is not None:
+            data["phone"] = decrypt_field(data["phone"])
+        if data.get("email") is not None:
+            data["email"] = decrypt_field(data["email"])
+        out.append(SimpleNamespace(**data))
+    return out
+
+
 async def _fetch_intersection(
     db: AsyncSession,
     user_id: str,
@@ -210,7 +235,7 @@ async def _fetch_intersection(
 
     sql = text(_INTERSECTION_SQL.format(county_clause=county_clause))
     result = await db.execute(sql, params)
-    return result.fetchall()
+    return _decrypt_pii_rows(result.fetchall())
 
 
 @router.post("/intersection", response_model=SegmentIntersectionResponse)
@@ -335,7 +360,7 @@ async def _fetch_union(
 
     sql = text(_UNION_SQL.format(county_clause=county_clause))
     result = await db.execute(sql, params)
-    return result.fetchall()
+    return _decrypt_pii_rows(result.fetchall())
 
 
 def _union_rows(rows: list) -> list[SegmentLeadRow]:

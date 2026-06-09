@@ -1,16 +1,22 @@
-"""H3 Phase 4: populate users.email_hmac from the (plaintext) email.
+"""H3 Phase 4: reconcile users.email_hmac to blind_index(email) under the CURRENT key.
 
 Run MANUALLY after the P4 migration adds users.email_hmac (nullable) — never on
 boot. This is the PREREQUISITE for the P5 cutover: the UNIQUE constraint on
-email_hmac and the login lookup switch are only safe once EVERY existing user
-row has its blind index populated (otherwise rows with NULL email_hmac become
-unloggable). Verify this script reports 0 remaining NULLs before deploying P5.
+email_hmac and the login-lookup switch are only safe once EVERY user row's blind
+index matches blind_index(email) under the key that P5 will use to look users up.
 
-Idempotent + re-runnable: only rows with email_hmac IS NULL are touched. The
-blind index is computed with crypto.blind_index (the SAME function the @validates
-choke point + the login lookup use), so backfilled and forward rows match.
+RECONCILING, not just fill-NULL (Codex P1): if P4 is deployed before the
+dedicated BLIND_INDEX_KEY is provisioned, the @validates dual-write computes
+email_hmac under the SECRET_KEY fallback. A fill-NULL-only backfill would skip
+those non-null rows, and once BLIND_INDEX_KEY is set their hashes would no longer
+match blind_index(email) — locking those users out after the P5 read switch. So
+this script recomputes EVERY row under the current key and rewrites any that
+differ. email_hmac is unused for lookups until P5, so correcting it here is safe.
 
-Keyset pagination by users.id; small batched commits.
+=> RUN THIS AFTER BLIND_INDEX_KEY IS FINALIZED IN PROD, and immediately before
+   deploying P5. Re-run until it reports 0 changed + 0 NULL.
+
+Idempotent: same key -> same hash -> no rewrite. Keyset pagination by users.id.
 
 Usage:  railway run --service worker python scripts/backfill_user_email_hmac.py [--batch 1000]
 """
@@ -33,11 +39,13 @@ def run(batch: int) -> None:
     changed = 0
     while True:
         with SyncSessionLocal() as db:
+            # Scan ALL rows (not just NULL email_hmac) so a hash computed under a
+            # stale/fallback key gets corrected to the current key (Codex P1).
             rows = db.execute(
                 text(
                     """
-                    SELECT id, email FROM users
-                    WHERE id > CAST(:last AS uuid) AND email_hmac IS NULL
+                    SELECT id, email, email_hmac FROM users
+                    WHERE id > CAST(:last AS uuid)
                     ORDER BY id
                     LIMIT :batch
                     """
@@ -48,11 +56,14 @@ def run(batch: int) -> None:
                 break
             last = str(rows[-1].id)
             scanned += len(rows)
-            updates = [
-                {"pk": str(r.id), "hmac": blind_index(r.email)}
-                for r in rows
-                if r.email
-            ]
+            # Only rewrite rows whose stored hash differs from the current key's.
+            updates = []
+            for r in rows:
+                if not r.email:
+                    continue
+                want = blind_index(r.email)
+                if r.email_hmac != want:
+                    updates.append({"pk": str(r.id), "hmac": want})
             if updates:
                 db.execute(
                     text("UPDATE users SET email_hmac = :hmac WHERE id = CAST(:pk AS uuid)"),

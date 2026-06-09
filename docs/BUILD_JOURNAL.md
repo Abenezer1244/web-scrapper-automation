@@ -19,6 +19,49 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-09 — H3: ran the two pending Codex merge-gates (Stage 1 CLEAN)
+
+**Built / Shipped:**
+- **Stage 1 (`security/h3-pii-encryption`) — Codex gate CLEAN.** First pass flagged 1 **P1**:
+  `backfill_user_email_hmac.py` called `decrypt_field(r.email)` unconditionally; under
+  `PII_ENCRYPTION_STRICT=true` that RAISES on plaintext, and in Stage 1 `users.email` stays plaintext —
+  so an operator who flips strict after the contact-PII backfill would crash the prerequisite. Fixed
+  `2bbebf7`: decrypt only when `is_encrypted(r.email)` (strict-safe), else treat as plaintext. Re-gate clean.
+- **Stage 2 (`security/h3-email-cutover`) — RESOLVED.** vs `main`: 2 **P2** (`2bf127d`: migration 048
+  key-guard now also fails closed on empty DB when `ENVIRONMENT=production`; preflight `sys.exit(1)` so a
+  CI/runbook gate is enforceable; + same `is_encrypted` guard for branch parity) then, with the noise gone,
+  2 **P1** — #1 (`ef34e88`: the `deploy-production` migration job ran `alembic upgrade head` without
+  `BLIND_INDEX_KEY`, so 048's in-migration reconcile would hash under the SECRET_KEY fallback and lock
+  users out → pass `BLIND_INDEX_KEY`+`FIELD_ENCRYPTION_KEY` from GitHub secrets); #2 (048 NOT NULL in a
+  rolling deploy) is the exact hazard the two-branch split exists to solve.
+
+**Tried / Decided:** Codex P1 #2 (NOT NULL rolling deploy) is a true-positive only because `codex review
+--base main` sees 047+048 together while Stage 1 is unmerged. Rather than assert "doc wins", **proved** it:
+`codex review --base security/h3-pii-encryption` (= the post-Stage-1-merge diff, 047+dual-write in baseline)
+returns CLEAN. So the split resolves it by design.
+
+**Failed / Blocked (codex CLI env, all fixed):**
+- Codex 0.125.0 hung 22 min on first review — session rollout showed it called the **graphify MCP
+  `query_graph`** (project `.codex/config.toml`) and the tool call never returned. `startup_timeout_sec`
+  only bounds the handshake, not the call. Ran reviews with `-c mcp_servers={}` (per-invocation MCP-off).
+  graphify left enabled in the untracked local `.codex/config.toml`; Claude's graphify + the post-commit
+  auto-refresh were never affected. **Open follow-up: fix the `graphify.serve` `query_graph` hang** so
+  codex can use it without freezing.
+- Global `~/.codex/config.toml` had `service_tier = "default"`, which 0.125.0 rejects (only `fast`/`flex`,
+  and the API rejects `flex` under ChatGPT auth) — it was breaking **every** codex call. Commented it out
+  → falls back to the account's natural (priority) tier.
+
+**Pending / Handoff:** Stage 1 ready to merge (code clean; deploy prereqs unchanged — provision keys in
+Railway, run backfills). Stage 2: add `BLIND_INDEX_KEY`+`FIELD_ENCRYPTION_KEY` as GitHub prod-env secrets;
+after Stage 1 merges, rebase Stage 2 (light conflict on `backfill_user_email_hmac.py` — keep combined
+`is_encrypted` guard + `sys.exit(1)`) and re-gate `--base main` (expect clean).
+
+**Facts learned:** `codex review --base X` is mutually exclusive with a `[PROMPT]` arg in 0.125.0.
+Reviewing a split branch `--base <the-other-stage>` cleanly simulates the post-merge diff — a reliable way
+to separate real findings from in-isolation artifacts.
+
+---
+
 ## 2026-06-09 — H3: PII-at-rest encryption (built; split into two deploy stages)
 
 **Built / Shipped (two branches off `main`, UNMERGED):**

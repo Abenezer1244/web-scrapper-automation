@@ -11,9 +11,10 @@ the H3 spec (`docs/superpowers/specs/2026-06-08-h3-pii-encryption-design.md`),
 ## 1. H3 — PII-at-rest encryption (code DONE; gates + deploy left)
 Two branches off `main`, unmerged. Stage 1 = contact PII + additive email_hmac. Stage 2 = User.email cutover.
 
-- [ ] 🔴 Codex-gate `security/h3-pii-encryption` (Stage-1 split composition) — `codex review --base main`
-- [ ] 🔴 Codex-gate `security/h3-email-cutover` (Stage-2 final composition) — `codex review --base main`
+- [x] 🔴 Codex-gate `security/h3-pii-encryption` (Stage-1) — CLEAN (2026-06-09). 1 P1 found + fixed (`2bbebf7`: email_hmac backfill strict-mode safe via `is_encrypted` guard), re-gate clean.
+- [x] 🔴 Codex-gate `security/h3-email-cutover` (Stage-2) — RESOLVED (2026-06-09). vs `main`: 2 P2 fixed (`2bf127d`: prod-env key guard + preflight `sys.exit(1)`) + 2 P1 — #1 fixed (`ef34e88`: pass `BLIND_INDEX_KEY`/`FIELD_ENCRYPTION_KEY` to the prod migration runner), #2 (048 NOT NULL rolling deploy) is the in-isolation artifact the two-branch split exists to solve — **empirically CLEAN when reviewed `--base security/h3-pii-encryption`** (the post-Stage-1-merge diff). ⚠️ Re-gate Stage-2 `--base main` AFTER it is rebased on merged Stage-1; expect clean. Rebase will lightly conflict on `backfill_user_email_hmac.py` (both branches edited the same block) — keep the combined `is_encrypted` guard + `sys.exit(1)`.
 - [ ] 👤 Provision `FIELD_ENCRYPTION_KEY` + `BLIND_INDEX_KEY` in Railway (BEFORE Stage-1 deploy)
+- [ ] 👤 Also add `FIELD_ENCRYPTION_KEY` + `BLIND_INDEX_KEY` as GitHub **production-environment secrets** (BEFORE Stage-2 merge) — the `deploy-production` migration job now passes them to `alembic upgrade head` so migration 048 reconciles `email_hmac` under the SAME key the app uses (else fail-closed or user lockout). Use the identical key values as Railway.
 - [ ] 🔴 Merge + deploy **Stage 1**
 - [ ] 👤 Run `backfill_pii_encryption.py` (contact PII) until `changed 0`
 - [ ] 👤 Run `backfill_user_email_hmac.py` until `OK to deploy P5 (0 NULL, 0 collisions)`

@@ -18,7 +18,7 @@ Chelan, Douglas, Pend Oreille
 import re
 from datetime import datetime, timedelta
 
-from src.api.middleware.security import add_scrape_domain
+from src.api.middleware.security import add_scrape_domain, validate_scraping_target
 from src.scrapers.base_scraper import (
     BridgeScraper,
     ScrapedRecord,
@@ -893,6 +893,7 @@ class AcclaimWebScraper(BridgeScraper):
         """
         import hashlib
         from concurrent.futures import ThreadPoolExecutor
+        from urllib.parse import urlparse
         import requests as _requests
 
         pacs_url = self._PACS_URLS.get(self.county.lower())
@@ -902,11 +903,29 @@ class AcclaimWebScraper(BridgeScraper):
 
         _logger.info("Looking up addresses for %d records via PACS (%s)...", len(records), self.county)
 
+        # M8 SSRF hardening (mirrors src/scrapers/enrichment/pacs.py): pacs_url is a
+        # static trusted constant, but validate defense-in-depth before any outbound
+        # request — refuse non-HTTPS, and resolve=True rejects a host that resolves
+        # to a private/loopback/metadata IP. Every request below also sets
+        # trust_env=False (no ambient-proxy reroute) + allow_redirects=False (a
+        # poisoned 3xx can't bounce to an internal host; PACS posts back to the
+        # same URL, so there is no legitimate redirect). Validated once here because
+        # the same pacs_url is reused by the init session and every per-lookup session.
+        if urlparse(pacs_url).scheme != "https":
+            _logger.warning("PACS lookup refused non-HTTPS URL for %s", self.county)
+            return
+        try:
+            validate_scraping_target(pacs_url, require_allowlisted=False, resolve=True)
+        except Exception as exc:
+            _logger.warning("PACS URL failed SSRF validation: %s", str(exc)[:80])
+            return
+
         # Get initial page for VIEWSTATE
         sess = _requests.Session()
+        sess.trust_env = False
         sess.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"
         try:
-            init = sess.get(pacs_url, timeout=10)
+            init = sess.get(pacs_url, timeout=10, allow_redirects=False)
         except Exception as exc:
             _logger.warning("PACS init failed: %s", str(exc)[:80])
             return
@@ -922,10 +941,12 @@ class AcclaimWebScraper(BridgeScraper):
             """Search PACS by owner name, return {address, parcel_id, mailing} or None."""
             try:
                 # Each lookup needs its own session (shared sessions cause
-                # VIEWSTATE conflicts under concurrency)
+                # VIEWSTATE conflicts under concurrency). M8: trust_env=False +
+                # allow_redirects=False; pacs_url already SSRF-validated above.
                 _s = _requests.Session()
+                _s.trust_env = False
                 _s.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"
-                r0 = _s.get(pacs_url, timeout=8)
+                r0 = _s.get(pacs_url, timeout=8, allow_redirects=False)
                 vs = re.search(r'__VIEWSTATE.*?value="([^"]+)"', r0.text)
                 ev = re.search(r'__EVENTVALIDATION.*?value="([^"]+)"', r0.text)
                 vsg = re.search(r'__VIEWSTATEGENERATOR.*?value="([^"]+)"', r0.text)
@@ -939,7 +960,7 @@ class AcclaimWebScraper(BridgeScraper):
                     "propertySearchOptions$ownerName": name,
                     "propertySearchOptions$search": "Search",
                 }
-                r = _s.post(pacs_url, data=data, timeout=10, allow_redirects=True)
+                r = _s.post(pacs_url, data=data, timeout=10, allow_redirects=False)
                 if r.status_code != 200:
                     return None
 

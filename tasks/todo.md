@@ -80,7 +80,27 @@ failure=exit 3). **H1-CUTOVER TODO recorded:** bridgeleads_app needs grants on m
 pre-existing gap) + mfa_break_glass_codes — blocked on reconciling app-DELETE vs the script's no-DELETE
 invariant. Harmless today (RLS_ENFORCE=False/BYPASSRLS).
 
-### C2 — in-app redemption (NEXT): POST /auth/login/break-glass + iat-override mint + tests.
+### ✅ C2 — DONE (Codex round-5; no Crit/High; 1 documented-accepted P2). compile+ruff clean; 51 pure tests.
+**Shipped:** `POST /auth/login/break-glass` (reuses the 5-min challenge token). Flow: IP limit → decode →
+per-user `mfa-breakglass:{id}` limit → RLS bind → revocation gate (503 fail-closed) → load user
+(active+mfa_enabled) → ATOMIC consume (UPDATE...RETURNING, unused/unrevoked/unexpired) → burn jti →
+revoke_all_for_user → recovery txn (clear MFA + delete backup + revoke sibling break-glass + clear API key)
+→ commit → WAIT for clock to pass revoke second → mint DEGRADED session `amr=["pwd","break_glass"]` (NO
+"mfa"). `BreakGlassLoginRequest` schema (code max_length=64). `revoke_all_for_user` now RETURNS the
+revoke datetime (single API clock w/ JWT iat). `tests/test_break_glass_login.py` (7 CI-only integration tests).
+**Codex gate (5 rounds):** R1 [P1] schema cap 32<35 + [P1] now-1 missed same-second tokens. R2 [P1] stale
+early `now` capture. R3 [P1] Python pre-write capture window + [P3] wait-loop fell through. R4 [P2]
+clock_timestamp introduced cross-clock skew. R5 [P2 ACCEPTED] row-lock-wait extends capture window —
+NOT fixed via SELECT FOR UPDATE because mfa_enable/disable call revoke_all_for_user while holding a users
+FOR UPDATE lock → would deadlock; inherent timestamp-precision limit, robust fix = token-versioning (separate).
+**Same-second-revoke solved:** revoke at now (catches same-second sessions), WAIT until clock>revoke_ts, mint
+iat=now (no future iat — PyJWT rejects future iat). fail-closed 503 if clock never advances.
+**⚠️ NOTE for user:** pre-existing concern observed — mfa_enable/mfa_disable call revoke_all_for_user while
+holding a `with_for_update()` lock on the users row; the separate-txn UPDATE inside contends with that lock.
+Apparently works in prod but worth verifying (NOT introduced by P5). **Frontend break-glass affordance =
+follow-up (not in P5 backend scope).**
+
+## ✅ H2 PHASE 5 COMPLETE (Step 0 + A + B + C1 + C2). See per-step blocks above.
 
 ## Step C — break-glass (BOTH)  (original plan below)
 - **New table `mfa_break_glass_codes`** (migration 045 — NOT reuse MfaBackupCode): `user_id, code_hash,

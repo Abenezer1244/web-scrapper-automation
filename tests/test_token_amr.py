@@ -156,6 +156,18 @@ def test_access_audience_constant_unchanged():
     assert _REFRESH_AUDIENCE == "bridgeleads-refresh"
 
 
+# ─── break-glass amr survives refresh (recovery session can't self-upgrade) ───
+
+def test_break_glass_amr_preserved_through_refresh():
+    """A break-glass refresh token stays break_glass on rotation and never gains
+    'mfa' — the recovery session can't self-upgrade to step-up-capable."""
+    old = create_refresh_token("u1", amr=["pwd", "break_glass"])
+    new_access, _ = _simulate_refresh(old)
+    amr = decode_secure_token(new_access)["amr"]
+    assert amr == ["pwd", "break_glass"]
+    assert "mfa" not in amr
+
+
 # ─── Codex P1: refresh must NOT mint a FRESH session for a missing auth_time ──
 
 def test_refresh_with_mfa_amr_but_missing_auth_time_is_stale_not_fresh():

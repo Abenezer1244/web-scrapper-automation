@@ -27,6 +27,7 @@ from src.api.deps import get_rls_db
 from src.api.middleware import BruteForceProtection, audit_log, client_ip, rate_limit
 from src.api.schemas import (
     ApiKeyResponse,
+    BreakGlassLoginRequest,
     ForgotPasswordRequest,
     LoginResponse,
     MfaDisableRequest,
@@ -521,6 +522,198 @@ async def login_mfa(
     token = create_secure_token(user.id, amr=["pwd", "mfa"])
     refresh = create_refresh_token(user.id, amr=["pwd", "mfa"])
     audit_log(request, "login_success", user.id)
+    return LoginResponse(access_token=token, refresh_token=refresh)
+
+
+@router.post("/login/break-glass", response_model=LoginResponse)
+async def login_break_glass(
+    body: BreakGlassLoginRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> LoginResponse:
+    """Redeem an operator-issued break-glass code (H2-P5) when the authenticator
+    is lost. Reuses the /auth/login challenge token (the password step was already
+    proven there) but verifies a BREAK-GLASS code, not TOTP/backup.
+
+    RECOVERY-ONLY + LOUD: on success it tears MFA down to un-enrolled (so the user
+    can set up a FRESH authenticator — they can't disable the old one, it's lost),
+    burns every remaining break-glass + backup code, revokes all sessions + the
+    API key, and mints a DEGRADED session: amr=["pwd","break_glass"] (NO "mfa"),
+    so it can never pass admin MFA step-up, and with mfa_enabled now False the
+    admin routes route the user to re-enrollment.
+    """
+    # Coarse IP limiter BEFORE we trust any identity from the token (Codex).
+    await rate_limit(request, zone="auth")
+    import jwt
+    import redis.exceptions as _redis_exceptions
+
+    from src.api.middleware.auth_hardening import (
+        TokenBlacklist,
+        revocation_unavailable_503,
+    )
+    from src.db.models import MfaBackupCode, MfaBreakGlassCode
+    from src.utils.mfa import hash_backup_code
+
+    try:
+        payload = _decode_mfa_challenge_token(body.mfa_token)
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired MFA challenge.",
+        )
+    user_id = payload.get("sub")
+    jti = payload.get("jti", "")
+    issued_at = payload.get("iat", 0)
+
+    # Per-user break-glass verify bucket — separate from mfa-verify/mfa-issue so
+    # the buckets can't starve each other; caps code-guessing across IPs.
+    await rate_limit(request, zone="auth", identifier=f"mfa-breakglass:{user_id}")
+
+    # Bind RLS to the cryptographically-proven challenge subject before any query.
+    db.sync_session.info["rls_user_id"] = str(user_id)
+    await db.execute(
+        text("SELECT set_config('app.current_user_id', :uid, true)"),
+        {"uid": str(user_id)},
+    )
+
+    # Revocation gate: a challenge minted before a logout-all / password change is
+    # dead even inside its 5-min window. Fail-closed 503 if Redis is down.
+    try:
+        if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired MFA challenge.",
+            )
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
+
+    result = await db.execute(select(User).where(User.id == user_id, User.is_active))
+    user = result.scalar_one_or_none()
+    if user is None or not user.mfa_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired MFA challenge.",
+        )
+
+    now = datetime.now(UTC)
+    ua = (request.headers.get("user-agent") or "")[:500]
+    ip = client_ip(request)
+
+    # ATOMIC single-use consume: burn exactly one unused, unrevoked, unexpired
+    # break-glass code for this user. RETURNING is non-empty iff one matched. This
+    # is the GATE — nothing destructive happens until a code is proven valid, so a
+    # password-knowing attacker cannot trigger a recovery/revocation with a bogus
+    # code. Staged (uncommitted) so a later failure rolls the consume back.
+    code_hash = hash_backup_code((body.code or "").strip())
+    consumed = await db.execute(
+        update(MfaBreakGlassCode)
+        .where(
+            MfaBreakGlassCode.user_id == user_id,
+            MfaBreakGlassCode.code_hash == code_hash,
+            MfaBreakGlassCode.used_at.is_(None),
+            MfaBreakGlassCode.revoked_at.is_(None),
+            or_(
+                MfaBreakGlassCode.expires_at.is_(None),
+                MfaBreakGlassCode.expires_at > now,
+            ),
+        )
+        .values(used_at=now, used_ip=ip, used_user_agent=ua)
+        .returning(MfaBreakGlassCode.id)
+    )
+    if consumed.scalar_one_or_none() is None:
+        # Generic failure — never distinguish invalid vs used vs expired vs revoked.
+        audit_log(request, "mfa_breakglass_failure", user_id)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid recovery code.",
+        )
+
+    # Burn the challenge jti so a stolen challenge + one valid code can't mint
+    # repeated recoveries within the window. A wrong code never reaches here.
+    try:
+        claimed = await TokenBlacklist.consume_once(jti, _MFA_CHALLENGE_EXPIRE_SECONDS)
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
+    if not claimed:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired MFA challenge.",
+        )
+
+    # FAIL-SAFE ORDERING (mirrors change_password / reset_user_mfa): revoke ALL
+    # sessions BEFORE committing the recovery. Our session currently holds only
+    # the break_glass row lock (from the consume above) — NOT the users row — so
+    # revoke_all_for_user's own transaction does not contend with us (Codex: no
+    # deadlock). 503 on Redis: the staged consume rolls back (code reusable) and
+    # nothing is torn down — safe.
+    #
+    # is_revoked uses issued_at <= revoke_time at whole-second precision, so
+    # revoking at the current instant catches EVERY pre-existing session,
+    # including any minted earlier in this same second. revoke_all_for_user
+    # stamps the time AT its write and RETURNS it (so there is no stale
+    # caller-side timestamp a racing token could slip past). The recovery session
+    # we mint below must then land in a LATER second to survive (a future iat is
+    # rejected by the decoder), so after the commit we wait for the wall clock to
+    # tick strictly past the returned revoke instant before minting.
+    try:
+        revoke_at = await TokenBlacklist.revoke_all_for_user(user_id)
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
+
+    # RECOVERY effect, committed atomically with the consume. Targeted Core
+    # UPDATE so we never clobber the revoked_at that revoke_all_for_user just
+    # wrote. Tear MFA down to un-enrolled + burn every remaining recovery
+    # credential so one redemption invalidates the whole set.
+    await db.execute(
+        update(User)
+        .where(User.id == user_id)
+        .values(
+            mfa_enabled=False,
+            mfa_secret_encrypted=None,
+            mfa_last_totp_counter=None,
+            mfa_enrolled_at=None,
+            api_key_hash=None,
+        )
+    )
+    await db.execute(delete(MfaBackupCode).where(MfaBackupCode.user_id == user_id))
+    await db.execute(
+        update(MfaBreakGlassCode)
+        .where(
+            MfaBreakGlassCode.user_id == user_id,
+            MfaBreakGlassCode.used_at.is_(None),
+            MfaBreakGlassCode.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    await db.commit()
+
+    # Wait for the wall clock to advance strictly past the revoke second, so the
+    # recovery session minted next has iat > revoke_time and survives the
+    # issued_at <= revoke_time check (while every same-second-or-earlier session
+    # stays revoked). Bounded (~1s worst case, the time to the next second tick)
+    # with a hard cap so a misbehaving clock can never hang the request.
+    import asyncio
+
+    revoke_ts = int(revoke_at.timestamp())
+    for _ in range(100):  # cap ~2s
+        if int(time.time()) > revoke_ts:
+            break
+        await asyncio.sleep(0.02)
+    else:
+        # The clock never advanced past the revoke second within the cap (clock
+        # skew / frozen time). Minting now would hand back a token whose iat could
+        # be <= revoke_ts — i.e. a SELF-REVOKED session. Fail closed instead: the
+        # recovery (MFA cleared, sessions revoked) is already committed and
+        # durable, so the user simply re-logs in (MFA is now off) to get a clean
+        # session. (Codex P3.)
+        raise revocation_unavailable_503()
+
+    # Mint the DEGRADED recovery session. amr WITHOUT "mfa" -> can never satisfy
+    # admin step-up; mfa_enabled is now False so require_admin routes the user to
+    # re-enrollment.
+    token = create_secure_token(user.id, amr=["pwd", "break_glass"])
+    refresh = create_refresh_token(user.id, amr=["pwd", "break_glass"])
+    audit_log(request, "mfa_breakglass_used", user_id)
     return LoginResponse(access_token=token, refresh_token=refresh)
 
 

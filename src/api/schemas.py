@@ -128,6 +128,15 @@ class MfaLoginRequest(BaseModel):
     code: str = Field(min_length=6, max_length=32)
 
 
+class BreakGlassLoginRequest(BaseModel):
+    """POST /auth/login/break-glass — redeem an operator-issued break-glass code.
+    Reuses the /auth/login challenge token; `code` is a 128-bit 'bg-' code which
+    renders as 35 chars ('bg-' + 26 base32 chars grouped by dashes), so it needs a
+    larger cap than MfaLoginRequest's 32 (Codex)."""
+    mfa_token: str = Field(max_length=4096)
+    code: str = Field(min_length=6, max_length=64)
+
+
 class UserResponse(BaseModel):
     id: str
     email: str

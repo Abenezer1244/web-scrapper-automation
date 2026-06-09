@@ -1,6 +1,7 @@
 """Auth hardening: token blacklist + brute-force protection (Redis-backed)."""
 
 import logging
+from datetime import datetime
 
 import redis.asyncio as aioredis
 import redis.exceptions as redis_exceptions
@@ -115,8 +116,18 @@ class TokenBlacklist:
     _REVOKE_CACHE_TTL_SECONDS = 7 * 24 * 3600
 
     @staticmethod
-    async def revoke_all_for_user(user_id: str) -> None:
-        """Store a revoke timestamp for the user, durably.
+    async def revoke_all_for_user(user_id: str) -> datetime:
+        """Store a revoke timestamp for the user, durably. Returns the exact UTC
+        instant it stamped.
+
+        Returning the instant lets a caller that mints a session in the SAME
+        request (the break-glass redeem) wait until the wall clock ticks strictly
+        past it before issuing the new token: is_revoked_by_user_logout_all
+        compares ``issued_at <= revoke_time`` at whole-second precision and a
+        future iat is rejected by the JWT decoder, so the new session must land in
+        a LATER second to survive while every session up to this instant stays
+        revoked. The timestamp is captured here, at the write, so nothing minted
+        before the write can slip through a stale caller-side value.
 
         Writes to BOTH the Postgres `users.revoked_at` column (durable
         source of truth) AND a Redis cache key (hot read path). The DB
@@ -146,9 +157,29 @@ class TokenBlacklist:
         from src.db.models import User
         from src.db.session import async_engine
 
-        now = datetime.now(UTC)
-        # 1) Durable write to users.revoked_at — must succeed.
+        # 1) Durable write to users.revoked_at — must succeed. The revoke instant
+        # MUST come from the SAME clock that mints JWT `iat` (the API host's
+        # time.time()/datetime.now), because is_revoked compares
+        # `issued_at <= revoke_time`. Stamping it from the DB clock instead
+        # (clock_timestamp) would introduce a cross-clock skew where an
+        # API-ahead/DB-behind host leaves a just-issued token un-revoked (Codex).
+        # So we use datetime.now(UTC), captured INSIDE the connection block right
+        # before the UPDATE — after the pool wait — so the gap between capture and
+        # write is just the statement round-trip (Codex P1: minimal window). The
+        # residual sub-round-trip window matches the existing documented
+        # "same-second login may need a retry" caveat on is_revoked.
+        #
+        # ACCEPTED RESIDUAL (Codex P2): if this UPDATE blocks on a row lock held
+        # by a concurrent txn, the capture->write window grows by the lock wait.
+        # We deliberately do NOT add a SELECT ... FOR UPDATE before the capture:
+        # mfa_enable / mfa_disable call this function WHILE already holding a
+        # with_for_update() lock on the same users row, so a second FOR UPDATE
+        # here would risk a cross-transaction deadlock — worse than the narrow
+        # race it would close. The robust fix is a monotonic token-version /
+        # nonce revocation scheme (separate effort); timestamp precision is the
+        # known limit of the current mechanism.
         async with async_engine.begin() as conn:
+            now = datetime.now(UTC)
             await conn.execute(
                 update(User).where(User.id == user_id).values(revoked_at=now)
             )
@@ -183,6 +214,8 @@ class TokenBlacklist:
                     user_id, del_exc,
                 )
                 raise
+
+        return now
 
     @staticmethod
     async def get_user_revoke_time(user_id: str) -> int:

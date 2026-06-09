@@ -18,9 +18,10 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import DeclarativeBase, relationship
+from sqlalchemy.orm import DeclarativeBase, relationship, validates
 
 from src.db.encrypted_types import EncryptedJSON, EncryptedString
+from src.utils.crypto import blind_index
 
 
 class Base(DeclarativeBase):
@@ -36,6 +37,13 @@ class User(Base):
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
     email = Column(String(255), unique=True, nullable=False, index=True)
+    # H3 blind index: deterministic HMAC of the normalized email (crypto.blind_index,
+    # keyed by the dedicated stable BLIND_INDEX_KEY). The searchable lookup key once
+    # `email` is encrypted — equality lookups + the uniqueness constraint move here
+    # (Fernet is non-deterministic, so the email column can't carry either). Added
+    # nullable in P4 and dual-written via @validates below; promoted to NOT NULL +
+    # UNIQUE in P5 after the backfill populates every row.
+    email_hmac = Column(String(64), nullable=True, index=True)
     password_hash = Column(String(255), nullable=False)
     api_key_hash = Column(String(64), nullable=True, index=True)
     plan = Column(String(32), nullable=False, default="starter")
@@ -88,6 +96,18 @@ class User(Base):
     mfa_last_totp_counter = Column(BigInteger, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    @validates("email")
+    def _sync_email_hmac(self, _key, value):
+        """Single choke point keeping email_hmac in lockstep with email.
+
+        Fires on any Python-side set of `email` (User(email=...) or user.email =
+        x), so a new or updated user always gets the matching blind index. Does
+        NOT fire on ORM load from the DB, so a row's stored hash is preserved on
+        read. This is the only place email_hmac is computed — it cannot drift.
+        """
+        self.email_hmac = blind_index(value) if value is not None else None
+        return value
 
     scraper_configs = relationship("ScraperConfig", back_populates="user", cascade="all, delete-orphan")
     jobs = relationship("Job", back_populates="user", cascade="all, delete-orphan")

@@ -93,9 +93,20 @@ def encrypt_field(plaintext: str) -> str:
 
 def _fernet_decrypt(token: str) -> str | None:
     """Try to Fernet-decrypt a raw token (no fe1: prefix); None if it is not a
-    valid token under any active key."""
+    valid token under any active key.
+
+    ``_instance()`` is called OUTSIDE the catch so a key/config error
+    (malformed ``FIELD_ENCRYPTION_KEY``) propagates and fails fast, rather than
+    being mistaken for "not a token" and silently passed through as plaintext.
+    Only token-level decode failures are suppressed.
+    """
+    fernet = _instance()
     try:
-        return _instance().decrypt(token.encode("ascii")).decode("utf-8")
+        raw = token.encode("ascii")
+    except UnicodeEncodeError:
+        return None  # non-ascii -> cannot be a base64url Fernet token
+    try:
+        return fernet.decrypt(raw).decode("utf-8")
     except (InvalidToken, ValueError):
         return None
 

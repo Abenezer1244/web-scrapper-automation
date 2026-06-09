@@ -11,6 +11,7 @@ import json
 import pytest
 from cryptography.fernet import InvalidToken
 
+import src.utils.crypto as crypto
 from src.config import settings
 from src.db.encrypted_types import EncryptedJSON, EncryptedString
 from src.utils.crypto import (
@@ -66,6 +67,20 @@ def test_encrypt_none_raises():
 
 def test_legacy_plaintext_passthrough_tolerant(tolerant):
     assert decrypt_field("206-555-0100") == "206-555-0100"
+
+
+def test_non_ascii_legacy_plaintext_passthrough_tolerant(tolerant):
+    # A legacy plaintext value with non-ascii chars must pass through, not crash
+    # on the ascii-only Fernet-token probe.
+    assert decrypt_field("Iñtërnâtiönal") == "Iñtërnâtiönal"
+
+
+def test_malformed_key_config_fails_fast(tolerant, monkeypatch):
+    # A broken FIELD_ENCRYPTION_KEY must surface, not be swallowed as "plaintext".
+    monkeypatch.setattr(crypto, "_fernet", None)
+    monkeypatch.setattr(settings, "FIELD_ENCRYPTION_KEY", ",")
+    with pytest.raises(ValueError):
+        decrypt_field(_ENC_PREFIX + "anything")
 
 
 def test_legacy_plaintext_rejected_strict(strict):

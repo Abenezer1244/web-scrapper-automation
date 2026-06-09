@@ -71,6 +71,24 @@ class Settings(BaseSettings):
                 ) from exc
         return v
 
+    # Dedicated, STABLE key for the deterministic HMAC blind index over
+    # User.email (H3). MUST be independent of FIELD_ENCRYPTION_KEY: rotating the
+    # Fernet key (MultiFernet) must NOT change the blind-index key, or every
+    # stored email_hmac stops matching and all logins break. Rotating this key
+    # requires a dual-index re-backfill — never rotate it casually. If blank,
+    # src/utils/crypto.py derives a key from SECRET_KEY via HKDF (dev fallback;
+    # provision a dedicated key in production before strict cutover). Generate:
+    #   python -c "import secrets; print(secrets.token_urlsafe(32))"
+    BLIND_INDEX_KEY: str = ""
+
+    # H3 PII encryption read mode. While False (tolerant), decrypt_field() treats
+    # any value that is not a valid fe1:-prefixed Fernet token as legacy
+    # plaintext and returns it as-is — required during the backfill window. Flip
+    # to True (strict) ONLY after the backfill verification script reports zero
+    # unencrypted in-scope PII rows: strict mode raises on any non-ciphertext,
+    # closing the "plaintext silently accepted forever" gap.
+    PII_ENCRYPTION_STRICT: bool = False
+
     @field_validator("SECRET_KEY")
     @classmethod
     def secret_key_must_be_strong(cls, v: str) -> str:

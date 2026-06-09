@@ -70,12 +70,14 @@ the 4-round same-second saga above.
   the users row then called `revoke_all_for_user`, whose own `async_engine.begin()` (NullPool = separate
   connection) blocked on that lock while the request coroutine awaited it → app-level deadlock/hang.
   Codex confirmed HIGH. Fix = in-session revoke: new `TokenBlacklist.update_revoke_cache` + stamp
-  `revoked_at` on the locked session, Redis-before-commit (503→rollback, fail-safe). ⚠️ Codex's final
-  *diff* gate on this commit is PENDING (Codex CLI hit its usage limit) — the fix IS Codex's prescribed
-  option B from the confirming consult; re-run `codex review ea9912a` when the limit resets.
-- **Shipped via PRs:** backend `web-scrapper-automation#13` (this whole branch, ready); frontend
-  `bridgeleads-web#2` (DRAFT — break-glass recovery-code UI on the login MFA step; HOLD until #13 deploys
-  or it 404s in prod).
+  `revoked_at` on the locked session, Redis-before-commit (503→rollback, fail-safe). **Codex diff-gate
+  CLOSED (`832f208`):** re-review found 2 follow-ups — [P1] update_revoke_cache SETEX-fail/DEL-ok was
+  unsafe pre-commit (cleared cache + concurrent reader backfills stale revoked_at, survives past commit)
+  → now ALWAYS raises on SETEX failure; [P2] mfa_disable didn't clear api_key_hash (API-key path ignores
+  revoked_at) → now cleared. Re-review CLEAN.
+- **Shipped via PRs (both Codex-gated CLEAN):** backend `web-scrapper-automation#13` (whole branch, ready
+  for merge — see operator prereqs below); frontend `bridgeleads-web#2` (DRAFT — break-glass recovery-code
+  UI on the login MFA step; HOLD until #13 deploys or it 404s in prod; Codex gate CLEAN).
 - **Accepted P2 (C2):** row-lock-wait can widen the revoke capture window; not closed via SELECT FOR
   UPDATE (would deadlock the mfa_enable/disable flows above). Robust fix = token-version revocation.
 - migrations 044 + 045 are branch-only (apply at deploy via alembic-on-boot).

@@ -19,6 +19,68 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-08 — H2 Phase 5: admin MFA enforcement + step-up + break-glass
+
+**Built / Shipped (committed):** the full P5 stack on `security/checklist-h4-m2-m1`, one Codex-gated
+commit per step.
+- **Step A (`9278a39`):** `amr` + `auth_time` JWT claims. `_sanitize_amr` (subset of
+  {pwd,mfa,break_glass}, legacy/garbage→["pwd"]), strict `_coerce_auth_time` (rejects bool/float/str).
+  `AuthContext` + `get_auth_context` (decode-once); `get_current_user` is now a thin wrapper so every
+  existing `CurrentUser`/`get_rls_db` dep is untouched. login_mfa→["pwd","mfa"], register/pwd-login→
+  ["pwd"], `/auth/refresh` copies amr+auth_time UNCHANGED (never adds/drops mfa; missing auth_time→0).
+  API-key sessions: amr=[]/auth_time=None. 31 pure tests (`tests/test_token_amr.py`).
+- **Step B (`0612e08`):** `require_admin` (non-admin→404 hidden; admin+no-MFA→403
+  `admin_mfa_enrollment_required`) and `require_admin_mfa` (step-up: jwt + "mfa" in amr + auth_time fresh
+  15min, both-sided; API-key always fails). Applied: `/billing/activation-funnel`→require_admin (read,
+  + pre-gate IP limiter), `POST /scrapers/connectors`→require_admin_mfa (write). Inline is_admin checks
+  removed. 13 pure tests (`tests/test_admin_mfa_deps.py`).
+- **Step C1 (`a00e2a7`):** migration 045 `mfa_break_glass_codes` + model; `generate_break_glass_codes`
+  (128-bit, `bg-` format, same keyed-HMAC as backup codes); operator scripts `reset_user_mfa.py`
+  (revoke-first fail-safe) + `generate_break_glass.py` (revokes prior, prints once). 6 tests.
+- **Step C2 (`d725ee3`):** `POST /auth/login/break-glass` — RECOVERY-ONLY redemption. Consumes a code
+  atomically, clears MFA to un-enrolled, revokes all sessions + API key, burns sibling+backup codes,
+  mints a degraded `amr=["pwd","break_glass"]` session that can NEVER pass admin step-up. `revoke_all_
+  for_user` now returns its revoke instant. 7 CI-only integration tests (`tests/test_break_glass_login.py`).
+
+**Tried / Decided:** owner picked FORCE-ENROLL + step-up + BOTH break-glass mechanisms, RECOVERY-ONLY
+(break-glass session has no "mfa" amr). Connector-creation = step-up (write), funnel = enroll-only
+(read) — Codex-endorsed split. Mid-session the user asked "should RLS be on everywhere?" → answered:
+RLS is enabled but NOT enforced (app runs BYPASSRLS); cutover (H1) deferred as the prod-boot landmine,
+keep building. User chose continue.
+
+**Failed / Blocked:** the same-second-revoke problem ate ~4 Codex rounds in C2. Approaches rejected:
+(a) mint break-glass token with `iat=now+1` → **PyJWT rejects future iat** (ImmatureSignatureError); (b)
+revoke at `now-1` → leaves a same-second pre-existing token alive; (c) stamp revoked_at via DB
+`clock_timestamp()` → cross-clock skew vs API-minted iat. **Winner:** revoke at `now` (single API clock,
+captured right before the write, returned to caller), then WAIT until the wall clock passes that second,
+then mint a normal `iat=now` (>revoke_ts, not future). Fail-closed 503 if the clock never advances.
+
+**Caught & fixed (Codex gates):** A — refresh minted a FRESH "now" for an mfa token with missing
+auth_time (silent step-up bypass) + bool⊂int. B — funnel probes un-rate-limited after gating moved to a
+dep + future auth_time stayed fresh. C1 — reset script swallowed Postgres revoke failures (then even
+RedisError, defeating fail-closed) → revoke-first, any-failure=exit-3. C2 — schema cap 32<35-char codes;
+the 4-round same-second saga above.
+
+**Pending / Handoff:**
+- **H1-CUTOVER TODO (tracked in `provision_rls_roles.sql` + migration 045):** at RLS-enforce,
+  `bridgeleads_app` needs grants on `mfa_backup_codes` (043, pre-existing gap) + `mfa_break_glass_codes`,
+  reconciled with the script's no-app-DELETE invariant. Harmless today (RLS_ENFORCE=False/BYPASSRLS).
+- **Frontend break-glass affordance** (a "use a recovery code" link on the OTP step) — not in P5 backend scope.
+- **⚠️ Verify (pre-existing, NOT P5):** `mfa_enable`/`mfa_disable` call `revoke_all_for_user` while
+  holding a `with_for_update()` lock on the users row; the function's own separate-txn UPDATE contends
+  with that lock. Apparently fine in prod but worth confirming it doesn't hang under load.
+- **Accepted P2 (C2):** row-lock-wait can widen the revoke capture window; not closed via SELECT FOR
+  UPDATE (would deadlock the mfa_enable/disable flows above). Robust fix = token-version revocation.
+- migrations 044 + 045 are branch-only (apply at deploy via alembic-on-boot).
+
+**Facts learned:** PyJWT rejects future `iat`. `is_revoked_by_user_logout_all` uses `issued_at <=
+revoke_time` at whole-second precision (same-second login may need a retry) — so a same-request
+revoke+mint must wait a second. FastAPI dependency caching = `get_auth_context` decodes once even when
+both `get_current_user` and `require_admin*` depend on it. The Bash tool here is `/usr/bin/bash`, so
+`@'...'@` PowerShell here-strings + apostrophes in commit messages break it — use `git commit -F`.
+
+---
+
 ## 2026-06-08 — CRITICAL fix: refresh tokens were valid access tokens
 
 **Built / Shipped (uncommitted):** Codex flagged this during the H2-P5 design consult. `create_refresh_token`

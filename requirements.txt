@@ -1,7 +1,7 @@
 # API
-fastapi==0.115.6
+fastapi==0.136.3            # M3: bumped from 0.115.6 to pull a fixed starlette (CVE-2025-54121/62727, PYSEC-2026-161)
 uvicorn[standard]==0.32.1
-python-multipart==0.0.20
+python-multipart==0.0.27    # M3: CVE-2026-24486/40347/42561
 
 # Async DB
 sqlalchemy[asyncio]==2.0.36
@@ -14,14 +14,14 @@ psycopg2-binary==2.9.10
 # Config
 pydantic-settings==2.6.1
 pydantic[email]==2.10.4
-python-dotenv==1.0.1
+python-dotenv==1.2.2         # M3: CVE-2026-28684
 
 # Auth / Security
-PyJWT[crypto]==2.9.0
+PyJWT[crypto]==2.13.0        # M3: PYSEC-2026-120/175/176/177/178/179 (PYSEC-2025-183 has no fix — ignored in CI gate)
 bcrypt==4.2.1
 passlib[bcrypt]==1.7.4
 pyotp==2.9.0                 # TOTP (MFA, H2)
-cryptography==43.0.0         # Fernet field encryption (MFA secret; H3 PII later) — was transitive via PyJWT
+cryptography==46.0.7         # Fernet field encryption (MFA secret; H3 PII). M3: PYSEC-2026-35/36, GHSA-h4gh-qq45-vh27, CVE-2024-12797, CVE-2026-26007
 
 # Task queue
 celery[redis]==5.4.0
@@ -30,8 +30,8 @@ redis==5.2.1
 # Scraping
 playwright==1.49.1
 beautifulsoup4==4.12.3
-lxml==5.3.0
-requests==2.32.3
+lxml==6.1.0                  # M3: PYSEC-2026-87
+requests==2.33.0             # M3: CVE-2024-47081, CVE-2026-25645
 
 # AI extraction (Claude API)
 anthropic==0.52.0
@@ -56,9 +56,9 @@ stripe==11.4.0
 colorlog==6.9.0
 
 # Testing
-pytest==8.3.4
-pytest-cov==6.0.0
-pytest-asyncio==0.24.0
+pytest==9.0.3                # M3: CVE-2025-71176 (test tooling)
+pytest-cov==7.0.0            # M3: pytest 9 compat
+pytest-asyncio==1.4.0        # M3: pytest 9 compat
 httpx==0.28.1
 # Worker restart: 2026-04-13T06:07:58Z
 playwright-recaptcha==0.5.1

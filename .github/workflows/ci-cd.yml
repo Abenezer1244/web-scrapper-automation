@@ -97,11 +97,48 @@ jobs:
           file: coverage.xml
           fail_ci_if_error: false
 
+  # ─── Dependency audit (M3) ────────────────────────────────────────────────────
+  # Fails the pipeline on any known vulnerability in the pinned dependency tree,
+  # and publishes a CycloneDX SBOM artifact. Audits requirements.txt (resolves
+  # transitive deps) rather than the runner venv, so it never reports the runner's
+  # global/tooling packages. npm audit lives in the separate frontend repo.
+  dependency-audit:
+    name: Dependency Audit (pip-audit + SBOM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pip-audit (pinned)
+        run: pip install pip-audit==2.10.0
+
+      # SBOM first, with || true, so the artifact uploads even when the audit
+      # below fails (pip-audit exits non-zero on findings).
+      - name: Generate CycloneDX SBOM
+        run: pip-audit -r requirements.txt --format=cyclonedx-json --output sbom.cdx.json || true
+
+      - name: Upload SBOM artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
+
+      # Gate: any known vuln fails the build. For an UNFIXABLE advisory, add an
+      # explicit, dated, commented --ignore-vuln <ID> below (keep the list small
+      # and visible). Currently empty — the dependency tree audits clean.
+      - name: Audit dependencies (fail on known vulns)
+        run: pip-audit -r requirements.txt --desc
+
   # ─── Build ───────────────────────────────────────────────────────────────────
   build:
     name: Build & Push Image
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, dependency-audit]
     if: github.event_name == 'push'
 
     permissions:

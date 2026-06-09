@@ -101,6 +101,34 @@ def verify_backup_code_hash(code: str, stored_hash: str) -> bool:
     return hmac.compare_digest(hash_backup_code(code), stored_hash)
 
 
+_BREAK_GLASS_CODE_COUNT = 8
+
+
+def generate_break_glass_codes(n: int = _BREAK_GLASS_CODE_COUNT) -> tuple[list[str], list[str]]:
+    """Return (plaintext_codes, hashes) for operator-issued break-glass codes.
+
+    Distinct from backup codes in BOTH entropy and visual format so the two can
+    never be confused operationally:
+      - 16 random bytes = 128 bits (backup codes are 80) — these are emergency
+        admin-recovery creds, worth the extra entropy.
+      - a 'BG-' prefix so a break-glass code is recognizable on sight.
+    Hashed with the SAME keyed HMAC as backup codes (hash_backup_code), so the
+    redeem path verifies them with the identical normalization. _normalize_
+    backup_code lowercases + strips dashes, so the prefix/grouping is cosmetic
+    and user formatting on entry does not matter.
+    """
+    plaintext: list[str] = []
+    hashes: list[str] = []
+    for _ in range(n):
+        # 16 bytes -> 26 base32 chars (no padding) = 128 bits.
+        b32 = base64.b32encode(secrets.token_bytes(16)).decode("ascii").rstrip("=").lower()
+        grouped = "-".join(b32[i:i + 4] for i in range(0, len(b32), 4))
+        code = f"bg-{grouped}"
+        plaintext.append(code)
+        hashes.append(hash_backup_code(code))
+    return plaintext, hashes
+
+
 def generate_backup_codes(n: int = _BACKUP_CODE_COUNT) -> tuple[list[str], list[str]]:
     """Return (plaintext_codes, hashes). Plaintext is shown to the user ONCE;
     only the hashes are persisted.

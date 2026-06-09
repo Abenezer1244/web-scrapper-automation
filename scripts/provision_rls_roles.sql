@@ -145,6 +145,23 @@ $verify$;
 -- dispatches to a Celery worker via .delay() (webhooks.py:134), so all
 -- skip-trace billing writes land on bridgeleads_system, not here.
 
+-- ⚠️ H1-CUTOVER TODO — MFA tables app-role grants (Codex H2-P5 review):
+--   mfa_backup_codes (migration 043) and mfa_break_glass_codes (migration 045)
+--   are NOT granted to bridgeleads_app here. The request path writes BOTH:
+--     - mfa_backup_codes: /auth/mfa/enable INSERTs + DELETEs, /auth/mfa/disable
+--       DELETEs, /auth/login/mfa UPDATEs (consume), break-glass redeem DELETEs.
+--     - mfa_break_glass_codes: /auth/login/break-glass UPDATEs (consume + revoke
+--       siblings).
+--   This is harmless TODAY (RLS_ENFORCE=False; the runtime role is BYPASSRLS with
+--   full grants), but at the RLS-enforce cutover (H1) bridgeleads_app will need
+--   SELECT/INSERT/UPDATE/DELETE on mfa_backup_codes and SELECT/UPDATE on
+--   mfa_break_glass_codes. That requires RECONCILING with the "no app DELETE"
+--   invariant + verify block above — a deliberate H1 design decision (relax the
+--   invariant for MFA tables, route deletes through a SECURITY DEFINER fn, or
+--   move them off the request path). Do NOT add the grants until H1 resolves it,
+--   or the verify block will hard-fail. The system role already covers these via
+--   GRANT ... ON ALL TABLES (re-run at provisioning, after the tables exist).
+
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_app;
 
 -- ── Role 2: bridgeleads_system — Celery workers + scheduler ──────────────────

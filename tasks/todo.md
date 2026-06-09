@@ -63,7 +63,26 @@ current_user/request params from funnel body.
   (connector creation). Replace inline `is_admin` checks with the dependency (Codex HIGH: inline checks
   will drift). Frontend: do NOT hide Settings behind an admin-gated 403 (no-MFA admin must reach enroll).
 
-## Step C — break-glass (BOTH)
+## ⏳ STEP C — IN PROGRESS. Decisions: FULL break-glass; RECOVERY-ONLY (break-glass session amr=
+## ["pwd","break_glass"], NO "mfa" → can never pass require_admin_mfa). RLS-enforce stays OFF (user
+## confirmed continue; H1 cutover deferred — grant gap tracked in provision_rls_roles.sql + 045).
+
+### ✅ C1 — DONE (Codex round-3 CLEAN; UNCOMMITTED). compile+ruff clean; 50 pure tests pass.
+**Shipped:** migration 045 `mfa_break_glass_codes` (id,user_id,code_hash,batch_id,created_by,
+created_reason,expires_at,used_at/used_ip/used_user_agent,revoked_at; RLS mirrors 043). Model
+`MfaBreakGlassCode`. `generate_break_glass_codes` (128-bit, `bg-` format, same keyed-HMAC as backup
+codes). Operator scripts (railway run): `reset_user_mfa.py` (revoke-FIRST fail-safe → clear MFA + delete
+backup+break-glass codes; any revoke failure = exit 3, nothing cleared) + `generate_break_glass.py`
+(revokes prior unused by default, prints once to stdout only, FOR UPDATE). `tests/test_break_glass.py` (6).
+**Codex gate:** R1 [P1] reset swallowed ALL revoke exceptions + [P2] cutover grant gap. R2: P1 partial
+(swallowing RedisError still defeats fail-closed) + P2 accepted-deferred. R3 CLEAN (revoke-first, any
+failure=exit 3). **H1-CUTOVER TODO recorded:** bridgeleads_app needs grants on mfa_backup_codes (043,
+pre-existing gap) + mfa_break_glass_codes — blocked on reconciling app-DELETE vs the script's no-DELETE
+invariant. Harmless today (RLS_ENFORCE=False/BYPASSRLS).
+
+### C2 — in-app redemption (NEXT): POST /auth/login/break-glass + iat-override mint + tests.
+
+## Step C — break-glass (BOTH)  (original plan below)
 - **New table `mfa_break_glass_codes`** (migration 045 — NOT reuse MfaBackupCode): `user_id, code_hash,
   batch_id, created_by, created_reason, expires_at, used_at, used_ip, used_user_agent, revoked_at`.
 - `scripts/reset_user_mfa.py` (railway run): clear MFA (enabled/secret/counter) + delete backup codes +

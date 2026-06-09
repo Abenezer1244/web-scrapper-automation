@@ -7,6 +7,21 @@
 property owners' contact info in cleartext.
 **Status:** design **Codex-consulted (high effort, NO-GO → revised)**. Scope reduced per the consult.
 
+> **⚠️ TWO-BRANCH SPLIT (2026-06-09).** Implementation ships in two deploy stages so the login-critical
+> `User.email` cutover never rides the same rolling deploy as the additive column add (Codex P5 finding):
+> - **`security/h3-pii-encryption` (STAGE 1, this branch):** P1–P3 contact-PII encryption (Result /
+>   SkipTraceCache phone/email/phones/emails + `raw_response`) **+ P4** additive `User.email` blind index
+>   (`email_hmac` nullable, `@validates` dual-write). `User.email` itself stays **plaintext**; login still
+>   looks it up by plaintext. Safe single deploy. Migrations 046 + 047.
+> - **`security/h3-email-cutover` (STAGE 2):** the `User.email` cutover — email→`EncryptedString`,
+>   `email_hmac` NOT NULL + UNIQUE (migration 048), login/register/reset switch to `email_hmac`,
+>   operator-script + test updates. Deploy ONLY after Stage 1 is fully rolled out and
+>   `scripts/backfill_user_email_hmac.py` reports 0 NULL / 0 collisions. Full ordered runbook (§11) and
+>   the P5 Codex-gate log live on that branch's copy of this spec.
+>
+> Sections below describe the FULL design (both stages). Stage 1 implements everything except the §4
+> `User.email` *encryption + read-switch* and migration 048.
+
 ---
 
 ## 0. Scope decision (owner, post-Codex)

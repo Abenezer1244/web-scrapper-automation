@@ -1,3 +1,27 @@
+# ✅ H3 — PII-at-rest encryption — BUILT (2026-06-09), SPLIT INTO TWO BRANCHES
+
+**Spec:** `docs/superpowers/specs/2026-06-08-h3-pii-encryption-design.md` (Codex-consulted; banner at top
+explains the split). Both branches off `main`, UNMERGED, NOT deployed.
+
+**Why two branches:** the `User.email` cutover (NOT NULL on `email_hmac`) can't ride the same rolling
+deploy as the column-add — old replicas would 500 on `/auth/register`. So:
+
+- **`security/h3-pii-encryption` (STAGE 1 — deploy first):** contact-PII encryption (P1–P3) + additive
+  `User.email` blind index (P4: `email_hmac` nullable + `@validates` dual-write; email stays plaintext).
+  Migrations 046 + 047. **Every phase Codex-gated CLEAN** (P1 R2, P2, P3, P4 R2). 32 pure tests pass.
+  Safe single deploy. **THIS is the high-value work — closes the audit's owner-contact-PII target.**
+- **`security/h3-email-cutover` (STAGE 2 — deploy after Stage 1 + backfill):** email→`EncryptedString`,
+  `email_hmac` NOT NULL + UNIQUE (migration 048), login/register/reset → `email_hmac`, operator-script +
+  test updates, verify + email-encrypt backfill scripts, full deploy runbook (spec §11). **Codex P5 gate:
+  6 rounds, all findings fixed; final round (R7) confirms clean — see that branch.**
+
+**Pre-merge:** Stage 1 → Codex-gate the split composition (re-run `codex review --base main` on this
+branch) → merge. Then deploy Stage 1, run `backfill_pii_encryption.py` + `backfill_user_email_hmac.py`
+(0 NULL/0 collisions), THEN merge + deploy Stage 2 (spec §11 runbook). Provision `FIELD_ENCRYPTION_KEY`
++ `BLIND_INDEX_KEY` in Railway before Stage 1.
+
+---
+
 # H2 Phase 5 — Admin MFA enforcement + step-up + break-glass — PLAN (implement in a fresh session)
 
 **Decisions (owner):** FORCE-ENROLL + STEP-UP; BOTH break-glass mechanisms (operator script + in-app

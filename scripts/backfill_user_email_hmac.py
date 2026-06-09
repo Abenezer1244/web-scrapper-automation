@@ -26,7 +26,7 @@ import logging
 from sqlalchemy import text
 
 from src.db.session import SyncSessionLocal
-from src.utils.crypto import blind_index, decrypt_field
+from src.utils.crypto import blind_index, decrypt_field, is_encrypted
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
@@ -61,10 +61,15 @@ def run(batch: int) -> None:
             for r in rows:
                 if not r.email:
                     continue
-                # decrypt_field is tolerant (plaintext passthrough, fe1: decrypt),
-                # so the blind index is always over the PLAINTEXT email even if this
-                # runs after email was encrypted (Codex P1) — never hash ciphertext.
-                want = blind_index(decrypt_field(r.email))
+                # Always blind-index the PLAINTEXT email — never the ciphertext.
+                # Decrypt ONLY when the stored value is actually encrypted: in
+                # Stage 1 users.email is still plaintext, and decrypt_field() would
+                # RAISE on plaintext under PII_ENCRYPTION_STRICT=true (Codex P1). The
+                # is_encrypted() guard is strict-safe (it never raises), so this
+                # prerequisite runs correctly in both tolerant and strict mode and
+                # across the Stage 1 -> Stage 2 mixed-state window.
+                email_plain = decrypt_field(r.email) if is_encrypted(r.email) else r.email
+                want = blind_index(email_plain)
                 if r.email_hmac != want:
                     updates.append({"pk": str(r.id), "hmac": want})
             if updates:

@@ -12,6 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import (
     CurrentUser,
+    _coerce_auth_time,
+    _sanitize_amr,
     create_refresh_token,
     create_secure_token,
     decode_refresh_token,
@@ -341,8 +343,9 @@ async def register(
     db.add(user)
     await db.flush()
 
-    token = create_secure_token(user.id)
-    refresh = create_refresh_token(user.id)
+    # Fresh password-only session (H2-P5): amr=["pwd"], auth_time=now (default).
+    token = create_secure_token(user.id, amr=["pwd"])
+    refresh = create_refresh_token(user.id, amr=["pwd"])
     audit_log(request, "register", user.id)
 
     # Send welcome email (non-blocking — failure must not break registration)
@@ -405,8 +408,9 @@ async def login(
         )
 
     await BruteForceProtection.clear(ip, body.email)
-    token = create_secure_token(user.id)
-    refresh = create_refresh_token(user.id)
+    # Password-only session (no MFA on this account): amr=["pwd"].
+    token = create_secure_token(user.id, amr=["pwd"])
+    refresh = create_refresh_token(user.id, amr=["pwd"])
     audit_log(request, "login_success", user.id)
     return LoginResponse(access_token=token, refresh_token=refresh)
 
@@ -511,8 +515,11 @@ async def login_mfa(
     # then complete login.
     await db.commit()
     await BruteForceProtection.clear(client_ip(request), user.email)
-    token = create_secure_token(user.id)
-    refresh = create_refresh_token(user.id)
+    # Full MFA-backed session (H2-P5): amr=["pwd","mfa"], auth_time=now (default)
+    # — this is the only login path that mints an "mfa" session, the marker the
+    # admin step-up dependency requires.
+    token = create_secure_token(user.id, amr=["pwd", "mfa"])
+    refresh = create_refresh_token(user.id, amr=["pwd", "mfa"])
     audit_log(request, "login_success", user.id)
     return LoginResponse(access_token=token, refresh_token=refresh)
 
@@ -582,8 +589,32 @@ async def refresh_token(
     except _redis_exceptions.RedisError:
         raise revocation_unavailable_503()
 
-    new_access = create_secure_token(user.id)
-    new_refresh = create_refresh_token(user.id)
+    # H2-P5: carry session strength + freshness across rotation UNCHANGED.
+    #   - amr is sanitized (subset of {pwd,mfa,break_glass}; legacy tokens with
+    #     no amr collapse to ["pwd"]). Refresh NEVER adds "mfa" (no silent
+    #     escalation to a step-up-capable session without a real 2nd factor) and
+    #     NEVER drops it (no silent downgrade of a legitimate MFA session).
+    #   - auth_time is copied as-is so refresh does NOT reset step-up freshness;
+    #     a stale MFA session must re-run /auth/login/mfa, not just /refresh, to
+    #     pass step-up. Legacy tokens with no auth_time fall back to now() in the
+    #     minter, but they also lack "mfa" in amr so step-up still fails them.
+    propagated_amr = _sanitize_amr(payload.get("amr"))
+    # FAIL-CLOSED freshness (Codex P1): copy a real auth_time verbatim, but if it
+    # is missing/garbage on this refresh token, substitute 0 (the epoch — always
+    # stale) rather than letting the minter stamp "now". Without this an
+    # amr=["pwd","mfa"] refresh token with no/invalid auth_time would rotate into
+    # a FRESH MFA-capable session and silently pass step-up freshness; with it,
+    # such a token still keeps its "mfa" strength but is forced through a real
+    # re-auth at /auth/login/mfa before it can clear step-up.
+    propagated_auth_time = _coerce_auth_time(payload.get("auth_time"))
+    if propagated_auth_time is None:
+        propagated_auth_time = 0
+    new_access = create_secure_token(
+        user.id, amr=propagated_amr, auth_time=propagated_auth_time
+    )
+    new_refresh = create_refresh_token(
+        user.id, amr=propagated_amr, auth_time=propagated_auth_time
+    )
     return TokenResponse(access_token=new_access, refresh_token=new_refresh)
 
 

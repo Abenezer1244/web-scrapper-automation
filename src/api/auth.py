@@ -4,6 +4,7 @@ import hashlib
 import secrets
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Annotated
 
 import jwt
@@ -59,9 +60,58 @@ _ISSUER = "bridgeleads"
 _ACCESS_AUDIENCE = "bridgeleads-api"
 _REFRESH_AUDIENCE = "bridgeleads-refresh"
 
+# ─── H2-P5: authentication-method (amr) + auth_time claims ─────────────────────
+# `amr` records HOW the session was authenticated so sensitive endpoints can
+# require a stronger session (e.g. admin step-up needs "mfa"). `auth_time` is the
+# epoch second the user last actually authenticated (login / mfa-login), used for
+# step-up FRESHNESS (re-prove a 2nd factor within N minutes). These claims live
+# in the signed JWT (unforgeable) but are still SANITIZED on the refresh path so
+# a legacy/garbage value can't smuggle a privilege in — refresh never ADDS "mfa"
+# (no silent escalation) and never DROPS it (no silent downgrade).
+_VALID_AMR = ("pwd", "mfa", "break_glass")
 
-def create_secure_token(user_id: str) -> str:
-    """Create a signed access JWT (1 hour) with jti, iss, aud, and exp claims."""
+
+def _sanitize_amr(raw: object) -> list[str]:
+    """Normalize an amr claim to an ordered, de-duped subset of _VALID_AMR.
+
+    Anything unrecognized (non-list, unknown tokens, legacy tokens with no amr)
+    collapses to the baseline ["pwd"] — a token always proves at least a password
+    step, never more than it legitimately carried.
+    """
+    if not isinstance(raw, list):
+        return ["pwd"]
+    seen: list[str] = []
+    for item in raw:
+        if isinstance(item, str) and item in _VALID_AMR and item not in seen:
+            seen.append(item)
+    return seen or ["pwd"]
+
+
+def _coerce_auth_time(raw: object) -> int | None:
+    """Return raw as an int epoch second, or None if it isn't a clean integer.
+
+    STRICT: rejects bool (Python bool is a subclass of int, so a JSON `true`
+    would otherwise coerce to 1), floats, and strings. A non-conforming
+    auth_time is treated as "unknown freshness" (None) rather than silently
+    accepted — the step-up dependency fails closed on a None/stale auth_time.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    return None
+
+
+def create_secure_token(
+    user_id: str,
+    amr: list[str] | None = None,
+    auth_time: int | None = None,
+) -> str:
+    """Create a signed access JWT (1 hour) with jti, iss, aud, amr, and exp.
+
+    amr defaults to ["pwd"]; auth_time defaults to now. Both are sanitized so an
+    issued token never carries an unknown auth-method token.
+    """
     now = int(time.time())
     payload = {
         "sub": user_id,
@@ -69,17 +119,33 @@ def create_secure_token(user_id: str) -> str:
         "iss": _ISSUER,
         "aud": _ACCESS_AUDIENCE,
         "purpose": "access",
+        "amr": _sanitize_amr(amr),
+        # None (the default for fresh logins/register) -> stamp now. A caller
+        # that passes an explicit value (e.g. /auth/refresh propagating an
+        # existing session) gets it preserved verbatim; bools/garbage are
+        # rejected by _coerce_auth_time and fall back to now.
+        "auth_time": (
+            _coerce_auth_time(auth_time)
+            if _coerce_auth_time(auth_time) is not None
+            else now
+        ),
         "iat": now,
         "exp": now + _ACCESS_TOKEN_EXPIRE_SECONDS,
     }
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=_ALGORITHM)
 
 
-def create_refresh_token(user_id: str) -> str:
+def create_refresh_token(
+    user_id: str,
+    amr: list[str] | None = None,
+    auth_time: int | None = None,
+) -> str:
     """Create a signed refresh JWT (7 days), usable ONLY at /auth/refresh.
 
     Scoped to the refresh audience so it cannot authenticate normal requests
-    (decode_secure_token pins the access audience).
+    (decode_secure_token pins the access audience). Carries the same amr +
+    auth_time as the access token so /auth/refresh can propagate session strength
+    and freshness UNCHANGED into the rotated pair.
     """
     now = int(time.time())
     payload = {
@@ -88,6 +154,16 @@ def create_refresh_token(user_id: str) -> str:
         "iss": _ISSUER,
         "aud": _REFRESH_AUDIENCE,
         "purpose": "refresh",
+        "amr": _sanitize_amr(amr),
+        # None (the default for fresh logins/register) -> stamp now. A caller
+        # that passes an explicit value (e.g. /auth/refresh propagating an
+        # existing session) gets it preserved verbatim; bools/garbage are
+        # rejected by _coerce_auth_time and fall back to now.
+        "auth_time": (
+            _coerce_auth_time(auth_time)
+            if _coerce_auth_time(auth_time) is not None
+            else now
+        ),
         "iat": now,
         "exp": now + _REFRESH_TOKEN_EXPIRE_SECONDS,
     }
@@ -139,13 +215,33 @@ _CREDENTIALS_EXCEPTION = HTTPException(
 )
 
 
-async def get_current_user(
+@dataclass(frozen=True)
+class AuthContext:
+    """Everything proven about the caller, decoded ONCE per request.
+
+    auth_method is "jwt" (bearer access token) or "api_key". amr/auth_time/jti/
+    payload are only meaningful for the JWT path: an API key is a long-lived
+    static credential with no authentication-method or freshness signal, so it
+    carries amr=[] and auth_time=None and can never satisfy an MFA step-up
+    (H2-P5: API-key sessions always fail step-up).
+    """
+    user: User
+    auth_method: str  # "jwt" | "api_key"
+    amr: list[str]
+    auth_time: int | None
+    jti: str | None
+    payload: dict | None
+
+
+async def get_auth_context(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> User:
-    """FastAPI dependency: resolves the current user from JWT bearer or API key.
+) -> AuthContext:
+    """FastAPI dependency: resolve + validate the caller into an AuthContext.
 
-    Accepts:
+    Single decode point for the request (FastAPI caches this dependency), so the
+    admin/step-up dependencies and get_current_user all share one decode rather
+    than re-parsing the bearer. Accepts:
     - Authorization: Bearer <jwt>
     - Authorization: Bearer <api_key>  (api keys start with 'bl_')
     """
@@ -178,7 +274,14 @@ async def get_current_user(
         user_match = result.scalar_one_or_none()
         if user_match is None:
             raise _CREDENTIALS_EXCEPTION
-        return user_match
+        return AuthContext(
+            user=user_match,
+            auth_method="api_key",
+            amr=[],
+            auth_time=None,
+            jti=None,
+            payload=None,
+        )
 
     # ── JWT path ──────────────────────────────────────────────────────────────
     try:
@@ -225,7 +328,22 @@ async def get_current_user(
     if user is None:
         raise _CREDENTIALS_EXCEPTION
 
-    return user
+    return AuthContext(
+        user=user,
+        auth_method="jwt",
+        amr=_sanitize_amr(payload.get("amr")),
+        auth_time=_coerce_auth_time(payload.get("auth_time")),
+        jti=jti or None,
+        payload=payload,
+    )
+
+
+async def get_current_user(
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+) -> User:
+    """Thin wrapper over get_auth_context — preserves every existing CurrentUser
+    dependency unchanged while the request decodes the bearer exactly once."""
+    return ctx.user
 
 
 # ─── Plan enforcement ─────────────────────────────────────────────────────────
@@ -247,3 +365,4 @@ def require_plan(*plans: str):
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+CurrentAuth = Annotated[AuthContext, Depends(get_auth_context)]

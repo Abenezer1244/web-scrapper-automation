@@ -17,7 +17,19 @@ Today that's a latent priv/longevity bug; with P5 it becomes a 7-day **MFA-backe
   must still accept only refresh-purpose tokens (it decodes via `decode_secure_token` today — verify it
   pins refresh purpose after the change). Add a test: a refresh token is rejected by `/auth/me`.
 
-## Step A — amr/auth_time + AuthContext
+## ✅ STEP A — DONE (Codex round-2 CLEAN; UNCOMMITTED). py_compile + ruff clean; 31 pure tests pass.
+**Shipped:** `create_secure_token`/`create_refresh_token` gained `amr`+`auth_time` params (access also
+already `purpose="access"`); `_sanitize_amr` (subset of {pwd,mfa,break_glass}, legacy→["pwd"]);
+`_coerce_auth_time` (STRICT — rejects bool/float/str). `AuthContext` dataclass + `get_auth_context`
+(decode-once: API-key→amr=[]/auth_time=None; jwt→sanitized amr/coerced auth_time); `get_current_user`
+now a thin wrapper (FastAPI dep-cache = single decode). Routes: register/login→["pwd"], login_mfa→
+["pwd","mfa"], `/auth/refresh` copies amr+auth_time UNCHANGED (never adds/drops mfa).
+`tests/test_token_amr.py` (31 pure tests, no DB). `CurrentAuth` type alias added.
+**Codex gate:** R1 [P1] (refresh minted FRESH "now" for an mfa token w/ missing/garbage auth_time →
+silent step-up-passing session) + [P3] (bool⊂int). FIXED: refresh substitutes 0 (stale epoch) not None;
+`_coerce_auth_time` rejects bool. **R2 CLEAN.**
+
+## Step A — amr/auth_time + AuthContext  (original plan below)
 - `create_secure_token(user_id, amr=["pwd"], auth_time=now)` + `purpose="access"`;
   `create_refresh_token(user_id, amr=["pwd"], auth_time=now)`. login/register → `["pwd"]`; login_mfa →
   `["pwd","mfa"]`; auth_time=now.

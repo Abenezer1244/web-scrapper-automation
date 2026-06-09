@@ -364,5 +364,86 @@ def require_plan(*plans: str):
     return _check
 
 
+# ─── H2-P5: admin MFA enforcement + step-up ───────────────────────────────────
+# Two layered dependencies:
+#   require_admin      — admin-only gate. Non-admins get 404 (hide the endpoint's
+#                        existence, matching the prior inline is_admin checks). An
+#                        admin who has NOT enrolled MFA gets 403 with the
+#                        machine-readable code "admin_mfa_enrollment_required" so
+#                        the frontend can route them to the enrollment flow
+#                        (FORCE-ENROLL). The Settings/enroll page must NOT itself
+#                        be gated behind an admin 403 — a no-MFA admin has to be
+#                        able to reach enrollment.
+#   require_admin_mfa  — step-up gate for SENSITIVE admin ops. On top of
+#                        require_admin it demands a JWT session (not an API key,
+#                        which carries no auth-method/freshness signal) whose amr
+#                        includes "mfa" AND whose auth_time is fresh
+#                        (< _ADMIN_STEP_UP_MAX_AGE_SECONDS). Otherwise 403
+#                        "admin_mfa_step_up_required" so the frontend can prompt a
+#                        re-authentication via /auth/login/mfa.
+_ADMIN_STEP_UP_MAX_AGE_SECONDS = 15 * 60  # 15 minutes
+# Tolerance for a slightly-future auth_time. Our own minter stamps now() under one
+# clock, so this should never be exceeded in practice; a wildly-future auth_time
+# would indicate a minting bug and must NOT read as "fresh forever" (Codex P3).
+_ADMIN_STEP_UP_FUTURE_SKEW_SECONDS = 60
+
+
+async def require_admin(
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+) -> AuthContext:
+    """Admin-only gate (404 to non-admins, 403 enrollment-required to no-MFA admins)."""
+    if not ctx.user.is_admin:
+        # 404, never 403: don't confirm the admin endpoint exists to a non-admin.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Not found",
+        )
+    if not ctx.user.mfa_enabled:
+        # Admin exists but hasn't enrolled MFA — force enrollment before any admin
+        # surface is usable. Distinct code so the UI can deep-link to enrollment.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="admin_mfa_enrollment_required",
+        )
+    return ctx
+
+
+async def require_admin_mfa(
+    ctx: Annotated[AuthContext, Depends(require_admin)],
+) -> AuthContext:
+    """Step-up gate for sensitive admin ops: fresh, MFA-backed JWT session.
+
+    require_admin (the dependency above) has already proven admin + enrolled. This
+    layer additionally requires the CURRENT session to be MFA-backed and recent.
+    API-key sessions always fail here (amr=[], auth_time=None) — a static
+    long-lived key is exactly what step-up exists to defeat.
+    """
+    if ctx.auth_method != "jwt" or "mfa" not in ctx.amr:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="admin_mfa_step_up_required",
+        )
+    # Freshness: auth_time must be present and within the step-up window. A None
+    # auth_time (unknown freshness) or a stale/0-sentinel one fails closed.
+    now = int(time.time())
+    if ctx.auth_time is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="admin_mfa_step_up_required",
+        )
+    age = now - ctx.auth_time
+    # Bound BOTH sides: too old (> window) is stale; meaningfully in the future
+    # (< -skew) is a minting bug / tampered clock and must not be trusted as
+    # perpetually fresh (Codex P3). A few seconds of jitter is tolerated.
+    if age > _ADMIN_STEP_UP_MAX_AGE_SECONDS or age < -_ADMIN_STEP_UP_FUTURE_SKEW_SECONDS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="admin_mfa_step_up_required",
+        )
+    return ctx
+
+
 CurrentUser = Annotated[User, Depends(get_current_user)]
 CurrentAuth = Annotated[AuthContext, Depends(get_auth_context)]
+RequireAdmin = Annotated[AuthContext, Depends(require_admin)]
+RequireAdminMfa = Annotated[AuthContext, Depends(require_admin_mfa)]

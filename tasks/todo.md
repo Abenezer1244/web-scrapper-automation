@@ -40,7 +40,20 @@ silent step-up-passing session) + [P3] (bool⊂int). FIXED: refresh substitutes 
   decodes once → `{user, auth_method: "jwt"|"api_key", amr, auth_time, jti, payload}`. `get_current_user`
   becomes a thin wrapper returning `ctx.user` (keeps all existing `CurrentUser` deps working).
 
-## Step B — admin enforcement dependencies
+## ✅ STEP B — DONE (Codex round-2 CLEAN; UNCOMMITTED). py_compile + ruff clean; 44 pure tests pass.
+**Shipped:** `require_admin` (non-admin→404 hidden; admin+mfa_enabled=False→403 `admin_mfa_enrollment_required`)
+and `require_admin_mfa` (layers on require_admin: auth_method=="jwt" AND "mfa" in amr AND auth_time fresh
+[15min window, both-sided: stale>900s OR future<-60s skew → fail]; API-key always fails). `RequireAdmin`/
+`RequireAdminMfa` aliases. Applied: `billing.py /activation-funnel` → `require_admin` (read-only, enroll-
+only) with new IP-keyed `_rate_limit_activation_funnel` dep FIRST (before gate); `scrapers.py POST
+/connectors` → `require_admin_mfa` (state-changing, registers SSRF target → step-up). Inline is_admin
+checks removed (central dep, Codex HIGH: won't drift). `tests/test_admin_mfa_deps.py` (13 tests).
+**Codex gate:** R1 0 P1, [P2] funnel probes un-rate-limited after gate moved to dep (no global limiter) +
+[P3] future auth_time stayed fresh. FIXED: pre-gate IP limiter + both-sided freshness. **R2 CLEAN.**
+**Decision (Codex-endorsed):** funnel=enroll-only (read), connector=step-up (write). Dropped now-unused
+current_user/request params from funnel body.
+
+## Step B — admin enforcement dependencies  (original plan below)
 - `require_admin(ctx)`: non-admin → **404** (endpoint hiding, matches current behavior); admin with
   `mfa_enabled=False` → **403 `admin_mfa_enrollment_required`**.
 - `require_admin_mfa(ctx)` (step-up): `require_admin` AND `auth_method=="jwt"` AND `"mfa" in amr` AND

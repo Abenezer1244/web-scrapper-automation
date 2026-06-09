@@ -6,9 +6,9 @@ from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.auth import CurrentUser
+from src.api.auth import CurrentUser, require_admin
 from src.api.deps import get_rls_db
-from src.api.middleware import rate_limit
+from src.api.middleware import client_ip, rate_limit
 from src.config import settings
 from src.db import User, get_db
 from src.utils.logger import setup_logger
@@ -20,10 +20,27 @@ stripe.api_key = settings.STRIPE_SECRET_KEY
 router = APIRouter(prefix="/billing", tags=["billing"])
 
 
-@router.get("/activation-funnel")
+async def _rate_limit_activation_funnel(request: Request) -> None:
+    """IP-keyed limiter that runs BEFORE require_admin (Codex P2).
+
+    The admin gate is a route dependency, so it would reject a non-admin caller
+    before any in-body limiter — leaving denied funnel probes unthrottled and
+    each one still paying an auth decode (Redis + DB user lookup). Rate-limiting
+    here, ahead of the gate, throttles ALL callers (admin and non-admin) before
+    the gate or the raw-SQL funnel runs. IP-keyed because non-admins are rejected
+    before we'd trust any per-user identity, and the funnel is admin-only +
+    low-traffic so an IP bucket is appropriate.
+    """
+    await rate_limit(
+        request, zone="general", identifier=f"admin-funnel:{client_ip(request)}"
+    )
+
+
+@router.get(
+    "/activation-funnel",
+    dependencies=[Depends(_rate_limit_activation_funnel), Depends(require_admin)],
+)
 async def activation_funnel(
-    current_user: CurrentUser,
-    request: Request,
     db: AsyncSession = Depends(get_db),
     days: int = 30,
 ) -> dict:
@@ -35,16 +52,17 @@ async def activation_funnel(
     All derived from existing tables — no new schema needed.
     Percentages are computed from signup count, so every step shows both
     an absolute count and a conversion rate from signup.
-    """
-    # Rate-limit the raw-SQL funnel before any DB work.
-    await rate_limit(request, zone="general", identifier=current_user.id)
-    # 404 (not 403) to non-admins — don't confirm the admin endpoint exists.
-    if not current_user.is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Not found",
-        )
 
+    Access (H2-P5): require_admin gates this route — non-admins get 404 (endpoint
+    hidden) and admins who have not enrolled MFA get 403
+    admin_mfa_enrollment_required. This is a READ-ONLY analytics surface, so it
+    requires MFA *enrollment* but not a fresh step-up; the state-changing admin
+    op (connector creation) is the one that uses require_admin_mfa.
+
+    Rate-limiting + admin gating both run as route dependencies before this body
+    (_rate_limit_activation_funnel then require_admin), so the raw-SQL funnel is
+    reached only by a throttled, authenticated admin.
+    """
     if days < 1 or days > 365:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

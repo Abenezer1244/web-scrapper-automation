@@ -34,8 +34,20 @@ from src.scrapers.enrichment.skip_trace import (
     address_cache_key,
     build_pending_row_payload,
 )
+from src.utils.crypto import encrypt_field, is_encrypted
 
 COUNTIES = ["thurston", "kitsap", "whatcom"]
+
+
+def _enc_pii(value):
+    """H3: ensure a contact value written via raw SQL into an EncryptedString
+    column is stored as ciphertext. The raw text() UPDATE here bypasses the
+    TypeDecorator, and the source SkipTraceCache value (also read raw) may be
+    plaintext (pre-backfill) or already fe1: ciphertext. Normalize: blank->NULL,
+    already-encrypted->keep, plaintext->encrypt. Mirrors EncryptedString."""
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return None
+    return value if is_encrypted(value) else encrypt_field(value)
 
 
 def main() -> int:
@@ -123,9 +135,9 @@ def main() -> int:
                             skip_trace_status = :s, skip_trace_attempted_at = :now
                         WHERE id = :id
                     """), {
-                        "p": cached.phone,
+                        "p": _enc_pii(cached.phone),
                         "pt": cached.phone_type,
-                        "e": cached.email,
+                        "e": _enc_pii(cached.email),
                         "s": "hit" if (cached.phone or cached.email) else "miss",
                         "now": datetime.now(UTC),
                         "id": r.id,

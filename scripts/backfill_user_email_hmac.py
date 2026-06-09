@@ -26,7 +26,7 @@ import logging
 from sqlalchemy import text
 
 from src.db.session import SyncSessionLocal
-from src.utils.crypto import blind_index
+from src.utils.crypto import blind_index, decrypt_field
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
@@ -61,7 +61,10 @@ def run(batch: int) -> None:
             for r in rows:
                 if not r.email:
                     continue
-                want = blind_index(r.email)
+                # decrypt_field is tolerant (plaintext passthrough, fe1: decrypt),
+                # so the blind index is always over the PLAINTEXT email even if this
+                # runs after email was encrypted (Codex P1) — never hash ciphertext.
+                want = blind_index(decrypt_field(r.email))
                 if r.email_hmac != want:
                     updates.append({"pk": str(r.id), "hmac": want})
             if updates:
@@ -72,14 +75,36 @@ def run(batch: int) -> None:
                 changed += len(updates)
             db.commit()
             _log.info("users: scanned %d, changed %d — through id %s", scanned, changed, last)
-    remaining = SyncSessionLocal().execute(
-        text("SELECT count(*) FROM users WHERE email_hmac IS NULL")
-    ).scalar()
+
+    with SyncSessionLocal() as db:
+        remaining = db.execute(
+            text("SELECT count(*) FROM users WHERE email_hmac IS NULL")
+        ).scalar()
+        # The old users.email UNIQUE constraint was CASE-SENSITIVE, so two rows
+        # like A@x.com and a@x.com could both exist. Their normalized blind index
+        # collides, and migration 048's UNIQUE(email_hmac) would FAIL to boot.
+        # Catch it here, before P5, so it can be resolved manually.
+        dups = db.execute(
+            text(
+                "SELECT email_hmac, count(*) AS c FROM users "
+                "WHERE email_hmac IS NOT NULL GROUP BY email_hmac HAVING count(*) > 1"
+            )
+        ).fetchall()
     _log.info(
-        "DONE — scanned %d, changed %d, remaining NULL email_hmac = %d "
-        "(must be 0 before deploying P5)",
+        "DONE — scanned %d, changed %d, remaining NULL email_hmac = %d",
         scanned, changed, remaining,
     )
+    if dups:
+        _log.error(
+            "%d duplicate email_hmac value(s) — case-variant duplicate emails exist. "
+            "Migration 048 UNIQUE(email_hmac) WILL FAIL to boot. Resolve these users "
+            "BEFORE deploying P5. Colliding hashes: %s",
+            len(dups), [d.email_hmac for d in dups],
+        )
+    if remaining == 0 and not dups:
+        _log.info("OK to deploy P5 (0 NULL, 0 collisions).")
+    else:
+        _log.info("NOT ready for P5 — fix the above first.")
 
 
 if __name__ == "__main__":

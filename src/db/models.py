@@ -21,7 +21,10 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, relationship, validates
 
 from src.db.encrypted_types import EncryptedJSON, EncryptedString
-from src.utils.crypto import blind_index
+
+# src.utils.crypto.blind_index is imported LAZILY inside the @validates hook below
+# (not at module top level) so that importing models — which alembic/env.py does
+# for every command — does not pull in Settings via crypto.
 
 
 class Base(DeclarativeBase):
@@ -106,6 +109,7 @@ class User(Base):
         NOT fire on ORM load from the DB, so a row's stored hash is preserved on
         read. This is the only place email_hmac is computed — it cannot drift.
         """
+        from src.utils.crypto import blind_index
         self.email_hmac = blind_index(value) if value is not None else None
         return value
 

@@ -23,7 +23,10 @@ from typing import Any
 
 from sqlalchemy.types import Text, TypeDecorator
 
-from src.utils.crypto import decrypt_field, encrypt_field
+# NOTE: src.utils.crypto is imported LAZILY inside the bind/result methods, not at
+# module top level. alembic/env.py imports Base (-> models -> this module) for every
+# Alembic command; a top-level crypto import would instantiate Settings (SECRET_KEY,
+# REDIS_URL, ...) and break migration-only environments that only provide the DB URL.
 
 
 class EncryptedString(TypeDecorator):
@@ -42,11 +45,13 @@ class EncryptedString(TypeDecorator):
         text = str(value)
         if text.strip() == "":
             return None
+        from src.utils.crypto import encrypt_field
         return encrypt_field(text)
 
     def process_result_value(self, value: Any, dialect: Any) -> str | None:
         if value is None:
             return None
+        from src.utils.crypto import decrypt_field
         return decrypt_field(value)
 
 
@@ -63,9 +68,11 @@ class EncryptedJSON(TypeDecorator):
     def process_bind_param(self, value: Any, dialect: Any) -> str | None:
         if value is None:
             return None
+        from src.utils.crypto import encrypt_field
         return encrypt_field(json.dumps(value, separators=(",", ":")))
 
     def process_result_value(self, value: Any, dialect: Any) -> Any:
         if value is None:
             return None
+        from src.utils.crypto import decrypt_field
         return json.loads(decrypt_field(value))

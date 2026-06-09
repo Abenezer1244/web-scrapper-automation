@@ -66,9 +66,16 @@ the 4-round same-second saga above.
   `bridgeleads_app` needs grants on `mfa_backup_codes` (043, pre-existing gap) + `mfa_break_glass_codes`,
   reconciled with the script's no-app-DELETE invariant. Harmless today (RLS_ENFORCE=False/BYPASSRLS).
 - **Frontend break-glass affordance** (a "use a recovery code" link on the OTP step) — not in P5 backend scope.
-- **⚠️ Verify (pre-existing, NOT P5):** `mfa_enable`/`mfa_disable` call `revoke_all_for_user` while
-  holding a `with_for_update()` lock on the users row; the function's own separate-txn UPDATE contends
-  with that lock. Apparently fine in prod but worth confirming it doesn't hang under load.
+- **✅ FIXED this session (`ea9912a`):** `mfa_enable`/`mfa_disable` held a `with_for_update()` lock on
+  the users row then called `revoke_all_for_user`, whose own `async_engine.begin()` (NullPool = separate
+  connection) blocked on that lock while the request coroutine awaited it → app-level deadlock/hang.
+  Codex confirmed HIGH. Fix = in-session revoke: new `TokenBlacklist.update_revoke_cache` + stamp
+  `revoked_at` on the locked session, Redis-before-commit (503→rollback, fail-safe). ⚠️ Codex's final
+  *diff* gate on this commit is PENDING (Codex CLI hit its usage limit) — the fix IS Codex's prescribed
+  option B from the confirming consult; re-run `codex review ea9912a` when the limit resets.
+- **Shipped via PRs:** backend `web-scrapper-automation#13` (this whole branch, ready); frontend
+  `bridgeleads-web#2` (DRAFT — break-glass recovery-code UI on the login MFA step; HOLD until #13 deploys
+  or it 404s in prod).
 - **Accepted P2 (C2):** row-lock-wait can widen the revoke capture window; not closed via SELECT FOR
   UPDATE (would deadlock the mfa_enable/disable flows above). Robust fix = token-version revocation.
 - migrations 044 + 045 are branch-only (apply at deploy via alembic-on-boot).

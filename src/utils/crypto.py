@@ -91,12 +91,11 @@ def encrypt_field(plaintext: str) -> str:
     return _ENC_PREFIX + token
 
 
-def _try_decrypt(token: str) -> str | None:
-    """Decrypt a ``fe1:``-prefixed token; return None if it is not in fact our
-    ciphertext (prefix present but body not decryptable by any active key)."""
-    body = token[len(_ENC_PREFIX):]
+def _fernet_decrypt(token: str) -> str | None:
+    """Try to Fernet-decrypt a raw token (no fe1: prefix); None if it is not a
+    valid token under any active key."""
     try:
-        return _instance().decrypt(body.encode("ascii")).decode("utf-8")
+        return _instance().decrypt(token.encode("ascii")).decode("utf-8")
     except (InvalidToken, ValueError):
         return None
 
@@ -107,42 +106,54 @@ def decrypt_field(value: str) -> str:
     Detection is decrypt-validated, not prefix-only:
 
     * ``fe1:``-prefixed AND decryptable -> the decrypted plaintext.
-    * ``fe1:``-prefixed but NOT decryptable -> treated as legacy plaintext that
-      happens to start with the sentinel. Returned as-is in tolerant mode; in
-      strict mode this is corruption and raises ``InvalidToken``.
-    * no prefix -> legacy plaintext. Returned as-is in tolerant mode; raises in
-      strict mode.
+    * ``fe1:``-prefixed but NOT decryptable -> legacy plaintext that happens to
+      start with the sentinel. Returned as-is in tolerant mode; raises in strict.
+    * no prefix AND a valid bare Fernet token -> the decrypted plaintext. This
+      preserves values written by the pre-H3 ``encrypt_field`` (which emitted
+      bare, unprefixed Fernet tokens), most importantly the H2 MFA secret
+      (``users.mfa_secret_encrypted``). Without this, existing MFA enrollments
+      would decrypt to raw ciphertext and TOTP login would break.
+    * no prefix AND not a Fernet token -> legacy plaintext (PII mid-backfill).
+      Returned as-is in tolerant mode; raises in strict mode.
 
     Tolerant mode (``settings.PII_ENCRYPTION_STRICT is False``) is required
     during the backfill window when a column holds a mix of ciphertext and
     plaintext. Strict mode is enabled only after backfill is verified complete.
+    Bare legacy ciphertext still decrypts in strict mode (it is encrypted at
+    rest); strict only rejects genuine plaintext.
     """
     if value.startswith(_ENC_PREFIX):
-        plaintext = _try_decrypt(value)
+        plaintext = _fernet_decrypt(value[len(_ENC_PREFIX):])
         if plaintext is not None:
             return plaintext
-        # Prefix present but not our ciphertext -> legacy plaintext or corruption.
         if settings.PII_ENCRYPTION_STRICT:
             raise InvalidToken(
                 "fe1:-prefixed value is not decryptable under strict mode"
             )
         return value
-    # No prefix -> legacy plaintext.
+    # No prefix: a legacy bare Fernet token (pre-H3, e.g. MFA secret) or plaintext.
+    legacy = _fernet_decrypt(value)
+    if legacy is not None:
+        return legacy
     if settings.PII_ENCRYPTION_STRICT:
         raise InvalidToken("unencrypted value rejected under strict mode")
     return value
 
 
 def is_encrypted(value: str | None) -> bool:
-    """True iff ``value`` is one of our fe1: ciphertext tokens (decrypt-validated).
+    """True iff ``value`` is ciphertext (decrypt-validated): an fe1: token, or a
+    legacy bare Fernet token.
 
-    Used by the backfill script for idempotency: a value that is already our
-    ciphertext is skipped; anything else (legacy plaintext, including a value
-    that coincidentally starts with ``fe1:``) is (re-)encrypted.
+    Backfill idempotency: an already-encrypted value is skipped; legacy plaintext
+    (including a value that coincidentally starts with ``fe1:``) is encrypted.
+    Returning True for bare Fernet tokens prevents a pre-H3 ciphertext from being
+    double-encrypted by the backfill.
     """
-    if value is None or not value.startswith(_ENC_PREFIX):
+    if value is None or value == "":
         return False
-    return _try_decrypt(value) is not None
+    if value.startswith(_ENC_PREFIX):
+        return _fernet_decrypt(value[len(_ENC_PREFIX):]) is not None
+    return _fernet_decrypt(value) is not None
 
 
 def _derive_blind_index_key() -> bytes:

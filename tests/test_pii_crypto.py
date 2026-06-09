@@ -15,12 +15,19 @@ from src.config import settings
 from src.db.encrypted_types import EncryptedJSON, EncryptedString
 from src.utils.crypto import (
     _ENC_PREFIX,
+    _instance,
     blind_index,
     decrypt_field,
     encrypt_field,
     is_encrypted,
     normalize_email,
 )
+
+
+def _bare_fernet_token(plaintext: str) -> str:
+    """A pre-H3 ciphertext: a Fernet token with NO fe1: prefix (how the old
+    encrypt_field stored the MFA secret)."""
+    return _instance().encrypt(plaintext.encode("utf-8")).decode("ascii")
 
 
 @pytest.fixture
@@ -69,6 +76,26 @@ def test_legacy_plaintext_rejected_strict(strict):
 def test_valid_ciphertext_decrypts_in_strict_mode(strict):
     # Real ciphertext must still decrypt once strict mode is on.
     assert decrypt_field(encrypt_field("owner@example.com")) == "owner@example.com"
+
+
+# ─── legacy bare Fernet tokens (pre-H3 MFA secret) — Codex P1 regression ───────
+
+def test_legacy_bare_fernet_token_decrypts_tolerant(tolerant):
+    # A pre-H3 value (bare, unprefixed Fernet token, e.g. mfa_secret_encrypted)
+    # must decrypt, not be mistaken for plaintext.
+    secret = "JBSWY3DPEHPK3PXP"
+    assert decrypt_field(_bare_fernet_token(secret)) == secret
+
+
+def test_legacy_bare_fernet_token_decrypts_strict(strict):
+    # Bare legacy ciphertext is encrypted at rest -> must still decrypt in strict.
+    secret = "JBSWY3DPEHPK3PXP"
+    assert decrypt_field(_bare_fernet_token(secret)) == secret
+
+
+def test_is_encrypted_true_for_bare_legacy_token():
+    # Backfill must not double-encrypt a pre-H3 ciphertext.
+    assert is_encrypted(_bare_fernet_token("JBSWY3DPEHPK3PXP")) is True
 
 
 # ─── the fe1: collision case (Codex P1 #1) ────────────────────────────────────

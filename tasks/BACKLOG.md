@@ -26,8 +26,9 @@ Two branches off `main`, unmerged. Stage 1 = contact PII + additive email_hmac. 
 
 ## 2. Security audit checklist — remaining (`SECURITY_CHECKLIST_AUDIT_2026-06-08.md`)
 
-- [ ] 🟠 **M3** — `pip-audit` + `npm audit` (+ SBOM) gate in `.github/workflows/ci-cd.yml`
-- [ ] 🟠 **M8** — route raw `requests.Session()` in scraper/enrichment through `safe_get`/`validate_scraping_target`; `allow_redirects=False` (`acclaimweb.py:906,926,942` + enrichment helpers)
+- [x] 🟠 **M3** — pip-audit + CycloneDX SBOM gate added (`dependency-audit` job; `build` needs it). Bumped all 8 vulnerable deps → 26 vulns cleared, audit 0 (fastapi 0.115.6→0.136.3, cryptography→46.0.7, PyJWT→2.13.0, requests/lxml/python-multipart/python-dotenv, pytest stack→9). npm audit = frontend repo (separate). **On `security/audit-m3-m8`, Codex-CLEAN.**
+- [x] 🟠 **M8** — acclaimweb PACS lookup SSRF-hardened (validate_scraping_target+HTTPS+trust_env=False+allow_redirects=False). pacs.py/skip_trace.py were already hardened (M8 note's other sites = false positives).
+- [x] 🟠 **CI was broken** (bonus, found during M3) — GH Actions workflow never ran (invalid YAML at the f-string `OK:` step → 0 jobs, "workflow file issue"). Fixed (block scalar + pinned ruff==0.15.6). Resurrecting it surfaced 80 ruff errors → all resolved (incl. a real bug: `select` NameError in `tasks.py` since_last_run). **⚠️ NOT merged: open PR for CI to validate the big dep bump first.**
 - [ ] 🟠 **M6** — alerting/escalation (Sentry / email / Slack) on watchdog+canary failures (currently log-only)
 - [ ] 🟠 **M7** — durable DB audit trail (login attempts, scraper-config changes) — `audit_log()` is file-only
 - [ ] 🟠 **M4** — documented edge DDoS rate-limit rules (Cloudflare WAF) + distributed-limiter resilience

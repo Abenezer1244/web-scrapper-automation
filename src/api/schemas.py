@@ -428,6 +428,19 @@ class ScraperConfigCreate(BaseModel):
         return v.lower().strip()
 
 
+class ScraperConfigUpdate(BaseModel):
+    """Partial update for an existing scraper config.
+
+    Currently only the metered skip-trace add-on toggle. Kept as a
+    dedicated optional-field model (not reusing ScraperConfigCreate) so
+    PATCH never silently rewrites county/record_type/schedule/deliver —
+    the only mutable field exposed is skip_trace_enabled. Enabling is
+    plan-gated in the route (SKIP_TRACE_ADDON_PLANS), mirroring create.
+    """
+
+    skip_trace_enabled: bool
+
+
 class ScraperConfigResponse(BaseModel):
     id: str
     user_id: str

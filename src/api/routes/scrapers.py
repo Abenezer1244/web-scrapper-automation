@@ -17,6 +17,7 @@ from src.api.schemas import (
     ConnectorResponse,
     ScraperConfigCreate,
     ScraperConfigResponse,
+    ScraperConfigUpdate,
 )
 from src.config.constants import BUSINESS_FEATURES_PLANS, SKIP_TRACE_ADDON_PLANS
 from src.db import CountyConnector, ScraperConfig, get_db
@@ -227,6 +228,54 @@ async def get_scraper(
     config = result.scalar_one_or_none()
     if config is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
+    return ScraperConfigResponse.model_validate(config)
+
+
+@router.patch("/{scraper_id}", response_model=ScraperConfigResponse)
+async def update_scraper(
+    scraper_id: str,
+    body: ScraperConfigUpdate,
+    current_user: CurrentUser,
+    request: Request,
+    db: AsyncSession = Depends(get_rls_db),
+) -> ScraperConfigResponse:
+    """Toggle the metered skip-trace add-on on an existing scraper config.
+
+    The create form has a skip-trace checkbox, but there was no way to flip it
+    afterward — so a scraper built with it off never returned phone/email until
+    rebuilt. This is the missing update path.
+
+    Tenant-scoped exactly like get/delete: loaded by id AND user_id (RLS belt +
+    explicit filter suspenders), 404 if not the caller's. ENABLING is plan-gated
+    on SKIP_TRACE_ADDON_PLANS — the SAME gate as create_scraper, so the update
+    path can't be a weaker door than create (a Starter user can't switch it on
+    here). Disabling is always allowed and only stops FUTURE enqueues; it never
+    cancels rows already queued/submitted to Tracerfy (those are independent of
+    this flag once enqueued).
+    """
+    await rate_limit(request, zone="general", identifier=current_user.id)
+
+    result = await db.execute(
+        select(ScraperConfig).where(
+            ScraperConfig.id == scraper_id,
+            ScraperConfig.user_id == current_user.id,
+        )
+    )
+    config = result.scalar_one_or_none()
+    if config is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
+
+    if body.skip_trace_enabled and (current_user.plan or "starter").lower() not in SKIP_TRACE_ADDON_PLANS:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=(
+                "Skip trace ($0.08/lookup) requires a Pro plan or higher. "
+                "Upgrade to Pro to unlock phone + email lookups."
+            ),
+        )
+
+    config.skip_trace_enabled = body.skip_trace_enabled
+    await db.flush()
     return ScraperConfigResponse.model_validate(config)
 
 

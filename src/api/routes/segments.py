@@ -21,7 +21,6 @@ suspenders). All exported fields pass sanitize_for_csv.
 
 Union (inclusive, strong + weak) is a deliberately separate later slice.
 """
-import csv
 import io
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
@@ -33,7 +32,7 @@ from starlette.responses import Response
 
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
-from src.api.middleware import rate_limit, sanitize_for_csv
+from src.api.middleware import rate_limit
 from src.api.schemas import (
     SegmentIntersectionRequest,
     SegmentIntersectionResponse,
@@ -42,11 +41,80 @@ from src.api.schemas import (
     SegmentUnionResponse,
 )
 from src.utils.crypto import decrypt_field
+from src.utils.lead_export import write_lead_csv_with_overlap
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("api.segments")
 
 router = APIRouter(prefix="/segments", tags=["segments"])
+
+# Human-readable list labels for the CSV `lists` column (matches the frontend).
+# Fallback title-cases an unknown slug so the export never shows a raw token.
+_RECORD_TYPE_LABELS = {
+    "probate": "Probate",
+    "death_certificate": "Death Certificate",
+    "pre_foreclosure": "Pre-Foreclosure",
+    "tax_delinquent": "Tax Delinquent",
+    "divorce": "Divorce",
+    "code_violation": "Code Violation",
+    "eviction": "Eviction",
+}
+
+
+def _label(slug: str) -> str:
+    return _RECORD_TYPE_LABELS.get(slug, slug.replace("_", " ").title())
+
+
+def _filing_sort_key(date_recorded: str | None) -> int:
+    """-(ordinal) of a 'M/D/YYYY' filing date so the most recent sorts first;
+    unparseable/blank -> 0 (sorts after real dates). Used for hottest-first."""
+    if not date_recorded:
+        return 0
+    try:
+        m, d, y = date_recorded.strip().split("/")
+        return -date(int(y), int(m), int(d)).toordinal()
+    except (ValueError, OverflowError):
+        return 0
+
+
+def _segment_csv_response(rows: list, filename_slug: str) -> Response:
+    """Render decoded segment rows to the unified dialer-ready overlap CSV.
+
+    Sort is hottest-first: most lists -> contactable (has phone/email) -> most
+    recent filing date -> stable. Routes through the canonical lead_export builder
+    (first/last + address split + 10-digit phone + sanitization) so the Lists CSV
+    and the per-job CSV share one format. `counties` is the representative row's
+    county (segments pick one row per property).
+    """
+    ordered = sorted(
+        rows,
+        key=lambda r: (
+            -(r.overlap_count or 0),
+            0 if (r.phone or r.email) else 1,
+            _filing_sort_key(r.date_recorded),
+        ),
+    )
+    pairs = [
+        (
+            r,
+            {
+                "lists_count": r.overlap_count,
+                "lists": "; ".join(_label(t) for t in (r.matched_record_types or [])),
+                "counties": r.county,
+            },
+        )
+        for r in ordered
+    ]
+    output = io.StringIO()
+    write_lead_csv_with_overlap(pairs, output)
+    return Response(
+        content=output.getvalue().encode("utf-8"),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename_slug}.csv"',
+            "Cache-Control": "private, no-store",
+        },
+    )
 
 # Representative rows returned in the JSON preview. The CSV export returns the
 # full set up to EXPORT_CAP (defensive bound — intersections are inherently
@@ -443,39 +511,8 @@ async def intersection_export(
             EXPORT_CAP, current_user.id, body.record_types,
         )
 
-    output = io.StringIO()
-    fieldnames = [
-        "matched_record_types", "overlap_count",
-        "party_name", "parcel_id", "property_address", "mailing_address",
-        "county", "state", "date_recorded", "phone", "phone_type", "email",
-    ]
-    writer = csv.DictWriter(output, fieldnames=fieldnames)
-    writer.writeheader()
-    for r in rows:
-        writer.writerow({
-            "matched_record_types": sanitize_for_csv("; ".join(r.matched_record_types or [])),
-            "overlap_count": r.overlap_count,
-            "party_name": sanitize_for_csv(r.party_name),
-            "parcel_id": sanitize_for_csv(r.parcel_id),
-            "property_address": sanitize_for_csv(r.property_address),
-            "mailing_address": sanitize_for_csv(r.mailing_address),
-            "county": sanitize_for_csv(r.county),
-            "state": sanitize_for_csv(r.state),
-            "date_recorded": sanitize_for_csv(r.date_recorded),
-            "phone": sanitize_for_csv(r.phone),
-            "phone_type": sanitize_for_csv(r.phone_type),
-            "email": sanitize_for_csv(r.email),
-        })
-
     types_slug = "_".join(body.record_types)[:60]
-    return Response(
-        content=output.getvalue().encode("utf-8"),
-        media_type="text/csv",
-        headers={
-            "Content-Disposition": f'attachment; filename="bridgeleads_overlap_{types_slug}.csv"',
-            "Cache-Control": "private, no-store",
-        },
-    )
+    return _segment_csv_response(rows, f"bridgeleads_overlap_{types_slug}")
 
 
 async def _fetch_union(
@@ -593,37 +630,5 @@ async def union_export(
             EXPORT_CAP, current_user.id, body.record_types,
         )
 
-    output = io.StringIO()
-    fieldnames = [
-        "identity_strength", "matched_record_types", "overlap_count",
-        "party_name", "parcel_id", "property_address", "mailing_address",
-        "county", "state", "date_recorded", "phone", "phone_type", "email",
-    ]
-    writer = csv.DictWriter(output, fieldnames=fieldnames)
-    writer.writeheader()
-    for r in rows:
-        writer.writerow({
-            "identity_strength": sanitize_for_csv(r.identity_strength),
-            "matched_record_types": sanitize_for_csv("; ".join(r.matched_record_types or [])),
-            "overlap_count": r.overlap_count,
-            "party_name": sanitize_for_csv(r.party_name),
-            "parcel_id": sanitize_for_csv(r.parcel_id),
-            "property_address": sanitize_for_csv(r.property_address),
-            "mailing_address": sanitize_for_csv(r.mailing_address),
-            "county": sanitize_for_csv(r.county),
-            "state": sanitize_for_csv(r.state),
-            "date_recorded": sanitize_for_csv(r.date_recorded),
-            "phone": sanitize_for_csv(r.phone),
-            "phone_type": sanitize_for_csv(r.phone_type),
-            "email": sanitize_for_csv(r.email),
-        })
-
     types_slug = "_".join(body.record_types)[:60]
-    return Response(
-        content=output.getvalue().encode("utf-8"),
-        media_type="text/csv",
-        headers={
-            "Content-Disposition": f'attachment; filename="bridgeleads_combined_{types_slug}.csv"',
-            "Cache-Control": "private, no-store",
-        },
-    )
+    return _segment_csv_response(rows, f"bridgeleads_combined_{types_slug}")

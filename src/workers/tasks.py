@@ -1378,6 +1378,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
             continue
 
         cache_key = address_cache_key(
+            job.user_id,  # per-tenant cache: no cross-tenant PII reuse
             payload["property_address"],
             payload["city"],
             payload["state"],

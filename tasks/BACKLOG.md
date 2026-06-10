@@ -39,8 +39,8 @@ Two branches off `main`, unmerged. Stage 1 = contact PII + additive email_hmac. 
 
 ## 3. Open security/privacy DECISIONS (need a call before coding)
 
-- [ ] 🧭🔴 **`SkipTraceCache` is global (no `user_id`)** → cross-tenant PII reuse by address. Decide: per-tenant cache key, or accept. (memory: `project_dedup_enrichment_reuse_2026_06_06`)
-- [ ] 🧭🟠 **DNC compliance** — no DNC feed (`phone_dnc_flag` always NULL); dialer push uses "not-known-DNC". Decide source/posture. (memory: `project_lead_targeting_milestone`)
+- [x] 🧭🔴 **`SkipTraceCache` cross-tenant reuse** — DECIDED 2026-06-10: **per-tenant cache key** (owner). Built on `security/skiptrace-per-tenant` (PR #16, Codex-CLEAN): `address_cache_key` hashes `user_id` too (no schema change), all 4 callers updated, per-tenant batch write. 👤 after deploy run `railway run --service worker python scripts/purge_skip_trace_cache.py` (one-time, purges orphaned global rows). ⚠️ merge auto-deploys.
+- [x] 🧭🟠 **DNC compliance** — DECIDED 2026-06-10: **keep current + honest labeling** (owner) — push "not-known-DNC" labeled `dnc_scrubbed:false`, dialer does the authoritative TCPA scrub, contracts place dialing compliance on the customer. No code change. (Codex: acceptable short-term; integrating a DNC feed = future target if marketing ever implies "compliant-ready" leads.)
 
 ## 4. Pending USER / ops actions
 

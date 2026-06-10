@@ -105,18 +105,23 @@ def _normalize_address(address: str | None) -> str:
 
 
 def address_cache_key(
+    user_id: str,
     property_address: str | None,
     city: str | None = None,
     state: str | None = None,
 ) -> str:
-    """SHA-256 hash of the normalized (address, city, state) triple.
+    """SHA-256 hash of (user_id, normalized address, city, state).
 
-    Used as the primary key for `skip_trace_cache`. Minor formatting
-    variations (punctuation, whitespace, casing) all collapse to the
-    same cache key so we don't re-trace a parcel just because the new
-    scrape formatted the street differently.
+    Used as the primary key for `skip_trace_cache`. The cache is PER-TENANT:
+    `user_id` is part of the hash, so the same address scraped by two different
+    tenants maps to two different keys — tenant B never reads the skip-traced PII
+    that tenant A paid Tracerfy to source (cross-tenant reuse decision, 2026-06-10).
+    A tenant re-scraping its OWN address still hits its own cache (cost-saving
+    within a tenant preserved). Minor formatting variations (punctuation,
+    whitespace, casing) still collapse to the same key for a given tenant.
     """
     parts = [
+        str(user_id),
         _normalize_address(property_address),
         _normalize_address(city),
         (state or "").strip().upper(),

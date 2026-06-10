@@ -109,8 +109,9 @@ def main() -> int:
                 if payload is None:
                     continue
 
-                # Cache lookup
+                # Cache lookup (per-tenant: user_id is part of the key)
                 cache_key = address_cache_key(
+                    r.user_id,
                     payload["property_address"],
                     payload["city"],
                     payload["state"],

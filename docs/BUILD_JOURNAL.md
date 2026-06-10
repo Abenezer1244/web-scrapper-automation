@@ -68,6 +68,21 @@ note: users should use in-app **Download** for dialer imports, not the emailed C
 be a garbage contact there). Optional future: "one row per phone" long-format export for single-phone
 dialers; emailed-CSV parity if users import that file.
 
+**Follow-up 2 same day — UNIFIED the two CSV builders (PR #21 → main `b511f64`):** owner: "can't tell
+users which to download." Root cause = two drifted builders (download had dialer columns; scheduled/R2
+`DataExporter` had a stale set + a `#` DNC footer row that corrupts dialer import). Codex-consulted +
+2-round GATE PASS. NEW `src/utils/lead_export.py` = ONE canonical builder (`LEAD_CSV_COLUMNS`,
+`build_lead_export_row` handling BOTH ORM objects and dicts via a `_get` accessor + secondary contacts
+from phones/emails arrays OR flattened keys, `write_lead_csv`). Both `jobs.py` download AND
+`DataExporter.to_csv`/`to_excel` now use it → identical dialer-ready output. Removed `_build_dataframe`/
+`_COLUMN_ORDER`/CSV footer. **DNC/TCPA disclaimer relocated to the delivery EMAIL body (html+text) from
+`constants.DNC_DISCLAIMER`** — out of the machine-import file (placement != compliance; real obligation =
+DNC scrub ≤31d + records). Deterministic `ORDER BY (party_name, date_recorded, id)` on BOTH export
+queries = byte-identical files (Codex P2) + restores estate grouping. `tasks.py` enriched export dict now
+carries phones/emails + tax fields. JSON left raw (not canonicalized). Codex caught + I fixed: stale
+`test_workers.py` import of removed symbols, and the row-order parity gap. 61 export/format tests pass
+(3 `test_watchdog_*` fail locally = no Celery broker, pre-existing/environmental). No migration.
+
 ---
 
 ## 2026-06-10 — Skip-trace toggle endpoint + "no phone/email" diagnosis (both deployed)

@@ -9,6 +9,8 @@ They prove the recovery-only contract: redeeming a break-glass code clears MFA,
 revokes existing sessions, mints a degraded session, and is single-use; the
 resulting session can never perform a sensitive admin op.
 """
+import asyncio
+import time
 import uuid
 
 import pyotp
@@ -42,6 +44,12 @@ async def _register_and_enable_mfa(client: AsyncClient, redis_client, email: str
         "/auth/mfa/enable", headers=headers, json={"code": pyotp.TOTP(secret).now()},
     )
     assert enable.status_code == 200, enable.text
+    # mfa/enable revokes all sessions at whole-second precision. Wait for the next
+    # second so a subsequent login's challenge iat > revoke_time — otherwise the
+    # issued_at <= revoke_time check rejects it ("Invalid or expired MFA challenge").
+    _t = int(time.time())
+    while int(time.time()) <= _t:
+        await asyncio.sleep(0.05)
     return secret
 
 

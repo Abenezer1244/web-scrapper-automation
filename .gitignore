@@ -149,3 +149,7 @@ _diag_is_pro/
 graphify-out/
 graphify-out-combined/
 src/graphify-out/
+
+# Local-only Node Playwright QA experiments (this is a Python repo; no package.json)
+tests/live_qa_chelan.js
+tests/live_qa_chelan.mjs

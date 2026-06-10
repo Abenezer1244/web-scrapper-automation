@@ -1,0 +1,240 @@
+"""Display-oriented name/address splitting for dialer-friendly CSV export.
+
+DISTINCT from skip_trace.select_traceable_owner / _parse_full_address: those are
+tuned to gate PAID skip-trace (conservative — blank for anything ambiguous, to
+avoid wasting credits). For a CSV a human imports into a dialer we want the
+opposite bias: fill first/last and address parts whenever we can do so WITHOUT
+emitting something misleading (Codex review). Two rules hold:
+
+  1. Never invent. If a part can't be parsed confidently, leave THAT field blank
+     and rely on the full party_name / property_address columns (kept alongside).
+  2. Never put garbage in an authoritative column. A wrong city/state/zip is worse
+     than a blank one, because a dialer maps it into structured fields and silently
+     corrupts the record. So state must be a real 2-letter US code and zip must be
+     a real ZIP before we split them out.
+
+Pure functions over raw strings. The caller sanitizes the OUTPUT for CSV at emit
+time (never sanitize before parsing — escaping changes the string shape).
+"""
+import re
+
+# US state/territory 2-letter codes — gate for splitting out a `state` column so
+# a token like a street-type abbreviation can't be mistaken for a state.
+_US_STATES = frozenset({
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL",
+    "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT",
+    "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI",
+    "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+    "DC", "PR", "VI", "GU", "AS", "MP",
+})
+
+# Tokens that mark a party_name as a NON-person (entity). If any appears we emit
+# no first/last (the full party_name column still carries it).
+_ENTITY_TOKENS = frozenset({
+    "LLC", "LLP", "LP", "PLLC", "INC", "CORP", "CO", "COMPANY", "TRUST", "TR",
+    "BANK", "MORTGAGE", "LOAN", "SERVICING", "ASSOCIATION", "ASSN", "HOA",
+    "FUND", "HOLDINGS", "PROPERTIES", "PROPERTY", "INVESTMENTS", "INVESTMENT",
+    "CAPITAL", "GROUP", "PARTNERS", "PARTNERSHIP", "ENTERPRISES", "REALTY",
+    "HOMES", "CHURCH", "MINISTRIES", "AUTHORITY", "DISTRICT", "DEPARTMENT",
+    "NA", "FSB", "FOUNDATION", "SERVICES", "MANAGEMENT", "VENTURES",
+})
+
+_ZIP_RE = re.compile(r"^\d{5}(?:-\d{4})?$")
+# No-comma tail: "<everything> <ST> <ZIP>". We can confidently lift the trailing
+# state+zip, but WITHOUT a comma the street/city boundary is unknowable, so the
+# whole pre-state chunk becomes `street` and `city` stays blank (honest > a wrong
+# guess — Codex). Accepted only when ST is a real state code and ZIP validates.
+_NO_COMMA_TAIL_RE = re.compile(
+    r"^(?P<street>.+?)\s+(?P<state>[A-Za-z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)$"
+)
+# "<CITY> <ST> <ZIP>" inside a single comma part (e.g. "SEATTLE WA 98101").
+_CITY_STATE_ZIP_RE = re.compile(
+    r"^(?P<city>.+?)\s+(?P<state>[A-Za-z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)$"
+)
+# Trailing "<ST> <ZIP?>" or "<ZIP>" in the last comma part.
+_STATE_ZIP_RE = re.compile(r"^(?P<state>[A-Za-z]{2})\s*(?P<zip>\d{5}(?:-\d{4})?)?$")
+
+_ESTATE_PREFIX_RE = re.compile(r"^(?:THE\s+)?ESTATE\s+OF\s+", re.IGNORECASE)
+_NAME_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z'\-]*")
+
+# Secondary-unit designators — a comma part starting with one of these is an
+# apartment/suite/lot line, NOT a city. Folded into street, never emitted as city.
+_UNIT_RE = re.compile(
+    r"^(?:#|APT|APARTMENT|UNIT|STE|SUITE|BLDG|BLD|FL|FLR|FLOOR|RM|ROOM|"
+    r"SPC|SPACE|LOT|TRLR|TRAILER|DEPT|NO|BOX|PO\s+BOX)\b",
+    re.IGNORECASE,
+)
+# Surname particles (compound last names): keep them attached to the surname so
+# 'VAN DYKE JOHN' -> last 'VAN DYKE', not 'VAN'.
+_SURNAME_PARTICLES = frozenset({
+    "VAN", "VON", "DE", "DEL", "DELA", "LA", "LE", "DI", "DA", "DU", "DOS",
+    "MC", "MAC", "O", "ST", "SAINT", "SANTA", "SAN",
+})
+
+
+def _is_entity(name: str) -> bool:
+    """True when the name contains an entity marker or a digit (not a person)."""
+    upper = name.upper()
+    if any(ch.isdigit() for ch in upper):
+        return True
+    tokens = {re.sub(r"[^A-Z]", "", t) for t in upper.split()}
+    return bool(tokens & _ENTITY_TOKENS)
+
+
+def _person_first_last(name: str, recorder_order: bool) -> tuple[str | None, str | None]:
+    """Split one cleaned person name into (first, last).
+
+    recorder_order=True  -> tokens are 'LAST FIRST [MIDDLE]' (WA county recorder).
+    recorder_order=False -> tokens are 'FIRST [MIDDLE] LAST' (natural order, e.g.
+                            after stripping an 'ESTATE OF ' prefix).
+    """
+    if "," in name:
+        # Comma always means 'LAST, FIRST [MIDDLE]' regardless of recorder_order.
+        # The FULL pre-comma chunk is the surname (handles 'DE LA CRUZ, MARIA').
+        last_part, _, rest = name.partition(",")
+        last_toks = _NAME_TOKEN_RE.findall(last_part)
+        first_toks = _NAME_TOKEN_RE.findall(rest)
+        last = " ".join(last_toks) if last_toks else None
+        first = first_toks[0] if first_toks else None
+        return first, last
+
+    toks = _NAME_TOKEN_RE.findall(name)
+    if not toks:
+        return None, None
+    if len(toks) == 1:
+        return None, toks[0]  # lone token -> treat as a surname, first blank
+    if recorder_order:
+        # 'LAST FIRST [MIDDLE]'. A run of leading surname particles binds to the
+        # surname ('VAN DYKE JOHN' -> 'VAN DYKE'/JOHN; 'DE LA CRUZ MARIA' ->
+        # 'DE LA CRUZ'/MARIA). Only for 3+ tokens so a plain 'VAN JOHN' (LAST
+        # FIRST) is untouched.
+        if len(toks) >= 3 and toks[0].upper() in _SURNAME_PARTICLES:
+            i = 0
+            while i < len(toks) - 1 and toks[i].upper() in _SURNAME_PARTICLES:
+                i += 1
+            first = toks[i + 1] if i + 1 < len(toks) else None
+            return first, " ".join(toks[: i + 1])
+        return toks[1], toks[0]
+    # natural order 'FIRST [MIDDLE] LAST' (e.g. after stripping 'ESTATE OF ')
+    return toks[0], toks[-1]
+
+
+def split_owner_for_display(party_name: str | None) -> tuple[str | None, str | None]:
+    """Best-effort (first_name, last_name) for a dialer CSV — permissive but honest.
+
+    Returns (None, None) for entities/unparseable names; the caller always keeps the
+    full party_name column. Among ' / '-separated owners, the first person-looking
+    candidate wins (so a real person beside a bank/trustee is still surfaced).
+    """
+    if not party_name or not party_name.strip():
+        return None, None
+
+    for raw in (party_name.split(" / ") or [party_name]):
+        cand = raw.strip()
+        if not cand:
+            continue
+        estate = bool(_ESTATE_PREFIX_RE.match(cand))
+        if estate:
+            cand = _ESTATE_PREFIX_RE.sub("", cand).strip()
+        if not cand or _is_entity(cand):
+            continue
+        # 'ESTATE OF JOHN SMITH' is written in natural order; plain recorder rows
+        # are 'LAST FIRST'. A comma form is handled inside _person_first_last.
+        first, last = _person_first_last(cand, recorder_order=not estate)
+        if first or last:
+            return first, last
+    return None, None
+
+
+def parse_property_for_display(addr: str | None) -> dict:
+    """Split a property address into {street, city, state, zip} for a CSV.
+
+    Validated: a `state` is only emitted when it is a real 2-letter US code and a
+    `zip` only when it matches a ZIP pattern. When the city/state/zip can't be read
+    confidently they stay None and the caller keeps the full property_address.
+    Always returns `street` (the whole string if nothing else parses). NEVER falls
+    back to mailing_address — these columns mean the PROPERTY address (Codex).
+    """
+    out = {"street": None, "city": None, "state": None, "zip": None}
+    if not addr or not addr.strip():
+        return out
+    clean = addr.strip().rstrip(",").strip()
+
+    if "," not in clean:
+        m = _NO_COMMA_TAIL_RE.match(clean)
+        if m and m.group("state").upper() in _US_STATES and _ZIP_RE.match(m.group("zip")):
+            # state+zip are confident; city is unknowable without a comma -> blank.
+            out["street"] = m.group("street").strip() or None
+            out["state"] = m.group("state").upper()
+            out["zip"] = m.group("zip")
+        else:
+            out["street"] = clean or None
+        return out
+
+    parts = [p for p in (x.strip() for x in clean.split(",")) if p]
+    if not parts:
+        return out
+
+    # tail = everything after the street; pull state+zip off its END, then the
+    # part immediately before them is the city candidate.
+    tail = parts[1:]
+    state, zip_, tail = _strip_state_zip(tail)
+
+    city = None
+    if tail:
+        cand = tail[-1]
+        # A real city has no digits and is not a unit/suite line. Anything that
+        # fails (e.g. 'APT 4', 'UNIT 2', a leftover bad state token) folds into
+        # street instead of becoming a bogus authoritative city column (Codex).
+        if not _UNIT_RE.match(cand) and not any(ch.isdigit() for ch in cand):
+            city = cand
+            tail = tail[:-1]
+
+    # street = the street part + any leftover tail fragments (units, etc.).
+    street_bits = [parts[0]] + tail
+    out["street"] = ", ".join(b for b in street_bits if b) or None
+    out["city"] = city
+    out["state"] = state
+    out["zip"] = zip_
+    return out
+
+
+def _strip_state_zip(tail: list[str]) -> tuple[str | None, str | None, list[str]]:
+    """Pull a validated trailing (state, zip) off the comma-part tail.
+
+    Returns (state, zip, remaining_parts). Handles the part being a bare ZIP, a
+    bare STATE, 'ST ZIP', or 'CITY ST ZIP' (the inline city is pushed back onto
+    the remaining parts so the caller can treat it as the city candidate). State
+    is only accepted as a real 2-letter US code; zip only when it validates.
+    """
+    if not tail:
+        return None, None, tail
+    parts = list(tail)
+    state = zip_ = None
+    last = parts[-1]
+
+    if _ZIP_RE.match(last):
+        zip_ = last
+        parts.pop()
+        if parts and parts[-1].strip().upper() in _US_STATES:
+            state = parts[-1].strip().upper()
+            parts.pop()
+        return state, zip_, parts
+
+    m = _CITY_STATE_ZIP_RE.match(last)  # "CITY ST ZIP" jammed in one part
+    if m and m.group("state").upper() in _US_STATES:
+        state = m.group("state").upper()
+        zip_ = m.group("zip")
+        parts.pop()
+        inline_city = m.group("city").strip()
+        if inline_city:
+            parts.append(inline_city)
+        return state, zip_, parts
+
+    m2 = _STATE_ZIP_RE.match(last)  # "ST" or "ST ZIP"
+    if m2 and m2.group("state").upper() in _US_STATES:
+        state = m2.group("state").upper()
+        if m2.group("zip"):
+            zip_ = m2.group("zip")
+        parts.pop()
+    return state, zip_, parts

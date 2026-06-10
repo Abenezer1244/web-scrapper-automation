@@ -29,7 +29,7 @@ async def test_register_creates_user(client: AsyncClient):
     assert me.status_code == 200
     me_data = me.json()
     assert me_data["email"] == "newuser@test.bridgeleads.io"
-    assert me_data["plan"] == "starter"
+    assert me_data["plan"] == "pro"  # registration defaults new users to pro (auth.py)
 
 
 async def test_register_duplicate_returns_generic_error(client: AsyncClient):

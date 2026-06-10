@@ -26,6 +26,10 @@ jobs:
           POSTGRES_DB: bridgeleads_test
         ports:
           - 5432:5432
+          # SyncSessionLocal rewrites :5432->:6543 (Supabase pgbouncer routing in
+          # src/db/session.py). Map host 6543 to the same postgres so the sync-DB
+          # tests (registry/workers/property_membership) connect to the test DB.
+          - 6543:5432
         options: >-
           --health-cmd pg_isready
           --health-interval 5s
@@ -92,8 +96,11 @@ jobs:
         run: |
           python -c "from main import app; print(f'OK: {len(app.routes)} routes loaded')"
 
+      # -m "not integration": RLS tests need provisioned cutover roles + RLS_ENFORCE
+      # (provision_rls_roles.sql, not in migrations) that a plain CI postgres lacks.
+      # They run in a dedicated prod-DB context, not this unit job.
       - name: Run tests
-        run: pytest tests/ --cov=src --cov-report=xml --cov-report=term-missing -v
+        run: pytest tests/ -m "not integration" --cov=src --cov-report=xml --cov-report=term-missing -v
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4

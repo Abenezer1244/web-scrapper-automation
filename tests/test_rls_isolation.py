@@ -24,6 +24,9 @@ from sqlalchemy import text
 from src.api.auth import hash_password
 from src.db.session import sync_engine
 
+# Needs provisioned RLS cutover roles + RLS_ENFORCE — excluded from the unit CI job.
+pytestmark = pytest.mark.integration
+
 
 def _create_non_bypass_role_if_missing(conn) -> str:
     """Ensure a test-only role exists that does NOT have BYPASSRLS.

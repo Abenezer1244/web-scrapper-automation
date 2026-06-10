@@ -783,9 +783,13 @@ def run_scrape_job(self, job_id: str) -> None:
             )
 
         # Fetch post-enrichment rows ONCE; reused by re-export AND membership.
+        # Same deterministic order as the in-app download (jobs.py) so the emailed/
+        # R2 CSV and the download are byte-identical, not just same-columns (Codex).
         try:
             refreshed = db.execute(
-                select(Result).where(Result.job_id == job_id, Result.user_id == job.user_id)
+                select(Result)
+                .where(Result.job_id == job_id, Result.user_id == job.user_id)
+                .order_by(Result.party_name, Result.date_recorded, Result.id)
             ).scalars().all()
         except Exception as exc:
             db.rollback()
@@ -804,9 +808,15 @@ def run_scrape_job(self, job_id: str) -> None:
                         "date_recorded", "party_name", "heirs", "parcel_id",
                         "property_address", "mailing_address", "legal_description",
                         "doc_type",
+                        # Structured tax fields (King tax_delinquent; null elsewhere).
+                        "delinquent_amount", "delinquent_bill_year",
                         # Sprint 4: skip trace fields (may be null on first export
-                        # if dispatcher hasn't submitted or webhook hasn't fired)
+                        # if dispatcher hasn't submitted or webhook hasn't fired).
                         "phone", "phone_type", "email", "skip_trace_status",
+                        # Multi-contact arrays so the scheduled/emailed export gets
+                        # phone_2/3 + email_2/3 too (canonical builder reads these),
+                        # matching the in-app download exactly.
+                        "phones", "emails",
                     ]}
                     for res in refreshed
                 ]

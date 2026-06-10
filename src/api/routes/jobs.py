@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.auth import CurrentUser
 from src.api.deps import get_db, get_rls_db
 from src.api.dialer_filters import dialer_ready_conditions
-from src.api.middleware import audit_log, rate_limit, sanitize_for_csv, sanitize_search
+from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.schemas import JobCreate, JobResponse, LogLine, ResultRow, ResultsPage
 from src.api.tax_filters import build_tax_conditions
 from src.config import settings
@@ -640,7 +640,12 @@ async def download_export(
     max_months: int | None = Query(None, ge=0, le=1200),
     dialer_ready: bool = Query(False),
 ):
-    """Stream the CSV export directly from R2.
+    """Build and stream the lead CSV LIVE from the DB (not from R2).
+
+    Uses the shared canonical builder (src/utils/lead_export.py), so this download
+    is byte-for-byte the same dialer-ready format as the scheduled/emailed export.
+    Reading live means skip-trace phone/email appear as soon as the dispatcher
+    completes, even if the original scheduled export ran before skip-trace.
 
     Accepts a short-lived download token (from /export-url) OR an Authorization header.
     The download token is scoped to a specific job, expires in 60s, and is safe for URLs.
@@ -794,7 +799,6 @@ async def download_export(
     if not job.export_key:
         raise HTTPException(status_code=404, detail="No export available yet")
 
-    import csv
     import io
 
     try:
@@ -820,6 +824,13 @@ async def download_export(
         # Any active filter -> an empty result is "no matches", not an empty job.
         any_filter_active = bool(tax_conditions) or dialer_ready
 
+        # Deterministic order (groups an estate's records together) — the SAME
+        # order the scheduled/R2 export uses, so the two exports are byte-identical,
+        # not just same-columns (Codex).
+        dl_query = dl_query.order_by(
+            Result.party_name, Result.date_recorded, Result.id
+        )
+
         results_query = await db.execute(dl_query)
         records = results_query.scalars().all()
 
@@ -844,85 +855,12 @@ async def download_export(
         # phone/email appear as soon as the skip trace dispatcher completes,
         # even if the original export was uploaded before skip trace ran.
         output = io.StringIO()
-
-        # Multi-contact: phone/email are the primary; phone_2/3 + email_2/3 are
-        # the extras from the phones/emails JSON arrays (each value still goes
-        # through sanitize_for_csv — never bypass it for JSON extraction).
-        def _nth_phone(rec, i: int) -> str | None:
-            ps = getattr(rec, "phones", None)
-            if not isinstance(ps, list) or i >= len(ps) or not isinstance(ps[i], dict):
-                return None
-            num = ps[i].get("number")
-            return num if isinstance(num, str) else None
-
-        def _nth_email(rec, i: int) -> str | None:
-            es = getattr(rec, "emails", None)
-            if not isinstance(es, list) or i >= len(es) or not isinstance(es[i], str):
-                return None
-            return es[i]
-
-        # Dialer-friendly split columns (appended at END so existing header-mapped
-        # and positional consumers are unaffected — Codex). Derived for display
-        # only: first/last is blank for entities, and city/state/zip are blank
-        # unless confidently parsed (never corrupt a dialer's structured fields).
-        from src.utils.lead_formatting import (
-            normalize_phone_for_dialer,
-            parse_property_for_display,
-            split_owner_for_display,
-        )
-
-        fieldnames = [
-            "date_recorded", "party_name", "heirs", "parcel_id",
-            "property_address", "mailing_address", "legal_description",
-            "doc_type",
-            # Phase 4: structured tax columns (King tax_delinquent; blank elsewhere)
-            "delinquent_amount", "delinquent_bill_year",
-            "phone", "phone_type", "email",
-            # Multi-contact extras (up to 3 total)
-            "phone_2", "phone_3", "email_2", "email_3",
-            # Dialer-import split columns (derived from party_name/property_address)
-            "first_name", "last_name",
-            "property_street", "property_city", "property_state", "property_zip",
-        ]
-        writer = csv.DictWriter(output, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in records:
-            _amt = getattr(r, "delinquent_amount", None)
-            # Parse RAW name/address for the dialer split columns, then sanitize
-            # each derived value at emit below (never before parsing — Codex).
-            _first, _last = split_owner_for_display(getattr(r, "party_name", None))
-            _prop = parse_property_for_display(getattr(r, "property_address", None))
-            writer.writerow({
-                "date_recorded": sanitize_for_csv(r.date_recorded),
-                "party_name": sanitize_for_csv(r.party_name),
-                "heirs": sanitize_for_csv(r.heirs),
-                "parcel_id": sanitize_for_csv(r.parcel_id),
-                "property_address": sanitize_for_csv(r.property_address),
-                "mailing_address": sanitize_for_csv(r.mailing_address),
-                "legal_description": sanitize_for_csv(r.legal_description),
-                # Phase 2a: live download must surface doc_type too (Codex P1)
-                "doc_type": sanitize_for_csv(getattr(r, "doc_type", None)),
-                # Phase 4: numeric/int — render plainly, no CSV-injection surface.
-                "delinquent_amount": "" if _amt is None else f"{_amt}",
-                "delinquent_bill_year": getattr(r, "delinquent_bill_year", None) or "",
-                # Phones normalized to bare 10-digit so all three slots share one
-                # dialer-safe format (cascade dialers like Mojo require identical
-                # formatting across phone columns). Digits-only output is also
-                # inherently CSV-injection-safe; still emitted via the writer.
-                "phone": normalize_phone_for_dialer(getattr(r, "phone", None)),
-                "phone_type": sanitize_for_csv(getattr(r, "phone_type", None)),
-                "email": sanitize_for_csv(getattr(r, "email", None)),
-                "phone_2": normalize_phone_for_dialer(_nth_phone(r, 1)),
-                "phone_3": normalize_phone_for_dialer(_nth_phone(r, 2)),
-                "email_2": sanitize_for_csv(_nth_email(r, 1)),
-                "email_3": sanitize_for_csv(_nth_email(r, 2)),
-                "first_name": sanitize_for_csv(_first),
-                "last_name": sanitize_for_csv(_last),
-                "property_street": sanitize_for_csv(_prop["street"]),
-                "property_city": sanitize_for_csv(_prop["city"]),
-                "property_state": sanitize_for_csv(_prop["state"]),
-                "property_zip": sanitize_for_csv(_prop["zip"]),
-            })
+        # Canonical dialer-ready CSV via the shared builder — the SAME format the
+        # scheduled/R2 export uses, so every export path produces an identical file
+        # (no "use the in-app download for dialers" caveat). This reads LIVE DB rows,
+        # so skip-trace phone/email appear as soon as the dispatcher completes.
+        from src.utils.lead_export import write_lead_csv
+        write_lead_csv(records, output)
 
         csv_bytes = output.getvalue().encode("utf-8")
 

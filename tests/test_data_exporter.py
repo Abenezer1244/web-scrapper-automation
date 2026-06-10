@@ -5,7 +5,8 @@ import json
 import pytest
 
 from src.api.middleware.security import sanitize_for_csv
-from src.utils.data_exporter import _COLUMN_ORDER, DataExporter, _build_dataframe
+from src.utils.data_exporter import DataExporter
+from src.utils.lead_export import LEAD_CSV_COLUMNS
 
 LEAD_RECORDS = [
     {
@@ -34,26 +35,22 @@ def exporter(tmp_path):
     return DataExporter(export_dir=str(tmp_path))
 
 
-# ─── Column ordering ──────────────────────────────────────────────────────────
+# ─── Canonical columns (shared builder) ───────────────────────────────────────
 
-def test_build_dataframe_column_order():
-    df = _build_dataframe(LEAD_RECORDS)
-    known = [c for c in _COLUMN_ORDER if c in df.columns]
-    assert list(df.columns[: len(known)]) == known
-
-
-def test_build_dataframe_extra_columns_appended():
-    records = [{"date_recorded": "01/01/2024", "party_name": "Test", "custom_field": "extra"}]
-    df = _build_dataframe(records)
-    assert "custom_field" in df.columns
-    assert list(df.columns).index("custom_field") > list(df.columns).index("party_name")
+def test_csv_header_is_canonical_columns(exporter):
+    path = exporter.to_csv(LEAD_RECORDS, filename="cols")
+    with open(path, newline="", encoding="utf-8") as f:
+        header = next(csv.reader(f))
+    assert header == LEAD_CSV_COLUMNS
 
 
-def test_build_dataframe_empty_returns_empty_with_columns():
-    df = _build_dataframe([])
-    assert len(df) == 0
-    for col in _COLUMN_ORDER:
-        assert col in df.columns
+def test_csv_has_dialer_split_columns(exporter):
+    path = exporter.to_csv(LEAD_RECORDS, filename="split")
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    # "Smith, John" -> first John / last Smith (case preserved); address splits.
+    assert rows[0]["first_name"] == "John" and rows[0]["last_name"] == "Smith"
+    assert rows[0]["property_city"] == "Tacoma" and rows[0]["property_state"] == "WA"
 
 
 # ─── CSV injection sanitization ───────────────────────────────────────────────
@@ -78,10 +75,10 @@ def test_sanitize_for_csv_clean_value_unchanged():
     assert sanitize_for_csv("LOT 4 BLOCK 2") == "LOT 4 BLOCK 2"
 
 
-def test_build_dataframe_sanitizes_injected_party_name():
-    records = [{"party_name": "=cmd|' /C calc'!A0", "parcel_id": "1234567890"}]
-    df = _build_dataframe(records)
-    assert not df["party_name"].iloc[0].startswith("=")
+def test_canonical_row_sanitizes_injected_party_name():
+    from src.utils.lead_export import build_lead_export_row
+    row = build_lead_export_row({"party_name": "=cmd|' /C calc'!A0", "parcel_id": "1234567890"})
+    assert not row["party_name"].startswith("=")
 
 
 def test_csv_file_contains_no_formula_prefixes(exporter, tmp_path):

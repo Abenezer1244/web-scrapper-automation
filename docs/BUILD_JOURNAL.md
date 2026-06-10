@@ -19,6 +19,55 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-10 — Skip-trace toggle endpoint + "no phone/email" diagnosis (both deployed)
+
+**Reported problem:** owner's 10 recent scrapes (Pierce/King/Snohomish) had zero phone/email.
+
+**Diagnosed (Claude + Codex agreed):** NOT a bug, NOT out-of-credits. Every scraper config had
+`skip_trace_enabled=False` (opt-in, defaults False at `models.py:194`), so `_enqueue_skip_trace_rows`
+bails at `tasks.py:1344` → 0 rows enter `pending_skip_trace_rows` → 4,761/4,765 results stuck
+`not_attempted`. Dispatcher was healthy submitting 0 rows. (Different root cause from the earlier
+out-of-credits/402 incident — added to the diagnosis order: check config flag → plan → queue → credits.)
+
+**Shipped to prod (2 merges):**
+- **Backend** PR #18 → main (`604cf90`): `PATCH /scrapers/{id}` + `ScraperConfigUpdate` schema — the
+  missing update path so skip-trace can be flipped on an EXISTING scraper without rebuilding it
+  (scrapers.py previously had only create/get/delete — gap Codex flagged). Tenant-scoped (id+user_id,
+  404), enabling plan-gated on `SKIP_TRACE_ADDON_PLANS` (same gate as create, not a weaker door),
+  rate-limited, normal CurrentUser auth. Disabling stops only FUTURE enqueues; never cancels
+  queued/submitted Tracerfy rows (dispatcher ignores the flag). **No migration** (route+schema only).
+- **Frontend** PR #3 → master (`bf12711`): plan-gated toggle switch on each scrapers-list row footer
+  (`updateScraperSkipTrace` PATCH client). Starter disabled w/ upsell; 402 → toast; copy says "future
+  runs" so disabling never implies cancellation.
+- **Tooling** (in PR #18): `scripts/backfill_skip_trace_jobs.py` (dry-run default, `--commit`, ORM-based
+  auto-encrypt, cache-first, excludes already-pending result_ids) + 2 read-only diag scripts.
+
+**Verified:** backend deploy live — unauth `PATCH /scrapers/{id}` → 401 (route exists + auth-gated, not
+405 old-code), api booted clean no crash-loop. Frontend `app.bridgeleads.io` 200. Backend ruff +
+py_compile clean; frontend `tsc --noEmit` clean (no ESLint configured in that repo).
+
+**Codex gate:** backend GATE: PASS, no P1/P2. Frontend review stalled on the Windows "Binary file
+matches" tool-output bug — reviewed inline instead (client gate is non-security; server endpoint is
+authoritative + already gated). `git diff` piped through PowerShell trips codex's binary detector →
+feed codex code INLINE, never via `git diff`, on this Windows box.
+
+**Decided (owner):** backfill of existing leads DEFERRED ("skip-trace all counties another time").
+Dry-run showed 4,692 eligible / ~7,031 Tracerfy credits to trace all, but balance was only **564**
+(Snohomish tax_delinquent alone = 6,268 of it). Re-run later after credit top-up:
+`railway run --service worker python scripts/backfill_skip_trace_jobs.py --hours 36 --commit`.
+
+**Facts learned:** prod disables `/openapi.json` (404) — verify routes by probing behavior (401 vs 405),
+not the schema. Agency user-facing skip-trace overage = $0.05/lookup (Pro/Biz $0.08), but the real cost
+to the account owner is Tracerfy account credits (~1–1.6/lookup), not that meter. Tracerfy balance:
+`GET https://tracerfy.com/v1/api/analytics/` → `.balance`. Frontend prod = `app.bridgeleads.io`
+(`FRONTEND_URL` on Railway api).
+
+**Pending / Handoff:** owner to (a) run the backfill after topping up Tracerfy credits, (b) live-click
+the new toggle to confirm end-to-end (authed round-trip not run here — needs admin login). Merged
+feature branches can be deleted.
+
+---
+
 ## 2026-06-10 — H3 Stage 1 deployed + audit M3/M8 + CI resurrection + §3 decisions
 
 **Shipped to prod (3 merges, all Codex-gated + CI/health-verified):**

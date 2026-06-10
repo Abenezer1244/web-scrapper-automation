@@ -287,7 +287,7 @@ class LaserficheWebLinkScraper(BridgeScraper):
         """
         records: list[ScrapedRecord] = []
         try:
-            raw = await self.page.evaluate("""() => {
+            raw = await self.page.evaluate(r"""() => {
                 // Find the results table — pick the table with the most
                 // rows where at least one row has a date (M/D/YYYY) in
                 // the 3rd cell. Laserfiche WebLink doesn't always include
@@ -303,7 +303,7 @@ class LaserficheWebLinkScraper(BridgeScraper):
                         const cells = rows[i].querySelectorAll('td');
                         if (cells.length >= 6) {
                             const val = (cells[2]?.textContent || '').trim();
-                            if (/\\d{1,2}\\/\\d{1,2}\\/\\d{4}/.test(val)) { hasDate = true; break; }
+                            if (/\d{1,2}\/\d{1,2}\/\d{4}/.test(val)) { hasDate = true; break; }
                         }
                     }
                     if (hasDate && (!best || rows.length > best.rows.length)) {

@@ -23,6 +23,7 @@ Union (inclusive, strong + weak) is a deliberately separate later slice.
 """
 import csv
 import io
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, Request
@@ -146,6 +147,14 @@ WITH candidates AS (
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
     WHERE r.user_id = :uid
       AND sc.record_type = ANY(:types)
+      -- Optional filing-date window (migration 049 date_recorded_parsed). When no
+      -- window is requested :require_date is FALSE and from/to are NULL, so all
+      -- three predicates pass and behavior is identical to the all-time query.
+      -- When a window IS active, NULL filing dates are excluded (can't be placed
+      -- in time) and reported separately via excluded_no_date_count.
+      AND (CAST(:filing_from AS date) IS NULL OR r.date_recorded_parsed >= CAST(:filing_from AS date))
+      AND (CAST(:filing_to AS date) IS NULL OR r.date_recorded_parsed <= CAST(:filing_to AS date))
+      AND (CAST(:require_date AS boolean) = FALSE OR r.date_recorded_parsed IS NOT NULL)
       {county_clause}
 ),
 agg AS (
@@ -184,6 +193,113 @@ ORDER BY a.overlap_count DESC, a.identity_strength, rk.property_address NULLS LA
 LIMIT :limit
 """
 
+# INTERSECTION, DATE-WINDOWED variant. The all-time intersection above uses the
+# property_list_membership rollup, which carries OUR scrape timestamps — NOT the
+# county filing date — so it CANNOT honor a filing-date window (Codex P1). When a
+# window is requested we compute overlap from `results` directly: candidates are
+# date-filtered first, then a property qualifies only if it appears on all :n
+# selected record types WITHIN that window. Strong-identity only (property_key).
+_INTERSECTION_DATED_SQL = """
+WITH candidates AS (
+    SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
+           r.mailing_address, r.phone, r.phone_type, r.email, r.property_key,
+           sc.record_type, sc.county, sc.state, j.created_at AS job_created_at
+    FROM results r
+    JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid
+    JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
+    WHERE r.user_id = :uid
+      AND r.property_key IS NOT NULL
+      AND r.date_recorded_parsed IS NOT NULL
+      AND sc.record_type = ANY(:types)
+      AND (CAST(:filing_from AS date) IS NULL OR r.date_recorded_parsed >= CAST(:filing_from AS date))
+      AND (CAST(:filing_to AS date) IS NULL OR r.date_recorded_parsed <= CAST(:filing_to AS date))
+      {county_clause}
+),
+agg AS (
+    SELECT property_key,
+           array_agg(DISTINCT record_type ORDER BY record_type) AS matched_record_types,
+           count(DISTINCT record_type) AS overlap_count
+    FROM candidates
+    GROUP BY property_key
+    HAVING count(DISTINCT record_type) = :n
+),
+ranked AS (
+    SELECT c.*,
+           row_number() OVER (
+               PARTITION BY c.property_key
+               ORDER BY (CASE WHEN c.phone IS NOT NULL OR c.email IS NOT NULL
+                              THEN 0 ELSE 1 END),
+                        c.job_created_at DESC NULLS LAST,
+                        c.id DESC
+           ) AS rn
+    FROM candidates c
+)
+SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
+       rk.mailing_address, rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
+       a.matched_record_types, a.overlap_count
+FROM ranked rk
+JOIN agg a ON a.property_key = rk.property_key
+WHERE rk.rn = 1
+ORDER BY a.overlap_count DESC, rk.property_address NULLS LAST, rk.id
+LIMIT :limit
+"""
+
+
+def _resolve_filing_window(
+    lookback_days: int | None,
+    filing_from: date | None,
+    filing_to: date | None,
+) -> tuple[date | None, date | None, bool]:
+    """Resolve the optional filing-date window to (from, to, require_date).
+
+    Precedence (Codex P2): an explicit filing_from/filing_to wins over
+    lookback_days. lookback_days is the preset path: filing_from = today - days.
+    require_date is True when ANY window is active (then NULL filing dates are
+    excluded). All-None => (None, None, False) = today's all-time behavior.
+    """
+    if filing_from is not None or filing_to is not None:
+        return filing_from, filing_to, True
+    if lookback_days is not None:
+        return datetime.now(UTC).date() - timedelta(days=lookback_days), None, True
+    return None, None, False
+
+
+_EXCLUDED_NO_DATE_SQL = """
+SELECT count(*)
+FROM results r
+JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid
+JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
+WHERE r.user_id = :uid
+  AND sc.record_type = ANY(:types)
+  AND r.date_recorded_parsed IS NULL
+  {pk_clause}
+  {county_clause}
+"""
+
+
+async def _count_excluded_no_date(
+    db: AsyncSession,
+    user_id: str,
+    record_types: list[str],
+    counties: list[str] | None,
+    require_property_key: bool,
+) -> int:
+    """Count in-scope leads skipped because their filing date is NULL/unparseable.
+
+    Only called when a window is active. Row-level count over the same base
+    filters (user + record_types + counties [+ property_key for intersection]);
+    surfaces a "N skipped (no filing date)" heads-up. In practice ~0 (the spike
+    found date_recorded ~100% parseable)."""
+    county_clause = "AND sc.county = ANY(:counties)" if counties else ""
+    pk_clause = "AND r.property_key IS NOT NULL" if require_property_key else ""
+    # Only fixed clause fragments are interpolated (no user data — values are bound
+    # params), matching the .format pattern used for the other queries in this file.
+    sql = text(_EXCLUDED_NO_DATE_SQL.format(pk_clause=pk_clause, county_clause=county_clause))
+    params: dict = {"uid": user_id, "types": record_types}
+    if counties:
+        params["counties"] = counties
+    return int((await db.execute(sql, params)).scalar_one())
+
 
 def _decrypt_pii_rows(rows: list) -> list:
     """Decrypt the encrypted phone/email columns of a raw-SQL result.
@@ -214,28 +330,47 @@ async def _fetch_intersection(
     record_types: list[str],
     counties: list[str] | None,
     limit: int,
-) -> list:
-    """Return representative lead rows for properties on ALL `record_types`.
+    lookback_days: int | None = None,
+    filing_from: date | None = None,
+    filing_to: date | None = None,
+) -> tuple[list, int]:
+    """Return (representative lead rows for properties on ALL `record_types`,
+    excluded_no_date_count).
 
-    Overlap is computed inside the query (membership subquery), so nothing is
-    materialized in Python and `limit` truly bounds the work. Empty list when
-    there is no overlap. `db` is already RLS-bound to the user. `record_types`
-    is pre-validated to a 2+ distinct set, so len() == the distinct-type count.
+    No window => the fast membership-backed all-time query (unchanged). A window
+    => the results-based `_INTERSECTION_DATED_SQL` (the membership rollup has no
+    filing date — Codex P1) and a count of NULL-filing-date in-scope leads.
+    `db` is RLS-bound to the user. `record_types` is pre-validated to 2+ distinct,
+    so len() == the distinct-type count.
     """
+    ff, ft, require_date = _resolve_filing_window(lookback_days, filing_from, filing_to)
+    county_clause = ""
     params: dict = {
         "uid": user_id,
         "types": record_types,
-        "n": len(record_types),
+        # Distinct count so a duplicate type can't make HAVING = :n unsatisfiable
+        # (the schema already dedupes; this is defense-in-depth — Codex P2).
+        "n": len(set(record_types)),
         "limit": limit,
     }
-    county_clause = ""
     if counties:
         county_clause = "AND sc.county = ANY(:counties)"
         params["counties"] = counties
 
+    if require_date:
+        params["filing_from"] = ff
+        params["filing_to"] = ft
+        sql = text(_INTERSECTION_DATED_SQL.format(county_clause=county_clause))
+        result = await db.execute(sql, params)
+        rows = _decrypt_pii_rows(result.fetchall())
+        excluded = await _count_excluded_no_date(
+            db, user_id, record_types, counties, require_property_key=True
+        )
+        return rows, excluded
+
     sql = text(_INTERSECTION_SQL.format(county_clause=county_clause))
     result = await db.execute(sql, params)
-    return _decrypt_pii_rows(result.fetchall())
+    return _decrypt_pii_rows(result.fetchall()), 0
 
 
 @router.post("/intersection", response_model=SegmentIntersectionResponse)
@@ -252,8 +387,9 @@ async def intersection_preview(
     await rate_limit(request, zone="general", identifier=current_user.id)
 
     # Fetch one extra row to detect truncation without a second count query.
-    rows = await _fetch_intersection(
-        db, str(current_user.id), body.record_types, body.counties, PREVIEW_CAP + 1
+    rows, excluded_no_date = await _fetch_intersection(
+        db, str(current_user.id), body.record_types, body.counties, PREVIEW_CAP + 1,
+        body.lookback_days, body.filing_from, body.filing_to,
     )
     truncated = len(rows) > PREVIEW_CAP
     rows = rows[:PREVIEW_CAP]
@@ -263,6 +399,7 @@ async def intersection_preview(
         counties=body.counties,
         property_count=len(rows),
         truncated=truncated,
+        excluded_no_date_count=excluded_no_date,
         rows=[
             SegmentLeadRow(
                 id=str(r.id),
@@ -296,8 +433,9 @@ async def intersection_export(
     """
     await rate_limit(request, zone="general", identifier=current_user.id)
 
-    rows = await _fetch_intersection(
-        db, str(current_user.id), body.record_types, body.counties, EXPORT_CAP
+    rows, _excluded = await _fetch_intersection(
+        db, str(current_user.id), body.record_types, body.counties, EXPORT_CAP,
+        body.lookback_days, body.filing_from, body.filing_to,
     )
     if len(rows) >= EXPORT_CAP:
         _logger.warning(
@@ -346,13 +484,26 @@ async def _fetch_union(
     record_types: list[str],
     counties: list[str] | None,
     limit: int,
-) -> list:
-    """Return one representative deduped lead per bucket across `record_types`.
+    lookback_days: int | None = None,
+    filing_from: date | None = None,
+    filing_to: date | None = None,
+) -> tuple[list, int]:
+    """Return (one representative deduped lead per bucket across `record_types`,
+    excluded_no_date_count).
 
     Inclusive: strong rows deduped by property_key, weak by dedup_hash, neither
-    kept as singletons — no lead dropped. `db` is RLS-bound to the user.
+    kept as singletons — no lead dropped. Optional filing-date window via the
+    same `_UNION_SQL` (predicates no-op when no window). `db` is RLS-bound.
     """
-    params: dict = {"uid": user_id, "types": record_types, "limit": limit}
+    ff, ft, require_date = _resolve_filing_window(lookback_days, filing_from, filing_to)
+    params: dict = {
+        "uid": user_id,
+        "types": record_types,
+        "limit": limit,
+        "filing_from": ff,
+        "filing_to": ft,
+        "require_date": require_date,
+    }
     county_clause = ""
     if counties:
         county_clause = "AND sc.county = ANY(:counties)"
@@ -360,7 +511,15 @@ async def _fetch_union(
 
     sql = text(_UNION_SQL.format(county_clause=county_clause))
     result = await db.execute(sql, params)
-    return _decrypt_pii_rows(result.fetchall())
+    rows = _decrypt_pii_rows(result.fetchall())
+    excluded = (
+        await _count_excluded_no_date(
+            db, user_id, record_types, counties, require_property_key=False
+        )
+        if require_date
+        else 0
+    )
+    return rows, excluded
 
 
 def _union_rows(rows: list) -> list[SegmentLeadRow]:
@@ -396,8 +555,9 @@ async def union_preview(
     PREVIEW_CAP. Inclusive — each row carries its identity_strength."""
     await rate_limit(request, zone="general", identifier=current_user.id)
 
-    rows = await _fetch_union(
-        db, str(current_user.id), body.record_types, body.counties, PREVIEW_CAP + 1
+    rows, excluded_no_date = await _fetch_union(
+        db, str(current_user.id), body.record_types, body.counties, PREVIEW_CAP + 1,
+        body.lookback_days, body.filing_from, body.filing_to,
     )
     truncated = len(rows) > PREVIEW_CAP
     rows = rows[:PREVIEW_CAP]
@@ -407,6 +567,7 @@ async def union_preview(
         counties=body.counties,
         lead_count=len(rows),
         truncated=truncated,
+        excluded_no_date_count=excluded_no_date,
         rows=_union_rows(rows),
     )
 
@@ -422,8 +583,9 @@ async def union_export(
     identity_strength column (strong|weak). CSV-injection sanitized."""
     await rate_limit(request, zone="general", identifier=current_user.id)
 
-    rows = await _fetch_union(
-        db, str(current_user.id), body.record_types, body.counties, EXPORT_CAP
+    rows, _excluded = await _fetch_union(
+        db, str(current_user.id), body.record_types, body.counties, EXPORT_CAP,
+        body.lookback_days, body.filing_from, body.filing_to,
     )
     if len(rows) >= EXPORT_CAP:
         _logger.warning(

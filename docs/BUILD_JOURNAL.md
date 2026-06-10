@@ -19,6 +19,40 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-10 — Dialer integration research + dialer-friendly CSV columns (shipped)
+
+**Researched** how RE-investor dialers ingest leads (PhoneBurner, Mojo, BatchDialer, CallTools,
+Ricochet360, ReadyMode, Kixie, JustCall, Aircall, Salesmsg, Smarter Contact, Launch Control, REISift,
+Vulcan7, …). **Key finding: a raw outbound webhook is NOT directly consumable by most dialers** — they
+don't listen for inbound JSON (only Ricochet360 + CallTools have a posting URL). Coverage ranking: **CSV
+import ~100%**, Zapier "create contact" ~75-80%, native REST API ~60% (PhoneBurner/CallTools/JustCall/
+Kixie/Aircall/Salesmsg). So our generic webhook is only useful as a feed INTO Zapier/Make, and CSV is
+the universal path. Owner chose: polish the CSV (we already deliver CSV — core product).
+
+**Shipped** (PR #19 → main `02ff2c0`, backend-only, **no migration**, read-path only):
+- `src/utils/lead_formatting.py` (new): `split_owner_for_display` (permissive person split — entities
+  blank, ' / ' picks the person, recorder LAST FIRST, comma LAST/FIRST, compound-surname particle runs,
+  ESTATE OF natural order) + `parse_property_for_display` (VALIDATED — state only if real US code, zip
+  only if valid; unit/digit fragments fold into street, never a bogus city; NO mailing fallback).
+- `jobs.py` download CSV: appended `first_name, last_name, property_street, property_city,
+  property_state, property_zip` at END (backward-compatible); derived from raw, each sanitized at emit.
+- `tests/test_lead_formatting.py`: 25 tests, ruff clean.
+
+**Worked with Codex (and FIXED Codex):** Codex CLI had been failing all session — root cause: I forced
+`-s read-only`, which fights this box's global `[windows] sandbox = "elevated"` config and auto-declines
+Codex's own file reads; AND my `grep -vE` output pipe collapsed Codex's TUI output to "Binary file
+matches". **Fix: drop the `-s read-only` override + filter with `grep -a`.** Codex then read files via
+its Node-FS fallback (sandboxed PowerShell host still errors `8009001d`, but it recovers). Review loop:
+pre-build consult (3 P1s folded in) → review R1 GATE FAIL (caught unit-fragment→city + truncated
+compound surnames) → fixed → R2 GATE PASS → fixed the last P2 (double-particle surnames).
+
+**Facts learned:** on this Windows box, work with Codex by (a) NOT passing `-s read-only` (let the trusted/
+elevated config stand), (b) piping its output through `grep -a` not plain grep, (c) for code review,
+either let it read files (Node-FS fallback works) or embed code inline. Codex's sandboxed PowerShell
+(`powershell.exe -Command`) fails with `8009001d` (managed-PS load) but Codex falls back to node_repl.
+
+---
+
 ## 2026-06-10 — Skip-trace toggle endpoint + "no phone/email" diagnosis (both deployed)
 
 > **REVERTED same session (owner decision):** the toggle was removed completely right after shipping.

@@ -21,6 +21,14 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ## 2026-06-10 — Skip-trace toggle endpoint + "no phone/email" diagnosis (both deployed)
 
+> **REVERTED same session (owner decision):** the toggle was removed completely right after shipping.
+> Owner's point was fair: it only affects FUTURE runs, and the create-form checkbox already covers new
+> scrapers — so its only real value was editing EXISTING scrapers in place, which the owner didn't need.
+> It never addressed the actual problem (empty phone/email on ALREADY-scraped leads = the **backfill**'s
+> job, still deferred). Toggle backend+frontend ripped out (`scrapers.py` PATCH + `ScraperConfigUpdate`
+> + frontend switch/api client); diagnostics + backfill scripts KEPT. Lesson: should have led with the
+> backfill (solves the stated problem) instead of building the toggle (solves a different, unasked one).
+
 **Reported problem:** owner's 10 recent scrapes (Pierce/King/Snohomish) had zero phone/email.
 
 **Diagnosed (Claude + Codex agreed):** NOT a bug, NOT out-of-credits. Every scraper config had
@@ -45,6 +53,17 @@ out-of-credits/402 incident — added to the diagnosis order: check config flag 
 **Verified:** backend deploy live — unauth `PATCH /scrapers/{id}` → 401 (route exists + auth-gated, not
 405 old-code), api booted clean no crash-loop. Frontend `app.bridgeleads.io` 200. Backend ruff +
 py_compile clean; frontend `tsc --noEmit` clean (no ESLint configured in that repo).
+
+**Caught & fixed (post-deploy 500):** clicking the toggle 500'd — `MissingGreenlet` in
+`ScraperConfigResponse.model_validate(config)`. After `await db.flush()` on the UPDATE, the onupdate
+server column (`updated_at = func.now()`, models.py:197) is EXPIRED, so Pydantic's sync attribute read
+triggered a lazy DB load outside the async greenlet. `create_scraper` was immune (INSERT fetches server
+defaults via RETURNING; UPDATE does not) and `delete_scraper` too (returns 204, no body) — this PATCH is
+the first route that UPDATEs AND serializes a response model. Fix (`1bf7788`): `await db.refresh(config)`
+before serializing. **Durable rule: any async-SQLAlchemy route that UPDATEs then returns a response_model
+built from the ORM object must `await db.refresh()` first** (or the onupdate/server cols crash serialization).
+Codex's review missed this — it explicitly hedged "model_validate is fine IF the response model supports
+from-attributes," which it does; the failure mode was the async-expiry interaction, not the model config.
 
 **Codex gate:** backend GATE: PASS, no P1/P2. Frontend review stalled on the Windows "Binary file
 matches" tool-output bug — reviewed inline instead (client gate is non-security; server endpoint is

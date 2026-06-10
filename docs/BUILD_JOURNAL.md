@@ -51,6 +51,23 @@ elevated config stand), (b) piping its output through `grep -a` not plain grep, 
 either let it read files (Node-FS fallback works) or embed code inline. Codex's sandboxed PowerShell
 (`powershell.exe -Command`) fails with `8009001d` (managed-PS load) but Codex falls back to node_repl.
 
+**Follow-up same day — read the import docs (after shipping, owner pushback) + phone-format fix
+(PR #20 → main `5e07b35`):** per-dialer CSV IMPORT specs confirmed the column SET was right (manual-
+mapping dialers ignore extras; split name+address is what they want) but caught the real gap: PHONE
+FORMAT. Bare 10-digit is accepted by every mainstay; cascade dialers (Mojo) require ALL phone columns
+share one format. Added `normalize_phone_for_dialer()` (strip ext incl. `ext:`/`x.`, strip non-digits,
+drop leading US `1`; blank on non-10-digit — predictable empty beats a row-poisoning malformed number),
+applied to phone/phone_2/phone_3 in the **download** CSV (digits-only = CSV-injection-safe). 30 tests,
+Codex GATE PASS (caught the punctuated-extension miss, fixed). **Multi-contact flow:** 3 phones map to
+Phone 1/2/3 — cascade dialers (Mojo/PhoneBurner/BatchDialer/ReadyMode) dial all 3 in sequence; single-
+phone dialers (Kixie/JustCall) dial only the primary (`phones[0]`, the best number) and keep extras as
+fields. 3 emails: dialers store (don't dial) email, usually one field — extras for CRM. **DECISION (owner):
+B — the in-app Download is the canonical dialer export; the emailed/R2 `DataExporter` CSV stays the
+general copy WITH its DNC footer (NOT made dialer-parity; avoids relocating the TCPA disclaimer).** UX
+note: users should use in-app **Download** for dialer imports, not the emailed CSV (the footer row would
+be a garbage contact there). Optional future: "one row per phone" long-format export for single-phone
+dialers; emailed-CSV parity if users import that file.
+
 ---
 
 ## 2026-06-10 — Skip-trace toggle endpoint + "no phone/email" diagnosis (both deployed)

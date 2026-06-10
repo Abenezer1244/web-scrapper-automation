@@ -83,6 +83,12 @@ app.conf.beat_schedule = {
         "task": "src.workers.scheduler.refresh_public_sample_cache",
         "schedule": 3600.0,  # every 1 hour
     },
+    "batch-completion-sweep": {
+        # Piece 2: finalize batch_runs whose child jobs are ALL terminal — build
+        # the one combined CSV + deliver. Claims each run once via claimed_at.
+        "task": "src.workers.scheduler.batch_completion_sweep",
+        "schedule": 60.0,  # every 1 minute
+    },
 }
 
 
@@ -1041,3 +1047,93 @@ def dialer_push_sweep() -> None:
 
         if pushed:
             _logger.info("Dialer push sweep: enqueued %d job push(es)", pushed)
+
+
+# ─── Piece 2: batch completion barrier ──────────────────────────────────────
+
+@app.task(name="src.workers.scheduler.batch_completion_sweep")
+def batch_completion_sweep() -> None:
+    """Finalize batch_runs whose child jobs are ALL terminal — build the one
+    combined CSV + deliver. Each run is claimed once via claimed_at (at-most-once,
+    same pattern as dialer_push_sweep). Does NOT wait on async skip-trace: the CSV
+    is built on property identity (ready at child enrichment); contacts fill in
+    later and the CSV is re-downloadable. No-op when no run is ready.
+    """
+    from sqlalchemy import func, select, update
+
+    from src.db.models import BatchRun, Job
+    from src.db.session import system_sync_session
+    from src.workers.batch_export import finalize_batch_run
+
+    _BATCH = 20
+    with system_sync_session() as db:
+        runs = db.execute(
+            select(BatchRun)
+            .where(BatchRun.status == "running", BatchRun.claimed_at.is_(None))
+            .limit(_BATCH)
+        ).scalars().all()
+
+        _terminal = ("done", "failed", "cancelled")
+        for run in runs:
+            distinct_ids = list({str(x) for x in (run.child_job_ids or [])})
+            if not distinct_ids:
+                continue
+            run_id, run_user = run.id, run.user_id
+            # Require EVERY child to exist for this tenant AND be terminal — not
+            # merely "none active" (Codex P2): a missing / cross-tenant / deleted /
+            # future-status child means the batch is not actually ready.
+            terminal = db.execute(
+                select(func.count())
+                .select_from(Job)
+                .where(
+                    Job.id.in_(distinct_ids),
+                    Job.user_id == run_user,
+                    Job.status.in_(_terminal),
+                )
+            ).scalar_one()
+            if terminal < len(distinct_ids):
+                continue  # not all children present + terminal — try next sweep
+
+            # Atomic, STATUS-GUARDED claim before the heavy finalize: only one
+            # sweep flips claimed_at NULL->now, AND it must still be 'running' (a
+            # concurrent cancel between select and claim makes rowcount 0 — Codex
+            # P1). Re-fetch fresh state after the claim.
+            claimed = db.execute(
+                update(BatchRun)
+                .where(
+                    BatchRun.id == run_id,
+                    BatchRun.claimed_at.is_(None),
+                    BatchRun.status == "running",
+                )
+                .values(claimed_at=datetime.now(UTC))
+            ).rowcount
+            db.commit()
+            if not claimed:
+                continue  # another sweep claimed it, or it was cancelled
+
+            run = db.get(BatchRun, run_id)
+            if run is None or run.status != "running":
+                continue  # cancelled/deleted after claim — don't finalize
+
+            try:
+                finalize_batch_run(db, run)
+            except Exception as exc:  # noqa: BLE001
+                # finalize commits status only at the END (after CSV+R2) and the
+                # email is best-effort, so a propagating error means nothing was
+                # committed. Release the claim so the next sweep RETRIES (R2 upload
+                # overwrites the same key — idempotent), avoiding a permanently
+                # stuck 'running' run.
+                _logger.error(
+                    "batch_completion_sweep: finalize %s failed (will retry): %s",
+                    run.id, str(exc)[:200],
+                )
+                try:
+                    db.rollback()
+                    db.execute(
+                        update(BatchRun)
+                        .where(BatchRun.id == run.id)
+                        .values(claimed_at=None)
+                    )
+                    db.commit()
+                except Exception:  # noqa: BLE001
+                    db.rollback()

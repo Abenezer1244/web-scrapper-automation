@@ -121,3 +121,17 @@ class SkipTraceStatus(str, Enum):
     HIT = "hit"
     MISS = "miss"
     ERRORED = "errored"
+
+
+# DNC/TCPA compliance disclaimer surfaced to users on lead exports. It lives in
+# the delivery email body + download UI — NOT inside the machine-import CSV/Excel
+# (a disclaimer row corrupts a dialer import). Placement is not compliance: the
+# real obligation is DNC-registry scrubbing (<=31 days) + records, done by the
+# user's dialer/process. Kept as one constant so every surface shows identical copy.
+DNC_DISCLAIMER: str = (
+    "IMPORTANT: Verify numbers against the National DNC Registry and your state "
+    "DNC list before calling. BridgeLeads does not currently pre-scrub phone "
+    "numbers against DNC or TCPA litigator lists. Contacting a number on the DNC "
+    "Registry without prior express consent may result in statutory damages of "
+    "$500-$1,500 per call under the TCPA."
+)

@@ -7,7 +7,8 @@ from sqlalchemy.orm import Session
 from src.api.auth import hash_password
 from src.db.models import Job, ScraperConfig, User
 from src.db.session import SyncSessionLocal
-from src.utils.data_exporter import _COLUMN_ORDER, DataExporter, _build_dataframe
+from src.utils.data_exporter import DataExporter
+from src.utils.lead_export import LEAD_CSV_COLUMNS, build_lead_export_row
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -59,17 +60,16 @@ def _create_stuck_job(db: Session, user_id: str, config_id: str, minutes_ago: in
 
 # ─── DataFrame / export ───────────────────────────────────────────────────────
 
-def test_build_dataframe_column_order():
-    records = [{"date_recorded": "01/01/2024", "party_name": "Test", "parcel_id": "1111111111"}]
-    df = _build_dataframe(records)
-    present = [c for c in _COLUMN_ORDER if c in df.columns]
-    assert list(df.columns[:len(present)]) == present
+def test_canonical_row_has_all_columns():
+    row = build_lead_export_row(
+        {"date_recorded": "01/01/2024", "party_name": "Test", "parcel_id": "1111111111"}
+    )
+    assert set(row.keys()) == set(LEAD_CSV_COLUMNS)
 
 
-def test_build_dataframe_sanitizes_formulas():
-    records = [{"party_name": "=SUM(A1)", "parcel_id": "1234567890"}]
-    df = _build_dataframe(records)
-    assert not df["party_name"].iloc[0].startswith("=")
+def test_canonical_row_sanitizes_formulas():
+    row = build_lead_export_row({"party_name": "=SUM(A1)", "parcel_id": "1234567890"})
+    assert not row["party_name"].startswith("=")
 
 
 def test_export_csv_real_file(tmp_path):

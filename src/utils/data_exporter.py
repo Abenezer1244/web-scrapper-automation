@@ -1,4 +1,12 @@
-"""Data exporter: CSV / Excel / JSON with CSV injection sanitization and R2 upload."""
+"""Data exporter: CSV / Excel / JSON with CSV injection sanitization and R2 upload.
+
+Lead CSV/Excel content (columns, phone normalization, name/address split,
+sanitization) is owned by src/utils/lead_export.py so the in-app download and the
+scheduled/R2 export produce the IDENTICAL dialer-ready file. This module owns only
+file writing + R2 I/O. JSON stays raw-typed for API consumers (NOT canonicalized).
+The DNC/TCPA disclaimer is NOT written into the CSV/Excel (a disclaimer row breaks
+dialer import) — it's surfaced in the delivery email body + download UI instead.
+"""
 
 import json
 from datetime import datetime
@@ -10,40 +18,14 @@ import requests as _requests
 
 from src.api.middleware.security import sanitize_for_csv
 from src.config import settings
+from src.utils.lead_export import (
+    LEAD_CSV_COLUMNS,
+    build_lead_export_row,
+    write_lead_csv,
+)
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("exporter")
-
-# Column display order for lead exports
-_COLUMN_ORDER = [
-    "date_recorded",
-    "party_name",
-    "heirs",
-    "legal_description",
-    "doc_type",
-    "parcel_id",
-    "property_address",
-    "mailing_address",
-    # Sprint 4: skip trace (Tracerfy). These are populated asynchronously
-    # by the skip-trace dispatcher + webhook. On first export they may be
-    # empty if the dispatcher hasn't submitted yet OR Tracerfy hasn't
-    # webhook'd back yet — users can re-download later for the filled
-    # values, or check the job's skip_trace status in the UI.
-    "phone",
-    "phone_type",
-    "email",
-    "skip_trace_status",
-]
-
-# Sprint 4: DNC compliance disclaimer appended as a footer to CSV/Excel.
-# Removed once Sprint 5 adds pre-call DNC/TCPA litigator scrubbing.
-_DNC_DISCLAIMER = (
-    "IMPORTANT: Verify numbers against the National DNC Registry and your "
-    "state DNC list before calling. BridgeLeads does not currently pre-scrub "
-    "phone numbers against DNC or TCPA litigator lists. Contacting a number "
-    "on the DNC Registry without prior express consent may result in "
-    "statutory damages of $500-$1,500 per call under the TCPA."
-)
 
 # Amber header colour for Excel (matches BridgeLeads design system)
 _AMBER_HEX = "F5A623"
@@ -61,36 +43,14 @@ def _r2_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {settings.R2_API_TOKEN}"}
 
 
-def _build_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
-    """Build a sanitized DataFrame from a list of result dicts.
-
-    Applies CSV injection sanitization to all string fields.
-    Columns are ordered per _COLUMN_ORDER; extra columns appended at end.
+def _canonical_dataframe(records: list[Any]) -> pd.DataFrame:
+    """Build a DataFrame of canonical lead rows — the SAME columns + formatting
+    (dialer split cols, normalized phones, sanitized values) as the CSV, so the
+    Excel export matches the CSV exactly. No DNC footer; that lives in the email
+    body + download UI (a disclaimer row breaks spreadsheet/dialer import).
     """
-    if not records:
-        return pd.DataFrame(columns=_COLUMN_ORDER)
-
-    df = pd.DataFrame(records)
-
-    # Apply CSV injection sanitization to every string-valued cell
-    for col in df.columns:
-        if df[col].dtype == object:
-            df[col] = df[col].apply(
-                lambda v: sanitize_for_csv(str(v)) if v is not None else ""
-            )
-
-    # Re-order columns: known columns first, then any extras
-    ordered = [c for c in _COLUMN_ORDER if c in df.columns]
-    extras = [c for c in df.columns if c not in _COLUMN_ORDER]
-    df = df[ordered + extras]
-
-    # Sort/group by party_name (estate) then date_recorded so related
-    # records from the same estate appear together in the export
-    sort_cols = [c for c in ["party_name", "date_recorded"] if c in df.columns]
-    if sort_cols:
-        df = df.sort_values(sort_cols, na_position="last").reset_index(drop=True)
-
-    return df
+    rows = [build_lead_export_row(r) for r in records]
+    return pd.DataFrame(rows, columns=LEAD_CSV_COLUMNS)
 
 
 class DataExporter:
@@ -102,35 +62,19 @@ class DataExporter:
 
     # ─── Local file export ────────────────────────────────────────────────────
 
-    def to_csv(self, records: list[dict[str, Any]], filename: str = "export") -> Path:
-        """Export records to a sanitized CSV file."""
+    def to_csv(self, records: list[Any], filename: str = "export") -> Path:
+        """Export records to the canonical dialer-ready CSV (shared builder)."""
         filepath = self._timestamped_path(filename, "csv")
-        df = _build_dataframe(records)
-        df.to_csv(filepath, index=False, encoding="utf-8")
-
-        # Sprint 4: append DNC/TCPA disclaimer footer when any phone value
-        # exists in the export. Prefixed with '#' so pandas readers can
-        # skip it via comment='#' and Excel displays it as plain text.
-        # Note: pandas `astype(bool)` on an object column returns True for
-        # any non-None value (including empty strings), so we explicitly
-        # check for non-empty stripped strings.
-        has_phones = False
-        if "phone" in df.columns:
-            has_phones = any(
-                str(v).strip() for v in df["phone"].tolist() if v is not None
-            )
-        if has_phones:
-            with open(filepath, "a", encoding="utf-8") as f:
-                f.write("\n")
-                f.write("# " + _DNC_DISCLAIMER + "\n")
-
-        _logger.info("CSV exported: %s (%d rows)", filepath.name, len(df))
+        # newline="" so the csv writer doesn't emit blank lines between rows.
+        with open(filepath, "w", encoding="utf-8", newline="") as f:
+            write_lead_csv(records, f)
+        _logger.info("CSV exported: %s (%d rows)", filepath.name, len(records))
         return filepath
 
-    def to_excel(self, records: list[dict[str, Any]], filename: str = "export") -> Path:
-        """Export records to an Excel file with amber header row."""
+    def to_excel(self, records: list[Any], filename: str = "export") -> Path:
+        """Export records to an Excel file (canonical columns) with amber header."""
         filepath = self._timestamped_path(filename, "xlsx")
-        df = _build_dataframe(records)
+        df = _canonical_dataframe(records)
 
         with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Leads")

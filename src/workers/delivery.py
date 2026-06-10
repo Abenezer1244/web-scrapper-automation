@@ -43,6 +43,12 @@ def deliver_job_results(
     safe_name = html.escape(scraper_name)
     subject = f"Your {scraper_name} leads are ready — {record_count:,} records"
 
+    # DNC/TCPA disclaimer is shown HERE (and the download UI), not inside the CSV
+    # — a disclaimer row corrupts a dialer/spreadsheet import. Single source in
+    # constants so every surface shows identical copy.
+    from src.config.constants import DNC_DISCLAIMER
+    safe_disclaimer = html.escape(DNC_DISCLAIMER)
+
     html_body = f"""
 <!DOCTYPE html>
 <html>
@@ -77,6 +83,10 @@ def deliver_job_results(
 
     <p class="expiry">This download link expires in 48 hours.</p>
 
+    <div class="notice" style="font-size:12px; color:#d9b13a; background:#1a1208; border:1px solid #7a4f08; border-radius:8px; padding:12px 16px; margin-bottom:20px; line-height:1.5;">
+      {safe_disclaimer}
+    </div>
+
     <div class="footer">
       You're receiving this because you set up automated delivery for {safe_name}.<br>
       Manage your delivery settings at app.bridgeleads.io
@@ -90,7 +100,8 @@ def deliver_job_results(
         f"Your {scraper_name} leads are ready.\n\n"
         f"{record_count:,} records found.\n\n"
         f"Download ({fmt.upper()}): {download_url}\n\n"
-        "This link expires in 48 hours.\n"
+        "This link expires in 48 hours.\n\n"
+        f"{DNC_DISCLAIMER}\n\n"
         "Manage delivery settings at app.bridgeleads.io"
     )
 

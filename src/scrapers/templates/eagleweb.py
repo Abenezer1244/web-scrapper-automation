@@ -555,7 +555,7 @@ class EagleWebScraper(BridgeScraper):
         try:
             # Extract directly via JavaScript — more reliable than BeautifulSoup
             # Also capture detail page links (href containing docDetail) for parcel lookups
-            raw = await self.page.evaluate("""
+            raw = await self.page.evaluate(r"""
                 (() => {
                     const tables = document.querySelectorAll('table');
                     let bestTable = null, bestRows = 0;
@@ -729,7 +729,7 @@ class EagleWebScraper(BridgeScraper):
                                 if parcel_match:
                                     pid = parcel_match.group(1)
                                     # Skip instrument numbers (start with 2024/2025/2026)
-                                    if not pid[:4] in ("2024", "2025", "2026"):
+                                    if pid[:4] not in ("2024", "2025", "2026"):
                                         record.parcel_id = pid
                                         parcel_source_counts["summary_digit"] += 1
                                     else:
@@ -788,8 +788,8 @@ class EagleWebScraper(BridgeScraper):
         clicking through the browser. Extracts parcel IDs from the HTML with regex.
         Does NOT navigate the browser, so pagination state is preserved.
         """
-        import re as _re
         import asyncio as _asyncio
+        import re as _re
         from concurrent.futures import ThreadPoolExecutor
 
         _PARCEL_PATTERNS = [
@@ -861,7 +861,7 @@ class EagleWebScraper(BridgeScraper):
                 tasks = [loop.run_in_executor(executor, _fetch_one, href) for _, href in batch]
                 results_list = await _asyncio.gather(*tasks, return_exceptions=True)
 
-                for (record, _), parcel in zip(batch, results_list):
+                for (record, _), parcel in zip(batch, results_list, strict=False):
                     if isinstance(parcel, str) and parcel:
                         record.parcel_id = parcel
                         found += 1

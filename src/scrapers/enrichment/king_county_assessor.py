@@ -122,7 +122,7 @@ async def batch_enrich_king_county(
                 if "Mailing Address" in body:
                     idx = body.index("Mailing Address") + len("Mailing Address")
                     after = body[idx:idx + 200]
-                    lines = [l.strip() for l in after.split("\n") if l.strip()]
+                    lines = [ln.strip() for ln in after.split("\n") if ln.strip()]
                     addr_lines = []
                     for line in lines:
                         if line.startswith("Pay by") or line.startswith("Annual") or line.startswith("Billing"):

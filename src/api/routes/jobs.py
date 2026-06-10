@@ -384,7 +384,7 @@ async def get_results(
                 ScraperConfig.user_id == current_user.id,
             )
         )
-        sibling_ids = [r for r in sibling_configs.scalars().all()]
+        sibling_ids = list(sibling_configs.scalars().all())
 
         if sibling_ids:
             # Find most recent done job across all sibling configs

@@ -55,7 +55,7 @@ def test_starter_limit():
 
 
 def test_pro_limit():
-    assert Settings.PLAN_LIMITS["pro"] == 500
+    assert Settings.PLAN_LIMITS["pro"] == 1000  # raised from 500 (pricing change)
 
 
 def test_business_limit():

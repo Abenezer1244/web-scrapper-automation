@@ -1,4 +1,3 @@
-import asyncio
 """LandmarkWeb template scraper for Hyland LandmarkWeb recorder portals.
 
 Covers WA counties using the Hyland LandmarkWeb interface.

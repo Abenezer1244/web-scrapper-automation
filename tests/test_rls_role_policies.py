@@ -22,6 +22,9 @@ from sqlalchemy import text
 from src.api.auth import hash_password
 from src.db.session import sync_engine
 
+# Needs provisioned RLS cutover roles + RLS_ENFORCE — excluded from the unit CI job.
+pytestmark = pytest.mark.integration
+
 
 def _cutover_applied(conn) -> bool:
     """True only when both cutover roles AND a role-targeted policy exist."""

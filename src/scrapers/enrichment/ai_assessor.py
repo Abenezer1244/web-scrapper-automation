@@ -87,9 +87,10 @@ async def enrich_parcel_ai(
         return _empty()
 
     try:
+        from urllib.parse import urlparse
+
         from src.api.middleware.security import add_scrape_domain
         from src.scrapers.base_scraper import BridgeScraper
-        from urllib.parse import urlparse
 
         domain = urlparse(url).hostname
         if domain:
@@ -199,7 +200,7 @@ def _parse_json_response(text: str) -> dict | None:
     if text.startswith("```"):
         lines = text.split("\n")
         # Remove first and last lines (```json and ```)
-        lines = [l for l in lines if not l.strip().startswith("```")]
+        lines = [ln for ln in lines if not ln.strip().startswith("```")]
         text = "\n".join(lines).strip()
 
     try:

@@ -18,9 +18,13 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from sqlalchemy import text
 
 from src.db.session import rls_sync_session, system_sync_session
+
+# Needs provisioned RLS cutover roles + RLS_ENFORCE — excluded from the unit CI job.
+pytestmark = pytest.mark.integration
 
 
 def test_guc_survives_commit_via_after_begin() -> None:

@@ -502,7 +502,7 @@ def _batch_query_wa_statewide(
             continue
 
         # Reverse map: query_value -> original caller parcel_id
-        query_to_original = {qv: orig for qv, orig in query_pairs}
+        query_to_original = dict(query_pairs)
         in_values = list(query_to_original.keys())
 
         in_clause = ",".join(f"'{p}'" for p in in_values)

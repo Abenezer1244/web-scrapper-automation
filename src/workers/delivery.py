@@ -187,8 +187,7 @@ def send_lockout_notification(email: str, failure_count: int, ip: str) -> None:
     if not settings.RESEND_API_KEY:
         return
 
-    safe_email = html.escape(email)
-    safe_ip = html.escape(ip)
+    safe_ip = html.escape(ip)  # email is the recipient, never rendered in the body
     subject = "Security alert: suspicious login activity on your BridgeLeads account"
 
     html_body = f"""

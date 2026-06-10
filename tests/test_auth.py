@@ -29,7 +29,7 @@ async def test_register_creates_user(client: AsyncClient):
     assert me.status_code == 200
     me_data = me.json()
     assert me_data["email"] == "newuser@test.bridgeleads.io"
-    assert me_data["plan"] == "starter"
+    assert me_data["plan"] == "pro"  # registration defaults new users to pro (auth.py)
 
 
 async def test_register_duplicate_returns_generic_error(client: AsyncClient):
@@ -295,7 +295,14 @@ async def _register_and_enable_mfa(client: AsyncClient, redis_client, email: str
         "/auth/mfa/enable", headers=headers, json={"code": pyotp.TOTP(secret).now()},
     )
     assert enable.status_code == 200, enable.text
-    return secret, enable.json()["backup_codes"]
+    backup_codes = enable.json()["backup_codes"]
+    # mfa/enable revokes all sessions at whole-second precision. Wait for the next
+    # second so a subsequent login's challenge iat > revoke_time — otherwise the
+    # issued_at <= revoke_time check rejects it ("Invalid or expired MFA challenge").
+    _t = int(time.time())
+    while int(time.time()) <= _t:
+        await asyncio.sleep(0.05)
+    return secret, backup_codes
 
 
 async def test_login_without_mfa_has_no_challenge(client: AsyncClient, redis_client):

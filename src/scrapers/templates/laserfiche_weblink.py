@@ -111,7 +111,6 @@ class LaserficheWebLinkScraper(BridgeScraper):
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         """Scrape records from a Laserfiche WebLink portal."""
-        from datetime import datetime, timedelta
 
         _logger.info(
             "Laserfiche WebLink scraper - %s/%s - %s to %s",
@@ -288,7 +287,7 @@ class LaserficheWebLinkScraper(BridgeScraper):
         """
         records: list[ScrapedRecord] = []
         try:
-            raw = await self.page.evaluate("""() => {
+            raw = await self.page.evaluate(r"""() => {
                 // Find the results table — pick the table with the most
                 // rows where at least one row has a date (M/D/YYYY) in
                 // the 3rd cell. Laserfiche WebLink doesn't always include
@@ -328,7 +327,7 @@ class LaserficheWebLinkScraper(BridgeScraper):
                     const htmlOf = (i) => cells[i] ? (cells[i].innerHTML || '').trim() : '';
                     // Look for a date in position 2 (MM/DD/YYYY or M/D/YYYY)
                     const dateVal = vals[2] || '';
-                    if (!/\\d{1,2}\\/\\d{1,2}\\/\\d{4}/.test(dateVal)) continue;
+                    if (!/\d{1,2}\/\d{1,2}\/\d{4}/.test(dateVal)) continue;
                     out.push({
                         afn: vals[1] || '',
                         date: dateVal,

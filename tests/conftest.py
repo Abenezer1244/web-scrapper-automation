@@ -4,7 +4,6 @@ All fixtures use real infrastructure (Postgres, Redis) — no mocks.
 The CI environment sets DATABASE_URL and DATABASE_URL_SYNC to a dedicated
 test database so production data is never touched.
 """
-import asyncio
 import uuid
 
 import pytest
@@ -21,22 +20,13 @@ from src.api.auth import create_secure_token, hash_password
 from src.config import settings
 from src.db.models import Job, JobLog, PropertyListMembership, Result, ScraperConfig, User
 
-# ─── Session-scoped event loop ────────────────────────────────────────────────
-
-@pytest.fixture(scope="session")
-def event_loop(request):  # noqa: ARG001
-    """Single event loop shared by all tests and async fixtures in the session.
-
-    Without this, pytest-asyncio creates a new event loop per test function
-    while async fixtures (db, starter_user, etc.) run in the session-scoped
-    loop set by asyncio_default_fixture_loop_scope = "session". This mismatch
-    causes 'Future attached to a different loop' errors whenever a test body
-    calls await db.commit(), and 'Event loop is closed' errors for the Redis
-    client singleton that was created in the previous test's loop.
-    """
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
+# ─── Event loop scope ─────────────────────────────────────────────────────────
+# pytest-asyncio 1.x REMOVED support for redefining the `event_loop` fixture (it
+# raised "Event loop is closed" once the override was ignored). Instead, loop
+# scope is configured in pyproject: asyncio_default_fixture_loop_scope = "session"
+# AND asyncio_default_test_loop_scope = "session" — so every async fixture AND
+# test body run in the SAME session loop, which is what the session-scoped engine
+# fixture below and the per-test `db` sessions require.
 
 
 # ─── Test engine override ─────────────────────────────────────────────────────
@@ -60,6 +50,35 @@ async def _setup_test_engine():
     )
     yield
     await engine.dispose()
+
+
+# ─── Redis isolation ──────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _flush_redis():
+    """Clear the test Redis before every test (LOCALHOST ONLY — never a remote DB).
+
+    The full suite shares one Redis (rate-limit counters, brute-force lockout
+    state). Without flushing, state accumulates across tests in a single CI run —
+    the auth-zone rate limiter trips ("Too many requests") and stale lockout keys
+    make MFA tests fail. Flushing at setup (before the test body) resets counters.
+
+    SAFETY (Codex P1): FLUSHDB is destructive, so it runs ONLY when REDIS_URL points
+    at localhost (CI's redis service + typical local dev). A shared/staging/prod
+    REDIS_URL (any non-local host) is never flushed — a misconfigured .env can't
+    wipe real rate-limit/lockout/Celery/session state.
+    """
+    from urllib.parse import urlparse
+
+    host = (urlparse(settings.REDIS_URL).hostname or "").lower()
+    if host in ("localhost", "127.0.0.1", "::1"):
+        try:
+            r = sync_redis.from_url(settings.REDIS_URL)
+            r.flushdb()
+            r.close()
+        except Exception:
+            pass  # Redis optional for pure-unit tests; soft-fail
+    yield
 
 
 # ─── Database fixture ─────────────────────────────────────────────────────────

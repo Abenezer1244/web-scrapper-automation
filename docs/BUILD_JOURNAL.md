@@ -19,6 +19,44 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-10 — H3 Stage 1 deployed + audit M3/M8 + CI resurrection + §3 decisions
+
+**Shipped to prod (3 merges, all Codex-gated + CI/health-verified):**
+- **H3 Stage 1** (PR #14, `9e2962e`): contact-PII encryption live. Caught that the encryption keys
+  were NOT in Railway despite belief — provisioned `FIELD_ENCRYPTION_KEY`+`BLIND_INDEX_KEY` on api+worker
+  via railway CLI (clean slate: 0 fe1: rows first), ran `backfill_pii_encryption` (results 1530 +
+  skip_trace_cache 958) + `backfill_user_email_hmac` (166/166), verified decrypt round-trip.
+  PII_ENCRYPTION_STRICT stays false (Stage 2 not done). **👤 key backup at `%TEMP%\h3-prod-keys-backup.txt`
+  — move to password manager + delete.**
+- **Audit M3+M8 + CI** (PR #15, `c24208e`): M3 dep-audit gate + bumped all 8 vuln pkgs (fastapi→0.136,
+  cryptography→46.0.7, pyjwt→2.13, starlette→1.x, …) 26→0; M8 acclaimweb SSRF. **Discovered GitHub Actions
+  CI had NEVER run** (invalid-YAML `OK:` f-string) — resurrected it + made the test job pass for the first
+  time (511/9-deselected): 80 lint errors incl. a real `select` NameError, pytest-asyncio 1.x loop
+  migration, `:6543` sync-DB CI port-map, RLS-integration exclusion, migration 048 for `max_date_range_days`
+  model-drift, localhost-only Redis test flush, MFA whole-second-revoke test waits, stale tests, coverage→34.
+- **§3 SkipTraceCache per-tenant** (PR #16, `04b7363`): cross-tenant PII reuse removed — `address_cache_key`
+  hashes `user_id`; per-tenant batch write; purged 958 orphaned global rows. DNC §3 half: owner chose
+  keep-current + honest labeling (no code).
+
+**Tried / Decided:** owner picked per-tenant cache (privacy > Tracerfy cost) + keep-current DNC. Codex
+P1 on the laserfiche/eagleweb raw-string JS regex = PROVEN FALSE POSITIVE (AST shows valid `/\d.../`);
+rejected with evidence — Codex has a raw-string blind spot.
+
+**Failed / Blocked (codex-cli env):** graphify MCP `query_graph` HANGS codex (disabled in `.codex/config.toml`;
+`-c mcp_servers={}` does NOT override a file-defined server). Global `~/.codex/config.toml` `service_tier="default"`
+rejected by 0.125.0 — commented out. Codex hit usage limits twice (deferred gates as workaround).
+
+**Pending / Handoff:** 🧭 pre-existing `PLAN_LIMITS["pro"]=1000` vs register `records_limit=500` inconsistency.
+Stage-2 h3-email-cutover rebase must renumber its migration 048→049 (this run's 048+049 land first). RLS
+integration tests need a prod-DB CI job (with H1). Ratchet coverage up from 34. Fix the graphify
+query_graph hang so codex can use it.
+
+**Facts learned:** Railway deploys via its OWN GitHub integration + migrate.py on boot, NOT the Actions
+workflow (which was dead). `railway run python scripts/X` needs `sys.path.insert(0,'.')` (else No module
+named src). `codex review --base <other-stage-branch>` cleanly simulates a post-merge diff.
+
+---
+
 ## 2026-06-09 — H3: ran the two pending Codex merge-gates (Stage 1 CLEAN)
 
 **Built / Shipped:**

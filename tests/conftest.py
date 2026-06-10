@@ -56,21 +56,28 @@ async def _setup_test_engine():
 
 @pytest.fixture(autouse=True)
 def _flush_redis():
-    """Clear the test Redis before every test.
+    """Clear the test Redis before every test (LOCALHOST ONLY — never a remote DB).
 
     The full suite shares one Redis (rate-limit counters, brute-force lockout
-    state, MFA challenge tokens). Without flushing, state accumulates across
-    tests in a single CI run — the auth-zone rate limiter trips ("Too many
-    requests") and stale lockout/challenge keys make MFA tests fail. Flushing at
-    setup (before the test body) resets counters while leaving any challenge a
-    test creates during its own run intact.
+    state). Without flushing, state accumulates across tests in a single CI run —
+    the auth-zone rate limiter trips ("Too many requests") and stale lockout keys
+    make MFA tests fail. Flushing at setup (before the test body) resets counters.
+
+    SAFETY (Codex P1): FLUSHDB is destructive, so it runs ONLY when REDIS_URL points
+    at localhost (CI's redis service + typical local dev). A shared/staging/prod
+    REDIS_URL (any non-local host) is never flushed — a misconfigured .env can't
+    wipe real rate-limit/lockout/Celery/session state.
     """
-    try:
-        r = sync_redis.from_url(settings.REDIS_URL)
-        r.flushdb()
-        r.close()
-    except Exception:
-        pass  # Redis optional for pure-unit tests; soft-fail
+    from urllib.parse import urlparse
+
+    host = (urlparse(settings.REDIS_URL).hostname or "").lower()
+    if host in ("localhost", "127.0.0.1", "::1"):
+        try:
+            r = sync_redis.from_url(settings.REDIS_URL)
+            r.flushdb()
+            r.close()
+        except Exception:
+            pass  # Redis optional for pure-unit tests; soft-fail
     yield
 
 

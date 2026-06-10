@@ -1,5 +1,5 @@
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, TypedDict
 from urllib.parse import urlparse
 
@@ -801,6 +801,14 @@ class SegmentIntersectionRequest(BaseModel):
     """
     record_types: list[str] = Field(min_length=2, max_length=10)
     counties: list[str] | None = Field(default=None, max_length=100)
+    # Optional filing-date window (migration 049 date_recorded_parsed). lookback_days
+    # is the preset path (server derives filing_from = today - days); filing_from/to
+    # is the custom path (explicit wins if both supplied). When ANY is set, rows with
+    # an unparseable/NULL filing date are excluded and reported via
+    # excluded_no_date_count. None everywhere = today's all-time behavior (unchanged).
+    lookback_days: int | None = Field(default=None, ge=1, le=3660)
+    filing_from: date | None = None
+    filing_to: date | None = None
 
     @field_validator("record_types")
     @classmethod
@@ -822,6 +830,15 @@ class SegmentIntersectionRequest(BaseModel):
         if any(len(c) > 64 for c in cleaned):
             raise ValueError("invalid county value")
         return cleaned or None
+
+    @model_validator(mode="after")
+    def _check_filing_window(self) -> "SegmentIntersectionRequest":
+        # Reject an inverted explicit window (Codex P2). lookback_days vs explicit
+        # filing_from/to precedence is resolved in the route (explicit wins) — see
+        # _resolve_filing_window in routes/segments.py.
+        if self.filing_from and self.filing_to and self.filing_from > self.filing_to:
+            raise ValueError("filing_from must be on or before filing_to")
+        return self
 
 
 class SegmentLeadRow(BaseModel):
@@ -852,6 +869,9 @@ class SegmentIntersectionResponse(BaseModel):
     counties: list[str] | None = None
     property_count: int
     truncated: bool = False  # preview cap reached — export for the full set
+    # Rows skipped because their filing date was unparseable/NULL. Only nonzero
+    # when a filing-date window is active (windowed queries require a real date).
+    excluded_no_date_count: int = 0
     rows: list[SegmentLeadRow]
 
 
@@ -865,6 +885,10 @@ class SegmentUnionRequest(BaseModel):
     """
     record_types: list[str] = Field(min_length=1, max_length=10)
     counties: list[str] | None = Field(default=None, max_length=100)
+    # Optional filing-date window — see SegmentIntersectionRequest (same semantics).
+    lookback_days: int | None = Field(default=None, ge=1, le=3660)
+    filing_from: date | None = None
+    filing_to: date | None = None
 
     @field_validator("record_types")
     @classmethod
@@ -887,6 +911,14 @@ class SegmentUnionRequest(BaseModel):
             raise ValueError("invalid county value")
         return cleaned or None
 
+    @model_validator(mode="after")
+    def _check_filing_window(self) -> "SegmentUnionRequest":
+        # Reject an inverted explicit window (Codex P2). Precedence (explicit wins
+        # over lookback_days) resolved in routes/segments.py._resolve_filing_window.
+        if self.filing_from and self.filing_to and self.filing_from > self.filing_to:
+            raise ValueError("filing_from must be on or before filing_to")
+        return self
+
 
 class SegmentUnionResponse(BaseModel):
     mode: str = "union"
@@ -895,4 +927,7 @@ class SegmentUnionResponse(BaseModel):
     counties: list[str] | None = None
     lead_count: int
     truncated: bool = False  # preview cap reached — export for the full set
+    # Rows skipped because their filing date was unparseable/NULL. Only nonzero
+    # when a filing-date window is active (windowed queries require a real date).
+    excluded_no_date_count: int = 0
     rows: list[SegmentLeadRow]

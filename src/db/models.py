@@ -1,10 +1,12 @@
 import uuid
 
 from sqlalchemy import (
+    DDL,
     JSON,
     BigInteger,
     Boolean,
     Column,
+    Computed,
     Date,
     DateTime,
     ForeignKey,
@@ -14,6 +16,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     func,
     text,
 )
@@ -29,6 +32,41 @@ from src.db.encrypted_types import EncryptedJSON, EncryptedString
 
 class Base(DeclarativeBase):
     pass
+
+
+# IMMUTABLE filing-date parser backing Result.date_recorded_parsed (migration 049).
+# Registered as a before_create DDL (Postgres only) so create_all-based test DBs
+# have the function the generated column references. MUST stay byte-identical to
+# migration 049's _PARSE_FN. to_date is only STABLE (can't back a generated
+# column — Codex P1); this make_date helper is IMMUTABLE and EXCEPTION-traps an
+# invalid calendar date to NULL so one bad row can't break inserts.
+_RESULT_PARSE_FILING_DATE_FN = DDL(
+    r"""
+CREATE OR REPLACE FUNCTION result_parse_filing_date(txt text)
+RETURNS date
+LANGUAGE plpgsql
+IMMUTABLE
+AS $func$
+BEGIN
+    IF txt IS NULL OR btrim(txt) !~ '^\d{1,2}/\d{1,2}/\d{4}$' THEN
+        RETURN NULL;
+    END IF;
+    RETURN make_date(
+        split_part(btrim(txt), '/', 3)::int,
+        split_part(btrim(txt), '/', 1)::int,
+        split_part(btrim(txt), '/', 2)::int
+    );
+EXCEPTION WHEN data_exception THEN
+    RETURN NULL;
+END;
+$func$;
+"""
+)
+event.listen(
+    Base.metadata,
+    "before_create",
+    _RESULT_PARSE_FILING_DATE_FN.execute_if(dialect="postgresql"),
+)
 
 
 def _uuid():
@@ -256,6 +294,22 @@ class Result(Base):
     job_id = Column(UUID(as_uuid=False), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
     user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     date_recorded = Column(String(32), nullable=True)
+    # Migration 049: county filing date parsed to a real DATE for the
+    # date-windowed overlap/combine query. DB-generated (regex-guarded to_date)
+    # so existing + future rows materialize automatically; unparseable/empty =>
+    # NULL (excluded from windows). Keep this expression IDENTICAL to migration
+    # 049's. Read-only (generated) — never assigned by the app.
+    date_recorded_parsed = Column(
+        Date,
+        # Generated via the IMMUTABLE result_parse_filing_date() helper (migration
+        # 049; also created by the before_create event below for create_all tests).
+        # to_date is only STABLE so it can't sit in a generated column (Codex P1);
+        # the helper uses make_date + EXCEPTION-trap so a bad date row can't break
+        # inserts. Computed => SQLAlchemy never INSERTs this (a generated column
+        # rejects explicit writes).
+        Computed("result_parse_filing_date(date_recorded)", persisted=True),
+        nullable=True,
+    )
     party_name = Column(String(512), nullable=True)
     heirs = Column(Text, nullable=True)
     legal_description = Column(Text, nullable=True)

@@ -861,6 +861,15 @@ async def download_export(
                 return None
             return es[i]
 
+        # Dialer-friendly split columns (appended at END so existing header-mapped
+        # and positional consumers are unaffected — Codex). Derived for display
+        # only: first/last is blank for entities, and city/state/zip are blank
+        # unless confidently parsed (never corrupt a dialer's structured fields).
+        from src.utils.lead_formatting import (
+            parse_property_for_display,
+            split_owner_for_display,
+        )
+
         fieldnames = [
             "date_recorded", "party_name", "heirs", "parcel_id",
             "property_address", "mailing_address", "legal_description",
@@ -870,11 +879,18 @@ async def download_export(
             "phone", "phone_type", "email",
             # Multi-contact extras (up to 3 total)
             "phone_2", "phone_3", "email_2", "email_3",
+            # Dialer-import split columns (derived from party_name/property_address)
+            "first_name", "last_name",
+            "property_street", "property_city", "property_state", "property_zip",
         ]
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
         for r in records:
             _amt = getattr(r, "delinquent_amount", None)
+            # Parse RAW name/address for the dialer split columns, then sanitize
+            # each derived value at emit below (never before parsing — Codex).
+            _first, _last = split_owner_for_display(getattr(r, "party_name", None))
+            _prop = parse_property_for_display(getattr(r, "property_address", None))
             writer.writerow({
                 "date_recorded": sanitize_for_csv(r.date_recorded),
                 "party_name": sanitize_for_csv(r.party_name),
@@ -895,6 +911,12 @@ async def download_export(
                 "phone_3": sanitize_for_csv(_nth_phone(r, 2)),
                 "email_2": sanitize_for_csv(_nth_email(r, 1)),
                 "email_3": sanitize_for_csv(_nth_email(r, 2)),
+                "first_name": sanitize_for_csv(_first),
+                "last_name": sanitize_for_csv(_last),
+                "property_street": sanitize_for_csv(_prop["street"]),
+                "property_city": sanitize_for_csv(_prop["city"]),
+                "property_state": sanitize_for_csv(_prop["state"]),
+                "property_zip": sanitize_for_csv(_prop["zip"]),
             })
 
         csv_bytes = output.getvalue().encode("utf-8")

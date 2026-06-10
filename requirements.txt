@@ -17,7 +17,7 @@ pydantic[email]==2.10.4
 python-dotenv==1.2.2         # M3: CVE-2026-28684
 
 # Auth / Security
-PyJWT[crypto]==2.13.0        # M3: PYSEC-2026-120/175/176/177/178/179 (PYSEC-2025-183 has no fix — ignored in CI gate)
+PyJWT[crypto]==2.13.0        # M3: clears PYSEC-2026-120/175/176/177/178/179 (audits clean at 2.13.0; no ignore needed)
 bcrypt==4.2.1
 passlib[bcrypt]==1.7.4
 pyotp==2.9.0                 # TOTP (MFA, H2)

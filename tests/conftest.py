@@ -52,6 +52,28 @@ async def _setup_test_engine():
     await engine.dispose()
 
 
+# ─── Redis isolation ──────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _flush_redis():
+    """Clear the test Redis before every test.
+
+    The full suite shares one Redis (rate-limit counters, brute-force lockout
+    state, MFA challenge tokens). Without flushing, state accumulates across
+    tests in a single CI run — the auth-zone rate limiter trips ("Too many
+    requests") and stale lockout/challenge keys make MFA tests fail. Flushing at
+    setup (before the test body) resets counters while leaving any challenge a
+    test creates during its own run intact.
+    """
+    try:
+        r = sync_redis.from_url(settings.REDIS_URL)
+        r.flushdb()
+        r.close()
+    except Exception:
+        pass  # Redis optional for pure-unit tests; soft-fail
+    yield
+
+
 # ─── Database fixture ─────────────────────────────────────────────────────────
 
 @pytest_asyncio.fixture

@@ -1215,7 +1215,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 connector_assessor_url, names, max_workers=5,
             )
             name_hits = 0
-            for res, pacs in zip(results_no_addr, pacs_results):
+            for res, pacs in zip(results_no_addr, pacs_results, strict=False):
                 if not pacs:
                     continue
                 if pacs.get("address"):
@@ -1565,6 +1565,8 @@ def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: st
         # Look up the last completed job for this scraper config and use
         # its date range end as our start. If no previous job exists,
         # fall back to 30 days (not 90 — avoids massive duplicate sets).
+        from sqlalchemy import select
+
         from src.db.models import Job
         from src.db.session import SyncSessionLocal
         try:

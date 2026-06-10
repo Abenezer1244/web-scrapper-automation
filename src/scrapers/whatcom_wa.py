@@ -18,7 +18,6 @@ Whatcom's result cards include GRANTOR, GRANTEE, Doc Type, date, and
 APN all inline — no HTTP detail fetch needed, unlike Thurston/Spokane.
 """
 
-import asyncio
 import re
 from datetime import datetime, timedelta
 
@@ -192,7 +191,7 @@ class WhatcomWAScraper(BridgeScraper):
             new_raw_count = 0
             for raw_text in raw_texts:
                 import hashlib
-                rh = hashlib.sha1(raw_text.encode("utf-8")).hexdigest()
+                rh = hashlib.sha1(raw_text.encode("utf-8"), usedforsecurity=False).hexdigest()
                 if rh not in seen_raw_hashes:
                     seen_raw_hashes.add(rh)
                     new_raw_count += 1

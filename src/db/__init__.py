@@ -1,4 +1,15 @@
-from .models import Base, CountyConnector, CountyRecord, Job, JobLog, PasswordHistory, Result, ScraperConfig, User, UserRecordView
+from .models import (
+    Base,
+    CountyConnector,
+    CountyRecord,
+    Job,
+    JobLog,
+    PasswordHistory,
+    Result,
+    ScraperConfig,
+    User,
+    UserRecordView,
+)
 from .session import (
     AsyncSessionLocal,
     SyncSessionLocal,

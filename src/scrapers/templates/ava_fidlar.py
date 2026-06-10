@@ -1,4 +1,3 @@
-import asyncio
 """AVA Fidlar template scraper for Fidlar Technologies AVA recorder portals.
 
 Covers WA counties using the AVA (Angular SPA) interface.

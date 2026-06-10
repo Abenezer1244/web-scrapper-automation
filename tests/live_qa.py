@@ -2,6 +2,7 @@
 import asyncio
 import os
 import sys
+
 from playwright.async_api import async_playwright
 
 APP = "https://app.bridgeleads.io"

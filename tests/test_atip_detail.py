@@ -9,10 +9,11 @@ os.environ["CAPTCHA_API_KEY"] = "af6f1a7bcff35945316c12c8ae15f829"
 os.environ["CAPTCHA_ENABLED"] = "true"
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
-from src.scrapers.enrichment.captcha import solve_recaptcha
 from src.scrapers.base_scraper import BridgeScraper
+from src.scrapers.enrichment.captcha import solve_recaptcha
 
 JS_CODE = """
 async (args) => {

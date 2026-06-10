@@ -6,7 +6,8 @@ and being listed in the DB.
 """
 
 import importlib
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select
 

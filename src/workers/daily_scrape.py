@@ -15,7 +15,7 @@ from sqlalchemy import func, insert, select, text
 from src.config import settings
 from src.db.models import CountyConnector, CountyRecord
 from src.db.session import SyncSessionLocal
-from src.scrapers.registry import get_scraper_class, UnsupportedCountyError
+from src.scrapers.registry import UnsupportedCountyError, get_scraper_class
 from src.utils.logger import setup_logger
 from src.workers.tasks import _run_scraper
 
@@ -25,7 +25,7 @@ _logger = setup_logger("worker.daily_scrape")
 def make_record_hash(county: str, state: str, party_name: str, date_recorded: str, legal_description: str) -> str:
     """MD5 hash for dedup. Excludes timestamps so re-scrapes deduplicate."""
     raw = f"{county}|{state}|{party_name or ''}|{date_recorded or ''}|{legal_description or ''}"
-    return hashlib.md5(raw.encode()).hexdigest()
+    return hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()
 
 
 def run_daily_scrape_for_county(county: str, state: str) -> int:
@@ -47,7 +47,7 @@ def run_daily_scrape_for_county(county: str, state: str) -> int:
             _logger.info("County %s/%s already scraped today (%d records), skipping", county, state, existing)
             return 0
 
-        lock_key = int(hashlib.md5(f"{county}|{state}".encode()).hexdigest()[:8], 16)
+        lock_key = int(hashlib.md5(f"{county}|{state}".encode(), usedforsecurity=False).hexdigest()[:8], 16)
         got_lock = db.execute(text(f"SELECT pg_try_advisory_lock({lock_key})")).scalar()
         if not got_lock:
             _logger.info("County %s/%s locked by another worker, skipping", county, state)

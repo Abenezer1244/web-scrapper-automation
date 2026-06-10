@@ -74,7 +74,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install ruff pytest-cov
+          pip install ruff==0.15.6   # pinned so CI lint matches local; bump deliberately
 
       - name: Install Playwright browsers
         run: python -m playwright install chromium --with-deps
@@ -85,8 +85,12 @@ jobs:
       - name: Run migrations
         run: alembic upgrade head
 
+      # Block scalar: the inline f-string contains "OK: " whose colon-space made
+      # this an invalid YAML mapping, which failed the whole workflow at startup
+      # (0 jobs ran). `run: |` keeps it literal.
       - name: Verify app starts (catch import-time crashes)
-        run: python -c "from main import app; print(f'OK: {len(app.routes)} routes loaded')"
+        run: |
+          python -c "from main import app; print(f'OK: {len(app.routes)} routes loaded')"
 
       - name: Run tests
         run: pytest tests/ --cov=src --cov-report=xml --cov-report=term-missing -v

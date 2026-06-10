@@ -111,7 +111,6 @@ class LaserficheWebLinkScraper(BridgeScraper):
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         """Scrape records from a Laserfiche WebLink portal."""
-        from datetime import datetime, timedelta
 
         _logger.info(
             "Laserfiche WebLink scraper - %s/%s - %s to %s",
@@ -304,7 +303,7 @@ class LaserficheWebLinkScraper(BridgeScraper):
                         const cells = rows[i].querySelectorAll('td');
                         if (cells.length >= 6) {
                             const val = (cells[2]?.textContent || '').trim();
-                            if (/\d{1,2}\/\d{1,2}\/\d{4}/.test(val)) { hasDate = true; break; }
+                            if (/\\d{1,2}\\/\\d{1,2}\\/\\d{4}/.test(val)) { hasDate = true; break; }
                         }
                     }
                     if (hasDate && (!best || rows.length > best.rows.length)) {

@@ -61,7 +61,8 @@ def test_strong_key_equals_legacy_inline_formula():
     """Lockstep guard: the helper key must equal the legacy inline strong key
     that _compute_dedup_hash produced, so the Task 2 refactor is behavior-
     preserving for strong rows."""
-    import hashlib, re
+    import hashlib
+    import re
     parcel_in, addr_in = "1234-56-7890", "123 Main St., #4"
     parcel = (parcel_in or "").strip().upper().replace("-", "").replace(" ", "")
     addr = (addr_in or "").strip().upper()

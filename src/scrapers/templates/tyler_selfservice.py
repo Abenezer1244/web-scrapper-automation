@@ -537,8 +537,9 @@ class TylerSelfServiceScraper(BridgeScraper):
 
         _logger.info("Enriching %d records via assessor TaxSifter (%s)", len(records), assessor_url)
 
-        from src.api.middleware.security import add_scrape_domain
         from urllib.parse import urlparse
+
+        from src.api.middleware.security import add_scrape_domain
         domain = urlparse(assessor_url).hostname
         if domain:
             add_scrape_domain(domain)

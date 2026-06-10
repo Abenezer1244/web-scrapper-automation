@@ -276,6 +276,13 @@ async def update_scraper(
 
     config.skip_trace_enabled = body.skip_trace_enabled
     await db.flush()
+    # Reload in async context before serializing. The UPDATE expires the
+    # server-side onupdate column (updated_at = func.now()); without this
+    # refresh, ScraperConfigResponse.model_validate() reads that expired
+    # attribute synchronously and triggers a lazy DB load outside the async
+    # greenlet -> MissingGreenlet 500. create_scraper avoids this only because
+    # INSERT populates server defaults via RETURNING; UPDATE does not.
+    await db.refresh(config)
     return ScraperConfigResponse.model_validate(config)
 
 

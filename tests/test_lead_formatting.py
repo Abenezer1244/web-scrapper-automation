@@ -1,8 +1,38 @@
 """Tests for dialer-CSV display formatting (src/utils/lead_formatting.py)."""
 from src.utils.lead_formatting import (
+    normalize_phone_for_dialer,
     parse_property_for_display,
     split_owner_for_display,
 )
+
+
+class TestNormalizePhoneForDialer:
+    def test_already_bare_10_digit(self):
+        assert normalize_phone_for_dialer("2065551234") == "2065551234"
+
+    def test_strips_formatting(self):
+        assert normalize_phone_for_dialer("(206) 555-1234") == "2065551234"
+        assert normalize_phone_for_dialer("206-555-1234") == "2065551234"
+        assert normalize_phone_for_dialer("206.555.1234") == "2065551234"
+
+    def test_drops_leading_country_code(self):
+        assert normalize_phone_for_dialer("12065551234") == "2065551234"
+        assert normalize_phone_for_dialer("+1 (206) 555-1234") == "2065551234"
+
+    def test_strips_extension(self):
+        assert normalize_phone_for_dialer("206-555-1234 x123") == "2065551234"
+        assert normalize_phone_for_dialer("2065551234 ext 5") == "2065551234"
+        # Punctuated extension forms must not blank a valid base number.
+        assert normalize_phone_for_dialer("2065551234 ext: 7") == "2065551234"
+        assert normalize_phone_for_dialer("2065551234 x. 7") == "2065551234"
+        assert normalize_phone_for_dialer("(206) 555-1234 extension: 12") == "2065551234"
+
+    def test_invalid_returns_blank(self):
+        assert normalize_phone_for_dialer("555-1234") == ""        # 7 digits
+        assert normalize_phone_for_dialer("not a phone") == ""
+        assert normalize_phone_for_dialer("449900112233") == ""    # 12 digits, non-US
+        assert normalize_phone_for_dialer(None) == ""
+        assert normalize_phone_for_dialer("") == ""
 
 
 class TestSplitOwnerForDisplay:

@@ -334,34 +334,46 @@ def ingest_tracerfy_batch(
             # csv-keyed write would never match our GIS address on a later run ->
             # 0 cache hits -> the same lead re-paid every scrape. pending_by_key
             # groups by (address, city, state), so all `matches` share this key.
-            _pend = matches[0]
-            cache_key = address_cache_key(
-                _pend.property_address or "",
-                _pend.city or "",
-                _pend.state or "",
-            )
-            existing_cache = db.get(SkipTraceCache, cache_key)
-            if existing_cache:
-                existing_cache.phone = phone
-                existing_cache.phone_type = csv_row.get("phone_type")
-                existing_cache.email = email
-                existing_cache.phones = phones
-                existing_cache.emails = emails
-                existing_cache.fetched_at = now
-            else:
-                db.add(
-                    SkipTraceCache(
-                        address_hash=cache_key,
-                        phone=phone,
-                        phone_type=csv_row.get("phone_type"),
-                        phone_dnc_flag=None,
-                        email=email,
-                        phones=phones,
-                        emails=emails,
-                        raw_response=csv_row.get("raw"),
-                        fetched_at=now,
-                    )
+            # PER-TENANT cache (cross-tenant reuse removed 2026-06-10): a Tracerfy
+            # batch can contain pending rows from MULTIPLE tenants for the same
+            # address, so write one cache row per distinct tenant — each keyed by
+            # its own user_id — so a tenant later reuses only ITS OWN result, never
+            # another tenant's. All `matches` share the address group, so the
+            # address fields come from matches[0]; only user_id varies.
+            _addr = matches[0]
+            _seen_users: set[str] = set()
+            for _pend in matches:
+                if _pend.user_id in _seen_users:
+                    continue
+                _seen_users.add(_pend.user_id)
+                cache_key = address_cache_key(
+                    _pend.user_id,
+                    _addr.property_address or "",
+                    _addr.city or "",
+                    _addr.state or "",
                 )
+                existing_cache = db.get(SkipTraceCache, cache_key)
+                if existing_cache:
+                    existing_cache.phone = phone
+                    existing_cache.phone_type = csv_row.get("phone_type")
+                    existing_cache.email = email
+                    existing_cache.phones = phones
+                    existing_cache.emails = emails
+                    existing_cache.fetched_at = now
+                else:
+                    db.add(
+                        SkipTraceCache(
+                            address_hash=cache_key,
+                            phone=phone,
+                            phone_type=csv_row.get("phone_type"),
+                            phone_dnc_flag=None,
+                            email=email,
+                            phones=phones,
+                            emails=emails,
+                            raw_response=csv_row.get("raw"),
+                            fetched_at=now,
+                        )
+                    )
 
             # Update matched Result rows — user_id filter for H10
             for p in matches:

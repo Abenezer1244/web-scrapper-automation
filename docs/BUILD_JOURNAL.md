@@ -19,6 +19,78 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-10 — Lists date-window (Piece 1, complete) + Batch scrape (Piece 2, backend through 2A.3)
+
+Re-implemented the user's ORIGINAL "combine + overlap lists" ask as TWO surfaces (Codex + Claude agreed
+they are NOT redundant): **Lists page** = FREE combine/overlap over already-scraped history; **Batch
+scrape** = spend quota to pull many lists at once → one combined CSV. Specs: `docs/superpowers/specs/
+2026-06-10-lists-date-window-overlap-foundation-design.md` + `...-batch-scrape-design.md`. Plans:
+`docs/superpowers/plans/2026-06-10-piece1-lists-date-window.md` + `...-piece2-batch-scrape.md`.
+
+**Built / Shipped (every phase Codex-gated PASS):**
+- **Spike** `scripts/spike_date_recorded_coverage.py` (read-only, 293,451 prod rows): `date_recorded` is
+  0.0% null, **100% parseable, ONE format family US M/D/YYYY**. Retired the "messy date" risk → use a
+  generated column, no app-parse/backfill.
+- **Piece 1 (branch `feature/lists-date-window-foundation`, PR #22 OPEN — CI/merge pending):**
+  - A `e40f520` — migration **049** `results.date_recorded_parsed DATE` generated col + segment window
+    schema fields.
+  - B — date-windowed union + NEW results-based dated intersection (membership rollup has no filing date)
+    + `excluded_no_date_count`.
+  - C — unified `/segments` CSV through canonical `src/utils/lead_export.py` + overlap columns
+    ("Overlap"/blank flag, caller-first, hottest-first). Fixed a real divergence (segments hand-rolled CSV).
+  - D `9b6cfdb` (frontend `feature/lists-date-window-ui`, NOT deployed) — Lists page look-back presets +
+    county filter + Filed column.
+- **Piece 2 (branch `feature/batch-scrape` off Piece-1 lineage; backend functionally complete, NOT merged):**
+  - 2A.1 `c985942` — migration **050** `scraper_batches` + `batch_runs` + `scraper_configs.batch_id`.
+  - 2A.2 — `POST /batches` fan-out (`src/api/routes/batches.py`) + `dispatch_batch_run`
+    (`src/workers/batch_tasks.py`): Pro+ gate, per-plan caps, quota preflight, connector validation,
+    child delivery/schedule suppressed.
+  - 2A.3 — `batch_completion_sweep` (scheduler beat) + `src/workers/batch_export.py::finalize_batch_run`:
+    combined dedup+overlap CSV over the batch's job_ids (reuses Piece-1 `write_lead_csv_with_overlap`) →
+    R2 → one email.
+
+**Tried / Decided:** date-frame = the **county filing date** (not `created_at`); DECOUPLED dials (scrape
+new, overlap looks back over existing data — "two settings"); batch gating **Pro+** (Codex: naturally
+quota-bounded), not Business+; overlap flag shows the WORD "Overlap"/blank (user rejected TRUE/FALSE);
+combined CSV routes through `lead_export` (one format everywhere). Build order: Piece 1 (shared engine)
+FIRST, then Piece 2 reuses it.
+
+**Caught & fixed (Codex earned its keep — bugs I could NOT catch locally w/o Postgres):**
+- **P1: `to_date()` is STABLE, not IMMUTABLE → cannot back a `GENERATED ... STORED` column** (ALTER
+  would fail → crash-loop the deploy). Fix: IMMUTABLE `result_parse_filing_date()` plpgsql helper using
+  `make_date` + `EXCEPTION WHEN data_exception → NULL` (a generated col must never raise on a bad date).
+- **P1: cross-tenant FK gap** on new tables → composite FK `(batch_id,user_id) → scraper_batches(id,
+  user_id)` + `UNIQUE(id,user_id)` (MATCH SIMPLE skips NULL single-scrape).
+- **P1 (2A.2): fan-out race + crash window** → `UNIQUE(batch_id)` + create-run-first + RECOVERY
+  re-enqueue of pending children; dispatch-time quota gate matching the scheduler.
+- **P1 (2A.3, 3 rounds): completion-barrier concurrency** → at-most-once `claimed_at` claim,
+  all-children-present+terminal check, and **status-guarded claim AND finalize write** so a cancel
+  mid-finalize can't be overwritten/delivered.
+
+**Failed / Blocked:** can't run DB-dependent steps locally (no Postgres; `.env` = PROD) — migrations 049
+/050 + DB-backed tests verify in CI; segment/batch tests are PURE by the existing convention. Migration
+049 = 293k-row table rewrite (advisory-lock migrate, merge-before-prod). Codex CLI on this box still
+errors `8009001d` in sandboxed PS but recovers; loads noisy gstack SKILL.md YAML errors (harmless).
+
+**Pending / Handoff:**
+- **Piece 1 backend: PR #22 — run CI, then USER decides merge** (auto-deploys prod; migration 049 rewrite).
+- **Piece 1 frontend: deploy `feature/lists-date-window-ui` → master** (after backend live).
+- **Piece 2 remaining: 2A.4** read/download endpoints (`GET /batches`, `/{id}`, `/{id}/download`; system
+  session + user_id filter) → **2A.5** frontend Single|Batch wizard fork + batch-run view → **2B**
+  scheduled batch (revisit `UNIQUE(batch_id)`).
+- **Follow-up (pre-existing, all paths): add atomic pending→queued claim to `run_scrape_job`** (no claim
+  today; acks_late redelivery can double-run — shared by scheduler + batch).
+
+**Facts learned:** `create_scraper` only creates a config (no enqueue); jobs run via `Job(pending)+commit
++run_scrape_job.delay`; terminal = NOT in `ACTIVE_STATUSES` ({done,failed,cancelled}); plan constants in
+`src/config/constants.py`; quota = `User.records_limit/records_used` (-1=unlimited), enforced at dispatch
+(scheduler skips over-limit); `BatchRun` is system-written (read via system session + user_id filter, like
+`dialer_deliveries`); routes import worker tasks LAZILY (inside the fn) to keep Celery out of the API
+import graph; `dialer_push_sweep` is the at-most-once claim template. Full detail in memory
+`project_batch_scrape_lists_datewindow_2026_06_10.md`.
+
+---
+
 ## 2026-06-10 — Dialer integration research + dialer-friendly CSV columns (shipped)
 
 **Researched** how RE-investor dialers ingest leads (PhoneBurner, Mojo, BatchDialer, CallTools,

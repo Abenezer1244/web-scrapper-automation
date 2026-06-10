@@ -323,6 +323,9 @@ class BatchRun(Base):
             ondelete="CASCADE",
             name="fk_batch_runs_batch_tenant",
         ),
+        # One run per batch (Phase 2A on-demand) — makes the worker fan-out
+        # at-most-once/race-safe (Codex P1). Phase 2B (scheduled) must revisit.
+        UniqueConstraint("batch_id", name="uq_batch_runs_batch_id"),
     )
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)

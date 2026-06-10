@@ -1,4 +1,5 @@
 from .routes.auth import router as auth_router
+from .routes.batches import router as batches_router
 from .routes.billing import router as billing_router
 from .routes.jobs import router as jobs_router
 from .routes.scrapers import router as scrapers_router
@@ -12,4 +13,5 @@ __all__ = [
     "billing_router",
     "webhooks_router",
     "segments_router",
+    "batches_router",
 ]

@@ -67,6 +67,11 @@ def upgrade() -> None:
             ondelete="CASCADE",
             name="fk_batch_runs_batch_tenant",
         ),
+        # ONE run per batch for the on-demand MVP (Phase 2A). Makes the worker
+        # fan-out at-most-once + race-safe: a duplicate Celery delivery hits this
+        # on flush -> IntegrityError -> the loser rolls back (Codex P1). NOTE: a
+        # scheduled batch (Phase 2B) has many runs per batch and MUST revisit this.
+        sa.UniqueConstraint("batch_id", name="uq_batch_runs_batch_id"),
     )
     op.create_index("ix_batch_runs_batch_id", "batch_runs", ["batch_id"])
     op.create_index("ix_batch_runs_user_id", "batch_runs", ["user_id"])

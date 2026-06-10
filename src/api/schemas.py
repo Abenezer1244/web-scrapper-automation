@@ -485,6 +485,60 @@ class ScraperConfigResponse(BaseModel):
             self.schedule = {}
 
 
+# ─── Batch scrape (Piece 2) ─────────────────────────────────────────────────
+
+class BatchCreateRequest(BaseModel):
+    """Create a batch scrape: multiple counties x record types under one parent,
+    sharing fields/enrichment/deliver. Fans out into N child scrapes. The batch
+    owns delivery (one combined CSV); per-child delivery is suppressed. schedule
+    is reserved for Phase 2B (on-demand 2A ignores it)."""
+
+    name: str | None = Field(default=None, max_length=120)
+    state: str = Field(max_length=16)
+    counties: list[str] = Field(min_length=1, max_length=250)
+    record_types: list[str] = Field(min_length=1, max_length=10)
+    fields: FieldsConfig = FieldsConfig()
+    enrichment: EnrichmentConfig = EnrichmentConfig()
+    deliver: DeliverConfig = DeliverConfig()
+    skip_trace_enabled: bool = False
+
+    @field_validator("state")
+    @classmethod
+    def state_uppercase(cls, v: str) -> str:
+        v = v.strip().upper()
+        if len(v) != 2:
+            raise ValueError("state must be a 2-letter code")
+        return v
+
+    @field_validator("counties", "record_types")
+    @classmethod
+    def dedupe_slugs(cls, v: list[str]) -> list[str]:
+        cleaned = sorted({s.strip().lower() for s in v if s and s.strip()})
+        if not cleaned:
+            raise ValueError("at least one value required")
+        return cleaned
+
+
+class BatchCreateResponse(BaseModel):
+    batch_id: str
+    child_count: int  # number of (county x record_type) scrapes launched
+    status: str  # "pending" — the run + child jobs are created async by the worker
+
+
+class BatchRunResponse(BaseModel):
+    id: str
+    batch_id: str
+    status: str  # pending | running | done | partial | failed | cancelled
+    child_job_ids: list[str] = []
+    excluded_no_date_count: int = 0
+    failed_children: list[dict[str, Any]] | None = None
+    combined_export_ready: bool = False  # presence flag — never expose the R2 key
+    created_at: datetime
+    completed_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
 # ─── Jobs ─────────────────────────────────────────────────────────────────────
 
 class JobCreate(BaseModel):

@@ -327,7 +327,7 @@ class LaserficheWebLinkScraper(BridgeScraper):
                     const htmlOf = (i) => cells[i] ? (cells[i].innerHTML || '').trim() : '';
                     // Look for a date in position 2 (MM/DD/YYYY or M/D/YYYY)
                     const dateVal = vals[2] || '';
-                    if (!/\\d{1,2}\\/\\d{1,2}\\/\\d{4}/.test(dateVal)) continue;
+                    if (!/\d{1,2}\/\d{1,2}\/\d{4}/.test(dateVal)) continue;
                     out.push({
                         afn: vals[1] || '',
                         date: dateVal,

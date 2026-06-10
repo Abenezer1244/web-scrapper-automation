@@ -866,6 +866,7 @@ async def download_export(
         # only: first/last is blank for entities, and city/state/zip are blank
         # unless confidently parsed (never corrupt a dialer's structured fields).
         from src.utils.lead_formatting import (
+            normalize_phone_for_dialer,
             parse_property_for_display,
             split_owner_for_display,
         )
@@ -904,11 +905,15 @@ async def download_export(
                 # Phase 4: numeric/int — render plainly, no CSV-injection surface.
                 "delinquent_amount": "" if _amt is None else f"{_amt}",
                 "delinquent_bill_year": getattr(r, "delinquent_bill_year", None) or "",
-                "phone": sanitize_for_csv(getattr(r, "phone", None)),
+                # Phones normalized to bare 10-digit so all three slots share one
+                # dialer-safe format (cascade dialers like Mojo require identical
+                # formatting across phone columns). Digits-only output is also
+                # inherently CSV-injection-safe; still emitted via the writer.
+                "phone": normalize_phone_for_dialer(getattr(r, "phone", None)),
                 "phone_type": sanitize_for_csv(getattr(r, "phone_type", None)),
                 "email": sanitize_for_csv(getattr(r, "email", None)),
-                "phone_2": sanitize_for_csv(_nth_phone(r, 1)),
-                "phone_3": sanitize_for_csv(_nth_phone(r, 2)),
+                "phone_2": normalize_phone_for_dialer(_nth_phone(r, 1)),
+                "phone_3": normalize_phone_for_dialer(_nth_phone(r, 2)),
                 "email_2": sanitize_for_csv(_nth_email(r, 1)),
                 "email_3": sanitize_for_csv(_nth_email(r, 2)),
                 "first_name": sanitize_for_csv(_first),

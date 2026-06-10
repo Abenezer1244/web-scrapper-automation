@@ -57,6 +57,29 @@ _STATE_ZIP_RE = re.compile(r"^(?P<state>[A-Za-z]{2})\s*(?P<zip>\d{5}(?:-\d{4})?)
 _ESTATE_PREFIX_RE = re.compile(r"^(?:THE\s+)?ESTATE\s+OF\s+", re.IGNORECASE)
 _NAME_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z'\-]*")
 
+# Trailing phone extension ('x123', 'ext 5', 'ext: 7', 'x. 7', '#4') — stripped
+# before normalizing so a valid 10-digit base isn't lost to merged ext digits.
+_PHONE_EXT_RE = re.compile(r"(?i)\s*(?:ext(?:ension)?|x|#)[.:]?\s*\d+\s*$")
+
+
+def normalize_phone_for_dialer(raw: str | None) -> str:
+    """Normalize a phone to bare 10-digit (e.g. '2065551234') for dialer import.
+
+    Bare 10-digit is accepted by every mainstay RE dialer (PhoneBurner, Mojo,
+    Kixie, ReadyMode, CallTools, BatchDialer, …); E.164 '+1' is rejected by some
+    (PhoneBurner docs say no '+'), so 10-digit is the safest universal default.
+    Anything that doesn't resolve to a clean US 10-digit number returns '' — a
+    blank cell is predictable; a malformed number can reject/poison a dialer row
+    (Codex). Strips a trailing extension first, then all non-digits, then drops a
+    US country-code '1' from an 11-digit number.
+    """
+    if not raw:
+        return ""
+    digits = re.sub(r"\D", "", _PHONE_EXT_RE.sub("", str(raw).strip()))
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits if len(digits) == 10 else ""
+
 # Secondary-unit designators — a comma part starting with one of these is an
 # apartment/suite/lot line, NOT a city. Folded into street, never emitted as city.
 _UNIT_RE = re.compile(

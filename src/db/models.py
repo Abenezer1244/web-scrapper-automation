@@ -1,19 +1,23 @@
 import uuid
 
 from sqlalchemy import (
+    DDL,
     JSON,
     BigInteger,
     Boolean,
     Column,
+    Computed,
     Date,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Numeric,
     String,
     Text,
     UniqueConstraint,
+    event,
     func,
     text,
 )
@@ -29,6 +33,41 @@ from src.db.encrypted_types import EncryptedJSON, EncryptedString
 
 class Base(DeclarativeBase):
     pass
+
+
+# IMMUTABLE filing-date parser backing Result.date_recorded_parsed (migration 049).
+# Registered as a before_create DDL (Postgres only) so create_all-based test DBs
+# have the function the generated column references. MUST stay byte-identical to
+# migration 049's _PARSE_FN. to_date is only STABLE (can't back a generated
+# column — Codex P1); this make_date helper is IMMUTABLE and EXCEPTION-traps an
+# invalid calendar date to NULL so one bad row can't break inserts.
+_RESULT_PARSE_FILING_DATE_FN = DDL(
+    r"""
+CREATE OR REPLACE FUNCTION result_parse_filing_date(txt text)
+RETURNS date
+LANGUAGE plpgsql
+IMMUTABLE
+AS $func$
+BEGIN
+    IF txt IS NULL OR btrim(txt) !~ '^\d{1,2}/\d{1,2}/\d{4}$' THEN
+        RETURN NULL;
+    END IF;
+    RETURN make_date(
+        split_part(btrim(txt), '/', 3)::int,
+        split_part(btrim(txt), '/', 1)::int,
+        split_part(btrim(txt), '/', 2)::int
+    );
+EXCEPTION WHEN data_exception THEN
+    RETURN NULL;
+END;
+$func$;
+"""
+)
+event.listen(
+    Base.metadata,
+    "before_create",
+    _RESULT_PARSE_FILING_DATE_FN.execute_if(dialect="postgresql"),
+)
 
 
 def _uuid():
@@ -193,6 +232,17 @@ class ScraperConfig(Base):
     doc_types = Column(JSON, nullable=True)
     skip_trace_enabled = Column(Boolean, nullable=False, default=False)
     active = Column(Boolean, nullable=False, default=True)
+    # Piece 2 (batch scrape, migration 050): NULL for ordinary single scrapes; set
+    # when this config is a child of a batch (one child per county x record_type).
+    # The PARENT batch owns delivery + schedule; child configs are created with
+    # those suppressed. Tenant integrity is DB-enforced by a COMPOSITE FK
+    # (batch_id, user_id) -> scraper_batches(id, user_id) in __table_args__ (Codex
+    # P1) — a config can never point at another tenant's batch. MATCH SIMPLE: a
+    # NULL batch_id (single scrape) skips the check. ondelete CASCADE, so NEVER
+    # hard-delete a ScraperBatch (archive via status) — deleting it would cascade
+    # to child configs + their jobs/results. The FK is what nulls/cascades, so the
+    # column itself carries no inline ForeignKey.
+    batch_id = Column(UUID(as_uuid=False), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -207,10 +257,96 @@ class ScraperConfig(Base):
             func.upper(state),
             "record_type",
         ),
+        # Tenant-scoped composite FK (Codex P1): a child config's (batch_id,
+        # user_id) must match a scraper_batches row owned by the SAME user.
+        # MATCH SIMPLE => skipped when batch_id IS NULL (single scrapes).
+        ForeignKeyConstraint(
+            ["batch_id", "user_id"],
+            ["scraper_batches.id", "scraper_batches.user_id"],
+            ondelete="CASCADE",
+            name="fk_scraper_configs_batch_tenant",
+        ),
     )
 
     user = relationship("User", back_populates="scraper_configs")
     jobs = relationship("Job", back_populates="scraper_config", cascade="all, delete-orphan")
+
+
+class ScraperBatch(Base):
+    """Piece 2: a 'batch scrape' parent. Holds the SHARED fields/enrichment/
+    schedule/deliver for N child scraper_configs (one per county x record_type),
+    so children never drift. Single scrapes are unaffected (no batch row;
+    ScraperConfig.batch_id stays NULL)."""
+
+    __tablename__ = "scraper_batches"
+    # UNIQUE(id, user_id) is what lets child configs / batch_runs reference this
+    # batch via a tenant-scoped COMPOSITE FK (Codex P1). id is already unique (PK);
+    # this composite-unique exists solely to be the FK target.
+    __table_args__ = (
+        UniqueConstraint("id", "user_id", name="uq_scraper_batches_id_user"),
+    )
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name = Column(String(255), nullable=True)
+    state = Column(String(2), nullable=False)
+    # Shared config applied to every child (same shape as ScraperConfig's cols).
+    fields = Column(JSON, nullable=False, default=list)
+    enrichment = Column(JSON, nullable=False, default=list)
+    schedule = Column(JSON, nullable=False, default=dict)
+    deliver = Column(JSON, nullable=False, default=dict)
+    status = Column(String(16), nullable=False, default="active")  # active | archived
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class BatchRun(Base):
+    """Piece 2: one execution of a batch. WORKER/SYSTEM-written (like
+    DialerDelivery / delivered_records) — NOT app-table-granted; read endpoints
+    use the system session + an explicit user_id filter. The completion barrier
+    flips status to done/partial once all child_job_ids are terminal, then the
+    combined CSV is built (scoped to those job_ids) and delivered once."""
+
+    __tablename__ = "batch_runs"
+    # Tenant-scoped composite FK (Codex P1): a run's (batch_id, user_id) must match
+    # a batch owned by the SAME user. batch_id carries no inline FK — the
+    # constraint here owns it. user_id keeps a direct users FK for user-delete
+    # cascade.
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["batch_id", "user_id"],
+            ["scraper_batches.id", "scraper_batches.user_id"],
+            ondelete="CASCADE",
+            name="fk_batch_runs_batch_tenant",
+        ),
+        # One run per batch (Phase 2A on-demand) — makes the worker fan-out
+        # at-most-once/race-safe (Codex P1). Phase 2B (scheduled) must revisit.
+        UniqueConstraint("batch_id", name="uq_batch_runs_batch_id"),
+    )
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    batch_id = Column(UUID(as_uuid=False), nullable=False, index=True)
+    user_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # pending -> running -> done | partial | failed | cancelled
+    status = Column(String(16), nullable=False, default="pending")
+    child_job_ids = Column(JSON, nullable=False, default=list)
+    combined_export_key = Column(String(512), nullable=True)  # R2 key of the combined CSV
+    excluded_no_date_count = Column(Integer, nullable=False, default=0)
+    failed_children = Column(JSON, nullable=True)  # [{job_id, county, record_type, reason}]
+    # At-most-once barrier claim (Codex P2): the completion sweep stamps this
+    # before building/delivering the combined CSV so two workers can't double-fire.
+    claimed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class Job(Base):
@@ -256,6 +392,22 @@ class Result(Base):
     job_id = Column(UUID(as_uuid=False), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
     user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     date_recorded = Column(String(32), nullable=True)
+    # Migration 049: county filing date parsed to a real DATE for the
+    # date-windowed overlap/combine query. DB-generated (regex-guarded to_date)
+    # so existing + future rows materialize automatically; unparseable/empty =>
+    # NULL (excluded from windows). Keep this expression IDENTICAL to migration
+    # 049's. Read-only (generated) — never assigned by the app.
+    date_recorded_parsed = Column(
+        Date,
+        # Generated via the IMMUTABLE result_parse_filing_date() helper (migration
+        # 049; also created by the before_create event below for create_all tests).
+        # to_date is only STABLE so it can't sit in a generated column (Codex P1);
+        # the helper uses make_date + EXCEPTION-trap so a bad date row can't break
+        # inserts. Computed => SQLAlchemy never INSERTs this (a generated column
+        # rejects explicit writes).
+        Computed("result_parse_filing_date(date_recorded)", persisted=True),
+        nullable=True,
+    )
     party_name = Column(String(512), nullable=True)
     heirs = Column(Text, nullable=True)
     legal_description = Column(Text, nullable=True)

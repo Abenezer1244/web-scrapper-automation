@@ -94,6 +94,25 @@ SKIP_TRACE_ADDON_PLANS: frozenset[str] = frozenset({
     Plan.AGENCY.value,
 })
 
+# Piece 2 (batch scrape). A batch fans out into many PAID scrapes, so it is
+# naturally quota-bounded; gating is Pro+ (a productivity feature), not
+# Business+ (Codex consult). Free/Starter stay single-scrape only.
+BATCH_PLANS: frozenset[str] = frozenset({
+    Plan.PRO.value,
+    Plan.BUSINESS.value,
+    Plan.AGENCY.value,
+})
+
+# Max (counties x record_types) combinations per batch, by plan — caps the
+# cost/DoS blast radius. A remaining-monthly-quota preflight is a SEPARATE check.
+BATCH_MAX_COMBINATIONS: dict[str, int] = {
+    Plan.PRO.value: 25,
+    Plan.BUSINESS.value: 100,
+    Plan.AGENCY.value: 250,
+}
+# Absolute backstop regardless of plan (hard API-validation ceiling).
+BATCH_HARD_CEILING: int = 250
+
 
 class ScraperFrequency(str, Enum):
     """`schedule.frequency` values in ScraperConfig."""

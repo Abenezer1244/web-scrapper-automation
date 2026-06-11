@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from src.api import (
     auth_router,
+    batches_router,
     billing_router,
     jobs_router,
     scrapers_router,
@@ -73,6 +74,7 @@ app.include_router(jobs_router)
 app.include_router(billing_router)
 app.include_router(webhooks_router)
 app.include_router(segments_router)
+app.include_router(batches_router)
 
 
 # ─── Global exception handler ─────────────────────────────────────────────────

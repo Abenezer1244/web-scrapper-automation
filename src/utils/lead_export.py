@@ -117,3 +117,58 @@ def write_lead_csv(records: list[Any], filelike) -> None:
     writer.writeheader()
     for rec in records:
         writer.writerow(build_lead_export_row(rec))
+
+
+# Overlap/combine CSV (Lists page + batch scrape). Same dialer-ready semantics as
+# the canonical row, with the overlap signal up front in "caller-first" order so a
+# human opening it in Excel sees the hottest leads and the contact fields first.
+# Reuses build_lead_export_row so the split/normalize/sanitize logic can never
+# drift from the per-job export. Columns the segment query doesn't (yet) provide
+# (multi-contact phone_2/3+email_2/3, heirs, legal_description, doc_type, tax)
+# come through blank — kept for header parity with the per-job CSV.
+OVERLAP_LEAD_COLUMNS: list[str] = [
+    "overlap", "lists_count", "lists", "counties",
+    "first_name", "last_name",
+    "phone", "phone_type", "email", "phone_2", "phone_3", "email_2", "email_3",
+    "property_street", "property_city", "property_state", "property_zip",
+    "filed_date", "doc_type", "delinquent_amount", "delinquent_bill_year",
+    "party_name", "mailing_address", "parcel_id", "heirs", "legal_description",
+    "property_address",
+]
+
+
+def build_overlap_export_row(record: Any, overlap: dict[str, Any]) -> dict[str, str]:
+    """One overlap-CSV row from a lead record + its overlap metadata.
+
+    `overlap` carries `lists_count` (distinct record types this property is on),
+    `lists` (human-readable, already "; "-joined), and `counties`. The `overlap`
+    flag is the WORD "Overlap" when on 2+ lists, else blank (more scannable than
+    TRUE/FALSE). All other fields come straight from the canonical dialer-ready
+    row so formatting stays identical across exports.
+    """
+    base = build_lead_export_row(record)
+    try:
+        count = int(overlap.get("lists_count") or 0)
+    except (TypeError, ValueError):
+        count = 0  # never let a malformed count crash the export (Codex P2)
+    row: dict[str, str] = {
+        "overlap": "Overlap" if count >= 2 else "",
+        "lists_count": str(count) if count else "",
+        "lists": sanitize_for_csv(overlap.get("lists")),
+        "counties": sanitize_for_csv(overlap.get("counties")),
+        # .get not [] so a future builder rename can't raise here (Codex P2).
+        "filed_date": base.get("date_recorded", ""),
+    }
+    for col in OVERLAP_LEAD_COLUMNS:
+        if col not in row:
+            row[col] = base.get(col, "")
+    return row
+
+
+def write_lead_csv_with_overlap(rows: list[tuple[Any, dict[str, Any]]], filelike) -> None:
+    """Write the overlap/combine CSV. `rows` = iterable of (record, overlap_dict),
+    already ordered by the caller (hottest-first). Header + rows, no footer."""
+    writer = csv.DictWriter(filelike, fieldnames=OVERLAP_LEAD_COLUMNS)
+    writer.writeheader()
+    for record, overlap in rows:
+        writer.writerow(build_overlap_export_row(record, overlap))

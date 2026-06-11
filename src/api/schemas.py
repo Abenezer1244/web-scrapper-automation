@@ -1,5 +1,5 @@
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, TypedDict
 from urllib.parse import urlparse
 
@@ -485,6 +485,95 @@ class ScraperConfigResponse(BaseModel):
             self.schedule = {}
 
 
+# ─── Batch scrape (Piece 2) ─────────────────────────────────────────────────
+
+class BatchCreateRequest(BaseModel):
+    """Create a batch scrape: multiple counties x record types under one parent,
+    sharing fields/enrichment/deliver. Fans out into N child scrapes. The batch
+    owns delivery (one combined CSV); per-child delivery is suppressed. schedule
+    is reserved for Phase 2B (on-demand 2A ignores it)."""
+
+    name: str | None = Field(default=None, max_length=120)
+    state: str = Field(max_length=16)
+    counties: list[str] = Field(min_length=1, max_length=250)
+    record_types: list[str] = Field(min_length=1, max_length=10)
+    fields: FieldsConfig = FieldsConfig()
+    enrichment: EnrichmentConfig = EnrichmentConfig()
+    deliver: DeliverConfig = DeliverConfig()
+    skip_trace_enabled: bool = False
+
+    @field_validator("state")
+    @classmethod
+    def state_uppercase(cls, v: str) -> str:
+        v = v.strip().upper()
+        if len(v) != 2:
+            raise ValueError("state must be a 2-letter code")
+        return v
+
+    @field_validator("counties", "record_types")
+    @classmethod
+    def dedupe_slugs(cls, v: list[str]) -> list[str]:
+        cleaned = sorted({s.strip().lower() for s in v if s and s.strip()})
+        if not cleaned:
+            raise ValueError("at least one value required")
+        return cleaned
+
+
+class BatchCreateResponse(BaseModel):
+    batch_id: str
+    child_count: int  # number of (county x record_type) scrapes launched
+    status: str  # "pending" — the run + child jobs are created async by the worker
+
+
+class BatchRunResponse(BaseModel):
+    id: str
+    batch_id: str
+    status: str  # pending | running | done | partial | failed | cancelled
+    child_job_ids: list[str] = []
+    excluded_no_date_count: int = 0
+    failed_children: list[dict[str, Any]] | None = None
+    combined_export_ready: bool = False  # presence flag — never expose the R2 key
+    created_at: datetime
+    completed_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class BatchChildSummary(BaseModel):
+    """One child scrape within a batch (county x record_type) and its job status."""
+
+    config_id: str
+    county: str
+    record_type: str
+    job_id: str | None = None  # None until the dispatch worker creates the job
+    status: str = "pending"  # pending | queued | probing | scraping | enriching | done | failed | cancelled
+    record_count: int = 0
+
+
+class BatchSummaryResponse(BaseModel):
+    """A batch + its (single, on-demand 2A) run status — for the list view."""
+
+    id: str
+    name: str | None = None
+    state: str
+    run_status: str = "pending"  # pending | running | done | partial | failed | cancelled
+    child_count: int = 0
+    combined_export_ready: bool = False  # presence flag — never expose the R2 key
+    created_at: datetime
+    completed_at: datetime | None = None
+
+
+class BatchDetailResponse(BatchSummaryResponse):
+    """A batch with its per-child summary + failed-child detail — for the run view."""
+
+    failed_children: list[dict[str, Any]] | None = None
+    children: list[BatchChildSummary] = Field(default_factory=list)
+
+
+class BatchDownloadResponse(BaseModel):
+    url: str  # short-lived presigned R2 URL for the combined CSV
+
+
 # ─── Jobs ─────────────────────────────────────────────────────────────────────
 
 class JobCreate(BaseModel):
@@ -801,6 +890,14 @@ class SegmentIntersectionRequest(BaseModel):
     """
     record_types: list[str] = Field(min_length=2, max_length=10)
     counties: list[str] | None = Field(default=None, max_length=100)
+    # Optional filing-date window (migration 049 date_recorded_parsed). lookback_days
+    # is the preset path (server derives filing_from = today - days); filing_from/to
+    # is the custom path (explicit wins if both supplied). When ANY is set, rows with
+    # an unparseable/NULL filing date are excluded and reported via
+    # excluded_no_date_count. None everywhere = today's all-time behavior (unchanged).
+    lookback_days: int | None = Field(default=None, ge=1, le=3660)
+    filing_from: date | None = None
+    filing_to: date | None = None
 
     @field_validator("record_types")
     @classmethod
@@ -822,6 +919,15 @@ class SegmentIntersectionRequest(BaseModel):
         if any(len(c) > 64 for c in cleaned):
             raise ValueError("invalid county value")
         return cleaned or None
+
+    @model_validator(mode="after")
+    def _check_filing_window(self) -> "SegmentIntersectionRequest":
+        # Reject an inverted explicit window (Codex P2). lookback_days vs explicit
+        # filing_from/to precedence is resolved in the route (explicit wins) — see
+        # _resolve_filing_window in routes/segments.py.
+        if self.filing_from and self.filing_to and self.filing_from > self.filing_to:
+            raise ValueError("filing_from must be on or before filing_to")
+        return self
 
 
 class SegmentLeadRow(BaseModel):
@@ -852,6 +958,9 @@ class SegmentIntersectionResponse(BaseModel):
     counties: list[str] | None = None
     property_count: int
     truncated: bool = False  # preview cap reached — export for the full set
+    # Rows skipped because their filing date was unparseable/NULL. Only nonzero
+    # when a filing-date window is active (windowed queries require a real date).
+    excluded_no_date_count: int = 0
     rows: list[SegmentLeadRow]
 
 
@@ -865,6 +974,10 @@ class SegmentUnionRequest(BaseModel):
     """
     record_types: list[str] = Field(min_length=1, max_length=10)
     counties: list[str] | None = Field(default=None, max_length=100)
+    # Optional filing-date window — see SegmentIntersectionRequest (same semantics).
+    lookback_days: int | None = Field(default=None, ge=1, le=3660)
+    filing_from: date | None = None
+    filing_to: date | None = None
 
     @field_validator("record_types")
     @classmethod
@@ -887,6 +1000,14 @@ class SegmentUnionRequest(BaseModel):
             raise ValueError("invalid county value")
         return cleaned or None
 
+    @model_validator(mode="after")
+    def _check_filing_window(self) -> "SegmentUnionRequest":
+        # Reject an inverted explicit window (Codex P2). Precedence (explicit wins
+        # over lookback_days) resolved in routes/segments.py._resolve_filing_window.
+        if self.filing_from and self.filing_to and self.filing_from > self.filing_to:
+            raise ValueError("filing_from must be on or before filing_to")
+        return self
+
 
 class SegmentUnionResponse(BaseModel):
     mode: str = "union"
@@ -895,4 +1016,7 @@ class SegmentUnionResponse(BaseModel):
     counties: list[str] | None = None
     lead_count: int
     truncated: bool = False  # preview cap reached — export for the full set
+    # Rows skipped because their filing date was unparseable/NULL. Only nonzero
+    # when a filing-date window is active (windowed queries require a real date).
+    excluded_no_date_count: int = 0
     rows: list[SegmentLeadRow]

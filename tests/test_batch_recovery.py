@@ -99,6 +99,40 @@ def test_finalize_forced_marks_nonterminal_children_failed():
         assert run.completed_at is not None
 
 
+def test_force_finalize_uses_running_time_not_created_time():
+    """A run created long ago but that JUST started running (running_at recent)
+    must NOT be force-finalized — else children that just started get marked timed
+    out (Codex P1). Completion sweep keys force-finalize off running_at."""
+    from src.workers.scheduler import (
+        BATCH_FORCE_MINUTES,
+        batch_completion_sweep,
+    )
+
+    with SyncSessionLocal() as db:
+        user = _user(db)
+        batch = _batch(db, user.id)
+        cfg = _config(db, user.id, batch.id)
+        # An active child that just started — finalizing now would wrongly fail it.
+        job = Job(id=str(uuid.uuid4()), user_id=user.id, scraper_config_id=cfg.id,
+                  status="scraping", trigger="batch")
+        db.add(job)
+        old_created = datetime.now(UTC) - timedelta(minutes=BATCH_FORCE_MINUTES + 30)
+        just_running = datetime.now(UTC) - timedelta(minutes=1)
+        run = BatchRun(id=str(uuid.uuid4()), batch_id=batch.id, user_id=user.id,
+                       status="running", child_job_ids=[job.id],
+                       created_at=old_created, running_at=just_running)
+        db.add(run)
+        db.commit()
+        run_id = run.id
+
+    batch_completion_sweep()
+
+    with SyncSessionLocal() as db:
+        run = db.get(BatchRun, run_id)
+        # Still running — NOT force-finalized despite old created_at.
+        assert run.status == "running"
+
+
 # ── Phase 4: delivery idempotency CAS ──────────────────────────────────────────
 
 def test_delivery_started_cas_is_at_most_once():

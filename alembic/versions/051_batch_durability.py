@@ -15,6 +15,11 @@ under a rolling deploy.
                         lease (reclaimable after a TTL) so a worker hard-killed
                         mid-finalize can't strand a run 'running' forever; the
                         token lets a finalize verify it still owns the lease.
+- running_at          — when the run transitioned pending->running. The
+                        force-finalize backstop measures stuck-time from THIS, not
+                        created_at, so a batch that sat 'pending' a long time
+                        (backed-up broker/workers) isn't force-failed moments after
+                        its children legitimately start.
 
 Existing status='pending' (the model default + documented lifecycle) is reused
 as the durable dispatch INTENT — created by the API in the same txn as the batch,
@@ -51,9 +56,14 @@ def upgrade() -> None:
         "batch_runs",
         sa.Column("claim_token", sa.String(36), nullable=True),
     )
+    op.add_column(
+        "batch_runs",
+        sa.Column("running_at", sa.DateTime(timezone=True), nullable=True),
+    )
 
 
 def downgrade() -> None:
+    op.drop_column("batch_runs", "running_at")
     op.drop_column("batch_runs", "claim_token")
     op.drop_column("batch_runs", "delivery_started_at")
     op.drop_column("batch_runs", "dispatch_attempts")

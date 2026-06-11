@@ -103,7 +103,9 @@ def test_dispatch_materializes_pending_run():
         run = db.query(BatchRun).filter(BatchRun.batch_id == batch_id).one()
         assert run.status == "running"
         assert len(run.child_job_ids) == 2
-        assert run.dispatch_attempts == 1
+        # dispatch_attempts is owned by the recovery sweep, not the normal dispatch.
+        assert run.dispatch_attempts == 0
+        assert run.running_at is not None  # stuck-time baseline set on materialize
         jobs = db.query(Job).filter(Job.id.in_(run.child_job_ids)).all()
         assert len(jobs) == 2
         assert all(j.status == "pending" and j.trigger == "batch" for j in jobs)

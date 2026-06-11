@@ -32,7 +32,7 @@ def test_batch_run_state_machine_fields():
 def test_batch_run_durability_columns():
     """Track A: durable-state columns for crash recovery (migration 051)."""
     cols = BatchRun.__table__.c
-    for c in ("claim_token", "dispatch_attempts", "delivery_started_at", "claimed_at"):
+    for c in ("claim_token", "dispatch_attempts", "delivery_started_at", "claimed_at", "running_at"):
         assert c in cols
     assert cols["dispatch_attempts"].nullable is False
     assert cols["delivery_started_at"].nullable is True

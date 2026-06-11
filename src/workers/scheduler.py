@@ -1116,7 +1116,13 @@ def batch_completion_sweep() -> None:
         for run in runs:
             distinct_ids = list({str(x) for x in (run.child_job_ids or [])})
             run_id, run_user = run.id, run.user_id
-            forced = run.created_at is not None and run.created_at < force_cutoff
+            # Measure stuck-time from when the run STARTED running, not when it was
+            # created (Codex P1): a batch that sat 'pending' a long time then just
+            # started must not be force-failed while its children are legitimately
+            # active. running_at is NULL only for runs materialized before this
+            # column existed -> fall back to created_at for those.
+            stuck_since = run.running_at or run.created_at
+            forced = stuck_since is not None and stuck_since < force_cutoff
 
             # Require EVERY child to exist for this tenant AND be terminal — not
             # merely "none active" (Codex P2): a missing / cross-tenant / deleted /
@@ -1233,6 +1239,11 @@ def batch_recovery_sweep() -> None:
                     run.id, run.dispatch_attempts,
                 )
             else:
+                # Bump the attempt count HERE, before enqueueing (Codex P2): the
+                # bound must hold even if a worker is paused/saturated and
+                # dispatch_batch_run never runs to bump it itself — otherwise this
+                # sweep would re-enqueue every cycle and flood the queue.
+                run.dispatch_attempts = (run.dispatch_attempts or 0) + 1
                 redispatch_batch_ids.append(run.batch_id)
 
         # Gap 3a: 'running' runs with still-'pending' children, bounded by attempts.

@@ -12,6 +12,7 @@ Idempotent: if a BatchRun already exists for the batch (a retried task), it does
 nothing — at-most-once fan-out.
 """
 import uuid
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -84,7 +85,8 @@ def dispatch_batch_run(batch_id: str) -> None:
         if run.status == "pending":
             # MATERIALIZE the pending intent: create child jobs + flip to running
             # (or a terminal state), all in this one locked transaction.
-            run.dispatch_attempts = (run.dispatch_attempts or 0) + 1
+            # dispatch_attempts is owned by batch_recovery_sweep (the bound on
+            # re-dispatch), not bumped here — this is the normal first execution.
             # Quota gate at dispatch — matches the scheduler's enforcement boundary.
             # records_used can change between create-time preflight and now (Codex);
             # re-check. -1 = unlimited. Over limit => a terminal run, no jobs.
@@ -121,13 +123,14 @@ def dispatch_batch_run(batch_id: str) -> None:
                         enqueued.append(str(job.id))
                     run.child_job_ids = enqueued
                     run.status = "running"
+                    run.running_at = datetime.now(UTC)  # stuck-time baseline (P1)
                     db.commit()
         elif run.status == "running":
             # RECOVERY: a duplicate/retried dispatch of an already-materialized run.
             # Re-enqueue any child jobs committed but maybe not dispatched (crash
             # between commit and .delay). Idempotent + safe (see _pending_child_ids:
             # run_scrape_job's atomic claim makes a re-enqueue a no-op if in flight).
-            run.dispatch_attempts = (run.dispatch_attempts or 0) + 1
+            # dispatch_attempts is bumped by batch_recovery_sweep, not here.
             enqueued = _pending_child_ids(db, run)
             db.commit()
         else:

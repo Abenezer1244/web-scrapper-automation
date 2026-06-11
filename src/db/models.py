@@ -349,6 +349,10 @@ class BatchRun(Base):
     # is the lease owner id so a finalize can verify it still holds the lease.
     claimed_at = Column(DateTime(timezone=True), nullable=True)
     claim_token = Column(String(36), nullable=True)
+    # When the run went pending->running. The force-finalize backstop measures
+    # stuck-time from HERE, not created_at, so a run that sat 'pending' a long
+    # time (backed-up broker) isn't force-failed right after its children start.
+    running_at = Column(DateTime(timezone=True), nullable=True)
     # Bounds re-dispatch / pending-child re-enqueue (Track A recovery sweep) so a
     # poisoned job or a down broker can't storm the queue forever.
     dispatch_attempts = Column(Integer, nullable=False, default=0)

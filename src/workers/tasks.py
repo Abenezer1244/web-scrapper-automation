@@ -323,7 +323,7 @@ def _extract_tax_fields(
 )
 def run_scrape_job(self, job_id: str) -> None:
     """Execute a full scrape job lifecycle for the given job_id."""
-    from sqlalchemy import func, select
+    from sqlalchemy import func, select, update
 
     from src.api.middleware.security import register_connector_domains_from_db
     from src.db.models import Job, Result, ScraperConfig, User
@@ -380,8 +380,29 @@ def run_scrape_job(self, job_id: str) -> None:
 
         user = db.execute(select(User).where(User.id == job.user_id)).scalar_one()
 
-        # ── QUEUED ────────────────────────────────────────────────────────────
-        _set_status(db, job, "queued", started_at=_now())
+        # ── QUEUED (atomic claim) ─────────────────────────────────────────────
+        # Compare-and-set pending->queued so a duplicate delivery of this job_id
+        # can't double-scrape. A duplicate can arrive from Celery redelivery OR a
+        # recovery re-enqueue of a child still in 'pending' (Track A). Only the
+        # worker that flips the row FROM 'pending' proceeds; rowcount 0 means
+        # another worker already owns it (or it was cancelled / already running),
+        # so we return without scraping. Every dispatch path (API trigger,
+        # scheduler, watchdog re-queue, batch fan-out) enqueues a 'pending' job,
+        # so this never rejects a legitimate first delivery.
+        claimed = db.execute(
+            update(Job)
+            .where(Job.id == job_id, Job.status == "pending")
+            .values(status="queued", started_at=_now())
+        ).rowcount
+        db.commit()
+        if not claimed:
+            _logger.info(
+                "Job %s not claimable (already in flight / not pending) — "
+                "skipping to avoid double-scrape",
+                job_id,
+            )
+            return
+        db.refresh(job)
         _publish_log(r, job_id, "info", f"Job queued — {config.name} ({config.county}, {config.state})", db=db)
 
         # ── PROBING ───────────────────────────────────────────────────────────

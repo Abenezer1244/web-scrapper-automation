@@ -159,6 +159,79 @@ def test_watchdog_ignores_recent_jobs():
         assert refreshed.status == "scraping"  # unchanged
 
 
+# ─── Atomic job claim (Track A: prevents double-scrape on duplicate delivery) ──
+
+def test_atomic_claim_pending_to_queued_is_at_most_once():
+    """run_scrape_job claims a job with an atomic CAS (UPDATE ... WHERE
+    status='pending'). A second delivery of the same job_id — Celery redelivery
+    or a recovery re-enqueue of a still-'pending' child — must claim nothing
+    (rowcount 0), so the scrape never runs twice. This is the exact statement
+    run_scrape_job executes for the pending->queued transition."""
+    from sqlalchemy import update
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="pending",
+            trigger="batch",
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    def _claim() -> int:
+        with SyncSessionLocal() as db:
+            rc = db.execute(
+                update(Job)
+                .where(Job.id == job_id, Job.status == "pending")
+                .values(status="queued", started_at=datetime.now(UTC))
+            ).rowcount
+            db.commit()
+            return rc
+
+    assert _claim() == 1  # first delivery wins
+    assert _claim() == 0  # duplicate / recovery re-enqueue claims nothing
+
+    with SyncSessionLocal() as db:
+        assert db.get(Job, job_id).status == "queued"
+
+
+def test_atomic_claim_skips_cancelled_job():
+    """A job cancelled before pickup is not 'pending', so the claim CAS rejects
+    it (rowcount 0) and the worker won't scrape a cancelled job."""
+    from sqlalchemy import update
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="cancelled",
+            trigger="batch",
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    with SyncSessionLocal() as db:
+        rc = db.execute(
+            update(Job)
+            .where(Job.id == job_id, Job.status == "pending")
+            .values(status="queued", started_at=datetime.now(UTC))
+        ).rowcount
+        db.commit()
+    assert rc == 0
+
+    with SyncSessionLocal() as db:
+        assert db.get(Job, job_id).status == "cancelled"  # untouched
+
+
 # ─── Monthly reset ────────────────────────────────────────────────────────────
 
 def test_monthly_reset_clears_records_used():

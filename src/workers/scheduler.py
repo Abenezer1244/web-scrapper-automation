@@ -85,9 +85,17 @@ app.conf.beat_schedule = {
     },
     "batch-completion-sweep": {
         # Piece 2: finalize batch_runs whose child jobs are ALL terminal — build
-        # the one combined CSV + deliver. Claims each run once via claimed_at.
+        # the one combined CSV + deliver. Claims each run via a reclaimable lease;
+        # force-finalizes a run stuck past the hard deadline (Track A).
         "task": "src.workers.scheduler.batch_completion_sweep",
         "schedule": 60.0,  # every 1 minute
+    },
+    "batch-recovery-sweep": {
+        # Track A: crash recovery for the dispatch windows — re-dispatch a
+        # 'pending' run whose .delay() was lost, and re-enqueue 'pending' children
+        # of a 'running' run (both bounded). Keeps a batch from stranding.
+        "task": "src.workers.scheduler.batch_recovery_sweep",
+        "schedule": 120.0,  # every 2 minutes
     },
 }
 
@@ -1060,89 +1068,205 @@ def dialer_push_sweep() -> None:
 
 # ─── Piece 2: batch completion barrier ──────────────────────────────────────
 
+# Track A durability tunables.
+BATCH_LEASE_MINUTES = 30              # finalize claim lease TTL (> worst-case CSV+R2 build)
+BATCH_FORCE_MINUTES = 90             # force-finalize a run stuck 'running' past this age
+BATCH_PENDING_REDISPATCH_MINUTES = 3  # re-dispatch a 'pending' run not materialized in time
+BATCH_DISPATCH_MAX = 5               # bound re-dispatch / child re-enqueue attempts
+
+
 @app.task(name="src.workers.scheduler.batch_completion_sweep")
 def batch_completion_sweep() -> None:
     """Finalize batch_runs whose child jobs are ALL terminal — build the one
-    combined CSV + deliver. Each run is claimed once via claimed_at (at-most-once,
-    same pattern as dialer_push_sweep). Does NOT wait on async skip-trace: the CSV
-    is built on property identity (ready at child enrichment); contacts fill in
-    later and the CSV is re-downloadable. No-op when no run is ready.
+    combined CSV + deliver. Does NOT wait on async skip-trace: the CSV is built on
+    property identity (ready at child enrichment); contacts fill in later and the
+    CSV is re-downloadable. No-op when no run is ready.
+
+    Track A: the claim is a LEASE (claimed_at + claim_token) reclaimable after
+    BATCH_LEASE_MINUTES, so a worker hard-killed mid-finalize can't strand a run
+    'running' forever (Gap 2). A run still 'running' past BATCH_FORCE_MINUTES is
+    FORCE-finalized even with a missing / stuck child, through this SAME claim +
+    finalize path (Gap 3b) — one code path, eligibility differs.
     """
-    from sqlalchemy import func, select, update
+    import uuid as _uuid
+
+    from sqlalchemy import func, or_, select, update
 
     from src.db.models import BatchRun, Job
     from src.db.session import system_sync_session
     from src.workers.batch_export import finalize_batch_run
 
     _BATCH = 20
+    now = datetime.now(UTC)
+    lease_cutoff = now - timedelta(minutes=BATCH_LEASE_MINUTES)
+    force_cutoff = now - timedelta(minutes=BATCH_FORCE_MINUTES)
+    _terminal = ("done", "failed", "cancelled")
+
     with system_sync_session() as db:
+        # Eligible to (re)claim: 'running' AND the lease is free or expired.
         runs = db.execute(
             select(BatchRun)
-            .where(BatchRun.status == "running", BatchRun.claimed_at.is_(None))
+            .where(
+                BatchRun.status == "running",
+                or_(BatchRun.claimed_at.is_(None), BatchRun.claimed_at < lease_cutoff),
+            )
             .limit(_BATCH)
         ).scalars().all()
 
-        _terminal = ("done", "failed", "cancelled")
         for run in runs:
             distinct_ids = list({str(x) for x in (run.child_job_ids or [])})
-            if not distinct_ids:
-                continue
             run_id, run_user = run.id, run.user_id
+            forced = run.created_at is not None and run.created_at < force_cutoff
+
             # Require EVERY child to exist for this tenant AND be terminal — not
             # merely "none active" (Codex P2): a missing / cross-tenant / deleted /
             # future-status child means the batch is not actually ready.
-            terminal = db.execute(
-                select(func.count())
-                .select_from(Job)
-                .where(
-                    Job.id.in_(distinct_ids),
-                    Job.user_id == run_user,
-                    Job.status.in_(_terminal),
-                )
-            ).scalar_one()
-            if terminal < len(distinct_ids):
-                continue  # not all children present + terminal — try next sweep
+            all_terminal = False
+            if distinct_ids:
+                terminal = db.execute(
+                    select(func.count())
+                    .select_from(Job)
+                    .where(
+                        Job.id.in_(distinct_ids),
+                        Job.user_id == run_user,
+                        Job.status.in_(_terminal),
+                    )
+                ).scalar_one()
+                all_terminal = terminal >= len(distinct_ids)
 
-            # Atomic, STATUS-GUARDED claim before the heavy finalize: only one
-            # sweep flips claimed_at NULL->now, AND it must still be 'running' (a
-            # concurrent cancel between select and claim makes rowcount 0 — Codex
-            # P1). Re-fetch fresh state after the claim.
+            # Finalize when all children settled OR the run is past the hard
+            # deadline (force-finalize so a permanently-stuck child can't strand it).
+            if not all_terminal and not forced:
+                continue
+
+            # Atomic LEASE claim before the heavy finalize: win if the lease is free
+            # or expired AND the run is still 'running' (a concurrent cancel makes
+            # rowcount 0). The claim_token identifies THIS lease owner so the
+            # error path only releases a lease it still holds.
+            token = str(_uuid.uuid4())
             claimed = db.execute(
                 update(BatchRun)
                 .where(
                     BatchRun.id == run_id,
-                    BatchRun.claimed_at.is_(None),
                     BatchRun.status == "running",
+                    or_(BatchRun.claimed_at.is_(None), BatchRun.claimed_at < lease_cutoff),
                 )
-                .values(claimed_at=datetime.now(UTC))
+                .values(claimed_at=now, claim_token=token)
             ).rowcount
             db.commit()
             if not claimed:
-                continue  # another sweep claimed it, or it was cancelled
+                continue  # another sweep holds the lease, or it was cancelled
 
             run = db.get(BatchRun, run_id)
             if run is None or run.status != "running":
                 continue  # cancelled/deleted after claim — don't finalize
 
             try:
-                finalize_batch_run(db, run)
+                finalize_batch_run(db, run, forced=forced)
             except Exception as exc:  # noqa: BLE001
                 # finalize commits status only at the END (after CSV+R2) and the
                 # email is best-effort, so a propagating error means nothing was
-                # committed. Release the claim so the next sweep RETRIES (R2 upload
-                # overwrites the same key — idempotent), avoiding a permanently
-                # stuck 'running' run.
+                # committed. Release the lease (only if we still hold it — token
+                # guard) so the next sweep RETRIES (R2 upload overwrites the same
+                # key — idempotent), avoiding a permanently stuck 'running' run.
                 _logger.error(
                     "batch_completion_sweep: finalize %s failed (will retry): %s",
-                    run.id, str(exc)[:200],
+                    run_id, str(exc)[:200],
                 )
                 try:
                     db.rollback()
                     db.execute(
                         update(BatchRun)
-                        .where(BatchRun.id == run.id)
-                        .values(claimed_at=None)
+                        .where(BatchRun.id == run_id, BatchRun.claim_token == token)
+                        .values(claimed_at=None, claim_token=None)
                     )
                     db.commit()
                 except Exception:  # noqa: BLE001
                     db.rollback()
+
+
+@app.task(name="src.workers.scheduler.batch_recovery_sweep")
+def batch_recovery_sweep() -> None:
+    """Pre-finalize crash recovery for the batch dispatch windows (Track A):
+
+      Gap 1  — a 'pending' run whose dispatch .delay() was lost: the batch sits
+               with no jobs. Re-dispatch it. If it can't be dispatched within
+               BATCH_FORCE_MINUTES (or after BATCH_DISPATCH_MAX tries), give up and
+               mark it 'failed' so it can't sit 'pending' forever.
+      Gap 3a — a 'running' run with children still 'pending' (a lost child .delay):
+               re-enqueue them, bounded by dispatch_attempts.
+
+    All enqueues happen AFTER commit (commit-before-delay). dispatch_batch_run is
+    idempotent (FOR UPDATE + UNIQUE(batch_id)); run_scrape_job's atomic claim makes
+    a re-enqueue of an in-flight child a no-op.
+    """
+    from sqlalchemy import select
+
+    from src.db.models import BatchRun, Job
+    from src.db.session import system_sync_session
+    from src.workers.batch_tasks import dispatch_batch_run
+    from src.workers.tasks import run_scrape_job
+
+    _BATCH = 50
+    now = datetime.now(UTC)
+    pending_cutoff = now - timedelta(minutes=BATCH_PENDING_REDISPATCH_MINUTES)
+    force_cutoff = now - timedelta(minutes=BATCH_FORCE_MINUTES)
+
+    redispatch_batch_ids: list[str] = []
+    reenqueue_job_ids: list[str] = []
+    with system_sync_session() as db:
+        # Gap 1: 'pending' runs not materialized in time.
+        pending_runs = db.execute(
+            select(BatchRun)
+            .where(BatchRun.status == "pending", BatchRun.created_at < pending_cutoff)
+            .limit(_BATCH)
+        ).scalars().all()
+        for run in pending_runs:
+            gave_up = (run.dispatch_attempts or 0) >= BATCH_DISPATCH_MAX or (
+                run.created_at is not None and run.created_at < force_cutoff
+            )
+            if gave_up:
+                run.status = "failed"
+                run.failed_children = [{"reason": "dispatch never materialized"}]
+                _logger.error(
+                    "batch_recovery_sweep: giving up on pending run %s (attempts=%s)",
+                    run.id, run.dispatch_attempts,
+                )
+            else:
+                redispatch_batch_ids.append(run.batch_id)
+
+        # Gap 3a: 'running' runs with still-'pending' children, bounded by attempts.
+        running_runs = db.execute(
+            select(BatchRun)
+            .where(
+                BatchRun.status == "running",
+                BatchRun.dispatch_attempts < BATCH_DISPATCH_MAX,
+            )
+            .limit(_BATCH)
+        ).scalars().all()
+        for run in running_runs:
+            ids = [str(x) for x in (run.child_job_ids or [])]
+            if not ids:
+                continue
+            pending_children = db.execute(
+                select(Job.id).where(
+                    Job.id.in_(ids),
+                    Job.user_id == run.user_id,
+                    Job.status == "pending",
+                )
+            ).scalars().all()
+            if pending_children:
+                run.dispatch_attempts = (run.dispatch_attempts or 0) + 1
+                reenqueue_job_ids.extend(str(x) for x in pending_children)
+        db.commit()
+
+    # Enqueue AFTER commit so a worker can't pick up an uncommitted row.
+    for bid in redispatch_batch_ids:
+        dispatch_batch_run.delay(bid)
+    for jid in reenqueue_job_ids:
+        run_scrape_job.delay(jid)
+    if redispatch_batch_ids or reenqueue_job_ids:
+        _logger.info(
+            "batch_recovery_sweep: re-dispatched %d run(s), re-enqueued %d child job(s)",
+            len(redispatch_batch_ids), len(reenqueue_job_ids),
+        )

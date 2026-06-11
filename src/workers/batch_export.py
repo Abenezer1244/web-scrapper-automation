@@ -174,20 +174,46 @@ def render_combined_csv(user_id: str, job_ids: list[str]) -> bytes:
         return buf.getvalue().encode("utf-8")
 
 
-def finalize_batch_run(db, run) -> None:
+def finalize_batch_run(db, run, forced: bool = False) -> None:
     """Build + upload the combined CSV and deliver it. Called AFTER the run is
-    claimed (claimed_at set) and all child jobs are terminal. Commits the run
-    status before emailing so a delivery failure can't undo the export."""
-    # Per-child status -> failed_children summary (failed/cancelled children).
+    claimed (lease held) and either all child jobs are terminal OR (forced=True)
+    the run is past the hard deadline. Commits the run status before emailing so a
+    delivery failure can't undo the export.
+
+    forced=True (Track A backstop): a run stuck 'running' past the deadline
+    finalizes anyway — missing / still-non-terminal children count as failed and
+    the combined CSV is built from whatever children DID produce results, so a
+    permanently-stuck child can't strand the run forever."""
+    # Per-child status -> failed_children summary.
     child_rows = db.execute(
         text(_FAILED_CHILDREN_SQL),
         {"uid": run.user_id, "job_ids": run.child_job_ids or []},
     ).fetchall()
-    failed = [
-        {"job_id": row.job_id, "county": row.county, "record_type": row.record_type, "reason": row.status}
-        for row in child_rows
-        if row.status in ("failed", "cancelled")
-    ]
+    if forced:
+        # Any child not 'done' (failed/cancelled OR still non-terminal) is a
+        # failure; children missing from the table entirely are 'missing'.
+        present = {row.job_id for row in child_rows}
+        failed = [
+            {
+                "job_id": row.job_id,
+                "county": row.county,
+                "record_type": row.record_type,
+                "reason": row.status if row.status in ("failed", "cancelled") else "timed out",
+            }
+            for row in child_rows
+            if row.status != "done"
+        ]
+        failed += [
+            {"job_id": jid, "county": None, "record_type": None, "reason": "missing"}
+            for jid in (run.child_job_ids or [])
+            if jid not in present
+        ]
+    else:
+        failed = [
+            {"job_id": row.job_id, "county": row.county, "record_type": row.record_type, "reason": row.status}
+            for row in child_rows
+            if row.status in ("failed", "cancelled")
+        ]
 
     pairs = _combined_pairs(db, run.user_id, run.child_job_ids or [])
 
@@ -243,8 +269,25 @@ def finalize_batch_run(db, run) -> None:
 
 
 def _deliver(db, run, lead_count: int, object_key: str | None) -> None:
-    """Send the one combined-CSV delivery email (best-effort, non-fatal)."""
+    """Send the one combined-CSV delivery email (best-effort, non-fatal).
+
+    At-most-once: a re-finalize (lease steal / retry after a crash) must not
+    re-send. The status-guarded final write protects DB state, not this
+    post-commit email, so we CAS delivery_started_at NULL->now and only the winner
+    sends (Codex: duplicate delivery is not tolerable; a missed email is
+    recoverable because the CSV is always downloadable in-app)."""
     if not object_key:
+        return
+    claimed = db.execute(
+        update(BatchRun)
+        .where(BatchRun.id == run.id, BatchRun.delivery_started_at.is_(None))
+        .values(delivery_started_at=datetime.now(UTC))
+    ).rowcount
+    db.commit()
+    if not claimed:
+        _logger.info(
+            "batch %s: delivery already started/sent — skipping duplicate email", run.id
+        )
         return
     batch = db.get(ScraperBatch, run.batch_id)
     if batch is None:

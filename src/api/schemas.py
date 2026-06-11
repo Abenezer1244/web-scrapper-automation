@@ -570,10 +570,6 @@ class BatchDetailResponse(BatchSummaryResponse):
     children: list[BatchChildSummary] = Field(default_factory=list)
 
 
-class BatchDownloadResponse(BaseModel):
-    url: str  # short-lived presigned R2 URL for the combined CSV
-
-
 # ─── Jobs ─────────────────────────────────────────────────────────────────────
 
 class JobCreate(BaseModel):

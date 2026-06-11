@@ -7,9 +7,11 @@ delivery + schedule are SUPPRESSED. The BatchRun + child Jobs are created async
 by the dispatch worker (system-written), so this route only persists the parent
 + children, then kicks off the fan-out.
 """
+import io
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,7 +23,6 @@ from src.api.schemas import (
     BatchCreateRequest,
     BatchCreateResponse,
     BatchDetailResponse,
-    BatchDownloadResponse,
     BatchSummaryResponse,
 )
 from src.config.constants import (
@@ -310,17 +311,19 @@ async def get_batch(
     )
 
 
-@router.get("/{batch_id}/download", response_model=BatchDownloadResponse)
+@router.get("/{batch_id}/download")
 async def download_batch(
     batch_id: str,
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
-) -> BatchDownloadResponse:
-    """Return a short-lived presigned R2 URL for the batch's combined CSV.
+) -> StreamingResponse:
+    """Stream the batch's combined CSV through this authed endpoint.
 
-    Re-fetched on demand, so the link reflects later skip-trace fills (contacts
-    that land after the export was first built). 404 until the barrier has
-    produced the combined CSV.
+    Streams via DataExporter.download_object (the Cloudflare R2 REST API — the
+    same path upload_to_r2 uses, proven in prod). We do NOT hand out an S3
+    presigned URL: that path isn't valid in this R2 config and PII stays behind
+    auth this way. Re-downloadable, so the file reflects later skip-trace fills.
+    404 until the barrier has produced the combined CSV.
     """
     await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
     run = await _run_for(db, batch_id, current_user.id)
@@ -332,12 +335,16 @@ async def download_batch(
     from src.utils.data_exporter import DataExporter
 
     try:
-        # Short TTL: the link is handed straight to the browser. R2 PII safety.
-        url = DataExporter().get_download_url(run.combined_export_key, expires_in=120)
-    except Exception as exc:  # presign/config failure — surface a clean 503
-        _logger.error("batch %s download presign failed: %s", batch_id, str(exc)[:200])
+        data = DataExporter().download_object(run.combined_export_key)
+    except Exception as exc:  # R2 fetch failure — surface a clean 503
+        _logger.error("batch %s download failed: %s", batch_id, str(exc)[:200])
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Export download is temporarily unavailable.",
         ) from exc
-    return BatchDownloadResponse(url=url)
+    filename = f"batch-{batch_id[:8]}.csv"
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

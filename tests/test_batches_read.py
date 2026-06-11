@@ -17,7 +17,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.schemas import (
     BatchChildSummary,
     BatchDetailResponse,
-    BatchDownloadResponse,
     BatchSummaryResponse,
 )
 from src.db.models import BatchRun, Job, ScraperBatch, ScraperConfig, User
@@ -48,10 +47,6 @@ class TestSchemas:
         assert c.job_id is None
         assert c.status == "pending"
         assert c.record_count == 0
-
-    def test_download_response(self):
-        assert BatchDownloadResponse(url="https://r2/x").url == "https://r2/x"
-
 
 def test_read_routes_registered():
     from src.api import batches_router
@@ -192,8 +187,9 @@ async def test_detail_tenant_isolation(
 async def test_download_ready_branch_not_404(
     client: AsyncClient, starter_token: str, starter_batch: SimpleNamespace
 ):
-    # combined_export_key IS set -> we take the presign branch, never 'not ready'.
-    # Presign is 200 (R2 configured) or 503 (not) — both prove the key was found.
+    # combined_export_key IS set -> we take the R2-stream branch, never 'not ready'.
+    # Streaming the object is 200 (R2 has it) or 503 (R2 unreachable / key absent
+    # in the test env) — both prove the key was found, neither is 404.
     resp = await client.get(
         f"/batches/{starter_batch.batch_id}/download", headers=_auth(starter_token)
     )

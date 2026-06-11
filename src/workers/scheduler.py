@@ -1246,7 +1246,7 @@ def batch_recovery_sweep() -> None:
     """
     from sqlalchemy import select, update
 
-    from src.db.models import BatchRun, Job
+    from src.db.models import BatchRun, Job, ScraperConfig
     from src.db.session import system_sync_session
     from src.workers.batch_tasks import dispatch_batch_run
     from src.workers.tasks import run_scrape_job
@@ -1280,35 +1280,41 @@ def batch_recovery_sweep() -> None:
                 run.dispatch_attempts = (run.dispatch_attempts or 0) + 1
                 redispatch_batch_ids.append(run.batch_id)
 
-        # Gap 3a: 'running' runs with still-'pending' children (a lost child .delay).
-        # Re-enqueue every sweep (the atomic claim dedupes if one is actually in
-        # flight); the completion sweep's 90min force-finalize is the terminal
-        # backstop for a child that can never be picked up. No attempt cap (it would
-        # strand a child on broker recovery — same reason as the pending branch).
-        running_runs = db.execute(
-            select(BatchRun).where(BatchRun.status == "running").limit(_BATCH)
-        ).scalars().all()
-        for run in running_runs:
-            # Skip a run the completion sweep is about to FORCE-finalize (past the
-            # deadline): re-enqueueing its children would let them scrape AFTER the
-            # run is terminalized — wasted work, results excluded from the CSV
-            # (Codex P2). Measure from running_at, same as the force-finalize.
-            stuck_since = run.running_at or run.created_at
+        # Gap 3a: batch child jobs stuck 'pending' (a lost child .delay) under a
+        # 'running' run. Drive off the JOBS (bounded by _BATCH) via
+        # job -> scraper_config.batch_id -> batch_run, so a large number of healthy
+        # running runs can't starve the few with a lost child — the old
+        # "load 50 running runs then filter" could page past the run that needed
+        # recovery (Codex P2). UNIQUE(batch_id) makes the run join 1:1. Re-enqueue
+        # every sweep (the atomic claim dedupes if one is actually in flight); the
+        # 90min force-finalize is the terminal backstop. Skip force-eligible runs:
+        # their children are about to be cancelled, so re-enqueueing would let them
+        # scrape after terminalization (wasted work, excluded results).
+        stuck_children = db.execute(
+            select(Job.id, BatchRun.id, BatchRun.running_at, BatchRun.created_at)
+            .join(ScraperConfig, ScraperConfig.id == Job.scraper_config_id)
+            .join(BatchRun, BatchRun.batch_id == ScraperConfig.batch_id)
+            .where(
+                Job.status == "pending",
+                Job.trigger == "batch",
+                BatchRun.status == "running",
+            )
+            .limit(_BATCH)
+        ).all()
+        bumped_run_ids: set[str] = set()
+        for job_id, run_id, running_at, created_at in stuck_children:
+            stuck_since = running_at or created_at
             if stuck_since is not None and stuck_since < force_cutoff:
-                continue
-            ids = [str(x) for x in (run.child_job_ids or [])]
-            if not ids:
-                continue
-            pending_children = db.execute(
-                select(Job.id).where(
-                    Job.id.in_(ids),
-                    Job.user_id == run.user_id,
-                    Job.status == "pending",
-                )
-            ).scalars().all()
-            if pending_children:
-                run.dispatch_attempts = (run.dispatch_attempts or 0) + 1
-                reenqueue_job_ids.extend(str(x) for x in pending_children)
+                continue  # force-finalize will cancel this child — don't re-enqueue
+            reenqueue_job_ids.append(str(job_id))
+            bumped_run_ids.add(run_id)
+        if bumped_run_ids:
+            # One dispatch_attempts bump per affected run (observability counter).
+            db.execute(
+                update(BatchRun)
+                .where(BatchRun.id.in_(bumped_run_ids))
+                .values(dispatch_attempts=BatchRun.dispatch_attempts + 1)
+            )
 
         # STATUS-GUARDED terminalization (Codex P1): only fail runs STILL 'pending'.
         # A delayed dispatch_batch_run can materialize one to 'running' (with active

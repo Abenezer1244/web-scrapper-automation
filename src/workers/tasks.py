@@ -115,18 +115,36 @@ def _publish_log(r: sync_redis.Redis, job_id: str, level: str, message: str, db=
             _db.commit()
 
 
-def _set_status(db, job, status: str, **kwargs: Unpack[JobUpdateFields]) -> None:
+_TERMINAL_STATUSES = ("done", "failed", "cancelled")
+
+
+def _set_status(db, job, status: str, **kwargs: Unpack[JobUpdateFields]) -> bool:
     """Update job status and any extra fields, then commit.
+
+    Terminal-write guard (Track A, Codex P2): the write is a CAS that only
+    touches a row still in a NON-terminal status. If the row was terminalized
+    externally — e.g. batch force-finalize cancelled a child that was still
+    mid-scrape — the UPDATE is a no-op and this returns False so the caller
+    stops instead of resurrecting a cancelled/failed/done job (and then
+    billing/emailing for it). The ORM object is refreshed either way, so
+    `job.status` reflects the DB after the call.
 
     `kwargs` keys are constrained by the JobUpdateFields TypedDict so a
     typo like `started=...` (instead of `started_at=...`) fails type
     checking instead of silently doing nothing.
     """
-    job.status = status
-    for k, v in kwargs.items():
-        setattr(job, k, v)
+    from sqlalchemy import update as _sa_update
+
+    from src.db.models import Job
+
+    rowcount = db.execute(
+        _sa_update(Job)
+        .where(Job.id == job.id, Job.status.not_in(_TERMINAL_STATUSES))
+        .values(status=status, **kwargs)
+    ).rowcount
     db.commit()
     db.refresh(job)
+    return rowcount == 1
 
 
 def _upsert_property_membership(db, rows, user_id: str, record_type: str) -> int:
@@ -418,7 +436,9 @@ def run_scrape_job(self, job_id: str) -> None:
         _publish_log(r, job_id, "info", f"Job queued — {config.name} ({config.county}, {config.state})", db=db)
 
         # ── PROBING ───────────────────────────────────────────────────────────
-        _set_status(db, job, "probing")
+        if not _set_status(db, job, "probing"):
+            _logger.info("Job %s externally terminalized (%s) — aborting", job_id, job.status)
+            return
         _publish_log(r, job_id, "info", "Probing county portal...", db=db)
 
         try:
@@ -428,7 +448,9 @@ def run_scrape_job(self, job_id: str) -> None:
             return
 
         # ── SCRAPING ──────────────────────────────────────────────────────────
-        _set_status(db, job, "scraping")
+        if not _set_status(db, job, "scraping"):
+            _logger.info("Job %s externally terminalized (%s) — aborting", job_id, job.status)
+            return
         record_label = config.record_type.replace("_", " ").title()
         _publish_log(r, job_id, "success", f"Starting scrape — {record_label} records", db=db)
 
@@ -554,7 +576,15 @@ def run_scrape_job(self, job_id: str) -> None:
                 records = records[:remaining]
 
         # ── ENRICHING ─────────────────────────────────────────────────────────
-        _set_status(db, job, "enriching", record_count=len(records))
+        # CAS no-op here means a batch force-finalize cancelled this child while
+        # it was scraping (>90min stuck): discard the scrape without saving,
+        # billing, or delivering — the batch already recorded it as timed out.
+        if not _set_status(db, job, "enriching", record_count=len(records)):
+            _logger.info(
+                "Job %s externally terminalized (%s) mid-scrape — discarding without billing",
+                job_id, job.status,
+            )
+            return
         _publish_log(r, job_id, "info", "Saving records to database...", db=db)
 
         # Bulk insert results (truncate fields to fit DB column limits)
@@ -768,6 +798,20 @@ def run_scrape_job(self, job_id: str) -> None:
         finally:
             local_file.unlink(missing_ok=True)
 
+        # Force-finalize guard (Codex P2): a batch force-finalize may have
+        # cancelled this child while it was exporting. Re-check the live DB
+        # status before charging quota — never bill a job that is no longer
+        # ours to complete. (A cancel landing between this check and the final
+        # done-CAS still can't resurrect the job; at worst that sliver of a
+        # window bills records that were genuinely scraped.)
+        db.refresh(job)
+        if job.status in _TERMINAL_STATUSES:
+            _logger.info(
+                "Job %s externally terminalized (%s) after export — skipping billing/delivery",
+                job_id, job.status,
+            )
+            return
+
         # Atomic update of monthly record usage.
         # Sprint 6.4: duplicates delivered to this user in a prior scrape
         # do NOT count against the monthly quota. Records without a
@@ -921,12 +965,19 @@ def run_scrape_job(self, job_id: str) -> None:
         # actually sees on the results page. The raw scrape total is in the
         # log: "{N} records saved ({unique} new leads, {dup} duplicates)".
         display_count = max(0, len(records) - dup_count)
-        _set_status(
+        if not _set_status(
             db, job, "done",
             finished_at=_now(),
             record_count=display_count,
             export_key=object_key,
-        )
+        ):
+            # Cancelled (force-finalize) while enriching: the CAS kept the row
+            # terminal — suppress the success log, email, and webhook.
+            _logger.info(
+                "Job %s externally terminalized (%s) — suppressing completion delivery",
+                job_id, job.status,
+            )
+            return
         _publish_log(r, job_id, "success", f"Job complete — {display_count} new leads ({dup_count} duplicates filtered)", db=db)
         r.publish(f"job_logs:{job_id}", json.dumps({"type": "done", "record_count": display_count}))
 

@@ -232,6 +232,84 @@ def test_atomic_claim_skips_cancelled_job():
         assert db.get(Job, job_id).status == "cancelled"  # untouched
 
 
+def test_set_status_terminal_write_guard_blocks_resurrection():
+    """Batch force-finalize cancels a still-running child by flipping its jobs
+    row to 'cancelled' from another session. The worker still executing that
+    child must NOT later overwrite the cancellation with 'done' (and then bill
+    and email for it). _set_status is a CAS over non-terminal rows only: it
+    returns False, leaves the row 'cancelled', and refreshes the ORM object so
+    the caller sees the real status."""
+    from sqlalchemy import update
+
+    from src.workers.tasks import _set_status
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="enriching",
+            trigger="batch",
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    with SyncSessionLocal() as worker_db:
+        job = worker_db.get(Job, job_id)
+        assert job.status == "enriching"  # worker's (soon stale) view
+
+        # Force-finalize terminalizes the row from another session mid-run.
+        with SyncSessionLocal() as other:
+            other.execute(
+                update(Job)
+                .where(Job.id == job_id)
+                .values(status="cancelled", finished_at=datetime.now(UTC))
+            )
+            other.commit()
+
+        ok = _set_status(
+            worker_db, job, "done",
+            finished_at=datetime.now(UTC), record_count=5,
+        )
+        assert ok is False
+        assert job.status == "cancelled"  # refreshed to the DB truth
+
+    with SyncSessionLocal() as db:
+        row = db.get(Job, job_id)
+        assert row.status == "cancelled"  # never resurrected
+        assert row.record_count != 5
+
+
+def test_set_status_normal_transition_returns_true():
+    """The guard must not break the normal lifecycle: a non-terminal row
+    transitions and reports success (including terminal transitions FROM a
+    non-terminal status, e.g. scraping -> done)."""
+    from src.workers.tasks import _set_status
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="scraping",
+            trigger="batch",
+        )
+        db.add(job)
+        db.commit()
+
+        assert _set_status(db, job, "enriching", record_count=3) is True
+        assert job.status == "enriching"
+        assert job.record_count == 3
+
+        assert _set_status(db, job, "done", finished_at=datetime.now(UTC)) is True
+        assert job.status == "done"
+
+
 def test_watchdog_repicks_stranded_retry_pending_job():
     """A job a prior watchdog cycle reset to 'pending' whose re-enqueue failed
     (broker hiccup) is stranded: 'pending' is excluded from the normal scan. The

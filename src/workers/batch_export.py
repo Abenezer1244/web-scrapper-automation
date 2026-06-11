@@ -10,6 +10,7 @@ Does NOT wait for async skip-trace — contacts (phone/email) fill in later; the
 CSV is re-downloadable once they land. The CSV is built on property identity,
 which is ready at child-job enrichment.
 """
+import io
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -153,6 +154,26 @@ def _combined_pairs(db, user_id: str, job_ids: list[str]) -> list[tuple]:
     ]
 
 
+def render_combined_csv(user_id: str, job_ids: list[str]) -> bytes:
+    """Build the combined, deduped, overlap-flagged CSV ON DEMAND from the DB
+    (NOT the stored R2 snapshot). Used by the download endpoint so:
+      - a re-download reflects later async skip-trace fills (fresh contacts), and
+      - the API never needs R2 access (R2_ACCOUNT_ID/keys live on the worker, not
+        the api — the stored object is only a 'barrier finished' marker).
+    Opens its own SYNC psycopg2 session like the worker. Tenant isolation is the
+    explicit user_id filter baked into _COMBINED_SQL — callers MUST pass the
+    verified owner's id + that batch_run's own child_job_ids.
+    """
+    from src.db.session import system_sync_session
+
+    with system_sync_session() as db:
+        pairs = _combined_pairs(db, user_id, job_ids)
+        buf = io.StringIO()
+        write_lead_csv_with_overlap(pairs, buf)
+        db.rollback()  # read-only
+        return buf.getvalue().encode("utf-8")
+
+
 def finalize_batch_run(db, run) -> None:
     """Build + upload the combined CSV and deliver it. Called AFTER the run is
     claimed (claimed_at set) and all child jobs are terminal. Commits the run
@@ -187,7 +208,15 @@ def finalize_batch_run(db, run) -> None:
     # STATUS-GUARDED final write (Codex P1): only flip running->done/partial if the
     # run is STILL 'running'. A cancel that committed during the CSV/R2 build (after
     # the claim) makes rowcount 0 -> we must NOT overwrite 'cancelled' or deliver.
-    new_status = "partial" if failed else "done"
+    # done = all succeeded; failed = ALL children failed; partial = a mix
+    # (Codex: 100%-failure must not read as 'partial').
+    total_children = len(run.child_job_ids or [])
+    if not failed:
+        new_status = "done"
+    elif len(failed) >= total_children and total_children > 0:
+        new_status = "failed"
+    else:
+        new_status = "partial"
     updated = db.execute(
         update(BatchRun)
         .where(BatchRun.id == run.id, BatchRun.status == "running")
@@ -225,8 +254,11 @@ def _deliver(db, run, lead_count: int, object_key: str | None) -> None:
     if not emails:
         return
     try:
+        from src.config import settings
         from src.workers.delivery import deliver_job_results
-        url = DataExporter().get_download_url(object_key, expires_in=48 * 3600)
+        # Link to the in-app batch page (authed streaming download), NOT an R2
+        # presigned URL — that S3-presign path 401s in this R2 config (Codex).
+        url = f"{settings.FRONTEND_URL.rstrip('/')}/batches/{run.batch_id}"
         deliver_job_results(
             job_id=str(run.id),
             scraper_name=batch.name or "Batch scrape",

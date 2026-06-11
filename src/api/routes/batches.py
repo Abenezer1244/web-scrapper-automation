@@ -314,17 +314,22 @@ async def get_batch(
 @router.get("/{batch_id}/download")
 async def download_batch(
     batch_id: str,
+    request: Request,
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> StreamingResponse:
     """Stream the batch's combined CSV through this authed endpoint.
 
-    Streams via DataExporter.download_object (the Cloudflare R2 REST API — the
-    same path upload_to_r2 uses, proven in prod). We do NOT hand out an S3
-    presigned URL: that path isn't valid in this R2 config and PII stays behind
-    auth this way. Re-downloadable, so the file reflects later skip-trace fills.
-    404 until the barrier has produced the combined CSV.
+    The CSV is REBUILT from the DB on demand (not fetched from R2): the api has
+    no R2 credentials (those live on the worker), and rebuilding means a
+    re-download reflects later async skip-trace fills. Tenant-scoped by the
+    verified owner's id. 404 until the barrier has finished (combined_export_key
+    is the 'ready' marker).
     """
+    # Each download rebuilds the CSV (a threadpool worker + sync DB connection +
+    # full-CSV buffer), so rate-limit to keep concurrent downloads from starving
+    # API capacity (Codex).
+    await rate_limit(request, zone="general", identifier=current_user.id)
     await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
     run = await _run_for(db, batch_id, current_user.id)
     if run is None or not run.combined_export_key:
@@ -332,11 +337,18 @@ async def download_batch(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="The combined CSV is not ready yet.",
         )
-    from src.utils.data_exporter import DataExporter
+    from starlette.concurrency import run_in_threadpool
+
+    from src.workers.batch_export import render_combined_csv
 
     try:
-        data = DataExporter().download_object(run.combined_export_key)
-    except Exception as exc:  # R2 fetch failure — surface a clean 503
+        # render_combined_csv opens a sync session + builds the CSV — run off the
+        # event loop so the DB/CSV work can't block other requests. run.user_id is
+        # the verified owner (composite FK + _run_for join), so it's safe to pass.
+        data = await run_in_threadpool(
+            render_combined_csv, run.user_id, run.child_job_ids or []
+        )
+    except Exception as exc:  # build failure — surface a clean 503
         _logger.error("batch %s download failed: %s", batch_id, str(exc)[:200])
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

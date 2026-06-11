@@ -111,7 +111,9 @@ def dispatch_batch_run(batch_id: str) -> None:
         # RECOVERY: a duplicate/retried dispatch (or the lost-race branch). Re-enqueue
         # any child jobs the winner committed but may not have dispatched (crash
         # between commit and .delay). Idempotent + safe (see _pending_child_ids).
-        if not enqueued and existing is not None:
+        # Only for a STILL-running run — never resurrect children of a cancelled /
+        # failed / done run (Codex).
+        if not enqueued and existing is not None and existing.status == "running":
             enqueued = _pending_child_ids(db, existing)
 
     # Enqueue AFTER commit so a worker can't pick up an uncommitted job row.

@@ -66,10 +66,10 @@ WITH candidates AS (
            sc.record_type, sc.county, j.created_at AS job_created_at,
            COALESCE(r.property_key, r.dedup_hash, 'id:' || r.id::text) AS bucket
     FROM results r
-    JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid
-    JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
-    WHERE r.user_id = :uid
-      AND r.job_id = ANY(:job_ids)
+    JOIN jobs j ON j.id = r.job_id AND j.user_id = CAST(:uid AS uuid)
+    JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = CAST(:uid AS uuid)
+    WHERE r.user_id = CAST(:uid AS uuid)
+      AND r.job_id = ANY(CAST(:job_ids AS uuid[]))
 ),
 agg AS (
     SELECT bucket,
@@ -98,6 +98,18 @@ FROM ranked rk
 JOIN agg a ON a.bucket = rk.bucket
 WHERE rk.rn = 1
 LIMIT :limit
+"""
+
+
+# Per-child terminal status for the failed_children summary. Same uuid-param
+# casting as _COMBINED_SQL (raw text() binds str/list[str] as text/text[]; the
+# columns are native uuid — psycopg2 has no uuid=text operator without the cast).
+_FAILED_CHILDREN_SQL = """
+SELECT j.id::text AS job_id, j.status AS status,
+       sc.county AS county, sc.record_type AS record_type
+FROM jobs j
+JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = CAST(:uid AS uuid)
+WHERE j.user_id = CAST(:uid AS uuid) AND j.id = ANY(CAST(:job_ids AS uuid[]))
 """
 
 
@@ -147,15 +159,7 @@ def finalize_batch_run(db, run) -> None:
     status before emailing so a delivery failure can't undo the export."""
     # Per-child status -> failed_children summary (failed/cancelled children).
     child_rows = db.execute(
-        text(
-            """
-            SELECT j.id::text AS job_id, j.status AS status,
-                   sc.county AS county, sc.record_type AS record_type
-            FROM jobs j
-            JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
-            WHERE j.user_id = :uid AND j.id = ANY(:job_ids)
-            """
-        ),
+        text(_FAILED_CHILDREN_SQL),
         {"uid": run.user_id, "job_ids": run.child_job_ids or []},
     ).fetchall()
     failed = [

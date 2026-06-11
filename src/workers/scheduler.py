@@ -1293,6 +1293,13 @@ def batch_recovery_sweep() -> None:
             select(BatchRun).where(BatchRun.status == "running").limit(_BATCH)
         ).scalars().all()
         for run in running_runs:
+            # Skip a run the completion sweep is about to FORCE-finalize (past the
+            # deadline): re-enqueueing its children would let them scrape AFTER the
+            # run is terminalized — wasted work, results excluded from the CSV
+            # (Codex P2). Measure from running_at, same as the force-finalize.
+            stuck_since = run.running_at or run.created_at
+            if stuck_since is not None and stuck_since < force_cutoff:
+                continue
             ids = [str(x) for x in (run.child_job_ids or [])]
             if not ids:
                 continue

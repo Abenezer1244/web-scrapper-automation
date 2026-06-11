@@ -11,6 +11,7 @@ CSV is re-downloadable once they land. The CSV is built on property identity,
 which is ready at child-job enrichment.
 """
 import io
+import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -227,7 +228,13 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
     object_key = None
     if pairs:
         exporter = DataExporter()
-        local_path = exporter.export_dir / f"batch_{run.id[:8]}.csv"
+        # UNIQUE local temp name per finalize (Codex P2): if a finalize outruns its
+        # lease and another reclaims, two finalizers can run at once. A shared name
+        # would let one overwrite/unlink the other's file mid-upload. A per-call
+        # suffix (claim_token if present, else a uuid) isolates them; the R2 object
+        # key stays stable (idempotent overwrite of equivalent content).
+        suffix = (claim_token or uuid.uuid4().hex)[:8]
+        local_path = exporter.export_dir / f"batch_{run.id[:8]}_{suffix}.csv"
         exporter.export_dir.mkdir(parents=True, exist_ok=True)
         try:
             with open(local_path, "w", newline="", encoding="utf-8") as fh:

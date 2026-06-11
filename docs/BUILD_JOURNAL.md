@@ -19,6 +19,45 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-11 — SHIPPED: Piece 2 batch scrape (2A) + Piece 1 backend → prod, both healthy
+
+Merged + deployed everything from the 2A.4/2A.5 session. Both pieces are live.
+
+**Shipped / Deployed:**
+- **Backend** PR #23 (`feature/batch-scrape` → main `4c7bbb3`, `--merge`). Because that branch was cut
+  off the Piece-1 lineage, the merge **also brought Piece 1 backend** with it — GitHub auto-closed
+  Piece-1 PR #22 as MERGED. Railway (deploys from main) ran **migrations 049 then 050** on boot via the
+  advisory-locked `scripts/migrate.py`. Verified prod: `/health` 200, **`/batches` → 401** (route live +
+  auth-gated, not 404=old code), migrations applied, no crash-loop.
+- **Frontend** PR #6 (`feature/batch-scrape-ui` → master `d1d8cae`). Vercel production deploy = success;
+  `app.bridgeleads.io` 200. Merged AFTER the backend was confirmed healthy so the UI had a live API.
+
+**Caught & fixed (CI, pre-merge — `af48fbd`):** the first CI run failed. `test_batches_read.py` fixtures
+added `ScraperBatch` + `ScraperConfig` + `Job` + `BatchRun` in ONE transaction with a single commit;
+the composite FK `fk_batch_runs_batch_tenant (batch_id, user_id) → scraper_batches` needs the batch row
+inserted **before** its referencers, and the single-flush order violated it (`ForeignKeyViolationError`).
+Fix: explicit `await db.flush()` after the batch (and after the job). **Product code unaffected** — in
+prod these are separate transactions (API commits the batch; the worker later inserts the run). Re-ran
+CI green (Test 2m31s), then merged.
+
+**Facts learned (ops):**
+- Migration **049** is a 293k-row generated-column table rewrite → takes a few minutes; the advisory-lock
+  migrate has ONE replica run it while others log "lock held by another replica; waiting". **A brief 502
+  window on `api.bridgeleads.io` during that migration is NORMAL**, not a failed deploy — it clears once
+  the migrating replica finishes and the app boots.
+- `railway logs --service api` shows the boot migration sequence (`Running upgrade NNN -> NNN` →
+  `migrations applied` → `Application startup complete`). Railway CLI is authed as michaelbeki99.
+- **Git-Bash mangles a `curl -w` format string that starts with `/`** (MSYS path-translation turns
+  `/health HTTP %{http_code}` into `C:/Program Files/Git/health ...`). Lead the format with a letter
+  (`health=%{http_code}`).
+
+**Pending / Handoff:**
+- **Piece 1 Lists look-back UI** (`feature/lists-date-window-ui`, a SEPARATE branch off master) is still
+  UNMERGED — it was NOT part of the batch FE PR (#6 was off clean master). Its backend is now live, so
+  merge it to master when ready.
+- Phase 2B (scheduled batch) = separate later plan. Pre-existing follow-up: atomic `pending→queued` claim
+  in `run_scrape_job`.
+
 ## 2026-06-10 — Batch scrape (Piece 2): read/download endpoints (2A.4) + frontend Single|Batch wizard (2A.5)
 
 Continued Piece 2 from the 2A.3 completion barrier. Backend read/download API, then the entire frontend.

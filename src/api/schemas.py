@@ -539,6 +539,41 @@ class BatchRunResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class BatchChildSummary(BaseModel):
+    """One child scrape within a batch (county x record_type) and its job status."""
+
+    config_id: str
+    county: str
+    record_type: str
+    job_id: str | None = None  # None until the dispatch worker creates the job
+    status: str = "pending"  # pending | queued | probing | scraping | enriching | done | failed | cancelled
+    record_count: int = 0
+
+
+class BatchSummaryResponse(BaseModel):
+    """A batch + its (single, on-demand 2A) run status — for the list view."""
+
+    id: str
+    name: str | None = None
+    state: str
+    run_status: str = "pending"  # pending | running | done | partial | failed | cancelled
+    child_count: int = 0
+    combined_export_ready: bool = False  # presence flag — never expose the R2 key
+    created_at: datetime
+    completed_at: datetime | None = None
+
+
+class BatchDetailResponse(BatchSummaryResponse):
+    """A batch with its per-child summary + failed-child detail — for the run view."""
+
+    failed_children: list[dict[str, Any]] | None = None
+    children: list[BatchChildSummary] = Field(default_factory=list)
+
+
+class BatchDownloadResponse(BaseModel):
+    url: str  # short-lived presigned R2 URL for the combined CSV
+
+
 # ─── Jobs ─────────────────────────────────────────────────────────────────────
 
 class JobCreate(BaseModel):

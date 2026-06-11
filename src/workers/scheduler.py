@@ -246,6 +246,7 @@ def watchdog_stuck_jobs() -> None:
             )
         ).scalars().all()
 
+        requeued_ids: list[str] = []
         for job in stuck_jobs:
             if job.retry_count < 3:
                 stuck_minutes = (
@@ -262,8 +263,7 @@ def watchdog_stuck_jobs() -> None:
                 job.page_current = 0
                 job.page_total = 0
                 job.record_count = 0
-                db.flush()
-                run_scrape_job.delay(job.id)
+                requeued_ids.append(job.id)
                 _logger.warning(
                     "Watchdog: re-queued stuck job %s (attempt %d/3, stuck for %s min)",
                     job.id,
@@ -280,6 +280,15 @@ def watchdog_stuck_jobs() -> None:
                 _logger.error("Watchdog: permanently failed job %s after 3 retries", job.id)
 
         db.commit()
+
+    # Enqueue AFTER the commit (commit-before-delay, like dispatch_scheduled_jobs
+    # and the batch fan-out): run_scrape_job now claims pending->queued with an
+    # atomic CAS, so a worker that consumes the retry before the 'pending' reset
+    # is committed would read the stale active status, get rowcount 0, and bail —
+    # stranding the job 'pending' with no message. Committing first guarantees the
+    # worker sees 'pending' and can claim it (Codex P2).
+    for jid in requeued_ids:
+        run_scrape_job.delay(jid)
 
 
 # ─── Task 3: Canary health checks ────────────────────────────────────────────

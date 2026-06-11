@@ -19,6 +19,59 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-11 — E2E prod test of batch scrape: PASSED, after fixing 5 prod-only bugs
+
+Ran a real end-to-end test against prod (user asked "does it do what we built it for"). Registered a
+throwaway Pro-trial account (register sets `plan="pro"`, 500-record trial → passes the batch gate),
+launched `island × {probate, pre_foreclosure}` with skip-trace + email OFF (zero Tracerfy cost).
+
+**Result: the full pipeline works.** Pro+ gate → validation (422 on empty record_types AND on the
+unsupported combo `island/eviction` with the exact message) → fan-out into 2 child scrapes → real
+Playwright scrape (**157 Island probate records**) → completion barrier finalize → **combined deduped CSV
+= 154 rows** (157→154 dedup by property identity) with the full canonical overlap schema
+(`overlap`/`lists_count`/`lists`/`counties`/first+last/property-split/`filed_date`/…), real names, downloaded
+via the authed endpoint.
+
+**The test caught 5 prod-only bugs that the pure unit tests AND `tsc`/`next build` all missed** (none
+exercised a real worker / real Postgres execution / real R2). Each fixed + Codex-gated:
+
+1. **Celery worker never registered `dispatch_batch_run`** — it was missing from the `include=[]` list in
+   `src/workers/__init__.py`. Worker logged `Received unregistered task ... KeyError` and dropped it → no
+   `BatchRun`, no child jobs → batch stuck at `pending` forever. Fix `9661905` + regression test asserting
+   the task is in `app.tasks`. **Lesson: every new `@app.task` module must be added to `include`; pure
+   tests never boot a worker.**
+2. **`uuid = text` in the barrier finalize SQL** — raw `text()` in `batch_export.py` bound `:uid` (str) and
+   `:job_ids` (list) as text/text[] vs native `uuid` columns → `psycopg2 UndefinedFunction` every 60s, so
+   a fully-scraped batch never built the CSV. Fix `d8308ea`: `CAST(:uid AS uuid)` +
+   `ANY(CAST(:job_ids AS uuid[]))` (cast the PARAMS, not the columns → keep uuid indexes on the 293k-row
+   results table), plus a **real-Postgres SYNC/psycopg2 execution** regression test — the async/asyncpg
+   test fixture handles uuid params differently and would NOT have caught it.
+3+4. **Download was doubly broken** (`78e15fb` → final `b08dfb2`). First it returned a boto3 S3 presigned
+   URL → R2 `401 Unauthorized`. Switched to the Cloudflare REST `download_object` → `404 "could not route
+   to accounts//r2"`, revealing the real cause: **the API service has no R2 credentials (`R2_ACCOUNT_ID`
+   unset) — R2 lives only on the worker** (which is why upload worked). Final fix: the download endpoint
+   no longer touches R2 at all — it **rebuilds the combined CSV from the DB on demand**
+   (`render_combined_csv` reuses `_combined_pairs` + `write_lead_csv_with_overlap`, own sync session, via
+   `run_in_threadpool`, rate-limited). Bonus: re-downloads now reflect later async skip-trace fills.
+   Frontend `c62b616`: `downloadBatchCsv` = authed `fetch` → blob (a `window.location` nav can't carry the
+   bearer token).
+5. **Codex adversarial audit of the whole batch flow** (`b08dfb2`) found: the batch delivery **email** used
+   the same broken presign → now links to `{FRONTEND_URL}/batches/{id}` (the in-app authed download;
+   `FRONTEND_URL=https://app.bridgeleads.io`); ALL-children-failed reported `partial` → now `failed`;
+   dispatch recovery could re-enqueue a cancelled run's children → now guarded on `status == "running"`.
+
+**Worked with Codex throughout** (consult on the wizard fork, reviews of each fix, a full adversarial
+audit). Codex also surfaced **crash-durability** gaps I **deferred** as a documented follow-up: a dispatch
+outbox / recovery sweep for the commit-before-`.delay()` windows, `claimed_at` as a 15-min **lease** (a
+worker killed right after claiming a run strands it `running` forever), and a missing-child → terminal
+`failed` path. These need a coherent recovery-sweep, not a rushed patch.
+
+**Ops facts learned:** Railway api + worker are SEPARATE services with SEPARATE env (R2 creds on worker,
+not api). Main-push deploys are slow and serialized (~10-13 min each; they queue when you push rapidly).
+`get_download_url`'s S3 presign is broken in this prod R2 config generally — it also affects single-scrape
+**email** download links (pre-existing, out of batch scope, worth a follow-up). Git-Bash mangles a curl
+`-w` format string that starts with `/`.
+
 ## 2026-06-11 — SHIPPED: Piece 2 batch scrape (2A) + Piece 1 backend → prod, both healthy
 
 Merged + deployed everything from the 2A.4/2A.5 session. Both pieces are live.

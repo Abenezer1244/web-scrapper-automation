@@ -15,6 +15,10 @@ app = Celery(
         "src.workers.skip_trace_dispatcher",
         "src.workers.webhook_delivery",
         "src.workers.tracerfy_ingest",
+        # Piece 2 batch scrape: the worker MUST import this or `dispatch_batch_run`
+        # (enqueued by POST /batches) is an unregistered task and gets dropped —
+        # the batch then sits at `pending` forever (caught in prod E2E test).
+        "src.workers.batch_tasks",
     ],
 )
 

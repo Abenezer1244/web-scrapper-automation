@@ -51,3 +51,16 @@ def test_router_registered():
     from src.api import batches_router
 
     assert any(getattr(rt, "path", None) == "/batches" for rt in batches_router.routes)
+
+
+def test_dispatch_batch_run_registered_with_worker():
+    """The worker only registers tasks in the Celery app `include`. If
+    batch_tasks is missing, POST /batches enqueues an UNREGISTERED task that the
+    worker drops -> the batch hangs forever at 'pending'. Caught in prod E2E;
+    this guards the wiring."""
+    from src.workers import app
+
+    assert "src.workers.batch_tasks" in app.conf.include
+    import src.workers.batch_tasks  # noqa: F401  (registers the @app.task)
+
+    assert "src.workers.batch_tasks.dispatch_batch_run" in app.tasks

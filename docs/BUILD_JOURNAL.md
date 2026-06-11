@@ -19,6 +19,44 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-11 — Tax-delinquency filter: diagnosed (UX, not logic), columns+label fix, Pierce/Kitsap proven infeasible
+
+User report: "tax delinquency filter doesn't filter correctly" + "make King, Pierce, Kitsap, Snohomish work."
+
+**Failed hypotheses (ruled out with evidence, not guesses):** NOT a backend math bug, NOT NULL columns, NOT
+the frontend wiring. Verified the REAL `build_tax_conditions` path against the live prod Snohomish job
+(`622aa2b0…`, 4269/4269 rows populated, clean) for 8 scenarios — every count matched independent SQL exactly
+(min $5000→975, min_months 24→2016). Then reproduced LIVE in Chromium (gstack `browse`, logged in as admin,
+MFA off): the filter works end-to-end (5000→975, 24mo→2016 on screen).
+
+**Caught (the actual bug):** the results table (`bridgeleads-web/.../results/[id]/page.tsx`) never DISPLAYED
+`delinquent_amount`/`delinquent_bill_year`, so a filtered view looked identical to unfiltered → reads as
+"doesn't filter." Plus the filter label said "(King tax records)" on a Snohomish dataset. Second surface
+confirmed: the scraper cached-records view (`/scrapers/{id}/records`, `county_records` table) has no tax
+filter at all and showed 0 Snohomish rows.
+
+**Built / Shipped (to branch, UNMERGED):** `bridgeleads-web` `feature/tax-filter-columns-label` `abf95eb` —
+Amount Owed + Tax Year columns on tax-delinquent results (single `hasTaxData` latch drives header + every
+row's 2 new `<td>`s + skeleton + `taxColCount`, so thead/tbody parity is structural), label →
+"(tax-delinquent records)". `tsc --noEmit` clean.
+
+**Failed / Blocked:** Codex CLI stalled 3× this session (exit 124) reviewing the diff — transient host
+flakiness (the earlier `codex exec` consult worked fine). Did a rigorous manual parity review instead;
+re-run `/code-review ultra` before merging to master (auto-deploys Vercel).
+
+**Decided (county coverage, with Codex consult + 2 parallel research agents):** filter is King+Snohomish
+only because only they publish structured owed-amount + tax-year. **Kitsap = blocked, data does not exist
+publicly** (confirms `docs/non_king_tax_data_spike.md`). **Pierce = not feasible cleanly** — read the live
+Data Mart `tax_account.pdf` schema: assessed VALUES + tax year, **no balance/owed column**; amount-owed only
+per-parcel behind ColdFusion ePIP (unreachable on probe). Owner deferred Pierce's fragile per-parcel route.
+
+**Facts learned:** (1) two distinct lead surfaces — per-job `results` (has tax filter) vs cached
+`county_records` (no tax filter, doc-type only). (2) `scripts/diag_snoho_tax_filter.py` kept = reusable
+"filter vs independent SQL" cross-check. (3) Pierce `piercecountywa.gov` 403s headless+real-browser, but
+`online.co.pierce.wa.us` PDF host works via curl with a browser UA. (4) Snohomish semantics: `bill_year` =
+oldest delinquent year, `delinquent_amount` = SUM across years (Codex: label as "oldest tax year"/"total"
+if it ever confuses users). **Pending:** merge the frontend fix (needs ultra-review + deploy go); BACKLOG §5.
+
 ## 2026-06-11 — Batch crash-durability hardening (Track A): built, 11 Codex rounds, merge-ready
 
 The deferred follow-up from the E2E session (below): close the 3 crash windows that could strand a

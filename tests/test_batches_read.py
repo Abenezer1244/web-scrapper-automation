@@ -80,6 +80,10 @@ async def starter_batch(db: AsyncSession, starter_user: User) -> SimpleNamespace
         status="active",
     )
     db.add(batch)
+    # Flush parents before the FK-dependent rows: batch_runs/scraper_configs carry
+    # a composite FK (batch_id, user_id) -> scraper_batches, so the batch row must
+    # exist in the txn first (in prod these are separate transactions).
+    await db.flush()
     cfg = ScraperConfig(
         id=str(uuid.uuid4()),
         user_id=starter_user.id,
@@ -103,6 +107,7 @@ async def starter_batch(db: AsyncSession, starter_user: User) -> SimpleNamespace
         record_count=42,
     )
     db.add(job)
+    await db.flush()  # job must exist before the run references its id
     run = BatchRun(
         id=str(uuid.uuid4()),
         batch_id=batch.id,
@@ -211,6 +216,7 @@ async def test_download_not_ready_404(
         status="active",
     )
     db.add(batch)
+    await db.flush()  # batch must exist before the run's composite FK references it
     run = BatchRun(
         id=str(uuid.uuid4()),
         batch_id=batch.id,

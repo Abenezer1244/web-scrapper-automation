@@ -19,6 +19,72 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-11 — Batch crash-durability hardening (Track A): built, 11 Codex rounds, merge-ready
+
+The deferred follow-up from the E2E session (below): close the 3 crash windows that could strand a
+batch forever. Branch `feature/batch-durability`, 16 commits, NOT yet merged.
+
+**Built / Shipped (on branch):**
+- **Migration 051** (additive, rolling-safe): `dispatch_attempts`, `delivery_started_at`, `claim_token`
+  on `batch_runs`. Applied locally only — do NOT touch prod until merged (branch-migration landmine).
+- **Gap 1 (lost dispatch):** `POST /batches` now creates `BatchRun(status='pending')` in the same API
+  transaction as the batch + child configs — dispatch intent is durable. Worker `dispatch_batch_run`
+  does a FOR UPDATE pending→running transition (idempotent, concurrent dispatches serialize). New
+  `batch_recovery_sweep` beat (2min) re-dispatches lost pending runs + re-`.delay()`s stuck pending
+  children (driven off the JOBS, not a run page — scalable), bounded by `dispatch_attempts`.
+- **Gap 2 (hard-kill mid-finalize):** `batch_completion_sweep`'s claim is a reclaimable 30-min LEASE
+  (`claimed_at` + `claim_token`); combined-CSV delivery email is at-most-once via `delivery_started_at`
+  CAS; finalize temp file is per-claim unique so two finalizers can't clobber each other.
+- **Gap 3 (stranded forever):** force-finalize folded INTO the completion sweep (one claim/finalize
+  path) at >90min from `running_at`; `finalize_batch_run(forced=True)` records non-done children as
+  timed out AND cancels still-active children in the same txn.
+- **Prerequisite (pre-existing Backlog §5 bug):** `run_scrape_job`'s blind `pending→queued` set is now
+  an atomic CAS — Celery redelivery / recovery re-enqueue can never double-scrape.
+- **Final-gate fix `9e4ad2d`:** `_set_status` is now a terminal-write CAS (returns False on rows already
+  done/failed/cancelled) + a live-status re-check before billing. A force-cancelled child mid-scrape can
+  no longer resurrect itself to `done`, bill quota, and email after the batch was terminalized.
+
+**Tried / Decided:**
+- Codex consult REJECTED the original "no-migration" sketch — durable recovery needs durable state.
+  Reconciled design: BatchRun-as-intent created by the API, not the worker (also future-proofs 2B
+  scheduled batches).
+- ONE claim/finalize path (completion sweep owns both normal + forced) instead of a separate backstop
+  beat — same lease/CAS, no second writer.
+- Failure is TIME-based only (90min), never attempt-based (a poisoned job storm can't fail a batch early).
+- **Accepted tradeoffs (final gate P2s, documented in todo):** (a) pending-only children force-fail at
+  90min — 90min unpicked ≈ 45 failed recovery re-enqueues = systemic outage; a clear "timed out" beats
+  an infinite spinner. (b) force-cancel includes `enriching` children — an earlier Codex round required
+  exactly that (late side-effects after terminal batch); the terminal-write guard makes it safe. Codex
+  rounds 10-11 were critiquing prescriptions from rounds 1-9 — that oscillation is the stop signal.
+- Accepted (acks_late): a worker killed post-claim pre-ack makes the redelivery a no-op; recovery of
+  such jobs is owned by `watchdog_stuck_jobs` (10-20min), trading speed for guaranteed no-double-scrape.
+
+**Caught & fixed (Codex, ~14 findings over 11 rounds — highlights):**
+- P1: watchdog set pending + `.delay()` BEFORE its commit — the new CAS would strand the retry
+  (commit-before-delay fix in `scheduler.py`).
+- P1: pending-run give-up wasn't status-guarded against a concurrent materialize.
+- P1 (round 10): force-cancelled child could complete, bill, and overwrite `cancelled`→`done` (the
+  `9e4ad2d` fix above; Codex rated P2, adopted with full guard anyway).
+- P2s: force-finalize had to run off `running_at` not `created_at`; lease-owner guard on finalize;
+  tolerate post-commit broker publish failure; unique finalize temp file; child recovery driven off
+  stuck jobs not a run page.
+
+**Pending / Handoff:**
+- **Merge `feature/batch-durability` → main** (auto-deploys; 051 runs via `scripts/migrate.py` on boot).
+- H1 RLS cutover must add a `batch_runs` INSERT grant for the app role (BACKLOG §2) — the API now
+  writes `batch_runs` from the rls session (fine today: BYPASSRLS prod role).
+- Residual (documented): broker outage at the watchdog moment can leave a non-batch job committed
+  'pending' that the watchdog won't re-pick (pre-existing property of commit-before-delay; batch
+  children ARE covered by the recovery sweep). Billing sliver: a cancel landing between the pre-billing
+  check and the done-CAS bills genuinely-scraped records (job still stays cancelled).
+
+**Facts learned:**
+- This Codex CLI version rejects `codex review <prompt> --base <branch>` — prompt and `--base` are
+  mutually exclusive; run it bare against the base.
+- `_set_status`-style blind ORM status writes are resurrection bugs waiting to happen the moment any
+  OTHER actor (sweep, force-finalize, admin) can terminalize a row — guard terminal states with a CAS
+  at the single choke point instead of sprinkling pre-checks.
+
 ## 2026-06-11 — E2E prod test of batch scrape: PASSED, after fixing 5 prod-only bugs
 
 Ran a real end-to-end test against prod (user asked "does it do what we built it for"). Registered a

@@ -29,29 +29,32 @@ sketch; durable recovery needs durable state. Each phase ≤5 files, Codex-gated
 
 ## Phases
 
-### Phase 1 — Durable state migration + model  ☐
-- [ ] `alembic/versions/051_batch_durability.py` — add to `batch_runs`: `dispatch_attempts INT
-      NOT NULL DEFAULT 0`, `delivery_started_at TIMESTAMPTZ NULL`, `claim_token VARCHAR(36) NULL`.
-      (Reuse existing `status='pending'` as intent — already the model default + documented
-      lifecycle.) down_revision="050".
-- [ ] `src/db/models.py` — add the 3 columns to `BatchRun`.
-- [ ] Verify: `py_compile` + `ruff` + model imports. Codex-gate.
+### Phase 1 — Durable state migration + model  ✅ (commit d54f07e)
+- [x] `alembic/versions/051_batch_durability.py` — added `dispatch_attempts`, `delivery_started_at`,
+      `claim_token` to `batch_runs`. All additive/defaulted, rolling-deploy safe. down_revision="050".
+- [x] `src/db/models.py` — 3 columns added to `BatchRun`.
+- [x] Verified: py_compile + ruff clean + model import shows the columns.
 
-### Phase 2 — Atomic pending→queued claim (the prerequisite)  ☐
-- [ ] `src/workers/tasks.py` — replace the blind `_set_status(job,"queued")` with an atomic
-      `UPDATE jobs SET status='queued', started_at=now() WHERE id=:id AND status='pending'`
-      (rowcount 0 ⇒ another worker owns it / not pending ⇒ return). Keep the cancelled checks.
-- [ ] `tests/` — regression: two deliveries of one job ⇒ exactly one scrape.
-- [ ] Verify + Codex-gate. (This is also Backlog §5 "atomic claim" — closes it.)
+### Phase 2 — Atomic pending→queued claim (the prerequisite)  ✅ (commits e?/P2 doc)
+- [x] `src/workers/tasks.py` — blind `_set_status(job,"queued")` → atomic CAS
+      `UPDATE jobs ... WHERE id=:id AND status='pending'` (rowcount 0 ⇒ return). Closes Backlog §5.
+- [x] `tests/test_workers.py` — 2 regression tests (at-most-once claim; cancelled job skipped). PASS.
+- [x] Codex-gated: GATE PASS, 1×P2 (acks_late recovery tradeoff) accepted + documented.
 
-### Phase 3 — BatchRun-as-intent  ☐
-- [ ] `src/api/routes/batches.py` — create `BatchRun(status='pending', child_job_ids=[])` in the
-      same txn as the batch+configs; still `dispatch_batch_run.delay(batch.id)` after commit.
-- [ ] `src/workers/batch_tasks.py` — `dispatch_batch_run` now LOADS the pending run (created by
-      API) and transitions `pending→running` + creates jobs; the over-limit/empty terminal paths
-      move onto the existing run; keep `UNIQUE(batch_id)` idempotency + recovery branch.
-- [ ] Update `tests/test_batches.py` / `test_batch_models.py`.
-- [ ] Verify + Codex-gate.
+### Phase 3 — BatchRun-as-intent  ✅ (commit Phase 3 + watchdog fix)
+- [x] `src/api/routes/batches.py` — creates `BatchRun(status='pending')` in the same txn (durable intent).
+- [x] `src/workers/batch_tasks.py` — `dispatch_batch_run` locks the run FOR UPDATE, transitions
+      pending→running + creates jobs (concurrent dispatches serialize); back-compat creates run if
+      none; bumps `dispatch_attempts`. Recovery branch unchanged.
+- [x] `tests/test_batch_dispatch.py` (new, DB-backed: transition, idempotency, over-limit) +
+      `test_batch_models.py` durability-cols test. 8/8 pass (broker-rate-limit tolerated hermetically).
+- [x] Codex-gated: GATE PASS, 1×P2 — a REAL bug it caught: watchdog set pending + .delay BEFORE its
+      commit; the new CAS would strand the retry. FIXED (commit-before-delay in `scheduler.py`).
+- [x] Migration 051 applied to local DB.
+
+> NOTE for Phase 6 journal: residual — a broker outage at the watchdog moment leaves a non-batch job
+> committed 'pending' that the next watchdog won't re-pick (excludes pending). Pre-existing property of
+> the commit-before-delay convention; batch children are covered by the Phase-5 recovery sweep.
 
 ### Phase 4 — Lease + delivery idempotency  ☐
 - [ ] `src/workers/scheduler.py` (`batch_completion_sweep`) — select + CAS claim become a LEASE

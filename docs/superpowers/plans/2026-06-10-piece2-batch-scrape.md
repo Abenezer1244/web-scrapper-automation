@@ -65,8 +65,11 @@ Output of 2A.0: fill the `// VERIFIED:` notes in the tasks below. If any assumpt
 
 **Files:** `src/api/routes/batches.py` (extend); Test `tests/test_batches_read.py`.
 
-- [ ] **Step 1:** `GET /batches` (list user's batches), `GET /batches/{id}` (status + per-child summary + combined_export_key presence), `GET /batches/{id}/download` (signed R2 URL or stream of the combined CSV). System session + explicit `user_id` filter (BatchRun not app-granted). Re-download reflects later skip-trace fills.
-- [ ] **Step 2: Tests** (tenant isolation: a user can't read another's batch). Commit + **Codex gate**.
+- [x] **Step 1:** `GET /batches` (list user's batches), `GET /batches/{id}` (status + per-child summary + combined_export_key presence), `GET /batches/{id}/download` (signed R2 URL or stream of the combined CSV). System session + explicit `user_id` filter (BatchRun not app-granted). Re-download reflects later skip-trace fills.
+  - // DONE `185f04a`: `get_db`-style reads via `get_rls_db` (RLS belt for joined scraper_configs/jobs) + explicit `user_id` on every batch-table query (the only boundary for non-RLS scraper_batches/batch_runs). Download returns a short-lived **presigned R2 URL** (`get_download_url`, the prod S3-presign path) — NOT a stream (`download_object` uses the unconfigured Cloudflare REST API in prod). Raw `combined_export_key` never exposed.
+  - // Codex P2: `_run_for` JOINs the owned `ScraperBatch` (don't trust `BatchRun.user_id` alone); P3: `children` uses `default_factory=list`.
+- [x] **Step 2: Tests** (tenant isolation: a user can't read another's batch). Commit + **Codex gate**.
+  - // DONE `tests/test_batches_read.py`: pure schema/route tests pass locally; DB-backed list/detail/download + tenant-isolation tests run in CI (no local Postgres on this box — same as all route tests).
 
 ---
 
@@ -74,10 +77,14 @@ Output of 2A.0: fill the `// VERIFIED:` notes in the tasks below. If any assumpt
 
 **Files:** `bridgeleads-web/app/(dashboard)/scrapers/new/page.tsx`; `lib/api.ts`; `lib/types.ts`; new `app/(dashboard)/batches/[id]/page.tsx` (or a section). Mirror R4.
 
-- [ ] **Step 1:** Step 0 gains a **Single | Batch** choice after state. Single = unchanged. Batch = county multi-select + record-type multi-select + a live "will run N scrapes (X×Y)" line + cap/quota warning. Steps Fields/Schedule(deferred 2B)/Delivery shared.
-- [ ] **Step 2:** `createBatch()` in api.ts; types for batch request/response. On submit → POST /batches → redirect to the batch-run view.
-- [ ] **Step 3:** Batch-run view: status (running/done/partial), per-child summary, **Download combined CSV**, "contacts still filling" note. Optionally link to the equivalent Lists view.
-- [ ] **Step 4:** `npx tsc --noEmit && npx next build` clean. Commit (frontend branch, no deploy) + **Codex gate**.
+- [x] **Step 1:** Step 0 gains a **Single | Batch** choice after state. Single = unchanged. Batch = county multi-select + record-type multi-select + a live "will run N scrapes (X×Y)" line + cap/quota warning. Steps Fields/Schedule(deferred 2B)/Delivery shared.
+  - // DONE `8e884ac` (branch `feature/batch-scrape-ui` off **master**, per user — NOT off the unmerged Piece 1 Lists UI). Body renders by logical `screen` from a `screens` array (batch omits "schedule"), so skipping Schedule needs no per-section index math. Record types = **intersection** across chosen counties (every combo supported → no backend 422). Batch lock is Pro+ UX-only (backend 402 authoritative). Cap is advisory client-side.
+- [x] **Step 2:** `createBatch()` in api.ts; types for batch request/response. On submit → POST /batches → redirect to the batch-run view.
+  - // DONE `34aa465`: `createBatch`/`listBatches`/`getBatch`/`getBatchDownloadUrl` + `Batch*` types. Batch selections live in plain `useState` (single zod schema would reject them); `<form onSubmit>` branches by mode so the Enter key never runs the single schema in batch.
+- [x] **Step 3:** Batch-run view: status (running/done/partial), per-child summary, **Download combined CSV**, "contacts still filling" note. Optionally link to the equivalent Lists view.
+  - // DONE `34aa465`: `app/(dashboard)/batches/[id]/page.tsx` polls every 3s until terminal; download via presigned URL (`window.location.href`); partial-failure note.
+- [x] **Step 4:** `npx tsc --noEmit && npx next build` clean. Commit (frontend branch, no deploy) + **Codex gate**.
+  - // DONE: tsc + `next build` both clean (`/batches/[id]` + `/scrapers/new` compile). Codex-gated: P3 clamp `setStep`, P2 batch button `type=submit`, P2 mode-aware name field.
 
 ---
 

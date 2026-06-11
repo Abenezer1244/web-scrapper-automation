@@ -28,8 +28,9 @@ _logger = setup_logger("worker.batch")
 def _pending_child_ids(db, run: "BatchRun") -> list[str]:
     """Child job ids of `run` still in 'pending' — i.e. created but not yet picked
     up. Used to RECOVER the commit-before-delay crash window: re-enqueuing these is
-    safe because run_scrape_job advances pending->queued at the very start, so a
-    job already in flight is no longer 'pending' (matches acks_late redelivery)."""
+    safe because run_scrape_job claims a job with an ATOMIC compare-and-set
+    (UPDATE ... WHERE status='pending'), so a job already in flight is no longer
+    'pending' and a re-enqueued duplicate is a no-op (return on rowcount 0)."""
     if not run.child_job_ids:
         return []
     rows = db.execute(

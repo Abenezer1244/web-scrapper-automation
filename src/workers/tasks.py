@@ -389,6 +389,18 @@ def run_scrape_job(self, job_id: str) -> None:
         # so we return without scraping. Every dispatch path (API trigger,
         # scheduler, watchdog re-queue, batch fan-out) enqueues a 'pending' job,
         # so this never rejects a legitimate first delivery.
+        #
+        # TRADEOFF (Codex P2, accepted): tasks are acks_late=True, so a worker
+        # killed AFTER this commit but before the broker ack triggers a
+        # redelivery. The pending-only guard makes that redelivery a no-op (the
+        # row is no longer 'pending'). Recovery of such an abandoned in-flight job
+        # is therefore owned by watchdog_stuck_jobs (re-queues stuck queued/
+        # scraping rows at 10-20 min), NOT the immediate acks_late path. We accept
+        # the slower recovery to GUARANTEE no concurrent double-scrape — the old
+        # blind set gave fast redelivery recovery only by also double-running
+        # genuine duplicates. A per-job lease would buy back the fast path; out of
+        # scope here and unnecessary (the batch barrier waits for terminal
+        # children regardless of which recovery path fires).
         claimed = db.execute(
             update(Job)
             .where(Job.id == job_id, Job.status == "pending")

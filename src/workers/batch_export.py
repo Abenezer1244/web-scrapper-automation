@@ -174,7 +174,7 @@ def render_combined_csv(user_id: str, job_ids: list[str]) -> bytes:
         return buf.getvalue().encode("utf-8")
 
 
-def finalize_batch_run(db, run, forced: bool = False) -> None:
+def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = None) -> None:
     """Build + upload the combined CSV and deliver it. Called AFTER the run is
     claimed (lease held) and either all child jobs are terminal OR (forced=True)
     the run is past the hard deadline. Commits the run status before emailing so a
@@ -183,7 +183,14 @@ def finalize_batch_run(db, run, forced: bool = False) -> None:
     forced=True (Track A backstop): a run stuck 'running' past the deadline
     finalizes anyway — missing / still-non-terminal children count as failed and
     the combined CSV is built from whatever children DID produce results, so a
-    permanently-stuck child can't strand the run forever."""
+    permanently-stuck child can't strand the run forever.
+
+    claim_token (Track A): the lease owner token. If a finalize runs longer than
+    the lease TTL, another sweep can re-claim the run and run a concurrent
+    finalize. Guarding the terminal write on claim_token ensures only the CURRENT
+    lease owner commits the status + triggers delivery — a stale worker's write
+    no-ops (Codex P2). The R2 overwrite is idempotent (same key, deterministic
+    content), so a double upload is harmless."""
     # Per-child status -> failed_children summary.
     child_rows = db.execute(
         text(_FAILED_CHILDREN_SQL),
@@ -243,9 +250,15 @@ def finalize_batch_run(db, run, forced: bool = False) -> None:
         new_status = "failed"
     else:
         new_status = "partial"
+    # LEASE-OWNER guard (Codex P2): if this finalize outran its lease and another
+    # sweep re-claimed the run, claim_token has changed -> rowcount 0 -> we don't
+    # commit a terminal state or deliver. Only the current owner finalizes.
+    guard = [BatchRun.id == run.id, BatchRun.status == "running"]
+    if claim_token is not None:
+        guard.append(BatchRun.claim_token == claim_token)
     updated = db.execute(
         update(BatchRun)
-        .where(BatchRun.id == run.id, BatchRun.status == "running")
+        .where(*guard)
         .values(
             combined_export_key=object_key,
             failed_children=failed or None,
@@ -256,7 +269,8 @@ def finalize_batch_run(db, run, forced: bool = False) -> None:
     db.commit()
     if not updated:
         _logger.info(
-            "finalize_batch_run %s: no longer 'running' (cancelled?) — no delivery",
+            "finalize_batch_run %s: not finalized (cancelled, or lease re-claimed "
+            "by another worker) — no delivery",
             run.id,
         )
         return

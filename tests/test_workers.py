@@ -235,8 +235,9 @@ def test_atomic_claim_skips_cancelled_job():
 def test_watchdog_repicks_stranded_retry_pending_job():
     """A job a prior watchdog cycle reset to 'pending' whose re-enqueue failed
     (broker hiccup) is stranded: 'pending' is excluded from the normal scan. The
-    stranded-retry branch (retry_count>0, started_at NULL, old) re-picks it so a
-    broker outage during the watchdog can't strand a single scrape (Codex P2)."""
+    stranded-retry branch (retry_count>0, started_at NULL, old) re-DELIVERS it
+    WITHOUT bumping retry_count, so a broker outage during the watchdog can't
+    strand a single scrape and backlog can't burn its retries (Codex P2)."""
     from kombu.exceptions import OperationalError
 
     from src.workers.scheduler import watchdog_stuck_jobs
@@ -261,12 +262,14 @@ def test_watchdog_repicks_stranded_retry_pending_job():
     try:
         watchdog_stuck_jobs()
     except OperationalError:
-        pass  # post-commit enqueue may hit a rate-limited broker; the bump is committed
+        pass  # post-commit enqueue may hit a rate-limited broker; that's fine
 
     with SyncSessionLocal() as db:
         refreshed = db.get(Job, job_id)
-        assert refreshed.retry_count == 2          # re-picked + bumped
-        assert refreshed.status == "pending"       # reset for the retry
+        # Re-DELIVERED, not counted as a new attempt: retry_count must NOT bump
+        # (else backlog + old created_at would burn retries and fail it early).
+        assert refreshed.retry_count == 1
+        assert refreshed.status == "pending"
 
 
 def test_watchdog_ignores_fresh_pending_job():

@@ -273,6 +273,19 @@ def watchdog_stuck_jobs() -> None:
 
         requeued_ids: list[str] = []
         for job in stuck_jobs:
+            # A stranded retry (already 'pending' with retry_count>0, never started):
+            # a PRIOR cycle already counted this retry; its enqueue just didn't land.
+            # Re-deliver it WITHOUT bumping retry_count or failing on count — else,
+            # under broker/worker backlog where created_at stays old, every tick
+            # would burn a retry and fail the job before it ever ran (Codex P2). The
+            # atomic claim dedupes if a worker is actually about to pick it up.
+            if job.status == "pending" and job.retry_count > 0 and job.started_at is None:
+                requeued_ids.append(job.id)
+                _logger.warning(
+                    "Watchdog: re-enqueueing stranded retry job %s (attempt %d/3)",
+                    job.id, job.retry_count,
+                )
+                continue
             if job.retry_count < 3:
                 stuck_minutes = (
                     int((datetime.now(UTC) - job.started_at).total_seconds() / 60)
@@ -1194,7 +1207,7 @@ def batch_completion_sweep() -> None:
                 continue  # cancelled/deleted after claim — don't finalize
 
             try:
-                finalize_batch_run(db, run, forced=forced)
+                finalize_batch_run(db, run, forced=forced, claim_token=token)
             except Exception as exc:  # noqa: BLE001
                 # finalize commits status only at the END (after CSV+R2) and the
                 # email is best-effort, so a propagating error means nothing was

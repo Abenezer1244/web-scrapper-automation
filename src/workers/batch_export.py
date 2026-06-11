@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 from sqlalchemy import text, update
 
-from src.db.models import BatchRun, ScraperBatch
+from src.db.models import BatchRun, Job, ScraperBatch
 from src.utils.crypto import decrypt_field
 from src.utils.data_exporter import DataExporter
 from src.utils.lead_export import write_lead_csv_with_overlap
@@ -216,6 +216,21 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
             for jid in (run.child_job_ids or [])
             if jid not in present
         ]
+        # Terminalize still-active children (Codex P2): force-finalize only RECORDS
+        # them as timed out, but the underlying jobs row stays pending/scraping. A
+        # lost child .delay() would leave a permanent active job, and a delayed
+        # broker message could claim + scrape + bill it AFTER the batch is terminal.
+        # Cancel them in this same txn so run_scrape_job's boot check / atomic claim
+        # short-circuits any late delivery (idempotent: only non-terminal rows flip).
+        db.execute(
+            update(Job)
+            .where(
+                Job.id.in_(run.child_job_ids or []),
+                Job.user_id == run.user_id,
+                Job.status.not_in(("done", "failed", "cancelled")),
+            )
+            .values(status="cancelled", finished_at=datetime.now(UTC))
+        )
     else:
         failed = [
             {"job_id": row.job_id, "county": row.county, "record_type": row.record_type, "reason": row.status}

@@ -97,6 +97,10 @@ def test_finalize_forced_marks_nonterminal_children_failed():
         reasons = {f["reason"] for f in (run.failed_children or [])}
         assert "timed out" in reasons
         assert run.completed_at is not None
+        # The still-active child must be CANCELLED so a late broker delivery can't
+        # scrape/bill it after the batch is terminal (Codex P2).
+        assert db.get(Job, j_stuck.id).status == "cancelled"
+        assert db.get(Job, j_done.id).status == "done"  # untouched
 
 
 def test_force_finalize_uses_running_time_not_created_time():

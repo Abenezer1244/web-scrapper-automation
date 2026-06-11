@@ -223,7 +223,7 @@ def watchdog_stuck_jobs() -> None:
     Runs every 5 minutes. Re-queues the job for retry up to max_retries times.
     EagleWeb chunked scraping can take 15-20min scrape + 15min DB save = 35min.
     """
-    from sqlalchemy import or_, select
+    from sqlalchemy import and_, or_, select
 
     from src.db.models import Job
     from src.db.session import system_sync_session
@@ -242,15 +242,32 @@ def watchdog_stuck_jobs() -> None:
     with system_sync_session() as db:
         stuck_jobs = db.execute(
             select(Job).where(
-                Job.status.in_(STUCK_CHECK_STATUSES),
                 or_(
-                    Job.started_at < stuck_cutoff,
-                    # Zombie: never got a started_at, but was created
-                    # more than 10 minutes ago. A legitimate job goes
-                    # from pending → queued → probing within seconds.
-                    (Job.started_at.is_(None))
-                    & (Job.created_at < queued_cutoff),
-                ),
+                    and_(
+                        Job.status.in_(STUCK_CHECK_STATUSES),
+                        or_(
+                            Job.started_at < stuck_cutoff,
+                            # Zombie: never got a started_at, but was created
+                            # more than 10 minutes ago. A legitimate job goes
+                            # from pending → queued → probing within seconds.
+                            (Job.started_at.is_(None))
+                            & (Job.created_at < queued_cutoff),
+                        ),
+                    ),
+                    # Stranded retry (Codex P2): a job a PRIOR watchdog cycle reset
+                    # to 'pending' whose re-enqueue failed (commit-before-delay +
+                    # broker hiccup). Fresh pending jobs (retry_count 0) are still
+                    # excluded — they may legitimately wait for capacity — but a
+                    # watchdog RETRY (retry_count > 0) sitting 'pending' too long was
+                    # likely stranded; re-pick it. Safe to re-enqueue: run_scrape_job's
+                    # atomic pending->queued claim dedupes if one is actually in flight.
+                    and_(
+                        Job.status == "pending",
+                        Job.retry_count > 0,
+                        Job.started_at.is_(None),
+                        Job.created_at < stuck_cutoff,
+                    ),
+                )
             )
         ).scalars().all()
 
@@ -294,9 +311,18 @@ def watchdog_stuck_jobs() -> None:
     # atomic CAS, so a worker that consumes the retry before the 'pending' reset
     # is committed would read the stale active status, get rowcount 0, and bail —
     # stranding the job 'pending' with no message. Committing first guarantees the
-    # worker sees 'pending' and can claim it (Codex P2).
+    # worker sees 'pending' and can claim it (Codex P2). A per-job try/except keeps
+    # one broker failure from aborting the rest; anything that fails here stays
+    # committed 'pending' with retry_count>0 and is re-picked by the next cycle's
+    # stranded-retry branch above.
     for jid in requeued_ids:
-        run_scrape_job.delay(jid)
+        try:
+            run_scrape_job.delay(jid)
+        except Exception as exc:  # noqa: BLE001 — committed 'pending'; re-picked next cycle
+            _logger.warning(
+                "watchdog: re-enqueue of %s failed (will re-pick next cycle): %s",
+                jid, str(exc)[:200],
+            )
 
 
 # ─── Task 3: Canary health checks ────────────────────────────────────────────

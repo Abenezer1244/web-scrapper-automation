@@ -177,7 +177,19 @@ async def create_batch(
     # Lazy import (matches the codebase) — keep the Celery app out of the API
     # import graph.
     from src.workers.batch_tasks import dispatch_batch_run
-    dispatch_batch_run.delay(batch.id)
+
+    # The durable 'pending' run is now committed, so the enqueue is best-effort: if
+    # the broker is unavailable, batch_recovery_sweep re-dispatches the pending run
+    # within minutes. Do NOT 500 on a publish failure (Codex P2) — a 500 would push
+    # the client to retry and create a SECOND batch (duplicate scrapes + billing)
+    # even though this one is already durably queued.
+    try:
+        dispatch_batch_run.delay(batch.id)
+    except Exception as exc:  # noqa: BLE001 — any broker failure is recoverable here
+        _logger.warning(
+            "batch %s: dispatch enqueue failed (recovery sweep will pick it up): %s",
+            batch.id, str(exc)[:200],
+        )
     _logger.info("batch %s created for user %s: %d scrapes", batch.id, current_user.id, combos)
     return BatchCreateResponse(batch_id=batch.id, child_count=combos, status="pending")
 

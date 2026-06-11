@@ -232,6 +232,73 @@ def test_atomic_claim_skips_cancelled_job():
         assert db.get(Job, job_id).status == "cancelled"  # untouched
 
 
+def test_watchdog_repicks_stranded_retry_pending_job():
+    """A job a prior watchdog cycle reset to 'pending' whose re-enqueue failed
+    (broker hiccup) is stranded: 'pending' is excluded from the normal scan. The
+    stranded-retry branch (retry_count>0, started_at NULL, old) re-picks it so a
+    broker outage during the watchdog can't strand a single scrape (Codex P2)."""
+    from kombu.exceptions import OperationalError
+
+    from src.workers.scheduler import watchdog_stuck_jobs
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="pending",
+            trigger="scheduled",
+            retry_count=1,           # a watchdog-reset retry, not a fresh job
+            started_at=None,
+            created_at=datetime.now(UTC) - timedelta(minutes=25),  # > stuck_cutoff
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    try:
+        watchdog_stuck_jobs()
+    except OperationalError:
+        pass  # post-commit enqueue may hit a rate-limited broker; the bump is committed
+
+    with SyncSessionLocal() as db:
+        refreshed = db.get(Job, job_id)
+        assert refreshed.retry_count == 2          # re-picked + bumped
+        assert refreshed.status == "pending"       # reset for the retry
+
+
+def test_watchdog_ignores_fresh_pending_job():
+    """A FRESH pending job (retry_count 0) waiting for capacity must NOT be
+    re-picked — only watchdog retries (retry_count>0) are eligible."""
+    from src.workers.scheduler import watchdog_stuck_jobs
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="pending",
+            trigger="scheduled",
+            retry_count=0,
+            started_at=None,
+            created_at=datetime.now(UTC) - timedelta(minutes=40),
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    watchdog_stuck_jobs()  # no re-queue => no broker enqueue
+
+    with SyncSessionLocal() as db:
+        refreshed = db.get(Job, job_id)
+        assert refreshed.retry_count == 0          # untouched
+        assert refreshed.status == "pending"
+
+
 # ─── Monthly reset ────────────────────────────────────────────────────────────
 
 def test_monthly_reset_clears_records_used():

@@ -1244,7 +1244,7 @@ def batch_recovery_sweep() -> None:
     idempotent (FOR UPDATE + UNIQUE(batch_id)); run_scrape_job's atomic claim makes
     a re-enqueue of an in-flight child a no-op.
     """
-    from sqlalchemy import select
+    from sqlalchemy import select, update
 
     from src.db.models import BatchRun, Job
     from src.db.session import system_sync_session
@@ -1265,6 +1265,7 @@ def batch_recovery_sweep() -> None:
             .where(BatchRun.status == "pending", BatchRun.created_at < pending_cutoff)
             .limit(_BATCH)
         ).scalars().all()
+        give_up_ids: list[str] = []
         for run in pending_runs:
             # FAILURE is purely TIME-based (Codex P2): a run that never materialized
             # within BATCH_FORCE_MINUTES is given up. dispatch_attempts must NOT be a
@@ -1274,12 +1275,7 @@ def batch_recovery_sweep() -> None:
             # re-dispatching (dispatch_batch_run is idempotent) every sweep until the
             # time cutoff; dispatch_attempts is an OBSERVABILITY counter only.
             if run.created_at is not None and run.created_at < force_cutoff:
-                run.status = "failed"
-                run.failed_children = [{"reason": "dispatch never materialized"}]
-                _logger.error(
-                    "batch_recovery_sweep: giving up on pending run %s (age > %dm, attempts=%s)",
-                    run.id, BATCH_FORCE_MINUTES, run.dispatch_attempts,
-                )
+                give_up_ids.append(run.id)
             else:
                 run.dispatch_attempts = (run.dispatch_attempts or 0) + 1
                 redispatch_batch_ids.append(run.batch_id)
@@ -1313,6 +1309,26 @@ def batch_recovery_sweep() -> None:
             if pending_children:
                 run.dispatch_attempts = (run.dispatch_attempts or 0) + 1
                 reenqueue_job_ids.extend(str(x) for x in pending_children)
+
+        # STATUS-GUARDED terminalization (Codex P1): only fail runs STILL 'pending'.
+        # A delayed dispatch_batch_run can materialize one to 'running' (with active
+        # child jobs) concurrently with this give-up; an ORM update-by-PK would
+        # clobber that 'running' and orphan the children. WHERE status='pending'
+        # makes the loser a no-op.
+        for rid in give_up_ids:
+            failed = db.execute(
+                update(BatchRun)
+                .where(BatchRun.id == rid, BatchRun.status == "pending")
+                .values(
+                    status="failed",
+                    failed_children=[{"reason": "dispatch never materialized"}],
+                )
+            ).rowcount
+            if failed:
+                _logger.error(
+                    "batch_recovery_sweep: gave up on pending run %s (age > %dm)",
+                    rid, BATCH_FORCE_MINUTES,
+                )
         db.commit()
 
     # Enqueue AFTER commit so a worker can't pick up an uncommitted row. Per-item

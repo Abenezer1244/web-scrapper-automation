@@ -1111,7 +1111,6 @@ def dialer_push_sweep() -> None:
 BATCH_LEASE_MINUTES = 30              # finalize claim lease TTL (> worst-case CSV+R2 build)
 BATCH_FORCE_MINUTES = 90             # force-finalize a run stuck 'running' past this age
 BATCH_PENDING_REDISPATCH_MINUTES = 3  # re-dispatch a 'pending' run not materialized in time
-BATCH_DISPATCH_MAX = 5               # bound re-dispatch / child re-enqueue attempts
 
 
 @app.task(name="src.workers.scheduler.batch_completion_sweep")
@@ -1235,11 +1234,11 @@ def batch_recovery_sweep() -> None:
     """Pre-finalize crash recovery for the batch dispatch windows (Track A):
 
       Gap 1  — a 'pending' run whose dispatch .delay() was lost: the batch sits
-               with no jobs. Re-dispatch it. If it can't be dispatched within
-               BATCH_FORCE_MINUTES (or after BATCH_DISPATCH_MAX tries), give up and
-               mark it 'failed' so it can't sit 'pending' forever.
+               with no jobs. Re-dispatch it (idempotent) every sweep. If it still
+               hasn't materialized after BATCH_FORCE_MINUTES, give up and mark it
+               'failed' so it can't sit 'pending' forever.
       Gap 3a — a 'running' run with children still 'pending' (a lost child .delay):
-               re-enqueue them, bounded by dispatch_attempts.
+               re-enqueue them every sweep (the atomic claim dedupes in-flight).
 
     All enqueues happen AFTER commit (commit-before-delay). dispatch_batch_run is
     idempotent (FOR UPDATE + UNIQUE(batch_id)); run_scrape_job's atomic claim makes
@@ -1267,32 +1266,31 @@ def batch_recovery_sweep() -> None:
             .limit(_BATCH)
         ).scalars().all()
         for run in pending_runs:
-            gave_up = (run.dispatch_attempts or 0) >= BATCH_DISPATCH_MAX or (
-                run.created_at is not None and run.created_at < force_cutoff
-            )
-            if gave_up:
+            # FAILURE is purely TIME-based (Codex P2): a run that never materialized
+            # within BATCH_FORCE_MINUTES is given up. dispatch_attempts must NOT be a
+            # failure cutoff — transient worker backlog / a broker hiccup would then
+            # turn a perfectly valid run terminal, and capping re-dispatch would also
+            # strand a run if the broker recovered after the cap. So we keep
+            # re-dispatching (dispatch_batch_run is idempotent) every sweep until the
+            # time cutoff; dispatch_attempts is an OBSERVABILITY counter only.
+            if run.created_at is not None and run.created_at < force_cutoff:
                 run.status = "failed"
                 run.failed_children = [{"reason": "dispatch never materialized"}]
                 _logger.error(
-                    "batch_recovery_sweep: giving up on pending run %s (attempts=%s)",
-                    run.id, run.dispatch_attempts,
+                    "batch_recovery_sweep: giving up on pending run %s (age > %dm, attempts=%s)",
+                    run.id, BATCH_FORCE_MINUTES, run.dispatch_attempts,
                 )
             else:
-                # Bump the attempt count HERE, before enqueueing (Codex P2): the
-                # bound must hold even if a worker is paused/saturated and
-                # dispatch_batch_run never runs to bump it itself — otherwise this
-                # sweep would re-enqueue every cycle and flood the queue.
                 run.dispatch_attempts = (run.dispatch_attempts or 0) + 1
                 redispatch_batch_ids.append(run.batch_id)
 
-        # Gap 3a: 'running' runs with still-'pending' children, bounded by attempts.
+        # Gap 3a: 'running' runs with still-'pending' children (a lost child .delay).
+        # Re-enqueue every sweep (the atomic claim dedupes if one is actually in
+        # flight); the completion sweep's 90min force-finalize is the terminal
+        # backstop for a child that can never be picked up. No attempt cap (it would
+        # strand a child on broker recovery — same reason as the pending branch).
         running_runs = db.execute(
-            select(BatchRun)
-            .where(
-                BatchRun.status == "running",
-                BatchRun.dispatch_attempts < BATCH_DISPATCH_MAX,
-            )
-            .limit(_BATCH)
+            select(BatchRun).where(BatchRun.status == "running").limit(_BATCH)
         ).scalars().all()
         for run in running_runs:
             ids = [str(x) for x in (run.child_job_ids or [])]
@@ -1310,11 +1308,19 @@ def batch_recovery_sweep() -> None:
                 reenqueue_job_ids.extend(str(x) for x in pending_children)
         db.commit()
 
-    # Enqueue AFTER commit so a worker can't pick up an uncommitted row.
+    # Enqueue AFTER commit so a worker can't pick up an uncommitted row. Per-item
+    # try/except: a broker failure on one shouldn't abort the rest, and anything
+    # that fails stays committed and is retried by the next sweep.
     for bid in redispatch_batch_ids:
-        dispatch_batch_run.delay(bid)
+        try:
+            dispatch_batch_run.delay(bid)
+        except Exception as exc:  # noqa: BLE001 — recovered next sweep
+            _logger.warning("batch_recovery_sweep: re-dispatch of %s failed: %s", bid, str(exc)[:200])
     for jid in reenqueue_job_ids:
-        run_scrape_job.delay(jid)
+        try:
+            run_scrape_job.delay(jid)
+        except Exception as exc:  # noqa: BLE001 — recovered next sweep
+            _logger.warning("batch_recovery_sweep: re-enqueue of %s failed: %s", jid, str(exc)[:200])
     if redispatch_batch_ids or reenqueue_job_ids:
         _logger.info(
             "batch_recovery_sweep: re-dispatched %d run(s), re-enqueued %d child job(s)",

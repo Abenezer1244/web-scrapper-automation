@@ -170,6 +170,11 @@ def test_completion_sweep_reclaims_expired_lease():
     from src.workers.scheduler import BATCH_LEASE_MINUTES, batch_completion_sweep
 
     with SyncSessionLocal() as db:
+        # The sweep processes LIMIT 20 'running' runs with no ordering; neutralize
+        # any leftover 'running' runs from earlier tests so this run is reached
+        # deterministically (test-DB hygiene; not a concurrency concern here).
+        db.execute(update(BatchRun).where(BatchRun.status == "running").values(status="cancelled"))
+        db.commit()
         user = _user(db)
         batch = _batch(db, user.id)
         cfg = _config(db, user.id, batch.id)

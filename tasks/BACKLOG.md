@@ -35,7 +35,7 @@ Two branches off `main`, unmerged. Stage 1 = contact PII + additive email_hmac. 
 - [ ] 🟠 **M7** — durable DB audit trail (login attempts, scraper-config changes) — `audit_log()` is file-only
 - [ ] 🟠 **M4** — documented edge DDoS rate-limit rules (Cloudflare WAF) + distributed-limiter resilience
 - [ ] 🟠 **M5** — document + restrict DB/Redis IP allowlisting (infra posture)
-- [ ] 🔴 **H1** — RLS enforcement (`RLS_ENFORCE=True`) — **DO LAST**, prod-boot landmine. Needs `users` self-row policy + app grants on `mfa_backup_codes` + `mfa_break_glass_codes` (tracked in `provision_rls_roles.sql`)
+- [ ] 🔴 **H1** — RLS enforcement (`RLS_ENFORCE=True`) — **DO LAST**, prod-boot landmine. Needs `users` self-row policy + app grants on `mfa_backup_codes` + `mfa_break_glass_codes` (tracked in `provision_rls_roles.sql`). **+ Track A follow-up:** the API now INSERTs `batch_runs` (durable run intent) from the rls session, so the H1 cutover must add `batch_runs` INSERT grant for the app role (OK today: BYPASSRLS prod role).
 
 ## 3. Open security/privacy DECISIONS (need a call before coding)
 
@@ -57,3 +57,4 @@ Two branches off `main`, unmerged. Stage 1 = contact PII + additive email_hmac. 
 
 - [ ] 🔵 `src/scrapers/templates/king_wa_probate.py:~698` — F821 `submit_btn` dead ref (captcha-retry, masked by try/except)
 - [ ] 🔵 Legacy `scripts/` lint debt (E402/F401) — not CI-gated (CI lints only `src/`+`tests/`), but present
+- [ ] 🟠🧭 **Free-tier records-limit copy vs backend mismatch** — `/register` page advertises "Free starter plan with 50 records/month", but a freshly registered account's dashboard shows **500 records/month** (0/1,000 usage ring also shows 1,000 cap). Confirmed live 2026-06-11 via real prod signup (test acct `bridgetest+1781150180@gmail.com`). Decide the true free-tier cap, then reconcile: register copy + `/auth/register` `records_limit` + `PLAN_LIMITS` + dashboard usage-ring cap. Related to the existing `PLAN_LIMITS["pro"]=1000` vs register pro `records_limit=500` inconsistency (§2 CI follow-up) — likely the same limits-config drift.

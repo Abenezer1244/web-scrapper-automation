@@ -344,7 +344,22 @@ class BatchRun(Base):
     failed_children = Column(JSON, nullable=True)  # [{job_id, county, record_type, reason}]
     # At-most-once barrier claim (Codex P2): the completion sweep stamps this
     # before building/delivering the combined CSV so two workers can't double-fire.
+    # Track A: claimed_at is now a LEASE (reclaimable after a TTL so a worker
+    # hard-killed mid-finalize can't strand the run 'running' forever); claim_token
+    # is the lease owner id so a finalize can verify it still holds the lease.
     claimed_at = Column(DateTime(timezone=True), nullable=True)
+    claim_token = Column(String(36), nullable=True)
+    # When the run went pending->running. The force-finalize backstop measures
+    # stuck-time from HERE, not created_at, so a run that sat 'pending' a long
+    # time (backed-up broker) isn't force-failed right after its children start.
+    running_at = Column(DateTime(timezone=True), nullable=True)
+    # Bounds re-dispatch / pending-child re-enqueue (Track A recovery sweep) so a
+    # poisoned job or a down broker can't storm the queue forever.
+    dispatch_attempts = Column(Integer, nullable=False, default=0)
+    # At-most-once guard for the combined-CSV delivery email: the status-guarded
+    # final write protects DB state, not the post-commit best-effort email. A CAS
+    # on this column makes "only the winner delivers" durable across a re-finalize.
+    delivery_started_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at = Column(DateTime(timezone=True), nullable=True)
 

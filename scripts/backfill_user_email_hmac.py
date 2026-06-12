@@ -22,6 +22,7 @@ Usage:  railway run --service worker python scripts/backfill_user_email_hmac.py 
 """
 import argparse
 import logging
+import sys
 
 from sqlalchemy import text
 
@@ -87,7 +88,7 @@ def run(batch: int) -> None:
         ).scalar()
         # The old users.email UNIQUE constraint was CASE-SENSITIVE, so two rows
         # like A@x.com and a@x.com could both exist. Their normalized blind index
-        # collides, and migration 048's UNIQUE(email_hmac) would FAIL to boot.
+        # collides, and migration 053's UNIQUE(email_hmac) would FAIL to boot.
         # Catch it here, before P5, so it can be resolved manually.
         dups = db.execute(
             text(
@@ -102,14 +103,19 @@ def run(batch: int) -> None:
     if dups:
         _log.error(
             "%d duplicate email_hmac value(s) — case-variant duplicate emails exist. "
-            "Migration 048 UNIQUE(email_hmac) WILL FAIL to boot. Resolve these users "
+            "Migration 053 UNIQUE(email_hmac) WILL FAIL to boot. Resolve these users "
             "BEFORE deploying P5. Colliding hashes: %s",
             len(dups), [d.email_hmac for d in dups],
         )
     if remaining == 0 and not dups:
         _log.info("OK to deploy P5 (0 NULL, 0 collisions).")
     else:
+        # Exit nonzero (Codex P2) so a runbook/CI gate keyed on this command's exit
+        # status actually blocks the P5 deploy — otherwise the cutover migration
+        # would only fail later at boot. NULL email_hmac or colliding hashes are
+        # both unsafe.
         _log.info("NOT ready for P5 — fix the above first.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ import pytest_asyncio
 import redis as sync_redis
 from httpx import ASGITransport, AsyncClient
 from main import app
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -96,7 +96,12 @@ async def db() -> AsyncSession:
         await session.execute(delete(PropertyListMembership))
         await session.execute(delete(Job))
         await session.execute(delete(ScraperConfig))
-        await session.execute(delete(User).where(User.email.like("%@test.bridgeleads.io")))
+        # H3: email is encrypted at rest, so a SQL LIKE on the domain no longer
+        # matches. Decrypt per row (EncryptedString) and delete the test-domain
+        # users by id. The test DB is small, so a full scan is fine.
+        for u in (await session.execute(select(User))).scalars().all():
+            if u.email and u.email.endswith("@test.bridgeleads.io"):
+                await session.delete(u)
         await session.commit()
 
 

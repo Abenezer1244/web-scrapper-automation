@@ -27,6 +27,7 @@ from sqlalchemy import delete, select, text, update
 
 from src.db.models import MfaBackupCode, MfaBreakGlassCode, User
 from src.db.session import SyncSessionLocal
+from src.utils.crypto import blind_index
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
@@ -37,8 +38,9 @@ def run(email: str, reason: str) -> int:
     now = datetime.now(UTC)
     # Resolve the user (no lock) just to confirm existence + get the id.
     with SyncSessionLocal() as db:
+        # H3: email is encrypted at rest — match on the blind index, not the value.
         user_id = db.execute(
-            select(User.id).where(User.email == email)
+            select(User.id).where(User.email_hmac == blind_index(email))
         ).scalar_one_or_none()
     if user_id is None:
         _log.error("No user with email %s — nothing reset.", email)

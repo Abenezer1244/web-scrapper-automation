@@ -23,6 +23,7 @@ from sqlalchemy import text
 
 from src.api.auth import hash_password
 from src.db.session import sync_engine
+from src.utils.crypto import blind_index
 
 # Needs provisioned RLS cutover roles + RLS_ENFORCE — excluded from the unit CI job.
 pytestmark = pytest.mark.integration
@@ -83,15 +84,16 @@ def test_rls_blocks_cross_tenant_read_on_results(rls_test_role: str) -> None:
         conn.execute(
             text("""
                 INSERT INTO users (
-                    id, email, password_hash, plan, records_used,
+                    id, email, email_hmac, password_hash, plan, records_used,
                     records_limit, is_active, is_admin, referral_credit_cents
                 ) VALUES
-                (:a, :ae, :pw, 'starter', 0, 50, true, false, 0),
-                (:b, :be, :pw, 'starter', 0, 50, true, false, 0)
+                (:a, :ae, :ah, :pw, 'starter', 0, 50, true, false, 0),
+                (:b, :be, :bh, :pw, 'starter', 0, 50, true, false, 0)
             """),
             {
-                "a": user_a_id, "ae": user_a_email,
-                "b": user_b_id, "be": user_b_email, "pw": pw,
+                "a": user_a_id, "ae": user_a_email, "ah": blind_index(user_a_email),
+                "b": user_b_id, "be": user_b_email, "bh": blind_index(user_b_email),
+                "pw": pw,
             },
         )
         # Seed a scraper_config owned by each user so we can then
@@ -211,15 +213,16 @@ def test_rls_blocks_cross_tenant_read_on_delivered_records(
         conn.execute(
             text("""
                 INSERT INTO users (
-                    id, email, password_hash, plan, records_used,
+                    id, email, email_hmac, password_hash, plan, records_used,
                     records_limit, is_active, is_admin, referral_credit_cents
                 ) VALUES
-                (:a, :ae, :pw, 'starter', 0, 50, true, false, 0),
-                (:b, :be, :pw, 'starter', 0, 50, true, false, 0)
+                (:a, :ae, :ah, :pw, 'starter', 0, 50, true, false, 0),
+                (:b, :be, :bh, :pw, 'starter', 0, 50, true, false, 0)
             """),
             {
-                "a": user_a_id, "ae": user_a_email,
-                "b": user_b_id, "be": user_b_email, "pw": pw,
+                "a": user_a_id, "ae": user_a_email, "ah": blind_index(user_a_email),
+                "b": user_b_id, "be": user_b_email, "bh": blind_index(user_b_email),
+                "pw": pw,
             },
         )
         dr_a_id = str(uuid.uuid4())

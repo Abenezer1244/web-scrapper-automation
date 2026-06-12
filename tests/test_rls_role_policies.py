@@ -21,6 +21,7 @@ from sqlalchemy import text
 
 from src.api.auth import hash_password
 from src.db.session import sync_engine
+from src.utils.crypto import blind_index
 
 # Needs provisioned RLS cutover roles + RLS_ENFORCE — excluded from the unit CI job.
 pytestmark = pytest.mark.integration
@@ -57,16 +58,17 @@ def _seed_two_tenants(conn) -> tuple[str, str, str, str]:
     """Seed users A/B each with a config+job+result. Returns the result ids."""
     a, b = str(uuid.uuid4()), str(uuid.uuid4())
     pw = hash_password("testpassword123")
+    ae, be = f"rt_a_{a[:8]}@bl.test", f"rt_b_{b[:8]}@bl.test"
     conn.execute(
         text("""
-            INSERT INTO users (id, email, password_hash, plan, records_used,
+            INSERT INTO users (id, email, email_hmac, password_hash, plan, records_used,
                 records_limit, is_active, is_admin, referral_credit_cents)
             VALUES
-            (:a, :ae, :pw, 'starter', 0, 50, true, false, 0),
-            (:b, :be, :pw, 'starter', 0, 50, true, false, 0)
+            (:a, :ae, :ah, :pw, 'starter', 0, 50, true, false, 0),
+            (:b, :be, :bh, :pw, 'starter', 0, 50, true, false, 0)
         """),
-        {"a": a, "ae": f"rt_a_{a[:8]}@bl.test", "b": b,
-         "be": f"rt_b_{b[:8]}@bl.test", "pw": pw},
+        {"a": a, "ae": ae, "ah": blind_index(ae), "b": b,
+         "be": be, "bh": blind_index(be), "pw": pw},
     )
     ra, rb = None, None
     for uid, holder in ((a, "ra"), (b, "rb")):

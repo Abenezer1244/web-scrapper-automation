@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import text
 
 from src.db.session import SyncSessionLocal
+from src.utils.crypto import blind_index
 from src.workers.tasks import _upsert_property_membership
 
 
@@ -22,11 +23,12 @@ class _Row:
 @pytest.fixture
 def membership_user():
     uid = str(uuid.uuid4())
+    email = f"test_{uid[:8]}@test.bridgeleads.io"
     with SyncSessionLocal() as db:
         db.execute(text(
-            "INSERT INTO users (id, email, password_hash, plan, records_used, records_limit) "
-            "VALUES (:id, :email, 'x', 'business', 0, 5000)"
-        ), {"id": uid, "email": f"test_{uid[:8]}@test.bridgeleads.io"})
+            "INSERT INTO users (id, email, email_hmac, password_hash, plan, records_used, records_limit) "
+            "VALUES (:id, :email, :email_hmac, 'x', 'business', 0, 5000)"
+        ), {"id": uid, "email": email, "email_hmac": blind_index(email)})
         db.commit()
     yield uid
     with SyncSessionLocal() as db:

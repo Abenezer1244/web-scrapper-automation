@@ -78,14 +78,17 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
-    email = Column(String(255), unique=True, nullable=False, index=True)
+    # H3 (P5): encrypted at rest. Fernet is non-deterministic, so this column can
+    # no longer carry an index or the unique constraint — equality lookups and
+    # uniqueness move to email_hmac below. Display reads (user.email) decrypt
+    # transparently via EncryptedString.
+    email = Column(EncryptedString, nullable=False)
     # H3 blind index: deterministic HMAC of the normalized email (crypto.blind_index,
-    # keyed by the dedicated stable BLIND_INDEX_KEY). The searchable lookup key once
-    # `email` is encrypted — equality lookups + the uniqueness constraint move here
-    # (Fernet is non-deterministic, so the email column can't carry either). Added
-    # nullable in P4 and dual-written via @validates below; promoted to NOT NULL +
-    # UNIQUE in P5 after the backfill populates every row.
-    email_hmac = Column(String(64), nullable=True, index=True)
+    # keyed by the dedicated stable BLIND_INDEX_KEY). The searchable lookup key now
+    # that `email` is encrypted — equality lookups + uniqueness live here. NOT NULL
+    # + UNIQUE (migration 053) after the P4 reconcile backfill populated every row.
+    # Dual-written via @validates below so it can never drift from email.
+    email_hmac = Column(String(64), nullable=False, unique=True)
     password_hash = Column(String(255), nullable=False)
     api_key_hash = Column(String(64), nullable=True, index=True)
     plan = Column(String(32), nullable=False, default="starter")

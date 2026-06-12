@@ -230,6 +230,14 @@ jobs:
           DATABASE_URL_SYNC: ${{ secrets.DATABASE_URL_SYNC }}
           REDIS_URL: ${{ secrets.REDIS_URL || 'redis://localhost:6379/0' }}
           SECRET_KEY: ${{ secrets.SECRET_KEY || 'migration-ci-placeholder-not-used-in-production!!' }}
+          # H3 (migration 053): the User.email cutover reconciles email_hmac =
+          # blind_index(email) IN-MIGRATION, so the migration runner MUST have the
+          # SAME BLIND_INDEX_KEY the app uses for login lookups — otherwise it hashes
+          # under the SECRET_KEY fallback and locks every user out (Codex P1). It also
+          # fails closed if the key is absent in production. FIELD_ENCRYPTION_KEY is
+          # provided too so decrypt_field uses the same Fernet key as the app.
+          BLIND_INDEX_KEY: ${{ secrets.BLIND_INDEX_KEY }}
+          FIELD_ENCRYPTION_KEY: ${{ secrets.FIELD_ENCRYPTION_KEY }}
         run: |
           pip install -r requirements.txt
           alembic upgrade head

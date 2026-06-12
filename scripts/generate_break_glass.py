@@ -28,6 +28,7 @@ from sqlalchemy import select, text, update
 
 from src.db.models import MfaBreakGlassCode, User
 from src.db.session import SyncSessionLocal
+from src.utils.crypto import blind_index
 from src.utils.mfa import generate_break_glass_codes
 
 
@@ -50,8 +51,9 @@ def run(email: str, count: int, reason: str, expires_days: int | None, keep_exis
     batch_id = str(uuid.uuid4())
 
     with SyncSessionLocal() as db:
+        # H3: email is encrypted at rest — match on the blind index, not the value.
         user = db.execute(
-            select(User).where(User.email == email).with_for_update()
+            select(User).where(User.email_hmac == blind_index(email)).with_for_update()
         ).scalar_one_or_none()
         if user is None:
             print(f"ERROR: no user with email {email} — nothing generated.", file=sys.stderr)

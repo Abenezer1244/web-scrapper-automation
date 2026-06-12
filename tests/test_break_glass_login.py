@@ -18,6 +18,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 
 from src.db.models import MfaBackupCode, MfaBreakGlassCode, User
+from src.utils.crypto import blind_index
 from src.utils.mfa import _TOTP_INTERVAL, generate_break_glass_codes, hash_backup_code
 
 _PW = "SecurePass1!"
@@ -74,7 +75,10 @@ async def _seed_break_glass(db, user_id: str, n: int = 3, **overrides) -> list[s
 
 
 async def _user_id(db, email: str) -> str:
-    return (await db.execute(select(User).where(User.email == email))).scalar_one().id
+    # H3: email is encrypted at rest — match on the blind index, not the value.
+    return (
+        await db.execute(select(User).where(User.email_hmac == blind_index(email)))
+    ).scalar_one().id
 
 
 async def _full_mfa_login(client: AsyncClient, redis_client, email: str, secret: str) -> str:

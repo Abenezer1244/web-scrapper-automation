@@ -243,3 +243,51 @@ revised.** Reconciliation (doctrine: docs silent → Codex wins; any Crit/High =
 Sound points Codex affirmed: ciphertext→ciphertext copy in reuse is fine for phone/email/phones/emails;
 `EncryptedJSON` over `Text` round-trips with `USING col::text` + `None`→`NULL`; contactability ranking
 survives encryption given blank→`NULL`.
+
+P4 gate (R1→R2): R1 [P1] the email_hmac backfill only filled NULLs, so rows whose hash was written under
+the SECRET_KEY fallback (before BLIND_INDEX_KEY was provisioned) would never be corrected and break login
+after the P5 read switch → FIXED: the backfill now reconciles EVERY row to `blind_index(email)` under the
+current key. R2 CLEAN.
+
+---
+
+## 11. Production deploy runbook (ordered — DO NOT reorder)
+
+Migrations apply on API boot (advisory-locked). **TWO deploys are required** because Railway does rolling
+deploys (old + new replicas overlap). Migration 048 makes `email_hmac` NOT NULL; that is only safe once
+the *currently-serving* code already dual-writes `email_hmac` (the `@validates` choke point from P4).
+If 047 (add column) and 048 (NOT NULL) shipped together, an old pre-H3 replica serving `/auth/register`
+during the overlap would insert a row without `email_hmac` and hit the NOT NULL → 500s until it drains
+(Codex P5-R3 P2). A DB-side fill can't help — the HMAC key is app-side, never in the DB.
+
+So the branch is merged/deployed in **two stages**: **Stage 1 = P1–P4** (migrations 046+047), **Stage 2 =
+P5** (migration 048). Split the merge accordingly (e.g. two PRs, or cap the first deploy at `047`).
+
+**Pre-req (once, BEFORE Stage 1):** provision dedicated `FIELD_ENCRYPTION_KEY` + `BLIND_INDEX_KEY` in
+Railway, and add `BLIND_INDEX_KEY` + `PII_ENCRYPTION_STRICT` to `.env.example`. `BLIND_INDEX_KEY` MUST be
+set before Stage 1 so every `email_hmac` (dual-write + backfills + 048) uses the same final key. (048
+also fails closed if users exist and the key is unset.)
+
+**Stage 1 — P1–P4 (migrations 046, 047):**
+1. Deploy P1–P4. 046 widens contact-PII columns; 047 adds `email_hmac` **nullable**. App now dual-writes
+   `email_hmac` (`@validates`) and reads users by plaintext email still. Let it FULLY roll out.
+2. **Encrypt contact PII:** `railway run --service worker python scripts/backfill_pii_encryption.py` →
+   results + skip_trace_cache. Re-run until `changed 0`.
+3. **Reconcile email_hmac:** `railway run --service worker python scripts/backfill_user_email_hmac.py`
+   under the FINAL `BLIND_INDEX_KEY`. Re-run until `OK to deploy P5 (0 NULL, 0 collisions)`. It also flags
+   **duplicate email_hmac** (old case-sensitive `email` UNIQUE allowed `A@x.com`+`a@x.com`, which collide
+   on the normalized index and would fail 048's UNIQUE) — resolve those users before Stage 2.
+
+**Stage 2 — P5 (migration 048):**
+4. Deploy P5 (only after Stage 1 fully drained, so the serving code dual-writes `email_hmac`). 048
+   reconciles any stragglers in-migration, then `email`→TEXT (drop unique/index) + `email_hmac` NOT NULL
+   + UNIQUE. Login now resolves via `email_hmac`.
+5. **Encrypt user email:** `railway run --service worker python scripts/backfill_user_email_encrypt.py`.
+   Re-run until `encrypted 0`. (Safe — reads already go via `email_hmac`.)
+6. **Verify:** `railway run --service worker python scripts/verify_pii_encryption.py` → must print
+   `ALL CLEAR` (decrypt-validates every value under the current key, not just the prefix).
+7. **Flip strict:** set `PII_ENCRYPTION_STRICT=true` in Railway and redeploy. Decrypt now raises on any
+   non-ciphertext in-scope value (catches a regression silently writing plaintext).
+
+Rollback: each migration has a downgrade, but downgrades past an encryption backfill are **lossy**
+(ciphertext won't fit the old widths / cast to JSON) — prefer forward fixes once a backfill has run.

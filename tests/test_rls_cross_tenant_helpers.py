@@ -19,6 +19,7 @@ from sqlalchemy import text
 
 from src.api.auth import hash_password
 from src.db.session import sync_engine
+from src.utils.crypto import blind_index
 
 # Needs provisioned RLS cutover roles + RLS_ENFORCE — excluded from the unit CI job.
 pytestmark = pytest.mark.integration
@@ -27,18 +28,20 @@ pytestmark = pytest.mark.integration
 def _seed_user(conn, *, referred_by: str | None = None) -> str:
     """Insert a minimal active user and return its id."""
     uid = str(uuid.uuid4())
+    email = f"helper_{uid[:8]}@bl.test"
     conn.execute(
         text("""
             INSERT INTO users (
-                id, email, password_hash, plan, records_used, records_limit,
+                id, email, email_hmac, password_hash, plan, records_used, records_limit,
                 is_active, is_admin, referral_credit_cents, referred_by_user_id
             ) VALUES (
-                :id, :email, :pw, 'starter', 0, 50, true, false, 0, :ref
+                :id, :email, :email_hmac, :pw, 'starter', 0, 50, true, false, 0, :ref
             )
         """),
         {
             "id": uid,
-            "email": f"helper_{uid[:8]}@bl.test",
+            "email": email,
+            "email_hmac": blind_index(email),
             "pw": hash_password("testpassword123"),
             "ref": referred_by,
         },

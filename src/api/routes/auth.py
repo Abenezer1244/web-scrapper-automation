@@ -8,6 +8,7 @@ from typing import Annotated
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import delete, or_, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import (
@@ -46,6 +47,7 @@ from src.api.schemas import (
 )
 from src.config import settings
 from src.db import User, get_db  # noqa: F401 (User used in Annotated type)
+from src.utils.crypto import blind_index
 from src.utils.logger import email_fingerprint
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -280,8 +282,13 @@ async def register(
 ) -> TokenResponse:
     await rate_limit(request, zone="auth")
 
-    # Check for duplicate — but return generic error (no user enumeration)
-    existing = await db.execute(select(User).where(User.email == body.email))
+    # Check for duplicate — but return generic error (no user enumeration).
+    # H3: look up by the email blind index (email is encrypted; the plaintext
+    # value is no longer directly matchable). The DB UNIQUE(email_hmac) is the
+    # race-safe authority — see the IntegrityError catch on flush below.
+    existing = await db.execute(
+        select(User).where(User.email_hmac == blind_index(body.email))
+    )
     if existing.scalar_one_or_none():
         # A4: constant-time parity with the success path. The new-account
         # branch below runs bcrypt via hash_password(); burn an equivalent
@@ -344,7 +351,18 @@ async def register(
         referred_by_user_id=referred_by_id,
     )
     db.add(user)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # H3: a concurrent signup with the same email won the UNIQUE(email_hmac)
+        # race. The pre-check above is not race-safe on its own — the DB
+        # constraint is the authority. Roll back and return the SAME generic
+        # error as the duplicate branch (no user enumeration).
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Registration failed. Please try again.",
+        ) from None
 
     # Fresh password-only session (H2-P5): amr=["pwd"], auth_time=now (default).
     token = create_secure_token(user.id, amr=["pwd"])
@@ -372,7 +390,10 @@ async def login(
     ip = client_ip(request)
     await BruteForceProtection.check(ip, body.email)
 
-    result = await db.execute(select(User).where(User.email == body.email, User.is_active))
+    # H3: match by the email blind index (email is encrypted at rest).
+    result = await db.execute(
+        select(User).where(User.email_hmac == blind_index(body.email), User.is_active)
+    )
     user = result.scalar_one_or_none()
 
     # Always run verify_password — even when user not found — to prevent timing attacks.
@@ -1312,7 +1333,10 @@ async def forgot_password(
 
     generic = {"message": "If that email exists, a reset link has been sent."}
 
-    result = await db.execute(select(User).where(User.email == body.email, User.is_active))
+    # H3: match by the email blind index (email is encrypted at rest).
+    result = await db.execute(
+        select(User).where(User.email_hmac == blind_index(body.email), User.is_active)
+    )
     user = result.scalar_one_or_none()
 
     if user is not None:

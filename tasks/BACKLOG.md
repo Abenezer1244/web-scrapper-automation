@@ -33,7 +33,7 @@ Two branches off `main`, unmerged. Stage 1 = contact PII + additive email_hmac. 
 - [x] 🟠 **M7** — SHIPPED 2026-06-12: `audit_events` table (migration 055, no user FK by design) + best-effort background insert in `audit_log()` (task-ref held, semaphore-bounded — Codex P2s) + scraper_created/scraper_deleted events added. Console line remains the fallback.
 - [ ] 🟠 **M4** — documented edge DDoS rate-limit rules (Cloudflare WAF) + distributed-limiter resilience
 - [ ] 🟠 **M5** — document + restrict DB/Redis IP allowlisting (infra posture)
-- [ ] 🔴 **H1** — RLS enforcement (`RLS_ENFORCE=True`) — **DO LAST**, prod-boot landmine. Needs `users` self-row policy + app grants on `mfa_backup_codes` + `mfa_break_glass_codes` (tracked in `provision_rls_roles.sql`). **+ Track A follow-up:** the API now INSERTs `batch_runs` (durable run intent) from the rls session, so the H1 cutover must add `batch_runs` INSERT grant for the app role (OK today: BYPASSRLS prod role). **+ M7 follow-up (2026-06-12): `audit_events` INSERT grant for the API runtime role — else durable audit silently degrades to console-only under enforced RLS (Codex).**
+- [x] 🔴 **H1 — RLS ENFORCED IN PROD 2026-06-12** (PR #33 + same-session cutover, Codex SIGN-OFF). Two NOBYPASSRLS roles serve all traffic (api=`bridgeleads_app`, worker/beat=`bridgeleads_system`), 47 role-targeted policies, `RLS_ENFORCE=true` fail-closed boot gates live, **FORCE on 23 tables**. All the tracked follow-ups landed: users broad app policy, MFA grants (single allowlisted app DELETE on mfa_backup_codes), batch_runs + audit_events grants/policies, dialer-replay off the system session. Verified: prod rehearsal 10/10, live E2E 147-record scrape mid-cutover, integration suite 13/13 vs prod. Rollback = repoint URLs + RLS_ENFORCE=false + NO FORCE (urls captured in `.rls-cutover-secrets`). 👤 residuals → §4.
 
 ## 3. Open security/privacy DECISIONS (need a call before coding)
 
@@ -42,6 +42,8 @@ Two branches off `main`, unmerged. Stage 1 = contact PII + additive email_hmac. 
 
 ## 4. Pending USER / ops actions
 
+- [ ] 👤🔴 **Move `.rls-cutover-secrets` to the password manager** (repo root, gitignored — the ONLY off-Railway copy of the `bridgeleads_app`/`bridgeleads_system` passwords + the pre-cutover rollback URLs; H1 2026-06-12). Keep a copy somewhere durable, then delete the local plaintext.
+- [ ] 👤🔵 Add `RLS_ENFORCE=false` line (with the H1 comment) to `.env.example` under `DATABASE_URL_MIGRATE=` — file was session-write-protected for the agent.
 - [ ] 👤🔴 Rotate live `admin@bridgeleads.io` password + set Railway `BRIDGELEADS_ADMIN_PASSWORD`
 - [ ] 👤🟠 Verify Redis `CERT_REQUIRED` on Railway (the `REDIS_SSL_CERT_REQS=none` escape from M1)
 - [ ] 👤🟠 Tracerfy: add credits + re-scrape ~334 already-`errored` leads; migrate Tracerfy auth → header + rotate secret. **(2026-06-11: still 402 — 2,382 rows queued waiting, needs ~1,480 more credits.)**

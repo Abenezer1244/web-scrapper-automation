@@ -19,6 +19,58 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-12 — H1 SHIPPED + CUT OVER: RLS is ENFORCED in production (roles + policies + RLS_ENFORCE=true + FORCE) — the last backlog code item is closed
+
+**Built / Shipped:** PR #33 (`security/h1-rls-cutover`, merged) extended the 2026-06-02 cutover
+artifacts to the 6 drift tables: app grants incl. the single allowlisted app DELETE on
+`mfa_backup_codes` (verify-block enforces it stays the only one); migration 056 (RLS-enable
+`scraper_batches`/`batch_runs`/`audit_events` — also closed their live PostgREST anon exposure;
+downgrade keeps RLS on by design); role-targeted per-verb policies + FORCE list 17→23 in the
+operator scripts (SQL + python mirror in lockstep); dialer-replay route moved off
+`system_sync_session` onto the RLS app session; tests: async GUC-reapply, per-table app
+denial proofs, system-role worker-critical write proofs. THEN executed the full prod cutover
+same session: roles provisioned (passwords in gitignored `.rls-cutover-secrets`), grants
+verify=0 disallowed, 47 role-targeted policies, Railway repoint (api=app/app, worker+beat=
+app/system, migrate=postgres) via staged vars + sequential beat→worker→api redeploys,
+`RLS_ENFORCE=true` (all fail-closed boot gates passed), `FORCE ROW LEVEL SECURITY` on 23
+tables. Live E2E mid-cutover: fresh account → island/WA probate job → DONE 147 records →
+results readable. Prod integration suite (owner DSN): 13 passed / 2 skipped. Prod rehearsal
+pre-repoint: 10/10 isolation checks on real data (tenant 136,281 vs total 310,248 rows).
+
+**Tried / Decided (all Codex-consulted, session 019ebbc2):** scoped MFA DELETE grant beats
+SECURITY DEFINER fns; audit_events = app INSERT-only `WITH CHECK (true)` (audit session has no
+GUC, user_id nullable); explicit FOR SELECT/FOR INSERT for batches (FOR ALL = "sloppy and
+brittle"); scratch-Supabase rehearsal (created + migrated + cut over + deleted a throwaway
+project first — caught real issues); rollback = repoint+RLS_ENFORCE=false+NO FORCE, NEVER
+alembic downgrade.
+
+**Failed / Blocked → fixed:** (1) Codex caught that the dialer-replay route would BREAK at
+cutover — `_cutover_step4_repoint.py` deliberately gives the API app-role sync creds, so its
+`system_sync_session` UPDATE had no role to run as. (2) `tests/test_rls_isolation.py`
+FALSE-FAILED post-cutover (asserts the legacy untargeted policies the cutover drops) — inverse
+skip guard added; without the scratch rehearsal this would have read as a prod isolation
+failure. (3) Windows CRLF in a secrets file put `\r` in a DB password — pooler auth
+"failed" until `tr -d '\r'`. (4) First prod policy run hit the designed 5s lock_timeout
+(transient beat lock on scraper_configs) — clean retry. (5) Local smoke vs prod Upstash
+tripped its rate limit → authed reads 503 (fail-closed revocation check, by design); waited
+for a clean prod auth smoke before repoint per Codex condition.
+
+**Caught & fixed (Codex challenge, 0 P1/3 P2/2 P3):** 056 downgrade now keeps RLS enabled
+(rollback must not reopen PostgREST anon); owner-DSN guard in the test fixture; system-role
+write tests added (grants can be wrong while policies are right — FORCE only checks policies).
+
+**Pending / Handoff:** 👤 move `.rls-cutover-secrets` (only off-Railway copy of the role
+passwords + rollback URLs) to the password manager; 👤 add `RLS_ENFORCE=false` line to
+`.env.example` (session write-protected); M4/M5 doc items; Master Security Review §14 pass
+(Codex final gate = SIGN-OFF; §14 sweep is the remaining formality).
+
+**Facts learned:** Supavisor authenticates custom roles on BOTH poolers (`role.project-ref`);
+`GRANT ... ON ALL TABLES` covers only existing tables — every new table now needs the 4-step
+drift checklist (runbook H1 addendum); `relforcerowsecurity` query = fast FORCE audit; the
+two RLS test modules cover mutually exclusive DB states (legacy vs role-targeted).
+
+---
+
 ## 2026-06-12 — Backlog sweep: download_url encrypted (054), M6 ops alerting, M7 durable audit trail — every code item except H1 now closed
 
 Worked the remaining audit items 1-by-1, each Codex-consulted BEFORE code and Codex-gated after.

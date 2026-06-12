@@ -467,11 +467,13 @@ class Result(Base):
     dedup_hash = Column(String(64), nullable=True, index=True)
     is_duplicate = Column(Boolean, nullable=False, default=False)
     raw_html_hash = Column(String(32), nullable=True, index=True)
-    # Phase 3 (migration 037): post-enrichment sha256(parcel|address), the SAME
-    # key property_list_membership stores (property_identity.compute_property_key).
+    # Phase 3 (migration 037; re-keyed 2026-06-12): the post-enrichment OVERLAP
+    # identity — parcel-primary + county/state-scoped (property_identity.
+    # compute_property_key), the SAME key property_list_membership stores.
     # NULL for weak-identity rows. Lets the combine/overlap export join overlap
-    # property_keys back to full Result rows. dedup_hash is PRE-enrichment and
-    # can differ, so it cannot serve this join.
+    # property_keys back to full Result rows. dedup_hash is the FROZEN legacy
+    # parcel|address scheme (billing dedup) and deliberately DIFFERS — it cannot
+    # serve this join.
     property_key = Column(String(64), nullable=True)
     # Phase 4 (migration 038): structured tax-delinquency fields for amount/age
     # filtering. Populated SOURCE-GATED (King Socrata tax_delinquent only);
@@ -565,8 +567,9 @@ class PropertyListMembership(Base):
     self-join over results history.
 
     One row per (user_id, record_type, property_key). STRONG-IDENTITY ONLY:
-    property_key is the post-enrichment sha256(parcel|address) from
-    property_identity.compute_property_key; weak name/date rows are excluded.
+    property_key is the post-enrichment parcel-primary, county/state-scoped key
+    from property_identity.compute_property_key (re-keyed 2026-06-12); weak
+    name/date rows are excluded.
 
     sighting_count is ADVISORY (cumulative scrape observations, not idempotent
     across job re-runs, never used for billing or correctness). Maintained by

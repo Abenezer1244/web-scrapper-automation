@@ -39,7 +39,7 @@ def run(batch: int) -> None:
                 text(
                     """
                     SELECT r.id, r.user_id, r.parcel_id, r.property_address,
-                           sc.record_type
+                           sc.record_type, sc.county, sc.state
                     FROM results r
                     JOIN jobs j ON j.id = r.job_id
                     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
@@ -55,7 +55,10 @@ def run(batch: int) -> None:
             last_id = rows[-1].id
             agg: dict[tuple, dict] = {}
             for row in rows:
-                key = compute_property_key(row.parcel_id, row.property_address)
+                # 2026-06-12: county/state-scoped key — context from the join.
+                key = compute_property_key(
+                    row.parcel_id, row.property_address, row.county, row.state
+                )
                 if not key or not row.record_type:
                     continue
                 k = (str(row.user_id), row.record_type, key)

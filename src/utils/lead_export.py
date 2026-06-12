@@ -123,9 +123,10 @@ def write_lead_csv(records: list[Any], filelike) -> None:
 # the canonical row, with the overlap signal up front in "caller-first" order so a
 # human opening it in Excel sees the hottest leads and the contact fields first.
 # Reuses build_lead_export_row so the split/normalize/sanitize logic can never
-# drift from the per-job export. Columns the segment query doesn't (yet) provide
-# (multi-contact phone_2/3+email_2/3, heirs, legal_description, doc_type, tax)
-# come through blank — kept for header parity with the per-job CSV.
+# drift from the per-job export. Segments provide multi-contact phones/emails
+# (decrypted arrays) so phone_2/3 + email_2/3 populate; columns the segment
+# query doesn't provide (heirs, legal_description, doc_type, tax) come through
+# blank — kept for header parity with the per-job CSV.
 OVERLAP_LEAD_COLUMNS: list[str] = [
     "overlap", "lists_count", "lists", "counties",
     "first_name", "last_name",

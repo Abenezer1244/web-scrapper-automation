@@ -22,6 +22,7 @@ suspenders). All exported fields pass sanitize_for_csv.
 Union (inclusive, strong + weak) is a deliberately separate later slice.
 """
 import io
+import json
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
@@ -138,7 +139,8 @@ EXPORT_CAP = 50_000
 _INTERSECTION_SQL = """
 WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
-           r.mailing_address, r.phone, r.phone_type, r.email, r.property_key,
+           r.mailing_address, r.phone, r.phone_type, r.email,
+           r.phones, r.emails, r.property_key,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at
     FROM results r
     JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid
@@ -176,6 +178,7 @@ ranked AS (
 )
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
        rk.mailing_address, rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
+       rk.phones, rk.emails,
        a.matched_record_types, a.overlap_count
 FROM ranked rk
 JOIN agg a ON a.property_key = rk.property_key
@@ -207,6 +210,7 @@ _UNION_SQL = """
 WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
            r.mailing_address, r.phone, r.phone_type, r.email,
+           r.phones, r.emails,
            r.property_key, r.is_duplicate,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at,
            COALESCE(r.property_key, r.dedup_hash, 'id:' || r.id::text) AS bucket
@@ -253,6 +257,7 @@ ranked AS (
 )
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
        rk.mailing_address, rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
+       rk.phones, rk.emails,
        a.matched_record_types, a.overlap_count, a.identity_strength
 FROM ranked rk
 JOIN agg a ON a.bucket = rk.bucket
@@ -270,7 +275,8 @@ LIMIT :limit
 _INTERSECTION_DATED_SQL = """
 WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
-           r.mailing_address, r.phone, r.phone_type, r.email, r.property_key,
+           r.mailing_address, r.phone, r.phone_type, r.email,
+           r.phones, r.emails, r.property_key,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at
     FROM results r
     JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid
@@ -304,6 +310,7 @@ ranked AS (
 )
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
        rk.mailing_address, rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
+       rk.phones, rk.emails,
        a.matched_record_types, a.overlap_count
 FROM ranked rk
 JOIN agg a ON a.property_key = rk.property_key
@@ -372,11 +379,13 @@ async def _count_excluded_no_date(
 def _decrypt_pii_rows(rows: list) -> list:
     """Decrypt the encrypted phone/email columns of a raw-SQL result.
 
-    The segment queries are raw ``text()`` so the ``EncryptedString`` type does
-    NOT run — ``phone``/``email`` come back as ``fe1:`` ciphertext. Decrypt them
-    here, centrally, so every consumer (preview + export, intersection + union)
-    receives plaintext and none can forget. Returns ``SimpleNamespace`` rows so
-    existing attribute access (``r.phone``, ``r.party_name``, ...) is unchanged.
+    The segment queries are raw ``text()`` so the ``EncryptedString`` /
+    ``EncryptedJSON`` types do NOT run — ``phone``/``email`` come back as
+    ``fe1:`` ciphertext and ``phones``/``emails`` as encrypted JSON text.
+    Decrypt them here, centrally, so every consumer (preview + export,
+    intersection + union) receives plaintext and none can forget. Returns
+    ``SimpleNamespace`` rows so existing attribute access (``r.phone``,
+    ``r.party_name``, ...) is unchanged.
     ``party_name``/addresses are out of H3 scope (plaintext) and pass through.
     The contactability ranking + ``ORDER BY`` already ran in SQL over ciphertext,
     which is correct (ciphertext is non-NULL; blanks were normalized to NULL).
@@ -388,6 +397,18 @@ def _decrypt_pii_rows(rows: list) -> list:
             data["phone"] = decrypt_field(data["phone"])
         if data.get("email") is not None:
             data["email"] = decrypt_field(data["email"])
+        # Multi-contact arrays (EncryptedJSON): decrypt + parse; a legacy
+        # plaintext-JSON row passes through decrypt_field unchanged (non-strict)
+        # and still parses. Anything unparseable degrades to None — the CSV
+        # builder then just emits blank phone_2/3 + email_2/3 (never a 500).
+        for key in ("phones", "emails"):
+            raw = data.get(key)
+            if raw is None:
+                continue
+            try:
+                data[key] = json.loads(decrypt_field(raw))
+            except (ValueError, TypeError):
+                data[key] = None
         out.append(SimpleNamespace(**data))
     return out
 

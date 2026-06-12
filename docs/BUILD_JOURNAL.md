@@ -19,6 +19,38 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-12 — Lists overlap property_key re-scheme: bug found via orchestrated investigation, FIXED, backfilled, residual zero proven statistical
+
+User asked "why is there no overlapping data?" Orchestrated answer (research agent + Codex in
+parallel + empirical prod queries at every fork):
+
+**Found (live bug):** `compute_property_key` hashed `parcel|address` together; tax pipelines
+store situs WITH city+ZIP4, GIS enrichment stores street-only → identical parcels produced
+different keys → tax_delinquent could never overlap recorder lists. The research agent's
+leading-zero theory was plausible-sounding but speculative; Codex's address-component trace was
+code-proven; the prod data (county-by-county) settled which was live. LESSON: run the data check
+before adopting either reviewer's theory.
+
+**Built / Shipped (PR #27 → main `8b45cd4`, Codex plan NO-GO→reconciled + impl round):**
+- SPLIT identity from dedup: `legacy_strong_signature()` FREEZES the old scheme for dedup_hash
+  (keys delivered_records = BILLING; golden-value test makes drift a loud failure) + the
+  enrichment-reuse gate. Billing byte-identical.
+- New `compute_property_key(parcel, address, county, state)`: parcel-PRIMARY (address drift can't
+  split identity), county/state-scoped (bare-parcel hashing would manufacture cross-county false
+  overlap — a trap BOTH initial reviewer fixes missed), branch-prefixed. NO leading-zero stripping
+  (Codex: merging distinct parcels is worse than missing overlap).
+- `scripts/backfill_property_keys.py` (system session — Codex P1): unconditional re-key + per-user
+  ATOMIC membership rebuild, explicit aggregates, dry-run default.
+
+**Ran on prod:** 310,142 results scanned, 182,696 re-keyed; membership 43,441→41,229 (2,212
+same-parcel identities MERGED = the fix observable); overlap 158→166 incl. a new
+code_violation×pre_foreclosure pair.
+
+**Decided / Facts learned:** King tax×probate stayed 0 and that is CORRECT: formats identical
+(10-digit both), parcel sets literally disjoint — 3,299 delinquent parcels of ~650k (0.5%) ×
+166 probate parcels → expected intersection <1. Don't re-investigate; overlap surfaces as data
+grows. Diag scripts kept (diag_overlap*, diag_parcel_mismatch, diag_king_parcel_formats).
+
 ## 2026-06-11/12 — Batch+Lists quad: Track A verified, presign fixed, 2B scheduled batches SHIPPED, multi-contact segments SHIPPED
 
 Four items worked 1-by-1, each Codex-gated. All four landed.

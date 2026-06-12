@@ -22,6 +22,20 @@ class TestNormalizeStreet:
     def test_punctuation_and_case(self):
         assert _normalize_street("123 main st.") == "123 MAIN ST"
 
+    def test_box_in_street_name_not_stripped(self):
+        # 'BOX CANYON RD' is a real street, not a PO box (Codex review)
+        assert _normalize_street("123 BOX CANYON RD") == "123 BOX CANYON RD"
+
+    def test_no_in_street_name_not_stripped(self):
+        assert _normalize_street("10 NO NAME RD") == "10 NO NAME RD"
+
+    def test_no_with_unit_number_is_stripped(self):
+        # 'NO 4' (a unit number) IS a secondary designator
+        assert _normalize_street("123 MAIN ST NO 4") == "123 MAIN ST"
+
+    def test_unit_letter_stripped(self):
+        assert _normalize_street("123 MAIN ST UNIT B") == "123 MAIN ST"
+
 
 class TestOutOfState:
     def test_different_states_true(self):
@@ -70,6 +84,25 @@ class TestAbsentee:
             "123 MAIN ST, TACOMA, WA 98401", "123 MAIN ST, SEATTLE, WA 98101"
         )
         assert f["absentee_owner"] is True
+
+    def test_same_street_no_discriminator_is_none(self):
+        # same normalized street (suffix spelling differs) but no ZIP/city/state
+        # to confirm same building -> unknown, NOT a guessed False
+        f = compute_owner_flags("123 MAIN ST", "123 MAIN STREET")
+        assert f["absentee_owner"] is None
+
+    def test_identical_addresses_is_false(self):
+        f = compute_owner_flags("123 MAIN ST", "123 MAIN ST")
+        assert f["absentee_owner"] is False  # byte-identical = confirmed same
+
+    def test_same_street_no_zip_different_city_is_absentee(self):
+        f = compute_owner_flags("123 MAIN ST, TACOMA, WA", "123 MAIN ST, SEATTLE, WA")
+        assert f["absentee_owner"] is True
+
+    def test_exact_full_string_match_is_false(self):
+        # no parsed street structure but identical strings -> confirmed same
+        f = compute_owner_flags("PARCEL ONLY 123", "PARCEL ONLY 123")
+        assert f["absentee_owner"] is False
 
     def test_missing_mailing_is_none(self):
         f = compute_owner_flags("123 MAIN ST, TACOMA, WA 98401", None)

@@ -22,9 +22,13 @@ import re
 from src.utils.lead_formatting import parse_property_for_display
 
 # Trailing secondary-unit designator → stripped before comparing the base street.
+# The lookahead requires a real unit identifier (a number, '#', or a 1-2 char
+# token like 'B') AFTER the designator, so ambiguous words that are also street
+# names — 'BOX CANYON RD', 'NO NAME RD' — are NOT eaten (Codex review): there the
+# token is followed by a multi-letter word, not a unit id, so the strip skips it.
 _UNIT_STRIP_RE = re.compile(
     r"\b(?:#|APT|APARTMENT|UNIT|STE|SUITE|BLDG|BLD|FL|FLR|FLOOR|RM|ROOM|"
-    r"SPC|SPACE|LOT|TRLR|TRAILER|DEPT|NO|BOX|PO\s+BOX)\b.*$",
+    r"SPC|SPACE|LOT|TRLR|TRAILER|DEPT|NO|BOX|PO\s+BOX)\b\s*(?=[#\d]|\w{1,2}\b).*$",
     re.IGNORECASE,
 )
 # "#5" (no space) form, plus any leftover stray hash.
@@ -69,36 +73,46 @@ def _zip5(z: str | None) -> str:
     return (z or "")[:5]
 
 
-def _addresses_differ(property_address: str, mailing_address: str) -> bool:
-    """True when the owner's mailing location clearly differs from the property.
+def _addresses_differ(property_address: str, mailing_address: str) -> bool | None:
+    """Tri-state: True=clearly different, False=confirmed same, None=underdetermined.
 
     Both args are non-empty (caller guarantees). Component compare per Codex:
-    base street first; then ZIP if both have one; else city/state; unit-only
-    differences fall through to NOT-different. Falls back to a normalized
-    full-string compare only when neither side parses a usable street.
+    base street first; if it differs → True. If it matches, return False ONLY when
+    a discriminator POSITIVELY confirms the same location (matching ZIP, or
+    matching city+state) — otherwise None (unknown), because counties here emit
+    street-only property addresses and "same street, nothing else to compare" is
+    not proof of owner-occupancy. Falls back to a normalized full-string compare
+    only when neither side parses a usable street.
     """
+    # Byte-identical (post-normalize) is unambiguous same-place → confirmed False,
+    # even with no parsed ZIP/city/state to discriminate.
+    if _normalize_full(property_address) == _normalize_full(mailing_address):
+        return False
+
     p = parse_property_for_display(property_address)
     m = parse_property_for_display(mailing_address)
     p_street = _normalize_street(p["street"])
     m_street = _normalize_street(m["street"])
 
     if not p_street or not m_street:
+        # No parsed street on a side — fall back to a whole-string compare. Equal
+        # strings are confirmed-same (False); different strings are different (True).
         return _normalize_full(property_address) != _normalize_full(mailing_address)
     if p_street != m_street:
         return True
 
-    # Base street matches — discriminate on ZIP, else city/state. Unit-only diffs
-    # (situs omits the unit the mailing carries) land here and read as NOT absentee.
+    # Base street matches — need a positive discriminator to call it same vs diff.
     if p["zip"] and m["zip"]:
-        return _zip5(p["zip"]) != _zip5(m["zip"])
+        return _zip5(p["zip"]) != _zip5(m["zip"])  # ZIP is decisive both ways
     p_state, m_state = (p["state"] or ""), (m["state"] or "")
     if p_state and m_state and p_state != m_state:
-        return True
+        return True  # same street text, different state → different place
     p_city = (p["city"] or "").upper().strip()
     m_city = (m["city"] or "").upper().strip()
-    if p_city and m_city and p_city != m_city:
-        return True
-    return False
+    if p_city and m_city and p_state and m_state:
+        return p_city != m_city  # same state: city confirms same/diff
+    # Same street, but no ZIP and not enough city/state to confirm → unknown.
+    return None
 
 
 def compute_owner_flags(

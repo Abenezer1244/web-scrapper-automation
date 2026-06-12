@@ -267,6 +267,13 @@ def _dispatch_due_batches(db, now: datetime) -> list[str]:
             )
             continue
 
+        # NOTE (Codex, documented-not-fixed): _should_run_now's ±1-minute window
+        # is not midnight-wraparound-aware, so a 23:59 target matches ticks
+        # 23:58/23:59 (not next-day 00:00) and a 00:00 target matches
+        # 00:00/00:01 (not prior-day 23:59). The matching ticks are therefore
+        # always SAME-DAY as the target — this key is consistent for every tick
+        # that can reach it, and no occurrence is ever missed (2 ticks still
+        # match) or doubled. Fixing wraparound lives with the shared helper.
         occurrence = now.replace(
             hour=int(run_hour), minute=int(run_minute), second=0, microsecond=0
         )

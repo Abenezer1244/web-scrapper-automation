@@ -216,6 +216,18 @@ class ScheduleConfig(BaseModel):
     date_from: str | None = Field(default=None, max_length=32)   # ISO date string
     date_to: str | None = Field(default=None, max_length=32)
 
+    @field_validator("frequency")
+    @classmethod
+    def known_frequency(cls, v: str) -> str:
+        # A typo'd frequency ("dailyx") would persist and silently never fire
+        # (both dispatchers skip anything that isn't an exact known value) —
+        # reject at the boundary instead (Codex P2). date_range_mode stays
+        # advisory for back-compat (legacy stored values exist).
+        v = v.strip().lower()
+        if v not in {"manual", "daily", "weekly", "monthly"}:
+            raise ValueError("frequency must be manual, daily, weekly, or monthly")
+        return v
+
 
 def _validate_https_webhook_url(v: str | None) -> str | None:
     """Structural validation only — HTTPS scheme + a real host + length.

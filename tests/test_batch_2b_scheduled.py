@@ -96,7 +96,7 @@ def test_adjacent_tick_in_window_does_not_double_fire():
         )
         db.commit()
 
-        second = _dispatch_due_batches(db, tick_0601)
+        _dispatch_due_batches(db, tick_0601)
         db.commit()
 
         # Scope to THIS batch — the dispatcher sweeps every active batch in the
@@ -116,7 +116,7 @@ def test_active_run_blocks_new_occurrence():
         db.commit()
         assert len(_runs(db, batch_id)) == 1  # still 'pending' (never materialized)
 
-        second = _dispatch_due_batches(db, next_day)
+        _dispatch_due_batches(db, next_day)
         db.commit()
 
         # Scope to THIS batch (other tests' batches may fire on the new day).
@@ -174,3 +174,39 @@ def test_create_request_schedule_defaults_to_manual():
     assert dumped["frequency"] == "daily"
     assert dumped["run_at_hour"] == 7
     assert dumped["run_at_minute"] == 15
+
+
+def test_invalid_frequency_rejected_at_boundary():
+    """A typo'd frequency would persist and silently never fire — reject it
+    (Codex P2)."""
+    import pytest as _pytest
+    from pydantic import ValidationError
+
+    with _pytest.raises(ValidationError):
+        BatchCreateRequest(
+            state="wa",
+            counties=["pierce"],
+            record_types=["probate"],
+            schedule={"frequency": "dailyx"},
+        )
+
+
+def test_parent_stores_only_recurrence_subset():
+    """The batch parent persists frequency/run_at_* ONLY — date-range fields are
+    not applied to batch children, so storing them would imply unsupported
+    behavior (Codex P2). Mirrors the include= in POST /batches."""
+    req = BatchCreateRequest(
+        state="wa",
+        counties=["pierce"],
+        record_types=["probate"],
+        schedule={
+            "frequency": "daily",
+            "run_at_hour": 7,
+            "run_at_minute": 15,
+            "date_range_mode": "custom",
+            "date_from": "2026-01-01",
+            "date_to": "2026-02-01",
+        },
+    )
+    stored = req.schedule.model_dump(include={"frequency", "run_at_hour", "run_at_minute"})
+    assert stored == {"frequency": "daily", "run_at_hour": 7, "run_at_minute": 15}

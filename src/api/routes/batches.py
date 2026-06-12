@@ -134,7 +134,13 @@ async def create_batch(
         enrichment=body.enrichment.model_dump(),
         # 2B: the PARENT carries the recurrence; dispatch_scheduled_batches fires
         # off it. frequency='manual' (the default) = no recurrence (2A behavior).
-        schedule=body.schedule.model_dump(),
+        # ONLY the recurrence subset is stored — ScheduleConfig's date-range
+        # fields are NOT applied to batch children (they scrape the 2A default
+        # window), so persisting them would imply support that doesn't exist
+        # (Codex P2). Extend to date ranges deliberately, not accidentally.
+        schedule=body.schedule.model_dump(
+            include={"frequency", "run_at_hour", "run_at_minute"}
+        ),
         deliver=body.deliver.model_dump(),
         status="active",
     )

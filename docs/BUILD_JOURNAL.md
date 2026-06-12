@@ -19,6 +19,39 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-12 — Backlog sweep: download_url encrypted (054), M6 ops alerting, M7 durable audit trail — every code item except H1 now closed
+
+Worked the remaining audit items 1-by-1, each Codex-consulted BEFORE code and Codex-gated after.
+
+**1. SkipTraceQueue.download_url encrypted (PR #30, migration 054) — VERIFIED ON PROD:** of 51
+queue rows, 43 expired links NULLed (data minimization), the 8 live ones encrypted; alembic 054.
+Key design (Codex GO + 3 conditions): the migration uses RAW SQL only — with strict mode already
+live, the ORM's EncryptedString result processor would RAISE on plaintext before the encrypt pass
+could run; fail-closed assertion refuses the deploy if any plaintext survives. Deploy window
+verified empirically (0 in-flight queues with URLs — Tracerfy out of credits).
+
+**2. M6 ops alerting (PR #31):** watchdog permanent-fails, canary →down transitions, batch
+give-ups now email OPS_ALERT_EMAIL via Resend. Best-effort contract (never raises into the
+calling task), Redis SET-NX-EX cooldown (fail-open), disabled by default. Codex round (3 P2s,
+all adopted): alerts dispatch only POST-COMMIT — an alert for rolled-back state would also burn
+the cooldown and SUPPRESS the later real alert; canary emails carry exception CLASS only (scraper
+errors can embed raw page content = PII); configured-mode tests via monkeypatched Resend.
+Self-caught: stuck_minutes NameError in the first watchdog hook draft (only defined in the
+retry branch). 👤 set OPS_ALERT_EMAIL on Railway to activate; add OPS_ALERT_* to .env.example
+(file perm-locked this session).
+
+**3. M7 durable audit trail (PR #32, migration 055):** audit_events table + fire-and-forget
+background insert in audit_log() (console line remains the fallback; an insert failure can never
+fail a request). Codex P2s adopted: task refs held until done (the create_task GC gotcha) +
+semaphore-bounded inserts (async engine is NullPool — login storms must not contend requests for
+connections). user_id deliberately carries NO FK (audit must survive user deletion).
+scraper_created/scraper_deleted events added (config changes were unaudited). H1 checklist grew:
+audit_events INSERT grant needed at RLS cutover.
+
+**Status:** the only remaining code item on the entire backlog is H1 RLS enforcement —
+deliberately left for a dedicated session (prod-boot landmine; its cutover checklist now carries
+users self-row policy, MFA-table grants, batch_runs INSERT, audit_events INSERT).
+
 ## 2026-06-12 — H3 STAGE 2 SHIPPED: User.email encryption cutover live, strict mode ON — H3 program COMPLETE
 
 **Built / Shipped (PR #29 `6445744`):** the gated `security/h3-email-cutover` branch (95 commits

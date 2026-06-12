@@ -102,6 +102,29 @@ GRANT SELECT, INSERT ON county_connectors, password_history TO bridgeleads_app;
 GRANT SELECT ON results, job_logs, county_records, referral_events,
     property_list_membership TO bridgeleads_app;
 
+-- ── H1 drift tables (2026-06-12, Codex-consulted session 019ebbc2) ──────────
+-- MFA tables (migrations 043/045). mfa_backup_codes is the SINGLE allowed app
+-- DELETE: /auth/mfa/enable replaces the code set (auth.py:1209), /auth/mfa/disable
+-- removes it (auth.py:1293), break-glass burns it (auth.py:701). Rows are the
+-- caller's own secret hashes; the tenant policy bounds the blast radius. Codex
+-- verdict: scoped grant beats SECURITY DEFINER fns here — do NOT generalize
+-- app DELETE beyond this table (the verify block enforces that).
+GRANT SELECT, INSERT, UPDATE, DELETE ON mfa_backup_codes TO bridgeleads_app;
+-- mfa_break_glass_codes: app consumes (atomic UPDATE..RETURNING) + revokes
+-- siblings — never INSERTs (operator script) and never DELETEs.
+GRANT SELECT, UPDATE ON mfa_break_glass_codes TO bridgeleads_app;
+-- Batch scrape (migration 050/052): POST /batches INSERTs the batch + the
+-- durable pending batch_runs intent; GETs read both. Lifecycle UPDATEs are
+-- worker-only (completion barrier, recovery sweep).
+GRANT SELECT, INSERT ON scraper_batches, batch_runs TO bridgeleads_app;
+-- audit_events (migration 055): audit_log() INSERTs from a background task
+-- (security.py:546) with no user context — INSERT only, no app read path.
+GRANT INSERT ON audit_events TO bridgeleads_app;
+-- dialer_deliveries (migration 041): the dialer-replay route resets this
+-- user's FAILED outbox rows to pending (UPDATE needs SELECT for its WHERE).
+-- INSERT/DELETE stay worker-only.
+GRANT SELECT, UPDATE ON dialer_deliveries TO bridgeleads_app;
+
 -- Converge to least privilege regardless of any prior (over-)grant: GRANT does
 -- not remove privileges an earlier version of this script handed out, so
 -- explicitly REVOKE everything the app must NOT hold (Codex review). DELETE is
@@ -114,16 +137,22 @@ REVOKE INSERT, UPDATE, DELETE ON
 REVOKE ALL ON
     delivered_records, pending_skip_trace_rows, skip_trace_queues,
     skip_trace_cache, skip_trace_meter_events FROM bridgeleads_app;
+-- H1 drift tables — converge to exactly the grants above:
+REVOKE INSERT, DELETE ON mfa_break_glass_codes FROM bridgeleads_app;
+REVOKE UPDATE, DELETE ON scraper_batches, batch_runs FROM bridgeleads_app;
+REVOKE SELECT, UPDATE, DELETE ON audit_events FROM bridgeleads_app;
+REVOKE INSERT, DELETE ON dialer_deliveries FROM bridgeleads_app;
 
--- Hard-fail if the app role still holds any DELETE, or any write on the
--- read-only / no-app tables — so a stale over-grant cannot survive a rerun.
+-- Hard-fail if the app role still holds any DELETE (single allowlisted
+-- exception: mfa_backup_codes — see the H1 grant block above), or any write on
+-- the read-only / no-app tables — so a stale over-grant cannot survive a rerun.
 DO $verify$
 DECLARE bad int;
 BEGIN
     SELECT COUNT(*) INTO bad FROM information_schema.role_table_grants
     WHERE grantee = 'bridgeleads_app'
       AND (
-        privilege_type = 'DELETE'
+        (privilege_type = 'DELETE' AND table_name <> 'mfa_backup_codes')
         OR (privilege_type IN ('INSERT', 'UPDATE')
             AND table_name IN ('results', 'job_logs', 'county_records', 'referral_events',
                                'property_list_membership'))
@@ -131,6 +160,12 @@ BEGIN
             AND table_name IN ('county_connectors', 'password_history'))
         OR table_name IN ('delivered_records', 'pending_skip_trace_rows',
                           'skip_trace_queues', 'skip_trace_cache', 'skip_trace_meter_events')
+        -- H1 drift tables:
+        OR (privilege_type = 'INSERT'
+            AND table_name IN ('mfa_break_glass_codes', 'dialer_deliveries'))
+        OR (privilege_type = 'UPDATE'
+            AND table_name IN ('scraper_batches', 'batch_runs', 'audit_events'))
+        OR (privilege_type = 'SELECT' AND table_name = 'audit_events')
       );
     IF bad > 0 THEN
         RAISE EXCEPTION 'provision_rls_roles: bridgeleads_app still holds % '
@@ -145,22 +180,11 @@ $verify$;
 -- dispatches to a Celery worker via .delay() (webhooks.py:134), so all
 -- skip-trace billing writes land on bridgeleads_system, not here.
 
--- ⚠️ H1-CUTOVER TODO — MFA tables app-role grants (Codex H2-P5 review):
---   mfa_backup_codes (migration 043) and mfa_break_glass_codes (migration 045)
---   are NOT granted to bridgeleads_app here. The request path writes BOTH:
---     - mfa_backup_codes: /auth/mfa/enable INSERTs + DELETEs, /auth/mfa/disable
---       DELETEs, /auth/login/mfa UPDATEs (consume), break-glass redeem DELETEs.
---     - mfa_break_glass_codes: /auth/login/break-glass UPDATEs (consume + revoke
---       siblings).
---   This is harmless TODAY (RLS_ENFORCE=False; the runtime role is BYPASSRLS with
---   full grants), but at the RLS-enforce cutover (H1) bridgeleads_app will need
---   SELECT/INSERT/UPDATE/DELETE on mfa_backup_codes and SELECT/UPDATE on
---   mfa_break_glass_codes. That requires RECONCILING with the "no app DELETE"
---   invariant + verify block above — a deliberate H1 design decision (relax the
---   invariant for MFA tables, route deletes through a SECURITY DEFINER fn, or
---   move them off the request path). Do NOT add the grants until H1 resolves it,
---   or the verify block will hard-fail. The system role already covers these via
---   GRANT ... ON ALL TABLES (re-run at provisioning, after the tables exist).
+-- ✅ H1 RESOLVED (2026-06-12) — the MFA-table grant question this block used to
+--   track is settled: mfa_backup_codes gets the single allowlisted app DELETE
+--   (grant block above), mfa_break_glass_codes is SELECT/UPDATE only, and the
+--   verify block allowlists exactly that. See tasks/todo.md (H1) for the design
+--   record and the Codex consult that picked scoped-grant over SECURITY DEFINER.
 
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_app;
 
@@ -192,6 +216,9 @@ GRANT USAGE ON SCHEMA public TO bridgeleads_system;
 GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO bridgeleads_system;
 GRANT DELETE ON county_records TO bridgeleads_system;   -- scheduler.py:521 retention only
 GRANT DELETE ON property_list_membership TO bridgeleads_system;  -- overlap rollup retention prune
+-- H1: operator MFA reset (scripts/reset_user_mfa.py:92, runs via railway worker)
+-- physically DELETEs both MFA tables.
+GRANT DELETE ON mfa_backup_codes, mfa_break_glass_codes TO bridgeleads_system;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_system;
 
 -- ── Role 3: owner / migration role ──────────────────────────────────────────
@@ -220,7 +247,8 @@ COMMIT;
 -- Both roles must be rolsuper=f, rolbypassrls=f:
 SELECT rolname, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole
 FROM pg_roles WHERE rolname LIKE 'bridgeleads_%';
--- bridgeleads_app must have ZERO DELETE rows:
+-- bridgeleads_app DELETE rows: expect EXACTLY ONE (mfa_backup_codes — the H1
+-- allowlisted exception):
 SELECT grantee, table_name, privilege_type
 FROM information_schema.role_table_grants
 WHERE grantee = 'bridgeleads_app' AND privilege_type = 'DELETE';

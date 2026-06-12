@@ -15,9 +15,6 @@ Run:  PYTHONPATH=. python scripts/_cutover_step2_grants_policies.py
 
 from __future__ import annotations
 
-import io
-import sys
-
 import psycopg2
 
 _POLICY_SQL = "scripts/apply_rls_cutover_policies.sql"
@@ -79,7 +76,7 @@ _VERIFY_APP_GRANTS = """
 
 
 def _admin_dsn() -> str:
-    with io.open(".env", "r", encoding="utf-8") as f:
+    with open(".env", encoding="utf-8") as f:
         for line in f:
             if line.strip().startswith("DATABASE_URL_SYNC="):
                 dsn = line.strip().split("=", 1)[1].replace("postgresql+psycopg2://", "postgresql://")
@@ -92,9 +89,9 @@ def _admin_dsn() -> str:
 
 
 def _policy_sql_without_psql_meta() -> str:
-    with io.open(_POLICY_SQL, "r", encoding="utf-8") as f:
+    with open(_POLICY_SQL, encoding="utf-8") as f:
         # Drop psql meta-command lines (start with backslash); keep SQL + DO + BEGIN/COMMIT.
-        return "".join(l for l in f if not l.lstrip().startswith("\\"))
+        return "".join(line for line in f if not line.lstrip().startswith("\\"))
 
 
 def main() -> None:

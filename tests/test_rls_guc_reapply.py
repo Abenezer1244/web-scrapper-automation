@@ -54,6 +54,44 @@ def test_guc_survives_commit_via_after_begin() -> None:
         s.rollback()
 
 
+async def test_async_session_guc_survives_commit() -> None:
+    """The async API session reapplies the GUC after a commit (Codex note D).
+
+    `get_rls_db` binds `rls_user_id` on `db.sync_session.info`; the same
+    `after_begin` listener must fire through the AsyncSession greenlet path.
+    The sync path is proven above — this closes the async half before Phase 4.
+    """
+    from src.db.session import AsyncSessionLocal
+
+    uid = str(uuid.uuid4())
+    async with AsyncSessionLocal() as s:
+        # Mirror get_rls_db (src/api/deps.py): bind info + set the GUC.
+        s.sync_session.info["rls_user_id"] = uid
+        await s.execute(
+            text("SELECT set_config('app.current_user_id', :uid, true)"),
+            {"uid": uid},
+        )
+        first = (
+            await s.execute(
+                text("SELECT current_setting('app.current_user_id', true)")
+            )
+        ).scalar()
+        assert first == uid, f"GUC not set on first async transaction: {first!r}"
+
+        await s.commit()
+
+        after = (
+            await s.execute(
+                text("SELECT current_setting('app.current_user_id', true)")
+            )
+        ).scalar()
+        assert after == uid, (
+            "GUC NOT reapplied after commit on the ASYNC session — API routes "
+            f"would lose RLS context mid-request. got {after!r}, expected {uid!r}"
+        )
+        await s.rollback()
+
+
 def test_system_session_carries_no_user_context() -> None:
     """system_sync_session must leave app.current_user_id unset.
 

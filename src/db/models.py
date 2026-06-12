@@ -308,11 +308,13 @@ class ScraperBatch(Base):
 
 
 class BatchRun(Base):
-    """Piece 2: one execution of a batch. WORKER/SYSTEM-written (like
-    DialerDelivery / delivered_records) — NOT app-table-granted; read endpoints
-    use the system session + an explicit user_id filter. The completion barrier
-    flips status to done/partial once all child_job_ids are terminal, then the
-    combined CSV is built (scoped to those job_ids) and delivered once."""
+    """Piece 2: one execution of a batch. The API CREATEs the durable 'pending'
+    intent (POST /batches) and READs run history on the RLS app session; every
+    lifecycle UPDATE (running/done/partial/failed, CSV key, recovery) is
+    WORKER/SYSTEM-only — under H1 the app role holds SELECT+INSERT and no
+    UPDATE (mig 056 + scripts/apply_rls_cutover_policies.sql). The completion
+    barrier flips status to done/partial once all child_job_ids are terminal,
+    then the combined CSV is built (scoped to those job_ids) and delivered once."""
 
     __tablename__ = "batch_runs"
     # Tenant-scoped composite FK (Codex P1): a run's (batch_id, user_id) must match

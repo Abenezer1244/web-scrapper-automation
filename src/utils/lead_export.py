@@ -18,6 +18,7 @@ Input is duck-typed: each record may be an ORM object (attribute access) OR a di
 exports never silently drop them.
 """
 import csv
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from src.api.middleware.security import sanitize_for_csv
@@ -28,7 +29,8 @@ from src.utils.lead_formatting import (
 )
 
 # Canonical column order. Existing reference/legacy columns first, dialer-import
-# split columns appended at END (backward-compatible for header-mapped consumers).
+# split columns + enrichment passthrough appended at END (backward-compatible for
+# header-mapped consumers — old importers keep working, new columns are extra).
 LEAD_CSV_COLUMNS: list[str] = [
     "date_recorded", "party_name", "heirs", "parcel_id",
     "property_address", "mailing_address", "legal_description", "doc_type",
@@ -37,7 +39,56 @@ LEAD_CSV_COLUMNS: list[str] = [
     "phone_2", "phone_3", "email_2", "email_3",
     "first_name", "last_name",
     "property_street", "property_city", "property_state", "property_zip",
+    # Enrichment passthrough (2026-06-12, gap-analysis Tier 0): structured data
+    # we already scrape into enrichment_data but never exported. Blank for record
+    # types that don't carry the field (same convention as delinquent_amount).
+    "assessed_value", "instrument_number",
+    "code_violation_type", "code_violation_status",
+    "code_violation_description", "code_violation_last_inspection",
+    "tax_billed_amount", "tax_paid_amount", "tax_account_status",
 ]
+
+
+def _enrichment(record: Any) -> dict:
+    """The record's enrichment_data as a dict (empty if absent/malformed).
+
+    Read straight from enrichment_data, NOT source-gated like _extract_tax_fields
+    in workers/tasks.py. The gate there guards delinquent_amount — a FILTER +
+    billing column where a mislabeled value changes what a user sees and pays for.
+    These columns are display-only passthrough: a stray value in the wrong column
+    is cosmetic, and the keys (instrument_number, billed_amount, last_inspection,
+    …) are specific to the scrapers that emit them. Dict exports (segments) may
+    not carry enrichment_data at all → blank, which is correct.
+    """
+    data = _get(record, "enrichment_data")
+    return data if isinstance(data, dict) else {}
+
+
+def _enrich_str(data: dict, key: str) -> str:
+    """Sanitized string value of enrichment_data[key], '' when absent."""
+    val = data.get(key)
+    return sanitize_for_csv(val) if val not in (None, "") else ""
+
+
+def _enrich_num(data: dict, key: str) -> str:
+    """Plain numeric string of enrichment_data[key], '' when absent/non-numeric.
+
+    Accepts numbers or numeric strings (scrapers store either). Renders without
+    currency symbols/commas so the value is dialer/spreadsheet clean. Digits-only
+    output after coercion is inherently CSV-injection-safe.
+    """
+    val = data.get(key)
+    if val in (None, ""):
+        return ""
+    try:
+        d = Decimal(str(val).replace(",", "").replace("$", "").strip())
+    except (InvalidOperation, ValueError, TypeError):
+        # Non-numeric (unexpected) — fall back to a sanitized string rather than drop.
+        return sanitize_for_csv(val)
+    if not d.is_finite():
+        return ""
+    # Plain decimal string — no scientific notation, no currency formatting.
+    return format(d, "f")
 
 
 def _get(record: Any, name: str) -> Any:
@@ -79,6 +130,7 @@ def build_lead_export_row(record: Any) -> dict[str, str]:
 
     amt = _get(record, "delinquent_amount")
     year = _get(record, "delinquent_bill_year")
+    enr = _enrichment(record)
 
     return {
         "date_recorded": sanitize_for_csv(_get(record, "date_recorded")),
@@ -104,6 +156,17 @@ def build_lead_export_row(record: Any) -> dict[str, str]:
         "property_city": sanitize_for_csv(prop["city"]),
         "property_state": sanitize_for_csv(prop["state"]),
         "property_zip": sanitize_for_csv(prop["zip"]),
+        # Enrichment passthrough (Tier 0): see _enrichment() for why these read
+        # the JSON keys directly. Numeric fields rendered plainly; rest sanitized.
+        "assessed_value": _enrich_num(enr, "assessed_value"),
+        "instrument_number": _enrich_str(enr, "instrument_number"),
+        "code_violation_type": _enrich_str(enr, "record_type"),
+        "code_violation_status": _enrich_str(enr, "status"),
+        "code_violation_description": _enrich_str(enr, "description"),
+        "code_violation_last_inspection": _enrich_str(enr, "last_inspection"),
+        "tax_billed_amount": _enrich_num(enr, "billed_amount"),
+        "tax_paid_amount": _enrich_num(enr, "paid_amount"),
+        "tax_account_status": _enrich_str(enr, "account_status"),
     }
 
 

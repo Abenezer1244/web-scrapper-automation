@@ -84,6 +84,83 @@ class TestBuildRow:
         assert build_lead_export_row({"phone": "555-1234"})["phone"] == ""
 
 
+class TestEnrichmentPassthrough:
+    """Tier 0: structured enrichment_data we scrape but used to drop from the CSV."""
+
+    def test_code_violation_fields_exported(self):
+        rec = {
+            "party_name": "DISTRESSED OWNER",
+            "property_address": "456 OAK AVE, SEATTLE, WA 98101",
+            "enrichment_data": {
+                "source": "seattle_sdci_code_violations",
+                "record_type": "Housing/Building",
+                "status": "Open",
+                "description": "Vacant building, unsecured; structural hazard",
+                "last_inspection": "2026-05-01",
+                "latitude": 47.6,  # captured but intentionally NOT a column
+            },
+        }
+        row = build_lead_export_row(rec)
+        assert row["code_violation_type"] == "Housing/Building"
+        assert row["code_violation_status"] == "Open"
+        assert row["code_violation_description"].startswith("Vacant building")
+        assert row["code_violation_last_inspection"] == "2026-05-01"
+        # tax columns stay blank for a non-tax row
+        assert row["tax_billed_amount"] == "" and row["tax_account_status"] == ""
+
+    def test_tax_fields_exported_and_numeric_normalized(self):
+        rec = {
+            "enrichment_data": {
+                "source": "king_county_delinquent_taxes",
+                "billed_amount": "5400.00",
+                "paid_amount": 1200,
+                "account_status": "DELINQUENT",
+            },
+        }
+        row = build_lead_export_row(rec)
+        assert row["tax_billed_amount"] == "5400.00"
+        assert row["tax_paid_amount"] == "1200"
+        assert row["tax_account_status"] == "DELINQUENT"
+        assert row["code_violation_type"] == ""  # not a code-violation row
+
+    def test_assessed_value_strips_currency_formatting(self):
+        row = build_lead_export_row({"enrichment_data": {"assessed_value": "$325,000"}})
+        assert row["assessed_value"] == "325000"
+
+    def test_instrument_number_passthrough(self):
+        row = build_lead_export_row({"enrichment_data": {"instrument_number": "20260101001234"}})
+        assert row["instrument_number"] == "20260101001234"
+
+    def test_missing_enrichment_blanks_all(self):
+        row = build_lead_export_row({"party_name": "X"})
+        for col in (
+            "assessed_value", "instrument_number", "code_violation_type",
+            "code_violation_status", "code_violation_description",
+            "code_violation_last_inspection", "tax_billed_amount",
+            "tax_paid_amount", "tax_account_status",
+        ):
+            assert row[col] == "", f"{col} should be blank with no enrichment_data"
+
+    def test_malformed_enrichment_data_does_not_raise(self):
+        # enrichment_data is sometimes None or (defensively) a non-dict
+        for bad in (None, [], "oops", 42):
+            row = build_lead_export_row({"enrichment_data": bad})
+            assert row["assessed_value"] == ""
+
+    def test_orm_object_enrichment(self):
+        obj = _Obj(enrichment_data={"assessed_value": 410000, "status": "Closed"})
+        row = build_lead_export_row(obj)
+        assert row["assessed_value"] == "410000"
+        assert row["code_violation_status"] == "Closed"
+
+    def test_csv_injection_sanitized_in_passthrough(self):
+        row = build_lead_export_row(
+            {"enrichment_data": {"description": "=cmd|'/c calc'!A1", "account_status": "@evil"}}
+        )
+        assert not row["code_violation_description"].startswith("=")
+        assert not row["tax_account_status"].startswith("@")
+
+
 class TestWriteCsv:
     def test_header_and_rows_no_footer(self):
         out = io.StringIO()

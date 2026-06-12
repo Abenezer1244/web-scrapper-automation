@@ -23,6 +23,7 @@ from src.config import settings
 from src.utils.logger import setup_logger
 from src.workers import app
 from src.workers.property_identity import compute_property_key as _compute_property_key
+from src.workers.property_identity import legacy_strong_signature as _legacy_strong_signature
 
 _logger = setup_logger("worker.task")
 
@@ -147,7 +148,9 @@ def _set_status(db, job, status: str, **kwargs: Unpack[JobUpdateFields]) -> bool
     return rowcount == 1
 
 
-def _upsert_property_membership(db, rows, user_id: str, record_type: str) -> int:
+def _upsert_property_membership(
+    db, rows, user_id: str, record_type: str, county: str | None, state: str | None
+) -> int:
     """Phase 1: roll up strong-identity property sightings for cross-list overlap.
 
     `rows` = post-enrichment Result objects (only .parcel_id / .property_address
@@ -161,7 +164,8 @@ def _upsert_property_membership(db, rows, user_id: str, record_type: str) -> int
     """
     agg: dict[str, dict] = {}
     for res in rows:
-        key = _compute_property_key(res.parcel_id, res.property_address)
+        # County/state-scoped overlap key (2026-06-12) — config context required.
+        key = _compute_property_key(res.parcel_id, res.property_address, county, state)
         if not key:
             continue
         cur = agg.get(key)
@@ -220,7 +224,9 @@ def _upsert_property_membership(db, rows, user_id: str, record_type: str) -> int
     return len(agg)
 
 
-def _write_result_property_keys(db, rows, user_id: str) -> tuple[int, int]:
+def _write_result_property_keys(
+    db, rows, user_id: str, county: str | None, state: str | None
+) -> tuple[int, int]:
     """Phase 3: stamp results.property_key on post-enrichment rows.
 
     property_key is the SAME strong-identity key membership stores
@@ -243,7 +249,8 @@ def _write_result_property_keys(db, rows, user_id: str) -> tuple[int, int]:
     pairs: list[tuple[str, str]] = []
     weak = 0
     for res in rows:
-        key = _compute_property_key(res.parcel_id, res.property_address)
+        # County/state-scoped overlap key (2026-06-12) — config context required.
+        key = _compute_property_key(res.parcel_id, res.property_address, county, state)
         if not key:
             weak += 1
             continue
@@ -601,10 +608,12 @@ def run_scrape_job(self, job_id: str) -> None:
             party_name: str | None = None,
             date_recorded: str | None = None,
         ) -> str | None:
-            """Sprint 6.4 dedup key. Strong branch shares normalization with
-            src/workers/property_identity (Phase 1) so the billing dedup_hash
-            and the overlap property_key cannot drift. Fallback unchanged."""
-            strong = _compute_property_key(parcel_id, property_address)
+            """Sprint 6.4 dedup key. Strong branch is the FROZEN
+            legacy_strong_signature (parcel|address) — this keys
+            delivered_records (BILLING dedup) and must never change scheme.
+            It deliberately DIVERGED from the overlap property_key on
+            2026-06-12 (see property_identity.py). Fallback unchanged."""
+            strong = _legacy_strong_signature(parcel_id, property_address)
             if strong is not None:
                 return strong
             # Fallback: party_name + date_recorded (unchanged)
@@ -915,7 +924,7 @@ def run_scrape_job(self, job_id: str) -> None:
         if refreshed:
             try:
                 _pk_updated, _pk_weak = _write_result_property_keys(
-                    db, refreshed, str(job.user_id)
+                    db, refreshed, str(job.user_id), config.county, config.state
                 )
                 _logger.info(
                     "Job %s: property_key stamped on %d rows (%d weak-identity skipped)",
@@ -943,7 +952,8 @@ def run_scrape_job(self, job_id: str) -> None:
         if refreshed:
             try:
                 _mcount = _upsert_property_membership(
-                    db, refreshed, str(job.user_id), config.record_type
+                    db, refreshed, str(job.user_id), config.record_type,
+                    config.county, config.state,
                 )
                 _logger.info("Job %s: property membership upserted %d properties", job_id, _mcount)
             except Exception as exc:
@@ -1108,11 +1118,13 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
     worker runs on the SYSTEM db session (which is not constrained by RLS), so
     this explicit user_id filter — not RLS — is the tenant boundary; it makes a
     cross-tenant copy impossible. Reuse is gated to PROVABLY-STRONG identity:
-    we recompute compute_property_key(parcel_id, property_address) per candidate
-    and reuse ONLY rows whose dedup_hash IS that strong key — so the hash must
-    have come from the parcel/address branch, never the weak NAME|DATE fallback.
-    A blank/placeholder parcel ('', 'N/A', whitespace) makes compute_property_key
-    return None (is_strong_identity=False), so it can't match and is excluded;
+    we recompute legacy_strong_signature(parcel_id, property_address) per
+    candidate (the FROZEN scheme dedup_hash stores — NOT the 2026-06-12 overlap
+    property_key) and reuse ONLY rows whose dedup_hash IS that strong key — so
+    the hash must have come from the parcel/address branch, never the weak
+    NAME|DATE fallback. A blank/placeholder parcel ('', 'N/A', whitespace) makes
+    legacy_strong_signature return None (is_strong_identity=False), so it can't
+    match and is excluded;
     `parcel_id IS NOT NULL` alone was insufficient (Codex P1). Thus one
     homeowner's PII can never be copied onto an unrelated record that merely
     shares a name + filing date. Address/source fields are FILL-MISSING (COALESCE
@@ -1135,7 +1147,11 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
 
     def _reusable(parcel_id, property_address, dedup_hash) -> bool:
         # 1) must be the STRONG (parcel|address) hash, never weak NAME|DATE.
-        if _compute_property_key(parcel_id, property_address) != dedup_hash:
+        # Compares against legacy_strong_signature — dedup_hash stores the
+        # FROZEN legacy scheme, NOT the (2026-06-12, county-scoped) overlap
+        # property_key. Comparing the new key here would silently disable all
+        # enrichment/skip-trace reuse (Codex P1).
+        if _legacy_strong_signature(parcel_id, property_address) != dedup_hash:
             return False
         # 2) a specific address makes the identity safe regardless of parcel.
         addr = normalize_address(property_address)

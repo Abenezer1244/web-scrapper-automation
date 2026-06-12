@@ -46,13 +46,18 @@ def run(batch: int) -> None:
         with SyncSessionLocal() as db:
             # Only rows still missing a key. Keyset by id so we never re-scan and
             # never use OFFSET. Select just what we need to compute the key.
+            # 2026-06-12: the key is county/state-scoped — join configs for the
+            # context (never recompute a key without it; see property_identity).
             rows = db.execute(
                 text(
                     """
-                    SELECT id, parcel_id, property_address
-                    FROM results
-                    WHERE id > CAST(:last_id AS uuid) AND property_key IS NULL
-                    ORDER BY id
+                    SELECT r.id, r.parcel_id, r.property_address,
+                           sc.county, sc.state
+                    FROM results r
+                    JOIN jobs j ON j.id = r.job_id
+                    JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+                    WHERE r.id > CAST(:last_id AS uuid) AND r.property_key IS NULL
+                    ORDER BY r.id
                     LIMIT :batch
                     """
                 ),
@@ -67,7 +72,9 @@ def run(batch: int) -> None:
             pairs: list[tuple[str, str]] = []
             for row in rows:
                 scanned += 1
-                key = compute_property_key(row.parcel_id, row.property_address)
+                key = compute_property_key(
+                    row.parcel_id, row.property_address, row.county, row.state
+                )
                 if not key:
                     weak += 1
                     continue

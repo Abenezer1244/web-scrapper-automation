@@ -539,33 +539,6 @@ async def get_cached_records(
     )
 
 
-def _reset_failed_dialer_deliveries(job_id: str, user_id: str) -> int:
-    """Reset this user's FAILED dialer outbox rows for a job back to pending.
-
-    Runs in the system session (the dialer_deliveries table is worker-only, not
-    granted to the app role) with an EXPLICIT user_id filter as the tenant guard.
-    Only 'failed' rows are touched, never 'delivered' — a replay can't re-push a
-    contact that already landed. Returns the number reset.
-    """
-    from sqlalchemy import update
-
-    from src.db.models import DialerDelivery
-    from src.db.session import system_sync_session
-
-    with system_sync_session() as db:
-        n = db.execute(
-            update(DialerDelivery)
-            .where(
-                DialerDelivery.job_id == job_id,
-                DialerDelivery.user_id == user_id,
-                DialerDelivery.status == "failed",
-            )
-            .values(status="pending", last_error=None)
-        ).rowcount
-        db.commit()
-    return int(n or 0)
-
-
 @router.post("/{config_id}/jobs/{job_id}/dialer-replay")
 async def replay_dialer_push(
     config_id: str,
@@ -579,12 +552,13 @@ async def replay_dialer_push(
     Native bulk-less dialers (e.g. PhoneBurner) deliver one contact per POST, so a
     job can finish with some contacts failed (rate-limit/401/outage). This resets
     only the failed rows to pending and re-runs the outbox drain — delivered rows
-    are never re-pushed. Tenant-scoped twice: the job must belong to the caller AND
-    to this config (RLS read), and the reset filters by user_id (system session).
+    are never re-pushed. The reset runs on the RLS app session (H1: the API holds
+    app-role credentials only — no system session in the request path) with the
+    explicit user_id filter kept as the suspenders.
     """
-    import anyio
+    from sqlalchemy import update
 
-    from src.db.models import Job
+    from src.db.models import DialerDelivery, Job
 
     await rate_limit(request, zone="general", identifier=current_user.id)
 
@@ -600,9 +574,19 @@ async def replay_dialer_push(
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
-    reset = await anyio.to_thread.run_sync(
-        _reset_failed_dialer_deliveries, job_id, current_user.id
-    )
+    reset = (
+        await db.execute(
+            update(DialerDelivery)
+            .where(
+                DialerDelivery.job_id == job_id,
+                DialerDelivery.user_id == current_user.id,
+                DialerDelivery.status == "failed",
+            )
+            .values(status="pending", last_error=None)
+        )
+    ).rowcount
+    await db.commit()
+    reset = int(reset or 0)
     if reset:
         from src.workers.dialer_outbox import process_dialer_outbox
         process_dialer_outbox.delay(job_id)

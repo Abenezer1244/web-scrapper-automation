@@ -114,3 +114,36 @@ Each phase is independently revertible:
 
 The fastest full rollback at any point: set the connection vars back to the original
 BYPASSRLS role and `RLS_ENFORCE=False` — returns to today's behavior immediately.
+
+## H1 addendum (2026-06-12) — drift tables + ordering rules
+
+The cutover artifacts now also cover the tables added after 2026-06-02:
+`mfa_backup_codes` (app S/I/U/**D** — the single allowlisted app DELETE),
+`mfa_break_glass_codes` (app S/U), `scraper_batches` + `batch_runs` (app S/I),
+`audit_events` (app INSERT-only, no GUC needed), `dialer_deliveries` (app S/U —
+the dialer-replay route now runs on the RLS app session, not the system
+session). The system role additionally gets DELETE on both MFA tables
+(`scripts/reset_user_mfa.py`).
+
+**Strict ordering (Codex challenge):**
+1. Deploy/migrate **056 first** (it ENABLEs RLS on the drift tables; auto-runs
+   on Railway boot, inert under BYPASSRLS), **then** run
+   `provision_rls_roles.sql` → `apply_rls_cutover_policies.sql`. Running the
+   policy script before 056 leaves the untargeted `*_user_isolation` policies
+   behind when 056 lands later — harmless but non-canonical; rerun the policy
+   script to converge.
+2. **Rollback is NEVER `alembic downgrade 055`** — 056's downgrade keeps RLS
+   enabled by design (disabling it would reopen the PostgREST anon surface).
+   Operational rollback = repoint URLs + `RLS_ENFORCE=False` (+ `NO FORCE`).
+3. The RLS integration tests (`pytest -m integration tests/test_rls_*.py`)
+   must run with an **owner/admin DSN** in `DATABASE_URL_SYNC` — the runtime
+   roles cannot GRANT themselves to the connecting user; the fixture skips
+   with an explanatory message otherwise.
+
+**Standing footgun (future drift):** `GRANT ... ON ALL TABLES` covers only
+tables that exist at provisioning time. EVERY new table needs: (1) RLS enabled
++ tenant policy in its migration (043/056 pattern), (2) grants in
+`provision_rls_roles.sql` AND `scripts/_cutover_step2_grants_policies.py`
+(lockstep), (3) role-targeted policies in `apply_rls_cutover_policies.sql`,
+(4) the table added to `apply_rls_force.sql`. Add this to every new-table PR
+checklist.

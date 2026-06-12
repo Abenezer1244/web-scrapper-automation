@@ -15,32 +15,42 @@ Run:  PYTHONPATH=. python scripts/_cutover_step2_grants_policies.py
 
 from __future__ import annotations
 
-import io
-import sys
-
 import psycopg2
 
 _POLICY_SQL = "scripts/apply_rls_cutover_policies.sql"
 
-# Faithful mirror of provision_rls_roles.sql grant block (post-fix).
+# Faithful mirror of provision_rls_roles.sql grant block (post-fix, incl. the
+# H1 drift tables 2026-06-12 — keep BOTH files in lockstep, Codex finding #9).
 _GRANTS = [
     "GRANT USAGE ON SCHEMA public TO bridgeleads_app",
     "GRANT SELECT, INSERT, UPDATE ON users, scraper_configs, jobs, user_record_views TO bridgeleads_app",
     "GRANT SELECT, INSERT ON county_connectors, password_history TO bridgeleads_app",
     "GRANT SELECT ON results, job_logs, county_records, referral_events, "
     "property_list_membership TO bridgeleads_app",
+    # H1 drift tables — mfa_backup_codes carries the SINGLE allowlisted app DELETE
+    "GRANT SELECT, INSERT, UPDATE, DELETE ON mfa_backup_codes TO bridgeleads_app",
+    "GRANT SELECT, UPDATE ON mfa_break_glass_codes TO bridgeleads_app",
+    "GRANT SELECT, INSERT ON scraper_batches, batch_runs TO bridgeleads_app",
+    "GRANT INSERT ON audit_events TO bridgeleads_app",
+    "GRANT SELECT, UPDATE ON dialer_deliveries TO bridgeleads_app",
     "REVOKE DELETE ON users, scraper_configs, jobs, user_record_views FROM bridgeleads_app",
     "REVOKE UPDATE, DELETE ON county_connectors, password_history FROM bridgeleads_app",
     "REVOKE INSERT, UPDATE, DELETE ON results, job_logs, county_records, referral_events, "
     "property_list_membership FROM bridgeleads_app",
     "REVOKE ALL ON delivered_records, pending_skip_trace_rows, skip_trace_queues, "
     "skip_trace_cache, skip_trace_meter_events FROM bridgeleads_app",
+    "REVOKE INSERT, DELETE ON mfa_break_glass_codes FROM bridgeleads_app",
+    "REVOKE UPDATE, DELETE ON scraper_batches, batch_runs FROM bridgeleads_app",
+    "REVOKE SELECT, UPDATE, DELETE ON audit_events FROM bridgeleads_app",
+    "REVOKE INSERT, DELETE ON dialer_deliveries FROM bridgeleads_app",
     "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_app",
     # system role
     "GRANT USAGE ON SCHEMA public TO bridgeleads_system",
     "GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO bridgeleads_system",
     "GRANT DELETE ON county_records TO bridgeleads_system",
     "GRANT DELETE ON property_list_membership TO bridgeleads_system",
+    # H1: operator MFA reset (scripts/reset_user_mfa.py) deletes both MFA tables
+    "GRANT DELETE ON mfa_backup_codes, mfa_break_glass_codes TO bridgeleads_system",
     "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_system",
 ]
 
@@ -48,7 +58,7 @@ _VERIFY_APP_GRANTS = """
     SELECT COUNT(*) FROM information_schema.role_table_grants
     WHERE grantee = 'bridgeleads_app'
       AND (
-        privilege_type = 'DELETE'
+        (privilege_type = 'DELETE' AND table_name <> 'mfa_backup_codes')
         OR (privilege_type IN ('INSERT','UPDATE')
             AND table_name IN ('results','job_logs','county_records','referral_events',
                                'property_list_membership'))
@@ -56,12 +66,17 @@ _VERIFY_APP_GRANTS = """
             AND table_name IN ('county_connectors','password_history'))
         OR table_name IN ('delivered_records','pending_skip_trace_rows',
                           'skip_trace_queues','skip_trace_cache','skip_trace_meter_events')
+        OR (privilege_type = 'INSERT'
+            AND table_name IN ('mfa_break_glass_codes','dialer_deliveries'))
+        OR (privilege_type = 'UPDATE'
+            AND table_name IN ('scraper_batches','batch_runs','audit_events'))
+        OR (privilege_type = 'SELECT' AND table_name = 'audit_events')
       )
 """
 
 
 def _admin_dsn() -> str:
-    with io.open(".env", "r", encoding="utf-8") as f:
+    with open(".env", encoding="utf-8") as f:
         for line in f:
             if line.strip().startswith("DATABASE_URL_SYNC="):
                 dsn = line.strip().split("=", 1)[1].replace("postgresql+psycopg2://", "postgresql://")
@@ -74,9 +89,9 @@ def _admin_dsn() -> str:
 
 
 def _policy_sql_without_psql_meta() -> str:
-    with io.open(_POLICY_SQL, "r", encoding="utf-8") as f:
+    with open(_POLICY_SQL, encoding="utf-8") as f:
         # Drop psql meta-command lines (start with backslash); keep SQL + DO + BEGIN/COMMIT.
-        return "".join(l for l in f if not l.lstrip().startswith("\\"))
+        return "".join(line for line in f if not line.lstrip().startswith("\\"))
 
 
 def main() -> None:

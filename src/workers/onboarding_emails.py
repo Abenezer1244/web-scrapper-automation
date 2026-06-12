@@ -69,7 +69,7 @@ h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 12px; }}
     <div class="step"><div class="num">4</div><div class="txt"><b>Download CSV</b> — Property + mailing address included. Mail letters today.</div></div>
   </div>
   <a href="{url}" class="btn">Set Up Your First Scraper</a>
-  <p style="font-size: 13px; color: #9998a0;">7-day free Pro trial. 500 records/month. No credit card.</p>
+  <p style="font-size: 13px; color: #9998a0;">7-day free Pro trial. 1,000 records/month. No credit card.</p>
   <div class="foot">Questions? Reply to this email.</div>
 </div></body></html>"""
 
@@ -125,7 +125,7 @@ h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 12px; }}
   </div>
   <a href="{url}" class="btn">Go to dashboard</a>
   <p style="font-size: 13px; color: #9998a0;">
-    Your free Pro trial is active for 6 more days &mdash; 500 records/month,
+    Your free Pro trial is active for 6 more days &mdash; 1,000 records/month,
     5 counties, daily auto-scrape.
   </p>
   <div class="foot">
@@ -216,7 +216,7 @@ h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 12px; }}
   <div class="logo">BridgeLeads</div>
   <h1>{headline}</h1>
   <div class="warn">After your trial, you move to Starter (50 records/month, 1 county). Upgrade to keep Pro access.</div>
-  <p style="color: #c8c7cf; font-size: 14px;">Pro ($49/mo) includes: 500 records, 5 counties, daily scraping, email delivery.</p>
+  <p style="color: #c8c7cf; font-size: 14px;">Pro ($79/mo) includes: 1,000 records, 5 counties, daily scraping, email delivery.</p>
   <a href="{url}" class="btn">Upgrade to Pro</a>
   <div class="foot">Questions? Reply or contact support@bridgeleads.io</div>
 </div></body></html>"""

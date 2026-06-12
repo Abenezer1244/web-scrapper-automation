@@ -626,6 +626,7 @@ def expire_trials() -> None:
 
     from sqlalchemy import select
 
+    from src.config import settings
     from src.db.models import User
     from src.db.session import SyncSessionLocal
 
@@ -644,7 +645,7 @@ def expire_trials() -> None:
 
         for user in expired:
             user.plan = "starter"
-            user.records_limit = 50  # Starter limit
+            user.records_limit = settings.PLAN_LIMITS["starter"]  # post-trial Starter limit
             _logger.info("Trial expired for %s — downgraded to starter", user.email)
 
         if expired:

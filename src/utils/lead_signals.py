@@ -27,15 +27,19 @@ _MDY = re.compile(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\b")
 def months_delinquent(bill_year: int | None, today: date) -> int | None:
     """Months a tax bill has been delinquent, derived from its bill year.
 
-    Mirrors src/api/tax_filters.py exactly: WA property-tax bills issue ~Jan 1 of
-    the bill year, so months = (today.year*12 + today.month-1) - bill_year*12.
-    None bill_year (every non-King/Snohomish-tax row) -> None. Never negative.
+    Mirrors src/api/tax_filters.py EXACTLY (Codex review): WA property-tax bills
+    issue ~Jan 1 of the bill year, so months = base - bill_year*12 where
+    base = today.year*12 + (today.month-1). No clamp — the value must agree with
+    the filter math for every bill_year. Real delinquent data never goes negative
+    (you can't be delinquent on a not-yet-issued bill, and _extract_tax_fields
+    caps bill_year at current+1); the unclamped formula only matters for that
+    one defensive edge, where parity with the filter beats a cosmetic floor.
+    None bill_year (every non-King/Snohomish-tax row) -> None.
     """
     if bill_year is None:
         return None
     base = today.year * 12 + (today.month - 1)
-    months = base - bill_year * 12
-    return months if months >= 0 else 0
+    return base - bill_year * 12
 
 
 def wa_foreclosure_eligible(bill_year: int | None, today: date) -> bool:
@@ -100,14 +104,14 @@ def contactability_score(
     """
     phone_nums: set[str] = set()
     if isinstance(phone, str) and phone.strip():
-        phone_nums.add(_digits(phone))
+        phone_nums.add(_us_phone_key(phone))
     if isinstance(phones, list):
         for item in phones:
             # Tolerate dicts ({"number": ...}) and objects (PhoneContact.number):
             # the export path passes JSON dicts, the API path passes Pydantic rows.
             num = item.get("number") if isinstance(item, dict) else getattr(item, "number", None)
             if isinstance(num, str) and num.strip():
-                phone_nums.add(_digits(num))
+                phone_nums.add(_us_phone_key(num))
     phone_nums.discard("")
 
     email_set: set[str] = set()
@@ -123,6 +127,19 @@ def contactability_score(
 
 def _digits(s: str) -> str:
     return re.sub(r"\D", "", s)
+
+
+def _us_phone_key(s: str) -> str:
+    """Dedup key for a US phone: bare 10 digits, dropping a leading country-code 1.
+
+    Skip-trace providers mix E.164/11-digit (`+1 206 555 1234`) and local 10-digit
+    (`2065551234`) for the SAME number; without this the primary would not dedup
+    against the array entry and contactability would over-count (Codex review).
+    """
+    d = _digits(s)
+    if len(d) == 11 and d.startswith("1"):
+        return d[1:]
+    return d
 
 
 def _get(record: Any, name: str) -> Any:

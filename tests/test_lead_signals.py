@@ -27,8 +27,9 @@ class TestMonthsDelinquent:
     def test_current_year_small(self):
         assert months_delinquent(2026, TODAY) == 5
 
-    def test_future_year_clamped_to_zero(self):
-        assert months_delinquent(2030, TODAY) == 0
+    def test_future_year_unclamped(self):
+        # exact tax_filters parity (Codex): no floor — future bill_year is negative
+        assert months_delinquent(2030, TODAY) < 0
 
     def test_matches_tax_filters_base_formula(self):
         base = TODAY.year * 12 + (TODAY.month - 1)
@@ -84,6 +85,17 @@ class TestContactabilityScore:
             ["a@x.com", "b@x.com"],
         )
         assert score == 2 + 2  # 2 distinct phones + 2 distinct emails
+
+    def test_dedup_e164_vs_local(self):
+        # +1-prefixed 11-digit and local 10-digit of the SAME number count once
+        score = contactability_score(
+            "+1 (206) 555-1234", None, [{"number": "2065551234"}], None
+        )
+        assert score == 1
+
+    def test_months_formula_unclamped_matches_filter(self):
+        # exact parity with tax_filters: future bill_year goes negative, not 0
+        assert months_delinquent(2030, TODAY) == TODAY.year * 12 + (TODAY.month - 1) - 2030 * 12
 
     def test_object_phones_tolerated(self):
         class _PC:

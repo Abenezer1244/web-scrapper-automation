@@ -9,7 +9,7 @@ dialer import) — it's surfaced in the delivery email body + download UI instea
 """
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -48,8 +48,12 @@ def _canonical_dataframe(records: list[Any]) -> pd.DataFrame:
     (dialer split cols, normalized phones, sanitized values) as the CSV, so the
     Excel export matches the CSV exactly. No DNC footer; that lives in the email
     body + download UI (a disclaimer row breaks spreadsheet/dialer import).
+
+    One `today` for the whole frame so a large export crossing UTC midnight can't
+    give two rows different freshness_days/months_delinquent (Codex review).
     """
-    rows = [build_lead_export_row(r) for r in records]
+    today = datetime.now(UTC).date()
+    rows = [build_lead_export_row(r, today) for r in records]
     return pd.DataFrame(rows, columns=LEAD_CSV_COLUMNS)
 
 

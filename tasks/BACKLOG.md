@@ -20,7 +20,7 @@ Two branches off `main`, unmerged. Stage 1 = contact PII + additive email_hmac. 
 - [x] 👤 `backfill_user_email_encrypt.py` — run 2026-06-12: **444/444 emails encrypted**
 - [x] 👤 `verify_pii_encryption.py` — **ALL CLEAR**
 - [x] 👤 `PII_ENCRYPTION_STRICT=true` set on api + worker 2026-06-12 (confirmed both) — **H3 COMPLETE** pending the post-redeploy live-login check
-- [ ] 🟠 Encrypt/rotate `SkipTraceQueue.download_url` (signed PII CSV URL) — H3 deferred residual
+- [x] 🟠 `SkipTraceQueue.download_url` — ENCRYPTED 2026-06-12 (PR #30, migration 054: expired links NULLed, rest encrypted in-migration, fail-closed assert; Codex GO).
 
 ## 2. Security audit checklist — remaining (`SECURITY_CHECKLIST_AUDIT_2026-06-08.md`)
 
@@ -29,11 +29,11 @@ Two branches off `main`, unmerged. Stage 1 = contact PII + additive email_hmac. 
 - [x] 🟠 **CI RESURRECTED** (bonus, found during M3; PR #15) — GH Actions workflow had NEVER run (invalid YAML at the f-string `OK:` step → 0 jobs). Fixed (block scalar + pinned ruff==0.15.6). First real run exposed a never-passing test job → fully fixed: 80 ruff errors (incl. real `select` NameError bug in `tasks.py`); pytest-asyncio 1.x loop migration (removed event_loop fixture + session test-loop-scope); CI postgres 6543→5432 port map (SyncSessionLocal rewrite); RLS/prod-DB integration tests marked `@pytest.mark.integration` + excluded (`-m "not integration"`); migration 048 for model-drift `county_connectors.max_date_range_days`; conftest Redis flush (rate-limit/lockout isolation); MFA tests wait past the whole-second revoke; 2 stale tests (pro limit 1000, register→pro); coverage fail_under 55→34 (real floor). **✅ CI GREEN: 511 pass / 9 integration deselected; Test + Dependency-Audit jobs pass.**
   - Follow-ups: 🔵 ratchet coverage up from 34 (write scraper/worker unit tests); 🔵 dedicated prod-DB CI job to run the 9 `integration` RLS tests; 🧭 **pre-existing inconsistency to review:** `PLAN_LIMITS["pro"]=1000` but `/auth/register` sets pro `records_limit=500`.
 - [x] 🟠 **M3/M8/CI Codex-gate + CI validation** — PR #15 (`security/audit-m3-m8`), **CI GREEN**. Codex gate: all real findings fixed across rounds (Redis-FLUSHDB-to-localhost P1, graphify/JS sweep-ins, PyJWT comment, strict-mode backfill). Remaining Codex flag = **PROVEN FALSE POSITIVE**: it calls the laserfiche/eagleweb raw-string JS date regex broken, but AST extraction shows `page.evaluate` receives the valid `/\d{1,2}\/\d{1,2}\/\d{4}/` — Codex has a raw-string blind spot (flagged both raw-`\d` and non-raw-`\\d` forms). Code is correct; rejected with evidence. ⚠️ Merge auto-deploys to prod (Railway) — your call.
-- [ ] 🟠 **M6** — alerting/escalation (Sentry / email / Slack) on watchdog+canary failures (currently log-only)
-- [ ] 🟠 **M7** — durable DB audit trail (login attempts, scraper-config changes) — `audit_log()` is file-only
+- [x] 🟠 **M6** — SHIPPED 2026-06-12 (PR #31): ops email alerts (Resend) on watchdog permanent-fail, canary →down transition, batch give-up; Redis cooldown, post-commit dispatch, PII-safe bodies (Codex 3 P2s adopted). 👤 set `OPS_ALERT_EMAIL` on Railway api+worker to activate + add OPS_ALERT_* to .env.example.
+- [x] 🟠 **M7** — SHIPPED 2026-06-12: `audit_events` table (migration 055, no user FK by design) + best-effort background insert in `audit_log()` (task-ref held, semaphore-bounded — Codex P2s) + scraper_created/scraper_deleted events added. Console line remains the fallback.
 - [ ] 🟠 **M4** — documented edge DDoS rate-limit rules (Cloudflare WAF) + distributed-limiter resilience
 - [ ] 🟠 **M5** — document + restrict DB/Redis IP allowlisting (infra posture)
-- [ ] 🔴 **H1** — RLS enforcement (`RLS_ENFORCE=True`) — **DO LAST**, prod-boot landmine. Needs `users` self-row policy + app grants on `mfa_backup_codes` + `mfa_break_glass_codes` (tracked in `provision_rls_roles.sql`). **+ Track A follow-up:** the API now INSERTs `batch_runs` (durable run intent) from the rls session, so the H1 cutover must add `batch_runs` INSERT grant for the app role (OK today: BYPASSRLS prod role).
+- [ ] 🔴 **H1** — RLS enforcement (`RLS_ENFORCE=True`) — **DO LAST**, prod-boot landmine. Needs `users` self-row policy + app grants on `mfa_backup_codes` + `mfa_break_glass_codes` (tracked in `provision_rls_roles.sql`). **+ Track A follow-up:** the API now INSERTs `batch_runs` (durable run intent) from the rls session, so the H1 cutover must add `batch_runs` INSERT grant for the app role (OK today: BYPASSRLS prod role). **+ M7 follow-up (2026-06-12): `audit_events` INSERT grant for the API runtime role — else durable audit silently degrades to console-only under enforced RLS (Codex).**
 
 ## 3. Open security/privacy DECISIONS (need a call before coding)
 

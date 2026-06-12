@@ -188,6 +188,94 @@ BEGIN
 END
 $sys_only$;
 
+-- ════════════════════════════════════════════════════════════════════════════
+-- H1 drift tables (2026-06-12, Codex consult 019ebbc2). Each replaces the
+-- untargeted user_isolation policy from its creating migration (043/045/041/056)
+-- with explicit role-targeted policies, matching the grants in
+-- provision_rls_roles.sql exactly.
+-- ════════════════════════════════════════════════════════════════════════════
+
+-- ── mfa_backup_codes: app FOR ALL (S/I/U/D — the single allowlisted app DELETE;
+--    /auth/mfa/enable replaces the set, /auth/mfa/disable + break-glass burn it).
+DROP POLICY IF EXISTS mfa_backup_codes_user_isolation ON public.mfa_backup_codes;
+DROP POLICY IF EXISTS mfa_backup_codes_app ON public.mfa_backup_codes;
+CREATE POLICY mfa_backup_codes_app ON public.mfa_backup_codes
+    FOR ALL TO bridgeleads_app
+    USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid)
+    WITH CHECK (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
+DROP POLICY IF EXISTS mfa_backup_codes_system ON public.mfa_backup_codes;
+CREATE POLICY mfa_backup_codes_system ON public.mfa_backup_codes
+    FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
+
+-- ── mfa_break_glass_codes: app SELECT + UPDATE only (atomic consume + revoke
+--    siblings); INSERT is the operator script (system), DELETE is system-only.
+DROP POLICY IF EXISTS mfa_break_glass_codes_user_isolation ON public.mfa_break_glass_codes;
+DROP POLICY IF EXISTS mfa_break_glass_codes_app_select ON public.mfa_break_glass_codes;
+CREATE POLICY mfa_break_glass_codes_app_select ON public.mfa_break_glass_codes
+    FOR SELECT TO bridgeleads_app
+    USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
+DROP POLICY IF EXISTS mfa_break_glass_codes_app_update ON public.mfa_break_glass_codes;
+CREATE POLICY mfa_break_glass_codes_app_update ON public.mfa_break_glass_codes
+    FOR UPDATE TO bridgeleads_app
+    USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid)
+    WITH CHECK (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
+DROP POLICY IF EXISTS mfa_break_glass_codes_system ON public.mfa_break_glass_codes;
+CREATE POLICY mfa_break_glass_codes_system ON public.mfa_break_glass_codes
+    FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
+
+-- ── scraper_batches + batch_runs: app SELECT + INSERT (POST /batches creates
+--    the batch + durable pending run intent; GETs read both); lifecycle UPDATEs
+--    are worker-only. Explicit per-verb policies, not FOR ALL (Codex D3).
+DO $batches$
+DECLARE
+    t text;
+    guc text := 'user_id = NULLIF(current_setting(''app.current_user_id'', true), '''')::uuid';
+BEGIN
+    FOREACH t IN ARRAY ARRAY['scraper_batches', 'batch_runs']
+    LOOP
+        EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_user_isolation', t);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_app_select', t);
+        EXECUTE format(
+            'CREATE POLICY %I ON public.%I FOR SELECT TO bridgeleads_app USING (%s)',
+            t || '_app_select', t, guc);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_app_insert', t);
+        EXECUTE format(
+            'CREATE POLICY %I ON public.%I FOR INSERT TO bridgeleads_app WITH CHECK (%s)',
+            t || '_app_insert', t, guc);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_system', t);
+        EXECUTE format(
+            'CREATE POLICY %I ON public.%I FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true)',
+            t || '_system', t);
+    END LOOP;
+END
+$batches$;
+
+-- ── audit_events: app INSERT-only WITH CHECK (true) — the audit background
+--    task runs in a fresh AsyncSessionLocal with NO GUC and nullable user_id
+--    (anon login failures). No app SELECT (no read path; forensics = owner).
+DROP POLICY IF EXISTS audit_events_app_insert ON public.audit_events;
+CREATE POLICY audit_events_app_insert ON public.audit_events
+    FOR INSERT TO bridgeleads_app WITH CHECK (true);
+DROP POLICY IF EXISTS audit_events_system ON public.audit_events;
+CREATE POLICY audit_events_system ON public.audit_events
+    FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
+
+-- ── dialer_deliveries: app SELECT + UPDATE (dialer-replay resets this user's
+--    FAILED outbox rows to pending); INSERT/DELETE worker-only.
+DROP POLICY IF EXISTS dialer_deliveries_user_isolation ON public.dialer_deliveries;
+DROP POLICY IF EXISTS dialer_deliveries_app_select ON public.dialer_deliveries;
+CREATE POLICY dialer_deliveries_app_select ON public.dialer_deliveries
+    FOR SELECT TO bridgeleads_app
+    USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
+DROP POLICY IF EXISTS dialer_deliveries_app_update ON public.dialer_deliveries;
+CREATE POLICY dialer_deliveries_app_update ON public.dialer_deliveries
+    FOR UPDATE TO bridgeleads_app
+    USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid)
+    WITH CHECK (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
+DROP POLICY IF EXISTS dialer_deliveries_system ON public.dialer_deliveries;
+CREATE POLICY dialer_deliveries_system ON public.dialer_deliveries
+    FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
+
 COMMIT;
 
 -- ── Verification (informational) ────────────────────────────────────────────

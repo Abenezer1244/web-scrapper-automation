@@ -32,7 +32,10 @@ DECLARE
         'pending_skip_trace_rows', 'skip_trace_queues', 'password_history',
         'user_record_views', 'referral_events', 'users', 'county_connectors',
         'county_records', 'skip_trace_cache', 'skip_trace_meter_events',
-        'public_sample_cache', 'property_list_membership'
+        'public_sample_cache', 'property_list_membership',
+        -- H1 drift tables (2026-06-12): policies in apply_rls_cutover_policies.sql
+        'mfa_backup_codes', 'mfa_break_glass_codes', 'dialer_deliveries',
+        'scraper_batches', 'batch_runs', 'audit_events'
     ];
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_app')
@@ -84,6 +87,8 @@ $guard$;
 --     'delivered_records','pending_skip_trace_rows','skip_trace_queues',
 --     'password_history','user_record_views','referral_events','users',
 --     'county_connectors','county_records','skip_trace_cache',
---     'skip_trace_meter_events','public_sample_cache','property_list_membership']
+--     'skip_trace_meter_events','public_sample_cache','property_list_membership',
+--     'mfa_backup_codes','mfa_break_glass_codes','dialer_deliveries',
+--     'scraper_batches','batch_runs','audit_events']
 --   LOOP EXECUTE format('ALTER TABLE IF EXISTS public.%I NO FORCE ROW LEVEL SECURITY', t);
 --   END LOOP; END $$;

@@ -19,6 +19,49 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-11/12 — Batch+Lists quad: Track A verified, presign fixed, 2B scheduled batches SHIPPED, multi-contact segments SHIPPED
+
+Four items worked 1-by-1, each Codex-gated. All four landed.
+
+**1. Track A prod health (read-only): HEALTHY.** Migration 051 applied, recovery/completion sweeps
+firing clean, 0 stuck runs, post-deploy batch completed with delivery CAS exercised. Codex:
+SUFFICIENT. Found+queued: recovery give-up path didn't set completed_at (fixed in 2B Phase 1).
+
+**2. Delivery-email download links FIXED (config, no code).** Root cause: R2 S3 presign 401s in
+prod (S3 keypair lacks read; presign generates locally so it never failed loudly) AND
+`API_BASE_URL` was unset on the worker, so `_delivery_download_url` fell back to the broken
+presign. Fix: set `API_BASE_URL=https://api.bridgeleads.io` on the Railway worker → emails mint
+revocable 48h app-token URLs; `/jobs/{id}/download` rebuilds CSV from DB (no R2 dep). Verified
+end-to-end: 200 text/csv 52KB. Codex GO. ⚠️ Emails sent before the fix still carry dead links;
+rotate R2 S3 creds or treat API_BASE_URL as required worker config (Backlog §4). Verified first
+that worker+api share SECRET_KEY (token mint/verify split across services).
+
+**3. 2B scheduled batches SHIPPED (backend #25 → main, deployed+verified; frontend #9 → master).**
+Codex rejected the v1 plan (4 P1s) — all adopted: migration 052 (UNIQUE(batch_id) → partial
+one-ACTIVE-run unique + scheduled_for + occurrence unique), `dispatch_batch_run(run_id)` contract
+(old batch_id select = MultipleResultsFound once runs are plural; transitional resolver kept),
+`dispatch_scheduled_batches` beat (occurrence key = TARGET minute — the ±1-min window would
+double-key on tick minute; INSERT..ON CONFLICT DO NOTHING covers both uniques), deterministic
+latest-run readers, run-history API (`/batches/{id}/runs` + run-scoped download). Frontend: batch
+wizard gets the Schedule step (recurrence only — date-range card is single-mode), run-history list
+with per-run CSV. Per-phase Codex rounds fixed: LIMIT-before-membership starvation (SQL JSONB
+containment), frequency enum validation, parent stores recurrence-subset only, stale batch header
+when a new scheduled run fires (runs-poll invalidates the detail query). VERIFIED ON PROD:
+alembic 052, beat firing every minute. **Facts:** local pytest hits prod Upstash Redis — Upstash
+temp rate-limited mid-session and auth tests 400'd (environmental; CI's own Redis green).
+Test-isolation trap: the batch dispatcher sweeps ALL active batches in the DB — test assertions
+must scope to their own batch, never the global created list.
+
+**4. Multi-contact segments SHIPPED (#26 → main).** Lists CSV phone_2/3+email_2/3 columns existed
+(header parity) but were always blank — segments only selected the scalar primary. The 3 segment
+SQLs now carry results.phones/emails; `_decrypt_pii_rows` decrypts the EncryptedJSON arrays (raw
+text() bypasses ORM types) with legacy-plaintext passthrough and garbage→None. CSV builder was
+already array-aware — zero writer changes. Codex PASS (its one finding: my test parsed CSV with
+naive split — comma-quoted addresses broke it; csv.DictReader).
+
+**Pending:** Tracerfy still out of credits (2,382 rows queued, needs ~1,480 credits — 👤);
+rotate R2 S3 creds 👤; rotate admin pw 👤 (used in-session for live QA).
+
 ## 2026-06-11 — Tax-delinquency filter: diagnosed (UX, not logic), columns+label fix, Pierce/Kitsap proven infeasible
 
 User report: "tax delinquency filter doesn't filter correctly" + "make King, Pierce, Kitsap, Snohomish work."

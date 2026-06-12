@@ -37,8 +37,15 @@ Build order = Tier 0 (cheap wins, data we already hold) first, 1 by 1, Codex-gat
             green → commit → Codex review.**
       - [x] **3b** code DONE: `scripts/backfill_owner_flags.py` (chunked 1-5k, resumable on
             all-4-NULL window, system role FOR ALL, dry-run default). Pending Codex review.
-      - [ ] **3c**: filter predicates (mirror tax_filters, IS TRUE not truthy) + CSV cols + ResultRow
-            fields + out-of-band CONCURRENT partial indexes. Deploy: merge 057 → run backfill.
+      - [x] **3c** code DONE: `owner_filters.build_owner_conditions` (IS TRUE/IS FALSE, excludes
+            NULL); wired into get_results + export-url + download_export (matches tax-filter
+            pattern); CSV cols absentee/out_of_state/owner_state (Yes/No/blank; property_state was
+            already a column — reused); ResultRow passthrough fields; worker export-dict now carries
+            owner flags + enrichment_data + date_recorded_parsed (so emailed CSV gets Phase 1/2/3
+            cols too); `scripts/create_owner_flag_indexes.sql` (CONCURRENT, out-of-band). Tests.
+      - **DEPLOY (after PR merge):** mig 057 auto-applies on boot (instant nullable ALTER) →
+        `railway run --service worker python scripts/backfill_owner_flags.py` (dry-run then
+        --commit) → `psql session-pooler -f scripts/create_owner_flag_indexes.sql`.
 - [ ] **Phase 4 — stacked_distress_count** (opt-in projection). Grouped subquery on
       property_list_membership keyed by (user_id, property_key); join only on detail/export, not
       base get_results. Surface in export + ResultRow when requested.

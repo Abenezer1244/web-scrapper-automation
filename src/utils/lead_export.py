@@ -53,7 +53,20 @@ LEAD_CSV_COLUMNS: list[str] = [
     # freshness_days + contactability_score apply to every record type.
     "months_delinquent", "wa_foreclosure_eligible",
     "freshness_days", "contactability_score",
+    # Owner-location flags (Tier 0, migration 057): tri-state Yes/No/blank(unknown).
+    # No property_state here — it already exists above as the dialer-split column
+    # (same value: parse(property_address).state == the stored property_state).
+    "absentee_owner", "out_of_state_owner", "owner_state",
 ]
+
+
+def _yes_no_blank(val: object) -> str:
+    """Tri-state boolean → Yes / No / '' (blank = unknown). Scannable in a dialer CSV."""
+    if val is True:
+        return "Yes"
+    if val is False:
+        return "No"
+    return ""
 
 
 def _enrichment(record: Any) -> dict:
@@ -196,6 +209,10 @@ def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, s
         "wa_foreclosure_eligible": "Yes" if sig["wa_foreclosure_eligible"] else "",
         "freshness_days": "" if sig["freshness_days"] is None else str(sig["freshness_days"]),
         "contactability_score": str(sig["contactability_score"]),
+        # Owner-location flags (stored columns 057): tri-state Yes/No/blank.
+        "absentee_owner": _yes_no_blank(_get(record, "absentee_owner")),
+        "out_of_state_owner": _yes_no_blank(_get(record, "out_of_state_owner")),
+        "owner_state": sanitize_for_csv(_get(record, "owner_state")),
     }
 
 

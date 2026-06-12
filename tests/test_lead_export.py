@@ -205,6 +205,26 @@ class TestDerivedSignalColumns:
         assert row["contactability_score"] == "0"  # always present, never blank
 
 
+class TestOwnerFlagColumns:
+    """Tier 0 (057): absentee / out_of_state / owner_state tri-state CSV columns."""
+
+    def test_absentee_yes_no_blank(self):
+        assert build_lead_export_row({"absentee_owner": True})["absentee_owner"] == "Yes"
+        assert build_lead_export_row({"absentee_owner": False})["absentee_owner"] == "No"
+        assert build_lead_export_row({"absentee_owner": None})["absentee_owner"] == ""
+        assert build_lead_export_row({})["absentee_owner"] == ""  # absent -> blank
+
+    def test_out_of_state_and_owner_state(self):
+        row = build_lead_export_row({"out_of_state_owner": True, "owner_state": "OR"})
+        assert row["out_of_state_owner"] == "Yes"
+        assert row["owner_state"] == "OR"
+
+    def test_no_duplicate_property_state_column(self):
+        # property_state exists ONCE (the dialer-split column), not duplicated
+        assert LEAD_CSV_COLUMNS.count("property_state") == 1
+        assert "owner_state" in LEAD_CSV_COLUMNS
+
+
 class TestWriteCsv:
     def test_header_and_rows_no_footer(self):
         out = io.StringIO()

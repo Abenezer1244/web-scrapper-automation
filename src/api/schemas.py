@@ -724,6 +724,12 @@ class ResultRow(BaseModel):
     # elsewhere). Surfaced so the results view can show + filter by them.
     delinquent_amount: float | None = None
     delinquent_bill_year: int | None = None
+    # Tier 0 (migration 057): owner-location flags, straight passthrough from the
+    # stored columns (tri-state True/False/None=unknown).
+    property_state: str | None = None
+    owner_state: str | None = None
+    absentee_owner: bool | None = None
+    out_of_state_owner: bool | None = None
     created_at: datetime
     # Derived signals (Tier 0, src/utils/lead_signals.py): computed at serialize
     # time, never stored. Populated in model_post_init from the fields above.

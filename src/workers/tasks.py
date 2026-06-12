@@ -936,6 +936,11 @@ def run_scrape_job(self, job_id: str) -> None:
                         "doc_type",
                         # Structured tax fields (King tax_delinquent; null elsewhere).
                         "delinquent_amount", "delinquent_bill_year",
+                        # Owner-location flags (057) so the emailed/R2 CSV carries
+                        # absentee/out_of_state/owner_state too (canonical builder reads these).
+                        "absentee_owner", "out_of_state_owner", "owner_state",
+                        # enrichment_data drives the passthrough cols + derived signals.
+                        "enrichment_data", "date_recorded_parsed",
                         # Sprint 4: skip trace fields (may be null on first export
                         # if dispatcher hasn't submitted or webhook hasn't fired).
                         "phone", "phone_type", "email", "skip_trace_status",

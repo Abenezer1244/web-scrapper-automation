@@ -16,6 +16,7 @@ from src.api.auth import CurrentUser
 from src.api.deps import get_db, get_rls_db
 from src.api.dialer_filters import dialer_ready_conditions
 from src.api.middleware import audit_log, rate_limit, sanitize_search
+from src.api.owner_filters import build_owner_conditions
 from src.api.schemas import JobCreate, JobResponse, LogLine, ResultRow, ResultsPage
 from src.api.tax_filters import build_tax_conditions
 from src.config import settings
@@ -227,6 +228,10 @@ async def get_results(
     max_months: int | None = Query(None, ge=0, le=1200),
     # Phase 5: dialer-ready filter (valid phone + confirmed not-DNC). VIEW filter.
     dialer_ready: bool = Query(False),
+    # Tier 0 (057): owner-location filters. None = no filter; True/False match the
+    # stored tri-state exactly (unknown/NULL rows excluded from a definite filter).
+    absentee: bool | None = Query(None),
+    out_of_state: bool | None = Query(None),
 ) -> ResultsPage:
     # Rate-limit before the (expensive, multi-query) read to prevent DB-amplification DoS.
     await rate_limit(request, zone="general", identifier=current_user.id)
@@ -279,6 +284,11 @@ async def get_results(
         min_amount, max_amount, min_months, max_months, datetime.now(UTC).date()
     )
     for cond in tax_conditions:
+        base_query = base_query.where(cond)
+
+    # Tier 0 (057): owner-location filters (absentee / out-of-state). Same view
+    # semantics as the tax filters — narrows total + items, leaves scrape stats.
+    for cond in build_owner_conditions(absentee, out_of_state):
         base_query = base_query.where(cond)
 
     # Phase 5: dialer-ready filter (valid phone + not known-DNC). Uses
@@ -578,6 +588,8 @@ async def get_export_url(
     min_months: int | None = Query(None, ge=0, le=1200),
     max_months: int | None = Query(None, ge=0, le=1200),
     dialer_ready: bool = Query(False),  # Phase 5: carry dialer filter through too
+    absentee: bool | None = Query(None),       # Tier 0 (057): owner-location filters
+    out_of_state: bool | None = Query(None),
 ) -> dict:
     """Return a short-lived download URL for the job's CSV export.
 
@@ -620,6 +632,11 @@ async def get_export_url(
             query[key] = val
     if dialer_ready:
         query["dialer_ready"] = "true"
+    # Owner-location filters carry through too (lowercase bools for the query string).
+    if absentee is not None:
+        query["absentee"] = "true" if absentee else "false"
+    if out_of_state is not None:
+        query["out_of_state"] = "true" if out_of_state else "false"
     return {"url": f"/jobs/{job_id}/download?{urlencode(query)}"}
 
 
@@ -639,6 +656,8 @@ async def download_export(
     min_months: int | None = Query(None, ge=0, le=1200),
     max_months: int | None = Query(None, ge=0, le=1200),
     dialer_ready: bool = Query(False),
+    absentee: bool | None = Query(None),       # Tier 0 (057): owner-location filters
+    out_of_state: bool | None = Query(None),
 ):
     """Build and stream the lead CSV LIVE from the DB (not from R2).
 
@@ -821,8 +840,12 @@ async def download_export(
         if dialer_ready:
             for cond in dialer_ready_conditions(include_unknown_dnc=True):
                 dl_query = dl_query.where(cond)
+        # Tier 0 (057): owner-location filters (match get_results).
+        owner_conditions = build_owner_conditions(absentee, out_of_state)
+        for cond in owner_conditions:
+            dl_query = dl_query.where(cond)
         # Any active filter -> an empty result is "no matches", not an empty job.
-        any_filter_active = bool(tax_conditions) or dialer_ready
+        any_filter_active = bool(tax_conditions) or dialer_ready or bool(owner_conditions)
 
         # Deterministic order (groups an estate's records together) — the SAME
         # order the scheduled/R2 export uses, so the two exports are byte-identical,

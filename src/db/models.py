@@ -323,9 +323,22 @@ class BatchRun(Base):
             ondelete="CASCADE",
             name="fk_batch_runs_batch_tenant",
         ),
-        # One run per batch (Phase 2A on-demand) — makes the worker fan-out
-        # at-most-once/race-safe (Codex P1). Phase 2B (scheduled) must revisit.
-        UniqueConstraint("batch_id", name="uq_batch_runs_batch_id"),
+        # 2B (migration 052): 2A's UNIQUE(batch_id) became a PARTIAL unique — at
+        # most one ACTIVE (pending/running) run per batch keeps the fan-out /
+        # recovery race-safety, while scheduled batches accumulate terminal
+        # history rows freely.
+        Index(
+            "uq_batch_runs_one_active",
+            "batch_id",
+            unique=True,
+            postgresql_where=text("status IN ('pending', 'running')"),
+        ),
+        # Durable occurrence idempotency (2B, Codex P1): one run per (batch,
+        # scheduled occurrence) even if the prior run finished inside the
+        # scheduler's ±1-minute due window (active-run dedupe dies at terminal;
+        # this unique does not). NULL scheduled_for = on-demand, exempt
+        # (Postgres treats NULLs as distinct).
+        UniqueConstraint("batch_id", "scheduled_for", name="uq_batch_runs_occurrence"),
     )
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
@@ -360,6 +373,9 @@ class BatchRun(Base):
     # final write protects DB state, not the post-commit best-effort email. A CAS
     # on this column makes "only the winner delivers" durable across a re-finalize.
     delivery_started_at = Column(DateTime(timezone=True), nullable=True)
+    # 2B: the schedule occurrence this run satisfies (minute-truncated due tick).
+    # NULL = on-demand (POST /batches). Backed by uq_batch_runs_occurrence.
+    scheduled_for = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at = Column(DateTime(timezone=True), nullable=True)
 

@@ -184,7 +184,9 @@ async def create_batch(
     # the client to retry and create a SECOND batch (duplicate scrapes + billing)
     # even though this one is already durably queued.
     try:
-        dispatch_batch_run.delay(batch.id)
+        # 2B: dispatch is RUN-scoped (runs are plural per batch; the run id is the
+        # unambiguous durable intent the worker materializes).
+        dispatch_batch_run.delay(run.id)
     except Exception as exc:  # noqa: BLE001 — any broker failure is recoverable here
         _logger.warning(
             "batch %s: dispatch enqueue failed (recovery sweep will pick it up): %s",
@@ -233,6 +235,9 @@ async def _run_for(db: AsyncSession, batch_id: str, user_id: str) -> BatchRun | 
     # Tie the run to an OWNED batch via the join (Codex P2): batch_runs is not
     # RLS-granted, so don't rely on BatchRun.user_id alone — require a
     # scraper_batches row with the same id AND user_id to exist.
+    # 2B: runs are PLURAL per batch — this is the deterministic LATEST run
+    # (created_at desc, id as tiebreak); scalar_one_or_none would raise
+    # MultipleResultsFound on any batch with history (Codex P1).
     return (
         await db.execute(
             select(BatchRun)
@@ -242,6 +247,8 @@ async def _run_for(db: AsyncSession, batch_id: str, user_id: str) -> BatchRun | 
                 BatchRun.user_id == user_id,
                 ScraperBatch.user_id == user_id,
             )
+            .order_by(BatchRun.created_at.desc(), BatchRun.id.desc())
+            .limit(1)
         )
     ).scalar_one_or_none()
 
@@ -262,11 +269,16 @@ async def list_batches(
     if not batches:
         return []
     batch_ids = [b.id for b in batches]
+    # 2B: runs are plural — keep the LATEST per batch, deterministically. Ordering
+    # ASC here means the dict comprehension's "last write wins" leaves the newest
+    # run per batch_id (created_at asc, id as tiebreak).
     runs = (
         await db.execute(
-            select(BatchRun).where(
+            select(BatchRun)
+            .where(
                 BatchRun.user_id == current_user.id, BatchRun.batch_id.in_(batch_ids)
             )
+            .order_by(BatchRun.created_at.asc(), BatchRun.id.asc())
         )
     ).scalars().all()
     run_by_batch = {r.batch_id: r for r in runs}

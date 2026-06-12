@@ -46,7 +46,8 @@ Two branches off `main`, unmerged. Stage 1 = contact PII + additive email_hmac. 
 
 - [ ] 👤🔴 Rotate live `admin@bridgeleads.io` password + set Railway `BRIDGELEADS_ADMIN_PASSWORD`
 - [ ] 👤🟠 Verify Redis `CERT_REQUIRED` on Railway (the `REDIS_SSL_CERT_REQS=none` escape from M1)
-- [ ] 👤🟠 Tracerfy: add credits + re-scrape ~334 already-`errored` leads; migrate Tracerfy auth → header + rotate secret
+- [ ] 👤🟠 Tracerfy: add credits + re-scrape ~334 already-`errored` leads; migrate Tracerfy auth → header + rotate secret. **(2026-06-11: still 402 — 2,382 rows queued waiting, needs ~1,480 more credits.)**
+- [ ] 👤🟠 **Rotate/fix R2 S3 presign credentials** (2026-06-11). The S3-compatible presign path (`get_download_url` boto3 branch) 401s in prod — presign generates but R2 rejects the GET (S3 keypair invalid or lacks object-read; uploads are unaffected — they use the R2 native API bearer token). **FIXED for delivery emails by setting `API_BASE_URL=https://api.bridgeleads.io` on the Railway worker** → emails now mint revocable 48h app download-token URLs (verified live: 200 text/csv). The presign branch is now a dead-but-broken fallback: either rotate the R2 S3 creds in Cloudflare (token with Object Read) or treat `API_BASE_URL` as REQUIRED worker config (env drift would silently reintroduce 401 links). ⚠️ Emails sent BEFORE 2026-06-11 still carry broken presigned links — re-run delivery for any customer who complains. 🔑 Doc note: interactive download token = 60s; delivery-email token = 48h (`_DELIVERY_TOKEN_TTL`) — don't "clean up" the route's 60s comments into a regression.
 
 ## 5. Unmerged / unfinished features (non-security)
 
@@ -60,5 +61,6 @@ Two branches off `main`, unmerged. Stage 1 = contact PII + additive email_hmac. 
 ## 6. Tech debt
 
 - [ ] 🔵 `src/scrapers/templates/king_wa_probate.py:~698` — F821 `submit_btn` dead ref (captcha-retry, masked by try/except)
+- [ ] 🔵 `batch_recovery_sweep` give-up path (`scheduler.py:~1325`) marks pending runs `failed` without setting `completed_at` (finalize path sets it; inconsistent terminal-state semantics, cosmetic). 1-line fix — fold into next batch PR.
 - [ ] 🔵 Legacy `scripts/` lint debt (E402/F401) — not CI-gated (CI lints only `src/`+`tests/`), but present
 - [ ] 🟠🧭 **Free-tier records-limit copy vs backend mismatch** — `/register` page advertises "Free starter plan with 50 records/month", but a freshly registered account's dashboard shows **500 records/month** (0/1,000 usage ring also shows 1,000 cap). Confirmed live 2026-06-11 via real prod signup (test acct `bridgetest+1781150180@gmail.com`). Decide the true free-tier cap, then reconcile: register copy + `/auth/register` `records_limit` + `PLAN_LIMITS` + dashboard usage-ring cap. Related to the existing `PLAN_LIMITS["pro"]=1000` vs register pro `records_limit=500` inconsistency (§2 CI follow-up) — likely the same limits-config drift.

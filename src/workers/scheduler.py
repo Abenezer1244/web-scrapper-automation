@@ -1256,7 +1256,7 @@ def batch_recovery_sweep() -> None:
     pending_cutoff = now - timedelta(minutes=BATCH_PENDING_REDISPATCH_MINUTES)
     force_cutoff = now - timedelta(minutes=BATCH_FORCE_MINUTES)
 
-    redispatch_batch_ids: list[str] = []
+    redispatch_run_ids: list[str] = []
     reenqueue_job_ids: list[str] = []
     with system_sync_session() as db:
         # Gap 1: 'pending' runs not materialized in time.
@@ -1278,20 +1278,29 @@ def batch_recovery_sweep() -> None:
                 give_up_ids.append(run.id)
             else:
                 run.dispatch_attempts = (run.dispatch_attempts or 0) + 1
-                redispatch_batch_ids.append(run.batch_id)
+                # 2B: dispatch is RUN-scoped (runs are plural per batch; the run id
+                # is the unambiguous durable intent).
+                redispatch_run_ids.append(run.id)
 
         # Gap 3a: batch child jobs stuck 'pending' (a lost child .delay) under a
         # 'running' run. Drive off the JOBS (bounded by _BATCH) via
         # job -> scraper_config.batch_id -> batch_run, so a large number of healthy
         # running runs can't starve the few with a lost child — the old
         # "load 50 running runs then filter" could page past the run that needed
-        # recovery (Codex P2). UNIQUE(batch_id) makes the run join 1:1. Re-enqueue
-        # every sweep (the atomic claim dedupes if one is actually in flight); the
-        # 90min force-finalize is the terminal backstop. Skip force-eligible runs:
-        # their children are about to be cancelled, so re-enqueueing would let them
-        # scrape after terminalization (wasted work, excluded results).
+        # recovery (Codex P2). The partial unique (one ACTIVE run per batch) keeps
+        # the status='running' join 1:1; the child_job_ids MEMBERSHIP check below
+        # is what makes this correct under 2B plural runs (Codex P2) — a stale
+        # pending job from an old terminal run of the same batch must NOT be
+        # re-enqueued against the current run. Re-enqueue every sweep (the atomic
+        # claim dedupes if one is actually in flight); the 90min force-finalize is
+        # the terminal backstop. Skip force-eligible runs: their children are about
+        # to be cancelled, so re-enqueueing would let them scrape after
+        # terminalization (wasted work, excluded results).
         stuck_children = db.execute(
-            select(Job.id, BatchRun.id, BatchRun.running_at, BatchRun.created_at)
+            select(
+                Job.id, BatchRun.id, BatchRun.running_at, BatchRun.created_at,
+                BatchRun.child_job_ids,
+            )
             .join(ScraperConfig, ScraperConfig.id == Job.scraper_config_id)
             .join(BatchRun, BatchRun.batch_id == ScraperConfig.batch_id)
             .where(
@@ -1302,7 +1311,9 @@ def batch_recovery_sweep() -> None:
             .limit(_BATCH)
         ).all()
         bumped_run_ids: set[str] = set()
-        for job_id, run_id, running_at, created_at in stuck_children:
+        for job_id, run_id, running_at, created_at, child_job_ids in stuck_children:
+            if str(job_id) not in (child_job_ids or []):
+                continue  # job belongs to a different (older) run of this batch
             stuck_since = running_at or created_at
             if stuck_since is not None and stuck_since < force_cutoff:
                 continue  # force-finalize will cancel this child — don't re-enqueue
@@ -1328,6 +1339,9 @@ def batch_recovery_sweep() -> None:
                 .values(
                     status="failed",
                     failed_children=[{"reason": "dispatch never materialized"}],
+                    # Terminal-state consistency: finalize sets completed_at on
+                    # every terminal write; this give-up path must too.
+                    completed_at=now,
                 )
             ).rowcount
             if failed:
@@ -1340,18 +1354,18 @@ def batch_recovery_sweep() -> None:
     # Enqueue AFTER commit so a worker can't pick up an uncommitted row. Per-item
     # try/except: a broker failure on one shouldn't abort the rest, and anything
     # that fails stays committed and is retried by the next sweep.
-    for bid in redispatch_batch_ids:
+    for rid in redispatch_run_ids:
         try:
-            dispatch_batch_run.delay(bid)
+            dispatch_batch_run.delay(rid)
         except Exception as exc:  # noqa: BLE001 — recovered next sweep
-            _logger.warning("batch_recovery_sweep: re-dispatch of %s failed: %s", bid, str(exc)[:200])
+            _logger.warning("batch_recovery_sweep: re-dispatch of %s failed: %s", rid, str(exc)[:200])
     for jid in reenqueue_job_ids:
         try:
             run_scrape_job.delay(jid)
         except Exception as exc:  # noqa: BLE001 — recovered next sweep
             _logger.warning("batch_recovery_sweep: re-enqueue of %s failed: %s", jid, str(exc)[:200])
-    if redispatch_batch_ids or reenqueue_job_ids:
+    if redispatch_run_ids or reenqueue_job_ids:
         _logger.info(
             "batch_recovery_sweep: re-dispatched %d run(s), re-enqueued %d child job(s)",
-            len(redispatch_batch_ids), len(reenqueue_job_ids),
+            len(redispatch_run_ids), len(reenqueue_job_ids),
         )

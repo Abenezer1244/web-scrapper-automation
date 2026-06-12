@@ -17,6 +17,12 @@ app.conf.beat_schedule = {
         "task": "src.workers.scheduler.dispatch_scheduled_jobs",
         "schedule": 60.0,  # every 1 minute
     },
+    "dispatch-scheduled-batches": {
+        # 2B: recurring batch scrapes — creates a 'pending' BatchRun when a
+        # batch's schedule fires; Track A dispatch/recovery does the rest.
+        "task": "src.workers.scheduler.dispatch_scheduled_batches",
+        "schedule": 60.0,  # every 1 minute
+    },
     "watchdog-stuck-jobs": {
         "task": "src.workers.scheduler.watchdog_stuck_jobs",
         "schedule": 300.0,  # every 5 minutes
@@ -212,6 +218,119 @@ def _should_run_now(frequency: str, run_time_str: str, now: datetime) -> bool:
     if frequency == "monthly":
         return now.day == 1
     return False
+
+
+# ─── Task 1b: Dispatch scheduled BATCHES (2B) ────────────────────────────────
+
+def _dispatch_due_batches(db, now: datetime) -> list[str]:
+    """Create a 'pending' BatchRun for every active, due, scheduled batch.
+
+    Returns the created run ids (caller enqueues AFTER commit). Idempotency is
+    DURABLE, not read-then-insert (Codex P1s):
+      - occurrence key = the batch's scheduled TARGET minute on `now`'s date —
+        NOT the tick minute. _should_run_now has a ±1-minute window, so two
+        adjacent ticks both match one occurrence; keying on the tick minute
+        would create two runs. uq_batch_runs_occurrence dedupes the second.
+      - a still-active previous run also rejects the insert (partial unique
+        uq_batch_runs_one_active) — a batch can't stack runs.
+    Both collisions surface through INSERT .. ON CONFLICT DO NOTHING (no
+    IntegrityError to race on; the loser is simply a no-op).
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import select
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    from src.db.models import BatchRun, ScraperBatch, User
+
+    created: list[str] = []
+    batches = db.execute(
+        select(ScraperBatch).where(ScraperBatch.status == "active")
+    ).scalars().all()
+    for batch in batches:
+        schedule = batch.schedule or {}
+        frequency = schedule.get("frequency", "manual")
+        if frequency == "manual":
+            continue
+        run_hour = schedule.get("run_at_hour", 6)
+        run_minute = schedule.get("run_at_minute", 0)
+        if not _should_run_now(frequency, f"{run_hour}:{run_minute:02d}", now):
+            continue
+
+        # Quota gate at fire time (same boundary as dispatch_scheduled_jobs);
+        # dispatch_batch_run re-checks at materialize time.
+        user = db.get(User, batch.user_id)
+        if user and user.records_limit != -1 and user.records_used >= user.records_limit:
+            _logger.info(
+                "dispatch_scheduled_batches: skipping batch %s — user at record limit",
+                batch.id,
+            )
+            continue
+
+        # NOTE (Codex, documented-not-fixed): _should_run_now's ±1-minute window
+        # is not midnight-wraparound-aware, so a 23:59 target matches ticks
+        # 23:58/23:59 (not next-day 00:00) and a 00:00 target matches
+        # 00:00/00:01 (not prior-day 23:59). The matching ticks are therefore
+        # always SAME-DAY as the target — this key is consistent for every tick
+        # that can reach it, and no occurrence is ever missed (2 ticks still
+        # match) or doubled. Fixing wraparound lives with the shared helper.
+        occurrence = now.replace(
+            hour=int(run_hour), minute=int(run_minute), second=0, microsecond=0
+        )
+        run_id = str(_uuid.uuid4())
+        inserted = db.execute(
+            pg_insert(BatchRun.__table__)
+            .values(
+                id=run_id,
+                batch_id=batch.id,
+                user_id=batch.user_id,
+                status="pending",
+                child_job_ids=[],
+                excluded_no_date_count=0,
+                dispatch_attempts=0,
+                scheduled_for=occurrence,
+            )
+            .on_conflict_do_nothing()  # any unique: dup occurrence OR active run
+        ).rowcount
+        if inserted:
+            created.append(run_id)
+            _logger.info(
+                "dispatch_scheduled_batches: run %s created for batch %s (%s)",
+                run_id, batch.id, occurrence.isoformat(),
+            )
+    return created
+
+
+@app.task(name="src.workers.scheduler.dispatch_scheduled_batches")
+def dispatch_scheduled_batches() -> None:
+    """2B: enqueue a run for every active batch whose schedule matches now.
+
+    Runs every minute (mirrors dispatch_scheduled_jobs). The created 'pending'
+    run is the durable intent — if the .delay below is lost, batch_recovery_sweep
+    re-dispatches it; everything downstream (fan-out, completion barrier,
+    combined CSV, delivery) is the existing Track A machinery.
+    """
+    from src.db.session import system_sync_session
+    from src.workers.batch_tasks import dispatch_batch_run
+
+    now = datetime.now(UTC)
+    with system_sync_session() as db:
+        created = _dispatch_due_batches(db, now)
+        db.commit()
+
+    # Enqueue AFTER commit (commit-before-delay, like every other dispatcher).
+    # Per-item try/except: a broker failure leaves the durable pending run for
+    # the recovery sweep.
+    for rid in created:
+        try:
+            dispatch_batch_run.delay(rid)
+        except Exception as exc:  # noqa: BLE001 — recovered by the sweep
+            _logger.warning(
+                "dispatch_scheduled_batches: enqueue of %s failed (sweep recovers): %s",
+                rid, str(exc)[:200],
+            )
+    if created:
+        _logger.info("dispatch_scheduled_batches: %d run(s) created", len(created))
 
 
 # ─── Task 2: Watchdog for stuck jobs ─────────────────────────────────────────
@@ -1256,7 +1375,7 @@ def batch_recovery_sweep() -> None:
     pending_cutoff = now - timedelta(minutes=BATCH_PENDING_REDISPATCH_MINUTES)
     force_cutoff = now - timedelta(minutes=BATCH_FORCE_MINUTES)
 
-    redispatch_batch_ids: list[str] = []
+    redispatch_run_ids: list[str] = []
     reenqueue_job_ids: list[str] = []
     with system_sync_session() as db:
         # Gap 1: 'pending' runs not materialized in time.
@@ -1278,31 +1397,50 @@ def batch_recovery_sweep() -> None:
                 give_up_ids.append(run.id)
             else:
                 run.dispatch_attempts = (run.dispatch_attempts or 0) + 1
-                redispatch_batch_ids.append(run.batch_id)
+                # 2B: dispatch is RUN-scoped (runs are plural per batch; the run id
+                # is the unambiguous durable intent).
+                redispatch_run_ids.append(run.id)
 
         # Gap 3a: batch child jobs stuck 'pending' (a lost child .delay) under a
         # 'running' run. Drive off the JOBS (bounded by _BATCH) via
         # job -> scraper_config.batch_id -> batch_run, so a large number of healthy
         # running runs can't starve the few with a lost child — the old
         # "load 50 running runs then filter" could page past the run that needed
-        # recovery (Codex P2). UNIQUE(batch_id) makes the run join 1:1. Re-enqueue
-        # every sweep (the atomic claim dedupes if one is actually in flight); the
-        # 90min force-finalize is the terminal backstop. Skip force-eligible runs:
-        # their children are about to be cancelled, so re-enqueueing would let them
-        # scrape after terminalization (wasted work, excluded results).
+        # recovery (Codex P2). The partial unique (one ACTIVE run per batch) keeps
+        # the status='running' join 1:1; the child_job_ids MEMBERSHIP check below
+        # is what makes this correct under 2B plural runs (Codex P2) — a stale
+        # pending job from an old terminal run of the same batch must NOT be
+        # re-enqueued against the current run. Re-enqueue every sweep (the atomic
+        # claim dedupes if one is actually in flight); the 90min force-finalize is
+        # the terminal backstop. Skip force-eligible runs: their children are about
+        # to be cancelled, so re-enqueueing would let them scrape after
+        # terminalization (wasted work, excluded results).
+        from sqlalchemy import text as _sql_text
         stuck_children = db.execute(
-            select(Job.id, BatchRun.id, BatchRun.running_at, BatchRun.created_at)
+            select(
+                Job.id, BatchRun.id, BatchRun.running_at, BatchRun.created_at,
+                BatchRun.child_job_ids,
+            )
             .join(ScraperConfig, ScraperConfig.id == Job.scraper_config_id)
             .join(BatchRun, BatchRun.batch_id == ScraperConfig.batch_id)
             .where(
                 Job.status == "pending",
                 Job.trigger == "batch",
                 BatchRun.status == "running",
+                # Membership in SQL (Codex P2): the LIMIT below must page over
+                # rows that ALREADY satisfy membership — stale pending jobs from
+                # older terminal runs of the same batch would otherwise fill the
+                # page and starve the rows that actually need recovery.
+                _sql_text(
+                    "batch_runs.child_job_ids::jsonb @> to_jsonb(jobs.id::text)"
+                ),
             )
             .limit(_BATCH)
         ).all()
         bumped_run_ids: set[str] = set()
-        for job_id, run_id, running_at, created_at in stuck_children:
+        for job_id, run_id, running_at, created_at, child_job_ids in stuck_children:
+            if str(job_id) not in (child_job_ids or []):
+                continue  # job belongs to a different (older) run of this batch
             stuck_since = running_at or created_at
             if stuck_since is not None and stuck_since < force_cutoff:
                 continue  # force-finalize will cancel this child — don't re-enqueue
@@ -1328,6 +1466,9 @@ def batch_recovery_sweep() -> None:
                 .values(
                     status="failed",
                     failed_children=[{"reason": "dispatch never materialized"}],
+                    # Terminal-state consistency: finalize sets completed_at on
+                    # every terminal write; this give-up path must too.
+                    completed_at=now,
                 )
             ).rowcount
             if failed:
@@ -1340,18 +1481,18 @@ def batch_recovery_sweep() -> None:
     # Enqueue AFTER commit so a worker can't pick up an uncommitted row. Per-item
     # try/except: a broker failure on one shouldn't abort the rest, and anything
     # that fails stays committed and is retried by the next sweep.
-    for bid in redispatch_batch_ids:
+    for rid in redispatch_run_ids:
         try:
-            dispatch_batch_run.delay(bid)
+            dispatch_batch_run.delay(rid)
         except Exception as exc:  # noqa: BLE001 — recovered next sweep
-            _logger.warning("batch_recovery_sweep: re-dispatch of %s failed: %s", bid, str(exc)[:200])
+            _logger.warning("batch_recovery_sweep: re-dispatch of %s failed: %s", rid, str(exc)[:200])
     for jid in reenqueue_job_ids:
         try:
             run_scrape_job.delay(jid)
         except Exception as exc:  # noqa: BLE001 — recovered next sweep
             _logger.warning("batch_recovery_sweep: re-enqueue of %s failed: %s", jid, str(exc)[:200])
-    if redispatch_batch_ids or reenqueue_job_ids:
+    if redispatch_run_ids or reenqueue_job_ids:
         _logger.info(
             "batch_recovery_sweep: re-dispatched %d run(s), re-enqueued %d child job(s)",
-            len(redispatch_batch_ids), len(reenqueue_job_ids),
+            len(redispatch_run_ids), len(reenqueue_job_ids),
         )

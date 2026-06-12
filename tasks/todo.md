@@ -1,126 +1,68 @@
-# Batch Scrape — Crash-Durability Hardening (Track A)
+# Batch 2B — Scheduled Batches (Codex-reconciled 2026-06-11)
 
-**Goal:** Close the 3 crash windows in the batch-scrape flow that can strand a batch forever.
-Design reconciled with Codex (consult 2026-06-11) — Codex rejected the original "no-migration"
-sketch; durable recovery needs durable state. Each phase ≤5 files, Codex-gated before the next.
+**Goal:** Recurring batch scrapes on a schedule, completing the Piece-2 batch story. Track A made
+everything downstream durable — a scheduled run is "create `BatchRun(pending)` when due."
+**Codex verdict on v1 plan: NO-GO** — 4 P1s, all adopted below. This is the reconciled design.
 
-## Design (Codex-reconciled)
+## Design (post-Codex)
 
-- **BatchRun is the single durable object.** It is created `status='pending'` in the **API
-  transaction** (same txn as `ScraperBatch` + child `ScraperConfig`s), NOT by the worker. This
-  makes dispatch intent durable (kills Gap 1 at the root) and future-proofs Phase 2B (scheduled
-  batches create a `pending` run when their schedule fires). Worker `dispatch_batch_run`
-  transitions `pending→running` + creates child jobs (idempotent via `UNIQUE(batch_id)`).
-- **`claimed_at` becomes a real lease** (30-min TTL > worst-case finalize) + `claim_token` for
-  unambiguous ownership — fixes Gap 2 (hard-kill mid-finalize stranding `running` forever).
-- **`delivery_started_at` CAS** makes the combined-CSV email at-most-once (status-guard protects
-  DB state, not the post-commit best-effort email — Codex obj #3).
-- **`dispatch_attempts`** bounds re-dispatch/re-enqueue so a poisoned job or broker-down can't
-  storm forever (Codex obj #5).
-- **One claim/finalize path:** the existing `batch_completion_sweep` owns BOTH normal completion
-  (all children terminal) AND force-finalize (age > hard deadline) — same lease/CAS, one
-  `finalize_batch_run(mode)` (Codex obj #4). No separate beat for the backstop.
-- **New `batch_recovery_sweep` beat** owns only pre-finalize recovery: re-dispatch `pending`
-  runs (Gap 1) + re-`.delay()` pending children (Gap 3a), both bounded by `dispatch_attempts`.
-- **Prerequisite (pre-existing bug):** `run_scrape_job` `pending→queued` is a BLIND set
-  (`tasks.py:384`), not an atomic CAS. The recovery's safety REQUIRES a guarded claim
-  (`UPDATE ... WHERE status='pending'`, exit on rowcount 0) or re-enqueue double-scrapes
-  (Codex obj #8).
+- **Scheduler creates the pending run, never the API** (per the reserved comment in
+  `batches.py:163-165`). New beat `dispatch_scheduled_batches` every minute.
+- **Migration 052** (all three, one migration):
+  1. Drop `uq_batch_runs_batch_id`; add **partial unique index**
+     `ON batch_runs(batch_id) WHERE status IN ('pending','running')` — at-most-one ACTIVE run.
+  2. **Add `scheduled_for` column** (nullable timestamptz; NULL = on-demand run) + unique
+     `(batch_id, scheduled_for)` — durable OCCURRENCE idempotency (🔑 Codex P1: the ±1-min
+     `_should_run_now` window can double-fire a batch that completes <1min; active-run dedupe
+     dies at terminal. Single scrapers have this latent bug too — noted, not fixed here).
+  3. Remove the model-level `UniqueConstraint("batch_id")` (else create_all/tests re-enforce it).
+- **🔑 Dispatch contract: `dispatch_batch_run(run_id)` not `(batch_id)`** (Codex P1: it currently
+  selects BatchRun by batch_id + `scalar_one_or_none()` → MultipleResultsFound with history).
+  Recovery re-dispatches RUN ids. Transitional: accept old batch_id payloads for queued
+  pre-deploy tasks (resolve via the active run).
+- **Scheduler INSERT race** (Codex P1): create the pending run via
+  `INSERT ... ON CONFLICT DO NOTHING` against the partial index (or catch IntegrityError) —
+  a read-then-insert check alone races on dual beat ticks.
+- **Readers → deterministic latest-run** (Codex P1): `_run_for()` = ORDER BY created_at DESC
+  LIMIT 1; list summaries = `DISTINCT ON (batch_id) ... ORDER BY batch_id, created_at DESC`.
+- **Stuck-child recovery** (Codex P2): drive off the active run's `child_job_ids`, not the
+  `Job → ScraperConfig.batch_id → BatchRun` join (brittle once runs are plural).
+- **Run-scoped API before frontend history** (Codex P2): `GET /batches/{id}/runs` (history) +
+  run-scoped download `GET /batches/{id}/runs/{run_id}/download`; delivery email keeps linking
+  the batch page (which shows latest + history).
+- **POST /batches accepts optional `schedule`**; children stay suppressed (frequency=manual —
+  verified `dispatch_scheduled_jobs` skips them). No schedule = today's behavior exactly.
+  With schedule: still runs immediately on create (`scheduled_for=NULL`), recurs when due.
 
-## Phases
+## Phases (each ≤5 files, Codex-gated, user check-in between)
 
-### Phase 1 — Durable state migration + model  ✅ (commit d54f07e)
-- [x] `alembic/versions/051_batch_durability.py` — added `dispatch_attempts`, `delivery_started_at`,
-      `claim_token` to `batch_runs`. All additive/defaulted, rolling-deploy safe. down_revision="050".
-- [x] `src/db/models.py` — 3 columns added to `BatchRun`.
-- [x] Verified: py_compile + ruff clean + model import shows the columns.
+### Phase 1 — backend foundation: plural runs + run-scoped dispatch
+- [ ] Migration 052 (partial unique + scheduled_for + occurrence unique; model updates)
+- [ ] `dispatch_batch_run` → run_id contract (+ transitional batch_id acceptance); recovery
+      re-dispatches run ids; stuck-child recovery via active run's child_job_ids
+- [ ] `_run_for()` + list summaries → deterministic latest-run
+- [ ] Fold in: recovery give-up path sets `completed_at` (Backlog §6 one-liner)
+- [ ] Tests: plural terminal + one active; latest-run reads; dispatch by run_id
+- [ ] Codex review gate
 
-### Phase 2 — Atomic pending→queued claim (the prerequisite)  ✅ (commits e?/P2 doc)
-- [x] `src/workers/tasks.py` — blind `_set_status(job,"queued")` → atomic CAS
-      `UPDATE jobs ... WHERE id=:id AND status='pending'` (rowcount 0 ⇒ return). Closes Backlog §5.
-- [x] `tests/test_workers.py` — 2 regression tests (at-most-once claim; cancelled job skipped). PASS.
-- [x] Codex-gated: GATE PASS, 1×P2 (acks_late recovery tradeoff) accepted + documented.
+### Phase 2 — backend: the schedule fires
+- [ ] `dispatch_scheduled_batches` beat (reuse `_should_run_now`; record-limit check;
+      occurrence key = due-tick timestamp truncated to minute; ON CONFLICT DO NOTHING)
+- [ ] `POST /batches` + schema accept optional validated `schedule`
+- [ ] `GET /batches/{id}/runs` + run-scoped download endpoint
+- [ ] Tests: due-ness, double-beat race, fast-batch re-fire blocked by occurrence unique,
+      record-limit skip
+- [ ] Codex review gate
 
-### Phase 3 — BatchRun-as-intent  ✅ (commit Phase 3 + watchdog fix)
-- [x] `src/api/routes/batches.py` — creates `BatchRun(status='pending')` in the same txn (durable intent).
-- [x] `src/workers/batch_tasks.py` — `dispatch_batch_run` locks the run FOR UPDATE, transitions
-      pending→running + creates jobs (concurrent dispatches serialize); back-compat creates run if
-      none; bumps `dispatch_attempts`. Recovery branch unchanged.
-- [x] `tests/test_batch_dispatch.py` (new, DB-backed: transition, idempotency, over-limit) +
-      `test_batch_models.py` durability-cols test. 8/8 pass (broker-rate-limit tolerated hermetically).
-- [x] Codex-gated: GATE PASS, 1×P2 — a REAL bug it caught: watchdog set pending + .delay BEFORE its
-      commit; the new CAS would strand the retry. FIXED (commit-before-delay in `scheduler.py`).
-- [x] Migration 051 applied to local DB.
+### Phase 3 — frontend: wizard + run history
+- [ ] Wizard renders Schedule screen in batch mode; payload carries `schedule`
+- [ ] Batch run view: history list (latest first) wired to /runs; download per run
+- [ ] `tsc --noEmit` + Codex review gate
 
-> NOTE for Phase 6 journal: residual — a broker outage at the watchdog moment leaves a non-batch job
-> committed 'pending' that the next watchdog won't re-pick (excludes pending). Pre-existing property of
-> the commit-before-delay convention; batch children are covered by the Phase-5 recovery sweep.
-
-### Phase 4 — Lease + delivery idempotency  ☐
-- [ ] `src/workers/scheduler.py` (`batch_completion_sweep`) — select + CAS claim become a LEASE
-      (`claimed_at IS NULL OR claimed_at < now()-30min`) with a generated `claim_token`.
-- [ ] `src/workers/batch_export.py` (`finalize_batch_run`) — gate the delivery email on a CAS
-      `UPDATE ... SET delivery_started_at=now() WHERE id=:id AND delivery_started_at IS NULL`.
-- [ ] Tests.  Verify + Codex-gate.
-
-### Phase 4 — Lease + delivery idempotency  ✅
-- [x] `batch_completion_sweep` claim → reclaimable LEASE (`claimed_at` OR < 30min) + `claim_token`.
-- [x] `_deliver` gated on a `delivery_started_at` CAS (at-most-once email).
-- [x] Tests + Codex-gate.
-
-### Phase 5 — Recovery sweep + force-finalize  ✅
-- [x] `batch_recovery_sweep` beat (every 2min): re-dispatch lost `pending` runs (Gap 1); re-enqueue
-      stuck `pending` batch children driven off the JOBS via job→config.batch_id→run (scalable).
-- [x] Force-finalize folded into `batch_completion_sweep` (eligibility age>90min from `running_at`),
-      one claim/finalize path; `finalize_batch_run(forced=True)` cancels still-active children.
-- [x] Failure is TIME-based only (90min), not attempt-based; status-guarded give-up.
-- [x] Tests + Codex-gate.
-
-### Phase 6 — Final review + docs  ◑ (in progress)
-- [x] Iterative Codex review of the whole diff — ~12 findings across 9 rounds (2 P1 + P2s), all fixed.
-- [x] Round 10 (final-gate pass): 2 P2s. (a) `batch_runs` INSERT from the API rls session under split
-      roles — ACCEPTED, already the documented H1 follow-up in BACKLOG §2. (b) REAL: force-cancelled
-      child could resurrect to `done` + bill — fixed `9e4ad2d`: `_set_status` is now a terminal-write
-      CAS (returns False on terminal rows), all transitions guarded, billing re-checks live status
-      after export. 2 regression tests; 18/18 worker tests pass. Residual (documented): cancel landing
-      between billing-check and done-CAS bills genuinely-scraped records but never resurrects the job;
-      a child cancelled post-insert can leave its already-saved rows in the forced CSV unbilled.
-- [x] Final gate (round 11): **PASS — no P1s.** 2 P2s, both ACCEPTED design tradeoffs of the
-      90-min hard-deadline backstop (and both made safe by `9e4ad2d`):
-      (a) pending-only children force-fail at 90min — deliberate: 90min unpicked ≈ 45 failed
-      recovery re-enqueues = systemic outage; clear "timed out" beats an infinite spinner.
-      (b) force-cancel includes `enriching` children — required by earlier round (664056c, late
-      side-effects after terminal batch); terminal-write guard means no resurrect/no email, and
-      post-insert rows still reach the user via the forced CSV. Codex is critiquing its own
-      prior prescriptions at this point — iteration stopped.
-- [x] `docs/BUILD_JOURNAL.md` entry + `tasks/BACKLOG.md` (H1 `batch_runs` grant follow-up logged ✅).
-
-## Notes / risks
-- Migrations run via `scripts/migrate.py` (advisory lock), NOT bare `alembic upgrade head`.
-- Do NOT apply 051 to prod DB until merged to main (branch-only migration = api crash-loop landmine).
-- API now writes `batch_runs` from the rls async session — OK today (RLS_ENFORCE=False, BYPASSRLS
-  prod role). H1 cutover MUST add `batch_runs` INSERT grant for the app role (logged in backlog).
-- Branch off `main`: `feature/batch-durability`.
+## Confirmed safe (Codex-verified)
+- Completion sweep claims/finalizes by `BatchRun.id` — plural-safe. ✓
+- Combined-CSV R2 key is per-run (`batch/{run.id}/combined.csv`). ✓
+- Billing is per child job — no one-run assumption. ✓
 
 ## Review
-
-**Track A complete — 16 commits on `feature/batch-durability`, merge-ready.** All 3 crash
-windows closed, plus a pre-existing double-scrape bug and a force-cancel resurrection bug:
-
-- **Gap 1 (lost dispatch):** `BatchRun(status='pending')` is created in the API transaction —
-  dispatch intent is durable; `batch_recovery_sweep` (2min beat) re-dispatches lost pending runs
-  and re-enqueues stuck pending children, bounded by `dispatch_attempts`.
-- **Gap 2 (hard-kill mid-finalize):** completion-sweep claim is a reclaimable 30-min lease
-  (`claimed_at` + `claim_token`); the delivery email is at-most-once via `delivery_started_at` CAS.
-- **Gap 3 (stranded forever):** force-finalize folded into `batch_completion_sweep` at >90min
-  from `running_at` — one claim/finalize path; cancels still-active children in the same txn.
-- **Prerequisite fix:** `run_scrape_job` pending→queued is an atomic CAS (no double-scrape).
-- **Final-gate fix (`9e4ad2d`):** `_set_status` = terminal-write CAS — a force-cancelled child
-  can never resurrect to `done`/bill/email; billing re-checks live status post-export.
-
-**Verification:** 26 worker/batch tests pass (incl. 4 new CAS regressions); ruff clean; ~14
-Codex findings over 11 review rounds all fixed or explicitly accepted+documented; final gate
-PASS (no P1s; 2 accepted-tradeoff P2s, see Phase 6).
-
-**Deploy notes:** migration 051 is additive/rolling-safe but MUST NOT touch prod until this
-merges to main (crash-loop landmine). H1 cutover needs a `batch_runs` INSERT grant (BACKLOG §2).
+_(filled at the end)_

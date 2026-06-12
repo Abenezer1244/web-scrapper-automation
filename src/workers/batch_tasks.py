@@ -1,15 +1,20 @@
-"""Piece 2: batch-scrape fan-out worker (Phase 2A.2).
+"""Piece 2: batch-scrape fan-out worker (Phase 2A.2; run-scoped since 2B).
 
-`dispatch_batch_run` is enqueued by POST /batches AFTER the parent ScraperBatch +
-child ScraperConfigs are committed. It creates the BatchRun (system-written, like
-dialer_deliveries — never inserted from the app/RLS session) + one Job per child
-config, then enqueues run_scrape_job for each — mirroring the scheduler's
-job-dispatch (sync session, commit BEFORE .delay so a worker can't pick up an
-uncommitted job). The completion barrier (Phase 2A.3) takes over once the
-children settle.
+`dispatch_batch_run` is enqueued with a **BatchRun id** (the durable 'pending'
+intent created by POST /batches — or, in 2B, by the scheduler when a schedule
+fires). It materializes that run: creates one Job per child config and flips
+pending->running — mirroring the scheduler's job-dispatch (sync session, commit
+BEFORE .delay so a worker can't pick up an uncommitted job). The completion
+barrier (Phase 2A.3) takes over once the children settle.
 
-Idempotent: if a BatchRun already exists for the batch (a retried task), it does
-nothing — at-most-once fan-out.
+2B made runs PLURAL per batch (migration 052), so the task contract is the RUN
+id, not the batch id — selecting "the run for a batch" is ambiguous once history
+exists (Codex P1). A transitional path still accepts a batch id (pre-deploy
+queued payloads): the ref is resolved as a run PK first, then as a batch whose
+ACTIVE run (or new pending run) is dispatched.
+
+Idempotent: the run row is locked FOR UPDATE; only a 'pending' run materializes,
+'running' re-enqueues lost children, terminal runs no-op.
 """
 import uuid
 from datetime import UTC, datetime
@@ -24,6 +29,8 @@ from src.workers import app
 from src.workers.tasks import run_scrape_job
 
 _logger = setup_logger("worker.batch")
+
+_ACTIVE_RUN_STATUSES = ("pending", "running")
 
 
 def _pending_child_ids(db, run: "BatchRun") -> list[str]:
@@ -40,47 +47,66 @@ def _pending_child_ids(db, run: "BatchRun") -> list[str]:
     return [str(x) for x in rows]
 
 
+def _resolve_run(db, ref: str) -> "BatchRun | None":
+    """Resolve the task ref to a locked BatchRun.
+
+    New contract: ref IS a BatchRun id. Transitional (pre-2B queued payloads):
+    ref is a ScraperBatch id — resolve its ACTIVE run; if none exists (old-API
+    batch that never got its durable intent), create one 'pending'. The partial
+    unique index uq_batch_runs_one_active makes that create at-most-once under a
+    race (IntegrityError loser re-selects the winner's row).
+    """
+    run = db.execute(
+        select(BatchRun).where(BatchRun.id == ref).with_for_update()
+    ).scalar_one_or_none()
+    if run is not None:
+        return run
+
+    batch = db.get(ScraperBatch, ref)
+    if batch is None:
+        return None
+    run = db.execute(
+        select(BatchRun)
+        .where(BatchRun.batch_id == batch.id, BatchRun.status.in_(_ACTIVE_RUN_STATUSES))
+        .with_for_update()
+    ).scalar_one_or_none()
+    if run is not None:
+        return run
+    db.add(
+        BatchRun(
+            id=str(uuid.uuid4()),
+            batch_id=batch.id,
+            user_id=batch.user_id,
+            status="pending",
+            child_job_ids=[],
+        )
+    )
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+    return db.execute(
+        select(BatchRun)
+        .where(BatchRun.batch_id == batch.id, BatchRun.status.in_(_ACTIVE_RUN_STATUSES))
+        .with_for_update()
+    ).scalar_one_or_none()
+
+
 @app.task(name="src.workers.batch_tasks.dispatch_batch_run")
-def dispatch_batch_run(batch_id: str) -> None:
+def dispatch_batch_run(run_id: str) -> None:
     enqueued: list[str] = []
     with system_sync_session() as db:
-        batch = db.get(ScraperBatch, batch_id)
-        if batch is None:
-            _logger.warning("dispatch_batch_run: batch %s not found", batch_id)
-            return
-
         # Lock the run row FOR UPDATE so concurrent dispatches serialize: exactly
         # one transitions pending->running + creates jobs; the rest see 'running'
-        # and fall to RECOVERY. The run is normally pre-created 'pending' by the
-        # API (durable intent). FOR UPDATE replaces the old INSERT/UNIQUE race now
-        # that the row already exists.
-        run = db.execute(
-            select(BatchRun).where(BatchRun.batch_id == batch_id).with_for_update()
-        ).scalar_one_or_none()
-
-        # Back-compat / safety: a batch from an OLD API (pre-intent) or any path
-        # that didn't pre-create the run. Create it 'pending' now; UNIQUE(batch_id)
-        # keeps it at-most-once under a race, then re-select FOR UPDATE.
+        # and fall to RECOVERY.
+        run = _resolve_run(db, run_id)
         if run is None:
-            db.add(
-                BatchRun(
-                    id=str(uuid.uuid4()),
-                    batch_id=batch_id,
-                    user_id=batch.user_id,
-                    status="pending",
-                    child_job_ids=[],
-                )
-            )
-            try:
-                db.flush()
-            except IntegrityError:
-                db.rollback()
-            run = db.execute(
-                select(BatchRun).where(BatchRun.batch_id == batch_id).with_for_update()
-            ).scalar_one_or_none()
-            if run is None:
-                _logger.warning("dispatch_batch_run: no run for batch %s", batch_id)
-                return
+            _logger.warning("dispatch_batch_run: no run/batch for ref %s", run_id)
+            return
+        batch = db.get(ScraperBatch, run.batch_id)
+        if batch is None:
+            _logger.warning("dispatch_batch_run: batch %s not found", run.batch_id)
+            return
 
         if run.status == "pending":
             # MATERIALIZE the pending intent: create child jobs + flip to running
@@ -97,17 +123,19 @@ def dispatch_batch_run(batch_id: str) -> None:
             if over_limit:
                 run.status = "failed"
                 run.failed_children = [{"reason": "monthly record limit reached"}]
+                run.completed_at = datetime.now(UTC)
                 db.commit()
             else:
                 configs = db.execute(
                     # Owner-scoped (defense-in-depth on top of the composite FK).
                     select(ScraperConfig).where(
-                        ScraperConfig.batch_id == batch_id,
+                        ScraperConfig.batch_id == batch.id,
                         ScraperConfig.user_id == batch.user_id,
                     )
                 ).scalars().all()
                 if not configs:
                     run.status = "done"
+                    run.completed_at = datetime.now(UTC)
                     db.commit()
                 else:
                     for c in configs:
@@ -140,4 +168,4 @@ def dispatch_batch_run(batch_id: str) -> None:
     # Enqueue AFTER commit so a worker can't pick up an uncommitted job row.
     for jid in enqueued:
         run_scrape_job.delay(jid)
-    _logger.info("dispatch_batch_run %s: dispatched %d child jobs", batch_id, len(enqueued))
+    _logger.info("dispatch_batch_run %s: dispatched %d child jobs", run_id, len(enqueued))

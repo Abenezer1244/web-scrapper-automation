@@ -23,6 +23,7 @@ from src.api.schemas import (
     BatchCreateRequest,
     BatchCreateResponse,
     BatchDetailResponse,
+    BatchRunResponse,
     BatchSummaryResponse,
 )
 from src.config.constants import (
@@ -131,7 +132,15 @@ async def create_batch(
         state=body.state.upper(),
         fields=body.fields.model_dump(),
         enrichment=body.enrichment.model_dump(),
-        schedule={},  # reserved for Phase 2B (scheduled batch)
+        # 2B: the PARENT carries the recurrence; dispatch_scheduled_batches fires
+        # off it. frequency='manual' (the default) = no recurrence (2A behavior).
+        # ONLY the recurrence subset is stored — ScheduleConfig's date-range
+        # fields are NOT applied to batch children (they scrape the 2A default
+        # window), so persisting them would imply support that doesn't exist
+        # (Codex P2). Extend to date ranges deliberately, not accidentally.
+        schedule=body.schedule.model_dump(
+            include={"frequency", "run_at_hour", "run_at_minute"}
+        ),
         deliver=body.deliver.model_dump(),
         status="active",
     )
@@ -184,7 +193,9 @@ async def create_batch(
     # the client to retry and create a SECOND batch (duplicate scrapes + billing)
     # even though this one is already durably queued.
     try:
-        dispatch_batch_run.delay(batch.id)
+        # 2B: dispatch is RUN-scoped (runs are plural per batch; the run id is the
+        # unambiguous durable intent the worker materializes).
+        dispatch_batch_run.delay(run.id)
     except Exception as exc:  # noqa: BLE001 — any broker failure is recoverable here
         _logger.warning(
             "batch %s: dispatch enqueue failed (recovery sweep will pick it up): %s",
@@ -233,6 +244,9 @@ async def _run_for(db: AsyncSession, batch_id: str, user_id: str) -> BatchRun | 
     # Tie the run to an OWNED batch via the join (Codex P2): batch_runs is not
     # RLS-granted, so don't rely on BatchRun.user_id alone — require a
     # scraper_batches row with the same id AND user_id to exist.
+    # 2B: runs are PLURAL per batch — this is the deterministic LATEST run
+    # (created_at desc, id as tiebreak); scalar_one_or_none would raise
+    # MultipleResultsFound on any batch with history (Codex P1).
     return (
         await db.execute(
             select(BatchRun)
@@ -242,6 +256,8 @@ async def _run_for(db: AsyncSession, batch_id: str, user_id: str) -> BatchRun | 
                 BatchRun.user_id == user_id,
                 ScraperBatch.user_id == user_id,
             )
+            .order_by(BatchRun.created_at.desc(), BatchRun.id.desc())
+            .limit(1)
         )
     ).scalar_one_or_none()
 
@@ -262,11 +278,16 @@ async def list_batches(
     if not batches:
         return []
     batch_ids = [b.id for b in batches]
+    # 2B: runs are plural — keep the LATEST per batch, deterministically. Ordering
+    # ASC here means the dict comprehension's "last write wins" leaves the newest
+    # run per batch_id (created_at asc, id as tiebreak).
     runs = (
         await db.execute(
-            select(BatchRun).where(
+            select(BatchRun)
+            .where(
                 BatchRun.user_id == current_user.id, BatchRun.batch_id.in_(batch_ids)
             )
+            .order_by(BatchRun.created_at.asc(), BatchRun.id.asc())
         )
     ).scalars().all()
     run_by_batch = {r.batch_id: r for r in runs}
@@ -360,6 +381,13 @@ async def download_batch(
     await rate_limit(request, zone="general", identifier=current_user.id)
     await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
     run = await _run_for(db, batch_id, current_user.id)
+    return await _stream_run_csv(batch_id, run)
+
+
+async def _stream_run_csv(batch_id: str, run: BatchRun | None) -> StreamingResponse:
+    """Rebuild + stream one run's combined CSV. Caller must have verified batch
+    ownership AND that `run` belongs to that batch (run.user_id is then the
+    verified owner — safe to pass to the system-session renderer)."""
     if run is None or not run.combined_export_key:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -371,8 +399,7 @@ async def download_batch(
 
     try:
         # render_combined_csv opens a sync session + builds the CSV — run off the
-        # event loop so the DB/CSV work can't block other requests. run.user_id is
-        # the verified owner (composite FK + _run_for join), so it's safe to pass.
+        # event loop so the DB/CSV work can't block other requests.
         data = await run_in_threadpool(
             render_combined_csv, run.user_id, run.child_job_ids or []
         )
@@ -382,9 +409,77 @@ async def download_batch(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Export download is temporarily unavailable.",
         ) from exc
-    filename = f"batch-{batch_id[:8]}.csv"
+    # Run-suffixed so files from different occurrences don't overwrite each other.
+    filename = f"batch-{batch_id[:8]}-{run.id[:8]}.csv"
     return StreamingResponse(
         io.BytesIO(data),
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ─── Run history (2B) ─────────────────────────────────────────────────────────
+
+_RUN_HISTORY_CAP = 100  # newest-first page bound — recurring dailies grow forever
+
+
+def _run_response(run: BatchRun) -> BatchRunResponse:
+    return BatchRunResponse(
+        id=run.id,
+        batch_id=run.batch_id,
+        status=run.status,
+        child_job_ids=list(run.child_job_ids or []),
+        excluded_no_date_count=run.excluded_no_date_count or 0,
+        failed_children=run.failed_children,
+        combined_export_ready=bool(run.combined_export_key),
+        created_at=run.created_at,
+        completed_at=run.completed_at,
+    )
+
+
+@router.get("/{batch_id}/runs", response_model=list[BatchRunResponse])
+async def list_batch_runs(
+    batch_id: str,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_rls_db),
+) -> list[BatchRunResponse]:
+    """Run history for a batch, newest first (2B: runs are plural). The combined
+    CSV per run is fetched via the run-scoped download below — never the R2 key."""
+    await rate_limit(request, zone="general", identifier=current_user.id)
+    await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
+    runs = (
+        await db.execute(
+            select(BatchRun)
+            .where(BatchRun.batch_id == batch_id, BatchRun.user_id == current_user.id)
+            .order_by(BatchRun.created_at.desc(), BatchRun.id.desc())
+            .limit(_RUN_HISTORY_CAP)
+        )
+    ).scalars().all()
+    return [_run_response(r) for r in runs]
+
+
+@router.get("/{batch_id}/runs/{run_id}/download")
+async def download_batch_run(
+    batch_id: str,
+    run_id: str,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_rls_db),
+) -> StreamingResponse:
+    """Run-scoped combined-CSV download (2B): history downloads must not drift to
+    the latest run the way /download (latest-run semantics) does."""
+    await rate_limit(request, zone="general", identifier=current_user.id)
+    await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
+    run = (
+        await db.execute(
+            select(BatchRun).where(
+                BatchRun.id == run_id,
+                BatchRun.batch_id == batch_id,  # run must belong to THIS batch
+                BatchRun.user_id == current_user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+    return await _stream_run_csv(batch_id, run)

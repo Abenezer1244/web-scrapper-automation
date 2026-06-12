@@ -1296,6 +1296,7 @@ def batch_recovery_sweep() -> None:
         # the terminal backstop. Skip force-eligible runs: their children are about
         # to be cancelled, so re-enqueueing would let them scrape after
         # terminalization (wasted work, excluded results).
+        from sqlalchemy import text as _sql_text
         stuck_children = db.execute(
             select(
                 Job.id, BatchRun.id, BatchRun.running_at, BatchRun.created_at,
@@ -1307,6 +1308,13 @@ def batch_recovery_sweep() -> None:
                 Job.status == "pending",
                 Job.trigger == "batch",
                 BatchRun.status == "running",
+                # Membership in SQL (Codex P2): the LIMIT below must page over
+                # rows that ALREADY satisfy membership — stale pending jobs from
+                # older terminal runs of the same batch would otherwise fill the
+                # page and starve the rows that actually need recovery.
+                _sql_text(
+                    "batch_runs.child_job_ids::jsonb @> to_jsonb(jobs.id::text)"
+                ),
             )
             .limit(_BATCH)
         ).all()

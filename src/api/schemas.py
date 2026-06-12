@@ -490,8 +490,13 @@ class ScraperConfigResponse(BaseModel):
 class BatchCreateRequest(BaseModel):
     """Create a batch scrape: multiple counties x record types under one parent,
     sharing fields/enrichment/deliver. Fans out into N child scrapes. The batch
-    owns delivery (one combined CSV); per-child delivery is suppressed. schedule
-    is reserved for Phase 2B (on-demand 2A ignores it)."""
+    owns delivery (one combined CSV); per-child delivery is suppressed.
+
+    2B: `schedule` (same validated shape as single scrapers) makes the batch
+    recur — the scheduler beat creates a new run when the schedule fires.
+    Default (frequency='manual') = 2A behavior: one immediate run, no recurrence.
+    Children always store schedule={} — the PARENT owns scheduling, and
+    dispatch_scheduled_jobs skips frequency='manual' children."""
 
     name: str | None = Field(default=None, max_length=120)
     state: str = Field(max_length=16)
@@ -500,6 +505,7 @@ class BatchCreateRequest(BaseModel):
     fields: FieldsConfig = FieldsConfig()
     enrichment: EnrichmentConfig = EnrichmentConfig()
     deliver: DeliverConfig = DeliverConfig()
+    schedule: ScheduleConfig = ScheduleConfig()
     skip_trace_enabled: bool = False
 
     @field_validator("state")

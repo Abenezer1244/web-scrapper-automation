@@ -13,15 +13,13 @@ Two branches off `main`, unmerged. Stage 1 = contact PII + additive email_hmac. 
 
 - [x] 🔴 Codex-gate `security/h3-pii-encryption` (Stage-1) — CLEAN (2026-06-09). 1 P1 found + fixed (`2bbebf7`: email_hmac backfill strict-mode safe via `is_encrypted` guard), re-gate clean.
 - [x] 🔴 Codex-gate `security/h3-email-cutover` (Stage-2) — RESOLVED (2026-06-09). vs `main`: 2 P2 fixed (`2bf127d`: prod-env key guard + preflight `sys.exit(1)`) + 2 P1 — #1 fixed (`ef34e88`: pass `BLIND_INDEX_KEY`/`FIELD_ENCRYPTION_KEY` to the prod migration runner), #2 (048 NOT NULL rolling deploy) is the in-isolation artifact the two-branch split exists to solve — **empirically CLEAN when reviewed `--base security/h3-pii-encryption`** (the post-Stage-1-merge diff). ⚠️ Re-gate Stage-2 `--base main` AFTER it is rebased on merged Stage-1; expect clean. Rebase will lightly conflict on `backfill_user_email_hmac.py` (both branches edited the same block) — keep the combined `is_encrypted` guard + `sys.exit(1)`.
-- [ ] 👤 Provision `FIELD_ENCRYPTION_KEY` + `BLIND_INDEX_KEY` in Railway (BEFORE Stage-1 deploy)
-- [ ] 👤 Also add `FIELD_ENCRYPTION_KEY` + `BLIND_INDEX_KEY` as GitHub **production-environment secrets** (BEFORE Stage-2 merge) — the `deploy-production` migration job now passes them to `alembic upgrade head` so migration 048 reconciles `email_hmac` under the SAME key the app uses (else fail-closed or user lockout). Use the identical key values as Railway.
-- [ ] 🔴 Merge + deploy **Stage 1**
-- [ ] 👤 Run `backfill_pii_encryption.py` (contact PII) until `changed 0`
-- [ ] 👤 Run `backfill_user_email_hmac.py` until `OK to deploy P5 (0 NULL, 0 collisions)`
-- [ ] 🔴 Merge + deploy **Stage 2** (only after the two backfills above)
-- [ ] 👤 Run `backfill_user_email_encrypt.py` until `encrypted 0`
-- [ ] 👤 Run `verify_pii_encryption.py` → must print `ALL CLEAR`
-- [ ] 👤 Set `PII_ENCRYPTION_STRICT=true` in Railway + redeploy
+- [x] 👤 Provision `FIELD_ENCRYPTION_KEY` + `BLIND_INDEX_KEY` in Railway — done 2026-06-09 (Stage-1 session)
+- [x] 👤 GitHub **production-environment secrets** — done 2026-06-12: `BLIND_INDEX_KEY` + `FIELD_ENCRYPTION_KEY` + `SECRET_KEY` set on the `production` env (read from Railway api service, identical values)
+- [x] 🔴 Stage 1 merged + deployed (PR #14, 2026-06-09) + contact-PII/email_hmac backfills run
+- [x] 🔴 **Stage 2 merged + DEPLOYED 2026-06-12** (PR #29 `6445744`): branch squash-rebased onto main (+95 commits, runbook conflicts), migration renumbered 048→**053**, Codex semantic-rebase review GO, prod hmac gate PASS. Migration 053 applied clean (health 200, alembic 053, no crash-loop — logins on the blind index).
+- [x] 👤 `backfill_user_email_encrypt.py` — run 2026-06-12: **444/444 emails encrypted**
+- [x] 👤 `verify_pii_encryption.py` — **ALL CLEAR**
+- [x] 👤 `PII_ENCRYPTION_STRICT=true` set on api + worker 2026-06-12 (confirmed both) — **H3 COMPLETE** pending the post-redeploy live-login check
 - [ ] 🟠 Encrypt/rotate `SkipTraceQueue.download_url` (signed PII CSV URL) — H3 deferred residual
 
 ## 2. Security audit checklist — remaining (`SECURITY_CHECKLIST_AUDIT_2026-06-08.md`)

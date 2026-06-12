@@ -19,6 +19,33 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-12 — H3 STAGE 2 SHIPPED: User.email encryption cutover live, strict mode ON — H3 program COMPLETE
+
+**Built / Shipped (PR #29 `6445744`):** the gated `security/h3-email-cutover` branch (95 commits
+behind) squash-rebased onto main in one conflict pass (3 conflicts, resolved per the documented
+runbook — combined `is_encrypted` strict-safe guard + `sys.exit(1)` deploy gate). Migration
+renumbered 048→**053** (down 052; the predicted renumber landmine), stale 048 refs swept.
+
+**Gates:** Codex semantic-rebase review **GO** (no plaintext-email equality anywhere on main, no
+raw user INSERTs missing email_hmac — the branch's R4 fix had auto-merged into the newer tests;
+CI migration-job keys survived; single alembic head). 32/32 H3 tests. Prod hmac gate PASS
+(0 NULL, 0 collisions — its own exit-code gate). **Provisioned the long-pending GitHub
+production-env secrets** (BLIND_INDEX_KEY/FIELD_ENCRYPTION_KEY/SECRET_KEY, read from Railway api).
+
+**Deployed + runbook executed:** migration 053 applied clean (health 200, alembic 053 — logins on
+the blind index, no crash-loop). The runbook's hard stop CAUGHT a real failure: both new runbook
+scripts lacked the railway-run `sys.path` shim → ModuleNotFoundError → strict mode correctly NOT
+flipped; shimmed (`20ac468`) and resumed. **444/444 user emails encrypted**, verify printed
+**ALL CLEAR**, `PII_ENCRYPTION_STRICT=true` set on api+worker (both confirmed).
+
+**Proven:** post-redeploy health OK + a FRESH live login in headed Chromium succeeded under
+encrypted-email + blind-index + strict mode (dashboard rendered as admin). One headed-browser
+quirk: the login redirect didn't fire but the session WAS established (authed /auth/onboarding
+200) — navigate directly, don't misread as login failure.
+
+**H3 (contact PII + User.email at-rest encryption) is now fully closed.** Remaining H3-adjacent:
+🟠 SkipTraceQueue.download_url encryption (deferred residual, Backlog §1).
+
 ## 2026-06-12 — Lists overlap property_key re-scheme: bug found via orchestrated investigation, FIXED, backfilled, residual zero proven statistical
 
 User asked "why is there no overlapping data?" Orchestrated answer (research agent + Codex in

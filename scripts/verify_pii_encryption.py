@@ -19,6 +19,8 @@ import argparse
 import logging
 import sys
 
+sys.path.insert(0, ".")  # railway-run: scripts/ is sys.path[0], repo root is not
+
 from sqlalchemy import text
 
 from src.db.session import SyncSessionLocal

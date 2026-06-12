@@ -18,6 +18,7 @@ Input is duck-typed: each record may be an ORM object (attribute access) OR a di
 exports never silently drop them.
 """
 import csv
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -27,6 +28,7 @@ from src.utils.lead_formatting import (
     parse_property_for_display,
     split_owner_for_display,
 )
+from src.utils.lead_signals import derive_signals
 
 # Canonical column order. Existing reference/legacy columns first, dialer-import
 # split columns + enrichment passthrough appended at END (backward-compatible for
@@ -46,6 +48,11 @@ LEAD_CSV_COLUMNS: list[str] = [
     "code_violation_type", "code_violation_status",
     "code_violation_description", "code_violation_last_inspection",
     "tax_billed_amount", "tax_paid_amount", "tax_account_status",
+    # Derived signals (Tier 0, src/utils/lead_signals.py): computed at export,
+    # never stored. months_delinquent + wa_foreclosure_eligible are tax-only;
+    # freshness_days + contactability_score apply to every record type.
+    "months_delinquent", "wa_foreclosure_eligible",
+    "freshness_days", "contactability_score",
 ]
 
 
@@ -127,20 +134,25 @@ def _nth_email(record: Any, i: int) -> Any:
     return _get(record, f"email_{i + 1}")  # email_2 for i=1, email_3 for i=2
 
 
-def build_lead_export_row(record: Any) -> dict[str, str]:
+def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, str]:
     """Build one canonical CSV row dict from an ORM Result or a plain dict.
 
     Parses raw name/address, THEN sanitizes each emitted value (never before
     parsing — escaping changes the string shape). Phones are normalized to bare
     10-digit (digits-only output is inherently CSV-injection-safe). Numerics are
-    rendered plainly. Keys exactly match LEAD_CSV_COLUMNS.
+    rendered plainly. Keys exactly match LEAD_CSV_COLUMNS. `today` is injected for
+    the derived freshness/delinquency signals (defaults to UTC today) so exports
+    are reproducible and tests don't freeze the clock.
     """
+    if today is None:
+        today = datetime.now(UTC).date()
     first, last = split_owner_for_display(_get(record, "party_name"))
     prop = parse_property_for_display(_get(record, "property_address"))
 
     amt = _get(record, "delinquent_amount")
     year = _get(record, "delinquent_bill_year")
     enr = _enrichment(record)
+    sig = derive_signals(record, today)
 
     return {
         "date_recorded": sanitize_for_csv(_get(record, "date_recorded")),
@@ -179,6 +191,11 @@ def build_lead_export_row(record: Any) -> dict[str, str]:
         "tax_billed_amount": _enrich_num(enr, "billed_amount"),
         "tax_paid_amount": _enrich_num(enr, "paid_amount"),
         "tax_account_status": _enrich_str(enr, "account_status"),
+        # Derived signals — blank/Yes rendering keeps the dialer CSV scannable.
+        "months_delinquent": "" if sig["months_delinquent"] is None else str(sig["months_delinquent"]),
+        "wa_foreclosure_eligible": "Yes" if sig["wa_foreclosure_eligible"] else "",
+        "freshness_days": "" if sig["freshness_days"] is None else str(sig["freshness_days"]),
+        "contactability_score": str(sig["contactability_score"]),
     }
 
 
@@ -188,10 +205,11 @@ def write_lead_csv(records: list[Any], filelike) -> None:
     No footer rows — the machine-import file stays clean (the DNC disclaimer lives
     in the delivery email + download UI). Caller owns opening/closing the stream.
     """
+    today = datetime.now(UTC).date()  # one consistent "today" for the whole file
     writer = csv.DictWriter(filelike, fieldnames=LEAD_CSV_COLUMNS)
     writer.writeheader()
     for rec in records:
-        writer.writerow(build_lead_export_row(rec))
+        writer.writerow(build_lead_export_row(rec, today))
 
 
 # Overlap/combine CSV (Lists page + batch scrape). Same dialer-ready semantics as

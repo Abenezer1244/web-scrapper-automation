@@ -180,6 +180,31 @@ class TestEnrichmentPassthrough:
         assert not row["tax_account_status"].startswith("@")
 
 
+class TestDerivedSignalColumns:
+    """Tier 0: months_delinquent / wa_foreclosure_eligible / freshness / contactability."""
+
+    def test_tax_row_signals_with_injected_today(self):
+        from datetime import date
+        rec = {
+            "delinquent_bill_year": 2022,
+            "date_recorded": "06/01/2026",
+            "phone": "2065551234",
+            "emails": ["a@x.com"],
+        }
+        row = build_lead_export_row(rec, today=date(2026, 6, 12))
+        assert row["months_delinquent"] != ""  # populated for a tax row
+        assert row["wa_foreclosure_eligible"] == "Yes"  # 2022 <= 2026-3
+        assert row["freshness_days"] == "11"
+        assert row["contactability_score"] == "2"  # 1 phone + 1 email
+
+    def test_non_tax_row_blank_tax_signals(self):
+        from datetime import date
+        row = build_lead_export_row({"party_name": "X"}, today=date(2026, 6, 12))
+        assert row["months_delinquent"] == ""
+        assert row["wa_foreclosure_eligible"] == ""
+        assert row["contactability_score"] == "0"  # always present, never blank
+
+
 class TestWriteCsv:
     def test_header_and_rows_no_footer(self):
         out = io.StringIO()

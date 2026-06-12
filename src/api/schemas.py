@@ -725,6 +725,13 @@ class ResultRow(BaseModel):
     delinquent_amount: float | None = None
     delinquent_bill_year: int | None = None
     created_at: datetime
+    # Derived signals (Tier 0, src/utils/lead_signals.py): computed at serialize
+    # time, never stored. Populated in model_post_init from the fields above.
+    # tax-only: months_delinquent / wa_foreclosure_eligible (None/False off-tax).
+    months_delinquent: int | None = None
+    wa_foreclosure_eligible: bool = False
+    freshness_days: int | None = None
+    contactability_score: int = 0
 
     model_config = {"from_attributes": True}
 
@@ -766,6 +773,17 @@ class ResultRow(BaseModel):
             object.__setattr__(self, "phones", self.phones[:3])
         if self.emails and len(self.emails) > 3:
             object.__setattr__(self, "emails", self.emails[:3])
+        # Derived signals: computed point-in-time from this row's own fields.
+        # date_recorded_parsed isn't a ResultRow field, so freshness falls back to
+        # parsing the date_recorded string (handled inside derive_signals).
+        from datetime import UTC, datetime
+
+        from src.utils.lead_signals import derive_signals
+        sig = derive_signals(self, datetime.now(UTC).date())
+        object.__setattr__(self, "months_delinquent", sig["months_delinquent"])
+        object.__setattr__(self, "wa_foreclosure_eligible", sig["wa_foreclosure_eligible"])
+        object.__setattr__(self, "freshness_days", sig["freshness_days"])
+        object.__setattr__(self, "contactability_score", sig["contactability_score"])
 
 
 class ResultsPage(BaseModel):

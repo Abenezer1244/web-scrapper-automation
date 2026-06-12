@@ -64,10 +64,20 @@ def _enrichment(record: Any) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _enrich_str(data: dict, key: str) -> str:
-    """Sanitized string value of enrichment_data[key], '' when absent."""
-    val = data.get(key)
-    return sanitize_for_csv(val) if val not in (None, "") else ""
+def _enrich_str(data: dict, *keys: str) -> str:
+    """Sanitized string value of the first present enrichment_data key, '' if none.
+
+    Accepts multiple key aliases because supported scrapers store the same datum
+    under different names (Codex review): the recorder instrument is
+    `instrument_number` (King probate JSON) | `recording_number` (Clark, King
+    LandmarkWeb) | `record_number` (King code-violation); the violation category
+    is `record_type` (Seattle SDCI) | `case_type` (Tacoma/Pierce).
+    """
+    for key in keys:
+        val = data.get(key)
+        if val not in (None, ""):
+            return sanitize_for_csv(val)
+    return ""
 
 
 def _enrich_num(data: dict, key: str) -> str:
@@ -159,8 +169,10 @@ def build_lead_export_row(record: Any) -> dict[str, str]:
         # Enrichment passthrough (Tier 0): see _enrichment() for why these read
         # the JSON keys directly. Numeric fields rendered plainly; rest sanitized.
         "assessed_value": _enrich_num(enr, "assessed_value"),
-        "instrument_number": _enrich_str(enr, "instrument_number"),
-        "code_violation_type": _enrich_str(enr, "record_type"),
+        "instrument_number": _enrich_str(
+            enr, "instrument_number", "recording_number", "record_number"
+        ),
+        "code_violation_type": _enrich_str(enr, "record_type", "case_type"),
         "code_violation_status": _enrich_str(enr, "status"),
         "code_violation_description": _enrich_str(enr, "description"),
         "code_violation_last_inspection": _enrich_str(enr, "last_inspection"),

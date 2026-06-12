@@ -131,6 +131,25 @@ class TestEnrichmentPassthrough:
         row = build_lead_export_row({"enrichment_data": {"instrument_number": "20260101001234"}})
         assert row["instrument_number"] == "20260101001234"
 
+    def test_instrument_number_key_aliases(self):
+        # Clark / King LandmarkWeb store the instrument under recording_number;
+        # King code-violation under record_number (Codex review).
+        assert build_lead_export_row(
+            {"enrichment_data": {"recording_number": "REC-9"}}
+        )["instrument_number"] == "REC-9"
+        assert build_lead_export_row(
+            {"enrichment_data": {"record_number": "CV-42"}}
+        )["instrument_number"] == "CV-42"
+
+    def test_violation_type_case_type_alias(self):
+        # Tacoma/Pierce store the violation category under case_type, not record_type.
+        row = build_lead_export_row(
+            {"enrichment_data": {"source": "tacoma_code_violations",
+                                 "case_type": "Junk/Debris", "status": "Active"}}
+        )
+        assert row["code_violation_type"] == "Junk/Debris"
+        assert row["code_violation_status"] == "Active"
+
     def test_missing_enrichment_blanks_all(self):
         row = build_lead_export_row({"party_name": "X"})
         for col in (

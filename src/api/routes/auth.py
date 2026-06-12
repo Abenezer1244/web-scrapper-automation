@@ -265,7 +265,9 @@ async def auth_config() -> dict:
         "trial": {
             "days": 7,
             "plan": "pro",
-            "records_limit": 500,
+            # Single source of truth — a hardcoded copy here drifted to a stale
+            # 500 when Pro became 1000 (limits-drift fix, 2026-06-12).
+            "records_limit": settings.PLAN_LIMITS["pro"],
         },
     }
 
@@ -336,7 +338,7 @@ async def register(
         email=body.email,
         password_hash=hash_password(body.password),
         plan="pro",
-        records_limit=settings.PLAN_LIMITS["pro"],  # 500 records during trial
+        records_limit=settings.PLAN_LIMITS["pro"],  # Pro limit during the 7-day trial
         trial_ends_at=trial_end,
         referral_code=referral_code,
         referred_by_user_id=referred_by_id,

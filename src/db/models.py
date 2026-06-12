@@ -743,7 +743,10 @@ class SkipTraceQueue(Base):
     # pending | completed | errored
     rows_uploaded = Column(Integer, nullable=False, default=0)
     credits_deducted = Column(Integer, nullable=False, default=0)
-    download_url = Column(Text, nullable=True)
+    # H3 residual (migration 054): the Tracerfy-signed CSV link targets traced
+    # PII, so it is encrypted at rest. Migration 054 NULLs expired links and
+    # encrypts the rest in the same deploy (strict mode tolerates no plaintext).
+    download_url = Column(EncryptedString, nullable=True)
     error_message = Column(Text, nullable=True)
     submitted_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at = Column(DateTime(timezone=True), nullable=True)

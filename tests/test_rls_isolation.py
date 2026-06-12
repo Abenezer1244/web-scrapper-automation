@@ -29,6 +29,30 @@ from src.utils.crypto import blind_index
 pytestmark = pytest.mark.integration
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _legacy_model_only() -> None:
+    """SKIP this module once the H1 cutover is applied.
+
+    These tests assert the LEGACY untargeted ``*_user_isolation`` policies
+    (migrations 001/018) via a generic non-bypass role. The cutover script
+    (apply_rls_cutover_policies.sql) deliberately DROPs those policies and
+    replaces them with role-targeted ``*_app``/``*_system`` ones — under that
+    model a generic role matches no policy and sees nothing, so this module
+    would false-fail (caught in the 2026-06-12 scratch rehearsal). The
+    role-targeted model is covered by test_rls_role_policies.py; the two
+    modules cover mutually exclusive DB states.
+    """
+    with sync_engine.begin() as conn:
+        cutover = conn.execute(
+            text("SELECT COUNT(*) FROM pg_policies WHERE policyname = 'results_app'")
+        ).scalar()
+    if cutover:
+        pytest.skip(
+            "H1 cutover applied (role-targeted policies) — this legacy-model "
+            "module is superseded by test_rls_role_policies.py"
+        )
+
+
 def _create_non_bypass_role_if_missing(conn) -> str:
     """Ensure a test-only role exists that does NOT have BYPASSRLS.
 

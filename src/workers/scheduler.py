@@ -391,6 +391,8 @@ def watchdog_stuck_jobs() -> None:
         ).scalars().all()
 
         requeued_ids: list[str] = []
+        # M6: alert payloads queued here, dispatched only AFTER the commit below.
+        pending_alerts: list[tuple[str, str, str, str]] = []
         for job in stuck_jobs:
             # A stranded retry (already 'pending' with retry_count>0, never started):
             # a PRIOR cycle already counted this retry; its enqueue just didn't land.
@@ -435,6 +437,16 @@ def watchdog_stuck_jobs() -> None:
                     "Our team has been notified and will investigate."
                 )
                 _logger.error("Watchdog: permanently failed job %s after 3 retries", job.id)
+                # M6: queue the ops alert; sent AFTER commit (Codex P2 — an
+                # alert for state that then fails to commit would also burn
+                # the cooldown and suppress the later real alert).
+                pending_alerts.append((
+                    "watchdog",
+                    str(job.id),
+                    f"Job permanently failed after 3 retries ({job.id})",
+                    f"job_id={job.id}\nuser_id={job.user_id}\n"
+                    f"config_id={job.scraper_config_id}",
+                ))
 
         db.commit()
 
@@ -455,6 +467,12 @@ def watchdog_stuck_jobs() -> None:
                 "watchdog: re-enqueue of %s failed (will re-pick next cycle): %s",
                 jid, str(exc)[:200],
             )
+
+    # M6: dispatch alerts AFTER the commit (Codex P2) — never for state that
+    # didn't durably land, and never burning a cooldown on a rolled-back fail.
+    from src.workers.ops_alerts import send_ops_alert
+    for kind, key, subject, body in pending_alerts:
+        send_ops_alert(kind, key, subject, body)
 
 
 # ─── Task 3: Canary health checks ────────────────────────────────────────────
@@ -496,7 +514,12 @@ def canary_check() -> None:
         connectors = random.sample(all_connectors, min(5, len(all_connectors)))
         _logger.info("Canary: checking %d/%d counties", len(connectors), len(all_connectors))
 
+        # M6: alert payloads queued here, dispatched only AFTER the commit below.
+        pending_alerts: list[tuple[str, str, str, str]] = []
         for connector in connectors:
+            # M6: alert only on the TRANSITION into 'down' (not every tick a
+            # connector stays down — the cooldown also dedupes, belt+suspenders).
+            prev_status = connector.health_status
             try:
                 scraper_class, _ = get_scraper_class(
                     connector.county, connector.state, connector.record_types[0]
@@ -541,10 +564,29 @@ def canary_check() -> None:
             except Exception as exc:
                 _logger.error("Canary failed for %s/%s: %s", connector.county, connector.state, exc)
                 connector.health_status = "down"
+                # M6: a previously-working portal just broke — queue an ops page
+                # (was log-only). Sent post-commit; exception CLASS only in the
+                # email (scraper errors can embed raw page content = PII risk —
+                # Codex P2; the full error is already in worker logs above).
+                if prev_status != "down":
+                    pending_alerts.append((
+                        "canary",
+                        f"{connector.county}/{connector.state}",
+                        f"Canary DOWN: {connector.county}/{connector.state} "
+                        f"(was {prev_status})",
+                        f"connector={connector.county}/{connector.state}\n"
+                        f"previous_status={prev_status}\n"
+                        f"error_class={type(exc).__name__} (full error in worker logs)",
+                    ))
 
             connector.last_checked = datetime.now(UTC)
 
         db.commit()
+
+    # M6: alerts only after the health statuses durably committed (Codex P2).
+    from src.workers.ops_alerts import send_ops_alert
+    for kind, key, subject, body in pending_alerts:
+        send_ops_alert(kind, key, subject, body)
 
 
 async def _canary_scrape(scraper_class, date_from: str, date_to: str) -> list:
@@ -1378,6 +1420,8 @@ def batch_recovery_sweep() -> None:
 
     redispatch_run_ids: list[str] = []
     reenqueue_job_ids: list[str] = []
+    # M6: give-up alert payloads, dispatched only AFTER the commit below.
+    give_up_alerts: list[tuple[str, str, str, str]] = []
     with system_sync_session() as db:
         # Gap 1: 'pending' runs not materialized in time.
         pending_runs = db.execute(
@@ -1477,6 +1521,16 @@ def batch_recovery_sweep() -> None:
                     "batch_recovery_sweep: gave up on pending run %s (age > %dm)",
                     rid, BATCH_FORCE_MINUTES,
                 )
+                # M6: a batch run that never materialized despite repeated
+                # re-dispatch usually means broker/worker trouble — queue an
+                # ops page, sent post-commit (Codex P2).
+                give_up_alerts.append((
+                    "batch",
+                    str(rid),
+                    f"Batch run gave up — dispatch never materialized ({rid})",
+                    f"run_id={rid}\nage > {BATCH_FORCE_MINUTES} min in 'pending' "
+                    "despite recovery re-dispatch (broker/worker issue likely)",
+                ))
         db.commit()
 
     # Enqueue AFTER commit so a worker can't pick up an uncommitted row. Per-item
@@ -1497,3 +1551,7 @@ def batch_recovery_sweep() -> None:
             "batch_recovery_sweep: re-dispatched %d run(s), re-enqueued %d child job(s)",
             len(redispatch_run_ids), len(reenqueue_job_ids),
         )
+    # M6: alerts only after the give-up terminalizations durably committed.
+    from src.workers.ops_alerts import send_ops_alert
+    for kind, key, subject, body in give_up_alerts:
+        send_ops_alert(kind, key, subject, body)

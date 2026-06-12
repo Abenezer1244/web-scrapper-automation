@@ -249,6 +249,13 @@ class Settings(BaseSettings):
     # ─── Export ───────────────────────────────────────────────────────────────
     EXPORT_FORMAT: str = "csv"
 
+    # ─── M6: operational alerting (watchdog / canary / batch failures) ────────
+    # Empty = disabled (dev/CI default). Set to an ops inbox in prod; alerts go
+    # out via the existing Resend integration. Cooldown dedupes repeats per
+    # (kind, key) so a down portal emails once per window, not once per tick.
+    OPS_ALERT_EMAIL: str = ""
+    OPS_ALERT_COOLDOWN_SECONDS: int = 21600  # 6h
+
     # ─── Plan limits: records per month (-1 = unlimited) ──────────────────────
     PLAN_LIMITS: ClassVar[dict[str, int]] = {
         "starter": 50,

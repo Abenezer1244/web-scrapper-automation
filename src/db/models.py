@@ -514,6 +514,14 @@ class Result(Base):
     # stored (stable); "months delinquent" is derived at query time from it.
     delinquent_amount = Column(Numeric(12, 2), nullable=True)
     delinquent_bill_year = Column(Integer, nullable=True)
+    # Tier 0 (migration 057): owner-location flags derived from the property +
+    # mailing addresses by src/utils/address_intel.compute_owner_flags. Tri-state
+    # booleans — True/False/NULL(unknown); filter with IS TRUE, never truthiness.
+    # property_state/owner_state = 2-letter states parsed from the two addresses.
+    property_state = Column(String(2), nullable=True)
+    owner_state = Column(String(2), nullable=True)
+    absentee_owner = Column(Boolean, nullable=True)
+    out_of_state_owner = Column(Boolean, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     # PERF (migration 033): get_results filters job_id + user_id, aggregates

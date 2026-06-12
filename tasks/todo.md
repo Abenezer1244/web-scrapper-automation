@@ -20,21 +20,25 @@ Build order = Tier 0 (cheap wins, data we already hold) first, 1 by 1, Codex-gat
 
 ## Phases (≤5 files each, Codex consult-before + review-after, verify tsc-equiv/lint/tests)
 
-- [ ] **Phase 1 — Export captured-but-dropped enrichment fields** (no migration). `lead_export.py`
-      +8 CSV cols read from `enrichment_data` (assessed_value, instrument_number,
-      code_violation_type/status/description/last_inspection, tax_billed_amount/paid_amount/
-      account_status); `schemas.py` ResultRow typed top-level fields; tests. Keys verified:
-      `enrichment_data["assessed_value"|"instrument_number"|"record_type"|"description"|"status"|
-      "last_inspection"|"billed_amount"|"paid_amount"|"account_status"]`.
-- [ ] **Phase 2 — Derived display/sort fields** (no migration). New pure-function module
-      `src/utils/lead_signals.py`: months_delinquent + wa_foreclosure_eligible (from bill_year),
-      freshness_days (from date_recorded_parsed/date_recorded), contactability_score (phones/emails).
-      Wire into ResultRow serialization + CSV export. Tests.
-- [ ] **Phase 3 — Absentee / out-of-state owner** (MIGRATION). Normalizer in `lead_signals.py` (or
-      new `address_intel.py`): normalize_address + extract_state. Stored cols `absentee_owner`,
-      `out_of_state_owner`, `owner_state`, `property_state` (nullable). Populate at insert
-      (tasks.py), chunked backfill script, partial indexes for the bool filters, export + ResultRow
-      + filter support (mirror tax_filters). Migration 057.
+- [x] **Phase 1 — Export captured-but-dropped enrichment fields** DONE (`d67b567`+`01db03f`,
+      Codex review PASS, alias fix adopted). 9 CSV cols from enrichment_data. Note: ResultRow
+      already exposes enrichment_data raw → UI change is frontend-only; kept Phase 1 to the CSV.
+- [x] **Phase 2 — Derived signal fields** DONE (`92b4ce3`+Codex-fix commit). `lead_signals.py`
+      (months_delinquent, wa_foreclosure_eligible, freshness_days, contactability_score 0-6).
+      Codex review: 3 fixes adopted (E.164 phone dedup, exact tax-filter months parity, single
+      today for Excel). Wired CSV + ResultRow.
+- [~] **Phase 3 — Absentee / out-of-state owner** (MIGRATION; Codex design-consulted). Sub-phases:
+      - [x] **3a** code DONE: `address_intel.py` (compute_owner_flags — component compare, unit-only
+            ≠ absentee, suffix/dir canonical, tri-state NULL); migration 057 (4 nullable cols, NO
+            indexes); Result model cols; **single end-of-job recompute choke point** at the
+            post-enrichment refetch (tasks.py:898 — `daily_scrape` writes CountyRecord not results,
+            so run_scrape_job is the sole results writer; reuse-for-dups runs inside enrichment
+            before the refetch) + best-effort populate-at-insert. 16 tests. **Pending: unit-suite
+            green → commit → Codex review.**
+      - [x] **3b** code DONE: `scripts/backfill_owner_flags.py` (chunked 1-5k, resumable on
+            all-4-NULL window, system role FOR ALL, dry-run default). Pending Codex review.
+      - [ ] **3c**: filter predicates (mirror tax_filters, IS TRUE not truthy) + CSV cols + ResultRow
+            fields + out-of-band CONCURRENT partial indexes. Deploy: merge 057 → run backfill.
 - [ ] **Phase 4 — stacked_distress_count** (opt-in projection). Grouped subquery on
       property_list_membership keyed by (user_id, property_key); join only on detail/export, not
       base get_results. Surface in export + ResultRow when requested.

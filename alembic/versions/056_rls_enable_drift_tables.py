@@ -51,7 +51,10 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute("ALTER TABLE audit_events DISABLE ROW LEVEL SECURITY")
+    # Deliberately does NOT disable RLS (Codex challenge P2): turning it back
+    # off would reopen the PostgREST anon exposure this migration closes —
+    # exactly the wrong thing during an emergency. The operational rollback for
+    # the H1 cutover is repoint-URLs + RLS_ENFORCE=False (+ NO FORCE), never an
+    # Alembic downgrade. This drops only the policies 056 added.
     for table in ("batch_runs", "scraper_batches"):
         op.execute(f"DROP POLICY IF EXISTS {table}_user_isolation ON {table}")
-        op.execute(f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY")

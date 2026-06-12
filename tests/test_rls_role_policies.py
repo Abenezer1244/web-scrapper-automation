@@ -48,9 +48,20 @@ def cutover_ready() -> bool:
             pytest.skip("RLS cutover not applied (roles + migration 030) — "
                         "legacy model covered by test_rls_isolation.py")
         # Allow the connecting (owner) role to SET ROLE to both cutover roles.
+        # Post-repoint runtime roles (bridgeleads_app/system) cannot GRANT —
+        # these tests must run with an OWNER/admin DSN in DATABASE_URL_SYNC,
+        # not the deployed runtime env (Codex challenge P2: a permission error
+        # here is a wrong-DSN problem, not a policy failure).
         current = conn.execute(text("SELECT current_user")).scalar()
-        for role in ("bridgeleads_app", "bridgeleads_system"):
-            conn.execute(text(f'GRANT {role} TO "{current}"'))
+        try:
+            for role in ("bridgeleads_app", "bridgeleads_system"):
+                conn.execute(text(f'GRANT {role} TO "{current}"'))
+        except Exception:
+            pytest.skip(
+                f"DATABASE_URL_SYNC connects as {current!r}, which cannot "
+                "GRANT the cutover roles — run these tests with an owner/admin "
+                "DSN (see RLS-CUTOVER-RUNBOOK.md, verification step)"
+            )
     return True
 
 
@@ -386,6 +397,109 @@ def test_dialer_deliveries_app_update_is_tenant_scoped(cutover_ready: bool) -> N
                         "c": by_user[user_a][2],
                     },
                 )
+
+        conn.execute(text("RESET ROLE"))
+        conn.rollback()
+
+
+def test_system_role_performs_worker_critical_drift_writes(cutover_ready: bool) -> None:
+    """bridgeleads_system can do every worker/operator write on the drift tables.
+
+    The app-side tests above prove DENIALS; this proves the system role's
+    GRANTS actually exist (Codex challenge P2: policies can be right while a
+    grant is missing — apply_rls_force.sql only checks policies). Covers:
+    batch_runs lifecycle UPDATE (completion barrier / recovery sweep),
+    dialer_deliveries INSERT+UPDATE (outbox materialize + drain), and the MFA
+    reset DELETEs (scripts/reset_user_mfa.py).
+    """
+    with sync_engine.begin() as conn:
+        user_a, _user_b, ra, _rb = _seed_two_tenants(conn)
+        row = conn.execute(
+            text("""
+                SELECT r.id, r.job_id, j.scraper_config_id
+                FROM results r JOIN jobs j ON j.id = r.job_id WHERE r.id = :ra
+            """),
+            {"ra": ra},
+        ).one()
+        res_id, job_id, cfg_id = str(row[0]), str(row[1]), str(row[2])
+        batch_id, run_id, code_id, bg_id = (str(uuid.uuid4()) for _ in range(4))
+        conn.execute(
+            text("""
+                INSERT INTO scraper_batches (id, user_id, state, fields, enrichment,
+                    schedule, deliver, status)
+                VALUES (:i, :u, 'WA', '[]'::json, '[]'::json, '{}'::json, '{}'::json,
+                        'active')
+            """),
+            {"i": batch_id, "u": user_a},
+        )
+        conn.execute(
+            text("""
+                INSERT INTO batch_runs (id, batch_id, user_id, status, child_job_ids,
+                    excluded_no_date_count)
+                VALUES (:r, :b, :u, 'pending', '[]'::json, 0)
+            """),
+            {"r": run_id, "b": batch_id, "u": user_a},
+        )
+        conn.execute(
+            text("""
+                INSERT INTO mfa_backup_codes (id, user_id, code_hash)
+                VALUES (:i, :u, repeat('e', 64))
+            """),
+            {"i": code_id, "u": user_a},
+        )
+        conn.execute(
+            text("""
+                INSERT INTO mfa_break_glass_codes (id, user_id, code_hash, batch_id,
+                    created_by, created_reason, expires_at)
+                VALUES (:i, :u, repeat('f', 64), :bt, 'rls-test', 'h1',
+                        now() + interval '1 day')
+            """),
+            {"i": bg_id, "u": user_a, "bt": str(uuid.uuid4())},
+        )
+
+        conn.execute(text("SET LOCAL ROLE bridgeleads_system"))
+
+        # batch_runs lifecycle UPDATE (no GUC — system carve-out).
+        n = conn.execute(
+            text("UPDATE batch_runs SET status = 'running' WHERE id = :r"),
+            {"r": run_id},
+        ).rowcount
+        assert n == 1, "system role cannot UPDATE batch_runs — completion barrier breaks"
+
+        # dialer_deliveries INSERT (outbox materialize) + UPDATE (drain).
+        dd_id = str(uuid.uuid4())
+        conn.execute(
+            text("""
+                INSERT INTO dialer_deliveries (id, job_id, result_id, user_id,
+                    scraper_config_id, vendor_id, status, attempts)
+                VALUES (:i, :j, :r, :u, :c, 'phoneburner', 'pending', 0)
+            """),
+            {"i": dd_id, "j": job_id, "r": res_id, "u": user_a, "c": cfg_id},
+        )
+        n = conn.execute(
+            text("UPDATE dialer_deliveries SET status = 'delivered' WHERE id = :i"),
+            {"i": dd_id},
+        ).rowcount
+        assert n == 1, "system role cannot UPDATE dialer_deliveries — drain breaks"
+
+        # MFA reset DELETEs (reset_user_mfa.py path).
+        n = conn.execute(
+            text("DELETE FROM mfa_backup_codes WHERE id = :i"), {"i": code_id}
+        ).rowcount
+        assert n == 1, "system role cannot DELETE mfa_backup_codes — MFA reset breaks"
+        n = conn.execute(
+            text("DELETE FROM mfa_break_glass_codes WHERE id = :i"), {"i": bg_id}
+        ).rowcount
+        assert n == 1, "system role cannot DELETE mfa_break_glass_codes — MFA reset breaks"
+
+        # audit_events INSERT (M6/M7 paths also run on beat/workers).
+        conn.execute(
+            text("""
+                INSERT INTO audit_events (id, event, user_id, ip, path, detail)
+                VALUES (:i, 'rls_test_system_event', NULL, NULL, NULL, 'h1')
+            """),
+            {"i": str(uuid.uuid4())},
+        )
 
         conn.execute(text("RESET ROLE"))
         conn.rollback()

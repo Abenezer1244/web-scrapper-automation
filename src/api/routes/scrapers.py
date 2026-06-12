@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.auth import CurrentUser, require_admin_mfa
 from src.api.deps import get_rls_db
 from src.api.middleware.rate_limit import rate_limit
+from src.api.middleware.security import audit_log
 from src.api.schemas import (
     CachedRecordRow,
     CachedResultsPage,
@@ -72,6 +73,7 @@ async def list_scrapers(
 @router.post("", response_model=ScraperConfigResponse, status_code=status.HTTP_201_CREATED)
 async def create_scraper(
     body: ScraperConfigCreate,
+    request: Request,
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> ScraperConfigResponse:
@@ -161,6 +163,12 @@ async def create_scraper(
     )
     db.add(config)
     await db.flush()
+    # M7: scraper-config changes were unaudited (audit checklist finding).
+    audit_log(
+        request, "scraper_created", current_user.id,
+        f"config_id={config.id} county={config.county}/{config.state} "
+        f"type={config.record_type}",
+    )
     return ScraperConfigResponse.model_validate(config)
 
 
@@ -233,6 +241,7 @@ async def get_scraper(
 @router.delete("/{scraper_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_scraper(
     scraper_id: str,
+    request: Request,
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> None:
@@ -247,6 +256,11 @@ async def delete_scraper(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
     config.active = False  # Soft delete — preserves job history
     await db.flush()
+    # M7: scraper-config changes were unaudited (audit checklist finding).
+    audit_log(
+        request, "scraper_deleted", current_user.id,
+        f"config_id={config.id} county={config.county}/{config.state}",
+    )
 
 
 # ─── Admin: County connector management ──────────────────────────────────────

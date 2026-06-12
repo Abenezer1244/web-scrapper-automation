@@ -383,6 +383,34 @@ class BatchRun(Base):
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
 
+class AuditEvent(Base):
+    """M7: durable security audit trail (migration 055).
+
+    `audit_log()` (src/api/middleware/security.py) previously emitted file/console
+    log lines only — lost on container restart and unqueryable. Each call now ALSO
+    inserts a row here, best-effort in a background task (an audit-write failure
+    must never fail the request; the log line remains the fallback).
+
+    user_id is a RAW uuid with NO FK on purpose: audit rows must survive user
+    deletion (an FK CASCADE would erase the trail; SET NULL would anonymize it).
+    SYSTEM-written, not app-RLS-granted (mirror batch_runs) — the H1 RLS cutover
+    must account for the writer role. No PII in `detail` by convention (callers
+    pass ids/fingerprints only — e.g. email_fingerprint, never raw email).
+    """
+
+    __tablename__ = "audit_events"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    event = Column(String(64), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=False), nullable=True, index=True)  # raw, no FK
+    ip = Column(String(64), nullable=True)
+    path = Column(String(256), nullable=True)
+    detail = Column(String(512), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+
 class Job(Base):
     __tablename__ = "jobs"
 

@@ -518,11 +518,57 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 # ─── Audit Logger ─────────────────────────────────────────────────────────────
 
+# M7 (Codex P2 ×2): hold strong refs so the GC can't collect an in-flight
+# fire-and-forget task, and bound concurrent audit inserts — the async engine
+# is NullPool, so each insert is a direct DB connection; a login storm must
+# not contend requests for connections.
+_audit_tasks: set = set()
+_audit_semaphore = None  # created lazily on the running loop
+
+
+async def _persist_audit_event(
+    event: str, user_id: str | None, ip: str, path: str, detail: str
+) -> None:
+    """M7: best-effort durable write to audit_events. NEVER raises — the log
+    line already exists; durability is additive. Own session: the request's
+    session may be mid-transaction/closed by the time this background task runs.
+    """
+    global _audit_semaphore
+    try:
+        import asyncio
+        import uuid as _uuid
+
+        from src.db.models import AuditEvent
+        from src.db.session import AsyncSessionLocal
+
+        if _audit_semaphore is None:
+            _audit_semaphore = asyncio.Semaphore(4)
+        async with _audit_semaphore, AsyncSessionLocal() as db:
+            db.add(
+                AuditEvent(
+                    id=str(_uuid.uuid4()),
+                    event=event[:64],
+                    user_id=str(user_id) if user_id else None,
+                    ip=(ip or "")[:64] or None,
+                    path=(path or "")[:256] or None,
+                    detail=(detail or "")[:512] or None,
+                )
+            )
+            await db.commit()
+    except Exception as exc:  # noqa: BLE001 — audit durability must not fail requests
+        _logger.warning("audit_events insert failed (log line stands): %s", str(exc)[:200])
+
+
 def audit_log(request: Request, event: str, user_id: str | None = None, detail: str = "") -> None:
     """Write a structured audit log entry for security-relevant events.
 
     Events: login_success, login_failure, logout, register, api_key_created,
-            api_key_revoked, plan_upgraded, job_created
+            api_key_revoked, plan_upgraded, job_created, scraper_created,
+            scraper_deleted, mfa_*, password_*, ...
+
+    M7: the console line is now ALSO persisted to audit_events (durable,
+    queryable) via a fire-and-forget background task — zero request latency,
+    and an insert failure can never fail the request.
     """
     from .rate_limit import client_ip
     ip = client_ip(request)
@@ -534,3 +580,22 @@ def audit_log(request: Request, event: str, user_id: str | None = None, detail: 
         clean_text(str(request.url.path)),
         clean_text(detail),
     )
+    try:
+        import asyncio
+
+        task = asyncio.get_running_loop().create_task(
+            _persist_audit_event(
+                clean_text(event),
+                user_id,
+                clean_text(ip),
+                clean_text(str(request.url.path)),
+                clean_text(detail),
+            )
+        )
+        # Strong ref until done (Codex P2): a bare create_task result can be
+        # garbage-collected mid-flight, silently dropping the durable write.
+        _audit_tasks.add(task)
+        task.add_done_callback(_audit_tasks.discard)
+    except RuntimeError:
+        # No running loop (sync/test context) — the log line stands alone.
+        pass

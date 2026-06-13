@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from src.scrapers.base_scraper import ProgressCallback
 
 from src.config import settings
+from src.utils.address_intel import compute_owner_flags
 from src.utils.logger import setup_logger
 from src.workers import app
 from src.workers.property_identity import compute_property_key as _compute_property_key
@@ -638,6 +639,11 @@ def run_scrape_job(self, job_id: str) -> None:
                 _tax_amount, _tax_bill_year = _extract_tax_fields(
                     rec.enrichment_data, config.record_type
                 )
+                # Tier 0 (057): best-effort owner-location flags at insert. mailing
+                # is usually NULL pre-enrichment (so absentee/out_of_state come back
+                # NULL here); the end-of-job recompute after _run_inline_enrichment
+                # is the authoritative pass once mailing is filled.
+                _owner = compute_owner_flags(rec.property_address, rec.mailing_address)
                 rows.append({
                     "id": str(_uuid.uuid4()),
                     "job_id": job_id,
@@ -659,6 +665,11 @@ def run_scrape_job(self, job_id: str) -> None:
                     # Phase 4: NULL for everything except King structured tax rows.
                     "delinquent_amount": _tax_amount,
                     "delinquent_bill_year": _tax_bill_year,
+                    # Tier 0 (057): owner-location flags (mostly recomputed post-enrich).
+                    "property_state": _owner["property_state"],
+                    "owner_state": _owner["owner_state"],
+                    "absentee_owner": _owner["absentee_owner"],
+                    "out_of_state_owner": _owner["out_of_state_owner"],
                 })
             db.execute(sa_insert(Result), rows)
             db.commit()
@@ -885,6 +896,35 @@ def run_scrape_job(self, job_id: str) -> None:
             # file nor write partial membership (Codex review).
             refreshed = None
 
+        # Tier 0 (057): authoritative owner-location recompute. This is the single
+        # choke point — `refreshed` holds every row AFTER enrichment +
+        # _reuse_enrichment_for_duplicates have settled the property/mailing
+        # addresses (skip trace runs later and never touches addresses), so one
+        # pass here keeps absentee/out_of_state fresh for rows whose mailing was
+        # NULL at insert. Non-fatal: a failure must not fail a delivered job.
+        if refreshed is not None:
+            try:
+                _owner_changed = 0
+                for res in refreshed:
+                    flags = compute_owner_flags(res.property_address, res.mailing_address)
+                    if (
+                        res.property_state != flags["property_state"]
+                        or res.owner_state != flags["owner_state"]
+                        or res.absentee_owner != flags["absentee_owner"]
+                        or res.out_of_state_owner != flags["out_of_state_owner"]
+                    ):
+                        res.property_state = flags["property_state"]
+                        res.owner_state = flags["owner_state"]
+                        res.absentee_owner = flags["absentee_owner"]
+                        res.out_of_state_owner = flags["out_of_state_owner"]
+                        _owner_changed += 1
+                if _owner_changed:
+                    db.commit()
+                    _logger.info("Job %s: owner flags recomputed for %d rows", job_id, _owner_changed)
+            except Exception as exc:
+                db.rollback()
+                _logger.warning("Job %s: owner-flag recompute failed: %s", job_id, str(exc)[:120])
+
         # Re-export CSV with enriched data — only if the refetch succeeded.
         if refreshed is not None:
             enriched_file = None
@@ -896,6 +936,11 @@ def run_scrape_job(self, job_id: str) -> None:
                         "doc_type",
                         # Structured tax fields (King tax_delinquent; null elsewhere).
                         "delinquent_amount", "delinquent_bill_year",
+                        # Owner-location flags (057) so the emailed/R2 CSV carries
+                        # absentee/out_of_state/owner_state too (canonical builder reads these).
+                        "absentee_owner", "out_of_state_owner", "owner_state",
+                        # enrichment_data drives the passthrough cols + derived signals.
+                        "enrichment_data", "date_recorded_parsed",
                         # Sprint 4: skip trace fields (may be null on first export
                         # if dispatcher hasn't submitted or webhook hasn't fired).
                         "phone", "phone_type", "email", "skip_trace_status",

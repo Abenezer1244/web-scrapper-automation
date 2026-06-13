@@ -84,6 +84,147 @@ class TestBuildRow:
         assert build_lead_export_row({"phone": "555-1234"})["phone"] == ""
 
 
+class TestEnrichmentPassthrough:
+    """Tier 0: structured enrichment_data we scrape but used to drop from the CSV."""
+
+    def test_code_violation_fields_exported(self):
+        rec = {
+            "party_name": "DISTRESSED OWNER",
+            "property_address": "456 OAK AVE, SEATTLE, WA 98101",
+            "enrichment_data": {
+                "source": "seattle_sdci_code_violations",
+                "record_type": "Housing/Building",
+                "status": "Open",
+                "description": "Vacant building, unsecured; structural hazard",
+                "last_inspection": "2026-05-01",
+                "latitude": 47.6,  # captured but intentionally NOT a column
+            },
+        }
+        row = build_lead_export_row(rec)
+        assert row["code_violation_type"] == "Housing/Building"
+        assert row["code_violation_status"] == "Open"
+        assert row["code_violation_description"].startswith("Vacant building")
+        assert row["code_violation_last_inspection"] == "2026-05-01"
+        # tax columns stay blank for a non-tax row
+        assert row["tax_billed_amount"] == "" and row["tax_account_status"] == ""
+
+    def test_tax_fields_exported_and_numeric_normalized(self):
+        rec = {
+            "enrichment_data": {
+                "source": "king_county_delinquent_taxes",
+                "billed_amount": "5400.00",
+                "paid_amount": 1200,
+                "account_status": "DELINQUENT",
+            },
+        }
+        row = build_lead_export_row(rec)
+        assert row["tax_billed_amount"] == "5400.00"
+        assert row["tax_paid_amount"] == "1200"
+        assert row["tax_account_status"] == "DELINQUENT"
+        assert row["code_violation_type"] == ""  # not a code-violation row
+
+    def test_assessed_value_strips_currency_formatting(self):
+        row = build_lead_export_row({"enrichment_data": {"assessed_value": "$325,000"}})
+        assert row["assessed_value"] == "325000"
+
+    def test_instrument_number_passthrough(self):
+        row = build_lead_export_row({"enrichment_data": {"instrument_number": "20260101001234"}})
+        assert row["instrument_number"] == "20260101001234"
+
+    def test_instrument_number_key_aliases(self):
+        # Clark / King LandmarkWeb store the instrument under recording_number;
+        # King code-violation under record_number (Codex review).
+        assert build_lead_export_row(
+            {"enrichment_data": {"recording_number": "REC-9"}}
+        )["instrument_number"] == "REC-9"
+        assert build_lead_export_row(
+            {"enrichment_data": {"record_number": "CV-42"}}
+        )["instrument_number"] == "CV-42"
+
+    def test_violation_type_case_type_alias(self):
+        # Tacoma/Pierce store the violation category under case_type, not record_type.
+        row = build_lead_export_row(
+            {"enrichment_data": {"source": "tacoma_code_violations",
+                                 "case_type": "Junk/Debris", "status": "Active"}}
+        )
+        assert row["code_violation_type"] == "Junk/Debris"
+        assert row["code_violation_status"] == "Active"
+
+    def test_missing_enrichment_blanks_all(self):
+        row = build_lead_export_row({"party_name": "X"})
+        for col in (
+            "assessed_value", "instrument_number", "code_violation_type",
+            "code_violation_status", "code_violation_description",
+            "code_violation_last_inspection", "tax_billed_amount",
+            "tax_paid_amount", "tax_account_status",
+        ):
+            assert row[col] == "", f"{col} should be blank with no enrichment_data"
+
+    def test_malformed_enrichment_data_does_not_raise(self):
+        # enrichment_data is sometimes None or (defensively) a non-dict
+        for bad in (None, [], "oops", 42):
+            row = build_lead_export_row({"enrichment_data": bad})
+            assert row["assessed_value"] == ""
+
+    def test_orm_object_enrichment(self):
+        obj = _Obj(enrichment_data={"assessed_value": 410000, "status": "Closed"})
+        row = build_lead_export_row(obj)
+        assert row["assessed_value"] == "410000"
+        assert row["code_violation_status"] == "Closed"
+
+    def test_csv_injection_sanitized_in_passthrough(self):
+        row = build_lead_export_row(
+            {"enrichment_data": {"description": "=cmd|'/c calc'!A1", "account_status": "@evil"}}
+        )
+        assert not row["code_violation_description"].startswith("=")
+        assert not row["tax_account_status"].startswith("@")
+
+
+class TestDerivedSignalColumns:
+    """Tier 0: months_delinquent / wa_foreclosure_eligible / freshness / contactability."""
+
+    def test_tax_row_signals_with_injected_today(self):
+        from datetime import date
+        rec = {
+            "delinquent_bill_year": 2022,
+            "date_recorded": "06/01/2026",
+            "phone": "2065551234",
+            "emails": ["a@x.com"],
+        }
+        row = build_lead_export_row(rec, today=date(2026, 6, 12))
+        assert row["months_delinquent"] != ""  # populated for a tax row
+        assert row["wa_foreclosure_eligible"] == "Yes"  # 2022 <= 2026-3
+        assert row["freshness_days"] == "11"
+        assert row["contactability_score"] == "2"  # 1 phone + 1 email
+
+    def test_non_tax_row_blank_tax_signals(self):
+        from datetime import date
+        row = build_lead_export_row({"party_name": "X"}, today=date(2026, 6, 12))
+        assert row["months_delinquent"] == ""
+        assert row["wa_foreclosure_eligible"] == ""
+        assert row["contactability_score"] == "0"  # always present, never blank
+
+
+class TestOwnerFlagColumns:
+    """Tier 0 (057): absentee / out_of_state / owner_state tri-state CSV columns."""
+
+    def test_absentee_yes_no_blank(self):
+        assert build_lead_export_row({"absentee_owner": True})["absentee_owner"] == "Yes"
+        assert build_lead_export_row({"absentee_owner": False})["absentee_owner"] == "No"
+        assert build_lead_export_row({"absentee_owner": None})["absentee_owner"] == ""
+        assert build_lead_export_row({})["absentee_owner"] == ""  # absent -> blank
+
+    def test_out_of_state_and_owner_state(self):
+        row = build_lead_export_row({"out_of_state_owner": True, "owner_state": "OR"})
+        assert row["out_of_state_owner"] == "Yes"
+        assert row["owner_state"] == "OR"
+
+    def test_no_duplicate_property_state_column(self):
+        # property_state exists ONCE (the dialer-split column), not duplicated
+        assert LEAD_CSV_COLUMNS.count("property_state") == 1
+        assert "owner_state" in LEAD_CSV_COLUMNS
+
+
 class TestWriteCsv:
     def test_header_and_rows_no_footer(self):
         out = io.StringIO()

@@ -35,7 +35,9 @@ DECLARE
         'public_sample_cache', 'property_list_membership',
         -- H1 drift tables (2026-06-12): policies in apply_rls_cutover_policies.sql
         'mfa_backup_codes', 'mfa_break_glass_codes', 'dialer_deliveries',
-        'scraper_batches', 'batch_runs', 'audit_events'
+        'scraper_batches', 'batch_runs', 'audit_events',
+        -- NTS Tier 1 (058): shared trustee-sale cache, system-only policy
+        'nts_notices'
     ];
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_app')

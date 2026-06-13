@@ -54,12 +54,32 @@ def match_nts_notices() -> dict:
 
 
 def match_results_inline(db, result_dicts: list[dict[str, Any]]) -> int:
-    """Inline path: match the given job's pre_foreclosure Result rows. Caller commits.
+    """Match the given Result rows (id/parcel_id/property_address/party_name). Caller commits.
 
-    `result_dicts` carry id/parcel_id/property_address/party_name (already loaded by
-    the scrape pipeline). Only rows with auction_date already None should be passed.
+    Only rows whose auction_date is already None should be passed.
     """
     return _match_and_write(db, result_dicts, commit=False)
+
+
+def match_job_inline(db, job_id: str) -> int:
+    """Inline path for the scrape pipeline: match THIS job's unmatched pre_foreclosure
+    Results. Queries the job's rows itself + commits, so the caller's later
+    post-enrichment refetch + re-export see the auction fields (the write must land
+    before the refetch — Codex). Returns the number of leads enriched.
+    """
+    from sqlalchemy import text as _sa_text
+
+    rows = db.execute(
+        _sa_text(
+            """
+            SELECT id, parcel_id, property_address, party_name
+            FROM results
+            WHERE job_id = :jid AND auction_date IS NULL
+            """
+        ),
+        {"jid": job_id},
+    ).fetchall()
+    return _match_and_write(db, [dict(r._mapping) for r in rows], commit=True)
 
 
 def _match_and_write(db, result_dicts: list[dict[str, Any]], commit: bool = True) -> int:
@@ -120,19 +140,22 @@ def _match_and_write(db, result_dicts: list[dict[str, Any]], commit: bool = True
             continue
         rid, conf = hit
         used_result_ids.add(rid)
-        _write_match(db, rid, nm, conf)
-        matched += 1
+        # Count only an actual write — the WHERE auction_date IS NULL guard means a
+        # row a concurrent beat/inline pass already claimed updates 0 rows (Codex).
+        if _write_match(db, rid, nm, conf) == 1:
+            matched += 1
 
     if commit and matched:
         db.commit()
     return matched
 
 
-def _write_match(db, result_id: Any, notice: dict, confidence: float) -> None:
+def _write_match(db, result_id: Any, notice: dict, confidence: float) -> int:
     """Write the auction columns + enrichment_data['nts'] onto one Result.
 
     enrichment_data is merged (not overwritten) so existing scrape/enrichment keys
-    survive. Only fills auction fields that are still NULL — never clobbers.
+    survive. Only fills auction fields that are still NULL — never clobbers. Returns
+    the rowcount (1 = written, 0 = another pass already claimed it).
     """
     from sqlalchemy import text as _sa_text
 
@@ -148,7 +171,7 @@ def _write_match(db, result_id: Any, notice: dict, confidence: float) -> None:
         "confidence": confidence,
     }
     import json
-    db.execute(
+    res = db.execute(
         _sa_text(
             """
             UPDATE results SET
@@ -170,6 +193,7 @@ def _write_match(db, result_id: Any, notice: dict, confidence: float) -> None:
             "rid": result_id,
         },
     )
+    return res.rowcount or 0
 
 
 def _td_days(days: int):

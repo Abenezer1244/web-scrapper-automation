@@ -33,15 +33,13 @@ def upgrade() -> None:
     op.add_column("results", sa.Column("default_amount", sa.Numeric(12, 2), nullable=True))
     op.add_column("results", sa.Column("nts_match_confidence", sa.Numeric(3, 2), nullable=True))
     op.add_column("results", sa.Column("nts_notice_id", UUID(as_uuid=False), nullable=True))
-    # Filter/sort on upcoming auctions within a job (days-to-auction).
-    op.create_index(
-        "ix_results_job_auction_date", "results", ["job_id", "auction_date"],
-        postgresql_where=sa.text("auction_date IS NOT NULL"),
-    )
+    # The filter/sort index ix_results_job_auction_date is created OUT-OF-BAND via
+    # scripts/create_owner_flag_indexes.sql (CREATE INDEX CONCURRENTLY) — a plain
+    # CREATE INDEX here would scan + lock the live 310k results table inside the
+    # alembic txn, behind the held ALTER locks (Codex, same as the owner-flag indexes).
 
 
 def downgrade() -> None:
-    op.drop_index("ix_results_job_auction_date", table_name="results")
     op.drop_column("results", "nts_notice_id")
     op.drop_column("results", "nts_match_confidence")
     op.drop_column("results", "default_amount")

@@ -879,6 +879,22 @@ def run_scrape_job(self, job_id: str) -> None:
                 db=db,
             )
 
+        # NTS Tier 1: attach matched trustee-sale auction data onto a Pierce
+        # pre_foreclosure job's leads. Runs HERE (before the post-enrichment refetch
+        # below) so the refetched rows + the re-export CSV carry the auction fields;
+        # writing after the refetch would leave the just-built CSV stale (Codex).
+        # The daily beat re-matches too. Non-fatal — must not fail a delivered job.
+        if (config.record_type == "pre_foreclosure"
+                and (config.county or "").strip().lower() == "pierce"):
+            try:
+                from src.workers.nts_matcher_task import match_job_inline
+                n = match_job_inline(db, job_id)
+                if n:
+                    _logger.info("Job %s: NTS auction data matched onto %d leads", job_id, n)
+            except Exception as exc:
+                db.rollback()
+                _logger.warning("Job %s: NTS inline match failed: %s", job_id, str(exc)[:120])
+
         # Fetch post-enrichment rows ONCE; reused by re-export AND membership.
         # Same deterministic order as the in-app download (jobs.py) so the emailed/
         # R2 CSV and the download are byte-identical, not just same-columns (Codex).
@@ -924,25 +940,6 @@ def run_scrape_job(self, job_id: str) -> None:
             except Exception as exc:
                 db.rollback()
                 _logger.warning("Job %s: owner-flag recompute failed: %s", job_id, str(exc)[:120])
-
-            # NTS Tier 1: for a Pierce pre_foreclosure job, attach matched trustee-
-            # sale auction data inline (the daily beat also re-matches). Non-fatal.
-            if (config.record_type == "pre_foreclosure"
-                    and (config.county or "").strip().lower() == "pierce"):
-                try:
-                    from src.workers.nts_matcher_task import match_results_inline
-                    rows = [
-                        {"id": res.id, "parcel_id": res.parcel_id,
-                         "property_address": res.property_address, "party_name": res.party_name}
-                        for res in refreshed if res.auction_date is None
-                    ]
-                    n = match_results_inline(db, rows)
-                    if n:
-                        db.commit()
-                        _logger.info("Job %s: NTS auction data matched onto %d leads", job_id, n)
-                except Exception as exc:
-                    db.rollback()
-                    _logger.warning("Job %s: NTS inline match failed: %s", job_id, str(exc)[:120])
 
         # Re-export CSV with enriched data — only if the refetch succeeded.
         if refreshed is not None:

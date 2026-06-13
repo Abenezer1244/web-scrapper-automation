@@ -925,6 +925,25 @@ def run_scrape_job(self, job_id: str) -> None:
                 db.rollback()
                 _logger.warning("Job %s: owner-flag recompute failed: %s", job_id, str(exc)[:120])
 
+            # NTS Tier 1: for a Pierce pre_foreclosure job, attach matched trustee-
+            # sale auction data inline (the daily beat also re-matches). Non-fatal.
+            if (config.record_type == "pre_foreclosure"
+                    and (config.county or "").strip().lower() == "pierce"):
+                try:
+                    from src.workers.nts_matcher_task import match_results_inline
+                    rows = [
+                        {"id": res.id, "parcel_id": res.parcel_id,
+                         "property_address": res.property_address, "party_name": res.party_name}
+                        for res in refreshed if res.auction_date is None
+                    ]
+                    n = match_results_inline(db, rows)
+                    if n:
+                        db.commit()
+                        _logger.info("Job %s: NTS auction data matched onto %d leads", job_id, n)
+                except Exception as exc:
+                    db.rollback()
+                    _logger.warning("Job %s: NTS inline match failed: %s", job_id, str(exc)[:120])
+
         # Re-export CSV with enriched data — only if the refetch succeeded.
         if refreshed is not None:
             enriched_file = None

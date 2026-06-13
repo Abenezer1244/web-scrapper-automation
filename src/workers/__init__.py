@@ -22,6 +22,8 @@ app = Celery(
         # NTS Tier 1: the beat crawler that fills nts_notices (trustee-sale auction
         # data). Must be imported here or the scheduled task is unregistered.
         "src.workers.nts_crawler",
+        # NTS Tier 1: the matcher beat that attaches auction data onto leads.
+        "src.workers.nts_matcher_task",
     ],
 )
 

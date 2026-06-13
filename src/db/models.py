@@ -522,6 +522,15 @@ class Result(Base):
     owner_state = Column(String(2), nullable=True)
     absentee_owner = Column(Boolean, nullable=True)
     out_of_state_owner = Column(Boolean, nullable=True)
+    # NTS Tier 1 (migration 059): trustee-sale auction data matched from nts_notices
+    # (pre_foreclosure only). auction_date = urgency clock; default_amount = principal
+    # owing. Descriptive fields (trustee/ts#/beneficiary) live in enrichment_data["nts"].
+    # nts_notice_id is a plain ref to the source nts_notices row (not an enforced FK —
+    # tenant→system-cache cross-RLS-domain).
+    auction_date = Column(Date, nullable=True)
+    default_amount = Column(Numeric(12, 2), nullable=True)
+    nts_match_confidence = Column(Numeric(3, 2), nullable=True)
+    nts_notice_id = Column(UUID(as_uuid=False), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     # PERF (migration 033): get_results filters job_id + user_id, aggregates
@@ -555,6 +564,13 @@ class Result(Base):
             "job_id",
             "delinquent_bill_year",
             postgresql_where=text("delinquent_bill_year IS NOT NULL"),
+        ),
+        # NTS Tier 1 (migration 059): filter/sort upcoming auctions within a job.
+        Index(
+            "ix_results_job_auction_date",
+            "job_id",
+            "auction_date",
+            postgresql_where=text("auction_date IS NOT NULL"),
         ),
     )
 

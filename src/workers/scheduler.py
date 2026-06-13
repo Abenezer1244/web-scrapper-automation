@@ -97,6 +97,12 @@ app.conf.beat_schedule = {
         "task": "src.workers.nts_crawler.crawl_nts_tacoma_index",
         "schedule": crontab(hour=10, minute=30),  # 10:30 UTC daily (after the AM scrape)
     },
+    "match-nts-notices": {
+        # NTS Tier 1: attach freshly-crawled auction data onto recent unmatched
+        # Pierce pre_foreclosure leads. Runs after the crawl so the cache is warm.
+        "task": "src.workers.nts_matcher_task.match_nts_notices",
+        "schedule": crontab(hour=11, minute=0),  # 11:00 UTC daily (30m after crawl)
+    },
     "batch-completion-sweep": {
         # Piece 2: finalize batch_runs whose child jobs are ALL terminal — build
         # the one combined CSV + deliver. Claims each run via a reclaimable lease;

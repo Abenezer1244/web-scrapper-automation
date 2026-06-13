@@ -143,6 +143,17 @@ class TestCrawlExtraction:
         assert urls[0].endswith("ts-25-76127-notice-of-trustees-sale/")
         assert all("notice-of-trustee" in u for u in urls)
 
+    def test_extract_notice_urls_rejects_offsite_host(self):
+        # a syndicated/compromised link with an NTS-shaped path on another host
+        # must NOT be crawled (Codex P2 host-pin)
+        listing = (
+            '<a href="https://evil.example.com/2026/06/05/ts-25-1-notice-of-trustees-sale/">x</a>'
+            '<a href="https://www.tacomadailyindex.com/2026/06/05/ts-25-2-notice-of-trustees-sale/">ok</a>'
+        )
+        urls = extract_notice_urls(listing)
+        assert len(urls) == 1
+        assert "tacomadailyindex.com" in urls[0]
+
     def test_extract_article_text_strips_chrome(self):
         html = "<html><nav>Menu</nav><article><p>TS #: 25-1</p><script>junk()</script><p>Body</p></article><footer>f</footer></html>"
         text = extract_article_text(html)

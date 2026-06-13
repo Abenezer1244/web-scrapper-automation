@@ -33,8 +33,11 @@ COUNTY = "pierce"
 STATE = "WA"
 
 # Notice URLs: /YYYY/MM/DD/ts-<num>-notice-of-trustees-sale/ (apostrophe stripped).
+# HOST-PINNED to tacomadailyindex.com (Codex P2): a syndicated/ad/compromised link
+# on the listing with a 'notice-of-trustee' path must not make the scheduled crawl
+# wander off-site. The worker also passes same_origin_as=BASE_URL to safe_get.
 _NOTICE_HREF = re.compile(
-    r'href="(https?://[^"]*?/\d{4}/\d{2}/\d{2}/[^"]*?notice-of-trustee[^"]*?)"',
+    r'href="(https?://(?:www\.)?tacomadailyindex\.com/\d{4}/\d{2}/\d{2}/[^"]*?notice-of-trustee[^"]*?)"',
     re.I,
 )
 _ARTICLE = re.compile(r"<article[^>]*>(.*?)</article>", re.S | re.I)

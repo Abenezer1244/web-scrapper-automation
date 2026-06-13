@@ -66,7 +66,12 @@ def crawl_nts_tacoma_index() -> dict:
     with system_sync_session() as db:
         for u in notice_urls:
             try:
-                resp = safe_get(u, timeout=20, headers={"User-Agent": "BridgeLeadsBot/1.0"})
+                # same_origin_as pins the fetch to the Tacoma Daily Index origin —
+                # defense-in-depth with the host-pinned URL regex (Codex P2).
+                resp = safe_get(
+                    u, timeout=20, same_origin_as=nts.BASE_URL,
+                    headers={"User-Agent": "BridgeLeadsBot/1.0"},
+                )
                 if resp.status_code != 200:
                     errored += 1
                     continue

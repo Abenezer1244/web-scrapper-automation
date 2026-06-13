@@ -191,3 +191,38 @@ class TestNoticeToRow:
         a = notice_to_row(p, "http://x/", today=date(2026, 6, 12))["raw_hash"]
         b = notice_to_row(p, "http://different-url/", today=date(2026, 6, 12))["raw_hash"]
         assert a == b  # hash is over content, not URL
+
+
+class TestQualityLoanFormat:
+    """Second REAL fixture: Quality Loan layout (whole header on one line, 'More
+    commonly known as', 'Subject to' stop) — the CURRENT Tacoma Daily Index format."""
+
+    def setup_method(self):
+        self.p = parse_nts_notice(
+            (Path(__file__).parent / "fixtures" / "nts_tacoma_quality_loan.txt").read_text(encoding="utf-8")
+        )
+
+    def test_ts_number_prefixed(self):
+        assert self.p["ts_number"] == "WA-25-1032618-RM"
+
+    def test_auction_date(self):
+        assert self.p["auction_date"] == "7/17/2026"
+
+    def test_trustee_not_ts_or_prose(self):
+        # must be the company, NOT the TS# (one-line-layout trap) nor "undersigned Trustee,"
+        assert self.p["trustee"] == "QUALITY LOAN SERVICE CORPORATION"
+
+    def test_beneficiary_and_grantor(self):
+        assert self.p["beneficiary"] == "Lakeview Loan Servicing, LLC"
+        assert "TORYIAN M CARTER" in self.p["grantor"]
+
+    def test_parcel(self):
+        assert self.p["parcel"] == "5005002880"
+
+    def test_address_clean_no_deed_overrun(self):
+        addr = self.p["property_address"]
+        assert "9016-9018" in addr and "LAKEWOOD" in addr and "98498" in addr
+        assert "Subject to" not in addr and "Deed of Trust" not in addr
+
+    def test_is_valid(self):
+        assert is_valid_nts(self.p)

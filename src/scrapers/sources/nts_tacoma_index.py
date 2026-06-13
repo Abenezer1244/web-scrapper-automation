@@ -32,44 +32,59 @@ SOURCE = "tacoma_daily_index"
 COUNTY = "pierce"
 STATE = "WA"
 
-# Notice URLs: /YYYY/MM/DD/ts-<num>-notice-of-trustees-sale/ (apostrophe stripped).
-# HOST-PINNED to tacomadailyindex.com (Codex P2): a syndicated/ad/compromised link
-# on the listing with a 'notice-of-trustee' path must not make the scheduled crawl
-# wander off-site. The worker also passes same_origin_as=BASE_URL to safe_get.
+# Notice URLs. The live slug format is /YYYY/MM/DD/ts-<wa-NN-NNNNN>-...-idx<N>/
+# (trustee-sale, "ts-" prefix); an older format used …-notice-of-trustees-sale.
+# The listing mixes other legal notices (probate "…-notice-to-creditors", etc.),
+# so we match dated paths whose slug is a trustee sale: starts with "ts-" OR
+# contains "trustee". is_valid_nts (TS# + auction_date) is the backstop that drops
+# any non-NTS page that slips through. HOST-PINNED to tacomadailyindex.com (Codex
+# P2) so a syndicated/compromised off-site link can't be crawled; the worker also
+# passes same_origin_as=BASE_URL to safe_get.
 _NOTICE_HREF = re.compile(
-    r'href="(https?://(?:www\.)?tacomadailyindex\.com/\d{4}/\d{2}/\d{2}/[^"]*?notice-of-trustee[^"]*?)"',
+    r'href="(https?://(?:www\.)?tacomadailyindex\.com/\d{4}/\d{2}/\d{2}/'
+    r'(?:ts-|[^"/]*trustee)[^"]*)"',
     re.I,
 )
 _ARTICLE = re.compile(r"<article[^>]*>(.*?)</article>", re.S | re.I)
 _TAGS = re.compile(r"<[^>]+>")
 _SCRIPT_STYLE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.S | re.I)
 
-# ── Labeled header fields ("Label: value" on their own line) ────────────────────
-# Line-bounded ([^:\n] / [^\n]): a negated class matches newlines, so an unbounded
-# label regex would jump across lines (e.g. "TRUSTEE'S SALE\nPublished 1:30 am…"
-# matching the trustee label up to the time's colon).
-#
-# TS#: accept the label variants different trustees use (TS #, T.S. No., Trustee
-# Sale No./Number) and the value formats that vary by trustee — North Star YY-NNNNN,
-# Quality Loan/Clear Recon prefixed/suffixed (WA-25-…, …-WA, F25-…). Captured
-# greedily but stopped before a trailing "-NOTICE…" (the page-title line concatenates
-# "TS #: 25-76127-NOTICE OF TRUSTEE'S SALE") and at whitespace/EOL (Codex P1).
+# ── Labeled header fields ─────────────────────────────────────────────────────
+# Two NTS layouts seen: North Star (each label on its own line) and Quality Loan
+# (the WHOLE header on ONE line: "Trustee Sale No.: X Title Order No.: Y Grantor(s)
+# …: Z Current Beneficiary …: W Current Trustee …: V"). So label VALUES can't stop
+# at a newline; they stop at the next KNOWN label (or section I/II, or end) via
+# _STOP. This handles both layouts and never lets a value swallow the next field.
+_STOP = (
+    r"(?=\s+(?:Title\s+Order|Reference\s+Number|Parcel\s+Number|Grantor|"
+    r"Current\s+Beneficiary|Current\s+Trustee|Current\s+(?:Loan\s+)?Mortgage|"
+    r"which\s+is\s+subject|Subject\s+to\b|I\.\s*NOTICE|II\.)|\n|\Z)"
+)
+
+# TS#: label variants (TS #, T.S. No., Trustee Sale No./Number) + value formats that
+# vary by trustee (North Star YY-NNNNN, Quality Loan WA-25-…-RM). Stop before a
+# trailing "-NOTICE…" (title-line concat) and at whitespace/EOL (Codex P1).
 _TS_NUMBER = re.compile(
     r"(?:T\.?S\.?\s*#|T\.?S\.?\s*No\.?|Trustee\s+Sale\s+(?:No\.?|Number))\s*:?\s*"
     r"([A-Za-z0-9][A-Za-z0-9\-]*?)(?=\s|$|-?NOTICE\b)",
     re.I,
 )
-_TITLE_ORDER = re.compile(r"Title\s*Order\s*#\s*:\s*([\w\-]+)", re.I)
-_GRANTOR = re.compile(r"^Grantor\s*:\s*([^\n]+)", re.I | re.M)
-_BENEFICIARY = re.compile(r"^(?:Current\s+)?beneficiary[^:\n]*:\s*([^\n]+)", re.I | re.M)
-# Negative lookahead so "Trustee Sale No.:" / "Trustee's Sale Number:" lines don't
-# match as the trustee NAME (Codex P2) — only the real "…trustee…:" label does.
+_TITLE_ORDER = re.compile(r"Title\s*Order\s*(?:#|No\.?)\s*:\s*([\w\-]+)", re.I)
+# Grantor / Grantor(s) [optional "for Recording Purposes …"] : value
+_GRANTOR = re.compile(r"Grantor\(?s?\)?[^:\n]*:\s*(.+?)" + _STOP, re.I | re.S)
+_BENEFICIARY = re.compile(r"(?:Current\s+)?Beneficiary[^:\n]*:\s*(.+?)" + _STOP, re.I | re.S)
+# Require the precise "Trustee of the Deed of Trust:" label (both layouts use it),
+# so neither "Trustee Sale No.:" nor a prose "the undersigned Trustee," is read as
+# the trustee NAME (Codex P2 + the one-line-layout 09:00-time-colon trap).
 _TRUSTEE = re.compile(
-    r"^(?:Current\s+)?trustee(?!\s*(?:'s)?\s+sale\s+(?:no|number))[^:\n]*:\s*([^\n]+)",
-    re.I | re.M,
+    r"(?:Current\s+)?Trustee\s+of\s+the\s+Deed\s+of\s+Trust\s*:\s*(.+?)" + _STOP,
+    re.I | re.S,
 )
-_SERVICER = re.compile(r"^(?:Current\s+)?mortgage\s+servicer[^:\n]*:\s*([^\n]+)", re.I | re.M)
-_DEED_REF = re.compile(r"Reference\s+number\s+of\s+the\s+deed\s+of\s+trust\s*:\s*([\w\-]+)", re.I)
+_SERVICER = re.compile(r"(?:Current\s+)?(?:Loan\s+)?Mortgage\s+Servicer[^:\n]*:\s*(.+?)" + _STOP, re.I | re.S)
+_DEED_REF = re.compile(
+    r"Reference\s+Number\s+(?:of\s+(?:the\s+)?)?Deed\s+of\s+Trust\s*:\s*(?:Instrument\s+No\.?\s*)?([\w\-]+)",
+    re.I,
+)
 _PARCEL = re.compile(r"Parcel\s+Number\(?s?\)?\s*:\s*([\w\-]+)", re.I)
 
 # ── Auction: "will on 7/10/2026, at 10:00 A.M. at <location> sell at public auction"
@@ -79,11 +94,12 @@ _AUCTION = re.compile(
     r"(.+?)\s+sell\s+at\s+public\s+auction",
     re.I | re.S,
 )
-# ── Property: "Commonly known as: 19012 160TH ST EAST\nBONNEY LAKE, WASHINGTON 98391"
-# Stop at "which is subject" / section II whether on the SAME line or the next
-# (Codex P1: a one-line CMS wrap would otherwise swallow the deed/legal body).
+# ── Property: "[More] commonly known as: <addr> [Subject to|which is subject…]".
+# Stop at "Subject to" (Quality Loan) OR "which is subject" (North Star) OR section
+# II, same line or next (a one-line layout would otherwise swallow the deed body).
 _COMMONLY_KNOWN = re.compile(
-    r"Commonly\s+known\s+as\s*:\s*(.+?)(?=\s+which\s+is\s+subject|\s+II\.\s|\n\n|\Z)",
+    r"commonly\s+known\s+as\s*:\s*(.+?)"
+    r"(?=\s+(?:which\s+is\s+)?[Ss]ubject\s+to\b|\s+II\.\s|\n\n|\Z)",
     re.I | re.S,
 )
 # ── Section IV: "The sum owing on the obligation ... is: Principal $185,895.06"

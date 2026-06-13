@@ -32,6 +32,7 @@ playwright==1.49.1
 beautifulsoup4==4.12.3
 lxml==6.1.0                  # M3: PYSEC-2026-87
 requests==2.33.0             # M3: CVE-2024-47081, CVE-2026-25645
+pypdf==6.13.2                # NTS Tier 1: extract text from Pacific Publishing legals PDFs (pure-python, no native deps)
 
 # AI extraction (Claude API)
 anthropic==0.52.0

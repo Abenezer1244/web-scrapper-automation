@@ -1,62 +1,40 @@
-# Lead-Quality Field Build (record-type gap analysis → implementation)
+# Thread 3b — King/Snohomish Pacific Publishing PDF NTS crawlers
 
-**Source:** `docs/research/record-type-fields/00-GAP-ANALYSIS.md` (6-type investor-demand
-research vs BridgeLeads delivery). **Architecture: Codex-consulted 2026-06-12** (verdict below).
-Build order = Tier 0 (cheap wins, data we already hold) first, 1 by 1, Codex-gated each.
+(Prior Tier-0 / Tier-1 build history captured in memory `project_record_type_lead_quality_2026_06_12`.)
 
-## Codex architecture verdict (locked)
-1. **Absentee/out-of-state** → STORED nullable columns + Python normalizer + chunked backfill.
-   NOT generated columns (address parsing too messy for an IMMUTABLE SQL expr). Add
-   `owner_state`/`property_state` for explainability + filtering.
-2. **Enrichment passthrough** (assessed_value, code-violation type/status/desc, tax billed/paid/
-   account_status, instrument_number) → CSV columns YES, DB columns NO. Read from `enrichment_data`
-   at export. Cap ~15-20 type-specific cols before per-type presets.
-3. **Derived** (months_delinquent, wa_foreclosure_eligible, freshness_days, contactability_score)
-   → DERIVE everywhere, never store. freshness_days decays daily — must be query-time.
-4. **stacked_distress_count** → opt-in projection on list/detail/export paths, NOT base
-   get_results. Materialized summary table only if it becomes a primary filter/sort.
-5. Generated columns = wrong for address intelligence (high IMMUTABLE risk).
-6. Sequence: C first (zero migration), then D/B derived, then A (first migration), defer E.
+Scope decision (user, 2026-06-13): **Snoho first, then King.** Defer DJC/buy.
+Pattern to extend: the existing Pierce/Tacoma pipeline (parser `src/scrapers/sources/nts_tacoma_index.py`,
+cache `nts_notices` mig 058, crawler beat `src/workers/nts_crawler.py`, matcher `nts_matcher.py` + task).
 
-## Phases (≤5 files each, Codex consult-before + review-after, verify tsc-equiv/lint/tests)
+## Discovery (DONE 2026-06-13 — verified against a real downloaded PDF)
 
-- [x] **Phase 1 — Export captured-but-dropped enrichment fields** DONE (`d67b567`+`01db03f`,
-      Codex review PASS, alias fix adopted). 9 CSV cols from enrichment_data. Note: ResultRow
-      already exposes enrichment_data raw → UI change is frontend-only; kept Phase 1 to the CSV.
-- [x] **Phase 2 — Derived signal fields** DONE (`92b4ce3`+Codex-fix commit). `lead_signals.py`
-      (months_delinquent, wa_foreclosure_eligible, freshness_days, contactability_score 0-6).
-      Codex review: 3 fixes adopted (E.164 phone dedup, exact tax-filter months parity, single
-      today for Excel). Wired CSV + ResultRow.
-- [~] **Phase 3 — Absentee / out-of-state owner** (MIGRATION; Codex design-consulted). Sub-phases:
-      - [x] **3a** code DONE: `address_intel.py` (compute_owner_flags — component compare, unit-only
-            ≠ absentee, suffix/dir canonical, tri-state NULL); migration 057 (4 nullable cols, NO
-            indexes); Result model cols; **single end-of-job recompute choke point** at the
-            post-enrichment refetch (tasks.py:898 — `daily_scrape` writes CountyRecord not results,
-            so run_scrape_job is the sole results writer; reuse-for-dups runs inside enrichment
-            before the refetch) + best-effort populate-at-insert. 16 tests. **Pending: unit-suite
-            green → commit → Codex review.**
-      - [x] **3b** code DONE: `scripts/backfill_owner_flags.py` (chunked 1-5k, resumable on
-            all-4-NULL window, system role FOR ALL, dry-run default). Pending Codex review.
-      - [x] **3c** code DONE: `owner_filters.build_owner_conditions` (IS TRUE/IS FALSE, excludes
-            NULL); wired into get_results + export-url + download_export (matches tax-filter
-            pattern); CSV cols absentee/out_of_state/owner_state (Yes/No/blank; property_state was
-            already a column — reused); ResultRow passthrough fields; worker export-dict now carries
-            owner flags + enrichment_data + date_recorded_parsed (so emailed CSV gets Phase 1/2/3
-            cols too); `scripts/create_owner_flag_indexes.sql` (CONCURRENT, out-of-band). Tests.
-      - **DEPLOY (after PR merge):** mig 057 auto-applies on boot (instant nullable ALTER) →
-        `railway run --service worker python scripts/backfill_owner_flags.py` (dry-run then
-        --commit) → `psql session-pooler -f scripts/create_owner_flag_indexes.sql`.
-- [ ] **Phase 4 — stacked_distress_count** (opt-in projection). Grouped subquery on
-      property_list_membership keyed by (user_id, property_key); join only on detail/export, not
-      base get_results. Surface in export + ResultRow when requested.
-- [ ] **Phase 5 — Death-cert heirs → skip trace** (workflow). Ensure `heirs` (grantee) feeds the
-      Tracerfy enqueue the way party_name does, for death_certificate leads; heir-out-of-state
-      reuses Phase 3 normalizer.
+- **Source (Snoho):** Snohomish County Tribune weekly Legals PDF.
+  URL seen: `.../static-4/snoho/images/Legals%20-%2012-17-25.pdf` (pacificpublishingcompany.media.clients.ellingtoncms.com)
+  - Text-based PDF (NOT scanned), 6 pages, 271 KB. `pypdf` extracts clean text. ✅
+  - ⚠️ CDN domain has flipped before; filename pattern inconsistent → **discover the current PDF URL by scraping the paper site (snoho.com) legals link, do NOT hardcode CDN paths.**
+- **Format:** SAME Quality Loan / North Star statutory layout the Tacoma parser already handles. One weekly PDF = MANY notices (7 NTS blocks in sample), all Snohomish County (sale @ Everett courthouse).
+- **Reuse test (real PDF):** after normalize+split, existing `parse_nts_notice` parsed TS#/parcel/address/principal on all 7 blocks. ✅
+- **Gaps that need real work:**
+  1. **PDF text artifacts:** column-wrap hyphenation (`Par-\ncel`, `SER-\nVICE`) breaks regexes → de-hyphenate (`([A-Za-z])-\n([a-z])`→`\1\2`), then `\n`→space, collapse. Curly apostrophe arrives as `�` (parser already maps it). ⚠️ RISK: never join on a digit (a wrapped `WA-25-\n1012820` must keep its hyphen) — needs a regression test.
+  2. **Multi-notice splitting:** split on `(?=NOTICE OF TRUSTEE'?S SALE)`; `is_valid_nts` (TS#+auction) is the backstop.
+  3. **Auction location-preposition variance (SHARED-MODULE change):** Snoho uses `at <time> On the Steps in Front of <loc>` AND `at <time> at <loc>`. Current `_AUCTION` requires `at <loc>` → misses "On the Steps" variant (5/7 blocks failed auction_date in the test). Broaden WITHOUT regressing Tacoma (keep Tacoma fixture green).
 
-## Tier 1 (after Tier 0 ships; bigger builds, agent-orchestrated, separate planning)
-- NTS document-image parse → pre-foreclosure auction date / default amount / trustee / TS#.
-- Probate superior-court docket scrape → PR + attorney + case# + filing date.
-- Equity estimate (buy-vs-build AVM/lien feed) — needs a product decision.
+## Plan (phased, each Codex-gated; max ~5 files/phase)
+
+- [x] **Phase 0 — Codex consult DONE.** Confirmed: (a) de-hyphenation needs to handle UPPERCASE wraps but NOT corrupt identifiers; (b) split notices FIRST so the lazy `_AUCTION` can't drift + add a drift guard + robust header regex; (c) FORK ingestion (nts_pdf), reuse field extraction; (d) `(source,ts_number)` with source-specific value, never key on PDF URL; (e) %PDF- magic + reject encrypted + page cap on top of safe_download_to_file.
+- [x] **Phase 1 — PDF infra + parser, fixture-tested. DONE + Codex-gated (branch `feature/nts-pdf-snoho-king`).**
+  - `pypdf==6.13.2` added (SBOM: 0 OSV vulns, pure-python).
+  - `src/scrapers/sources/nts_pdf.py`: extract (magic/encrypted/page-cap) + normalize (2-rule de-hyphenation: soft letter-wrap joins, identifier wrap keeps hyphen — Codex caught TS# truncation) + split (ALL-CAPS possessive header only, no boilerplate over-split).
+  - REAL PDF fixture `tests/fixtures/nts_snoho_tribune_2025-12-17.pdf`; 5/7 notices parse clean (2 misses = commercial + MTC formats, safely skipped). 69 tests pass.
+  - `_AUCTION` broadened (location-preposition flexible + drift guard); Tacoma green.
+  - `notice_to_row` parameterized `source`/`county` (Codex P2: avoid mislabeling Snoho as Pierce).
+- [ ] **Phase 2 — Snoho crawler beat** in `nts_crawler.py`: discover PDF URL from snoho.com (safe_get host-pin) → `safe_download_to_file` → extract→normalize→split→parse→`notice_to_row` (county='snohomish') → upsert. Parametrize county/source (currently hardcoded 'pierce'). Register weekly beat.
+- [ ] **Phase 3 — Snoho matcher wiring**: match Snohomish pre_foreclosure Results (same scoring; county gate). Verify in prod via railway run.
+- [ ] **Phase 4 — King (Queen Anne & Magnolia News)**: reuse Phase 1 infra; `crawl_nts_king_queenanne()` (county='king'), URL discovery from queenannenews.com. PARTIAL coverage (document gap). King matcher wiring.
+
+## Notes
+- King build-vs-buy: building free Queen Anne PDF (partial); DJC ($350/yr, complete) deferred to user.
+- `nts_notices` already FORCE'd + system policy; Snoho/King crawlers reuse the verified system_sync_session write path.
 
 ## Review
-- _Phase 1 in progress._
+(to be filled at end)

@@ -87,10 +87,16 @@ _DEED_REF = re.compile(
 )
 _PARCEL = re.compile(r"Parcel\s+Number\(?s?\)?\s*:\s*([\w\-]+)", re.I)
 
-# ── Auction: "will on 7/10/2026, at 10:00 A.M. at <location> sell at public auction"
+# ── Auction: "will on 7/10/2026, at 10:00 A.M. <location> sell at public auction"
 # Accept AM / A.M. / a.m. (dotted, Codex P1) and a multi-line location (.+? with re.S).
+# The location INTRODUCER varies by source/trustee — Tacoma/some Snoho say "at <loc>",
+# other Snoho notices say "On the Steps in Front of <loc>" / "Outside <loc>". So we do
+# NOT require "at" before the location (that dropped auction_date on 5/7 Snoho notices);
+# we capture everything up to "sell at public auction" and strip a leading "at " connector
+# in parse_nts_notice. The lazy (.+?) is safe because callers parse ONE notice block at a
+# time (PDF crawler splits first) — it can't drift across a notice boundary (Codex consult).
 _AUCTION = re.compile(
-    r"will\s+on\s+(\d{1,2}/\d{1,2}/\d{4})\s*,?\s*at\s+(\d{1,2}:\d{2}\s*[AP]\.?M\.?)\s+at\s+"
+    r"will\s+on\s+(\d{1,2}/\d{1,2}/\d{4})\s*,?\s*at\s+(\d{1,2}:\d{2}\s*[AP]\.?M\.?)\s+"
     r"(.+?)\s+sell\s+at\s+public\s+auction",
     re.I | re.S,
 )
@@ -169,9 +175,16 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
     auction_date = auction_time = auction_location = None
     am = _AUCTION.search(text)
     if am:
-        auction_date = am.group(1).strip()
-        auction_time = " ".join(am.group(2).split())
-        auction_location = " ".join(am.group(3).split()).strip().rstrip(".,")
+        loc = " ".join(am.group(3).split()).strip().rstrip(".,")
+        # Drop the redundant grammatical "at" connector ("at <time> at <loc>") so the
+        # location reads cleanly; keep descriptive introducers like "On the Steps…".
+        loc = re.sub(r"^at\s+", "", loc, flags=re.I)
+        # Drift guard (Codex): a real sale location never spans into the next notice or
+        # runs hundreds of chars. If it does, the match is suspect — discard it whole.
+        if "NOTICE OF TRUSTEE" not in loc.upper() and len(loc) <= 300:
+            auction_date = am.group(1).strip()
+            auction_time = " ".join(am.group(2).split())
+            auction_location = loc or None
 
     return {
         "ts_number": _first(_TS_NUMBER, text),
@@ -245,13 +258,26 @@ def _to_date(mdy: str | None) -> date | None:
         return None
 
 
-def notice_to_row(parsed: dict[str, Any], source_url: str, today: date) -> dict[str, Any] | None:
+def notice_to_row(
+    parsed: dict[str, Any],
+    source_url: str,
+    today: date,
+    *,
+    source: str = SOURCE,
+    county: str = COUNTY,
+) -> dict[str, Any] | None:
     """Transform a parsed notice into an nts_notices upsert row, or None if unusable.
 
     Adds the normalized match key (address_intel.address_match_key — the SAME key
     the matcher computes for a lead), an is_active flag (False once the auction is
     in the past), and a content hash for dedup / source-drift detection. Returns
     None for non-NTS pages (is_valid_nts) so the caller skips them.
+
+    `source` / `county` default to the Tacoma Daily Index (Pierce) so existing
+    callers are unchanged, but the Pacific Publishing PDF crawlers MUST pass their
+    own (e.g. source='pacific_publishing_snohomish_tribune', county='snohomish').
+    The matcher scopes notices by county, so a wrong county silently routes a notice
+    to the wrong leads — these are the cache row's tenant-of-record fields (Codex).
     """
     if not is_valid_nts(parsed):
         return None
@@ -269,9 +295,9 @@ def notice_to_row(parsed: dict[str, Any], source_url: str, today: date) -> dict[
     )
     raw_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return {
-        "source": SOURCE,
+        "source": source,
         "ts_number": parsed["ts_number"],
-        "county": COUNTY,
+        "county": county,
         "state": STATE,
         "parcel": parsed.get("parcel"),
         "property_address": addr,

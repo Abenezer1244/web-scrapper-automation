@@ -879,18 +879,23 @@ def run_scrape_job(self, job_id: str) -> None:
                 db=db,
             )
 
-        # NTS Tier 1: attach matched trustee-sale auction data onto a Pierce
-        # pre_foreclosure job's leads. Runs HERE (before the post-enrichment refetch
-        # below) so the refetched rows + the re-export CSV carry the auction fields;
-        # writing after the refetch would leave the just-built CSV stale (Codex).
-        # The daily beat re-matches too. Non-fatal — must not fail a delivered job.
-        if (config.record_type == "pre_foreclosure"
-                and (config.county or "").strip().lower() == "pierce"):
+        # NTS Tier 1: attach matched trustee-sale auction data onto a pre_foreclosure
+        # job's leads (any county with an NTS source — Pierce/Snohomish, King later).
+        # Runs HERE (before the post-enrichment refetch below) so the refetched rows +
+        # the re-export CSV carry the auction fields; writing after the refetch would
+        # leave the just-built CSV stale (Codex). match_job_inline derives the job's
+        # county and matches same-county notices. The daily beat re-matches too.
+        # Non-fatal — must not fail a delivered job.
+        if config.record_type == "pre_foreclosure":
             try:
-                from src.workers.nts_matcher_task import match_job_inline
-                n = match_job_inline(db, job_id)
-                if n:
-                    _logger.info("Job %s: NTS auction data matched onto %d leads", job_id, n)
+                from src.workers.nts_matcher_task import (
+                    NTS_MATCH_COUNTIES,
+                    match_job_inline,
+                )
+                if (config.county or "").strip().lower() in NTS_MATCH_COUNTIES:
+                    n = match_job_inline(db, job_id)
+                    if n:
+                        _logger.info("Job %s: NTS auction data matched onto %d leads", job_id, n)
             except Exception as exc:
                 db.rollback()
                 _logger.warning("Job %s: NTS inline match failed: %s", job_id, str(exc)[:120])

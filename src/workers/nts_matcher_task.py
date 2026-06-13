@@ -22,43 +22,55 @@ from src.workers import app
 
 _logger = setup_logger("workers.nts_matcher")
 
-_RECENT_DAYS = 45  # beat re-match window for un-enriched Pierce pre_foreclosure leads
+_RECENT_DAYS = 45  # beat re-match window for un-enriched pre_foreclosure leads
+
+# Counties with an NTS cache source wired up (Pierce=Tacoma Daily Index, Snohomish=
+# Snohomish County Tribune, King=Queen Anne & Magnolia News). Matching is scoped PER
+# COUNTY — a notice only ever matches a lead in the SAME county — so a same street+zip
+# in a different county can never cross-match (the address key isn't county-unique).
+NTS_MATCH_COUNTIES = ("pierce", "snohomish", "king")
 
 
 @app.task(name="src.workers.nts_matcher_task.match_nts_notices")
 def match_nts_notices() -> dict:
-    """Beat: match active Pierce notices onto recent unmatched pre_foreclosure leads."""
+    """Beat: match active notices onto recent unmatched pre_foreclosure leads, per county."""
     from sqlalchemy import text as _sa_text
 
     from src.db.session import system_sync_session
 
     cutoff = datetime.now(UTC) - _td_days(_RECENT_DAYS)
+    total_candidates = total_matched = 0
     with system_sync_session() as db:
-        result_rows = db.execute(
-            _sa_text(
-                """
-                SELECT r.id, r.parcel_id, r.property_address, r.party_name
-                FROM results r JOIN jobs j ON j.id = r.job_id
-                JOIN scraper_configs sc ON sc.id = j.scraper_config_id
-                WHERE sc.record_type = 'pre_foreclosure'
-                  AND lower(sc.county) = 'pierce'
-                  AND r.auction_date IS NULL
-                  AND r.created_at >= :cutoff
-                """
-            ),
-            {"cutoff": cutoff},
-        ).fetchall()
-        matched = _match_and_write(db, [dict(r._mapping) for r in result_rows])
-    _logger.info("NTS match (beat): %d leads enriched from %d candidates", matched, len(result_rows))
-    return {"candidates": len(result_rows), "matched": matched}
+        for county in NTS_MATCH_COUNTIES:
+            result_rows = db.execute(
+                _sa_text(
+                    """
+                    SELECT r.id, r.parcel_id, r.property_address, r.party_name
+                    FROM results r JOIN jobs j ON j.id = r.job_id
+                    JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+                    WHERE sc.record_type = 'pre_foreclosure'
+                      AND lower(sc.county) = :county
+                      AND r.auction_date IS NULL
+                      AND r.created_at >= :cutoff
+                    """
+                ),
+                {"county": county, "cutoff": cutoff},
+            ).fetchall()
+            matched = _match_and_write(db, [dict(r._mapping) for r in result_rows], county=county)
+            total_candidates += len(result_rows)
+            total_matched += matched
+    _logger.info("NTS match (beat): %d leads enriched from %d candidates across %s",
+                 total_matched, total_candidates, ",".join(NTS_MATCH_COUNTIES))
+    return {"candidates": total_candidates, "matched": total_matched}
 
 
-def match_results_inline(db, result_dicts: list[dict[str, Any]]) -> int:
+def match_results_inline(db, result_dicts: list[dict[str, Any]], county: str) -> int:
     """Match the given Result rows (id/parcel_id/property_address/party_name). Caller commits.
 
-    Only rows whose auction_date is already None should be passed.
+    Only rows whose auction_date is already None should be passed. `county` scopes the
+    notices considered (must be the leads' county) so matching stays county-aligned.
     """
-    return _match_and_write(db, result_dicts, commit=False)
+    return _match_and_write(db, result_dicts, county=county, commit=False)
 
 
 def match_job_inline(db, job_id: str) -> int:
@@ -66,9 +78,25 @@ def match_job_inline(db, job_id: str) -> int:
     Results. Queries the job's rows itself + commits, so the caller's later
     post-enrichment refetch + re-export see the auction fields (the write must land
     before the refetch — Codex). Returns the number of leads enriched.
+
+    Derives the job's county from its scraper_config so it matches against the SAME
+    county's notices (county-aligned). A job whose county has no NTS source matches
+    nothing (empty notice set) — harmless.
     """
     from sqlalchemy import text as _sa_text
 
+    county = db.execute(
+        _sa_text(
+            """
+            SELECT lower(sc.county)
+            FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+            WHERE j.id = :jid
+            """
+        ),
+        {"jid": job_id},
+    ).scalar()
+    if not county:
+        return 0
     rows = db.execute(
         _sa_text(
             """
@@ -79,11 +107,18 @@ def match_job_inline(db, job_id: str) -> int:
         ),
         {"jid": job_id},
     ).fetchall()
-    return _match_and_write(db, [dict(r._mapping) for r in rows], commit=True)
+    return _match_and_write(db, [dict(r._mapping) for r in rows], county=county, commit=True)
 
 
-def _match_and_write(db, result_dicts: list[dict[str, Any]], commit: bool = True) -> int:
-    """Core: index candidates, score each active notice, write the unambiguous wins."""
+def _match_and_write(
+    db, result_dicts: list[dict[str, Any]], *, county: str, commit: bool = True
+) -> int:
+    """Core: index candidates, score each active notice (scoped to `county`), write wins.
+
+    Only notices for `county` are considered, and the candidates are that county's
+    leads — so a notice can never match a lead in another county (the scorer keys on
+    parcel/address, which aren't globally county-unique).
+    """
     from sqlalchemy import text as _sa_text
 
     from src.scrapers.sources.nts_matcher import best_match, result_match_candidate
@@ -112,10 +147,10 @@ def _match_and_write(db, result_dicts: list[dict[str, Any]], commit: bool = True
                    beneficiary, ts_number, principal_owing, source, source_url
             FROM nts_notices
             WHERE is_active AND auction_date IS NOT NULL AND auction_date >= :today
-              AND lower(county) = 'pierce'
+              AND lower(county) = :county
             """
         ),
-        {"today": today},
+        {"today": today, "county": county},
     ).fetchall()
 
     matched = 0

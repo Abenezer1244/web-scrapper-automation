@@ -4,14 +4,23 @@ The candidate-load/write SQL is integration-level (needs a real DB); here we pin
 cheap invariants: empty input is a no-op (no DB touched) and the module imports +
 registers its beat task cleanly.
 """
-from src.workers.nts_matcher_task import match_results_inline
+from src.workers.nts_matcher_task import (
+    NTS_MATCH_COUNTIES,
+    match_results_inline,
+)
 
 
 def test_inline_empty_is_noop_without_db():
     # `db` is never touched when there are no candidate rows
-    assert match_results_inline(db=None, result_dicts=[]) == 0
+    assert match_results_inline(db=None, result_dicts=[], county="snohomish") == 0
 
 
 def test_beat_task_registered():
     from src.workers import app
     assert "src.workers.nts_matcher_task.match_nts_notices" in app.tasks
+
+
+def test_match_counties_include_pierce_and_snohomish():
+    # the matcher must be wired for every county that has a crawler populating notices
+    assert "pierce" in NTS_MATCH_COUNTIES
+    assert "snohomish" in NTS_MATCH_COUNTIES

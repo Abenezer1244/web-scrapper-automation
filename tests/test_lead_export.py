@@ -243,3 +243,26 @@ class TestWriteCsv:
         write_lead_csv([], out)
         lines = [ln for ln in out.getvalue().splitlines() if ln.strip()]
         assert len(lines) == 1 and lines[0].split(",") == LEAD_CSV_COLUMNS
+
+
+class TestNtsAuctionColumns:
+    """NTS Tier 1 (059): auction_date / days_to_auction / default_amount / trustee / ts#."""
+
+    def test_auction_fields_from_columns_and_nts_blob(self):
+        from datetime import date
+        rec = {
+            "auction_date": date(2026, 7, 10),
+            "default_amount": __import__("decimal").Decimal("185895.06"),
+            "enrichment_data": {"nts": {"trustee": "North Star Trustee, LLC", "ts_number": "25-76127"}},
+        }
+        row = build_lead_export_row(rec, today=date(2026, 6, 12))
+        assert row["auction_date"] == "2026-07-10"
+        assert row["days_to_auction"] == "28"
+        assert row["default_amount"] == "185895.06"
+        assert row["trustee"] == "North Star Trustee, LLC"
+        assert row["ts_number"] == "25-76127"
+
+    def test_blank_when_no_auction(self):
+        row = build_lead_export_row({"party_name": "X"})
+        for col in ("auction_date", "days_to_auction", "default_amount", "trustee", "ts_number"):
+            assert row[col] == "", col

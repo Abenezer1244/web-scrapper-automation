@@ -730,6 +730,10 @@ class ResultRow(BaseModel):
     owner_state: str | None = None
     absentee_owner: bool | None = None
     out_of_state_owner: bool | None = None
+    # NTS Tier 1 (migration 059): matched trustee-sale auction data (pre_foreclosure).
+    auction_date: date | None = None
+    default_amount: float | None = None
+    nts_match_confidence: float | None = None
     created_at: datetime
     # Derived signals (Tier 0, src/utils/lead_signals.py): computed at serialize
     # time, never stored. Populated in model_post_init from the fields above.
@@ -738,6 +742,7 @@ class ResultRow(BaseModel):
     wa_foreclosure_eligible: bool = False
     freshness_days: int | None = None
     contactability_score: int = 0
+    days_to_auction: int | None = None
 
     model_config = {"from_attributes": True}
 
@@ -790,6 +795,7 @@ class ResultRow(BaseModel):
         object.__setattr__(self, "wa_foreclosure_eligible", sig["wa_foreclosure_eligible"])
         object.__setattr__(self, "freshness_days", sig["freshness_days"])
         object.__setattr__(self, "contactability_score", sig["contactability_score"])
+        object.__setattr__(self, "days_to_auction", sig["days_to_auction"])
 
 
 class ResultsPage(BaseModel):

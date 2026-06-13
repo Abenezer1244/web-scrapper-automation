@@ -955,6 +955,8 @@ def run_scrape_job(self, job_id: str) -> None:
                         # Owner-location flags (057) so the emailed/R2 CSV carries
                         # absentee/out_of_state/owner_state too (canonical builder reads these).
                         "absentee_owner", "out_of_state_owner", "owner_state",
+                        # NTS auction data (059) so the emailed/R2 CSV carries it too.
+                        "auction_date", "default_amount",
                         # enrichment_data drives the passthrough cols + derived signals.
                         "enrichment_data", "date_recorded_parsed",
                         # Sprint 4: skip trace fields (may be null on first export

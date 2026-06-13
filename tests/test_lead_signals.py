@@ -135,3 +135,21 @@ class TestDeriveSignals:
         assert sig["wa_foreclosure_eligible"] is False
         assert sig["freshness_days"] == 0
         assert sig["contactability_score"] == 0
+
+
+class TestDaysToAuction:
+    def test_future_auction(self):
+        from datetime import date
+
+        from src.utils.lead_signals import days_to_auction
+        assert days_to_auction(date(2026, 7, 10), date(2026, 6, 12)) == 28
+
+    def test_none_when_no_auction(self):
+        from src.utils.lead_signals import days_to_auction
+        assert days_to_auction(None, TODAY) is None
+
+    def test_past_auction_clamped(self):
+        from datetime import date
+
+        from src.utils.lead_signals import days_to_auction
+        assert days_to_auction(date(2026, 1, 1), date(2026, 6, 12)) == 0

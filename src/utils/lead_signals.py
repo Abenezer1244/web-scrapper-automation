@@ -89,6 +89,19 @@ def freshness_days(
     return delta if delta >= 0 else 0
 
 
+def days_to_auction(auction_date: Any, today: date) -> int | None:
+    """Days until the trustee-sale auction — the pre-foreclosure urgency clock.
+
+    From the matched NTS auction_date (a real date). None when no auction is matched.
+    Clamped at 0 (a past auction shouldn't reach here — the matcher only attaches
+    future sales — but a stale row must read as 0-days, not negative).
+    """
+    if not isinstance(auction_date, date):
+        return None
+    delta = (auction_date - today).days
+    return delta if delta >= 0 else 0
+
+
 def contactability_score(
     phone: Any,
     email: Any,
@@ -168,4 +181,6 @@ def derive_signals(record: Any, today: date) -> dict[str, Any]:
             _get(record, "phones"),
             _get(record, "emails"),
         ),
+        # NTS Tier 1: days until the matched trustee-sale auction (pre_foreclosure).
+        "days_to_auction": days_to_auction(_get(record, "auction_date"), today),
     }

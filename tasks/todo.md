@@ -28,13 +28,13 @@ cache `nts_notices` mig 058, crawler beat `src/workers/nts_crawler.py`, matcher 
   - REAL PDF fixture `tests/fixtures/nts_snoho_tribune_2025-12-17.pdf`; 5/7 notices parse clean (2 misses = commercial + MTC formats, safely skipped). 69 tests pass.
   - `_AUCTION` broadened (location-preposition flexible + drift guard); Tacoma green.
   - `notice_to_row` parameterized `source`/`county` (Codex P2: avoid mislabeling Snoho as Pierce).
-- [ ] **Phase 2 — Snoho crawler beat** in `nts_crawler.py`: discover PDF URL from snoho.com (safe_get host-pin) → `safe_download_to_file` → extract→normalize→split→parse→`notice_to_row` (county='snohomish') → upsert. Parametrize county/source (currently hardcoded 'pierce'). Register weekly beat.
-- [ ] **Phase 3 — Snoho matcher wiring**: match Snohomish pre_foreclosure Results (same scoring; county gate). Verify in prod via railway run.
-- [ ] **Phase 4 — King (Queen Anne & Magnolia News)**: reuse Phase 1 infra; `crawl_nts_king_queenanne()` (county='king'), URL discovery from queenannenews.com. PARTIAL coverage (document gap). King matcher wiring.
+- [x] **Phase 2 — Snoho crawler beat. DONE + Codex-gated.** `crawl_nts_snoho_tribune` + shared `_crawl_pacific_publishing_pdf` (discover via snoho.com [browser UA, follows 302, soft-404 tolerant, "legal"-in-filename filter] → `safe_download_to_file` [SSRF, https, 25 MB cap] → extract→normalize→split→parse→`notice_to_row(source='snohomish_tribune', county='snohomish')` → per-row SAVEPOINT upsert → source-scoped expiry). Weekly beat (Thu). **Live prod: 2 Snoho notices upserted, Pierce untouched.** Codex [P1]=matcher-not-wired → resolved by Phase 3.
+- [x] **Phase 3 — county-generic matcher. DONE + Codex-gated.** `NTS_MATCH_COUNTIES`, beat loops counties, `_match_and_write(county=)` + `match_job_inline` derives job county, tasks.py inline gate widened. **County-ALIGNED** (a notice only matches a same-county lead). Live prod: runs pierce+snohomish, 1061 candidates, 0 errors. 0 matched = correct (0 Snohomish pre_foreclosure LEADS exist — see follow-up).
+- [x] **Phase 4 — King (Queen Anne). DONE + Codex-gated.** `crawl_nts_king_queenanne` (constants only), king in NTS_MATCH_COUNTIES, weekly beat. **Live prod: discovered QA Legals PDF, 0 errors (0 upserted this week — partial coverage, those trustees use unsupported formats).**
 
-## Notes
-- King build-vs-buy: building free Queen Anne PDF (partial); DJC ($350/yr, complete) deferred to user.
-- `nts_notices` already FORCE'd + system policy; Snoho/King crawlers reuse the verified system_sync_session write path.
-
-## Review
-(to be filled at end)
+## Review (2026-06-13)
+- **Branch `feature/nts-pdf-snoho-king` (5 commits, pushed `59c9a32`, NOT merged). 71 NTS tests pass, ruff clean. Codex GATE PASS (no P1); all P2s fixed** (TS#-wrap truncation, county/source param, lazy page cap).
+- All 3 crawlers (Tacoma/Snoho/King) + the county-generic matcher proven live in prod via `railway run`.
+- **King build-vs-buy:** free Queen Anne PDF shipped (partial); DJC ($350/yr, complete) deferred to user.
+- **⚠️ Product follow-ups (not bugs):** (1) Snohomish/King NTS data only enriches leads once there ARE Snohomish/King **pre_foreclosure scrapers** producing leads — currently 0 Snohomish pre_foreclosure leads. (2) Parser covers Quality Loan + North Star formats; add MTC/Trustee-Corps + commercial-loan + Affinia/Aztec (King) formats to lift coverage (safely skipped today). (3) `nts_notices.source` is varchar(32) — sources kept short.
+- **DEPLOY decision (user):** merging adds `pypdf` dep + 2 weekly beats + the matcher refactor. No migration. Recommend merge.

@@ -31,3 +31,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_results_user_absentee
 CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_results_user_out_of_state
     ON results (user_id)
     WHERE out_of_state_owner IS TRUE;
+
+-- NTS Tier 1 (migration 059): filter/sort upcoming trustee-sale auctions within a
+-- job (days-to-auction). Deferred here for the same reason — a plain CREATE INDEX
+-- in the migration would lock the live results table.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_results_job_auction_date
+    ON results (job_id, auction_date)
+    WHERE auction_date IS NOT NULL;

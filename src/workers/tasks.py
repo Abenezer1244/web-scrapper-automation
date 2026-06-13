@@ -879,6 +879,22 @@ def run_scrape_job(self, job_id: str) -> None:
                 db=db,
             )
 
+        # NTS Tier 1: attach matched trustee-sale auction data onto a Pierce
+        # pre_foreclosure job's leads. Runs HERE (before the post-enrichment refetch
+        # below) so the refetched rows + the re-export CSV carry the auction fields;
+        # writing after the refetch would leave the just-built CSV stale (Codex).
+        # The daily beat re-matches too. Non-fatal — must not fail a delivered job.
+        if (config.record_type == "pre_foreclosure"
+                and (config.county or "").strip().lower() == "pierce"):
+            try:
+                from src.workers.nts_matcher_task import match_job_inline
+                n = match_job_inline(db, job_id)
+                if n:
+                    _logger.info("Job %s: NTS auction data matched onto %d leads", job_id, n)
+            except Exception as exc:
+                db.rollback()
+                _logger.warning("Job %s: NTS inline match failed: %s", job_id, str(exc)[:120])
+
         # Fetch post-enrichment rows ONCE; reused by re-export AND membership.
         # Same deterministic order as the in-app download (jobs.py) so the emailed/
         # R2 CSV and the download are byte-identical, not just same-columns (Codex).
@@ -939,6 +955,8 @@ def run_scrape_job(self, job_id: str) -> None:
                         # Owner-location flags (057) so the emailed/R2 CSV carries
                         # absentee/out_of_state/owner_state too (canonical builder reads these).
                         "absentee_owner", "out_of_state_owner", "owner_state",
+                        # NTS auction data (059) so the emailed/R2 CSV carries it too.
+                        "auction_date", "default_amount",
                         # enrichment_data drives the passthrough cols + derived signals.
                         "enrichment_data", "date_recorded_parsed",
                         # Sprint 4: skip trace fields (may be null on first export

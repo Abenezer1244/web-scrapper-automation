@@ -57,6 +57,10 @@ LEAD_CSV_COLUMNS: list[str] = [
     # No property_state here — it already exists above as the dialer-split column
     # (same value: parse(property_address).state == the stored property_state).
     "absentee_owner", "out_of_state_owner", "owner_state",
+    # NTS Tier 1 (migration 059): matched trustee-sale auction data (pre_foreclosure).
+    # auction_date + default_amount are stored columns; trustee/ts# from
+    # enrichment_data["nts"]; days_to_auction is the derived urgency clock.
+    "auction_date", "days_to_auction", "default_amount", "trustee", "ts_number",
 ]
 
 
@@ -82,6 +86,19 @@ def _enrichment(record: Any) -> dict:
     """
     data = _get(record, "enrichment_data")
     return data if isinstance(data, dict) else {}
+
+
+def _nts(enr: dict) -> dict:
+    """The nested 'nts' object the matcher wrote into enrichment_data (or empty)."""
+    nts = enr.get("nts")
+    return nts if isinstance(nts, dict) else {}
+
+
+def _plain(val: Any) -> str:
+    """Plain string for a stored date/numeric column ('' when None). A date renders
+    ISO (2026-07-10), a Decimal renders without exponent — both dialer/sheet clean
+    and digit-only after rendering, so no CSV-injection escaping is needed."""
+    return "" if val in (None, "") else f"{val}"
 
 
 def _enrich_str(data: dict, *keys: str) -> str:
@@ -213,6 +230,12 @@ def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, s
         "absentee_owner": _yes_no_blank(_get(record, "absentee_owner")),
         "out_of_state_owner": _yes_no_blank(_get(record, "out_of_state_owner")),
         "owner_state": sanitize_for_csv(_get(record, "owner_state")),
+        # NTS auction data (059): stored cols + nts blob in enrichment_data.
+        "auction_date": _plain(_get(record, "auction_date")),
+        "days_to_auction": "" if sig["days_to_auction"] is None else str(sig["days_to_auction"]),
+        "default_amount": _plain(_get(record, "default_amount")),
+        "trustee": _enrich_str(_nts(enr), "trustee"),
+        "ts_number": _enrich_str(_nts(enr), "ts_number"),
     }
 
 

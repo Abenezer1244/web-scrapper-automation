@@ -137,6 +137,9 @@ REVOKE INSERT, UPDATE, DELETE ON
 REVOKE ALL ON
     delivered_records, pending_skip_trace_rows, skip_trace_queues,
     skip_trace_cache, skip_trace_meter_events FROM bridgeleads_app;
+-- nts_notices (058): shared trustee-sale cache, system-written only; the app
+-- reads auction data off Result columns, never this table.
+REVOKE ALL ON nts_notices FROM bridgeleads_app;
 -- H1 drift tables — converge to exactly the grants above:
 REVOKE INSERT, DELETE ON mfa_break_glass_codes FROM bridgeleads_app;
 REVOKE UPDATE, DELETE ON scraper_batches, batch_runs FROM bridgeleads_app;
@@ -159,7 +162,8 @@ BEGIN
         OR (privilege_type = 'UPDATE'
             AND table_name IN ('county_connectors', 'password_history'))
         OR table_name IN ('delivered_records', 'pending_skip_trace_rows',
-                          'skip_trace_queues', 'skip_trace_cache', 'skip_trace_meter_events')
+                          'skip_trace_queues', 'skip_trace_cache', 'skip_trace_meter_events',
+                          'nts_notices')
         -- H1 drift tables:
         OR (privilege_type = 'INSERT'
             AND table_name IN ('mfa_break_glass_codes', 'dialer_deliveries'))

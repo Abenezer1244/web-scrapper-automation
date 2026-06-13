@@ -19,6 +19,68 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-12 — Record-type lead-quality program: research → Tier 0 shipped → NTS Tier-1 parser
+
+**Built / Shipped:**
+- **Record-type field gap analysis** (`docs/research/record-type-fields/`): 6 parallel research
+  agents (one per record type) on what investors actually want vs competitor field sets
+  (PropStream/PropertyRadar/BatchLeads/All The Leads/ATTOM), + a codebase audit + a Codex
+  product consult → `00-GAP-ANALYSIS.md`. Headline: our source freshness is best-in-class but
+  per-lead we ship none of the 3 things investors filter on first — equity, absentee, urgency —
+  two of which are computable from data we already hold.
+- **Tier 0 lead-quality fields — PR #34 MERGED + DEPLOYED** (7 commits, each Codex-gated):
+  P1 export 9 captured-but-dropped enrichment_data cols (assessed_value, code-violation
+  type/status/desc, tax billed/paid, instrument#, with scraper key-aliases); P2 derived signals
+  `src/utils/lead_signals.py` (months_delinquent + wa_foreclosure_eligible per RCW 84.64,
+  freshness_days, contactability 0-6); P3 absentee/out-of-state owner flags (migration 057,
+  `src/utils/address_intel.py`, `src/api/owner_filters.py`, backfill script, CONCURRENT index
+  script). Migration 057 applied clean on prod; backfill running.
+- **NTS Tier-1 parser** (branch `feature/nts-pierce-auction-data`, Codex-gated):
+  `src/scrapers/sources/nts_tacoma_index.py` — parses WA Notice-of-Trustee-Sale notices from the
+  Tacoma Daily Index (Pierce County) into auction_date/default/trustee/TS#/address. The crawler
+  + matcher-onto-existing-leads are the remaining units.
+
+**Tried / Decided (Codex-consulted):**
+- Tier-0 architecture: absentee = STORED cols + Python normalizer + chunked backfill (NOT
+  generated columns — address parsing too business-rule-heavy for an IMMUTABLE SQL expr);
+  enrichment passthrough = CSV cols read from JSON, no DB cols; derived signals = compute-never-
+  store; stacked_distress = opt-in projection (deferred). Sequenced C→D→A (export first, migration
+  last).
+- Absentee = component compare (base street + zip, unit-stripped, suffix/dir-canonical); tri-state
+  True/False/**NULL** — unit-only diff is NOT absentee, underdetermined same-street is NULL not a
+  guessed False. Single end-of-job recompute choke point (post-enrichment refetch) — `run_scrape_job`
+  is the sole `results` writer (daily_scrape writes CountyRecord).
+- **NTS source decision (research):** do NOT scrape the recorder doc image (King LandmarkWeb ToS
+  prohibits automation) — use the legal-newspaper network WA law requires (RCW 61.24.040). Tacoma
+  Daily Index (Pierce) verified free + open-robots.txt + fully parseable. King/Snoho = Pacific
+  Publishing PDFs OR buy DJC ($350/yr, 4 counties) OR ATTOM API — build-vs-buy still open.
+- NTS shape: enrich onto existing Pierce pre_foreclosure leads (1,158 in prod), not a standalone
+  scraper.
+
+**Caught & fixed (Codex reviews, all adopted):** P1 enrichment key-aliases; P2 E.164 phone dedup +
+exact tax-filter months parity + single-today Excel; P3a tri-state NULL + BOX/NO street-name
+over-strip + identical-address short-circuit; P3c `?absentee=false` bool-coercion (clean); NTS
+parser 5 fixes (TS# label/format variants, dotted A.M., trustee-sale-no line, same-line address
+stop, unit-prefix preserved).
+
+**Failed / Blocked:** owner-flags backfill on 310k rows kept hitting Supavisor session drops
+(long-lived connection + prod DEBUG SQL echo). Hardened the script: silence echo +
+auto-reconnect-and-resume on OperationalError (commits are per-chunk so progress is durable).
+Backfill running to completion in the background.
+
+**Pending / Handoff:** backfill finishing (idempotent, resumable — re-run if it stalls); run
+`scripts/create_owner_flag_indexes.sql` (CONCURRENT, session pooler) after backfill; NTS feature
+continuation = crawler (Tacoma Daily Index dated listing) → matcher (address/parcel onto Pierce
+pre_foreclosure) → field storage + export → King/Snoho (build-vs-buy DJC). Phase 4 (stacked
+distress) + Phase 5 (death-cert heirs→skip trace) of Tier 0 still open.
+
+**Facts learned:** `railway run` uses LOCAL code + injects the service env (so script edits take
+effect without redeploy, but inherit prod DEBUG echo); Supavisor kills long sessions → backfills
+must self-resume; WA NTS bodies are statutorily structured (labeled header + Roman-numeral
+sections) so label/section regex is reliable, but TS#/time/address formats vary by trustee.
+
+---
+
 ## 2026-06-12 — H1 SHIPPED + CUT OVER: RLS is ENFORCED in production (roles + policies + RLS_ENFORCE=true + FORCE) — the last backlog code item is closed
 
 **Built / Shipped:** PR #33 (`security/h1-rls-cutover`, merged) extended the 2026-06-02 cutover

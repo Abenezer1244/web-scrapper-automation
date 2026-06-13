@@ -175,7 +175,8 @@ DECLARE t text;
 BEGIN
     FOREACH t IN ARRAY ARRAY[
         'delivered_records', 'pending_skip_trace_rows', 'skip_trace_queues',
-        'skip_trace_cache', 'skip_trace_meter_events'
+        'skip_trace_cache', 'skip_trace_meter_events',
+        'nts_notices'  -- 058: shared trustee-sale cache, system-written only
     ]
     LOOP
         -- Drop any legacy untargeted tenant policy from 018.

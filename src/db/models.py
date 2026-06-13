@@ -522,6 +522,15 @@ class Result(Base):
     owner_state = Column(String(2), nullable=True)
     absentee_owner = Column(Boolean, nullable=True)
     out_of_state_owner = Column(Boolean, nullable=True)
+    # NTS Tier 1 (migration 059): trustee-sale auction data matched from nts_notices
+    # (pre_foreclosure only). auction_date = urgency clock; default_amount = principal
+    # owing. Descriptive fields (trustee/ts#/beneficiary) live in enrichment_data["nts"].
+    # nts_notice_id is a plain ref to the source nts_notices row (not an enforced FK —
+    # tenant→system-cache cross-RLS-domain).
+    auction_date = Column(Date, nullable=True)
+    default_amount = Column(Numeric(12, 2), nullable=True)
+    nts_match_confidence = Column(Numeric(3, 2), nullable=True)
+    nts_notice_id = Column(UUID(as_uuid=False), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     # PERF (migration 033): get_results filters job_id + user_id, aggregates
@@ -555,6 +564,13 @@ class Result(Base):
             "job_id",
             "delinquent_bill_year",
             postgresql_where=text("delinquent_bill_year IS NOT NULL"),
+        ),
+        # NTS Tier 1 (migration 059): filter/sort upcoming auctions within a job.
+        Index(
+            "ix_results_job_auction_date",
+            "job_id",
+            "auction_date",
+            postgresql_where=text("auction_date IS NOT NULL"),
         ),
     )
 
@@ -1000,3 +1016,54 @@ class DialerDelivery(Base):
         # The chunk drain + replay both scan pending/failed rows for a job.
         Index("ix_dialer_deliveries_job_status", "job_id", "status"),
     )
+
+
+class NtsNotice(Base):
+    """NTS Tier 1 (migration 058): shared cache of Notice-of-Trustee-Sale auction
+    data parsed from legal newspapers (WA RCW 61.24.040 mandates publication).
+
+    SHARED reference table, NOT tenant-scoped — like CountyRecord / skip_trace_cache.
+    The crawler (workers/nts_crawler, system role) upserts notices; the matcher
+    attaches the auction fields onto each tenant's pre_foreclosure Results. The app
+    never reads this directly, so it is system-only under RLS (no app grant/policy).
+
+    Natural key is (source, ts_number) — TS numbers collide across trustees/sources,
+    so bare ts_number is not unique. raw_hash detects source/parser drift for reparse;
+    is_active flips false once the auction is past (kept for audit, excluded from match).
+    """
+
+    __tablename__ = "nts_notices"
+    __table_args__ = (
+        UniqueConstraint("source", "ts_number", name="uq_nts_notices_source_ts"),
+        Index(
+            "ix_nts_notices_addr_active", "property_address_normalized",
+            postgresql_where=text("is_active AND property_address_normalized IS NOT NULL"),
+        ),
+        Index(
+            "ix_nts_notices_parcel_active", "parcel",
+            postgresql_where=text("is_active AND parcel IS NOT NULL"),
+        ),
+    )
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    source = Column(String(32), nullable=False)
+    ts_number = Column(String(64), nullable=False)
+    county = Column(String(64), nullable=True)
+    state = Column(String(2), nullable=True)
+    parcel = Column(String(64), nullable=True)
+    property_address = Column(String(512), nullable=True)
+    property_address_normalized = Column(String(512), nullable=True)
+    auction_date = Column(Date, nullable=True)
+    auction_time = Column(String(16), nullable=True)
+    auction_location = Column(String(512), nullable=True)
+    grantor = Column(String(512), nullable=True)
+    trustee = Column(String(255), nullable=True)
+    beneficiary = Column(String(255), nullable=True)
+    principal_owing = Column(Numeric(12, 2), nullable=True)
+    note_amount = Column(Numeric(12, 2), nullable=True)
+    nod_date = Column(String(32), nullable=True)
+    source_url = Column(String(512), nullable=True)
+    raw_hash = Column(String(64), nullable=True)
+    is_active = Column(Boolean, nullable=False, server_default=text("true"))
+    fetched_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

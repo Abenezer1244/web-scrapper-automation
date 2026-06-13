@@ -115,6 +115,25 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
     return None
 
 
+def address_match_key(address: str | None) -> str | None:
+    """A normalized comparable key for deciding two addresses are the same property.
+
+    `<normalized base street>|<zip5>` (or just the street when no ZIP parses). Used
+    by the NTS pipeline: the crawler stores it on each notice and the matcher
+    computes the SAME key for a lead's property_address, so identical keys = the
+    same physical property regardless of source formatting (suffix spelling, unit,
+    directional). Returns None when no usable street parses (don't match on junk).
+    """
+    if not address:
+        return None
+    parsed = parse_property_for_display(address)
+    street = _normalize_street(parsed["street"])
+    if not street:
+        return None
+    zip5 = (parsed["zip"] or "")[:5]
+    return f"{street}|{zip5}" if zip5 else street
+
+
 def compute_owner_flags(
     property_address: str | None, mailing_address: str | None
 ) -> dict[str, object]:

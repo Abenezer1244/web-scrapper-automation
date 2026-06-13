@@ -119,11 +119,11 @@ class TestParseRealBlocks:
         # would mislabel the notice and the county-scoped matcher would route it wrong.
         row = notice_to_row(
             p, source_url="http://x/snoho.pdf", today=date(2025, 12, 1),
-            source="pacific_publishing_snohomish_tribune", county="snohomish",
+            source="snohomish_tribune", county="snohomish",
         )
         assert row is not None
         assert row["ts_number"] == "WA-25-1012820-SW"
-        assert row["source"] == "pacific_publishing_snohomish_tribune"
+        assert row["source"] == "snohomish_tribune"
         assert row["county"] == "snohomish"
         assert row["state"] == "WA"
         assert row["auction_date"] == date(2025, 12, 26)

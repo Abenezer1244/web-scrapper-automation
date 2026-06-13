@@ -24,11 +24,11 @@ _logger = setup_logger("workers.nts_matcher")
 
 _RECENT_DAYS = 45  # beat re-match window for un-enriched pre_foreclosure leads
 
-# Counties with an NTS cache source wired up (Pierce=Tacoma, Snohomish=Tribune;
-# King=Queen Anne added in Phase 4). Matching is scoped PER COUNTY — a notice only
-# ever matches a lead in the SAME county — so a same street+zip in a different
-# county can never cross-match (the address key isn't county-unique on its own).
-NTS_MATCH_COUNTIES = ("pierce", "snohomish")
+# Counties with an NTS cache source wired up (Pierce=Tacoma Daily Index, Snohomish=
+# Snohomish County Tribune, King=Queen Anne & Magnolia News). Matching is scoped PER
+# COUNTY — a notice only ever matches a lead in the SAME county — so a same street+zip
+# in a different county can never cross-match (the address key isn't county-unique).
+NTS_MATCH_COUNTIES = ("pierce", "snohomish", "king")
 
 
 @app.task(name="src.workers.nts_matcher_task.match_nts_notices")

@@ -20,7 +20,13 @@ def test_beat_task_registered():
     assert "src.workers.nts_matcher_task.match_nts_notices" in app.tasks
 
 
-def test_match_counties_include_pierce_and_snohomish():
+def test_match_counties_cover_every_crawler():
     # the matcher must be wired for every county that has a crawler populating notices
-    assert "pierce" in NTS_MATCH_COUNTIES
-    assert "snohomish" in NTS_MATCH_COUNTIES
+    assert set(NTS_MATCH_COUNTIES) >= {"pierce", "snohomish", "king"}
+
+
+def test_pdf_crawler_tasks_registered():
+    import src.workers.nts_crawler  # noqa: F401 — import registers the @app.task crawlers
+    from src.workers import app
+    assert "src.workers.nts_crawler.crawl_nts_snoho_tribune" in app.tasks
+    assert "src.workers.nts_crawler.crawl_nts_king_queenanne" in app.tasks

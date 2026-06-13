@@ -111,6 +111,13 @@ app.conf.beat_schedule = {
         "task": "src.workers.nts_crawler.crawl_nts_snoho_tribune",
         "schedule": crontab(hour=10, minute=45, day_of_week=4),  # Thu 10:45 UTC
     },
+    "crawl-nts-king-queenanne": {
+        # NTS Tier 1 (King, PARTIAL coverage): the Queen Anne & Magnolia News weekly
+        # "Legals" PDF. Same weekly cadence; runs Thursdays. King's dominant venue is
+        # the DJC (paid, deferred), so this is supplemental King NTS coverage.
+        "task": "src.workers.nts_crawler.crawl_nts_king_queenanne",
+        "schedule": crontab(hour=10, minute=50, day_of_week=4),  # Thu 10:50 UTC
+    },
     "batch-completion-sweep": {
         # Piece 2: finalize batch_runs whose child jobs are ALL terminal — build
         # the one combined CSV + deliver. Claims each run via a reclaimable lease;

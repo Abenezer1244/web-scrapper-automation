@@ -50,6 +50,14 @@ _SNOHO_PDF_PREFIX = "/static-4/snoho/images/"
 # source is the nts_notices natural-key prefix and is varchar(32) — keep it short.
 _SNOHO_SOURCE = "snohomish_tribune"
 
+# King County via the Queen Anne & Magnolia News (Pacific Publishing). PARTIAL
+# coverage — it's a neighborhood paper, not King County's dominant foreclosure venue
+# (that's the DJC, $350/yr, deferred). Same weekly-PDF pipeline; its legals live in a
+# /legals/ subdir (vs snoho's flat /images/).
+_KING_PAGE = "https://queenannenews.com/Content/Default/Default/Classified/Legal-Notices/-3/-3/498"
+_KING_PDF_PREFIX = "/static-4/queenannenews/images/legals/"
+_KING_SOURCE = "queen_anne_news"
+
 
 @app.task(name="src.workers.nts_crawler.crawl_nts_tacoma_index")
 def crawl_nts_tacoma_index() -> dict:
@@ -138,6 +146,17 @@ def crawl_nts_snoho_tribune() -> dict:
         pdf_path_prefix=_SNOHO_PDF_PREFIX,
         source=_SNOHO_SOURCE,
         county="snohomish",
+    )
+
+
+@app.task(name="src.workers.nts_crawler.crawl_nts_king_queenanne")
+def crawl_nts_king_queenanne() -> dict:
+    """Crawl the Queen Anne & Magnolia News weekly Legals PDF into nts_notices (King)."""
+    return _crawl_pacific_publishing_pdf(
+        page_url=_KING_PAGE,
+        pdf_path_prefix=_KING_PDF_PREFIX,
+        source=_KING_SOURCE,
+        county="king",
     )
 
 

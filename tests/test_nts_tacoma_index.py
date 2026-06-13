@@ -223,6 +223,17 @@ class TestQualityLoanFormat:
         addr = self.p["property_address"]
         assert "9016-9018" in addr and "LAKEWOOD" in addr and "98498" in addr
         assert "Subject to" not in addr and "Deed of Trust" not in addr
+        # 'WASHINGTON BLVD' is a STREET name — must NOT be abbreviated to 'WA BLVD'
+        # (Codex: a global WASHINGTON->WA rewrite corrupted the match key).
+        assert "WASHINGTON BLVD" in addr.upper()
+
+    def test_match_key_uses_full_street_name(self):
+        from datetime import date as _d
+
+        from src.scrapers.sources.nts_tacoma_index import notice_to_row
+        row = notice_to_row(self.p, "x", _d(2026, 6, 12))
+        # the key the matcher joins on must carry the real street, not 'WA BLVD'
+        assert "WASHINGTON BLVD" in row["property_address_normalized"]
 
     def test_is_valid(self):
         assert is_valid_nts(self.p)

@@ -134,13 +134,16 @@ def _clean_address(raw: str | None) -> str | None:
     Does NOT strip leading non-digit text (Codex P2): a legitimate unit prefix like
     'UNIT B 123 MAIN ST' must survive — stripping to the first digit would collapse
     distinct units to the same address and mis-attach auction data. We only collapse
-    whitespace + normalize the state word; _COMMONLY_KNOWN already starts the capture
-    after the label, so there is no preamble to remove.
+    whitespace; _COMMONLY_KNOWN already starts the capture after the label.
+
+    'WASHINGTON' is normalized to 'WA' ONLY in the STATE position (before a ZIP or
+    at end) — NOT inside a street name like 'WASHINGTON BLVD' (Codex: a global
+    rewrite corrupted the match key, since the lead side never abbreviates streets).
     """
     if not raw:
         return None
     addr = " ".join(raw.split()).strip().rstrip(".,")
-    addr = re.sub(r"\bWASHINGTON\b", "WA", addr, flags=re.I)
+    addr = re.sub(r"\bWASHINGTON\b(?=\s*,?\s*\d{5}(?:-\d{4})?\s*$|\s*$)", "WA", addr, flags=re.I)
     return addr or None
 
 

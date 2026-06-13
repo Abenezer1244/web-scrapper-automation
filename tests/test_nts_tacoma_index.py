@@ -4,10 +4,17 @@ Runs against a REAL saved notice (tests/fixtures/nts_tacoma_25-76127.txt — Pie
 County NTS, fetched 2026-06-12), per the no-mocks rule. Pins the investor-critical
 field extraction.
 """
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
-from src.scrapers.sources.nts_tacoma_index import is_valid_nts, parse_nts_notice
+from src.scrapers.sources.nts_tacoma_index import (
+    extract_article_text,
+    extract_notice_urls,
+    is_valid_nts,
+    notice_to_row,
+    parse_nts_notice,
+)
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "nts_tacoma_25-76127.txt"
 
@@ -121,3 +128,55 @@ class TestTrusteeFormatVariety:
         addr = parse_nts_notice(body)["property_address"]
         assert "Deed of Trust" not in addr and "which is subject" not in addr
         assert "5 OAK AVE" in addr
+
+
+class TestCrawlExtraction:
+    def test_extract_notice_urls_filters_and_dedupes(self):
+        listing = '''
+        <a href="https://www.tacomadailyindex.com/2026/06/05/ts-25-76127-notice-of-trustees-sale/">x</a>
+        <a href="https://www.tacomadailyindex.com/2026/06/05/ts-25-76127-notice-of-trustees-sale/">dup</a>
+        <a href="https://www.tacomadailyindex.com/2026/06/04/jane-doe-name-change/">not nts</a>
+        <a href="https://www.tacomadailyindex.com/2026/06/03/ts-25-99999-notice-of-trustees-sale/">y</a>
+        '''
+        urls = extract_notice_urls(listing)
+        assert len(urls) == 2  # deduped + non-NTS filtered out
+        assert urls[0].endswith("ts-25-76127-notice-of-trustees-sale/")
+        assert all("notice-of-trustee" in u for u in urls)
+
+    def test_extract_article_text_strips_chrome(self):
+        html = "<html><nav>Menu</nav><article><p>TS #: 25-1</p><script>junk()</script><p>Body</p></article><footer>f</footer></html>"
+        text = extract_article_text(html)
+        assert "TS #: 25-1" in text and "Body" in text
+        assert "junk()" not in text and "Menu" not in text
+
+
+class TestNoticeToRow:
+    def _parsed(self):
+        return parse_nts_notice((Path(__file__).parent / "fixtures" / "nts_tacoma_25-76127.txt").read_text(encoding="utf-8"))
+
+    def test_row_fields_and_normalized_address(self):
+        # today BEFORE the 7/10/2026 auction -> active
+        row = notice_to_row(self._parsed(), "http://x/ts-25-76127/", today=date(2026, 6, 12))
+        assert row["source"] == "tacoma_daily_index"
+        assert row["ts_number"] == "25-76127"
+        assert row["county"] == "pierce" and row["state"] == "WA"
+        assert row["auction_date"] == date(2026, 7, 10)
+        assert row["is_active"] is True
+        assert row["property_address_normalized"] is not None
+        assert "98391" in row["property_address_normalized"]
+        assert len(row["raw_hash"]) == 64
+        assert row["source_url"] == "http://x/ts-25-76127/"
+
+    def test_past_auction_is_inactive(self):
+        # today AFTER the auction -> not matched (kept for audit)
+        row = notice_to_row(self._parsed(), "http://x/", today=date(2026, 8, 1))
+        assert row["is_active"] is False
+
+    def test_invalid_notice_returns_none(self):
+        assert notice_to_row(parse_nts_notice("site chrome only"), "http://x/", today=date(2026, 6, 12)) is None
+
+    def test_raw_hash_stable_for_same_content(self):
+        p = self._parsed()
+        a = notice_to_row(p, "http://x/", today=date(2026, 6, 12))["raw_hash"]
+        b = notice_to_row(p, "http://different-url/", today=date(2026, 6, 12))["raw_hash"]
+        assert a == b  # hash is over content, not URL

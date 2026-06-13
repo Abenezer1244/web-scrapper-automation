@@ -18,9 +18,28 @@ against a real saved notice (tests/fixtures/nts_tacoma_*.txt), no mocks.
 """
 from __future__ import annotations
 
+import hashlib
+import html as _html
 import re
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any
+
+BASE_URL = "https://www.tacomadailyindex.com"
+LEGAL_NOTICES_PATH = "/category/legal-notices/"
+SOURCE = "tacoma_daily_index"
+# Pierce County — every notice this paper carries is a Pierce trustee sale.
+COUNTY = "pierce"
+STATE = "WA"
+
+# Notice URLs: /YYYY/MM/DD/ts-<num>-notice-of-trustees-sale/ (apostrophe stripped).
+_NOTICE_HREF = re.compile(
+    r'href="(https?://[^"]*?/\d{4}/\d{2}/\d{2}/[^"]*?notice-of-trustee[^"]*?)"',
+    re.I,
+)
+_ARTICLE = re.compile(r"<article[^>]*>(.*?)</article>", re.S | re.I)
+_TAGS = re.compile(r"<[^>]+>")
+_SCRIPT_STYLE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.S | re.I)
 
 # ── Labeled header fields ("Label: value" on their own line) ────────────────────
 # Line-bounded ([^:\n] / [^\n]): a negated class matches newlines, so an unbounded
@@ -152,3 +171,91 @@ def is_valid_nts(parsed: dict[str, Any]) -> bool:
     yields neither is site chrome or a non-NTS legal notice — discard it.
     """
     return bool(parsed.get("ts_number")) and bool(parsed.get("auction_date"))
+
+
+# ── Crawl helpers (pure: extraction + transform; the worker injects the fetcher) ──
+
+def extract_notice_urls(listing_html: str) -> list[str]:
+    """Pull distinct NTS-notice URLs from a /category/legal-notices/ listing page.
+
+    Order-preserving dedupe (a notice can appear twice on a listing). The regex
+    targets the dated trustee-sale URL shape, so non-NTS legal notices on the same
+    page (probate, name changes, …) are skipped.
+    """
+    seen: list[str] = []
+    for m in _NOTICE_HREF.finditer(listing_html):
+        url = _html.unescape(m.group(1))
+        if url not in seen:
+            seen.append(url)
+    return seen
+
+
+def extract_article_text(notice_html: str) -> str:
+    """Strip a notice page down to its article body plain text for the parser."""
+    m = _ARTICLE.search(notice_html)
+    body = m.group(1) if m else notice_html
+    body = _SCRIPT_STYLE.sub(" ", body)
+    body = _TAGS.sub("\n", body)
+    body = _html.unescape(body)
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    return "\n".join(lines)
+
+
+def _to_date(mdy: str | None) -> date | None:
+    """Parse an M/D/YYYY auction date string to a date; None if unparseable."""
+    if not mdy:
+        return None
+    m = re.match(r"\s*(\d{1,2})/(\d{1,2})/(\d{4})\b", mdy)
+    if not m:
+        return None
+    mm, dd, yyyy = (int(g) for g in m.groups())
+    try:
+        return date(yyyy, mm, dd)
+    except ValueError:
+        return None
+
+
+def notice_to_row(parsed: dict[str, Any], source_url: str, today: date) -> dict[str, Any] | None:
+    """Transform a parsed notice into an nts_notices upsert row, or None if unusable.
+
+    Adds the normalized match key (address_intel.address_match_key — the SAME key
+    the matcher computes for a lead), an is_active flag (False once the auction is
+    in the past), and a content hash for dedup / source-drift detection. Returns
+    None for non-NTS pages (is_valid_nts) so the caller skips them.
+    """
+    if not is_valid_nts(parsed):
+        return None
+    from src.utils.address_intel import address_match_key
+
+    auction = _to_date(parsed.get("auction_date"))
+    addr = parsed.get("property_address")
+    norm = address_match_key(addr)
+    # Hash the load-bearing parsed fields so a re-crawl of an unchanged notice is a
+    # no-op and a source/parser change is observable.
+    payload = "|".join(
+        str(parsed.get(k) or "")
+        for k in ("ts_number", "auction_date", "property_address", "trustee",
+                  "beneficiary", "principal_owing", "parcel")
+    )
+    raw_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return {
+        "source": SOURCE,
+        "ts_number": parsed["ts_number"],
+        "county": COUNTY,
+        "state": STATE,
+        "parcel": parsed.get("parcel"),
+        "property_address": addr,
+        "property_address_normalized": norm,
+        "auction_date": auction,
+        "auction_time": parsed.get("auction_time"),
+        "auction_location": parsed.get("auction_location"),
+        "grantor": parsed.get("grantor"),
+        "trustee": parsed.get("trustee"),
+        "beneficiary": parsed.get("beneficiary"),
+        "principal_owing": parsed.get("principal_owing"),
+        "note_amount": parsed.get("note_amount"),
+        "nod_date": parsed.get("nod_date"),
+        "source_url": source_url,
+        "raw_hash": raw_hash,
+        "is_active": bool(auction and auction >= today),
+    }

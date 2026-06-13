@@ -89,6 +89,14 @@ app.conf.beat_schedule = {
         "task": "src.workers.scheduler.refresh_public_sample_cache",
         "schedule": 3600.0,  # every 1 hour
     },
+    "crawl-nts-tacoma-index": {
+        # NTS Tier 1: harvest Pierce trustee-sale auction data (auction date /
+        # default amount / trustee) from the Tacoma Daily Index legal notices into
+        # the nts_notices cache. Daily is plenty — WA NTS publish 7-35 days before
+        # the sale (RCW 61.24.040), so the data isn't same-day perishable.
+        "task": "src.workers.nts_crawler.crawl_nts_tacoma_index",
+        "schedule": crontab(hour=10, minute=30),  # 10:30 UTC daily (after the AM scrape)
+    },
     "batch-completion-sweep": {
         # Piece 2: finalize batch_runs whose child jobs are ALL terminal — build
         # the one combined CSV + deliver. Claims each run via a reclaimable lease;

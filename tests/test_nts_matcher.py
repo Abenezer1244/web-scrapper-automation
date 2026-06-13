@@ -45,9 +45,14 @@ class TestScore:
     def test_nothing_zero(self):
         assert _score() == 0.0
 
-    def test_parcel_mismatch_falls_to_address(self):
-        # different parcels but same address+grantor -> address path (0.92), not parcel
-        assert _score(np_="P1", nk=KEY_A, ng="X SMITH", rp="P2", rk=KEY_A, rn="SMITH") == 0.92
+    def test_conflicting_parcels_block_match(self):
+        # different parcels = different property; do NOT fall through to address
+        # (Codex: two units at same street+zip with same surname must not match)
+        assert _score(np_="P1", nk=KEY_A, ng="X SMITH", rp="P2", rk=KEY_A, rn="SMITH") == 0.0
+
+    def test_one_parcel_missing_uses_address(self):
+        # parcel only on one side (no conflict) -> address+grantor path still works
+        assert _score(nk=KEY_A, ng="X SMITH", rp="P2", rk=KEY_A, rn="SMITH JOHN") == 0.92
 
     def test_grantor_token_set_order_independent(self):
         assert _score(np_="P1", ng="JANE AND JOHN SMITH", rp="P1", rn="SMITH JOHN") == 0.96
@@ -91,3 +96,20 @@ class TestBestMatch:
 
     def test_empty_candidates(self):
         assert best_match(self._notice(parcel="P1"), []) is None
+
+    def test_conflicting_parcel_unit_collision_not_matched(self):
+        # notice + two same-street units; the unit whose parcel CONFLICTS is blocked,
+        # only the parcel-agreeing unit can match
+        notice = self._notice(parcel="P1", key=KEY_A, grantor="SMITH")
+        cands = [
+            {"id": "right", "parcel": "P1", "addr_key": KEY_A, "party_name": "SMITH JOHN"},
+            {"id": "wrong_unit", "parcel": "P2", "addr_key": KEY_A, "party_name": "SMITH JANE"},
+        ]
+        m = best_match(notice, cands)
+        assert m is not None and m[0] == "right"  # wrong_unit scored 0.0, not ambiguous
+
+    def test_non_string_parcel_does_not_crash(self):
+        assert score_match(
+            notice_parcel=12345, notice_addr_key=None, notice_grantor=None,
+            result_parcel=12345, result_addr_key=None, result_party_name=None,
+        ) == 0.90  # int parcels coerced, exact-match

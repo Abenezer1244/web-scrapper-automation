@@ -27,23 +27,27 @@ from src.utils.address_intel import address_match_key
 MATCH_THRESHOLD = 0.90
 
 
-def _norm_parcel(parcel: str | None) -> str:
-    """Comparable parcel key: alphanumerics only, uppercased (strip hyphens/spaces/dots)."""
+def _norm_parcel(parcel: Any) -> str:
+    """Comparable parcel key: alphanumerics only, uppercased (strip hyphens/spaces/dots).
+
+    Coerces to str defensively (a non-str parcel must not raise — Codex)."""
     if not parcel:
         return ""
-    return re.sub(r"[^A-Za-z0-9]", "", parcel).upper()
+    return re.sub(r"[^A-Za-z0-9]", "", str(parcel)).upper()
 
 
-def _surnames(name: str | None) -> set[str]:
+def _surnames(name: Any) -> set[str]:
     """Uppercase alpha tokens length>=3 from a party/grantor name — a loose surname set.
 
     Borrower vs grantor strings come from different sources (recorder vs newspaper)
     in different orders ("SMITH JOHN" vs "JOHN AND JANE SMITH"), so we compare token
-    SETS, not order. Drops short connectors (AND, JR) and non-alpha.
+    SETS, not order. Drops short connectors (AND, JR) and non-alpha. Coerces to str
+    defensively (Codex). Name agreement is a SECONDARY signal — it only lifts a
+    score when parcel or address already agrees; it never auto-matches alone.
     """
     if not name:
         return set()
-    toks = re.findall(r"[A-Za-z]{3,}", name.upper())
+    toks = re.findall(r"[A-Za-z]{3,}", str(name).upper())
     stop = {"AND", "THE", "JR", "SR", "III", "HUSBAND", "WIFE", "TRUST", "ESTATE", "ETAL"}
     return {t for t in toks if t not in stop}
 
@@ -72,8 +76,17 @@ def score_match(
     rp, rk = _norm_parcel(result_parcel), (result_addr_key or "")
 
     parcel_exact = bool(np_ and rp and np_ == rp)
+    parcel_conflict = bool(np_ and rp and np_ != rp)
     addr_exact = bool(nk and rk and nk == rk)
     grantor_ok = _grantor_agrees(notice_grantor, result_party_name)
+
+    # Conflicting parcels (both present, different) = different property — do NOT
+    # auto-match even if the address key + names coincide (Codex: two units at the
+    # same street+zip with the same surname would otherwise reach 0.92). We favor a
+    # missed match over a wrong one. (A same-property parcel-format drift across
+    # sources falls here too and is left for manual/other signals — the safe side.)
+    if parcel_conflict:
+        return 0.0
 
     if parcel_exact:
         if addr_exact and grantor_ok:
@@ -83,6 +96,7 @@ def score_match(
         if grantor_ok:
             return 0.96
         return 0.90
+    # No parcel conflict and no parcel match (>=1 parcel missing): lean on address.
     if addr_exact:
         return 0.92 if grantor_ok else 0.80
     return 0.0  # grantor-only or nothing never auto-matches

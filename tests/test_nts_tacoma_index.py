@@ -143,6 +143,21 @@ class TestCrawlExtraction:
         assert urls[0].endswith("ts-25-76127-notice-of-trustees-sale/")
         assert all("notice-of-trustee" in u for u in urls)
 
+    def test_extract_notice_urls_current_idx_slug(self):
+        # The CURRENT live Tacoma Daily Index slug — /ts-<wa-NN-NNNNN>-...-idx<N>/ —
+        # carries NO 'notice-of-trustee' text. The pre-#36 regex required that text,
+        # so this listing yielded ZERO URLs and the prod crawler upserted 0 rows.
+        # Lock the current format in so the 0-rows regression can't return.
+        listing = '''
+        <a href="https://www.tacomadailyindex.com/2026/06/12/ts-wa-26-1033982-rm-idx1031786/">a</a>
+        <a href="https://www.tacomadailyindex.com/2026/06/12/no-26-4-04376-8-sea-probate-notice-to-creditors-idx-1032180/">probate</a>
+        <a href="https://www.tacomadailyindex.com/2026/06/12/ts-wa-25-1032618-rm-idx1031750/">b</a>
+        '''
+        urls = extract_notice_urls(listing)
+        assert len(urls) == 2  # both ts- notices; the probate notice filtered out
+        assert urls[0].endswith("ts-wa-26-1033982-rm-idx1031786/")
+        assert all("/ts-wa-" in u for u in urls)
+
     def test_extract_notice_urls_rejects_offsite_host(self):
         # a syndicated/compromised link with an NTS-shaped path on another host
         # must NOT be crawled (Codex P2 host-pin)
@@ -218,6 +233,12 @@ class TestQualityLoanFormat:
 
     def test_parcel(self):
         assert self.p["parcel"] == "5005002880"
+
+    def test_default_amount_principal_sum_phrasing(self):
+        # Quality Loan phrases section IV as "...is: The principal sum of $X" (not the
+        # North Star "Principal $X"). The default amount feeds Result.default_amount —
+        # the whole point of Tier 1 — so it must parse for this dominant live format.
+        assert self.p["principal_owing"] == Decimal("170667.37")
 
     def test_address_clean_no_deed_overrun(self):
         addr = self.p["property_address"]

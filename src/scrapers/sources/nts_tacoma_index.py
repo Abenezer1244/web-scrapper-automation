@@ -102,8 +102,16 @@ _COMMONLY_KNOWN = re.compile(
     r"(?=\s+(?:which\s+is\s+)?[Ss]ubject\s+to\b|\s+II\.\s|\n\n|\Z)",
     re.I | re.S,
 )
-# ── Section IV: "The sum owing on the obligation ... is: Principal $185,895.06"
-_PRINCIPAL_OWING = re.compile(r"sum\s+owing\s+on\s+the\s+obligation[^$]*?Principal\s*\$?([\d,]+\.\d{2})", re.I | re.S)
+# ── Section IV "sum owing on the obligation": two real phrasings —
+#   North Star : "...is: Principal $185,895.06"
+#   Quality Loan: "...is: The principal sum of $423,798.66"
+# So after "principal" we lazily skip non-$ chars ("sum of ") to the first dollar
+# figure. [^$] can't cross a '$', so the capture is pinned to the amount that
+# immediately follows "principal" — never a later figure (interest, fees).
+_PRINCIPAL_OWING = re.compile(
+    r"sum\s+owing\s+on\s+the\s+obligation[^$]*?principal[^$]*?\$([\d,]+\.\d{2})",
+    re.I | re.S,
+)
 # ── "Note Amount: $234,533.00" (original loan size)
 _NOTE_AMOUNT = re.compile(r"Note\s+Amount\s*:?\s*\$?([\d,]+\.\d{2})", re.I)
 # ── NOD transmittal date ("by both first class and certified mail on 1/20/2026")

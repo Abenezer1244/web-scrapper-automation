@@ -65,12 +65,18 @@ def extract_pdf_text(data: bytes, *, max_pages: int = _MAX_PAGES) -> str:
     """
     if not data or not data.startswith(_PDF_MAGIC):
         raise ValueError("not a PDF (missing %PDF- magic)")
+    import itertools
+
     from pypdf import PdfReader
 
     reader = PdfReader(BytesIO(data))
     if reader.is_encrypted:
         raise ValueError("encrypted PDF not supported")
-    pages = list(reader.pages)[:max_pages]
+    # islice over the LAZY page sequence so a hostile/huge PDF only ever has its first
+    # max_pages text-extracted — `list(reader.pages)[:max_pages]` would materialize +
+    # extract every page first, defeating the cap (Codex). The 25 MB download cap is the
+    # primary guard; this bounds the per-page extraction CPU.
+    pages = itertools.islice(reader.pages, max_pages)
     return "\n".join(p.extract_text() or "" for p in pages)
 
 

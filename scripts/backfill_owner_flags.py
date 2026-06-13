@@ -21,11 +21,18 @@ relative to the bulk.
   Tune batch:                    ... --commit --batch 2000
 """
 import argparse
+import logging
 import sys
+import time
 
 sys.path.insert(0, ".")  # railway-run cwd shim (see other scripts)
 
+# Silence the prod worker's SQLAlchemy echo (DEBUG): it floods the log AND slows
+# the per-row UPDATE loop. We only want our own progress lines.
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+
 from sqlalchemy import text  # noqa: E402
+from sqlalchemy.exc import OperationalError  # noqa: E402
 
 from src.db.session import system_sync_session  # noqa: E402
 from src.utils.address_intel import compute_owner_flags  # noqa: E402
@@ -67,41 +74,51 @@ def main() -> None:
     would_set = {"property_state": 0, "owner_state": 0, "absentee": 0, "out_of_state": 0}
     committed = 0
 
-    with system_sync_session() as db:
-        # The SELECT window is "all four flags still NULL". On --commit, a row that
-        # gets any non-NULL flag leaves the window; rows that stay all-NULL (no
-        # parseable data at all) remain, so OFFSET must skip PAST them or the next
-        # read re-fetches them forever. We advance OFFSET by the number of rows we
-        # intentionally left NULL this chunk (computed inline, no recompute).
-        offset = 0
-        while True:
-            rows = db.execute(_SELECT, {"lim": batch, "off": offset}).fetchall()
-            if not rows:
-                break
-            chunk_left_null = 0
-            for rid, prop, mail in rows:
-                flags = compute_owner_flags(prop, mail)
-                scanned += 1
-                if flags["property_state"]:
-                    would_set["property_state"] += 1
-                if flags["owner_state"]:
-                    would_set["owner_state"] += 1
-                if flags["absentee_owner"] is not None:
-                    would_set["absentee"] += 1
-                if flags["out_of_state_owner"] is not None:
-                    would_set["out_of_state"] += 1
-                has_any = any(v is not None for v in flags.values())
-                if not has_any:
-                    chunk_left_null += 1  # stays in the NULL window — skip past it
-                elif args.commit:
-                    db.execute(_UPDATE, {"id": rid, **flags})
-                    committed += 1
-            if args.commit:
-                db.commit()
-                offset += chunk_left_null  # committed rows left the window already
-            else:
-                offset += len(rows)  # dry run changes nothing; walk the whole table
-            print(f"  scanned={scanned} committed={committed}", flush=True)
+    # The SELECT window is "all four flags still NULL". On --commit, a row that gets
+    # any non-NULL flag leaves the window; rows that stay all-NULL (no parseable
+    # data at all) remain, so OFFSET must skip PAST them or the next read re-fetches
+    # them forever. `offset` counts intentionally-left-NULL rows and PERSISTS across
+    # reconnects (below), so a dropped pooler connection just resumes where it was.
+    offset = 0
+    done = False
+    while not done:
+        try:
+            with system_sync_session() as db:
+                while True:
+                    rows = db.execute(_SELECT, {"lim": batch, "off": offset}).fetchall()
+                    if not rows:
+                        done = True
+                        break
+                    chunk_left_null = 0
+                    for rid, prop, mail in rows:
+                        flags = compute_owner_flags(prop, mail)
+                        scanned += 1
+                        if flags["property_state"]:
+                            would_set["property_state"] += 1
+                        if flags["owner_state"]:
+                            would_set["owner_state"] += 1
+                        if flags["absentee_owner"] is not None:
+                            would_set["absentee"] += 1
+                        if flags["out_of_state_owner"] is not None:
+                            would_set["out_of_state"] += 1
+                        has_any = any(v is not None for v in flags.values())
+                        if not has_any:
+                            chunk_left_null += 1  # stays in the NULL window — skip past it
+                        elif args.commit:
+                            db.execute(_UPDATE, {"id": rid, **flags})
+                            committed += 1
+                    if args.commit:
+                        db.commit()
+                        offset += chunk_left_null  # committed rows left the window already
+                    else:
+                        offset += len(rows)  # dry run changes nothing; walk the whole table
+                    print(f"  scanned={scanned} committed={committed} offset={offset}", flush=True)
+        except OperationalError as exc:
+            # Supavisor drops long-lived sessions; commits are per-chunk so progress
+            # is durable. Reconnect and resume from the preserved offset.
+            print(f"  [reconnect] pooler dropped the session ({str(exc).splitlines()[0][:60]}); "
+                  f"resuming at offset={offset} in 5s", flush=True)
+            time.sleep(5)
 
     print("\n=== owner-flag backfill ===")
     print(f"scanned:        {scanned}")

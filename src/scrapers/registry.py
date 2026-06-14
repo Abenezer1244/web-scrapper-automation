@@ -127,6 +127,7 @@ def get_scraper_class(
         "src.scrapers.king_wa_tax_delinquent",
         "src.scrapers.king_wa_probate",
         "src.scrapers.snohomish_wa_tax_delinquent",
+        "src.scrapers.snohomish_wa_pre_foreclosure",
         "src.scrapers.ai_scraper",
         "src.scrapers.base_scraper",
     ])

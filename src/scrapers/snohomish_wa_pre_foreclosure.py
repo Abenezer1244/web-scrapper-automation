@@ -102,8 +102,17 @@ class SnohomishWAPreForeclosureScraper(BridgeScraper):
         super().__init__()
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
-        # The source is the current weekly issue (no per-record date range); the
-        # date window is applied downstream against date_recorded.
+        # date_from/date_to are part of the connector interface but intentionally
+        # unused (Codex review): this source is ONE current weekly publication — the
+        # latest Tribune Legals PDF — NOT a searchable historical index, so there is
+        # no per-record date range to satisfy (you cannot get a prior month's Snoho
+        # NTS from this week's PDF). Mirrors snohomish_wa_tax_delinquent, the other
+        # current-snapshot connector. Crucially, post-hoc filtering the returned
+        # records by [date_from, date_to] would be WRONG here: a lead's date_recorded
+        # is its FUTURE auction date, so a typical past-looking scrape window would
+        # drop exactly the active trustee sales we want. Every notice this PDF carries
+        # is a current, active sale; the user-facing date window lives at the
+        # results-query / Lists layer (date_recorded_parsed), not at scrape-insert.
         del date_from, date_to
 
         pdf_url = _discover_pdf_url()

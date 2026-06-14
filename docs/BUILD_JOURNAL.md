@@ -19,6 +19,60 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-14 — Snohomish pre_foreclosure NTS scraper shipped + derived encryption key dropped
+
+**Built / Shipped:**
+- **Snohomish pre_foreclosure LEAD source** (PR #39 → main `94aaac1`, deployed). The NTS crawler already
+  cached Snohomish auction data and the matcher was snohomish-aware, but there were **0 Snohomish
+  pre_foreclosure leads** to enrich. New `src/scrapers/snohomish_wa_pre_foreclosure.py` — a pure-HTTP
+  `BridgeScraper` (Playwright lifecycle no-op'd, mirrors `snohomish_wa_tax_delinquent`) that downloads the
+  same weekly Snohomish County Tribune "Legals" PDF the `nts_crawler` harvests, parses each Notice of
+  Trustee Sale via the **tested** `nts_pdf` + `parse_nts_notice` path, and emits one `ScrapedRecord` per
+  notice. Registry allowlisted; migration `060` inserts the `county_connectors` row (INSERT-only, idempotent
+  `WHERE NOT EXISTS` keyed on scraper_class so it coexists with the tax connector).
+- **Verified end-to-end in prod:** live scrape → 2 real future-dated NTS leads (auction 2026-07-10, Everett +
+  Marysville). E2E (`scripts/e2e_snoho_matcher.py`): `match_job_inline` attached `Result.auction_date` to
+  **2/2** leads (Marysville parcel-exact conf 0.99, Everett addr+grantor 0.92; defaults $101,974 / $664,064).
+- **Dropped the derived encryption key** (last step of the 2026-06-13 key-drift incident). `FIELD_ENCRYPTION_KEY`
+  set from `<primary>,<derived>` → `<primary>` only (fp `8af30f234202`) on api + worker; redeployed both.
+
+**Tried / Decided:**
+- E2E via the real `run_scrape_job` (eager `.apply`) **failed** — it publishes progress to
+  `redis.railway.internal`, unreachable when `railway run` executes locally. Pivoted to a Postgres-only
+  verification (`e2e_snoho_matcher.py`): persist scraped leads as `Result` rows + run the REAL
+  `match_job_inline`. Same matcher, real DB, real notices — proves the exact ask without the Redis coupling.
+- Codex review P2 (scraper discards `date_from`/`date_to`) → resolved **doc-only** with Codex ACCEPT: this is
+  a current-weekly-snapshot source (like the tax connector); a past-looking window filter would wrongly drop
+  the FUTURE-dated active leads. Corrected a misleading comment that claimed a downstream filter that doesn't exist.
+
+**Caught & fixed:**
+- The draft's `_ = settings` placeholder + hardcoded `timeout=25` → wired `settings.DEFAULT_TIMEOUT` (Codex Low).
+- Registry `_ALLOWED_SCRAPER_MODULES` did NOT include the new module — would have rejected the connector at
+  load despite the DB row. Added it.
+- Connector shipped `health='unknown'` → hidden from the DEFAULT `/scrapers/connectors` picker (only shows
+  healthy/degraded) until the daily 00:05 UTC canary probes. Nudged to `healthy` (live-verified ≥1 record =
+  the canary's own criterion) so it's usable in the picker immediately.
+
+**Facts learned:**
+- `/scrapers/connectors` (default) hides `unknown`/`down` health; new connectors are invisible in the picker
+  until the canary marks them healthy/degraded — or you nudge `health_status`. `?include_all=true` shows all.
+- `railway run` executes LOCAL code with the REMOTE service's env. Postgres (pooler host) is reachable; the
+  internal `redis.railway.internal` (Celery broker + progress pub/sub) is NOT — so eager/`.delay()` task
+  execution can't be driven from local `railway run`. Drive Redis-coupled tasks from inside Railway only.
+- The api role (`bridgeleads_app`) lacks SELECT on `alembic_version` — confirm migration state via
+  `county_connectors` (which the public endpoint reads) or the worker/owner DSN, not the api role.
+- Dropping a MultiFernet key is safe iff every value is decryptable by the remaining key: the
+  `reencrypt_derived_key_pii.py --verify` `primary=N, derived=0` count IS that proof (primary = "primary-only
+  MultiFernet decrypts it"). MultiFernet tokens don't encode key count; single-key just tries that key.
+
+**Pending / Handoff:**
+- 👤 Shared `nts_pdf.normalize_pdf_text` space-before-hyphen de-hyphen artifact (`LUD -WIG`, `Mort -gage`)
+  in grantor/trustee cosmetics — pre-existing, hits the crawler cache identically, match keys parse clean so
+  matching is unaffected. Needs its own fixture + Codex gate (shared code, don't fold into a county PR).
+- 👤 MTC/commercial/Affinia/Aztec NTS parser formats still skipped (safely, by `is_valid_nts`).
+
+---
+
 ## 2026-06-12 — Record-type lead-quality program: research → Tier 0 shipped → NTS Tier-1 parser
 
 **Built / Shipped:**

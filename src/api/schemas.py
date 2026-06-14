@@ -827,12 +827,6 @@ class LogLine(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class ProgressEvent(BaseModel):
-    page_current: int
-    page_total: int
-    record_count: int
-
-
 # ─── County connectors ────────────────────────────────────────────────────────
 
 class ConnectorCreate(BaseModel):

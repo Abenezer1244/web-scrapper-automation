@@ -537,6 +537,7 @@ async def _persist_audit_event(
     try:
         import asyncio
         import uuid as _uuid
+        from datetime import UTC, datetime
 
         from src.db.models import AuditEvent
         from src.db.session import AsyncSessionLocal
@@ -552,6 +553,13 @@ async def _persist_audit_event(
                     ip=(ip or "")[:64] or None,
                     path=(path or "")[:256] or None,
                     detail=(detail or "")[:512] or None,
+                    # Set created_at client-side so the INSERT emits no
+                    # RETURNING. The bridgeleads_app role has an INSERT policy on
+                    # audit_events (WITH CHECK true) but NO SELECT policy, so under
+                    # FORCE RLS an INSERT…RETURNING (which the server_default would
+                    # trigger) is denied "new row violates RLS policy". A client
+                    # value removes the RETURNING entirely (Codex).
+                    created_at=datetime.now(UTC),
                 )
             )
             await db.commit()

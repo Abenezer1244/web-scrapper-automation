@@ -421,12 +421,27 @@ async def get_results(
             if prev_row:
                 previous_job_id = prev_row
 
+    # NTS Tier 1: does this JOB have any auction-matched lead? Job-wide (NOT
+    # page/filter-scoped) so the auction columns don't flicker by page when matches
+    # are sparse (Codex). LIMIT 1 over ix_results_job_auction_date — cheap.
+    auction_probe = await db.execute(
+        select(Result.id)
+        .where(
+            Result.job_id == job_id,
+            Result.user_id == current_user.id,
+            Result.auction_date.isnot(None),
+        )
+        .limit(1)
+    )
+    has_auction_data = auction_probe.scalar_one_or_none() is not None
+
     return ResultsPage(
         job_id=job_id, total=total, page=page, page_size=page_size,
         items=items, enriched_count=enriched_count, enriching=enriching,
         total_scraped=total_scraped, duplicate_count=duplicate_count,
         date_range_mode=date_range_mode,
         previous_job_id=previous_job_id,
+        has_auction_data=has_auction_data,
     )
 
 

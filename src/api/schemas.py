@@ -810,6 +810,10 @@ class ResultsPage(BaseModel):
     duplicate_count: int = 0     # records flagged as duplicate
     date_range_mode: str = ""    # rolling_90 | since_last_run | custom etc.
     previous_job_id: str | None = None  # most recent job with results (for "view previous" link)
+    # NTS Tier 1: True if the JOB has ANY auction-matched lead (independent of the
+    # current page/filter). The frontend gates the Auction Date / Default Owed
+    # columns on this so they don't flicker by page when auction matches are sparse.
+    has_auction_data: bool = False
 
 
 # ─── Live run (SSE) ───────────────────────────────────────────────────────────

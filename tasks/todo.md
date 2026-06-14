@@ -38,3 +38,44 @@ cache `nts_notices` mig 058, crawler beat `src/workers/nts_crawler.py`, matcher 
 - **King build-vs-buy:** free Queen Anne PDF shipped (partial); DJC ($350/yr, complete) deferred to user.
 - **⚠️ Product follow-ups (not bugs):** (1) Snohomish/King NTS data only enriches leads once there ARE Snohomish/King **pre_foreclosure scrapers** producing leads — currently 0 Snohomish pre_foreclosure leads. (2) Parser covers Quality Loan + North Star formats; add MTC/Trustee-Corps + commercial-loan + Affinia/Aztec (King) formats to lift coverage (safely skipped today). (3) `nts_notices.source` is varchar(32) — sources kept short.
 - **DEPLOY decision (user):** merging adds `pypdf` dep + 2 weekly beats + the matcher refactor. No migration. Recommend merge.
+
+
+---
+
+# Thread 3c — Finish Snohomish pre_foreclosure SCRAPER (the missing LEAD source)
+
+(2026-06-14. The crawler caches Snoho NTS *auction data*; the matcher is snohomish-aware;
+but there are 0 Snohomish pre_foreclosure LEADS for it to enrich. This scraper produces them.)
+
+Draft: `src/scrapers/snohomish_wa_pre_foreclosure.py` (pure-HTTP BaseScraper, reuses the TESTED
+`nts_pdf` + `parse_nts_notice`; discovery mirrors the proven `_discover_latest_legals_pdf`). Parses + ruff-clean.
+
+## Plan (each Codex-gated; branch `feature/nts-snoho-preforeclosure-scraper`)
+
+- [x] **Step 0 — Codex consult** DONE. 5 findings, all reconciled: (High) migration idempotency must key
+      on scraper_class — mig 040 already does, mirrored. (Med) no date_recorded→today fallback (draft already
+      avoids; is_valid_nts guarantees auction_date so `nod_date or auction_date` is never None). (Med) no
+      double-count; dedup on stable parcel/addr. (Med) matcher needs cache populated → run crawler first in
+      Step 4. (Low) wired settings.DEFAULT_TIMEOUT, dropped `_ = settings` placeholder.
+- [x] **Step 1 — Live-test** DONE (`railway run --service worker python scripts/test_snoho_preforeclosure.py`).
+      Current PDF = `Legals - 6-10-26.pdf`. **2 real Snohomish NTS leads, both FUTURE-dated (auction 7/10/2026)**,
+      clean Everett/Marysville addresses, TS#/default/grantor populated. Re-verified after the settings edits.
+      🔎 Cosmetic de-hyphen artifacts in grantor/trustee (`LUD -WIG`, `Mort -gage`) — pre-existing SHARED
+      `nts_pdf` behavior (space-before-hyphen wrap), hits the crawler cache identically, match keys (parcel/addr)
+      parse clean → matching unaffected. Logged as a follow-up, NOT folded in (shared code, needs own gate).
+- [x] **Step 2 — Register** DONE. (a) `src.scrapers.snohomish_wa_pre_foreclosure` added to registry
+      `_ALLOWED_SCRAPER_MODULES`. (b) Migration `060_add_snohomish_pre_foreclosure.py` (mirrors 040, INSERT-only,
+      idempotent WHERE NOT EXISTS keyed on scraper_class, down_revision=059). ruff-clean (src); linear chain.
+- [ ] **Step 3 — Deploy migration** (merge → Railway runs `scripts/migrate.py`). NO concurrent backfill
+      during the deploy ([[incident_backfill_blocks_migration]]) — this migration is INSERT-only, no ALTER,
+      but keep the rule.
+- [ ] **Step 4 — Run E2E in prod**: ensure the Snoho crawler has run (fresh future-dated notices in
+      nts_notices), run a Snohomish pre_foreclosure scrape, verify `match_job_inline` attaches
+      `Result.auction_date`. NOTE: a match only writes auction_date if the current PDF carries a
+      FUTURE-dated auction — surface honestly if this week is all past-dated.
+- [ ] **Step 5 — Codex review** the full diff (gate). Critical/High in either reviewer = NO-GO.
+
+## Then (low-urgency) — drop the derived encryption key
+- [ ] Set `FIELD_ENCRYPTION_KEY` = PRIMARY key ONLY (first of the comma pair) on api + worker via
+      `--set-from-stdin`, `railway redeploy` both, re-verify reads (`reencrypt_derived_key_pii.py --verify`
+      = 0 derived already PASSED). [[incident_field_encryption_key_drift_2026_06_13]]

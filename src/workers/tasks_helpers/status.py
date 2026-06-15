@@ -29,6 +29,18 @@ def _delivery_download_url(job_id: str, user_id, object_key: str, exporter) -> s
         from src.api.download_tokens import mint_download_token
         token = mint_download_token(str(user_id), job_id, ttl_seconds=_DELIVERY_TOKEN_TTL)
         return f"{settings.API_BASE_URL.rstrip('/')}/jobs/{job_id}/download?token={token}"
+    # API_BASE_URL unset: the only remaining path is the raw R2/S3 presign, which
+    # 401s in production (the R2 S3 presign keypair is broken — see BACKLOG §4).
+    # Fail the delivery LOUDLY instead of emailing the customer a dead link they
+    # only notice days later: a failed job is visible to ops (M6 alerting) and
+    # retryable, whereas a silent 401 link looks successful internally. This
+    # guard is naturally worker-scoped (only the worker mints delivery links).
+    if settings.ENVIRONMENT.strip().lower() == "production":
+        raise RuntimeError(
+            "API_BASE_URL is required in production to mint delivery download "
+            "links; the R2/S3 presign fallback is broken in prod (401). Set "
+            "API_BASE_URL on the Railway worker service."
+        )
     return exporter.get_download_url(object_key, expires_in=_DELIVERY_TOKEN_TTL)
 
 

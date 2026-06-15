@@ -96,6 +96,12 @@ jobs:
         run: |
           python -c "from main import app; print(f'OK: {len(app.routes)} routes loaded')"
 
+      # API contract: schema/openapi.json is the source of truth the frontend
+      # generates TS types from. Fail if a code change altered the schema without
+      # re-committing it (run `python scripts/export_openapi.py` to update).
+      - name: Check OpenAPI schema is current
+        run: python scripts/export_openapi.py --check
+
       # -m "not integration": RLS tests need provisioned cutover roles + RLS_ENFORCE
       # (provision_rls_roles.sql, not in migrations) that a plain CI postgres lacks.
       # They run in a dedicated prod-DB context, not this unit job.

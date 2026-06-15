@@ -1,0 +1,4 @@
+# The OpenAPI contract is machine-generated and diffed byte-for-byte by the CI
+# staleness gate (scripts/export_openapi.py --check). Force LF so a Windows
+# checkout (autocrlf) can't introduce CRLF and trip a false STALE.
+schema/openapi.json text eol=lf

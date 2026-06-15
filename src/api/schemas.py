@@ -658,11 +658,15 @@ class JobResponse(BaseModel):
             self.elapsed_time = self._fmt_time(self.elapsed_seconds)
 
         # Terminal states: 100% done, no estimate needed
-        if self.status in ("done", "failed", "cancelled"):
-            self.progress_pct = 100 if self.status == "done" else None
+        if self.status in (JobStatus.DONE, JobStatus.FAILED, JobStatus.CANCELLED):
+            self.progress_pct = 100 if self.status == JobStatus.DONE else None
             self.estimated_seconds_remaining = 0
-            self.estimated_time_remaining = "Done" if self.status == "done" else None
-            self.progress_label = f"Complete — {self.record_count} records" if self.status == "done" else self.status.title()
+            self.estimated_time_remaining = "Done" if self.status == JobStatus.DONE else None
+            self.progress_label = (
+                f"Complete — {self.record_count} records"
+                if self.status == JobStatus.DONE
+                else self.status.value.title()
+            )
             return
 
         # Progress based on page_current / page_total
@@ -682,13 +686,13 @@ class JobResponse(BaseModel):
                 pages_left = self.page_total - self.page_current
                 self.estimated_seconds_remaining = max(0, int(secs_per_page * pages_left))
                 self.estimated_time_remaining = self._fmt_time(self.estimated_seconds_remaining)
-        elif self.status == "scraping":
+        elif self.status == JobStatus.SCRAPING:
             self.progress_label = "Starting scrape..."
-        elif self.status == "enriching":
+        elif self.status == JobStatus.ENRICHING:
             self.progress_label = "Enriching addresses..."
-        elif self.status in ("pending", "queued"):
+        elif self.status in (JobStatus.PENDING, JobStatus.QUEUED):
             self.progress_label = "Waiting to start..."
-        elif self.status == "probing":
+        elif self.status == JobStatus.PROBING:
             self.progress_label = "Connecting to county portal..."
 
 

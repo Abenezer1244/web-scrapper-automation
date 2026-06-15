@@ -26,6 +26,7 @@ wheels/
 # Virtual Environment
 .venv/
 venv/
+.venv-schema/   # throwaway pinned env for regenerating schema/openapi.json
 
 # Environment variables (all variants; keep the documented example tracked)
 .env
@@ -153,3 +154,4 @@ src/graphify-out/
 # Local-only Node Playwright QA experiments (this is a Python repo; no package.json)
 tests/live_qa_chelan.js
 tests/live_qa_chelan.mjs
+.gstack/

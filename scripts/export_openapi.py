@@ -9,6 +9,15 @@ code produces a byte-identical file — that's what the CI staleness gate diffs.
 
   python scripts/export_openapi.py            # write schema/openapi.json
   python scripts/export_openapi.py --check     # exit 1 if the committed file is stale
+
+WARNING: app.openapi() output is dependency-version-sensitive (FastAPI/Pydantic/
+Starlette), so ALWAYS regenerate inside an env with the PINNED deps — otherwise CI
+(which installs the requirements.txt pins) flags your commit STALE. From a clean
+checkout:
+
+  python -m venv .venv-schema
+  .venv-schema/Scripts/pip install -r requirements.txt   # bin/pip on POSIX
+  .venv-schema/Scripts/python scripts/export_openapi.py
 """
 import argparse
 import json

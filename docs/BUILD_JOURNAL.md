@@ -19,6 +19,45 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-15 — Cross-repo code-quality program: dead-code sweep + lint gate + 8 monolith refactors
+
+**Built / Shipped (14 PRs across both repos, all Codex-gated):**
+- **Audit** (`docs/CODE_QUALITY_AUDIT_2026-06-14.md`): 2 Claude analysts + 2 Codex passes, cross-checked. Verdict: both codebases cleaner than expected on true dead code; the wins were frontend dead UI + script clutter + the monoliths.
+- **Phase 1 — frontend dead code** (`bridgeleads-web` PR #13): ~8.8k LOC — junk files, `components/landing/` (9), 46 unused `ui/*` wrappers (58→14), 7 deps, dead `lib` exports.
+- **Phase 2 — ESLint gate** (PR #15): the repo had NO lint step (root cause of the accumulation). `eslint.config.mjs` (typescript-eslint `no-unused-vars`=error), `npm run lint`, cleared 21 pre-existing errors.
+- **Phase 3 — backend dead code** (PR #41): removed dead `ProgressEvent`; golden + divergence-guard test pinning the two address normalizers (NOT merged — frozen-key-adjacent).
+- **Phase 4 — `range_mode`:** verified-KEPT. A prod-DB query found **3 live `scraper_configs` still carry the legacy key** → the back-compat fallback is load-bearing, not dead. Verify-then-remove did its job.
+- **Phase 5 — 8 monolith decompositions** (behavior-preserving extraction, each agent-driven + gated):
+  - Frontend (PRs #16-20): wizard 2138→585, marketing 1727→45, settings 1339→178, results 1290→545, dashboard 799→244. ~6.5k LOC → ~40 focused modules.
+  - Backend (PRs #42-44): scheduler 1586→394 (`scheduler_helpers/`), auth 1514→399 (`auth_helpers/`), tasks 1786→848 (`tasks_helpers/`).
+
+**Tried / Decided (the methodology that made backend refactors safe):**
+- **Registration-integrity diff** (`scripts/_registry_integrity.py`): dumps all Celery task names + FastAPI routes; captured a baseline (25 tasks + 59 routes) and diffed after EACH backend refactor — proved byte-identical registration. This is the backend equivalent of the frontend's `tsc` net.
+- **Safe Celery/FastAPI decomposition:** keep every `@app.task`/`@router` definition + name string IN PLACE; extract only the BODY logic into helper modules. Zero registration risk.
+- Backend gate per file: ruff + registry-identical + pytest + Codex + a **live prod smoke** (scheduler: beats executing in logs; auth: live login → 200+token; tasks: API-dispatched `run_scrape_job` → `done`).
+
+**Caught & fixed (Codex earned its keep — the gate caught real regressions a build can't):**
+- Settings P2: extraction moved `generatedKey` into `ApiKeysTab` which unmounts on tab switch → a one-time API key could be lost. Lifted back to the parent.
+- Tasks P2: relocated `tasks_helpers/` re-entered the coverage denominator (parent `tasks.py` was omitted) → could trip `fail_under=34`. Added to coverage `omit`.
+- Static-analysis false positives the gated review rejected: the "12 dead types" were mostly used intra-file (kept); `Plan`/`SampleRecord` live; 14 `ui/*` wrappers live; the address normalizers feed a frozen billing key (pinned, not merged).
+
+**Failed / Blocked:**
+- Vercel **preview** QA blocked by deployment protection (401 SSO) → QA'd on prod post-merge instead (behavior-preserving + gates made the window safe).
+- Local `next dev` next-auth login wouldn't establish a session (missing local env) → API/prod smokes instead.
+- Codex hit a usage limit mid-`auth.py` review → **held the auth PR** (did not merge security code without the review gate); limit cleared within minutes, re-reviewed clean, then merged.
+- The browse daemon went flaky late in the session → switched the final `run_scrape_job` E2E from UI-driven to API-driven (login → POST /jobs → poll), which is cleaner anyway.
+
+**Facts learned:**
+- The drop of the SECRET_KEY-derived encryption key (from the 2026-06-13 incident) is confirmed CLEAN: a full scan of all 11 encrypted columns (5,501 values) under the single primary key = **0 decrypt failures**. The `fe1:` InvalidToken still seen in worker logs is a stale/historical line, not a live regression.
+- `railway run` executes LOCAL code in the REMOTE env — so the registry-integrity check runs against your working tree in the prod environment (proves imports + registration there before deploy). This is the single most valuable backend-refactor safety tool.
+- Coverage `omit` must be kept in lockstep when relocating omitted code, or CI's `fail_under` silently breaks.
+
+**Pending / Handoff:**
+- 👤 Rotate `admin@bridgeleads.io` password — it was shared in chat this session for QA (and was already a pending rotation item).
+- 👤 The `_helpers/` decompositions are structural only; future work can now add focused tests to the smaller modules.
+
+---
+
 ## 2026-06-14 — Snohomish pre_foreclosure NTS scraper shipped + derived encryption key dropped
 
 **Built / Shipped:**

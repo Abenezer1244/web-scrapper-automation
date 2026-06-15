@@ -111,3 +111,18 @@ Two branches off `main`, unmerged. Stage 1 = contact PII + additive email_hmac. 
   `# noqa: E402` (scripts `sys.path.insert(0,'.')` before `from src...`, required to run standalone) and
   scripts/ is not CI-gated. WON'T-FIX — architectural, not debt.
 - [x] 🟠🧭 **Free-tier records-limit copy drift — FIXED+SHIPPED 2026-06-12** (backend PR #28 `3006e47`, frontend PR #10 `fe6c348`). Diagnosis: NOT a limits bug — starter=50 consistent everywhere; fresh accounts correctly get the 7-day Pro trial (hence 1,000 on the dashboard). The drift = 8 stale copies of Pro's old 500 limit + one stale $49 price after Pro became 1,000/$79: `/auth/validation-rules` (→`PLAN_LIMITS["pro"]`), onboarding emails ×3 (Codex catch incl. the $49), trial-expiry downgrade (→`PLAN_LIMITS["starter"]`), frontend upgrade/trial banners + marketing ×3 + FAQ, register benefits now name the trial. Also resolves the §2 follow-up (`PLAN_LIMITS["pro"]` vs register 500 — register already used PLAN_LIMITS; the 500s were copies).
+
+## 7. Open PRs + deferred ops follow-ups (registered 2026-06-15 — COME BACK TO THESE)
+
+**Two PRs open, awaiting merge (each merge auto-deploys; do in this order):**
+- [ ] 🟠 **Merge [PR #45](https://github.com/Abenezer1244/web-scrapper-automation/pull/45)** — `security/backlog-sweep-2026-06-15`: R2 delivery hardening (`API_BASE_URL` required in prod) + M4/M5 security docs + backlog cleanup. Low risk (no behavior change — `API_BASE_URL` already set in prod). Auto-deploys Railway on merge to main.
+- [ ] 🟠 **Merge [PR #47](https://github.com/Abenezer1244/web-scrapper-automation/pull/47)** — `security/m5-force-db-tls`: force TLS (`sslmode/ssl=require`) on Supabase DB connections (M5 Tier-1). **Merge AFTER #45.** Prod-DB transport change — after deploy do a quick `/health` 200 check + one worker-task to confirm DB connects over TLS. Codex GO/CLEAN, 13 tests.
+
+**Ops actions I cannot do from CLI (need your dashboards / a plan / a password manager):**
+- [ ] 👤🟠 **M4 — apply the Cloudflare edge rules** per `docs/security/M4-edge-ddos-rate-limit.md` §4/§5 (HTTP DDoS managed ruleset confirm, WAF managed rules, the 5 Rate Limiting Rules, scope Bot Fight Mode off the API host). Needs the Cloudflare dashboard + the API's plan tier. ⚠️ If you ever orange-cloud the API, do the §3 proxy-trust prerequisite (`TRUSTED_PROXY_HOPS=2` or a network-layer CF-IP lock) FIRST.
+- [ ] 👤🟠 **M5 Tier-1 — flip Supabase "Enforce SSL on incoming connections"** (Dashboard → Settings → Database → SSL Configuration). **Do this only AFTER PR #47 is deployed** (the `sslmode=require` code is the prerequisite; enabling before could break connections). Then verify api + worker still connect.
+- [ ] 👤🔵 **M5 Tier-2 — DB/Redis IP allowlisting** (gated on Railway Pro): enable Static Outbound IPs on api/worker/beat → set Supabase Network Restrictions + Upstash IP allowlist (IPv4) to those IPs. Per `M5-db-redis-network-posture.md` §4. If not on Railway Pro, the §5 residual risk stands (accept in writing).
+- [ ] 👤🔵 **M5 follow-up — Alembic TLS:** `alembic/env.py` builds its own engine not covered by PR #47's `_ssl_connect_args`. Apply the same policy if migrations ever run over an untrusted network (today they run from Railway, same network — low priority).
+- [ ] 👤🔴 **Move `.rls-cutover-secrets` off-disk** (also in §4) — verified present + gitignored; needs a password manager.
+- [x] ✅ **3 stale branches deleted 2026-06-15** (`feature/tax-filter-columns-label`, `feature/phase5-dialer`, `feature/phase5-dialer-ui` — already gone from origin; local + tracking-ref cleanup done).
+- [x] ✅ **Redis CERT verified 2026-06-15** — `REDIS_SSL_CERT_REQS` unset on api + worker → code default `"required"` applies (SAFE).

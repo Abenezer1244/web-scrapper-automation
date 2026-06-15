@@ -17,17 +17,28 @@ Working the remaining `tasks/BACKLOG.md` items **1-by-1**, Codex consult-before 
 
 ## Plan (sequential)
 
-- [ ] **A. `.rls-cutover-secrets` (§4 item 1)** — verify present + gitignored (DONE: both true). Give user exact
-      move-to-pw-manager + delete steps. *USER action; nothing to code.*
-- [ ] **B. R2 / `API_BASE_URL` hardening (§4 item 6)** — Codex consult → make `API_BASE_URL` required worker
-      config in prod (no silent fallback to broken presign). Implement + Codex review. *CODE.*
-- [ ] **C. Redis CERT_REQUIRED (§4 item 5)** — ops verification step + prod-boot warning if `REDIS_SSL_CERT_REQS=none`. *Small CODE + ops.*
-- [ ] **D. M4 + M5 security docs (§2)** — write `docs/security/M4-edge-ddos-rate-limit.md` (Cloudflare WAF) +
-      `docs/security/M5-db-redis-network-posture.md` (IP allowlisting). Orchestrate research agents. Codex review. *DOCS.*
-- [ ] **E. Tax-filter UI branch (§5)** — review `bridgeleads-web feature/tax-filter-columns-label`, then merge to
-      master (⚠️ master auto-deploys Vercel — confirm before merge). *FRONTEND merge.*
-- [ ] **F. Phase 5 dialer (§5)** — surface merge decision to user. *DECISION.*
-- [ ] **G. Backlog cleanup** — mark stale §6 items done, check off completed items, update `docs/BUILD_JOURNAL.md`.
+- [x] **A. `.rls-cutover-secrets` (§4 item 1)** — verified present + gitignored. USER move/delete steps given.
+- [x] **B. R2 / `API_BASE_URL` hardening (§4 item 6)** — DONE (commit `13e42eb`). Prod hard-guard +
+      worker-boot error + 6 tests, ruff clean, Codex-gated (SHIP, P2 normalize applied).
+- [x] **C. Redis CERT_REQUIRED (§4 item 5)** — no code gap (safe-by-default); documented in M5 §3.3 +
+      verification command given to user.
+- [x] **D. M4 + M5 security docs (§2)** — DONE (commit `2407374`). 2 research agents + Codex fact-check
+      (4 corrections adopted).
+- [ ] **E. Tax-filter UI branch (§5)** — ⏸ AWAITING USER: review + merge auto-deploys Vercel. Need confirm.
+- [ ] **F. Phase 5 dialer (§5)** — ⏸ AWAITING USER decision (merge generic-webhook push + build UI, or defer).
+- [x] **G. Backlog cleanup** — stale §6 items closed with evidence; B/C/D/M4/M5 checked off in BACKLOG.md.
 
-## Review
-_(filled at end)_
+## Review (2026-06-15)
+**Done autonomously (branch `security/backlog-sweep-2026-06-15`, 3 commits):**
+- **B** `13e42eb` — `_delivery_download_url()` raises in prod if `API_BASE_URL` unset (was silently minting
+  broken R2/S3 presign links). Worker boot logs the misconfig. 6 tests, ruff clean. Codex: approach +
+  diff both gated, verdict SHIP (1 P2 — ENVIRONMENT normalize — applied).
+- **D** `2407374` — `docs/security/M4-edge-ddos-rate-limit.md` + `M5-db-redis-network-posture.md`. Research
+  orchestrated via 2 parallel agents; Codex fact-checked, 4 corrections adopted (CF-IP lock must be
+  network-layer; Free vs Pro+ WAF tiers; plain Bot Fight Mode can't be path-scoped; Railway IPs change on
+  region move). These close the last 2 security-audit checklist items + cover Redis-CERT verification (C).
+- **G** — BACKLOG §6 tech-debt was STALE: F821 `submit_btn` gone (ruff clean), batch give-up already sets
+  `completed_at` (`batch.py:257`, PR #42), scripts E402 are intentional `# noqa` (won't-fix).
+
+**Skipped per user:** admin-pw rotation, Tracerfy credits.
+**Needs user:** A (move secrets file), C (verify Railway var), E (merge → Vercel deploy), F (dialer decision).

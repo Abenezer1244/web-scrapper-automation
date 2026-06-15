@@ -46,9 +46,8 @@
             "type": "string"
           },
           "status": {
-            "default": "pending",
-            "title": "Status",
-            "type": "string"
+            "$ref": "#/components/schemas/JobStatus",
+            "default": "pending"
           }
         },
         "required": [
@@ -159,8 +158,7 @@
             "type": "integer"
           },
           "status": {
-            "title": "Status",
-            "type": "string"
+            "$ref": "#/components/schemas/BatchRunStatus"
           }
         },
         "required": [
@@ -238,9 +236,8 @@
             "title": "Name"
           },
           "run_status": {
-            "default": "pending",
-            "title": "Run Status",
-            "type": "string"
+            "$ref": "#/components/schemas/BatchRunStatus",
+            "default": "pending"
           },
           "state": {
             "title": "State",
@@ -315,8 +312,7 @@
             "type": "string"
           },
           "status": {
-            "title": "Status",
-            "type": "string"
+            "$ref": "#/components/schemas/BatchRunStatus"
           }
         },
         "required": [
@@ -327,6 +323,19 @@
         ],
         "title": "BatchRunResponse",
         "type": "object"
+      },
+      "BatchRunStatus": {
+        "description": "Batch-run state machine: pending -> running -> done | partial | failed\n| cancelled (`partial` = a mix of succeeded + failed children). Typing the\nresponse fields with this enum makes the OpenAPI schema emit the union, so\nthe frontend's generated types carry it instead of a bare string.",
+        "enum": [
+          "pending",
+          "running",
+          "done",
+          "partial",
+          "failed",
+          "cancelled"
+        ],
+        "title": "BatchRunStatus",
+        "type": "string"
       },
       "BatchSummaryResponse": {
         "description": "A batch + its (single, on-demand 2A) run status — for the list view.",
@@ -374,9 +383,8 @@
             "title": "Name"
           },
           "run_status": {
-            "default": "pending",
-            "title": "Run Status",
-            "type": "string"
+            "$ref": "#/components/schemas/BatchRunStatus",
+            "default": "pending"
           },
           "state": {
             "title": "State",
@@ -1219,8 +1227,7 @@
             "title": "State"
           },
           "status": {
-            "title": "Status",
-            "type": "string"
+            "$ref": "#/components/schemas/JobStatus"
           },
           "trigger": {
             "title": "Trigger",
@@ -1249,6 +1256,21 @@
         ],
         "title": "JobResponse",
         "type": "object"
+      },
+      "JobStatus": {
+        "description": "Job state machine. PENDING -> QUEUED -> PROBING -> SCRAPING ->\nENRICHING -> DONE | FAILED | CANCELLED.",
+        "enum": [
+          "pending",
+          "queued",
+          "probing",
+          "scraping",
+          "enriching",
+          "done",
+          "failed",
+          "cancelled"
+        ],
+        "title": "JobStatus",
+        "type": "string"
       },
       "LoginResponse": {
         "description": "POST /auth/login (and /auth/login/mfa) response. Two mutually exclusive\nshapes, discriminated by `mfa_required`:\n- mfa_required=False → login complete: access_token + refresh_token are\n  ALWAYS populated. This is the only shape a non-MFA account ever sees, so\n  the prior no-MFA runtime contract is unchanged.\n- mfa_required=True → password OK but MFA enabled: access_token/refresh_token\n  are null and a short-lived mfa_token is returned to redeem at\n  POST /auth/login/mfa.\nThe fields are Optional (vs TokenResponse's required access_token) only to\nmodel the challenge shape — clients must branch on mfa_required.",

@@ -5,6 +5,8 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
+from src.config.constants import BatchRunStatus, JobStatus
+
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
 def _validate_password_rules(v: str) -> str:
@@ -540,13 +542,13 @@ class BatchCreateRequest(BaseModel):
 class BatchCreateResponse(BaseModel):
     batch_id: str
     child_count: int  # number of (county x record_type) scrapes launched
-    status: str  # "pending" — the run + child jobs are created async by the worker
+    status: BatchRunStatus  # "pending" — the run + child jobs are created async by the worker
 
 
 class BatchRunResponse(BaseModel):
     id: str
     batch_id: str
-    status: str  # pending | running | done | partial | failed | cancelled
+    status: BatchRunStatus  # pending | running | done | partial | failed | cancelled
     child_job_ids: list[str] = []
     excluded_no_date_count: int = 0
     failed_children: list[dict[str, Any]] | None = None
@@ -564,7 +566,7 @@ class BatchChildSummary(BaseModel):
     county: str
     record_type: str
     job_id: str | None = None  # None until the dispatch worker creates the job
-    status: str = "pending"  # pending | queued | probing | scraping | enriching | done | failed | cancelled
+    status: JobStatus = JobStatus.PENDING  # a child IS a job, so it uses the job state machine
     record_count: int = 0
 
 
@@ -574,7 +576,7 @@ class BatchSummaryResponse(BaseModel):
     id: str
     name: str | None = None
     state: str
-    run_status: str = "pending"  # pending | running | done | partial | failed | cancelled
+    run_status: BatchRunStatus = BatchRunStatus.PENDING
     child_count: int = 0
     combined_export_ready: bool = False  # presence flag — never expose the R2 key
     created_at: datetime
@@ -606,7 +608,7 @@ class JobResponse(BaseModel):
     id: str
     user_id: str
     scraper_config_id: str
-    status: str
+    status: JobStatus
     trigger: str
     page_current: int
     page_total: int
@@ -656,11 +658,15 @@ class JobResponse(BaseModel):
             self.elapsed_time = self._fmt_time(self.elapsed_seconds)
 
         # Terminal states: 100% done, no estimate needed
-        if self.status in ("done", "failed", "cancelled"):
-            self.progress_pct = 100 if self.status == "done" else None
+        if self.status in (JobStatus.DONE, JobStatus.FAILED, JobStatus.CANCELLED):
+            self.progress_pct = 100 if self.status == JobStatus.DONE else None
             self.estimated_seconds_remaining = 0
-            self.estimated_time_remaining = "Done" if self.status == "done" else None
-            self.progress_label = f"Complete — {self.record_count} records" if self.status == "done" else self.status.title()
+            self.estimated_time_remaining = "Done" if self.status == JobStatus.DONE else None
+            self.progress_label = (
+                f"Complete — {self.record_count} records"
+                if self.status == JobStatus.DONE
+                else self.status.value.title()
+            )
             return
 
         # Progress based on page_current / page_total
@@ -680,13 +686,13 @@ class JobResponse(BaseModel):
                 pages_left = self.page_total - self.page_current
                 self.estimated_seconds_remaining = max(0, int(secs_per_page * pages_left))
                 self.estimated_time_remaining = self._fmt_time(self.estimated_seconds_remaining)
-        elif self.status == "scraping":
+        elif self.status == JobStatus.SCRAPING:
             self.progress_label = "Starting scrape..."
-        elif self.status == "enriching":
+        elif self.status == JobStatus.ENRICHING:
             self.progress_label = "Enriching addresses..."
-        elif self.status in ("pending", "queued"):
+        elif self.status in (JobStatus.PENDING, JobStatus.QUEUED):
             self.progress_label = "Waiting to start..."
-        elif self.status == "probing":
+        elif self.status == JobStatus.PROBING:
             self.progress_label = "Connecting to county portal..."
 
 

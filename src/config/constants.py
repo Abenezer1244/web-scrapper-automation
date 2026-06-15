@@ -29,6 +29,20 @@ class JobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class BatchRunStatus(str, Enum):
+    """Batch-run state machine: pending -> running -> done | partial | failed
+    | cancelled (`partial` = a mix of succeeded + failed children). Typing the
+    response fields with this enum makes the OpenAPI schema emit the union, so
+    the frontend's generated types carry it instead of a bare string."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE = "done"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 # Statuses where `POST /jobs/{id}/cancel` is allowed. Includes PROBING —
 # previously omitted, which left jobs stuck in that state without a way
 # to cancel them while still blocking re-enqueue. PENDING is included

@@ -127,6 +127,18 @@ def _bootstrap_ssrf_allowlist(sender=None, **_kwargs) -> None:
     """
     import logging
 
+    # BACKLOG §4: API_BASE_URL is required in production so delivery emails mint
+    # revocable app download-token links instead of the broken R2/S3 presign
+    # fallback (which 401s). _delivery_download_url() hard-fails the delivery if
+    # it is missing; surface the misconfig at BOOT — before the first delivery
+    # job — so env drift is caught immediately rather than per-job.
+    if settings.ENVIRONMENT.strip().lower() == "production" and not settings.API_BASE_URL:
+        logging.getLogger("worker.bootstrap").error(
+            "API_BASE_URL is UNSET in production — delivery emails/webhooks "
+            "will FAIL (the R2/S3 presign fallback is broken). Set API_BASE_URL "
+            "on the worker service."
+        )
+
     try:
         from src.api.middleware import register_connector_domains_from_db
         register_connector_domains_from_db()

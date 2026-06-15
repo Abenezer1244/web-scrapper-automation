@@ -83,6 +83,26 @@ def test_malformed_key_config_fails_fast(tolerant, monkeypatch):
         decrypt_field(_ENC_PREFIX + "anything")
 
 
+def test_strict_mode_refuses_silent_derived_fallback(strict, monkeypatch):
+    # Root-cause guard (incident 2026-06): strict mode with NO FIELD_ENCRYPTION_KEY
+    # must REFUSE the SECRET_KEY-derived fallback — silently using it is what stranded
+    # 61 users.email as undecryptable once a real key was provisioned.
+    monkeypatch.setattr(crypto, "_fernet", None)
+    monkeypatch.setattr(settings, "FIELD_ENCRYPTION_KEY", "")
+    with pytest.raises(RuntimeError, match="FIELD_ENCRYPTION_KEY is not set"):
+        crypto._build_fernet()
+
+
+def test_nonstrict_mode_keeps_derived_fallback(tolerant, monkeypatch):
+    # Out-of-the-box dev/test convenience preserved: non-strict + no key -> derived key
+    # still works (round-trips), so local dev never needs a provisioned key.
+    monkeypatch.setattr(crypto, "_fernet", None)
+    monkeypatch.setattr(settings, "FIELD_ENCRYPTION_KEY", "")
+    fernet = crypto._build_fernet()
+    token = fernet.encrypt(b"dev-value")
+    assert fernet.decrypt(token) == b"dev-value"
+
+
 def test_legacy_plaintext_rejected_strict(strict):
     with pytest.raises(InvalidToken):
         decrypt_field("206-555-0100")

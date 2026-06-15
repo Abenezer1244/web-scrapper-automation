@@ -36,6 +36,12 @@ async def lifespan(app: FastAPI):
     # docs/compliance/connector-audit-2026-04-10.md follow-ups.
     from src.db.session import check_rls_role_status
     check_rls_role_status()
+    # Fail fast at boot if field encryption is misconfigured (production/strict with
+    # no FIELD_ENCRYPTION_KEY): build the Fernet now so a bad crypto config breaks
+    # startup rather than the first PII operation. _build_fernet() refuses the
+    # SECRET_KEY-derived fallback in prod/strict (incident 2026-06).
+    from src.utils.crypto import _instance
+    _instance()
     yield
 
 

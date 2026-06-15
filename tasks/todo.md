@@ -24,8 +24,12 @@ Working the remaining `tasks/BACKLOG.md` items **1-by-1**, Codex consult-before 
       verification command given to user.
 - [x] **D. M4 + M5 security docs (§2)** — DONE (commit `2407374`). 2 research agents + Codex fact-check
       (4 corrections adopted).
-- [ ] **E. Tax-filter UI branch (§5)** — ⏸ AWAITING USER: review + merge auto-deploys Vercel. Need confirm.
-- [ ] **F. Phase 5 dialer (§5)** — ⏸ AWAITING USER decision (merge generic-webhook push + build UI, or defer).
+- [x] **E. Tax-filter UI branch (§5)** — NO-OP: feature ALREADY ON MASTER via `feat/nts-auction-columns`
+      (ResultsTable.tsx:72 cols + ResultsToolbar.tsx:139 label). Stale branch (1 ahead/12 behind) redundant
+      → 👤 delete `origin/feature/tax-filter-columns-label`.
+- [x] **F. Phase 5 dialer (§5)** — NO-OP: backend (main) + frontend UI (master) BOTH already shipped +
+      extended (native PhoneBurner). Branches 0-ahead stale pointers → 👤 delete `feature/phase5-dialer` +
+      `feature/phase5-dialer-ui`.
 - [x] **G. Backlog cleanup** — stale §6 items closed with evidence; B/C/D/M4/M5 checked off in BACKLOG.md.
 
 ## Review (2026-06-15)
@@ -41,4 +45,12 @@ Working the remaining `tasks/BACKLOG.md` items **1-by-1**, Codex consult-before 
   `completed_at` (`batch.py:257`, PR #42), scripts E402 are intentional `# noqa` (won't-fix).
 
 **Skipped per user:** admin-pw rotation, Tracerfy credits.
-**Needs user:** A (move secrets file), C (verify Railway var), E (merge → Vercel deploy), F (dialer decision).
+
+**E + F turned out to be NO-OPS — both already shipped on main/master.** The BACKLOG (last touched
+2026-06-09) was stale: tax-filter columns shipped via `feat/nts-auction-columns`; the whole Phase 5 dialer
+(backend + UI) shipped + got extended with a native PhoneBurner connector. Verified by branch ahead/behind
+counts (all 0-ahead) + live code on main/master. Three stale branches to delete (E + F's two).
+
+**Still needs user (ops, can't be done from code):** A (move `.rls-cutover-secrets` off-disk), C (confirm
+`REDIS_SSL_CERT_REQS` on Railway), delete 3 stale branches, + the M4/M5 ops actions (Cloudflare rules,
+Supabase/Upstash restrictions) per their doc checklists.

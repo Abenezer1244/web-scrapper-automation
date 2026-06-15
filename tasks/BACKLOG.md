@@ -72,13 +72,32 @@ Two branches off `main`, unmerged. Stage 1 = contact PII + additive email_hmac. 
 
 ## 5. Unmerged / unfinished features (non-security)
 
-- [ ] 🔵 **Phase 5 dialer** — built but UNMERGED on `feature/phase5-dialer` (generic webhook push). Decide merge + all-phase frontend UI + offline backfills + optional native connectors
+- [x] 🔵 **Phase 5 dialer — ALREADY SHIPPED + EXTENDED on main/master (verified 2026-06-15).** The backlog
+  entry was stale: `feature/phase5-dialer` (backend) and `feature/phase5-dialer-ui` (frontend) are both
+  **0 commits ahead** of main/master (218 / 47 behind) — pure stale pointers to already-merged work. Live on
+  **main**: `DeliverConfig.dialer_webhook_url` (schemas.py:274/404, Business+ gated in batches.py:73 +
+  scrapers.py:127), `Job.dialer_pushed_at` (models.py:439), `dialer_push_sweep` beat (scheduler.py:125),
+  `build_dialer_push_payload`, and the `dialer_connectors/` framework (base + generic_webhook). Live on
+  **master**: the full delivery-step UI (`scrapers/new/_steps/DeliveryStep.tsx` — method picker generic
+  webhook/Zapier + native PhoneBurner, plan-gated, DNC-labeled), `_lib.ts` zod + payload, `deliver/page.tsx`
+  destination display. Went BEYOND original P5 scope (native PhoneBurner connector = "Thread 3"). The DNC
+  decision (§3) is honored in the UI copy. 👤 **ACTION: delete the stale `feature/phase5-dialer` +
+  `feature/phase5-dialer-ui` branches** — nothing to merge or build.
 - [x] 🔵 **Multi-contact segments** — SHIPPED 2026-06-12 (PR #26): Lists CSVs now carry phone_2/3 + email_2/3.
 - [x] 🔴 **Lists overlap: property_key address-mismatch bug — FIXED+SHIPPED 2026-06-12** (PR #27 `8b45cd4`; backfill run: 182,696 re-keyed, 2,212 identities merged, overlap 158→166). Residual King tax×probate zero = statistically expected (3,299 tax parcels × 166 probate parcels over ~650k county parcels → E[∩]<1). Original finding: `compute_property_key` hashes `parcel|address` TOGETHER, but the tax pipeline stores situs WITH city+ZIP4 (`…EDMONDS WA 98026-6022`) while recorder+GIS enrichment stores street-only (`8021 188TH ST SW`) → **identical parcels still hash to different keys** → tax_delinquent NEVER overlaps recorder lists. Proven live: admin has 39,208 King tax + King probate results, ZERO tax×probate overlap (155 death-cert×probate overlaps exist, so the machinery works within one pipeline). **Fix (Codex-recommended): parcel-primary key** — hash parcel alone when strong, address only as fallback — **+ backfill `results.property_key` + rebuild `property_list_membership`** (stored keys don't self-heal). Blast radius: overlap/intersection, union bucketing, `_reuse_enrichment_for_duplicates`, dedup-adjacent reuse — needs the full plan→Codex→phased treatment. Secondary unverified hypothesis (agent): leading-zero parcel format drift between sources — test during the fix (`scripts/diag_parcel_mismatch.py` kept). NOTE: zero Snohomish-tax overlap is EXPECTED for this tenant (no non-tax Snohomish leads — cross-county can't match); the King pair is the bug's proof.
 - [ ] 🟠 **Tax-delinquency amount/months filter — county coverage** (2026-06-11). The filter (`src/api/tax_filters.py` → `delinquent_amount` + `delinquent_bill_year`) is correct and verified live (King+Snohomish: min $5000→975, min_months 24→2016 exact). It is **source-gated to King + Snohomish only** (`_TRUSTED_TAX_SOURCES`, `tasks.py:285`) because only those two publish structured **dollars-owed + tax-year** at the source. Investigated extending to Pierce + Kitsap (2026-06-11):
   - **Kitsap = blocked, data does not exist.** No public source has parcel + amount-owed + year (Assessor bulk = assessed *values*; Treasurer foreclosure/tax-title PDFs have no balance; delinquency is collections-internal). Confirms `docs/non_king_tax_data_spike.md` (2026-06-05). Adding it would mean fabricating amounts = violates no-mock rule + the gate comment. **Do not build.**
   - **Pierce = not feasible cleanly.** Bulk Data Mart `tax_account` schema confirmed (read directly): Parcel/Account/Use/Tax-Year/Tax-Code-Area/Land+Improvement+Market+**Taxable Value**/exemptions/legal — **no balance/owed/delinquent column.** Amount-owed lives only per-parcel behind `epip.co.pierce.wa.us/...taxvalue.cfm` (ColdFusion, HTTP, was unreachable on probe). Only remaining route = fragile two-stage per-parcel scrape of the foreclosure-eligible subset (3+ yrs, >$100). Owner deferred (2026-06-11). Revisit only if partial foreclosure-subset coverage is explicitly wanted.
-  - ✅ **Frontend UX fix SHIPPED-TO-BRANCH** (`bridgeleads-web` `feature/tax-filter-columns-label`, commit `abf95eb`, UNMERGED): added **Amount Owed + Tax Year** columns to tax-delinquent results (the filter operated on fields the table never showed → looked like it did nothing) + label `(King tax records)`→`(tax-delinquent records)`. `tsc` clean. ⚠️ Codex CLI stalled 3× on this host — re-run `/code-review ultra` before merge to master (master auto-deploys Vercel).
+  - ✅ **Frontend UX fix ALREADY ON MASTER — stale branch is redundant (verified 2026-06-15).** The
+    `feature/tax-filter-columns-label` branch (`abf95eb`, 1 commit ahead / 12 behind) was SUPERSEDED: the
+    `feat/nts-auction-columns` work re-implemented the same Amount Owed + Tax Year columns (gated on
+    `hasTaxData`) + the `(tax-delinquent records)` relabel on the refactored shadcn results page, and went
+    further (also adds Auction Date + Default Owed via `hasAuctionData`). Confirmed live on master:
+    `_components/ResultsTable.tsx:72` (`...(hasTaxData ? ["Amount Owed","Tax Year"] : [])`),
+    `_components/ResultsToolbar.tsx:139` (`(tax-delinquent records)`), `page.tsx:85`
+    (`dynamicColCount = 7 + (hasTaxData?2:0) + (hasAuctionData?2:0)`). A cherry-pick of `abf95eb` onto master
+    conflicts (file refactored after the branch was cut) and would only re-add what's already there.
+    👤 **ACTION: delete `origin/feature/tax-filter-columns-label`** — nothing to merge.
 
 ## 6. Tech debt
 

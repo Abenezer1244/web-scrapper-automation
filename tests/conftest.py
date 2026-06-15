@@ -4,6 +4,15 @@ All fixtures use real infrastructure (Postgres, Redis) — no mocks.
 The CI environment sets DATABASE_URL and DATABASE_URL_SYNC to a dedicated
 test database so production data is never touched.
 """
+import os
+
+# Align local test runs with CI (.github/workflows/ci-cd.yml sets ENVIRONMENT=test).
+# settings defaults ENVIRONMENT="production", and crypto._build_fernet() now REFUSES
+# the SECRET_KEY-derived fallback in production/strict mode — so the suite, which
+# runs with no FIELD_ENCRYPTION_KEY, must declare the test environment BEFORE
+# src.config.settings is imported below. setdefault respects an explicit override.
+os.environ.setdefault("ENVIRONMENT", "test")
+
 import uuid
 
 import pytest

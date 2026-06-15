@@ -139,6 +139,13 @@ def _bootstrap_ssrf_allowlist(sender=None, **_kwargs) -> None:
             "on the worker service."
         )
 
+    # Fail fast at boot if field encryption is misconfigured (production/strict with
+    # no FIELD_ENCRYPTION_KEY): build the Fernet now so a missing key breaks worker
+    # startup rather than silently encrypting PII under the SECRET_KEY-derived
+    # fallback (incident 2026-06 stranded 61 users.email). _build_fernet() raises.
+    from src.utils.crypto import _instance
+    _instance()
+
     try:
         from src.api.middleware import register_connector_domains_from_db
         register_connector_domains_from_db()

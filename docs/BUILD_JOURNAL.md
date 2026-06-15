@@ -19,6 +19,53 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-15 — InvalidToken incident: 61 derived-key user emails recovered + silent-fallback guard
+
+**Symptom:** post-deploy worker logs showed `InvalidToken('fe1:-prefixed value is not decryptable under
+strict mode')` during `run_scrape_job`. Investigated with systematic-debugging + Codex + 2 Explore agents.
+
+**Root cause (evidence-backed):** `crypto.decrypt_field` raises when an `fe1:` token decrypts under no key
+in the live `FIELD_ENCRYPTION_KEY` set + strict mode. A read-only prod diagnostic
+(`scripts/diag_undecryptable_pii.py`) classified all 5,562 fe1: tokens across the 11 encrypted columns:
+**61 in `users.email` encrypted under the HKDF-from-SECRET_KEY derived key**, every other column clean,
+**0 anomalies**. api+worker fingerprints matched (same primary key + SECRET_KEY, STRICT=true) → the bleed
+had stopped; the 61 were historical. So: a past window where the API lacked `FIELD_ENCRYPTION_KEY` →
+`_build_fernet()` SILENTLY fell back to the SECRET_KEY-derived key → wrote 61 user emails under it → once
+the real key returned they were undecryptable (login + scrape owner-lookup both 500 for those users). The
+2026-06-13 fix re-encrypted point-in-time but never closed the silent-fallback hole, so it recurred.
+
+**Fixed (branch `fix/crypto-reencrypt-derived-emails`, 2 commits, Codex-gated):**
+- **A — data recovery (DONE in prod):** `diag_undecryptable_pii.py --apply` re-encrypts derived_hkdf tokens
+  onto the primary key — self-contained (computes HKDF directly, NO env mutation, unlike
+  `reencrypt_derived_key_pii.py` which requires a 2-key env and aborts on primary-only), **compare-and-swap
+  on the old ciphertext** (Codex P1: never revert a concurrently-updated email), re-verify-before-write,
+  idempotent, never touches anomaly. Ran: 61 reencrypted, 0 cas_skipped, 0 anomaly → re-scan CLEAN.
+- **B — root-cause guard (`6fbf85b`, ships via PR):** `_build_fernet()` RAISES instead of using the HKDF
+  fallback when the key is empty + (PII_ENCRYPTION_STRICT or ENVIRONMENT=production). Boot-time `_instance()`
+  in API lifespan + worker `worker_ready` → misconfig fails startup, not the first PII op. `conftest.py` sets
+  `ENVIRONMENT=test` before settings import (CI parity) so the stronger guard doesn't trip the fallback-based
+  suite.
+
+**Tried / Decided:** first gated the guard on STRICT-only (because ENVIRONMENT defaults to production and that
+broke 19 local tests). Codex P1: that re-opens the hole if prod ever runs STRICT=false + missing key →
+restored `STRICT or production` and fixed the TEST ENV instead (don't weaken a security guard to satisfy
+tests). Codex CLEAN/GO.
+
+**Caught & fixed (Codex):** P1 stale-overwrite TOCTOU on the re-encrypt UPDATE → compare-and-swap; P1
+strict-only guard gap → restored prod clause; P2 boot-time check → added to both entrypoints.
+
+**Facts learned:**
+- `reencrypt_derived_key_pii.py` is unusable once the derived key is dropped (needs 2-key env); the durable
+  diagnosis tool computes HKDF(SECRET_KEY) directly so it works on a primary-only env.
+- `derived_hkdf` (decrypts under HKDF-from-current-SECRET_KEY) vs `anomaly` (decrypts under neither) is THE
+  fork: derived_hkdf = recoverable (SECRET_KEY unchanged), anomaly = key lost.
+- Re-encrypting live login PII needs CAS on the old ciphertext, not pk-only UPDATE.
+- The original 2026-06-13 incident's missing piece was a PREVENTION guard; without it the class recurred.
+
+**Pending:** merge the PR (deploys the guard). Recovery already applied. 👤 Tracerfy 402 (separate, deferred).
+
+---
+
 ## 2026-06-15 — Backlog sweep: R2 delivery hardening + M4/M5 security docs (+ 2 stale items debunked)
 
 **Built / Shipped (branch `security/backlog-sweep-2026-06-15`, 4 commits, Codex-gated):**

@@ -66,6 +66,21 @@ def _build_fernet() -> MultiFernet:
         if not keys:
             raise ValueError("FIELD_ENCRYPTION_KEY is set but contains no valid key")
         return MultiFernet(keys)
+    # No FIELD_ENCRYPTION_KEY configured. Silently deriving a key from SECRET_KEY is
+    # what stranded 61 users.email as undecryptable in 2026-06: a process running a
+    # window without the key encrypted PII under the derived key, which then became
+    # unreadable once the real key was (re)provisioned. In production OR strict mode
+    # this is never legitimate — REFUSE rather than silently encrypt under the
+    # ephemeral fallback. (Belt AND suspenders: prod runs PII_ENCRYPTION_STRICT=true
+    # today, but a future window with STRICT=false + a missing key would re-open the
+    # exact failure mode, so we also fail on ENVIRONMENT=production.) The HKDF
+    # fallback stays available only for non-prod, non-strict local dev / tests.
+    if settings.PII_ENCRYPTION_STRICT or settings.ENVIRONMENT.strip().lower() == "production":
+        raise RuntimeError(
+            "FIELD_ENCRYPTION_KEY is not set in production / strict mode. Refusing to "
+            "fall back to the SECRET_KEY-derived key — it strands PII as undecryptable "
+            "once a real key is provisioned. Set FIELD_ENCRYPTION_KEY on every api+worker."
+        )
     return MultiFernet([Fernet(_derive_key_from_secret())])
 
 

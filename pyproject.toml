@@ -37,6 +37,8 @@ ignore = [
 # PLACEHOLDER strings (values are always bound via params dicts — verified); the
 # heuristic can't see the binding. Scoped per-file so the rule stays active elsewhere.
 "src/workers/tasks.py" = ["S608"]
+"src/workers/tasks_helpers/dedup.py" = ["S608"]   # membership/property_key SQL builders moved here from tasks.py
+"src/workers/tasks_helpers/enrich.py" = ["S608"]  # duplicate-reuse SQL builder moved here from tasks.py
 "src/api/routes/scrapers.py" = ["S608"]
 
 [tool.ruff.lint.isort]
@@ -74,6 +76,7 @@ omit = [
     "src/scrapers/ai/*",                   # AI scraper — requires Claude API key
     "src/scrapers/ai_scraper.py",          # AI scraper — requires Claude API key
     "src/workers/tasks.py",               # Celery task runner — requires Celery broker
+    "src/workers/tasks_helpers/*",        # pipeline-phase helpers relocated from tasks.py — same task-runner code, same omit
 ]
 
 [tool.coverage.report]

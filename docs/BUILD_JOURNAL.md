@@ -19,6 +19,74 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-15 — Backlog sweep: R2 delivery hardening + M4/M5 security docs (+ 2 stale items debunked)
+
+**Built / Shipped (branch `security/backlog-sweep-2026-06-15`, 4 commits, Codex-gated):**
+- **R2/delivery env-drift hardening** (`13e42eb`): `_delivery_download_url()` (`tasks_helpers/status.py`)
+  silently fell back to the broken R2/S3 presign (401s in prod) when `API_BASE_URL` was unset. Now in
+  production it RAISES (job fails loudly → M6 alert) instead of emailing a dead link; non-prod still falls
+  back so dev/test work. Worker boot (`workers/__init__.py` `worker_ready`) logs the misconfig before the
+  first delivery. 6 new tests (`tests/test_delivery_download_url.py`), ruff clean. Closes BACKLOG §4 R2 item
+  (code half — residual R2-cred rotation stays 👤 ops).
+- **M4 + M5 security docs** (`2407374`): `docs/security/M4-edge-ddos-rate-limit.md` (app-limiter zones +
+  fail-open/closed-per-zone on Redis outage; Cloudflare edge rules as the infra-independent backstop; the
+  ⚠️ proxy-trust prerequisite for orange-clouding the API) and `M5-db-redis-network-posture.md` (DB
+  5432/6543 + Redis cert-required transport; Tier-1 SSL-enforce now / Tier-2 Railway-Pro static-IP
+  allowlists gated). Closes the **last two** security-audit checklist items (M4/M5); M5 also covers the
+  "verify Redis CERT_REQUIRED" item.
+
+**Tried / Decided:**
+- Codex consult chose **option 2** for the R2 fix (delivery-time hard guard + boot warning + test) over a
+  pydantic prod-required validator (which would also crash the API, a broader contract than the worker-only
+  risk needs). Verdict SHIP after normalizing `ENVIRONMENT` (`.strip().lower()`) — applied.
+- Orchestrated 2 parallel research agents (M4 edge posture, M5 infra posture) → I wrote the docs → Codex
+  fact-checked the actionable recommendations.
+
+**Caught & fixed (Codex fact-check on the docs — 4 corrections adopted):**
+- M4: "lock to CF IPs" must be enforced at the **network/proxy layer**, not app-level header trust
+  (trusting `CF-Connecting-IP` while the origin is publicly reachable = bypass). Free vs Pro+ WAF/rate-limit
+  tiers were imprecise. **Plain Bot Fight Mode can't be path-scoped** (whole-domain) → use a separate API
+  hostname or Super Bot Fight Mode/Bot Management with skip rules.
+- M5: Railway static outbound IPs change on **region move**, not "service restart".
+
+**Failed / Blocked (Codex CLI quirk):** `codex exec` kept auto-loading the gstack `review` skill + running
+`/graphify` and burning the turn on preamble instead of answering. Fix: prepend "Do NOT load any skill, do
+NOT run /graphify or any preamble; answer directly inline." Then it gave clean verdicts. (Keep `-c
+mcp_servers={}` + `--skip-git-repo-check`; pipe through `grep -a`.)
+
+**Debunked as STALE (the BACKLOG was last touched 2026-06-09, before weeks of work):**
+- **§6 tech-debt all stale:** F821 `submit_btn` gone (`king_wa_probate.py` ruff-clean); `batch_recovery_sweep`
+  give-up path already sets `completed_at` (`scheduler_helpers/batch.py:257`, PR #42); `scripts/` E402 are
+  intentional `# noqa` (0 F401) → won't-fix.
+- **§5 tax-filter UI ALREADY ON MASTER:** the `feat/nts-auction-columns` work re-implemented the Amount
+  Owed/Tax Year columns + `(tax-delinquent records)` label on the refactored shadcn results page
+  (`_components/ResultsTable.tsx:72`, `ResultsToolbar.tsx:139`) and went further (auction columns). The
+  `feature/tax-filter-columns-label` branch (1-ahead/12-behind) cherry-picks with conflict and only re-adds
+  what's there.
+- **§5 Phase 5 dialer ALREADY SHIPPED + EXTENDED:** backend (main: `dialer_webhook_url`,
+  `Job.dialer_pushed_at`, `dialer_push_sweep`, `dialer_connectors/`) + frontend UI (master:
+  `DeliveryStep.tsx` method picker + PhoneBurner) both live; the two branches are 0-ahead stale pointers.
+  The user asked to "merge backend + build UI" — it was all already done, incl. a native PhoneBurner
+  connector beyond the original generic-webhook scope.
+
+**Pending / Handoff (all 👤 ops — cannot be done from code):**
+- Delete 3 stale branches: `feature/tax-filter-columns-label`, `feature/phase5-dialer`,
+  `feature/phase5-dialer-ui`.
+- Merge/push branch `security/backlog-sweep-2026-06-15` (auto-deploys Railway on main merge — user's call;
+  `API_BASE_URL` is already set in prod so the new guard is a no-behavior-change safety net).
+- M4: apply the Cloudflare rules per the doc §4/§5 checklist. M5: Tier-1 (Supabase Enforce SSL + explicit
+  `sslmode`, localhost-guarded — a small future Codex-gated PR) + verify `REDIS_SSL_CERT_REQS`; Tier-2 if on
+  Railway Pro. Plus the pre-existing §4 items (move `.rls-cutover-secrets`, admin-pw [skipped], Tracerfy
+  [skipped]).
+
+**Facts learned:**
+- Always re-verify a stale backlog against live `git rev-list --count` ahead/behind + a grep on HEAD before
+  treating an item as work — three of this session's items were already shipped weeks ago.
+- `_delivery_download_url` is worker-only; batch delivery uses `FRONTEND_URL` (a different path) — so the
+  prod guard scopes naturally to the worker without touching the API or batch flows.
+
+---
+
 ## 2026-06-15 — Cross-repo code-quality program: dead-code sweep + lint gate + 8 monolith refactors
 
 **Built / Shipped (14 PRs across both repos, all Codex-gated):**

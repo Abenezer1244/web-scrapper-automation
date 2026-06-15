@@ -34,7 +34,10 @@ def main() -> None:
 
     rendered = _render()
     if args.check:
-        current = _OUT.read_text(encoding="utf-8") if _OUT.exists() else ""
+        # Normalize CRLF->LF on read so a Windows checkout (autocrlf) doesn't
+        # false-STALE against the LF-rendered output (belt-and-suspenders with
+        # the .gitattributes `eol=lf` pin).
+        current = _OUT.read_text(encoding="utf-8").replace("\r\n", "\n") if _OUT.exists() else ""
         if current != rendered:
             print("STALE: schema/openapi.json is out of date. Run: python scripts/export_openapi.py")
             sys.exit(1)

@@ -1,7 +1,7 @@
 # API
 fastapi==0.136.3            # M3: bumped from 0.115.6 to pull a fixed starlette (CVE-2025-54121/62727, PYSEC-2026-161)
 uvicorn[standard]==0.32.1
-python-multipart==0.0.27    # M3: CVE-2026-24486/40347/42561
+python-multipart==0.0.31    # M3 + 2026-06-15: CVE-2026-53538/53539/53540 (form-parse DoS/HPP)
 
 # Async DB
 sqlalchemy[asyncio]==2.0.36
@@ -21,7 +21,7 @@ PyJWT[crypto]==2.13.0        # M3: clears PYSEC-2026-120/175/176/177/178/179 (au
 bcrypt==4.2.1
 passlib[bcrypt]==1.7.4
 pyotp==2.9.0                 # TOTP (MFA, H2)
-cryptography==46.0.7         # Fernet field encryption (MFA secret; H3 PII). M3: PYSEC-2026-35/36, GHSA-h4gh-qq45-vh27, CVE-2024-12797, CVE-2026-26007
+cryptography==48.0.1         # Fernet field encryption (MFA secret; H3 PII). 2026-06-15: GHSA-537c-gmf6-5ccf (bundled OpenSSL secadv 2026-06-09)
 
 # Task queue
 celery[redis]==5.4.0

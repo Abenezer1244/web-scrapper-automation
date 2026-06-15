@@ -1,5 +1,6 @@
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import contextmanager
+from urllib.parse import parse_qs, urlsplit
 
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -7,6 +8,41 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
 
 from src.config import settings
+
+# ─── DB transport security (M5) ───────────────────────────────────────────────
+# Supabase issues plain connection strings with NO sslmode, so libpq defaults to
+# 'prefer' (encrypt if offered, else SILENTLY plaintext) and asyncpg defaults to
+# no SSL. For any non-local host we force 'require' (encrypt; no cert verification
+# so Supabase's cert chain can't break the connection). If the URL already pins
+# an encrypted mode we leave it alone; if it pins a plaintext-capable mode in
+# production we fail fast rather than ship an unencrypted DB link.
+#   NOTE: Alembic builds its own engine (alembic/env.py) and is NOT covered here
+#   — apply the same policy there if it ever connects to prod over an untrusted
+#   network (follow-up; migrations run from Railway, same network as the app).
+_LOCAL_DB_HOSTS = {"localhost", "127.0.0.1", "::1", ""}
+_PLAINTEXT_SSLMODES = {"disable", "allow", "prefer"}   # permit an unencrypted link
+_ENCRYPTED_SSLMODES = {"require", "verify-ca", "verify-full"}
+
+
+def _ssl_connect_args(url: str, *, async_driver: bool) -> dict:
+    """Return connect_args that force TLS on a non-local Postgres connection."""
+    parts = urlsplit(url)
+    if (parts.hostname or "") in _LOCAL_DB_HOSTS:
+        return {}  # local dev / CI Postgres — no TLS forced
+    q = {k.lower(): v[-1].lower() for k, v in parse_qs(parts.query).items()}
+    existing = q.get("sslmode") or q.get("ssl")
+    if existing in _ENCRYPTED_SSLMODES:
+        return {}  # URL already guarantees encryption — respect it
+    if existing in _PLAINTEXT_SSLMODES:
+        if settings.ENVIRONMENT.strip().lower() == "production":
+            raise RuntimeError(
+                f"Refusing to start: a DB URL pins sslmode={existing} "
+                "(plaintext-capable) in production. Use sslmode=require or drop it."
+            )
+        return {}  # non-prod: respect the explicit choice
+    # No SSL specified → force encryption (asyncpg takes `ssl`, psycopg2 `sslmode`).
+    return {"ssl": "require"} if async_driver else {"sslmode": "require"}
+
 
 # ─── Async engine — FastAPI / async routes ────────────────────────────────────
 # Supabase port 6543 = pgbouncer (breaks asyncpg prepared statements).
@@ -17,7 +53,10 @@ async_engine = create_async_engine(
     _async_url,
     poolclass=NullPool,
     echo=settings.DEBUG,
-    connect_args={"statement_cache_size": 0},
+    connect_args={
+        "statement_cache_size": 0,
+        **_ssl_connect_args(_async_url, async_driver=True),
+    },
 )
 
 AsyncSessionLocal = async_sessionmaker(
@@ -65,6 +104,8 @@ sync_engine = create_engine(
         # cause of Railway workers hanging at "Checking for duplicate
         # leads" — the db.commit() would wait forever.
         "options": "-c statement_timeout=120000",
+        # M5: force TLS on the Supavisor pooler (6543) for non-local hosts.
+        **_ssl_connect_args(_sync_url, async_driver=False),
     },
 )
 

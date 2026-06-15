@@ -5,6 +5,8 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
+from src.config.constants import BatchRunStatus, JobStatus
+
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
 def _validate_password_rules(v: str) -> str:
@@ -540,13 +542,13 @@ class BatchCreateRequest(BaseModel):
 class BatchCreateResponse(BaseModel):
     batch_id: str
     child_count: int  # number of (county x record_type) scrapes launched
-    status: str  # "pending" — the run + child jobs are created async by the worker
+    status: BatchRunStatus  # "pending" — the run + child jobs are created async by the worker
 
 
 class BatchRunResponse(BaseModel):
     id: str
     batch_id: str
-    status: str  # pending | running | done | partial | failed | cancelled
+    status: BatchRunStatus  # pending | running | done | partial | failed | cancelled
     child_job_ids: list[str] = []
     excluded_no_date_count: int = 0
     failed_children: list[dict[str, Any]] | None = None
@@ -564,7 +566,7 @@ class BatchChildSummary(BaseModel):
     county: str
     record_type: str
     job_id: str | None = None  # None until the dispatch worker creates the job
-    status: str = "pending"  # pending | queued | probing | scraping | enriching | done | failed | cancelled
+    status: JobStatus = JobStatus.PENDING  # a child IS a job, so it uses the job state machine
     record_count: int = 0
 
 
@@ -574,7 +576,7 @@ class BatchSummaryResponse(BaseModel):
     id: str
     name: str | None = None
     state: str
-    run_status: str = "pending"  # pending | running | done | partial | failed | cancelled
+    run_status: BatchRunStatus = BatchRunStatus.PENDING
     child_count: int = 0
     combined_export_ready: bool = False  # presence flag — never expose the R2 key
     created_at: datetime
@@ -606,7 +608,7 @@ class JobResponse(BaseModel):
     id: str
     user_id: str
     scraper_config_id: str
-    status: str
+    status: JobStatus
     trigger: str
     page_current: int
     page_total: int

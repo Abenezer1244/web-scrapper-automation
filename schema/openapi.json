@@ -1,0 +1,5611 @@
+{
+  "components": {
+    "schemas": {
+      "ApiKeyResponse": {
+        "properties": {
+          "api_key": {
+            "title": "Api Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "api_key"
+        ],
+        "title": "ApiKeyResponse",
+        "type": "object"
+      },
+      "BatchChildSummary": {
+        "description": "One child scrape within a batch (county x record_type) and its job status.",
+        "properties": {
+          "config_id": {
+            "title": "Config Id",
+            "type": "string"
+          },
+          "county": {
+            "title": "County",
+            "type": "string"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "record_count": {
+            "default": 0,
+            "title": "Record Count",
+            "type": "integer"
+          },
+          "record_type": {
+            "title": "Record Type",
+            "type": "string"
+          },
+          "status": {
+            "default": "pending",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "config_id",
+          "county",
+          "record_type"
+        ],
+        "title": "BatchChildSummary",
+        "type": "object"
+      },
+      "BatchCreateRequest": {
+        "description": "Create a batch scrape: multiple counties x record types under one parent,\nsharing fields/enrichment/deliver. Fans out into N child scrapes. The batch\nowns delivery (one combined CSV); per-child delivery is suppressed.\n\n2B: `schedule` (same validated shape as single scrapers) makes the batch\nrecur — the scheduler beat creates a new run when the schedule fires.\nDefault (frequency='manual') = 2A behavior: one immediate run, no recurrence.\nChildren always store schedule={} — the PARENT owns scheduling, and\ndispatch_scheduled_jobs skips frequency='manual' children.",
+        "properties": {
+          "counties": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 250,
+            "minItems": 1,
+            "title": "Counties",
+            "type": "array"
+          },
+          "deliver": {
+            "$ref": "#/components/schemas/DeliverConfig",
+            "default": {
+              "emails": [],
+              "formats": [
+                "csv"
+              ]
+            }
+          },
+          "enrichment": {
+            "$ref": "#/components/schemas/EnrichmentConfig",
+            "default": {
+              "property_lookup": true,
+              "skip_tracing": false
+            }
+          },
+          "fields": {
+            "$ref": "#/components/schemas/FieldsConfig",
+            "default": {
+              "date_recorded": true,
+              "heirs": true,
+              "legal_description": false,
+              "mailing_address": true,
+              "parcel_id": true,
+              "party_name": true,
+              "property_address": true
+            }
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "record_types": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10,
+            "minItems": 1,
+            "title": "Record Types",
+            "type": "array"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/ScheduleConfig",
+            "default": {
+              "date_range_mode": "rolling_90",
+              "frequency": "manual",
+              "run_at_hour": 6,
+              "run_at_minute": 0
+            }
+          },
+          "skip_trace_enabled": {
+            "default": false,
+            "title": "Skip Trace Enabled",
+            "type": "boolean"
+          },
+          "state": {
+            "maxLength": 16,
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "counties",
+          "record_types"
+        ],
+        "title": "BatchCreateRequest",
+        "type": "object"
+      },
+      "BatchCreateResponse": {
+        "properties": {
+          "batch_id": {
+            "title": "Batch Id",
+            "type": "string"
+          },
+          "child_count": {
+            "title": "Child Count",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "batch_id",
+          "child_count",
+          "status"
+        ],
+        "title": "BatchCreateResponse",
+        "type": "object"
+      },
+      "BatchDetailResponse": {
+        "description": "A batch with its per-child summary + failed-child detail — for the run view.",
+        "properties": {
+          "child_count": {
+            "default": 0,
+            "title": "Child Count",
+            "type": "integer"
+          },
+          "children": {
+            "items": {
+              "$ref": "#/components/schemas/BatchChildSummary"
+            },
+            "title": "Children",
+            "type": "array"
+          },
+          "combined_export_ready": {
+            "default": false,
+            "title": "Combined Export Ready",
+            "type": "boolean"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "failed_children": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failed Children"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "run_status": {
+            "default": "pending",
+            "title": "Run Status",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "state",
+          "created_at"
+        ],
+        "title": "BatchDetailResponse",
+        "type": "object"
+      },
+      "BatchRunResponse": {
+        "properties": {
+          "batch_id": {
+            "title": "Batch Id",
+            "type": "string"
+          },
+          "child_job_ids": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Child Job Ids",
+            "type": "array"
+          },
+          "combined_export_ready": {
+            "default": false,
+            "title": "Combined Export Ready",
+            "type": "boolean"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "excluded_no_date_count": {
+            "default": 0,
+            "title": "Excluded No Date Count",
+            "type": "integer"
+          },
+          "failed_children": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failed Children"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "batch_id",
+          "status",
+          "created_at"
+        ],
+        "title": "BatchRunResponse",
+        "type": "object"
+      },
+      "BatchSummaryResponse": {
+        "description": "A batch + its (single, on-demand 2A) run status — for the list view.",
+        "properties": {
+          "child_count": {
+            "default": 0,
+            "title": "Child Count",
+            "type": "integer"
+          },
+          "combined_export_ready": {
+            "default": false,
+            "title": "Combined Export Ready",
+            "type": "boolean"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "run_status": {
+            "default": "pending",
+            "title": "Run Status",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "state",
+          "created_at"
+        ],
+        "title": "BatchSummaryResponse",
+        "type": "object"
+      },
+      "BreakGlassLoginRequest": {
+        "description": "POST /auth/login/break-glass — redeem an operator-issued break-glass code.\nReuses the /auth/login challenge token; `code` is a 128-bit 'bg-' code which\nrenders as 35 chars ('bg-' + 26 base32 chars grouped by dashes), so it needs a\nlarger cap than MfaLoginRequest's 32 (Codex).",
+        "properties": {
+          "code": {
+            "maxLength": 64,
+            "minLength": 6,
+            "title": "Code",
+            "type": "string"
+          },
+          "mfa_token": {
+            "maxLength": 4096,
+            "title": "Mfa Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mfa_token",
+          "code"
+        ],
+        "title": "BreakGlassLoginRequest",
+        "type": "object"
+      },
+      "CachedRecordRow": {
+        "properties": {
+          "date_recorded": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date Recorded"
+          },
+          "doc_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc Type"
+          },
+          "heirs": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heirs"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "is_new": {
+            "default": false,
+            "title": "Is New",
+            "type": "boolean"
+          },
+          "legal_description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Legal Description"
+          },
+          "mailing_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mailing Address"
+          },
+          "parcel_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parcel Id"
+          },
+          "party_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Party Name"
+          },
+          "property_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Property Address"
+          },
+          "scraped_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scraped At"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "CachedRecordRow",
+        "type": "object"
+      },
+      "CachedResultsPage": {
+        "properties": {
+          "cache_age": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Age"
+          },
+          "cache_stale": {
+            "default": false,
+            "title": "Cache Stale",
+            "type": "boolean"
+          },
+          "config_id": {
+            "title": "Config Id",
+            "type": "string"
+          },
+          "county": {
+            "title": "County",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CachedRecordRow"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "new_count": {
+            "title": "New Count",
+            "type": "integer"
+          },
+          "page": {
+            "title": "Page",
+            "type": "integer"
+          },
+          "page_size": {
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "config_id",
+          "county",
+          "state",
+          "total",
+          "new_count",
+          "page",
+          "page_size",
+          "items"
+        ],
+        "title": "CachedResultsPage",
+        "type": "object"
+      },
+      "CheckoutRequest": {
+        "properties": {
+          "price_id": {
+            "title": "Price Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "price_id"
+        ],
+        "title": "CheckoutRequest",
+        "type": "object"
+      },
+      "ConnectorCreate": {
+        "properties": {
+          "assessor_url": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assessor Url"
+          },
+          "base_url": {
+            "maxLength": 2000,
+            "title": "Base Url",
+            "type": "string"
+          },
+          "county": {
+            "maxLength": 64,
+            "title": "County",
+            "type": "string"
+          },
+          "gis_endpoint": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gis Endpoint"
+          },
+          "record_types": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "title": "Record Types",
+            "type": "array"
+          },
+          "scraper_mode": {
+            "default": "ai",
+            "maxLength": 16,
+            "title": "Scraper Mode",
+            "type": "string"
+          },
+          "state": {
+            "maxLength": 16,
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "county",
+          "state",
+          "record_types",
+          "base_url"
+        ],
+        "title": "ConnectorCreate",
+        "type": "object"
+      },
+      "ConnectorResponse": {
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          },
+          "assessor_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assessor Url"
+          },
+          "base_url": {
+            "title": "Base Url",
+            "type": "string"
+          },
+          "county": {
+            "title": "County",
+            "type": "string"
+          },
+          "gis_endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gis Endpoint"
+          },
+          "health_status": {
+            "title": "Health Status",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "last_checked": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Checked"
+          },
+          "max_date_range_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Date Range Days"
+          },
+          "pre_foreclosure_doc_types": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pre Foreclosure Doc Types"
+          },
+          "record_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Record Types",
+            "type": "array"
+          },
+          "render_mode": {
+            "title": "Render Mode",
+            "type": "string"
+          },
+          "scraper_mode": {
+            "title": "Scraper Mode",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "county",
+          "state",
+          "record_types",
+          "scraper_mode",
+          "render_mode",
+          "base_url",
+          "health_status",
+          "last_checked",
+          "active"
+        ],
+        "title": "ConnectorResponse",
+        "type": "object"
+      },
+      "DeliverConfig": {
+        "properties": {
+          "dialer_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dialer Type"
+          },
+          "dialer_webhook_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dialer Webhook Secret"
+          },
+          "dialer_webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dialer Webhook Url"
+          },
+          "emails": {
+            "items": {
+              "format": "email",
+              "type": "string"
+            },
+            "maxItems": 10,
+            "title": "Emails",
+            "type": "array"
+          },
+          "formats": {
+            "default": [
+              "csv"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 5,
+            "title": "Formats",
+            "type": "array"
+          },
+          "phoneburner_access_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phoneburner Access Token"
+          },
+          "phoneburner_owner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phoneburner Owner Id"
+          },
+          "webhook_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Secret"
+          },
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url"
+          }
+        },
+        "title": "DeliverConfig",
+        "type": "object"
+      },
+      "EnrichmentConfig": {
+        "properties": {
+          "property_lookup": {
+            "default": true,
+            "title": "Property Lookup",
+            "type": "boolean"
+          },
+          "skip_tracing": {
+            "default": false,
+            "title": "Skip Tracing",
+            "type": "boolean"
+          }
+        },
+        "title": "EnrichmentConfig",
+        "type": "object"
+      },
+      "FieldsConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "date_recorded": {
+            "default": true,
+            "title": "Date Recorded",
+            "type": "boolean"
+          },
+          "heirs": {
+            "default": true,
+            "title": "Heirs",
+            "type": "boolean"
+          },
+          "legal_description": {
+            "default": false,
+            "title": "Legal Description",
+            "type": "boolean"
+          },
+          "mailing_address": {
+            "default": true,
+            "title": "Mailing Address",
+            "type": "boolean"
+          },
+          "parcel_id": {
+            "default": true,
+            "title": "Parcel Id",
+            "type": "boolean"
+          },
+          "party_name": {
+            "default": true,
+            "title": "Party Name",
+            "type": "boolean"
+          },
+          "property_address": {
+            "default": true,
+            "title": "Property Address",
+            "type": "boolean"
+          }
+        },
+        "title": "FieldsConfig",
+        "type": "object"
+      },
+      "ForgotPasswordRequest": {
+        "description": "A3: request a password-reset link. Body for POST /auth/forgot-password.\n\nOnly the email is needed. The endpoint is enumeration-safe — it\nALWAYS returns 200 regardless of whether this address has an\naccount — so no other field is accepted or revealed here.",
+        "properties": {
+          "email": {
+            "format": "email",
+            "title": "Email",
+            "type": "string"
+          }
+        },
+        "required": [
+          "email"
+        ],
+        "title": "ForgotPasswordRequest",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "JobCreate": {
+        "properties": {
+          "scraper_config_id": {
+            "maxLength": 64,
+            "title": "Scraper Config Id",
+            "type": "string"
+          },
+          "trigger": {
+            "default": "manual",
+            "maxLength": 16,
+            "title": "Trigger",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scraper_config_id"
+        ],
+        "title": "JobCreate",
+        "type": "object"
+      },
+      "JobResponse": {
+        "properties": {
+          "county": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "County"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "date_from": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date From"
+          },
+          "date_to": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date To"
+          },
+          "elapsed_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Elapsed Seconds"
+          },
+          "elapsed_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Elapsed Time"
+          },
+          "error_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Message"
+          },
+          "estimated_seconds_remaining": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Seconds Remaining"
+          },
+          "estimated_time_remaining": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Time Remaining"
+          },
+          "estimated_total_records": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Total Records"
+          },
+          "export_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Export Key"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "page_current": {
+            "title": "Page Current",
+            "type": "integer"
+          },
+          "page_total": {
+            "title": "Page Total",
+            "type": "integer"
+          },
+          "progress_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Progress Label"
+          },
+          "progress_pct": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Progress Pct"
+          },
+          "record_count": {
+            "title": "Record Count",
+            "type": "integer"
+          },
+          "record_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Record Type"
+          },
+          "retry_count": {
+            "title": "Retry Count",
+            "type": "integer"
+          },
+          "scraper_config_id": {
+            "title": "Scraper Config Id",
+            "type": "string"
+          },
+          "scraper_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scraper Name"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "trigger": {
+            "title": "Trigger",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "user_id",
+          "scraper_config_id",
+          "status",
+          "trigger",
+          "page_current",
+          "page_total",
+          "record_count",
+          "export_key",
+          "error_message",
+          "retry_count",
+          "started_at",
+          "finished_at",
+          "created_at"
+        ],
+        "title": "JobResponse",
+        "type": "object"
+      },
+      "LoginResponse": {
+        "description": "POST /auth/login (and /auth/login/mfa) response. Two mutually exclusive\nshapes, discriminated by `mfa_required`:\n- mfa_required=False → login complete: access_token + refresh_token are\n  ALWAYS populated. This is the only shape a non-MFA account ever sees, so\n  the prior no-MFA runtime contract is unchanged.\n- mfa_required=True → password OK but MFA enabled: access_token/refresh_token\n  are null and a short-lived mfa_token is returned to redeem at\n  POST /auth/login/mfa.\nThe fields are Optional (vs TokenResponse's required access_token) only to\nmodel the challenge shape — clients must branch on mfa_required.",
+        "properties": {
+          "access_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Access Token"
+          },
+          "expires_in": {
+            "default": 3600,
+            "title": "Expires In",
+            "type": "integer"
+          },
+          "mfa_required": {
+            "default": false,
+            "title": "Mfa Required",
+            "type": "boolean"
+          },
+          "mfa_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mfa Token"
+          },
+          "refresh_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Refresh Token"
+          },
+          "token_type": {
+            "default": "bearer",
+            "title": "Token Type",
+            "type": "string"
+          }
+        },
+        "title": "LoginResponse",
+        "type": "object"
+      },
+      "MfaDisableRequest": {
+        "description": "Disabling MFA requires the password AND a second factor (TOTP or a\nbackup code) — knowledge of the password alone must not remove MFA.",
+        "properties": {
+          "code": {
+            "maxLength": 32,
+            "minLength": 6,
+            "title": "Code",
+            "type": "string"
+          },
+          "password": {
+            "maxLength": 72,
+            "title": "Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "password",
+          "code"
+        ],
+        "title": "MfaDisableRequest",
+        "type": "object"
+      },
+      "MfaEnableRequest": {
+        "description": "Confirm enrollment with a current TOTP code from the authenticator.",
+        "properties": {
+          "code": {
+            "maxLength": 10,
+            "minLength": 6,
+            "title": "Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "MfaEnableRequest",
+        "type": "object"
+      },
+      "MfaEnableResponse": {
+        "description": "One-time backup codes, shown exactly once at enable time.",
+        "properties": {
+          "backup_codes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Backup Codes",
+            "type": "array"
+          }
+        },
+        "required": [
+          "backup_codes"
+        ],
+        "title": "MfaEnableResponse",
+        "type": "object"
+      },
+      "MfaLoginRequest": {
+        "description": "POST /auth/login/mfa — redeem the login MFA challenge. `mfa_token` is the\nshort-lived challenge token returned by /auth/login when MFA is enabled;\n`code` is a 6-digit TOTP or an 80-bit base32 backup code.",
+        "properties": {
+          "code": {
+            "maxLength": 32,
+            "minLength": 6,
+            "title": "Code",
+            "type": "string"
+          },
+          "mfa_token": {
+            "maxLength": 4096,
+            "title": "Mfa Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mfa_token",
+          "code"
+        ],
+        "title": "MfaLoginRequest",
+        "type": "object"
+      },
+      "MfaSetupResponse": {
+        "description": "POST /auth/mfa/setup — returns the new TOTP secret (manual entry) and an\notpauth:// provisioning URI for QR. Shown once; not yet enabled.",
+        "properties": {
+          "provisioning_uri": {
+            "title": "Provisioning Uri",
+            "type": "string"
+          },
+          "secret": {
+            "title": "Secret",
+            "type": "string"
+          }
+        },
+        "required": [
+          "secret",
+          "provisioning_uri"
+        ],
+        "title": "MfaSetupResponse",
+        "type": "object"
+      },
+      "MfaStatusResponse": {
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "MfaStatusResponse",
+        "type": "object"
+      },
+      "NotificationPrefsUpdate": {
+        "additionalProperties": false,
+        "description": "Allowlisted notification toggles. Every field is optional so the client\ncan send a partial update; unknown keys are rejected (extra='forbid') so a\ncaller can't stuff arbitrary data into the JSON column.",
+        "properties": {
+          "job_completed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Completed"
+          },
+          "job_failed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Failed"
+          },
+          "new_records": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "New Records"
+          },
+          "payment_failed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payment Failed"
+          },
+          "usage_alert": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Usage Alert"
+          }
+        },
+        "title": "NotificationPrefsUpdate",
+        "type": "object"
+      },
+      "PasswordChange": {
+        "properties": {
+          "current_password": {
+            "maxLength": 72,
+            "title": "Current Password",
+            "type": "string"
+          },
+          "new_password": {
+            "title": "New Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "title": "PasswordChange",
+        "type": "object"
+      },
+      "PhoneContact": {
+        "description": "One skip-traced phone. ``type`` is Mobile|Landline|VoIP|null.",
+        "properties": {
+          "number": {
+            "title": "Number",
+            "type": "string"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type"
+          }
+        },
+        "required": [
+          "number"
+        ],
+        "title": "PhoneContact",
+        "type": "object"
+      },
+      "RefreshRequest": {
+        "properties": {
+          "refresh_token": {
+            "title": "Refresh Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "refresh_token"
+        ],
+        "title": "RefreshRequest",
+        "type": "object"
+      },
+      "ResetPasswordRequest": {
+        "description": "A3: complete a password reset. Body for POST /auth/reset-password.\n\n`token` is the short-lived single-use reset JWT (aud=bridgeleads-reset)\nminted by /auth/forgot-password. `new_password` is validated against\nthe SAME policy as registration/change-password via the shared\nvalidator so the reset path cannot weaken the password rules.",
+        "properties": {
+          "new_password": {
+            "title": "New Password",
+            "type": "string"
+          },
+          "token": {
+            "maxLength": 4096,
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "new_password"
+        ],
+        "title": "ResetPasswordRequest",
+        "type": "object"
+      },
+      "ResultRow": {
+        "properties": {
+          "absentee_owner": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Absentee Owner"
+          },
+          "auction_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auction Date"
+          },
+          "contactability_score": {
+            "default": 0,
+            "title": "Contactability Score",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "date_recorded": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date Recorded"
+          },
+          "days_to_auction": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Days To Auction"
+          },
+          "default_amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Amount"
+          },
+          "delinquent_amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delinquent Amount"
+          },
+          "delinquent_bill_year": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delinquent Bill Year"
+          },
+          "doc_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc Type"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "emails": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emails"
+          },
+          "enrichment_data": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enrichment Data"
+          },
+          "freshness_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Freshness Days"
+          },
+          "heirs": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heirs"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "is_duplicate": {
+            "default": false,
+            "title": "Is Duplicate",
+            "type": "boolean"
+          },
+          "legal_description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Legal Description"
+          },
+          "mailing_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mailing Address"
+          },
+          "months_delinquent": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Months Delinquent"
+          },
+          "nts_match_confidence": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nts Match Confidence"
+          },
+          "out_of_state_owner": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Out Of State Owner"
+          },
+          "owner_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner State"
+          },
+          "parcel_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parcel Id"
+          },
+          "party_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Party Name"
+          },
+          "phone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phone"
+          },
+          "phone_dnc_flag": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phone Dnc Flag"
+          },
+          "phone_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phone Type"
+          },
+          "phones": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PhoneContact"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phones"
+          },
+          "property_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Property Address"
+          },
+          "property_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Property State"
+          },
+          "skip_trace_attempted_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skip Trace Attempted At"
+          },
+          "skip_trace_status": {
+            "default": "not_attempted",
+            "title": "Skip Trace Status",
+            "type": "string"
+          },
+          "wa_foreclosure_eligible": {
+            "default": false,
+            "title": "Wa Foreclosure Eligible",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "date_recorded",
+          "party_name",
+          "heirs",
+          "legal_description",
+          "parcel_id",
+          "property_address",
+          "mailing_address",
+          "enrichment_data",
+          "created_at"
+        ],
+        "title": "ResultRow",
+        "type": "object"
+      },
+      "ResultsPage": {
+        "properties": {
+          "date_range_mode": {
+            "default": "",
+            "title": "Date Range Mode",
+            "type": "string"
+          },
+          "duplicate_count": {
+            "default": 0,
+            "title": "Duplicate Count",
+            "type": "integer"
+          },
+          "enriched_count": {
+            "default": 0,
+            "title": "Enriched Count",
+            "type": "integer"
+          },
+          "enriching": {
+            "default": false,
+            "title": "Enriching",
+            "type": "boolean"
+          },
+          "has_auction_data": {
+            "default": false,
+            "title": "Has Auction Data",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ResultRow"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "page": {
+            "title": "Page",
+            "type": "integer"
+          },
+          "page_size": {
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "previous_job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Job Id"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          },
+          "total_scraped": {
+            "default": 0,
+            "title": "Total Scraped",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "job_id",
+          "total",
+          "page",
+          "page_size",
+          "items"
+        ],
+        "title": "ResultsPage",
+        "type": "object"
+      },
+      "ScheduleConfig": {
+        "properties": {
+          "date_from": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date From"
+          },
+          "date_range_mode": {
+            "default": "rolling_90",
+            "maxLength": 24,
+            "title": "Date Range Mode",
+            "type": "string"
+          },
+          "date_to": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date To"
+          },
+          "frequency": {
+            "default": "manual",
+            "maxLength": 16,
+            "title": "Frequency",
+            "type": "string"
+          },
+          "run_at_hour": {
+            "default": 6,
+            "maximum": 23.0,
+            "minimum": 0.0,
+            "title": "Run At Hour",
+            "type": "integer"
+          },
+          "run_at_minute": {
+            "default": 0,
+            "maximum": 59.0,
+            "minimum": 0.0,
+            "title": "Run At Minute",
+            "type": "integer"
+          }
+        },
+        "title": "ScheduleConfig",
+        "type": "object"
+      },
+      "ScraperConfigCreate": {
+        "properties": {
+          "county": {
+            "maxLength": 64,
+            "title": "County",
+            "type": "string"
+          },
+          "deliver": {
+            "$ref": "#/components/schemas/DeliverConfig",
+            "default": {
+              "emails": [],
+              "formats": [
+                "csv"
+              ]
+            }
+          },
+          "doc_types": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 10,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc Types"
+          },
+          "enrichment": {
+            "$ref": "#/components/schemas/EnrichmentConfig",
+            "default": {
+              "property_lookup": true,
+              "skip_tracing": false
+            }
+          },
+          "fields": {
+            "$ref": "#/components/schemas/FieldsConfig",
+            "default": {
+              "date_recorded": true,
+              "heirs": true,
+              "legal_description": false,
+              "mailing_address": true,
+              "parcel_id": true,
+              "party_name": true,
+              "property_address": true
+            }
+          },
+          "name": {
+            "maxLength": 120,
+            "title": "Name",
+            "type": "string"
+          },
+          "record_type": {
+            "maxLength": 64,
+            "title": "Record Type",
+            "type": "string"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/ScheduleConfig",
+            "default": {
+              "date_range_mode": "rolling_90",
+              "frequency": "manual",
+              "run_at_hour": 6,
+              "run_at_minute": 0
+            }
+          },
+          "skip_trace_enabled": {
+            "default": false,
+            "title": "Skip Trace Enabled",
+            "type": "boolean"
+          },
+          "state": {
+            "maxLength": 16,
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "county",
+          "state",
+          "record_type"
+        ],
+        "title": "ScraperConfigCreate",
+        "type": "object"
+      },
+      "ScraperConfigResponse": {
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          },
+          "county": {
+            "title": "County",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "deliver": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {}
+            ],
+            "title": "Deliver"
+          },
+          "doc_types": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc Types"
+          },
+          "enrichment": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {}
+            ],
+            "title": "Enrichment"
+          },
+          "fields": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {}
+            ],
+            "title": "Fields"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "record_type": {
+            "title": "Record Type",
+            "type": "string"
+          },
+          "schedule": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {}
+            ],
+            "title": "Schedule"
+          },
+          "skip_trace_enabled": {
+            "default": false,
+            "title": "Skip Trace Enabled",
+            "type": "boolean"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "user_id",
+          "name",
+          "county",
+          "state",
+          "record_type",
+          "fields",
+          "enrichment",
+          "schedule",
+          "deliver",
+          "active",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "ScraperConfigResponse",
+        "type": "object"
+      },
+      "SegmentIntersectionRequest": {
+        "description": "Intersection ('on both lists'): properties a user has on ALL of the\nselected record-type lists. STRONG-IDENTITY ONLY (parcel/address match);\nweak name/date rows are excluded by design (see property_identity).\n\nrecord_types must be 2+ distinct slugs — a single list cannot 'overlap'\nitself. counties is an optional lowercase filter.",
+        "properties": {
+          "counties": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 100,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Counties"
+          },
+          "filing_from": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filing From"
+          },
+          "filing_to": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filing To"
+          },
+          "lookback_days": {
+            "anyOf": [
+              {
+                "maximum": 3660.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lookback Days"
+          },
+          "record_types": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10,
+            "minItems": 2,
+            "title": "Record Types",
+            "type": "array"
+          }
+        },
+        "required": [
+          "record_types"
+        ],
+        "title": "SegmentIntersectionRequest",
+        "type": "object"
+      },
+      "SegmentIntersectionResponse": {
+        "properties": {
+          "counties": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Counties"
+          },
+          "excluded_no_date_count": {
+            "default": 0,
+            "title": "Excluded No Date Count",
+            "type": "integer"
+          },
+          "identity_strength": {
+            "default": "strong",
+            "title": "Identity Strength",
+            "type": "string"
+          },
+          "mode": {
+            "default": "intersection",
+            "title": "Mode",
+            "type": "string"
+          },
+          "property_count": {
+            "title": "Property Count",
+            "type": "integer"
+          },
+          "record_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Record Types",
+            "type": "array"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/SegmentLeadRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "record_types",
+          "property_count",
+          "rows"
+        ],
+        "title": "SegmentIntersectionResponse",
+        "type": "object"
+      },
+      "SegmentLeadRow": {
+        "description": "One representative lead per dedup bucket (best row chosen by the window\nfunction). `identity_strength` is \"strong\" for intersection (always) and\nper-row for union (strong = parcel/address match, weak = name/date).",
+        "properties": {
+          "county": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "County"
+          },
+          "date_recorded": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date Recorded"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "identity_strength": {
+            "default": "strong",
+            "title": "Identity Strength",
+            "type": "string"
+          },
+          "mailing_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mailing Address"
+          },
+          "matched_record_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Matched Record Types",
+            "type": "array"
+          },
+          "overlap_count": {
+            "title": "Overlap Count",
+            "type": "integer"
+          },
+          "parcel_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parcel Id"
+          },
+          "party_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Party Name"
+          },
+          "phone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phone"
+          },
+          "phone_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phone Type"
+          },
+          "property_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Property Address"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          }
+        },
+        "required": [
+          "id",
+          "matched_record_types",
+          "overlap_count"
+        ],
+        "title": "SegmentLeadRow",
+        "type": "object"
+      },
+      "SegmentUnionRequest": {
+        "description": "Union ('combine'): every lead a user has on ANY of the selected\nrecord-type lists, merged into one INCLUSIVE deduped set — strong rows\ndeduped by property_key, weak rows by dedup_hash, rows with neither kept as\nsingletons. NO lead is ever silently dropped (contrast intersection, which\nis strong-only). 1+ distinct slug (combining one list just dedupes it across\ncounties/jobs). counties is an optional lowercase filter.",
+        "properties": {
+          "counties": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 100,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Counties"
+          },
+          "filing_from": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filing From"
+          },
+          "filing_to": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filing To"
+          },
+          "lookback_days": {
+            "anyOf": [
+              {
+                "maximum": 3660.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lookback Days"
+          },
+          "record_types": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10,
+            "minItems": 1,
+            "title": "Record Types",
+            "type": "array"
+          }
+        },
+        "required": [
+          "record_types"
+        ],
+        "title": "SegmentUnionRequest",
+        "type": "object"
+      },
+      "SegmentUnionResponse": {
+        "properties": {
+          "counties": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Counties"
+          },
+          "excluded_no_date_count": {
+            "default": 0,
+            "title": "Excluded No Date Count",
+            "type": "integer"
+          },
+          "lead_count": {
+            "title": "Lead Count",
+            "type": "integer"
+          },
+          "mode": {
+            "default": "union",
+            "title": "Mode",
+            "type": "string"
+          },
+          "record_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Record Types",
+            "type": "array"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/SegmentLeadRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "record_types",
+          "lead_count",
+          "rows"
+        ],
+        "title": "SegmentUnionResponse",
+        "type": "object"
+      },
+      "TokenResponse": {
+        "properties": {
+          "access_token": {
+            "title": "Access Token",
+            "type": "string"
+          },
+          "expires_in": {
+            "default": 3600,
+            "title": "Expires In",
+            "type": "integer"
+          },
+          "refresh_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Refresh Token"
+          },
+          "token_type": {
+            "default": "bearer",
+            "title": "Token Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "access_token"
+        ],
+        "title": "TokenResponse",
+        "type": "object"
+      },
+      "UserLogin": {
+        "properties": {
+          "email": {
+            "format": "email",
+            "title": "Email",
+            "type": "string"
+          },
+          "password": {
+            "maxLength": 72,
+            "title": "Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "email",
+          "password"
+        ],
+        "title": "UserLogin",
+        "type": "object"
+      },
+      "UserRegister": {
+        "properties": {
+          "email": {
+            "format": "email",
+            "title": "Email",
+            "type": "string"
+          },
+          "password": {
+            "title": "Password",
+            "type": "string"
+          },
+          "ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref"
+          }
+        },
+        "required": [
+          "email",
+          "password"
+        ],
+        "title": "UserRegister",
+        "type": "object"
+      },
+      "UserResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "email": {
+            "title": "Email",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "is_admin": {
+            "default": false,
+            "title": "Is Admin",
+            "type": "boolean"
+          },
+          "is_trial": {
+            "default": false,
+            "title": "Is Trial",
+            "type": "boolean"
+          },
+          "notification_prefs": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "default": {},
+            "title": "Notification Prefs",
+            "type": "object"
+          },
+          "plan": {
+            "title": "Plan",
+            "type": "string"
+          },
+          "records_limit": {
+            "title": "Records Limit",
+            "type": "integer"
+          },
+          "records_used": {
+            "title": "Records Used",
+            "type": "integer"
+          },
+          "trial_days_remaining": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trial Days Remaining"
+          },
+          "trial_ends_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trial Ends At"
+          }
+        },
+        "required": [
+          "id",
+          "email",
+          "plan",
+          "records_used",
+          "records_limit",
+          "created_at"
+        ],
+        "title": "UserResponse",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "HTTPBearer": {
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "title": "BridgeLeads API",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/auth/api-key": {
+      "post": {
+        "description": "Generate a new API key. The raw key is shown exactly once.",
+        "operationId": "create_api_key_auth_api_key_post",
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Create Api Key",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/change-password": {
+      "post": {
+        "description": "Change the current user's password.",
+        "operationId": "change_password_auth_change_password_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Change Password",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/config": {
+      "get": {
+        "description": "Public endpoint: returns auth validation rules for frontend forms.\n\nKeeps frontend placeholder text in sync with backend validation.",
+        "operationId": "auth_config_auth_config_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Auth Config Auth Config Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Auth Config",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/forgot-password": {
+      "post": {
+        "description": "A3: request a password-reset link.\n\nENUMERATION-SAFE: ALWAYS returns 200 with the same generic message whether\nor not the email has an account. We never reveal existence — not via the\nbody, not via the status code, not via email send/failure, AND not via\nresponse TIMING: the slow Resend network call is queued as a BACKGROUND\ntask that runs AFTER the response is sent, so the existing-email and\nmissing-email paths return with the same latency (Codex final review). If a\nmatching active user exists we mint a short-lived reset token and email a\nlink; otherwise we do nothing observable.",
+        "operationId": "forgot_password_auth_forgot_password_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForgotPasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Forgot Password Auth Forgot Password Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Forgot Password",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "operationId": "login_auth_login_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserLogin"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Login",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/login/break-glass": {
+      "post": {
+        "description": "Redeem an operator-issued break-glass code (H2-P5) when the authenticator\nis lost. Reuses the /auth/login challenge token (the password step was already\nproven there) but verifies a BREAK-GLASS code, not TOTP/backup.\n\nRECOVERY-ONLY + LOUD: on success it tears MFA down to un-enrolled (so the user\ncan set up a FRESH authenticator — they can't disable the old one, it's lost),\nburns every remaining break-glass + backup code, revokes all sessions + the\nAPI key, and mints a DEGRADED session: amr=[\"pwd\",\"break_glass\"] (NO \"mfa\"),\nso it can never pass admin MFA step-up, and with mfa_enabled now False the\nadmin routes route the user to re-enrollment.",
+        "operationId": "login_break_glass_auth_login_break_glass_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BreakGlassLoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Login Break Glass",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/login/mfa": {
+      "post": {
+        "description": "Redeem the login MFA challenge (H2-P3): validate the short-lived challenge\ntoken from /auth/login, verify the 2nd factor, and — only on success — issue\nthe real session tokens. The challenge token proves the password step was\npassed; it carries no access privilege on its own.",
+        "operationId": "login_mfa_auth_login_mfa_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MfaLoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Login Mfa",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "operationId": "logout_auth_logout_post",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Logout",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/logout-all": {
+      "post": {
+        "operationId": "logout_all_auth_logout_all_post",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Logout All",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/me": {
+      "get": {
+        "operationId": "me_auth_me_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Me",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/mfa/disable": {
+      "post": {
+        "description": "Disable MFA. Requires the password AND a valid second factor (TOTP or an\nunused backup code) — password alone must not remove MFA.",
+        "operationId": "mfa_disable_auth_mfa_disable_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MfaDisableRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Mfa Disable",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/mfa/enable": {
+      "post": {
+        "description": "Verify a TOTP code against the pending secret, enable MFA, return backup\ncodes ONCE, and revoke all existing sessions (force a fresh login).",
+        "operationId": "mfa_enable_auth_mfa_enable_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MfaEnableRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MfaEnableResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Mfa Enable",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/mfa/setup": {
+      "post": {
+        "description": "Generate a TOTP secret, store it encrypted (NOT yet enabled), and return\nthe secret + otpauth URI. Re-calling before enable rotates the pending secret.",
+        "operationId": "mfa_setup_auth_mfa_setup_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MfaSetupResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Mfa Setup",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/mfa/status": {
+      "get": {
+        "description": "Whether the current user has MFA enabled (for settings UI).",
+        "operationId": "mfa_status_auth_mfa_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MfaStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Mfa Status",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/notification-preferences": {
+      "put": {
+        "description": "Persist the user's email-notification toggles (settings → Notifications).\n\nPartial update: only the allowlisted keys the client sent are merged into\nusers.notification_prefs (unknown keys are already rejected by the schema's\nextra='forbid'). The WHERE id == current_user.id filter is the tenant guard\n— RLS on `users` is permissive under the app role, so the query filter is the\nreal own-row constraint (belt-and-suspenders per the project rules).",
+        "operationId": "update_notification_preferences_auth_notification_preferences_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotificationPrefsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Update Notification Preferences",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/onboarding": {
+      "get": {
+        "description": "Return the user's onboarding progress and next suggested action.\n\nThe frontend uses this to show a getting-started wizard or checklist.",
+        "operationId": "onboarding_status_auth_onboarding_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Onboarding Status Auth Onboarding Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Onboarding Status",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/refresh": {
+      "post": {
+        "description": "Exchange a valid refresh token for a new access + refresh token pair.",
+        "operationId": "refresh_token_auth_refresh_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh Token",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/register": {
+      "post": {
+        "operationId": "register_auth_register_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserRegister"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/reset-password": {
+      "post": {
+        "description": "A3: complete a password reset with a token from /forgot-password.\n\nVerifies the reset token (distinct audience — a session token cannot be\nused here), single-uses it atomically, rotates the password, writes\nhistory, and revokes ALL existing sessions BEFORE committing the new\npassword (fail-safe ordering).",
+        "operationId": "reset_password_auth_reset_password_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResetPasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Reset Password Auth Reset Password Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reset Password",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/batches": {
+      "get": {
+        "description": "List the current user's batches, newest first, with run status.",
+        "operationId": "list_batches_batches_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/BatchSummaryResponse"
+                  },
+                  "title": "Response List Batches Batches Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Batches",
+        "tags": [
+          "batches"
+        ]
+      },
+      "post": {
+        "operationId": "create_batch_batches_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchCreateResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Create Batch",
+        "tags": [
+          "batches"
+        ]
+      }
+    },
+    "/batches/{batch_id}": {
+      "get": {
+        "description": "A batch's status + per-child (county x record_type) summary.",
+        "operationId": "get_batch_batches__batch_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "batch_id",
+            "required": true,
+            "schema": {
+              "title": "Batch Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchDetailResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Batch",
+        "tags": [
+          "batches"
+        ]
+      }
+    },
+    "/batches/{batch_id}/download": {
+      "get": {
+        "description": "Stream the batch's combined CSV through this authed endpoint.\n\nThe CSV is REBUILT from the DB on demand (not fetched from R2): the api has\nno R2 credentials (those live on the worker), and rebuilding means a\nre-download reflects later async skip-trace fills. Tenant-scoped by the\nverified owner's id. 404 until the barrier has finished (combined_export_key\nis the 'ready' marker).",
+        "operationId": "download_batch_batches__batch_id__download_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "batch_id",
+            "required": true,
+            "schema": {
+              "title": "Batch Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Download Batch",
+        "tags": [
+          "batches"
+        ]
+      }
+    },
+    "/batches/{batch_id}/runs": {
+      "get": {
+        "description": "Run history for a batch, newest first (2B: runs are plural). The combined\nCSV per run is fetched via the run-scoped download below — never the R2 key.",
+        "operationId": "list_batch_runs_batches__batch_id__runs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "batch_id",
+            "required": true,
+            "schema": {
+              "title": "Batch Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/BatchRunResponse"
+                  },
+                  "title": "Response List Batch Runs Batches  Batch Id  Runs Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Batch Runs",
+        "tags": [
+          "batches"
+        ]
+      }
+    },
+    "/batches/{batch_id}/runs/{run_id}/download": {
+      "get": {
+        "description": "Run-scoped combined-CSV download (2B): history downloads must not drift to\nthe latest run the way /download (latest-run semantics) does.",
+        "operationId": "download_batch_run_batches__batch_id__runs__run_id__download_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "batch_id",
+            "required": true,
+            "schema": {
+              "title": "Batch Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Download Batch Run",
+        "tags": [
+          "batches"
+        ]
+      }
+    },
+    "/billing/activation-funnel": {
+      "get": {
+        "description": "Sprint 5.5: activation funnel metrics (admin-only).\n\nReturns the conversion funnel across the last `days` days:\n  signup -> first scraper -> first job -> first download -> paid upgrade\n\nAll derived from existing tables — no new schema needed.\nPercentages are computed from signup count, so every step shows both\nan absolute count and a conversion rate from signup.\n\nAccess (H2-P5): require_admin gates this route — non-admins get 404 (endpoint\nhidden) and admins who have not enrolled MFA get 403\nadmin_mfa_enrollment_required. This is a READ-ONLY analytics surface, so it\nrequires MFA *enrollment* but not a fresh step-up; the state-changing admin\nop (connector creation) is the one that uses require_admin_mfa.\n\nRate-limiting + admin gating both run as route dependencies before this body\n(_rate_limit_activation_funnel then require_admin), so the raw-SQL funnel is\nreached only by a throttled, authenticated admin.",
+        "operationId": "activation_funnel_billing_activation_funnel_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "title": "Days",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Activation Funnel Billing Activation Funnel Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Activation Funnel",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/billing/checkout": {
+      "post": {
+        "description": "Create a Stripe Checkout session to upgrade the user's plan.",
+        "operationId": "create_checkout_billing_checkout_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CheckoutRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Checkout Billing Checkout Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Create Checkout",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/billing/plans": {
+      "get": {
+        "description": "Return the full plan catalog + founding member offer status.",
+        "operationId": "list_plans_billing_plans_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Plans Billing Plans Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Plans",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/billing/portal": {
+      "post": {
+        "description": "Return a Stripe Customer Portal URL for managing subscriptions.",
+        "operationId": "customer_portal_billing_portal_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Customer Portal Billing Portal Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Customer Portal",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/billing/pricing": {
+      "get": {
+        "description": "Return full pricing page data including feature comparison matrix.\n\nPublic endpoint — no auth required. Used by the frontend pricing page.",
+        "operationId": "pricing_page_billing_pricing_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Pricing Page Billing Pricing Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Pricing Page",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/billing/referral": {
+      "get": {
+        "description": "Sprint 7.3: referral program — code, stats, and credit balance.\n\nReturns:\n  - code: the user's shareable referral code\n  - share_url: canonical signup URL with ?ref= appended\n  - referred_count: number of users who signed up via this code\n  - paid_conversions: number of those users who converted to paid\n  - credit_earned_cents / credit_earned_usd: running balance\n  - bonus_per_conversion_cents: display constant for the frontend\n\nReferrals that don't yet have a code (legacy accounts created\nbefore migration 017) get one generated on first call so the\nendpoint is always safe to hit.",
+        "operationId": "referral_status_billing_referral_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Referral Status Billing Referral Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Referral Status",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/billing/skip-trace-usage": {
+      "get": {
+        "description": "Return the user's skip-trace lookup usage + bundled quota.\n\nUsed by the frontend billing page to render a progress bar and\noverage estimate. Values are read from the cached counter on the\nUser row — no external calls.",
+        "operationId": "skip_trace_usage_billing_skip_trace_usage_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Skip Trace Usage Billing Skip Trace Usage Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Skip Trace Usage",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/billing/subscription": {
+      "get": {
+        "description": "Return the user's active Stripe subscription details, if any.",
+        "operationId": "get_subscription_billing_subscription_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Subscription Billing Subscription Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Subscription",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/billing/usage": {
+      "get": {
+        "description": "Return current plan, record usage, and limit for the settings page.",
+        "operationId": "get_usage_billing_usage_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Usage Billing Usage Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Usage",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/billing/webhook": {
+      "post": {
+        "description": "Handle Stripe webhook events to keep plan state in sync.\n\nRegisters for:\n  - checkout.session.completed      → activate new plan\n  - customer.subscription.updated   → handle upgrades / downgrades\n  - customer.subscription.deleted   → downgrade to starter\n  - invoice.payment_failed          → notify user by email",
+        "operationId": "stripe_webhook_billing_webhook_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "stripe-signature",
+            "required": true,
+            "schema": {
+              "title": "Stripe-Signature",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Stripe Webhook Billing Webhook Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stripe Webhook",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Health Health Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health",
+        "tags": [
+          "system"
+        ]
+      }
+    },
+    "/jobs": {
+      "get": {
+        "operationId": "list_jobs_jobs_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/JobResponse"
+                  },
+                  "title": "Response List Jobs Jobs Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Jobs",
+        "tags": [
+          "jobs"
+        ]
+      },
+      "post": {
+        "operationId": "create_job_jobs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Create Job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/jobs/{job_id}": {
+      "delete": {
+        "operationId": "cancel_job_jobs__job_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Cancel Job",
+        "tags": [
+          "jobs"
+        ]
+      },
+      "get": {
+        "operationId": "get_job_jobs__job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/jobs/{job_id}/download": {
+      "get": {
+        "description": "Build and stream the lead CSV LIVE from the DB (not from R2).\n\nUses the shared canonical builder (src/utils/lead_export.py), so this download\nis byte-for-byte the same dialer-ready format as the scheduled/emailed export.\nReading live means skip-trace phone/email appear as soon as the dispatcher\ncompletes, even if the original scheduled export ran before skip-trace.\n\nAccepts a short-lived download token (from /export-url) OR an Authorization header.\nThe download token is scoped to a specific job, expires in 60s, and is safe for URLs.",
+        "operationId": "download_export_jobs__job_id__download_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "token",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Token",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_amount",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 100000000,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Amount"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_amount",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 100000000,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Max Amount"
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_months",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 1200,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Months"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_months",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 1200,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Max Months"
+            }
+          },
+          {
+            "in": "query",
+            "name": "dialer_ready",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Dialer Ready",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "absentee",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Absentee"
+            }
+          },
+          {
+            "in": "query",
+            "name": "out_of_state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Out Of State"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download Export",
+        "tags": [
+          "jobs",
+          "jobs"
+        ]
+      }
+    },
+    "/jobs/{job_id}/export-url": {
+      "get": {
+        "description": "Return a short-lived download URL for the job's CSV export.\n\nGenerates a single-use token (60s) scoped to this job + user.\nThe token is safe to put in a URL — it's not the full JWT.",
+        "operationId": "get_export_url_jobs__job_id__export_url_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_amount",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 100000000,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Amount"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_amount",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 100000000,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Max Amount"
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_months",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 1200,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Months"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_months",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 1200,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Max Months"
+            }
+          },
+          {
+            "in": "query",
+            "name": "dialer_ready",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Dialer Ready",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "absentee",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Absentee"
+            }
+          },
+          {
+            "in": "query",
+            "name": "out_of_state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Out Of State"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Export Url Jobs  Job Id  Export Url Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Export Url",
+        "tags": [
+          "jobs",
+          "jobs"
+        ]
+      }
+    },
+    "/jobs/{job_id}/logs": {
+      "get": {
+        "description": "SSE endpoint: replays existing logs then streams new ones via Redis Pub/Sub.",
+        "operationId": "stream_logs_jobs__job_id__logs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Stream Logs",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/jobs/{job_id}/results": {
+      "get": {
+        "operationId": "get_results_jobs__job_id__results_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "minimum": 1,
+              "title": "Page",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_amount",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 100000000,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Amount"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_amount",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 100000000,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Max Amount"
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_months",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 1200,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Months"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_months",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 1200,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Max Months"
+            }
+          },
+          {
+            "in": "query",
+            "name": "dialer_ready",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Dialer Ready",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "absentee",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Absentee"
+            }
+          },
+          {
+            "in": "query",
+            "name": "out_of_state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Out Of State"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultsPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Results",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/scrapers": {
+      "get": {
+        "operationId": "list_scrapers_scrapers_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ScraperConfigResponse"
+                  },
+                  "title": "Response List Scrapers Scrapers Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Scrapers",
+        "tags": [
+          "scrapers"
+        ]
+      },
+      "post": {
+        "operationId": "create_scraper_scrapers_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScraperConfigCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScraperConfigResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Create Scraper",
+        "tags": [
+          "scrapers"
+        ]
+      }
+    },
+    "/scrapers/connectors": {
+      "get": {
+        "description": "Return county connectors for the frontend county picker.\n\nPublic endpoint — no auth required so the county browser loads for\nanonymous visitors.\n\nBy default returns connectors whose canary health check has marked\nthem as either ``healthy`` or ``degraded``. Excludes only ``down``\n(scraper threw an exception on last probe) and ``unknown`` (never\ncanary-checked).\n\nThe ``degraded`` status means \"scraper ran cleanly, but last\nprobe returned zero records on a 7-day window\". For small counties\nwith sparse filings (e.g., rural WA counties that file <5 probates\nper week), this oscillates randomly based on which week the canary\nhappens to sample. Excluding them from the picker just because\nthe most recent 7-day sample was empty would remove most of our\ncoverage for smaller markets. Instead, we surface them as\navailable and the user sees 0 records only if the actual scrape\nwindow is empty — which is the correct honest outcome.\n\nPass ``?include_all=true`` to include ``down`` and ``unknown``\nconnectors for admin tooling and support investigation.",
+        "operationId": "list_connectors_scrapers_connectors_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "include_all",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include All",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ConnectorResponse"
+                  },
+                  "title": "Response List Connectors Scrapers Connectors Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Connectors",
+        "tags": [
+          "scrapers"
+        ]
+      },
+      "post": {
+        "description": "Add a new county connector. Agency plan only.\n\nAccess (H2-P5): require_admin_mfa gates this route. Creating a connector is a\nstate-changing admin op (it registers a new SSRF-allowlisted scrape target),\nso it demands a STEP-UP session — admin + enrolled MFA + a fresh, MFA-backed\nJWT (not an API key). Non-admins get 404; un-enrolled admins get 403\nadmin_mfa_enrollment_required; a stale or non-MFA session gets 403\nadmin_mfa_step_up_required. The inline is_admin check is gone — central\ndependency so the gate can't drift per-endpoint (Codex HIGH).\n\nFor AI-mode connectors, no Python scraper code is needed — just provide\nthe county portal URL and Claude handles the rest.",
+        "operationId": "create_connector_scrapers_connectors_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectorCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Create Connector",
+        "tags": [
+          "scrapers"
+        ]
+      }
+    },
+    "/scrapers/sample": {
+      "get": {
+        "description": "Public endpoint: returns precomputed, sanitized sample records.\n\nReads ONLY the public_sample_cache singleton (refreshed hourly by the\nrefresh_public_sample_cache Celery task, which does all PII redaction).\nThis unauthenticated endpoint therefore never live-queries the tenant\ntables (results/jobs/scraper_configs) — so under the non-BYPASSRLS cutover\nrole it needs no cross-tenant read access, and there is no path by which an\nanonymous caller can reach un-sanitized PII (RLS cutover Phase 2b, Codex\ndesign). Returns an empty-but-valid shape until the first refresh runs.",
+        "operationId": "sample_records_scrapers_sample_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Sample Records Scrapers Sample Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Sample Records",
+        "tags": [
+          "scrapers"
+        ]
+      }
+    },
+    "/scrapers/{config_id}/jobs/{job_id}/dialer-replay": {
+      "post": {
+        "description": "Re-queue FAILED native-dialer (outbox) deliveries for a job.\n\nNative bulk-less dialers (e.g. PhoneBurner) deliver one contact per POST, so a\njob can finish with some contacts failed (rate-limit/401/outage). This resets\nonly the failed rows to pending and re-runs the outbox drain — delivered rows\nare never re-pushed. The reset runs on the RLS app session (H1: the API holds\napp-role credentials only — no system session in the request path) with the\nexplicit user_id filter kept as the suspenders.",
+        "operationId": "replay_dialer_push_scrapers__config_id__jobs__job_id__dialer_replay_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "config_id",
+            "required": true,
+            "schema": {
+              "title": "Config Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Replay Dialer Push Scrapers  Config Id  Jobs  Job Id  Dialer Replay Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Replay Dialer Push",
+        "tags": [
+          "scrapers"
+        ]
+      }
+    },
+    "/scrapers/{config_id}/records": {
+      "get": {
+        "description": "Serve pre-scraped records from cache with per-user 'new' badges.",
+        "operationId": "get_cached_records_scrapers__config_id__records_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "config_id",
+            "required": true,
+            "schema": {
+              "title": "Config Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "minimum": 1,
+              "title": "Page",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CachedResultsPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Cached Records",
+        "tags": [
+          "scrapers"
+        ]
+      }
+    },
+    "/scrapers/{scraper_id}": {
+      "delete": {
+        "operationId": "delete_scraper_scrapers__scraper_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scraper_id",
+            "required": true,
+            "schema": {
+              "title": "Scraper Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Delete Scraper",
+        "tags": [
+          "scrapers"
+        ]
+      },
+      "get": {
+        "operationId": "get_scraper_scrapers__scraper_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scraper_id",
+            "required": true,
+            "schema": {
+              "title": "Scraper Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScraperConfigResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Scraper",
+        "tags": [
+          "scrapers"
+        ]
+      }
+    },
+    "/segments/intersection": {
+      "post": {
+        "description": "JSON preview of the intersection ('on both lists'), capped at PREVIEW_CAP.\n\nStrong-identity only — the response says so via identity_strength.",
+        "operationId": "intersection_preview_segments_intersection_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SegmentIntersectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SegmentIntersectionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Intersection Preview",
+        "tags": [
+          "segments"
+        ]
+      }
+    },
+    "/segments/intersection/export": {
+      "post": {
+        "description": "CSV export of the intersection. One representative lead per property,\nwith matched_record_types + overlap_count columns. CSV-injection sanitized.",
+        "operationId": "intersection_export_segments_intersection_export_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SegmentIntersectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Intersection Export",
+        "tags": [
+          "segments"
+        ]
+      }
+    },
+    "/segments/union": {
+      "post": {
+        "description": "JSON preview of the combined ('union') deduped lead set, capped at\nPREVIEW_CAP. Inclusive — each row carries its identity_strength.",
+        "operationId": "union_preview_segments_union_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SegmentUnionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SegmentUnionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Union Preview",
+        "tags": [
+          "segments"
+        ]
+      }
+    },
+    "/segments/union/export": {
+      "post": {
+        "description": "CSV export of the combined ('union') deduped lead set. Adds an\nidentity_strength column (strong|weak). CSV-injection sanitized.",
+        "operationId": "union_export_segments_union_export_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SegmentUnionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Union Export",
+        "tags": [
+          "segments"
+        ]
+      }
+    },
+    "/webhooks/tracerfy": {
+      "post": {
+        "description": "Receive Tracerfy batch completion webhook (PREFERRED).\n\nAuth: constant-time compare of the `X-Tracerfy-Webhook-Secret` header against\nTRACERFY_WEBHOOK_SECRET — keeps the secret out of the URL (and out of access\nlogs / Referer). Configure Tracerfy to POST here with that header.",
+        "operationId": "tracerfy_webhook_webhooks_tracerfy_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Tracerfy Webhook Webhooks Tracerfy Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Tracerfy Webhook",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/webhooks/tracerfy/{provided_secret}": {
+      "post": {
+        "description": "LEGACY: secret in the URL path. Deprecated — the path secret leaks into\naccess logs. Migrate Tracerfy to `POST /webhooks/tracerfy` with the\n`X-Tracerfy-Webhook-Secret` header, rotate TRACERFY_WEBHOOK_SECRET, then this\nroute can be removed.\n\nHeader-first (Codex): if the header is present it is authoritative — a wrong\nheader is rejected even if the path secret is right. Current Tracerfy traffic\nsends no header, so this branch is inert until migration.",
+        "operationId": "tracerfy_webhook_legacy_webhooks_tracerfy__provided_secret__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provided_secret",
+            "required": true,
+            "schema": {
+              "title": "Provided Secret",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Tracerfy Webhook Legacy Webhooks Tracerfy  Provided Secret  Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Tracerfy Webhook Legacy",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    }
+  }
+}

@@ -185,7 +185,7 @@ def run_scrape_job(self, job_id: str) -> None:
         from src.api.schemas import ScheduleConfigDict
         schedule: ScheduleConfigDict = cast(ScheduleConfigDict, config.schedule or {})
         range_mode = schedule.get("date_range_mode") or schedule.get("range_mode", "rolling_90")  # type: ignore[call-overload]  # legacy "range_mode" alias kept for old configs
-        date_from, date_to = _resolve_date_range(schedule, config_id=config.id, job_id=job_id, user_plan=user.plan)
+        date_from, date_to = _resolve_date_range(schedule, config_id=config.id, job_id=job_id, user_plan=user.plan, record_type=config.record_type)
 
         # Enforce per-connector max date range (e.g. Chelan single-date = 30 days max).
         # Look up the connector to get the limit.

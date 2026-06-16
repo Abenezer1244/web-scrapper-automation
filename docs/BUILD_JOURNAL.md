@@ -19,6 +19,35 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-15 — King tax-delinquent: latent scraper bug fixed (0.6%→full) + cross-county standardization
+
+**How it started:** user asked "why only 2 counties for tax delinquent?" → answered (data-access + legality + semantics, not existence; built `docs/research/record-type-fields/tax-delinquent-county-qualification.md`, a vet-then-build rubric, LLM-council + 3-round-Codex gated). Then "make the amount consistent across counties (Snohomish way)" → which surfaced a **latent production bug**.
+
+**The bug (verified live against King's Socrata API):** `king_wa_tax_delinquent.py` filtered `receivable_type='D'` believing D="Delinquent". WRONG — the whole `dsv3-ct3e` dataset is *already* delinquent, and **D = Drainage district assessment** (one charge code). It captured **178 of 28,609** delinquent parcels (~0.6%) and reported a tiny drainage line (~$91) instead of the real balance. A real $2.98M-delinquent parcel was **invisible** (it had no D line).
+
+**Built / Shipped (PR #52 → main, squash-merged + deployed; PR #24 frontend → master):**
+- Rewrote King scraper: pure `aggregate_delinquent_rows()` sums `(billed-paid)` across ALL included charge types and ALL delinquent years per parcel; excludes A=Abatement + unknown codes (fail-closed + alert); 12-digit real-property gate; floor at parcel total; `bill_year`=oldest; full-pagination-before-emit; **raises** on mid-pagination error (no silent truncation). 7 tests.
+- **Standard locked (LLM council, unanimous Option A):** `delinquent_amount` = total unpaid principal on the tax bill, summed across all charges+years per parcel. Snohomish already did this; King now matches.
+- **Current-year: INCLUDED for King** (reversed an initial conservative exclude). King's dataset is delinquent-only and ~99% current-year; WA RCW 84.56.020 (missed Apr-30 first-half accelerates the full year) makes current-year rows genuinely delinquent. Snohomish still excludes (its file lists all parcels).
+- **Default ~18-month window for tax_delinquent (all counties):** `_resolve_date_range` branches on record_type (548 days); other types keep 90. Frontend wizard defaults tax to an 18-month custom range. Codex: no P1.
+- Honest labels: "Amount Owed"→"Tax Balance Owed", "principal only — excludes penalties & interest".
+- **Live re-run validation (2 tenants):** new jobs resolved to 12/14/2024→06/15/2026 (548d) and scraped **28,496 parcels** (vs 178). Fix proven end-to-end in prod.
+
+**Tried / Decided — backfill DROPPED (the key lesson):** built a Codex-gated re-scrape-and-overwrite backfill with a plan→guard→apply structure. Its **own guard aborted** the dry-run: only **62 of 3,400** old parcels still matched today's delinquent set — the old `results` rows are ~95% current-year (2026) **point-in-time snapshots**, not correctable against a fresh scrape (King's dataset is a live snapshot; the world moved on). Overwrite would have NULLed 98%. **Lesson: you cannot "correct" historical point-in-time lead lists by re-scraping today — fix-forward + re-run instead.** The guard (min-fresh-parcels + max-null-parcels + RLS-tenant-visibility) is what saved the data; that pattern is reusable for any cross-tenant data migration.
+
+**Facts learned (durable):**
+- King's `receivable_type` codes are decoded by King's own dataset **`dyps-vajd`** ("Real Property Tax Receivable Attributes Descriptions"): R=Real Property Levy, N=Noxious Weed, V=Conservation, U=Surface Water Mgmt, X=Surface Water Bond, E=Fire, F=Forest Patrol, D=Drainage, I=Irrigation, C/O/W=other charges, **A=Abatement (credit; $169K-$6M billed/$0 paid — MUST exclude)**. **No penalty/interest code exists** — King computes those at payment time; neither King nor Snohomish exposes them, so the figure is **principal only**.
+- `dsv3-ct3e` is pre-filtered to delinquent (paid=0, billed>0). Total delinquent owed/parcel = sum(billed-paid) across all its lines.
+- `delinquent_amount` is NOT in dedup_hash / property identity / billing (billing counts records) — so correcting amounts is safe (no double-bill / dup). Re-scrape overwrites via `COALESCE(new,old)` (enrich.py).
+- King/Snohomish connectors have `max_date_range_days=None` (no clamp). Chelan=30 (down).
+- `results.enrichment_data` is Postgres `json` (not jsonb) — use `::jsonb ||` to merge.
+- Re-run mechanism (no admin endpoint exists): mint `create_secure_token(user_id)` + POST prod `/jobs` (API_BASE_URL=https://api.bridgeleads.io) → enqueues to prod Redis → worker runs. `railway run` can't reach prod Redis locally, but CAN hit the prod API.
+- Inline `railway run python -c "..."` swallows output on this box → use a script file.
+
+**Pending / Handoff:** owner may re-run other King/tax scrapers from the dashboard (now defaults to 18mo; the focused re-run only did 2 representative configs). The 14 historical King configs' old `results` keep stale values (point-in-time; not corrected — by design).
+
+---
+
 ## 2026-06-15 — InvalidToken incident: 61 derived-key user emails recovered + silent-fallback guard
 
 **Symptom:** post-deploy worker logs showed `InvalidToken('fe1:-prefixed value is not decryptable under

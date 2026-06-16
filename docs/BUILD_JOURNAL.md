@@ -19,6 +19,40 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-16 — Stuck "running" scrape jobs: enqueue-before-commit race fixed (backend) + UI honesty (frontend)
+
+**How it started:** "scrape stuck running forever" on the admin account. Prior session ran the LLM council + Codex consult and code-confirmed the root cause; this session executed the fix one phase at a time (handoff: `tasks/stuck-job-fix-handoff.md`).
+
+**Root cause (CODE-CONFIRMED):** single-job create used **enqueue-before-commit**. `create_job` called `run_scrape_job.apply_async()` while still inside the request transaction (`get_rls_db`/`get_db` commit only AFTER the route returns). If a worker consumed the message before that commit landed, the worker's atomic claim (`UPDATE jobs SET status='queued' WHERE id=:id AND status='pending'`) got `rowcount=0` and bailed to avoid a double-scrape, leaving the row committed orphaned in `pending` forever. The watchdog deliberately excluded fresh `retry_count=0` pending, so it never recovered them. The UI then rendered `pending` as a spinning "Running" — so a transient ~6% race looked like permanent hangs.
+
+**Phase 0 — confirmed on prod (read-only):** 105 active jobs ALL `pending`/`retry_count=0`/`started_at=NULL` across 58 users, oldest 37d; worker+beat healthy (good jobs claim in ~1s). Intermittent (~6%/job), not an outage. Tools kept: `scripts/diag_stuck_jobs.py`, `scripts/diag_job_status_rates.py`.
+
+**Phase 1 — unstuck:** user chose fail-clean all 105. `scripts/failclean_orphaned_pending_jobs.py` (dry-run default; guarded raw UPDATE, CAS `status='pending' AND started_at IS NULL AND retry_count=0` so it can't clobber a just-claimed job). 105 → `failed`, 0 remaining.
+
+**Phase 2 — durable backend fix (Option A + watchdog backstop; chosen over Option B by prior Codex consult):**
+- `src/api/routes/jobs.py` `create_job`: `await db.commit()` after `flush()` and BEFORE `apply_async` (commit-then-enqueue — same contract the batch fan-out already uses; `get_db` teardown commit then no-ops). `apply_async` wrapped in try/except: on broker-publish failure it logs `exc_info=True` and STILL returns the committed `JobResponse` — a 500 there would invite a client retry → duplicate job; the job is durably `pending` and the watchdog re-delivers.
+- `src/workers/scheduler_helpers/health.py` watchdog: added an OR-branch + loop handler for orphaned fresh pending (`status='pending' AND retry_count==0 AND started_at IS NULL AND created_at < now-10min`) → re-delivers via `run_scrape_job.delay()` (atomic CAS dedupes), NO `retry_count` mutation (delivery repair, not a retry). Added `_WATCHDOG_REDELIVER_LIMIT=500` + `ORDER BY created_at ASC` so a large orphan burst doesn't re-flood the broker every 5-min tick.
+
+**Phase 3 — UI honesty (`bridgeleads-web`, on a branch off master):** `lib/utils.ts` conflated "non-terminal (keep polling)" with "actively working (spinner)". Split it: `pending` relabeled "Pending"→**"Waiting"**; added `PROCESSING_STATUSES`+`isProcessing()` (`probing/scraping/enriching`) for the spinner / "Running Now" count / scrapers "Running" badge; `RUNNING_STATUSES`/`isRunning` kept for polling + Watch link + sidebar pulse. pending/queued now render a static Clock + muted "Waiting"/"Queued" pill, not a spinner. 4 files.
+
+**Caught & fixed (in review):**
+- Codex 1st-pass [P1] "watchdog re-delivers to wrong queue → stranding" → **refuted by code**: `task_routes` pins `run_scrape_job`→`scrape`, workers consume `scrape` (start.sh `WORKER_QUEUES`); the `.delay()` pattern is already shared by 3 recovery call sites. Residual = pre-existing priority-loss [P2], not a stranding. Codex 2nd pass agreed.
+- Security Master Review (parallel agent) Medium "unbounded per-tick re-delivery" → fixed with the LIMIT. L2 "narrow the broad except" → **declined with reasoning**: broad catch is correct here (job durably committed + watchdog re-delivers → swallowing any publish error prevents the duplicate a 500 would cause; not error-silencing — recovered by a durable backstop, traceback preserved).
+- Frontend Codex [P1] "Clock not imported" → false positive (snippet visibility; tsc+eslint green prove resolution). [P2] "queued labels Queued but renders Clock" → intended per-status honest design.
+
+**Failed / Blocked:** none. Backfill of historical orphans was unnecessary (fail-clean covered it).
+
+**Verification:** backend ruff clean; `pytest tests/test_workers.py -k "watchdog or stuck or pending or stranded"` → 6/6 (twice). Frontend `tsc --noEmit` + eslint exit 0. Codex review clean on both diffs; security GO (0 Crit/High).
+
+**Facts learned (durable):**
+- `run_scrape_job.delay()` is NOT the default `celery` queue — `task_routes` (`src/workers/__init__.py`) pins it to `scrape`, which workers consume. So watchdog/batch/dispatch `.delay()` recovery paths are deliverable (they just don't preserve `scrape-priority`).
+- The frontend `RUNNING_STATUSES`/`isRunning` is the **non-terminal** set (drives polling); `isProcessing` is the **actively-working** set (drives spinners). Don't gate polling on `isProcessing` — pending/queued must keep polling to advance.
+- `AsyncSessionLocal` is `expire_on_commit=False` (session.py:65), so returning an ORM object after `db.commit()` does NOT lazy-load/500.
+
+**Pending / Handoff:** committed to both repos (backend `test/ui-tax-date-column`; frontend branched off master). PR + deploy decision is the user's. The `scrape-priority` loss on watchdog recovery is a known, accepted [P2] (shared by all `.delay()` recovery sites); revisit only if prod evidence shows it matters.
+
+---
+
 ## 2026-06-15 — Tax-delinquent "Date" column: stop showing/exporting a synthetic date
 
 **How it started:** follow-on to the King tax-delinquent fix. A user flagged the shared "Date" column showing "Jan 1, 2024" for tax leads as confusing. I had claimed tax delinquency "has no real per-record event date"; the user challenged it: *"are you sure … do a deep research on all counties and use the llm council and codex then based on those we will decide."*

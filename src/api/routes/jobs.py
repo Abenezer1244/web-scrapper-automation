@@ -159,12 +159,39 @@ async def create_job(
     )
     db.add(job)
     await db.flush()
+    # Commit BEFORE enqueuing so the row is durably 'pending' when the worker
+    # consumes the message. The worker claims the job with an atomic CAS
+    # (UPDATE ... WHERE status='pending'); if we enqueued first and a worker
+    # consumed the task before this transaction committed, that claim would see
+    # no row (rowcount=0), bail to avoid a double-scrape, and the job would
+    # commit orphaned in 'pending' forever (watchdog deliberately skips fresh
+    # retry_count=0 pending). This is the same commit-then-enqueue contract the
+    # batch fan-out already uses. get_db's teardown commit then no-ops on the
+    # clean session; the after_begin listener re-applies the RLS GUC on the next
+    # transaction (the is_local GUC self-clears on this commit).
+    await db.commit()
 
-    # Enqueue Celery task — paid plans get priority queue
+    # Enqueue Celery task — paid plans get priority queue. If the broker publish
+    # fails here the job is already committed 'pending'; the watchdog re-delivers
+    # it (its atomic claim dedupes), so we never strand it.
     from src.workers.tasks import run_scrape_job
 
     queue = "scrape-priority" if current_user.plan in PRIORITY_QUEUE_PLANS else "scrape"
-    run_scrape_job.apply_async(args=[job.id], queue=queue)
+    try:
+        run_scrape_job.apply_async(args=[job.id], queue=queue)
+    except Exception:
+        # Broker publish failed (e.g. Redis blip). The job is already durably
+        # committed 'pending', so we do NOT 500: a 500 here would tell the client
+        # the create failed and invite a retry, minting a DUPLICATE job for the
+        # same intent. Instead we log and return the committed job — the watchdog
+        # re-delivers orphaned fresh-pending rows within ~10 min and its atomic
+        # claim dedupes, so the scrape still runs exactly once.
+        _logger.warning(
+            "run_scrape_job publish failed for job_id=%s; committed 'pending', "
+            "leaving for watchdog re-delivery",
+            job.id,
+            exc_info=True,
+        )
 
     audit_log(request, "job_created", current_user.id, f"job_id={job.id}")
     return JobResponse.model_validate(job)

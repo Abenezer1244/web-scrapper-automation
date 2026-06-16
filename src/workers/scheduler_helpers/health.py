@@ -7,6 +7,15 @@ from src.utils.logger import setup_logger
 
 _logger = setup_logger("worker.scheduler")
 
+# Cap how many stuck jobs one watchdog tick re-delivers. Without a bound, a large
+# orphan burst (the prod incident was 105) or a sustained worker backlog would
+# re-`delay()` EVERY matching row on EVERY 5-min tick — the CAS dedupes execution,
+# but the broker queue depth / Redis memory are not deduped, so unbounded
+# re-delivery is an amplification vector. 500 drains the known incident in one
+# tick with headroom; anything beyond is picked up (oldest-first) over the next
+# few cycles since the rows persist until claimed.
+_WATCHDOG_REDELIVER_LIMIT = 500
+
 
 def _watchdog_stuck_jobs_impl() -> None:
     """Fail jobs that have been stuck in an active state for > 55 minutes.
@@ -58,8 +67,26 @@ def _watchdog_stuck_jobs_impl() -> None:
                         Job.started_at.is_(None),
                         Job.created_at < stuck_cutoff,
                     ),
+                    # Orphaned fresh pending (enqueue-before-commit race): a job
+                    # whose Celery message was consumed before its row committed
+                    # 'pending' got rowcount=0 on the worker's atomic claim and
+                    # was stranded — OR a post-fix broker publish that failed
+                    # after commit-then-enqueue. retry_count==0 fresh pending is
+                    # normally EXCLUDED (it may legitimately wait for capacity),
+                    # but one created > 10 min ago that never got a started_at was
+                    # never claimed. Re-deliver it; the worker's atomic
+                    # pending->queued CAS dedupes if a worker is about to pick it
+                    # up. This is the backstop for the 105-orphan prod incident.
+                    and_(
+                        Job.status == "pending",
+                        Job.retry_count == 0,
+                        Job.started_at.is_(None),
+                        Job.created_at < queued_cutoff,
+                    ),
                 )
             )
+            .order_by(Job.created_at.asc())
+            .limit(_WATCHDOG_REDELIVER_LIMIT)
         ).scalars().all()
 
         requeued_ids: list[str] = []
@@ -77,6 +104,18 @@ def _watchdog_stuck_jobs_impl() -> None:
                 _logger.warning(
                     "Watchdog: re-enqueueing stranded retry job %s (attempt %d/3)",
                     job.id, job.retry_count,
+                )
+                continue
+            # Orphaned fresh pending (enqueue-before-commit race / failed publish):
+            # re-deliver WITHOUT bumping retry_count — no scrape attempt was ever
+            # made, so this is delivery repair, not a retry. The atomic claim
+            # dedupes if a worker is concurrently picking it up.
+            if job.status == "pending" and job.retry_count == 0 and job.started_at is None:
+                requeued_ids.append(job.id)
+                _logger.warning(
+                    "Watchdog: re-delivering orphaned pending job %s "
+                    "(enqueue-before-commit race; no retry burned)",
+                    job.id,
                 )
                 continue
             if job.retry_count < 3:
@@ -134,10 +173,10 @@ def _watchdog_stuck_jobs_impl() -> None:
     for jid in requeued_ids:
         try:
             run_scrape_job.delay(jid)
-        except Exception as exc:  # noqa: BLE001 — committed 'pending'; re-picked next cycle
+        except Exception:  # noqa: BLE001 — committed 'pending'; re-picked next cycle
             _logger.warning(
-                "watchdog: re-enqueue of %s failed (will re-pick next cycle): %s",
-                jid, str(exc)[:200],
+                "watchdog: re-enqueue of %s failed (will re-pick next cycle)",
+                jid, exc_info=True,
             )
 
     # M6: dispatch alerts AFTER the commit (Codex P2) — never for state that

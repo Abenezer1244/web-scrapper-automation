@@ -37,8 +37,11 @@ class TestRawSqlExecutesOnPostgres:
     exercised (empty -> ANY(CAST('{}' AS uuid[])) must not error)."""
 
     def _run(self, sql: str):
+        from datetime import UTC, datetime
+
         from sqlalchemy import text
 
+        from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year
         from src.db.session import system_sync_session
 
         with system_sync_session() as db:
@@ -46,6 +49,12 @@ class TestRawSqlExecutesOnPostgres:
                 params = {"uid": str(uuid.uuid4()), "job_ids": job_ids}
                 if ":limit" in sql or "LIMIT :limit" in sql:
                     params["limit"] = 10
+                # Bind the 18-month tax cap only for SQL that carries the fragment
+                # (_COMBINED_SQL does; _FAILED_CHILDREN_SQL does not). text() raises
+                # InvalidRequestError on a missing bind, so the placeholder presence
+                # check keeps the shared helper correct for BOTH constants.
+                if f":{TAX_CAP_BIND}" in sql:
+                    params[TAX_CAP_BIND] = tax_cap_min_year(datetime.now(UTC).date())
                 db.execute(text(sql), params).fetchall()
             db.rollback()
 

@@ -189,16 +189,20 @@ async def test_intersection_sql_excludes_out_of_window(
         "limit": 1000,
         TAX_CAP_BIND: _CAP_BIND_VALUE,
     })
-    returned_keys = {r._mapping["property_key"] for r in result.fetchall()}
+    # _INTERSECTION_SQL does NOT expose property_key in its final SELECT, so
+    # identify each property by party_name (which IS returned). One ranked row is
+    # emitted per overlapping property bucket; for pk-in that row is EITHER the tax
+    # or the probate owner, so test membership with a set intersection.
+    returned_names = {r._mapping["party_name"] for r in result.fetchall()}
 
-    # The in-window property is on both lists AND within the cap -> kept.
-    assert f"pk-in-{tax_job}" in returned_keys
-    # The out-of-window property is on both lists but its tax row is capped out;
-    # the candidates CTE drops that tax row, so the property no longer overlaps
-    # within the candidate scope -> excluded.
-    assert f"pk-out-{tax_job}" not in returned_keys
+    # The in-window property is on both lists AND within the cap -> its bucket
+    # survives (the ranked row is one of its two owners).
+    assert returned_names & {"IN WINDOW OWNER", "PROBATE in_window"}
+    # The out-of-window property's tax row is capped out of the candidates CTE, so
+    # only its probate row remains -> overlap_count 1 < n=2 -> bucket excluded.
+    assert not (returned_names & {"STALE DEBT OWNER", "PROBATE out_of_window"})
     # The non-tax (single-list) property never overlaps -> excluded regardless.
-    assert f"pk-nontax-{tax_job}" not in returned_keys
+    assert "PROBATE OWNER" not in returned_names
 
 
 # ─── Live DB: batch combined export query ───────────────────────────────────────

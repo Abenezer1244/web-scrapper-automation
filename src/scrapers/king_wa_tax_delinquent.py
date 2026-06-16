@@ -277,18 +277,23 @@ class KingWATaxDelinquentScraper(BridgeScraper):
         start_year = datetime.strptime(date_from, "%m/%d/%Y").year
         end_year = datetime.strptime(date_to, "%m/%d/%Y").year
 
-        # Conservative annual-delinquency rule (matches Snohomish's
-        # `tax_year < as_of_year`): a bill is only counted once its cycle is past.
-        # Cap the requested range at last year so not-yet-due current-year bills
-        # never inflate the figure.
+        # INCLUDE the current year. King's dataset publishes ONLY delinquent
+        # receivables, and in WA a missed first-half installment (due Apr 30)
+        # accelerates the FULL year's tax to delinquent (RCW 84.56.020) — so a
+        # current-year row here is a genuine, fresh, motivated-seller lead and its
+        # full (billed - paid) is correctly delinquent, not a not-yet-due overstate.
+        # (This differs from Snohomish, whose file lists ALL parcels and therefore
+        # MUST exclude the current year to isolate the delinquent ones. The
+        # cross-county AMOUNT definition stays identical — sum all charges per
+        # parcel — only the delinquency-determination differs, by source shape.)
+        # Cap at current_year so a future date_to can't pull not-yet-billed years.
         current_year = datetime.now().year
-        max_delinquent_year = current_year - 1
-        effective_end = min(end_year, max_delinquent_year)
+        effective_end = min(end_year, current_year)
 
         if effective_end < start_year:
             _logger.info(
-                "King WA tax delinquent — requested %d-%d resolves to no past "
-                "delinquent years (current year=%d); nothing to scrape",
+                "King WA tax delinquent — requested %d-%d resolves to no billed "
+                "years (current year=%d); nothing to scrape",
                 start_year, end_year, current_year,
             )
             return []

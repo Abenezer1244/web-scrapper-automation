@@ -133,3 +133,45 @@ def test_select_survives_monthly_id_rotation():
 def test_select_raises_when_no_link():
     with pytest.raises(ValueError, match="no 'Current Tax List' download link"):
         _select_current_tax_list_url("<p>page changed, no link here</p>", "https://www.snohomishcountywa.gov/5568/Treasurer-Public-Records")
+
+
+# ─── 18-month product cap (drop parcels whose OLDEST unpaid year is too old) ───
+
+# as-of year 2026 (col 13) so both 2010 and 2025 are prior (delinquent) years.
+# Parcel OLD is delinquent across 2010 + 2025; the cap drops it by its OLDEST
+# year (2010) even though it carries a recent 2025 line (recency-over-volume,
+# user decision 2026-06-16). Parcel NEW's oldest year is 2025.
+_CAP_ROWS = """\
+00100000000001|2010|1 OLD ST||EVERETT|WA|98201|OLD OWNER|||EVERETT|WA|98201|06/01/2026|100|100|100
+00100000000001|2025|1 OLD ST||EVERETT|WA|98201|OLD OWNER|||EVERETT|WA|98201|06/01/2026|200|200|200
+00200000000002|2025|2 NEW ST||EVERETT|WA|98201|NEW OWNER|||EVERETT|WA|98201|06/01/2026|300|300|300
+""".splitlines()
+
+
+def test_cap_drops_parcel_with_old_oldest_year():
+    records, stats = parse_tax_list(_CAP_ROWS, fallback_year=2099, cap_min_year=2025)
+    by = _by_parcel(records)
+    assert set(by) == {"00200000000002"}          # NEW kept
+    assert "00100000000001" not in by             # OLD dropped (oldest 2010 < 2025)
+    assert stats["capped_out"] == 1
+    assert by["00200000000002"].enrichment_data["bill_year"] == 2025
+
+
+def test_cap_keeps_parcel_at_boundary_year():
+    # A parcel whose oldest year EQUALS cap_min_year is kept (>= cutoff).
+    rows = (
+        "00300000000003|2025|3 EDGE ST||EVERETT|WA|98201|EDGE OWNER|||"
+        "EVERETT|WA|98201|06/01/2026|100|100|100"
+    ).splitlines()
+    records, stats = parse_tax_list(rows, fallback_year=2099, cap_min_year=2025)
+    assert _by_parcel(records)["00300000000003"].enrichment_data["bill_year"] == 2025
+    assert stats["capped_out"] == 0
+
+
+def test_cap_none_disables_cap_back_compat():
+    # cap_min_year=None (default) must leave every parcel — back-compat.
+    records, stats = parse_tax_list(_CAP_ROWS, fallback_year=2099)
+    by = _by_parcel(records)
+    assert set(by) == {"00100000000001", "00200000000002"}
+    assert stats["capped_out"] == 0
+    assert by["00100000000001"].enrichment_data["bill_year"] == 2010

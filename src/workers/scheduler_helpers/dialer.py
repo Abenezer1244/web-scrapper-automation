@@ -56,6 +56,7 @@ def _dialer_push_sweep_impl() -> None:
     from sqlalchemy import and_, func, or_, select, update
 
     from src.api.dialer_filters import dialer_ready_conditions
+    from src.api.tax_filters import tax_cap_condition
     from src.config.constants import BUSINESS_FEATURES_PLANS
     from src.db.models import Job, PendingSkipTraceRow, Result, ScraperConfig, User
     from src.db.session import system_sync_session
@@ -79,7 +80,9 @@ def _dialer_push_sweep_impl() -> None:
     #    completed CSV omits them; those age out past the cutoff so a wedged row
     #    can't block the push forever. Age by submitted_at (COALESCE to
     #    enqueued_at only as a defensive fallback for a NULL submitted_at).
-    _stale_cutoff = datetime.now(UTC) - timedelta(hours=12)
+    _now = datetime.now(UTC)
+    _today = _now.date()  # frozen for the whole sweep so the 18-month tax cap can't drift
+    _stale_cutoff = _now - timedelta(hours=12)
     _submitted_age = func.coalesce(
         PendingSkipTraceRow.submitted_at, PendingSkipTraceRow.enqueued_at
     )
@@ -178,6 +181,11 @@ def _dialer_push_sweep_impl() -> None:
                 # it (with a NEW result id as external_id) would re-import the same
                 # contact every run (Codex). Push only fresh leads.
                 conds = [*conds, Result.is_duplicate.is_(False)]
+                # Hard 18-month cap on tax-delinquent leads (self-scoping: non-tax
+                # rows have NULL delinquent_bill_year and pass untouched), applied
+                # to BOTH the count and the fetch below so they can never disagree.
+                # An out-of-window tax lead is never swept into dialing.
+                conds = [*conds, tax_cap_condition(_today)]
                 total = db.execute(
                     select(func.count()).select_from(Result).where(
                         Result.job_id == job.id, Result.user_id == job.user_id, *conds

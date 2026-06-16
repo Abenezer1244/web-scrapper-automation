@@ -48,6 +48,7 @@ from decimal import Decimal, InvalidOperation
 from urllib.parse import urljoin
 
 from src.api.middleware.security import add_scrape_domain
+from src.api.tax_filters import tax_cap_min_year
 from src.config import settings
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.utils.logger import setup_logger
@@ -156,7 +157,9 @@ def _join_address(street: str, line2: str, city: str, state: str, zip_code: str)
     return BridgeScraper.clean(head)
 
 
-def parse_tax_list(lines, *, fallback_year: int) -> tuple[list[ScrapedRecord], dict]:
+def parse_tax_list(
+    lines, *, fallback_year: int, cap_min_year: int | None = None
+) -> tuple[list[ScrapedRecord], dict]:
     """Parse the pipe-delimited Current Tax List into delinquent ScrapedRecords.
 
     Streams ``lines`` (a file iterator or any line iterable) and keeps only the
@@ -166,8 +169,13 @@ def parse_tax_list(lines, *, fallback_year: int) -> tuple[list[ScrapedRecord], d
     Delinquency = 14-digit parcel AND amount owed > 0 AND tax year < the file's
     as-of year (read from col 13; falls back to ``fallback_year``).
 
+    ``cap_min_year`` enforces the 18-month product cap: a parcel is DROPPED when
+    its oldest delinquent year (``bill_year``) is older than this year. ``None``
+    (the default) disables the cap, keeping the parser pure for callers/tests
+    that don't want it; the scraper passes ``tax_cap_min_year(today)``.
+
     Returns ``(records, stats)`` where stats = {total, malformed, delinquent_rows,
-    as_of_year} for the caller's structural-validation / canary checks.
+    capped_out, as_of_year} for the caller's structural-validation / canary checks.
     """
     agg: dict[str, dict] = {}
     total = 0
@@ -226,9 +234,15 @@ def parse_tax_list(lines, *, fallback_year: int) -> tuple[list[ScrapedRecord], d
             entry["total_billed"] += billed
 
     records: list[ScrapedRecord] = []
+    capped_out = 0
     for parcel, entry in agg.items():
         years_sorted = sorted(entry["years"])
         bill_year = years_sorted[0]  # oldest delinquent year = most months delinquent
+        # 18-month product cap: drop the whole parcel if its OLDEST unpaid year is
+        # further back than the cap allows (opt-in via cap_min_year; None = no cap).
+        if cap_min_year is not None and bill_year < cap_min_year:
+            capped_out += 1
+            continue
         amount = entry["amount"].quantize(Decimal("0.01"))
 
         rec = ScrapedRecord()
@@ -264,6 +278,7 @@ def parse_tax_list(lines, *, fallback_year: int) -> tuple[list[ScrapedRecord], d
         "total": total,
         "malformed": malformed,
         "delinquent_rows": delinquent_rows,
+        "capped_out": capped_out,
         "as_of_year": current_year,
     }
     return records, stats
@@ -309,9 +324,16 @@ class SnohomishWATaxDelinquentScraper(BridgeScraper):
                 headers=_HEADERS,
                 timeout=120,
             )
+            # Freeze "now" ONCE (UTC, matching tax_filters.build_tax_conditions) so
+            # the cap year and the fallback as-of year can't disagree across a
+            # year-boundary rollover between two separate now() calls.
+            _now = datetime.now(UTC)
+            cap_min_year = tax_cap_min_year(_now.date())
             with open(tmp_path, encoding="utf-8-sig", errors="replace") as fh:
                 records, stats = parse_tax_list(
-                    fh, fallback_year=datetime.now(UTC).year
+                    fh,
+                    fallback_year=_now.year,
+                    cap_min_year=cap_min_year,
                 )
         finally:
             try:
@@ -340,9 +362,10 @@ class SnohomishWATaxDelinquentScraper(BridgeScraper):
 
         _logger.info(
             "Snohomish tax delinquent complete — %d bytes, %d rows (%d malformed), "
-            "%d delinquent rows → %d parcels (as_of_year=%s)",
+            "%d delinquent rows → %d parcels (%d capped out >18mo, "
+            "cap_min_year=%d, as_of_year=%s)",
             n_bytes, total, malformed, stats["delinquent_rows"],
-            len(records), stats["as_of_year"],
+            len(records), stats["capped_out"], cap_min_year, stats["as_of_year"],
         )
         if self.on_progress:
             self.on_progress(1, 1, len(records))

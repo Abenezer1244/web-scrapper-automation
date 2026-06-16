@@ -185,7 +185,14 @@ def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, s
     sig = derive_signals(record, today)
 
     return {
-        "date_recorded": sanitize_for_csv(_get(record, "date_recorded")),
+        # Tax-delinquent rows carry a SYNTHETIC date_recorded ("01/01/{bill_year}")
+        # — county tax data has no real per-record event date. Emitting it as a real
+        # `date_recorded` ships a fabricated event date into dialers/CRMs that sort,
+        # dedupe, and trigger campaigns off it (Codex Critical). The honest tax
+        # temporal signal is the separate `delinquent_bill_year` + derived
+        # `months_delinquent` columns. `sig` above is derived from the record
+        # (date_recorded intact), so only the emitted string is blanked.
+        "date_recorded": "" if year is not None else sanitize_for_csv(_get(record, "date_recorded")),
         "party_name": sanitize_for_csv(_get(record, "party_name")),
         "heirs": sanitize_for_csv(_get(record, "heirs")),
         "parcel_id": sanitize_for_csv(_get(record, "parcel_id")),

@@ -19,6 +19,36 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-15 — Tax-delinquent "Date" column: stop showing/exporting a synthetic date
+
+**How it started:** follow-on to the King tax-delinquent fix. A user flagged the shared "Date" column showing "Jan 1, 2024" for tax leads as confusing. I had claimed tax delinquency "has no real per-record event date"; the user challenged it: *"are you sure … do a deep research on all counties and use the llm council and codex then based on those we will decide."*
+
+**Tried / Decided — research → council → Codex → decide:**
+- **Deep research (all counties):** my claim was *overstated, not wrong*. Dated tax-delinquency events DO exist in the world (Certificate of Delinquency filing, lien-certificate sale, auction, redemption) and ARE published in bulk in lien/deed states (FL/CA/AZ/IL/Cook County). But **WA bulk feeds expose none of them** — King's Socrata `dsv3-ct3e` has only `bill_year`; Snohomish's treasurer file has a tax YEAR + a file-level as-of date. So for the two counties we scrape, there is no real per-record calendar date. Industry convention (PropertyRadar): "Delinquent Since {year}"; no vendor shows a calendar delinquency date — investors filter on years-delinquent + amount.
+- **LLM council:** recommended showing "X yrs behind (since 2020)" + a structured integer, and **caught the CSV-export blind spot** (the synthetic date also flows into the emitted CSV, not just the table).
+- **Codex:** pressure-tested and simplified to **presentation-only**: em-dash in the Date cell, blank the synthetic date in the CSV, keep the "Date" header, and **drop** the years-behind count (0-yr edge case for current-year delinquencies, which are ~99% of King). Flagged the synthetic date shipping into dialers/CRMs as a Critical (they sort/dedupe/trigger campaigns off it).
+- **User delegated the final cell choice** ("which do u recommend") → I recommended and implemented the em-dash.
+
+**Built / Shipped (local, verified — NOT yet committed):**
+- Frontend `bridgeleads-web/app/(dashboard)/results/[id]/_components/ResultsTable.tsx`: the shared Date cell now branches on the job-level `hasTaxData` — tax rows render a dimmed em-dash, non-tax rows keep `formatDate(row.date_recorded)`. Freshness badge still renders. (The honest tax temporal signal is the existing "Oldest Tax Year" column.)
+- Backend `src/utils/lead_export.py` (`build_lead_export_row`): emit `date_recorded` as `""` when `delinquent_bill_year is not None` (the structural tax-row marker), else the real value. `sig = derive_signals(record, today)` is computed from the **record** before the dict is built, so blanking the emitted string doesn't touch `months_delinquent`/freshness. The overlap CSV (`build_overlap_export_row`) inherits the blank via `base.get("date_recorded","")` — consistent.
+- `tests/test_lead_export.py`: added `TestTaxRowDateBlanked` (tax row → date blanked but `delinquent_bill_year`/`months_delinquent` intact; non-tax row → date preserved).
+
+**Caught & fixed (in review):** my initial reasoning (and Codex's first pass) assumed `date_recorded` was load-bearing for `months_delinquent`. Reading `lead_signals.py` showed `months_delinquent` derives from `bill_year`, not `date_recorded` — so the dependency is only the freshness fallback, and derivation reads the record object, making the blank-the-emitted-string change strictly safe.
+
+**Verification:** ruff clean; frontend `tsc` exit 0; `pytest tests/test_lead_export.py tests/test_lead_export_overlap.py` → 33 passed (the new 2 + existing). Broader export suite 99 passed (1 unrelated live-Postgres integration failure in `test_batch_export.py`, touches no code I changed).
+
+**Codex diff-review gate:** PASS — **0 Critical, 0 High**. Two minor findings, both non-issues for the current architecture: (Medium) "`year is not None` detector completeness" — verified `delinquent_bill_year` is structurally tax-only (no probate/foreclosure path sets it), so the detector is complete; (Low) "frontend job-level vs per-row gating" — a `tax_delinquent` job contains only tax rows and the overlap CSV uses a separate export path, so no mixing. Codex independently confirmed the freshness-derivation ordering is safe.
+
+**Facts learned (durable):**
+- The honest temporal signal for WA tax-delinquent leads is `delinquent_bill_year` + derived `months_delinquent`, NOT a calendar date. Tax scrapers store a SYNTHETIC `date_recorded = "01/01/{bill_year}"` purely as a placeholder; it must never present or export as a real event date.
+- `delinquent_bill_year` is a reliable structural "is this a tax row?" marker in the export layer — only tax-delinquent scrapers populate it.
+- `derive_signals(record, today)` reads from the record object, so the emitted CSV `date_recorded` string can be blanked without affecting any derived signal.
+
+**Pending / Handoff:** commit + PR decision on both repos (the prior pattern in this program: branch + PR each repo). Build is done and gated; the deploy call is the user's.
+
+---
+
 ## 2026-06-15 — King tax-delinquent: latent scraper bug fixed (0.6%→full) + cross-county standardization
 
 **How it started:** user asked "why only 2 counties for tax delinquent?" → answered (data-access + legality + semantics, not existence; built `docs/research/record-type-fields/tax-delinquent-county-qualification.md`, a vet-then-build rubric, LLM-council + 3-round-Codex gated). Then "make the amount consistent across counties (Snohomish way)" → which surfaced a **latent production bug**.

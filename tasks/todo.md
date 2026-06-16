@@ -66,6 +66,29 @@ Residual (👤 owner, optional): re-run other King/tax scrapers from dashboard (
 ## Open follow-ups (user/ops)
 - 👤 Owner can re-run other specific King/tax scrapers from the dashboard (now defaults to 18mo) — focused script only does 2 representative configs.
 
+---
+
+## Follow-on task: tax-delinquent "Date" column (synthetic date) — DONE (local, gated; uncommitted)
+
+### Context / why
+- User flagged the shared "Date" column showing "Jan 1, 2024" for tax leads as confusing. I'd claimed tax delinquency "has no real per-record date"; user challenged → ordered deep research + LLM council + Codex, "based on those we will decide."
+
+### What the research/council/Codex concluded
+- Claim was OVERSTATED, not wrong: dated tax-delinquency events exist + are bulk-published in lien/deed states, but **WA bulk feeds (King Socrata, Snohomish treasurer file) expose only a tax YEAR** — no real per-record calendar date for the 2 counties we scrape.
+- Council: show years-behind + structured int; caught the CSV-export blind spot. Codex: simplify to presentation-only em-dash + blank the CSV date + keep "Date" header + drop years-behind (0-yr edge for ~99%-current-year King). User delegated cell choice → em-dash.
+
+### Changes (presentation-only, 3 files)
+- [x] Frontend `ResultsTable.tsx`: Date cell branches on `hasTaxData` → tax rows show dimmed em-dash, non-tax unchanged; freshness badge kept. (Honest tax signal = existing "Oldest Tax Year" column.)
+- [x] Backend `lead_export.py`: `date_recorded` emitted as `""` when `delinquent_bill_year is not None`, else real value. `sig` derived from record before dict build → `months_delinquent`/freshness unaffected. Overlap CSV inherits blank (consistent).
+- [x] `tests/test_lead_export.py`: `TestTaxRowDateBlanked` (tax → blanked + year/months intact; non-tax → preserved).
+
+### Verification
+- [x] ruff clean; frontend tsc exit 0; `pytest tests/test_lead_export.py tests/test_lead_export_overlap.py` → 33 passed. (1 unrelated live-PG failure in test_batch_export.py — touches no changed code.)
+- [x] **Codex diff-review gate: PASS — 0 Critical, 0 High.** 2 minor findings, both non-issues for current arch: (M) `year is not None` is structurally tax-only → complete detector; (L) job-level gating fine (tax job = only tax rows; overlap uses separate export path). Codex confirmed freshness ordering safe.
+
+### Review
+- Presentation-only; structured fields (`delinquent_bill_year`, `months_delinquent`) already existed/shown/exported, so risk is low. No DB/scraper/schema change. **Pending: commit + PR both repos (user's deploy call).**
+
 ## Verification gates
 - [ ] `ruff check` + `pytest tests/test_king_tax_delinquent.py tests/test_tax_fields_extract.py tests/test_tax_filters.py`
 - [ ] Live King scrape sanity (railway run worker): parcel count ~thousands not ~178; amounts realistic.

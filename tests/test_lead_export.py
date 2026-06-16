@@ -205,6 +205,31 @@ class TestDerivedSignalColumns:
         assert row["contactability_score"] == "0"  # always present, never blank
 
 
+class TestTaxRowDateBlanked:
+    """Tax-delinquent rows have NO real per-record event date — the scraper stores a
+    SYNTHETIC date_recorded ("01/01/{bill_year}"). It must NOT ship into the CSV as a
+    real event date (dialers/CRMs sort, dedupe, and trigger campaigns off it). The
+    honest temporal signal is the separate delinquent_bill_year + months_delinquent
+    columns; non-tax rows keep their real date_recorded untouched."""
+
+    def test_tax_row_date_recorded_blanked_but_signals_intact(self):
+        from datetime import date
+        rec = {
+            "delinquent_bill_year": 2024,
+            "date_recorded": "01/01/2024",  # synthetic, no real event happened
+            "parcel_id": "1234567890",
+        }
+        row = build_lead_export_row(rec, today=date(2026, 6, 15))
+        assert row["date_recorded"] == ""  # fabricated date stripped from export
+        assert row["delinquent_bill_year"] == "2024"  # honest year kept
+        assert row["months_delinquent"] != ""  # derived from bill_year, unaffected
+
+    def test_non_tax_row_date_recorded_preserved(self):
+        # No delinquent_bill_year => a real filing date flows through unchanged.
+        row = build_lead_export_row({"date_recorded": "03/15/2026", "doc_type": "probate"})
+        assert row["date_recorded"] == "03/15/2026"
+
+
 class TestOwnerFlagColumns:
     """Tier 0 (057): absentee / out_of_state / owner_state tri-state CSV columns."""
 

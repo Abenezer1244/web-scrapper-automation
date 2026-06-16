@@ -40,6 +40,8 @@ ignore = [
 "src/workers/tasks_helpers/dedup.py" = ["S608"]   # membership/property_key SQL builders moved here from tasks.py
 "src/workers/tasks_helpers/enrich.py" = ["S608"]  # duplicate-reuse SQL builder moved here from tasks.py
 "src/api/routes/scrapers.py" = ["S608"]
+"src/api/routes/segments.py" = ["S608"]   # segment SQL interpolates only generated tax_cap_sql/{county_clause} placeholders; values bound via params
+"src/workers/batch_export.py" = ["S608"]  # combined-export SQL interpolates only the tax_cap_sql placeholder; values bound via params
 
 [tool.ruff.lint.isort]
 known-first-party = ["src"]

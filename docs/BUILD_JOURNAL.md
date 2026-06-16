@@ -19,6 +19,29 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-16 — Hard 18-month cap on tax-delinquent leads (all counties)
+
+**How it started:** admin saw a Snohomish tax-delinquent scrape showing data "not max 18 months but more." Pulled the live job (read-only): 4,269 rows, `delinquent_bill_year` (oldest unpaid year per parcel) ranging **1996→2025**; only the 2025 bucket (~17mo, 2,253 rows) is within 18 months. The >18mo data is BY DESIGN — the King #52 / Snohomish bulk scrapers intentionally aggregate ALL unpaid prior years per parcel and set `bill_year`=oldest (most-delinquent signal); they ignore the `_resolve_date_range` window entirely. The misleading part the user reacted to was the **"Oldest Tax Year" column** surfacing 1996/2010/etc.
+
+**Decided (with user, 2-reviewer dissent on record):** user wants a HARD 18-month cap. Locked: (1) **drop if OLDEST year >18mo** (only fully-within-window parcels survive); (2) **hide existing rows, don't delete** (reversible); (3) future scrapes don't store >18mo. Both Claude AND Codex flagged rule #1 drops parcels delinquent RIGHT NOW that also carry old debt (e.g. unpaid 2015+2025 → dropped) and the aggregate amount can't be cleanly retrimmed on existing rows — **user confirmed the trade (recency over volume)** after seeing both objections.
+
+**Built / Shipped (uncommitted, branch `test/ui-tax-date-column`; 8 source + 5 test files):**
+- `src/api/tax_filters.py`: single source of truth — `DEFAULT_TAX_CAP_MONTHS=18`, `tax_cap_min_year(today)` (reuses `bill_year_bounds_for_months`), `tax_cap_condition(today)` ORM clause, `tax_cap_sql(alias)`+`TAX_CAP_BIND` raw-SQL twin. **Self-scoping:** `(delinquent_bill_year IS NULL OR >= min_year)` — non-tax rows (NULL) pass untouched, so no `record_type` plumbing needed and it's safe on any Result query.
+- **Read layer (hide existing, all counties):** jobs.py results list+count+CSV; segments.py ×4 raw-SQL (intersection/union/dated/excluded-no-date) + binds; batch_export `_COMBINED_SQL`; dialer_outbox + scheduler_helpers/dialer push sweep (so >18mo tax leads aren't delivered either).
+- **Ingestion (future-clean):** snohomish + king parse drop a parcel when oldest year < cutoff (opt-in `cap_min_year` param, `None`=no cap so parsers stay pure; `capped_out` in stats + completion log).
+
+**Tried / Decided:** orchestrated 4 parallel subagents over disjoint files after writing the shared helper myself; brainstorm + design pressure-tested with Codex (consult) BEFORE coding, per the codex-collaboration rule.
+
+**Caught & fixed (Codex diff review, gpt-5.5 — GATE PASS, 0 P1):** 2 P2 year-boundary `today`-drift bugs, both fixed — segments `_count_excluded_no_date` now takes the caller's frozen `today` (was recomputing); snohomish scrape freezes one `_now` for cap-year + fallback-year (were two `now()` calls).
+
+**Failed / Blocked:** Codex CLI hung twice on Windows until I added `< /dev/null` (it was waiting on stdin) — the `2>&1 | grep` pipe also swallowed output; raw redirect to a file is the reliable pattern here.
+
+**Verified:** ruff clean (8 files); all modules import; 21 King+Snohomish parser tests pass; segments no-DB guard tests pass (live-DB tests need CI — no local test DB). **Prod read-only proof:** Snohomish 4,269→2,253 visible (2,016 hidden), King 165→165, chelan/clark/skagit unaffected.
+
+**Facts learned:** only `king_wa_tax_delinquent.py` + `snohomish_wa_tax_delinquent.py` populate `delinquent_bill_year` — every other county's tax records are recorder-style (NULL bill_year, date-windowed at scrape → already ≤18mo), so the one self-scoping predicate makes the cap genuinely all-counties + auto-covers any future bulk-tax county. `min_year` today = 2025 (a Jan-2025 bill reads ~17.5mo, flips out as the year turns — year-granularity is inherent since the source has only a bill YEAR).
+
+**Pending / Handoff:** NOT committed/deployed — awaiting user go-ahead. FOLLOW-UPS (not blocking): frontend should drop `min_months` filter options >18 for tax jobs (now always-empty under the cap); cached-records page `/scrapers/{id}/records` reads CountyRecord (bill_year only in `enrichment_data` JSON, no column) — NOT capped, defer unless asked.
+
 ## 2026-06-16 — Stuck "running" scrape jobs: enqueue-before-commit race fixed (backend) + UI honesty (frontend)
 
 **How it started:** "scrape stuck running forever" on the admin account. Prior session ran the LLM council + Codex consult and code-confirmed the root cause; this session executed the fix one phase at a time (handoff: `tasks/stuck-job-fix-handoff.md`).

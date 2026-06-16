@@ -14,7 +14,28 @@ a `>=`/`<=` comparison, so they are correctly excluded whenever a filter is set.
 from datetime import date
 from decimal import Decimal
 
+from sqlalchemy import or_
+
 from src.db.models import Result
+
+# Hard product cap: a tax-delinquent parcel is visible (and stored by future
+# scrapes) ONLY if its OLDEST unpaid bill year is within this many months of
+# today. Parcels whose delinquency reaches further back are hidden everywhere
+# and dropped at ingestion. User decision 2026-06-16: "drop if oldest year >18mo"
+# — Claude and Codex both flagged that this also drops parcels which are
+# delinquent right now but carry old debt too; user confirmed the trade with
+# full dissent on record (recency over volume).
+#
+# Year granularity: `delinquent_bill_year` is a YEAR (bills modeled ~Jan 1), so
+# the cutoff is calendar-year-approximated — a Jan-2025 bill reads as ~17.5mo in
+# mid-2026, just inside an 18-month window, and flips out as the year turns. The
+# caller MUST freeze `today` for the whole request/job (use UTC, matching
+# build_tax_conditions) so the cap and the optional months filter never drift.
+DEFAULT_TAX_CAP_MONTHS = 18
+
+# Bind-parameter name for the raw-SQL twin (tax_cap_sql). Callers bind this to
+# tax_cap_min_year(today) on their hand-written queries.
+TAX_CAP_BIND = "tax_cap_min_year"
 
 
 def bill_year_bounds_for_months(
@@ -41,6 +62,43 @@ def bill_year_bounds_for_months(
         num = base - max_months
         min_year = -((-num) // 12)
     return (max_year, min_year)
+
+
+def tax_cap_min_year(today: date) -> int:
+    """Oldest `delinquent_bill_year` still visible under the 18-month cap.
+
+    Reuses bill_year_bounds_for_months (the same math the optional months filter
+    uses) so the hard cap and the user filter can never drift. `max_months` is
+    always passed, so the returned min_year is never None.
+    """
+    _, min_year = bill_year_bounds_for_months(None, DEFAULT_TAX_CAP_MONTHS, today)
+    assert min_year is not None  # max_months is always supplied above
+    return min_year
+
+
+def tax_cap_condition(today: date):
+    """ORM predicate enforcing the 18-month cap on a Result query.
+
+    SELF-SCOPING: rows with NULL `delinquent_bill_year` (every non-tax row) pass
+    untouched, so this is safe to AND onto ANY Result query without first
+    checking record_type. Tax rows survive only when their oldest unpaid year is
+    within the window.
+    """
+    min_year = tax_cap_min_year(today)
+    return or_(
+        Result.delinquent_bill_year.is_(None),
+        Result.delinquent_bill_year >= min_year,
+    )
+
+
+def tax_cap_sql(alias: str) -> str:
+    """Raw-SQL twin of tax_cap_condition for the hand-written segments/batch
+    queries. The caller MUST bind ``:tax_cap_min_year`` (= tax_cap_min_year(today)).
+
+    Same self-scoping via IS NULL as the ORM clause, so non-tax rows pass.
+    """
+    col = f"{alias}.delinquent_bill_year"
+    return f"({col} IS NULL OR {col} >= :{TAX_CAP_BIND})"
 
 
 def build_tax_conditions(

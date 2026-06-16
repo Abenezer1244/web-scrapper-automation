@@ -41,6 +41,7 @@ from src.api.schemas import (
     SegmentUnionRequest,
     SegmentUnionResponse,
 )
+from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
 from src.utils.crypto import decrypt_field
 from src.utils.lead_export import write_lead_csv_with_overlap
 from src.utils.logger import setup_logger
@@ -136,7 +137,7 @@ EXPORT_CAP = 50_000
 # that the intersection STILL holds within the county-filtered candidate scope,
 # so a county filter can't return a property that is only on one list there
 # (Codex P2). :n is the count of distinct selected record types.
-_INTERSECTION_SQL = """
+_INTERSECTION_SQL = f"""
 WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
            r.mailing_address, r.phone, r.phone_type, r.email,
@@ -148,6 +149,8 @@ WITH candidates AS (
     WHERE r.user_id = :uid
       AND r.property_key IS NOT NULL
       AND sc.record_type = ANY(:types)
+      -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass).
+      AND {tax_cap_sql('r')}
       AND r.property_key IN (
           SELECT property_key
           FROM property_list_membership
@@ -155,7 +158,7 @@ WITH candidates AS (
           GROUP BY property_key
           HAVING count(DISTINCT record_type) = :n
       )
-      {county_clause}
+      {{county_clause}}
 ),
 agg AS (
     SELECT property_key,
@@ -206,7 +209,7 @@ LIMIT :limit
 # are always correct. Weak dedup is name|date (not property identity), so weak
 # buckets can merge same-name/date leads across types — intended, do not
 # overclaim overlap_count for weak rows.
-_UNION_SQL = """
+_UNION_SQL = f"""
 WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
            r.mailing_address, r.phone, r.phone_type, r.email,
@@ -219,6 +222,8 @@ WITH candidates AS (
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
     WHERE r.user_id = :uid
       AND sc.record_type = ANY(:types)
+      -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass).
+      AND {tax_cap_sql('r')}
       -- Optional filing-date window (migration 049 date_recorded_parsed). When no
       -- window is requested :require_date is FALSE and from/to are NULL, so all
       -- three predicates pass and behavior is identical to the all-time query.
@@ -227,7 +232,7 @@ WITH candidates AS (
       AND (CAST(:filing_from AS date) IS NULL OR r.date_recorded_parsed >= CAST(:filing_from AS date))
       AND (CAST(:filing_to AS date) IS NULL OR r.date_recorded_parsed <= CAST(:filing_to AS date))
       AND (CAST(:require_date AS boolean) = FALSE OR r.date_recorded_parsed IS NOT NULL)
-      {county_clause}
+      {{county_clause}}
 ),
 agg AS (
     SELECT bucket,
@@ -272,7 +277,7 @@ LIMIT :limit
 # window is requested we compute overlap from `results` directly: candidates are
 # date-filtered first, then a property qualifies only if it appears on all :n
 # selected record types WITHIN that window. Strong-identity only (property_key).
-_INTERSECTION_DATED_SQL = """
+_INTERSECTION_DATED_SQL = f"""
 WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
            r.mailing_address, r.phone, r.phone_type, r.email,
@@ -285,9 +290,11 @@ WITH candidates AS (
       AND r.property_key IS NOT NULL
       AND r.date_recorded_parsed IS NOT NULL
       AND sc.record_type = ANY(:types)
+      -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass).
+      AND {tax_cap_sql('r')}
       AND (CAST(:filing_from AS date) IS NULL OR r.date_recorded_parsed >= CAST(:filing_from AS date))
       AND (CAST(:filing_to AS date) IS NULL OR r.date_recorded_parsed <= CAST(:filing_to AS date))
-      {county_clause}
+      {{county_clause}}
 ),
 agg AS (
     SELECT property_key,
@@ -339,7 +346,7 @@ def _resolve_filing_window(
     return None, None, False
 
 
-_EXCLUDED_NO_DATE_SQL = """
+_EXCLUDED_NO_DATE_SQL = f"""
 SELECT count(*)
 FROM results r
 JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid
@@ -347,8 +354,11 @@ JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
 WHERE r.user_id = :uid
   AND sc.record_type = ANY(:types)
   AND r.date_recorded_parsed IS NULL
-  {pk_clause}
-  {county_clause}
+  -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass), so
+  -- this "skipped (no filing date)" count matches the capped candidate scope.
+  AND {tax_cap_sql('r')}
+  {{pk_clause}}
+  {{county_clause}}
 """
 
 
@@ -358,6 +368,7 @@ async def _count_excluded_no_date(
     record_types: list[str],
     counties: list[str] | None,
     require_property_key: bool,
+    today: date,
 ) -> int:
     """Count in-scope leads skipped because their filing date is NULL/unparseable.
 
@@ -370,7 +381,14 @@ async def _count_excluded_no_date(
     # Only fixed clause fragments are interpolated (no user data — values are bound
     # params), matching the .format pattern used for the other queries in this file.
     sql = text(_EXCLUDED_NO_DATE_SQL.format(pk_clause=pk_clause, county_clause=county_clause))
-    params: dict = {"uid": user_id, "types": record_types}
+    params: dict = {
+        "uid": user_id,
+        "types": record_types,
+        # Hard 18-month tax-delinquent cap — bound for the tax_cap_sql fragment.
+        # `today` is the SAME frozen value the caller used for the capped candidate
+        # query, so this heads-up count can't drift from it at a UTC year boundary.
+        TAX_CAP_BIND: tax_cap_min_year(today),
+    }
     if counties:
         params["counties"] = counties
     return int((await db.execute(sql, params)).scalar_one())
@@ -434,6 +452,9 @@ async def _fetch_intersection(
     """
     ff, ft, require_date = _resolve_filing_window(lookback_days, filing_from, filing_to)
     county_clause = ""
+    # Freeze today (UTC) for the whole request so the hard tax cap and any optional
+    # months filter never drift mid-query (tax_filters contract).
+    today = datetime.now(UTC).date()
     params: dict = {
         "uid": user_id,
         "types": record_types,
@@ -441,6 +462,8 @@ async def _fetch_intersection(
         # (the schema already dedupes; this is defense-in-depth — Codex P2).
         "n": len(set(record_types)),
         "limit": limit,
+        # Hard 18-month tax-delinquent cap — bound for the tax_cap_sql fragment.
+        TAX_CAP_BIND: tax_cap_min_year(today),
     }
     if counties:
         county_clause = "AND sc.county = ANY(:counties)"
@@ -453,7 +476,7 @@ async def _fetch_intersection(
         result = await db.execute(sql, params)
         rows = _decrypt_pii_rows(result.fetchall())
         excluded = await _count_excluded_no_date(
-            db, user_id, record_types, counties, require_property_key=True
+            db, user_id, record_types, counties, require_property_key=True, today=today
         )
         return rows, excluded
 
@@ -554,6 +577,8 @@ async def _fetch_union(
     same `_UNION_SQL` (predicates no-op when no window). `db` is RLS-bound.
     """
     ff, ft, require_date = _resolve_filing_window(lookback_days, filing_from, filing_to)
+    # Freeze today (UTC) for the whole request so the hard tax cap never drifts.
+    today = datetime.now(UTC).date()
     params: dict = {
         "uid": user_id,
         "types": record_types,
@@ -561,6 +586,8 @@ async def _fetch_union(
         "filing_from": ff,
         "filing_to": ft,
         "require_date": require_date,
+        # Hard 18-month tax-delinquent cap — bound for the tax_cap_sql fragment.
+        TAX_CAP_BIND: tax_cap_min_year(today),
     }
     county_clause = ""
     if counties:
@@ -572,7 +599,7 @@ async def _fetch_union(
     rows = _decrypt_pii_rows(result.fetchall())
     excluded = (
         await _count_excluded_no_date(
-            db, user_id, record_types, counties, require_property_key=False
+            db, user_id, record_types, counties, require_property_key=False, today=today
         )
         if require_date
         else 0

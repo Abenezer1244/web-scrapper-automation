@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 from sqlalchemy import text, update
 
+from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
 from src.db.models import BatchRun, Job, ScraperBatch
 from src.utils.crypto import decrypt_field
 from src.utils.data_exporter import DataExporter
@@ -60,7 +61,7 @@ def _filing_sort_key(date_recorded: str | None) -> int:
 # id), overlap_count = distinct record types within the batch, source_counties
 # aggregated. Tenant-scoped (every join carries :uid). Same dedup/ranking as the
 # /segments union, scoped to job_ids instead of record_type-over-history.
-_COMBINED_SQL = """
+_COMBINED_SQL = f"""
 WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
            r.mailing_address, r.phone, r.phone_type, r.email,
@@ -72,6 +73,8 @@ WITH candidates AS (
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = CAST(:uid AS uuid)
     WHERE r.user_id = CAST(:uid AS uuid)
       AND r.job_id = ANY(CAST(:job_ids AS uuid[]))
+      -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass).
+      AND {tax_cap_sql('r')}
 ),
 agg AS (
     SELECT bucket,
@@ -124,7 +127,15 @@ def _combined_pairs(db, user_id: str, job_ids: list[str]) -> list[tuple]:
     if not job_ids:
         return []
     result = db.execute(
-        text(_COMBINED_SQL), {"uid": user_id, "job_ids": job_ids, "limit": EXPORT_CAP}
+        text(_COMBINED_SQL),
+        {
+            "uid": user_id,
+            "job_ids": job_ids,
+            "limit": EXPORT_CAP,
+            # Hard 18-month tax-delinquent cap — bound for the tax_cap_sql fragment.
+            # today frozen UTC, matching the api/tax_filters contract.
+            TAX_CAP_BIND: tax_cap_min_year(datetime.now(UTC).date()),
+        },
     )
     rows = []
     for r in result.fetchall():

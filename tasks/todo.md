@@ -1,98 +1,86 @@
-# Task: Standardize tax-delinquent "amount owed" + fix King scraper bug
+# Task: Cap tax-delinquent leads at 18 months (Snohomish + King)
 
-## Context / why
-- User goal: make the "amount owed" number consistent across all tax-delinquent counties, the "Snohomish way" (the fuller balance), and have it be what a wholesaler actually wants (true distress signal).
-- INVESTIGATION (this session, verified live against county data):
-  - **King's `dsv3-ct3e` scraper is structurally broken.** It filters `receivable_type='D'` believing D = "Delinquent", but the whole dataset is already delinquent and `D` = **D**rainage district assessment (one minor charge type). Result: catches **178 of 28,609** delinquent parcels (~0.6%) and reports a tiny drainage line (~$91) instead of the real balance ($15k+).
-  - King's authoritative code dictionary (dataset `dyps-vajd`): all `receivable_type` codes are PRINCIPAL charges (R=Real Property Levy, U/X=Surface Water, V=Conservation, N=Noxious Weed, D=Drainage, E=Fire, F=Forest Patrol, I=Irrigation, A=Abatement). **No penalty/interest code exists** — King computes those at payment time only.
-  - Snohomish col 16 "amount owed" is (strong evidence, official PDF unread) **also principal-only**.
-  - => "Full payoff incl penalty/interest" is NOT available from either county's bulk data. Achievable consistent standard = **total delinquent principal (tax + assessments) summed per parcel across delinquent years** — which Snohomish already does and King does not.
-- Decisions locked with user: (1) fix bug + standardize together; (2) target the fullest number the data supports, labeled honestly.
-- OPEN (pending LLM Council verdict): include ALL charge types (A) vs only R real-property levy (B); how to handle A=Abatement; column label.
+## Context
+Admin Snohomish tax-delinquent job (`b33009fc`, 4,269 rows) surfaces parcels whose
+**oldest unpaid year** (`delinquent_bill_year`, shown as "Oldest Tax Year") goes back
+to 1996. By design the tax scrapers aggregate ALL unpaid prior years per parcel and
+set `bill_year` = oldest year. User wants a hard **18-month** cap based on the current
+year.
 
-## Plan (phased — max 5 files/phase, verify between phases)
+## Decisions (locked with user)
+1. **Cap rule:** drop a parcel if its *oldest* unpaid year is >18 months old
+   (only parcels fully within 18 months survive). Today that = `delinquent_bill_year >= 2025`
+   → keeps ~2,253 of 4,269 rows.
+2. **Existing data:** HIDE from UI/exports, do NOT delete (reversible; matches prior
+   "old rows are point-in-time snapshots, fix-forward" decision).
+3. **Future scrapes:** don't include >18-month parcels.
 
-### Phase 0 — decisions (IN PROGRESS)
-- [x] Confirm King data structure + bug magnitude (live API)
-- [x] Confirm King receivable_type code meanings (research agent)
-- [x] Confirm Snohomish col 16 semantics (research agent)
-- [ ] LLM Council verdict on A-vs-B + abatement + label (running)
-- [ ] Codex pressure-test of the chosen design (before code)
+## Single source of truth
+`DEFAULT_TAX_MAX_MONTHS = 18`. Predicate already exists:
+`bill_year_bounds_for_months(None, 18, today)[1]` → `min_year` → keep iff
+`delinquent_bill_year >= min_year`. (tax_filters.py — pure, tested.)
 
-### Phase 1 — King scraper rewrite (1 file) — DONE
-- [x] `src/scrapers/king_wa_tax_delinquent.py`: dropped `receivable_type='D'` filter; pure `aggregate_delinquent_rows()` sums (billed-paid) across included charge types + all delinquent years per parcel; `bill_year`=min; conservative current-year exclusion (matches Snoho); A=Abatement excluded+alert; unknown codes fail-closed+alert; 12-digit real-property gate; floor at parcel total; per-type/per-year breakdown stored; canary on zero-parcels.
-- [x] Full-pagination-before-emit generator (fixes old dedup-first-row hazard).
+## Plan (phased, <=5 files/phase)
 
-### Phase 2 — tests (1 file) — DONE
-- [x] `tests/test_king_tax_delinquent.py` (7 tests): per-parcel sum across types+years, same-parcel-multi-account grouping, bill_year=min, abatement+unknown exclusion+alerts, malformed quarantine, current-year/out-of-range exclusion, net-zero drop, Decimal precision. **ruff clean, 39/39 pass.**
+### Phase 1 — Hide existing >18mo rows on the primary surface (per-job results + CSV)
+- [ ] tax_filters.py: add `DEFAULT_TAX_MAX_MONTHS = 18` + helper `default_tax_cap_condition(today)`.
+- [ ] jobs.py: in the 3 tax endpoints (list `:310`, count `:669`, download `:874`),
+      when job `record_type == "tax_delinquent"`, AND the default cap onto the query.
+- [ ] tests: cap keeps bill_year>=min_year, drops older; non-tax jobs unaffected.
+- VERIFY: pytest + re-run diag_snoho_tax_filter.py (read-only) → 4,269 visible-capped to ~2,253.
 
-### Phase 2.5 — LIVE validation (council's #1 priority) — DONE
-- [x] Old D-only vs new (years<=2024): **41 -> 3,892 parcels (~95x).**
-- [x] Real parcel 7534800005: NEW=$2,982,616.57 (2024+2025, 2026 excluded) vs OLD=$0.00 (no D line -> was invisible). Math + current-year rule + bill_year=min all verified on live data.
+### Phase 2 — Future scrapes don't store >18mo parcels (at source)
+- [ ] snohomish_wa_tax_delinquent.py `parse_tax_list`: skip parcel when oldest year < cutoff.
+- [ ] king_wa_tax_delinquent.py: same cap (CONFIRM — user named only Snohomish).
+- [ ] tests for both parse functions.
 
-### Phase 3 — labeling + doc — DONE
-- [x] Agents confirmed: CSV header is the literal key `delinquent_amount` (KEEP — dialer/test contract); display labels live in frontend.
-- [x] Frontend honest labels (bridgeleads-web): ResultsTable.tsx header "Amount Owed"→"Tax Balance Owed", "Tax Year"→"Oldest Tax Year"; ResultsToolbar.tsx help text now states "principal only — excludes penalties & interest". **frontend tsc clean.**
-- [x] Qualification doc §3: added RESOLVED STANDARD (sum all charges across years per parcel; King fixed; penalty/interest deferred).
+### Phase 3 — Secondary surfaces (only if needed)
+- [ ] Cached-records page reads CountyRecord (bill_year in enrichment_data JSON). Defer unless asked.
+- [ ] Segments / dashboard "today" — confirm if tax rows there need the cap.
 
-### Phase 3.5 — Codex implementation gate — DONE
-- [x] Codex final review: **P1 none.** Validated cent math, floor-at-parcel-total, generator consumption, current-year math, fixture math. 1 P2 (silent partial-pagination truncation) → FIXED: `_iter_api_rows` now RAISES on mid-pagination fetch error (no silent truncation). Re-verified ruff + 7/7 tests.
-- [x] Dedup/billing safety verified (agent): delinquent_amount NOT in dedup_hash/property_key/billing; re-scrape overwrites via COALESCE(new,old).
+## Codex reconciliation (gpt-5.5, consult 2026-06-16)
+- #2 cap rule: BOTH Claude+Codex flagged "drop if oldest>18mo" drops currently-delinquent
+  parcels w/ old debt. **User CONFIRMED keep this rule (full dissent on record).**
+- #1 min_months>18 → empty set: inherent (cap keeps <=17.5mo, min_months>=18 wants older →
+  disjoint). Backend stays HONEST (empty). FOLLOW-UP: frontend should drop min_months options
+  >18 for tax jobs. Not blocking.
+- #3 ADOPTED: scraper + read-layer = defense-in-depth, predicate from ONE helper.
+- #4 ADOPTED: chokepoint — `tax_cap_condition(today)` (ORM) + `tax_cap_sql(alias)` (raw SQL fragment).
+- #5 ADOPTED: freeze `today` per request, use UTC (matches existing build_tax_conditions),
+  document calendar-YEAR-granularity approximation (Jan-2025 bill ~17.5mo, flips fast).
 
-### Phase 4 — existing-data remediation — RESOLVED (backfill DROPPED)
-- [x] Sized it (read-only): 59,380 rows / 3,400 parcels / 14 jobs / **2 tenants**; cache=0.
-- [x] Built backfill script (Codex-gated, plan→guard→apply). **DRY-RUN guard ABORTED correctly:** only 62/3,400 old parcels still match today's delinquent set — old data is ~95% current-year (2026) point-in-time snapshots; overwrite would NULL 98%.
-- [x] DECISION (user): **drop the overwrite backfill** (wrong tool for point-in-time historical data) → **fix-forward**; re-run King for the 2 tenants for fresh correct lists. Scratch scripts removed.
+## Shared predicate (DONE, foundational — tax_filters.py)
+- `DEFAULT_TAX_CAP_MONTHS = 18`
+- `tax_cap_min_year(today)` → reuses bill_year_bounds_for_months(None,18,today)[1]
+- `tax_cap_condition(today)` → `or_(bill_year IS NULL, bill_year >= min_year)` — SELF-SCOPING
+- `tax_cap_sql(alias)` + bind `:tax_cap_min_year` — raw-SQL twin
 
-### Phase 5 — current-year inclusion (surfaced by Phase 4) — DONE (committed to PR #52)
-- [x] DECISION (user): King INCLUDES current-year (delinquent-only source; WA first-half-miss accelerates full year per RCW 84.56.020; ~99% of King is current-year). Snohomish still excludes (lists all parcels).
-- [x] Scraper effective_end cap current_year-1 → current_year; doc §2 updated. ruff + 7/7 tests pass. Pushed (commit 2d92836).
-- [x] CONFIRMED with user: target = "previous ~1–1.5 years" delinquency → served by scrape date range + `max_months` filter (bill_year=oldest). OPEN: set a default ~18-month window? (awaiting user)
+## Orchestration (agents, disjoint files)
+- Agent A: jobs.py results list/count/CSV download (+ tests)
+- Agent B: segments.py (4 raw SQL) + batch_export.py (_COMBINED_SQL) (+ tests)
+- Agent C: dialer_outbox.py + scheduler_helpers/dialer.py (+ tests)
+- Agent D: snohomish + king scrapers parse cap (+ tests)  [Phase 2 future-clean]
+- Then: central pytest/ruff + diag re-run (4269→~2253) + Codex diff review (NO-GO on Crit/High)
 
-### Phase 6 — default ~18-month window (user: "all counties tax deli") — DONE + MERGED
-- [x] Backend `_resolve_date_range`: record_type=tax_delinquent → 548-day default (all counties; only the default path; explicit modes win). Caller passes record_type. 5 tests. Codex: no P1.
-- [x] Frontend wizard: tax_delinquent defaults to 18-month custom range (UI matches backend). tsc clean.
-- [x] Verified King/Snoho connectors have max_date_range_days=None → 18mo NOT clamped (Chelan=30 but down).
-- [x] **MERGED: PR #52 (backend→main) + #24 (frontend→master), squash, branches deleted. Auto-deploying.**
-
-### Phase 7 — re-run for 2 tenants — DONE ✅
-- [x] Deploy confirmed live (re-run jobs resolved to 12/14/2024→06/15/2026 = 548d = 18mo default proves new code).
-- [x] Fired focused re-run (mint create_secure_token + POST prod /jobs) for 1 King config/tenant. Both jobs scraped **28,496 parcels** (vs old 178) — fix VALIDATED end-to-end in prod. Now in skip-trace enrichment → done.
-- [x] BUILD_JOURNAL + memory written. Scratch scripts removed.
-
-## ✅ COMPLETE — all phases done, merged, deployed, prod-validated.
-Residual (👤 owner, optional): re-run other King/tax scrapers from dashboard (now 18mo default). Uncommitted local docs: BUILD_JOURNAL.md + this todo (offer to commit).
-
-## Open follow-ups (user/ops)
-- 👤 Owner can re-run other specific King/tax scrapers from the dashboard (now defaults to 18mo) — focused script only does 2 representative configs.
-
----
-
-## Follow-on task: tax-delinquent "Date" column (synthetic date) — DONE (local, gated; uncommitted)
-
-### Context / why
-- User flagged the shared "Date" column showing "Jan 1, 2024" for tax leads as confusing. I'd claimed tax delinquency "has no real per-record date"; user challenged → ordered deep research + LLM council + Codex, "based on those we will decide."
-
-### What the research/council/Codex concluded
-- Claim was OVERSTATED, not wrong: dated tax-delinquency events exist + are bulk-published in lien/deed states, but **WA bulk feeds (King Socrata, Snohomish treasurer file) expose only a tax YEAR** — no real per-record calendar date for the 2 counties we scrape.
-- Council: show years-behind + structured int; caught the CSV-export blind spot. Codex: simplify to presentation-only em-dash + blank the CSV date + keep "Date" header + drop years-behind (0-yr edge for ~99%-current-year King). User delegated cell choice → em-dash.
-
-### Changes (presentation-only, 3 files)
-- [x] Frontend `ResultsTable.tsx`: Date cell branches on `hasTaxData` → tax rows show dimmed em-dash, non-tax unchanged; freshness badge kept. (Honest tax signal = existing "Oldest Tax Year" column.)
-- [x] Backend `lead_export.py`: `date_recorded` emitted as `""` when `delinquent_bill_year is not None`, else real value. `sig` derived from record before dict build → `months_delinquent`/freshness unaffected. Overlap CSV inherits blank (consistent).
-- [x] `tests/test_lead_export.py`: `TestTaxRowDateBlanked` (tax → blanked + year/months intact; non-tax → preserved).
-
-### Verification
-- [x] ruff clean; frontend tsc exit 0; `pytest tests/test_lead_export.py tests/test_lead_export_overlap.py` → 33 passed. (1 unrelated live-PG failure in test_batch_export.py — touches no changed code.)
-- [x] **Codex diff-review gate: PASS — 0 Critical, 0 High.** 2 minor findings, both non-issues for current arch: (M) `year is not None` is structurally tax-only → complete detector; (L) job-level gating fine (tax job = only tax rows; overlap uses separate export path). Codex confirmed freshness ordering safe.
-
-### Review
-- Presentation-only; structured fields (`delinquent_bill_year`, `months_delinquent`) already existed/shown/exported, so risk is low. No DB/scraper/schema change. **Pending: commit + PR both repos (user's deploy call).**
-
-## Verification gates
-- [ ] `ruff check` + `pytest tests/test_king_tax_delinquent.py tests/test_tax_fields_extract.py tests/test_tax_filters.py`
-- [ ] Live King scrape sanity (railway run worker): parcel count ~thousands not ~178; amounts realistic.
-- [ ] Codex review of the diff (gate). Any Critical/High = NO-GO.
-
-## Review
-_(to be filled at end)_
+## Review — DONE 2026-06-16
+**Shipped (uncommitted, branch test/ui-tax-date-column):** 8 source + 5 test files.
+- tax_filters.py: `DEFAULT_TAX_CAP_MONTHS=18`, `tax_cap_min_year`, `tax_cap_condition` (ORM,
+  self-scoping), `tax_cap_sql`+`TAX_CAP_BIND` (raw-SQL twin).
+- Read-layer cap (hide existing, ALL counties): jobs.py results list+count+CSV; segments.py
+  ×4 raw SQL (intersection/union/dated/excluded-no-date) + binds; batch_export _COMBINED_SQL;
+  dialer_outbox (+ skipped-status guard so capped leads aren't resurrected by replay);
+  scheduler_helpers/dialer push sweep (count+fetch).
+- Ingestion cap (future-clean): snohomish + king parse drop parcel when oldest year < cutoff
+  (opt-in `cap_min_year` param, None=no cap; capped_out in stats + completion log).
+**Verified:** ruff clean (8 files); all modules import; 21 parser tests pass; segments no-DB
+guard tests pass (live-DB tests need CI — no local test DB). **Prod read-only proof:**
+snohomish 4269→2253 visible (2016 hidden), king 165→165, chelan/clark/skagit unaffected.
+**Codex review (gpt-5.5): GATE PASS** — 0 P1, 2 P2 (year-boundary today-drift) BOTH FIXED
+(segments `_count_excluded_no_date` now takes frozen `today`; snohomish single `_now`).
+**Why "all counties" is satisfied:** only King+Snohomish populate delinquent_bill_year; the
+self-scoping predicate caps them everywhere + auto-covers any future bulk-tax county; other
+counties' tax records have NULL bill_year (date-windowed at scrape → already <=18mo) and pass.
+**FOLLOW-UP (not blocking):** frontend should drop min_months filter options >18 for tax jobs
+(now always-empty under the cap). Cached-records page (/scrapers/{id}/records) reads
+CountyRecord (no bill_year col; bill_year in enrichment_data JSON) — NOT capped; defer unless asked.
+**NOT committed/deployed** — awaiting user go-ahead.

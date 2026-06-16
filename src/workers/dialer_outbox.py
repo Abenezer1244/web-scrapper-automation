@@ -69,9 +69,12 @@ def process_dialer_outbox(job_id: str) -> None:
     """
     from sqlalchemy import select
 
+    from src.api.tax_filters import tax_cap_condition
     from src.db.models import DialerDelivery, Job, Result, ScraperConfig
     from src.db.session import system_sync_session
     from src.workers.dialer_connectors import get_connector
+
+    today = datetime.now(UTC).date()
 
     with system_sync_session() as db:
         job = db.get(Job, job_id)
@@ -124,14 +127,38 @@ def process_dialer_outbox(job_id: str) -> None:
 
         for row in pending:
             row.attempts += 1
+            # tax_cap_condition is self-scoping: non-tax rows (NULL
+            # delinquent_bill_year) pass untouched, so this only ever HIDES a
+            # tax-delinquent lead whose oldest unpaid year is past the 18-month
+            # cap — it never changes which non-tax lead is selected.
             result = db.execute(
                 select(Result).where(
-                    Result.id == row.result_id, Result.user_id == job.user_id
+                    Result.id == row.result_id,
+                    Result.user_id == job.user_id,
+                    tax_cap_condition(today),
                 )
             ).scalar_one_or_none()
             if result is None:
-                row.status = "failed"
-                row.last_error = "result row missing"
+                # Two reasons the row can be missing now: the result was deleted,
+                # OR it's an out-of-window tax lead the cap intentionally hides.
+                # Either way it's terminal (not a transient error): drop it as
+                # 'skipped' so a replay never re-evaluates it. Re-check existence
+                # without the cap only to log the accurate reason.
+                exists = db.execute(
+                    select(Result.id).where(
+                        Result.id == row.result_id, Result.user_id == job.user_id
+                    )
+                ).first()
+                if exists is not None:
+                    row.status = "skipped"
+                    row.last_error = "tax lead past 18-month cap"
+                    _logger.info(
+                        "dialer_outbox row %s: tax lead past 18-month cap — skipped",
+                        str(row.id)[:8],
+                    )
+                else:
+                    row.status = "failed"
+                    row.last_error = "result row missing"
                 db.commit()
                 continue
 

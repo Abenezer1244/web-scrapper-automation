@@ -143,3 +143,47 @@ def test_empty_input_is_clean():
     assert records == []
     assert stats["total_rows"] == 0
     assert stats["unknown_codes"] == set()
+
+
+# ─── 18-month product cap (drop parcels whose OLDEST unpaid year is too old) ───
+
+# Parcel OLD (oldest year 2010) vs Parcel NEW (oldest year 2025). The cap drops
+# a parcel by its OLDEST delinquent year, so OLD must go even though it also
+# carries a 2025 line (recency-over-volume trade, user decision 2026-06-16).
+_CAP_ROWS = [
+    _row("011111111100", 2010, "R", 100000, 0),   # Parcel OLD: oldest = 2010
+    _row("011111111100", 2025, "R", 200000, 0),   # ...also delinquent 2025
+    _row("022222222200", 2025, "R", 300000, 0),   # Parcel NEW: oldest = 2025
+]
+
+
+def test_cap_drops_parcel_with_old_oldest_year():
+    records, stats = aggregate_delinquent_rows(
+        _CAP_ROWS, start_year=2000, effective_end_year=2025, cap_min_year=2025
+    )
+    by = _by_parcel(records)
+    assert set(by) == {"0222222222"}          # NEW kept
+    assert "0111111111" not in by             # OLD dropped (oldest 2010 < 2025)
+    assert stats["capped_out"] == 1
+    assert by["0222222222"].enrichment_data["bill_year"] == 2025
+
+
+def test_cap_keeps_parcel_at_boundary_year():
+    # A parcel whose oldest year EQUALS cap_min_year is kept (>= cutoff).
+    rows = [_row("033333333300", 2025, "R", 100000, 0)]
+    records, stats = aggregate_delinquent_rows(
+        rows, start_year=2000, effective_end_year=2025, cap_min_year=2025
+    )
+    assert _by_parcel(records)["0333333333"].enrichment_data["bill_year"] == 2025
+    assert stats["capped_out"] == 0
+
+
+def test_cap_none_disables_cap_back_compat():
+    # cap_min_year=None (default) must leave every parcel — back-compat.
+    records, stats = aggregate_delinquent_rows(
+        _CAP_ROWS, start_year=2000, effective_end_year=2025
+    )
+    by = _by_parcel(records)
+    assert set(by) == {"0111111111", "0222222222"}
+    assert stats["capped_out"] == 0
+    assert by["0111111111"].enrichment_data["bill_year"] == 2010

@@ -18,7 +18,7 @@ from src.api.dialer_filters import dialer_ready_conditions
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.owner_filters import build_owner_conditions
 from src.api.schemas import JobCreate, JobResponse, LogLine, ResultRow, ResultsPage
-from src.api.tax_filters import build_tax_conditions
+from src.api.tax_filters import build_tax_conditions, tax_cap_condition
 from src.config import settings
 from src.config.constants import CANCELLABLE_STATUSES, PRIORITY_QUEUE_PLANS
 from src.db import CountyConnector, Job, JobLog, Result, ScraperConfig, User
@@ -307,11 +307,20 @@ async def get_results(
     # scrape stats below (enriched/parcel/dedup counts) intentionally stay
     # unfiltered (they describe the scrape, not the current filter view).
     from datetime import UTC, datetime
+    today = datetime.now(UTC).date()
     tax_conditions = build_tax_conditions(
-        min_amount, max_amount, min_months, max_months, datetime.now(UTC).date()
+        min_amount, max_amount, min_months, max_months, today
     )
     for cond in tax_conditions:
         base_query = base_query.where(cond)
+
+    # Hard product cap: tax-delinquent rows whose OLDEST unpaid year is more than
+    # 18 months old are NEVER shown/counted, regardless of the optional amount/
+    # months filters above. Self-scoping (NULL bill_year rows pass), so it's safe
+    # on every record type. NOT part of `tax_conditions` because that variable
+    # gates the empty-scrape "previous job" hint below — the cap is a standing
+    # rule, not a user-set view filter, so it must not change that branch.
+    base_query = base_query.where(tax_cap_condition(today))
 
     # Tier 0 (057): owner-location filters (absentee / out-of-state). Same view
     # semantics as the tax filters — narrows total + items, leaves scrape stats.
@@ -866,16 +875,23 @@ async def download_export(
         # RLS context already set above (before the Job ownership read).
         # Generate CSV directly from database results
         from datetime import UTC, datetime
+        today = datetime.now(UTC).date()
         dl_query = select(Result).where(Result.job_id == job_id, Result.user_id == user.id)
         # Phase 4: apply the SAME tax view-filters as get_results so the export
         # matches the filtered view. Track whether a filter is active so an
         # empty filtered set returns a header-only CSV (a valid "no matches")
         # rather than the 404 used for a genuinely empty job.
         tax_conditions = build_tax_conditions(
-            min_amount, max_amount, min_months, max_months, datetime.now(UTC).date()
+            min_amount, max_amount, min_months, max_months, today
         )
         for cond in tax_conditions:
             dl_query = dl_query.where(cond)
+        # Hard product cap: never EXPORT tax rows whose oldest unpaid year is >18
+        # months old, regardless of user filters. Matches get_results. Kept OUT
+        # of `any_filter_active` below: the cap is a standing rule, not a user
+        # view-filter, so it must not flip a genuinely empty/unmatched job from a
+        # 404 into a header-only CSV — that decision stays driven by USER filters.
+        dl_query = dl_query.where(tax_cap_condition(today))
         # Phase 5: dialer-ready filter (not known-DNC; matches get_results +
         # the push — strict IS-FALSE would hide skip-traced phones whose DNC is
         # NULL; the dialer scrubs DNC).

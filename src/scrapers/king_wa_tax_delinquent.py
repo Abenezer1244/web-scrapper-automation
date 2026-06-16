@@ -30,10 +30,11 @@ HTTP GET. Owner name + address are enriched downstream via GIS + eRealProperty.
 """
 
 from collections import defaultdict
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from src.api.middleware.security import add_scrape_domain
+from src.api.tax_filters import tax_cap_min_year
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
@@ -96,7 +97,7 @@ def _parse_cents(raw) -> int | None:
 
 
 def aggregate_delinquent_rows(
-    rows, *, start_year: int, effective_end_year: int
+    rows, *, start_year: int, effective_end_year: int, cap_min_year: int | None = None
 ) -> tuple[list[ScrapedRecord], dict]:
     """Aggregate raw Socrata rows into one ScrapedRecord per delinquent parcel.
 
@@ -104,6 +105,11 @@ def aggregate_delinquent_rows(
     (a live paginating generator in prod, a plain list in tests). Accumulates
     fully before emitting: a parcel's charge lines span API pages, so NOTHING is
     emitted mid-stream.
+
+    ``cap_min_year`` enforces the 18-month product cap: a parcel is DROPPED when
+    its oldest delinquent year (``bill_year``) is older than this year. ``None``
+    (the default) disables the cap, keeping the function pure for callers/tests
+    that don't want it; the scraper passes ``tax_cap_min_year(today)``.
 
     Returns ``(records, stats)``. ``delinquent_amount`` for a parcel =
     SUM(billed - paid) over included charge types and delinquent years, floored
@@ -119,6 +125,7 @@ def aggregate_delinquent_rows(
         "unknown_type_rows": 0,
         "unknown_codes": set(),
         "overflow": 0,
+        "capped_out": 0,
     }
 
     for item in rows:
@@ -188,6 +195,11 @@ def aggregate_delinquent_rows(
 
         years_sorted = sorted(entry["years"])
         bill_year = years_sorted[0]  # oldest delinquent year (matches Snoho)
+        # 18-month product cap: drop the whole parcel if its OLDEST unpaid year is
+        # further back than the cap allows (opt-in via cap_min_year; None = no cap).
+        if cap_min_year is not None and bill_year < cap_min_year:
+            stats["capped_out"] += 1
+            continue
 
         rec = ScrapedRecord()
         rec.parcel_id = parcel
@@ -304,18 +316,24 @@ class KingWATaxDelinquentScraper(BridgeScraper):
             start_year, effective_end,
         )
 
+        # Freeze "today" once (UTC, matching tax_filters.build_tax_conditions) so
+        # the 18-month cap can't drift mid-scrape.
+        cap_min_year = tax_cap_min_year(datetime.now(UTC).date())
+
         records, stats = aggregate_delinquent_rows(
             self._iter_api_rows(where),
             start_year=start_year,
             effective_end_year=effective_end,
+            cap_min_year=cap_min_year,
         )
 
         _logger.info(
             "King WA tax delinquent complete — %d rows scanned, %d parcels emitted "
             "(%d malformed-acct skipped, %d abatement rows, %d unknown-type rows, "
-            "%d overflow)",
+            "%d overflow, %d capped out >18mo, cap_min_year=%d)",
             stats["total_rows"], len(records), stats["skipped_malformed_acct"],
             stats["abatement_rows"], stats["unknown_type_rows"], stats["overflow"],
+            stats["capped_out"], cap_min_year,
         )
         # Alerts (not silent): these signal a possible parse/decode/source change.
         if stats["unknown_type_rows"]:

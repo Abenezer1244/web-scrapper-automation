@@ -12,6 +12,12 @@ from src.utils.logger import setup_logger
 
 _logger = setup_logger("worker.task")
 
+# Default lookback for tax-delinquent scrapes (ANY county). Tax delinquency is
+# annual/multi-year, so the generic 90-day default would miss almost everyone;
+# ~18 months is the fresh "last 1-1.5 years" motivated-seller target. Only the
+# DEFAULT path is affected — an explicit rolling_30/7/custom/since_last_run wins.
+_TAX_DELINQUENT_DEFAULT_DAYS = 548  # ~18 months
+
 
 def _to_mmddyyyy(date_str: str) -> str:
     """Convert any date string to MM/DD/YYYY format for county portals.
@@ -37,8 +43,12 @@ def _to_mmddyyyy(date_str: str) -> str:
     return date_str  # Return as-is if nothing works
 
 
-def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: str | None = None, user_plan: str = "starter") -> tuple[str, str]:
-    """Compute date_from and date_to from a scraper's schedule config."""
+def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: str | None = None, user_plan: str = "starter", record_type: str | None = None) -> tuple[str, str]:
+    """Compute date_from and date_to from a scraper's schedule config.
+
+    ``record_type`` selects the DEFAULT window: tax_delinquent defaults to ~18
+    months (all counties), everything else to 90 days. Explicit modes win.
+    """
     from datetime import timedelta
     from zoneinfo import ZoneInfo
 
@@ -107,6 +117,9 @@ def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: st
     elif range_mode == "rolling_7":
         date_from = end_date - timedelta(days=7)
     else:
-        date_from = end_date - timedelta(days=90)
+        # Default path (no explicit/narrow mode). Tax-delinquent gets the ~18-month
+        # window for ALL counties; other record types keep the 90-day default.
+        default_days = _TAX_DELINQUENT_DEFAULT_DAYS if record_type == "tax_delinquent" else 90
+        date_from = end_date - timedelta(days=default_days)
 
     return date_from.strftime("%m/%d/%Y"), end_date.strftime("%m/%d/%Y")

@@ -20,6 +20,11 @@ if TYPE_CHECKING:
 
 _logger = setup_logger("worker.task")
 
+# How many parcels the GIS sweep enriches+commits per transaction. Small enough
+# that a hard-kill loses at most one batch of work; large enough to keep the
+# commit overhead negligible against the per-chunk (50-parcel) HTTP cost.
+_GIS_COMMIT_BATCH = 500
+
 
 async def _run_scraper(
     scraper_class,
@@ -228,18 +233,56 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             if pid not in parcel_map:
                 parcel_map[pid] = []
             parcel_map[pid].append(res)
-        gis_results = batch_enrich_parcels_gis(list(parcel_map.keys()), config.county, config.state)
-        for pid, gis_data in gis_results.items():
-            if not gis_data.get("property_address"):
+        # Commit the GIS sweep INCREMENTALLY (per parcel batch) instead of once at
+        # the end: a final-only commit meant a hard-kill mid-sweep persisted
+        # nothing, so a re-run restarted the whole sweep and never converged. With
+        # per-batch commits, filled rows survive a kill and the results_need_addr
+        # filter excludes them on re-run, so each resume does strictly less work.
+        all_pids = list(parcel_map.keys())
+        rows_updated = 0
+        commit_failures = 0
+        for i in range(0, len(all_pids), _GIS_COMMIT_BATCH):
+            batch_pids = all_pids[i:i + _GIS_COMMIT_BATCH]
+            gis_results = batch_enrich_parcels_gis(batch_pids, config.county, config.state)
+            batch_updated = 0
+            for pid, gis_data in gis_results.items():
+                if not gis_data.get("property_address"):
+                    continue
+                for res in parcel_map.get(pid, []):
+                    res.property_address = gis_data["property_address"]
+                    res.mailing_address = gis_data.get("mailing_address") or res.mailing_address
+                    batch_updated += 1
+            try:
+                db.commit()
+            except Exception as exc:
+                # Don't rollback-then-empty-commit (that would discard this batch's
+                # fills while reporting success). Roll back (recovers the session
+                # for the next batch) and skip the progress log. Enrichment is
+                # best-effort by design — the caller wraps this whole function in a
+                # try/except and delivers the job DONE without enriched fields on
+                # failure (tasks.py) — so a commit hiccup must not fail the job. The
+                # unfilled rows stay in results_need_addr and are re-attempted if
+                # the job is re-run; the end-of-sweep summary below surfaces it.
+                db.rollback()
+                commit_failures += 1
+                _logger.warning(
+                    "Job %s: GIS batch commit failed at %d/%d: %s",
+                    job_id, i, len(all_pids), str(exc)[:120],
+                )
                 continue
-            for res in parcel_map.get(pid, []):
-                res.property_address = gis_data["property_address"]
-                res.mailing_address = gis_data.get("mailing_address") or res.mailing_address
-        try:
-            db.commit()
-        except Exception:
-            db.rollback()
-            db.commit()
+            rows_updated += batch_updated
+            _publish_log(
+                r, job_id, "info",
+                f"Property lookup progress: {min(i + _GIS_COMMIT_BATCH, len(all_pids))}"
+                f"/{len(all_pids)} parcels ({rows_updated} rows updated)",
+                db=db,
+            )
+        if commit_failures:
+            _logger.warning(
+                "Job %s: GIS sweep finished with %d batch commit failure(s) — some "
+                "addresses are unfilled (best-effort; re-run to fill)",
+                job_id, commit_failures,
+            )
 
     # Name-based PACS fallback for records with no parcel (e.g. probate
     # estate filings: Cert of Death, Letters Testamentary, Personal Rep

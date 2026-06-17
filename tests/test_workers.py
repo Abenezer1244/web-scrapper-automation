@@ -288,15 +288,18 @@ def test_result_insert_is_idempotent_on_rerun():
 
         # Must match production's partial-index arbiter exactly (index_where), or
         # Postgres won't infer uq_results_job_fingerprint as the conflict target.
+        # RETURNING lets us count actually-inserted rows: ON CONFLICT DO NOTHING
+        # returns rows only for inserts, not for skipped conflicts. (`.rowcount`
+        # is unavailable on the ORM insertmanyvalues result — an IteratorResult.)
         stmt = pg_insert(Result).on_conflict_do_nothing(
             index_elements=["job_id", "source_fingerprint"],
             index_where=sa_text("source_fingerprint IS NOT NULL"),
-        )
+        ).returning(Result.id)
         rows = [_row("fp-a"), _row("fp-b")]
-        first = db.execute(stmt, rows).rowcount
+        first = len(db.execute(stmt, rows).scalars().all())
         db.commit()
         # Re-run: same fingerprints, fresh row ids → all conflict → 0 inserted.
-        rerun = db.execute(stmt, [_row("fp-a"), _row("fp-b")]).rowcount
+        rerun = len(db.execute(stmt, [_row("fp-a"), _row("fp-b")]).scalars().all())
         db.commit()
 
         total = db.execute(

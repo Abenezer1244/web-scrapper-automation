@@ -2,6 +2,7 @@
 import uuid
 from datetime import UTC, datetime, timedelta
 
+from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
 from src.api.auth import hash_password
@@ -181,6 +182,172 @@ def test_watchdog_leaves_long_running_live_job_alone():
         refreshed = db.get(Job, job_id)
         assert refreshed.status == "scraping"  # unchanged — still live, not stuck
         assert refreshed.retry_count == 0
+
+
+# ─── Watchdog: heartbeat-based liveness (Phase 1, migration 061) ──────────────
+
+def test_watchdog_leaves_live_long_job_with_fresh_heartbeat_alone():
+    """The core Phase 1 guarantee: a job that has run far longer than the 70-min
+    started_at fallback is still LIVE — not stuck — as long as its heartbeat is
+    fresh. A 24,708-parcel King enrich legitimately runs > 65 min; with a recent
+    heartbeat the watchdog must leave it alone (no false re-queue → no dup)."""
+    from src.workers.scheduler import watchdog_stuck_jobs
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = _create_stuck_job(db, user.id, config.id, minutes_ago=90)
+        job.last_heartbeat_at = datetime.now(UTC) - timedelta(minutes=2)  # alive
+        job_id = job.id
+        db.commit()
+
+    watchdog_stuck_jobs()
+
+    with SyncSessionLocal() as db:
+        refreshed = db.get(Job, job_id)
+        assert refreshed.status == "scraping"  # left alone — heartbeat is fresh
+        assert refreshed.retry_count == 0
+
+
+def test_watchdog_requeues_job_with_stale_heartbeat():
+    """A job whose heartbeat has gone stale (> 15 min) is genuinely dead (worker
+    hard-killed / crashed) and must be re-queued even though its started_at is
+    well within the 70-min fallback window."""
+    from src.workers.scheduler import watchdog_stuck_jobs
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = _create_stuck_job(db, user.id, config.id, minutes_ago=30)
+        job.last_heartbeat_at = datetime.now(UTC) - timedelta(minutes=20)  # stale
+        job_id = job.id
+        db.commit()
+
+    watchdog_stuck_jobs()
+
+    with SyncSessionLocal() as db:
+        refreshed = db.get(Job, job_id)
+        assert refreshed.status == "pending"  # re-queued
+        assert refreshed.retry_count == 1
+
+
+def test_heartbeat_write_is_attempt_scoped():
+    """_write_heartbeat refreshes only the attempt that matches started_at. A
+    thread left over from a superseded attempt (different started_at) updates 0
+    rows and self-reaps, so it can't mask a dead new attempt."""
+    from src.workers.tasks_helpers.status import (
+        _HB_ALIVE,
+        _HB_TERMINAL,
+        _write_heartbeat,
+    )
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        started = datetime.now(UTC) - timedelta(minutes=5)
+        job = _create_stuck_job(db, user.id, config.id, minutes_ago=5)
+        job.started_at = started
+        job.status = "enriching"
+        job_id = job.id
+        db.commit()
+
+    # Matching started_at → row updated, last_heartbeat_at set.
+    assert _write_heartbeat(job_id, started) == _HB_ALIVE
+    with SyncSessionLocal() as db:
+        assert db.get(Job, job_id).last_heartbeat_at is not None
+
+    # A superseded attempt's started_at → 0 rows → terminal signal (self-reap).
+    stale_started = started - timedelta(minutes=30)
+    assert _write_heartbeat(job_id, stale_started) == _HB_TERMINAL
+
+
+# ─── Idempotent result inserts (Phase 2, migration 062) ──────────────────────
+
+def test_result_insert_is_idempotent_on_rerun():
+    """A re-run that re-inserts the same (job_id, source_fingerprint) rows via
+    ON CONFLICT DO NOTHING appends NO duplicate rows — the 2026-06-17 dup fix."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    from src.db.models import Result
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = _create_stuck_job(db, user.id, config.id, minutes_ago=1)
+        job_id, user_id = job.id, user.id
+        db.commit()
+
+        def _row(fp: str) -> dict:
+            return {
+                "id": str(uuid.uuid4()),
+                "job_id": job_id,
+                "user_id": user_id,
+                "source_fingerprint": fp,
+                "is_duplicate": False,
+            }
+
+        # Must match production's partial-index arbiter exactly (index_where), or
+        # Postgres won't infer uq_results_job_fingerprint as the conflict target.
+        stmt = pg_insert(Result).on_conflict_do_nothing(
+            index_elements=["job_id", "source_fingerprint"],
+            index_where=sa_text("source_fingerprint IS NOT NULL"),
+        )
+        rows = [_row("fp-a"), _row("fp-b")]
+        first = db.execute(stmt, rows).rowcount
+        db.commit()
+        # Re-run: same fingerprints, fresh row ids → all conflict → 0 inserted.
+        rerun = db.execute(stmt, [_row("fp-a"), _row("fp-b")]).rowcount
+        db.commit()
+
+        total = db.execute(
+            sa_text("SELECT count(*) FROM results WHERE job_id = :j"), {"j": job_id}
+        ).scalar()
+
+    assert first == 2
+    assert rerun == 0
+    assert total == 2  # no duplicate copy appended
+
+
+# ─── Idempotent billing (Phase 3, migration 063) ─────────────────────────────
+
+def test_billing_cas_applies_once_across_reruns():
+    """The billing CAS (UPDATE jobs SET billing_applied_at WHERE billing_applied_at
+    IS NULL) lets only the first attempt bill; a re-run gets rowcount 0 and must
+    not double-charge records_used."""
+    from sqlalchemy import update as sa_update
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db, records_used=0)
+        config = _create_sync_config(db, user.id)
+        job = _create_stuck_job(db, user.id, config.id, minutes_ago=1)
+        job_id, user_id = job.id, user.id
+        db.commit()
+
+        def _bill(amount: int) -> int:
+            billed = db.execute(
+                sa_update(Job)
+                .where(Job.id == job_id, Job.billing_applied_at.is_(None))
+                .values(billed_count=amount, billing_applied_at=datetime.now(UTC))
+            ).rowcount
+            if billed:
+                db.execute(
+                    sa_update(User)
+                    .where(User.id == user_id)
+                    .values(records_used=User.records_used + amount)
+                )
+            db.commit()
+            return billed
+
+        first = _bill(10)
+        second = _bill(10)  # re-run
+
+        refreshed = db.get(User, user_id)
+        job_after = db.get(Job, job_id)
+
+    assert first == 1
+    assert second == 0  # CAS blocks the second billing
+    assert refreshed.records_used == 10  # charged exactly once
+    assert job_after.billed_count == 10
 
 
 # ─── Atomic job claim (Track A: prevents double-scrape on duplicate delivery) ──

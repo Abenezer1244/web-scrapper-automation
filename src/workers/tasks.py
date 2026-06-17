@@ -44,6 +44,7 @@ from src.workers.tasks_helpers.enrich import (  # noqa: F401  (re-export)
 from src.workers.tasks_helpers.status import (
     _DELIVERY_TOKEN_TTL,  # noqa: F401  (re-export)
     _TERMINAL_STATUSES,
+    HeartbeatThread,
     JobUpdateFields,  # noqa: F401  (re-export)
     _delivery_download_url,
     _fail_job,
@@ -107,7 +108,14 @@ def run_scrape_job(self, job_id: str) -> None:
     # this job's user_id. Inserts into results, delivered_records,
     # pending_skip_trace_rows etc. are now scoped at the DB level as
     # well as the ORM level. H1 + C1 from the full-SaaS review.
-    with rls_sync_session(_boot_user_id) as db:
+    #
+    # The HeartbeatThread context wraps the whole body so its stop() fires on
+    # EVERY exit path — normal return, early return, OR uncaught exception — and
+    # can't pin a non-terminal job "alive" past the work (the primary lifecycle;
+    # self-reap + lifetime cap are backups). It is constructed here but only
+    # .start()ed after the claim below, so a job this worker doesn't own never
+    # gets a heartbeat.
+    with HeartbeatThread(job_id) as _hb, rls_sync_session(_boot_user_id) as db:
         # ── Load job ─────────────────────────────────────────────────────────
         job = db.execute(select(Job).where(Job.id == job_id)).scalar_one_or_none()
         if job is None:
@@ -145,10 +153,14 @@ def run_scrape_job(self, job_id: str) -> None:
         # genuine duplicates. A per-job lease would buy back the fast path; out of
         # scope here and unnecessary (the batch barrier waits for terminal
         # children regardless of which recovery path fires).
+        # Reset last_heartbeat_at IN the claim so a watchdog-retried job can't
+        # carry a STALE heartbeat from a prior attempt into the window between
+        # claim and the heartbeat thread's first write — the watchdog would
+        # otherwise see the old stale value and re-queue this live retry (Codex).
         claimed = db.execute(
             update(Job)
             .where(Job.id == job_id, Job.status == "pending")
-            .values(status="queued", started_at=_now())
+            .values(status="queued", started_at=_now(), last_heartbeat_at=_now())
         ).rowcount
         db.commit()
         if not claimed:
@@ -159,6 +171,14 @@ def run_scrape_job(self, job_id: str) -> None:
             )
             return
         db.refresh(job)
+        # Liveness heartbeat: now that THIS worker owns the job, prove it is alive
+        # every ~60s from a daemon thread (its own short txn — never this work
+        # session). The watchdog re-queues an active job only when this signal is
+        # STALE, so a long-but-healthy enrich is never falsely re-queued. Scoped to
+        # job.started_at (the value the claim just stamped) so a thread from a
+        # superseded attempt can't refresh this row. stop() is guaranteed by the
+        # enclosing `with HeartbeatThread(...)` __exit__.
+        _hb.start(job.started_at)
         _publish_log(r, job_id, "info", f"Job queued — {config.name} ({config.county}, {config.state})", db=db)
 
         # ── PROBING ───────────────────────────────────────────────────────────
@@ -344,8 +364,32 @@ def run_scrape_job(self, job_id: str) -> None:
                 return hashlib.sha256(key.encode("utf-8")).hexdigest()
             return None
 
-        # Bulk insert using execute + multi-row VALUES (much faster than db.add loop)
-        from sqlalchemy import insert as sa_insert
+        # Bulk insert with ON CONFLICT DO NOTHING on the per-job idempotency key
+        # (job_id, source_fingerprint) so a watchdog re-run of this SAME job
+        # re-inserts the same rows as no-ops instead of APPENDING a second copy
+        # (the 2026-06-17 duplication incident). pg_insert is required for the
+        # ON CONFLICT clause; the plain core insert can't express it.
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        def _source_fingerprint(rec) -> str:
+            """Stable within-job idempotency key from the record's SCRAPE-TIME
+            source identity ONLY. Deliberately EXCLUDES enrichment_data and
+            mailing_address: those are filled / re-normalized during enrichment,
+            so hashing the full record (make_hash(to_dict())) could yield a
+            DIFFERENT key on a re-run and append a duplicate instead of conflicting
+            (Codex). SHA-256 of a canonical field tuple; genuinely-distinct records
+            (incl. multiple filings per parcel) keep distinct tuples, so ON CONFLICT
+            never collapses a legitimate row."""
+            parts = (
+                config.record_type or "",
+                (rec.parcel_id or "").strip(),
+                (rec.date_recorded or "").strip(),
+                (rec.doc_type or "").strip(),
+                (rec.party_name or "").strip(),
+                (rec.legal_description or "").strip(),
+                (rec.property_address or "").strip(),
+            )
+            return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
         batch_size = 1000
         total_rows_inserted = 0
@@ -357,6 +401,13 @@ def run_scrape_job(self, job_id: str) -> None:
                 _tax_amount, _tax_bill_year = _extract_tax_fields(
                     rec.enrichment_data, config.record_type
                 )
+                # Within-job idempotency key (migration 062). Reuse the scraper's
+                # raw_html_hash when set — it is the scraper's OWN stable in-memory
+                # dedup key (recomputed identically on a re-run). For scrapers that
+                # don't set it (e.g. King Socrata tax), fall back to a canonical
+                # scrape-time identity tuple. Both are stable across re-runs, so
+                # ON CONFLICT skips an already-present row instead of appending.
+                _fingerprint = rec.raw_html_hash or _source_fingerprint(rec)
                 # Tier 0 (057): best-effort owner-location flags at insert. mailing
                 # is usually NULL pre-enrichment (so absentee/out_of_state come back
                 # NULL here); the end-of-job recompute after _run_inline_enrichment
@@ -376,6 +427,8 @@ def run_scrape_job(self, job_id: str) -> None:
                     "mailing_address": _trunc(rec.mailing_address, 512),
                     "enrichment_data": rec.enrichment_data or {},
                     "raw_html_hash": rec.raw_html_hash,
+                    # Migration 062: per-job idempotency key (ON CONFLICT target).
+                    "source_fingerprint": _fingerprint,
                     # Sprint 6.4: dedup hash computed now, duplicate flag
                     # resolved in the post-insert dedup scan below
                     "dedup_hash": _compute_dedup_hash(rec.parcel_id, rec.property_address, rec.party_name, rec.date_recorded),
@@ -389,9 +442,17 @@ def run_scrape_job(self, job_id: str) -> None:
                     "absentee_owner": _owner["absentee_owner"],
                     "out_of_state_owner": _owner["out_of_state_owner"],
                 })
-            db.execute(sa_insert(Result), rows)
+            # ON CONFLICT on the partial unique index (job_id, source_fingerprint)
+            # WHERE source_fingerprint IS NOT NULL — every row here has a non-null
+            # fingerprint, so a re-run's already-present rows are skipped (rowcount
+            # counts only genuinely-new rows). index_where MUST match the partial
+            # index predicate or Postgres won't use it as the conflict arbiter.
+            stmt = pg_insert(Result).on_conflict_do_nothing(
+                index_elements=["job_id", "source_fingerprint"],
+                index_where=sa_text("source_fingerprint IS NOT NULL"),
+            )
+            total_rows_inserted += db.execute(stmt, rows).rowcount
             db.commit()
-            total_rows_inserted += len(rows)
 
         # ── SPRINT 6.4: CROSS-JOB DEDUPLICATION ────────────────────────────
         # For each newly-inserted Result that has a dedup_hash, try to
@@ -474,6 +535,22 @@ def run_scrape_job(self, job_id: str) -> None:
             db.commit()
             _logger.info("Job %s: dedup step 2 committed — %d claimed", job_id, len(claimed_hashes))
 
+            # Step 2b (idempotent re-run): claims this job already owns from a PRIOR
+            # attempt (first_job_id = this job) conflict on the ON CONFLICT above so
+            # they're absent from RETURNING — without this, a watchdog re-run would
+            # mark every already-claimed row is_duplicate=true and "deliver" an
+            # all-duplicate empty result. Treat hashes THIS job already owns as
+            # first-delivery (mine), not duplicates. New attempts on a fresh job
+            # return nothing here, so this is a no-op on the normal path.
+            owned = db.execute(
+                sa_text(
+                    "SELECT dedup_hash FROM delivered_records WHERE first_job_id = :jid"
+                ),
+                {"jid": job_id},
+            ).fetchall()
+            for row in owned:
+                claimed_hashes.add(row.dedup_hash)
+
             # Step 3: any fresh Result whose dedup_hash is NOT in claimed_hashes
             # was a duplicate. Mark those rows.
             duplicate_result_ids = [
@@ -555,13 +632,52 @@ def run_scrape_job(self, job_id: str) -> None:
         # do NOT count against the monthly quota. Records without a
         # dedup_hash (no parcel AND no address) still count, because
         # they are genuinely new data even though we can't dedupe them.
-        billable_count = max(0, len(records) - dup_count)
+        #
+        # Bill the PERSISTED billable set, not len(records): with conflict-skipping
+        # inserts the in-memory scrape count can diverge from what actually landed
+        # (intra-run fingerprint collisions, a re-run over a changed source set), so
+        # the authoritative billable count is this job's non-duplicate result rows
+        # (no-dedup_hash rows have is_duplicate=false, so they're included). (Codex)
+        billable_count = db.execute(
+            sa_text(
+                "SELECT count(*) FROM results "
+                "WHERE job_id = :jid AND is_duplicate = false"
+            ),
+            {"jid": job_id},
+        ).scalar() or 0
         from sqlalchemy import update as sa_update
-        db.execute(
-            sa_update(User)
-            .where(User.id == user.id)
-            .values(records_used=User.records_used + billable_count)
-        )
+        # Idempotent billing (migration 063): claim billing for THIS job via a CAS
+        # on billing_applied_at. Only the attempt that flips it from NULL bills the
+        # user, so a watchdog re-run (which re-reaches this point) never
+        # double-charges records_used. billed_count records the charged amount. The
+        # Job CAS + the User increment commit together (a crash between the two
+        # execute()s rolls both back — neither is committed until db.commit()).
+        billed_now = db.execute(
+            sa_update(Job)
+            .where(Job.id == job_id, Job.billing_applied_at.is_(None))
+            .values(billed_count=billable_count, billing_applied_at=_now())
+        ).rowcount
+        if billed_now:
+            user_billed = db.execute(
+                sa_update(User)
+                .where(User.id == user.id)
+                .values(records_used=User.records_used + billable_count)
+            ).rowcount
+            if user_billed != 1:
+                # The job was CAS-marked billed but the user counter did NOT move
+                # (deleted user / bad id / RLS scope). Don't leave the job marked
+                # billed-without-charge — roll back and fail loudly (Codex).
+                db.rollback()
+                _fail_job(
+                    db, job, r, job_id,
+                    "Billing failed: user record-usage counter could not be updated.",
+                )
+                return
+        else:
+            _logger.info(
+                "Job %s already billed (billing_applied_at set) — skipping "
+                "records_used increment on this re-run", job_id,
+            )
         db.commit()
         db.refresh(user)
 

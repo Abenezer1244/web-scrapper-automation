@@ -432,6 +432,19 @@ class Job(Base):
     started_at = Column(DateTime(timezone=True), nullable=True)
     finished_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # Migration 061: liveness signal for the watchdog. run_scrape_job writes this
+    # every ~60s from a background heartbeat thread while the job is active. The
+    # watchdog re-queues an active job only once this is STALE (worker genuinely
+    # gone), not merely old — so a long-but-healthy enrich is never falsely
+    # re-queued. NULL = not yet beat / pre-deploy → watchdog falls back to the
+    # conservative started_at cutoff.
+    last_heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    # Migration 063: idempotent billing. billing_applied_at is the CAS gate —
+    # only the attempt that flips it from NULL increments users.records_used, so a
+    # watchdog re-run can't double-bill. billed_count = what was charged (stored,
+    # not recomputed: no-dedup_hash billable rows aren't in delivered_records).
+    billed_count = Column(Integer, nullable=False, server_default="0", default=0)
+    billing_applied_at = Column(DateTime(timezone=True), nullable=True)
     # Phase 5 (migration 039): set once the dialer-push sweep has handled this
     # job (after skip-trace settles). NULL = not yet evaluated; the sweep claims
     # only done jobs with a dialer_webhook_url whose skip-trace is settled and
@@ -531,6 +544,18 @@ class Result(Base):
     default_amount = Column(Numeric(12, 2), nullable=True)
     nts_match_confidence = Column(Numeric(3, 2), nullable=True)
     nts_notice_id = Column(UUID(as_uuid=False), nullable=True)
+    # Migration 062: within-job row identity for idempotent inserts. Computed in
+    # the worker at insert from the SCRAPE-TIME source identity — the scraper's
+    # raw_html_hash when set, else a SHA-256 over a canonical tuple (record_type,
+    # parcel_id, date_recorded, doc_type, party_name, legal_description,
+    # property_address). EXCLUDES enrichment_data + mailing_address so it can't
+    # drift between a run and its re-run. The (job_id, source_fingerprint) partial
+    # UNIQUE index (uq_results_job_fingerprint) lets a re-run insert the SAME rows
+    # as ON CONFLICT no-ops instead of appending a duplicate copy. Distinct from
+    # dedup_hash (FROZEN cross-job billing key) and property_key (overlap key):
+    # one parcel with multiple distinct filings yields multiple results, each with
+    # its own fingerprint. NULL on legacy rows (excluded from the partial index).
+    source_fingerprint = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     # PERF (migration 033): get_results filters job_id + user_id, aggregates
@@ -571,6 +596,19 @@ class Result(Base):
             "job_id",
             "auction_date",
             postgresql_where=text("auction_date IS NOT NULL"),
+        ),
+        # Migration 062: idempotency key for re-runs. UNIQUE per (job_id,
+        # source_fingerprint) so a re-scrape inserts the same rows as ON CONFLICT
+        # no-ops. Partial (non-null) so legacy NULL-fingerprint rows are excluded.
+        # PROD builds this CONCURRENTLY out-of-band (scripts/
+        # create_result_fingerprint_index.sql); declared here so create_all (tests)
+        # has the constraint the ON CONFLICT insert targets.
+        Index(
+            "uq_results_job_fingerprint",
+            "job_id",
+            "source_fingerprint",
+            unique=True,
+            postgresql_where=text("source_fingerprint IS NOT NULL"),
         ),
     )
 

@@ -18,10 +18,20 @@ _WATCHDOG_REDELIVER_LIMIT = 500
 
 
 def _watchdog_stuck_jobs_impl() -> None:
-    """Fail jobs that have been stuck in an active state for > 55 minutes.
+    """Re-queue jobs that have been stuck in an ACTIVE state past the task budget.
 
     Runs every 5 minutes. Re-queues the job for retry up to max_retries times.
-    EagleWeb chunked scraping can take 15-20min scrape + 15min DB save = 35min.
+
+    The cutoff MUST exceed run_scrape_job's Celery hard time_limit (3900s = 65min,
+    tasks.py) — a job is "stuck" only once it has run LONGER than a live task can
+    possibly run. The old 20-min cutoff fired while a job was still legitimately
+    working (a 24,708-parcel King tax enrich runs well past 20min): the watchdog
+    re-queued a LIVE job, and since run_scrape_job is not yet retry-idempotent the
+    re-run appended a second full copy of its results (the 2026-06-17 duplication
+    incident). 70min = 65min hard limit + one 5-min tick of headroom, so only a
+    genuinely killed/dead job (already past the Celery kill) is ever re-queued.
+    (Idempotent re-run + heartbeat-based detection is the deferred complete fix;
+    it needs a system-role DELETE grant on results + delivered_records re-point.)
     """
     from sqlalchemy import and_, or_, select
 
@@ -30,7 +40,9 @@ def _watchdog_stuck_jobs_impl() -> None:
     from src.workers.tasks import run_scrape_job
 
     now = datetime.now(UTC)
-    stuck_cutoff = now - timedelta(minutes=20)
+    # > Celery hard time_limit (65min) so a LIVE long job (e.g. big-county tax
+    # enrichment) is never declared stuck while it is still running.
+    stuck_cutoff = now - timedelta(minutes=70)
     # A job stuck in 'queued' state with started_at=NULL is a zombie
     # — the worker died before it could mark the job started. The
     # old predicate `Job.started_at < stuck_cutoff` returned NULL

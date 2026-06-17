@@ -19,6 +19,58 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-17 - Cleanup duplicate-results script stall fix
+**Built / Shipped:** `scripts/cleanup_watchdog_dup_results.py` no longer holds one
+admin transaction across a whole large job. Commit mode now rechecks terminal job
+status, recomputes the admin plan, commits `delivered_records.first_result_id`
+repoints first, then deletes `results` in committed 500-row batches with a per-batch
+anchor assertion and exact rowcount check. Updated `tasks/todo.md`.
+
+**Tried / Decided:** root-cause call is client-side blockage while a transaction was
+open, not "slow delete", because Postgres reported `idle in transaction`; a slow
+cascade would normally be `active` with wait details. Most likely trigger is stdout
+or process backpressure from the echoed dry-plan/pipeline. Confirmation path:
+capture `pg_stat_activity` (`state`, `wait_event_type`, `wait_event`, `query`,
+`state_change`) and a Python stack dump if it happens again.
+
+**Failed / Blocked:** required Codex CLI pressure-test failed under the current
+sandbox with `EPERM` resolving `C:\Users\Windows`. Full-repo Ruff is already red
+on unrelated `.venv-schema`, Alembic, task, and old script files, so the meaningful
+lint gate for this change was the touched script.
+
+**Caught & fixed:** committed repoints are counted immediately, so reported totals
+stay honest even if a later delete batch fails after partial progress.
+
+**Pending / Handoff:** rerun only explicit remaining big job IDs, no `--all`, no
+SQL echo, no `grep | tail` pipeline. Redirect clean output to a file. Watch
+`pg_stat_activity` from a second session while it runs.
+
+**Facts learned:** for this maintenance script, "commit all anchors first, then
+delete batches" is safer than repointing per delete batch: interruption leaves
+billing/delivery anchors pointed at survivors, and rerun recomputes a smaller plan.
+
+**RESULT (rerun complete):** the batched script re-ran clean on the 3 remaining big
+jobs (DEBUG=false, direct file output — no echo, no `grep|tail`): incremental per-batch
+progress, no `idle in transaction`, deleted 158,692 rows. Combined with the 5 jobs that
+committed before the stall, **all 8 King-tax watchdog-victim jobs are now deduped to
+exactly one row per parcel (~236,722 rows removed, all `is_duplicate=true` → zero billing
+impact, 0 anchor re-points)**. idle-in-txn=0, no stuck locks, no corruption. The ~29,395
+`is_duplicate=false` (BILLED) dup rows (King-tax x6 a988b776, spokane/probate jobs) were
+left UNTOUCHED — the script refuses them; they need a separate billing-aware pass.
+
+## 2026-06-17 — Watchdog duplication: the COMPLETE fix (heartbeat + idempotent inserts + idempotent billing)
+**How it started:** resuming the handoff. Step 1 was to check the verified King job `1a54d04e`. Still `enriching` at 36min, `single_copy=YES`, `retry_count=0` — clean but mid-flight, and the GIS enrichment sweep was STALLED (mailing filled stuck at 140/24708 for 13+ min). The 70-min watchdog stopgap (PR#57) does NOT protect a job that legitimately needs >65min: Celery hard-kills at 65min, watchdog re-queues at 70min, non-idempotent re-run dups. Ran a protective monitor (`scripts/monitor_king_job_guard.py`) that CAS-cancelled the job at the 65-min wire — terminal, `single_copy=YES`, NO dup. Tax-filter verification stands on the clean snapshot.
+**Codex-first design (consult BEFORE code):** my initial plan was "delete prior results + reverse billing on retry_count>0." Codex (gpt-5.5, high) rejected it: too destructive (crash-after-delete erases recoverable state), racy (concurrent claim-release), `retry_count` not a safe trigger, cross-tenant system-role DELETE grant dangerous. **Adopted Codex's reframe in full:** make inserts idempotent instead of deleting.
+**Built / Shipped (Phases 1-3, ONE PR, all Codex-gated, uncommitted as of session end):**
+- **Phase 1 — heartbeat + watchdog** (mig 061 `jobs.last_heartbeat_at`): `HeartbeatThread` (daemon, OWN short txn, attempt-scoped by `started_at`, context-manager so `stop()` fires on every exit incl. exception, self-reap on terminal + 75min cap). Watchdog (`scheduler_helpers/health.py`) re-queues an active job only when `last_heartbeat_at < now()-15min`, conservative `started_at>70min` fallback for NULL-heartbeat jobs. Claim UPDATE stamps `last_heartbeat_at=now()` (closes stale-retry race).
+- **Phase 2 — idempotent inserts** (mig 062 `results.source_fingerprint` + partial UNIQUE `uq_results_job_fingerprint`): `pg_insert(...).on_conflict_do_nothing(index_elements=[job_id,source_fingerprint], index_where=...)`. Fingerprint = `raw_html_hash or` SHA-256 of a canonical SCRAPE-TIME tuple (EXCLUDES enrichment_data/mailing_address so it can't drift on re-run). Dedup Step 2b unions `first_job_id=job` owned claims so a re-run doesn't mark every row `is_duplicate`.
+- **Phase 3 — idempotent billing** (mig 063 `jobs.billed_count` + `billing_applied_at`): billing CAS (only the attempt that flips `billing_applied_at` from NULL charges); `billable_count` from PERSISTED non-duplicate rows (not `len(records)`); User-update rowcount!=1 → rollback + fail loud.
+**Caught & fixed (5 Codex review rounds, P1 each, all fixed):** (R1) thread could pin a dead job ~90min via uncaught exception → context-manager `stop()`; (R2) stale heartbeat from a prior attempt re-queues the live retry → claim stamps heartbeat + attempt-scoped writes; (R3) unstable full-payload fingerprint → canonical tuple; bill-from-len → bill-from-persisted; User-rowcount guard; index re-runnability gate; (R-final) migration validity gate (indisvalid+indisready, not name-only) + test must use the exact partial-index `index_where` arbiter; HeartbeatThread.start() made idempotent.
+**Tried / Decided:** considered instrumenting every enrich loop with heartbeat calls (7 files) — chose a background daemon thread (5 files, decoupled). Considered the unique index in the migration (locks 310k prod table) — chose inline-build-when-small + out-of-band CONCURRENTLY for prod, with a RAISE on large-without-index so a forgotten pre-build can't ship a broken ON CONFLICT.
+**Key insight / why Phase 4 still needed:** Phases 1+2 make a hard-kill→requeue a SAFE resume (no dup), BUT `batch_enrich_parcels_gis` commits ONCE at the end, so a mid-sweep kill persists nothing → resume restarts the full sweep → never completes. Phase 4 (GIS resumability/perf) NOT started.
+**Pending / Handoff:** Phase 4 (GIS incremental-commit/cap/parallelize — sweep stalls, likely 30s/chunk timeouts on a slow King GIS endpoint) + Phase 5 (historical x2–x6 dup cleanup, one-off script as table owner) NOT started. Tests in `tests/test_workers.py` validated in CI (local pytest hits PROD Supabase/Upstash — DATABASE_URL/REDIS_URL are prod; do NOT run locally). DEPLOY ORDER: migrations 061+062+063 → build `uq_results_job_fingerprint` CONCURRENTLY out-of-band on prod → then worker code. Branch/PR not yet created.
+**Facts learned:** `delivered_records.first_result_id` is ON DELETE SET NULL, `first_job_id` is a plain UUID (not FK) — deleting a job's results leaves its billing claims (why the delete approach broke). `make_hash` = MD5 of sorted-keys JSON of `to_dict()` (incl. enrichment_data — unsafe as idempotency key). CI builds test schema via `alembic upgrade head` (not create_all), so an ON CONFLICT arbiter index MUST be reachable by migration. `codex exec` on this box: pass prompt via stdin for big diffs (CLI arg hits "Argument list too long"); always `< /dev/null` or it hangs "Reading additional input from stdin".
+
 ## 2026-06-17 — FEK-drift recovery (3rd recurrence) + King tax Socrata `:id` paging fix
 **How it started:** resuming the 06-16 handoff. Two blockers: (1) a 3rd recurrence of the FIELD_ENCRYPTION_KEY drift flooding `InvalidToken('fe1: … not decryptable under strict')` in `run_scrape_job`; (2) the King tax filter re-test still blocked.
 **Codex first (consult, then review gate):** consulted on all prior work + the recovery plan BEFORE touching prod. Tax-cap read layer verified clean (ORM `tax_cap_condition` == raw `tax_cap_sql`; no surface missing it). Codex raised a **P1** on the recovery tooling and later a **HIGH** on the King query (below).

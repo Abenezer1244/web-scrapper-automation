@@ -29,12 +29,17 @@ time), so the figure is PRINCIPAL ONLY — label it "Total Delinquent Tax Balanc
 HTTP GET. Owner name + address are enriched downstream via GIS + eRealProperty.
 """
 
+import random
+import time
 from collections import defaultdict
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import requests
+
 from src.api.middleware.security import add_scrape_domain
 from src.api.tax_filters import tax_cap_min_year
+from src.config import settings
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
@@ -75,6 +80,43 @@ _PARCEL_LEN = 10
 _AMOUNT_MAX = Decimal("99999999.99")
 
 _PAGE_SIZE = 5000
+
+# Per-page fetch retries for transient Socrata failures (read timeout / 429 /
+# 5xx). Backoff seconds, indexed by attempt; jittered to desync shared-IP retries.
+_RETRY_BACKOFF = (1, 3, 7)
+_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+def _page_params(where: str, offset: int) -> dict:
+    """Socrata query params for one page.
+
+    Orders by ``:id`` — the dataset's unique, indexed system row id. This is the
+    only stable key for ``$offset`` paging here: the previous
+    ``account_number,bill_year`` order is NON-unique (a parcel has many
+    same-account/year charge lines), so ties reorder at page boundaries and
+    ``$offset`` can skip or duplicate the exact rows being summed — undercounting,
+    overcounting, or flipping a parcel across the owed>0 threshold. ``:id`` is
+    unique + indexed → correct paging AND ~24x faster (no server-side sort of the
+    filtered set). Aggregation is order-independent (parcel-keyed over the full
+    stream), so row order never affects the emitted records.
+    """
+    return {
+        "$where": where,
+        "$order": ":id",
+        "$limit": _PAGE_SIZE,
+        "$offset": offset,
+    }
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """True for transient HTTP failures worth re-attempting (read timeout /
+    connection drop / 429 / 5xx); False for SSRF (ValueError) and non-transient
+    4xx (bad query / forbidden), which a retry can't fix."""
+    if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+    if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
+        return exc.response.status_code in _RETRY_STATUS
+    return False
 
 
 def _parse_cents(raw) -> int | None:
@@ -244,34 +286,50 @@ class KingWATaxDelinquentScraper(BridgeScraper):
     def __init__(self, record_type: str = "tax_delinquent"):
         super().__init__()
 
+    def _fetch_page(self, params: dict, offset: int, page_num: int) -> list:
+        """Fetch one Socrata page with bounded retries on transient failures.
+
+        Retries read-timeout / 429 / 5xx with jittered backoff
+        (settings.MAX_RETRIES attempts). A failure that survives all retries — or
+        any non-transient error (SSRF ValueError, 4xx) — FAILS LOUD: a partial
+        parcel set would ship an incomplete lead list the zero-parcel canary
+        can't catch, so the job must fail rather than truncate.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(1, settings.MAX_RETRIES + 1):
+            try:
+                # S4: safe_http (SSRF defense-in-depth) — re-validates the fixed
+                # HTTPS Socrata endpoint each attempt, disables ambient proxy,
+                # refuses redirect-to-internal.
+                resp = safe_get(_API_URL, params=params, headers=_HEADERS,
+                                timeout=settings.DEFAULT_TIMEOUT)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= settings.MAX_RETRIES or not _is_retryable(exc):
+                    break
+                wait = _RETRY_BACKOFF[min(attempt - 1, len(_RETRY_BACKOFF) - 1)]
+                wait += random.uniform(0, 0.5)  # jitter to desync shared-IP retries
+                _logger.warning(
+                    "King tax page fetch failed (offset=%d page=%d attempt=%d/%d): %s "
+                    "— retrying in %.1fs",
+                    offset, page_num + 1, attempt, settings.MAX_RETRIES,
+                    str(exc)[:120], wait,
+                )
+                time.sleep(wait)
+        raise RuntimeError(
+            f"King tax delinquent: API page fetch failed at offset {offset} "
+            f"(page {page_num + 1}) after {settings.MAX_RETRIES} attempt(s) — "
+            f"aborting to avoid a truncated result: {str(last_exc)[:120]}"
+        ) from last_exc
+
     def _iter_api_rows(self, where: str):
         """Yield rows across all Socrata pages — a parcel's lines may span pages."""
         offset = 0
         page_num = 0
         while True:
-            params = {
-                "$where": where,
-                "$order": "account_number,bill_year",  # stable pagination
-                "$limit": _PAGE_SIZE,
-                "$offset": offset,
-            }
-            try:
-                # S4: safe_http (SSRF defense-in-depth) — re-validates the fixed
-                # HTTPS Socrata endpoint, disables ambient proxy, refuses
-                # redirect-to-internal.
-                resp = safe_get(_API_URL, params=params, headers=_HEADERS, timeout=30)
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as exc:
-                # FAIL LOUD on a mid-pagination error — never silently truncate.
-                # A partial parcel set would ship an incomplete lead list that the
-                # zero-parcel canary can't catch. Raise so the job fails + retries.
-                raise RuntimeError(
-                    f"King tax delinquent: API page fetch failed at offset {offset} "
-                    f"(page {page_num + 1}) — aborting to avoid a truncated result: "
-                    f"{str(exc)[:120]}"
-                ) from exc
-
+            data = self._fetch_page(_page_params(where, offset), offset, page_num)
             if not data:
                 break
             yield from data

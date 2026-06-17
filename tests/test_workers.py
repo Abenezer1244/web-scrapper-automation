@@ -101,13 +101,14 @@ def test_export_json_real_file(tmp_path):
 # ─── Watchdog: stuck job detection ────────────────────────────────────────────
 
 def test_watchdog_requeues_stuck_job():
-    """A job stuck for > 30 min with retry_count=0 should be reset to pending."""
+    """A job stuck past the Celery hard time_limit (70-min cutoff) with
+    retry_count=0 should be reset to pending."""
     from src.workers.scheduler import watchdog_stuck_jobs
 
     with SyncSessionLocal() as db:
         user = _create_sync_user(db)
         config = _create_sync_config(db, user.id)
-        job = _create_stuck_job(db, user.id, config.id, minutes_ago=35)
+        job = _create_stuck_job(db, user.id, config.id, minutes_ago=75)
         job_id = job.id
         db.commit()
 
@@ -127,7 +128,7 @@ def test_watchdog_permanently_fails_after_max_retries():
     with SyncSessionLocal() as db:
         user = _create_sync_user(db)
         config = _create_sync_config(db, user.id)
-        job = _create_stuck_job(db, user.id, config.id, minutes_ago=35)
+        job = _create_stuck_job(db, user.id, config.id, minutes_ago=75)
         job.retry_count = 3
         job_id = job.id
         db.commit()
@@ -157,6 +158,29 @@ def test_watchdog_ignores_recent_jobs():
     with SyncSessionLocal() as db:
         refreshed = db.get(Job, job_id)
         assert refreshed.status == "scraping"  # unchanged
+
+
+def test_watchdog_leaves_long_running_live_job_alone():
+    """Regression for the 2026-06-17 duplication incident: a job that has been
+    actively running for 60 min — LONGER than the old 20-min cutoff but still
+    within run_scrape_job's 65-min Celery hard time_limit — is a LIVE job, not a
+    dead one. The watchdog must NOT re-queue it (re-queuing a live job made the
+    non-idempotent re-run append a second full copy of its results)."""
+    from src.workers.scheduler import watchdog_stuck_jobs
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = _create_stuck_job(db, user.id, config.id, minutes_ago=60)
+        job_id = job.id
+        db.commit()
+
+    watchdog_stuck_jobs()
+
+    with SyncSessionLocal() as db:
+        refreshed = db.get(Job, job_id)
+        assert refreshed.status == "scraping"  # unchanged — still live, not stuck
+        assert refreshed.retry_count == 0
 
 
 # ─── Atomic job claim (Track A: prevents double-scrape on duplicate delivery) ──

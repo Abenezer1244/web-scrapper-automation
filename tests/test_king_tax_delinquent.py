@@ -12,7 +12,13 @@ Railway smoke run; here we lock the money math + gating that the old
 """
 from decimal import Decimal
 
-from src.scrapers.king_wa_tax_delinquent import aggregate_delinquent_rows
+import requests
+
+from src.scrapers.king_wa_tax_delinquent import (
+    _is_retryable,
+    _page_params,
+    aggregate_delinquent_rows,
+)
 
 
 def _row(acct, year, rtype, billed, paid):
@@ -187,3 +193,36 @@ def test_cap_none_disables_cap_back_compat():
     assert set(by) == {"0111111111", "0222222222"}
     assert stats["capped_out"] == 0
     assert by["0111111111"].enrichment_data["bill_year"] == 2010
+
+
+# --- Socrata pagination: MUST order by the unique, indexed :id ---------------
+# account_number,bill_year is NON-unique (a parcel has many same-account/year
+# charge LINES). Under $offset paging, tied rows reorder at page boundaries and
+# can be skipped or duplicated — the exact rows being summed — silently
+# undercounting/overcounting a parcel. :id is unique+indexed: stable paging AND
+# ~24x faster (no server-side sort of the filtered set, which read-timed-out).
+
+def test_page_params_order_by_id_for_stable_offset_paging():
+    p = _page_params("bill_year>='2025'", offset=10000)
+    assert p["$order"] == ":id", "offset paging requires the unique :id order"
+    assert p["$where"] == "bill_year>='2025'"
+    assert p["$offset"] == 10000
+    assert p["$limit"] > 0
+
+
+def test_retryable_classification():
+    # Transient → retry: read timeout, connection drop, 429, 5xx.
+    assert _is_retryable(requests.exceptions.ReadTimeout())
+    assert _is_retryable(requests.exceptions.ConnectionError())
+    for code in (429, 500, 502, 503, 504):
+        err = requests.exceptions.HTTPError()
+        err.response = requests.Response()
+        err.response.status_code = code
+        assert _is_retryable(err), f"{code} should retry"
+    # Non-transient → fail loud: 4xx (bad query/forbidden) and SSRF refusal.
+    for code in (400, 403, 404):
+        err = requests.exceptions.HTTPError()
+        err.response = requests.Response()
+        err.response.status_code = code
+        assert not _is_retryable(err), f"{code} must not retry"
+    assert not _is_retryable(ValueError("SSRF: refusing internal host"))

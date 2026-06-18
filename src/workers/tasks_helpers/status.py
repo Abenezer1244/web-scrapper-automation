@@ -7,10 +7,13 @@ is byte-identical to the originals in tasks.py.
 """
 
 import json
+import threading
+import time
 from datetime import UTC, datetime
 from typing import TypedDict, Unpack
 
 import redis as sync_redis
+from sqlalchemy import text
 
 from src.config import settings
 from src.utils.logger import setup_logger
@@ -188,3 +191,155 @@ def _fail_job(db, job, r, job_id: str, reason: str) -> None:
     _publish_log(r, job_id, "error", reason, db=None)
     r.publish(f"job_logs:{job_id}", json.dumps({"type": "failed", "error": reason}))
     _logger.error("Job %s failed: %s", job_id, reason)
+
+
+# ── Liveness heartbeat (watchdog input) ──────────────────────────────────────
+# Updates jobs.last_heartbeat_at in its OWN short system transaction — NEVER the
+# caller's work session — so proving liveness can't commit partial scrape/enrich
+# state. The CAS excludes terminal statuses so a heartbeat can never resurrect a
+# done/failed/cancelled job, and the rowcount tells the heartbeat thread when the
+# job has gone terminal (so it can self-reap).
+# Attempt-scoped: the WHERE pins started_at to the attempt that started THIS
+# thread. Each claim stamps a fresh started_at, so a thread left over from a
+# prior attempt (e.g. one whose writes failed long enough for the watchdog to
+# re-queue the job, then recovered) updates 0 rows against the re-claimed attempt
+# and self-reaps — it can't refresh and mask a dead new attempt (Codex). The
+# terminal-status exclusion also means a heartbeat never resurrects a done/
+# failed/cancelled job.
+_HEARTBEAT_SQL = text(
+    "UPDATE jobs SET last_heartbeat_at = now() "
+    "WHERE id = :j AND started_at = :sa "
+    "AND status NOT IN ('done', 'failed', 'cancelled')"
+)
+
+# _write_heartbeat result codes.
+_HB_ALIVE = 1     # row updated — job still active and this attempt still owns it
+_HB_TERMINAL = 0  # rowcount 0 — job terminal/gone OR re-claimed by a newer attempt
+_HB_ERROR = -1    # write failed — treat as alive (don't strand a healthy job)
+
+
+def _write_heartbeat(job_id: str, started_at) -> int:
+    """Best-effort liveness ping for one job ATTEMPT. Returns an _HB_* code.
+
+    ``started_at`` scopes the write to the attempt that owns this thread; a
+    rowcount of 0 means the job is terminal, gone, or has been re-claimed by a
+    newer attempt — in every case this thread should stop. Never raises: liveness
+    is best-effort and must not fail a job. A write error returns _HB_ERROR (not
+    _HB_TERMINAL) so a single bad commit doesn't stop the thread and strand a
+    healthy job — the thread counts consecutive errors instead.
+    """
+    from src.db.session import system_sync_session
+
+    try:
+        with system_sync_session() as _db:
+            rowcount = _db.execute(
+                _HEARTBEAT_SQL, {"j": str(job_id), "sa": started_at}
+            ).rowcount
+            _db.commit()
+            return _HB_ALIVE if rowcount == 1 else _HB_TERMINAL
+    except Exception:  # noqa: BLE001 — liveness is best-effort; never fail a job on it
+        _logger.debug("heartbeat write failed for job %s", job_id, exc_info=True)
+        return _HB_ERROR
+
+
+class HeartbeatThread:
+    """Background liveness pinger for a running scrape job.
+
+    Writes jobs.last_heartbeat_at every ``interval_s`` from a daemon thread so a
+    long-but-healthy scrape/enrich proves it is alive and the watchdog does not
+    falsely re-queue it.
+
+    Lifecycle — stop() (called from __exit__) is the PRIMARY shutdown, so use it
+    as a context manager wrapping the task body:
+
+        with HeartbeatThread(job_id) as hb, rls_sync_session(uid) as db:
+            ... claim ...
+            hb.start()        # start only once THIS worker owns the job
+            ... work ...
+        # __exit__ -> stop() fires on normal exit, return, OR exception
+
+    Two backstops cover the case where stop() somehow doesn't run:
+      1. Self-reap: the heartbeat CAS returns rowcount 0 once the job is terminal,
+         so the thread stops within one interval.
+      2. ``_MAX_LIFETIME_S`` hard cap: a daemon thread also dies with the worker
+         process (Celery's hard time_limit kill — the one moment a re-queue SHOULD
+         happen), and the cap sits just above the 65min hard limit so an orphaned
+         thread can never pin a non-terminal job "alive" indefinitely.
+    """
+
+    __slots__ = ("_job_id", "_interval", "_stop", "_thread", "_started_at")
+
+    _MAX_LIFETIME_S = 75 * 60  # backstop > 65min Celery hard limit; reaps orphans only
+    # Log once consecutive write failures cross this threshold. Sustained failure
+    # lets last_heartbeat_at go stale; the watchdog may then re-queue a still-live
+    # worker — non-duplicating once migration 062 ships, but worth surfacing.
+    _FAIL_WARN_AT = 5
+
+    def __init__(self, job_id: str, interval_s: float = 60.0) -> None:
+        self._job_id = str(job_id)
+        self._interval = interval_s
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._started_at = None
+
+    def _run(self) -> None:
+        deadline = time.monotonic() + self._MAX_LIFETIME_S
+        consecutive_failures = 0
+        while not self._stop.is_set() and time.monotonic() < deadline:
+            code = _write_heartbeat(self._job_id, self._started_at)
+            if code == _HB_TERMINAL:
+                return  # job terminal/gone — self-reap
+            if code == _HB_ERROR:
+                consecutive_failures += 1
+                if (
+                    consecutive_failures == self._FAIL_WARN_AT
+                    or consecutive_failures % 30 == 0
+                ):
+                    # Once a heartbeat has succeeded at least once, last_heartbeat_at
+                    # is non-NULL and the watchdog uses the 15-min STALE-heartbeat
+                    # path (not the started_at fallback) — so sustained write
+                    # failures on a still-live worker CAN make the watchdog re-queue
+                    # it. That re-queue is non-duplicating once the idempotent-insert
+                    # work ships (migration 062), but it is worth surfacing to ops.
+                    _logger.warning(
+                        "heartbeat for job %s failed %d× consecutively — "
+                        "last_heartbeat_at is going stale; the watchdog may re-queue "
+                        "this job even though the worker is alive",
+                        self._job_id, consecutive_failures,
+                    )
+            else:
+                consecutive_failures = 0
+            self._stop.wait(self._interval)
+
+    def start(self, started_at) -> "HeartbeatThread":
+        """Start beating for the attempt identified by ``started_at``.
+
+        ``started_at`` must be the value the claim UPDATE stamped on this job
+        (job.started_at after the claim). It scopes every heartbeat write to this
+        attempt so a thread from a superseded attempt can't refresh the row.
+        """
+        if self._thread is not None:
+            # Idempotent: a second start() would orphan the first thread (only the
+            # latest is tracked by stop()). Never expected on the one code path,
+            # but the helper is reused — don't leak.
+            return self
+        self._started_at = started_at
+        self._thread = threading.Thread(
+            target=self._run, name=f"heartbeat-{self._job_id[:8]}", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout=2.0)
+
+    def __enter__(self) -> "HeartbeatThread":
+        # Does NOT start the thread — the caller starts it only after claiming the
+        # job (see class docstring). __exit__ stops it regardless.
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.stop()

@@ -22,16 +22,20 @@ def _watchdog_stuck_jobs_impl() -> None:
 
     Runs every 5 minutes. Re-queues the job for retry up to max_retries times.
 
-    The cutoff MUST exceed run_scrape_job's Celery hard time_limit (3900s = 65min,
-    tasks.py) — a job is "stuck" only once it has run LONGER than a live task can
-    possibly run. The old 20-min cutoff fired while a job was still legitimately
-    working (a 24,708-parcel King tax enrich runs well past 20min): the watchdog
-    re-queued a LIVE job, and since run_scrape_job is not yet retry-idempotent the
-    re-run appended a second full copy of its results (the 2026-06-17 duplication
-    incident). 70min = 65min hard limit + one 5-min tick of headroom, so only a
-    genuinely killed/dead job (already past the Celery kill) is ever re-queued.
-    (Idempotent re-run + heartbeat-based detection is the deferred complete fix;
-    it needs a system-role DELETE grant on results + delivered_records re-point.)
+    Liveness is driven by jobs.last_heartbeat_at (migration 061): run_scrape_job
+    beats every ~60s from a daemon thread while it owns the job. An active job is
+    "stuck" only once that signal goes STALE (HEARTBEAT_STALE_MINUTES) — i.e. the
+    worker is genuinely gone — regardless of how long the job has legitimately run.
+    This replaces the old started_at-age cutoff, which fired on a LIVE long job (a
+    24,708-parcel King tax enrich runs well past 20min): the watchdog re-queued a
+    live job, and since run_scrape_job appended results on re-run that DOUBLED them
+    (the 2026-06-17 duplication incident).
+
+    NULL last_heartbeat_at = a pre-deploy job (started before this code shipped) or
+    one that hasn't beat yet. For those we fall back to the conservative started_at
+    cutoff (> the 65min Celery hard limit) so a live long job that predates the
+    heartbeat is never falsely re-queued during the rolling deploy. New jobs beat
+    within ~60s, so the heartbeat path governs them almost immediately.
     """
     from sqlalchemy import and_, or_, select
 
@@ -40,8 +44,14 @@ def _watchdog_stuck_jobs_impl() -> None:
     from src.workers.tasks import run_scrape_job
 
     now = datetime.now(UTC)
-    # > Celery hard time_limit (65min) so a LIVE long job (e.g. big-county tax
-    # enrichment) is never declared stuck while it is still running.
+    # A live worker beats every ~60s; 15min of silence = the worker is genuinely
+    # gone (process hard-killed by Celery's time_limit, OOM, crash, broker loss).
+    # Comfortably above the longest single bounded blocking unit (30s GIS chunk,
+    # 240s assessor cap) so a slow-but-alive step can't trip it.
+    heartbeat_cutoff = now - timedelta(minutes=15)
+    # Fallback for NULL-heartbeat jobs only (pre-deploy / not-yet-beat): keep the
+    # conservative > Celery-hard-limit (65min) cutoff so a LIVE long job is never
+    # declared stuck while still running.
     stuck_cutoff = now - timedelta(minutes=70)
     # A job stuck in 'queued' state with started_at=NULL is a zombie
     # — the worker died before it could mark the job started. The
@@ -58,7 +68,19 @@ def _watchdog_stuck_jobs_impl() -> None:
                     and_(
                         Job.status.in_(STUCK_CHECK_STATUSES),
                         or_(
-                            Job.started_at < stuck_cutoff,
+                            # Heartbeat present and STALE → worker genuinely gone.
+                            # A live worker beats every ~60s, so a healthy long
+                            # job never matches this no matter its total runtime.
+                            Job.last_heartbeat_at < heartbeat_cutoff,
+                            # No heartbeat yet (pre-deploy / not-yet-beat): fall
+                            # back to the conservative started_at cutoff (>65min
+                            # Celery hard limit) so a live long job is never
+                            # falsely re-queued. NULL started_at is the zombie
+                            # case below, not this one.
+                            and_(
+                                Job.last_heartbeat_at.is_(None),
+                                Job.started_at < stuck_cutoff,
+                            ),
                             # Zombie: never got a started_at, but was created
                             # more than 10 minutes ago. A legitimate job goes
                             # from pending → queued → probing within seconds.

@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
-from src.config.constants import BatchRunStatus, JobStatus
+from src.config.constants import BatchRunStatus, JobStatus, NotificationType
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -1067,4 +1067,25 @@ class SegmentUnionResponse(BaseModel):
     # Rows skipped because their filing date was unparseable/NULL. Only nonzero
     # when a filing-date window is active (windowed queries require a real date).
     excluded_no_date_count: int = 0
+
+
+# ─── Notifications (Phase 2b) ─────────────────────────────────────────────────
+
+class NotificationResponse(BaseModel):
+    id: str
+    type: NotificationType
+    job_id: str | None = None
+    detail: dict | None = None
+    read_at: datetime | None = None
+    created_at: datetime
+    model_config = {"from_attributes": True}
+
+
+class NotificationListResponse(BaseModel):
+    items: list[NotificationResponse]
+    unread_count: int
+
+
+class ReadAllResponse(BaseModel):
+    updated: int
     rows: list[SegmentLeadRow]

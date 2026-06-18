@@ -296,7 +296,17 @@ def run_scrape_job(self, job_id: str) -> None:
         try:
             scraper_class, matched_record_type = get_scraper_class(config.county, config.state, config.record_type)
         except UnsupportedCountyError as exc:
-            _fail_job(db, job, r, job_id, str(exc))
+            reason = str(exc)
+            if _fail_job(db, job, r, job_id, reason):
+                from src.workers.notification_emit import create_notification
+                create_notification(
+                    user_id=job.user_id, type="job_failed", job_id=job_id,
+                    detail={
+                        "scraper_name": getattr(config, "name", None),
+                        "county": getattr(config, "county", None),
+                        "error_summary": reason[:200],
+                    },
+                )
             return
 
         # ── SCRAPING ──────────────────────────────────────────────────────────
@@ -403,7 +413,17 @@ def run_scrape_job(self, job_id: str) -> None:
                 db.rollback()
             except Exception:
                 pass
-            _fail_job(db, job, r, job_id, f"Scraper timed out after {_SCRAPE_TIMEOUT // 60} minutes. Try a shorter date range.")
+            reason = f"Scraper timed out after {_SCRAPE_TIMEOUT // 60} minutes. Try a shorter date range."
+            if _fail_job(db, job, r, job_id, reason):
+                from src.workers.notification_emit import create_notification
+                create_notification(
+                    user_id=job.user_id, type="job_failed", job_id=job_id,
+                    detail={
+                        "scraper_name": getattr(config, "name", None),
+                        "county": getattr(config, "county", None),
+                        "error_summary": reason[:200],
+                    },
+                )
             return
         except Exception:
             _logger.exception("Scraper error for job %s", job_id)
@@ -412,7 +432,17 @@ def run_scrape_job(self, job_id: str) -> None:
                 db.rollback()
             except Exception:
                 pass
-            _fail_job(db, job, r, job_id, "Scraper encountered an error — our team has been notified.")
+            reason = "Scraper encountered an error — our team has been notified."
+            if _fail_job(db, job, r, job_id, reason):
+                from src.workers.notification_emit import create_notification
+                create_notification(
+                    user_id=job.user_id, type="job_failed", job_id=job_id,
+                    detail={
+                        "scraper_name": getattr(config, "name", None),
+                        "county": getattr(config, "county", None),
+                        "error_summary": reason[:200],
+                    },
+                )
             return
 
         _publish_log(r, job_id, "success", f"Scrape complete — {len(records)} records found", db=db)
@@ -779,10 +809,17 @@ def run_scrape_job(self, job_id: str) -> None:
                 # (deleted user / bad id / RLS scope). Don't leave the job marked
                 # billed-without-charge — roll back and fail loudly (Codex).
                 db.rollback()
-                _fail_job(
-                    db, job, r, job_id,
-                    "Billing failed: user record-usage counter could not be updated.",
-                )
+                reason = "Billing failed: user record-usage counter could not be updated."
+                if _fail_job(db, job, r, job_id, reason):
+                    from src.workers.notification_emit import create_notification
+                    create_notification(
+                        user_id=job.user_id, type="job_failed", job_id=job_id,
+                        detail={
+                            "scraper_name": getattr(config, "name", None),
+                            "county": getattr(config, "county", None),
+                            "error_summary": reason[:200],
+                        },
+                    )
                 return
         else:
             _logger.info(
@@ -1003,6 +1040,17 @@ def run_scrape_job(self, job_id: str) -> None:
             return
         _publish_log(r, job_id, "success", f"Job complete — {display_count} new leads ({dup_count} duplicates filtered)", db=db)
         r.publish(f"job_logs:{job_id}", json.dumps({"type": "done", "record_count": display_count}))
+
+        # ── IN-APP NOTIFICATION (best-effort; gated by CAS already confirmed above) ──
+        from src.workers.notification_emit import create_notification
+        create_notification(
+            user_id=job.user_id, type="job_completed", job_id=job_id,
+            detail={
+                "scraper_name": config.name,
+                "county": config.county,
+                "record_count": display_count,
+            },
+        )
 
         # ── EMAIL DELIVERY ─────────────────────────────────────────────────────
         emails = deliver_config.get("emails", [])

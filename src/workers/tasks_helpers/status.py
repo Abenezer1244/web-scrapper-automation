@@ -153,7 +153,7 @@ def _set_status(db, job, status: str, **kwargs: Unpack[JobUpdateFields]) -> bool
     return rowcount == 1
 
 
-def _fail_job(db, job, r, job_id: str, reason: str) -> None:
+def _fail_job(db, job, r, job_id: str, reason: str) -> bool:
     """Transition job to FAILED with a human-readable error message.
 
     H3 (full-SaaS review): the previous implementation rolled back
@@ -174,13 +174,18 @@ def _fail_job(db, job, r, job_id: str, reason: str) -> None:
          opens a fresh system_sync_session for the INSERT. This
          guarantees the failure message lands in job_logs even if
          the main session is misbehaving.
+
+    Returns the CAS boolean from _set_status so callers can gate
+    notification emit on whether the transition actually succeeded
+    (False means the job was already terminal — no-op, no emit).
     """
     try:
         db.rollback()  # Recover from any pending failed transaction
     except Exception:
         pass
+    cas_ok = False
     try:
-        _set_status(db, job, "failed", finished_at=_now(), error_message=reason)
+        cas_ok = _set_status(db, job, "failed", finished_at=_now(), error_message=reason)
     except Exception as exc:
         _logger.error(
             "Job %s: _set_status failed during _fail_job: %s",
@@ -191,6 +196,7 @@ def _fail_job(db, job, r, job_id: str, reason: str) -> None:
     _publish_log(r, job_id, "error", reason, db=None)
     r.publish(f"job_logs:{job_id}", json.dumps({"type": "failed", "error": reason}))
     _logger.error("Job %s failed: %s", job_id, reason)
+    return cas_ok
 
 
 # ── Liveness heartbeat (watchdog input) ──────────────────────────────────────

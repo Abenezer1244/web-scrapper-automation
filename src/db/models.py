@@ -413,6 +413,33 @@ class AuditEvent(Base):
     )
 
 
+class Notification(Base):
+    """Phase 2b: per-user in-app notification feed (migration 065).
+
+    SYSTEM-written (Celery workers via system_sync_session), APP-read (user-
+    scoped endpoints via get_rls_db). Unlike AuditEvent, user_id IS an FK with
+    ondelete=CASCADE so a deleted user's notifications are cleaned up. job_id is
+    a plain ref (NO FK) so a notification survives job deletion; NULL for
+    payment_failed. read_at NULL = unread. detail holds small display context
+    only (no stack traces / PII)."""
+
+    __tablename__ = "notifications"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    type = Column(String(32), nullable=False)
+    job_id = Column(UUID(as_uuid=False), nullable=True)  # soft ref, no FK
+    detail = Column(JSON, nullable=True)
+    read_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class Job(Base):
     __tablename__ = "jobs"
 

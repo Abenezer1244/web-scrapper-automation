@@ -277,6 +277,23 @@ DROP POLICY IF EXISTS dialer_deliveries_system ON public.dialer_deliveries;
 CREATE POLICY dialer_deliveries_system ON public.dialer_deliveries
     FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
 
+-- ── notifications (065): app SELECT (read own feed) + UPDATE (mark read_at);
+--    NO app INSERT — the feed is written by workers (system). Drop the
+--    untargeted isolation policy from migration 065 first, then role-target.
+DROP POLICY IF EXISTS notifications_user_isolation ON public.notifications;
+DROP POLICY IF EXISTS notifications_app_select ON public.notifications;
+CREATE POLICY notifications_app_select ON public.notifications
+    FOR SELECT TO bridgeleads_app
+    USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
+DROP POLICY IF EXISTS notifications_app_update ON public.notifications;
+CREATE POLICY notifications_app_update ON public.notifications
+    FOR UPDATE TO bridgeleads_app
+    USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid)
+    WITH CHECK (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
+DROP POLICY IF EXISTS notifications_system ON public.notifications;
+CREATE POLICY notifications_system ON public.notifications
+    FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
+
 COMMIT;
 
 -- ── Verification (informational) ────────────────────────────────────────────

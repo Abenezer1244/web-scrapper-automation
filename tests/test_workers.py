@@ -632,3 +632,64 @@ def test_deliver_job_results_soft_fails_gracefully():
         recipient_emails=["test@test.bridgeleads.io"],
         fmt="csv",
     )
+
+
+def test_on_failure_terminalizes_stuck_non_terminal_job():
+    """An uncaught exception in run_scrape_job leaves the job in a non-terminal
+    status (e.g. 'enriching'). The custom task base's on_failure must CAS-fail it so
+    it terminalizes with an error message instead of hanging until the watchdog's slow
+    started_at fallback (the 2026-06-18 insertmanyvalues .rowcount crash failure mode)."""
+    from src.workers.tasks import run_scrape_job
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="enriching",
+            trigger="manual",
+            started_at=datetime.now(UTC),
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    # Simulate Celery invoking the task's failure hook (args == the task's user args).
+    run_scrape_job.on_failure(RuntimeError("boom"), "task-1", (job_id,), {}, None)
+
+    with SyncSessionLocal() as db:
+        row = db.get(Job, job_id)
+        assert row.status == "failed"
+        assert row.error_message  # carries a human-readable reason
+        assert row.finished_at is not None
+
+
+def test_on_failure_leaves_already_terminal_job_untouched():
+    """If the job genuinely finished before an unrelated late crash, on_failure must
+    NOT overwrite the terminal status (the _fail_job CAS excludes terminal rows)."""
+    from src.workers.tasks import run_scrape_job
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="done",
+            trigger="manual",
+            record_count=7,
+            finished_at=datetime.now(UTC),
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    run_scrape_job.on_failure(RuntimeError("late boom"), "task-2", (job_id,), {}, None)
+
+    with SyncSessionLocal() as db:
+        row = db.get(Job, job_id)
+        assert row.status == "done"  # never flipped to failed
+        assert row.record_count == 7

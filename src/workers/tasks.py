@@ -57,8 +57,59 @@ from src.workers.tasks_helpers.status import (
 _logger = setup_logger("worker.task")
 
 
+def _fail_job_after_uncaught(job_id: str, reason: str) -> None:
+    """Last-resort terminal cleanup for a crashed run_scrape_job (see _RunScrapeJobTask).
+
+    If an exception escapes run_scrape_job, the job is left pinned in a NON-terminal
+    status (e.g. 'enriching') with no error message — indistinguishable from a hang and
+    only recoverable by the watchdog's slow started_at fallback. This opens a FRESH
+    system session (the task's own session is gone by the time on_failure runs) and fails
+    the job via the standard _fail_job path. The _set_status CAS inside _fail_job excludes
+    terminal statuses, so a job that genuinely finished before an unrelated late crash is
+    left untouched. Best-effort: it must never raise out of on_failure.
+    """
+    try:
+        from sqlalchemy import select
+
+        from src.db.models import Job
+        from src.db.session import system_sync_session
+
+        r = _redis()
+        with system_sync_session() as db:
+            job = db.execute(
+                select(Job).where(Job.id == job_id)
+            ).scalar_one_or_none()
+            if job is None or job.status in _TERMINAL_STATUSES:
+                return
+            _fail_job(db, job, r, job_id, reason)
+    except Exception:  # cleanup must never mask or replace the original failure
+        _logger.exception("Job %s: post-crash terminal cleanup failed", job_id)
+
+
+class _RunScrapeJobTask(app.Task):
+    """Custom base so an UNCAUGHT exception in run_scrape_job fails the job cleanly.
+
+    run_scrape_job protects the scrape phase with try/except + _fail_job, but the
+    post-scrape phase (insert / dedup / export / billing) is not fully wrapped; a crash
+    there (e.g. the 2026-06-18 insertmanyvalues .rowcount AttributeError) escaped the task
+    and left the job stuck in 'enriching'. on_failure fires in the worker once the task
+    has raised its final exception (no self.retry() is used, so this IS the final
+    outcome — Retry/soft-timeout included) and CAS-fails the job so it terminalizes with
+    an error message instead of hanging.
+    """
+
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        job_id = args[0] if args else (kwargs or {}).get("job_id")
+        if job_id:
+            _fail_job_after_uncaught(
+                str(job_id),
+                "Job failed during processing — our team has been notified.",
+            )
+
+
 @app.task(
     name="src.workers.tasks.run_scrape_job",
+    base=_RunScrapeJobTask,
     bind=True,
     max_retries=3,
     default_retry_delay=30,

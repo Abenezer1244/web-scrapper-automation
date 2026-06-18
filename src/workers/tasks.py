@@ -153,14 +153,17 @@ def run_scrape_job(self, job_id: str) -> None:
         # genuine duplicates. A per-job lease would buy back the fast path; out of
         # scope here and unnecessary (the batch barrier waits for terminal
         # children regardless of which recovery path fires).
-        # Reset last_heartbeat_at IN the claim so a watchdog-retried job can't
-        # carry a STALE heartbeat from a prior attempt into the window between
-        # claim and the heartbeat thread's first write — the watchdog would
-        # otherwise see the old stale value and re-queue this live retry (Codex).
+        # ROLLBACK 2026-06-18: the HeartbeatThread is DISABLED (see below) because it
+        # deadlocked the insert phase contending for the small worker connection pool
+        # (every post-PR#59 scrape wedged at "Saving records to database..."). We
+        # deliberately do NOT stamp last_heartbeat_at here, so it stays NULL and the
+        # watchdog uses its conservative started_at>stuck_cutoff fallback (the proven
+        # PR#57 behavior). Re-enable the heartbeat only with a dedicated NullPool
+        # engine isolated from the work pool (see docs/BUILD_JOURNAL.md).
         claimed = db.execute(
             update(Job)
             .where(Job.id == job_id, Job.status == "pending")
-            .values(status="queued", started_at=_now(), last_heartbeat_at=_now())
+            .values(status="queued", started_at=_now())
         ).rowcount
         db.commit()
         if not claimed:
@@ -171,14 +174,16 @@ def run_scrape_job(self, job_id: str) -> None:
             )
             return
         db.refresh(job)
-        # Liveness heartbeat: now that THIS worker owns the job, prove it is alive
-        # every ~60s from a daemon thread (its own short txn — never this work
-        # session). The watchdog re-queues an active job only when this signal is
-        # STALE, so a long-but-healthy enrich is never falsely re-queued. Scoped to
-        # job.started_at (the value the claim just stamped) so a thread from a
-        # superseded attempt can't refresh this row. stop() is guaranteed by the
-        # enclosing `with HeartbeatThread(...)` __exit__.
-        _hb.start(job.started_at)
+        # Liveness heartbeat DISABLED (rollback 2026-06-18). The daemon thread shared
+        # the worker's small sync connection pool (pool_size=2) with the main work
+        # session + _publish_log; during the DB-heavy insert phase the main thread and
+        # the heartbeat thread deadlocked on the pool, wedging EVERY scrape at the
+        # insert with a frozen heartbeat (worker-internal, invisible to pg_stat_activity;
+        # DB/insert/commit all verified fast in isolation). Leaving it unstarted (the
+        # `with HeartbeatThread(...)` __enter__ never starts it; __exit__.stop() no-ops)
+        # restores scraping and reverts the watchdog to its started_at fallback. Re-enable
+        # ONLY with a dedicated NullPool engine for the heartbeat (Codex; BUILD_JOURNAL).
+        # _hb.start(job.started_at)  # DISABLED — do not re-enable without pool isolation
         _publish_log(r, job_id, "info", f"Job queued — {config.name} ({config.county}, {config.state})", db=db)
 
         # ── PROBING ───────────────────────────────────────────────────────────

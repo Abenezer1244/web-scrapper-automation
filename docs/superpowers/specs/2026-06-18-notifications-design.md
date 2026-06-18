@@ -37,7 +37,12 @@ Mirrors the `AuditEvent` (`src/db/models.py`) and `Job` conventions: string UUID
 | `read_at` | `DateTime(timezone=True)`, `nullable=True` | unread = `NULL` |
 | `created_at` | `DateTime(timezone=True)`, `server_default=func.now()`, `nullable=False`, indexed | newest-first ordering |
 
-Model: `Notification(Base)` in `src/db/models.py`. Volume is low (≈1 row/job + rare payment events), so the `(user_id)` and `(created_at)` indexes are created normally in the migration — **not** `CONCURRENTLY` (the >50k-row caution from migrations 062/064 does not apply here).
+Model: `Notification(Base)` in `src/db/models.py`. Volume is low (≈1 row/job + rare payment events), so indexes are created normally in the migration — **not** `CONCURRENTLY` (the >50k-row caution from migrations 062/064 does not apply here).
+
+**Indexes (match the actual queries — Codex P2):**
+- Composite `ix_notifications_user_created` on `(user_id, created_at DESC)` — serves `GET /notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 50`.
+- Partial `ix_notifications_user_unread` on `(user_id) WHERE read_at IS NULL` — serves the `unread_count` and keeps it cheap as old unread rows accumulate.
+- (No standalone single-column `user_id`/`created_at` index — the composite covers `user_id` prefix lookups.)
 
 ### RLS — the 4-step drift checklist (verbatim to existing precedent)
 1. **In migration 065:** `ALTER TABLE notifications ENABLE ROW LEVEL SECURITY` + an untargeted isolation policy (the role-independent pattern from migration 056):
@@ -46,40 +51,38 @@ Model: `Notification(Base)` in `src/db/models.py`. Volume is low (≈1 row/job +
      USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
    ```
    No `FORCE` and no role-targeted DDL in Alembic (the 030/031 lesson: role-conditional DDL no-ops in CI and never re-runs).
-2. **`scripts/provision_rls_roles.sql`:** grant `bridgeleads_app` `SELECT, INSERT, UPDATE` on `notifications`; the broad system grant already covers it. Add `notifications` to the verification `DO $verify$` block's expectations and **REVOKE DELETE** from the app role (app never deletes notifications in 2b).
-3. **`scripts/apply_rls_cutover_policies.sql`:** role-targeted policies:
+2. **`scripts/provision_rls_roles.sql`:** grant `bridgeleads_app` **`SELECT, UPDATE` only** on `notifications` (the app endpoints only read and mark-read; **all inserts come from the system role** — see §3 — so the app gets no INSERT surface, per Codex P2 least-privilege). The broad system grant (`GRANT SELECT, INSERT, UPDATE … TO bridgeleads_system`) already covers writes. Add `notifications` to the verification `DO $verify$` block's expectations and **REVOKE INSERT, DELETE** from the app role.
+3. **`scripts/apply_rls_cutover_policies.sql`:** **first `DROP POLICY IF EXISTS notifications_user_isolation ON notifications`** (the repo's cutover pattern drops the untargeted policy when installing role-targeted ones — Codex P2), then:
    ```sql
    CREATE POLICY notifications_app_select ON notifications FOR SELECT TO bridgeleads_app
      USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
-   CREATE POLICY notifications_app_insert ON notifications FOR INSERT TO bridgeleads_app
-     WITH CHECK (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
    CREATE POLICY notifications_app_update ON notifications FOR UPDATE TO bridgeleads_app
      USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid)
      WITH CHECK (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
    CREATE POLICY notifications_system ON notifications FOR ALL TO bridgeleads_system
      USING (true) WITH CHECK (true);
    ```
-4. **`scripts/apply_rls_force.sql`:** add `ALTER TABLE notifications FORCE ROW LEVEL SECURITY` (operator cutover script only).
+   (No `notifications_app_insert` — the app never inserts.)
+4. **`scripts/apply_rls_force.sql`:** add `notifications` to the script's `tbls` array (and the rollback comment) so it's included in the FORCE cutover — the script hard-fails any forced table lacking a system policy, so step 3's `notifications_system` must exist first (Codex P2).
 
 ---
 
 ## 3. Backend — emit + endpoints
 
-### Emit helper
-`create_notification(db, *, user_id, type, job_id=None, detail=None)` — the single insert point. It **reads `User.notification_prefs[type]` and inserts only if enabled** (one toggle governs both email and in-app — consistent with existing email gating). Defaults to enabled if the key is absent. Idempotency is not required (one terminal transition → one call), but the helper must not raise into the job's critical path — a notification-insert failure is logged and swallowed (a notification is not worth failing a completed job over), consistent with the existing fire-and-forget email behavior.
+### Emit helper — unified system write path
+`create_notification(*, user_id, type, job_id=None, detail=None)` — the single insert point. **It opens its OWN `system_sync_session()`** (system role, covered by `notifications_system FOR ALL`) — it does NOT take a caller's `db`. This matters: the only correct insert path is the system role, because (a) the worker's job session is `rls_sync_session(job.user_id)` and we want notification emit decoupled from the job's transaction, and (b) the Stripe webhook's session has no user GUC at all (see payment path below). Inside, it **reads `User.notification_prefs[type]` and inserts only if enabled** (one toggle governs both email and in-app — defaults to enabled if the key absent), and **fails closed on an unknown `type`** (Codex P3). The helper never raises into the caller — a notification-insert failure is logged and swallowed (a notification is not worth failing a completed job or a webhook over). Exactly-once is **not** required; emit is best-effort (the email is the primary channel).
 
-Emit call-sites (all already carry `user_id`):
-- `src/workers/tasks.py` `→ done` (≈ line 991, alongside `deliver_job_results`) → `type="job_completed"`, `job_id`, `detail={scraper_name, county, record_count}`.
-- `src/workers/tasks_helpers/status.py` `_fail_job` (or the `tasks.py` fail call-sites) `→ failed` → `type="job_failed"`, `job_id`, `detail={scraper_name, county, error_summary}`.
-- Stripe `payment_failed` path (alongside `_send_payment_failed_email`) → `type="payment_failed"`, `job_id=None`, `detail={attempt_count}`.
+**This helper runs in the WORKER process only.** Call-sites:
 
-**Write path:** workers run outside any request, so they insert via **`system_sync_session()`** (system role, covered by `notifications_system FOR ALL`). The API path never uses `system_sync_session` (session.py constraint).
+- **`job_completed`** — `src/workers/tasks.py` `→ done` (≈ line 991). The done transition already checks the `_set_status(... "done")` CAS return before delivering email; emit the notification in the **same `if cas_succeeded:` block, after the CAS commit** (Codex P1/P2 — never emit if the row was already terminalized). `detail={scraper_name, county, record_count}`.
+- **`job_failed`** — gate emit on the `_set_status(..., "failed")` CAS result. `_fail_job` (`src/workers/tasks_helpers/status.py:156`) currently **ignores** that boolean — thread it out (return it) and emit `job_failed` only when the failed-transition actually occurred (Codex P1). `detail={scraper_name, county, error_summary}` (short, no stack trace/PII).
+- **`payment_failed`** — runs in the **FastAPI Stripe webhook** (`src/api/routes/billing.py`, `Depends(get_db)`, no user GUC), NOT a worker. The API process must never use `system_sync_session` (non-negotiable). So the webhook **enqueues a Celery task** `emit_payment_notification.delay(user_id=…, attempt_count=…)`; the worker task calls `create_notification(type="payment_failed", job_id=None, detail={attempt_count})`. The user is resolved via the unique `stripe_customer_id` (migration 019), which the webhook already does to send the email. Best-effort: if the enqueue/insert is lost after Stripe's event is claimed (Redis dedup → no retry), the notification is simply absent — acceptable for a supplementary channel.
 
 ### Endpoints (`src/api/routes/notifications.py`)
-All use `current_user: CurrentUser` + `db = Depends(get_rls_db)` and the **mandatory `.where(Notification.user_id == current_user.id)` filter** (defense-in-depth on top of RLS). Router `prefix="/notifications"`.
+All use `current_user: CurrentUser` + `db = Depends(get_rls_db)` and the **mandatory `.where(Notification.user_id == current_user.id)` filter** (defense-in-depth on top of RLS). Router `prefix="/notifications"`. **Wire it up** (Codex P1): register the router in `src/api/__init__.py` and `app.include_router(...)` in `main.py` — otherwise the endpoints + OpenAPI silently never appear.
 
 - `GET /notifications` → `{ items: NotificationResponse[], unread_count: int }`. `items` = newest 50 (`order_by(created_at.desc()).limit(50)`); `unread_count` = `COUNT(read_at IS NULL)` for the user (one wrapper response avoids a second round-trip).
-- `PATCH /notifications/{id}/read` → set `read_at = now()` on that row (scoped to the user); returns the updated `NotificationResponse`. 404 if not owned/not found.
+- `PATCH /notifications/{id}/read` → set `read_at = now()`. **Fetch via `select(Notification).where(id == … , user_id == current_user.id)` — never `db.get(Notification, id)` before applying the user filter** (Codex P2). 404 if not owned/not found.
 - `POST /notifications/read-all` → set `read_at = now()` for all unread rows of the user; returns `{ updated: int }`.
 
 ### Schemas & types
@@ -108,10 +111,20 @@ All use `current_user: CurrentUser` + `db = Depends(get_rls_db)` and the **manda
 ---
 
 ## 6. Testing (real DB, no mocks)
-- **RLS isolation:** user A cannot `SELECT`/`PATCH` user B's notifications (needs the OWNER DSN per the existing RLS test pattern).
-- **Emit:** job→done and job→failed each create one row with correct `type`/`job_id`/`detail`; emit is **suppressed when the user's pref for that type is disabled**; `payment_failed` path inserts a row.
-- **Endpoints:** `GET` returns only the caller's rows, newest-first, with correct `unread_count`; `PATCH /{id}/read` sets `read_at` and 404s on a foreign id; `POST /read-all` marks only the caller's unread.
-- **Emit safety:** a forced notification-insert failure does not fail the job (helper swallows + logs).
+- **RLS role-policy suite (extend `tests/test_rls_role_policies.py`, not just endpoint tests — Codex P3):** under the `bridgeleads_app` role, `SELECT`/`UPDATE` are scoped to `app.current_user_id` and a foreign-user row is invisible/unwritable; **app `INSERT` is denied** (no grant); under `bridgeleads_system`, `INSERT`/`UPDATE` succeed (`FOR ALL`). Policies can be right while grants are missing — this suite catches that. (Needs the OWNER DSN per the existing pattern.)
+- **Route-wiring test:** the app's OpenAPI/paths include `/notifications`, `/notifications/{id}/read`, `/notifications/read-all` (mirror the batch route-wiring tests) — proves the router was registered.
+- **Emit:** job→done and job→failed each create one row with correct `type`/`job_id`/`detail`, **only when the `_set_status` CAS returns True**; emit is **suppressed when the user's pref for that type is disabled**; unknown `type` fails closed; the `emit_payment_notification` Celery task inserts a `payment_failed` row.
+- **Endpoints:** `GET` returns only the caller's rows, newest-first, with correct `unread_count`; `PATCH /{id}/read` sets `read_at` and 404s on a foreign id (and does not leak existence); `POST /read-all` marks only the caller's unread.
+- **Emit safety:** a forced notification-insert failure does not fail the job or the webhook (helper swallows + logs).
+
+## 6a. Codex consult reconciliation (folded into this spec)
+Pressure-tested before implementation (`.claude/rules/codex-collaboration.md`). Findings adopted:
+- **P1 — payment_failed write path:** the Stripe webhook is an API path with no user GUC; inserting under an app policy would fail post-cutover. → All emits use the system role; the webhook **enqueues a Celery task** rather than writing directly (API never uses `system_sync_session`).
+- **P1 — failed-job CAS:** emit gated on the `_set_status` CAS result (thread it out of `_fail_job`); emit after the commit, never for an already-terminal row.
+- **P1 — router wiring:** register in `src/api/__init__.py` + `main.py`.
+- **P2:** drop the untargeted isolation policy at cutover; app role = `SELECT, UPDATE` only (no INSERT); add `notifications` to `apply_rls_force.sql`; composite `(user_id, created_at DESC)` + partial unread index; PATCH filters by `user_id` (no `db.get` first).
+- **P3:** enum `type` + fail-closed on unknown; extend the role-policy test suite + add a route-wiring test.
+Confirmed-correct by Codex: `system_sync_session` as the worker write path; `get_rls_db` + mandatory `user_id` filter on reads; prefs gating from a system session (`users_system FOR ALL` exists); OpenAPI drift gate.
 
 ---
 
@@ -125,6 +138,7 @@ All use `current_user: CurrentUser` + `db = Depends(get_rls_db)` and the **manda
 ## 8. Component boundaries (one responsibility each)
 - `Notification` model — schema only.
 - migration 065 + the three RLS scripts — DDL + isolation.
-- `create_notification(...)` helper — the gated, swallow-on-error emit primitive (one place all emit points call).
-- `src/api/routes/notifications.py` — read + mark endpoints (user-scoped).
+- `create_notification(...)` helper — the gated, swallow-on-error emit primitive that owns its own `system_sync_session` (worker-process only; one place all emit points call).
+- `emit_payment_notification` Celery task — the webhook's bridge into the worker/system write path for `payment_failed`.
+- `src/api/routes/notifications.py` — read + mark endpoints (user-scoped); registered in `src/api/__init__.py` + `main.py`.
 - `NotificationsBell.tsx` — presentation + polling + read actions (consumes the typed API).

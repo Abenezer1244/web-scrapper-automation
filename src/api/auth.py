@@ -7,11 +7,11 @@ import uuid
 from dataclasses import dataclass
 from typing import Annotated
 
+import bcrypt
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt.exceptions import InvalidTokenError as JWTError
-from passlib.context import CryptContext
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,16 +20,40 @@ from src.config import settings
 from src.db import User, get_db
 
 # ─── Password hashing ─────────────────────────────────────────────────────────
+# Direct pyca/bcrypt — we dropped passlib (the unmaintained 1.7.4 pin blocked
+# every bcrypt>=5 upgrade: passlib's backend self-test hashes a >72-byte probe,
+# which bcrypt 5.0 now rejects with ValueError). bcrypt's modular-crypt format
+# is unchanged, so existing passlib-produced "$2b$12$..." hashes verify here
+# identically, and cost 12 is preserved (gensalt default == passlib default).
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+BCRYPT_ROUNDS = 12
+
+
+def _bcrypt_password_bytes(password: str) -> bytes:
+    # bcrypt only uses the first 72 BYTES of the password. passlib + bcrypt<5
+    # silently truncated; bcrypt>=5 raises on longer input, so we truncate
+    # explicitly to reproduce the long-standing effective behavior (and keep
+    # existing hashes verifiable). The API caps passwords at 72 CHARS, but a
+    # multibyte 72-char password can still exceed 72 bytes.
+    return password.encode("utf-8")[:72]
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    return bcrypt.hashpw(
+        _bcrypt_password_bytes(password),
+        bcrypt.gensalt(rounds=BCRYPT_ROUNDS),
+    ).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    # checkpw uses the salt/cost/prefix embedded in the stored hash. A malformed
+    # stored hash (not a valid bcrypt string) is treated as an auth failure
+    # rather than raising — the login path always passes a real or dummy
+    # "$2b$" hash, so this is purely defensive.
+    try:
+        return bcrypt.checkpw(_bcrypt_password_bytes(plain), hashed.encode("utf-8"))
+    except (TypeError, ValueError):
+        return False
 
 
 # ─── API key hashing ──────────────────────────────────────────────────────────

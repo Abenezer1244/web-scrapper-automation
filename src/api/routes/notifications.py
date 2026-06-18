@@ -3,6 +3,7 @@
 System (worker) writes notifications; the API only reads + marks read. Every
 query filters by current_user.id (defense-in-depth over RLS). The API never
 uses system_sync_session."""
+import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -56,6 +57,10 @@ async def mark_read(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> NotificationResponse:
+    try:
+        uuid.UUID(notification_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notification not found")
     # Never db.get() before the user filter.
     row = (
         await db.execute(

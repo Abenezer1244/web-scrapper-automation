@@ -60,6 +60,27 @@ def upgrade() -> None:
         USING ({_GUC_PREDICATE})
         """
     )
+    # Self-grant the runtime roles at creation time (guarded by role existence
+    # so CI — no provisioned roles — no-ops, prod converges). The one-time
+    # GRANT ... ON ALL TABLES in provision_rls_roles.sql does not retroactively
+    # cover a table created later; this removes that ordering dependency.
+    # Privileges mirror provision_rls_roles.sql exactly: app = SELECT, UPDATE
+    # (no INSERT/DELETE — system writes the feed); system = SELECT, INSERT,
+    # UPDATE (no DELETE — notifications are pruned via the users FK CASCADE).
+    op.execute(
+        """
+        DO $notif_grants$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_app') THEN
+                GRANT SELECT, UPDATE ON notifications TO bridgeleads_app;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_system') THEN
+                GRANT SELECT, INSERT, UPDATE ON notifications TO bridgeleads_system;
+            END IF;
+        END
+        $notif_grants$;
+        """
+    )
 
 
 def downgrade() -> None:

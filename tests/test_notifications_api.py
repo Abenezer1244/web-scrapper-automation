@@ -66,6 +66,12 @@ async def test_patch_foreign_id_404(client, starter_token):
 
 
 @pytest.mark.asyncio
+async def test_patch_malformed_id_404(client, starter_token):
+    resp = await client.patch("/notifications/not-a-uuid/read", headers=_auth(starter_token))
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_read_all(client, starter_user, starter_token):
     _seed_notification(starter_user.id, read=False)
     _seed_notification(starter_user.id, read=False)

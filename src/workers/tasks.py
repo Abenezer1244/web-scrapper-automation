@@ -58,6 +58,26 @@ from src.workers.tasks_helpers.status import (
 _logger = setup_logger("worker.task")
 
 
+@app.task(
+    name="src.workers.tasks.emit_payment_notification",
+    bind=True,
+    max_retries=3,
+    default_retry_delay=60,
+    acks_late=True,
+)
+def emit_payment_notification(self, user_id: str, attempt_count: int) -> None:
+    """Best-effort in-app notification for a failed Stripe payment.
+
+    Runs in the worker process so the notification insert uses the system role
+    (the Stripe webhook is an API path with no user RLS GUC, and the API must
+    never use system_sync_session)."""
+    from src.workers.notification_emit import create_notification
+    create_notification(
+        user_id=user_id, type="payment_failed", job_id=None,
+        detail={"attempt_count": attempt_count},
+    )
+
+
 def _fail_job_after_uncaught(job_id: str, reason: str, expected_started_at=None) -> None:
     """Last-resort terminal cleanup for a crashed run_scrape_job (see _RunScrapeJobTask).
 

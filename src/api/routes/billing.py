@@ -814,3 +814,11 @@ async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:
     # Send notification — imported here to avoid circular at startup
     from src.workers.delivery import _send_payment_failed_email
     _send_payment_failed_email(user.email, attempt_count)
+
+    # Phase 2b: best-effort in-app notification via the worker/system path
+    # (the webhook session has no user RLS GUC — never write notifications here).
+    try:
+        from src.workers.tasks import emit_payment_notification
+        emit_payment_notification.delay(str(user.id), attempt_count)
+    except Exception as exc:  # enqueue failure must not fail the webhook
+        _logger.warning("payment notification enqueue failed (non-fatal): %s", exc)

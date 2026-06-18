@@ -29,6 +29,15 @@ class JobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class NotificationType(str, Enum):
+    """In-app notification kinds (Phase 2b). Mirrors the notification_prefs
+    allowlist keys so one preference toggle governs both email and in-app."""
+
+    JOB_COMPLETED = "job_completed"
+    JOB_FAILED = "job_failed"
+    PAYMENT_FAILED = "payment_failed"
+
+
 class BatchRunStatus(str, Enum):
     """Batch-run state machine: pending -> running -> done | partial | failed
     | cancelled (`partial` = a mix of succeeded + failed children). Typing the

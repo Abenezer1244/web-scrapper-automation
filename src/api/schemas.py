@@ -1067,6 +1067,7 @@ class SegmentUnionResponse(BaseModel):
     # Rows skipped because their filing date was unparseable/NULL. Only nonzero
     # when a filing-date window is active (windowed queries require a real date).
     excluded_no_date_count: int = 0
+    rows: list[SegmentLeadRow]
 
 
 # ─── Notifications (Phase 2b) ─────────────────────────────────────────────────
@@ -1088,4 +1089,3 @@ class NotificationListResponse(BaseModel):
 
 class ReadAllResponse(BaseModel):
     updated: int
-    rows: list[SegmentLeadRow]

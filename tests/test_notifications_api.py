@@ -76,10 +76,9 @@ async def test_read_all(client, starter_user, starter_token):
     assert after.json()["unread_count"] == 0
 
 
-@pytest.mark.asyncio
-async def test_routes_registered_in_openapi(client):
-    resp = await client.get("/openapi.json")
-    paths = resp.json()["paths"]
+def test_routes_registered_in_openapi():
+    from main import app
+    paths = app.openapi()["paths"]
     assert "/notifications" in paths
     assert "/notifications/{notification_id}/read" in paths
     assert "/notifications/read-all" in paths

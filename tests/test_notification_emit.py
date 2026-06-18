@@ -1,6 +1,8 @@
 import uuid
+
 import pytest
 from sqlalchemy import text
+
 from src.db.session import system_sync_session
 from src.workers.notification_emit import create_notification
 

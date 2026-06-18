@@ -4,7 +4,7 @@ System (worker) writes notifications; the API only reads + marks read. Every
 query filters by current_user.id (defense-in-depth over RLS). The API never
 uses system_sync_session."""
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select, update
@@ -76,7 +76,7 @@ async def mark_read(
             detail="Notification not found",
         )
     if row.read_at is None:
-        row.read_at = datetime.now(timezone.utc)
+        row.read_at = datetime.now(UTC)
     await db.flush()
     return NotificationResponse.model_validate(row)
 
@@ -92,7 +92,7 @@ async def mark_all_read(
             Notification.user_id == current_user.id,
             Notification.read_at.is_(None),
         )
-        .values(read_at=datetime.now(timezone.utc))
+        .values(read_at=datetime.now(UTC))
     )
     await db.flush()
     return ReadAllResponse(updated=result.rowcount or 0)

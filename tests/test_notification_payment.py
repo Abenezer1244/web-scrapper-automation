@@ -5,8 +5,9 @@ Webhook test: uses AsyncMock for the DB session — the one sanctioned mock for
 this project (external-API-shaped webhook boundary; driving a real async
 Stripe+DB session in a unit test is disproportionate per the testing rules).
 """
+from unittest.mock import AsyncMock, patch
+
 import pytest
-from unittest.mock import patch, AsyncMock
 
 from src.workers.tasks import emit_payment_notification
 

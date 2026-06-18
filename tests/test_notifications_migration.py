@@ -1,5 +1,6 @@
 import pytest
 from sqlalchemy import text
+
 from src.db.session import sync_engine
 
 pytestmark = pytest.mark.integration

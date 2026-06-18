@@ -5,6 +5,7 @@ Redis connection (pure local execution). The done-path emit is verified by the
 integration test in Task 7's endpoint round-trip and by manual proof.
 """
 from unittest.mock import patch
+
 from src.workers.tasks_helpers.status import _fail_job
 
 

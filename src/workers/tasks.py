@@ -397,7 +397,6 @@ def run_scrape_job(self, job_id: str) -> None:
             return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
         batch_size = 1000
-        total_rows_inserted = 0
         for i in range(0, len(records), batch_size):
             batch = records[i:i + batch_size]
             rows = []
@@ -456,7 +455,13 @@ def run_scrape_job(self, job_id: str) -> None:
                 index_elements=["job_id", "source_fingerprint"],
                 index_where=sa_text("source_fingerprint IS NOT NULL"),
             )
-            total_rows_inserted += db.execute(stmt, rows).rowcount
+            # Executed with a list of rows, pg_insert(...).on_conflict_do_nothing()
+            # routes through SQLAlchemy insertmanyvalues, whose IteratorResult has NO
+            # .rowcount — reading it raises AttributeError and crashed EVERY scrape
+            # post-PR#59 (job left stuck in 'enriching'; 2026-06-18). We don't need a
+            # per-batch insert count: the authoritative persisted count is the dedup
+            # SELECT below (and billing counts persisted non-dup rows, not rowcount).
+            db.execute(stmt, rows)
             db.commit()
 
         # ── SPRINT 6.4: CROSS-JOB DEDUPLICATION ────────────────────────────

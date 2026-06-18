@@ -57,7 +57,7 @@ from src.workers.tasks_helpers.status import (
 _logger = setup_logger("worker.task")
 
 
-def _fail_job_after_uncaught(job_id: str, reason: str) -> None:
+def _fail_job_after_uncaught(job_id: str, reason: str, expected_started_at=None) -> None:
     """Last-resort terminal cleanup for a crashed run_scrape_job (see _RunScrapeJobTask).
 
     If an exception escapes run_scrape_job, the job is left pinned in a NON-terminal
@@ -67,6 +67,14 @@ def _fail_job_after_uncaught(job_id: str, reason: str) -> None:
     the job via the standard _fail_job path. The _set_status CAS inside _fail_job excludes
     terminal statuses, so a job that genuinely finished before an unrelated late crash is
     left untouched. Best-effort: it must never raise out of on_failure.
+
+    ATTEMPT-SCOPED (Codex P2): pass the crashed attempt's started_at. The watchdog
+    re-queues a stuck job by setting started_at=NULL (scheduler_helpers/health.py), and a
+    replacement worker's claim stamps a fresh started_at. So if the row's current
+    started_at no longer matches this attempt's, the row now belongs to a re-queued/
+    re-claimed NEW attempt — we must NOT fail it (that would bypass watchdog retry
+    recovery and kill a live attempt). Only the attempt that actually crashed fails its
+    own row.
     """
     try:
         from sqlalchemy import select
@@ -80,6 +88,12 @@ def _fail_job_after_uncaught(job_id: str, reason: str) -> None:
                 select(Job).where(Job.id == job_id)
             ).scalar_one_or_none()
             if job is None or job.status in _TERMINAL_STATUSES:
+                return
+            if expected_started_at is not None and job.started_at != expected_started_at:
+                _logger.info(
+                    "Job %s: skipping post-crash cleanup — row re-queued/re-claimed "
+                    "by a newer attempt (started_at moved)", job_id,
+                )
                 return
             _fail_job(db, job, r, job_id, reason)
     except Exception:  # cleanup must never mask or replace the original failure
@@ -101,9 +115,14 @@ class _RunScrapeJobTask(app.Task):
     def on_failure(self, exc, task_id, args, kwargs, einfo):
         job_id = args[0] if args else (kwargs or {}).get("job_id")
         if job_id:
+            # started_at of THIS attempt, stashed on the request by run_scrape_job
+            # right after it claimed the job. None if the crash happened before the
+            # claim (nothing to clobber) — the helper then falls back to status-only.
+            expected_started_at = getattr(self.request, "scrape_started_at", None)
             _fail_job_after_uncaught(
                 str(job_id),
                 "Job failed during processing — our team has been notified.",
+                expected_started_at=expected_started_at,
             )
 
 
@@ -225,6 +244,13 @@ def run_scrape_job(self, job_id: str) -> None:
             )
             return
         db.refresh(job)
+        # Record THIS attempt's started_at on the Celery request so the on_failure hook
+        # (_RunScrapeJobTask) can attempt-scope its crash cleanup — it must only fail the
+        # row if started_at still matches, never a re-queued/re-claimed newer attempt.
+        try:
+            self.request.scrape_started_at = job.started_at
+        except Exception:  # request context unavailable (e.g. direct call) — non-fatal
+            pass
         # Liveness heartbeat DISABLED (rollback 2026-06-18). The daemon thread shared
         # the worker's small sync connection pool (pool_size=2) with the main work
         # session + _publish_log; during the DB-heavy insert phase the main thread and

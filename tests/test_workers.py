@@ -693,3 +693,36 @@ def test_on_failure_leaves_already_terminal_job_untouched():
         row = db.get(Job, job_id)
         assert row.status == "done"  # never flipped to failed
         assert row.record_count == 7
+
+
+def test_on_failure_is_attempt_scoped_skips_requeued_attempt():
+    """Codex P2: an old attempt's late on_failure must NOT clobber a row that was
+    re-queued/re-claimed for a newer attempt. The watchdog re-queue nulls started_at and
+    a replacement claim stamps a fresh one, so when the crashed attempt's started_at no
+    longer matches the row, cleanup must skip (preserving watchdog retry recovery)."""
+    from src.workers.tasks import _fail_job_after_uncaught
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        current_started = datetime.now(UTC)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="scraping",  # a live NEWER attempt
+            trigger="manual",
+            started_at=current_started,
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    # The crashed OLD attempt had a different (earlier) started_at.
+    stale_started = current_started - timedelta(minutes=20)
+    _fail_job_after_uncaught(job_id, "old attempt crashed", expected_started_at=stale_started)
+
+    with SyncSessionLocal() as db:
+        row = db.get(Job, job_id)
+        assert row.status == "scraping"  # live newer attempt untouched
+        assert row.error_message is None

@@ -58,13 +58,11 @@ def test_unique_salts_per_hash():
 
 
 def test_passlib_context_removed():
-    # The migration's whole point: passlib is gone (its 1.7.4 pin blocked
-    # bcrypt>=5). The old module-level CryptContext must no longer exist, and
-    # passlib must not be importable in this environment (dropped from
-    # requirements.txt).
+    # The migration's whole point: the app stopped using passlib (its 1.7.4 pin
+    # blocked bcrypt>=5). Assert the module no longer exposes the old
+    # CryptContext — NOT that passlib is absent from site-packages, which is
+    # environment-dependent (a cached CI env may still have it installed even
+    # though it's dropped from requirements.txt) (Codex).
     import src.api.auth as auth_mod
 
     assert not hasattr(auth_mod, "pwd_context")
-    import importlib.util
-
-    assert importlib.util.find_spec("passlib") is None

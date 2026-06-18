@@ -63,39 +63,48 @@ def _fail_job_after_uncaught(job_id: str, reason: str, expected_started_at=None)
     If an exception escapes run_scrape_job, the job is left pinned in a NON-terminal
     status (e.g. 'enriching') with no error message — indistinguishable from a hang and
     only recoverable by the watchdog's slow started_at fallback. This opens a FRESH
-    system session (the task's own session is gone by the time on_failure runs) and fails
-    the job via the standard _fail_job path. The _set_status CAS inside _fail_job excludes
-    terminal statuses, so a job that genuinely finished before an unrelated late crash is
-    left untouched. Best-effort: it must never raise out of on_failure.
+    system session (the task's own session is gone by the time on_failure runs) and
+    terminalizes the job. Best-effort: it must never raise out of on_failure.
 
-    ATTEMPT-SCOPED (Codex P2): pass the crashed attempt's started_at. The watchdog
-    re-queues a stuck job by setting started_at=NULL (scheduler_helpers/health.py), and a
-    replacement worker's claim stamps a fresh started_at. So if the row's current
-    started_at no longer matches this attempt's, the row now belongs to a re-queued/
-    re-claimed NEW attempt — we must NOT fail it (that would bypass watchdog retry
-    recovery and kill a live attempt). Only the attempt that actually crashed fails its
-    own row.
+    ATTEMPT-SCOPED ownership (Codex P2 ×2):
+    - REQUIRE the attempt token. `expected_started_at` is the started_at this worker
+      stamped when it WON the pending→queued claim. If it's None the task crashed before
+      claiming (allowlist refresh / redis / bootstrap) or is a stale duplicate delivery —
+      it never owned the job, so we must NOT fail it (that could kill another live
+      attempt). No token → no-op.
+    - ATOMIC guard. The watchdog re-queues a stuck job by NULLing started_at
+      (scheduler_helpers/health.py) and a replacement claim stamps a fresh started_at, so
+      ownership can change between a SELECT-side check and the UPDATE. We therefore fail
+      the row in ONE statement whose WHERE pins BOTH `started_at = :expected` AND a
+      non-terminal status. A re-queued/re-claimed newer attempt (different or NULL
+      started_at) matches 0 rows and is left untouched; the watchdog retry path is
+      preserved. The failure log is published ONLY if this UPDATE actually terminalized
+      the row.
     """
+    if expected_started_at is None:
+        return
     try:
-        from sqlalchemy import select
+        from sqlalchemy import update
 
         from src.db.models import Job
         from src.db.session import system_sync_session
 
-        r = _redis()
         with system_sync_session() as db:
-            job = db.execute(
-                select(Job).where(Job.id == job_id)
-            ).scalar_one_or_none()
-            if job is None or job.status in _TERMINAL_STATUSES:
-                return
-            if expected_started_at is not None and job.started_at != expected_started_at:
-                _logger.info(
-                    "Job %s: skipping post-crash cleanup — row re-queued/re-claimed "
-                    "by a newer attempt (started_at moved)", job_id,
+            failed = db.execute(
+                update(Job)
+                .where(
+                    Job.id == job_id,
+                    Job.started_at == expected_started_at,
+                    Job.status.notin_(_TERMINAL_STATUSES),
                 )
-                return
-            _fail_job(db, job, r, job_id, reason)
+                .values(status="failed", finished_at=_now(), error_message=reason)
+            ).rowcount
+            db.commit()
+        if failed:
+            r = _redis()
+            _publish_log(r, job_id, "error", reason, db=None)
+            r.publish(f"job_logs:{job_id}", json.dumps({"type": "failed", "error": reason}))
+            _logger.error("Job %s failed (post-crash cleanup): %s", job_id, reason)
     except Exception:  # cleanup must never mask or replace the original failure
         _logger.exception("Job %s: post-crash terminal cleanup failed", job_id)
 

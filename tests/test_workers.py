@@ -636,28 +636,30 @@ def test_deliver_job_results_soft_fails_gracefully():
 
 def test_on_failure_terminalizes_stuck_non_terminal_job():
     """An uncaught exception in run_scrape_job leaves the job in a non-terminal
-    status (e.g. 'enriching'). The custom task base's on_failure must CAS-fail it so
-    it terminalizes with an error message instead of hanging until the watchdog's slow
-    started_at fallback (the 2026-06-18 insertmanyvalues .rowcount crash failure mode)."""
-    from src.workers.tasks import run_scrape_job
+    status (e.g. 'enriching'). The crash cleanup must atomically fail the OWNED attempt
+    (matching started_at) so it terminalizes with an error message instead of hanging
+    until the watchdog's slow started_at fallback (the 2026-06-18 insertmanyvalues
+    .rowcount crash failure mode)."""
+    from src.workers.tasks import _fail_job_after_uncaught
 
     with SyncSessionLocal() as db:
         user = _create_sync_user(db)
         config = _create_sync_config(db, user.id)
+        started = datetime.now(UTC)
         job = Job(
             id=str(uuid.uuid4()),
             user_id=user.id,
             scraper_config_id=config.id,
             status="enriching",
             trigger="manual",
-            started_at=datetime.now(UTC),
+            started_at=started,
         )
         db.add(job)
         db.commit()
         job_id = job.id
 
-    # Simulate Celery invoking the task's failure hook (args == the task's user args).
-    run_scrape_job.on_failure(RuntimeError("boom"), "task-1", (job_id,), {}, None)
+    # The crashed attempt owns the row (started_at matches what it stamped at claim).
+    _fail_job_after_uncaught(job_id, "Job failed during processing.", expected_started_at=started)
 
     with SyncSessionLocal() as db:
         row = db.get(Job, job_id)
@@ -666,9 +668,11 @@ def test_on_failure_terminalizes_stuck_non_terminal_job():
         assert row.finished_at is not None
 
 
-def test_on_failure_leaves_already_terminal_job_untouched():
-    """If the job genuinely finished before an unrelated late crash, on_failure must
-    NOT overwrite the terminal status (the _fail_job CAS excludes terminal rows)."""
+def test_on_failure_without_attempt_token_is_noop():
+    """Codex P2: a task that crashed BEFORE winning the pending->queued claim (or a stale
+    duplicate delivery) has no started_at token. It never owned the job, so cleanup must
+    skip rather than risk failing another live attempt. on_failure passes None when the
+    request never recorded scrape_started_at."""
     from src.workers.tasks import run_scrape_job
 
     with SyncSessionLocal() as db:
@@ -678,16 +682,48 @@ def test_on_failure_leaves_already_terminal_job_untouched():
             id=str(uuid.uuid4()),
             user_id=user.id,
             scraper_config_id=config.id,
+            status="scraping",
+            trigger="manual",
+            started_at=datetime.now(UTC),
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    # Direct on_failure call: self.request carries no scrape_started_at -> token is None.
+    run_scrape_job.on_failure(RuntimeError("pre-claim boom"), "task-1", (job_id,), {}, None)
+
+    with SyncSessionLocal() as db:
+        row = db.get(Job, job_id)
+        assert row.status == "scraping"  # untouched — no ownership token
+        assert row.error_message is None
+
+
+def test_on_failure_leaves_already_terminal_job_untouched():
+    """If the job genuinely finished before an unrelated late crash, cleanup must NOT
+    overwrite the terminal status (the atomic UPDATE excludes terminal rows) even when
+    the attempt token matches."""
+    from src.workers.tasks import _fail_job_after_uncaught
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        started = datetime.now(UTC)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
             status="done",
             trigger="manual",
             record_count=7,
+            started_at=started,
             finished_at=datetime.now(UTC),
         )
         db.add(job)
         db.commit()
         job_id = job.id
 
-    run_scrape_job.on_failure(RuntimeError("late boom"), "task-2", (job_id,), {}, None)
+    _fail_job_after_uncaught(job_id, "late boom", expected_started_at=started)
 
     with SyncSessionLocal() as db:
         row = db.get(Job, job_id)

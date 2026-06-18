@@ -430,9 +430,8 @@ class Notification(Base):
         UUID(as_uuid=False),
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
     )
-    type = Column(String(32), nullable=False, index=True)
+    type = Column(String(32), nullable=False)
     job_id = Column(UUID(as_uuid=False), nullable=True)  # soft ref, no FK
     detail = Column(JSON, nullable=True)
     read_at = Column(DateTime(timezone=True), nullable=True)

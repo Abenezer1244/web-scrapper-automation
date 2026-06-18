@@ -19,6 +19,46 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-17 — Billing-aware watchdog-dup cleanup (BILLED rows) — shipped + verified
+**Built / Shipped:** `scripts/cleanup_watchdog_billed_dups.py` (new, sibling of the safe-subset
+script) — the deferred pass over the `is_duplicate=false` BILLED watchdog-dup rows the safe script
+refuses. Ran `--commit` as the postgres owner: **deleted 72,183 billed-dup rows across 16 jobs,
+records_used decrement = 0, exit 0**, every job now exactly one row per content-fingerprint. Each
+deleted row archived to a locked-down `results_watchdog_billed_backup` (JSONB, same txn) for rollback.
+
+**Tried / Decided:** Both design Qs user-confirmed — (a) PERIOD-AWARE decrement: only when
+`effective_billed_at (billing_applied_at→finished_at) >= users.records_period_start`, else delete-only
+(a prior-period charge was already wiped by the monthly reset; decrementing now would double-subtract);
+(b) SEPARATE script (don't weaken the safe script's load-bearing NONDUP guard). Survivor ranked
+`is_duplicate ASC` first so the kept row stays billable. Per-job ATOMIC txn with `FOR UPDATE OF j,u`-locked
+billing state. Enumerated the FULL universe by fingerprint (17 jobs / 72,185 rows — 2.5× the memory's
+~29,395 estimate, incl. unrecorded spokane-probate 20,616 + king code_violation 13,071).
+
+**Failed / Blocked:** none. (codex CLI worked fine via STDIN + `-c mcp_servers={} --skip-git-repo-check`.)
+
+**Caught & fixed (Codex, 7 review rounds → CLEAN):** (1) **Critical** — decrement used STALE dry-run
+billing meta → month-boundary race could decrement the new period; fixed by re-reading FOR-UPDATE-locked
+job/user state inside the apply txn. (2) column-presence detected on system conn but used on admin conn
+→ re-detect on admin. (3) `current_schema()` qualification + composite/non-id FK fail-closed. (4) two
+`ON DELETE CASCADE` FKs to results.id (pending_skip_trace_rows, dialer_deliveries) → catalog-driven FK
+scan + apply-time assert (verified 0/0 refs). (5) backup table PII exposure → REVOKE app/anon/auth/
+service_role + ENABLE+FORCE RLS (owner postgres has BYPASSRLS, verified, so rollback reads still work).
+
+**Caught & EXCLUDED (verify-each-job, don't-assume):** okanogan `560e2846` — its 2 dups share ONE
+`created_at` (same-scrape duplicate, NOT a watchdog re-run append). `retry_count` proved unreliable
+(4 confirmed victims at 0, incl. eb56dd72) so the proof signal is the temporal wave + the fact that
+`run_scrape_job` (tasks.py:450) is the SOLE results inserter → 2+ created_at waves = re-execution.
+
+**Pending / Handoff:** (1) the new script is UNCOMMITTED to git (add to PR #59). (2) PR #59 merge/deploy
+still open — pre-build `uq_results_job_fingerprint` CONCURRENTLY out-of-band, then merge (migration 062
+RAISES on large prod results unless the index pre-exists).
+
+**Facts learned:** `results` has NO case_number/document_number/recording#/source_url column — the only
+scrape-time field outside the fingerprint is `heirs` (verified non-divergent within all groups). Local
+`settings.DATABASE_URL_SYNC` connects as `postgres` (super=f, **bypassrls=t**); app/anon/auth roles
+bypassrls=f; service_role bypassrls=t. A BYPASSRLS role overrides FORCE RLS, so a forced-RLS PII table
+is still readable by the owner for rollback while default-denying every API role.
+
 ## 2026-06-17 - Cleanup duplicate-results script stall fix
 **Built / Shipped:** `scripts/cleanup_watchdog_dup_results.py` no longer holds one
 admin transaction across a whole large job. Commit mode now rechecks terminal job

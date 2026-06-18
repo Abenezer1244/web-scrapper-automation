@@ -182,3 +182,96 @@ redacted; raw secret values will not be echoed into chat or committed to docs.
 - Existing dirty worktree changes are unrelated and must not be reverted.
 
 ---
+
+# Billing-aware watchdog dup cleanup (2026-06-17) — DEFERRED Phase 5 pass
+
+The safe-subset cleanup is DONE. This is the deferred pass over the ~29,395
+`is_duplicate=false` BILLED watchdog-dup rows that `cleanup_watchdog_dup_results.py`
+REFUSES (NONDUP guard). Targets: a988b776 (king-tax x6, 16,810), 505ed943 (spokane,
+10,748), eb56dd72 (jefferson, 1,413), king-probate x2.09 jobs.
+
+## Locked + user-confirmed (2026-06-17)
+- [x] (a) PERIOD-AWARE decrement: decrement `records_used` ONLY when
+      `effective_billed_at (billing_applied_at -> finished_at -> REFUSE if neither)
+      >= users.records_period_start`; older = DELETE-ONLY (prior-period charge already
+      wiped by the monthly reset → decrementing would double-subtract the current month).
+- [x] (b) SEPARATE script (don't weaken the safe script's load-bearing NONDUP guard).
+
+## Build rules (Codex locked)
+- No `GREATEST(0,...)`: decrement via `WHERE records_used >= :dec` + assert rowcount=1 (fail loud).
+- Survivor stays `is_duplicate=false` if any group member is (rank `is_duplicate ASC` first).
+- Atomic PER-JOB txn: repoint anchors + delete doomed + decrement + recompute billed_count.
+- Unit of idempotency = exact deleted result IDs → rerun is naturally a no-op.
+- explicit `--ids` ONLY + extra `--i-understand-billing-decrement` confirm + `--commit`.
+- Owner DSN via `ADMIN_DATABASE_URL_SYNC` (worker role can't DELETE results / decrement under RLS).
+- Column guard: pre-deploy prod has NO `jobs.billing_applied_at` / `billed_count`
+  → fall back to `finished_at`; skip billed_count recompute when column absent.
+
+## Steps
+- [x] 1. Build `scripts/cleanup_watchdog_billed_dups.py`.
+- [x] 2. Dry-run vs the named jobs; verify period_current + decrement amounts.
+- [x] 3. Codex-review the diff before `--commit` (2 rounds, clean on Critical/High).
+- [ ] 4. USER DECISION: run `--commit` on the 3 jobs (+enumerate king-probate?) — destructive, needs owner DSN.
+- [ ] 5. (separate, later) PR #59 merge/deploy with out-of-band index pre-build.
+
+## Out of scope
+- Stripe invoices (separate credits/refunds), already-delivered CSVs not rewritten.
+- x1.0x legit multi-lead-per-parcel probate dups (different fingerprint groups — never touched).
+
+## Review (2026-06-17)
+Built `scripts/cleanup_watchdog_billed_dups.py` (separate from the safe script). DRY-RUN
+validated against the 3 named jobs — delete counts match memory EXACTLY (a988b776=16,810,
+505ed943=10,748, eb56dd72=1,413; total 28,971).
+
+KEY FINDING (changes the risk profile): all 3 jobs finished MAR/APR 2026, all PRIOR to the
+June period. So the period-aware rule classifies every one as DELETE-ONLY, decrement=0 — the
+over-charge was already wiped by the May/June monthly resets; touching records_used now would
+corrupt June. The decrement path is correctly defensive (a no-op) for these historical jobs.
+
+Codex (gpt-5.x, 2 rounds):
+- R1 found 1 CRITICAL (decrement used STALE dry-run billing meta → month-boundary race could
+  decrement the new period for an old charge) + 3 High + 3 Med. Fixed all:
+  - billing meta now re-read INSIDE the admin txn with `FOR UPDATE OF j, u` (locks job+user so
+    the daily reset can't race the decrement); period_current/decrement/user_id from fresh state.
+  - admin-connection re-detects columns + recomputes the refusal gate (no false refusal).
+  - `_column_exists` filters `table_schema = current_schema()`.
+  - survivor-existence asserted before repoint; dry-run prints sample multi-billed groups.
+- R2: CLEAN on Critical/High. Residual: 1 Med (false-refusal) FIXED; 1 Low (explicit `public.`
+  qualification) accepted — `current_schema()` + admin re-detect is materially safe and explicit
+  qualification would diverge from the codebase's unqualified-table convention.
+- Sample dump empirically REFUTES the over-group risk: every multi-billed group is billed=6
+  total=6, six identical copies of ONE parcel — watchdog copies, not distinct leads.
+
+NOT YET COMMITTED — `--commit` is a destructive prod delete; awaiting explicit user go-ahead
++ ADMIN_DATABASE_URL_SYNC (owner DSN). decrement=0 means zero billing impact for these 3.
+
+## Review ADDENDUM (2026-06-17, after "verify each job, don't assume")
+Enumerated the FULL billed-dup universe by content-fingerprint (not the memory's partial list):
+**17 jobs, 72,185 rows** — far more than the ~29,395 estimate. New ones the memory never had:
+11670aea (spokane probate, 20,616), e712c43f (king code_violation FAILED, 13,071), grant/island/
+pierce probate, 6 small king-probate. PER-JOB verification (no assuming):
+- overgrp=0 ALL jobs (fingerprint never collapses visually-distinct rows).
+- heirs (only scrape field outside fingerprint) diverges in 0 groups, ALL jobs.
+- NO case_number/document_number/recording_number/source_url column EXISTS (schema-confirmed).
+- temporal signature: 16 jobs have every dup group inserted at >=2 distinct created_at (re-run append).
+- sole `results` inserter = run_scrape_job (tasks.py:450); no importer/backfill → 2+ waves = re-run. PROOF.
+- skip-trace + dialer CASCADE FK refs to doomed rows = 0/0, ALL jobs.
+- **EXCLUDED okanogan 560e2846**: its 2 dups share ONE created_at (same-scrape dup, NOT watchdog) — different root cause, out of scope. retry_count is noisy (4 watchdog victims at 0, incl. known victim eb56dd72) so NOT used as the signal.
+VERIFIED SET = **16 jobs, 72,183 rows, decrement=0** (all prior period).
+
+Codex rounds 3-7 (mutual verification) → script hardened + CLEAN:
+- archive-before-delete: every deleted row -> results_watchdog_billed_backup (JSONB, same txn; rollback).
+  Locked down: REVOKE FROM PUBLIC + revoke app/anon/auth/service_role grants + ENABLE+FORCE RLS
+  (owner postgres has BYPASSRLS verified=t -> rollback reads OK; all API roles blocked).
+- FK safety now catalog-driven (pg_constraint scan), fails closed on composite/non-id FK shapes.
+- per-job atomic txn: FOR UPDATE-locked billing meta + repoint + archive + delete + decrement.
+Round 7 = CLEAN. py_compile + ruff clean.
+
+## ✅ COMMITTED + VERIFIED (2026-06-17)
+Ran `--commit` as postgres owner. **Deleted 72,183 billed-dup rows across all 16 jobs, decrement=0,
+exit 0**, no stall. Post-verify ALL PASS: residual billed-dups=0, rows==distinct-fingerprint every job,
+backup table=72,183 rows (RLS enabled+forced, 0 app-role grants, owner=postgres). okanogan excluded.
+Rollback available from results_watchdog_billed_backup.row_data.
+
+REMAINING: (1) commit the new script to git (sibling of safe script, currently untracked).
+(2) PR #59 merge/deploy — pre-build uq_results_job_fingerprint CONCURRENTLY out-of-band, then merge.

@@ -81,6 +81,13 @@ def _fail_job_after_uncaught(job_id: str, reason: str, expected_started_at=None)
       started_at) matches 0 rows and is left untouched; the watchdog retry path is
       preserved. The failure log is published ONLY if this UPDATE actually terminalized
       the row.
+    - NOT-YET-BILLED guard (Codex P2). Only terminalize a job that has not billed
+      (`billing_applied_at IS NULL`). A crash AFTER billing committed (e.g. a transient
+      redis/DB error in a later _publish_log / enrichment / delivery, before the final
+      'done') must be left for the watchdog: its re-run skips the billing CAS (already
+      applied) and drives the job to 'done', so the user isn't left charged-but-failed.
+      The primary failure mode this hook targets — a crash in the insert/dedup phase —
+      happens BEFORE billing, so billing_applied_at is NULL and it still fails cleanly.
     """
     if expected_started_at is None:
         return
@@ -97,6 +104,7 @@ def _fail_job_after_uncaught(job_id: str, reason: str, expected_started_at=None)
                     Job.id == job_id,
                     Job.started_at == expected_started_at,
                     Job.status.notin_(_TERMINAL_STATUSES),
+                    Job.billing_applied_at.is_(None),
                 )
                 .values(status="failed", finished_at=_now(), error_message=reason)
             ).rowcount

@@ -711,6 +711,39 @@ def test_on_failure_soft_timeout_left_for_watchdog_retry():
         assert row.error_message is None
 
 
+def test_on_failure_leaves_already_billed_job_for_watchdog():
+    """Codex P2: a crash AFTER billing committed (billing_applied_at set) but before the
+    final 'done' must NOT be terminalized — the user is already charged and the watchdog
+    re-run (billing CAS skips) drives it to 'done'. Failing it would leave a
+    charged-but-failed job. Only not-yet-billed crashes terminalize."""
+    from src.workers.tasks import _fail_job_after_uncaught
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        started = datetime.now(UTC)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="enriching",
+            trigger="manual",
+            started_at=started,
+            billed_count=5,
+            billing_applied_at=datetime.now(UTC),  # already charged
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    _fail_job_after_uncaught(job_id, "post-billing transient crash", expected_started_at=started)
+
+    with SyncSessionLocal() as db:
+        row = db.get(Job, job_id)
+        assert row.status == "enriching"  # left for the watchdog to complete
+        assert row.error_message is None
+
+
 def test_on_failure_without_attempt_token_is_noop():
     """Codex P2: a task that crashed BEFORE winning the pending->queued claim (or a stale
     duplicate delivery) has no started_at token. It never owned the job, so cleanup must

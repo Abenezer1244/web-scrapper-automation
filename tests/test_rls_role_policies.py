@@ -402,6 +402,44 @@ def test_dialer_deliveries_app_update_is_tenant_scoped(cutover_ready: bool) -> N
         conn.rollback()
 
 
+def test_notifications_role_policies(cutover_ready: bool) -> None:
+    """app: SELECT scoped + no INSERT grant; system: INSERT works (worker emit)."""
+    import uuid as _uuid
+    with sync_engine.begin() as conn:
+        user_a, _user_b, _ra, _rb = _seed_two_tenants(conn)
+        nid = str(_uuid.uuid4())
+
+        # system role can INSERT a notification (worker write path)
+        conn.execute(text("SET LOCAL ROLE bridgeleads_system"))
+        n = conn.execute(
+            text("""
+                INSERT INTO notifications (id, user_id, type, created_at)
+                VALUES (:i, :u, 'job_completed', now())
+            """),
+            {"i": nid, "u": user_a},
+        ).rowcount
+        assert n == 1, "system role cannot INSERT notifications — worker emit breaks"
+        conn.execute(text("RESET ROLE"))
+
+        # app role with no GUC sees zero rows (tenant policy hides everything)
+        conn.execute(text("SET LOCAL ROLE bridgeleads_app"))
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM notifications WHERE id = :i"), {"i": nid}
+        ).scalar() == 0, "app role with no GUC must see zero notifications"
+        # app INSERT must be denied (no grant)
+        with pytest.raises(DBAPIError):
+            with conn.begin_nested():
+                conn.execute(
+                    text("""
+                        INSERT INTO notifications (id, user_id, type, created_at)
+                        VALUES (:i, :u, 'job_failed', now())
+                    """),
+                    {"i": str(_uuid.uuid4()), "u": user_a},
+                )
+        conn.execute(text("RESET ROLE"))
+        conn.rollback()
+
+
 def test_system_role_performs_worker_critical_drift_writes(cutover_ready: bool) -> None:
     """bridgeleads_system can do every worker/operator write on the drift tables.
 

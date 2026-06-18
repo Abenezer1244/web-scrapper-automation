@@ -120,6 +120,9 @@ GRANT SELECT, INSERT ON scraper_batches, batch_runs TO bridgeleads_app;
 -- audit_events (migration 055): audit_log() INSERTs from a background task
 -- (security.py:546) with no user context — INSERT only, no app read path.
 GRANT INSERT ON audit_events TO bridgeleads_app;
+-- notifications (migration 065): system (workers) WRITEs; the app only READs
+-- its own feed (GET) and UPDATEs read_at (mark-read). No app INSERT/DELETE.
+GRANT SELECT, UPDATE ON notifications TO bridgeleads_app;
 -- dialer_deliveries (migration 041): the dialer-replay route resets this
 -- user's FAILED outbox rows to pending (UPDATE needs SELECT for its WHERE).
 -- INSERT/DELETE stay worker-only.
@@ -145,6 +148,8 @@ REVOKE INSERT, DELETE ON mfa_break_glass_codes FROM bridgeleads_app;
 REVOKE UPDATE, DELETE ON scraper_batches, batch_runs FROM bridgeleads_app;
 REVOKE SELECT, UPDATE, DELETE ON audit_events FROM bridgeleads_app;
 REVOKE INSERT, DELETE ON dialer_deliveries FROM bridgeleads_app;
+-- notifications (065): app gets SELECT + UPDATE only; system writes the feed.
+REVOKE INSERT, DELETE ON notifications FROM bridgeleads_app;
 
 -- Hard-fail if the app role still holds any DELETE (single allowlisted
 -- exception: mfa_backup_codes — see the H1 grant block above), or any write on
@@ -166,7 +171,8 @@ BEGIN
                           'nts_notices')
         -- H1 drift tables:
         OR (privilege_type = 'INSERT'
-            AND table_name IN ('mfa_break_glass_codes', 'dialer_deliveries'))
+            AND table_name IN ('mfa_break_glass_codes', 'dialer_deliveries',
+                               'notifications'))
         OR (privilege_type = 'UPDATE'
             AND table_name IN ('scraper_batches', 'batch_runs', 'audit_events'))
         OR (privilege_type = 'SELECT' AND table_name = 'audit_events')

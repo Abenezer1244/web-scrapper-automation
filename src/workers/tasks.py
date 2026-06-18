@@ -98,7 +98,7 @@ def _fail_job_after_uncaught(job_id: str, reason: str, expected_started_at=None)
         from src.db.session import system_sync_session
 
         with system_sync_session() as db:
-            failed = db.execute(
+            row = db.execute(
                 update(Job)
                 .where(
                     Job.id == job_id,
@@ -107,13 +107,20 @@ def _fail_job_after_uncaught(job_id: str, reason: str, expected_started_at=None)
                     Job.billing_applied_at.is_(None),
                 )
                 .values(status="failed", finished_at=_now(), error_message=reason)
-            ).rowcount
+                .returning(Job.user_id)
+            ).fetchone()
             db.commit()
-        if failed:
+        if row is not None:
             r = _redis()
             _publish_log(r, job_id, "error", reason, db=None)
             r.publish(f"job_logs:{job_id}", json.dumps({"type": "failed", "error": reason}))
             _logger.error("Job %s failed (post-crash cleanup): %s", job_id, reason)
+            # in-app notification (best-effort; gated by prefs inside the helper)
+            from src.workers.notification_emit import create_notification
+            create_notification(
+                user_id=row[0], type="job_failed", job_id=job_id,
+                detail={"error_summary": reason[:200]},
+            )
     except Exception:  # cleanup must never mask or replace the original failure
         _logger.exception("Job %s: post-crash terminal cleanup failed", job_id)
 

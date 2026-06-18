@@ -20,7 +20,7 @@ python-dotenv==1.2.2         # M3: CVE-2026-28684
 PyJWT[crypto]==2.13.0        # M3: clears PYSEC-2026-120/175/176/177/178/179 (audits clean at 2.13.0; no ignore needed)
 bcrypt==5.0.0                # direct pyca/bcrypt (passlib dropped 2026-06-18 — its 1.7.4 pin blocked bcrypt>=5)
 pyotp==2.9.0                 # TOTP (MFA, H2)
-cryptography==48.0.1         # Fernet field encryption (MFA secret; H3 PII). 2026-06-15: GHSA-537c-gmf6-5ccf (bundled OpenSSL secadv 2026-06-09)
+cryptography==49.0.0         # Fernet field encryption (MFA secret; H3 PII). 2026-06-15: GHSA-537c-gmf6-5ccf (bundled OpenSSL secadv 2026-06-09)
 
 # Task queue
 celery[redis]==5.4.0

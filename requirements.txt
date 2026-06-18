@@ -23,8 +23,8 @@ pyotp==2.9.0                 # TOTP (MFA, H2)
 cryptography==49.0.0         # Fernet field encryption (MFA secret; H3 PII). 2026-06-15: GHSA-537c-gmf6-5ccf (bundled OpenSSL secadv 2026-06-09)
 
 # Task queue
-celery[redis]==5.4.0
-redis==5.2.1
+celery[redis]==5.6.3
+redis==5.2.1         # pinned <6.5: celery 5.6's kombu[redis] requires redis<6.5 (redis 8.x is incompatible)
 
 # Scraping
 playwright==1.49.1

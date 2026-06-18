@@ -210,6 +210,7 @@
             "anyOf": [
               {
                 "items": {
+                  "additionalProperties": true,
                   "type": "object"
                 },
                 "type": "array"
@@ -297,6 +298,7 @@
             "anyOf": [
               {
                 "items": {
+                  "additionalProperties": true,
                   "type": "object"
                 },
                 "type": "array"
@@ -754,6 +756,7 @@
           "pre_foreclosure_doc_types": {
             "anyOf": [
               {
+                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -1705,6 +1708,7 @@
           "enrichment_data": {
             "anyOf": [
               {
+                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -2179,6 +2183,7 @@
           "deliver": {
             "anyOf": [
               {
+                "additionalProperties": true,
                 "type": "object"
               },
               {}
@@ -2202,6 +2207,7 @@
           "enrichment": {
             "anyOf": [
               {
+                "additionalProperties": true,
                 "type": "object"
               },
               {}
@@ -2211,6 +2217,7 @@
           "fields": {
             "anyOf": [
               {
+                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -2238,6 +2245,7 @@
           "schedule": {
             "anyOf": [
               {
+                "additionalProperties": true,
                 "type": "object"
               },
               {}
@@ -2980,6 +2988,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Auth Config Auth Config Get",
                   "type": "object"
                 }
@@ -3013,6 +3022,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Forgot Password Auth Forgot Password Post",
                   "type": "object"
                 }
@@ -3423,6 +3433,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Onboarding Status Auth Onboarding Get",
                   "type": "object"
                 }
@@ -3544,6 +3555,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Reset Password Auth Reset Password Post",
                   "type": "object"
                 }
@@ -3865,6 +3877,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Activation Funnel Billing Activation Funnel Get",
                   "type": "object"
                 }
@@ -3913,6 +3926,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Create Checkout Billing Checkout Post",
                   "type": "object"
                 }
@@ -3951,6 +3965,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response List Plans Billing Plans Get",
                   "type": "object"
                 }
@@ -3974,6 +3989,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Customer Portal Billing Portal Post",
                   "type": "object"
                 }
@@ -4002,6 +4018,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Pricing Page Billing Pricing Get",
                   "type": "object"
                 }
@@ -4025,6 +4042,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Referral Status Billing Referral Get",
                   "type": "object"
                 }
@@ -4053,6 +4071,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Skip Trace Usage Billing Skip Trace Usage Get",
                   "type": "object"
                 }
@@ -4081,6 +4100,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Get Subscription Billing Subscription Get",
                   "type": "object"
                 }
@@ -4109,6 +4129,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Get Usage Billing Usage Get",
                   "type": "object"
                 }
@@ -4148,6 +4169,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Stripe Webhook Billing Webhook Post",
                   "type": "object"
                 }
@@ -4180,6 +4202,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Health Health Get",
                   "type": "object"
                 }
@@ -4384,8 +4407,8 @@
             "schema": {
               "anyOf": [
                 {
-                  "maximum": 100000000.0,
-                  "minimum": 0.0,
+                  "maximum": 100000000,
+                  "minimum": 0,
                   "type": "number"
                 },
                 {
@@ -4402,8 +4425,8 @@
             "schema": {
               "anyOf": [
                 {
-                  "maximum": 100000000.0,
-                  "minimum": 0.0,
+                  "maximum": 100000000,
+                  "minimum": 0,
                   "type": "number"
                 },
                 {
@@ -4540,8 +4563,8 @@
             "schema": {
               "anyOf": [
                 {
-                  "maximum": 100000000.0,
-                  "minimum": 0.0,
+                  "maximum": 100000000,
+                  "minimum": 0,
                   "type": "number"
                 },
                 {
@@ -4558,8 +4581,8 @@
             "schema": {
               "anyOf": [
                 {
-                  "maximum": 100000000.0,
-                  "minimum": 0.0,
+                  "maximum": 100000000,
+                  "minimum": 0,
                   "type": "number"
                 },
                 {
@@ -4653,6 +4676,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Get Export Url Jobs  Job Id  Export Url Get",
                   "type": "object"
                 }
@@ -4789,8 +4813,8 @@
             "schema": {
               "anyOf": [
                 {
-                  "maximum": 100000000.0,
-                  "minimum": 0.0,
+                  "maximum": 100000000,
+                  "minimum": 0,
                   "type": "number"
                 },
                 {
@@ -4807,8 +4831,8 @@
             "schema": {
               "anyOf": [
                 {
-                  "maximum": 100000000.0,
-                  "minimum": 0.0,
+                  "maximum": 100000000,
+                  "minimum": 0,
                   "type": "number"
                 },
                 {
@@ -5106,6 +5130,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Sample Records Scrapers Sample Get",
                   "type": "object"
                 }
@@ -5149,6 +5174,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Replay Dialer Push Scrapers  Config Id  Jobs  Job Id  Dialer Replay Post",
                   "type": "object"
                 }
@@ -5543,6 +5569,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Tracerfy Webhook Webhooks Tracerfy Post",
                   "type": "object"
                 }
@@ -5577,6 +5604,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Tracerfy Webhook Legacy Webhooks Tracerfy  Provided Secret  Post",
                   "type": "object"
                 }

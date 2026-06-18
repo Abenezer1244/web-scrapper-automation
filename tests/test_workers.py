@@ -632,3 +632,209 @@ def test_deliver_job_results_soft_fails_gracefully():
         recipient_emails=["test@test.bridgeleads.io"],
         fmt="csv",
     )
+
+
+def test_on_failure_terminalizes_stuck_non_terminal_job():
+    """An uncaught exception in run_scrape_job leaves the job in a non-terminal
+    status (e.g. 'enriching'). The crash cleanup must atomically fail the OWNED attempt
+    (matching started_at) so it terminalizes with an error message instead of hanging
+    until the watchdog's slow started_at fallback (the 2026-06-18 insertmanyvalues
+    .rowcount crash failure mode)."""
+    from src.workers.tasks import _fail_job_after_uncaught
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        started = datetime.now(UTC)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="enriching",
+            trigger="manual",
+            started_at=started,
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    # The crashed attempt owns the row (started_at matches what it stamped at claim).
+    _fail_job_after_uncaught(job_id, "Job failed during processing.", expected_started_at=started)
+
+    with SyncSessionLocal() as db:
+        row = db.get(Job, job_id)
+        assert row.status == "failed"
+        assert row.error_message  # carries a human-readable reason
+        assert row.finished_at is not None
+
+
+def test_on_failure_soft_timeout_left_for_watchdog_retry():
+    """Codex P2: a SoftTimeLimitExceeded is a recoverable timeout, not a crash. on_failure
+    must NOT terminalize it — the watchdog re-queues long scrapes up to max_retries. The
+    job stays non-terminal so the existing retry path is preserved."""
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    from src.workers.tasks import run_scrape_job
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        started = datetime.now(UTC)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="scraping",
+            trigger="manual",
+            started_at=started,
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    # Even with a matching attempt token, a soft timeout must be left for the watchdog.
+    task = run_scrape_job
+    try:
+        task.request.scrape_started_at = started
+        task.on_failure(SoftTimeLimitExceeded(), "task-t", (job_id,), {}, None)
+    finally:
+        # Don't leak the stashed token into other tests sharing the task singleton.
+        if hasattr(task.request, "scrape_started_at"):
+            try:
+                del task.request.scrape_started_at
+            except Exception:
+                task.request.scrape_started_at = None
+
+    with SyncSessionLocal() as db:
+        row = db.get(Job, job_id)
+        assert row.status == "scraping"  # untouched — watchdog will retry
+        assert row.error_message is None
+
+
+def test_on_failure_leaves_already_billed_job_for_watchdog():
+    """Codex P2: a crash AFTER billing committed (billing_applied_at set) but before the
+    final 'done' must NOT be terminalized — the user is already charged and the watchdog
+    re-run (billing CAS skips) drives it to 'done'. Failing it would leave a
+    charged-but-failed job. Only not-yet-billed crashes terminalize."""
+    from src.workers.tasks import _fail_job_after_uncaught
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        started = datetime.now(UTC)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="enriching",
+            trigger="manual",
+            started_at=started,
+            billed_count=5,
+            billing_applied_at=datetime.now(UTC),  # already charged
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    _fail_job_after_uncaught(job_id, "post-billing transient crash", expected_started_at=started)
+
+    with SyncSessionLocal() as db:
+        row = db.get(Job, job_id)
+        assert row.status == "enriching"  # left for the watchdog to complete
+        assert row.error_message is None
+
+
+def test_on_failure_without_attempt_token_is_noop():
+    """Codex P2: a task that crashed BEFORE winning the pending->queued claim (or a stale
+    duplicate delivery) has no started_at token. It never owned the job, so cleanup must
+    skip rather than risk failing another live attempt. on_failure passes None when the
+    request never recorded scrape_started_at."""
+    from src.workers.tasks import run_scrape_job
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="scraping",
+            trigger="manual",
+            started_at=datetime.now(UTC),
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    # Direct on_failure call: self.request carries no scrape_started_at -> token is None.
+    run_scrape_job.on_failure(RuntimeError("pre-claim boom"), "task-1", (job_id,), {}, None)
+
+    with SyncSessionLocal() as db:
+        row = db.get(Job, job_id)
+        assert row.status == "scraping"  # untouched — no ownership token
+        assert row.error_message is None
+
+
+def test_on_failure_leaves_already_terminal_job_untouched():
+    """If the job genuinely finished before an unrelated late crash, cleanup must NOT
+    overwrite the terminal status (the atomic UPDATE excludes terminal rows) even when
+    the attempt token matches."""
+    from src.workers.tasks import _fail_job_after_uncaught
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        started = datetime.now(UTC)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="done",
+            trigger="manual",
+            record_count=7,
+            started_at=started,
+            finished_at=datetime.now(UTC),
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    _fail_job_after_uncaught(job_id, "late boom", expected_started_at=started)
+
+    with SyncSessionLocal() as db:
+        row = db.get(Job, job_id)
+        assert row.status == "done"  # never flipped to failed
+        assert row.record_count == 7
+
+
+def test_on_failure_is_attempt_scoped_skips_requeued_attempt():
+    """Codex P2: an old attempt's late on_failure must NOT clobber a row that was
+    re-queued/re-claimed for a newer attempt. The watchdog re-queue nulls started_at and
+    a replacement claim stamps a fresh one, so when the crashed attempt's started_at no
+    longer matches the row, cleanup must skip (preserving watchdog retry recovery)."""
+    from src.workers.tasks import _fail_job_after_uncaught
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        current_started = datetime.now(UTC)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="scraping",  # a live NEWER attempt
+            trigger="manual",
+            started_at=current_started,
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    # The crashed OLD attempt had a different (earlier) started_at.
+    stale_started = current_started - timedelta(minutes=20)
+    _fail_job_after_uncaught(job_id, "old attempt crashed", expected_started_at=stale_started)
+
+    with SyncSessionLocal() as db:
+        row = db.get(Job, job_id)
+        assert row.status == "scraping"  # live newer attempt untouched
+        assert row.error_message is None

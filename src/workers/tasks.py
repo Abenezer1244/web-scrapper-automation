@@ -9,6 +9,7 @@ import asyncio
 import json
 from datetime import datetime
 
+from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
 
 from src.utils.address_intel import compute_owner_flags
@@ -57,8 +58,101 @@ from src.workers.tasks_helpers.status import (
 _logger = setup_logger("worker.task")
 
 
+def _fail_job_after_uncaught(job_id: str, reason: str, expected_started_at=None) -> None:
+    """Last-resort terminal cleanup for a crashed run_scrape_job (see _RunScrapeJobTask).
+
+    If an exception escapes run_scrape_job, the job is left pinned in a NON-terminal
+    status (e.g. 'enriching') with no error message — indistinguishable from a hang and
+    only recoverable by the watchdog's slow started_at fallback. This opens a FRESH
+    system session (the task's own session is gone by the time on_failure runs) and
+    terminalizes the job. Best-effort: it must never raise out of on_failure.
+
+    ATTEMPT-SCOPED ownership (Codex P2 ×2):
+    - REQUIRE the attempt token. `expected_started_at` is the started_at this worker
+      stamped when it WON the pending→queued claim. If it's None the task crashed before
+      claiming (allowlist refresh / redis / bootstrap) or is a stale duplicate delivery —
+      it never owned the job, so we must NOT fail it (that could kill another live
+      attempt). No token → no-op.
+    - ATOMIC guard. The watchdog re-queues a stuck job by NULLing started_at
+      (scheduler_helpers/health.py) and a replacement claim stamps a fresh started_at, so
+      ownership can change between a SELECT-side check and the UPDATE. We therefore fail
+      the row in ONE statement whose WHERE pins BOTH `started_at = :expected` AND a
+      non-terminal status. A re-queued/re-claimed newer attempt (different or NULL
+      started_at) matches 0 rows and is left untouched; the watchdog retry path is
+      preserved. The failure log is published ONLY if this UPDATE actually terminalized
+      the row.
+    - NOT-YET-BILLED guard (Codex P2). Only terminalize a job that has not billed
+      (`billing_applied_at IS NULL`). A crash AFTER billing committed (e.g. a transient
+      redis/DB error in a later _publish_log / enrichment / delivery, before the final
+      'done') must be left for the watchdog: its re-run skips the billing CAS (already
+      applied) and drives the job to 'done', so the user isn't left charged-but-failed.
+      The primary failure mode this hook targets — a crash in the insert/dedup phase —
+      happens BEFORE billing, so billing_applied_at is NULL and it still fails cleanly.
+    """
+    if expected_started_at is None:
+        return
+    try:
+        from sqlalchemy import update
+
+        from src.db.models import Job
+        from src.db.session import system_sync_session
+
+        with system_sync_session() as db:
+            failed = db.execute(
+                update(Job)
+                .where(
+                    Job.id == job_id,
+                    Job.started_at == expected_started_at,
+                    Job.status.notin_(_TERMINAL_STATUSES),
+                    Job.billing_applied_at.is_(None),
+                )
+                .values(status="failed", finished_at=_now(), error_message=reason)
+            ).rowcount
+            db.commit()
+        if failed:
+            r = _redis()
+            _publish_log(r, job_id, "error", reason, db=None)
+            r.publish(f"job_logs:{job_id}", json.dumps({"type": "failed", "error": reason}))
+            _logger.error("Job %s failed (post-crash cleanup): %s", job_id, reason)
+    except Exception:  # cleanup must never mask or replace the original failure
+        _logger.exception("Job %s: post-crash terminal cleanup failed", job_id)
+
+
+class _RunScrapeJobTask(app.Task):
+    """Custom base so an UNCAUGHT exception in run_scrape_job fails the job cleanly.
+
+    run_scrape_job protects the scrape phase with try/except + _fail_job, but the
+    post-scrape phase (insert / dedup / export / billing) is not fully wrapped; a crash
+    there (e.g. the 2026-06-18 insertmanyvalues .rowcount AttributeError) escaped the task
+    and left the job stuck in 'enriching'. on_failure fires in the worker once the task
+    has raised its final exception (no self.retry() is used, so this IS the final
+    outcome — Retry/soft-timeout included) and CAS-fails the job so it terminalizes with
+    an error message instead of hanging.
+    """
+
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        # Timeouts are RECOVERABLE, not crashes (Codex P2): a long scrape that blew the
+        # soft/hard time_limit should go through the watchdog retry path (re-queue up to
+        # max_retries), not be permanently failed on its first timeout. Only genuine
+        # exceptions (which leave the job stuck non-terminal) terminalize here.
+        if isinstance(exc, (SoftTimeLimitExceeded, TimeLimitExceeded)):
+            return
+        job_id = args[0] if args else (kwargs or {}).get("job_id")
+        if job_id:
+            # started_at of THIS attempt, stashed on the request by run_scrape_job right
+            # after it WON the claim. None if the crash happened before the claim — the
+            # helper then no-ops (we never owned the job, so we must not fail it).
+            expected_started_at = getattr(self.request, "scrape_started_at", None)
+            _fail_job_after_uncaught(
+                str(job_id),
+                "Job failed during processing — our team has been notified.",
+                expected_started_at=expected_started_at,
+            )
+
+
 @app.task(
     name="src.workers.tasks.run_scrape_job",
+    base=_RunScrapeJobTask,
     bind=True,
     max_retries=3,
     default_retry_delay=30,
@@ -174,6 +268,13 @@ def run_scrape_job(self, job_id: str) -> None:
             )
             return
         db.refresh(job)
+        # Record THIS attempt's started_at on the Celery request so the on_failure hook
+        # (_RunScrapeJobTask) can attempt-scope its crash cleanup — it must only fail the
+        # row if started_at still matches, never a re-queued/re-claimed newer attempt.
+        try:
+            self.request.scrape_started_at = job.started_at
+        except Exception:  # request context unavailable (e.g. direct call) — non-fatal
+            pass
         # Liveness heartbeat DISABLED (rollback 2026-06-18). The daemon thread shared
         # the worker's small sync connection pool (pool_size=2) with the main work
         # session + _publish_log; during the DB-heavy insert phase the main thread and

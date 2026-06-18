@@ -668,6 +668,49 @@ def test_on_failure_terminalizes_stuck_non_terminal_job():
         assert row.finished_at is not None
 
 
+def test_on_failure_soft_timeout_left_for_watchdog_retry():
+    """Codex P2: a SoftTimeLimitExceeded is a recoverable timeout, not a crash. on_failure
+    must NOT terminalize it — the watchdog re-queues long scrapes up to max_retries. The
+    job stays non-terminal so the existing retry path is preserved."""
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    from src.workers.tasks import _RunScrapeJobTask, run_scrape_job
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        started = datetime.now(UTC)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="scraping",
+            trigger="manual",
+            started_at=started,
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    # Even with a matching attempt token, a soft timeout must be left for the watchdog.
+    task = run_scrape_job
+    try:
+        task.request.scrape_started_at = started
+        task.on_failure(SoftTimeLimitExceeded(), "task-t", (job_id,), {}, None)
+    finally:
+        # Don't leak the stashed token into other tests sharing the task singleton.
+        if hasattr(task.request, "scrape_started_at"):
+            try:
+                del task.request.scrape_started_at
+            except Exception:
+                task.request.scrape_started_at = None
+
+    with SyncSessionLocal() as db:
+        row = db.get(Job, job_id)
+        assert row.status == "scraping"  # untouched — watchdog will retry
+        assert row.error_message is None
+
+
 def test_on_failure_without_attempt_token_is_noop():
     """Codex P2: a task that crashed BEFORE winning the pending->queued claim (or a stale
     duplicate delivery) has no started_at token. It never owned the job, so cleanup must

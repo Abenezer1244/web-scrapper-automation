@@ -9,6 +9,7 @@ import asyncio
 import json
 from datetime import datetime
 
+from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
 
 from src.utils.address_intel import compute_owner_flags
@@ -122,11 +123,17 @@ class _RunScrapeJobTask(app.Task):
     """
 
     def on_failure(self, exc, task_id, args, kwargs, einfo):
+        # Timeouts are RECOVERABLE, not crashes (Codex P2): a long scrape that blew the
+        # soft/hard time_limit should go through the watchdog retry path (re-queue up to
+        # max_retries), not be permanently failed on its first timeout. Only genuine
+        # exceptions (which leave the job stuck non-terminal) terminalize here.
+        if isinstance(exc, (SoftTimeLimitExceeded, TimeLimitExceeded)):
+            return
         job_id = args[0] if args else (kwargs or {}).get("job_id")
         if job_id:
-            # started_at of THIS attempt, stashed on the request by run_scrape_job
-            # right after it claimed the job. None if the crash happened before the
-            # claim (nothing to clobber) — the helper then falls back to status-only.
+            # started_at of THIS attempt, stashed on the request by run_scrape_job right
+            # after it WON the claim. None if the crash happened before the claim — the
+            # helper then no-ops (we never owned the job, so we must not fail it).
             expected_started_at = getattr(self.request, "scrape_started_at", None)
             _fail_job_after_uncaught(
                 str(job_id),

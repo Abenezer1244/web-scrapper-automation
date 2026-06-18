@@ -674,7 +674,7 @@ def test_on_failure_soft_timeout_left_for_watchdog_retry():
     job stays non-terminal so the existing retry path is preserved."""
     from celery.exceptions import SoftTimeLimitExceeded
 
-    from src.workers.tasks import _RunScrapeJobTask, run_scrape_job
+    from src.workers.tasks import run_scrape_job
 
     with SyncSessionLocal() as db:
         user = _create_sync_user(db)

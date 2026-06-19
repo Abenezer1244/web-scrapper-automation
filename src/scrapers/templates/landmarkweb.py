@@ -20,6 +20,10 @@ from datetime import datetime, timedelta
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord, normalize_party_text
+from src.scrapers.preforeclosure import (
+    is_cancellation_or_admin,
+    orient_pre_foreclosure_party,
+)
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.landmarkweb")
@@ -29,9 +33,13 @@ _DOC_TYPE_MAP = {
     "probate": ["PROBATE", "LETTERS TESTAMENTARY", "LETTERS OF ADMINISTRATION",
                 "PERSONAL REPRESENTATIVE", "PERSONAL REP", "ESTATE", "WILL",
                 "DEATH", "AFFIDAVIT OF HEIRSHIP", "HEIR"],
+    # NOTE: "DISCONTINUANCE TRUSTEE", "SUBSTITUTION OF TRUSTEE", and bare
+    # "DEFAULT" were removed — they match cancelled/cured/trustee-admin docs
+    # (the OPPOSITE of an active foreclosure) or over-match unrelated documents.
+    # "NOTICE OF DEFAULT" is kept (a real active-distress filing). The
+    # is_cancellation_or_admin() guard in _extract_page provides defence in depth.
     "pre_foreclosure": ["LIS PENDENS", "NOTICE OF TRUSTEE", "TRUSTEE SALE",
-                        "TRUSTEE'S SALE", "DISCONTINUANCE TRUSTEE",
-                        "SUBSTITUTION OF TRUSTEE", "DEFAULT", "FORECLOSURE",
+                        "TRUSTEE'S SALE", "FORECLOSURE",
                         "NOTICE OF DEFAULT"],
     "tax_delinquent": ["TAX", "DELINQUENT", "TAX LIEN", "CERTIFICATE OF DELINQUENCY",
                        "CERTIFICATE OF SALE"],
@@ -432,23 +440,48 @@ class LandmarkWebScraper(BridgeScraper):
 
                 doc_type = (item.get("doc_type") or "").strip().upper()
 
-                # Filter by record type if specified
-                if self.record_types and doc_type:
-                    matched = False
-                    for rt in self.record_types:
-                        keywords = _DOC_TYPE_MAP.get(rt, [])
-                        if any(kw in doc_type for kw in keywords):
-                            matched = True
-                            break
-                    if not matched:
-                        continue
+                # Filter by record type if specified. Track WHICH type matched so
+                # the pre_foreclosure correctness guards below fire only when the
+                # row actually matched a foreclosure keyword. An EMPTY doc_type is
+                # dropped (fail-closed) ONLY for a pre_foreclosure request — an
+                # unclassified row must never emit as a foreclosure lead; other
+                # record types keep the legacy pass-through (Codex review).
+                matched_rt: str | None = None
+                if self.record_types:
+                    if not doc_type:
+                        if "pre_foreclosure" in self.record_types:
+                            continue
+                    else:
+                        for rt in self.record_types:
+                            keywords = _DOC_TYPE_MAP.get(rt, [])
+                            if any(kw in doc_type for kw in keywords):
+                                matched_rt = rt
+                                break
+                        if matched_rt is None:
+                            continue
 
                 # Party names: normalize stacked owners (nameSeperator div) -> " / "
                 grantor = normalize_party_text(item.get("grantor"))
+                grantee = normalize_party_text(item.get("grantee"))
+
+                # Pre-foreclosure correctness guards. A doc that keyword-matched
+                # but signals a CANCELLED/CURED foreclosure (Discontinuance,
+                # Rescission) or pure trustee ADMIN (Substitution of Trustee) is
+                # not active distress — drop it. Then orient the borrower
+                # (person) into party_name, since an NTS is often indexed with
+                # the trustee company as grantor; drop bank-vs-trustee rows with
+                # no homeowner. Only for pre_foreclosure; other types untouched.
+                if matched_rt == "pre_foreclosure":
+                    if is_cancellation_or_admin(doc_type):
+                        continue
+                    oriented = orient_pre_foreclosure_party(grantor, grantee)
+                    if oriented is None:
+                        continue
+                    grantor, grantee = oriented
+
                 if grantor:
                     record.party_name = grantor
 
-                grantee = normalize_party_text(item.get("grantee"))
                 if grantee:
                     record.heirs = grantee
 

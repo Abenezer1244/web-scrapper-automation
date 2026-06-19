@@ -41,6 +41,10 @@ from src.scrapers.base_scraper import (
     ScrapedRecord,
     normalize_party_text,
 )
+from src.scrapers.preforeclosure import (
+    is_cancellation_or_admin,
+    orient_pre_foreclosure_party,
+)
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.idocmarket")
@@ -424,18 +428,20 @@ class IDocMarketScraper(BridgeScraper):
             grantee = self._clean_party(normalize_party_text(" / ".join(grantees)))
 
             if active_rt == "pre_foreclosure":
-                # The homeowner can be on either side depending on the doc type
-                # (a Trustee's Sale names the borrower as grantor; other filings
-                # flip it). Pick whichever side is a real person; drop the record
-                # if both sides are companies — bank-vs-bank is not a lead.
-                if grantor and self._is_person(grantor):
-                    record.party_name = grantor
-                    record.heirs = grantee or None
-                elif grantee and self._is_person(grantee):
-                    record.party_name = grantee
-                    record.heirs = grantor or None
-                else:
+                # A doc that keyword-matched but signals the foreclosure was
+                # cancelled/cured (Discontinuance, Rescission) or is pure trustee
+                # admin (Substitution of Trustee) is NOT active distress — drop
+                # it before the person/company orientation below.
+                if is_cancellation_or_admin(doc_type):
                     continue
+                # Borrower orientation via the shared helper: keeps the PERSON
+                # sub-name from a stacked "BORROWER / TRUSTEE COMPANY" cell (the
+                # old whole-cell person check dropped that legit lead) and drops
+                # bank-vs-trustee rows with no homeowner.
+                oriented = orient_pre_foreclosure_party(grantor, grantee)
+                if oriented is None:
+                    continue
+                record.party_name, record.heirs = oriented
             else:
                 # Probate: the decedent / fiduciary is the grantor.
                 if grantor:

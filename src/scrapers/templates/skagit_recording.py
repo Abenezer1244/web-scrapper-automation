@@ -19,6 +19,10 @@ import re
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord, normalize_party_text
+from src.scrapers.preforeclosure import (
+    is_cancellation_or_admin,
+    orient_pre_foreclosure_party,
+)
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.skagit")
@@ -441,16 +445,38 @@ class SkagitRecordingScraper(BridgeScraper):
             return False
 
     def _filter_by_type(self, records: list[ScrapedRecord]) -> list[ScrapedRecord]:
-        """Filter by active record type using both doc_type AND comment fields."""
+        """Filter by active record type using both doc_type AND comment fields.
+
+        For pre_foreclosure, additionally drop cancelled/cured/trustee-admin docs
+        (Discontinuance, Rescission, Substitution of Trustee — they substring-match
+        the legit keywords but are the OPPOSITE of active distress) and re-orient
+        the party so the BORROWER (person) lands in party_name. The probate
+        death-cert filing-state swap in _extract_page is untouched.
+        """
         if not self.active_record_type or self.active_record_type == "all":
             return records
         keywords = _DOC_TYPE_MAP.get(self.active_record_type, [])
         if not keywords:
             return records
+        is_preforeclosure = self.active_record_type == "pre_foreclosure"
         kept = []
         for r in records:
             # Check both doc_type and comment for keyword matches
             text = f"{r.doc_type or ''} {r.enrichment_data.get('comment', '')}".upper()
-            if any(kw in text for kw in keywords):
-                kept.append(r)
+            if not any(kw in text for kw in keywords):
+                continue
+            if is_preforeclosure:
+                # Cancelled/cured/trustee-admin docs are not active distress.
+                # Check doc_type + comment (Skagit records the real nature in
+                # the comment field for otherwise-generic doc types).
+                if is_cancellation_or_admin(text):
+                    continue
+                # Borrower orientation: an NTS is often indexed with the trustee
+                # company as grantor and the borrower as grantee. Put the person
+                # (homeowner) in party_name; drop bank-vs-trustee records.
+                oriented = orient_pre_foreclosure_party(r.party_name, r.heirs)
+                if oriented is None:
+                    continue
+                r.party_name, r.heirs = oriented
+            kept.append(r)
         return kept

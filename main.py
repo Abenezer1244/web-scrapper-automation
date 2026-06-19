@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from src.api import (
+    analytics_router,
     auth_router,
     batches_router,
     billing_router,
@@ -83,6 +84,7 @@ app.include_router(webhooks_router)
 app.include_router(segments_router)
 app.include_router(batches_router)
 app.include_router(notifications_router)
+app.include_router(analytics_router)
 
 
 # ─── Global exception handler ─────────────────────────────────────────────────

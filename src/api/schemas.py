@@ -1089,3 +1089,37 @@ class NotificationListResponse(BaseModel):
 
 class ReadAllResponse(BaseModel):
     updated: int
+
+
+# ─── Analytics (Phase 3) ──────────────────────────────────────────────────────
+
+class TrendPoint(BaseModel):
+    date: str  # ISO date (YYYY-MM-DD) in ANALYTICS_TIMEZONE
+    leads: int
+
+
+class RecordTypeCount(BaseModel):
+    record_type: str  # 'probate' | ... | 'unknown'
+    leads: int
+
+
+class CountyCount(BaseModel):
+    county: str  # lowercased county, or 'other' / 'unknown'
+    state: str | None  # uppercased 2-letter, None for 'other'/'unknown' buckets
+    leads: int
+
+
+class SkipTraceStats(BaseModel):
+    total: int
+    enriched: int  # skip_trace_status == 'hit' (trace found contact)
+    phone_pct: int  # 0-100, share of total with a primary phone
+    email_pct: int  # 0-100, share of total with a primary email
+
+
+class AnalyticsSummary(BaseModel):
+    window_days: int
+    timezone: str
+    trend: list[TrendPoint]  # dense, zero-filled, today inclusive
+    by_record_type: list[RecordTypeCount]
+    by_county: list[CountyCount]
+    skip_trace: SkipTraceStats

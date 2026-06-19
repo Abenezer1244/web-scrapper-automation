@@ -178,6 +178,13 @@ class Settings(BaseSettings):
     # take the real client IP from the RIGHT of the XFF chain (rate_limit I1).
     TRUSTED_PROXY_HOPS: int = 1
 
+    # ─── Analytics (Phase 3) ──────────────────────────────────────────────────
+    # Day-grouping timezone for the dashboard charts. Postgres groups
+    # `date(created_at)` in the session TZ (UTC on Supabase), which would split
+    # a Pacific user's day at the wrong boundary. The analytics endpoint groups
+    # by created_at AT TIME ZONE this value. Must be a valid IANA zone name.
+    ANALYTICS_TIMEZONE: str = "America/Los_Angeles"
+
     # ─── Worker scaling ──────────────────────────────────────────────────────
     WORKER_CONCURRENCY: int = 2
     WORKER_QUEUES: str = "scrape,enrichment"

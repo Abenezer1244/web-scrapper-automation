@@ -216,6 +216,13 @@ def _detect_template(base_url: str):
         from src.scrapers.templates.laserfiche_weblink import LaserficheWebLinkScraper
         return LaserficheWebLinkScraper
 
+    # iDocMarket (Tyler) — Columbia (COLWA1). base_url is the full per-county
+    # search URL (e.g. .../COLWA1/Document/Search); the county code lives in the
+    # URL so the template is generic across iDocMarket counties.
+    if "idocmarket.com" in url_lower:
+        from src.scrapers.templates.idocmarket import IDocMarketScraper
+        return IDocMarketScraper
+
     return None
 
 

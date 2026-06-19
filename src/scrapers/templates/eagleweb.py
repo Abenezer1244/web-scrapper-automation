@@ -64,6 +64,52 @@ _DOC_TYPE_EXCLUDE = {
 }
 
 
+# Certificate-of-Death filing agency (WA State Dept of Health — the issuing
+# authority, not the decedent). Two live shapes: benton concatenates it onto the
+# decedent ("PERRIN, RONALD RALPH, STATE OF WA, DEPT OF HEALTH"); thurston puts it
+# alone in the grantor ("WASHINGTON STATE").
+#
+# The Dept-of-Health phrase (optionally prefixed by the state qualifier) is
+# unambiguous — no legitimate grantor is "...DEPT OF HEALTH" — so it is stripped
+# wherever it appears. The BARE state phrase is risky (it is the prefix of real
+# entities like "WASHINGTON STATE UNIVERSITY"), so it is only treated as the filer
+# when it is the WHOLE grantor value (anchored ^...$).
+_HEALTH_DEPT_RE = re.compile(
+    r"(?:STATE\s+OF\s+WA(?:SHINGTON)?\s*,?\s*)?"
+    r"(?:DEPARTMENT|DEPT)\.?\s+OF\s+HEALTH\b",
+    re.IGNORECASE,
+)
+_BARE_STATE_RE = re.compile(
+    r"^\s*(?:WASHINGTON\s+STATE|STATE\s+OF\s+WA(?:SHINGTON)?)\s*$",
+    re.IGNORECASE,
+)
+# Residue that is only a status word (no actual name) — treat as empty so the
+# caller falls back to the grantee. Defensive: guards a "DECEASED, <agency>" index.
+_STATUS_ONLY_TOKENS = {"DECEASED", "DECEDENT", "DECD", "ESTATE", "OF"}
+
+
+def _strip_filing_agency(name: str) -> str:
+    """Remove the Certificate-of-Death filing agency from a grantor name.
+
+    "PERRIN, RONALD RALPH, STATE OF WA, DEPT OF HEALTH" -> "PERRIN, RONALD RALPH".
+    "WASHINGTON STATE" -> "" (agency only — caller falls back to the grantee).
+    "WASHINGTON STATE UNIVERSITY" -> unchanged (not the filer).
+    """
+    if not name:
+        return name
+    cleaned = _HEALTH_DEPT_RE.sub("", name)
+    cleaned = re.sub(r"(?:\s*/\s*){2,}", " / ", cleaned)  # collapse separators left behind
+    cleaned = re.sub(r"(?:,\s*){2,}", ", ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = cleaned.strip(" ,/").strip()
+    if _BARE_STATE_RE.match(cleaned):
+        return ""
+    tokens = set(re.findall(r"[A-Z]+", cleaned.upper()))
+    if tokens and tokens <= _STATUS_ONLY_TOKENS:
+        return ""
+    return cleaned
+
+
 def _doc_type_matches(doc_upper: str, keywords: list[str]) -> bool:
     """True if any keyword matches ``doc_upper``.
 
@@ -706,6 +752,26 @@ class EagleWebScraper(BridgeScraper):
                     grantee = normalize_party_text(grantee_match.group(1)).rstrip(",").rstrip(".")
                     if grantee:
                         record.heirs = grantee
+
+                # Death-certificate party orientation. On a Certificate of Death
+                # the recorder indexes the issuing AGENCY (WA State Dept of
+                # Health) as/within the grantor; the lead is the DECEASED. When an
+                # agency phrase is present in the grantor, strip it (Benton
+                # concatenates "DECEASED, STATE OF WA, DEPT OF HEALTH"); if nothing
+                # real remains (Thurston grantor = "WASHINGTON STATE"), fall back
+                # to the grantee, which carries the decedent. Only fires when an
+                # agency phrase is actually present, so non-death-cert records
+                # (and "Transfer On Death" deeds, whose grantor is a live person)
+                # are untouched.
+                if record.party_name:
+                    deagencied = _strip_filing_agency(record.party_name)
+                    if deagencied != record.party_name:
+                        if deagencied:
+                            record.party_name = deagencied
+                        elif record.heirs:
+                            record.party_name, record.heirs = record.heirs, None
+                        else:
+                            record.party_name = None
 
                 # Parcel ID — check both summary and description (if not already from table)
                 combined = f"{summary} {desc}"

@@ -458,6 +458,13 @@ class TylerSelfServiceScraper(BridgeScraper):
                 instrument_number = ""
                 doc_type = h1_text
 
+            # Strip a leading status-icon glyph (e.g. the U+FFFD replacement char
+            # some Tyler rows render before the type, "� Notice Of Trustee's
+            # Sale") so the stored/classified doc_type starts at the first real
+            # letter/digit. Recorder doc types never lead with punctuation.
+            if doc_type:
+                doc_type = re.sub(r"^[^0-9A-Za-z]+", "", doc_type).strip()
+
             # Parse "Recording Date" — text looks like
             # "Recording Date\n04/10/2026 02:12 PM"
             date_match = re.search(r"Recording Date\s*\n?\s*(\d{1,2}/\d{1,2}/\d{4})", full_text)

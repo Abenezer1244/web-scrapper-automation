@@ -22,6 +22,10 @@ from datetime import datetime, timedelta
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord, normalize_party_text
+from src.scrapers.preforeclosure import (
+    is_cancellation_or_admin,
+    orient_pre_foreclosure_party,
+)
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.clark_wa")
@@ -358,9 +362,26 @@ class ClarkWAScraper(BridgeScraper):
             record = ScrapedRecord()
             record.parcel_id = pid_match.group(1) if pid_match else None
             # Party names: normalize stacked owners (nameSeperator div) -> " / "
-            record.party_name = normalize_party_text(item.get("grantor"))
-            record.heirs = normalize_party_text(item.get("grantee"))
-            record.doc_type = (item.get("docType") or "").strip()
+            grantor = normalize_party_text(item.get("grantor"))
+            grantee = normalize_party_text(item.get("grantee"))
+            doc_type = (item.get("docType") or "").strip()
+
+            # Pre-foreclosure correctness (same as the recorder templates): drop
+            # cancelled/cured/trustee-admin docs, and orient the BORROWER (person)
+            # into party_name — a Notice of Trustee's Sale is indexed with the
+            # trustee company as grantor, so without this the trustee corp becomes
+            # the lead. Only for pre_foreclosure; probate/divorce unchanged.
+            if self._record_type == "pre_foreclosure":
+                if is_cancellation_or_admin(doc_type):
+                    continue
+                oriented = orient_pre_foreclosure_party(grantor, grantee)
+                if oriented is None:
+                    continue
+                grantor, grantee = oriented
+
+            record.party_name = grantor
+            record.heirs = grantee
+            record.doc_type = doc_type
             record.legal_description = (item.get("recNum") or "").strip()
 
             date_str = (item.get("date") or "").strip()

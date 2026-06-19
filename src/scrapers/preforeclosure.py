@@ -90,15 +90,34 @@ _COMPANY_WORDS: frozenset[str] = frozenset({
 })
 
 
+# Known organization suffixes that the recorder sometimes spells letter-spaced
+# ("COUGNIT L L C", "MCCARTHY HOLTHUS P L L C"), which would slip past the
+# whole-word company-token check ("L L C" tokenizes to L/L/C, none == "LLC").
+# Only these specific entity spellings are collapsed — NOT arbitrary single-letter
+# runs — so a person's spaced middle initials are left intact (Codex review).
+_SPACED_ORG_RE: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bP\s+L\s+L\s+C\b"), "PLLC"),
+    (re.compile(r"\bL\s+L\s+C\b"), "LLC"),
+    (re.compile(r"\bL\s+L\s+P\b"), "LLP"),
+    (re.compile(r"\bI\s+N\s+C\b"), "INC"),
+    (re.compile(r"\bC\s+O\s+R\s+P\b"), "CORP"),
+)
+
+
 def is_person_name(name: str | None) -> bool:
     """True if ``name`` looks like a real person (a foreclosure homeowner lead).
 
-    Rejects organization names (any company token), single-token strings
-    (FIG / NA / MERS-style abbreviations), and very short strings.
+    Rejects organization names (any company token, incl. letter-spaced entity
+    suffixes like "L L C"), single-token strings (FIG / NA / MERS-style
+    abbreviations), and very short strings. The collapsed form is used only for
+    this classification — it is never returned or stored.
     """
     if not name:
         return False
-    words = name.upper().split()
+    up = name.upper()
+    for rx, repl in _SPACED_ORG_RE:
+        up = rx.sub(repl, up)
+    words = up.split()
     if any(w.strip(".,") in _COMPANY_WORDS for w in words):
         return False
     if len(words) < 2:

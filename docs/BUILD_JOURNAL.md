@@ -19,6 +19,72 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-18 — tax_delinquent offered on 3 recorder counties that produce 0 leads — removed
+**Built / Shipped:** `alembic/versions/066_drop_recorder_tax_delinquent.py` (branch
+`fix/drop-recorder-tax-delinquent`, off main@064). Removes `tax_delinquent` from the `record_types`
+of **clark / skagit / chelan** (wa) while preserving their other types (Clark/Chelan: probate,
+pre_foreclosure; Skagit: +divorce). Idempotent UPDATE (jsonb filter, order-preserving). King +
+Snohomish untouched — they remain the only `tax_delinquent` sources (the `_TRUSTED_TAX_SOURCES` set).
+
+**Tried / Decided:** Question started as "is tax_delinquent working on all counties?" Read-only query
+of the live `county_connectors` table found **5** connectors carry tax_delinquent, not the 2
+(King/Snoho) everyone assumed. The 3 extras are recorder portals. Decision (user + Codex consult):
+remove rather than relabel, after a live verify. User chose a separate branch off main so the fix
+ships independent of the in-flight notifications 065.
+
+**Failed / Blocked:** none. (codex consult + review via STDIN + `-c mcp_servers={}`.)
+
+**Codex loop — stopped at round 7 (judgment call).** Rounds 2-5 surfaced REAL issues, all fixed below.
+Rounds 6-7 escalated into ever-finer hypotheticals on a 0-row path (refine the batch guard; then
+"terminalize in-flight standalone jobs in the migration"). HELD on the last ask: a migration that
+mutates live job state would RACE the worker actively processing that job — a real concurrency risk
+introduced to prevent a low-probability, GRACEFUL, self-healing failure (an in-flight tax_delinquent
+job for these counties fails once with caught UnsupportedCountyError + one notification; the config is
+deactivated so it never recurs). The correct layer for "don't run/dispatch a job whose connector no
+longer supports the record type" is the WORKER (run_scrape_job / dispatch_batch_run capability check),
+filed as the backlog "structural guard" item — NOT a one-shot migration. All remaining items are P2
+(not Critical/High → not a NO-GO per codex-collaboration).
+
+**Caught & fixed (Codex review, rounds 2-5 → real issues resolved):** (1) **P2 — orphaned scraper_configs.** The
+connector change alone would leave any active clark/skagit/chelan `tax_delinquent` *user config*
+re-enqueuing and then failing in `get_scraper_class` (UnsupportedCountyError, caught → graceful job
+FAIL) every schedule tick. Live query confirmed it real: **9 active configs (3 each)**. Migration now
+ALSO `UPDATE scraper_configs SET active=false` for those 3 counties + tax_delinquent (idempotent).
+(2) **P2 — batch dispatch** ignores `ScraperConfig.active` (selects children by batch_id), so
+deactivation wouldn't stop a batch. Verified live: **0 batch children** for these counties (all
+batch_id NULL). Added a **fail-closed guard**: upgrade() aborts (whole migration rolls back, one txn)
+if a tax_delinquent child under an **ACTIVE** batch exists for these counties — no-op in prod, protects
+other envs / a create-before-deploy race. Guard joins `scraper_batches.status='active'` (not bare
+batch_id) so retained historical/archived children don't false-trip and the "archive the parent"
+remediation actually clears the count. Chose fail-closed over blanket-archiving (kills valid sibling
+record types) or deleting the child (CASCADEs to jobs/results). (3) **P3 —
+downgrade reactivation** would flip ON configs the user themselves had disabled (upgrade doesn't record
+which rows it changed) → changed downgrade to LEAVE configs inactive (connector restored, user can
+re-enable). (4) downgrade APPENDS tax_delinquent rather than restoring original index — Low, documented
+(order is non-semantic: membership match + scheduler uses record_types[0]="probate"). Codex confirmed
+the SQL has no correctness bug (correlated subquery unambiguous, `?` membership correct, NULL/`[]`
+skipped, scope tight).
+
+**Pending / Handoff:** PR #67 open. **MERGE LANDMINE FIRED + RESOLVED:** notifications 065 (PR #66)
+merged to main mid-session, so CI's `alembic upgrade head` hit "Multiple head revisions" (065 and 066
+both children of 064). Fix: rebased the branch onto 065 and changed down_revision 064 → 065 → single
+linear head 064→065→066. Lesson: re-point a migration's parent to main's CURRENT head at PR time, not
+authoring time. Backlog (Codex point #4): (a) structural guard so
+the API can't OFFER a record type a connector can't fulfill (only `_TRUSTED_TAX_SOURCES` counties may
+carry tax_delinquent); (b) record-type-level health canary (these showed `healthy` while yielding 0);
+(c) `record_types[0]`-only scheduling = advertised-but-never-auto-scraped inventory; (d) investigate
+whether acclaimweb keyword-mode grid-read is broken for Chelan (0 rows/day is suspicious) before any
+re-enable.
+
+**Facts learned:** A **Federal Tax Lien is unpaid IRS *income* tax against a person — NOT county
+property-tax delinquency**, and it has no parcel id. Clark + Skagit `tax_delinquent` search ONLY the
+Federal Tax Lien doc type (Clark checkbox `97`, Skagit dropdown `"Federal Tax Lien"`), so a live
+non-persisting scrape (120-day window, via `scripts/live_scrape_tax_recorders.py` — direct
+`get_scraper_class().scrape()`, no Celery/DB/enrichment/billing) found **Clark 159 FTLs → 0 kept**
+(all dropped `no_pid`), **Skagit 25 → 0** (25/25 `no_pid`), **Chelan 0** rows. These three were
+structurally incapable of ever producing a tax_delinquent lead. Safe ad-hoc scrape pattern: instantiate
+the scraper via the registry and call `scrape()` directly — bypasses the whole persist/bill pipeline.
+
 ## 2026-06-17 — Billing-aware watchdog-dup cleanup (BILLED rows) — shipped + verified
 **Built / Shipped:** `scripts/cleanup_watchdog_billed_dups.py` (new, sibling of the safe-subset
 script) — the deferred pass over the `is_duplicate=false` BILLED watchdog-dup rows the safe script

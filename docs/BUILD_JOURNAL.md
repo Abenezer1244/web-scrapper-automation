@@ -58,6 +58,52 @@ schema change (even a docstring) breaks the frontend type-sync CI gate until reg
 deploys to Vercel Production on push to `master`; verify via the deployment's `environment_url` status +
 `bridgeleads.io`/`app.bridgeleads.io` returning 200.
 
+## 2026-06-19 — Probate audit (21 counties) + shared decedent-orientation helper
+**Built / Shipped:** New `src/scrapers/probate.py` — shared `orient_probate_party(grantor, grantee,
+doc_type)` (+ `strip_filing_agency` / `strip_estate_caption` / `is_person_like_party`). On a
+Certificate of Death the recorder indexes the issuing AGENCY ("STATE OF WASHINGTON DEPARTMENT OF
+HEALTH") or bare filing state as grantor, with the DECEDENT in the grantee slot; the helper promotes
+the decedent and strips "Estate of" captions. Wired (probate-gated, no-op when grantor is already the
+decedent) into **laserfiche_weblink, king_wa_probate (JSON+DOM), tyler_selfservice, whatcom_wa,
+clark_wa, acclaimweb**. `tests/test_probate_party.py` (28 tests on the REAL live samples). Branch
+`chore/probate-multitenant-harden` off main@c23523e, worktree `../bridgeleads-probate-harden`.
+
+**Tried / Decided:** Orchestrated 10 parallel audit agents (one per template group + base_scraper +
+a dedicated multi-tenant-infra unit), each cross-corroborated; the "party_name = grantor verbatim"
+gap was found INDEPENDENTLY by 6 agents. Built a hardened live-verify harness
+(`scripts/live_verify_probate_hardened.py`) that asserts party ORIENTATION (flags agency/court/state/
+org/empty), not just count, and ran all 21 counties non-persisting against prod. Decided AGAINST a
+blind shared helper — Codex flagged that probate's decedent-side varies by doc-type — so the helper
+only does the universally-safe strip+promote with 3 guards (person-like grantee only; both-agency→
+None; TOD no-op). Left EagleWeb + Skagit AS-IS (already correct, live red_flags=0) to keep blast
+radius small; pierce DEFERRED ([R]/[E] structure differs, live-clean).
+
+**Failed / Blocked:** chelan/douglas Acclaim scrapers too slow in single-date mode (>420s timeout →
+no live party data); whatcom portal also timed out (>350s) — its fix is applied defensively from the
+code audit, not live-confirmed. spokane = Cloudflare (note-only, no evasion).
+
+**Caught & fixed:** Codex diff review found 2 real P2 edge cases — (1) abbreviated "WA DEPT OF HEALTH"
+left a lone "WA" as party; (2) `strip_estate_caption` collapsed ANY " / "-stacked party to the first
+segment even with no caption, corrupting "SMITH JOHN / SMITH JANE". Both fixed + regression-tested;
+Codex re-review → "BOTH FIXED, PASS".
+
+**Proof (live, non-persisting, prod):** cowlitz 12/42→0 red_flags, king 1/65→0, okanogan 1/23→0;
+clark 0→0 (no regression). columbia + pacific RECOVERED (return clean data live — their down/degraded
+health flags are STALE).
+
+**Pending / Handoff:** 👤 product Q — keep TRANSFER ON DEATH deeds as probate leads? (grantor = living
+owner; clark is 67% TOD). Deferred hardening (separate PR): captcha/timeout-page parsed as valid-empty
+(pierce/king/whatcom/eagleweb-spokane/laserfiche); doc-type word-boundary overmatch ("WILL"/"HEIR");
+skagit `\d{6,}` parcel fallback; pierce doc_type=none; acclaim single-date-mode perf.
+
+**Facts learned:** MULTI-TENANT IS CLEAN — every probate hot-path query is belt (RLS+FORCE on all
+probate tables) + suspenders (explicit user_id); SkipTraceCache key already includes user_id (the
+memory's "global cross-tenant" note is STALE); scraper instances are per-job with a fresh Playwright
+context. For most counties the death-cert grantor genuinely IS the decedent — the wrong-party bug is
+concentrated where the recorder indexes the issuing agency (cowlitz, occasionally king).
+
+---
+
 ## 2026-06-18 — tax_delinquent offered on 3 recorder counties that produce 0 leads — removed
 **Built / Shipped:** `alembic/versions/066_drop_recorder_tax_delinquent.py` (branch
 `fix/drop-recorder-tax-delinquent`, off main@064). Removes `tax_delinquent` from the `record_types`

@@ -30,6 +30,7 @@ from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
 )
+from src.scrapers.probate import orient_probate_party
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.laserfiche")
@@ -373,6 +374,15 @@ class LaserficheWebLinkScraper(BridgeScraper):
                     if oriented is None:
                         continue
                     record.party_name, record.heirs = oriented
+                elif self.active_record_type == "probate":
+                    # On a Certificate of Death the recorder indexes the issuing
+                    # agency (WA Dept of Health) or bare filing state as grantor,
+                    # with the DECEDENT in the grantee slot. Promote the decedent
+                    # and strip "Estate of" captions. No-op when the grantor is
+                    # already the decedent (TOD deeds, affidavits).
+                    record.party_name, record.heirs = orient_probate_party(
+                        grantor, grantee, doc_type
+                    )
                 else:
                     # Grantor → party_name, Grantee → heirs (unchanged).
                     if grantor:

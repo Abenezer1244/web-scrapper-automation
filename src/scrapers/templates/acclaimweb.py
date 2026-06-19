@@ -28,6 +28,7 @@ from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
 )
+from src.scrapers.probate import orient_probate_party
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.acclaimweb")
@@ -837,6 +838,14 @@ class AcclaimWebScraper(BridgeScraper):
                     if oriented is None:
                         continue
                     record.party_name, record.heirs = oriented
+                elif active_rt == "probate":
+                    # Death certs index the issuing agency / filing state as
+                    # grantor, with the DECEDENT as grantee; promote the decedent
+                    # and strip "Estate of" captions. No-op when grantor is the
+                    # decedent.
+                    record.party_name, record.heirs = orient_probate_party(
+                        grantor, grantee, doc_type
+                    )
                 else:
                     if grantor:
                         record.party_name = grantor

@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.probate import orient_probate_party
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.whatcom_wa")
@@ -290,8 +291,17 @@ class WhatcomWAScraper(BridgeScraper):
 
             record = ScrapedRecord()
             record.parcel_id = parcel_id
-            record.party_name = grantor
-            record.heirs = grantee
+            if self._record_type == "probate":
+                # Death certs index the issuing agency (WA Dept of Health) /
+                # filing state as grantor, with the DECEDENT as grantee; promote
+                # the decedent and strip "Estate of" captions. No-op when the
+                # grantor is already the decedent.
+                record.party_name, record.heirs = orient_probate_party(
+                    grantor, grantee, doc_type
+                )
+            else:
+                record.party_name = grantor
+                record.heirs = grantee
             record.doc_type = doc_type
             record.date_recorded = date_recorded
             record.legal_description = instrument

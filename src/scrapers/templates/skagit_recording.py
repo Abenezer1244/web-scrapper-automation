@@ -24,10 +24,25 @@ from src.utils.logger import setup_logger
 _logger = setup_logger("scraper.template.skagit")
 
 _DOC_TYPE_MAP = {
+    # CLIENT-SIDE refinement map (used ONLY by _filter_by_type). The coarse
+    # SERVER dropdown selection is driven by the separate _SERVER_DOC_TYPES below
+    # (which still searches the broad "Affidavit" bucket) — so removing bare
+    # "AFFIDAVIT" here narrows the post-search filter, NOT what gets searched.
+    # Keywords are substring-matched against doc_type + the recorder COMMENT
+    # field by _filter_by_type. The COMMENT is where Skagit records the probate
+    # nature of an otherwise-generic "Affidavit" (e.g. "INHERITANCE LACK OF
+    # PROBATE AFFIDAVIT", "COMMUNITY PROPERTY AGREEMENT AFFIDAVIT"). Bare
+    # "AFFIDAVIT"/"ESTATE"/"WILL"/"HEIR" are intentionally EXCLUDED: "AFFIDAVIT"
+    # is the whole over-broad doc type (keeps every affidavit), and "WILL"/"HEIR"
+    # / bare "ESTATE" substring-match common surnames ("WILLIAMS") and "REAL
+    # ESTATE". "PROBATE" already covers "LACK OF PROBATE". The remaining terms
+    # are probate-unambiguous as substrings.
     "probate": [
-        "PROBATE", "LETTERS TESTAMENTARY", "LETTERS OF ADMINISTRATION",
-        "PERSONAL REPRESENTATIVE", "DEATH CERTIFICATE", "AFFIDAVIT",
-        "TRANSFER ON DEATH", "ESTATE", "WILL", "HEIR", "LACK OF PROBATE",
+        "PROBATE", "INHERITANCE", "LETTERS TESTAMENTARY",
+        "LETTERS OF ADMINISTRATION", "PERSONAL REPRESENTATIVE",
+        "DEATH CERTIFICATE", "CERTIFICATE OF DEATH", "TRANSFER ON DEATH",
+        "COMMUNITY PROPERTY AGREEMENT", "AFFIDAVIT OF HEIRSHIP",
+        "DECEASED", "DECEDENT", "ESTATE OF",
     ],
     "pre_foreclosure": [
         "LIS PENDENS", "NOTICE OF TRUSTEE", "TRUSTEE SALE",
@@ -129,6 +144,21 @@ class SkagitRecordingScraper(BridgeScraper):
             "Skagit %s: %d total records from %d doc type searches",
             self.active_record_type or "all", len(all_records), len(doc_types_to_search),
         )
+
+        # Refine the coarse server results client-side. The doc-type dropdown is
+        # broad — "Affidavit" returns EVERY affidavit, not just probate ones.
+        # _filter_by_type keeps a record only when its doc_type OR recorder
+        # comment carries a probate signal, dropping generic non-probate
+        # affidavits (the probate nature lives in the comment, e.g. "LACK OF
+        # PROBATE AFFIDAVIT"). Previously this method was defined but never
+        # called, so the over-broad results passed through unfiltered.
+        before_filter = len(all_records)
+        all_records = self._filter_by_type(all_records)
+        if len(all_records) != before_filter:
+            _logger.info(
+                "Doc-type refine: kept %d/%d (dropped %d off-type)",
+                len(all_records), before_filter, before_filter - len(all_records),
+            )
 
         if self.require_parcel_id:
             before = len(all_records)

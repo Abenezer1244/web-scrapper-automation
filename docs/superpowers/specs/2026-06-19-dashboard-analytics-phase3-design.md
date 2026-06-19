@@ -78,7 +78,7 @@ Four aggregates, each its own `SELECT`, run **sequentially on the one async sess
    bucket and missing metadata into `{"county":"unknown","state":null}` **in Python**. State is in the
    key so King-WA ≠ King-TX (matters under national expansion; Codex).
 4. **skip_trace** — `results` ONLY, in window: `total` = all non-dup leads; `enriched` =
-   `skip_trace_status='done'`; `phone_pct`/`email_pct` = leads whose **scalar `phone`/`email`** (the
+   `skip_trace_status='hit'`; `phone_pct`/`email_pct` = leads whose **scalar `phone`/`email`** (the
    canonical primary = `phones[0]`, per multi-contact) `IS NOT NULL` over total. Percentages in Python
    (divide-by-zero → 0). `skip_trace_status` is `NOT NULL default 'not_attempted'` so no NULL bucket,
    but the response returns the **fixed status set** with zeroes for absent ones.

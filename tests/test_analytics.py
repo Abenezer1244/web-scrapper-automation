@@ -15,9 +15,6 @@ from sqlalchemy import text
 
 from src.db.session import system_sync_session
 
-pytestmark = pytest.mark.integration
-
-
 # ─── Auth helper ──────────────────────────────────────────────────────────────
 
 def _auth(token: str) -> dict:
@@ -33,6 +30,9 @@ def _seed_result(
     state: str = "WA",
     record_type: str = "probate",
     is_duplicate: bool = False,
+    skip_trace_status: str = "not_attempted",
+    phone: str | None = None,
+    email: str | None = None,
 ) -> str:
     """Insert the full FK chain (scraper_config → job → result) for one result.
 
@@ -80,16 +80,19 @@ def _seed_result(
             text("""
                 INSERT INTO results
                     (id, job_id, user_id, is_duplicate,
-                     skip_trace_status, created_at)
+                     skip_trace_status, phone, email, created_at)
                 VALUES
                     (:result_id, :job_id, :user_id, :is_duplicate,
-                     'not_attempted', now())
+                     :skip_trace_status, :phone, :email, now())
             """),
             {
                 "result_id": result_id,
                 "job_id": job_id,
                 "user_id": user_id,
                 "is_duplicate": is_duplicate,
+                "skip_trace_status": skip_trace_status,
+                "phone": phone,
+                "email": email,
             },
         )
         db.commit()
@@ -98,6 +101,7 @@ def _seed_result(
 
 # ─── Tests ────────────────────────────────────────────────────────────────────
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_summary_requires_auth(client):
     """No bearer token → 401 or 403."""
@@ -105,6 +109,7 @@ async def test_summary_requires_auth(client):
     assert r.status_code in (401, 403)
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_summary_rejects_bad_window(client, starter_user, starter_token):
     """window=7 is not in Literal[30,90] → 422 Unprocessable Entity."""
@@ -112,6 +117,7 @@ async def test_summary_rejects_bad_window(client, starter_user, starter_token):
     assert r.status_code == 422
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_summary_empty_account_all_zeros(client, starter_user, starter_token):
     """Account with no results → 30-point zero-filled trend + empty lists + zero skip_trace."""
@@ -132,6 +138,7 @@ async def test_summary_empty_account_all_zeros(client, starter_user, starter_tok
     }
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_summary_90_day_window(client, starter_user, starter_token):
     """window=90 returns a 90-point trend."""
@@ -142,6 +149,7 @@ async def test_summary_90_day_window(client, starter_user, starter_token):
     assert len(body["trend"]) == 90
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_summary_tenant_isolation(
     client, starter_user, starter_token, business_user
@@ -159,6 +167,7 @@ async def test_summary_tenant_isolation(
     assert body["by_county"] == []
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_summary_counts_own_leads(
     client, starter_user, starter_token
@@ -204,6 +213,7 @@ async def test_summary_counts_own_leads(
     assert st["email_pct"] == 0
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_summary_state_collision_king_wa_vs_king_tx(
     client, starter_user, starter_token
@@ -223,6 +233,20 @@ async def test_summary_state_collision_king_wa_vs_king_tx(
     counties = {(c["county"], c["state"]): c["leads"] for c in body["by_county"]}
     assert counties.get(("king", "WA")) == 1
     assert counties.get(("king", "TX")) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_summary_skip_trace_hit_counts(client, starter_user, starter_token):
+    """enriched counts 'hit' (not the never-written 'done'); pct = contact presence."""
+    _seed_result(starter_user.id, skip_trace_status="hit", phone="x", email="x")
+    _seed_result(starter_user.id, skip_trace_status="miss")  # traced, no contact
+    r = await client.get("/analytics/summary?window=30", headers=_auth(starter_token))
+    st = r.json()["skip_trace"]
+    assert st["total"] == 2
+    assert st["enriched"] == 1   # only the hit, NOT the miss
+    assert st["phone_pct"] == 50
+    assert st["email_pct"] == 50
 
 
 def test_analytics_route_registered_in_openapi():

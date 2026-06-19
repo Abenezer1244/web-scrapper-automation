@@ -8,12 +8,12 @@ buckets as 'unknown'. No PII is read: phone/email presence is a NULL check on
 the encrypted scalar columns. Queries run sequentially on the one async session
 (the session is not concurrency-safe).
 """
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import and_, func, select
+from sqlalchemy import Select, and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
@@ -33,6 +33,18 @@ router = APIRouter(prefix="/analytics", tags=["analytics"])
 _TOP_COUNTIES = 8
 
 
+def _with_meta_join(stmt: Select, uid: str) -> Select:
+    """LEFT JOIN results -> jobs -> scraper_configs, tenant-scoped on every hop."""
+    return (
+        stmt.select_from(Result)
+        .outerjoin(Job, and_(Job.id == Result.job_id, Job.user_id == uid))
+        .outerjoin(
+            ScraperConfig,
+            and_(ScraperConfig.id == Job.scraper_config_id, ScraperConfig.user_id == uid),
+        )
+    )
+
+
 @router.get("/summary", response_model=AnalyticsSummary)
 async def analytics_summary(
     current_user: CurrentUser,
@@ -43,16 +55,18 @@ async def analytics_summary(
     tz_name = settings.ANALYTICS_TIMEZONE
     tz = ZoneInfo(tz_name)
 
-    # Calendar-day window in the configured TZ: today + prior (window-1) days.
-    today = datetime.now(tz).date()
+    now_tz = datetime.now(tz)
+    today = now_tz.date()
     start = today - timedelta(days=window - 1)
-
-    # created_at AT TIME ZONE tz, truncated to the local date.
+    # Redundant bare-column lower bound (1-day TZ slack) so the partial
+    # (user_id, created_at) index range is usable; local_day does the exact filter.
+    start_dt = datetime.combine(start, time.min, tzinfo=tz) - timedelta(days=1)
     local_day = func.date(func.timezone(tz_name, Result.created_at))
 
     base = (
         Result.user_id == uid,
         Result.is_duplicate.is_(False),
+        Result.created_at >= start_dt,
         local_day >= start,
     )
 
@@ -77,16 +91,7 @@ async def analytics_summary(
     rt_col = func.coalesce(ScraperConfig.record_type, "unknown")
     rt_rows = (
         await db.execute(
-            select(rt_col.label("rt"), func.count().label("n"))
-            .select_from(Result)
-            .outerjoin(Job, and_(Job.id == Result.job_id, Job.user_id == uid))
-            .outerjoin(
-                ScraperConfig,
-                and_(
-                    ScraperConfig.id == Job.scraper_config_id,
-                    ScraperConfig.user_id == uid,
-                ),
-            )
+            _with_meta_join(select(rt_col.label("rt"), func.count().label("n")), uid)
             .where(*base)
             .group_by("rt")
             .order_by(func.count().desc(), rt_col.asc())
@@ -95,19 +100,15 @@ async def analytics_summary(
     by_record_type = [RecordTypeCount(record_type=r.rt, leads=r.n) for r in rt_rows]
 
     # 3. by_county — county+state key; top 8 then fold the tail into 'other'.
+    # NULL county (missing metadata) is emitted separately and does NOT consume
+    # a top-8 rank slot — it goes straight to the 'unknown' bucket.
     county_col = func.lower(ScraperConfig.county)
     state_col = func.upper(ScraperConfig.state)
     county_rows = (
         await db.execute(
-            select(county_col.label("c"), state_col.label("s"), func.count().label("n"))
-            .select_from(Result)
-            .outerjoin(Job, and_(Job.id == Result.job_id, Job.user_id == uid))
-            .outerjoin(
-                ScraperConfig,
-                and_(
-                    ScraperConfig.id == Job.scraper_config_id,
-                    ScraperConfig.user_id == uid,
-                ),
+            _with_meta_join(
+                select(county_col.label("c"), state_col.label("s"), func.count().label("n")),
+                uid,
             )
             .where(*base)
             .group_by("c", "s")
@@ -116,11 +117,14 @@ async def analytics_summary(
     ).all()
     by_county: list[CountyCount] = []
     other = 0
-    for i, r in enumerate(county_rows):
-        if r.c is None:  # missing metadata (safety net)
+    rank = 0
+    for r in county_rows:
+        if r.c is None:  # missing metadata (safety net; ~never with the NOT NULL FK chain)
             by_county.append(CountyCount(county="unknown", state=None, leads=r.n))
-        elif i < _TOP_COUNTIES:
+            continue
+        if rank < _TOP_COUNTIES:
             by_county.append(CountyCount(county=r.c, state=r.s, leads=r.n))
+            rank += 1
         else:
             other += r.n
     if other:
@@ -130,11 +134,13 @@ async def analytics_summary(
     # Verified: phone/email absent == SQL NULL in the skip-trace writer.
     # tracerfy_ingest sets phone=None when no phones found (not an encrypted
     # empty string), so IS NOT NULL is a true presence test.
+    # enriched = skip_trace_status='hit' (the real terminal status for a found
+    # contact); 'done' is never written by the pipeline.
     st = (
         await db.execute(
             select(
                 func.count().label("total"),
-                func.count().filter(Result.skip_trace_status == "done").label("enriched"),
+                func.count().filter(Result.skip_trace_status == "hit").label("enriched"),
                 func.count().filter(Result.phone.isnot(None)).label("phone"),
                 func.count().filter(Result.email.isnot(None)).label("email"),
             ).where(*base)

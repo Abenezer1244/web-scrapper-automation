@@ -1111,7 +1111,7 @@ class CountyCount(BaseModel):
 
 class SkipTraceStats(BaseModel):
     total: int
-    enriched: int  # skip_trace_status == 'done'
+    enriched: int  # skip_trace_status == 'hit' (trace found contact)
     phone_pct: int  # 0-100, share of total with a primary phone
     email_pct: int  # 0-100, share of total with a primary email
 

@@ -287,8 +287,9 @@ async def create_connector(
     admin_mfa_step_up_required. The inline is_admin check is gone — central
     dependency so the gate can't drift per-endpoint (Codex HIGH).
 
-    For AI-mode connectors, no Python scraper code is needed — just provide
-    the county portal URL and Claude handles the rest.
+    For AI-mode connectors, no per-county Python scraper code is needed — the
+    registry detects the recorder-platform template from the portal URL. The URL
+    must match a known platform (rejected with 400 otherwise).
     """
     # Check for duplicate
     result = await db.execute(
@@ -364,12 +365,43 @@ async def create_connector(
                 detail=f"Invalid assessor_url: {exc}",
             )
 
+    # This endpoint only creates AI/template-mode connectors — it has no
+    # scraper_class input, so it cannot configure a manual (code-backed) scraper.
+    # Manual connectors are provisioned via migrations/seeds with an allowlisted
+    # scraper_class. Reject manual mode here rather than persist an empty
+    # scraper_class that would crash get_scraper_class() at scrape time.
+    if body.scraper_mode != "ai":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Only AI-mode (template-detected) connectors can be created via the API. "
+                "Manual-mode connectors require a code-backed scraper class and are "
+                "provisioned via a migration."
+            ),
+        )
+
+    # AI-mode connectors resolve to a recorder-platform TEMPLATE by base_url
+    # (the generic AI scraper was removed). Reject at creation if the URL matches
+    # no known template — otherwise the connector would fail at scrape time with
+    # UnsupportedCountyError. scraper_class stays empty: ai-mode resolution uses
+    # base_url (the ai branch returns before any scraper_class import).
+    from src.scrapers.registry import has_template
+    if not has_template(body.base_url):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "No scraper template matches this portal URL. AI-mode connectors "
+                "require a recognized recorder platform (EagleWeb, AcclaimWeb, Tyler "
+                "SelfService, LandmarkWeb, AVA Fidlar, Laserfiche, Skagit, iDocMarket)."
+            ),
+        )
+
     connector = CountyConnector(
         id=str(uuid.uuid4()),
         county=body.county,
         state=body.state.upper(),
         record_types=body.record_types,
-        scraper_class="src.scrapers.ai_scraper.AIScraper",
+        scraper_class="",
         scraper_mode=body.scraper_mode,
         base_url=body.base_url,
         # REDTEAM LOW N3: persist the validated enrichment endpoints so the

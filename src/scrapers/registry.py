@@ -81,35 +81,29 @@ def get_scraper_class(
             f"Supported: {list(set(all_types))}"
         )
 
-    # AI-powered scraper: return AIScraper configured with the connector's base_url
+    # AI-mode connector: resolve to the recorder-platform TEMPLATE that matches
+    # its base_url. "ai" mode means "detect the platform template from the URL" —
+    # NOT "run a generic LLM navigator". The old generic AIScraper fallback was
+    # removed: it produced low-quality unstructured output and every active
+    # ai-mode connector now maps to a concrete template. If no template matches,
+    # fail closed (UnsupportedCountyError) rather than silently degrade.
     scraper_mode = getattr(connector, "scraper_mode", "manual")
     if scraper_mode == "ai":
         from functools import partial
 
-        # Check for template match (saves Claude AI tokens)
         template_class = _detect_template(connector.base_url)
-        if template_class:
-            _logger.info(
-                "Registry resolved %s/%s/%s → %s (template, base_url=%s)",
-                county, state, record_type, template_class.__name__, connector.base_url,
+        if template_class is None:
+            raise UnsupportedCountyError(
+                f"No scraper template matches base_url {connector.base_url!r} for "
+                f"{county}, {state} (ai-mode connector with no recognized recorder "
+                "platform; the generic AI scraper has been removed)"
             )
-            return partial(
-                template_class,
-                base_url=connector.base_url,
-                county=connector.county,
-                state=connector.state,
-                record_types=connector.record_types,
-            ), record_type
-
-        from src.scrapers.ai_scraper import AIScraper
-
         _logger.info(
-            "Registry resolved %s/%s/%s → AIScraper (ai mode, base_url=%s)",
-            county, state, record_type, connector.base_url,
+            "Registry resolved %s/%s/%s → %s (template, base_url=%s)",
+            county, state, record_type, template_class.__name__, connector.base_url,
         )
-        # Return a factory that creates an AIScraper with the right config
         return partial(
-            AIScraper,
+            template_class,
             base_url=connector.base_url,
             county=connector.county,
             state=connector.state,
@@ -128,7 +122,6 @@ def get_scraper_class(
         "src.scrapers.king_wa_probate",
         "src.scrapers.snohomish_wa_tax_delinquent",
         "src.scrapers.snohomish_wa_pre_foreclosure",
-        "src.scrapers.ai_scraper",
         "src.scrapers.base_scraper",
     ])
 
@@ -216,7 +209,24 @@ def _detect_template(base_url: str):
         from src.scrapers.templates.laserfiche_weblink import LaserficheWebLinkScraper
         return LaserficheWebLinkScraper
 
+    # iDocMarket (Tyler) — Columbia (COLWA1). base_url is the full per-county
+    # search URL (e.g. .../COLWA1/Document/Search); the county code lives in the
+    # URL so the template is generic across iDocMarket counties.
+    if "idocmarket.com" in url_lower:
+        from src.scrapers.templates.idocmarket import IDocMarketScraper
+        return IDocMarketScraper
+
     return None
+
+
+def has_template(base_url: str) -> bool:
+    """True if ``base_url`` maps to a known recorder-platform template.
+
+    Public predicate for callers (e.g. the connector-create API) that need to
+    know, without importing the private detector, whether an ai-mode connector
+    pointed at this URL would resolve to a template or fail closed.
+    """
+    return _detect_template(base_url or "") is not None
 
 
 def list_supported() -> list[dict]:

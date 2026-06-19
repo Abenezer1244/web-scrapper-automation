@@ -15,6 +15,8 @@ Benton, Clallam, Grant, Grays Harbor, Island, Jefferson, Kitsap,
 Lewis, Lincoln, Mason, Okanogan, Pacific, Spokane, Stevens, Thurston, Whitman
 """
 
+import re
+
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import (
     BridgeScraper,
@@ -36,8 +38,11 @@ _DOC_TYPE_MAP = {
                 "DEATH", "LETTR", "EXEC", "TOD", "SUCC"],
     "pre_foreclosure": ["LIS PENDENS", "NOTICE OF TRUSTEE SALE", "TRUSTEE SALE",
                         "TRUSTEE'S SALE", "NOTICE OF DEFAULT", "FORECLOSURE",
-                        # Abbreviated codes (e.g. Clallam: LISP, NTS, NTSCL)
-                        "LISP", "NTS"],
+                        # Abbreviated codes (e.g. Clallam: LISP, NTS, NTSCL).
+                        # NTSCL must be listed explicitly: matching is now
+                        # word-boundary, so "NTS" no longer substring-matches
+                        # "NTSCL" (Codex review).
+                        "LISP", "NTS", "NTSCL"],
     "tax_delinquent": ["TAX LIEN", "CERTIFICATE OF DELINQUENCY",
                        "TAX DELINQUENT", "CERTIFICATE OF SALE"],
     "divorce": ["DIVORCE", "DISSOLUTION", "DECREE OF DISSOLUTION",
@@ -48,8 +53,79 @@ _DOC_TYPE_MAP = {
 # Doc type phrases that LOOK like a match but document the opposite.
 # Checked AFTER _DOC_TYPE_MAP — any match here drops the record.
 _DOC_TYPE_EXCLUDE = {
-    "probate": ["LACK OF PROBATE"],  # affidavit stating there is NO probate
+    # "LACK OF PROBATE" = affidavit stating there is NO probate.
+    # "TRUSTEE" = successor-trustee / deed-of-trust instruments (e.g. "Appointment
+    # Of Successor Trustee", "Resign/appt/sub Succ Trustee") — trust/foreclosure
+    # docs, NOT probate. Live verification (2026-06-18) confirmed these were
+    # polluting probate results on island + pacific. No genuine probate instrument
+    # carries "TRUSTEE"; pre_foreclosure's "TRUSTEE SALE" is unaffected because the
+    # exclude list is per-record-type.
+    "probate": ["LACK OF PROBATE", "TRUSTEE"],
 }
+
+
+# Certificate-of-Death filing agency (WA State Dept of Health — the issuing
+# authority, not the decedent). Two live shapes: benton concatenates it onto the
+# decedent ("PERRIN, RONALD RALPH, STATE OF WA, DEPT OF HEALTH"); thurston puts it
+# alone in the grantor ("WASHINGTON STATE").
+#
+# The Dept-of-Health phrase (optionally prefixed by the state qualifier) is
+# unambiguous — no legitimate grantor is "...DEPT OF HEALTH" — so it is stripped
+# wherever it appears. The BARE state phrase is risky (it is the prefix of real
+# entities like "WASHINGTON STATE UNIVERSITY"), so it is only treated as the filer
+# when it is the WHOLE grantor value (anchored ^...$).
+_HEALTH_DEPT_RE = re.compile(
+    r"(?:STATE\s+OF\s+WA(?:SHINGTON)?\s*,?\s*)?"
+    r"(?:DEPARTMENT|DEPT)\.?\s+OF\s+HEALTH\b",
+    re.IGNORECASE,
+)
+_BARE_STATE_RE = re.compile(
+    r"^\s*(?:WASHINGTON\s+STATE|STATE\s+OF\s+WA(?:SHINGTON)?)\s*$",
+    re.IGNORECASE,
+)
+# Residue that is only a status word (no actual name) — treat as empty so the
+# caller falls back to the grantee. Defensive: guards a "DECEASED, <agency>" index.
+_STATUS_ONLY_TOKENS = {"DECEASED", "DECEDENT", "DECD", "ESTATE", "OF"}
+
+
+def _strip_filing_agency(name: str) -> str:
+    """Remove the Certificate-of-Death filing agency from a grantor name.
+
+    "PERRIN, RONALD RALPH, STATE OF WA, DEPT OF HEALTH" -> "PERRIN, RONALD RALPH".
+    "WASHINGTON STATE" -> "" (agency only — caller falls back to the grantee).
+    "WASHINGTON STATE UNIVERSITY" -> unchanged (not the filer).
+    """
+    if not name:
+        return name
+    cleaned = _HEALTH_DEPT_RE.sub("", name)
+    cleaned = re.sub(r"(?:\s*/\s*){2,}", " / ", cleaned)  # collapse separators left behind
+    cleaned = re.sub(r"(?:,\s*){2,}", ", ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = cleaned.strip(" ,/").strip()
+    if _BARE_STATE_RE.match(cleaned):
+        return ""
+    tokens = set(re.findall(r"[A-Z]+", cleaned.upper()))
+    if tokens and tokens <= _STATUS_ONLY_TOKENS:
+        return ""
+    return cleaned
+
+
+def _doc_type_matches(doc_upper: str, keywords: list[str]) -> bool:
+    """True if any keyword matches ``doc_upper``.
+
+    Multi-word phrases and longer terms use substring match. Short single-token
+    abbreviation codes (<=5 chars, no space — e.g. DEATH, EXEC, TOD, SUCC, NTS)
+    use WORD-BOUNDARY match so a code like ``SUCC`` cannot substring-bleed into
+    ``SUCCESSOR`` (a deed-of-trust doc, not probate) — a live-confirmed
+    false-positive source on EagleWeb counties.
+    """
+    for kw in keywords:
+        if " " in kw or len(kw) > 5:
+            if kw in doc_upper:
+                return True
+        elif re.search(rf"\b{re.escape(kw)}\b", doc_upper):
+            return True
+    return False
 
 
 class EagleWebScraper(BridgeScraper):
@@ -677,6 +753,26 @@ class EagleWebScraper(BridgeScraper):
                     if grantee:
                         record.heirs = grantee
 
+                # Death-certificate party orientation. On a Certificate of Death
+                # the recorder indexes the issuing AGENCY (WA State Dept of
+                # Health) as/within the grantor; the lead is the DECEASED. When an
+                # agency phrase is present in the grantor, strip it (Benton
+                # concatenates "DECEASED, STATE OF WA, DEPT OF HEALTH"); if nothing
+                # real remains (Thurston grantor = "WASHINGTON STATE"), fall back
+                # to the grantee, which carries the decedent. Only fires when an
+                # agency phrase is actually present, so non-death-cert records
+                # (and "Transfer On Death" deeds, whose grantor is a live person)
+                # are untouched.
+                if record.party_name:
+                    deagencied = _strip_filing_agency(record.party_name)
+                    if deagencied != record.party_name:
+                        if deagencied:
+                            record.party_name = deagencied
+                        elif record.heirs:
+                            record.party_name, record.heirs = record.heirs, None
+                        else:
+                            record.party_name = None
+
                 # Parcel ID — check both summary and description (if not already from table)
                 combined = f"{summary} {desc}"
                 if not record.parcel_id:
@@ -757,7 +853,7 @@ class EagleWebScraper(BridgeScraper):
                     if active_rt and active_rt != "all":
                         doc_upper = desc.upper()
                         kws = _DOC_TYPE_MAP.get(active_rt, [])
-                        if not any(kw in doc_upper for kw in kws):
+                        if not _doc_type_matches(doc_upper, kws):
                             continue  # Skip non-matching doc types
                         excludes = _DOC_TYPE_EXCLUDE.get(active_rt, [])
                         if any(neg in doc_upper for neg in excludes):

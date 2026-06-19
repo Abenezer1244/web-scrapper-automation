@@ -24,10 +24,25 @@ from src.utils.logger import setup_logger
 _logger = setup_logger("scraper.template.skagit")
 
 _DOC_TYPE_MAP = {
+    # CLIENT-SIDE refinement map (used ONLY by _filter_by_type). The coarse
+    # SERVER dropdown selection is driven by the separate _SERVER_DOC_TYPES below
+    # (which still searches the broad "Affidavit" bucket) — so removing bare
+    # "AFFIDAVIT" here narrows the post-search filter, NOT what gets searched.
+    # Keywords are substring-matched against doc_type + the recorder COMMENT
+    # field by _filter_by_type. The COMMENT is where Skagit records the probate
+    # nature of an otherwise-generic "Affidavit" (e.g. "INHERITANCE LACK OF
+    # PROBATE AFFIDAVIT", "COMMUNITY PROPERTY AGREEMENT AFFIDAVIT"). Bare
+    # "AFFIDAVIT"/"ESTATE"/"WILL"/"HEIR" are intentionally EXCLUDED: "AFFIDAVIT"
+    # is the whole over-broad doc type (keeps every affidavit), and "WILL"/"HEIR"
+    # / bare "ESTATE" substring-match common surnames ("WILLIAMS") and "REAL
+    # ESTATE". "PROBATE" already covers "LACK OF PROBATE". The remaining terms
+    # are probate-unambiguous as substrings.
     "probate": [
-        "PROBATE", "LETTERS TESTAMENTARY", "LETTERS OF ADMINISTRATION",
-        "PERSONAL REPRESENTATIVE", "DEATH CERTIFICATE", "AFFIDAVIT",
-        "TRANSFER ON DEATH", "ESTATE", "WILL", "HEIR", "LACK OF PROBATE",
+        "PROBATE", "INHERITANCE", "LETTERS TESTAMENTARY",
+        "LETTERS OF ADMINISTRATION", "PERSONAL REPRESENTATIVE",
+        "DEATH CERTIFICATE", "CERTIFICATE OF DEATH", "TRANSFER ON DEATH",
+        "COMMUNITY PROPERTY AGREEMENT", "AFFIDAVIT OF HEIRSHIP",
+        "DECEASED", "DECEDENT", "ESTATE OF",
     ],
     "pre_foreclosure": [
         "LIS PENDENS", "NOTICE OF TRUSTEE", "TRUSTEE SALE",
@@ -42,6 +57,36 @@ _DOC_TYPE_MAP = {
         "DECREE-DIVORCE", "SEPARATION",
     ],
 }
+
+
+# Certificate-of-Death filing agency (the issuing STATE — not the decedent).
+# Skagit indexes the issuing state as the grantor in INVERTED form:
+# "STATE OF WASHINGTON" -> "WASH. STATE OF", "STATE OF CALIFORNIA" ->
+# "CALIFORNIA STATE OF". The lead is the DECEASED, who is recorded as the
+# grantee. No legitimate person/company grantor IS the whole value
+# "<state> STATE OF", so the phrase is treated as the filer ONLY when it is
+# the ENTIRE grantor value (anchored ^...$). This leaves real entities like
+# "WASHINGTON STATE UNIVERSITY" untouched (they don't end in "STATE OF"),
+# and the \b before STATE means "...ESTATE OF" never matches (no word
+# boundary inside ESTATE). Matching any leading state name (not just the two
+# observed live) so an out-of-state death cert is also corrected.
+_FILING_STATE_RE = re.compile(
+    r"^\s*[A-Z][A-Z.\s]*\bSTATE\s+OF\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_filing_state_party(value: str) -> bool:
+    """True if ``value`` is wholly one or more filing-state phrases.
+
+    normalize_party_text() joins structurally stacked parties with " / ", so a
+    death cert grantor is "WASH. STATE OF" (single) or — defensively — could be
+    several stacked filing states. Every " / "-split part must itself be a
+    whole-value filing-state phrase; any real person/company part makes this
+    False, so genuine grantors (and Transfer-on-Death deeds) are never matched.
+    """
+    parts = [p for p in value.split(" / ") if p.strip()]
+    return bool(parts) and all(_FILING_STATE_RE.match(p) for p in parts)
 
 
 class SkagitRecordingScraper(BridgeScraper):
@@ -129,6 +174,21 @@ class SkagitRecordingScraper(BridgeScraper):
             "Skagit %s: %d total records from %d doc type searches",
             self.active_record_type or "all", len(all_records), len(doc_types_to_search),
         )
+
+        # Refine the coarse server results client-side. The doc-type dropdown is
+        # broad — "Affidavit" returns EVERY affidavit, not just probate ones.
+        # _filter_by_type keeps a record only when its doc_type OR recorder
+        # comment carries a probate signal, dropping generic non-probate
+        # affidavits (the probate nature lives in the comment, e.g. "LACK OF
+        # PROBATE AFFIDAVIT"). Previously this method was defined but never
+        # called, so the over-broad results passed through unfiltered.
+        before_filter = len(all_records)
+        all_records = self._filter_by_type(all_records)
+        if len(all_records) != before_filter:
+            _logger.info(
+                "Doc-type refine: kept %d/%d (dropped %d off-type)",
+                len(all_records), before_filter, before_filter - len(all_records),
+            )
 
         if self.require_parcel_id:
             before = len(all_records)
@@ -305,6 +365,22 @@ class SkagitRecordingScraper(BridgeScraper):
                 grantee = normalize_party_text(item.get("grantee"))
                 if grantee:
                     record.heirs = grantee
+
+                # Death-certificate party orientation. On a Certificate of
+                # Death the recorder indexes the issuing STATE as the grantor
+                # ("WASH. STATE OF" / "CALIFORNIA STATE OF"); the lead is the
+                # DECEASED, who is the grantee. When the grantor is wholly a
+                # filing-state phrase, promote the grantee to party_name (and
+                # clear heirs — the grantee WAS the decedent, not a separate
+                # heir). Only fires on the whole-value agency match, so
+                # Transfer-on-Death deeds (grantor = a live owner) and
+                # affidavits are untouched. Falls back to None if no grantee
+                # was captured so the raw agency name never reaches a lead.
+                if record.party_name and _is_filing_state_party(record.party_name):
+                    if record.heirs:
+                        record.party_name, record.heirs = record.heirs, None
+                    else:
+                        record.party_name = None
 
                 # Comment — contains probate info like "INHERITANCE LACK OF PROBATE"
                 # Use for doc_type filtering AND store in enrichment_data

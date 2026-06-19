@@ -304,40 +304,62 @@ class TylerSelfServiceScraper(BridgeScraper):
         ACTIONGROUP number from its href, and construct the Document
         Type Search URL.
         """
-        # After the disclaimer click, the URL may be left as
-        # "…/Web/user/disclaimer#/Web/" — the hash fragment is NOT a
-        # real navigation, so we force a hard goto to the home page.
-        # web_root is "https://host/Web" (no trailing slash), so
-        # appending "/" gives the Tyler SelfService home URL exactly.
+        # web_root is "https://host/Web" (no trailing slash), so appending "/"
+        # gives the Tyler SelfService home URL exactly.
         home_url = self.web_root + "/"
-        if self.page.url.split("#")[0] != home_url:
-            await self.navigate(home_url)
+
+        # Discover the "Official Records Search" link with retries. After the
+        # disclaimer click the URL is already /Web/, but the nav menu that holds
+        # this link renders a beat later (and on some loads the /Web/ page briefly
+        # re-shows the disclaimer until the session cookie settles). A one-shot
+        # query raced that and intermittently found nothing — okanogan returned
+        # 0 on ~half of runs. Re-navigate home on each miss and wait for the link
+        # element itself to exist before reading its href.
+        href = None
+        for attempt in range(1, 4):
+            if attempt > 1 or self.page.url.split("#")[0] != home_url:
+                await self.navigate(home_url)
+                try:
+                    await self.page.wait_for_load_state("networkidle", timeout=10_000)
+                except Exception:
+                    pass
+                # The /Web/ shell sometimes re-shows the disclaimer until the
+                # session cookie settles. Re-accept it (idempotent — a no-op when
+                # the menu is already showing) so the nav link can render; without
+                # this a reappearing disclaimer makes all retries find no link.
+                await self._bypass_disclaimer()
+
             try:
-                await self.page.wait_for_load_state("networkidle", timeout=10_000)
+                await self.page.wait_for_function(
+                    """() => Array.from(document.querySelectorAll('a'))
+                        .some(a => (a.innerText || '').trim().startsWith('Official Records Search'))""",
+                    timeout=10_000,
+                )
             except Exception:
-                pass
+                _logger.info(
+                    "Official Records Search link not present yet (attempt %d/3)", attempt
+                )
+                await self.page.wait_for_timeout(2_000)
+                continue
+
+            try:
+                href = await self.page.evaluate(
+                    """() => {
+                        const a = Array.from(document.querySelectorAll('a'))
+                            .find(a => (a.innerText || '').trim().startsWith('Official Records Search'));
+                        return a ? a.getAttribute('href') : null;
+                    }"""
+                )
+            except Exception as exc:
+                _logger.warning("JS error finding search link: %s", str(exc)[:120])
+                href = None
+
+            if href:
+                break
             await self.page.wait_for_timeout(2_000)
 
-        # Find the Official Records Search link
-        try:
-            href = await self.page.evaluate(
-                """() => {
-                    const anchors = Array.from(document.querySelectorAll('a'));
-                    for (const a of anchors) {
-                        const t = (a.innerText || '').trim();
-                        if (t.startsWith('Official Records Search')) {
-                            return a.getAttribute('href');
-                        }
-                    }
-                    return null;
-                }"""
-            )
-        except Exception as exc:
-            _logger.warning("JS error finding search link: %s", str(exc)[:120])
-            return None
-
         if not href:
-            _logger.warning("No 'Official Records Search' link on home page")
+            _logger.warning("No 'Official Records Search' link on home page after 3 attempts")
             return None
 
         # href looks like /Web/action/ACTIONGROUP769S1 — extract 769
@@ -468,12 +490,23 @@ class TylerSelfServiceScraper(BridgeScraper):
         return records
 
     async def _goto_next_page(self) -> bool:
-        """Click the 'next' pagination link. Returns False if there is none."""
+        """Click the 'next' pagination link. Returns False if there is none.
+
+        Waits for the result list to actually SWAP to the next page (the first
+        row's document id changes) instead of a bare row-present check. The old
+        rows stay in the DOM during the next-page AJAX, so a present-check
+        matches the STALE rows instantly; a slow AJAX then let _extract_page run
+        on the old page, every row deduped out (new=0), and the caller stopped
+        early — silently dropping later pages (okanogan: 300 vs 716 across runs).
+        """
         try:
-            # Find all "next" links, pick the first that is both visible
-            # and enabled. On the last page, Tyler SelfService renders the
-            # Next link with display:none so the locator matches but
-            # is_visible() returns False.
+            first_id_before = await self.page.evaluate(
+                "() => { const li = document.querySelector('li.ss-search-row');"
+                " return li ? li.getAttribute('data-documentid') : null; }"
+            )
+            # Find all "next" links, pick the first that is both visible and
+            # enabled. On the last page, Tyler SelfService renders the Next link
+            # with display:none so the locator matches but is_visible() is False.
             next_btns = await self.page.locator(
                 "a:has-text('next'), a:has-text('Next')"
             ).all()
@@ -488,12 +521,26 @@ class TylerSelfServiceScraper(BridgeScraper):
             if clickable is None:
                 return False
             await clickable.click(timeout=5_000)
-            await self.page.wait_for_timeout(4_000)
+            # Wait until the first row's id differs — the next page has rendered.
             try:
-                await self.page.wait_for_load_state("networkidle", timeout=10_000)
+                await self.page.wait_for_function(
+                    """(prev) => { const li = document.querySelector('li.ss-search-row');
+                        return li && li.getAttribute('data-documentid') !== prev; }""",
+                    arg=first_id_before,
+                    timeout=15_000,
+                )
             except Exception:
-                pass
-            await self.page.wait_for_selector("li.ss-search-row", timeout=10_000)
+                # Slow AJAX: give it one more beat and re-check before concluding
+                # the pages are exhausted, so a slow tail page isn't dropped.
+                await self.page.wait_for_timeout(3_000)
+                first_id_after = await self.page.evaluate(
+                    "() => { const li = document.querySelector('li.ss-search-row');"
+                    " return li ? li.getAttribute('data-documentid') : null; }"
+                )
+                if first_id_after == first_id_before:
+                    _logger.info("Next page did not load new rows (pagination ended or slow)")
+                    return False
+            await self.page.wait_for_timeout(500)
             return True
         except Exception as exc:
             _logger.info("Pagination ended: %s", str(exc)[:80])

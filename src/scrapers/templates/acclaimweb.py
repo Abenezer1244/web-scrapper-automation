@@ -24,6 +24,10 @@ from src.scrapers.base_scraper import (
     ScrapedRecord,
     normalize_party_text,
 )
+from src.scrapers.preforeclosure import (
+    is_cancellation_or_admin,
+    orient_pre_foreclosure_party,
+)
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.acclaimweb")
@@ -61,7 +65,7 @@ _DOC_TYPE_MAP = {
     # excluded — they signal a pre-foreclosure stage but don't name the
     # homeowner in grantor/grantee, so they produce low-quality leads.
     "pre_foreclosure": ["LIS PENDENS", "NOTICE OF TRUSTEE", "TRUSTEE SALE",
-                        "TRUSTEE'S SALE", "DISCONTINUANCE TRUSTEE",
+                        "TRUSTEE'S SALE",
                         "FORECLOSURE", "NOTICE OF DEFAULT",
                         # Chelan abbreviations for Notice of Trustee Sale
                         # and Notice of Default — both name the borrower
@@ -820,39 +824,19 @@ class AcclaimWebScraper(BridgeScraper):
                 grantor = normalize_party_text(item.get("grantor", ""))
                 grantee = normalize_party_text(item.get("grantee", ""))
 
-                # Person-vs-company heuristic. For pre-foreclosure the
-                # homeowner can show up as either grantor or grantee
-                # depending on the document type (Trustee's Sale has
-                # trustee as grantor; other pre-foreclosure filings may
-                # have borrower as grantor). Pick whichever side looks
-                # like a real person; drop the record if both sides are
-                # companies — banks foreclosing on banks is not a
-                # homeowner lead. (_COMPANY_WORDS is a module-level constant.)
-                def _is_person(name: str) -> bool:
-                    upper = name.upper()
-                    words = upper.split()
-                    if any(w in _COMPANY_WORDS for w in words):
-                        return False
-                    # Real people have first+last names. One-word tokens
-                    # (FIG, NA, MERS) are almost always company
-                    # abbreviations even when not in the keyword list.
-                    if len(words) < 2:
-                        return False
-                    # Guard against very short strings that slip past.
-                    return len(name) >= 5
-
+                # Pre-foreclosure borrower orientation via the shared helper: it
+                # keeps the PERSON sub-name from a stacked "BORROWER / TRUSTEE
+                # COMPANY" cell (the old whole-cell person check dropped that
+                # legit lead because the cell contains "CORP") and drops
+                # bank-vs-trustee rows with no homeowner. Other record types keep
+                # the default grantor→party_name / grantee→heirs below.
                 if active_rt == "pre_foreclosure":
-                    if grantor and _is_person(grantor):
-                        record.party_name = grantor
-                        if grantee:
-                            record.heirs = grantee
-                    elif grantee and _is_person(grantee):
-                        record.party_name = grantee
-                        if grantor:
-                            record.heirs = grantor
-                    else:
-                        # Both sides are companies — no homeowner lead.
+                    if is_cancellation_or_admin(doc_type):
                         continue
+                    oriented = orient_pre_foreclosure_party(grantor, grantee)
+                    if oriented is None:
+                        continue
+                    record.party_name, record.heirs = oriented
                 else:
                     if grantor:
                         record.party_name = grantor

@@ -134,6 +134,66 @@ def best_match(notice: dict[str, Any], candidates: list[dict[str, Any]]) -> tupl
     return (top_id, top)
 
 
+def best_match_group(
+    notice: dict[str, Any], candidates: list[dict[str, Any]]
+) -> list[tuple[Any, float]]:
+    """All Results for the SAME winning property that should receive this notice.
+
+    Multi-tenant coverage: an NTS notice is PUBLIC statutory data about a
+    PROPERTY, and several tenants can each hold a pre_foreclosure Result for the
+    same foreclosed property. ``best_match`` returns a SINGLE id and bails on any
+    second at-threshold candidate — which silently drops the (common, valuable)
+    case where two tenants track the same property, since both score ≥ threshold.
+
+    This returns EVERY at-threshold candidate that resolves to the same physical
+    property as the top match (same normalized parcel or same address key), so the
+    caller attaches the auction data to all of them. If a second candidate at/above
+    threshold is a DIFFERENT property, that is genuine ambiguity → return [] (never
+    guess across distinct properties), preserving ``best_match``'s safety contract.
+    """
+    scored: list[tuple[dict[str, Any], float]] = []
+    for c in candidates:
+        s = score_match(
+            notice_parcel=notice.get("parcel"),
+            notice_addr_key=notice.get("property_address_normalized"),
+            notice_grantor=notice.get("grantor"),
+            result_parcel=c.get("parcel"),
+            result_addr_key=c.get("addr_key"),
+            result_party_name=c.get("party_name"),
+        )
+        if s >= MATCH_THRESHOLD:
+            scored.append((c, s))
+    if not scored:
+        return []
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top_c = scored[0][0]
+    win_parcel = _norm_parcel(top_c.get("parcel"))
+    win_addr = top_c.get("addr_key") or ""
+
+    def _same_property(c: dict[str, Any]) -> bool:
+        cp = _norm_parcel(c.get("parcel"))
+        # Parcel is authoritative in BOTH directions: if EITHER the winner or
+        # this candidate carries a parcel, they are the same property ONLY when
+        # both parcels are present and equal. The address fallback is used ONLY
+        # when NEITHER side has a parcel — addr_key strips unit numbers (two
+        # condo/apartment units share a base street+ZIP key), so a parcel-less
+        # address must never group two distinct units onto one notice (Codex P1:
+        # a false cross-property attach is worse than a missed match).
+        if win_parcel or cp:
+            return bool(win_parcel and cp and cp == win_parcel)
+        ca = c.get("addr_key") or ""
+        return bool(win_addr and ca and ca == win_addr)
+
+    group: list[tuple[Any, float]] = []
+    for c, s in scored:
+        if _same_property(c):
+            group.append((c.get("id"), s))
+        else:
+            # A different property also reached the threshold — ambiguous, skip.
+            return []
+    return group
+
+
 def result_match_candidate(result: Any) -> dict[str, Any]:
     """Build a matcher candidate dict from a Result ORM row (precompute addr_key)."""
     def _get(name: str) -> Any:

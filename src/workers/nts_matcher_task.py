@@ -102,7 +102,9 @@ def match_job_inline(db, job_id: str) -> int:
             """
             SELECT id, parcel_id, property_address, party_name
             FROM results
-            WHERE job_id = :jid AND auction_date IS NULL
+            WHERE job_id = :jid
+              AND user_id = (SELECT user_id FROM jobs WHERE id = :jid)
+              AND auction_date IS NULL
             """
         ),
         {"jid": job_id},
@@ -121,7 +123,7 @@ def _match_and_write(
     """
     from sqlalchemy import text as _sa_text
 
-    from src.scrapers.sources.nts_matcher import best_match, result_match_candidate
+    from src.scrapers.sources.nts_matcher import best_match_group, result_match_candidate
 
     if not result_dicts:
         return 0
@@ -170,15 +172,18 @@ def _match_and_write(
         candidates = [c for c in pool.values() if c["id"] not in used_result_ids]
         if not candidates:
             continue
-        hit = best_match(nm, candidates)
-        if hit is None:
-            continue
-        rid, conf = hit
-        used_result_ids.add(rid)
-        # Count only an actual write — the WHERE auction_date IS NULL guard means a
-        # row a concurrent beat/inline pass already claimed updates 0 rows (Codex).
-        if _write_match(db, rid, nm, conf) == 1:
-            matched += 1
+        # Attach the PUBLIC auction data to EVERY Result for the same property —
+        # multiple tenants can each track the same foreclosure, and they should
+        # all get it (best_match's single-winner bail silently dropped that case).
+        # best_match_group still returns [] on a different-property tie (ambiguous).
+        group = best_match_group(nm, candidates)
+        for rid, conf in group:
+            used_result_ids.add(rid)
+            # Count only an actual write — the WHERE auction_date IS NULL guard
+            # means a row a concurrent beat/inline pass already claimed updates 0
+            # rows (Codex).
+            if _write_match(db, rid, nm, conf) == 1:
+                matched += 1
 
     if commit and matched:
         db.commit()

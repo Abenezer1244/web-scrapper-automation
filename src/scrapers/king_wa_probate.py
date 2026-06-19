@@ -25,6 +25,10 @@ from datetime import datetime, timedelta
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord, normalize_party_text
+from src.scrapers.preforeclosure import (
+    is_cancellation_or_admin,
+    orient_pre_foreclosure_party,
+)
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.king_wa_probate")
@@ -82,6 +86,10 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
 
         # Look up config for the requested record type
         cfg = self.RECORD_TYPE_CONFIG.get(record_type, self.RECORD_TYPE_CONFIG["probate"])
+        # Resolved record type key (the requested one if known, else the probate
+        # fallback). Used by the extraction paths to apply the pre_foreclosure
+        # cancellation/orientation guards only when actually scraping foreclosures.
+        self._record_type = record_type if record_type in self.RECORD_TYPE_CONFIG else "probate"
         self.DOC_TYPE_SEARCH_TEXTS = cfg["search_texts"]
         # Phase 2b: if an explicit pre-foreclosure doc-type selection was made,
         # narrow to the chosen canonical types' search texts (registry-mapped).
@@ -821,6 +829,23 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
             if not grantor and not date_str:
                 continue
 
+            # Pre-foreclosure correctness guards. King selects the "Notice of
+            # Trustee Sale" CATEGORY but the dropdown also returns
+            # Discontinuance / Amended / Rescission of Notice of Trustee Sale
+            # rows — those signal a CANCELLED/CURED foreclosure, not an active
+            # lead, so drop them first. Then orient the borrower: King indexes
+            # the trustee company as grantor on an NTS (and may stack the
+            # borrower + trustee company), so put the PERSON in party_name and
+            # drop bank-vs-trustee rows with no homeowner. Only fires for
+            # pre_foreclosure; probate/death-cert/divorce are untouched.
+            if self._record_type == "pre_foreclosure":
+                if is_cancellation_or_admin(doc_type):
+                    continue
+                oriented = orient_pre_foreclosure_party(grantor, grantee)
+                if oriented is None:
+                    continue
+                grantor, grantee = oriented
+
             record = ScrapedRecord()
             record.date_recorded = date_str
             record.party_name = grantor
@@ -952,6 +977,28 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
 
                 parcel_id = pid_match.group(1)
 
+                # Doc type (read early — needed by the pre_foreclosure guard)
+                doc_type = (item.get("doc_type") or "").strip()
+
+                # Party names (normalize stacked owners -> " / ").
+                # Default orientation: grantor = subject (deceased for probate),
+                # grantee = heir/counterparty.
+                grantor = normalize_party_text(item.get("grantor") or "")
+                grantee = normalize_party_text(item.get("grantee") or "")
+
+                # Pre-foreclosure correctness guards (see _parse_json_results).
+                # Drop cancelled/cured/trustee-admin NTS rows first, then orient
+                # the borrower (person) into the grantor slot, dropping
+                # bank-vs-trustee rows. Only for pre_foreclosure — probate/
+                # death-cert/divorce orientation is unchanged.
+                if self._record_type == "pre_foreclosure":
+                    if is_cancellation_or_admin(doc_type):
+                        continue
+                    oriented = orient_pre_foreclosure_party(grantor, grantee)
+                    if oriented is None:
+                        continue
+                    grantor, grantee = oriented
+
                 record = ScrapedRecord()
                 record.parcel_id = parcel_id
 
@@ -967,18 +1014,12 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                     if date_match:
                         record.date_recorded = date_match.group(1)
 
-                # Grantor = deceased person (normalize stacked owners -> " / ")
-                grantor = normalize_party_text(item.get("grantor") or "")
                 if grantor:
                     record.party_name = grantor
 
-                # Grantee = heir/family inheriting the property
-                grantee = normalize_party_text(item.get("grantee") or "")
                 if grantee:
                     record.heirs = grantee
 
-                # Doc type
-                doc_type = (item.get("doc_type") or "").strip()
                 record.doc_type = doc_type or self.DOC_TYPE_LABEL
 
                 # Store all metadata in enrichment_data

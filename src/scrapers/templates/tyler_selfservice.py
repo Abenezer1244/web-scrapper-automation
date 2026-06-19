@@ -38,6 +38,10 @@ import re
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.preforeclosure import (
+    is_cancellation_or_admin,
+    orient_pre_foreclosure_party,
+)
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.tyler_selfservice")
@@ -465,14 +469,18 @@ class TylerSelfServiceScraper(BridgeScraper):
             gm = re.search(r"Grantor(?:\s*\(\d+\))?\s*\n([^\n]+(?:\n[^\n]+)*?)(?=\nGrantee|\n\n|$)", full_text)
             if gm:
                 lines = [ln.strip() for ln in gm.group(1).splitlines() if ln.strip()]
-                grantor = ", ".join(lines[:5]) if lines else None
+                # Join DISTINCT parties with " / " (the project-wide stacked-party
+                # convention) — each line is itself "LAST, FIRST", so a comma can't
+                # be the party separator, and " / " lets the pre_foreclosure
+                # borrower-orientation split the trustee company off the homeowner.
+                grantor = " / ".join(lines[:5]) if lines else None
 
             # Parse Grantee(s)
             grantee = None
             gem = re.search(r"Grantee(?:\s*\(\d+\))?\s*\n([^\n]+(?:\n[^\n]+)*?)(?=\n\n|$)", full_text)
             if gem:
                 lines = [ln.strip() for ln in gem.group(1).splitlines() if ln.strip()]
-                grantee = ", ".join(lines[:5]) if lines else None
+                grantee = " / ".join(lines[:5]) if lines else None
 
             record = ScrapedRecord()
             record.date_recorded = date_recorded
@@ -547,17 +555,39 @@ class TylerSelfServiceScraper(BridgeScraper):
             return False
 
     def _filter_by_type(self, records: list[ScrapedRecord]) -> list[ScrapedRecord]:
-        """Keep only records whose doc_type matches the active record type."""
+        """Keep only records whose doc_type matches the active record type.
+
+        For pre_foreclosure, additionally drop cancelled/cured/trustee-admin
+        docs (Discontinuance, Rescission, Substitution of Trustee — they
+        substring-match the legit keywords but are the OPPOSITE of active
+        distress) and re-orient the party so the BORROWER (person) lands in
+        party_name. Orientation MUST run here, before _enrich_parcels_via_assessor
+        keys its name → parcel lookup off party_name.
+        """
         if not self.active_record_type or self.active_record_type == "all":
             return records
         keywords = _DOC_TYPE_MAP.get(self.active_record_type, [])
         if not keywords:
             return records
+        is_preforeclosure = self.active_record_type == "pre_foreclosure"
         kept = []
         for r in records:
             doc = (r.doc_type or "").upper()
-            if any(kw in doc for kw in keywords):
-                kept.append(r)
+            if not any(kw in doc for kw in keywords):
+                continue
+            if is_preforeclosure:
+                # A doc that keyword-matched but signals the foreclosure was
+                # cancelled/cured or is pure trustee admin is NOT active distress.
+                if is_cancellation_or_admin(r.doc_type):
+                    continue
+                # Borrower orientation: an NTS is often indexed with the trustee
+                # company as grantor and the borrower as grantee. Put the person
+                # (homeowner) in party_name; drop bank-vs-trustee records.
+                oriented = orient_pre_foreclosure_party(r.party_name, r.heirs)
+                if oriented is None:
+                    continue
+                r.party_name, r.heirs = oriented
+            kept.append(r)
         return kept
 
     # ─── Assessor-based parcel enrichment ─────────────────────────────────

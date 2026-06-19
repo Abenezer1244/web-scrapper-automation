@@ -26,6 +26,10 @@ from src.scrapers.base_scraper import (
     ScrapedRecord,
     normalize_party_text,
 )
+from src.scrapers.preforeclosure import (
+    is_cancellation_or_admin,
+    orient_pre_foreclosure_party,
+)
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.laserfiche")
@@ -351,15 +355,30 @@ class LaserficheWebLinkScraper(BridgeScraper):
                 # Doc type
                 doc_type = item.get("doc_type", "").strip()
                 record.doc_type = doc_type if doc_type else None
-                # Grantor → party_name (HTML from the cell — normalize so
-                # stacked co-owners keep their " / " boundary).
+                # Party cells (HTML from the cell — normalize so stacked
+                # co-owners keep their " / " boundary).
                 grantor = normalize_party_text(item.get("grantor", ""))
-                if grantor:
-                    record.party_name = grantor
-                # Grantee → heirs
                 grantee = normalize_party_text(item.get("grantee", ""))
-                if grantee:
-                    record.heirs = grantee
+                if self.active_record_type == "pre_foreclosure":
+                    # A doc type that signals the foreclosure was cancelled/cured
+                    # (Discontinuance, Rescission) or is pure trustee admin
+                    # (Substitution of Trustee) is NOT active distress — drop it.
+                    if is_cancellation_or_admin(doc_type):
+                        continue
+                    # Borrower orientation: an NTS is often indexed with the
+                    # trustee company as grantor and the borrower as grantee.
+                    # Put the real person (homeowner) in party_name; drop
+                    # bank-vs-trustee records with no homeowner.
+                    oriented = orient_pre_foreclosure_party(grantor, grantee)
+                    if oriented is None:
+                        continue
+                    record.party_name, record.heirs = oriented
+                else:
+                    # Grantor → party_name, Grantee → heirs (unchanged).
+                    if grantor:
+                        record.party_name = grantor
+                    if grantee:
+                        record.heirs = grantee
                 # Parcel
                 parcel = item.get("parcel", "").strip()
                 if parcel and re.match(r"[\d\w]", parcel):

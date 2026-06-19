@@ -15,6 +15,8 @@ Benton, Clallam, Grant, Grays Harbor, Island, Jefferson, Kitsap,
 Lewis, Lincoln, Mason, Okanogan, Pacific, Spokane, Stevens, Thurston, Whitman
 """
 
+import re
+
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import (
     BridgeScraper,
@@ -36,8 +38,11 @@ _DOC_TYPE_MAP = {
                 "DEATH", "LETTR", "EXEC", "TOD", "SUCC"],
     "pre_foreclosure": ["LIS PENDENS", "NOTICE OF TRUSTEE SALE", "TRUSTEE SALE",
                         "TRUSTEE'S SALE", "NOTICE OF DEFAULT", "FORECLOSURE",
-                        # Abbreviated codes (e.g. Clallam: LISP, NTS, NTSCL)
-                        "LISP", "NTS"],
+                        # Abbreviated codes (e.g. Clallam: LISP, NTS, NTSCL).
+                        # NTSCL must be listed explicitly: matching is now
+                        # word-boundary, so "NTS" no longer substring-matches
+                        # "NTSCL" (Codex review).
+                        "LISP", "NTS", "NTSCL"],
     "tax_delinquent": ["TAX LIEN", "CERTIFICATE OF DELINQUENCY",
                        "TAX DELINQUENT", "CERTIFICATE OF SALE"],
     "divorce": ["DIVORCE", "DISSOLUTION", "DECREE OF DISSOLUTION",
@@ -48,8 +53,33 @@ _DOC_TYPE_MAP = {
 # Doc type phrases that LOOK like a match but document the opposite.
 # Checked AFTER _DOC_TYPE_MAP — any match here drops the record.
 _DOC_TYPE_EXCLUDE = {
-    "probate": ["LACK OF PROBATE"],  # affidavit stating there is NO probate
+    # "LACK OF PROBATE" = affidavit stating there is NO probate.
+    # "TRUSTEE" = successor-trustee / deed-of-trust instruments (e.g. "Appointment
+    # Of Successor Trustee", "Resign/appt/sub Succ Trustee") — trust/foreclosure
+    # docs, NOT probate. Live verification (2026-06-18) confirmed these were
+    # polluting probate results on island + pacific. No genuine probate instrument
+    # carries "TRUSTEE"; pre_foreclosure's "TRUSTEE SALE" is unaffected because the
+    # exclude list is per-record-type.
+    "probate": ["LACK OF PROBATE", "TRUSTEE"],
 }
+
+
+def _doc_type_matches(doc_upper: str, keywords: list[str]) -> bool:
+    """True if any keyword matches ``doc_upper``.
+
+    Multi-word phrases and longer terms use substring match. Short single-token
+    abbreviation codes (<=5 chars, no space — e.g. DEATH, EXEC, TOD, SUCC, NTS)
+    use WORD-BOUNDARY match so a code like ``SUCC`` cannot substring-bleed into
+    ``SUCCESSOR`` (a deed-of-trust doc, not probate) — a live-confirmed
+    false-positive source on EagleWeb counties.
+    """
+    for kw in keywords:
+        if " " in kw or len(kw) > 5:
+            if kw in doc_upper:
+                return True
+        elif re.search(rf"\b{re.escape(kw)}\b", doc_upper):
+            return True
+    return False
 
 
 class EagleWebScraper(BridgeScraper):
@@ -757,7 +787,7 @@ class EagleWebScraper(BridgeScraper):
                     if active_rt and active_rt != "all":
                         doc_upper = desc.upper()
                         kws = _DOC_TYPE_MAP.get(active_rt, [])
-                        if not any(kw in doc_upper for kw in kws):
+                        if not _doc_type_matches(doc_upper, kws):
                             continue  # Skip non-matching doc types
                         excludes = _DOC_TYPE_EXCLUDE.get(active_rt, [])
                         if any(neg in doc_upper for neg in excludes):

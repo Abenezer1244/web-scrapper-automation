@@ -29,6 +29,7 @@ from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
 )
+from src.scrapers.probate import orient_probate_party
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.king_wa_probate")
@@ -870,6 +871,12 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                 if oriented is None:
                     continue
                 grantor, grantee = oriented
+            elif self._record_type == "probate":
+                # Death certs are indexed with the issuing agency (WA Dept of
+                # Health) as grantor and the DECEDENT as grantee; promote the
+                # decedent and strip "Estate of" captions. No-op when the grantor
+                # is already the decedent.
+                grantor, grantee = orient_probate_party(grantor, grantee, doc_type)
 
             record = ScrapedRecord()
             record.date_recorded = date_str
@@ -1026,6 +1033,10 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                     if oriented is None:
                         continue
                     grantor, grantee = oriented
+                elif self._record_type == "probate":
+                    # Promote the decedent over the issuing agency/filing state;
+                    # strip "Estate of" captions. No-op when grantor is the decedent.
+                    grantor, grantee = orient_probate_party(grantor, grantee, doc_type)
 
                 record = ScrapedRecord()
                 record.parcel_id = parcel_id

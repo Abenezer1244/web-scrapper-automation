@@ -42,6 +42,7 @@ from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
 )
+from src.scrapers.probate import orient_probate_party
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.tyler_selfservice")
@@ -594,6 +595,12 @@ class TylerSelfServiceScraper(BridgeScraper):
                 if oriented is None:
                     continue
                 r.party_name, r.heirs = oriented
+            elif self.active_record_type == "probate":
+                # Death certs index the issuing agency/filing state as grantor and
+                # the DECEDENT as grantee; promote the decedent and strip "Estate
+                # of" captions BEFORE the assessor name→parcel lookup. No-op when
+                # the grantor is already the decedent.
+                r.party_name, r.heirs = orient_probate_party(r.party_name, r.heirs, r.doc_type)
             kept.append(r)
         return kept
 

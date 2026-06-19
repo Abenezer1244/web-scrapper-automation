@@ -5277,7 +5277,7 @@
         ]
       },
       "post": {
-        "description": "Add a new county connector. Agency plan only.\n\nAccess (H2-P5): require_admin_mfa gates this route. Creating a connector is a\nstate-changing admin op (it registers a new SSRF-allowlisted scrape target),\nso it demands a STEP-UP session — admin + enrolled MFA + a fresh, MFA-backed\nJWT (not an API key). Non-admins get 404; un-enrolled admins get 403\nadmin_mfa_enrollment_required; a stale or non-MFA session gets 403\nadmin_mfa_step_up_required. The inline is_admin check is gone — central\ndependency so the gate can't drift per-endpoint (Codex HIGH).\n\nFor AI-mode connectors, no Python scraper code is needed — just provide\nthe county portal URL and Claude handles the rest.",
+        "description": "Add a new county connector. Agency plan only.\n\nAccess (H2-P5): require_admin_mfa gates this route. Creating a connector is a\nstate-changing admin op (it registers a new SSRF-allowlisted scrape target),\nso it demands a STEP-UP session — admin + enrolled MFA + a fresh, MFA-backed\nJWT (not an API key). Non-admins get 404; un-enrolled admins get 403\nadmin_mfa_enrollment_required; a stale or non-MFA session gets 403\nadmin_mfa_step_up_required. The inline is_admin check is gone — central\ndependency so the gate can't drift per-endpoint (Codex HIGH).\n\nFor AI-mode connectors, no per-county Python scraper code is needed — the\nregistry detects the recorder-platform template from the portal URL. The URL\nmust match a known platform (rejected with 400 otherwise).",
         "operationId": "create_connector_scrapers_connectors_post",
         "requestBody": {
           "content": {

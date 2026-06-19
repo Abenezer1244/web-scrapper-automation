@@ -73,6 +73,10 @@ async def analytics_summary(
         Result.is_duplicate.is_(False),
         Result.created_at >= start_dt,
         local_day >= start,
+        # Upper bound at today's local day so a future-dated created_at (clock
+        # skew) can't inflate by_record_type/county/skip_trace beyond the trend
+        # (which only spans start..today) — keeps every aggregate's total consistent.
+        local_day <= today,
     )
 
     # 1. trend — results only, grouped by local day.

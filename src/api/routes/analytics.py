@@ -12,12 +12,13 @@ from datetime import datetime, time, timedelta
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import Select, and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
+from src.api.middleware import rate_limit
 from src.api.schemas import (
     AnalyticsSummary,
     CountyCount,
@@ -47,10 +48,14 @@ def _with_meta_join(stmt: Select, uid: str) -> Select:
 
 @router.get("/summary", response_model=AnalyticsSummary)
 async def analytics_summary(
+    request: Request,
     current_user: CurrentUser,
     window: Annotated[Literal[30, 90], Query()] = 30,
     db: AsyncSession = Depends(get_rls_db),
 ) -> AnalyticsSummary:
+    # Per-route throttle (4 aggregate queries per call). Matches the read-endpoint
+    # pattern in jobs.py; the app rate-limits per-route, not via global middleware.
+    await rate_limit(request, zone="general", identifier=current_user.id)
     uid = current_user.id
     tz_name = settings.ANALYTICS_TIMEZONE
     tz = ZoneInfo(tz_name)

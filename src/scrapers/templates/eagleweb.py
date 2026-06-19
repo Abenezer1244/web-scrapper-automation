@@ -754,6 +754,15 @@ class EagleWebScraper(BridgeScraper):
                 grantee_match = re.search(r"Grantee:\s*(.+?)(?:Grantor:|" + _LEGAL_STOP[4:], party_summary, re.DOTALL)
                 if grantee_match:
                     grantee = normalize_party_text(grantee_match.group(1)).rstrip(",").rstrip(".")
+                    # Strip the recorder's "Workflow Status: ..." processing
+                    # boilerplate that some in-progress records append to the
+                    # grantee cell (e.g. '... / Workflow Status: "This document is
+                    # being processed..."'). Surgical — only this trailing clause;
+                    # real party names are left intact.
+                    grantee = re.sub(
+                        r"\s*/?\s*Workflow\s+Status:.*$", "", grantee,
+                        flags=re.IGNORECASE | re.DOTALL,
+                    ).rstrip(" ,/").strip()
                     if grantee:
                         record.heirs = grantee
 

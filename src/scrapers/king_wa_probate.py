@@ -33,6 +33,26 @@ from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.king_wa_probate")
 
+# Positive doc-type allowlist for pre_foreclosure. King selects the NTS dropdown
+# CATEGORY but accepts every returned row, and the ClarkWaProbateScraper subclass
+# (below) searches "all categories" — so keep only rows whose doc_type is an
+# actual foreclosure-stage filing. Belt-and-suspenders for King. (The LIVE Clark
+# connector is src/scrapers/clark_wa.ClarkWAScraper, which has its own checkbox
+# doc-type selection + the shared pre_foreclosure guards.) The
+# is_cancellation_or_admin() guard then removes the cancelled/cured variants that
+# still match these keywords. (Codex: prefer a post-extraction allowlist over
+# betting on portal category semantics for a LandmarkWeb site.)
+_PREFORECLOSURE_DOC_KEYWORDS = (
+    "NOTICE OF TRUSTEE", "TRUSTEE SALE", "TRUSTEE'S SALE",
+    "NOTICE OF DEFAULT", "LIS PENDENS", "FORECLOSURE",
+)
+
+
+def _is_preforeclosure_doc(doc_type: str | None) -> bool:
+    """True if doc_type names an active foreclosure-stage filing (allowlist)."""
+    up = (doc_type or "").upper()
+    return any(kw in up for kw in _PREFORECLOSURE_DOC_KEYWORDS)
+
 _BASE_URL = "https://recordsearch.kingcounty.gov/LandmarkWeb"
 _SEARCH_URL = f"{_BASE_URL}/search/index"
 
@@ -839,6 +859,11 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
             # drop bank-vs-trustee rows with no homeowner. Only fires for
             # pre_foreclosure; probate/death-cert/divorce are untouched.
             if self._record_type == "pre_foreclosure":
+                # Keep only real foreclosure-stage doc types (Clark searches "all
+                # categories"); drop everything else off-type.
+                if not _is_preforeclosure_doc(doc_type):
+                    _logger.debug("pre_foreclosure: dropping off-type doc %r", doc_type)
+                    continue
                 if is_cancellation_or_admin(doc_type):
                     continue
                 oriented = orient_pre_foreclosure_party(grantor, grantee)
@@ -992,6 +1017,9 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                 # bank-vs-trustee rows. Only for pre_foreclosure — probate/
                 # death-cert/divorce orientation is unchanged.
                 if self._record_type == "pre_foreclosure":
+                    if not _is_preforeclosure_doc(doc_type):
+                        _logger.debug("pre_foreclosure: dropping off-type doc %r", doc_type)
+                        continue
                     if is_cancellation_or_admin(doc_type):
                         continue
                     oriented = orient_pre_foreclosure_party(grantor, grantee)

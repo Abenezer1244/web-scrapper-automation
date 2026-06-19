@@ -338,7 +338,11 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             if name_hits:
                 try:
                     db.commit()
-                except Exception:
+                except Exception as exc:
+                    _logger.warning(
+                        "Job %s: PACS enrichment commit failed (%d fills discarded): %s",
+                        job_id, name_hits, str(exc)[:120],
+                    )
                     db.rollback()
                     db.commit()
             _publish_log(
@@ -382,7 +386,10 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                         res.mailing_address = mail
             try:
                 db.commit()
-            except Exception:
+            except Exception as exc:
+                _logger.warning(
+                    "Job %s: King enrichment commit failed: %s", job_id, str(exc)[:120]
+                )
                 db.rollback()
                 db.commit()
             found = sum(1 for d in enriched.values() if d.get("mailing_address"))

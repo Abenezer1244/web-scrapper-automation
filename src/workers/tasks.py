@@ -637,9 +637,9 @@ def run_scrape_job(self, job_id: str) -> None:
             sa_text("""
                 SELECT id, dedup_hash, parcel_id, property_address
                 FROM results
-                WHERE job_id = :jid AND dedup_hash IS NOT NULL
+                WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) AND dedup_hash IS NOT NULL
             """),
-            {"jid": job_id},
+            {"jid": job_id, "uid": str(job.user_id)},
         ).fetchall()
 
         _logger.info("Job %s: dedup step 1 done — %d fresh rows", job_id, len(fresh_rows))
@@ -809,9 +809,9 @@ def run_scrape_job(self, job_id: str) -> None:
         billable_count = db.execute(
             sa_text(
                 "SELECT count(*) FROM results "
-                "WHERE job_id = :jid AND is_duplicate = false"
+                "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) AND is_duplicate = false"
             ),
-            {"jid": job_id},
+            {"jid": job_id, "uid": str(job.user_id)},
         ).scalar() or 0
         from sqlalchemy import update as sa_update
         # Idempotent billing (migration 063): claim billing for THIS job via a CAS

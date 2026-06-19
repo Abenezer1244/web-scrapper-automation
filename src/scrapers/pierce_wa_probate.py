@@ -230,6 +230,11 @@ class PierceWAARMSScraper(BridgeScraper):
             const m = document.body.innerText.match(/(\d+) records found/);
             return m ? m[1] : 'unknown';
         }""")
+        # Persist for _extract_records: "0" = genuine empty (search ran);
+        # "unknown" = the "N records found" marker never rendered, i.e. the page
+        # never loaded / was blocked, so a missing results table must FAIL the
+        # job rather than be scored as a healthy 0.
+        self._record_count = record_count
         _logger.info("Search: %s records found", record_count)
 
         # Detect total pages from the page dropdown
@@ -414,8 +419,18 @@ class PierceWAARMSScraper(BridgeScraper):
                     break
 
         if data_table is None:
-            _logger.warning("No results data table found on page")
-            return []
+            # Genuine empty day ("0 records found") legitimately has no table →
+            # return []. But if the record-count marker never rendered ("unknown"),
+            # the search page never loaded / was blocked — fail loud so the job
+            # isn't scored as a healthy 0-record success.
+            count = getattr(self, "_record_count", "unknown")
+            if count == "0":
+                _logger.info("No results table — '0 records found' marker present (genuine empty)")
+                return []
+            raise RuntimeError(
+                f"Pierce ARMS: results table missing and record-count marker is "
+                f"{count!r} (not '0') — search page never loaded / blocked / errored"
+            )
 
         rows = data_table.find_all("tr")
         records: list[ScrapedRecord] = []
@@ -503,6 +518,11 @@ class PierceWAARMSScraper(BridgeScraper):
                 "Select All", "#ImageItem", "SelectInstrument", "#Boo"]
         if any(kw in record.party_name for kw in junk):
             return None
+
+        # ARMS results rows carry no reliable per-row doc-type column we can map
+        # non-positionally; the search was filtered to this connector's
+        # document-type checkboxes, so the configured label IS the doc type.
+        record.doc_type = self.DOC_TYPE_LABEL
 
         return record
 

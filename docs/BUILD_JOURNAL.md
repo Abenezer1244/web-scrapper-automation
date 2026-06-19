@@ -19,6 +19,55 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-19 — Probate follow-ups sweep (false-empty reliability + 6 smaller fixes)
+**Built / Shipped:** Branch `chore/probate-followups` off main@bcb0a1b. Seven deferred items from the
+#72 audit, implemented 1-by-1: (A) **false-empty reliability** — laserfiche/eagleweb/whatcom/pierce/king
+now RAISE `RuntimeError` (→ worker `_fail_job` marks FAILED) when a captcha/block/error page would
+otherwise return a false-empty `[]`; a genuine empty (the portal's real no-results marker / valid JSON
+envelope) still returns `[]`. (B) clark+whatcom doc-type single-token keywords match on `\b` boundary.
+(C) skagit dropped the `\d{6,}` parcel fallback (wrong-parcel). (D) pierce stamps `doc_type` (was None).
+(E) acclaim removed a redundant 3s wait + trimmed a settle 3s→1s. (F1) eagleweb `_LEGAL_STOP[4:]`
+slice → explicit `_STOP_BODY`. (F2) base `_LANDMARK_PREFIX_RE` anchored to a token boundary.
+
+**Tried / Decided:** Orchestrated 5 investigation agents (parallel) to scope each fix precisely
+(file:line, old→new, risk) → cross-verified → implemented in risk order (cosmetic → A). Confirmed two
+load-bearing facts before A: there is NO `ScrapeError` class (use `RuntimeError`), and a raised
+`scrape()` exception DOES fail the job (tasks.py:455 `except Exception → _fail_job`). For A, the
+discriminator is per-scraper: laserfiche "N Results" header, eagleweb "No documents found" (page-1
+only — later pages = pagination end), whatcom results-UI selectors, pierce "N records found" marker
+("0"=empty, "unknown"=blocked), king GetSearchResults JSON envelope. NO Cloudflare evasion — spokane
+fix is detect-and-fail-loudly only.
+
+**Failed / Blocked:** chelan/douglas (acclaim single-date mode) still hit the 280s TEST timeout even
+after E; the real ceiling is the prod 30-min wrapper (tasks.py:430) which single-date mode fits, so
+scheduled 1-day jobs are fine. The in-place re-fill refactor (skip re-navigation per day) deferred —
+only matters for >45-day manual backfills.
+
+**Caught & fixed (Codex, two passes):** (1) Batch review — the investigation agent's `set(doc.split())`
+whole-word approach would DROP punctuation-adjacent labels like `WILL/TESTAMENT`, `WILL, TESTAMENT`,
+`(WILL)` that the old substring kept → switched to a `\b` word-boundary regex (eagleweb's proven idiom),
+which matches all legit forms AND excludes GOODWILL. (2) Item-A adversarial challenge — king
+`_submit_search`: a captcha error followed by a retry that legitimately returned 0 rows (valid empty
+envelope) WRONGLY raised (keyed on `retry_rows` being non-empty) → fixed by making the retry the
+authoritative `json_data` and gating solely on envelope validity → re-review FIXED, PASS.
+
+**Proof (live, non-persisting, prod, all 21):** 17 healthy counties unchanged (no false failures);
+pierce now `doc_types=['PROBATE']`; whatcom finally returned (31 records, red_flags=0 — #72 party fix
+holds); spokane + pacific now FAIL LOUD on the Cloudflare/welcome page (`RuntimeError: results table
+missing … page never loaded / blocked`) instead of silent-0.
+
+**Pending / Handoff:** pacific intermittently lands on its welcome page → now fails loud (watchdog
+re-queues) rather than reporting a silent 0 — intended but worth watching. pierce per-row ARMS sub-type
+(vs connector label) needs a live column probe. columbia/pacific health flags still stale (canary
+self-corrects).
+
+**Facts learned:** A raised exception in any scraper's `scrape()` reliably fails the job via
+`_fail_job` — so "fail loud on a block" is the correct pattern vs returning `[]`. EagleWeb's genuine
+empty ALWAYS prints "No documents found"/"0 items found"; the absence of BOTH the table and that marker
+on page 1 = a real block (Cloudflare "Performing security check", or a county welcome/disclaimer page
+the nav didn't get past). `\b` word-boundary beats `set(split())` for doc-type keywords because it also
+matches across `/`,`,`,`(` punctuation.
+
 ## 2026-06-19 — Probate audit (21 counties) + shared decedent-orientation helper
 **Built / Shipped:** New `src/scrapers/probate.py` — shared `orient_probate_party(grantor, grantee,
 doc_type)` (+ `strip_filing_agency` / `strip_estate_caption` / `is_person_like_party`). On a

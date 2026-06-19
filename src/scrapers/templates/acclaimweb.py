@@ -334,7 +334,9 @@ class AcclaimWebScraper(BridgeScraper):
         """Fill the Kendo DatePicker date inputs."""
         _logger.info("Fill dates page URL: %s", self.page.url)
         try:
-            await self.page.wait_for_timeout(3_000)
+            # Short settle after navigation (trimmed from 3s — the subsequent
+            # element probe + fill already tolerate a not-fully-idle page).
+            await self.page.wait_for_timeout(1_000)
 
             # Log what elements exist on page
             page_info = await self.page.evaluate("""
@@ -517,8 +519,10 @@ class AcclaimWebScraper(BridgeScraper):
                 await self.page.wait_for_timeout(3_000)
                 _logger.info("Results selector timeout, continuing anyway")
 
-            # Extra wait for Kendo AJAX to fully populate grid data
-            await self.page.wait_for_timeout(3_000)
+            # (Removed a redundant unconditional 3s Kendo-AJAX wait here — the
+            # event-driven selector wait above plus the loading-indicator wait
+            # below already gate on the grid being populated. Saves ~3s per
+            # day-chunk; Chelan's single-date mode runs ~45 chunks per 45-day run.)
 
             # Wait for any Kendo loading indicator to disappear
             try:

@@ -177,6 +177,8 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
 
             try:
                 records = await self._search_chunk(cf, ct)
+            except RuntimeError:
+                raise  # block/captcha/error — fail the job, don't silently skip a window
             except Exception as exc:
                 _logger.warning("Chunk %d failed: %s — skipping", chunk_num, str(exc)[:120])
                 chunk_start = chunk_end
@@ -709,15 +711,42 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                     "Retry GetSearchResults: %d total, %d rows returned",
                     retry_data.get("recordsTotal", 0), len(retry_rows),
                 )
-                # Keep whichever attempt actually returned rows.
-                if retry_rows:
-                    self._json_results = retry_rows
+                # The retry is now the AUTHORITATIVE attempt — adopt it even if it
+                # found 0 rows. A valid retry envelope with recordsTotal:0/data:[]
+                # means the captcha cleared and the search genuinely found nothing
+                # (must NOT fail the job); only a missing envelope below = still
+                # blocked. (Keying on retry_rows being non-empty here would wrongly
+                # fail a legitimate empty retry — Codex challenge.)
+                json_data = retry_data
+                self._json_results = retry_rows
+
+            # Distinguish "search ran, 0 results" from "search never ran /
+            # blocked". A real GetSearchResults envelope carries recordsTotal +
+            # a data list (recordsTotal:0/data:[] is a legitimate empty); its
+            # ABSENCE means a captcha block / error response (incl. a captcha that
+            # persisted through the retry) — fail loud so the job isn't scored as
+            # a healthy 0-record success.
+            if (
+                not isinstance(json_data, dict)
+                or "recordsTotal" not in json_data
+                or not isinstance(json_data.get("data"), list)
+            ):
+                keys = list(json_data.keys()) if isinstance(json_data, dict) else type(json_data).__name__
+                raise RuntimeError(
+                    f"King LandmarkWeb: GetSearchResults returned no valid envelope "
+                    f"(captcha block / error). keys={keys}"
+                )
 
             _logger.info("Results page ready")
             await self.page.wait_for_timeout(2000)
 
+        except RuntimeError:
+            raise  # block/error signal — must fail the job, not return a false-0
         except Exception as exc:
             _logger.warning("Submit error: %s", str(exc)[:120])
+            raise RuntimeError(
+                f"King LandmarkWeb submit failed — search did not run: {str(exc)[:120]}"
+            ) from exc
 
     async def _execute_document_search(self, form_data: dict, token: str) -> dict:
         """Run the two-step DocumentType search via direct AJAX fetch; return the

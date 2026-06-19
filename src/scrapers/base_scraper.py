@@ -38,7 +38,11 @@ _logger = setup_logger("scraper.base")
 _NAME_SEPARATOR_RE = re.compile(r"(?i)<div[^>]*\bnameSeperator\b[^>]*>\s*</div>")
 _BR_RE = re.compile(r"(?i)<br\s*/?>")
 _TAG_RE = re.compile(r"<[^>]+>")
-_LANDMARK_PREFIX_RE = re.compile(r"(?i)(?:nobreak_|unclickable_)")
+# LandmarkWeb bakes CSS-class prefixes (nobreak_/unclickable_) onto the start of
+# a cell token. Anchor to a token boundary (start, or after whitespace / the
+# " / " owner separator) so a real name that merely contains the substring
+# mid-token is never corrupted.
+_LANDMARK_PREFIX_RE = re.compile(r"(?i)(?:^|(?<=[\s/]))(?:nobreak_|unclickable_)")
 _MULTI_DELIM_RE = re.compile(r"\s*/\s*(?:/\s*)+")
 _WS_RE = re.compile(r"\s+")
 

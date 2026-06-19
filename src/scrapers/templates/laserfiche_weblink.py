@@ -137,8 +137,12 @@ class LaserficheWebLinkScraper(BridgeScraper):
             await self.page.locator("#Search_Input0").fill(date_from)
             await self.page.locator("#Search_Input0_end").fill(date_to)
         except Exception as exc:
-            _logger.error("Failed to fill dates: %s", str(exc)[:120])
-            return []
+            # A failed date-fill means the search never ran — fail loud rather
+            # than return [] (which would score as a healthy 0-record scrape).
+            raise RuntimeError(
+                f"{self.county}: Laserfiche date-fill failed — search page never "
+                f"loaded / blocked: {str(exc)[:120]}"
+            ) from exc
 
         # Submit search
         try:
@@ -149,8 +153,10 @@ class LaserficheWebLinkScraper(BridgeScraper):
             except Exception:
                 pass
         except Exception as exc:
-            _logger.error("Submit failed: %s", str(exc)[:120])
-            return []
+            raise RuntimeError(
+                f"{self.county}: Laserfiche submit failed — search never ran: "
+                f"{str(exc)[:120]}"
+            ) from exc
 
         # Wait for the async PrimeFaces datatable to populate, THEN read the
         # count. The "N Results" header and the rows load a moment AFTER
@@ -161,13 +167,25 @@ class LaserficheWebLinkScraper(BridgeScraper):
         # Poll for the count text, which appears for both populated AND
         # genuinely-empty ("0 Results") searches.
         total = 0
+        count_seen = False
         for _ in range(30):  # up to ~30s
             body = await self.page.inner_text("body")
             count_match = re.search(r"(\d+)\s+Results?", body)
             if count_match:
                 total = int(count_match.group(1))
+                count_seen = True
                 break
             await self.page.wait_for_timeout(1_000)
+        # The "N Results" header renders for BOTH populated AND genuinely-empty
+        # ("0 Results") searches, so its TOTAL ABSENCE means the results page
+        # never rendered (block / error / portal down) — fail loud instead of
+        # returning a false-empty [].
+        if not count_seen:
+            body_head = (await self.page.inner_text("body"))[:200].replace("\n", " ")
+            raise RuntimeError(
+                f"{self.county}: Laserfiche results count never appeared — page "
+                f"never loaded / blocked. Body head: {body_head!r}"
+            )
         _logger.info("Search returned %d total results", total)
         if total == 0:
             return []

@@ -1,6 +1,52 @@
 {
   "components": {
     "schemas": {
+      "AnalyticsSummary": {
+        "properties": {
+          "by_county": {
+            "items": {
+              "$ref": "#/components/schemas/CountyCount"
+            },
+            "title": "By County",
+            "type": "array"
+          },
+          "by_record_type": {
+            "items": {
+              "$ref": "#/components/schemas/RecordTypeCount"
+            },
+            "title": "By Record Type",
+            "type": "array"
+          },
+          "skip_trace": {
+            "$ref": "#/components/schemas/SkipTraceStats"
+          },
+          "timezone": {
+            "title": "Timezone",
+            "type": "string"
+          },
+          "trend": {
+            "items": {
+              "$ref": "#/components/schemas/TrendPoint"
+            },
+            "title": "Trend",
+            "type": "array"
+          },
+          "window_days": {
+            "title": "Window Days",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "window_days",
+          "timezone",
+          "trend",
+          "by_record_type",
+          "by_county",
+          "skip_trace"
+        ],
+        "title": "AnalyticsSummary",
+        "type": "object"
+      },
       "ApiKeyResponse": {
         "properties": {
           "api_key": {
@@ -798,6 +844,36 @@
           "active"
         ],
         "title": "ConnectorResponse",
+        "type": "object"
+      },
+      "CountyCount": {
+        "properties": {
+          "county": {
+            "title": "County",
+            "type": "string"
+          },
+          "leads": {
+            "title": "Leads",
+            "type": "integer"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          }
+        },
+        "required": [
+          "county",
+          "state",
+          "leads"
+        ],
+        "title": "CountyCount",
         "type": "object"
       },
       "DeliverConfig": {
@@ -1646,6 +1722,24 @@
           "updated"
         ],
         "title": "ReadAllResponse",
+        "type": "object"
+      },
+      "RecordTypeCount": {
+        "properties": {
+          "leads": {
+            "title": "Leads",
+            "type": "integer"
+          },
+          "record_type": {
+            "title": "Record Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "record_type",
+          "leads"
+        ],
+        "title": "RecordTypeCount",
         "type": "object"
       },
       "RefreshRequest": {
@@ -2796,6 +2890,34 @@
         "title": "SegmentUnionResponse",
         "type": "object"
       },
+      "SkipTraceStats": {
+        "properties": {
+          "email_pct": {
+            "title": "Email Pct",
+            "type": "integer"
+          },
+          "enriched": {
+            "title": "Enriched",
+            "type": "integer"
+          },
+          "phone_pct": {
+            "title": "Phone Pct",
+            "type": "integer"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "enriched",
+          "phone_pct",
+          "email_pct"
+        ],
+        "title": "SkipTraceStats",
+        "type": "object"
+      },
       "TokenResponse": {
         "properties": {
           "access_token": {
@@ -2828,6 +2950,24 @@
           "access_token"
         ],
         "title": "TokenResponse",
+        "type": "object"
+      },
+      "TrendPoint": {
+        "properties": {
+          "date": {
+            "title": "Date",
+            "type": "string"
+          },
+          "leads": {
+            "title": "Leads",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "date",
+          "leads"
+        ],
+        "title": "TrendPoint",
         "type": "object"
       },
       "UserLogin": {
@@ -3014,6 +3154,58 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/analytics/summary": {
+      "get": {
+        "operationId": "analytics_summary_analytics_summary_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "enum": [
+                30,
+                90
+              ],
+              "title": "Window",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsSummary"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Analytics Summary",
+        "tags": [
+          "analytics"
+        ]
+      }
+    },
     "/auth/api-key": {
       "post": {
         "description": "Generate a new API key. The raw key is shown exactly once.",

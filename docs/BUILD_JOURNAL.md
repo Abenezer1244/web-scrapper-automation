@@ -19,6 +19,45 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-19 — Darkmatter UI stack SHIPPED to prod (FRONTEND `bridgeleads-web`)
+**Built / Shipped:** Finished the 5 deferred design-audit findings, then shipped the **entire darkmatter
+stack** (#27 tokens → #28 oklch theme → #29 shell → #30 notifications-bell + TEAL-primary/ORANGE-accent
+brand swap + Geist/Inter/JetBrains typography) to `master` via **PR #30 (merge commit `cf0d182`)**. Vercel
+**Production deploy SUCCESS**; live-verified on `https://bridgeleads.io` + `https://app.bridgeleads.io`
+(`--brand-teal`=teal, `--font-heading`="Geist", new hero copy). The 5 fixes (commit `b168d6c`):
+`<MotionConfig reducedMotion="user">` at the provider root; hover-only copy/delete buttons made
+keyboard/touch reachable (`group-focus-within`+`focus-visible`+`[@media(hover:none)]`); settings page mobile
+layout (`flex-col md:flex-row`); marketing contrast bumps toward WCAG AA; honest teal/Geist brand docs.
+**Gates:** tsc 0, eslint 0, Codex `review --base 2000d5e` CLEAN (no findings).
+
+**Tried / Decided:** #27 auto-closed MERGED on the #30 merge; #28/#29 did NOT auto-close (merged transitively
+via #30's branch, not their own base) → manually CLOSED after `git merge-base --is-ancestor` confirmed both
+fully in master. Kept the scrapers orange Zap "Running" pill (the branch's own choice) but used darkmatter
+TEAL for the RecentActivity active spinner. `tailwind.config.ts` `amber` left = `var(--ring)` (teal) on
+purpose — repointing it to orange would flip the misnamed-legacy amber utilities.
+
+**Failed / Blocked:** Headed browse-tool Chromium is genuinely broken on this Windows box (daemon won't start
+in 15s, exit-21) — used headless + opened the user's real browser via `Start-Process` instead.
+
+**Caught & fixed:** (1) Re-pointing PR #30 base→master surfaced a real conflict with master commit `d29c132`
+(#26 "pending/queued = Waiting, not spinning Running") in scrapers/page.tsx + RecentActivity.tsx — resolved by
+merging master into the branch (commit `cd482b2`): union the utils import (isProcessing/statusLabel +
+recordTypeTone, all used), take master's processing/waiting/cancelled icon split. (2) CI **OpenAPI type-drift
+gate** failed — `lib/api-types.generated.ts` was stale vs backend `main` (the probate campaign changed the
+connector AI-mode docstring); fixed with `npm run gen:api-types` + commit `9fba102` (comment-only, no type
+change).
+
+**Pending / Handoff:** Darkmatter **Phase 3 (dashboard analytics)** is next — spec at
+`docs/superpowers/specs/2026-06-19-dashboard-analytics-phase3-design.md` (new `/analytics/summary` endpoint +
+4 chart cards). Latent cross-repo backend bug still open: `jobs.py`/`batches.py`/`scrapers.py` `str` path
+params vs `uuid` columns → uncaught 500 on a non-UUID id.
+
+**Facts learned:** frontend `gen:api-types` fetches `web-scrapper-automation/main/schema/openapi.json` from
+GitHub raw (NO venv needed frontend-side, unlike backend OpenAPI dump which needs `.venv-schema`) — any backend
+schema change (even a docstring) breaks the frontend type-sync CI gate until regenerated + committed. Frontend
+deploys to Vercel Production on push to `master`; verify via the deployment's `environment_url` status +
+`bridgeleads.io`/`app.bridgeleads.io` returning 200.
+
 ## 2026-06-19 — Probate audit (21 counties) + shared decedent-orientation helper
 **Built / Shipped:** New `src/scrapers/probate.py` — shared `orient_probate_party(grantor, grantee,
 doc_type)` (+ `strip_filing_agency` / `strip_estate_caption` / `is_person_like_party`). On a

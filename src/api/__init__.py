@@ -1,3 +1,4 @@
+from .routes.analytics import router as analytics_router
 from .routes.auth import router as auth_router
 from .routes.batches import router as batches_router
 from .routes.billing import router as billing_router
@@ -8,6 +9,7 @@ from .routes.segments import router as segments_router
 from .routes.webhooks import router as webhooks_router
 
 __all__ = [
+    "analytics_router",
     "auth_router",
     "scrapers_router",
     "jobs_router",

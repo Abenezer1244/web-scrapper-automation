@@ -63,6 +63,7 @@ class PierceWAARMSScraper(BridgeScraper):
 
     def __init__(self, record_type: str = "probate", doc_types: list[str] | None = None):
         super().__init__()
+        self._record_type = record_type
         cfg = self.RECORD_TYPE_CONFIG.get(record_type, self.RECORD_TYPE_CONFIG["probate"])
         self.DOC_TYPE_IDS: list[str] = cfg["ids"]
         self.DOC_TYPE_LABEL: str = cfg["label"]
@@ -495,7 +496,7 @@ class PierceWAARMSScraper(BridgeScraper):
             cell_text = c.get_text(separator="|", strip=True)
             if "[R]" in cell_text or "[E]" in cell_text:
                 record.party_name, record.heirs = self._parse_name_cell(c)
-                if self.DOC_TYPE_LABEL == "DIVORCE":
+                if self._record_type == "divorce":
                     # ARMS checkbox 87 already constrains the search to DECREE OF
                     # DISSOLUTION (precise), so no doc-type re-filter is needed.
                     # Both spouses are valid leads; only correct the case where a

@@ -47,6 +47,10 @@ _DOC_TYPE_KEYWORDS = {
         "TAX LIEN", "CERTIFICATE OF DELINQUENCY", "CERTIFICATE OF SALE",
         "FEDERAL TAX LIEN",
     ],
+    # NOTE: the divorce path does NOT use these keywords — _extract_page delegates
+    # divorce classification entirely to divorce.is_divorce_doc (which rejects
+    # corporate/entity dissolutions and bare separations). This entry is retained
+    # only so __init__'s self._keywords build does not KeyError for divorce.
     "divorce": ["DISSOLUTION", "DIVORCE"],
 }
 

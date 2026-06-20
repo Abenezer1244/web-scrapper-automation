@@ -103,7 +103,7 @@ _NEGATIVE_PHRASES: tuple[str, ...] = (
 # entity dissolution, not a divorce. Word-boundary matched so "CORP" does not fire
 # inside "CORPORAL" and "LP" does not fire inside "HELP".
 _ENTITY_TOKENS: tuple[str, ...] = (
-    "LLC", "LLP", "LP", "PLLC", "INC", "CORP", "CORPORATION",
+    "LLC", "LLP", "LP", "PLLC", "INC", "CORP", "CORPORATE", "CORPORATION",
     "COMPANY", "PARTNERSHIP", "NONPROFIT", "BUSINESS", "ENTITY",
 )
 _ENTITY_RE = re.compile(

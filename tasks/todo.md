@@ -93,4 +93,27 @@ Pulled live Pierce [R]/[E] samples: `SAKUMOTO MILAGROS EST OF(+)`/`SAKUMOTO HOWA
 - **Consolidation lands on the two real divergent copies: EagleWeb (11 counties) + Skagit.** ✅
 
 ## Review
-_(filled at end)_
+
+### Shipped (branch chore/deathcert-multitenant-harden, 3 commits)
+- **5A `d400656`** — `src/scrapers/probate.py` extended to a strict SUPERSET of the per-template copies: broadened `_AGENCY_DEPT_RE` (Vital Records/Statistics, Licensing, Revenue, Social&Health), `_NON_PERSON_RE` death-care institutions (funeral/coroner/examiner/DSHS), per-segment bare-state drop. +10 tests.
+- **5B/5C `d1e9dcf`** — EagleWeb (11 counties) + Skagit migrated onto the shared helper; their own `_strip_filing_agency`/`_is_filing_state_party` deleted. Gated to per-row PROBATE type (helper now collapses ESTATE OF). ONE death-cert rule everywhere.
+- **Codex-fix `59c8cda`** — round-2 review fixes: `_US_STATE` enumeration (no more "MCKINLEY STATE" false-drop), `_AGENCY_DEPT_RE` covers "WASHINGTON STATE DEPT OF HEALTH" word order, comma-form person fast-path (rescues "CORONER, JANE"/"BANK, JOHN"). 42 tests green, ruff clean.
+
+### Cross-verification ("verify each others jobs") — DONE
+- 6 parallel audit agents, each finding corroborated (multi-tenant + lifecycle independently confirmed CLEAN by 2 agents).
+- Codex consulted on the design BEFORE coding (Pierce gated on live samples; phrase-based tokens) AND reviewed the diff AFTER (3 P2s caught + fixed).
+- Live data = the third, empirical cross-check (different angle from static read).
+
+### Live proof (railway run --service api, non-persisting, real portals)
+- Full 21-county: 18/21 returned, red_flags=0 everywhere; pacific/spokane fail-loud (block), chelan timeout (perf).
+- Migrated re-verify (13 counties): red_flags=0, counts stable.
+- Final agency-affected re-verify (post Codex-fix): **8/8 returned, red_flags=0** — thurston(34, bare-state), king(65, "WASHINGTON STATE DEPT OF HEALTH" concat), cowlitz(43), skagit(72, inverted), benton(3), jefferson(47), grant(14), lewis(5). State-enum + broadened-agency + comma-form fixes did NOT regress live stripping.
+
+### Decisions (evidence-based)
+- **Pierce NOT wired** — live [R]/[E] = persons (court-probate, no agency); orient inapplicable.
+- **idocmarket/landmark/ava** — untouched (no-op / not in active probate set).
+- **Multi-tenant** — CLEAN, UNCHANGED by this PR (diff is pure party-string transforms; no persistence/user_id/RLS/SkipTraceCache touch).
+- **Reliability false-empty (clark/acclaim/skagit-counter/tyler)** — tracked FOLLOW-UP (orthogonal to party correctness; EagleWeb RAISE pattern already proven on pacific/spokane). Fix direction: mirror eagleweb's results-marker-or-RAISE.
+
+### Op note (raw_html_hash churn)
+Changing party/heirs re-hashes already-scraped rows (`raw_html_hash` from `record.to_dict()`); harmless for a correctness fix but a re-scrape may treat corrected rows as new. Billing dedup keys on parcel/address (`delivered_records`), not raw_html_hash, so no double-charge.

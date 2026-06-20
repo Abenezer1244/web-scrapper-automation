@@ -13,6 +13,7 @@ from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Query, Request
+from pydantic import BeforeValidator
 from sqlalchemy import Select, and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +35,25 @@ router = APIRouter(prefix="/analytics", tags=["analytics"])
 _TOP_COUNTIES = 8
 
 
+def _coerce_window(value: object) -> object:
+    """Coerce the ?window= query string so the Literal[30, 90] validates.
+
+    Query values always arrive as strings, and pydantic v2 does NOT str->int
+    coerce Literal members — so '?window=30' would 422 ("Input should be 30 or
+    90") even though 30 is valid. Coerce digit strings to int here; leave any
+    other input untouched so genuinely invalid values (e.g. '45', 'foo') still
+    422 against the Literal.
+    """
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return value
+
+
+# 30/90-day window. BeforeValidator runs pre-Literal, preserving the 30|90
+# enum in the OpenAPI schema (so the generated frontend types are unchanged).
+WindowDays = Annotated[Literal[30, 90], BeforeValidator(_coerce_window), Query()]
+
+
 def _with_meta_join(stmt: Select, uid: str) -> Select:
     """LEFT JOIN results -> jobs -> scraper_configs, tenant-scoped on every hop."""
     return (
@@ -50,7 +70,7 @@ def _with_meta_join(stmt: Select, uid: str) -> Select:
 async def analytics_summary(
     request: Request,
     current_user: CurrentUser,
-    window: Annotated[Literal[30, 90], Query()] = 30,
+    window: WindowDays = 30,
     db: AsyncSession = Depends(get_rls_db),
 ) -> AnalyticsSummary:
     # Per-route throttle (4 aggregate queries per call). Matches the read-endpoint

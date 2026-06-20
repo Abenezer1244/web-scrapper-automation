@@ -33,8 +33,11 @@ from src.scrapers.reliability import (
 )
 from src.utils.logger import setup_logger
 
-# Substrings a LandmarkWeb results page renders for a genuine zero-result window.
-_EMPTY_MARKERS = ("no results", "0 record", "no documents", "no matching")
+# Phrases a LandmarkWeb results page renders for a genuine zero-result window.
+# classify_results_page matches each with \b word boundaries, so list BOTH the
+# plural "0 records" and singular "0 record" (one does not cover the other under
+# boundary matching) — while neither matches a non-zero count like "10 records".
+_EMPTY_MARKERS = ("no results", "0 records", "0 record", "no documents", "no matching")
 
 _logger = setup_logger("scraper.template.landmarkweb")
 

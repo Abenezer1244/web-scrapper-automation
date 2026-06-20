@@ -74,6 +74,47 @@ keys on parcel/address (`delivered_records`), not raw_html_hash, so no double-ch
 probate = court cases ([R]=executor/estate/decedent person, [E]=heir), structurally never a recorder
 death-cert with a Dept-of-Health grantor.
 
+---
+
+## 2026-06-20 — Dashboard Analytics Phase 3b (frontend) + the window-coercion prod bug
+**Built / Shipped:** Phase 3b frontend (bridgeleads-web PR #31 → master `483ec3f`, live on bridgeleads.io):
+the analytics row — `LeadsTrendChart` (area + 30/90 toggle, owns its own `["analytics",window]` query),
+`RecordTypeMix` (donut, `recordTypeTone` slices), `TopCountiesBars` (h-bars), `SkipTraceRate` (stat +
+phone/email mini-bars) — wired into `dashboard/page.tsx` between `<StatCards/>` and the bento grid.
+The 3 secondary cards share `useQuery(["analytics",30])` (react-query dedupes); trend card owns the toggle.
+**Caught & fixed:** (1) Codex (frontend, --base origin/master) flagged a **P1**: recharts 3 needs the
+`react-is` **peer** dep — absent from package.json+lockfile → `Cannot find module 'react-is'` at runtime.
+tsc/lint/`next build` typecheck do NOT catch missing runtime peer deps. Fixed `npm i react-is@^19`
+(`8a5dc73`), re-review clean. (2) **THE root-cause bug** (backend PR #75 → main `a8cd26f`): prod
+`GET /analytics/summary?window=30|90` returned **422** "Input should be 30 or 90". Param is
+`window: Literal[30,90]`, but HTTP query values are strings and pydantic v2 does NOT str→int coerce
+`Literal` members — so every real `?window=` request 422'd; only the no-param default (real int 30)
+worked, which is exactly why Phase 3a's "401 = route exists" check passed while the feature was dead.
+Fix: `WindowDays = Annotated[Literal[30,90], BeforeValidator(_coerce_window), Query()]` (`_coerce_window`
+int()s digit strings, runs pre-Literal so the 30|90 OpenAPI enum is unchanged → no frontend regen;
+invalid 45/foo/30.0 still 422). ruff clean; Codex inline-focused review = No issues.
+**Tried / Decided:** First Codex backend review (`codex review --base origin/main`) wandered into the
+repo's `.claude/` skill+agent files despite the boundary instruction (known "skill-file rabbit hole") —
+re-ran feeding the 21-line diff INLINE via `codex exec` with an explicit no-file-read instruction; that
+returned a clean focused verdict. Chose `BeforeValidator` over switching the param to plain `int`
+specifically to keep the OpenAPI `30|90` enum so the frontend's generated types needed no regen.
+**Failed / Blocked (local-verify):** prod CORS (`ALLOWED_ORIGINS`=prod domains) blocks a localhost dev
+frontend from authing against the prod API; the Vercel preview is behind Vercel SSO. Solution that
+worked: run the backend locally against the real DB via
+`railway run sh -c 'ALLOWED_ORIGINS="http://localhost:3000,…" python _local_dev_api.py'` — `railway run`
+injects prod secrets (incl. `FIELD_ENCRYPTION_KEY`, which is NOT in `.env`, only on Railway — so
+`_local_dev_api.py` alone crashes in strict mode), the inner-shell `ALLOWED_ORIGINS` overrides railway's
+injected value, and `_local_dev_api.py` swaps fakeredis. Note: `taskkill //IM node.exe` does NOT kill the
+python uvicorn backend; headed browse is broken on this Windows box (headless works).
+**Pending / Handoff:** none functional. Both layers prod-verified: api.bridgeleads.io window=30/90→200,
+45→422, real data (30 trend pts, 5 record types, 9 counties, 27,660 leads); bridgeleads.io dashboard
+renders all 4 charts with real data, 30/90 toggle re-queries window=90→200, zero console errors.
+**Facts learned:** A `Literal[int]`/IntEnum FastAPI **query** param does not coerce the inbound string in
+pydantic v2 — needs `BeforeValidator` or `int`+validate; ALWAYS verify the actual parametrized request
+returns 200, never just that the route exists (401). recharts 3 requires the `react-is` peer dep.
+
+---
+
 ## 2026-06-19 — Probate follow-ups sweep (false-empty reliability + 6 smaller fixes)
 **Built / Shipped:** Branch `chore/probate-followups` off main@bcb0a1b. Seven deferred items from the
 #72 audit, implemented 1-by-1: (A) **false-empty reliability** — laserfiche/eagleweb/whatcom/pierce/king

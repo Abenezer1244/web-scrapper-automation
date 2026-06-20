@@ -19,6 +19,51 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-20 — Divorce record-type hardening (shared classifier + party guard), all connectors
+**Scope:** Make `divorce` legit/solid/hardened across every divorce-capable scraper, multi-tenant.
+Branch `fix/divorce-classifier-harden` (PR1, not yet merged). Commits c297d3f → 3b313ae → (P2 fix).
+**Truth table (live DB `county_connectors`):** only **2** connectors are ACTIVE with divorce in
+`record_types`: **Pierce** (ARMS checkbox 87 = DECREE OF DISSOLUTION, manual, precise) and **Skagit**
+(ai→SkagitRecording template, server doc-type "Decree-divorce", precise). King divorce = INACTIVE
+placeholder (Superior Court, mig 009). Clark portal doesn't record divorce. Whatcom + all
+EagleWeb/Tyler/Acclaim/Ava/Laserfiche/iDocMarket counties do NOT advertise divorce — their divorce
+code is now correct-but-dormant. **Divorce is overwhelmingly a Superior Court record, so recorder
+"divorce" coverage is structurally tiny — exactly as Codex predicted in the pre-code consult.**
+**Built / Shipped (branch, NOT merged):** new `src/scrapers/divorce.py` — 3-state classifier
+`classify_divorce_doc` (MATCH/NON_MATCH/AMBIGUOUS) + `is_divorce_doc(precise_source)` +
+`orient_divorce_party`. Wired gated to `record_type=='divorce'` into 9 scrapers (eagleweb,
+tyler_selfservice, laserfiche_weblink, landmarkweb, ava_fidlar, acclaimweb, skagit_recording,
+whatcom_wa, pierce_wa_probate). 44 tests (`tests/test_divorce.py`). Diag scripts
+`scripts/diag_divorce_connectors.py` + `scripts/diag_divorce_live.py`.
+**Key design (user-approved decisions):** (1) **fail closed** on ambiguous bare `DISSOLUTION` for
+generic keyword connectors (`precise_source=False`) so corporate/LLC/partnership/nonprofit
+dissolutions never leak in as divorce leads; trusted only when the connector has a precise
+server-side divorce filter (Pierce/Skagit, `precise_source=True`). (2) **legal separation
+included** (`DECREE OF LEGAL SEPARATION` / `LEGAL SEPARATION`), but bare `SEPARATION` and
+`SEPARATION AGREEMENT` excluded. (3) **split scope** — PR1 divorce-only; fail-loud reliability
+hardening deferred to PR2. Removed Skagit's over-broad `SEPARATION` keyword.
+**orient_divorce_party** is narrow on purpose: both spouses are valid leads, so it only promotes a
+real person when the recorder indexed a court/state/agency as the party (reuses
+`probate.is_person_like_party`); no-op when the party is already a person.
+**Caught & fixed (review):** code-reviewer agent → added `CORPORATE` to entity tokens (so
+"CORPORATE DISSOLUTION" is NON_MATCH even under precise_source), Pierce now gates on stored
+`_record_type` not the mutable display label, Whatcom dead keyword list annotated. Codex review ×2
+→ **P2** "LEGAL SEPARATION AGREEMENT" wrongly MATCHed (broad positive ran before the agreement
+negative) — reordered to check agreement/settlement negatives FIRST; **P2** EagleWeb `DISS`/`DISOL`
+abbreviations were silently NON_MATCH-dropped — now AMBIGUOUS (kept for precise, fail-closed for
+generic). Downgraded one reviewer "medium" (Laserfiche orients all types in `_extract_page` by
+design; divorce is consistent and `_filter_by_type` always re-gates).
+**Live-verified (new code vs real portals, prod env via `railway run`):** Pierce 6 divorce records
+(person↔person spouses e.g. RIJWANI MANOJ | RIJHWANI LISA, all doc_type=DIVORCE, 5/6 enriched),
+Skagit 2 records (DECREE-DIVORCE) — **0 corporate-dissolution leaks** either county.
+**Multi-tenant verdict:** PASS, no change. Scrapers are stateless; tenant isolation is the worker's
+`user_id` stamp + RLS, export sanitizes every field via `sanitize_for_csv`. The divorce change is a
+pure party-string/doc-type transform — no shared state, no cross-tenant surface.
+**Pending / Handoff:** PR1 not merged → prod UI still runs old code; verifying via app.bridgeleads.io
+wizard needs merge + Railway deploy. PR2 = fail-loud silent-empty hardening (landmarkweb/ava/acclaim/
+tyler/skagit). If Whatcom divorce is ever activated, it likely needs the probate-style no-parcel
+exemption (divorce decrees often lack an APN).
+
 ## 2026-06-20 — Code-violation scrapers hardening (King + Pierce), multi-tenant + fail-loud
 **Scope:** "All counties" with a `code_violation` connector = exactly **two** (confirmed via
 registry allowlist + `docs/compliance/connector-audit-2026-04-10.md`): `king` (Seattle SDCI /

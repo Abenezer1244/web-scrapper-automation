@@ -1,53 +1,38 @@
-# Code Violation Scrapers — Hardening Pass (2026-06-20)
+# Divorce record-type hardening — PR1 (classifier + party guard)
 
-**Scope:** Every county with a `code_violation` connector. Confirmed via registry +
-`county_connectors` audit: exactly **two** — `king` (Seattle SDCI / Socrata) and
-`pierce` (Tacoma / ArcGIS). Both pure-HTTP (no Playwright).
+Branch: `fix/divorce-classifier-harden`
 
-**Goal (user ask):** verify each is legit/solid/hardened for multi-tenant use,
-fix what's wrong, collaborate with Codex, cross-verify with orchestrated agents,
-and live-test that both work.
+## Goal
+Make the `divorce` record type legit/solid/hardened across every county scraper,
+mirroring the proven `probate.py` / `preforeclosure.py` shared-module campaigns.
+Multi-tenant isolation is already enforced at the worker (user_id stamp + RLS) and
+export (`sanitize_for_csv`) — audit confirmed clean, no change needed there.
 
-## Live baseline (read-only, before any change)
-`scripts/live_test_code_violation.py 30` vs REAL public APIs:
-- King (Seattle Socrata): 1963 records/30d. red_flags: no_parcel 1963 (by design), no_address 1, **party_name pollution**.
-- Pierce (Tacoma ArcGIS): 35 records/30d. red_flags all 0 — clean.
+## Decisions (user-approved)
+- **Ambiguous bare `DISSOLUTION`** -> fail closed (precision) unless the connector has a
+  precise server-side divorce filter (Pierce checkbox 87, Skagit `Decree-divorce`).
+- **Legal separation** -> included as a divorce-adjacent lead (`DECREE OF LEGAL SEPARATION`,
+  `LEGAL SEPARATION`). Bare `SEPARATION` / `SEPARATION AGREEMENT` excluded.
+- **Scope** -> split. PR1 = divorce-only (this file). PR2 = cross-cutting fail-loud
+  reliability hardening (landmarkweb/ava/acclaim/tyler/skagit) — deferred.
 
-## Findings
-- [ ] F1 HIGH (King) party_name PII pollution — falls back to raw free-text `description` (complainant narrative incl. disability disclosure, unbounded) when `recordtypedesc` empty; same text in enrichment_data. Fix: clean violation-type label + address only; drop complaint fallback; stop persisting narrative.
-- [ ] F2 HIGH (both) false-empty reliability — both `break` on API error, return partial/empty → job marked DONE (silent truncation). Fix: bounded retry then RAISE (match king_wa_tax_delinquent / probate / preforeclosure).
-- [ ] F3 MEDIUM (King) unstable Socrata pagination — `$order: opendate DESC` + offset skips/dupes rows. Fix: `$order: ":id"`.
-- [ ] F4 MEDIUM (Pierce) date-window off-by-one — `opendate <= TIMESTAMP 'YYYY-MM-DD'` drops end-date records. Fix: end-of-day bound.
-- [ ] F5 MEDIUM (Pierce) ArcGIS pagination robustness — honor `exceededTransferLimit`, order by unique objectid.
-- [ ] F6 LOW (King) silent dateless drop + no zero-canary — add structural canary like King tax.
-- [ ] F7 multi-tenant (both): PASS — stateless scrapers; isolation at worker/RLS layer. Document, no change.
+## Codex consult (pre-code) — key points folded in
+- Divorce is largely a Superior Court record, not a recorder record (King is already an
+  inactive placeholder for this). Need a connector **truth table**, not blanket "make it work".
+- Classifier must be 3-state (MATCH / NON_MATCH / AMBIGUOUS), not a boolean.
+- Keep the party guard narrow (`is_non_person_party` only); do NOT deepen the `heirs`
+  naming lie (heirs = secondary party for non-probate).
+- Tests = deterministic fixtures first; live probe is final proof only.
 
-## Plan
-1. [ ] Consult Codex on findings before code (CLAUDE.md mandate).
-2. [ ] Implement — one agent per scraper file (independent, 1 file each).
-3. [ ] Cross-verify: code-reviewer agent + Codex review the diff.
-4. [ ] Live-test both again; confirm clean party_name, fail-loud, sane counts.
-5. [ ] ruff + tests. BUILD_JOURNAL entry. Review section.
+## Tasks
+- [ ] 1. `src/scrapers/divorce.py` — `classify_divorce_doc`, `is_divorce_doc`, `orient_divorce_party`
+- [ ] 2. `tests/test_divorce.py` — positives / corporate negatives / ambiguous / separation / orient
+- [ ] 3. Wire into scrapers, gated to `record_type=='divorce'` (Phase A templates, Phase B manual)
+      - Phase A (<=5): eagleweb, tyler_selfservice, laserfiche_weblink, landmarkweb, ava_fidlar
+      - Phase B (<=5): acclaimweb, skagit_recording (remove SEPARATION), whatcom_wa, pierce_wa_probate
+- [ ] 4. Connector divorce truth table (confirm active set from live DB)
+- [ ] 5. Verify — ruff + pytest + Codex review + code-reviewer agent; reconcile findings
+- [ ] 6. Live-test active divorce connectors on BridgeLeads UI/API (before vs after counts)
 
 ## Review
-_(to be filled in after implementation)_
-
-## Review (completed 2026-06-20)
-**Outcome:** Both code_violation scrapers (King/Seattle, Pierce/Tacoma) hardened + live-verified. NOT yet committed.
-
-**Findings status:**
-- F1 ✅ King party_name PII leak fixed (structured label only; description dropped from enrichment). Live-verified clean.
-- F2 ✅ Both fail loud (bounded-retry-then-RAISE `_fetch_page`); ArcGIS 200-error-body detected + retryable marker.
-- F3 ✅ King `$order=:id` stable pagination.
-- F4 ✅ Pierce half-open UTC date window; epoch parsed tz=UTC.
-- F5 ✅ Pierce exceededTransferLimit + objectid ordering.
-- F6 ✅ Both: canary (≥100 fetched/0 emitted→raise) + max-page guard + date-skip counter/warning.
-- F7 ✅ Multi-tenant PASS (stateless scrapers; isolation at worker/RLS).
-
-**Cross-verification:** Codex consult (pre-code, caught 3 misses) + 2 impl agents (parallel) + code-reviewer agent (caught retryable-marker + bare-except, both adopted; 1 claim rejected) + Codex review ×2 = NO P1/P2.
-
-**Reviewer findings reconciled:** R2 (Pierce bare except→log+count) ADOPTED; R3 (ArcGIS error-body retryable) ADOPTED; R1/R7 (date-skip counters) ADOPTED; R6 (stale comment) ADOPTED; R4 (King guard→top) ADOPTED; R5 (infinite-loop claim) REJECTED as false.
-
-**Live evidence:** King 1963 records/30d (party_name clean), Pierce 35/30d (red_flags all 0). 3 runs, identical counts (no records lost from pagination changes). ruff clean, py_compile OK.
-
-**Handoff:** commit + branch + PR + prod canary re-probe. King = Seattle-city scope only (separate product decision).
+_(filled in at end)_

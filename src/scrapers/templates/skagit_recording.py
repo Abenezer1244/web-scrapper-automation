@@ -19,6 +19,7 @@ import re
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord, normalize_party_text
+from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
@@ -57,8 +58,11 @@ _DOC_TYPE_MAP = {
         "FEDERAL TAX LIEN", "TREASURER",
     ],
     "divorce": [
-        "DIVORCE", "DISSOLUTION", "DECREE OF DISSOLUTION",
-        "DECREE-DIVORCE", "SEPARATION",
+        # Coarse list retained so _filter_by_type's "no keywords" guard does not
+        # short-circuit and return everything; the AUTHORITATIVE divorce gate is
+        # divorce.is_divorce_doc (rejects corporate/entity dissolutions and bare
+        # separations — "SEPARATION" was removed here for that reason).
+        "DIVORCE", "DISSOLUTION", "DECREE OF DISSOLUTION", "DECREE-DIVORCE",
     ],
 }
 
@@ -458,10 +462,24 @@ class SkagitRecordingScraper(BridgeScraper):
         if not keywords:
             return records
         is_preforeclosure = self.active_record_type == "pre_foreclosure"
+        is_divorce = self.active_record_type == "divorce"
         kept = []
         for r in records:
             # Check both doc_type and comment for keyword matches
             text = f"{r.doc_type or ''} {r.enrichment_data.get('comment', '')}".upper()
+            if is_divorce:
+                # Skagit constrains the server dropdown to "Decree-divorce" (a
+                # precise server-side divorce filter), so an ambiguous bare
+                # "DISSOLUTION" left in the doc_type/comment text is trustworthy.
+                # The shared classifier still rejects corporate/entity dissolutions
+                # and bare separations. Then keep a real person in party_name.
+                if not is_divorce_doc(text, precise_source=True):
+                    continue
+                r.party_name, r.heirs = orient_divorce_party(
+                    r.party_name, r.heirs, r.doc_type
+                )
+                kept.append(r)
+                continue
             if not any(kw in text for kw in keywords):
                 continue
             if is_preforeclosure:

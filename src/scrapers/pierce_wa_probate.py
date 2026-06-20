@@ -17,6 +17,7 @@ from bs4 import BeautifulSoup, Tag
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.divorce import orient_divorce_party
 from src.scrapers.enrichment.county_gis import batch_enrich_parcels_gis
 from src.utils.logger import setup_logger
 
@@ -494,6 +495,15 @@ class PierceWAARMSScraper(BridgeScraper):
             cell_text = c.get_text(separator="|", strip=True)
             if "[R]" in cell_text or "[E]" in cell_text:
                 record.party_name, record.heirs = self._parse_name_cell(c)
+                if self.DOC_TYPE_LABEL == "DIVORCE":
+                    # ARMS checkbox 87 already constrains the search to DECREE OF
+                    # DISSOLUTION (precise), so no doc-type re-filter is needed.
+                    # Both spouses are valid leads; only correct the case where a
+                    # court/state landed in the [R] (party_name) slot. No-op when
+                    # it is already a person.
+                    record.party_name, record.heirs = orient_divorce_party(
+                        record.party_name, record.heirs, self.DOC_TYPE_LABEL
+                    )
                 break
 
         # Legal description

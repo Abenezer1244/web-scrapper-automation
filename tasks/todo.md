@@ -77,8 +77,20 @@ Every audit finding produced by agent A is re-checked by agent B from a DIFFEREN
 ### Live (P3) — in progress
 - Smoke: clallam OK count=1 red_flags=0 doc_type=Death. Full 21-county run pending.
 
-## Findings — P3 live
-_(filled when railway run completes)_
+## Findings — P3 live (full 21-county run COMPLETE)
+**18/21 returned, red_flags=0 on EVERY county.** The current shipped death-cert scrapers emit ZERO agency/state/court/org parties in the 45d window. 3 non-returns are correct fail-loud, NOT bugs:
+- pacific + spokane: EagleWeb/Cloudflare block → correctly RAISED RuntimeError (reliability hardening working).
+- chelan: Acclaim timeout (known perf).
+Counts: benton 3, clallam 1, columbia 3, grant 19, island 42, jefferson 43, kitsap 8, king 65, cowlitz 43, clark 165, douglas 12, skagit 72, lewis 5, okanogan 18, pierce 64, whitman 2, thurston 52, whatcom 90.
+⟹ Campaign value = PREVENTIVE consolidation + latent-gap closure (funeral-home/out-of-state/partial-concat/lone-state), not active-red-flag fixing.
+
+### Pierce decision — EVIDENCE-BASED (Codex P0 satisfied)
+Pulled live Pierce [R]/[E] samples: `SAKUMOTO MILAGROS EST OF(+)`/`SAKUMOTO HOWARD K`, `ENGLER DAVID M EXEC`/`ENGLER MARIAN L(+)`, `MOUGHTON PAMELA`/`MOUGHTON TERENCE...`. [R] is ALWAYS a person (executor/estate/decedent); Pierce probate = COURT-CASE data, NOT recorder death certs → a filing agency STRUCTURALLY never lands in [R]. ⟹ **Pierce NOT wired** (orient would be a no-op at best + estate-caption/drop risk on edge rows, zero upside). Documented, not deferred-by-default.
+
+### Scope narrowing (evidence-based)
+- **idocmarket/columbia**: decedent=grantor (no-op) → leave untouched (Codex P2).
+- **landmarkweb/ava_fidlar**: NOT in the active 21-county probate set (King probate = king_wa_probate.py; Yakima/ava not a live probate connector) → not wired blindly (Codex P1 multi-type-row risk). Documented follow-up.
+- **Consolidation lands on the two real divergent copies: EagleWeb (11 counties) + Skagit.** ✅
 
 ## Review
 _(filled at end)_

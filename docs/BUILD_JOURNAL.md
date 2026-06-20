@@ -19,6 +19,53 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-20 — Code-violation scrapers hardening (King + Pierce), multi-tenant + fail-loud
+**Scope:** "All counties" with a `code_violation` connector = exactly **two** (confirmed via
+registry allowlist + `docs/compliance/connector-audit-2026-04-10.md`): `king` (Seattle SDCI /
+Socrata `data.seattle.gov` ez4a-iug7) and `pierce` (Tacoma / ArcGIS FeatureServer). Both pure-HTTP.
+**Built / Shipped (working tree, NOT committed):** hardened `src/scrapers/king_wa_code_violation.py`
+and `src/scrapers/pierce_wa_code_violation.py` (+256/−47). Added live harness
+`scripts/live_test_code_violation.py` (pure-HTTP, dummy DB/REDIS env, hits real APIs, reports
+counts + red_flags + samples).
+**Caught & fixed (the real bug):** 🔴 **King `party_name` was leaking complainant PII.** It fell
+back to the raw free-text `description` field when `recordtypedesc` was empty — live baseline showed
+a record whose party_name was a tenant's complaint narrative *including a disability disclosure*, and
+the same text was persisted in `enrichment_data.description[:200]`. Fix: party_name now built from
+STRUCTURED fields only (`recordtypedesc` → `recordtype` → `"Code Violation"`, capped 120 chars),
+`description` dropped from enrichment entirely. Live-verified: party_name now reads "Complaint — 3220
+SW BARTON ST", "Noise — …", "Construction — …". All 1963 records retained.
+**Also fixed:** (F2) both scrapers used `except Exception: break` → silently returned a truncated/empty
+list, which the worker marks job **DONE** (a paying tenant gets a partial lead list on a transient API
+blip). Replaced with the house `_fetch_page` bounded-retry-then-RAISE pattern (mirrors
+`king_wa_tax_delinquent`); **ArcGIS HTTP-200-with-`{"error":…}` body** now detected and treated as
+failure (retryable marker `_ArcGISErrorBodyError`, not "0 results"). (F3) King Socrata `$order`
+`opendate DESC` → `:id` (stable offset paging). (F4) Pierce date window `<= TIMESTAMP 'end'` dropped
+end-day rows → half-open `[start 00:00, end+1day 00:00)`. Pierce epoch-ms parsed `tz=UTC` (was naive
+local → day-boundary drift). (F5) Pierce honors `exceededTransferLimit` + orders by unique `objectid`.
+Both: structural canary (≥100 fetched, 0 emitted → raise), max-page guard (1000), date-skip
+counter+warning (no silent drops).
+**Tried / Decided:** Orchestrated 2 parallel impl agents (1 file each, no shared file = no collision)
++ code-reviewer agent + Codex consult (pre-code) + Codex review ×2 (gate). Codex consult caught the
+ArcGIS-200-error-body + Pierce timezone + canary-for-Pierce that I'd missed. Code-reviewer caught
+that the ArcGIS-error-body `RuntimeError` was NOT retryable (0 retries on transient throttle) and a
+Pierce bare `except: pass` — both adopted. **Rejected** 1 reviewer claim (Pierce `exceeded=True,
+features=[]` infinite loop — false: `if not features: break` runs first). **Kept** dedup grain (King
+`recordnum` / Pierce `casenumber` = one lead per case; downstream property-key dedup handles the rest)
+against a Codex suggestion to dedup by source row-id.
+**Multi-tenant verdict:** PASS, no change. Both scrapers are stateless (no module-level mutable
+cache); per-tenant isolation is enforced at the worker/RLS layer (`rls_sync_session(user_id)` +
+`user_id` filters in `src/workers/tasks.py`). The user's "hardened for multiple users" concern maps
+to the fail-loud + PII fixes, not to scraper-level tenancy.
+**Verification:** live-tested 3× (King 1963 / Pierce 35, all clean); `_is_retryable` classification
+asserted (error-body=retry, plain RuntimeError/SSRF/4xx=no-retry, 5xx=retry); ruff clean; py_compile OK.
+Both Codex review passes = NO P1/P2.
+**Pending / Handoff:** not committed — needs branch + PR + prod canary re-probe. King is Seattle-city
+only (no parcel_id; GIS-enriched downstream) — geographic-scope expansion to all of King County is a
+separate product call (noted in the 2026-04-10 audit, root cause #D).
+**Facts learned:** worker treats `scrape()` returning `[]` as job DONE but a RAISE as job FAILED+notify
+— so a scraper MUST raise on block/error, never return partial. ArcGIS FeatureServers answer 200 with
+an error body under load (not a 5xx). Socrata offset paging needs `$order=:id` to be stable.
+
 ## 2026-06-20 — Dashboard Analytics Phase 3b (frontend) + the window-coercion prod bug
 **Built / Shipped:** Phase 3b frontend (bridgeleads-web PR #31 → master `483ec3f`, live on bridgeleads.io):
 the analytics row — `LeadsTrendChart` (area + 30/90 toggle, owns its own `["analytics",window]` query),

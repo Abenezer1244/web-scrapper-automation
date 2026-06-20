@@ -79,7 +79,7 @@ class ScraperBlockedError(ScraperExecutionError):
 _BLOCK_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"re-?captcha|hcaptcha", "captcha"),
     (r"\bcaptcha\b", "captcha"),
-    (r"cloudflare|cf-ray|checking your browser|attention required", "cloudflare"),
+    (r"cloudflare|cf-ray|checking your browser", "cloudflare"),
     (r"verify (?:you are|you're)(?: a)? human|are you a human|unusual traffic from",
      "bot-challenge"),
     (r"too many requests|rate limit exceeded", "rate-limited"),

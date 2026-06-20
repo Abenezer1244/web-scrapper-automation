@@ -323,7 +323,11 @@ class SkagitRecordingScraper(BridgeScraper):
                     if attempt < 3:
                         await self.page.wait_for_timeout(1_500 * attempt)
             if page_records is None:
-                raise last_exc  # type: ignore[misc]
+                raise last_exc or ScraperExecutionError(
+                    self.county, "SkagitRecording",
+                    "page extraction failed after retries (no recorded cause)",
+                    record_type=self.active_record_type, doc_type=doc_type_label,
+                )
             if not page_records:
                 break
             all_page_records.extend(page_records)

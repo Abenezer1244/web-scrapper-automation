@@ -98,6 +98,10 @@ class AvaFidlarScraper(BridgeScraper):
         seen_hashes: set[str] = set()
         chunk_start = start
 
+        # Fail-loud contract (intentional): a setup failure / block / ambiguous
+        # results page on ANY chunk RAISES and fails the whole job (the scheduler
+        # re-runs it) — we never swallow a bad chunk and continue, which would
+        # silently under-deliver a partial date window under a DONE job.
         while chunk_start < end:
             chunk_end = min(chunk_start + timedelta(days=chunk_days), end)
             cf = chunk_start.strftime("%m/%d/%Y")
@@ -176,6 +180,9 @@ class AvaFidlarScraper(BridgeScraper):
 
     async def _submit_search(self) -> None:
         """Click the Search button and wait for results."""
+        # Reset the canary baseline up front so a regex-miss / early failure this
+        # chunk can never reuse a previous chunk's positive count.
+        self._last_results_total = None
         try:
             search_btn = self.page.locator("button:has-text('Search')").first
             await search_btn.click()

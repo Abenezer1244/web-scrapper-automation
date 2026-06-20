@@ -183,6 +183,10 @@ class AcclaimWebScraper(BridgeScraper):
         except Exception:
             pass
 
+        # Fail-loud contract (intentional): a setup failure / block / ambiguous
+        # results page on ANY day-chunk RAISES and fails the whole job (the
+        # scheduler re-runs it) — we never swallow a bad chunk and continue, which
+        # would silently under-deliver a partial date window under a DONE job.
         while chunk_start < end:
             # Use 1-day chunks in single-date mode, 7-day chunks otherwise
             effective_days = 1 if self._single_date_mode else chunk_days
@@ -594,7 +598,11 @@ class AcclaimWebScraper(BridgeScraper):
                     if attempt < 3:
                         await self.page.wait_for_timeout(1_500 * attempt)
             if records is None:
-                raise last_exc  # type: ignore[misc]
+                raise last_exc or ScraperExecutionError(
+                    self.county, "AcclaimWeb",
+                    "page extraction failed after retries (no recorded cause)",
+                    record_type=self.active_record_type, page=page_num,
+                )
 
             new_count = self.dedupe_extend(records, seen_hashes, all_records)
             _logger.info("Page %d — %d new records (total: %d)", page_num, new_count, len(all_records))

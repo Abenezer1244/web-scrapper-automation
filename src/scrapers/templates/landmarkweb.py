@@ -97,6 +97,11 @@ class LandmarkWebScraper(BridgeScraper):
         seen_hashes: set[str] = set()
         chunk_start = start
 
+        # Fail-loud contract (intentional): a setup failure (date-fill / submit),
+        # a block, or an ambiguous results page on ANY chunk RAISES and fails the
+        # whole job — the scheduler then re-runs it. We deliberately do NOT swallow
+        # a bad chunk and continue, which would silently under-deliver a partial
+        # date window under a DONE job (the exact false-empty this PR removes).
         while chunk_start < end:
             chunk_end = min(chunk_start + timedelta(days=chunk_days), end)
             cf = chunk_start.strftime("%m/%d/%Y")
@@ -365,7 +370,11 @@ class LandmarkWebScraper(BridgeScraper):
                     if attempt < 3:
                         await self.page.wait_for_timeout(1_500 * attempt)
             if records is None:
-                raise last_exc  # type: ignore[misc]
+                raise last_exc or ScraperExecutionError(
+                    self.county, "LandmarkWeb",
+                    "page extraction failed after retries (no recorded cause)",
+                    page=page_num,
+                )
 
             new_count = self.dedupe_extend(records, seen_hashes, all_records)
             _logger.info("Page %d — %d new records (total: %d)", page_num, new_count, len(all_records))

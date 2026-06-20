@@ -272,7 +272,11 @@ class TylerSelfServiceScraper(BridgeScraper):
                     if attempt < 3:
                         await self.page.wait_for_timeout(1_500 * attempt)
             if page_records is None:
-                raise last_exc  # type: ignore[misc]
+                raise last_exc or ScraperExecutionError(
+                    self.county, "Tyler SelfService",
+                    "page extraction failed after retries (no recorded cause)",
+                    record_type=self.active_record_type, page=page_num,
+                )
             new = 0
             for r in page_records:
                 did = r.enrichment_data.get("document_id")

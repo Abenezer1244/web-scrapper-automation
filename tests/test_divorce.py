@@ -50,6 +50,7 @@ NON_MATCH_DOCS = [
     "CORPORATE DISSOLUTION",
     "SEPARATION",                 # bare separation (user excluded)
     "SEPARATION AGREEMENT",
+    "LEGAL SEPARATION AGREEMENT",  # agreement, not a decree (Codex: order matters)
     "PROPERTY SETTLEMENT AGREEMENT",
     "WARRANTY DEED",              # no divorce signal at all
     "DEED OF TRUST",
@@ -72,6 +73,8 @@ AMBIGUOUS_DOCS = [
     "DISSOLUTION",
     "DECREE",
     "FINAL DECREE",
+    "DISS",          # EagleWeb dissolution abbreviation (Codex review)
+    "DISOL",         # EagleWeb dissolution abbreviation (Codex review)
 ]
 
 

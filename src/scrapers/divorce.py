@@ -95,8 +95,14 @@ _NEGATIVE_PHRASES: tuple[str, ...] = (
     "DISSOLUTION OF CORPORATION",
     "DISSOLUTION OF NONPROFIT",
     "DISSOLUTION OF NON-PROFIT",
-    "PROPERTY SETTLEMENT",     # "PROPERTY SETTLEMENT AGREEMENT" — not the decree
+)
+
+# Agreement / settlement documents are NOT decrees and must be excluded BEFORE the
+# broad "LEGAL SEPARATION" positive can catch "LEGAL SEPARATION AGREEMENT" (Codex
+# review). Checked first in classify_divorce_doc.
+_AGREEMENT_NEGATIVE: tuple[str, ...] = (
     "SEPARATION AGREEMENT",
+    "PROPERTY SETTLEMENT",
 )
 
 # Whole-word entity tokens. If any appears in the doc type it is a corporate /
@@ -111,9 +117,16 @@ _ENTITY_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Bare ambiguous markers — a "DISSOLUTION" or "DECREE" with no marital qualifier
-# and no entity token. Matched whole-word so they do not fire inside a longer word.
-_AMBIGUOUS_RE = re.compile(r"\b(?:DISSOLUTION|DECREE)\b", re.IGNORECASE)
+# Bare ambiguous markers — a "DISSOLUTION"/"DECREE" or a recorder abbreviation of
+# dissolution (DISS / DISOL / DISSOL) with no marital qualifier and no entity
+# token. Matched whole-word so they do not fire inside a longer word. EagleWeb
+# counties label divorce with these abbreviations; treating them as AMBIGUOUS keeps
+# them for a precise server-side source and fails them closed for generic keyword
+# connectors (Codex review — preserves the abbreviation option without leaking
+# corporate dissolutions).
+_AMBIGUOUS_RE = re.compile(
+    r"\b(?:DISSOLUTION|DISSOL|DISOL|DISS|DECREE)\b", re.IGNORECASE
+)
 
 
 def classify_divorce_doc(
@@ -122,10 +135,13 @@ def classify_divorce_doc(
     """Classify a recorder document-type string for the divorce record type.
 
     Order matters:
-      1. Unambiguous marital positive  -> MATCH.
-      2. Explicit corporate/entity dissolution or excluded separation -> NON_MATCH.
-      3. Bare "DISSOLUTION"/"DECREE" with no qualifier -> AMBIGUOUS.
-      4. Anything else (no divorce signal) -> NON_MATCH.
+      1. Agreement / settlement document (not a decree) -> NON_MATCH. Checked
+         first so "LEGAL SEPARATION AGREEMENT" cannot slip through the broad
+         "LEGAL SEPARATION" positive below (Codex review).
+      2. Unambiguous marital positive -> MATCH.
+      3. Explicit corporate/entity dissolution -> NON_MATCH.
+      4. Bare "DISSOLUTION"/"DECREE" or dissolution abbreviation -> AMBIGUOUS.
+      5. Anything else (no divorce signal) -> NON_MATCH.
 
     ``precise_source`` does not change the classification — it changes how the
     AMBIGUOUS bucket is *resolved* by ``is_divorce_doc``. It is accepted here so a
@@ -135,6 +151,9 @@ def classify_divorce_doc(
         return DivorceMatch.NON_MATCH
 
     up = doc_type.upper()
+
+    if any(p in up for p in _AGREEMENT_NEGATIVE):
+        return DivorceMatch.NON_MATCH
 
     if any(p in up for p in _STRONG_POSITIVE):
         return DivorceMatch.MATCH

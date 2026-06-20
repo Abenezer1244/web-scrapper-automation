@@ -24,7 +24,16 @@ from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
 )
+from src.scrapers.reliability import (
+    ScraperBlockedError,
+    ScraperExecutionError,
+    classify_results_page,
+    detect_block,
+)
 from src.utils.logger import setup_logger
+
+# Substrings the Skagit results page renders for a genuine zero-result window.
+_EMPTY_MARKERS = ("returned 0 records", "no results", "no records", "no documents")
 
 _logger = setup_logger("scraper.template.skagit")
 
@@ -231,8 +240,12 @@ class SkagitRecordingScraper(BridgeScraper):
         try:
             await self.page.locator("#content_ddlDocumentType").select_option(label=doc_type_label)
         except Exception as exc:
-            _logger.warning("Could not select doc type '%s': %s", doc_type_label, str(exc)[:80])
-            return []
+            raise ScraperExecutionError(
+                self.county, "SkagitRecording",
+                "could not select doc-type dropdown (search never ran)",
+                record_type=self.active_record_type, doc_type=doc_type_label,
+                context=str(exc)[:120],
+            ) from exc
 
         # Force-hide calendar overlays
         await self.page.evaluate(
@@ -245,8 +258,12 @@ class SkagitRecordingScraper(BridgeScraper):
                 "input[type='submit'][value='Search'], input[name*='btnSearch']"
             ).first.click(timeout=10_000)
         except Exception as exc:
-            _logger.warning("Search click failed for '%s': %s", doc_type_label, str(exc)[:80])
-            return []
+            raise ScraperExecutionError(
+                self.county, "SkagitRecording",
+                "search click failed (search never ran)",
+                record_type=self.active_record_type, doc_type=doc_type_label,
+                context=str(exc)[:120],
+            ) from exc
 
         await self.page.wait_for_timeout(5_000)
         try:
@@ -254,12 +271,35 @@ class SkagitRecordingScraper(BridgeScraper):
         except Exception:
             pass
 
-        # Check result count
+        # Check result count. The "returned N records" line is Skagit's
+        # authoritative signal. Its ABSENCE is NOT a confirmed zero — it can mean a
+        # block / silent failure — so classify the page instead of assuming empty.
         body = await self.page.inner_text("body")
         count_match = re.search(r"returned\s+(\d+)\s+records?", body)
-        total = int(count_match.group(1)) if count_match else 0
-        if total == 0:
+        if count_match is None:
+            verdict = classify_results_page(
+                row_count=0, page_text=body, empty_markers=_EMPTY_MARKERS
+            )
+            if verdict == "block":
+                raise ScraperBlockedError(
+                    self.county, "SkagitRecording",
+                    f"block wall on results page ({detect_block(body)})",
+                    record_type=self.active_record_type, doc_type=doc_type_label,
+                    context=body[:120],
+                )
+            if verdict == "ambiguous":
+                raise ScraperExecutionError(
+                    self.county, "SkagitRecording",
+                    "no result-count line and no empty-marker (search may have "
+                    "silently failed / been blocked)",
+                    record_type=self.active_record_type, doc_type=doc_type_label,
+                    context=body[:120],
+                )
+            _logger.info("Doc type '%s': genuine empty window", doc_type_label)
             return []
+        total = int(count_match.group(1))
+        if total == 0:
+            return []  # genuine zero for THIS doc type — caller tries the next
 
         # Extract all pages for this doc type
         all_page_records: list[ScrapedRecord] = []
@@ -267,7 +307,27 @@ class SkagitRecordingScraper(BridgeScraper):
         max_pages = 20
 
         while page_num <= max_pages:
-            page_records = await self._extract_page()
+            # Bounded retry on a transient extraction failure, then fail loud.
+            page_records = None
+            last_exc: ScraperExecutionError | None = None
+            for attempt in range(1, 4):
+                try:
+                    page_records = await self._extract_page()
+                    break
+                except ScraperExecutionError as exc:
+                    last_exc = exc
+                    _logger.warning(
+                        "  '%s' page %d extract attempt %d/3 failed: %s",
+                        doc_type_label, page_num, attempt, str(exc)[:100],
+                    )
+                    if attempt < 3:
+                        await self.page.wait_for_timeout(1_500 * attempt)
+            if page_records is None:
+                raise last_exc or ScraperExecutionError(
+                    self.county, "SkagitRecording",
+                    "page extraction failed after retries (no recorded cause)",
+                    record_type=self.active_record_type, doc_type=doc_type_label,
+                )
             if not page_records:
                 break
             all_page_records.extend(page_records)
@@ -280,6 +340,16 @@ class SkagitRecordingScraper(BridgeScraper):
             if not await self._goto_next_page():
                 break
             page_num += 1
+
+        # Canary: the header promised `total` records but we extracted none -> the
+        # table parse drifted (or a silent block) — fail loud, don't return [].
+        if total > 0 and not all_page_records:
+            raise ScraperExecutionError(
+                self.county, "SkagitRecording",
+                f"results header reported {total} record(s) but extracted 0 rows "
+                "(parse drift)",
+                record_type=self.active_record_type, doc_type=doc_type_label,
+            )
 
         return all_page_records
 
@@ -420,8 +490,13 @@ class SkagitRecordingScraper(BridgeScraper):
                     records.append(record)
 
             _logger.info("Extracted %d records from page", len(records))
+        except ScraperExecutionError:
+            raise
         except Exception as exc:
-            _logger.warning("Extraction error: %s", str(exc)[:120])
+            raise ScraperExecutionError(
+                self.county, "SkagitRecording", "page extraction failed",
+                record_type=self.active_record_type, context=str(exc)[:120],
+            ) from exc
 
         return records
 

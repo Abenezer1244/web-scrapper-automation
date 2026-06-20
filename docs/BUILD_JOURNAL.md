@@ -19,6 +19,45 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-20 — Scraper fail-loud reliability (PR2): silent-empty -> raise across 5 templates
+**Scope:** The deferred PR2 from the divorce campaign. 5 template scrapers (landmarkweb,
+ava_fidlar, tyler_selfservice, acclaimweb, skagit_recording) SWALLOWED captcha/block/setup/
+extraction failures (log + `return []`), and the worker marks a job DONE when a scraper returns
+a list — so a transient failure handed a paying tenant an empty lead list that looked legitimate.
+Branch `fix/scraper-fail-loud-pr2` (NOT merged at time of writing). Cross-cuts probate +
+pre_foreclosure + divorce (all share these templates).
+**Built:** new `src/scrapers/reliability.py` — `ScraperExecutionError`/`ScraperBlockedError`
+(RuntimeError subclasses; the worker's `except Exception → _fail_job` at tasks.py:455 already
+terminalizes the job — verified), `detect_block` (HIGH-CONFIDENCE only: captcha/cloudflare/
+rate-limit/bot-challenge — tight to avoid false-failing legit pages), `classify_results_page`
+(rows/block/empty/ambiguous; **neither-rows-nor-marker → raise**), strict pre-dedup
+`check_extraction_canary` (header N>0 but 0 raw rows → raise). 40 tests. Wired into all 5
+templates: setup failures (date-fill/submit/disclaimer/url-discovery/doc-type-select) → raise;
+per-page extraction → bounded retry (3×) then raise; 0-row pages classified; genuine zero-result
+windows still return []. ava uses its "Results: N" header for the canary; skagit uses
+"returned N records" (absent count line → classify, not assume-empty) + a post-loop canary, and
+its doc-type loop raises on select/click failure but a genuine per-doc-type "returned 0" returns
+[] and continues. Diag: `scripts/diag_failloud_live.py`.
+**Decisions (user-approved):** FULL Codex version (block detect + canary + typed errors) +
+bounded-retry-then-raise. Documented the intentional fail-loud chunk contract (any chunk
+setup/block failure fails the whole job; the scheduler re-runs it — never swallow a partial under DONE).
+**Caught & fixed (the review loop earned its keep):** code-reviewer agent → defensive
+`raise last_exc or fallback` (no `raise None`), dropped over-broad "attention required" block
+pattern, ava canary baseline reset. **Codex review ×N → P1:** `classify_results_page` matched
+empty markers by SUBSTRING, so "0 records" matched "10 records"/"100 records" — a parse-drift
+page reporting a non-zero count but 0 extracted rows would be misread as genuine-empty (the exact
+false-empty PR2 exists to kill). Fixed with `\b` word-boundary matching + 7 tests. **Codex → P2:**
+the \b fix then broke landmarkweb's singular "0 record" marker against a plural "0 records" page →
+listed both. Final Codex pass clean (no P1/High in the shipped state).
+**Live-verified (new code vs real portals, prod env via `scripts/diag_failloud_live.py`):**
+clark/landmark 104, chelan/acclaim 1, okanogan/tyler 11, skagit 32 on populated windows (zero
+false-raises); all 4 return [] on a future-empty window (genuine empty handled). ava_fidlar has
+NO active connector (correct-but-dormant, like its divorce path) — not live-tested.
+**Known limitation (follow-up):** landmarkweb exposes no numeric result count, so a soft-fail that
+renders a "0 records" empty-state is indistinguishable from a genuine empty (no canary possible) —
+observed once as a transient clark 0 that recovered to 104 on retry. Out of scope for PR2.
+**Multi-tenant:** unchanged — purely the extraction-boundary error contract; no shared state.
+
 ## 2026-06-20 — Divorce record-type hardening (shared classifier + party guard), all connectors
 **Scope:** Make `divorce` legit/solid/hardened across every divorce-capable scraper, multi-tenant.
 Branch `fix/divorce-classifier-harden` (PR1, not yet merged). Commits c297d3f → 3b313ae → (P2 fix).

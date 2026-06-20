@@ -469,11 +469,14 @@ class SkagitRecordingScraper(BridgeScraper):
             text = f"{r.doc_type or ''} {r.enrichment_data.get('comment', '')}".upper()
             if is_divorce:
                 # Skagit constrains the server dropdown to "Decree-divorce" (a
-                # precise server-side divorce filter), so an ambiguous bare
-                # "DISSOLUTION" left in the doc_type/comment text is trustworthy.
-                # The shared classifier still rejects corporate/entity dissolutions
-                # and bare separations. Then keep a real person in party_name.
-                if not is_divorce_doc(text, precise_source=True):
+                # precise server-side divorce filter), so classify on the DOC TYPE
+                # ALONE — NOT the doc_type+comment text (Codex re-review): the
+                # classifier's agreement/settlement negatives (SEPARATION AGREEMENT,
+                # PROPERTY SETTLEMENT) would otherwise drop a valid Decree-divorce
+                # row merely because its comment mentions a settlement. precise=True
+                # keeps an ambiguous bare "DISSOLUTION" doc type; the classifier
+                # still rejects corporate/entity dissolutions. Then person-guard.
+                if not is_divorce_doc(r.doc_type, precise_source=True):
                     continue
                 r.party_name, r.heirs = orient_divorce_party(
                     r.party_name, r.heirs, r.doc_type

@@ -255,3 +255,45 @@ def test_orient_per_segment_agency_co_party_stripped():
     )
     assert party == "DOE, JOHN"
     assert heirs == "DOE, JANE"
+
+
+# --- Codex review fixes (round 2) ---------------------------------------------
+
+def test_bare_state_only_matches_real_states_not_any_word():
+    # Codex P2: the per-segment drop must NOT drop a co-party that merely ends in
+    # "STATE" but is not an actual US state ("MCKINLEY STATE", "JOHN STATE").
+    assert strip_filing_agency("DOE, JOHN / MCKINLEY STATE") == "DOE, JOHN / MCKINLEY STATE"
+    assert strip_filing_agency("MCKINLEY STATE") == "MCKINLEY STATE"
+    assert strip_filing_agency("JOHN STATE / SMITH JANE") == "JOHN STATE / SMITH JANE"
+
+
+def test_bare_state_still_matches_real_states_both_orders():
+    assert strip_filing_agency("STATE OF WASHINGTON") == ""
+    assert strip_filing_agency("WASHINGTON STATE") == ""
+    assert strip_filing_agency("WASH. STATE OF") == ""        # Skagit inverted
+    assert strip_filing_agency("STATE OF OREGON") == ""       # out-of-state
+    assert strip_filing_agency("CALIFORNIA STATE OF") == ""   # Skagit inverted, other state
+
+
+def test_concatenated_washington_state_word_order_dept_health_stripped():
+    # Codex P2: "<decedent>, WASHINGTON STATE DEPARTMENT OF HEALTH" (state-word
+    # order, not "STATE OF WA") must strip the FULL agency, not leave "WASHINGTON
+    # STATE" polluting the decedent.
+    assert strip_filing_agency(
+        "PERRIN, RONALD, WASHINGTON STATE DEPARTMENT OF HEALTH"
+    ) == "PERRIN, RONALD"
+    assert strip_filing_agency("WASHINGTON STATE DEPARTMENT OF HEALTH") == ""
+
+
+def test_is_person_like_comma_form_rescues_institution_word_surname():
+    # Codex P2: a real decedent whose surname collides with an institution word
+    # ("CORONER, JANE", "BANK, JOHN") is still person-like in LAST, FIRST form.
+    assert is_person_like_party("CORONER, JANE")
+    assert is_person_like_party("BANK, JOHN")
+
+
+def test_is_person_like_still_rejects_institutional_form():
+    # The institution form (NOT comma LAST, FIRST) is still rejected.
+    assert not is_person_like_party("PIERCE COUNTY CORONER")
+    assert not is_person_like_party("FIRST NATIONAL BANK")
+    assert not is_person_like_party("WASHINGTON, STATE OF")  # comma-inverted state

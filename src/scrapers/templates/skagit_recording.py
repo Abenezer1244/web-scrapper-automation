@@ -405,11 +405,10 @@ class SkagitRecordingScraper(BridgeScraper):
                 parcel_match = re.search(r"(P\d{4,})", parcel_text)
                 if parcel_match:
                     record.parcel_id = parcel_match.group(1)
-                elif not parcel_match:
-                    # Fallback: any 6+ digit number
-                    digit_match = re.search(r"\b(\d{6,})\b", parcel_text)
-                    if digit_match:
-                        record.parcel_id = digit_match.group(1)
+                # No bare-digit fallback: the parcelCell concatenates PLSS /
+                # tax-account / permit numbers, so a generic \d{6,} grab stores a
+                # WRONG parcel_id (poisoning enrichment + the dedup/property key).
+                # Prefer no parcel — require_parcel_id=True drops the row cleanly.
 
                 record.enrichment_data["source"] = "skagit_recording"
 

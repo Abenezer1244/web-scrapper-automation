@@ -88,6 +88,8 @@ class WhatcomWAScraper(BridgeScraper):
 
             try:
                 chunk_records = await self._search_chunk_all_pages(cf, ct)
+            except RuntimeError:
+                raise  # block/error signal — fail the job, don't skip to a false-0
             except Exception as exc:
                 _logger.warning("Chunk failed: %s — skipping", str(exc)[:80])
                 chunk_start = chunk_end
@@ -162,6 +164,20 @@ class WhatcomWAScraper(BridgeScraper):
             )
         except Exception:
             _logger.warning("Result container did not appear in time")
+
+        # Distinguish a blocked/error page from a genuine empty result: an empty
+        # day still renders #search-results-header (and/or .floating-message). If
+        # NONE of the results-UI markers is present, the page never loaded — fail
+        # loud instead of returning a false-empty [] scored as a healthy 0.
+        ui_present = await self.page.evaluate(
+            "() => !!document.querySelector('.search-result, #search-results-header, .floating-message')"
+        )
+        if not ui_present:
+            body_head = (await self.page.inner_text("body"))[:200].replace("\n", " ")
+            raise RuntimeError(
+                f"Whatcom: results UI never rendered — page blocked / errored. "
+                f"Body head: {body_head!r}"
+            )
 
         all_records: list[ScrapedRecord] = []
         seen_hashes: set[str] = set()
@@ -250,10 +266,18 @@ class WhatcomWAScraper(BridgeScraper):
             doc_type_upper = doc_type.upper()
             doc_type_counter[doc_type] = doc_type_counter.get(doc_type, 0) + 1
 
-            # Filter by record type keywords client-side
+            # Filter by record type keywords client-side. Single-token keywords
+            # (e.g. "WILL") match on a word boundary so they can't substring-leak
+            # an unrelated type like "GOODWILL", while still matching across
+            # punctuation ("WILL/TESTAMENT", "(WILL)"); multiword phrases stay
+            # plain substring.
             matched = False
             for kw in self._keywords:
-                if kw and kw in doc_type_upper:
+                if not kw:
+                    continue
+                if (kw in doc_type_upper) if " " in kw else re.search(
+                    rf"\b{re.escape(kw)}\b", doc_type_upper
+                ):
                     matched = True
                     break
             if not matched:

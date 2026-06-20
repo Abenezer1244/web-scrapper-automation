@@ -584,7 +584,7 @@ class EagleWebScraper(BridgeScraper):
         while page_num < max_pages:
             page_num += 1
 
-            records = await self._extract_page()
+            records = await self._extract_page(page_num)
             new_count = 0
             new_records: list[ScrapedRecord] = []
             for record in records:
@@ -623,7 +623,7 @@ class EagleWebScraper(BridgeScraper):
                      (parcels_found / len(all_records) * 100) if all_records else 0)
         return all_records
 
-    async def _extract_page(self) -> list[ScrapedRecord]:
+    async def _extract_page(self, page_num: int = 1) -> list[ScrapedRecord]:
         """Extract records from the current EagleWeb results page via JavaScript.
 
         Uses browser-side JS extraction instead of BeautifulSoup for reliability.
@@ -697,8 +697,19 @@ class EagleWebScraper(BridgeScraper):
                 page_text = await self.page.inner_text("body")
                 if "No documents found" in page_text or "0 items found" in page_text:
                     _logger.info("No results found on this page")
-                else:
-                    _logger.warning("Could not find results table via JS")
+                    return []
+                # No results table AND no genuine empty-marker. On page 1 this
+                # means the search page never rendered (block / captcha / error,
+                # e.g. Spokane behind Cloudflare) — fail loud instead of scoring
+                # a false-empty 0. On later pages an absent table is just the end
+                # of pagination, so return [] there.
+                if page_num == 1:
+                    raise RuntimeError(
+                        f"{self.county}: EagleWeb results table missing and no "
+                        f"empty-marker present — page never loaded / blocked. "
+                        f"Body head: {page_text[:200]!r}"
+                    )
+                _logger.warning("Could not find results table via JS (page %d)", page_num)
                 return []
 
             import re
@@ -738,7 +749,13 @@ class EagleWebScraper(BridgeScraper):
                 # summary cell. Without these as stop markers, the Grantor regex
                 # captures "FORD, MICHAEL M ESTSubdivision HIDDEN EST Lot 5..."
                 # because probate records often have no Grantee: label.
-                _LEGAL_STOP = r"(?:Grantee:|Legal[:\s]|Subdivision|Section\s*:|Section\s+\d|Lot\s+\d|Block\s+\d|Parcel[:\s]|Plat\s|Tract\s|$)"
+                # Stop markers shared by both party captures. "Grantee:" is a stop
+                # only for the GRANTOR capture; the grantee capture swaps it for
+                # "Grantor:" (its own opposite-field boundary). Build both from one
+                # body so editing the markers can't desync the two regexes — the
+                # old `_LEGAL_STOP[4:]` string slice was a footgun.
+                _STOP_BODY = r"Legal[:\s]|Subdivision|Section\s*:|Section\s+\d|Lot\s+\d|Block\s+\d|Parcel[:\s]|Plat\s|Tract\s|$"
+                _LEGAL_STOP = r"(?:Grantee:|" + _STOP_BODY + r")"
 
                 # Parse Grantor (from the separator-preserving party_summary so
                 # stacked co-owners keep their " / " boundary). Re-run
@@ -751,7 +768,7 @@ class EagleWebScraper(BridgeScraper):
                     record.party_name = normalize_party_text(grantor_match.group(1)).rstrip(",")
 
                 # Parse Grantee
-                grantee_match = re.search(r"Grantee:\s*(.+?)(?:Grantor:|" + _LEGAL_STOP[4:], party_summary, re.DOTALL)
+                grantee_match = re.search(r"Grantee:\s*(.+?)(?:Grantor:|" + _STOP_BODY + r")", party_summary, re.DOTALL)
                 if grantee_match:
                     grantee = normalize_party_text(grantee_match.group(1)).rstrip(",").rstrip(".")
                     # Strip the recorder's "Workflow Status: ..." processing
@@ -902,6 +919,8 @@ class EagleWebScraper(BridgeScraper):
                 parcel_source_counts["none_yet"],
             )
 
+        except RuntimeError:
+            raise  # block/error signal — must fail the job, not return []
         except Exception as exc:
             _logger.warning("Error extracting page: %s", str(exc)[:80])
 

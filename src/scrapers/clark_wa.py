@@ -340,10 +340,18 @@ class ClarkWAScraper(BridgeScraper):
             item_doc_type = (item.get("docType") or "").strip().upper()
             doc_type_counter[item_doc_type] = doc_type_counter.get(item_doc_type, 0) + 1
 
-            # Skip rows whose docType doesn't match any configured keyword
+            # Skip rows whose docType doesn't match any configured keyword.
+            # Single-token keywords (e.g. "WILL") match on a word boundary so they
+            # can't substring-leak an unrelated type like "GOODWILL", while still
+            # matching across punctuation ("WILL/TESTAMENT", "(WILL)"); multiword
+            # phrases stay plain substring.
             matched = False
             for keyword in allowed_types_upper:
-                if keyword and keyword in item_doc_type:
+                if not keyword:
+                    continue
+                if (keyword in item_doc_type) if " " in keyword else re.search(
+                    rf"\b{re.escape(keyword)}\b", item_doc_type
+                ):
                     matched = True
                     break
             if not matched:

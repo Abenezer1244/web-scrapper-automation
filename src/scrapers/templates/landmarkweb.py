@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord, normalize_party_text
+from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
@@ -453,6 +454,15 @@ class LandmarkWebScraper(BridgeScraper):
                             continue
                     else:
                         for rt in self.record_types:
+                            if rt == "divorce":
+                                # Generic keyword connector — fail closed on an
+                                # ambiguous bare "DISSOLUTION" via the shared
+                                # 3-state classifier (keeps corporate/entity
+                                # dissolutions out of divorce results).
+                                if is_divorce_doc(doc_type, precise_source=False):
+                                    matched_rt = rt
+                                    break
+                                continue
                             keywords = _DOC_TYPE_MAP.get(rt, [])
                             if any(kw in doc_type for kw in keywords):
                                 matched_rt = rt
@@ -478,6 +488,11 @@ class LandmarkWebScraper(BridgeScraper):
                     if oriented is None:
                         continue
                     grantor, grantee = oriented
+                elif matched_rt == "divorce":
+                    # Both spouses are valid leads; only correct the case where the
+                    # recorder indexed a court/state/agency as grantor. No-op when
+                    # the grantor is already a person.
+                    grantor, grantee = orient_divorce_party(grantor, grantee, doc_type)
 
                 if grantor:
                     record.party_name = grantor

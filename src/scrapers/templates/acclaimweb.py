@@ -24,6 +24,7 @@ from src.scrapers.base_scraper import (
     ScrapedRecord,
     normalize_party_text,
 )
+from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
@@ -812,7 +813,13 @@ class AcclaimWebScraper(BridgeScraper):
                 # Deeds of Trust and other unrelated records leak
                 # through the filter and appear as "pre-foreclosures".
                 active_rt = self.active_record_type
-                if active_rt:
+                if active_rt == "divorce":
+                    # Generic keyword connector — fail closed on ambiguous bare
+                    # "DISSOLUTION" via the shared 3-state classifier (keeps
+                    # corporate/entity dissolutions out of divorce results).
+                    if not doc_type or not is_divorce_doc(doc_type, precise_source=False):
+                        continue
+                elif active_rt:
                     keywords = _DOC_TYPE_MAP.get(active_rt, [])
                     if keywords:
                         if not doc_type or not _doc_type_matches(doc_type, keywords):
@@ -848,6 +855,13 @@ class AcclaimWebScraper(BridgeScraper):
                     # and strip "Estate of" captions. No-op when grantor is the
                     # decedent.
                     record.party_name, record.heirs = orient_probate_party(
+                        grantor, grantee, doc_type
+                    )
+                elif active_rt == "divorce":
+                    # Both spouses are valid leads; only correct the case where the
+                    # recorder indexed a court/state/agency as grantor. No-op when
+                    # the grantor is already a person.
+                    record.party_name, record.heirs = orient_divorce_party(
                         grantor, grantee, doc_type
                     )
                 else:

@@ -23,6 +23,7 @@ from src.scrapers.base_scraper import (
     ScrapedRecord,
     normalize_party_text,
 )
+from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
@@ -882,29 +883,41 @@ class EagleWebScraper(BridgeScraper):
                     active_rt = self.active_record_type
                     if active_rt and active_rt != "all":
                         doc_upper = desc.upper()
-                        kws = _DOC_TYPE_MAP.get(active_rt, [])
-                        if not _doc_type_matches(doc_upper, kws):
-                            continue  # Skip non-matching doc types
-                        excludes = _DOC_TYPE_EXCLUDE.get(active_rt, [])
-                        if any(neg in doc_upper for neg in excludes):
-                            continue  # e.g. "LACK OF PROBATE AFFIDAVIT"
-                        if active_rt == "pre_foreclosure":
-                            # A doc type that keyword-matched but signals the
-                            # foreclosure was cancelled/cured (Discontinuance,
-                            # Rescission) or is pure trustee admin (Substitution
-                            # of Trustee) is NOT active distress — drop it.
-                            if is_cancellation_or_admin(desc):
+                        if active_rt == "divorce":
+                            # EagleWeb is a generic keyword connector with no
+                            # precise server-side divorce filter, so fail closed
+                            # on an ambiguous bare "DISSOLUTION" (keeps corporate/
+                            # entity dissolutions out), then keep a real person —
+                            # not a court/state — in party_name.
+                            if not is_divorce_doc(desc, precise_source=False):
                                 continue
-                            # Borrower orientation: an NTS is often indexed with
-                            # the trustee company as grantor and the borrower as
-                            # grantee. Put the person (homeowner) in party_name;
-                            # drop bank-vs-trustee records with no homeowner.
-                            oriented = orient_pre_foreclosure_party(
-                                record.party_name, record.heirs
+                            record.party_name, record.heirs = orient_divorce_party(
+                                record.party_name, record.heirs, desc
                             )
-                            if oriented is None:
-                                continue
-                            record.party_name, record.heirs = oriented
+                        else:
+                            kws = _DOC_TYPE_MAP.get(active_rt, [])
+                            if not _doc_type_matches(doc_upper, kws):
+                                continue  # Skip non-matching doc types
+                            excludes = _DOC_TYPE_EXCLUDE.get(active_rt, [])
+                            if any(neg in doc_upper for neg in excludes):
+                                continue  # e.g. "LACK OF PROBATE AFFIDAVIT"
+                            if active_rt == "pre_foreclosure":
+                                # A doc type that keyword-matched but signals the
+                                # foreclosure was cancelled/cured (Discontinuance,
+                                # Rescission) or is pure trustee admin (Substitution
+                                # of Trustee) is NOT active distress — drop it.
+                                if is_cancellation_or_admin(desc):
+                                    continue
+                                # Borrower orientation: an NTS is often indexed with
+                                # the trustee company as grantor and the borrower as
+                                # grantee. Put the person (homeowner) in party_name;
+                                # drop bank-vs-trustee records with no homeowner.
+                                oriented = orient_pre_foreclosure_party(
+                                    record.party_name, record.heirs
+                                )
+                                if oriented is None:
+                                    continue
+                                record.party_name, record.heirs = oriented
                     # Phase 2a: capture the document type so it reaches Result/export.
                     if desc:
                         record.doc_type = desc.strip()[:128]

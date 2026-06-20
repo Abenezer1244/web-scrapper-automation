@@ -38,6 +38,7 @@ import re
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
@@ -578,9 +579,22 @@ class TylerSelfServiceScraper(BridgeScraper):
         if not keywords:
             return records
         is_preforeclosure = self.active_record_type == "pre_foreclosure"
+        is_divorce = self.active_record_type == "divorce"
         kept = []
         for r in records:
             doc = (r.doc_type or "").upper()
+            if is_divorce:
+                # Tyler SelfService is a generic keyword connector with no precise
+                # server-side divorce filter — use the shared 3-state classifier
+                # and fail closed on ambiguous bare "DISSOLUTION" (keeps corporate/
+                # entity dissolutions out), then keep a real person in party_name.
+                if not is_divorce_doc(r.doc_type, precise_source=False):
+                    continue
+                r.party_name, r.heirs = orient_divorce_party(
+                    r.party_name, r.heirs, r.doc_type
+                )
+                kept.append(r)
+                continue
             if not any(kw in doc for kw in keywords):
                 continue
             if is_preforeclosure:

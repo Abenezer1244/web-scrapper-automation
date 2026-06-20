@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
 from src.scrapers.probate import orient_probate_party
 from src.utils.logger import setup_logger
 
@@ -46,6 +47,10 @@ _DOC_TYPE_KEYWORDS = {
         "TAX LIEN", "CERTIFICATE OF DELINQUENCY", "CERTIFICATE OF SALE",
         "FEDERAL TAX LIEN",
     ],
+    # NOTE: the divorce path does NOT use these keywords — _extract_page delegates
+    # divorce classification entirely to divorce.is_divorce_doc (which rejects
+    # corporate/entity dissolutions and bare separations). This entry is retained
+    # only so __init__'s self._keywords build does not KeyError for divorce.
     "divorce": ["DISSOLUTION", "DIVORCE"],
 }
 
@@ -271,18 +276,27 @@ class WhatcomWAScraper(BridgeScraper):
             # an unrelated type like "GOODWILL", while still matching across
             # punctuation ("WILL/TESTAMENT", "(WILL)"); multiword phrases stay
             # plain substring.
-            matched = False
-            for kw in self._keywords:
-                if not kw:
+            if self._record_type == "divorce":
+                # Generic recorder portal (no precise server-side divorce filter)
+                # — fail closed on an ambiguous bare "DISSOLUTION" via the shared
+                # 3-state classifier (keeps corporate/entity dissolutions and bare
+                # separations out of divorce results).
+                if not is_divorce_doc(doc_type, precise_source=False):
+                    dropped_wrong_doctype += 1
                     continue
-                if (kw in doc_type_upper) if " " in kw else re.search(
-                    rf"\b{re.escape(kw)}\b", doc_type_upper
-                ):
-                    matched = True
-                    break
-            if not matched:
-                dropped_wrong_doctype += 1
-                continue
+            else:
+                matched = False
+                for kw in self._keywords:
+                    if not kw:
+                        continue
+                    if (kw in doc_type_upper) if " " in kw else re.search(
+                        rf"\b{re.escape(kw)}\b", doc_type_upper
+                    ):
+                        matched = True
+                        break
+                if not matched:
+                    dropped_wrong_doctype += 1
+                    continue
 
             # APN# — 16 digits is the Whatcom canonical format
             apn_match = re.search(r"APN#\s*(\d{10,})", text)
@@ -321,6 +335,13 @@ class WhatcomWAScraper(BridgeScraper):
                 # the decedent and strip "Estate of" captions. No-op when the
                 # grantor is already the decedent.
                 record.party_name, record.heirs = orient_probate_party(
+                    grantor, grantee, doc_type
+                )
+            elif self._record_type == "divorce":
+                # Both spouses are valid leads; only correct the case where the
+                # recorder indexed a court/state/agency as grantor. No-op when the
+                # grantor is already a person.
+                record.party_name, record.heirs = orient_divorce_party(
                     grantor, grantee, doc_type
                 )
             else:

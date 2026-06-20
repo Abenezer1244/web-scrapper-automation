@@ -47,12 +47,16 @@ real person when the recorder indexed a court/state/agency as the party (reuses
 `probate.is_person_like_party`); no-op when the party is already a person.
 **Caught & fixed (review):** code-reviewer agent → added `CORPORATE` to entity tokens (so
 "CORPORATE DISSOLUTION" is NON_MATCH even under precise_source), Pierce now gates on stored
-`_record_type` not the mutable display label, Whatcom dead keyword list annotated. Codex review ×2
+`_record_type` not the mutable display label, Whatcom dead keyword list annotated. Codex review ×3
 → **P2** "LEGAL SEPARATION AGREEMENT" wrongly MATCHed (broad positive ran before the agreement
 negative) — reordered to check agreement/settlement negatives FIRST; **P2** EagleWeb `DISS`/`DISOL`
 abbreviations were silently NON_MATCH-dropped — now AMBIGUOUS (kept for precise, fail-closed for
-generic). Downgraded one reviewer "medium" (Laserfiche orients all types in `_extract_page` by
-design; divorce is consistent and `_filter_by_type` always re-gates).
+generic); **P2 (introduced by the first fix, caught on re-review)** Skagit fed `doc_type+comment` into
+the classifier, so the new agreement-negative could drop a valid `Decree-divorce` row whose comment
+mentioned a settlement — changed Skagit to classify on `r.doc_type` ALONE (server already constrains to
+Decree-divorce). Live-reverified after: Skagit still 2 records. Downgraded one reviewer "medium"
+(Laserfiche orients all types in `_extract_page` by design; divorce is consistent and `_filter_by_type`
+always re-gates). No P1/Critical/High in any pass.
 **Live-verified (new code vs real portals, prod env via `railway run`):** Pierce 6 divorce records
 (person↔person spouses e.g. RIJWANI MANOJ | RIJHWANI LISA, all doc_type=DIVORCE, 5/6 enriched),
 Skagit 2 records (DECREE-DIVORCE) — **0 corporate-dissolution leaks** either county.

@@ -1,38 +1,84 @@
-# Probate follow-ups — deferred-item sweep (2026-06-19)
+# Death-certificate audit + consolidation + multi-tenant hardening (2026-06-19)
 
-Worktree `../bridgeleads-probate-followups`, branch `chore/probate-followups` off `origin/main` (`bcb0a1b`, incl. PR #72).
-Workflow: orchestrate investigation agents (parallel, cross-verified) → implement 1-by-1 → Codex review EACH → ruff + test → live-verify where possible. Probate-only. Any Codex P1/High = NO-GO.
+Worktree `../bridgeleads-deathcert-harden`, branch `chore/deathcert-multitenant-harden` off `origin/main` (`242eee3`, post PR #74).
+Scope: **death-certificate party orientation + reliability + multi-tenancy across ALL probate connectors**. Never touch pre_foreclosure/tax/divorce/code_violation orientation logic.
 
-## Items
-- [ ] **A. False-empty reliability** — captcha/timeout/error page parsed as valid-empty (returns [] = looks healthy). Scrapers: pierce, king, whatcom, eagleweb(spokane), laserfiche. Distinguish "genuine 0 results" (known empty-marker present) from "page never loaded / blocked" → raise/FAIL.
-- [ ] **B. doc-type word-boundary** — bare "WILL"/"HEIR" substring overmatch (clark, acclaim, whatcom, laserfiche). king/eagleweb already use _doc_type_matches word-boundary.
-- [ ] **C. skagit parcel fallback** — `\b(\d{6,})\b` grabs tax-acct/permit # as parcel_id; prefer no-parcel over wrong-parcel.
-- [ ] **D. pierce doc_type=none** — capture per-row doc_type (live showed all 64 blank).
-- [ ] **E. acclaim perf** — single-date-mode too slow (chelan/douglas timeout >420s); chunk/speed up.
-- [ ] **F. cosmetic** — eagleweb `_LEGAL_STOP[4:]` brittle slice; base_scraper `_LANDMARK_PREFIX_RE` unanchored.
-- [ ] **G. whatcom live-verify** — confirm the #72 party fix live (portal was too slow; smaller window).
-- [ ] **H. columbia/pacific stale health** — down/degraded flags but work live; flip or leave to canary (ops).
+## User decisions (this session)
+- **Fix scope = Consolidate + harden ALL** — migrate EagleWeb (11 counties), Skagit, Pierce onto the single shared `src/scrapers/probate.py` `orient_probate_party`. ONE death-cert rule everywhere. Phased ≤5 files, Codex review per phase.
+- **Live test = `railway run --service api`** — real prod env (DB/REDIS/SECRET + CAPTCHA for King). Non-persisting harness `scripts/live_verify_probate_hardened.py`. Hits real portals.
 
-## Review — ALL ITEMS DONE
+## The problem (why this campaign)
+On a Certificate of Death the recorder indexes the ISSUING AUTHORITY (WA Dept of Health / "STATE OF WASHINGTON") as grantor, decedent in grantee. A scraper copying `party_name = grantor` surfaces the agency as the lead. PR #69/#72 fixed this but left **THREE divergent implementations**:
+1. `probate.py::orient_probate_party` — shared, 3 guards (clark, king, whatcom, acclaim, laserfiche/cowlitz, tyler/okanogan)
+2. `eagleweb.py::_strip_filing_agency` — own copy (benton clallam grant island jefferson kitsap lewis pacific spokane thurston whitman)
+3. `skagit_recording.py::_is_filing_state_party` — own copy (skagit)
+4. Pierce — NO orientation (deferred)
+5. idocmarket/columbia, landmarkweb, ava_fidlar — decedent=grantor (verify no-op)
 
-Orchestrated 5 investigation agents → cross-verified specs → implemented 1-by-1 → Codex reviewed in 2 passes (caught 2 real issues, both fixed) → full 21-county live regression.
+Divergence = drift risk: a fix to one rule never reaches the other counties. Consolidation makes the shared module the single source of truth.
 
-### Shipped
-- **A. False-empty reliability** — laserfiche/eagleweb/whatcom/pierce/king now RAISE RuntimeError (→ worker `_fail_job`) when a captcha/block/error page would otherwise return a false-empty []; a GENUINE empty (portal's real no-results marker present / valid JSON envelope recordsTotal:0) still returns []. Each scraper's known marker is the discriminator; RuntimeError re-raised past every inner chunk/extract catch-all. **Live-proven:** spokane + pacific now fail loud on the Cloudflare/welcome page (were silent-0); all 17 healthy counties unaffected.
-- **B. doc-type word-boundary** — clark + whatcom single-token keywords ("WILL") now match on `\b` boundary (matches WILL / LAST WILL AND TESTAMENT / WILL/TESTAMENT / (WILL); excludes GOODWILL). acclaim/laserfiche already correct (no change). *(Codex caught that the agent's `set(split())` would drop punctuation-adjacent labels → switched to `\b` regex = eagleweb idiom.)*
-- **C. skagit parcel** — dropped the `\d{6,}` fallback that stored a wrong tax-acct/permit # as parcel_id (require_parcel_id drops the no-parcel row cleanly).
-- **D. pierce doc_type** — stamp `record.doc_type = self.DOC_TYPE_LABEL` (was None on all rows). **Live-confirmed: doc_types=['PROBATE'].**
-- **E. acclaim perf** — removed a redundant 3s Kendo wait + trimmed a post-nav settle 3s→1s (~30% faster). Single-date mode fits the prod 30-min cap; chelan/douglas only timed out the 280s TEST.
-- **F1. eagleweb** — replaced the `_LEGAL_STOP[4:]` slice footgun with an explicit `_STOP_BODY` constant (behavior = the intended one).
-- **F2. base_scraper** — anchored `_LANDMARK_PREFIX_RE` to a token boundary.
-- **G. whatcom live-verify** — finally returned live (31 records, red_flags=0): the #72 party fix holds.
+## Connector inventory (21 probate connectors)
+- **EagleWeb (11):** benton clallam grant island jefferson kitsap lewis pacific spokane thurston whitman
+- **Acclaim (2):** chelan douglas  -- already shared
+- **manual:** king OK / pierce DEFERRED / clark OK / whatcom OK
+- **1-offs:** idocmarket=columbia / laserfiche=cowlitz OK / tyler=okanogan OK / skagit OWN
 
-### Codex (verify-each-other)
-- Batch review → P2: `set(split())` drops `WILL/TESTAMENT`-style labels → fixed to `\b` regex.
-- Item-A challenge → king false-failure (captcha-error then valid-empty retry wrongly raised) → fixed (retry envelope authoritative) → re-review FIXED, PASS.
+## Phases
+- [x] **P0 Setup** — worktree, plan, env check (railway 4.33.0 + .env present)
+- [ ] **P1 Codex approach consult** — pressure-test the consolidation plan (esp. EagleWeb behavior parity + Pierce [R]/[E] structure) BEFORE coding
+- [ ] **P2 Orchestrated code audit (Agent tool, cross-verified)** — fan out by group; each finding verified by a 2nd agent from a different angle; multi-tenant-infra unit; base_scraper unit; completeness critic. Output: severity-ranked findings.
+- [ ] **P3 Live test (railway run, all 21)** — non-persisting hardened harness, 45d window; assert party orientation (no agency/court/state/org), doc-type sanity, count. Capture death-cert specific samples.
+- [ ] **P4 Reconcile** audit x live -> confirmed fix list (severity-tagged)
+- [ ] **P5 Fix (phased <=5 files, Codex review per phase, ruff clean)**
+  - A. Verify/extend shared `orient_probate_party` covers EagleWeb + Skagit behavior (Dept of Licensing/Revenue, filing-state variants). Add unit tests on real samples from both.
+  - B. Migrate EagleWeb -> shared module (parity-tested, keep behavior >= current)
+  - C. Migrate Skagit -> shared module
+  - D. Wire Pierce ([R]/[E] structure-aware)
+  - E. Secondary hardening: false-empty reliability (captcha/timeout -> RAISE not silent-0), doc-type word-boundary, idocmarket/landmarkweb/ava_fidlar verify-no-op
+- [ ] **P6 Re-verify** — re-live-test changed counties + 2-user tenant-isolation check (test DB)
+- [ ] **P7 Ship** — Codex final review, commit, push, PR, CI green, BUILD_JOURNAL + memory
 
-### Deferred / noted
-- spokane stays Cloudflare-blocked (now fails loud, no evasion). pacific intermittently lands on its welcome page → now fails loud (watchdog re-queues) instead of silent-0 — intended.
-- chelan/douglas (acclaim) still slow for large windows; the in-place re-fill refactor deferred (only matters for >45-day manual backfills; scheduled 1-day jobs are fast).
-- pierce per-row ARMS sub-type (vs connector label) needs a live column probe — separate follow-up.
-- columbia/pacific connector health flags still stale (canary self-corrects).
+## Codex approach verdict (P1, consult complete)
+Consolidation onto ONE module = RIGHT for agency/death-cert orientation; keep portal parsing / role semantics / doc-type matching / placeholder cleanup per-template. Refinements folded in:
+- **Pierce = gate on LIVE [R]/[E] death-cert samples.** Don't assume [R]=grantor/[E]=grantee. Order bug: `_map_row` drops on required-party (:510) BEFORE doc_type set (:525). → wire ONLY if live data confirms agency-in-[R]; else keep deferred (documented).
+- **Regex: comma-form person fast-path BEFORE org rejection.** "LAST, FIRST" = person-like unless strong-org syntax present. Agency tokens PHRASE-based (FUNERAL HOME, BUREAU OF, DEPT OF REVENUE/LICENSING, VITAL RECORDS/STATISTICS, CORONER, MEDICAL EXAMINER) — NEVER standalone. Prevents false-DROP of real decedents.
+- **Per-segment agency drop** valid only after `normalize_party_text` → " / " (eagleweb+skagit yes; Pierce no).
+- **Gate shared call to per-row PROBATE-typed records** (helper now collapses ESTATE OF; global call would mutate non-probate rows before the type filter). landmark/ava: use MATCHED row type.
+- **idocmarket: leave untouched** (no-op; would needlessly change ESTATE-OF output).
+- **TOD guard runs strip_estate_caption** (probate.py:187) — document+test as intended.
+- **Op risk:** `raw_html_hash` from `record.to_dict()` → changing party/heirs re-hashes already-scraped rows (dedup/output churn). Expected; note to user.
+- **De-risk: fixture tests BEFORE migration.**
+
+## Cross-verification doctrine ("verify each other's jobs")
+Every audit finding produced by agent A is re-checked by agent B from a DIFFERENT angle (live data vs static read, or a second independent reader). Codex reviews every fix phase. Consensus -> higher severity; Codex wins on silent-doc disagreement. Any Critical/High from either reviewer = NO-GO.
+
+## Findings — P2 audit (6 agents, cross-corroborated)
+
+### Death-cert orientation (the consolidation target)
+- **[High] eagleweb.py:95-114,786-805 — lone-state residue not stripped.** "WA DEPT OF HEALTH"→"WA" survives as party (no `_LONE_STATE_RE`). Shared module fixes. + **[Med] unguarded grantee promotion** (agency/court/company grantee can become lead; no `is_person_like_party`). + must pass `desc` (record.doc_type is None at that point) so TOD guard + Clallam abbrev codes resolve. ESTATE-caption collapse = NEW behavior across 11 counties → live-verify.
+- **[Med] skagit_recording.py:383-387 — partial-concat agency not stripped.** Only swaps when WHOLE value is filing-state; "PERRIN, RONALD, STATE OF WA, DEPT OF HEALTH" keeps agency embedded. Shared `strip_filing_agency` fixes. + unguarded grantee promotion (Low). Shared `_BARE_STATE_RE` confirmed to absorb Skagit's inverted "WASH. STATE OF" order (no regression).
+- **[Med] pierce_wa_probate.py:545-547,553-556 — no orientation; agency CAN land in [R].** ARMS doesn't make filing-agency-party impossible. Wire `orient_probate_party([R]=grantor, [E]=grantee, doc_type)` on PROBATE label after doc_type set; whole-cell junk fallback routes through it; drop on (None,None). Reliability already RAISES on block (good).
+- **[Med] landmarkweb.py:482-486 (King generic path) & ava_fidlar.py:330-334 (Yakima) — raw grantor→party, no orientation.** Wire defensively. **[Low] idocmarket.py:446-455 (columbia) — decedent IS grantor → no-op**, optional defensive wiring.
+
+### Shared module gaps to ADD before migrating (so consolidation is a strict superset)
+- **[High] probate.py:71-78 `_NON_PERSON_RE`** missing FUNERAL HOME/MORTUARY/CREMATORY, CORONER/MEDICAL EXAMINER, DEPT OF LICENSING/REVENUE, DSHS/SOCIAL & HEALTH, BUREAU — a funeral-home grantee would be promoted to lead.
+- **[Med] probate.py:90-120 `strip_filing_agency`** strips only DEPT OF HEALTH; add VITAL RECORDS/STATISTICS + LICENSING/REVENUE tails; and DROP per-`/`-segment agency parts in stacked multi-grantor ("DOE, JOHN / STATE OF WASHINGTON"→"DOE, JOHN").
+- **[Low] `_LONE_STATE_RE`** WA-only (out-of-state 2-letter residue); **[Low] `is_person_like_party`** could reject a legit surname containing BANK/STATE token (accept conservative or refine comma-form).
+
+### Reliability — false-empty (block/captcha/timeout → [] scored as healthy 0)
+- PASS (RAISE on block): king, eagleweb, pierce, whatcom, laserfiche, idocmarket.
+- **[Med] clark_wa.py:104-107,323-325** — block→[] healthy 0; chunk except swallows. Assert results-UI marker + RAISE; narrow except.
+- **[Med] acclaimweb.py:774-780** — grid-never-rendered→[] healthy 0. RAISE when empty & no "no results" marker.
+- **[Low] skagit_recording.py:254-258** — missing "returned N" counter treated as 0. **[Low] tyler_selfservice.py:177-211** — structural-failure return [] paths → RAISE.
+
+### MULTI-TENANT: CLEAN ✅ (independently re-confirmed, NOT just inherited)
+- Every death-cert lead read/write user_id-scoped (belt); RLS+FORCE on all 10 touched tables (suspenders); **SkipTraceCache key IS per-tenant** (hashes user_id — memory's "global" note is STALE/refuted, skip_trace.py:124); enrichment-reuse fenced to same-uid; billing CAS to job.user_id; export keyed `exports/{user_id}/...`. Per-job scraper instances, fresh Playwright context, no class-level mutable state, no mutable-default args, no page.on cross-job handlers. Concurrency-safe. One Low: system_sync_session used for single-row-by-PK/job_id writes only (no tenant fan-out) — acceptable.
+
+### Live (P3) — in progress
+- Smoke: clallam OK count=1 red_flags=0 doc_type=Death. Full 21-county run pending.
+
+## Findings — P3 live
+_(filled when railway run completes)_
+
+## Review
+_(filled at end)_

@@ -32,13 +32,19 @@ import re
 
 # --- Filing-agency / issuing-authority detection -------------------------------
 
-# WA State Department of Health — the Certificate-of-Death issuing authority, not
-# the decedent. The optional "STATE OF WA[SHINGTON]," qualifier covers the shape
-# where the recorder concatenates the full agency name. No legitimate grantor is
-# "...DEPARTMENT OF HEALTH", so the phrase is stripped wherever it appears.
-_HEALTH_DEPT_RE = re.compile(
+# The Certificate-of-Death / probate issuing authority a recorder may index as the
+# grantor instead of the decedent: WA Dept of Health (the dominant live shape) plus
+# the vital-records-adjacent agencies seen across counties — Vital Records/Statistics,
+# Licensing, Revenue, Social & Health Services. The optional "STATE OF WA[SHINGTON],"
+# qualifier covers the concatenated shape. Every agency suffix is PHRASE-anchored
+# ("(DEPT|BUREAU|OFFICE) OF <agency>") so no bare ambiguous token (REVENUE, LICENSING,
+# BUREAU) can strip a real surname — the phrase is removed wherever it appears.
+_AGENCY_DEPT_RE = re.compile(
     r"(?:(?:STATE\s+OF\s+)?WA(?:SH(?:INGTON)?)?\.?\s*,?\s*)?"
-    r"(?:DEPARTMENT|DEPT)\.?\s+OF\s+HEALTH\b",
+    r"(?:DEPARTMENT|DEPT|BUREAU|OFFICE)\.?\s+OF\s+"
+    r"(?:HEALTH|LICENSING|REVENUE"
+    r"|VITAL\s+(?:RECORDS|STATISTICS)"
+    r"|SOCIAL\s+(?:AND|&)\s+HEALTH(?:\s+SERVICES)?)\b",
     re.IGNORECASE,
 )
 
@@ -72,6 +78,12 @@ _NON_PERSON_RE = re.compile(
     r"\bDEPARTMENT\b|\bDEPT\b|\bHEALTH\b|\bAUDITOR\b|\bRECORDER\b|\bASSESSOR\b"
     r"|\b(?:SUPERIOR|DISTRICT)\s+COURT\b|\bCOUNTY\s+CLERK\b|\bCLERK\s+OF\b"
     r"|\bVITAL\s+(?:RECORDS|STATISTICS)\b"
+    # Death-care / vital-records institutions that index as the death-cert party.
+    # Phrase-anchored (FUNERAL HOME, MEDICAL EXAMINER) or unambiguous occupational
+    # words (MORTUARY, CREMATORY, CORONER) that are not used as personal surnames.
+    r"|\bFUNERAL\s+(?:HOME|SERVICE|CHAPEL)\b|\bMORTUARY\b|\bCREMAT(?:ORY|ORIUM|ION)\b"
+    r"|\bCORONER\b|\bMEDICAL\s+EXAMINER\b|\bDSHS\b"
+    r"|\b(?:DEPARTMENT|DEPT|BUREAU|OFFICE)\s+OF\s+(?:LICENSING|REVENUE|VITAL|SOCIAL)\b"
     r"|\b(?:LLC|L\.?L\.?C|INC|CORP|CORPORATION|COMPANY|BANK|ESCROW|ASSOCIATION)\b"
     r"|\bTITLE\s+CO\b",
     re.IGNORECASE,
@@ -100,7 +112,7 @@ def strip_filing_agency(name: str | None) -> str:
     """
     if not name:
         return name or ""
-    cleaned = _HEALTH_DEPT_RE.sub("", name)
+    cleaned = _AGENCY_DEPT_RE.sub("", name)
     cleaned = re.sub(r"(?:\s*/\s*){2,}", " / ", cleaned)   # collapse left-behind separators
     cleaned = re.sub(r"(?:,\s*){2,}", ", ", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
@@ -114,6 +126,15 @@ def strip_filing_agency(name: str | None) -> str:
     parts = [p for p in cleaned.split(" / ") if p.strip()]
     if parts and all(_BARE_STATE_RE.match(p) for p in parts):
         return ""
+    # A stacked grantor where SOME (not all) " / "-segments are a bare filing state
+    # ("DOE, JOHN / STATE OF WASHINGTON"): drop only the exact bare-state/lone-state
+    # segments, keep the decedent. Limited to exact filing-state segments (Codex) so
+    # a genuine co-decedent ("SMITH JOHN / SMITH JANE") is never dropped.
+    if len(parts) > 1:
+        kept = [p for p in parts if not _BARE_STATE_RE.match(p) and not _LONE_STATE_RE.match(p)]
+        if kept and len(kept) != len(parts):
+            cleaned = " / ".join(kept)
+            parts = kept
     tokens = set(re.findall(r"[A-Z]+", cleaned.upper()))
     if tokens and tokens <= _STATUS_ONLY_TOKENS:
         return ""

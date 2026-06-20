@@ -188,3 +188,70 @@ def test_orient_no_doc_type_still_safe_on_agency():
     # doc_type omitted: agency swap still fires (agency grantor is never a TOD owner).
     party, _ = orient_probate_party("STATE OF WASHINGTON", "NELSON MYRNA JOAN")
     assert party == "NELSON MYRNA JOAN"
+
+
+# --- Consolidation extension (2026-06-19): EagleWeb/Skagit absorb ---------------
+# Phrase-based agency variants the per-template copies (eagleweb._strip_filing_agency,
+# skagit._is_filing_state_party) and audit surfaced. Codex-reviewed: tokens are
+# PHRASE-anchored, never bare, so a real "LAST, FIRST" decedent is not false-dropped.
+
+def test_strip_vital_records_tail():
+    # Out-of-state cert: decedent + a Bureau/Office of Vital Records/Statistics tail.
+    assert strip_filing_agency("DOE, JANE A, BUREAU OF VITAL STATISTICS") == "DOE, JANE A"
+    assert strip_filing_agency("DEPARTMENT OF VITAL RECORDS") == ""
+
+
+def test_strip_dept_of_licensing_and_revenue():
+    assert strip_filing_agency("STATE OF WASHINGTON DEPARTMENT OF LICENSING") == ""
+    assert strip_filing_agency("SMITH, ROBERT, DEPT OF REVENUE") == "SMITH, ROBERT"
+
+
+def test_strip_per_segment_bare_state_dropped_keeps_person():
+    # Stacked grantor where one " / "-segment is a bare filing state (Codex-endorsed
+    # exact-segment drop). The person segment survives.
+    assert strip_filing_agency("DOE, JOHN / STATE OF WASHINGTON") == "DOE, JOHN"
+    assert strip_filing_agency("WASHINGTON STATE / NELSON MYRNA JOAN") == "NELSON MYRNA JOAN"
+
+
+def test_strip_per_segment_agency_with_health_dept_dropped():
+    # Health-dept phrase stripped in-place reduces a segment to a bare state, then
+    # the bare-state segment is dropped, leaving the decedent.
+    assert strip_filing_agency(
+        "DOE, JOHN / WASHINGTON STATE DEPARTMENT OF HEALTH"
+    ) == "DOE, JOHN"
+
+
+def test_strip_per_segment_keeps_genuine_co_decedents():
+    # No agency/state segment present -> every co-party kept (no spurious drop).
+    assert strip_filing_agency("SMITH JOHN / SMITH JANE") == "SMITH JOHN / SMITH JANE"
+
+
+def test_is_person_like_rejects_funeral_and_examiner():
+    # A death-cert grantee that is an institution must NOT be promoted to the lead.
+    assert not is_person_like_party("EVERGREEN FUNERAL HOME")
+    assert not is_person_like_party("SMITH MORTUARY")
+    assert not is_person_like_party("PIERCE COUNTY MEDICAL EXAMINER")
+    assert not is_person_like_party("KING COUNTY CORONER")
+    assert not is_person_like_party("DEPARTMENT OF LICENSING")
+
+
+def test_is_person_like_still_accepts_real_decedent():
+    assert is_person_like_party("CONKLIN DENNIS WILLIAM")
+    assert is_person_like_party("PERRIN, RONALD RALPH")
+
+
+def test_orient_agency_grantor_funeral_home_grantee_dropped():
+    # Both sides institutional -> guard #2 returns (None, None); no agency lead leaks.
+    party, heirs = orient_probate_party(
+        "WASHINGTON STATE DEPARTMENT OF HEALTH", "EVERGREEN FUNERAL HOME", "Death Certificate"
+    )
+    assert party is None
+    assert heirs is None
+
+
+def test_orient_per_segment_agency_co_party_stripped():
+    party, heirs = orient_probate_party(
+        "DOE, JOHN / STATE OF WASHINGTON", "DOE, JANE", "DEATH CERTIFICATE"
+    )
+    assert party == "DOE, JOHN"
+    assert heirs == "DOE, JANE"

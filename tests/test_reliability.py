@@ -89,6 +89,31 @@ def test_classify_ambiguous_on_empty_text():
     assert classify_results_page(row_count=0, page_text=None, empty_markers=_MARKERS) == "ambiguous"
 
 
+# Codex P1: a numeric zero-count marker must NOT match a non-zero count via substring.
+@pytest.mark.parametrize("text", [
+    "Showing 10 records",
+    "100 records returned",
+    "Search returned 10 records",
+    "20 records",
+])
+def test_classify_zero_marker_not_substring_of_nonzero_count(text):
+    # 0-records parse drift on a populated page -> ambiguous (caller raises), NOT empty.
+    assert classify_results_page(
+        row_count=0, page_text=text, empty_markers=("0 records", "0 record")
+    ) == "ambiguous"
+
+
+@pytest.mark.parametrize("text", [
+    "0 records found",
+    "Search returned 0 records",
+    "There are 0 records for this range.",
+])
+def test_classify_genuine_zero_count_is_empty(text):
+    assert classify_results_page(
+        row_count=0, page_text=text, empty_markers=("0 records", "0 record")
+    ) == "empty"
+
+
 # ── check_extraction_canary ───────────────────────────────────────────────────
 
 def test_canary_raises_on_header_vs_zero():

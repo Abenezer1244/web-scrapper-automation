@@ -125,8 +125,16 @@ def classify_results_page(
     if detect_block(page_text):
         return "block"
     low = (page_text or "").lower()
-    if any(m.lower() in low for m in empty_markers):
-        return "empty"
+    # WORD-BOUNDARY match, not substring (Codex P1): a numeric marker like
+    # "0 records" is a substring of "10 records" / "100 records". A plain
+    # substring check would misread a parse-drift page that says "10 records"
+    # (but yielded 0 rows) as a genuine empty and complete the job with 0 leads —
+    # the exact false-empty this module exists to prevent. \b before the leading
+    # "0" does not match between the "1" and "0" of "10", so "10 records" no
+    # longer counts as empty.
+    for m in empty_markers:
+        if re.search(r"\b" + re.escape(m.lower()) + r"\b", low):
+            return "empty"
     return "ambiguous"
 
 

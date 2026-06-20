@@ -29,7 +29,17 @@ from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
 )
+from src.scrapers.reliability import (
+    ScraperBlockedError,
+    ScraperExecutionError,
+    check_extraction_canary,
+    classify_results_page,
+    detect_block,
+)
 from src.utils.logger import setup_logger
+
+# Substrings an AVA Fidlar results page renders for a genuine zero-result window.
+_EMPTY_MARKERS = ("no results", "results: 0", "no records", "no documents")
 
 _logger = setup_logger("scraper.template.ava_fidlar")
 
@@ -159,7 +169,10 @@ class AvaFidlarScraper(BridgeScraper):
             _logger.info("Dates filled: %s to %s", date_from, date_to)
 
         except Exception as exc:
-            _logger.warning("Could not fill dates: %s", str(exc)[:120])
+            raise ScraperExecutionError(
+                self.county, "AVA Fidlar", "date-fill failed (search never ran)",
+                date_from=date_from, date_to=date_to, context=str(exc)[:120],
+            ) from exc
 
     async def _submit_search(self) -> None:
         """Click the Search button and wait for results."""
@@ -173,13 +186,20 @@ class AvaFidlarScraper(BridgeScraper):
 
             body = await self.page.inner_text("body")
             results_match = re.search(r"Results:\s*(\d+)", body)
+            # Store the portal's reported total for the extraction canary.
+            self._last_results_total = int(results_match.group(1)) if results_match else None
             if results_match:
                 _logger.info("Results count: %s", results_match.group(1))
             elif "no results" in body.lower():
                 _logger.info("No results for this date range")
 
+        except ScraperExecutionError:
+            raise
         except Exception as exc:
-            _logger.warning("Could not submit search: %s", str(exc)[:120])
+            raise ScraperExecutionError(
+                self.county, "AVA Fidlar", "search submit failed",
+                context=str(exc)[:120],
+            ) from exc
 
     async def _extract_results(self) -> list[ScrapedRecord]:
         """Extract records from the AVA results page.
@@ -267,7 +287,29 @@ class AvaFidlarScraper(BridgeScraper):
             """)
 
             if not raw:
-                _logger.info("No records extracted from results page")
+                # Canary: portal reported N>0 but we extracted 0 -> parse drift.
+                check_extraction_canary(
+                    expected_total=getattr(self, "_last_results_total", None),
+                    raw_extracted=0, county=self.county, platform="AVA Fidlar",
+                )
+                body = await self.page.inner_text("body")
+                verdict = classify_results_page(
+                    row_count=0, page_text=body, empty_markers=_EMPTY_MARKERS
+                )
+                if verdict == "block":
+                    raise ScraperBlockedError(
+                        self.county, "AVA Fidlar",
+                        f"block wall on results page ({detect_block(body)})",
+                        context=body[:120],
+                    )
+                if verdict == "ambiguous":
+                    raise ScraperExecutionError(
+                        self.county, "AVA Fidlar",
+                        "no result rows and no empty-marker (search may have "
+                        "silently failed / been blocked)",
+                        context=body[:120],
+                    )
+                _logger.info("No results for this chunk (genuine empty window)")
                 return []
 
             for item in raw:
@@ -365,8 +407,13 @@ class AvaFidlarScraper(BridgeScraper):
 
             _logger.info("Extracted %d records from results", len(records))
 
+        except ScraperExecutionError:
+            raise  # block / ambiguous / canary — propagate, never silent []
         except Exception as exc:
-            _logger.warning("Error extracting results: %s", str(exc)[:80])
+            raise ScraperExecutionError(
+                self.county, "AVA Fidlar", "results extraction failed",
+                context=str(exc)[:120],
+            ) from exc
 
         return records
 

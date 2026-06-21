@@ -19,6 +19,71 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-21 — King tax owner-name REACH fix (PR #80 follow-up, PR #81)
+**Scope:** Started as the PR #80 live UI verification (does the scraped King tax_delinquent lead
+show a real owner name?). The merged PR #80 swap logic is correct and live-proven (6/6 parcels
+returned real owners), but the live job showed **all placeholders** — discovered the swap never
+reaches existing leads.
+**Caught (the reach gap):** the owner-swap lives inside the King enrichment pass, which is gated
+to rows MISSING a mailing address (`enrich.py` `needs = [... not res.mailing_address]`).
+`_reuse_enrichment_for_duplicates` runs first and COALESCEs `mailing_address` from the pre-fix
+delivered duplicate onto the new row → it now HAS a mailing address → excluded from the King pass
+→ placeholder survives. King tax is a point-in-time snapshot (every parcel already exists, so
+fresh jobs are ~100% duplicates), so this hit essentially all ~28k leads. `_MAX_KING_PARCELS=300`
+also caps per-job reach. NB: `_reuse_enrichment_for_duplicates` does NOT copy `party_name` (only
+address/skip-trace fields), so it doesn't re-introduce placeholders — confirmed.
+**Built / Shipped (branch `fix/king-tax-owner-reach`, PR #81, commit `853e7d9`):**
+- `king_county_assessor.py`: `batch_extract_king_owners()` — HTTP-only owner lookup (reuses
+  `_extract_owner_name` + SSRF-guarded `safe_get`, NO Playwright) + `_fetch_king_owner()` with
+  bounded retry (`Settings.MAX_RETRIES`, linear backoff) that distinguishes a genuine 200-miss
+  from a transient 429/5xx (so a transient failure isn't recorded as "no owner"). Numeric-parcel
+  guard.
+- `enrich.py` King block: NEW owner-only forward pass AFTER the missing-mailing pass — resolves
+  owners for tax_delinquent rows that already have a mailing address but still a placeholder
+  (the dedup-reuse case). 500-cap with non-silent overflow log; commit-honest logging.
+- `scripts/backfill_king_tax_owner_names.py`: idempotent, re-runnable backfill of existing leads.
+  Scope = placeholder shape AND `jobs→scraper_configs` join (king/WA/tax_delinquent) +
+  `parcel_id NOT NULL`. Global parcel→owner cache; bulk UPDATE w/ still-placeholder WHERE guard;
+  `--dry-run/--batch/--limit` (limit applied to the SELECT).
+**Tried / Decided:** First considered just widening the `needs` filter — Codex (consult) flagged
+it wasteful (full `batch_enrich_king_county` always runs the slow Playwright mailing fetch even
+for rows that only need an owner). Chose the structural split instead: keep missing-mailing path
+as-is, add a separate owner-ONLY HTTP path. Decided the backfill is the PRIMARY fix for the 28k
+historical rows; the forward gate just stops NEW placeholder rows from being permanently skipped.
+**Caught & fixed (Codex review ×3):** (1) owner lookup swallowed failures + cached transient
+errors as permanent misses → bounded retry + error/miss distinction; (2) owner-only block logged
+success even when the commit failed → decide committed-vs-failed on the owner commit alone, then
+publish; (3) the post-commit `_publish_log(db=db)` itself commits, so an unguarded success log
+could mislabel persistence OR crash and skip the downstream skip-trace enqueue → wrapped it
+(log+rollback+continue); (4) `--limit` applied after a full batch → applied to the SELECT;
+dry-run "updated" → "would-attempt". Final Codex pass: CLEAN, no P1.
+**Verification:** ruff clean; 27 targeted tests pass. Live owner extraction returned real owners
+for the exact placeholder parcels (AL-SABAH JABER / CWIAK KATHLEEN L / RIAN SKYE GOOD LEWIN).
+Prod dry-run: scope join finds **213,326** in-scope result rows (many rows per parcel across
+jobs/tenants); `--limit 20` scanned exactly 20, 19 would-attempt, 1 correctly rejected as
+not-exact-placeholder, ROLLBACK. Security §14 non-negotiables PASS.
+**Shipped (cont.):** PR #81 MERGED (`5043d4c`), PR #82 tooling MERGED (`a2c44aa`,
+e2e finally-guard + `diag_king_tax_owner_results.py`). Backfill started in prod and repaired
+~1,017 leads, then **King eRealProperty rate-limited us** — the first 2000-row batch fired ~10
+req/s (fixed 0.1s spacing) and got ~45% transient failures, then King began **302-redirecting**
+every request (IP throttle; single probes for parcels that resolved minutes earlier now 302).
+Stopped the run (no evasion — project rule). PR #83 MERGED (`b49c736`): added a `delay` param to
+`batch_extract_king_owners` (default 0.1 UNCHANGED → forward path untouched) + backfill `--delay`
+(default 0.6s, ~1.6 req/s) so the bulk run stays polite/under the limit.
+**Failed / Blocked:** the bulk backfill is BLOCKED on King's rate-limit cooldown (302s persist as
+of session end). Could not validate the 0.6s rate live because we were already throttled.
+**Pending / Handoff:** 👤 After King's throttle cools down (give it a few hours), re-run
+`python scripts/backfill_king_tax_owner_names.py` (now defaults to `--delay 0.6`; consider
+`--delay 1.0` and watch the first batch's "failed after" WARNING — if still high, King is still
+throttling, wait longer). Idempotent: resumes from the ~1,017 already-repaired (they skip). ~28k
+distinct parcel lookups → multi-hour. NOTE: a cloud `/schedule` run can't do this — it needs
+local prod `DATABASE_URL`; run it from a local session.
+**Facts learned:** King tax leads are dedup-heavy (point-in-time snapshot) so per-job enrichment
+reach is structurally limited — historical repair needs a backfill, not just a forward fix.
+eRealProperty Dashboard carries the owner in the same page already fetched for the address (zero
+extra HTTP). `_publish_log(db=db)` commits — folding it into a commit try/except mislabels
+persistence. Local prod-DB access works for backfill dry-runs (`SyncSessionLocal`).
+
 ## 2026-06-20 — Scraper fail-loud reliability (PR2): silent-empty -> raise across 5 templates
 **Scope:** The deferred PR2 from the divorce campaign. 5 template scrapers (landmarkweb,
 ava_fidlar, tyler_selfservice, acclaimweb, skagit_recording) SWALLOWED captcha/block/setup/

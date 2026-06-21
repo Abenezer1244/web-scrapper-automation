@@ -179,15 +179,28 @@ def run(batch: int, limit: int | None, dry_run: bool, delay: float) -> None:
     )
 
 
+def _polite_delay(raw: str) -> float:
+    """argparse type for --delay: a finite second value with a polite 0.1s floor.
+
+    Rejects negative / nan / inf (which would disable throttling or hang
+    asyncio.sleep), and floors at 0.1s so a bulk run can't hammer eRealProperty.
+    """
+    import math
+    v = float(raw)
+    if not math.isfinite(v) or v < 0:
+        raise argparse.ArgumentTypeError(f"--delay must be a finite, non-negative number (got {raw!r})")
+    return max(v, 0.1)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", type=int, default=2000, help="rows scanned per DB page")
     ap.add_argument("--limit", type=int, default=None, help="stop after scanning N rows (for a bounded test run)")
     ap.add_argument("--dry-run", action="store_true", help="resolve owners + count would-be updates, write nothing")
     ap.add_argument(
-        "--delay", type=float, default=0.6,
-        help="seconds between eRealProperty requests (default 0.6 — eRealProperty "
-        "rate-limits a faster sustained stream over a bulk run)",
+        "--delay", type=_polite_delay, default=0.6,
+        help="seconds between eRealProperty requests (default 0.6, min 0.1 — "
+        "eRealProperty rate-limits a faster sustained stream over a bulk run)",
     )
     args = ap.parse_args()
     run(args.batch, args.limit, args.dry_run, args.delay)

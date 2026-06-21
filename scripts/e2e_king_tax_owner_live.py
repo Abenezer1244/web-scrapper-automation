@@ -148,11 +148,19 @@ async def drive_ui(jid: str):
 
 
 def classify(rows: list[dict]) -> dict:
-    placeholders, owners = [], []
+    # A real owner is a NON-EMPTY string that isn't the placeholder. None / "" /
+    # missing party_name is tracked as `blank`, never counted as a real owner, so
+    # an all-empty result can't yield a false PASS.
+    placeholders, owners, blank = [], [], []
     for x in rows:
         pn = x.get("party_name")
-        (placeholders if is_tax_placeholder_party(pn) else owners).append(pn)
-    return {"total": len(rows), "owners": owners, "placeholders": placeholders}
+        if is_tax_placeholder_party(pn):
+            placeholders.append(pn)
+        elif isinstance(pn, str) and pn.strip():
+            owners.append(pn)
+        else:
+            blank.append(pn)
+    return {"total": len(rows), "owners": owners, "placeholders": placeholders, "blank": blank}
 
 
 async def main():
@@ -177,6 +185,7 @@ async def main():
         print(f"  records returned : {c['total']}")
         print(f"  REAL owner names : {len(c['owners'])}")
         print(f"  still placeholder: {len(c['placeholders'])}  (capped/missed enrichment)")
+        print(f"  blank/invalid    : {len(c['blank'])}")
         print("\n  sample REAL owner names (proof the fix is live):")
         for nm in c["owners"][:12]:
             print(f"    • {nm}")
@@ -185,16 +194,19 @@ async def main():
             for nm in c["placeholders"][:3]:
                 print(f"    • {nm}")
 
+        # Print the VERDICT (from the API-side classify) BEFORE any browser action,
+        # so a closed/broken browser can never suppress it.
+        verdict = "PASS — real owner names present" if c["owners"] else "FAIL — no real owner names"
+        print(f"\nVERDICT: {verdict}")
+
+        # Proof-only screenshot — guarded so a closed window can't mask the verdict.
         try:
             await page.goto(f"{APP}/jobs/{jid}/results", wait_until="domcontentloaded", timeout=45000)
             await page.wait_for_timeout(3500)
-        except Exception:
-            pass
-        await page.screenshot(path="king_tax_owner_03_results.png", full_page=True)
-        print("\n  screenshots: king_tax_owner_01_dashboard.png / _02_job.png / _03_results.png")
-
-        verdict = "PASS — real owner names present" if c["owners"] else "FAIL — no real owner names"
-        print(f"\nVERDICT: {verdict}")
+            await page.screenshot(path="king_tax_owner_03_results.png", full_page=True)
+            print("\n  screenshots: king_tax_owner_01_dashboard.png / _02_job.png / _03_results.png")
+        except Exception as e:
+            print(f"\n  (results screenshot skipped: {e})")
     finally:
         # The visible browser is only for proof — never let a closed window
         # (manual close / Ctrl-C) mask the API-side verdict above.

@@ -454,17 +454,20 @@ class IDocMarketScraper(BridgeScraper):
                     if heir_tokens and not heir_tokens <= _HEIR_NOISE_TOKENS:
                         record.heirs = grantee
 
-            # Doc number + first legal stored in legal_description (no dedicated
-            # instrument field on ScrapedRecord; mirrors the acclaimweb template).
-            parts = []
+            # Doc number is a document id, NOT a legal description — keep it in
+            # enrichment_data; legal_description holds the REAL legal only (None when
+            # the index has none; never DOC# as a stand-in).
             docnum = (item.get("docnum") or "").strip().lstrip("#").strip()
-            if docnum:
-                parts.append(f"DOC#{docnum}")
+            record.enrichment_data = {"instrument_number": docnum, "source": "idocmarket"}
             legal = (item.get("legal") or "").strip()
             if legal:
-                parts.append(legal)
-            if parts:
-                record.legal_description = " | ".join(parts)
+                record.legal_description = legal
+
+            # Stable, unique per-row fingerprint (includes instrument_number via
+            # enrichment_data in to_dict); never the bare doc#, which would collapse
+            # multi-party rows under one document. Keeps tasks.py source_fingerprint
+            # stable + distinct without depending on legal_description.
+            record.raw_html_hash = self.make_hash(record.to_dict())
 
             if record.party_name or record.date_recorded:
                 records.append(record)

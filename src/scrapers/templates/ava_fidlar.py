@@ -323,8 +323,11 @@ class AvaFidlarScraper(BridgeScraper):
                 record = ScrapedRecord()
 
                 inst = (item.get("instrument") or "").strip()
-                if inst:
-                    record.legal_description = inst
+                # Instrument # is a document id, not a legal description — keep it in
+                # enrichment_data and use it as the stable per-record fingerprint
+                # (no raw_html_hash on this template, so source_fingerprint would
+                # otherwise depend on the legal_description we're changing).
+                record.enrichment_data = {"instrument_number": inst, "source": "ava_fidlar"}
 
                 date_str = (item.get("date_recorded") or "").strip()
                 if date_str:
@@ -399,15 +402,21 @@ class AvaFidlarScraper(BridgeScraper):
                     if grantee:
                         record.heirs = grantee
 
+                # Real property legal description only (None when none in the index;
+                # never the instrument # as a stand-in).
                 legal = (item.get("legal") or "").strip()
-                if legal and record.legal_description:
-                    record.legal_description = f"{record.legal_description} | {legal}"
-                elif legal:
+                if legal:
                     record.legal_description = legal
 
                 parcel = (item.get("parcel") or "").strip()
                 if parcel:
                     record.parcel_id = parcel
+
+                # Stable, unique per-row fingerprint (includes instrument_number via
+                # enrichment_data in to_dict); never the bare instrument, which would
+                # collapse multi-party/parcel rows under one recording. Keeps tasks.py
+                # source_fingerprint stable + distinct without legal_description.
+                record.raw_html_hash = self.make_hash(record.to_dict())
 
                 if record.party_name or record.date_recorded:
                     records.append(record)

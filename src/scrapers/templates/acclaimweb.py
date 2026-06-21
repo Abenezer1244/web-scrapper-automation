@@ -853,10 +853,13 @@ class AcclaimWebScraper(BridgeScraper):
 
                 record = ScrapedRecord()
 
-                # Instrument number
+                # Instrument number — a document id, NOT a legal description. Keep
+                # it in enrichment_data, and use it as the stable per-record
+                # fingerprint: this template sets no raw_html_hash, so without this
+                # the within-job idempotency key (tasks.py source_fingerprint) would
+                # depend on the legal_description we're now changing.
                 inst = item.get("instrument", "").strip()
-                if inst:
-                    record.legal_description = inst  # store instrument # in legal_description
+                record.enrichment_data = {"instrument_number": inst, "source": "acclaimweb"}
 
                 # Date recorded — normalize various date formats
                 date_str = item.get("date_recorded", "").strip()
@@ -937,17 +940,22 @@ class AcclaimWebScraper(BridgeScraper):
                     if grantee:
                         record.heirs = grantee
 
-                # Legal description
+                # Legal description — real legal only (None when the index has none;
+                # never the instrument # as a stand-in).
                 legal = item.get("legal", "").strip()
-                if legal and record.legal_description:
-                    record.legal_description = f"{record.legal_description} | {legal}"
-                elif legal:
+                if legal:
                     record.legal_description = legal
 
                 # Parcel ID
                 parcel = item.get("parcel", "").strip()
                 if parcel:
                     record.parcel_id = parcel
+
+                # Stable, unique per-row fingerprint (includes instrument_number via
+                # enrichment_data in to_dict); never the bare instrument, which would
+                # collapse multi-party/parcel rows under one recording. Keeps tasks.py
+                # source_fingerprint stable + distinct without legal_description.
+                record.raw_html_hash = self.make_hash(record.to_dict())
 
                 if record.party_name or record.date_recorded:
                     records.append(record)

@@ -1070,10 +1070,12 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                 record = ScrapedRecord()
                 record.parcel_id = parcel_id
 
-                # Recording number
+                # Recording number is a document id, NOT a legal description (it is
+                # kept in enrichment_data below). legal_description holds the REAL
+                # legal text parsed above (None when the index has none).
                 inst = (item.get("instrument") or "").strip()
-                if inst:
-                    record.legal_description = inst
+                if legal:
+                    record.legal_description = legal
 
                 # Recording date
                 date_str = (item.get("date_recorded") or "").strip()
@@ -1098,6 +1100,11 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                     "legal_description": legal,
                     "doc_type": doc_type,
                 }
+
+                # Stable, unique per-row fingerprint (includes recording_number via
+                # enrichment_data in to_dict); keeps tasks.py source_fingerprint
+                # stable + distinct without depending on legal_description.
+                record.raw_html_hash = self.make_hash(record.to_dict())
 
                 if record.party_name or record.date_recorded:
                     records.append(record)

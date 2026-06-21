@@ -250,7 +250,9 @@ def parse_tax_list(
         rec.party_name = BridgeScraper.clean(entry["owner"])
         rec.property_address = entry["situs"]
         rec.mailing_address = entry["mailing"]
-        rec.legal_description = parcel
+        # No legal description in the Snohomish tax bulk file — leave None rather
+        # than standing in the parcel number (parcel_id is its own field above).
+        rec.legal_description = None
         rec.date_recorded = f"01/01/{bill_year}"
         # doc_type left None (like King tax rows): the daily-cache records filter
         # for tax_delinquent matches `doc_type IS NULL` OR keyword ILIKE patterns

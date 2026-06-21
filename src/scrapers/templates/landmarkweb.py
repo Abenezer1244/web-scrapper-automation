@@ -505,8 +505,12 @@ class LandmarkWebScraper(BridgeScraper):
                 record = ScrapedRecord()
 
                 inst = (item.get("instrument") or "").strip()
-                if inst:
-                    record.legal_description = inst
+                # Recorder instrument # is a document identifier, NOT a property
+                # legal description — store it in enrichment_data, and use it as the
+                # stable per-record fingerprint so changing a display field
+                # (legal_description) can't shift the within-job idempotency key
+                # (tasks.py source_fingerprint) for this no-raw_html_hash template.
+                record.enrichment_data = {"instrument_number": inst, "source": "landmarkweb"}
 
                 date_str = (item.get("date_recorded") or "").strip()
                 if date_str:
@@ -579,15 +583,22 @@ class LandmarkWebScraper(BridgeScraper):
                 if grantee:
                     record.heirs = grantee
 
+                # Real property legal description only (None when the index has
+                # none — never the instrument # as a stand-in).
                 legal = (item.get("legal") or "").strip()
-                if legal and record.legal_description:
-                    record.legal_description = f"{record.legal_description} | {legal}"
-                elif legal:
+                if legal:
                     record.legal_description = legal
 
                 parcel = (item.get("parcel") or "").strip()
                 if parcel:
                     record.parcel_id = parcel
+
+                # Stable, unique per-row fingerprint (includes instrument_number via
+                # enrichment_data in to_dict). This template sets no raw_html_hash
+                # otherwise, so without it tasks.py source_fingerprint would depend
+                # on legal_description. A full composite — never the bare instrument,
+                # which would collapse multi-party/parcel rows under one recording.
+                record.raw_html_hash = self.make_hash(record.to_dict())
 
                 if record.party_name or record.date_recorded:
                     records.append(record)

@@ -213,6 +213,9 @@ class LaserficheWebLinkScraper(BridgeScraper):
                 seen_afns.add(key)
                 h = self.make_hash(r.to_dict())
                 seen_hashes.add(h)
+                # Full-record hash (includes enrichment_data.instrument_number via
+                # to_dict) — a unique per-row fingerprint; never the bare AFN, which
+                # would collapse multi-party/parcel rows under one recording.
                 r.raw_html_hash = h
                 all_records.append(r)
                 new += 1
@@ -426,11 +429,15 @@ class LaserficheWebLinkScraper(BridgeScraper):
                     "instrument_number": afn,
                     "source": "laserfiche_weblink",
                 }
-                # Legal description from volume/page
+                # Volume/Page is the RECORD location (recorder's book/page), NOT a
+                # property legal description — keep it for reference in
+                # enrichment_data, but never present it as legal_description. This
+                # source carries no real legal description, so legal_description
+                # stays None rather than a misleading stand-in.
                 vol = item.get("volume", "").strip()
                 pg = item.get("page_num", "").strip()
                 if vol or pg:
-                    record.legal_description = f"Vol {vol} Pg {pg}".strip()
+                    record.enrichment_data["volume_page"] = f"Vol {vol} Pg {pg}".strip()
 
                 if record.party_name or record.date_recorded:
                     records.append(record)

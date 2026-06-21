@@ -53,7 +53,15 @@ _HAS_HEADER = re.compile(r"NOTICE\s+OF\s+TRUSTEE['’ʼ�]S\s+SALE")
 # ('Smith-\nJones') is joined by rule 1 — accepted because it only ever causes a
 # MISSED match (the lead side, from the county recorder, is unaffected), never a
 # WRONG one (the matcher's safe-side rule).
-_DEHYPHEN_WORD = re.compile(r"([A-Za-z])-\n[ \t]*([A-Za-z])")
+#
+# The Snohomish Tribune layout inserts a SPACE before the soft-wrap hyphen
+# ('MI -\nCHAEL', 'PROP -\nERTY', 'SOLEIMANZA -\nDEH'), so rule 1 allows optional
+# whitespace between the letter and the hyphen. Without it the hyphen fell through
+# to rule 2 (digit-ID protection) and survived as a stray 'MI -CHAEL' in the name —
+# corrupting the homeowner's name for skip-trace. Both sides must still be LETTERS,
+# so a digit identifier wrap ('WA-25-\n1012820') is untouched here and handled by
+# rule 2.
+_DEHYPHEN_WORD = re.compile(r"([A-Za-z])[ \t]*-\n[ \t]*([A-Za-z])")
 _DEHYPHEN_ID = re.compile(r"-\n[ \t]*(?=\w)")
 
 

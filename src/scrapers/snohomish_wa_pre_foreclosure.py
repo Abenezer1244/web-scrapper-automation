@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 
 from src.config import settings
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.preforeclosure import strip_vesting_clause
 from src.scrapers.sources import nts_pdf
 from src.scrapers.sources import nts_tacoma_index as nts
 from src.utils.logger import setup_logger
@@ -72,7 +73,10 @@ def _discover_pdf_url() -> str | None:
 def _record_from_notice(parsed: dict) -> ScrapedRecord:
     """Build a pre_foreclosure ScrapedRecord from a parsed, valid NTS notice."""
     rec = ScrapedRecord()
-    rec.party_name = BridgeScraper.clean(parsed.get("grantor"))
+    # The NTS grantor line is the homeowner followed by legal vesting boilerplate
+    # ("... A MARRIED MAN, AS HIS SOLE AND SEPARATE PROPERTY") — strip it so the lead
+    # shows just the owner name(s). De-hyphenation already happened in normalize_pdf_text.
+    rec.party_name = BridgeScraper.clean(strip_vesting_clause(parsed.get("grantor")))
     rec.property_address = parsed.get("property_address")
     rec.parcel_id = parsed.get("parcel")
     rec.doc_type = "Notice of Trustee Sale"

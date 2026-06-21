@@ -19,6 +19,7 @@ from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.scrapers.divorce import orient_divorce_party
 from src.scrapers.enrichment.county_gis import batch_enrich_parcels_gis
+from src.scrapers.preforeclosure import orient_pre_foreclosure_party
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.pierce_wa_probate")
@@ -37,6 +38,18 @@ _LEGAL_KEYWORDS = re.compile(
     r"\b(LT|LOT|BLK|BLOCK|SEC|TWNSHP|RNG|ADDN|PLAT|DIV|SHORT PLAT)\b",
     re.IGNORECASE,
 )
+
+# ARMS appends "(+)" to a party when more parties share that role than the results
+# row shows (e.g. "QUALITY LOAN SERVICE CORP(+)"). It is a UI marker, never part of
+# a real name, so strip it before any person/company classification or display.
+_ARMS_PLUS = re.compile(r"\s*\(\+\)\s*")
+
+
+def _strip_arms_plus(value: str | None) -> str | None:
+    """Remove the ARMS "(+)" more-parties marker; return None unchanged."""
+    if not value:
+        return value
+    return _ARMS_PLUS.sub(" ", value).strip() or None
 
 
 class PierceWAARMSScraper(BridgeScraper):
@@ -505,6 +518,23 @@ class PierceWAARMSScraper(BridgeScraper):
                     record.party_name, record.heirs = orient_divorce_party(
                         record.party_name, record.heirs, self.DOC_TYPE_LABEL
                     )
+                elif self._record_type == "pre_foreclosure":
+                    # ARMS indexes a Notice of Trustee Sale with the TRUSTEE /
+                    # beneficiary as the [R] party and the borrower as [E] (or the
+                    # reverse) — so the raw [R] is frequently a company
+                    # ("TRUSTEE CORPS", "QUALITY LOAN SERVICE CORP"), not the
+                    # distressed homeowner. Strip the ARMS "(+)" more-parties marker
+                    # first (it is never part of a name), then orient so the PERSON
+                    # becomes party_name and the company context moves to heirs.
+                    # orient returns None for a bank-vs-trustee row with no person
+                    # (borrower hidden behind "(+)") → drop it: it is not a lead.
+                    party = _strip_arms_plus(record.party_name)
+                    heirs = _strip_arms_plus(record.heirs)
+                    oriented = orient_pre_foreclosure_party(party, heirs)
+                    if oriented is None:
+                        record.party_name = None  # dropped by the party-name guard below
+                    else:
+                        record.party_name, record.heirs = oriented
                 break
 
         # Legal description

@@ -1,83 +1,69 @@
-# Divorce record-type hardening — PR1 (classifier + party guard)
+# King tax-delinquent — replace party_name placeholder with real owner name
 
-Branch: `fix/divorce-classifier-harden`
+Branch: `fix/king-tax-owner-name`
 
-## Goal
-Make the `divorce` record type legit/solid/hardened across every county scraper,
-mirroring the proven `probate.py` / `preforeclosure.py` shared-module campaigns.
-Multi-tenant isolation is already enforced at the worker (user_id stamp + RLS) and
-export (`sanitize_for_csv`) — audit confirmed clean, no change needed there.
+## Problem
+King tax-delinquent leads ship to users with `party_name =
+"Tax Delinquent — $X owed (Parcel …)"` — a placeholder, never a person.
+- King's Socrata source (`dsv3-ct3e`) has no owner column, so the placeholder is
+  correct AT SCRAPE TIME (`king_wa_tax_delinquent.py:248`).
+- The docstring (`king_wa_tax_delinquent.py:29`) claims the name is "enriched
+  downstream" — but the enrichment (`enrich.py:354`, `king_county_assessor.py`)
+  only extracts `property_address` + `mailing_address`. It NEVER reads the owner
+  name and NEVER writes `party_name`. So the placeholder is permanent.
+- Snohomish is unaffected — its bulk file already carries the owner (field 7).
 
-## Decisions (user-approved)
-- **Ambiguous bare `DISSOLUTION`** -> fail closed (precision) unless the connector has a
-  precise server-side divorce filter (Pierce checkbox 87, Skagit `Decree-divorce`).
-- **Legal separation** -> included as a divorce-adjacent lead (`DECREE OF LEGAL SEPARATION`,
-  `LEGAL SEPARATION`). Bare `SEPARATION` / `SEPARATION AGREEMENT` excluded.
-- **Scope** -> split. PR1 = divorce-only (this file). PR2 = cross-cutting fail-loud
-  reliability hardening (landmarkweb/ava/acclaim/tyler/skagit) — deferred.
+## Verified facts
+- eRealProperty Dashboard page (already fetched in Phase 1 HTTP for the property
+  address) DOES carry the owner, markup `<td ...>Name</td><td>VALUE`.
+- `Name</td>` appears EXACTLY ONCE on the page → safe, unique regex.
+- Example: parcel `1954600115` → `TOMLINSON WILLIAM+CHERYL L` (King joins
+  co-owners with `+`; entity owners e.g. LLC/bank are valid tax-delinquent leads).
 
-## Codex consult (pre-code) — key points folded in
-- Divorce is largely a Superior Court record, not a recorder record (King is already an
-  inactive placeholder for this). Need a connector **truth table**, not blanket "make it work".
-- Classifier must be 3-state (MATCH / NON_MATCH / AMBIGUOUS), not a boolean.
-- Keep the party guard narrow (`is_non_person_party` only); do NOT deepen the `heirs`
-  naming lie (heirs = secondary party for non-probate).
-- Tests = deterministic fixtures first; live probe is final proof only.
+## Plan (small, gated, no extra requests)
+- [x] 1. `king_county_assessor.py` Phase 1: extract owner via pure helper
+      `_extract_owner_name(html)` (tolerant regex + `html.unescape` + tag-strip +
+      junk rejection). `owner_name` added to result dict; row created when prop OR
+      tax_url OR owner.
+- [x] 2. `enrich.py` King block: overwrite party_name under DUAL gate —
+      `config.record_type == "tax_delinquent"` (belt) AND
+      `is_tax_placeholder_party()` (suspenders). Probate/death-cert King rows on
+      the same path untouched; capped/missed parcels keep the labeled placeholder.
+- [x] 3. Shared `tax_placeholder_party` / `is_tax_placeholder_party` predicate
+      co-located with the producer in `king_wa_tax_delinquent.py` (anchored regex,
+      can't drift). Tests: `_extract_owner_name` (10 cases) + predicate roundtrip
+      (real markup, no mocks, no network).
+- [x] 4. ruff clean; 24 targeted tests pass; verified on 3 LIVE King parcels.
 
-## Tasks
-- [ ] 1. `src/scrapers/divorce.py` — `classify_divorce_doc`, `is_divorce_doc`, `orient_divorce_party`
-- [ ] 2. `tests/test_divorce.py` — positives / corporate negatives / ambiguous / separation / orient
-- [ ] 3. Wire into scrapers, gated to `record_type=='divorce'` (Phase A templates, Phase B manual)
-      - Phase A (<=5): eagleweb, tyler_selfservice, laserfiche_weblink, landmarkweb, ava_fidlar
-      - Phase B (<=5): acclaimweb, skagit_recording (remove SEPARATION), whatcom_wa, pierce_wa_probate
-- [ ] 4. Connector divorce truth table (confirm active set from live DB)
-- [ ] 5. Verify — ruff + pytest + Codex review + code-reviewer agent; reconcile findings
-- [ ] 6. Live-test active divorce connectors on BridgeLeads UI/API (before vs after counts)
-
-## Connector divorce truth table (confirmed from live DB `county_connectors`)
-
-Authoritative query: `railway run python scripts/diag_divorce_connectors.py`.
-Only **2** connectors are ACTIVE with `divorce` in `record_types`:
-
-| County | State | Status | Handler | precise_source | Live result |
-|---|---|---|---|---|---|
-| Pierce | WA | **ACTIVE — recorder-precise** | PierceWAARMSScraper, ARMS checkbox 87 = DECREE OF DISSOLUTION | True | 6 records, 0 corporate leaks, person↔person spouses, 5/6 enriched |
-| Skagit | WA | **ACTIVE — recorder-precise** | SkagitRecordingScraper, server doc-type "Decree-divorce" | True | 2 records, 0 corporate leaks |
-| King | WA | INACTIVE placeholder (court-only) | KingWaDivorceScraper | n/a | divorce is at Superior Court (dja.kingcounty.gov), not the recorder (mig 009) |
-| Clark | WA | Not advertised (portal does not record divorce) | clark_wa.py code exists, unused | n/a | divorce not in record_types |
-| Whatcom + all EagleWeb/Tyler/Acclaim/Ava/Laserfiche/iDocMarket counties | WA | Not advertised (court-only) | template/manual divorce code now correct-but-dormant | False (if ever enabled) | divorce not in record_types |
-
-**Conclusion:** "divorce works on all counties" = it is only *available* on Pierce + Skagit
-(the only WA recorders that record divorce decrees and advertise them). Everywhere else divorce
-is a Superior Court record, structurally unavailable via recorder scraping — not a bug. The
-shared classifier makes every dormant template path correct + fail-closed if divorce is ever enabled.
+## Codex collaboration
+- [x] Consulted Codex on the plan BEFORE coding — tightened regex, gate, junk check.
+- [x] Codex reviewed the diff x3: round 1 found 2 Medium + 2 Low (all adopted),
+      round 2 found 1 residual edge (predicate not exact-shape), round 3 CLEAN.
+      No Critical/High at any point.
 
 ## Review
+**What changed (3 source files + 2 test files):**
+- `src/scrapers/enrichment/king_county_assessor.py` — new `_extract_owner_name()`;
+  Phase 1 now reads the owner off the SAME eRealProperty page already fetched for
+  the address (zero extra HTTP). Returns `owner_name` in the result dict.
+- `src/scrapers/king_wa_tax_delinquent.py` — placeholder now built by
+  `tax_placeholder_party()`; new `is_tax_placeholder_party()` anchored-regex matcher
+  (requires the `$amount` clause, so a real name starting with the prefix is never
+  clobbered; dash-encoding-agnostic).
+- `src/workers/tasks_helpers/enrich.py` — King enrichment block swaps the
+  placeholder for the real owner under the dual gate.
+- `tests/test_king_assessor_owner.py` (new, 10) + `tests/test_king_tax_delinquent.py`
+  (+3 predicate tests).
 
-**Built:** `src/scrapers/divorce.py` (3-state classifier `classify_divorce_doc`,
-`is_divorce_doc`, narrow `orient_divorce_party`) + 44 tests. Wired gated to
-`record_type=='divorce'` into 9 scrapers (eagleweb, tyler_selfservice, laserfiche_weblink,
-landmarkweb, ava_fidlar, acclaimweb, skagit_recording, whatcom_wa, pierce_wa_probate).
-Removed Skagit's over-broad `SEPARATION` keyword. Zero behavior change to other record types
-(every change is gated; non-divorce branches byte-for-byte unchanged).
+**Proof:** live extraction verified —
+`1954600115 → TOMLINSON WILLIAM+CHERYL L`, `4023500466 → AMES WILLIAM E & CHAMBERS G`,
+`7941110080 → KALLEM SWARAJ & JYOTHI`.
 
-**Verification:** ruff clean; 44 unit tests pass; all changed modules import-smoke clean;
-`code-reviewer` agent (4 findings, all addressed/justified); Codex review ×2 (2 P2s fixed:
-LEGAL SEPARATION AGREEMENT ordering + EagleWeb DISS/DISOL abbreviations). **Live-verified** the
-new code against the real Pierce + Skagit portals via `scripts/diag_divorce_live.py`
-(prod env): 6 + 2 records, **0 corporate-dissolution leaks**, correct person orientation.
+**Behavior:** King tax-delinquent leads now show the real owner once enriched.
+Misses/capped parcels keep the labeled placeholder (never blank). Snohomish
+unchanged. Multi-tenant isolation unchanged (edit stays within the job's pid_map;
+Codex confirmed no tenant-leak path).
 
-**Decisions honored:** fail-closed on ambiguous bare DISSOLUTION for generic connectors;
-legal separation included (but not bare SEPARATION / SEPARATION AGREEMENT); split scope.
-
-**Deferred (PR2, separate blast radius):** cross-cutting fail-loud reliability hardening of the
-silent-empty template paths (landmarkweb/ava/acclaim/tyler/skagit swallow extraction errors →
-job DONE with 0). Affects probate/pre_foreclosure too, so it ships separately.
-
-**Follow-up note:** Whatcom requires an APN/parcel on every row; divorce decrees often lack one,
-so if Whatcom divorce is ever activated it may need the probate-style parcel exemption (eagleweb
-already exempts probate+divorce). Not relevant today (Whatcom divorce inactive).
-
-**Prod-UI caveat:** these changes are on branch `fix/divorce-classifier-harden`, NOT deployed.
-The live verification ran the new code directly against the portals. Verifying via the prod
-app.bridgeleads.io wizard requires merging PR1 and a Railway deploy first.
+## Out of scope
+- Snohomish (already correct). Skip-trace (separate opt-in). The 300-parcel
+  enrichment cap (pre-existing; capped rows keep the labeled placeholder).

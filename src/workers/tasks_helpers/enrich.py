@@ -376,14 +376,29 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 _logger.info("Capping King County mailing lookup to %d/%d parcels", _MAX_KING_PARCELS, len(pids))
                 pids = pids[:_MAX_KING_PARCELS]
             enriched = asyncio.run(asyncio.wait_for(batch_enrich_king_county(pids), timeout=240))
+            # King tax-delinquent rows ship with a placeholder party_name because
+            # the Socrata source has no owner column. The eRealProperty lookup
+            # above now also yields the owner name; swap it in here. Dual gate:
+            # job-level record_type (belt) + the exact placeholder shape
+            # (suspenders, so probate/death-cert King rows sharing this enrichment
+            # path are never touched).
+            from src.scrapers.king_wa_tax_delinquent import is_tax_placeholder_party
+            is_tax_delinquent = config.record_type == "tax_delinquent"
             for pid, data in enriched.items():
                 prop = data.get("property_address")
                 mail = data.get("mailing_address")
+                owner = data.get("owner_name")
                 for res in pid_map.get(pid, []):
                     if prop and not res.property_address:
                         res.property_address = prop
                     if mail:
                         res.mailing_address = mail
+                    if (
+                        is_tax_delinquent
+                        and owner
+                        and is_tax_placeholder_party(res.party_name)
+                    ):
+                        res.party_name = owner
             try:
                 db.commit()
             except Exception as exc:

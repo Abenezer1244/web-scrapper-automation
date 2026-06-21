@@ -14,6 +14,7 @@ for the subset that need mailing addresses.
 """
 
 import asyncio
+import html
 import re
 
 from src.api.middleware.security import add_scrape_domain
@@ -28,6 +29,33 @@ _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.
 
 add_scrape_domain("blue.kingcounty.com")
 add_scrape_domain("payment.kingcounty.gov")
+
+# eRealProperty Dashboard labels the owner/taxpayer cell `<td>Name</td><td>VALUE`
+# exactly once per page. The label cell is plain text (no nested tags on the live
+# page); the VALUE cell is captured lazily to its closing </td> and tag-stripped,
+# so markup inside the value is tolerated. Case- and whitespace-insensitive.
+# King joins co-owners with "+"; entity owners (LLC/bank/estate) are valid
+# tax-delinquent leads, so no person-vs-agency orientation is applied.
+_OWNER_RE = re.compile(
+    r"<td[^>]*>\s*Name\s*</td>\s*<td[^>]*>(.*?)</td>", re.IGNORECASE | re.DOTALL
+)
+# Reject placeholders the assessor sometimes serves so we never overwrite a
+# labeled lead with junk. Compared after stripping non-alphanumerics, so "N/A",
+# "N.A.", and "N / A" all collapse to "NA".
+_OWNER_JUNK = frozenset({"NA", "NONE", "NULL", "UNKNOWN"})
+
+
+def _extract_owner_name(page_html: str) -> str | None:
+    """Owner/taxpayer name from an eRealProperty Dashboard page, or None."""
+    m = _OWNER_RE.search(page_html)
+    if not m:
+        return None
+    # Strip any nested tags, then decode HTML entities (&nbsp;, &amp;, &#160;…).
+    text = re.sub(r"<[^>]+>", " ", m.group(1))
+    name = BridgeScraper.clean(html.unescape(text))
+    if not name or re.sub(r"[^A-Z0-9]", "", name.upper()) in _OWNER_JUNK:
+        return None
+    return name
 
 
 async def batch_enrich_king_county(
@@ -70,8 +98,16 @@ async def batch_enrich_king_county(
             )
             tax_url = m2.group(1).replace("&amp;", "&") if m2 else None
 
-            if prop or tax_url:
-                results[pid] = {"property_address": prop, "mailing_address": None}
+            # Owner/taxpayer name — same page, no extra request. Fills the
+            # placeholder party_name on King tax-delinquent leads downstream.
+            owner = _extract_owner_name(r.text)
+
+            if prop or tax_url or owner:
+                results[pid] = {
+                    "property_address": prop,
+                    "mailing_address": None,
+                    "owner_name": owner,
+                }
                 if tax_url:
                     tax_urls[pid] = tax_url
 

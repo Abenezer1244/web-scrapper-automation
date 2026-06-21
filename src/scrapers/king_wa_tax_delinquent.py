@@ -30,6 +30,7 @@ HTTP GET. Owner name + address are enriched downstream via GIS + eRealProperty.
 """
 
 import random
+import re
 import time
 from collections import defaultdict
 from datetime import UTC, datetime
@@ -51,6 +52,33 @@ _HEADERS = {"User-Agent": "Mozilla/5.0 BridgeLeads/1.0"}
 _SOURCE = "king_county_delinquent_taxes"
 
 add_scrape_domain("data.kingcounty.gov")
+
+# The Socrata source has no owner column, so a tax row ships with this synthetic
+# party_name until enrichment (eRealProperty) swaps in the real owner. The
+# producer (`tax_placeholder_party`) and the matcher (`is_tax_placeholder_party`,
+# used by the enrichment overwrite gate) MUST stay in sync — keep them together.
+_TAX_PLACEHOLDER_PREFIX = "Tax Delinquent"
+# Exact shape of `tax_placeholder_party` output: prefix, a "$<amount>" clause, and
+# a closing "(Parcel <id>)". Requiring the dollar amount stops a real owner name
+# that merely starts with the prefix from being matched. The separator is `.*?`
+# (not the literal em dash) so source/DB encoding of the dash can never break it.
+_TAX_PLACEHOLDER_RE = re.compile(
+    r"^Tax Delinquent\b.*?\$[\d,]+ owed \(Parcel [^)]+\)$"
+)
+
+
+def tax_placeholder_party(amount: Decimal, parcel: str) -> str:
+    """Synthetic party_name for a King tax-delinquent row (no owner at scrape)."""
+    return f"{_TAX_PLACEHOLDER_PREFIX} — ${amount:,.0f} owed (Parcel {parcel})"
+
+
+def is_tax_placeholder_party(party_name: str | None) -> bool:
+    """True iff party_name is the placeholder `tax_placeholder_party` produces.
+
+    Anchored full-shape match (prefix + "$amount" + "(Parcel id)"), so a real
+    owner name that happens to start with "Tax Delinquent" is never clobbered.
+    """
+    return bool(_TAX_PLACEHOLDER_RE.match(party_name or ""))
 
 # Charge types whose (billed - paid) is real principal owed on the tax bill.
 # Allowlist (fail-closed for money): anything NOT here and NOT abatement is an
@@ -245,7 +273,7 @@ def aggregate_delinquent_rows(
 
         rec = ScrapedRecord()
         rec.parcel_id = parcel
-        rec.party_name = f"Tax Delinquent — ${amount:,.0f} owed (Parcel {parcel})"
+        rec.party_name = tax_placeholder_party(amount, parcel)
         rec.legal_description = parcel
         rec.date_recorded = f"01/01/{bill_year}"
         rec.enrichment_data = {

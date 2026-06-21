@@ -24,6 +24,10 @@ from datetime import datetime, timedelta
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
+from src.scrapers.preforeclosure import (
+    is_cancellation_or_admin,
+    orient_pre_foreclosure_party,
+)
 from src.scrapers.probate import orient_probate_party
 from src.utils.logger import setup_logger
 
@@ -344,6 +348,27 @@ class WhatcomWAScraper(BridgeScraper):
                 record.party_name, record.heirs = orient_divorce_party(
                     grantor, grantee, doc_type
                 )
+            elif self._record_type == "pre_foreclosure":
+                # An NTS is indexed with the TRUSTEE/beneficiary company in the
+                # grantor slot as often as the borrower, so take the PERSON side as
+                # party_name (homeowner) and move the company context to heirs.
+                # Direction-agnostic — orient checks both sides (matches King/Pierce).
+                # Drop cancelled/cured/admin docs first (the keyword search can match
+                # Reconveyance / Discontinuance / Rescission), then drop rows with no
+                # person on either side (bank-vs-trustee = not a homeowner lead). Use
+                # `continue` — the append guard below keeps any row with a date, so
+                # leaving party_name None would NOT drop it (Codex review).
+                if is_cancellation_or_admin(doc_type):
+                    continue
+                oriented = orient_pre_foreclosure_party(grantor, grantee)
+                if oriented is None:
+                    _logger.info(
+                        "pre_foreclosure: no person party — doc=%r parcel=%r "
+                        "grantor=%r grantee=%r (dropped)",
+                        doc_type, parcel_id, (grantor or "")[:40], (grantee or "")[:40],
+                    )
+                    continue
+                record.party_name, record.heirs = oriented
             else:
                 record.party_name = grantor
                 record.heirs = grantee

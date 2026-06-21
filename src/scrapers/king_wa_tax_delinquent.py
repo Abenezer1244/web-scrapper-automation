@@ -291,7 +291,14 @@ def aggregate_delinquent_rows(
 
         rec = ScrapedRecord()
         rec.parcel_id = parcel
-        rec.party_name = tax_placeholder_party(amount, parcel)
+        # No owner name in the Socrata tax feed (and King redacts it from bulk
+        # downloads). Leave party_name BLANK — honest "not provided" — rather than a
+        # synthetic placeholder that reads as a fake name next to the real
+        # property/tax data. The real owner name comes from skip-trace (address →
+        # name + phone + email) or per-parcel eRealProperty enrichment. The
+        # tax_placeholder_party/is_tax_placeholder_party helpers are kept ONLY so the
+        # one-time clear-backfill can still recognize and null out historical rows.
+        rec.party_name = None
         rec.legal_description = parcel
         rec.date_recorded = f"01/01/{bill_year}"
         rec.enrichment_data = {

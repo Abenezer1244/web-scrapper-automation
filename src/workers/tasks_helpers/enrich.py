@@ -396,7 +396,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                     if (
                         is_tax_delinquent
                         and owner
-                        and is_tax_placeholder_party(res.party_name)
+                        and (not res.party_name or is_tax_placeholder_party(res.party_name))
                     ):
                         res.party_name = owner
             try:
@@ -425,7 +425,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 res for res in all_results
                 if res.parcel_id and len(res.parcel_id.strip()) >= 6
                 and res.mailing_address
-                and is_tax_placeholder_party(res.party_name)
+                and (not res.party_name or is_tax_placeholder_party(res.party_name))
             ]
             if owner_needs:
                 _publish_log(
@@ -454,10 +454,10 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 swapped = 0
                 for pid, owner in owners.items():
                     for res in o_pid_map.get(pid, []):
-                        # Re-assert the placeholder guard at write time (the row
-                        # could only have been a placeholder to enter owner_needs,
-                        # but keep the swap self-defending and idempotent).
-                        if is_tax_placeholder_party(res.party_name):
+                        # Fill only a BLANK or placeholder party_name (never clobber
+                        # a real owner). King tax rows now ship blank, so accept
+                        # None as well as the legacy placeholder.
+                        if not res.party_name or is_tax_placeholder_party(res.party_name):
                             res.party_name = owner
                             swapped += 1
                 # Decide persisted-vs-failed on the OWNER commit alone, THEN publish.

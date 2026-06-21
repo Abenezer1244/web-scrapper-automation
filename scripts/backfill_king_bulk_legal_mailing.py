@@ -69,8 +69,16 @@ _TARGET_SQL = text(
 
 
 def _pin(major: str, minor: str) -> str:
-    """Major(6)+Minor(4) = 10-digit PIN, matching results.parcel_id."""
-    return f"{major.strip().zfill(6)}{minor.strip().zfill(4)}"
+    """Major(6)+Minor(4) = 10-digit PIN, matching results.parcel_id.
+
+    Returns "" for malformed (non-numeric / over-length) parts so a garbage key
+    can never match a target parcel.
+    """
+    m = (major or "").strip()
+    n = (minor or "").strip()
+    if not (m.isdigit() and n.isdigit()) or len(m) > 6 or len(n) > 4:
+        return ""
+    return f"{m.zfill(6)}{n.zfill(4)}"
 
 
 def _download(url: str, cache_dir: str) -> bytes:
@@ -91,8 +99,10 @@ def _download(url: str, cache_dir: str) -> bytes:
 
 def _csv_rows(zip_bytes: bytes):
     z = zipfile.ZipFile(io.BytesIO(zip_bytes))
-    name = z.namelist()[0]
-    with z.open(name) as f:
+    csvs = [n for n in z.namelist() if n.lower().endswith(".csv")]
+    if not csvs:
+        raise ValueError(f"no .csv member in zip: {z.namelist()}")
+    with z.open(csvs[0]) as f:
         yield from csv.DictReader(io.TextIOWrapper(f, encoding="latin-1"))
 
 
@@ -195,29 +205,33 @@ def run(batch: int, dry_run: bool, cache_dir: str) -> None:
             if not rows:
                 break
             last_id = str(rows[-1].id)
-            legal_triples: list[tuple[str, str, str]] = []   # (id, new_legal, old_legal)
+            legal_triples: list[tuple[str, str, str]] = []   # (id, new_legal, pin)
             mail_pairs: list[tuple[str, str]] = []           # (id, mailing)
             for row in rows:
                 seen += 1
                 pin = row.parcel_id.strip()
                 new_legal = legal_map.get(pin)
                 if new_legal and is_parcel_legal_placeholder(row.legal_description, pin):
-                    legal_triples.append((str(row.id), new_legal, row.legal_description))
+                    legal_triples.append((str(row.id), new_legal, pin))
                 if row.need_mail and pin in mail_map:
                     mail_pairs.append((str(row.id), mail_map[pin]))
 
             if not dry_run and legal_triples:
-                vsql = ",".join(f"(:id_{i}, :new_{i}, :old_{i})" for i in range(len(legal_triples)))
+                vsql = ",".join(f"(:id_{i}, :new_{i}, :pin_{i})" for i in range(len(legal_triples)))
                 p: dict = {}
-                for i, (rid, new, old) in enumerate(legal_triples):
-                    p[f"id_{i}"], p[f"new_{i}"], p[f"old_{i}"] = rid, new, old
+                for i, (rid, new, pin) in enumerate(legal_triples):
+                    p[f"id_{i}"], p[f"new_{i}"], p[f"pin_{i}"] = rid, new, pin
+                # Re-assert the stand-in shape in SQL (legal_description == parcel_id
+                # == pin) so the swap is idempotent and self-evidently only replaces
+                # the placeholder, never a real legal description.
                 res = db.execute(
                     text(
                         f"""
                         UPDATE results SET legal_description = data.new
-                        FROM (VALUES {vsql}) AS data(id, new, old)
+                        FROM (VALUES {vsql}) AS data(id, new, pin)
                         WHERE results.id = data.id::uuid
-                          AND results.legal_description = data.old
+                          AND results.parcel_id = data.pin
+                          AND results.legal_description = data.pin
                         """
                     ),
                     p,
@@ -264,6 +278,12 @@ def run(batch: int, dry_run: bool, cache_dir: str) -> None:
         "would-set" if dry_run else "set", legal_upd,
         "would-set" if dry_run else "set", mail_upd,
     )
+    if not dry_run and mail_upd:
+        _log.warning(
+            "Mailing addresses changed — run `python scripts/backfill_owner_flags.py` "
+            "next to refresh owner-location flags (absentee_owner / out_of_state_owner / "
+            "owner_state), which lead filters depend on and which this script does not touch."
+        )
 
 
 if __name__ == "__main__":

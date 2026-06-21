@@ -83,7 +83,9 @@ async def _fetch_king_owner(pid: str) -> tuple[str | None, bool]:
     return None, True
 
 
-async def batch_extract_king_owners(parcel_ids: list[str]) -> dict[str, str]:
+async def batch_extract_king_owners(
+    parcel_ids: list[str], delay: float = 0.1
+) -> dict[str, str]:
     """Owner/taxpayer name per parcel from eRealProperty — HTTP only, no Playwright.
 
     A lean, owner-ONLY companion to batch_enrich_king_county's Phase 1. The full
@@ -93,6 +95,11 @@ async def batch_extract_king_owners(parcel_ids: list[str]) -> dict[str, str]:
     have a mailing address) must not pay that cost. Same eRealProperty endpoint,
     same SSRF-guarded safe_get, same _extract_owner_name parser/junk-rejection —
     so a name produced here is identical to one produced by the full path.
+
+    `delay` is the pause between requests (default 0.1s — fine for a normal
+    ~300-parcel job). A bulk caller (the backfill, tens of thousands of parcels)
+    should pass a larger value: eRealProperty rate-limits a sustained ~10 req/s
+    stream, so too small a delay makes ~half the lookups fail transiently.
 
     Returns {parcel_id: owner_name} for parcels that yielded a real owner; misses
     are simply absent (never an empty/None value), so a caller can swap
@@ -121,7 +128,7 @@ async def batch_extract_king_owners(parcel_ids: list[str]) -> dict[str, str]:
             owners[pid] = owner
         elif errored:
             failures += 1
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(delay)
 
     if failures:
         _logger.warning(

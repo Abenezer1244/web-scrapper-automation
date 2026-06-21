@@ -70,18 +70,18 @@ _SELECT_SQL = text(
 )
 
 
-def _resolve_owners(parcels: list[str], cache: dict[str, str | None]) -> None:
+def _resolve_owners(parcels: list[str], cache: dict[str, str | None], delay: float) -> None:
     """Fetch owners for parcels not already in `cache`; record misses as None so a
     not-found parcel is never re-fetched within this run."""
     todo = sorted({p for p in parcels if p not in cache})
     if not todo:
         return
-    found = asyncio.run(batch_extract_king_owners(todo))
+    found = asyncio.run(batch_extract_king_owners(todo, delay=delay))
     for pid in todo:
         cache[pid] = found.get(pid)  # real owner or None (looked-up, absent)
 
 
-def run(batch: int, limit: int | None, dry_run: bool) -> None:
+def run(batch: int, limit: int | None, dry_run: bool, delay: float) -> None:
     last_id = _NIL_UUID
     owner_cache: dict[str, str | None] = {}
     scanned = updated = skipped_no_owner = skipped_not_placeholder = 0
@@ -117,7 +117,7 @@ def run(batch: int, limit: int | None, dry_run: bool) -> None:
 
             if candidates:
                 _resolve_owners(
-                    [c.parcel_id.strip() for c in candidates], owner_cache
+                    [c.parcel_id.strip() for c in candidates], owner_cache, delay
                 )
                 # (id, owner, old_placeholder) for rows whose parcel resolved to a
                 # real owner. old_placeholder re-asserts the still-placeholder guard
@@ -184,5 +184,10 @@ if __name__ == "__main__":
     ap.add_argument("--batch", type=int, default=2000, help="rows scanned per DB page")
     ap.add_argument("--limit", type=int, default=None, help="stop after scanning N rows (for a bounded test run)")
     ap.add_argument("--dry-run", action="store_true", help="resolve owners + count would-be updates, write nothing")
+    ap.add_argument(
+        "--delay", type=float, default=0.6,
+        help="seconds between eRealProperty requests (default 0.6 — eRealProperty "
+        "rate-limits a faster sustained stream over a bulk run)",
+    )
     args = ap.parse_args()
-    run(args.batch, args.limit, args.dry_run)
+    run(args.batch, args.limit, args.dry_run, args.delay)

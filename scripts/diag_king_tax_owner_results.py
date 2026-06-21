@@ -57,8 +57,9 @@ def fetch_results(tok, jid, cap=2000):
         r = req.get(f"{API}/jobs/{jid}/results", headers=_hdr(tok),
                     params={"page": page, "per_page": per}, timeout=30)
         if r.status_code != 200:
-            print(f"    results fetch {r.status_code}: {r.text[:120]}")
-            break
+            # Fail loud — a swallowed fetch error must not read as "no results"
+            # and let a partial/empty page pass as a verdict.
+            sys.exit(f"RESULTS FETCH FAILED {r.status_code}: {r.text[:160]}")
         data = r.json()
         batch = data.get("results") or data.get("items") or data.get("records") or []
         rows.extend(batch)
@@ -70,11 +71,22 @@ def fetch_results(tok, jid, cap=2000):
 
 
 def classify(rows):
-    owners, placeholders = [], []
+    """Split party_names into real owners, placeholders, and blank/invalid.
+
+    A real owner is a NON-EMPTY string that is not the placeholder. None / "" /
+    missing party_name is tracked as `blank` — never counted as a real owner, so a
+    job full of empty names can't read as a PASS.
+    """
+    owners, placeholders, blank = [], [], []
     for x in rows:
         pn = x.get("party_name")
-        (placeholders if is_tax_placeholder_party(pn) else owners).append(pn)
-    return owners, placeholders
+        if is_tax_placeholder_party(pn):
+            placeholders.append(pn)
+        elif isinstance(pn, str) and pn.strip():
+            owners.append(pn)
+        else:
+            blank.append(pn)
+    return owners, placeholders, blank
 
 
 def main():
@@ -94,10 +106,11 @@ def main():
         if not rows:
             print("  no results persisted yet (leads likely written at job completion)")
             continue
-        owners, placeholders = classify(rows)
+        owners, placeholders, blank = classify(rows)
         print(f"  results sampled : {len(rows)}")
         print(f"  REAL owner names: {len(owners)}")
         print(f"  placeholders    : {len(placeholders)}")
+        print(f"  blank/invalid   : {len(blank)}")
         if owners:
             print("  sample REAL owners (fix is live):")
             for nm in owners[:12]:

@@ -46,6 +46,7 @@ def test_legal_placeholder_rejects_real_legal_and_blanks():
     assert is_parcel_legal_placeholder("", "1954600115") is False
     assert is_parcel_legal_placeholder("1954600115", None) is False
     assert is_parcel_legal_placeholder("9999999999", "1954600115") is False  # different parcel
+    assert is_parcel_legal_placeholder("   ", "  ") is False  # whitespace-only must not pass
 
 
 def test_matcher_rejects_real_and_empty_party_names():

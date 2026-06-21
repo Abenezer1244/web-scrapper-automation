@@ -93,7 +93,10 @@ def is_parcel_legal_placeholder(legal_description: str | None, parcel_id: str | 
     """
     if not legal_description or not parcel_id:
         return False
-    return legal_description.strip() == parcel_id.strip()
+    p = parcel_id.strip()
+    # Require a non-empty parcel so whitespace-only values ("   ") don't collapse
+    # to "" == "" and falsely report a stand-in.
+    return bool(p) and legal_description.strip() == p
 
 # Charge types whose (billed - paid) is real principal owed on the tax bill.
 # Allowlist (fail-closed for money): anything NOT here and NOT abatement is an

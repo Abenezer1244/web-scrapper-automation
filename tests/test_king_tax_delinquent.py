@@ -18,7 +18,30 @@ from src.scrapers.king_wa_tax_delinquent import (
     _is_retryable,
     _page_params,
     aggregate_delinquent_rows,
+    is_tax_placeholder_party,
+    tax_placeholder_party,
 )
+
+
+def test_placeholder_party_roundtrips_through_matcher():
+    # The producer's output must be recognized by the enrichment overwrite gate.
+    pn = tax_placeholder_party(Decimal("12345.67"), "1954600115")
+    assert pn == "Tax Delinquent — $12,346 owed (Parcel 1954600115)"
+    assert is_tax_placeholder_party(pn) is True
+
+
+def test_matcher_rejects_real_and_empty_party_names():
+    # Real owner names (even one starting with the prefix) and blanks are NOT
+    # treated as the placeholder, so enrichment never clobbers a real lead.
+    assert is_tax_placeholder_party(None) is False
+    assert is_tax_placeholder_party("") is False
+    assert is_tax_placeholder_party("TOMLINSON WILLIAM+CHERYL L") is False
+    assert is_tax_placeholder_party("Tax Delinquent Holdings LLC") is False
+    # Contrived name with the prefix + "owed (Parcel …)" but NO "$amount" clause
+    # must not match (the anchored amount requirement defeats it).
+    assert is_tax_placeholder_party(
+        "Tax Delinquent Holdings LLC owed (Parcel Services)"
+    ) is False
 
 
 def _row(acct, year, rtype, billed, paid):

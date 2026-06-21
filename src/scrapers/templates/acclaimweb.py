@@ -860,8 +860,6 @@ class AcclaimWebScraper(BridgeScraper):
                 # depend on the legal_description we're now changing.
                 inst = item.get("instrument", "").strip()
                 record.enrichment_data = {"instrument_number": inst, "source": "acclaimweb"}
-                if inst:
-                    record.raw_html_hash = inst
 
                 # Date recorded — normalize various date formats
                 date_str = item.get("date_recorded", "").strip()
@@ -952,6 +950,12 @@ class AcclaimWebScraper(BridgeScraper):
                 parcel = item.get("parcel", "").strip()
                 if parcel:
                     record.parcel_id = parcel
+
+                # Stable, unique per-row fingerprint (includes instrument_number via
+                # enrichment_data in to_dict); never the bare instrument, which would
+                # collapse multi-party/parcel rows under one recording. Keeps tasks.py
+                # source_fingerprint stable + distinct without legal_description.
+                record.raw_html_hash = self.make_hash(record.to_dict())
 
                 if record.party_name or record.date_recorded:
                     records.append(record)

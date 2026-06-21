@@ -511,8 +511,6 @@ class LandmarkWebScraper(BridgeScraper):
                 # (legal_description) can't shift the within-job idempotency key
                 # (tasks.py source_fingerprint) for this no-raw_html_hash template.
                 record.enrichment_data = {"instrument_number": inst, "source": "landmarkweb"}
-                if inst:
-                    record.raw_html_hash = inst
 
                 date_str = (item.get("date_recorded") or "").strip()
                 if date_str:
@@ -594,6 +592,13 @@ class LandmarkWebScraper(BridgeScraper):
                 parcel = (item.get("parcel") or "").strip()
                 if parcel:
                     record.parcel_id = parcel
+
+                # Stable, unique per-row fingerprint (includes instrument_number via
+                # enrichment_data in to_dict). This template sets no raw_html_hash
+                # otherwise, so without it tasks.py source_fingerprint would depend
+                # on legal_description. A full composite — never the bare instrument,
+                # which would collapse multi-party/parcel rows under one recording.
+                record.raw_html_hash = self.make_hash(record.to_dict())
 
                 if record.party_name or record.date_recorded:
                     records.append(record)

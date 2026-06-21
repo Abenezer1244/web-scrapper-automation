@@ -213,12 +213,10 @@ class LaserficheWebLinkScraper(BridgeScraper):
                 seen_afns.add(key)
                 h = self.make_hash(r.to_dict())
                 seen_hashes.add(h)
-                # Prefer the recorder instrument id (afn) as the stable per-record
-                # fingerprint: it is unique + content-independent, so changing a
-                # display field (e.g. legal_description) can't shift the within-job
-                # idempotency key (tasks.py source_fingerprint). Falls back to the
-                # full-record hash when afn is absent.
-                r.raw_html_hash = afn or h
+                # Full-record hash (includes enrichment_data.instrument_number via
+                # to_dict) — a unique per-row fingerprint; never the bare AFN, which
+                # would collapse multi-party/parcel rows under one recording.
+                r.raw_html_hash = h
                 all_records.append(r)
                 new += 1
 

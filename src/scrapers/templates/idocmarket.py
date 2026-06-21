@@ -455,17 +455,19 @@ class IDocMarketScraper(BridgeScraper):
                         record.heirs = grantee
 
             # Doc number is a document id, NOT a legal description — keep it in
-            # enrichment_data and use it as the stable per-record fingerprint (this
-            # template sets no raw_html_hash, so source_fingerprint would otherwise
-            # depend on the legal_description we're changing). legal_description
-            # holds the REAL legal only (None when the index has none; never DOC#).
+            # enrichment_data; legal_description holds the REAL legal only (None when
+            # the index has none; never DOC# as a stand-in).
             docnum = (item.get("docnum") or "").strip().lstrip("#").strip()
             record.enrichment_data = {"instrument_number": docnum, "source": "idocmarket"}
-            if docnum:
-                record.raw_html_hash = docnum
             legal = (item.get("legal") or "").strip()
             if legal:
                 record.legal_description = legal
+
+            # Stable, unique per-row fingerprint (includes instrument_number via
+            # enrichment_data in to_dict); never the bare doc#, which would collapse
+            # multi-party rows under one document. Keeps tasks.py source_fingerprint
+            # stable + distinct without depending on legal_description.
+            record.raw_html_hash = self.make_hash(record.to_dict())
 
             if record.party_name or record.date_recorded:
                 records.append(record)

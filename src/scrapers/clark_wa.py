@@ -397,7 +397,9 @@ class ClarkWAScraper(BridgeScraper):
             record.party_name = grantor
             record.heirs = grantee
             record.doc_type = doc_type
-            record.legal_description = (item.get("recNum") or "").strip()
+            # Real property legal description (the same text we parsed the PID from),
+            # NOT the recording number — recNum is kept in enrichment_data below.
+            record.legal_description = legal or None
 
             date_str = (item.get("date") or "").strip()
             date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", date_str)

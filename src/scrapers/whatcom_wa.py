@@ -349,7 +349,9 @@ class WhatcomWAScraper(BridgeScraper):
                 record.heirs = grantee
             record.doc_type = doc_type
             record.date_recorded = date_recorded
-            record.legal_description = instrument
+            # No real legal description on the Helion card — leave None rather than
+            # standing in the instrument # (which is kept in enrichment_data below).
+            record.legal_description = None
             record.enrichment_data = {
                 "source": "whatcom_county_recorder",
                 "instrument_number": instrument,

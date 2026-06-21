@@ -323,8 +323,13 @@ class AvaFidlarScraper(BridgeScraper):
                 record = ScrapedRecord()
 
                 inst = (item.get("instrument") or "").strip()
+                # Instrument # is a document id, not a legal description — keep it in
+                # enrichment_data and use it as the stable per-record fingerprint
+                # (no raw_html_hash on this template, so source_fingerprint would
+                # otherwise depend on the legal_description we're changing).
+                record.enrichment_data = {"instrument_number": inst, "source": "ava_fidlar"}
                 if inst:
-                    record.legal_description = inst
+                    record.raw_html_hash = inst
 
                 date_str = (item.get("date_recorded") or "").strip()
                 if date_str:
@@ -399,10 +404,10 @@ class AvaFidlarScraper(BridgeScraper):
                     if grantee:
                         record.heirs = grantee
 
+                # Real property legal description only (None when none in the index;
+                # never the instrument # as a stand-in).
                 legal = (item.get("legal") or "").strip()
-                if legal and record.legal_description:
-                    record.legal_description = f"{record.legal_description} | {legal}"
-                elif legal:
+                if legal:
                     record.legal_description = legal
 
                 parcel = (item.get("parcel") or "").strip()

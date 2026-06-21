@@ -454,17 +454,18 @@ class IDocMarketScraper(BridgeScraper):
                     if heir_tokens and not heir_tokens <= _HEIR_NOISE_TOKENS:
                         record.heirs = grantee
 
-            # Doc number + first legal stored in legal_description (no dedicated
-            # instrument field on ScrapedRecord; mirrors the acclaimweb template).
-            parts = []
+            # Doc number is a document id, NOT a legal description — keep it in
+            # enrichment_data and use it as the stable per-record fingerprint (this
+            # template sets no raw_html_hash, so source_fingerprint would otherwise
+            # depend on the legal_description we're changing). legal_description
+            # holds the REAL legal only (None when the index has none; never DOC#).
             docnum = (item.get("docnum") or "").strip().lstrip("#").strip()
+            record.enrichment_data = {"instrument_number": docnum, "source": "idocmarket"}
             if docnum:
-                parts.append(f"DOC#{docnum}")
+                record.raw_html_hash = docnum
             legal = (item.get("legal") or "").strip()
             if legal:
-                parts.append(legal)
-            if parts:
-                record.legal_description = " | ".join(parts)
+                record.legal_description = legal
 
             if record.party_name or record.date_recorded:
                 records.append(record)

@@ -18,6 +18,7 @@ import html
 import re
 
 from src.api.middleware.security import add_scrape_domain
+from src.config import settings
 from src.scrapers.base_scraper import BridgeScraper
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
@@ -56,6 +57,79 @@ def _extract_owner_name(page_html: str) -> str | None:
     if not name or re.sub(r"[^A-Z0-9]", "", name.upper()) in _OWNER_JUNK:
         return None
     return name
+
+
+async def _fetch_king_owner(pid: str) -> tuple[str | None, bool]:
+    """Resolve one parcel's owner with bounded retry.
+
+    Returns (owner_name_or_None, had_transient_error). A 200 response whose page
+    has no owner cell is a GENUINE miss -> (None, False). A persistent non-200
+    (429/5xx/4xx) or exception after Settings.MAX_RETRIES attempts is a TRANSIENT
+    failure -> (None, True), so a caller can avoid treating it as "no such owner".
+    """
+    for attempt in range(settings.MAX_RETRIES):
+        try:
+            # S4: safe_get re-validates the (fixed HTTPS) target for SSRF defense
+            # in depth — same call the full enricher uses.
+            r = safe_get(f"{_ERP_URL}{pid}", headers=_HEADERS, timeout=10)
+            if r.status_code == 200:
+                return _extract_owner_name(r.text), False  # genuine result (name or miss)
+        except Exception as exc:
+            _logger.debug(
+                "Owner fetch error parcel=%s attempt=%d: %s", pid, attempt + 1, str(exc)[:160]
+            )
+        if attempt < settings.MAX_RETRIES - 1:
+            await asyncio.sleep(0.5 * (attempt + 1))  # linear backoff
+    return None, True
+
+
+async def batch_extract_king_owners(parcel_ids: list[str]) -> dict[str, str]:
+    """Owner/taxpayer name per parcel from eRealProperty — HTTP only, no Playwright.
+
+    A lean, owner-ONLY companion to batch_enrich_king_county's Phase 1. The full
+    enricher also fetches mailing addresses via Playwright (slow, ~5s/parcel);
+    callers that only need to repair a placeholder party_name (the King
+    tax-delinquent backfill, and the inline owner-only pass for rows that already
+    have a mailing address) must not pay that cost. Same eRealProperty endpoint,
+    same SSRF-guarded safe_get, same _extract_owner_name parser/junk-rejection —
+    so a name produced here is identical to one produced by the full path.
+
+    Returns {parcel_id: owner_name} for parcels that yielded a real owner; misses
+    are simply absent (never an empty/None value), so a caller can swap
+    unconditionally on a present key. Transient failures (counted + logged at
+    WARNING) are also absent — but the backfill is re-runnable, so a parcel that
+    failed transiently this run is retried on the next run (it is still a
+    placeholder), never permanently abandoned.
+    """
+    owners: dict[str, str] = {}
+    # parcel_id comes from our own scraped DB rows (not user input), but require a
+    # digit so a malformed value can't generate a noisy external request.
+    clean = list(dict.fromkeys(
+        pid.strip() for pid in parcel_ids
+        if pid and len(pid.strip()) >= 6 and any(c.isdigit() for c in pid)
+    ))
+    if not clean:
+        return owners
+
+    _logger.info("Owner-only lookup for %d parcels...", len(clean))
+    failures = 0
+    for i, pid in enumerate(clean):
+        if i % 100 == 0 and i > 0:
+            _logger.info("  owner HTTP: %d / %d ...", i, len(clean))
+        owner, errored = await _fetch_king_owner(pid)
+        if owner:
+            owners[pid] = owner
+        elif errored:
+            failures += 1
+        await asyncio.sleep(0.1)
+
+    if failures:
+        _logger.warning(
+            "Owner-only lookup: %d/%d parcels failed after %d retries (transient — "
+            "re-run to retry; not abandoned)", failures, len(clean), settings.MAX_RETRIES,
+        )
+    _logger.info("Owner-only lookup done: %d/%d parcels resolved", len(owners), len(clean))
+    return owners
 
 
 async def batch_enrich_king_county(

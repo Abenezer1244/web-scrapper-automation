@@ -410,6 +410,90 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             found = sum(1 for d in enriched.values() if d.get("mailing_address"))
             _publish_log(r, job_id, "info", f"Found {found}/{len(pids)} mailing addresses", db=db)
 
+        # Owner-only repair for King tax-delinquent rows that ALREADY have a
+        # mailing address (so the missing-mailing pass above skipped them — e.g.
+        # mailing was COALESCE-copied onto a duplicate by
+        # _reuse_enrichment_for_duplicates) yet still carry the placeholder
+        # party_name. King tax is a point-in-time snapshot, so fresh jobs are
+        # ~100% duplicates that all hit this path. We resolve the owner with an
+        # HTTP-only lookup (no Playwright mailing fetch — that data is already
+        # present), under the SAME dual gate as the swap above: record_type ==
+        # tax_delinquent (belt) + exact placeholder shape (suspenders).
+        if config.record_type == "tax_delinquent":
+            from src.scrapers.king_wa_tax_delinquent import is_tax_placeholder_party
+            owner_needs = [
+                res for res in all_results
+                if res.parcel_id and len(res.parcel_id.strip()) >= 6
+                and res.mailing_address
+                and is_tax_placeholder_party(res.party_name)
+            ]
+            if owner_needs:
+                _publish_log(
+                    r, job_id, "info",
+                    f"Resolving owner names for {len(owner_needs)} tax-delinquent leads...",
+                    db=db,
+                )
+                from src.scrapers.enrichment.king_county_assessor import batch_extract_king_owners
+                o_pid_map: dict[str, list] = {}
+                for res in owner_needs:
+                    o_pid_map.setdefault(res.parcel_id.strip(), []).append(res)
+                o_pids_all = list(o_pid_map.keys())
+                # Owner-only HTTP is fast (~0.2s/parcel), so a higher cap than the
+                # Playwright mailing path is safe; still bounded to protect the
+                # enrichment time budget. Overflow is left for the (re-runnable)
+                # backfill script — logged here so the cap is never silent.
+                _MAX_KING_OWNER_PARCELS = 500
+                overflow = max(0, len(o_pids_all) - _MAX_KING_OWNER_PARCELS)
+                o_pids = o_pids_all[:_MAX_KING_OWNER_PARCELS]
+                if overflow:
+                    _logger.info(
+                        "King owner lookup capped at %d/%d parcels this job; %d deferred to backfill",
+                        _MAX_KING_OWNER_PARCELS, len(o_pids_all), overflow,
+                    )
+                owners = asyncio.run(asyncio.wait_for(batch_extract_king_owners(o_pids), timeout=180))
+                swapped = 0
+                for pid, owner in owners.items():
+                    for res in o_pid_map.get(pid, []):
+                        # Re-assert the placeholder guard at write time (the row
+                        # could only have been a placeholder to enter owner_needs,
+                        # but keep the swap self-defending and idempotent).
+                        if is_tax_placeholder_party(res.party_name):
+                            res.party_name = owner
+                            swapped += 1
+                # Decide persisted-vs-failed on the OWNER commit alone, THEN publish.
+                # _publish_log(db=db) commits too, so folding the success log into
+                # the same try would mislabel a persisted swap as "not persisted"
+                # if only the log's commit failed.
+                committed = False
+                try:
+                    db.commit()
+                    committed = True
+                except Exception as exc:
+                    _logger.warning(
+                        "Job %s: King owner-only commit failed (%d swaps not persisted): %s",
+                        job_id, swapped, str(exc)[:120],
+                    )
+                    db.rollback()
+                # Guard the post-commit log: _publish_log(db=db) commits, and a
+                # failure HERE must not crash after the swaps already persisted nor
+                # skip the skip-trace enqueue that follows this block.
+                if committed:
+                    deferred = f" ({overflow} deferred to backfill)" if overflow else ""
+                    msg, level = (
+                        f"Resolved {swapped} owner names from {len(owners)}/{len(o_pids)} parcels{deferred}",
+                        "info",
+                    )
+                else:
+                    msg, level = (
+                        "Owner-name resolution failed to persist (will retry next run)",
+                        "warning",
+                    )
+                try:
+                    _publish_log(r, job_id, level, msg, db=db)
+                except Exception as exc:
+                    _logger.warning("Job %s: owner-only progress log failed: %s", job_id, str(exc)[:120])
+                    db.rollback()  # log write failed; swaps already settled — keep going
+
     # ── Post-enrichment: log unactionable records (kept for visibility) ──
     # Records with no property_address and no mailing_address can't be
     # mailed, but we keep them in the DB so users see what was scraped.

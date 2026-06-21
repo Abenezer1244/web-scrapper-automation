@@ -1,4 +1,83 @@
-# King tax-delinquent — replace party_name placeholder with real owner name
+# King tax-delinquent owner-name REACH fix (follow-up to PR #80)
+
+> PR #80 (`d2253f6`) is MERGED — the owner-swap logic is correct and live-proven
+> (6/6 parcels returned real owners on 2026-06-21). This follow-up makes the swap
+> actually REACH existing leads. Original PR #80 plan archived in `tasks/todo.pr80.bak`.
+
+## Problem (reach gap)
+The swap (`enrich.py:396-401`) only runs inside the King eRealProperty pass, which
+is gated to rows **missing a mailing address** (`enrich.py:354-360`). But:
+1. `_reuse_enrichment_for_duplicates` COALESCEs `mailing_address` from the pre-fix
+   delivered record onto duplicates → they have a mailing address → excluded from
+   the King pass → placeholder survives.
+2. King tax is a point-in-time snapshot; every parcel already exists, so a fresh
+   job is ~100% duplicates → almost nothing gets the swap.
+3. `_MAX_KING_PARCELS = 300` caps per-job lookups.
+Result: UI still shows placeholders on existing ~28k King tax leads.
+
+## Decision (user-approved 2026-06-21): widen the forward gate + backfill existing.
+
+## Plan
+### Phase 1 — Forward gate (`src/workers/tasks_helpers/enrich.py`) [1 file + tests]
+- [ ] Compute `is_tax_delinquent` + import `is_tax_placeholder_party` before `needs`.
+- [ ] Widen `needs` to also include tax_delinquent placeholder-named rows even when
+      `mailing_address` is present.
+- [ ] When capping to `_MAX_KING_PARCELS`, prioritize placeholder-named parcels.
+- [ ] Test: tax row WITH mailing + placeholder name gets its owner swapped.
+
+### Phase 2 — Owner-only helper (`src/scrapers/enrichment/king_county_assessor.py`) [1 file + tests]
+- [ ] `batch_extract_king_owners(parcel_ids) -> dict[str,str]`: Phase-1-only HTTP
+      (reuses `_extract_owner_name`, no Playwright) for the backfill.
+- [ ] Tests against real markup (no mocks).
+
+### Phase 3 — Backfill (`scripts/backfill_king_tax_owner_names.py`) [1 file]
+- [ ] Select `results` with placeholder `party_name` + parcel_id, joined to
+      `scraper_configs` for county=king/state=wa/record_type=tax_delinquent.
+- [ ] parcel→owner map via `batch_extract_king_owners`; UPDATE only still-placeholder
+      rows (idempotent), batched commits, dry-run flag, loud summary.
+- [ ] Owner is public parcel-keyed data → safe across tenants; row updated under its
+      own user_id.
+
+### Gates
+- [ ] Codex consult BEFORE coding · ruff clean · pytest green · Codex review+challenge
+- [ ] Security Master Review (§14): multi-tenant, SSRF (safe_get), no PII in logs
+- [ ] New PR; do not push until user approves.
+
+## Review (2026-06-21)
+All three phases implemented on branch `fix/king-tax-owner-reach`, verified, Codex-clean.
+
+**Changes**
+- `src/scrapers/enrichment/king_county_assessor.py`: new `batch_extract_king_owners()`
+  (HTTP-only owner lookup, no Playwright) + `_fetch_king_owner()` (bounded retry on
+  transient failure via `Settings.MAX_RETRIES`, distinguishes genuine 200-miss from
+  transient error). Numeric-parcel guard.
+- `src/workers/tasks_helpers/enrich.py`: new owner-only forward pass in the King block —
+  resolves owners for tax_delinquent rows that have a mailing address but still a
+  placeholder name (the dedup-reuse case the missing-mailing pass skipped). 500-cap with
+  non-silent overflow log; commit-honest success/failure logging (guarded post-commit log).
+- `scripts/backfill_king_tax_owner_names.py`: idempotent, re-runnable backfill of existing
+  leads. Config-join + placeholder-shape scope; global parcel→owner cache; still-placeholder
+  UPDATE guard; `--dry-run/--batch/--limit` (limit applied to SELECT).
+- `tests/test_king_assessor_owner.py`: +3 tests (helper guard/dedup/numeric); 27 pass total.
+- `pyproject.toml`: per-file S608 ignore for the backfill (generated-:param SQL, values bound).
+
+**Verification**
+- ruff clean; 27 targeted tests pass.
+- LIVE: `batch_extract_king_owners` returned real owners for the exact parcels that showed
+  placeholders (AL-SABAH JABER / CWIAK KATHLEEN L / RIAN SKYE GOOD LEWIN); short/blank/
+  non-numeric skipped with zero requests.
+- LIVE dry-run vs prod DB: scope join finds 213,326 in-scope placeholder rows; bounded
+  dry-run scanned 20 (precise --limit), 19 would-attempt, 1 correctly rejected as
+  not-exact-placeholder, ROLLBACK (no writes).
+- Codex: consult (pre-build) + review + 2 re-reviews → final CLEAN, no P1.
+- Security §14 non-negotiables: multi-tenant / SSRF / CSV / secrets / PII-in-logs all PASS.
+
+**NOT done (needs user decision)**
+- [ ] Commit + open PR (not pushed).
+- [ ] Run the backfill in PROD (213k-row mutation) — only dry-runs executed so far.
+
+---
+## (ARCHIVED) PR #80 — replace party_name placeholder with real owner name
 
 Branch: `fix/king-tax-owner-name`
 

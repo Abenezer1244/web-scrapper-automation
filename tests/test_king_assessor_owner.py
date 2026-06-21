@@ -5,7 +5,10 @@ page so King tax-delinquent leads get a real name instead of the
 "Tax Delinquent — $X owed (Parcel …)" placeholder. The markup samples below are
 the REAL shape served by blue.kingcounty.com (captured live), not invented.
 """
-from src.scrapers.enrichment.king_county_assessor import _extract_owner_name
+from src.scrapers.enrichment.king_county_assessor import (
+    _extract_owner_name,
+    batch_extract_king_owners,
+)
 
 # Exact markup captured from a live Dashboard page (parcel 1954600115). King
 # joins co-owners with "+" and bolds the label cell.
@@ -65,3 +68,23 @@ def test_first_name_cell_wins_when_unrelated_name_labels_follow():
         "<td>District Name</td><td>SEATTLE SD</td>"
     )
     assert _extract_owner_name(markup) == "OWNER OF RECORD"
+
+
+# ── batch_extract_king_owners: owner-only HTTP helper (PR #80 reach fix) ──────
+# These exercise the input-guard path only — empty / too-short parcel lists are
+# filtered BEFORE any HTTP, so they run with no network (no mocks needed).
+
+async def test_batch_extract_king_owners_empty_input_makes_no_requests():
+    assert await batch_extract_king_owners([]) == {}
+
+
+async def test_batch_extract_king_owners_filters_short_and_blank_parcels():
+    # All entries are < 6 chars (or blank) and are dropped before any lookup,
+    # so the result is empty and no request is ever issued.
+    assert await batch_extract_king_owners(["", "   ", "ab", "12345"]) == {}
+
+
+async def test_batch_extract_king_owners_filters_non_numeric_parcels():
+    # A long but digit-less value is rejected by the numeric guard before any HTTP,
+    # so no external request is generated for a malformed parcel.
+    assert await batch_extract_king_owners(["abcdef", "no-digits-here"]) == {}

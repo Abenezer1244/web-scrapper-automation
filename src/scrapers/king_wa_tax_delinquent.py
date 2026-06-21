@@ -80,6 +80,24 @@ def is_tax_placeholder_party(party_name: str | None) -> bool:
     """
     return bool(_TAX_PLACEHOLDER_RE.match(party_name or ""))
 
+
+def is_parcel_legal_placeholder(legal_description: str | None, parcel_id: str | None) -> bool:
+    """True iff legal_description is the parcel-number stand-in this scraper sets.
+
+    The King Socrata tax feed has no legal description (it's a tax-receivable roll),
+    so `scrape()` stores the parcel number in `legal_description` as a placeholder
+    (`rec.legal_description = parcel`). A real legal description is then available
+    from eRealProperty enrichment. This predicate gates that overwrite: only a row
+    whose legal_description is STILL just its own parcel is eligible to be replaced,
+    so a real legal description is never clobbered (mirrors the party_name gate).
+    """
+    if not legal_description or not parcel_id:
+        return False
+    p = parcel_id.strip()
+    # Require a non-empty parcel so whitespace-only values ("   ") don't collapse
+    # to "" == "" and falsely report a stand-in.
+    return bool(p) and legal_description.strip() == p
+
 # Charge types whose (billed - paid) is real principal owed on the tax bill.
 # Allowlist (fail-closed for money): anything NOT here and NOT abatement is an
 # UNKNOWN code → excluded from the sum + alerted, never silently summed.

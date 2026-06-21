@@ -526,12 +526,22 @@ class PierceWAARMSScraper(BridgeScraper):
                     # distressed homeowner. Strip the ARMS "(+)" more-parties marker
                     # first (it is never part of a name), then orient so the PERSON
                     # becomes party_name and the company context moves to heirs.
-                    # orient returns None for a bank-vs-trustee row with no person
-                    # (borrower hidden behind "(+)") → drop it: it is not a lead.
+                    # orient returns None only when NEITHER visible role carries a
+                    # natural person — observed: bank-vs-bank, trustee-vs-commercial-LLC,
+                    # or a parse-junk "[E]" cell. That is the SAME drop-if-no-person
+                    # contract King already applies (no homeowner = not a lead). When a
+                    # person exists it is always present in [R] or [E] (never only
+                    # behind "(+)"), so no real homeowner is lost — verified live.
                     party = _strip_arms_plus(record.party_name)
                     heirs = _strip_arms_plus(record.heirs)
                     oriented = orient_pre_foreclosure_party(party, heirs)
                     if oriented is None:
+                        # No person on either visible role — log (never silent) so a
+                        # systematic borrower-behind-"(+)" loss is observable.
+                        _logger.info(
+                            "pre_foreclosure: no person party — [R]=%r [E]=%r (dropped)",
+                            party, heirs,
+                        )
                         record.party_name = None  # dropped by the party-name guard below
                     else:
                         record.party_name, record.heirs = oriented

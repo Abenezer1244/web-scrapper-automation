@@ -111,9 +111,9 @@ _SPACED_ORG_RE: tuple[tuple[re.Pattern[str], str], ...] = (
 # upper-cased name. Keep this list to genuinely token-less trustee brands — every
 # other trustee/servicer ("QUALITY LOAN…", "TRUSTEE CORPS", "CLEAR RECON",
 # "NORTHWEST TRUSTEE") already carries a _COMPANY_WORDS token.
-_KNOWN_ORG_PHRASES: tuple[str, ...] = (
-    "WESTERN PROGRESSIVE",
-)
+# Word-boundary anchored so it can only match the standalone brand, never a phrase
+# that happens to span two unrelated name tokens.
+_KNOWN_ORG_PHRASE_RE = re.compile(r"\bWESTERN\s+PROGRESSIVE\b")
 
 
 # Vesting / tenancy boilerplate that trails an owner name in a Notice of Trustee
@@ -166,7 +166,7 @@ def is_person_name(name: str | None) -> bool:
     if not name:
         return False
     up = name.upper()
-    if any(phrase in up for phrase in _KNOWN_ORG_PHRASES):
+    if _KNOWN_ORG_PHRASE_RE.search(up):
         return False
     for rx, repl in _SPACED_ORG_RE:
         up = rx.sub(repl, up)

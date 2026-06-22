@@ -138,12 +138,12 @@ def dispatch_batch_run(run_id: str) -> None:
                     run.completed_at = datetime.now(UTC)
                     db.commit()
                 else:
+                    from src.api.entitlements import (
+                        ConfigRow,
+                        config_run_violation,
+                        should_block_run,
+                    )
                     for c in configs:
-                        from src.api.entitlements import (
-                            ConfigRow,
-                            config_run_violation,
-                            should_block_run,
-                        )
                         _active = db.execute(
                             select(
                                 ScraperConfig.id, ScraperConfig.state, ScraperConfig.county,

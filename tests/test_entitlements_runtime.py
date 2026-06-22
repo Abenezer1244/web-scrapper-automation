@@ -59,7 +59,7 @@ def test_reconciliation_pauses_over_limit_and_revives():
         _row(4, "Clark", rt="probate", mins=3),    # 4th county → over pro cap of 3
     ]
     pause, revive = plan_reconciliation(rows, "pro")
-    assert pause == {"2", "4"}   # premium type + 4th county
+    assert pause == {"2"}  # only the premium-type config is paused; the 3 probate/tax counties all fit Pro's cap of 3
     assert revive == set()
 
 
@@ -97,8 +97,8 @@ def test_active_county_not_evicted_by_older_paused():
 def test_reconciliation_dry_run_in_audit_mode(monkeypatch):
     """In audit mode (ENTITLEMENT_ENFORCEMENT=False), apply_reconciliation_sync must
     return (0, 0) and must NOT call db.execute (no DB mutations)."""
-    from src.config.settings import settings
     import src.api.entitlements as ent
+    from src.config.settings import settings
 
     monkeypatch.setattr(settings, "ENTITLEMENT_ENFORCEMENT", False)
 
@@ -141,3 +141,31 @@ def test_reconciliation_dry_run_in_audit_mode(monkeypatch):
     # Only the initial SELECT to load rows is allowed; no UPDATE should occur.
     # With plan_reconciliation mocked, the gate fires before any config_by_id loop.
     assert safe_db.get_execute_count() == 1  # exactly the row-load SELECT
+
+
+def test_disallowed_type_config_does_not_consume_county_slot():
+    # Business user downgraded to Pro (3 counties, no divorce). Alpha/divorce is the
+    # OLDEST but must not eat a county slot; the 3 probate counties must all survive.
+    rows = [
+        _row(1, "Alpha", rt="divorce", mins=0),
+        _row(2, "Bravo", rt="probate", mins=1),
+        _row(3, "Charlie", rt="probate", mins=2),
+        _row(4, "Delta", rt="probate", mins=3),
+    ]
+    pause, revive = plan_reconciliation(rows, "pro")
+    assert pause == {"1"}        # only the divorce config
+    assert revive == set()
+    assert allowed_county_set(rows, "pro") == {("WA", "bravo"), ("WA", "charlie"), ("WA", "delta")}
+
+
+def test_run_violation_fails_closed_on_none_plan():
+    rows = [_row(1, "King", rt="probate")]
+    # None plan -> treated as starter; probate allowed, single county ok
+    assert config_run_violation(None, "WA", "King", "probate", rows) is None
+    # starter disallows pre_foreclosure
+    assert config_run_violation(None, "WA", "King", "pre_foreclosure", rows) is not None
+
+
+def test_allowed_county_set_empty_rows():
+    assert allowed_county_set([], "starter") == set()
+    assert allowed_county_set([], "agency") is None

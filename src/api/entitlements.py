@@ -188,17 +188,20 @@ def allowed_county_set(
     rows: Iterable[ConfigRow], plan: str
 ) -> set[tuple[str, str]] | None:
     """Normalized (STATE, county) jurisdictions the plan permits, chosen
-    deterministically. ACTIVE configs claim slots first (earliest created_at
-    wins); entitlement-paused configs fill only any REMAINING slots (revival
-    candidates) so a live config is never evicted in favor of a dormant one.
-    Returns None for unlimited plans (cap < 0)."""
+    deterministically. Only configs whose record_type is ALLOWED for the plan can
+    claim a slot (a disallowed-type config is paused on type grounds and must not
+    evict a valid county). ACTIVE configs claim slots first (earliest created_at
+    wins); entitlement-paused configs fill only remaining slots. None = unlimited."""
     plan = (plan or "starter").lower()
     cap = COUNTY_LIMIT_BY_PLAN.get(plan, COUNTY_LIMIT_BY_PLAN["starter"])
     if cap < 0:
         return None
+    allowed_types = RECORD_TYPES_BY_PLAN.get(plan, RECORD_TYPES_BY_PLAN["starter"])
     active_earliest: dict[tuple[str, str], datetime] = {}
     paused_earliest: dict[tuple[str, str], datetime] = {}
     for row in rows:
+        if row.record_type.lower() not in allowed_types:
+            continue  # disallowed-type config: paused on type, never holds a slot
         key = _norm_county(row.state, row.county)
         if row.active:
             if key not in active_earliest or row.created_at < active_earliest[key]:
@@ -206,7 +209,6 @@ def allowed_county_set(
         elif row.paused_reason == PAUSED_REASON_ENTITLEMENT:
             if key not in paused_earliest or row.created_at < paused_earliest[key]:
                 paused_earliest[key] = row.created_at
-    # Active counties claim slots first, ordered by age (then key for tie-determinism).
     chosen = [k for k, _ in sorted(active_earliest.items(), key=lambda kv: (kv[1], kv[0]))]
     chosen = chosen[:cap]
     remaining = cap - len(chosen)

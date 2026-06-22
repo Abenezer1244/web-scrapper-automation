@@ -18,9 +18,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.middleware.auth_hardening import TokenBlacklist
 from src.config import settings
 from src.db import User, get_db
-from src.utils.logger import setup_logger
-
-_logger = setup_logger("api.auth")
 
 # ─── Password hashing ─────────────────────────────────────────────────────────
 # Direct pyca/bcrypt — we dropped passlib (the unmaintained 1.7.4 pin blocked
@@ -301,19 +298,14 @@ async def get_auth_context(
         user_match = result.scalar_one_or_none()
         if user_match is None:
             raise _CREDENTIALS_EXCEPTION
-        # API ACCESS is a Business+ capability. A key minted while on Business
-        # must stop working after a downgrade (gated by the enforcement flag so
-        # audit mode only logs). Mirrors the create-time require_plan gate.
+        # API access is a Business+ capability — an always-on feature gate (mirrors
+        # the create-time require_plan("business","agency") gate and the generic-
+        # webhook gate). A key minted while on Business stops working after downgrade.
         from src.config.constants import BUSINESS_FEATURES_PLANS
         if (user_match.plan or "starter").lower() not in BUSINESS_FEATURES_PLANS:
-            if settings.ENTITLEMENT_ENFORCEMENT:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="API access requires a Business or Agency plan.",
-                )
-            _logger.info(
-                "entitlement audit user=%s plan=%s context=api_key_use would_block: API access requires Business+",
-                user_match.id, (user_match.plan or "starter"),
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="API access requires a Business or Agency plan.",
             )
         return AuthContext(
             user=user_match,

@@ -131,6 +131,11 @@ class Settings(BaseSettings):
     STRIPE_PRICE_PRO: str = ""
     STRIPE_PRICE_BUSINESS: str = ""
     STRIPE_PRICE_AGENCY: str = ""
+    # Annual (yearly-interval) Stripe Price IDs — wired into checkout so the
+    # ~20%-off annual prepay shown on /plans is actually buyable, not display-only.
+    STRIPE_PRICE_PRO_ANNUAL: str = ""
+    STRIPE_PRICE_BUSINESS_ANNUAL: str = ""
+    STRIPE_PRICE_AGENCY_ANNUAL: str = ""
     STRIPE_PRODUCT_PRO: str = ""
     STRIPE_PRODUCT_BUSINESS: str = ""
     STRIPE_PRODUCT_AGENCY: str = ""

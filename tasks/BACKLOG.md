@@ -126,3 +126,15 @@ Two branches off `main`, unmerged. Stage 1 = contact PII + additive email_hmac. 
 - [ ] 👤🔴 **Move `.rls-cutover-secrets` off-disk** (also in §4) — verified present + gitignored; needs a password manager.
 - [x] ✅ **3 stale branches deleted 2026-06-15** (`feature/tax-filter-columns-label`, `feature/phase5-dialer`, `feature/phase5-dialer-ui` — already gone from origin; local + tracking-ref cleanup done).
 - [x] ✅ **Redis CERT verified 2026-06-15** — `REDIS_SSL_CERT_REQS` unset on api + worker → code default `"required"` applies (SAFE).
+
+## 8. Landing/marketing monopo redesign — billing $199 coupling (registered 2026-06-20; mostly RESOLVED 2026-06-21)
+
+The original concern: monopo marketing pages advertise **$199** (`docs/pricing-strategy-2026-06.md`)
+while the live billing API still charged the OLD **$79** tiers → bait-and-switch risk. **Billing has
+since migrated to $199 and is verified live**, so the coupling blocker is cleared. Only the
+frontend "wire the page to live pricing" item remains, and it lives in the separate `bridgeleads-web`
+repo (not this backend repo).
+
+- [x] ✅ **Marketing/billing price match — RESOLVED 2026-06-21.** Billing now charges $199 (Pro $199 / Business $499 / Agency $1499), so marketing pages showing $199 are no longer a bait-and-switch. No longer a launch blocker.
+- [x] ✅ **Billing migrated to the $199 strategy** — backend **PR #90** (`src/config/settings.py` PLAN_LIMITS + SKIP_TRACE_BUNDLED_QUOTAS, real `price_` Stripe ids on api+worker, onboarding copy $79→$199, annual + FOUNDING25 promo). Frontend **PR #39/#40** + BillingTab monthly/annual toggle **PR #42**. Entitlement validator **PR #93** (flagged OFF, audit-only). WTP playbook **PR #94**. Stripe ids in `docs/stripe-prices-2026-06.md`. All live + verified.
+- [ ] 🟢 **(FRONTEND REPO)** Re-wire the registered billing-API connection on the marketing `/pricing` page. Seam is BUILT + dormant at `bridgeleads-web/app/(marketing)/_monopo/pricingApi.ts` (`USE_LIVE_PRICING=false`, typed `fetchLivePricing()` + `toPlanCols()` mapper, endpoint `GET /billing/pricing`). Now that billing is $199: flip the flag, drive `/pricing` + landing from the live response, restore the "X of Y founding spots remaining" counter. Lives in `bridgeleads-web`, not this repo.

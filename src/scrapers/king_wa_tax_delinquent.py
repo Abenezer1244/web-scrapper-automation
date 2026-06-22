@@ -30,6 +30,7 @@ HTTP GET. Owner name + address are enriched downstream via GIS + eRealProperty.
 """
 
 import random
+import re
 import time
 from collections import defaultdict
 from datetime import UTC, datetime
@@ -51,6 +52,51 @@ _HEADERS = {"User-Agent": "Mozilla/5.0 BridgeLeads/1.0"}
 _SOURCE = "king_county_delinquent_taxes"
 
 add_scrape_domain("data.kingcounty.gov")
+
+# The Socrata source has no owner column, so a tax row ships with this synthetic
+# party_name until enrichment (eRealProperty) swaps in the real owner. The
+# producer (`tax_placeholder_party`) and the matcher (`is_tax_placeholder_party`,
+# used by the enrichment overwrite gate) MUST stay in sync — keep them together.
+_TAX_PLACEHOLDER_PREFIX = "Tax Delinquent"
+# Exact shape of `tax_placeholder_party` output: prefix, a "$<amount>" clause, and
+# a closing "(Parcel <id>)". Requiring the dollar amount stops a real owner name
+# that merely starts with the prefix from being matched. The separator is `.*?`
+# (not the literal em dash) so source/DB encoding of the dash can never break it.
+_TAX_PLACEHOLDER_RE = re.compile(
+    r"^Tax Delinquent\b.*?\$[\d,]+ owed \(Parcel [^)]+\)$"
+)
+
+
+def tax_placeholder_party(amount: Decimal, parcel: str) -> str:
+    """Synthetic party_name for a King tax-delinquent row (no owner at scrape)."""
+    return f"{_TAX_PLACEHOLDER_PREFIX} — ${amount:,.0f} owed (Parcel {parcel})"
+
+
+def is_tax_placeholder_party(party_name: str | None) -> bool:
+    """True iff party_name is the placeholder `tax_placeholder_party` produces.
+
+    Anchored full-shape match (prefix + "$amount" + "(Parcel id)"), so a real
+    owner name that happens to start with "Tax Delinquent" is never clobbered.
+    """
+    return bool(_TAX_PLACEHOLDER_RE.match(party_name or ""))
+
+
+def is_parcel_legal_placeholder(legal_description: str | None, parcel_id: str | None) -> bool:
+    """True iff legal_description is the parcel-number stand-in this scraper sets.
+
+    The King Socrata tax feed has no legal description (it's a tax-receivable roll),
+    so `scrape()` stores the parcel number in `legal_description` as a placeholder
+    (`rec.legal_description = parcel`). A real legal description is then available
+    from eRealProperty enrichment. This predicate gates that overwrite: only a row
+    whose legal_description is STILL just its own parcel is eligible to be replaced,
+    so a real legal description is never clobbered (mirrors the party_name gate).
+    """
+    if not legal_description or not parcel_id:
+        return False
+    p = parcel_id.strip()
+    # Require a non-empty parcel so whitespace-only values ("   ") don't collapse
+    # to "" == "" and falsely report a stand-in.
+    return bool(p) and legal_description.strip() == p
 
 # Charge types whose (billed - paid) is real principal owed on the tax bill.
 # Allowlist (fail-closed for money): anything NOT here and NOT abatement is an
@@ -245,7 +291,14 @@ def aggregate_delinquent_rows(
 
         rec = ScrapedRecord()
         rec.parcel_id = parcel
-        rec.party_name = f"Tax Delinquent — ${amount:,.0f} owed (Parcel {parcel})"
+        # No owner name in the Socrata tax feed (and King redacts it from bulk
+        # downloads). Leave party_name BLANK — honest "not provided" — rather than a
+        # synthetic placeholder that reads as a fake name next to the real
+        # property/tax data. The real owner name comes from skip-trace (address →
+        # name + phone + email) or per-parcel eRealProperty enrichment. The
+        # tax_placeholder_party/is_tax_placeholder_party helpers are kept ONLY so the
+        # one-time clear-backfill can still recognize and null out historical rows.
+        rec.party_name = None
         rec.legal_description = parcel
         rec.date_recorded = f"01/01/{bill_year}"
         rec.enrichment_data = {

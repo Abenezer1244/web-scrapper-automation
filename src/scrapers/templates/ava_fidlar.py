@@ -24,11 +24,22 @@ from src.scrapers.base_scraper import (
     ScrapedRecord,
     normalize_party_text,
 )
+from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
 )
+from src.scrapers.reliability import (
+    ScraperBlockedError,
+    ScraperExecutionError,
+    check_extraction_canary,
+    classify_results_page,
+    detect_block,
+)
 from src.utils.logger import setup_logger
+
+# Substrings an AVA Fidlar results page renders for a genuine zero-result window.
+_EMPTY_MARKERS = ("no results", "results: 0", "no records", "no documents")
 
 _logger = setup_logger("scraper.template.ava_fidlar")
 
@@ -87,6 +98,10 @@ class AvaFidlarScraper(BridgeScraper):
         seen_hashes: set[str] = set()
         chunk_start = start
 
+        # Fail-loud contract (intentional): a setup failure / block / ambiguous
+        # results page on ANY chunk RAISES and fails the whole job (the scheduler
+        # re-runs it) — we never swallow a bad chunk and continue, which would
+        # silently under-deliver a partial date window under a DONE job.
         while chunk_start < end:
             chunk_end = min(chunk_start + timedelta(days=chunk_days), end)
             cf = chunk_start.strftime("%m/%d/%Y")
@@ -158,10 +173,16 @@ class AvaFidlarScraper(BridgeScraper):
             _logger.info("Dates filled: %s to %s", date_from, date_to)
 
         except Exception as exc:
-            _logger.warning("Could not fill dates: %s", str(exc)[:120])
+            raise ScraperExecutionError(
+                self.county, "AVA Fidlar", "date-fill failed (search never ran)",
+                date_from=date_from, date_to=date_to, context=str(exc)[:120],
+            ) from exc
 
     async def _submit_search(self) -> None:
         """Click the Search button and wait for results."""
+        # Reset the canary baseline up front so a regex-miss / early failure this
+        # chunk can never reuse a previous chunk's positive count.
+        self._last_results_total = None
         try:
             search_btn = self.page.locator("button:has-text('Search')").first
             await search_btn.click()
@@ -172,13 +193,20 @@ class AvaFidlarScraper(BridgeScraper):
 
             body = await self.page.inner_text("body")
             results_match = re.search(r"Results:\s*(\d+)", body)
+            # Store the portal's reported total for the extraction canary.
+            self._last_results_total = int(results_match.group(1)) if results_match else None
             if results_match:
                 _logger.info("Results count: %s", results_match.group(1))
             elif "no results" in body.lower():
                 _logger.info("No results for this date range")
 
+        except ScraperExecutionError:
+            raise
         except Exception as exc:
-            _logger.warning("Could not submit search: %s", str(exc)[:120])
+            raise ScraperExecutionError(
+                self.county, "AVA Fidlar", "search submit failed",
+                context=str(exc)[:120],
+            ) from exc
 
     async def _extract_results(self) -> list[ScrapedRecord]:
         """Extract records from the AVA results page.
@@ -266,15 +294,40 @@ class AvaFidlarScraper(BridgeScraper):
             """)
 
             if not raw:
-                _logger.info("No records extracted from results page")
+                # Canary: portal reported N>0 but we extracted 0 -> parse drift.
+                check_extraction_canary(
+                    expected_total=getattr(self, "_last_results_total", None),
+                    raw_extracted=0, county=self.county, platform="AVA Fidlar",
+                )
+                body = await self.page.inner_text("body")
+                verdict = classify_results_page(
+                    row_count=0, page_text=body, empty_markers=_EMPTY_MARKERS
+                )
+                if verdict == "block":
+                    raise ScraperBlockedError(
+                        self.county, "AVA Fidlar",
+                        f"block wall on results page ({detect_block(body)})",
+                        context=body[:120],
+                    )
+                if verdict == "ambiguous":
+                    raise ScraperExecutionError(
+                        self.county, "AVA Fidlar",
+                        "no result rows and no empty-marker (search may have "
+                        "silently failed / been blocked)",
+                        context=body[:120],
+                    )
+                _logger.info("No results for this chunk (genuine empty window)")
                 return []
 
             for item in raw:
                 record = ScrapedRecord()
 
                 inst = (item.get("instrument") or "").strip()
-                if inst:
-                    record.legal_description = inst
+                # Instrument # is a document id, not a legal description — keep it in
+                # enrichment_data and use it as the stable per-record fingerprint
+                # (no raw_html_hash on this template, so source_fingerprint would
+                # otherwise depend on the legal_description we're changing).
+                record.enrichment_data = {"instrument_number": inst, "source": "ava_fidlar"}
 
                 date_str = (item.get("date_recorded") or "").strip()
                 if date_str:
@@ -298,6 +351,15 @@ class AvaFidlarScraper(BridgeScraper):
                             continue
                     else:
                         for rt in self.record_types:
+                            if rt == "divorce":
+                                # Generic keyword connector — fail closed on an
+                                # ambiguous bare "DISSOLUTION" via the shared
+                                # 3-state classifier (keeps corporate/entity
+                                # dissolutions out of divorce results).
+                                if is_divorce_doc(doc_type, precise_source=False):
+                                    matched_rt = rt
+                                    break
+                                continue
                             keywords = _DOC_TYPE_MAP.get(rt, [])
                             if any(kw in doc_type for kw in keywords):
                                 matched_rt = rt
@@ -327,29 +389,47 @@ class AvaFidlarScraper(BridgeScraper):
                     if oriented is None:
                         continue
                     record.party_name, record.heirs = oriented
+                elif matched_rt == "divorce":
+                    # Both spouses are valid leads; only correct the case where the
+                    # recorder indexed a court/state/agency as grantor. No-op when
+                    # the grantor is already a person.
+                    record.party_name, record.heirs = orient_divorce_party(
+                        grantor, grantee, doc_type
+                    )
                 else:
                     if grantor:
                         record.party_name = grantor
                     if grantee:
                         record.heirs = grantee
 
+                # Real property legal description only (None when none in the index;
+                # never the instrument # as a stand-in).
                 legal = (item.get("legal") or "").strip()
-                if legal and record.legal_description:
-                    record.legal_description = f"{record.legal_description} | {legal}"
-                elif legal:
+                if legal:
                     record.legal_description = legal
 
                 parcel = (item.get("parcel") or "").strip()
                 if parcel:
                     record.parcel_id = parcel
 
+                # Stable, unique per-row fingerprint (includes instrument_number via
+                # enrichment_data in to_dict); never the bare instrument, which would
+                # collapse multi-party/parcel rows under one recording. Keeps tasks.py
+                # source_fingerprint stable + distinct without legal_description.
+                record.raw_html_hash = self.make_hash(record.to_dict())
+
                 if record.party_name or record.date_recorded:
                     records.append(record)
 
             _logger.info("Extracted %d records from results", len(records))
 
+        except ScraperExecutionError:
+            raise  # block / ambiguous / canary — propagate, never silent []
         except Exception as exc:
-            _logger.warning("Error extracting results: %s", str(exc)[:80])
+            raise ScraperExecutionError(
+                self.county, "AVA Fidlar", "results extraction failed",
+                context=str(exc)[:120],
+            ) from exc
 
         return records
 

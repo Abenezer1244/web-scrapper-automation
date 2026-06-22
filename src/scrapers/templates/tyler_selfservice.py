@@ -38,12 +38,24 @@ import re
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
 )
 from src.scrapers.probate import orient_probate_party
+from src.scrapers.reliability import (
+    ScraperBlockedError,
+    ScraperExecutionError,
+    classify_results_page,
+    detect_block,
+)
 from src.utils.logger import setup_logger
+
+# Substrings a Tyler SelfService results page renders for a genuine zero-result
+# window (it has no numeric results header). Kept exact to avoid misreading a
+# block/login page as a genuine empty.
+_EMPTY_MARKERS = ("no records", "no results", "0 records", "did not return any", "no documents found")
 
 _logger = setup_logger("scraper.template.tyler_selfservice")
 
@@ -173,10 +185,13 @@ class TylerSelfServiceScraper(BridgeScraper):
             self.base_url = lowercase_root
             await self.navigate(lowercase_root)
 
-        # Step 1: disclaimer
+        # Step 1: disclaimer (a required disclaimer we cannot accept = real failure)
         if not await self._bypass_disclaimer():
-            _logger.error("Disclaimer bypass failed")
-            return []
+            raise ScraperExecutionError(
+                self.county, "Tyler SelfService",
+                "disclaimer bypass failed (search never started)",
+                record_type=self.active_record_type,
+            )
 
         # Step 2: find the Official Records Search action group id by walking
         # the home page. Tyler names links like "Official Records Search" —
@@ -185,8 +200,11 @@ class TylerSelfServiceScraper(BridgeScraper):
         # DOCSEARCH...S3 (Document Type Search).
         search_url = await self._discover_search_url()
         if not search_url:
-            _logger.error("Could not discover Document Type Search URL")
-            return []
+            raise ScraperExecutionError(
+                self.county, "Tyler SelfService",
+                "could not discover Document Type Search URL (page layout changed / blocked)",
+                record_type=self.active_record_type,
+            )
 
         _logger.info("Document Type Search URL: %s", search_url)
         await self.navigate(search_url)
@@ -198,16 +216,37 @@ class TylerSelfServiceScraper(BridgeScraper):
 
         # Step 3: fill dates and submit
         if not await self._fill_and_submit(date_from, date_to):
-            _logger.warning("Failed to submit search for %s-%s", date_from, date_to)
-            return []
+            raise ScraperExecutionError(
+                self.county, "Tyler SelfService",
+                "date-fill / submit failed (search never ran)",
+                record_type=self.active_record_type, date_from=date_from, date_to=date_to,
+            )
 
-        # Step 4: wait for results to render
+        # Step 4: wait for results to render. A timeout here is NOT automatically
+        # "empty" — distinguish a genuine zero-result window (explicit marker) from
+        # a block / silent failure (raise). Otherwise a blocked search hands the
+        # tenant an empty list under a DONE job.
         try:
             await self.page.wait_for_selector("li.ss-search-row", timeout=15_000)
         except Exception:
-            page_text = (await self.page.inner_text("body"))[:500]
-            _logger.warning("No result rows appeared for Tyler search")
-            _logger.debug("Body starts: %s", page_text)  # scraped body may contain PII
+            page_text = await self.page.inner_text("body")
+            verdict = classify_results_page(
+                row_count=0, page_text=page_text, empty_markers=_EMPTY_MARKERS
+            )
+            if verdict == "block":
+                raise ScraperBlockedError(
+                    self.county, "Tyler SelfService",
+                    f"block wall on results page ({detect_block(page_text)})",
+                    record_type=self.active_record_type, context=page_text[:120],
+                ) from None
+            if verdict == "ambiguous":
+                raise ScraperExecutionError(
+                    self.county, "Tyler SelfService",
+                    "no result rows appeared and no empty-marker (search may have "
+                    "silently failed / been blocked)",
+                    record_type=self.active_record_type, context=page_text[:120],
+                ) from None
+            _logger.info("Tyler search returned a genuine empty window")
             return []
         await self.page.wait_for_timeout(2_000)
 
@@ -217,7 +256,27 @@ class TylerSelfServiceScraper(BridgeScraper):
         page_num = 1
         max_pages = 20  # safety cap — 2000 records for a 30-day window is plenty
         while page_num <= max_pages:
-            page_records = await self._extract_page()
+            # Bounded retry on a transient extraction failure, then fail loud.
+            page_records = None
+            last_exc: ScraperExecutionError | None = None
+            for attempt in range(1, 4):
+                try:
+                    page_records = await self._extract_page(page_num)
+                    break
+                except ScraperExecutionError as exc:
+                    last_exc = exc
+                    _logger.warning(
+                        "Page %d extract attempt %d/3 failed: %s",
+                        page_num, attempt, str(exc)[:100],
+                    )
+                    if attempt < 3:
+                        await self.page.wait_for_timeout(1_500 * attempt)
+            if page_records is None:
+                raise last_exc or ScraperExecutionError(
+                    self.county, "Tyler SelfService",
+                    "page extraction failed after retries (no recorded cause)",
+                    record_type=self.active_record_type, page=page_num,
+                )
             new = 0
             for r in page_records:
                 did = r.enrichment_data.get("document_id")
@@ -409,7 +468,7 @@ class TylerSelfServiceScraper(BridgeScraper):
         # Search is AJAX — no navigation. The caller waits for results.
         return True
 
-    async def _extract_page(self) -> list[ScrapedRecord]:
+    async def _extract_page(self, page_num: int = 1) -> list[ScrapedRecord]:
         """Extract all ss-search-row elements on the current page.
 
         Tyler SelfService renders each record as an <li class="ss-search-row">
@@ -438,8 +497,20 @@ class TylerSelfServiceScraper(BridgeScraper):
                 }"""
             )
         except Exception as exc:
-            _logger.warning("Page extraction failed: %s", str(exc)[:120])
-            return []
+            raise ScraperExecutionError(
+                self.county, "Tyler SelfService", "page extraction failed",
+                page=page_num, record_type=self.active_record_type,
+                context=str(exc)[:120],
+            ) from exc
+
+        if not raw and page_num == 1:
+            # Step 4 already confirmed result rows rendered; extracting 0 here is
+            # parse drift (layout change), not a genuine empty window.
+            raise ScraperExecutionError(
+                self.county, "Tyler SelfService",
+                "result rows rendered but extracted 0 (parse drift)",
+                page=page_num, record_type=self.active_record_type,
+            )
 
         records: list[ScrapedRecord] = []
         for item in raw:
@@ -578,9 +649,22 @@ class TylerSelfServiceScraper(BridgeScraper):
         if not keywords:
             return records
         is_preforeclosure = self.active_record_type == "pre_foreclosure"
+        is_divorce = self.active_record_type == "divorce"
         kept = []
         for r in records:
             doc = (r.doc_type or "").upper()
+            if is_divorce:
+                # Tyler SelfService is a generic keyword connector with no precise
+                # server-side divorce filter — use the shared 3-state classifier
+                # and fail closed on ambiguous bare "DISSOLUTION" (keeps corporate/
+                # entity dissolutions out), then keep a real person in party_name.
+                if not is_divorce_doc(r.doc_type, precise_source=False):
+                    continue
+                r.party_name, r.heirs = orient_divorce_party(
+                    r.party_name, r.heirs, r.doc_type
+                )
+                kept.append(r)
+                continue
             if not any(kw in doc for kw in keywords):
                 continue
             if is_preforeclosure:

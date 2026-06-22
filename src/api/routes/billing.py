@@ -244,30 +244,34 @@ _PLANS = [
     {
         "id": "pro",
         "name": "Pro",
-        "price_monthly": 79,
-        "price_annual": 758,  # ~$63/mo, 20% off
+        "price_monthly": 199,
+        "price_annual": 1910,  # ~$159/mo, ~20% off
         "records_limit": 1000,
+        # Bullets describe ENFORCED entitlements only. Per-tier county /
+        # record-type gating is the value-metric build (separate phase); until
+        # it ships we do NOT advertise a county cap the backend does not honor.
         "features": [
             "1,000 records/month",
-            "5 counties",
             "All record types",
             "Skip tracing (phone + email)",
             "CSV + Excel export",
             "Daily/weekly schedule",
             "Email delivery",
+            "Batch scraping",
         ],
         "stripe_price_id": settings.STRIPE_PRICE_PRO,
+        "stripe_price_id_annual": settings.STRIPE_PRICE_PRO_ANNUAL,
         "popular": True,
     },
     {
         "id": "business",
         "name": "Business",
-        "price_monthly": 149,
-        "price_annual": 1430,  # ~$119/mo, 20% off
+        "price_monthly": 499,
+        "price_annual": 4790,  # ~$399/mo, ~20% off
         "records_limit": 5000,
         "features": [
             "5,000 records/month",
-            "Unlimited counties",
+            "All record types",
             "All export formats",
             "All schedules",
             "Email + Webhook delivery",
@@ -276,16 +280,16 @@ _PLANS = [
             "5 team members",
         ],
         "stripe_price_id": settings.STRIPE_PRICE_BUSINESS,
+        "stripe_price_id_annual": settings.STRIPE_PRICE_BUSINESS_ANNUAL,
     },
     {
         "id": "agency",
         "name": "Agency",
-        "price_monthly": 499,
-        "price_annual": 4790,  # ~$399/mo, 20% off
+        "price_monthly": 1499,
+        "price_annual": 14390,  # ~$1,199/mo, ~20% off
         "records_limit": -1,
         "features": [
             "Unlimited records",
-            "Unlimited counties",
             "All features",
             "Skip tracing (2,000 included)",
             "Unlimited team members",
@@ -294,21 +298,43 @@ _PLANS = [
             "Dedicated account manager",
         ],
         "stripe_price_id": settings.STRIPE_PRICE_AGENCY,
+        "stripe_price_id_annual": settings.STRIPE_PRICE_AGENCY_ANNUAL,
     },
 ]
 
-# price_id → (plan_name, records_limit)
+# price_id → (plan_name, records_limit). Includes BOTH the monthly and annual
+# Stripe Price IDs so the webhook maps an annual subscription to the right plan,
+# not just the monthly one.
 _PRICE_TO_PLAN: dict[str, tuple[str, int]] = {
-    p["stripe_price_id"]: (p["id"], p["records_limit"])
+    pid: (p["id"], p["records_limit"])
     for p in _PLANS
-    if p["stripe_price_id"]
+    for pid in (p.get("stripe_price_id"), p.get("stripe_price_id_annual"))
+    if pid
 }
+
+# Config sanity (log-only — NEVER raise here: a hard failure at import would
+# crash-loop the Railway api on boot, per the boot-migration landmine). Warn
+# loudly if a configured plan price id is not a Stripe Price ("price_…"); that
+# is how a Product id ("prod_…") ended up in a STRIPE_PRICE_* slot before.
+for _p in _PLANS:
+    for _slot in ("stripe_price_id", "stripe_price_id_annual"):
+        _pid = _p.get(_slot)
+        if _pid and not _pid.startswith("price_"):
+            _logger.warning(
+                "billing config: %s for plan '%s' is %r — expected a 'price_' "
+                "id; checkout for this plan will fail until Railway env (api AND "
+                "worker) is corrected.",
+                _slot, _p["id"], _pid,
+            )
 
 
 # ─── Plans catalog ────────────────────────────────────────────────────────────
 
-_FOUNDING_COUPON_ID = "8mX1xa35"
-_FOUNDING_CACHE_KEY = "founding_offer:8mX1xa35"
+# 2026-06 pricing migration: founding discount reduced 40% -> 25% so founding
+# prices stay above the $99 credibility floor (Pro ~$149.25). New Stripe coupon
+# id == "FOUNDING25"; the old 40% coupon "8mX1xa35" was retired in Stripe.
+_FOUNDING_COUPON_ID = "FOUNDING25"
+_FOUNDING_CACHE_KEY = "founding_offer:FOUNDING25"
 _FOUNDING_CACHE_TTL = 60  # seconds
 
 
@@ -326,7 +352,7 @@ async def _get_founding_offer() -> dict:
     inactive (fail-closed for a promo banner).
     """
     founding = {
-        "active": False, "code": "FOUNDING40", "percent_off": 40,
+        "active": False, "code": "FOUNDING25", "percent_off": 25,
         "spots_total": 25, "spots_remaining": 0,
     }
 
@@ -510,6 +536,21 @@ async def create_checkout(
     # Validate: resolved price must be a known plan price
     if stripe_price_id not in _PRICE_TO_PLAN:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
+
+    # Defensive: the resolved id MUST be a Stripe Price ("price_…"), never a
+    # Product ("prod_…"). A misconfigured STRIPE_PRICE_* env (a product id in a
+    # price slot) would otherwise reach Stripe and surface as a generic 502;
+    # fail fast with a logged config error and a clean message instead.
+    if not stripe_price_id.startswith("price_"):
+        _logger.error(
+            "checkout: resolved id %r is not a 'price_' id — STRIPE_PRICE_* is "
+            "misconfigured (check Railway env on api AND worker).",
+            stripe_price_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Billing is temporarily unavailable. Please try again later.",
+        )
 
     try:
         customer_id = current_user.stripe_customer_id

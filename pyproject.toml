@@ -42,6 +42,8 @@ ignore = [
 "src/api/routes/scrapers.py" = ["S608"]
 "src/api/routes/segments.py" = ["S608"]   # segment SQL interpolates only generated tax_cap_sql/{county_clause} placeholders; values bound via params
 "src/workers/batch_export.py" = ["S608"]  # combined-export SQL interpolates only the tax_cap_sql placeholder; values bound via params
+"scripts/backfill_king_tax_owner_names.py" = ["S608"]  # bulk UPDATE interpolates only generated :id_N/:owner_N/:old_N placeholders; values bound via params
+"scripts/backfill_king_bulk_legal_mailing.py" = ["S608"]  # bulk UPDATE interpolates only generated :id_N/:new_N/:m_N placeholders; values bound via params
 
 [tool.ruff.lint.isort]
 known-first-party = ["src"]

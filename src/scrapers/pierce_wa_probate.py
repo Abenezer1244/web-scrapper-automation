@@ -17,7 +17,9 @@ from bs4 import BeautifulSoup, Tag
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.divorce import orient_divorce_party
 from src.scrapers.enrichment.county_gis import batch_enrich_parcels_gis
+from src.scrapers.preforeclosure import orient_pre_foreclosure_party
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.pierce_wa_probate")
@@ -36,6 +38,18 @@ _LEGAL_KEYWORDS = re.compile(
     r"\b(LT|LOT|BLK|BLOCK|SEC|TWNSHP|RNG|ADDN|PLAT|DIV|SHORT PLAT)\b",
     re.IGNORECASE,
 )
+
+# ARMS appends "(+)" to a party when more parties share that role than the results
+# row shows (e.g. "QUALITY LOAN SERVICE CORP(+)"). It is a UI marker, never part of
+# a real name, so strip it before any person/company classification or display.
+_ARMS_PLUS = re.compile(r"\s*\(\+\)\s*")
+
+
+def _strip_arms_plus(value: str | None) -> str | None:
+    """Remove the ARMS "(+)" more-parties marker; return None unchanged."""
+    if not value:
+        return value
+    return _ARMS_PLUS.sub(" ", value).strip() or None
 
 
 class PierceWAARMSScraper(BridgeScraper):
@@ -62,6 +76,7 @@ class PierceWAARMSScraper(BridgeScraper):
 
     def __init__(self, record_type: str = "probate", doc_types: list[str] | None = None):
         super().__init__()
+        self._record_type = record_type
         cfg = self.RECORD_TYPE_CONFIG.get(record_type, self.RECORD_TYPE_CONFIG["probate"])
         self.DOC_TYPE_IDS: list[str] = cfg["ids"]
         self.DOC_TYPE_LABEL: str = cfg["label"]
@@ -494,6 +509,42 @@ class PierceWAARMSScraper(BridgeScraper):
             cell_text = c.get_text(separator="|", strip=True)
             if "[R]" in cell_text or "[E]" in cell_text:
                 record.party_name, record.heirs = self._parse_name_cell(c)
+                if self._record_type == "divorce":
+                    # ARMS checkbox 87 already constrains the search to DECREE OF
+                    # DISSOLUTION (precise), so no doc-type re-filter is needed.
+                    # Both spouses are valid leads; only correct the case where a
+                    # court/state landed in the [R] (party_name) slot. No-op when
+                    # it is already a person.
+                    record.party_name, record.heirs = orient_divorce_party(
+                        record.party_name, record.heirs, self.DOC_TYPE_LABEL
+                    )
+                elif self._record_type == "pre_foreclosure":
+                    # ARMS indexes a Notice of Trustee Sale with the TRUSTEE /
+                    # beneficiary as the [R] party and the borrower as [E] (or the
+                    # reverse) — so the raw [R] is frequently a company
+                    # ("TRUSTEE CORPS", "QUALITY LOAN SERVICE CORP"), not the
+                    # distressed homeowner. Strip the ARMS "(+)" more-parties marker
+                    # first (it is never part of a name), then orient so the PERSON
+                    # becomes party_name and the company context moves to heirs.
+                    # orient returns None only when NEITHER visible role carries a
+                    # natural person — observed: bank-vs-bank, trustee-vs-commercial-LLC,
+                    # or a parse-junk "[E]" cell. That is the SAME drop-if-no-person
+                    # contract King already applies (no homeowner = not a lead). When a
+                    # person exists it is always present in [R] or [E] (never only
+                    # behind "(+)"), so no real homeowner is lost — verified live.
+                    party = _strip_arms_plus(record.party_name)
+                    heirs = _strip_arms_plus(record.heirs)
+                    oriented = orient_pre_foreclosure_party(party, heirs)
+                    if oriented is None:
+                        # No person on either visible role — log (never silent) so a
+                        # systematic borrower-behind-"(+)" loss is observable.
+                        _logger.info(
+                            "pre_foreclosure: no person party — [R]=%r [E]=%r (dropped)",
+                            party, heirs,
+                        )
+                        record.party_name = None  # dropped by the party-name guard below
+                    else:
+                        record.party_name, record.heirs = oriented
                 break
 
         # Legal description

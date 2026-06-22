@@ -14,9 +14,11 @@ for the subset that need mailing addresses.
 """
 
 import asyncio
+import html
 import re
 
 from src.api.middleware.security import add_scrape_domain
+from src.config import settings
 from src.scrapers.base_scraper import BridgeScraper
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
@@ -28,6 +30,113 @@ _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.
 
 add_scrape_domain("blue.kingcounty.com")
 add_scrape_domain("payment.kingcounty.gov")
+
+# eRealProperty Dashboard labels the owner/taxpayer cell `<td>Name</td><td>VALUE`
+# exactly once per page. The label cell is plain text (no nested tags on the live
+# page); the VALUE cell is captured lazily to its closing </td> and tag-stripped,
+# so markup inside the value is tolerated. Case- and whitespace-insensitive.
+# King joins co-owners with "+"; entity owners (LLC/bank/estate) are valid
+# tax-delinquent leads, so no person-vs-agency orientation is applied.
+_OWNER_RE = re.compile(
+    r"<td[^>]*>\s*Name\s*</td>\s*<td[^>]*>(.*?)</td>", re.IGNORECASE | re.DOTALL
+)
+# Reject placeholders the assessor sometimes serves so we never overwrite a
+# labeled lead with junk. Compared after stripping non-alphanumerics, so "N/A",
+# "N.A.", and "N / A" all collapse to "NA".
+_OWNER_JUNK = frozenset({"NA", "NONE", "NULL", "UNKNOWN"})
+
+
+def _extract_owner_name(page_html: str) -> str | None:
+    """Owner/taxpayer name from an eRealProperty Dashboard page, or None."""
+    m = _OWNER_RE.search(page_html)
+    if not m:
+        return None
+    # Strip any nested tags, then decode HTML entities (&nbsp;, &amp;, &#160;…).
+    text = re.sub(r"<[^>]+>", " ", m.group(1))
+    name = BridgeScraper.clean(html.unescape(text))
+    if not name or re.sub(r"[^A-Z0-9]", "", name.upper()) in _OWNER_JUNK:
+        return None
+    return name
+
+
+async def _fetch_king_owner(pid: str) -> tuple[str | None, bool]:
+    """Resolve one parcel's owner with bounded retry.
+
+    Returns (owner_name_or_None, had_transient_error). A 200 response whose page
+    has no owner cell is a GENUINE miss -> (None, False). A persistent non-200
+    (429/5xx/4xx) or exception after Settings.MAX_RETRIES attempts is a TRANSIENT
+    failure -> (None, True), so a caller can avoid treating it as "no such owner".
+    """
+    for attempt in range(settings.MAX_RETRIES):
+        try:
+            # S4: safe_get re-validates the (fixed HTTPS) target for SSRF defense
+            # in depth — same call the full enricher uses.
+            r = safe_get(f"{_ERP_URL}{pid}", headers=_HEADERS, timeout=10)
+            if r.status_code == 200:
+                return _extract_owner_name(r.text), False  # genuine result (name or miss)
+        except Exception as exc:
+            _logger.debug(
+                "Owner fetch error parcel=%s attempt=%d: %s", pid, attempt + 1, str(exc)[:160]
+            )
+        if attempt < settings.MAX_RETRIES - 1:
+            await asyncio.sleep(0.5 * (attempt + 1))  # linear backoff
+    return None, True
+
+
+async def batch_extract_king_owners(
+    parcel_ids: list[str], delay: float = 0.1
+) -> dict[str, str]:
+    """Owner/taxpayer name per parcel from eRealProperty — HTTP only, no Playwright.
+
+    A lean, owner-ONLY companion to batch_enrich_king_county's Phase 1. The full
+    enricher also fetches mailing addresses via Playwright (slow, ~5s/parcel);
+    callers that only need to repair a placeholder party_name (the King
+    tax-delinquent backfill, and the inline owner-only pass for rows that already
+    have a mailing address) must not pay that cost. Same eRealProperty endpoint,
+    same SSRF-guarded safe_get, same _extract_owner_name parser/junk-rejection —
+    so a name produced here is identical to one produced by the full path.
+
+    `delay` is the pause between requests (default 0.1s — fine for a normal
+    ~300-parcel job). A bulk caller (the backfill, tens of thousands of parcels)
+    should pass a larger value: eRealProperty rate-limits a sustained ~10 req/s
+    stream, so too small a delay makes ~half the lookups fail transiently.
+
+    Returns {parcel_id: owner_name} for parcels that yielded a real owner; misses
+    are simply absent (never an empty/None value), so a caller can swap
+    unconditionally on a present key. Transient failures (counted + logged at
+    WARNING) are also absent — but the backfill is re-runnable, so a parcel that
+    failed transiently this run is retried on the next run (it is still a
+    placeholder), never permanently abandoned.
+    """
+    owners: dict[str, str] = {}
+    # parcel_id comes from our own scraped DB rows (not user input), but require a
+    # digit so a malformed value can't generate a noisy external request.
+    clean = list(dict.fromkeys(
+        pid.strip() for pid in parcel_ids
+        if pid and len(pid.strip()) >= 6 and any(c.isdigit() for c in pid)
+    ))
+    if not clean:
+        return owners
+
+    _logger.info("Owner-only lookup for %d parcels...", len(clean))
+    failures = 0
+    for i, pid in enumerate(clean):
+        if i % 100 == 0 and i > 0:
+            _logger.info("  owner HTTP: %d / %d ...", i, len(clean))
+        owner, errored = await _fetch_king_owner(pid)
+        if owner:
+            owners[pid] = owner
+        elif errored:
+            failures += 1
+        await asyncio.sleep(delay)
+
+    if failures:
+        _logger.warning(
+            "Owner-only lookup: %d/%d parcels failed after %d retries (transient — "
+            "re-run to retry; not abandoned)", failures, len(clean), settings.MAX_RETRIES,
+        )
+    _logger.info("Owner-only lookup done: %d/%d parcels resolved", len(owners), len(clean))
+    return owners
 
 
 async def batch_enrich_king_county(
@@ -70,8 +179,16 @@ async def batch_enrich_king_county(
             )
             tax_url = m2.group(1).replace("&amp;", "&") if m2 else None
 
-            if prop or tax_url:
-                results[pid] = {"property_address": prop, "mailing_address": None}
+            # Owner/taxpayer name — same page, no extra request. Fills the
+            # placeholder party_name on King tax-delinquent leads downstream.
+            owner = _extract_owner_name(r.text)
+
+            if prop or tax_url or owner:
+                results[pid] = {
+                    "property_address": prop,
+                    "mailing_address": None,
+                    "owner_name": owner,
+                }
                 if tax_url:
                     tax_urls[pid] = tax_url
 

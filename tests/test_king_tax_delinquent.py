@@ -18,7 +18,49 @@ from src.scrapers.king_wa_tax_delinquent import (
     _is_retryable,
     _page_params,
     aggregate_delinquent_rows,
+    is_parcel_legal_placeholder,
+    is_tax_placeholder_party,
+    tax_placeholder_party,
 )
+
+
+def test_placeholder_party_roundtrips_through_matcher():
+    # The producer's output must be recognized by the enrichment overwrite gate.
+    pn = tax_placeholder_party(Decimal("12345.67"), "1954600115")
+    assert pn == "Tax Delinquent — $12,346 owed (Parcel 1954600115)"
+    assert is_tax_placeholder_party(pn) is True
+
+
+def test_legal_placeholder_detects_parcel_stand_in():
+    # scrape() sets legal_description = parcel (no legal desc in the Socrata feed),
+    # so the stand-in is detected iff legal_description equals the parcel.
+    assert is_parcel_legal_placeholder("1954600115", "1954600115") is True
+    assert is_parcel_legal_placeholder(" 1954600115 ", "1954600115") is True  # whitespace-tolerant
+
+
+def test_legal_placeholder_rejects_real_legal_and_blanks():
+    # A real legal description must NOT be seen as the placeholder, and blanks/None
+    # are never the stand-in (so enrichment never clobbers a real value).
+    assert is_parcel_legal_placeholder("LOT 4 BLK 2 GREENBRIDGE DIV NO 3", "1954600115") is False
+    assert is_parcel_legal_placeholder(None, "1954600115") is False
+    assert is_parcel_legal_placeholder("", "1954600115") is False
+    assert is_parcel_legal_placeholder("1954600115", None) is False
+    assert is_parcel_legal_placeholder("9999999999", "1954600115") is False  # different parcel
+    assert is_parcel_legal_placeholder("   ", "  ") is False  # whitespace-only must not pass
+
+
+def test_matcher_rejects_real_and_empty_party_names():
+    # Real owner names (even one starting with the prefix) and blanks are NOT
+    # treated as the placeholder, so enrichment never clobbers a real lead.
+    assert is_tax_placeholder_party(None) is False
+    assert is_tax_placeholder_party("") is False
+    assert is_tax_placeholder_party("TOMLINSON WILLIAM+CHERYL L") is False
+    assert is_tax_placeholder_party("Tax Delinquent Holdings LLC") is False
+    # Contrived name with the prefix + "owed (Parcel …)" but NO "$amount" clause
+    # must not match (the anchored amount requirement defeats it).
+    assert is_tax_placeholder_party(
+        "Tax Delinquent Holdings LLC owed (Parcel Services)"
+    ) is False
 
 
 def _row(acct, year, rtype, billed, paid):
@@ -125,7 +167,8 @@ def test_single_charge_parcel_amount_and_label():
     assert b.enrichment_data["delinquent_amount"] == "3000.00"
     assert b.enrichment_data["bill_year"] == 2024
     assert b.parcel_id == "0222222222"
-    assert b.party_name == "Tax Delinquent — $3,000 owed (Parcel 0222222222)"
+    # No fabricated owner name — blank (honest); real name comes from skip-trace/eRealProperty.
+    assert b.party_name is None
     # doc_type stays None (like Snoho tax) so cached-records `doc_type IS NULL`
     # keeps these rows visible.
     assert b.doc_type is None

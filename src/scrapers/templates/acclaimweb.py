@@ -24,12 +24,22 @@ from src.scrapers.base_scraper import (
     ScrapedRecord,
     normalize_party_text,
 )
+from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
 )
 from src.scrapers.probate import orient_probate_party
+from src.scrapers.reliability import (
+    ScraperBlockedError,
+    ScraperExecutionError,
+    classify_results_page,
+    detect_block,
+)
 from src.utils.logger import setup_logger
+
+# Substrings an AcclaimWeb results page renders for a genuine zero-result window.
+_EMPTY_MARKERS = ("no results", "0 records", "no records", "no documents found")
 
 _logger = setup_logger("scraper.template.acclaimweb")
 
@@ -173,6 +183,10 @@ class AcclaimWebScraper(BridgeScraper):
         except Exception:
             pass
 
+        # Fail-loud contract (intentional): a setup failure / block / ambiguous
+        # results page on ANY day-chunk RAISES and fails the whole job (the
+        # scheduler re-runs it) — we never swallow a bad chunk and continue, which
+        # would silently under-deliver a partial date window under a DONE job.
         while chunk_start < end:
             # Use 1-day chunks in single-date mode, 7-day chunks otherwise
             effective_days = 1 if self._single_date_mode else chunk_days
@@ -473,10 +487,20 @@ class AcclaimWebScraper(BridgeScraper):
                     self._single_date_mode = True
                 return
 
-            _logger.warning("Could not find date inputs on page")
+            raise ScraperExecutionError(
+                self.county, "AcclaimWeb",
+                "could not locate date inputs (search never ran)",
+                record_type=self.active_record_type, date_from=date_from, date_to=date_to,
+            )
 
+        except ScraperExecutionError:
+            raise
         except Exception as exc:
-            _logger.warning("Could not set dates: %s", str(exc)[:120])
+            raise ScraperExecutionError(
+                self.county, "AcclaimWeb", "date-fill failed",
+                record_type=self.active_record_type, date_from=date_from, date_to=date_to,
+                context=str(exc)[:120],
+            ) from exc
 
     async def _submit_search(self) -> None:
         """Click the Search button and wait for results grid to populate."""
@@ -494,10 +518,12 @@ class AcclaimWebScraper(BridgeScraper):
                 _logger.info("Fallback search button count: %d", btn_count)
 
             if btn_count == 0:
-                _logger.warning("No search button found!")
                 body = await self.page.inner_text("body")
-                _logger.debug("Page body (500 chars): %s", body[:500].replace('\n', ' '))
-                return
+                raise ScraperExecutionError(
+                    self.county, "AcclaimWeb",
+                    "no search button found (search never ran)",
+                    record_type=self.active_record_type, context=body[:120],
+                )
 
             await search_btn.first.click()
             _logger.info("Search button clicked, waiting for results...")
@@ -538,8 +564,13 @@ class AcclaimWebScraper(BridgeScraper):
             _logger.info("After search URL: %s", self.page.url)
             _logger.debug("After search text (500): %s", body[:500].replace('\n', ' '))
 
+        except ScraperExecutionError:
+            raise
         except Exception as exc:
-            _logger.warning("Could not submit search: %s", str(exc)[:120])
+            raise ScraperExecutionError(
+                self.county, "AcclaimWeb", "search submit failed",
+                record_type=self.active_record_type, context=str(exc)[:120],
+            ) from exc
 
     async def _extract_all_pages(self) -> list[ScrapedRecord]:
         """Extract records from all result pages in the Kendo Grid."""
@@ -551,7 +582,28 @@ class AcclaimWebScraper(BridgeScraper):
         while page_num < max_pages:
             page_num += 1
 
-            records = await self._extract_page()
+            # Bounded retry on a transient extraction failure, then fail loud.
+            records = None
+            last_exc: ScraperExecutionError | None = None
+            for attempt in range(1, 4):
+                try:
+                    records = await self._extract_page(page_num)
+                    break
+                except ScraperExecutionError as exc:
+                    last_exc = exc
+                    _logger.warning(
+                        "Page %d extract attempt %d/3 failed: %s",
+                        page_num, attempt, str(exc)[:100],
+                    )
+                    if attempt < 3:
+                        await self.page.wait_for_timeout(1_500 * attempt)
+            if records is None:
+                raise last_exc or ScraperExecutionError(
+                    self.county, "AcclaimWeb",
+                    "page extraction failed after retries (no recorded cause)",
+                    record_type=self.active_record_type, page=page_num,
+                )
+
             new_count = self.dedupe_extend(records, seen_hashes, all_records)
             _logger.info("Page %d — %d new records (total: %d)", page_num, new_count, len(all_records))
 
@@ -566,7 +618,7 @@ class AcclaimWebScraper(BridgeScraper):
 
         return all_records
 
-    async def _extract_page(self) -> list[ScrapedRecord]:
+    async def _extract_page(self, page_num: int = 1) -> list[ScrapedRecord]:
         """Extract records from the current Kendo Grid results page.
 
         AcclaimWeb renders results in a Kendo Grid with standard columns:
@@ -772,11 +824,27 @@ class AcclaimWebScraper(BridgeScraper):
             """)
 
             if not raw:
-                page_text = await self.page.inner_text("body")
-                if "no results" in page_text.lower() or "0 records" in page_text.lower():
-                    _logger.info("No results found on this page")
-                else:
-                    _logger.warning("Could not extract results from Kendo Grid")
+                if page_num == 1:
+                    page_text = await self.page.inner_text("body")
+                    verdict = classify_results_page(
+                        row_count=0, page_text=page_text, empty_markers=_EMPTY_MARKERS
+                    )
+                    if verdict == "block":
+                        raise ScraperBlockedError(
+                            self.county, "AcclaimWeb",
+                            f"block wall on results page ({detect_block(page_text)})",
+                            record_type=self.active_record_type, page=page_num,
+                            context=page_text[:120],
+                        )
+                    if verdict == "ambiguous":
+                        raise ScraperExecutionError(
+                            self.county, "AcclaimWeb",
+                            "no result rows and no empty-marker (search may have "
+                            "silently failed / been blocked)",
+                            record_type=self.active_record_type, page=page_num,
+                            context=page_text[:120],
+                        )
+                    _logger.info("No results for this chunk (genuine empty window)")
                 return []
 
             for item in raw:
@@ -785,10 +853,13 @@ class AcclaimWebScraper(BridgeScraper):
 
                 record = ScrapedRecord()
 
-                # Instrument number
+                # Instrument number — a document id, NOT a legal description. Keep
+                # it in enrichment_data, and use it as the stable per-record
+                # fingerprint: this template sets no raw_html_hash, so without this
+                # the within-job idempotency key (tasks.py source_fingerprint) would
+                # depend on the legal_description we're now changing.
                 inst = item.get("instrument", "").strip()
-                if inst:
-                    record.legal_description = inst  # store instrument # in legal_description
+                record.enrichment_data = {"instrument_number": inst, "source": "acclaimweb"}
 
                 # Date recorded — normalize various date formats
                 date_str = item.get("date_recorded", "").strip()
@@ -812,7 +883,13 @@ class AcclaimWebScraper(BridgeScraper):
                 # Deeds of Trust and other unrelated records leak
                 # through the filter and appear as "pre-foreclosures".
                 active_rt = self.active_record_type
-                if active_rt:
+                if active_rt == "divorce":
+                    # Generic keyword connector — fail closed on ambiguous bare
+                    # "DISSOLUTION" via the shared 3-state classifier (keeps
+                    # corporate/entity dissolutions out of divorce results).
+                    if not doc_type or not is_divorce_doc(doc_type, precise_source=False):
+                        continue
+                elif active_rt:
                     keywords = _DOC_TYPE_MAP.get(active_rt, [])
                     if keywords:
                         if not doc_type or not _doc_type_matches(doc_type, keywords):
@@ -850,17 +927,23 @@ class AcclaimWebScraper(BridgeScraper):
                     record.party_name, record.heirs = orient_probate_party(
                         grantor, grantee, doc_type
                     )
+                elif active_rt == "divorce":
+                    # Both spouses are valid leads; only correct the case where the
+                    # recorder indexed a court/state/agency as grantor. No-op when
+                    # the grantor is already a person.
+                    record.party_name, record.heirs = orient_divorce_party(
+                        grantor, grantee, doc_type
+                    )
                 else:
                     if grantor:
                         record.party_name = grantor
                     if grantee:
                         record.heirs = grantee
 
-                # Legal description
+                # Legal description — real legal only (None when the index has none;
+                # never the instrument # as a stand-in).
                 legal = item.get("legal", "").strip()
-                if legal and record.legal_description:
-                    record.legal_description = f"{record.legal_description} | {legal}"
-                elif legal:
+                if legal:
                     record.legal_description = legal
 
                 # Parcel ID
@@ -868,13 +951,25 @@ class AcclaimWebScraper(BridgeScraper):
                 if parcel:
                     record.parcel_id = parcel
 
+                # Stable, unique per-row fingerprint (includes instrument_number via
+                # enrichment_data in to_dict); never the bare instrument, which would
+                # collapse multi-party/parcel rows under one recording. Keeps tasks.py
+                # source_fingerprint stable + distinct without legal_description.
+                record.raw_html_hash = self.make_hash(record.to_dict())
+
                 if record.party_name or record.date_recorded:
                     records.append(record)
 
             _logger.info("Extracted %d records from page", len(records))
 
+        except ScraperExecutionError:
+            raise  # block / ambiguous — propagate, never silent []
         except Exception as exc:
-            _logger.warning("Error extracting page: %s", str(exc)[:80])
+            raise ScraperExecutionError(
+                self.county, "AcclaimWeb", "page extraction failed",
+                record_type=self.active_record_type, page=page_num,
+                context=str(exc)[:120],
+            ) from exc
 
         return records
 

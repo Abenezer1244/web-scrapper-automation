@@ -104,17 +104,70 @@ _SPACED_ORG_RE: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+# Known WA/national foreclosure-TRUSTEE brand phrases that carry NO standard
+# company token, so the whole-word check below misses them and they slip into
+# party_name as a fake "person" (e.g. "WESTERN PROGRESSIVE-WASHINGTON", a national
+# substitute-trustee). These are never homeowners. Matched as a substring on the
+# upper-cased name. Keep this list to genuinely token-less trustee brands — every
+# other trustee/servicer ("QUALITY LOAN…", "TRUSTEE CORPS", "CLEAR RECON",
+# "NORTHWEST TRUSTEE") already carries a _COMPANY_WORDS token.
+# Word-boundary anchored so it can only match the standalone brand, never a phrase
+# that happens to span two unrelated name tokens.
+_KNOWN_ORG_PHRASE_RE = re.compile(r"\bWESTERN\s+PROGRESSIVE\b")
+
+
+# Vesting / tenancy boilerplate that trails an owner name in a Notice of Trustee
+# Sale grantor line ("MICHAEL A. BRANDT, A MARRIED MAN, AS HIS SOLE AND SEPARATE
+# PROPERTY"). It is legal vesting language, not part of the name, and pollutes the
+# displayed lead + the skip-trace key. Removed; the " AND " connector BETWEEN two
+# owner names is preserved so co-borrowers survive.
+_VESTING_CLAUSE = re.compile(
+    r"\s*,?\s*(?:"
+    r"AN?\s+(?:MARRIED|UNMARRIED|WIDOWED|DIVORCED|SINGLE)\s+(?:MAN|WOMAN|PERSON|COUPLE)\b"
+    r"|A\s+SINGLE\s+(?:MAN|WOMAN|PERSON)\b"
+    r"|AS\s+(?:HIS|HER|THEIR|ITS)\s+(?:SOLE\s+AND\s+)?SEPARATE\s+(?:PROPERTY|ESTATE)\b"
+    r"|(?:AS\s+)?(?:HUSBAND\s+AND\s+WIFE|WIFE\s+AND\s+HUSBAND)\b"
+    r"|AS\s+JOINT\s+TENANTS(?:\s+WITH\s+(?:THE\s+)?RIGHTS?\s+OF\s+SURVIVORSHIP)?\b"
+    r"|AS\s+TENANTS\s+IN\s+COMMON\b"
+    r")",
+    re.I,
+)
+
+
+def strip_vesting_clause(name: str | None) -> str | None:
+    """Remove trailing vesting/tenancy boilerplate from an NTS grantor name.
+
+    'MICHAEL A. BRANDT, A MARRIED MAN, AS HIS SOLE AND SEPARATE PROPERTY'
+        -> 'MICHAEL A. BRANDT'
+    'VADAD SOLEIMANZADEH, AN UNMARRIED PERSON, AND YAHYA KAZEMIKARANI, AN UNMARRIED PERSON'
+        -> 'VADAD SOLEIMANZADEH AND YAHYA KAZEMIKARANI'
+    Returns the input unchanged when no vesting phrase is present.
+    """
+    if not name:
+        return name
+    s = _VESTING_CLAUSE.sub("", name)
+    s = re.sub(r",\s*,", ",", s)            # collapse the comma left where a clause was
+    s = re.sub(r",\s*(?=AND\b)", " ", s, flags=re.I)  # ", AND NAME2" -> " AND NAME2"
+    s = re.sub(r"[\s,]+$", "", s)           # trailing commas/space
+    s = re.sub(r"^[\s,]+", "", s)           # leading commas/space
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip() or None
+
+
 def is_person_name(name: str | None) -> bool:
     """True if ``name`` looks like a real person (a foreclosure homeowner lead).
 
     Rejects organization names (any company token, incl. letter-spaced entity
-    suffixes like "L L C"), single-token strings (FIG / NA / MERS-style
-    abbreviations), and very short strings. The collapsed form is used only for
-    this classification — it is never returned or stored.
+    suffixes like "L L C", and known token-less trustee brand phrases),
+    single-token strings (FIG / NA / MERS-style abbreviations), and very short
+    strings. The collapsed form is used only for this classification — it is never
+    returned or stored.
     """
     if not name:
         return False
     up = name.upper()
+    if _KNOWN_ORG_PHRASE_RE.search(up):
+        return False
     for rx, repl in _SPACED_ORG_RE:
         up = rx.sub(repl, up)
     words = up.split()

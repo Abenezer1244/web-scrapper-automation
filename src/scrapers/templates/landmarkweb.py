@@ -20,11 +20,24 @@ from datetime import datetime, timedelta
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord, normalize_party_text
+from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
 )
+from src.scrapers.reliability import (
+    ScraperBlockedError,
+    ScraperExecutionError,
+    classify_results_page,
+    detect_block,
+)
 from src.utils.logger import setup_logger
+
+# Phrases a LandmarkWeb results page renders for a genuine zero-result window.
+# classify_results_page matches each with \b word boundaries, so list BOTH the
+# plural "0 records" and singular "0 record" (one does not cover the other under
+# boundary matching) — while neither matches a non-zero count like "10 records".
+_EMPTY_MARKERS = ("no results", "0 records", "0 record", "no documents", "no matching")
 
 _logger = setup_logger("scraper.template.landmarkweb")
 
@@ -87,6 +100,11 @@ class LandmarkWebScraper(BridgeScraper):
         seen_hashes: set[str] = set()
         chunk_start = start
 
+        # Fail-loud contract (intentional): a setup failure (date-fill / submit),
+        # a block, or an ambiguous results page on ANY chunk RAISES and fails the
+        # whole job — the scheduler then re-runs it. We deliberately do NOT swallow
+        # a bad chunk and continue, which would silently under-deliver a partial
+        # date window under a DONE job (the exact false-empty this PR removes).
         while chunk_start < end:
             chunk_end = min(chunk_start + timedelta(days=chunk_days), end)
             cf = chunk_start.strftime("%m/%d/%Y")
@@ -243,13 +261,29 @@ class LandmarkWebScraper(BridgeScraper):
                     await date_inputs[1].fill("")
                     await date_inputs[1].press_sequentially(date_to, delay=30)
                     _logger.info("Dates filled via last-resort date inputs")
+                    filled = True
                 else:
                     _logger.warning("Could not find date inputs on page")
 
             await self.page.wait_for_timeout(1_000)
 
+            if not filled:
+                # Dates never landed in the form -> the search would run on the
+                # wrong/blank window. Fail loud instead of returning a window of
+                # silently-wrong (or zero) results.
+                raise ScraperExecutionError(
+                    self.county, "LandmarkWeb",
+                    "could not locate date inputs (search never ran)",
+                    date_from=date_from, date_to=date_to,
+                )
+
+        except ScraperExecutionError:
+            raise
         except Exception as exc:
-            _logger.warning("Could not set dates: %s", str(exc)[:120])
+            raise ScraperExecutionError(
+                self.county, "LandmarkWeb", "date-fill failed",
+                date_from=date_from, date_to=date_to, context=str(exc)[:120],
+            ) from exc
 
     async def _submit_search(self) -> None:
         """Click the Submit button and wait for results."""
@@ -277,8 +311,10 @@ class LandmarkWebScraper(BridgeScraper):
                     await submit_btn.first.click(force=True)
                     _logger.info("Submit clicked via Playwright, waiting for results...")
                 else:
-                    _logger.warning("No submit button found")
-                    return
+                    raise ScraperExecutionError(
+                        self.county, "LandmarkWeb",
+                        "no submit button found (search never ran)",
+                    )
 
             # Wait for results grid
             try:
@@ -301,8 +337,13 @@ class LandmarkWebScraper(BridgeScraper):
             # Extra wait for AJAX / DataTable render
             await self.page.wait_for_timeout(5_000)
 
+        except ScraperExecutionError:
+            raise
         except Exception as exc:
-            _logger.warning("Could not submit search: %s", str(exc)[:120])
+            raise ScraperExecutionError(
+                self.county, "LandmarkWeb", "search submit failed",
+                context=str(exc)[:120],
+            ) from exc
 
     async def _extract_all_pages(self) -> list[ScrapedRecord]:
         """Extract records from all result pages."""
@@ -314,7 +355,30 @@ class LandmarkWebScraper(BridgeScraper):
         while page_num < max_pages:
             page_num += 1
 
-            records = await self._extract_page()
+            # Bounded retry on a transient extraction failure, then fail loud.
+            # A block / ambiguous / setup failure also raises here and, after the
+            # retries are exhausted, propagates (job FAILED) — never a silent [].
+            records = None
+            last_exc: ScraperExecutionError | None = None
+            for attempt in range(1, 4):
+                try:
+                    records = await self._extract_page(page_num)
+                    break
+                except ScraperExecutionError as exc:
+                    last_exc = exc
+                    _logger.warning(
+                        "Page %d extract attempt %d/3 failed: %s",
+                        page_num, attempt, str(exc)[:100],
+                    )
+                    if attempt < 3:
+                        await self.page.wait_for_timeout(1_500 * attempt)
+            if records is None:
+                raise last_exc or ScraperExecutionError(
+                    self.county, "LandmarkWeb",
+                    "page extraction failed after retries (no recorded cause)",
+                    page=page_num,
+                )
+
             new_count = self.dedupe_extend(records, seen_hashes, all_records)
             _logger.info("Page %d — %d new records (total: %d)", page_num, new_count, len(all_records))
 
@@ -329,7 +393,7 @@ class LandmarkWebScraper(BridgeScraper):
 
         return all_records
 
-    async def _extract_page(self) -> list[ScrapedRecord]:
+    async def _extract_page(self, page_num: int = 1) -> list[ScrapedRecord]:
         """Extract records from the current results page.
 
         LandmarkWeb renders results in an HTML table within #resultsGridDiv.
@@ -411,11 +475,27 @@ class LandmarkWebScraper(BridgeScraper):
 
             if not raw:
                 page_text = await self.page.inner_text("body")
-                if "no results" in page_text.lower() or "0 record" in page_text.lower():
-                    _logger.info("No results found on this page")
-                else:
-                    _logger.warning("Could not extract results from grid")
-                    _logger.debug("Page text (300): %s", page_text[:300].replace('\n', ' '))
+                # Only the FIRST page of a chunk can be a genuine zero-result
+                # window vs a block / silent failure. Pages 2+ with no rows are a
+                # normal end-of-pagination signal.
+                if page_num == 1:
+                    verdict = classify_results_page(
+                        row_count=0, page_text=page_text, empty_markers=_EMPTY_MARKERS
+                    )
+                    if verdict == "block":
+                        raise ScraperBlockedError(
+                            self.county, "LandmarkWeb",
+                            f"block wall on results page ({detect_block(page_text)})",
+                            page=page_num, context=page_text[:120],
+                        )
+                    if verdict == "ambiguous":
+                        raise ScraperExecutionError(
+                            self.county, "LandmarkWeb",
+                            "no result rows and no empty-marker (search may have "
+                            "silently failed / been blocked)",
+                            page=page_num, context=page_text[:120],
+                        )
+                    _logger.info("No results for this chunk (genuine empty window)")
                 return []
 
             for item in raw:
@@ -425,8 +505,12 @@ class LandmarkWebScraper(BridgeScraper):
                 record = ScrapedRecord()
 
                 inst = (item.get("instrument") or "").strip()
-                if inst:
-                    record.legal_description = inst
+                # Recorder instrument # is a document identifier, NOT a property
+                # legal description — store it in enrichment_data, and use it as the
+                # stable per-record fingerprint so changing a display field
+                # (legal_description) can't shift the within-job idempotency key
+                # (tasks.py source_fingerprint) for this no-raw_html_hash template.
+                record.enrichment_data = {"instrument_number": inst, "source": "landmarkweb"}
 
                 date_str = (item.get("date_recorded") or "").strip()
                 if date_str:
@@ -453,6 +537,15 @@ class LandmarkWebScraper(BridgeScraper):
                             continue
                     else:
                         for rt in self.record_types:
+                            if rt == "divorce":
+                                # Generic keyword connector — fail closed on an
+                                # ambiguous bare "DISSOLUTION" via the shared
+                                # 3-state classifier (keeps corporate/entity
+                                # dissolutions out of divorce results).
+                                if is_divorce_doc(doc_type, precise_source=False):
+                                    matched_rt = rt
+                                    break
+                                continue
                             keywords = _DOC_TYPE_MAP.get(rt, [])
                             if any(kw in doc_type for kw in keywords):
                                 matched_rt = rt
@@ -478,6 +571,11 @@ class LandmarkWebScraper(BridgeScraper):
                     if oriented is None:
                         continue
                     grantor, grantee = oriented
+                elif matched_rt == "divorce":
+                    # Both spouses are valid leads; only correct the case where the
+                    # recorder indexed a court/state/agency as grantor. No-op when
+                    # the grantor is already a person.
+                    grantor, grantee = orient_divorce_party(grantor, grantee, doc_type)
 
                 if grantor:
                     record.party_name = grantor
@@ -485,23 +583,37 @@ class LandmarkWebScraper(BridgeScraper):
                 if grantee:
                     record.heirs = grantee
 
+                # Real property legal description only (None when the index has
+                # none — never the instrument # as a stand-in).
                 legal = (item.get("legal") or "").strip()
-                if legal and record.legal_description:
-                    record.legal_description = f"{record.legal_description} | {legal}"
-                elif legal:
+                if legal:
                     record.legal_description = legal
 
                 parcel = (item.get("parcel") or "").strip()
                 if parcel:
                     record.parcel_id = parcel
 
+                # Stable, unique per-row fingerprint (includes instrument_number via
+                # enrichment_data in to_dict). This template sets no raw_html_hash
+                # otherwise, so without it tasks.py source_fingerprint would depend
+                # on legal_description. A full composite — never the bare instrument,
+                # which would collapse multi-party/parcel rows under one recording.
+                record.raw_html_hash = self.make_hash(record.to_dict())
+
                 if record.party_name or record.date_recorded:
                     records.append(record)
 
             _logger.info("Extracted %d records from page", len(records))
 
+        except ScraperExecutionError:
+            raise  # block / ambiguous / already-classified — propagate
         except Exception as exc:
-            _logger.warning("Error extracting page: %s", str(exc)[:80])
+            # A hard extraction failure must NOT silently return [] (that becomes a
+            # DONE job with 0 leads). Raise; _extract_all_pages bounds the retry.
+            raise ScraperExecutionError(
+                self.county, "LandmarkWeb", "page extraction failed",
+                page=page_num, context=str(exc)[:120],
+            ) from exc
 
         return records
 

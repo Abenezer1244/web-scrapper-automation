@@ -26,6 +26,7 @@ from src.scrapers.base_scraper import (
     ScrapedRecord,
     normalize_party_text,
 )
+from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
@@ -212,6 +213,9 @@ class LaserficheWebLinkScraper(BridgeScraper):
                 seen_afns.add(key)
                 h = self.make_hash(r.to_dict())
                 seen_hashes.add(h)
+                # Full-record hash (includes enrichment_data.instrument_number via
+                # to_dict) — a unique per-row fingerprint; never the bare AFN, which
+                # would collapse multi-party/parcel rows under one recording.
                 r.raw_html_hash = h
                 all_records.append(r)
                 new += 1
@@ -401,6 +405,14 @@ class LaserficheWebLinkScraper(BridgeScraper):
                     record.party_name, record.heirs = orient_probate_party(
                         grantor, grantee, doc_type
                     )
+                elif self.active_record_type == "divorce":
+                    # Both spouses are valid leads; only correct the case where the
+                    # recorder indexed a court/state/agency as grantor. No-op when
+                    # the grantor is already a person. (Doc-type gating happens in
+                    # _filter_by_type via the shared divorce classifier.)
+                    record.party_name, record.heirs = orient_divorce_party(
+                        grantor, grantee, doc_type
+                    )
                 else:
                     # Grantor → party_name, Grantee → heirs (unchanged).
                     if grantor:
@@ -417,11 +429,15 @@ class LaserficheWebLinkScraper(BridgeScraper):
                     "instrument_number": afn,
                     "source": "laserfiche_weblink",
                 }
-                # Legal description from volume/page
+                # Volume/Page is the RECORD location (recorder's book/page), NOT a
+                # property legal description — keep it for reference in
+                # enrichment_data, but never present it as legal_description. This
+                # source carries no real legal description, so legal_description
+                # stays None rather than a misleading stand-in.
                 vol = item.get("volume", "").strip()
                 pg = item.get("page_num", "").strip()
                 if vol or pg:
-                    record.legal_description = f"Vol {vol} Pg {pg}".strip()
+                    record.enrichment_data["volume_page"] = f"Vol {vol} Pg {pg}".strip()
 
                 if record.party_name or record.date_recorded:
                     records.append(record)
@@ -489,9 +505,17 @@ class LaserficheWebLinkScraper(BridgeScraper):
         keywords = _DOC_TYPE_MAP.get(self.active_record_type, [])
         if not keywords:
             return records
+        is_divorce = self.active_record_type == "divorce"
         kept = []
         for r in records:
             doc = (r.doc_type or "").upper()
+            if is_divorce:
+                # Generic keyword connector — fail closed on ambiguous bare
+                # "DISSOLUTION" via the shared 3-state classifier so corporate/
+                # entity dissolutions stay out of divorce results.
+                if is_divorce_doc(r.doc_type, precise_source=False):
+                    kept.append(r)
+                continue
             if _doc_type_matches(doc, keywords):
                 kept.append(r)
         return kept

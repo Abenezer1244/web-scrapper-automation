@@ -23,6 +23,11 @@ from datetime import datetime, timedelta
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
+from src.scrapers.preforeclosure import (
+    is_cancellation_or_admin,
+    orient_pre_foreclosure_party,
+)
 from src.scrapers.probate import orient_probate_party
 from src.utils.logger import setup_logger
 
@@ -46,6 +51,10 @@ _DOC_TYPE_KEYWORDS = {
         "TAX LIEN", "CERTIFICATE OF DELINQUENCY", "CERTIFICATE OF SALE",
         "FEDERAL TAX LIEN",
     ],
+    # NOTE: the divorce path does NOT use these keywords — _extract_page delegates
+    # divorce classification entirely to divorce.is_divorce_doc (which rejects
+    # corporate/entity dissolutions and bare separations). This entry is retained
+    # only so __init__'s self._keywords build does not KeyError for divorce.
     "divorce": ["DISSOLUTION", "DIVORCE"],
 }
 
@@ -271,18 +280,27 @@ class WhatcomWAScraper(BridgeScraper):
             # an unrelated type like "GOODWILL", while still matching across
             # punctuation ("WILL/TESTAMENT", "(WILL)"); multiword phrases stay
             # plain substring.
-            matched = False
-            for kw in self._keywords:
-                if not kw:
+            if self._record_type == "divorce":
+                # Generic recorder portal (no precise server-side divorce filter)
+                # — fail closed on an ambiguous bare "DISSOLUTION" via the shared
+                # 3-state classifier (keeps corporate/entity dissolutions and bare
+                # separations out of divorce results).
+                if not is_divorce_doc(doc_type, precise_source=False):
+                    dropped_wrong_doctype += 1
                     continue
-                if (kw in doc_type_upper) if " " in kw else re.search(
-                    rf"\b{re.escape(kw)}\b", doc_type_upper
-                ):
-                    matched = True
-                    break
-            if not matched:
-                dropped_wrong_doctype += 1
-                continue
+            else:
+                matched = False
+                for kw in self._keywords:
+                    if not kw:
+                        continue
+                    if (kw in doc_type_upper) if " " in kw else re.search(
+                        rf"\b{re.escape(kw)}\b", doc_type_upper
+                    ):
+                        matched = True
+                        break
+                if not matched:
+                    dropped_wrong_doctype += 1
+                    continue
 
             # APN# — 16 digits is the Whatcom canonical format
             apn_match = re.search(r"APN#\s*(\d{10,})", text)
@@ -323,12 +341,42 @@ class WhatcomWAScraper(BridgeScraper):
                 record.party_name, record.heirs = orient_probate_party(
                     grantor, grantee, doc_type
                 )
+            elif self._record_type == "divorce":
+                # Both spouses are valid leads; only correct the case where the
+                # recorder indexed a court/state/agency as grantor. No-op when the
+                # grantor is already a person.
+                record.party_name, record.heirs = orient_divorce_party(
+                    grantor, grantee, doc_type
+                )
+            elif self._record_type == "pre_foreclosure":
+                # An NTS is indexed with the TRUSTEE/beneficiary company in the
+                # grantor slot as often as the borrower, so take the PERSON side as
+                # party_name (homeowner) and move the company context to heirs.
+                # Direction-agnostic — orient checks both sides (matches King/Pierce).
+                # Drop cancelled/cured/admin docs first (the keyword search can match
+                # Reconveyance / Discontinuance / Rescission), then drop rows with no
+                # person on either side (bank-vs-trustee = not a homeowner lead). Use
+                # `continue` — the append guard below keeps any row with a date, so
+                # leaving party_name None would NOT drop it (Codex review).
+                if is_cancellation_or_admin(doc_type):
+                    continue
+                oriented = orient_pre_foreclosure_party(grantor, grantee)
+                if oriented is None:
+                    _logger.info(
+                        "pre_foreclosure: no person party — doc=%r parcel=%r "
+                        "grantor=%r grantee=%r (dropped)",
+                        doc_type, parcel_id, (grantor or "")[:40], (grantee or "")[:40],
+                    )
+                    continue
+                record.party_name, record.heirs = oriented
             else:
                 record.party_name = grantor
                 record.heirs = grantee
             record.doc_type = doc_type
             record.date_recorded = date_recorded
-            record.legal_description = instrument
+            # No real legal description on the Helion card — leave None rather than
+            # standing in the instrument # (which is kept in enrichment_data below).
+            record.legal_description = None
             record.enrichment_data = {
                 "source": "whatcom_county_recorder",
                 "instrument_number": instrument,

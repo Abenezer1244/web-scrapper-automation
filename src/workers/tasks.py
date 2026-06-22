@@ -254,25 +254,6 @@ def run_scrape_job(self, job_id: str) -> None:
 
         user = db.execute(select(User).where(User.id == job.user_id)).scalar_one()
 
-        # Execution-time entitlement backstop (audit until ENTITLEMENT_ENFORCEMENT).
-        # Catches API/scheduled/retry/watchdog paths that bypassed create-time checks.
-        from src.api.entitlements import ConfigRow, config_run_violation, should_block_run
-        _active = db.execute(
-            select(
-                ScraperConfig.id, ScraperConfig.state, ScraperConfig.county,
-                ScraperConfig.record_type, ScraperConfig.created_at,
-                ScraperConfig.active, ScraperConfig.paused_reason,
-            ).where(ScraperConfig.user_id == job.user_id, ScraperConfig.active)
-        ).all()
-        _violation = config_run_violation(
-            user.plan, config.state, config.county, config.record_type,
-            [ConfigRow(*r) for r in _active],
-        )
-        if should_block_run(_violation, user_id=str(job.user_id), plan=(user.plan or "starter"), context="worker_run"):
-            _publish_log(r, job_id, "error", f"Plan limit — {_violation}", db=db)
-            _fail_job(db, job, r, job_id, f"Plan limit reached: {_violation}")
-            return
-
         # ── QUEUED (atomic claim) ─────────────────────────────────────────────
         # Compare-and-set pending->queued so a duplicate delivery of this job_id
         # can't double-scrape. A duplicate can arrive from Celery redelivery OR a
@@ -322,6 +303,29 @@ def run_scrape_job(self, job_id: str) -> None:
             self.request.scrape_started_at = job.started_at
         except Exception:  # request context unavailable (e.g. direct call) — non-fatal
             pass
+
+        # Execution-time entitlement backstop (audit until ENTITLEMENT_ENFORCEMENT).
+        # Catches API/scheduled/retry/watchdog paths that bypassed create-time checks.
+        # IMPORTANT: runs AFTER the ownership CAS (pending->queued) so that only the
+        # owning worker can act — a duplicate/redelivered task would have returned at
+        # `if not claimed` above and never reach this guard.
+        from src.api.entitlements import ConfigRow, config_run_violation, should_block_run
+        _active = db.execute(
+            select(
+                ScraperConfig.id, ScraperConfig.state, ScraperConfig.county,
+                ScraperConfig.record_type, ScraperConfig.created_at,
+                ScraperConfig.active, ScraperConfig.paused_reason,
+            ).where(ScraperConfig.user_id == job.user_id, ScraperConfig.active)
+        ).all()
+        _violation = config_run_violation(
+            user.plan, config.state, config.county, config.record_type,
+            [ConfigRow(*r) for r in _active],
+        )
+        if should_block_run(_violation, user_id=str(job.user_id), plan=(user.plan or "starter"), context="worker_run"):
+            _publish_log(r, job_id, "error", f"Plan limit — {_violation}", db=db)
+            _fail_job(db, job, r, job_id, f"Plan limit reached: {_violation}")
+            return
+
         # Liveness heartbeat DISABLED (rollback 2026-06-18). The daemon thread shared
         # the worker's small sync connection pool (pool_size=2) with the main work
         # session + _publish_log; during the DB-heavy insert phase the main thread and

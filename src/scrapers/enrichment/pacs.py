@@ -39,7 +39,7 @@ def is_pacs_url(url: str | None) -> bool:
     return "/propertyaccess" in low or "propertyaccess/" in low
 
 
-def _parse_pacs_result_html(html_text: str) -> dict | None:
+def parse_pacs_result_html(html_text: str) -> dict | None:
     """Parse a PACS PropertyAccess search-results page into {address, mailing, value}.
 
     Over-inference guard (Codex point C). An owner-name search can match MANY
@@ -109,7 +109,7 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> dict | None:
     """Search a PACS PropertyAccess portal by owner name.
 
     Returns a dict with any of: address, mailing, value (NEVER parcel_id — an
-    owner-name match is weak evidence; see ``_parse_pacs_result_html``).
+    owner-name match is weak evidence; see ``parse_pacs_result_html``).
     Returns None on no unique match or error.
 
     Blocks on HTTP; call from a thread pool when batching.
@@ -171,7 +171,7 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> dict | None:
         if r is None or r.status_code != 200 or "None found" in r.text:
             return None
 
-        return _parse_pacs_result_html(r.text)
+        return parse_pacs_result_html(r.text)
     except Exception as exc:
         _logger.warning("PACS name lookup failed for %r: %s", owner_name[:30], str(exc)[:80])
         return None

@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser, require_admin_mfa
 from src.api.deps import get_rls_db
+from src.api.entitlements import enforce_entitlements
 from src.api.middleware.rate_limit import rate_limit
 from src.api.middleware.security import audit_log
 from src.api.schemas import (
@@ -102,6 +103,17 @@ async def create_scraper(
             detail=f"Record type '{body.record_type}' not supported for {body.county}, {body.state}. "
                    f"Supported: {list(set(supported_types))}",
         )
+
+    # Value-metric entitlement gate (county count + record-type). Feature-flagged:
+    # 402 when settings.ENTITLEMENT_ENFORCEMENT is on, else audit-log only.
+    await enforce_entitlements(
+        db,
+        current_user,
+        state=body.state,
+        counties={body.county},
+        record_types={body.record_type},
+        context="create_scraper",
+    )
 
     # Phase 2b: validate optional pre-foreclosure document-type selection against
     # the capability registry (single source of truth). None = legacy/full output

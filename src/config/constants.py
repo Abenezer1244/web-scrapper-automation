@@ -137,6 +137,44 @@ BATCH_MAX_COMBINATIONS: dict[str, int] = {
 BATCH_HARD_CEILING: int = 250
 
 
+# ── Value-metric entitlement matrix (docs/pricing-strategy-2026-06.md) ───────
+# County access + record-type gating per tier. Defined here as the single source
+# of truth; ENFORCED by src/api/entitlements.py ONLY when
+# settings.ENTITLEMENT_ENFORCEMENT is true. Until that flag flips, the validator
+# runs in audit/log-only mode (see that module's docstring for why).
+
+# Per-plan cap on the number of DISTINCT counties a user may scrape across their
+# active scraper configs. Count-based (any N counties, user's choice), -1 =
+# unlimited. Matches the strategy's Starter 1 / Pro 3 / Business 10 / Agency all.
+COUNTY_LIMIT_BY_PLAN: dict[str, int] = {
+    Plan.STARTER.value: 1,
+    Plan.PRO.value: 3,
+    Plan.BUSINESS.value: 10,
+    Plan.AGENCY.value: -1,
+}
+
+# The LIVE record-type slugs as stored in county_connectors.record_types — NOT
+# the CLAUDE.md wishlist ("eviction"/"death_cert"), which have no live connector.
+# Keep in sync with the registry; gating an unavailable type is meaningless.
+ALL_RECORD_TYPES: frozenset[str] = frozenset({
+    "probate",
+    "pre_foreclosure",
+    "tax_delinquent",
+    "code_violation",
+    "divorce",
+    "death_certificate",
+})
+
+# Per-plan allowed record types. Starter = probate sample; Pro = the three
+# broadly-available "core" distress lists; Business/Agency = every live type.
+RECORD_TYPES_BY_PLAN: dict[str, frozenset[str]] = {
+    Plan.STARTER.value: frozenset({"probate"}),
+    Plan.PRO.value: frozenset({"probate", "pre_foreclosure", "tax_delinquent"}),
+    Plan.BUSINESS.value: ALL_RECORD_TYPES,
+    Plan.AGENCY.value: ALL_RECORD_TYPES,
+}
+
+
 class ScraperFrequency(str, Enum):
     """`schedule.frequency` values in ScraperConfig."""
 

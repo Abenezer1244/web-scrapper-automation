@@ -151,10 +151,19 @@ class Settings(BaseSettings):
     # not billed per-trace (the cost is absorbed into the base plan price).
     SKIP_TRACE_BUNDLED_QUOTAS: ClassVar[dict[str, int]] = {
         "starter": 0,
-        "pro": 0,          # Pro pays per-trace from lookup #1
+        "pro": 250,        # 250 included/month (2026-06 strategy), then $0.08/trace
         "business": 1000,  # Business gets 1000 free/month, then $0.08/trace
         "agency": 2000,    # Agency gets 2000 free/month, then $0.05/trace
     }
+
+    # Per-tier entitlement enforcement (value-metric: county access + record-type
+    # gating — see src/api/entitlements.py + src/config/constants.py). Default
+    # FALSE = audit/log-only: the validator computes would-block violations and
+    # logs them but does NOT 402, so we ship the infrastructure + measure impact
+    # without reversing the "all paid plans access all counties" marketing or
+    # locking out existing accounts. Flip per-service (api+worker) ONLY after the
+    # pricing/UI/copy land and existing accounts are intentionally grandfathered.
+    ENTITLEMENT_ENFORCEMENT: bool = False
 
     # ─── Email ────────────────────────────────────────────────────────────────
     RESEND_API_KEY: str = ""

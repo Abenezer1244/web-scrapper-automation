@@ -104,6 +104,15 @@ async def create_scraper(
                    f"Supported: {list(set(supported_types))}",
         )
 
+    # TOCTOU fix (entitlements.py county-count race): serialize concurrent creates
+    # for THIS user with a per-user advisory xact lock so the distinct-county count
+    # in enforce_entitlements can't be raced. Auto-released at transaction end.
+    # Namespaced (classid=4242 "entitlement") to avoid collision with other locks.
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(4242, hashtext(:uid))"),
+        {"uid": str(current_user.id)},
+    )
+
     # Value-metric entitlement gate (county count + record-type). Feature-flagged:
     # 402 when settings.ENTITLEMENT_ENFORCEMENT is on, else audit-log only.
     await enforce_entitlements(

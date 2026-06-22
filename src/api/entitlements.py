@@ -339,6 +339,15 @@ async def apply_reconciliation_async(
 
     pause_ids, revive_ids = plan_reconciliation(config_rows, plan)
 
+    if not settings.ENTITLEMENT_ENFORCEMENT:
+        if pause_ids or revive_ids:
+            _logger.info(
+                "reconcile DRY-RUN (audit mode, not applied) user=%s plan=%s "
+                "would_pause=%d would_revive=%d",
+                user_id, plan, len(pause_ids), len(revive_ids),
+            )
+        return 0, 0
+
     config_by_id = {str(c.id): c for c in configs}
     for cid in pause_ids:
         cfg = config_by_id.get(cid)
@@ -387,6 +396,15 @@ def apply_reconciliation_sync(
     ]
 
     pause_ids, revive_ids = plan_reconciliation(config_rows, plan)
+
+    if not settings.ENTITLEMENT_ENFORCEMENT:
+        if pause_ids or revive_ids:
+            _logger.info(
+                "reconcile DRY-RUN (audit mode, not applied) user=%s plan=%s "
+                "would_pause=%d would_revive=%d",
+                user_id, plan, len(pause_ids), len(revive_ids),
+            )
+        return 0, 0
 
     config_by_id = {str(c.id): c for c in configs}
     for cid in pause_ids:

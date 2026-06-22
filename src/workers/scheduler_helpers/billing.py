@@ -88,11 +88,11 @@ def _expire_trials_impl() -> None:
             )
         ).scalars().all()
 
+        from src.api.entitlements import apply_reconciliation_sync
         for user in expired:
             user.plan = "starter"
             user.records_limit = settings.PLAN_LIMITS["starter"]  # post-trial Starter limit
             _logger.info("Trial expired for %s — downgraded to starter", user.email)
-            from src.api.entitlements import apply_reconciliation_sync
             apply_reconciliation_sync(db, str(user.id), "starter")
 
         if expired:

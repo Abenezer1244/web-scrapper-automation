@@ -1,5 +1,6 @@
 # tests/test_entitlements_runtime.py
 from datetime import UTC, datetime, timedelta
+from unittest.mock import MagicMock
 
 from src.api.entitlements import (
     PAUSED_REASON_ENTITLEMENT,
@@ -91,3 +92,52 @@ def test_active_county_not_evicted_by_older_paused():
     pause, revive = plan_reconciliation(rows, "starter")
     assert pause == set()
     assert revive == set()
+
+
+def test_reconciliation_dry_run_in_audit_mode(monkeypatch):
+    """In audit mode (ENTITLEMENT_ENFORCEMENT=False), apply_reconciliation_sync must
+    return (0, 0) and must NOT call db.execute (no DB mutations)."""
+    from src.config.settings import settings
+    import src.api.entitlements as ent
+
+    monkeypatch.setattr(settings, "ENTITLEMENT_ENFORCEMENT", False)
+
+    # Fake DB whose execute() raises if called — proves no mutations happen.
+    class _BoomDB:
+        def execute(self, *a, **k):
+            raise AssertionError("must not mutate in audit mode")
+
+    # Make plan_reconciliation return a non-empty set so the early-return is
+    # non-trivially tested (there IS something that would have been applied).
+    def _fake_reconciliation(rows, plan):
+        return {"fake-id-1"}, set()
+
+    # The sync wrapper calls db.execute to load rows first; patch plan_reconciliation
+    # to bypass that path: still need the row-load execute to succeed, so use a
+    # MagicMock db that allows execute() for the SELECT but we verify no UPDATE occurs.
+    # Simpler: monkeypatch plan_reconciliation to avoid DB entirely by patching
+    # the internal row load too.
+    mock_scalars = MagicMock()
+    mock_scalars.all.return_value = []
+    mock_result = MagicMock()
+    mock_result.scalars.return_value = mock_scalars
+
+    class _SafeDB:
+        _execute_count = 0
+
+        def execute(self, *a, **k):
+            self._execute_count += 1
+            return mock_result
+
+        def get_execute_count(self):
+            return self._execute_count
+
+    monkeypatch.setattr(ent, "plan_reconciliation", _fake_reconciliation)
+
+    safe_db = _SafeDB()
+    paused, revived = ent.apply_reconciliation_sync(safe_db, "u1", "starter")
+
+    assert (paused, revived) == (0, 0)
+    # Only the initial SELECT to load rows is allowed; no UPDATE should occur.
+    # With plan_reconciliation mocked, the gate fires before any config_by_id loop.
+    assert safe_db.get_execute_count() == 1  # exactly the row-load SELECT

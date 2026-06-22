@@ -168,10 +168,22 @@ def dispatch_batch_run(run_id: str) -> None:
                         db.add(job)
                         db.flush()
                         enqueued.append(str(job.id))
-                    run.child_job_ids = enqueued
-                    run.status = "running"
-                    run.running_at = datetime.now(UTC)  # stuck-time baseline (P1)
-                    db.commit()
+                    if not enqueued:
+                        # Every child config was blocked by tier-enforcement, so no
+                        # child jobs exist to fire the completion barrier. Terminalize
+                        # as failed (mirrors the monthly-record-limit branch above)
+                        # instead of leaving the run "running" forever.
+                        run.status = "failed"
+                        run.failed_children = [
+                            {"reason": "all batch configs blocked by plan limits"}
+                        ]
+                        run.completed_at = datetime.now(UTC)
+                        db.commit()
+                    else:
+                        run.child_job_ids = enqueued
+                        run.status = "running"
+                        run.running_at = datetime.now(UTC)  # stuck-time baseline (P1)
+                        db.commit()
         elif run.status == "running":
             # RECOVERY: a duplicate/retried dispatch of an already-materialized run.
             # Re-enqueue any child jobs committed but maybe not dispatched (crash

@@ -25,6 +25,7 @@ from src.scrapers.base_scraper import (
     normalize_party_text,
 )
 from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
+from src.scrapers.enrichment.pacs import parse_pacs_result_html
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
@@ -1033,7 +1034,10 @@ class AcclaimWebScraper(BridgeScraper):
             return
 
         def _lookup_one(name: str) -> dict | None:
-            """Search PACS by owner name, return {address, parcel_id, mailing} or None."""
+            """Search PACS by owner name, return {address, mailing, value} or None.
+
+            parcel_id is intentionally NOT returned (owner-name match is weak
+            evidence — see parse_pacs_result_html / Codex point C)."""
             try:
                 # Each lookup needs its own session (shared sessions cause
                 # VIEWSTATE conflicts under concurrency). M8: trust_env=False +
@@ -1063,38 +1067,13 @@ class AcclaimWebScraper(BridgeScraper):
                 if "None found" in r.text:
                     return None
 
-                # Extract from search results table (ID: propertySearchResults_resultsTable)
-                table_start = r.text.find("resultsTable")
-                if table_start == -1:
-                    return None
-                table_end = r.text.find("</table>", table_start)
-                chunk = r.text[table_start:table_end] if table_end > table_start else r.text[table_start:table_start + 5000]
-
-                tds = re.findall(r"<td[^>]*>(.*?)</td>", chunk, re.DOTALL)
-                cells = [re.sub(r"<[^>]+>", " ", td).strip().replace("&nbsp;", "").strip() for td in tds]
-                cells = [c for c in cells if c]
-
-                if len(cells) < 5:
-                    return None
-
-                # PACS table order: checkbox, account, parcel, type, tax_code, address, legal, owner, value, view
-                result = {}
-                for cell in cells:
-                    cell_clean = cell.replace("\r\n", "\n").replace("\r", "\n")
-                    # Parcel ID: 10-12 digit number
-                    if re.match(r"^\d{10,}$", cell.replace(" ", "")) and "parcel_id" not in result:
-                        result["parcel_id"] = cell.replace(" ", "")
-                    # Address: number + street, may have city/state on next line
-                    elif re.search(r"\d+\s+[A-Z].*WA\s+\d{5}", cell_clean, re.I | re.DOTALL):
-                        lines = [ln.strip() for ln in cell_clean.split("\n") if ln.strip()]
-                        result["address"] = lines[0]
-                        if len(lines) > 1:
-                            result["mailing"] = ", ".join(lines)
-                    # Value: dollar amount
-                    elif cell.startswith("$") and "value" not in result:
-                        result["value"] = cell
-
-                return result if result.get("address") or result.get("parcel_id") else None
+                # Shared hardened parser (Codex point C): requires exactly ONE
+                # plausible result row and never returns parcel_id — an owner-name
+                # match is weak evidence and parcel_id is the identity/dedup/billing
+                # key. Replaces the old flatten-all-rows / first-10-digit-cell parse
+                # that could trust row 1 of an ambiguous match (and mislabel the
+                # account number as the parcel).
+                return parse_pacs_result_html(r.text)
             except Exception:
                 return None
 
@@ -1113,8 +1092,8 @@ class AcclaimWebScraper(BridgeScraper):
                             record.property_address = result["address"]
                         if result.get("mailing"):
                             record.mailing_address = result["mailing"]
-                        if result.get("parcel_id"):
-                            record.parcel_id = result["parcel_id"]
+                        # parcel_id intentionally NOT set from owner-name PACS
+                        # lookup (Codex point C — weak evidence, identity key).
                         if result.get("value"):
                             record.enrichment_data = record.enrichment_data or {}
                             record.enrichment_data["assessed_value"] = result["value"]

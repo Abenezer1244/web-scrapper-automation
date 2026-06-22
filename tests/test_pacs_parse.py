@@ -1,13 +1,13 @@
 """PACS owner-name results parser — over-inference guard (Codex point C).
 
-`_parse_pacs_result_html` must (1) trust a result ONLY when the search returned
+`parse_pacs_result_html` must (1) trust a result ONLY when the search returned
 exactly one property, and (2) NEVER surface parcel_id (weak owner-name evidence
 must not feed the parcel-primary property_key / billing dedup identity).
 
 Pure parser over real HTML fixtures — no mocks, no network (per testing.md).
 """
 
-from src.scrapers.enrichment.pacs import _parse_pacs_result_html
+from src.scrapers.enrichment.pacs import parse_pacs_result_html
 
 # PACS PropertyAccess result columns: checkbox, account, parcel, type, tax_code,
 # address, legal, owner, value, view. account AND parcel are both long numbers.
@@ -33,7 +33,7 @@ def _page(*rows: str) -> str:
 
 def test_single_result_returns_address_and_mailing():
     html = _page(_row("9876543210", "1234567890", "123 MAIN ST, OAK HARBOR WA 98277", "DOE JANE"))
-    out = _parse_pacs_result_html(html)
+    out = parse_pacs_result_html(html)
     assert out is not None
     assert out["address"] == "123 MAIN ST, OAK HARBOR WA 98277"
 
@@ -41,7 +41,7 @@ def test_single_result_returns_address_and_mailing():
 def test_single_result_never_returns_parcel_id():
     """Even though parcel + account cells are present, parcel_id must NOT surface."""
     html = _page(_row("9876543210", "1234567890", "123 MAIN ST, OAK HARBOR WA 98277", "DOE JANE"))
-    out = _parse_pacs_result_html(html)
+    out = parse_pacs_result_html(html)
     assert out is not None
     assert "parcel_id" not in out
 
@@ -51,7 +51,7 @@ def test_single_result_with_a_stray_pager_row_still_parses():
     must NOT be mis-counted as ambiguous (Codex P2 — plausible-row filter)."""
     pager = "<tr><td colspan=10>Page 1 of 1</td></tr>"
     html = _page(_row("9876543210", "1234567890", "5 BAY ST, OAK HARBOR WA 98277", "DOE JANE") + pager)
-    out = _parse_pacs_result_html(html)
+    out = parse_pacs_result_html(html)
     assert out is not None
     assert out["address"] == "5 BAY ST, OAK HARBOR WA 98277"
 
@@ -61,7 +61,7 @@ def test_single_result_mailing_from_multiline_cell():
     from the full multi-line value (the skip-trace payload)."""
     addr_cell = "742 EVERGREEN TER\nOAK HARBOR WA 98277"
     html = _page(_row("9876543210", "1234567890", addr_cell, "DOE JANE"))
-    out = _parse_pacs_result_html(html)
+    out = parse_pacs_result_html(html)
     assert out is not None
     assert out["address"] == "742 EVERGREEN TER"
     assert out["mailing"] == "742 EVERGREEN TER, OAK HARBOR WA 98277"
@@ -73,22 +73,22 @@ def test_multiple_results_returns_none():
         _row("1111111111", "2222222222", "1 FIR LN, COUPEVILLE WA 98239", "SMITH JOHN"),
         _row("3333333333", "4444444444", "2 OAK AVE, LANGLEY WA 98260", "SMITH JOHN A"),
     )
-    assert _parse_pacs_result_html(html) is None
+    assert parse_pacs_result_html(html) is None
 
 
 def test_no_results_table_returns_none():
-    assert _parse_pacs_result_html("<html><body>None found</body></html>") is None
+    assert parse_pacs_result_html("<html><body>None found</body></html>") is None
 
 
 def test_header_only_no_data_row_returns_none():
     html = f"<html><table id='resultsTable'>{_HEADER}</table></html>"
-    assert _parse_pacs_result_html(html) is None
+    assert parse_pacs_result_html(html) is None
 
 
 def test_single_row_without_address_returns_none():
     """A unique row that has no parseable address yields nothing usable."""
     html = _page(_row("9876543210", "1234567890", "ADDRESS UNAVAILABLE", "DOE JANE"))
-    assert _parse_pacs_result_html(html) is None
+    assert parse_pacs_result_html(html) is None
 
 
 def test_uppercase_tags_still_counted():
@@ -100,7 +100,7 @@ def test_uppercase_tags_still_counted():
         "<TD>DOE JANE</TD><TD>$1</TD><TD>VIEW</TD></TR>"
     )
     html = f"<html><table id='resultsTable'><TR><TH>HDR</TH></TR>{row}</table></html>"
-    out = _parse_pacs_result_html(html)
+    out = parse_pacs_result_html(html)
     assert out is not None
     assert out["address"] == "9 PINE RD, FREELAND WA 98249"
     assert "parcel_id" not in out

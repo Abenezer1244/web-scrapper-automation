@@ -332,8 +332,11 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                     res.property_address = pacs["address"]
                 if pacs.get("mailing") and not res.mailing_address:
                     res.mailing_address = pacs["mailing"]
-                if pacs.get("parcel_id") and not res.parcel_id:
-                    res.parcel_id = pacs["parcel_id"]
+                # parcel_id is intentionally NOT taken from the owner-name PACS
+                # lookup (Codex point C): it's weak evidence and parcel_id is the
+                # identity/billing/dedup key (parcel-primary compute_property_key).
+                # _parse_pacs_result_html no longer returns it; this is the
+                # explicit provenance boundary at the consumer.
                 name_hits += 1
             if name_hits:
                 try:

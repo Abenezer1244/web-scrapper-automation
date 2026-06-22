@@ -197,6 +197,7 @@ def run_scrape_job(self, job_id: str) -> None:
     from src.db.session import rls_sync_session, system_sync_session
     from src.scrapers.registry import UnsupportedCountyError, get_scraper_class
     from src.utils.data_exporter import DataExporter
+    from src.utils.lead_export import resolve_hidden_output_fields
     from src.workers.delivery import deliver_job_results
 
     # Refresh the in-process SSRF allowlist from the connectors table before
@@ -776,8 +777,13 @@ def run_scrape_job(self, job_id: str) -> None:
         _publish_log(r, job_id, "info", f"Building {fmt.upper()} export...", db=db)
 
         record_dicts = [r_obj.to_dict() for r_obj in records]
+        # Honor the user's output-field visibility (blank deselected hideable
+        # columns; identity/derived columns always present). Legacy/empty => all.
+        hidden_fields = resolve_hidden_output_fields(config.fields)
         exporter = DataExporter()
-        local_file = exporter.export(record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt)
+        local_file = exporter.export(
+            record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt, hidden_fields=hidden_fields
+        )
 
         object_key = f"exports/{job.user_id}/{job_id}/leads.{local_file.suffix.lstrip('.')}"
         try:
@@ -992,7 +998,10 @@ def run_scrape_job(self, job_id: str) -> None:
                     ]}
                     for res in refreshed
                 ]
-                enriched_file = exporter.export(record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt)
+                enriched_file = exporter.export(
+                    record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt,
+                    hidden_fields=resolve_hidden_output_fields(config.fields),
+                )
                 if object_key:
                     exporter.upload_to_r2(enriched_file, object_key)
                     _logger.info("Re-exported CSV with enriched data")

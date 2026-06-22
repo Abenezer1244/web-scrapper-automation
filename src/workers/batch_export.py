@@ -166,7 +166,9 @@ def _combined_pairs(db, user_id: str, job_ids: list[str]) -> list[tuple]:
     ]
 
 
-def render_combined_csv(user_id: str, job_ids: list[str]) -> bytes:
+def render_combined_csv(
+    user_id: str, job_ids: list[str], hidden_fields: set[str] | None = None
+) -> bytes:
     """Build the combined, deduped, overlap-flagged CSV ON DEMAND from the DB
     (NOT the stored R2 snapshot). Used by the download endpoint so:
       - a re-download reflects later async skip-trace fills (fresh contacts), and
@@ -175,13 +177,16 @@ def render_combined_csv(user_id: str, job_ids: list[str]) -> bytes:
     Opens its own SYNC psycopg2 session like the worker. Tenant isolation is the
     explicit user_id filter baked into _COMBINED_SQL — callers MUST pass the
     verified owner's id + that batch_run's own child_job_ids.
+
+    `hidden_fields` (from the batch's shared `fields`) blanks the user-deselected
+    hideable columns so the combined download matches the per-job exports.
     """
     from src.db.session import system_sync_session
 
     with system_sync_session() as db:
         pairs = _combined_pairs(db, user_id, job_ids)
         buf = io.StringIO()
-        write_lead_csv_with_overlap(pairs, buf)
+        write_lead_csv_with_overlap(pairs, buf, hidden_fields=hidden_fields)
         db.rollback()  # read-only
         return buf.getvalue().encode("utf-8")
 
@@ -251,6 +256,13 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
 
     pairs = _combined_pairs(db, run.user_id, run.child_job_ids or [])
 
+    # Honor the batch's shared output-field visibility (blank deselected hideable
+    # columns; identity/derived columns always present). The batch parent owns
+    # `fields` (children copy it); legacy/empty => show everything.
+    from src.utils.lead_export import resolve_hidden_output_fields
+    _batch = db.get(ScraperBatch, run.batch_id)
+    hidden_fields = resolve_hidden_output_fields(_batch.fields if _batch else None)
+
     object_key = None
     if pairs:
         exporter = DataExporter()
@@ -264,7 +276,7 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
         exporter.export_dir.mkdir(parents=True, exist_ok=True)
         try:
             with open(local_path, "w", newline="", encoding="utf-8") as fh:
-                write_lead_csv_with_overlap(pairs, fh)
+                write_lead_csv_with_overlap(pairs, fh, hidden_fields=hidden_fields)
             object_key = exporter.upload_to_r2(
                 local_path, f"exports/{run.user_id}/batch/{run.id}/combined.csv"
             )

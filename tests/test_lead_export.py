@@ -4,11 +4,14 @@ Covers BOTH input shapes the two export paths use: ORM-like objects (live downlo
 and plain dicts (scheduled/R2 export), incl. secondary contacts from either the
 `phones`/`emails` arrays OR flattened `phone_2`/`email_2` keys.
 """
+import csv
 import io
 
 from src.utils.lead_export import (
+    HIDEABLE_OUTPUT_FIELDS,
     LEAD_CSV_COLUMNS,
     build_lead_export_row,
+    resolve_hidden_output_fields,
     write_lead_csv,
 )
 
@@ -291,3 +294,79 @@ class TestNtsAuctionColumns:
         row = build_lead_export_row({"party_name": "X"})
         for col in ("auction_date", "days_to_auction", "default_amount", "trustee", "ts_number"):
             assert row[col] == "", col
+
+
+class TestOutputFieldVisibility:
+    """Output-boundary field visibility — the wizard's "Fields to collect" checkboxes
+    blank deselected HIDEABLE columns at export, never drop columns, never touch
+    identity/derived columns, and treat legacy/empty configs as "show everything"."""
+
+    def test_resolver_hides_only_explicit_false_hideables(self):
+        cfg = {
+            "party_name": True, "parcel_id": True, "property_address": True,
+            "mailing_address": False, "heirs": True, "legal_description": False,
+            "date_recorded": True,
+        }
+        assert resolve_hidden_output_fields(cfg) == {"mailing_address", "legal_description"}
+
+    def test_resolver_ignores_identity_false(self):
+        # Even if an identity field is unchecked, it is NEVER hideable.
+        cfg = {"party_name": False, "parcel_id": False,
+               "property_address": False, "date_recorded": False}
+        assert resolve_hidden_output_fields(cfg) == set()
+
+    def test_resolver_legacy_and_empty_means_show_all(self):
+        for legacy in (None, [], {}, "garbage", ["party_name"]):
+            assert resolve_hidden_output_fields(legacy) == set(), legacy
+
+    def test_resolver_missing_key_is_visible(self):
+        # A hideable field absent from the dict is shown (only explicit False hides).
+        assert resolve_hidden_output_fields({"party_name": True}) == set()
+
+    def test_write_csv_blanks_hidden_keeps_header_and_identity(self):
+        rec = {
+            "party_name": "SMITH JOHN",
+            "parcel_id": "1234567890",
+            "property_address": "123 MAIN ST, TACOMA, WA 98401",
+            "mailing_address": "PO BOX 9, TACOMA, WA 98401",
+            "heirs": "SMITH JANE",
+            "legal_description": "LOT 4 BLK 2 SUNNYDALE",
+            "date_recorded": "2026-05-01",
+        }
+        out = io.StringIO()
+        write_lead_csv([rec], out, hidden_fields={"legal_description", "heirs"})
+        out.seek(0)
+        rows = list(csv.DictReader(out))
+        assert len(rows) == 1
+        row = rows[0]
+        # Header set unchanged (column kept, value blanked).
+        assert set(row.keys()) == set(LEAD_CSV_COLUMNS)
+        assert row["legal_description"] == "" and row["heirs"] == ""
+        # Identity + non-hidden columns intact.
+        assert row["party_name"] == "SMITH JOHN"
+        assert row["parcel_id"] == "1234567890"
+        assert row["mailing_address"] == "PO BOX 9, TACOMA, WA 98401"
+        assert row["date_recorded"] == "2026-05-01"
+
+    def test_write_csv_no_hidden_is_unchanged(self):
+        rec = {"party_name": "DOE JANE", "legal_description": "LOT 1", "heirs": "DOE JOHN"}
+        for hidden in (None, set()):
+            out = io.StringIO()
+            write_lead_csv([rec], out, hidden_fields=hidden)
+            out.seek(0)
+            row = next(csv.DictReader(out))
+            assert row["legal_description"] == "LOT 1"
+            assert row["heirs"] == "DOE JOHN"
+
+    def test_apply_visibility_cannot_blank_identity(self):
+        # Defensive: even a miswired caller passing an identity field can't blank it.
+        rec = {"party_name": "SMITH JOHN", "legal_description": "LOT 4"}
+        out = io.StringIO()
+        write_lead_csv([rec], out, hidden_fields={"party_name", "legal_description"})
+        out.seek(0)
+        row = next(csv.DictReader(out))
+        assert row["party_name"] == "SMITH JOHN"   # identity protected
+        assert row["legal_description"] == ""        # hideable blanked
+
+    def test_hideable_set_is_exactly_the_three(self):
+        assert HIDEABLE_OUTPUT_FIELDS == frozenset({"mailing_address", "heirs", "legal_description"})

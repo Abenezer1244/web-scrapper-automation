@@ -46,6 +46,27 @@ def test_single_result_never_returns_parcel_id():
     assert "parcel_id" not in out
 
 
+def test_single_result_with_a_stray_pager_row_still_parses():
+    """A genuine single result plus a footer/pager row (few cells, no parcel#)
+    must NOT be mis-counted as ambiguous (Codex P2 — plausible-row filter)."""
+    pager = "<tr><td colspan=10>Page 1 of 1</td></tr>"
+    html = _page(_row("9876543210", "1234567890", "5 BAY ST, OAK HARBOR WA 98277", "DOE JANE") + pager)
+    out = _parse_pacs_result_html(html)
+    assert out is not None
+    assert out["address"] == "5 BAY ST, OAK HARBOR WA 98277"
+
+
+def test_single_result_mailing_from_multiline_cell():
+    """When the address cell carries newline-separated lines, mailing hydrates
+    from the full multi-line value (the skip-trace payload)."""
+    addr_cell = "742 EVERGREEN TER\nOAK HARBOR WA 98277"
+    html = _page(_row("9876543210", "1234567890", addr_cell, "DOE JANE"))
+    out = _parse_pacs_result_html(html)
+    assert out is not None
+    assert out["address"] == "742 EVERGREEN TER"
+    assert out["mailing"] == "742 EVERGREEN TER, OAK HARBOR WA 98277"
+
+
 def test_multiple_results_returns_none():
     """Ambiguous owner-name match (2 properties) → trust nothing."""
     html = _page(

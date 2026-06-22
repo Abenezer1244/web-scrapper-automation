@@ -46,8 +46,8 @@ def _parse_pacs_result_html(html_text: str) -> dict | None:
     properties; the old parser flattened ALL result rows' cells and trusted the
     first parcel/address it saw — silently picking row 1 of an ambiguous match.
     An owner-name match is WEAK evidence, so:
-      1. Require EXACTLY ONE data row in resultsTable; on 0 or >1, return None
-         (we can't know which property is the filing party's).
+      1. Require EXACTLY ONE plausible result row in resultsTable; on 0 or >1,
+         return None (we can't know which property is the filing party's).
       2. NEVER return parcel_id from this path. parcel_id is identity/billing/
          dedup input (``compute_property_key`` is parcel-primary, and the FROZEN
          ``legacy_strong_signature`` keys billing dedup) — a name-derived parcel
@@ -68,21 +68,26 @@ def _parse_pacs_result_html(html_text: str) -> dict | None:
              if table_end > table_start
              else html_text[table_start:table_start + 5000])
 
-    # Data rows only (header rows use <th>, excluded by the "<td" requirement).
-    # Case-insensitive so an uppercase-tag portal isn't mis-counted as 0 rows.
-    data_rows = [
-        row for row in re.findall(r"<tr[^>]*>(.*?)</tr>", chunk, re.DOTALL | re.IGNORECASE)
-        if re.search(r"<td", row, re.IGNORECASE)
-    ]
-    if len(data_rows) != 1:
-        return None
+    def _row_cells(row_html: str) -> list[str]:
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", row_html, re.DOTALL | re.IGNORECASE)
+        cleaned = [re.sub(r"<[^>]+>", " ", td).strip().replace("&nbsp;", "").strip()
+                   for td in tds]
+        return [c for c in cleaned if c]
 
-    tds = re.findall(r"<td[^>]*>(.*?)</td>", data_rows[0], re.DOTALL | re.IGNORECASE)
-    cells = [re.sub(r"<[^>]+>", " ", td).strip().replace("&nbsp;", "").strip()
-             for td in tds]
-    cells = [c for c in cells if c]
-    if len(cells) < 5:  # a real PACS result row has ~10 columns; guard pager/footer rows
+    # Count only PLAUSIBLE result rows, not "any <tr> with a <td>" (Codex P2): a
+    # real PACS result row has ~10 columns INCLUDING long account/parcel numbers.
+    # Filtering on (>=5 cells AND a 6+ digit number) before the uniqueness check
+    # means a stray pager/footer row, or a header rendered with <td> instead of
+    # <th>, can't turn a single genuine match into a false miss. Case-insensitive
+    # so an uppercase-tag portal isn't mis-read as zero rows.
+    candidate_rows = []
+    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", chunk, re.DOTALL | re.IGNORECASE):
+        cells = _row_cells(row)
+        if len(cells) >= 5 and any(re.search(r"\d{6,}", c) for c in cells):
+            candidate_rows.append(cells)
+    if len(candidate_rows) != 1:
         return None
+    cells = candidate_rows[0]
 
     result: dict[str, str] = {}
     for cell in cells:

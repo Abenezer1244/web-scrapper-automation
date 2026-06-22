@@ -942,8 +942,11 @@ async def download_export(
         # so skip-trace phone/email appear as soon as the dispatcher completes.
         # Honor the user's output-field visibility for this job's config (blank
         # deselected hideable columns; identity/derived columns always present).
-        # Loaded scoped to the owner (RLS belt + explicit user filter); a missing
-        # config or legacy/empty fields => show everything.
+        # Loaded scoped to the owner (RLS belt + explicit user filter); legacy/empty
+        # fields => show everything. Covers batch children too: each child is its OWN
+        # ScraperConfig carrying the batch's `fields` (batches.py), and Job.scraper_
+        # config_id is NOT NULL, so the guard's None branch is defensive only. (The
+        # batch COMBINED export is a separate path — see batch_export.py.)
         from src.utils.lead_export import resolve_hidden_output_fields, write_lead_csv
         hidden_fields: set[str] = set()
         if job.scraper_config_id:

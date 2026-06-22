@@ -4,7 +4,7 @@ Called by the Tracerfy webhook receiver after a batch's rows are ingested.
 For each user whose records were in the batch:
 
   1. Count the ingested rows attributable to that user
-  2. Determine the bundled quota for the user's plan (0 for pro,
+  2. Determine the bundled quota for the user's plan (250 for pro,
      1000 for business, 2000 for agency, starter is blocked upstream)
   3. Read `users.skip_trace_used_this_month`
   4. Compute billable_units = max(0, (used + new) - quota)

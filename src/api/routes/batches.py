@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
+from src.api.entitlements import enforce_entitlements
 from src.api.middleware.rate_limit import rate_limit
 from src.api.schemas import (
     BatchChildSummary,
@@ -121,6 +122,18 @@ async def create_batch(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Unsupported county/record-type combinations: {', '.join(invalid[:10])}",
         )
+
+    # Value-metric entitlement gate (distinct-county count + record-type), across
+    # the WHOLE batch so we never partially create configs. Feature-flagged:
+    # 402 when settings.ENTITLEMENT_ENFORCEMENT is on, else audit-log only.
+    await enforce_entitlements(
+        db,
+        current_user,
+        state=body.state,
+        counties=set(body.counties),
+        record_types=set(body.record_types),
+        context="create_batch",
+    )
 
     # 6. Persist the parent batch (shared config) + child configs (delivery +
     #    schedule SUPPRESSED — the batch owns them). BatchRun + jobs are created by

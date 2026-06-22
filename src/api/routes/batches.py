@@ -392,15 +392,21 @@ async def download_batch(
     # full-CSV buffer), so rate-limit to keep concurrent downloads from starving
     # API capacity (Codex).
     await rate_limit(request, zone="general", identifier=current_user.id)
-    await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
+    batch = await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
     run = await _run_for(db, batch_id, current_user.id)
-    return await _stream_run_csv(batch_id, run)
+    return await _stream_run_csv(batch_id, run, batch.fields)
 
 
-async def _stream_run_csv(batch_id: str, run: BatchRun | None) -> StreamingResponse:
+async def _stream_run_csv(
+    batch_id: str, run: BatchRun | None, batch_fields: object = None
+) -> StreamingResponse:
     """Rebuild + stream one run's combined CSV. Caller must have verified batch
     ownership AND that `run` belongs to that batch (run.user_id is then the
-    verified owner — safe to pass to the system-session renderer)."""
+    verified owner — safe to pass to the system-session renderer).
+
+    `batch_fields` is the owning batch's `ScraperConfig`-shape `fields` JSON; it
+    resolves to the hideable columns to blank so the combined CSV honors the same
+    output-field visibility as the per-job exports (legacy/empty => show all)."""
     if run is None or not run.combined_export_key:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -408,13 +414,15 @@ async def _stream_run_csv(batch_id: str, run: BatchRun | None) -> StreamingRespo
         )
     from starlette.concurrency import run_in_threadpool
 
+    from src.utils.lead_export import resolve_hidden_output_fields
     from src.workers.batch_export import render_combined_csv
 
+    hidden_fields = resolve_hidden_output_fields(batch_fields)
     try:
         # render_combined_csv opens a sync session + builds the CSV — run off the
         # event loop so the DB/CSV work can't block other requests.
         data = await run_in_threadpool(
-            render_combined_csv, run.user_id, run.child_job_ids or []
+            render_combined_csv, run.user_id, run.child_job_ids or [], hidden_fields
         )
     except Exception as exc:  # build failure — surface a clean 503
         _logger.error("batch %s download failed: %s", batch_id, str(exc)[:200])
@@ -483,7 +491,7 @@ async def download_batch_run(
     """Run-scoped combined-CSV download (2B): history downloads must not drift to
     the latest run the way /download (latest-run semantics) does."""
     await rate_limit(request, zone="general", identifier=current_user.id)
-    await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
+    batch = await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
     run = (
         await db.execute(
             select(BatchRun).where(
@@ -495,4 +503,4 @@ async def download_batch_run(
     ).scalar_one_or_none()
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
-    return await _stream_run_csv(batch_id, run)
+    return await _stream_run_csv(batch_id, run, batch.fields)

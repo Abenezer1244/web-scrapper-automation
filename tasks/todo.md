@@ -26,17 +26,15 @@ Skip-trace mapping was also checked: frontend "Skip trace" → top-level `skip_t
 
 Codex session: `019ef0c7-1e11-7463-abca-e74018bfc2f6` (saved for follow-ups).
 
-## Phase 1 — single-job export (the 95% path)  [<=5 files]
-- [ ] `src/utils/lead_export.py`: add `HIDEABLE_OUTPUT_FIELDS = {"mailing_address","heirs","legal_description"}`,
-      `resolve_hidden_output_fields(config_fields) -> set[str]`, and `_apply_visibility(row, hidden)`.
-      Thread `hidden_fields: set[str] | None = None` into `write_lead_csv`.
-- [ ] `src/utils/data_exporter.py`: thread `hidden_fields` through `to_csv`, `to_excel`
-      (`_canonical_dataframe`), `to_json`, and `export()`.
-- [ ] `src/workers/tasks.py:780,995`: pass `hidden_fields=resolve_hidden_output_fields(config.fields)`
-      (config already in scope).
-- [ ] `src/api/routes/jobs.py:944`: load the job's `ScraperConfig.fields` (scoped to `user.id`),
-      pass `hidden_fields` to `write_lead_csv`.
-- [ ] Verify: `python -m py_compile`, `ruff`, targeted pytest. Codex reviews the diff.
+## Phase 1 — single-job export (the 95% path)  [<=5 files]  ✅ DONE (commits af13b51, 30602f0)
+- [x] `src/utils/lead_export.py`: `HIDEABLE_OUTPUT_FIELDS`, `resolve_hidden_output_fields`,
+      `_apply_visibility`; `write_lead_csv` gains `hidden_fields`.
+- [x] `src/utils/data_exporter.py`: threaded `hidden_fields` through to_csv/to_excel/to_json/export.
+- [x] `src/workers/tasks.py:780,995`: pass `resolve_hidden_output_fields(config.fields)`.
+- [x] `src/api/routes/jobs.py`: load job's `ScraperConfig.fields` (owner-scoped), pass to `write_lead_csv`.
+- [x] Verify: py_compile + ruff clean; 75 export tests pass (+12 new). Codex review: gate PASS.
+      P1 (batch-child) verified theoretical (Job.scraper_config_id NOT NULL + children carry fields);
+      P2 (export-format tests) addressed.
 
 ## Phase 2 — batch combined export  [<=2 files]
 - [ ] `src/utils/lead_export.py`: thread `hidden_fields` into `write_lead_csv_with_overlap` /

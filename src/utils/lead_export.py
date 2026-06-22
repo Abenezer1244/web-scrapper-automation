@@ -324,7 +324,9 @@ OVERLAP_LEAD_COLUMNS: list[str] = [
 ]
 
 
-def build_overlap_export_row(record: Any, overlap: dict[str, Any]) -> dict[str, str]:
+def build_overlap_export_row(
+    record: Any, overlap: dict[str, Any], hidden_fields: set[str] | None = None
+) -> dict[str, str]:
     """One overlap-CSV row from a lead record + its overlap metadata.
 
     `overlap` carries `lists_count` (distinct record types this property is on),
@@ -332,8 +334,11 @@ def build_overlap_export_row(record: Any, overlap: dict[str, Any]) -> dict[str, 
     flag is the WORD "Overlap" when on 2+ lists, else blank (more scannable than
     TRUE/FALSE). All other fields come straight from the canonical dialer-ready
     row so formatting stays identical across exports.
+
+    `hidden_fields` (from the batch's `fields`) blanks the user-deselected hideable
+    columns; the header set is unchanged, matching the per-job CSV's behavior.
     """
-    base = build_lead_export_row(record)
+    base = _apply_visibility(build_lead_export_row(record), hidden_fields)
     try:
         count = int(overlap.get("lists_count") or 0)
     except (TypeError, ValueError):
@@ -352,10 +357,16 @@ def build_overlap_export_row(record: Any, overlap: dict[str, Any]) -> dict[str, 
     return row
 
 
-def write_lead_csv_with_overlap(rows: list[tuple[Any, dict[str, Any]]], filelike) -> None:
+def write_lead_csv_with_overlap(
+    rows: list[tuple[Any, dict[str, Any]]], filelike, hidden_fields: set[str] | None = None
+) -> None:
     """Write the overlap/combine CSV. `rows` = iterable of (record, overlap_dict),
-    already ordered by the caller (hottest-first). Header + rows, no footer."""
+    already ordered by the caller (hottest-first). Header + rows, no footer.
+
+    `hidden_fields` (from the batch's shared `fields`) blanks the user-deselected
+    hideable columns, keeping the combined CSV consistent with each per-job export.
+    """
     writer = csv.DictWriter(filelike, fieldnames=OVERLAP_LEAD_COLUMNS)
     writer.writeheader()
     for record, overlap in rows:
-        writer.writerow(build_overlap_export_row(record, overlap))
+        writer.writerow(build_overlap_export_row(record, overlap, hidden_fields))

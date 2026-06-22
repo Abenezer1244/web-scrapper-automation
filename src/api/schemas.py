@@ -214,6 +214,25 @@ class ScheduleConfig(BaseModel):
     frequency: str = Field(default="manual", max_length=16)      # manual | daily | weekly | monthly
     run_at_hour: int = Field(default=6, ge=0, le=23)             # UTC
     run_at_minute: int = Field(default=0, ge=0, le=59)
+    # Day selectors for recurring schedules. run_at_weekday applies ONLY to
+    # frequency="weekly", run_at_day_of_month ONLY to "monthly" (both ignored
+    # otherwise). CONTRACT: run_at_weekday is 0=Monday .. 6=Sunday — it matches
+    # Python's datetime.weekday(), NOT JS getDay() (the frontend select must map
+    # its labels to this, it must not send getDay() raw). Defaults (0=Monday,
+    # 1st) reproduce the pre-picker hardcoded behavior, so configs saved before
+    # these fields existed keep firing Monday / the 1st with no migration.
+    # day_of_month accepts 1..31; the dispatcher clamps to the month's last day,
+    # so "31" fires on the last day of short months (Feb -> 28/29).
+    run_at_weekday: int = Field(
+        default=0, ge=0, le=6,
+        description="Weekly only. 0=Monday .. 6=Sunday (matches Python datetime.weekday()). "
+                    "Frontend must map its day labels to this; do NOT send JS Date.getDay().",
+    )
+    run_at_day_of_month: int = Field(
+        default=1, ge=1, le=31,
+        description="Monthly only. 1..31; the dispatcher clamps to the month's last day, "
+                    "so 31 fires on the last day of short months (Feb -> 28/29).",
+    )
     date_range_mode: str = Field(default="rolling_90", max_length=24)  # rolling_90 | custom | since_last_run
     date_from: str | None = Field(default=None, max_length=32)   # ISO date string
     date_to: str | None = Field(default=None, max_length=32)
@@ -229,6 +248,36 @@ class ScheduleConfig(BaseModel):
         if v not in {"manual", "daily", "weekly", "monthly"}:
             raise ValueError("frequency must be manual, daily, weekly, or monthly")
         return v
+
+    @model_validator(mode="after")
+    def validate_custom_range(self) -> "ScheduleConfig":
+        # Reject a backwards custom window at SAVE time (Codex) so the user gets a
+        # clear error instead of a silently-wrong scrape. The worker's
+        # _ordered_window is the belt for legacy / direct-DB rows; this is the
+        # suspenders. Only enforced when mode is custom AND both dates parse —
+        # a half-filled form falls back to rolling_90 downstream, not an error.
+        if self.date_range_mode == "custom" and self.date_from and self.date_to:
+            d0 = _parse_schedule_date(self.date_from)
+            d1 = _parse_schedule_date(self.date_to)
+            if d0 and d1 and d0 > d1:
+                raise ValueError("date_from must be on or before date_to")
+        return self
+
+
+def _parse_schedule_date(value: str) -> date | None:
+    """Parse a schedule date string (ISO YYYY-MM-DD or US MM/DD/YYYY) to a date.
+
+    Returns None when it can't be parsed — the caller treats that as "can't
+    compare", not as an error, so a malformed string is left to the worker's
+    normalizer rather than blocking the save on a format technicality.
+    """
+    value = value.strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(value[:10], fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 def _validate_https_webhook_url(v: str | None) -> str | None:
@@ -393,6 +442,8 @@ class ScheduleConfigDict(TypedDict, total=False):
     frequency: str           # one of: manual, daily, weekly, monthly
     run_at_hour: int
     run_at_minute: int
+    run_at_weekday: int      # 0=Mon..6=Sun, weekly only (see ScheduleConfig)
+    run_at_day_of_month: int  # 1..31 (clamped to month length), monthly only
     date_range_mode: str     # one of: rolling_90, custom, since_last_run
     date_from: str | None
     date_to: str | None

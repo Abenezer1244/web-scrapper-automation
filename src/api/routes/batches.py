@@ -12,7 +12,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
@@ -122,15 +122,6 @@ async def create_batch(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Unsupported county/record-type combinations: {', '.join(invalid[:10])}",
         )
-
-    # TOCTOU fix (entitlements.py county-count race): serialize concurrent creates
-    # for THIS user with a per-user advisory xact lock so the distinct-county count
-    # in enforce_entitlements can't be raced. Auto-released at transaction end.
-    # Namespaced (classid=4242 "entitlement") to avoid collision with other locks.
-    await db.execute(
-        text("SELECT pg_advisory_xact_lock(4242, hashtext(:uid))"),
-        {"uid": str(current_user.id)},
-    )
 
     # Value-metric entitlement gate (distinct-county count + record-type), across
     # the WHOLE batch so we never partially create configs. Feature-flagged:

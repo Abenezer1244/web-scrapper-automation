@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.constants import (
@@ -119,6 +119,19 @@ async def enforce_entitlements(
     is exceeded; otherwise logs the would-block at INFO and returns (audit mode).
     """
     plan = _plan_of(user)
+
+    # TOCTOU fix: when enforcing, serialize concurrent creates for THIS user with a
+    # per-user advisory xact lock so the distinct-county count below can't be raced.
+    # Transaction-scoped: held until the route commits its new config, so a second
+    # concurrent create blocks until the first is visible. No-op in audit mode (the
+    # count blocks nothing there, so the lock would only add needless serialization).
+    # Namespaced classid 4242 ("entitlement") to avoid collision with other locks.
+    if settings.ENTITLEMENT_ENFORCEMENT:
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(4242, hashtext(:uid))"),
+            {"uid": str(user.id)},
+        )
+
     problems: list[str] = []
 
     bad_types = record_type_violations(plan, record_types)

@@ -1,148 +1,91 @@
-# King tax-delinquent owner-name REACH fix (follow-up to PR #80)
+# Task: Migrate billing to the new $199 pricing strategy (Phase 1: prices)
 
-> PR #80 (`d2253f6`) is MERGED — the owner-swap logic is correct and live-proven
-> (6/6 parcels returned real owners on 2026-06-21). This follow-up makes the swap
-> actually REACH existing leads. Original PR #80 plan archived in `tasks/todo.pr80.bak`.
+> Decision (user, 2026-06-21): **Go with the new pricing.**
+> Scope = **Prices first, entitlements next** (value-metric county/record-type gating is a SEPARATE later build).
+> PR #39 = **Split**: ship the app redesign now, HOLD the $199 marketing pages until billing matches.
+> Source of truth: `docs/pricing-strategy-2026-06.md`.
 
-## Problem (reach gap)
-The swap (`enrich.py:396-401`) only runs inside the King eRealProperty pass, which
-is gated to rows **missing a mailing address** (`enrich.py:354-360`). But:
-1. `_reuse_enrichment_for_duplicates` COALESCEs `mailing_address` from the pre-fix
-   delivered record onto duplicates → they have a mailing address → excluded from
-   the King pass → placeholder survives.
-2. King tax is a point-in-time snapshot; every parcel already exists, so a fresh
-   job is ~100% duplicates → almost nothing gets the swap.
-3. `_MAX_KING_PARCELS = 300` caps per-job lookups.
-Result: UI still shows placeholders on existing ~28k King tax leads.
+## Verified ground truth (2026-06-21)
+- LIVE `/billing/plans`: Starter $0 / Pro **$79** / Business **$149** / Agency **$499** (records_limit 50/1000/5000/-1).
+- Target: Pro **$199** / Business **$499** / Agency **$1,499** + annual ~20% off; skip-trace metered $0.08.
+- 🔴 **Stripe misconfig found:** Railway `STRIPE_PRICE_{PRO,BUSINESS,AGENCY}` hold **`prod_…` (product) IDs**, and `STRIPE_PRODUCT_*` are **unset**. Checkout feeds `STRIPE_PRICE_*` straight into `line_items[].price`, which Stripe requires to be `price_…`. ⇒ **live checkout is currently broken** (consistent with 0 paying customers). Skip-trace price vars ARE correct (`price_…`).
+- 0 paying customers ⇒ no grandfathering needed (confirm no active paid subs on the 4 billing accounts).
+- PR #39 commits (frontend `redesign/monopo-marketing`): marketing redesign = base commit `1a9da04`; app redesign (theme/auth/dashboard/scrapers/settings) stacked on top.
 
-## Decision (user-approved 2026-06-21): widen the forward gate + backfill existing.
+## DECISIONS (user, 2026-06-21)
+- Annual = **wire it now** (6 Stripe prices: monthly+annual ×3).
+- Founding coupon = **reduce to 25%** (Pro ~$149.25 / Business ~$374.25 / Agency ~$1,124.25 effective).
+- Stripe objects = **Claude creates them via live API**, captures IDs into a committed doc, sets Railway env, user verifies in dashboard.
 
-## Plan
-### Phase 1 — Forward gate (`src/workers/tasks_helpers/enrich.py`) [1 file + tests]
-- [ ] Compute `is_tax_delinquent` + import `is_tax_placeholder_party` before `needs`.
-- [ ] Widen `needs` to also include tax_delinquent placeholder-named rows even when
-      `mailing_address` is present.
-- [ ] When capping to `_MAX_KING_PARCELS`, prioritize placeholder-named parcels.
-- [ ] Test: tax row WITH mailing + placeholder name gets its owner swapped.
+## Phase 1 — Backend code (web-scrapper-automation) [2 files: settings.py + billing.py]
+- [ ] `settings.py`: add `STRIPE_PRICE_{PRO,BUSINESS,AGENCY}_ANNUAL: str = ""`.
+- [ ] `billing.py` `_PLANS`: Pro 79→199 (annual 758→**1910**), Business 149→499 (annual 1430→**4790**), Agency 499→1499 (annual 4790→**14390**). Add `stripe_price_id_annual` per paid plan.
+- [ ] Feature bullets: keep honest (drop the unenforced "5 counties" cap on Pro; keep records/skip-trace/exports/schedule/delivery/API). NO new county/record-type claims (Codex HIGH).
+- [ ] `_PRICE_TO_PLAN`: include BOTH monthly + annual price IDs → same (plan, records_limit). Keep records_limit unchanged.
+- [ ] `/checkout`: guard that resolved id starts with `price_` → clean 400 (defensive, no boot crash).
+- [ ] Startup: log-WARN (not raise) if any `STRIPE_PRICE_*` lacks `price_` prefix (avoid crash-loop landmine).
+- [ ] Verify: `pytest` (billing tests), security Master Review, **Codex review of diff**.
 
-### Phase 2 — Owner-only helper (`src/scrapers/enrichment/king_county_assessor.py`) [1 file + tests]
-- [ ] `batch_extract_king_owners(parcel_ids) -> dict[str,str]`: Phase-1-only HTTP
-      (reuses `_extract_owner_name`, no Playwright) for the backfill.
-- [ ] Tests against real markup (no mocks).
+## Phase 2 — Live Stripe + env (Claude, with per-object confirmation) [config only]
+- [ ] Create 6 new Stripe **Price** objects (monthly+annual ×3) under existing products → `price_…` IDs.
+- [ ] Create new **25% founding coupon** → update `_FOUNDING_COUPON_ID` + cache key + display (`percent_off: 25`, `code: "FOUNDING25"`); archive/retire old 40% coupon `8mX1xa35`.
+- [ ] Document all IDs/amounts/interval in a committed `docs/stripe-prices-2026-06.md`.
+- [ ] Set Railway `STRIPE_PRICE_{PRO,BUSINESS,AGENCY}` + `_ANNUAL` on **api AND worker** with real `price_…` IDs (fixes prod_/price_ bug). Optionally set `STRIPE_PRODUCT_*` too.
+- [ ] Deploy/restart both services; smoke test `/billing/plans`, monthly + annual checkout, a webhook event.
 
-### Phase 3 — Backfill (`scripts/backfill_king_tax_owner_names.py`) [1 file]
-- [ ] Select `results` with placeholder `party_name` + parcel_id, joined to
-      `scraper_configs` for county=king/state=wa/record_type=tax_delinquent.
-- [ ] parcel→owner map via `batch_extract_king_owners`; UPDATE only still-placeholder
-      rows (idempotent), batched commits, dry-run flag, loud summary.
-- [ ] Owner is public parcel-keyed data → safe across tenants; row updated under its
-      own user_id.
+## Phase 3 — Frontend split (bridgeleads-web) [git surgery]
+- [ ] New branch from `master`; include app-redesign commits, EXCLUDE marketing commit `1a9da04` (verify no later commit edits `app/(marketing)` shared files e.g. globals.css).
+- [ ] Open replacement PR (redesign only). Hold marketing for a later PR once entitlements/marketing copy are ready.
+- [ ] Verify: `npx tsc --noEmit` + `npm run lint` + `npm run build`.
 
-### Gates
-- [ ] Codex consult BEFORE coding · ruff clean · pytest green · Codex review+challenge
-- [ ] Security Master Review (§14): multi-tenant, SSRF (safe_get), no PII in logs
-- [ ] New PR; do not push until user approves.
+## Open questions for Codex
+1. Should Phase 1 `_PLANS` feature bullets adopt the new-strategy text (3 counties / 250 skip-traces) even though NOT enforced yet, or stay accurate to the still-volume-based enforcement?
+2. Best/safest way to split marketing out of PR #39 (cherry-pick onto master vs revert base commit) given marketing is the base commit.
+3. Anything that breaks when only PRICES change but entitlement enforcement stays volume-based (webhook `_PRICE_TO_PLAN`, records_limit on upgrade, founding coupon math)?
+4. Should we fix the prod_/price_ Stripe bug as part of this, and is creating live Price objects via API acceptable vs dashboard?
 
-## Review (2026-06-21)
-All three phases implemented on branch `fix/king-tax-owner-reach`, verified, Codex-clean.
+## Codex consult notes (2026-06-21, consult mode)
+Codex agreed the plan is coherent IF the offer is framed around enforceable limits. Key findings reconciled:
+- **HIGH — feature text:** do NOT advertise "3 counties / 250 skip-traces / record types" in `/plans` unless enforced or labeled "coming soon". Keep bullets to what's enforced (records_limit, skip-trace metered $0.08, existing features). → **Decision: keep honest bullets; defer county/record-type marketing to the held marketing PR + Phase-2 entitlement build.**
+- **HIGH — annual:** `/plans` shows annual but `/checkout` only uses monthly env → annual is unbuyable. Either wire annual honestly or drop the display. Minimal fix: add `STRIPE_PRICE_*_ANNUAL`, include annual price IDs in `_PLANS` + `_PRICE_TO_PLAN`; `/checkout` already validates any price_id, so frontend just sends the chosen one. → **needs user decision.**
+- **HIGH/MED — webhook mapping:** swapping `STRIPE_PRICE_*` means old price IDs won't map in the webhook. With 0 paying customers + broken checkout (prod_ ids) there are no valid in-flight sessions, so low risk; cheap insurance = keep old IDs mappable during the window / expire stale Checkout Sessions.
+- **MED — founding coupon:** FOUNDING40 (40% off) at new prices = Pro **$119.40** / Business **$299.40** / Agency **$899.40**. Confirm intent or retire/adjust before cutover. → **needs user decision.**
+- **MED — startup validation:** add a guard that every `STRIPE_PRICE_*` starts with `price_` (this misconfig is how `prod_` got in). → **adopt.**
+- **Cutover order (adopt):** create NEW Price objects (Stripe prices are immutable; archive old later) → separate `_MONTHLY`/`_ANNUAL` env vars → deploy backend w/ startup validation + both-ID mapping → set env on BOTH api+worker same window → restart → smoke test plans/checkout/webhook.
+- **API vs dashboard:** dashboard preferred for founder traceability on a one-time business change; document product IDs, price IDs, amounts, currency, interval, coupon behavior either way. → **needs user decision.**
 
-**Changes**
-- `src/scrapers/enrichment/king_county_assessor.py`: new `batch_extract_king_owners()`
-  (HTTP-only owner lookup, no Playwright) + `_fetch_king_owner()` (bounded retry on
-  transient failure via `Settings.MAX_RETRIES`, distinguishes genuine 200-miss from
-  transient error). Numeric-parcel guard.
-- `src/workers/tasks_helpers/enrich.py`: new owner-only forward pass in the King block —
-  resolves owners for tax_delinquent rows that have a mailing address but still a
-  placeholder name (the dedup-reuse case the missing-mailing pass skipped). 500-cap with
-  non-silent overflow log; commit-honest success/failure logging (guarded post-commit log).
-- `scripts/backfill_king_tax_owner_names.py`: idempotent, re-runnable backfill of existing
-  leads. Config-join + placeholder-shape scope; global parcel→owner cache; still-placeholder
-  UPDATE guard; `--dry-run/--batch/--limit` (limit applied to SELECT).
-- `tests/test_king_assessor_owner.py`: +3 tests (helper guard/dedup/numeric); 27 pass total.
-- `pyproject.toml`: per-file S608 ignore for the backfill (generated-:param SQL, values bound).
+## Decisions resolved by Codex (no user input needed)
+- Feature bullets stay accurate to enforcement; no unenforced entitlement claims.
+- Add `price_`-prefix startup validation for STRIPE_PRICE_*.
+- Keep existing records_limit values (volume metric unchanged this phase).
+- Create new Stripe Price objects (never edit), archive old.
 
-**Verification**
-- ruff clean; 27 targeted tests pass.
-- LIVE: `batch_extract_king_owners` returned real owners for the exact parcels that showed
-  placeholders (AL-SABAH JABER / CWIAK KATHLEEN L / RIAN SKYE GOOD LEWIN); short/blank/
-  non-numeric skipped with zero requests.
-- LIVE dry-run vs prod DB: scope join finds 213,326 in-scope placeholder rows; bounded
-  dry-run scanned 20 (precise --limit), 19 would-attempt, 1 correctly rejected as
-  not-exact-placeholder, ROLLBACK (no writes).
-- Codex: consult (pre-build) + review + 2 re-reviews → final CLEAN, no P1.
-- Security §14 non-negotiables: multi-tenant / SSRF / CSV / secrets / PII-in-logs all PASS.
+## Progress (2026-06-21)
+- ✅ Phase 1 code (commit `9764652`): _PLANS $199/$499/$1499 + annual, annual env vars, _PRICE_TO_PLAN monthly+annual, /checkout price_ guard (503), import-time config WARN. Compiles; no test asserts on prices.
+- ✅ Codex review of diff = **GATE PASS** (no P1/P2/P3).
+- ✅ Phase 2 live Stripe (commit `bfb25fd`): created 6 Price ids + FOUNDING25 (25%) via `scripts/stripe_pricing_migration_2026_06.py`; deleted old 40% coupon `8mX1xa35` (0 redemptions); ids in `docs/stripe-prices-2026-06.md`; founding code 40%→25%.
+- ✅ **PR #90 OPEN** (branch `feat/pricing-199-migration`, worktree `../bridgeleads-pricing`).
+- ⏳ POST-MERGE: set 6 `STRIPE_PRICE_*`(+`_ANNUAL`) env on api AND worker → smoke test plans/checkout/webhook.
+- ⏳ Phase 3 frontend split (bridgeleads-web): ship app redesign, hold $199 marketing.
+- ⏳ Dashboard BillingTab annual toggle (frontend) so annual is actually selectable.
 
-**NOT done (needs user decision)**
-- [ ] Commit + open PR (not pushed).
-- [ ] Run the backfill in PROD (213k-row mutation) — only dry-runs executed so far.
+## Review — SHIPPED + VERIFIED 2026-06-21
+**Backend (PR #90 MERGED → main, Railway deployed):**
+- /billing/plans live: Pro $199/$1910, Business $499/$4790, Agency $1499/$14390; FOUNDING25 25% active (25 spots).
+- Checkout E2E verified in prod: monthly AND annual both create live `cs_live_…` sessions; invalid/`prod_` ids 400 cleanly.
+- Fixed a latent prod bug: `STRIPE_PRICE_*` held `prod_` ids → checkout was BROKEN; now real `price_` ids on api+worker.
+- 6 live Stripe prices + FOUNDING25 created via `scripts/stripe_pricing_migration_2026_06.py`; old 40% coupon deleted (0 redemptions). IDs in `docs/stripe-prices-2026-06.md`.
 
----
-## (ARCHIVED) PR #80 — replace party_name placeholder with real owner name
+**Frontend (PR #39 + #40 MERGED → master, Vercel deployed):**
+- App redesign + $199 marketing live on bridgeleads.io.
+- Marketing copy made HONEST: removed unenforced county-count caps, record-type gating, overlap-gated-at-Business; skip-trace numbers match backend (Pro pay-per-use, Business 1000, Agency 2000); FOUNDING40→FOUNDING25.
+- Codex review caught a P1 (Starter "Sample" type-gate) + P2 (Business-only overlap) → both fixed before merge.
+- Hotfix PR #40: two hardcoded `FOUNDING40` banners → FOUNDING25. Prod verified clean.
 
-Branch: `fix/king-tax-owner-name`
+**Process:** Codex consulted before build + reviewed every diff (2 backend, 2 frontend). tsc/lint/build all green. Isolated worktrees used.
 
-## Problem
-King tax-delinquent leads ship to users with `party_name =
-"Tax Delinquent — $X owed (Parcel …)"` — a placeholder, never a person.
-- King's Socrata source (`dsv3-ct3e`) has no owner column, so the placeholder is
-  correct AT SCRAPE TIME (`king_wa_tax_delinquent.py:248`).
-- The docstring (`king_wa_tax_delinquent.py:29`) claims the name is "enriched
-  downstream" — but the enrichment (`enrich.py:354`, `king_county_assessor.py`)
-  only extracts `property_address` + `mailing_address`. It NEVER reads the owner
-  name and NEVER writes `party_name`. So the placeholder is permanent.
-- Snohomish is unaffected — its bulk file already carries the owner (field 7).
-
-## Verified facts
-- eRealProperty Dashboard page (already fetched in Phase 1 HTTP for the property
-  address) DOES carry the owner, markup `<td ...>Name</td><td>VALUE`.
-- `Name</td>` appears EXACTLY ONCE on the page → safe, unique regex.
-- Example: parcel `1954600115` → `TOMLINSON WILLIAM+CHERYL L` (King joins
-  co-owners with `+`; entity owners e.g. LLC/bank are valid tax-delinquent leads).
-
-## Plan (small, gated, no extra requests)
-- [x] 1. `king_county_assessor.py` Phase 1: extract owner via pure helper
-      `_extract_owner_name(html)` (tolerant regex + `html.unescape` + tag-strip +
-      junk rejection). `owner_name` added to result dict; row created when prop OR
-      tax_url OR owner.
-- [x] 2. `enrich.py` King block: overwrite party_name under DUAL gate —
-      `config.record_type == "tax_delinquent"` (belt) AND
-      `is_tax_placeholder_party()` (suspenders). Probate/death-cert King rows on
-      the same path untouched; capped/missed parcels keep the labeled placeholder.
-- [x] 3. Shared `tax_placeholder_party` / `is_tax_placeholder_party` predicate
-      co-located with the producer in `king_wa_tax_delinquent.py` (anchored regex,
-      can't drift). Tests: `_extract_owner_name` (10 cases) + predicate roundtrip
-      (real markup, no mocks, no network).
-- [x] 4. ruff clean; 24 targeted tests pass; verified on 3 LIVE King parcels.
-
-## Codex collaboration
-- [x] Consulted Codex on the plan BEFORE coding — tightened regex, gate, junk check.
-- [x] Codex reviewed the diff x3: round 1 found 2 Medium + 2 Low (all adopted),
-      round 2 found 1 residual edge (predicate not exact-shape), round 3 CLEAN.
-      No Critical/High at any point.
-
-## Review
-**What changed (3 source files + 2 test files):**
-- `src/scrapers/enrichment/king_county_assessor.py` — new `_extract_owner_name()`;
-  Phase 1 now reads the owner off the SAME eRealProperty page already fetched for
-  the address (zero extra HTTP). Returns `owner_name` in the result dict.
-- `src/scrapers/king_wa_tax_delinquent.py` — placeholder now built by
-  `tax_placeholder_party()`; new `is_tax_placeholder_party()` anchored-regex matcher
-  (requires the `$amount` clause, so a real name starting with the prefix is never
-  clobbered; dash-encoding-agnostic).
-- `src/workers/tasks_helpers/enrich.py` — King enrichment block swaps the
-  placeholder for the real owner under the dual gate.
-- `tests/test_king_assessor_owner.py` (new, 10) + `tests/test_king_tax_delinquent.py`
-  (+3 predicate tests).
-
-**Proof:** live extraction verified —
-`1954600115 → TOMLINSON WILLIAM+CHERYL L`, `4023500466 → AMES WILLIAM E & CHAMBERS G`,
-`7941110080 → KALLEM SWARAJ & JYOTHI`.
-
-**Behavior:** King tax-delinquent leads now show the real owner once enriched.
-Misses/capped parcels keep the labeled placeholder (never blank). Snohomish
-unchanged. Multi-tenant isolation unchanged (edit stays within the job's pid_map;
-Codex confirmed no tenant-leak path).
-
-## Out of scope
-- Snohomish (already correct). Skip-trace (separate opt-in). The 300-parcel
-  enrichment cap (pre-existing; capped rows keep the labeled placeholder).
+## ⏭️ Follow-ups (NOT done — deliberate)
+- **Value-metric entitlement enforcement** (per-tier county allowlist + record-type gating + skip-trace bundle for Pro): the strategy's #1 lever, deferred. Until built, copy stays volume-honest.
+- **Dashboard BillingTab annual toggle**: annual is buyable via API but the dashboard UI only sends monthly; add a monthly/annual switch to expose annual prepay.
+- **Backend `/pricing` comparison matrix** (billing.py) still has old county/volume framing — dormant (marketing uses static data.ts), align if ever consumed.
+- **WTP validation**: still 0 paying customers; the $199 matrix remains a hypothesis — validate via founding calls.

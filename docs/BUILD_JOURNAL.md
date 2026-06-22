@@ -19,6 +19,247 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-21 — Fill REAL legal_description on Snohomish + Clark tax leads from assessor data (PR #95)
+**Scope:** User: "build" real legal descriptions for Snohomish + Clark tax leads (after PR #92 nulled
+the stand-ins), Codex consulted on every move. Worktree `../bridgeleads-tax-assessor`.
+**Research-first (research subagent):** free, no-auth bulk assessor sources. Snohomish: ArcGIS
+"Assessor Roll CSV Collection" ZIP (item `ee76dfa5...`) → `LegalDescr.csv` (ID/PropId/parcel_number/
+line_nr/legal_desc_line; legal is MULTI-LINE per parcel). Clark: ArcGIS `TaxlotsPublic/MapServer/0`
+`LegalShort` (county short/display legal), join `Prop_id`.
+**Codex consult (pre-build) + review (post-build):** consult demanded "verify Snohomish schema/URL/
+match-rate before any write", "don't treat Clark LegalShort as authoritative — provenance flag",
+"fail-closed joins". Read-only probe FIRST: Snohomish `parcel_number` == our 14-digit `parcel_id`
+exact, 4267/4269 (99.95%); Clark `Prop_id` == numeric parcel_id, 8/8 sample.
+**Built / Shipped (PR #95):** `scripts/backfill_tax_legal_from_assessor.py --county snohomish|clark`,
+modeled on the King bulk script. Snohomish: download ZIP (cached), concat LegalDescr lines per parcel
+by (line_nr, ID). Clark: batched ArcGIS `Prop_id IN (...)` (chunk 50). **APPLIED to prod: Snohomish
+15,053/15,060 + Clark 1,910/1,968 rows filled** with real legals + provenance. Verified live (Snoho
+"BLUE SPRUCE GROVE DIV. #1 BLK 000 D-00 - LOT 111", Clark "COUGAR MEADOWS LOT 21 SUB 95").
+**Caught & fixed (Codex review, no P1; GO-only-with-changes → adopted all):** min-match-rate default
+0.5 too weak → per-county ABORT thresholds (snoho 0.99 / clark 0.95); Clark REST batch failure now
+FATAL (raise before any write) so a transient outage can't half-fill under the guard; Clark Prop_id
+None-vs-0 fix; Snohomish (line_nr, ID) deterministic tie-break; TOCTOU-skip logging. json→jsonb
+provenance merge preserves existing enrichment_data keys (validated in rolled-back txn). DRY-RUN
+default, --apply to write.
+**Facts learned:** Snohomish Assessor Roll ZIP = the bulk legal source the tax file lacks (parcel_number
+14-digit == parcel_id, multi-line legal). Clark TaxlotsPublic REST has LegalShort (truncated short-legal,
+flagged in provenance) + redacted owner (fine — we have the owner). Both free/no-auth; RCW 42.56.070(8)
+restricts resale not internal enrichment. Backfill-only (King precedent); re-run heals future scrapes.
+
+## 2026-06-21 — Pricing follow-ups #1–3 (entitlement validator + annual toggle + WTP playbook)
+**Scope:** The three deferred items after the $199 migration, tackled 1-by-1 with Codex consult+review.
+**#1 Entitlement enforcement (backend PR #93 + frontend PR #41, MERGED+LIVE):** Codex consult pushed
+back HARD on building hard county caps pre-revenue ("gold-plating… reverses freshly shipped
+positioning"). Re-scoped with the user to: build the value-metric INFRASTRUCTURE, ship the bundle,
+defer caps. Shipped `src/api/entitlements.py` — centralized record-type + distinct-county validator,
+**feature-flagged** (`ENTITLEMENT_ENFORCEMENT`, default False = audit/log-only, never 402) — wired into
+create_scraper + create_batch. Matrix in `constants.py` uses LIVE connector slugs (caught: my first
+matrix listed dead `eviction` + omitted live `death_certificate`). Pro skip-trace bundle 0→250
+(billing already meters above-quota). Frontend marketing aligned (Pro "pay-per-use"→"250 included").
+Codex review (no P1) → adopted 4 findings: fail CLOSED on unknown plans, count distinct (STATE,county)
+not bare county, trim legacy rows, fix stale comment.
+**#2 Annual toggle (frontend PR #42, MERGED+LIVE):** monthly/annual switch on dashboard BillingTab;
+sends `stripe_price_id_annual`. Codex review caught a **P1** (annual-selected could send the MONTHLY
+id in the no-annual-id gap) → fixed: checkoutId is undefined in that gap so the CTA hides. Annual data
+confirmed live in /billing/plans.
+**#3 WTP validation (backend PR #94, MERGED):** non-code (founder must execute). Codex-reviewed
+playbook `docs/wtp-validation-2026-06.md`: annual-prepay real-checkout test + price interviews;
+**FOUNDING25 contaminates full-price validation** → lead full-price, track discount separately; Stripe
+Dashboard already captures checkout_completed (no analytics stack); concrete 2-week go/no-go rule.
+**🛑 Concurrent-session hazard (handled):** a parallel session was mid-editing dashboard files
+(`RecordTypeMix.tsx` etc.) in the shared OneDrive frontend tree, breaking the local build. Isolated #2
+via `git stash push <my 2 files>` → fresh worktree off `origin/master` → `git stash pop` (stashes are
+repo-global across worktrees) → junctioned `node_modules` in (PowerShell `New-Item -ItemType Junction`;
+removed with `(Get-Item).Delete()` BEFORE `git worktree remove` so it can't follow the link into the
+real node_modules). Their WIP left untouched.
+**Facts learned:** `require_plan()` + inline 402 is the plan-gate pattern; `ScraperConfig.active` exists
+for the distinct-county count; conftest instantiates Settings at collection (constants-only tests still
+need dummy DATABASE_URL/REDIS_URL/SECRET_KEY env); /billing/plans isn't OpenAPI-typed so BillingPlan is
+hand-written (no drift-gate). Pending: flip ENTITLEMENT_ENFORCEMENT only after pricing/UI/copy +
+grandfathering + hardening the documented concurrent-create race.
+
+## 2026-06-21 — Other-county tax_delinquent data-quality sweep (Snohomish + Clark legal backfill)
+**Scope:** User asked to extend the King tax data-quality work to "the rest" of the tax_delinquent
+counties. Probed prod first. Worked in worktree `../bridgeleads-tax-legal`. Codex consulted/reviewed.
+**Key finding (reframes the ask):** **King was the ONLY county with the fake `party_name` placeholder**
+— its Socrata feed has no owner column, hence the synthetic `Tax Delinquent — $X owed`. Snohomish's
+dedicated tax scraper and Clark's tax-lien recorder path already produce REAL owner names (0 fakes
+anywhere). So there is NO King-style fake-name fix to repeat. The other counties' issue is a
+`legal_description` **stand-in** on PRE-PR#87 historical rows.
+**Data picture (prod):** King 241,553 (0 fake / 240,527 blank / 1,029 real). Snohomish 15,060 (real
+names, legal=parcel#, mailing=city/state/zip only). Clark 1,968 (real names, legal=numeric doc#, full
+mailing). Chelan/Skagit ~0 real rows. All Snohomish jobs (latest 2026-06-20) + Clark jobs (latest
+2026-04-10) predate PR #87 (merged 2026-06-21) → forward legal fixes are in code but haven't produced
+data yet; the bad legals are purely historical.
+**Built / Shipped (PR #92, branch `fix/other-county-tax-legal`):** new
+`scripts/backfill_tax_legal_stand_in.py` (`--county snohomish|clark`), modeled on the King clear
+script (job_id-scoped keyset, TOCTOU-safe `(id, original_legal)` unnest UPDATE, idempotent).
+Predicates: Snohomish `legal_description == parcel_id`; Clark `legal ~ '^[0-9]+$' AND legal =
+enrichment_data->>'recording_number'`. **RAN the backfill: Snohomish 15,060 + Clark 1,968 nulled**
+(re-run dry = 0). Fully recoverable (parcel_id column / enrichment recording_number unchanged);
+`dedup_hash` excludes legal so billing/dedup untouched.
+**Caught & fixed (Codex, no P1):** tightened the Clark predicate from "numeric" to "numeric AND equals
+the stored recording_number" so every nulled value is provably recoverable, not assumed (still matched
+all 1,968, 0 skipped). Verified every `legal_description` consumer guards for None.
+**Failed / Not-fixable:** **Snohomish mailing street** — the bulk "Current Tax List" source does NOT
+publish the mailing street (col f8 empty; only city/state/zip). 0/15,060 stored mailings start with a
+street number vs 11,629/15,060 situs addresses. Parser reads the correct columns; nothing to recover —
+fully-populated `property_address` (situs) is the better address for these leads. **Clark co-owner name
+concat** (e.g. `DAY LETICIA JWELCH LETICIA J`) — forward already split via `nameSeperator`; glued
+historical names aren't reliably un-gluable without a re-scrape (Clark tax dormant). Left as-is.
+**Pending / Handoff:** merge PR #92 (script-only, no migration; backfill already run).
+**Facts learned:** Snohomish tax bulk source omits mailing street entirely. Clark tax_delinquent =
+recorder tax-lien docs, not a bulk feed, dormant since April 2026. `results.enrichment_data` is `json`
+(not jsonb) but `->>` works.
+
+## 2026-06-21 — King tax clear-script perf fix + headed UI confirm (party_name blank)
+**Scope:** Two follow-ups after PR #88 (legal/mailing bulk backfill) and PR #89 (party_name=None +
+212,309 placeholders cleared). Worked in an isolated `git worktree` (`../bridgeleads-king-clear`).
+**Built / Shipped (PR #91, branch `fix/king-tax-clear-script`):** rewrote
+`scripts/backfill_clear_king_tax_placeholder_names.py`. The committed version JOINed
+`results⋈jobs⋈scraper_configs` on EVERY batch against the 200k+ `results` table → hit the 120s
+statement_timeout and cleared nothing. Rewrite resolves the King tax `job_id` set ONCE then
+keyset-paginates by `job_id = ANY(...)` (indexed FK); canonical `is_tax_placeholder_party` confirms
+shape in Python. Codex review (no P1): closed read→write TOCTOU via `unnest((id,name))` exact-match
+UPDATE (rolled-back-txn verified wrong→0/exact→1); reject `--batch<1`. Verified 29 jobs/~213k rows,
+under timeout, 0 to clear (idempotent).
+**Verified (headed UI):** visible Chromium → `/results/20b1017d-…`, PARTY NAME column BLANK, no fakes.
+"No output last run" = `os.environ["BRIDGELEADS_ADMIN_PASSWORD"]` KeyError before any print (no MFA).
+Job `20b1017d` (28,445 rows) = 0 placeholders / 28,293 blank / 152 real enriched owners — enrichment
+healing as designed.
+
+## 2026-06-21 — $199 pricing migration SHIPPED (backend PR#90 + frontend PR#39/#40)
+**Scope:** Resolve the $199-marketing vs $79-live-billing mismatch. User chose "prices first,
+entitlements next" — change prices now, defer the value-metric county/record-type enforcement.
+Worked backend in an isolated `git worktree` (`../bridgeleads-pricing`) per the concurrent-session hazard.
+**Built / Shipped (backend PR #90 → main, Railway live):** `_PLANS` → Pro $199 / Business $499 /
+Agency $1499 (+ ~20%-off annual 1910/4790/14390). Wired annual into checkout: new
+`STRIPE_PRICE_*_ANNUAL` settings + `stripe_price_id_annual` per plan; `_PRICE_TO_PLAN` maps BOTH
+monthly+annual ids so the webhook resolves annual subs. `/checkout` now 503s on a non-`price_`
+resolved id; import-time log-WARN (never raises) on misconfig. Feature bullets made honest (dropped
+unenforced "N counties"). Created 6 live Stripe Price objects + `FOUNDING25` (25%) coupon via
+`scripts/stripe_pricing_migration_2026_06.py` (idempotent, dry-run default); deleted old 40% coupon
+`8mX1xa35` (0 redemptions); ids in `docs/stripe-prices-2026-06.md`.
+**Built / Shipped (frontend PR #39 + #40 → master, Vercel live):** merged the colorful app redesign
++ $199 marketing together. Made `_monopo/data.ts` HONEST vs backend enforcement: removed county-count
+tier caps, "WA counties" comparison row, record-type gating, overlap-gated-at-Business; skip-traces
+match `SKIP_TRACE_BUNDLED_QUOTAS` (Pro pay-per-use, Business 1000, Agency 2000 — was 250/2500);
+FOUNDING40→25.
+**Tried / Decided:** First plan was to SPLIT PR #39 (ship redesign, hold marketing) via
+`git rebase --onto master <marketing-base>`. Aborted: the marketing-monochrome and colorful-theme
+edits are interleaved in the same `globals.css` (7-commit conflict chain). Re-decided once backend
+went live at $199 — the marketing PRICES were now truthful, so the only blocker was unenforced
+ENTITLEMENT copy. Cheaper + coherent path: ship the whole PR after softening copy. No git surgery.
+**Caught & fixed (Codex, every diff):** backend diff = GATE PASS. Frontend copy diff = P1 (Starter
+"Sample" implies a record-type gate that isn't enforced) + P2 (Business-only "Overlap & intersection"
+is a false tier gate) → both fixed pre-merge. Post-deploy prod check then found `FOUNDING40`
+HARDCODED in two banner components (`pricing/page.tsx`, `_monopo/Pricing.tsx`) — outside data.ts, so
+the data.ts-only grep missed them → hotfix PR #40. **The bonus catch:** prod `STRIPE_PRICE_*` env held
+`prod_` (product) ids in the price slots (and `STRIPE_PRODUCT_*` were unset) → Stripe rejects a product
+id in `line_items.price`, so live checkout was ALREADY BROKEN (consistent with 0 paying customers).
+Setting real `price_` ids on api+worker fixed it.
+**Verified (prod E2E):** `/billing/plans` shows $199/$499/$1499 + annual + FOUNDING25 active; admin
+login → `/billing/checkout` creates live `cs_live_` sessions for BOTH monthly and annual; a `prod_`
+id returns 400. bridgeleads.io/pricing shows $199 + FOUNDING25, no stale FOUNDING40, no county caps.
+tsc/lint/build all green.
+**Pending / Handoff:** (1) **value-metric entitlement enforcement** (per-tier county allowlist +
+record-type gating + Pro 250-skip-trace bundle) — the strategy's #1 lever, deliberately deferred;
+copy stays volume-honest until built. (2) **Dashboard BillingTab annual toggle** — annual is buyable
+via API but the UI only sends the monthly price id. (3) Backend `/pricing` comparison matrix still has
+old county/volume framing (dormant; marketing uses static data.ts). (4) **0 WTP data** — $199 is a
+hypothesis; validate via founding annual-prepay calls before trusting it.
+**Facts learned:** marketing pricing is decoupled (`USE_LIVE_PRICING=false`, static `data.ts`); do NOT
+flip to live until the backend `/pricing` matrix is also made honest. Railway truncates `railway
+variables` table output — use `--kv`/`--json` to read full secret values. Stripe Prices are immutable
+(create-not-edit; archive old). When changing a coupon/price string, grep the WHOLE frontend, not just
+the data model — banners hardcode copy.
+
+## 2026-06-21 — King tax clear-script perf fix + headed UI confirm (party_name blank)
+**Scope:** Two follow-ups after PR #88 (legal/mailing bulk backfill) and PR #89 (party_name=None +
+212,309 placeholders cleared). Worked in an isolated `git worktree` (`../bridgeleads-king-clear`)
+per the standing concurrent-session hazard.
+**Built / Shipped (PR #91, branch `fix/king-tax-clear-script`):** rewrote
+`scripts/backfill_clear_king_tax_placeholder_names.py`. The committed version JOINed
+`results⋈jobs⋈scraper_configs` on EVERY batch against the 200k+ `results` table + `ORDER BY id` →
+hit the 120s statement_timeout and cleared nothing (last session fell back to an ad-hoc job_id
+UPDATE). Rewrite resolves the small King/WA/tax_delinquent `job_id` set ONCE (28–29 jobs), then
+keyset-paginates `results` filtered by `job_id = ANY(...)` (indexed FK). Canonical
+`is_tax_placeholder_party` still confirms exact shape in Python before any write.
+**Caught & fixed (Codex review, no P1):** (1) read→write TOCTOU — the old UPDATE guard was
+`id=ANY AND party_name LIKE 'Tax Delinquent%'`, so a name swapped to a real owner between SELECT
+and UPDATE could be clobbered. Fixed by nulling only on the EXACT validated string:
+`UPDATE … FROM unnest((:ids,:names)) u WHERE r.id=u.id AND r.party_name=u.name`. Verified in a
+rolled-back txn (wrong-name→0, exact-name→1, empty→0). (2) reject `--batch<1`. (3) documented
+offline/idempotent + sub-timeout runtime. ruff clean.
+**Verified (Task 1 — headed UI):** ran a VISIBLE Chromium (`scripts/ui_verify_king_legal_mailing.py`,
+untracked local helper) logged in as admin, opened `/results/20b1017d-…`. The "no output last run"
+cause = `os.environ["BRIDGELEADS_ADMIN_PASSWORD"]` KeyError before any print when the env var is
+unset (no MFA — login 200 + token). PARTY NAME column renders BLANK; no `Tax Delinquent — $X owed`
+fakes. Enhanced the helper to print a party_name blank/fake summary.
+**Facts learned:** target job `20b1017d` (28,445 rows) = **0** placeholders, **28,293 blank**,
+**152 real enriched owners** (e.g. KHANAL NABIN, OLIVER INVESTMENT GROUP LLC) WITH real legal +
+mailing. So "party_name=None on ALL King tax rows" is now slightly stale — enrichment has filled
+152 real names, which is the DESIRED honest state (blank where unknown, real where found, zero
+fakes). Daily King tax scrapes are running (28→29 jobs mid-session); new jobs store `party_name=None`
+so they never reintroduce placeholders. The dry-run's terminal empty scan is ~36s (full ordered scan
+when nothing matches LIKE) — slow but well under the 120s timeout; non-empty batches short-circuit on
+LIMIT. Reschedule/owner-backfill loop stays RETIRED (untouched).
+**Pending / Handoff:** merge PR #91 (script-only, no Railway impact, no migration). The clear backfill
+itself is already done (0 to clear). UI helper left untracked.
+
+## 2026-06-21 — pre_foreclosure party-name shows the HOMEOWNER (verification sweep + Pierce/Whatcom/Snohomish + backfill)
+**Scope:** User report — pre_foreclosure leads "don't show party name / wrong names." Diagnosed
+(`scripts/diag_preforeclosure_party_names.py`, prod, 6488 rows): `party_name` is NEVER null — the
+bug is the WRONG party (trustee/lender/servicer/law-firm company instead of the distressed
+homeowner). Decision (user): party_name = homeowner ONLY; trustee/lender/law-firm context kept in
+`heirs` + `enrichment_data`. Worked WITH Codex on every step (consult + diff review).
+**Key insight:** the 2-day-old PR#70/#71 already fixed the recorder TEMPLATES via
+`orient_pre_foreclosure_party`. So the bad names the user SEES are overwhelmingly HISTORICAL rows
+scraped before that fix → the dominant remedy is a BACKFILL, not more scraper code.
+**Built / Shipped (branch `fix/preforeclosure-party-refinements`, PR #85; bulk also on main via b49c736):**
+- `scripts/live_verify_preforeclosure.py` — non-persisting per-county current-code verifier (via
+  `railway run --service worker`). Verified EVERY active county: all templates (landmark/eagleweb/
+  laserfiche/tyler/skagit/clark_wa/idocmarket) already produce the homeowner. Only the two
+  hand-coded scrapers NOT in the 9-file rollout were broken: **Pierce** and **Whatcom**.
+- **Pierce** (`pierce_wa_probate.py`): `_strip_arms_plus` removes ARMS `(+)`, then
+  `orient_pre_foreclosure_party([R],[E])` so the borrower (usually `[E]`) becomes party_name.
+  Live: 23→66 person / 0 company.
+- **Whatcom** (`whatcom_wa.py`): same gap — pre_foreclosure branch (cancellation gate → orient →
+  `continue`-drop). Live: `KENNEDY, MARY` (was `ONITY MORTGAGE CORPORATION`).
+- **Snohomish** (`snohomish_wa_pre_foreclosure.py` + shared `nts_pdf.py`): de-hyphenation allows a
+  SPACE before the wrap hyphen (`MI -\nCHAEL`→`MICHAEL`); `strip_vesting_clause` drops vesting
+  boilerplate keeping co-borrower " AND ".
+- `is_person_name`: `\bWESTERN\s+PROGRESSIVE\b` word-boundary (token-less national trustee brand).
+- **BACKFILL** (`scripts/backfill_preforeclosure_party_names.py`): in-place re-orient of stored
+  (party_name, heirs) — lossless (borrower already in `heirs` for the unwired counties).
+  **Applied 1,529 rows across all tenants** (Pierce 821, clark 588, king 75, lewis 15, cowlitz 9,
+  chelan 7, clallam 6, okanogan 6, spokane 2), 0 suspicious. Re-scan=0 (idempotent + landed). Old
+  values stashed in `enrichment_data.{party_name,heirs}_pre_backfill_2026_06_21` (reversible).
+  Identity/dedup/billing/property_key UNTOUCHED (display-only).
+**Tried / Decided:** homeowner-in-party_name vs keep-company (chose homeowner; company→heirs).
+Re-scrape vs in-place reparse (chose in-place re-orient — lossless, re-scrape only covers current
+window + creates dups). Comma-splitting rejected as core fix (Codex: salvage only); backfill
+`_is_clean_person` rejects securitization-TRUST/LLC/PUBLIC/digit-concat.
+**Caught & fixed (Codex):** Pierce drop=data-loss (P1) disproved with live evidence (drops are
+bank-vs-bank / trustee-vs-commercial-LLC / parse-junk, never a borrower behind `(+)`); added log.
+Whatcom append guard is `party_name OR date` so `party_name=None` won't drop — must `continue`.
+Backfill: `::json` cast on json column, object-only jsonb merge, skip-already-backed-up, skipped-id
+reporting; 60 dirty new_party rows (securitization trusts, `LLCRemarks:`) excluded by `_is_clean_person`.
+**Failed / Blocked:** chelan(acclaim)+whatcom portals time out under concurrency (chelan
+unsampled — correct-by-review). `python -c` stdout swallowed under `railway run` (use file scripts).
+🛑 GIT HAZARD: a CONCURRENT session (King PRs #82–84) in this shared OneDrive dir ran a broad
+`git add` that SWEPT the bulk of this work into PR #83 (`b49c736`, mislabeled) + pushed to main,
+and kept flipping HEAD to `main`. Only source files swept (no secrets). FIX: isolated the rest in
+a dedicated `git worktree`. Don't run two committing sessions in one working tree.
+**Pending / Handoff:** merge **PR #85** (Railway auto-deploys). Cosmetic name cleanup (concat
+"COPES SARAHCOPES RICHARD E", Remarks:/PUBLIC) deferred per Codex. Unrecoverable rows (company
+party + no person in heirs: clark 854/chelan 203/king 195/douglas 85) left as-is (need re-scrape;
+many genuine commercial LLC owners).
+**Facts learned:** WORKER role (`bridgeleads_system`, NOT bypassrls) CAN `UPDATE results` via
+`SyncSessionLocal` (probed `--commit --limit 1`) — no owner DSN for a results-only party_name/heirs
+migration. `enrichment_data` is a `json` column (not jsonb). Pierce/Whatcom are hand-coded scrapers
+outside the template rollout — risk signature is `else: party_name = grantor`.
+
 ## 2026-06-21 — King tax owner-name REACH fix (PR #80 follow-up, PR #81)
 **Scope:** Started as the PR #80 live UI verification (does the scraped King tax_delinquent lead
 show a real owner name?). The merged PR #80 swap logic is correct and live-proven (6/6 parcels

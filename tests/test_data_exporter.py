@@ -133,6 +133,28 @@ def test_export_json_is_valid_and_correct_count(exporter):
     assert len(data) == len(LEAD_RECORDS)
 
 
+def test_export_json_sanitizes_nested_enrichment_strings(exporter):
+    """Formula triggers inside nested objects (enrichment_data) and the
+    phones/emails arrays must be neutralized, not just top-level columns."""
+    records = [
+        {
+            "party_name": "Smith, John",
+            "enrichment_data": {
+                "description": "=cmd|'/c calc'!A1",
+                "nested": {"deep": "+SUM(A1)"},
+            },
+            "emails": ["=HYPERLINK(\"http://evil\")"],
+        }
+    ]
+    path = exporter.to_json(records, filename="nested_injection")
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    enr = data[0]["enrichment_data"]
+    assert enr["description"].startswith("'"), enr["description"]
+    assert enr["nested"]["deep"].startswith("'"), enr["nested"]["deep"]
+    assert data[0]["emails"][0].startswith("'"), data[0]["emails"][0]
+
+
 def test_export_excel_creates_file(exporter):
     path = exporter.to_excel(LEAD_RECORDS, filename="test")
     assert path.exists()

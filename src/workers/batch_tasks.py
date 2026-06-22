@@ -139,6 +139,25 @@ def dispatch_batch_run(run_id: str) -> None:
                     db.commit()
                 else:
                     for c in configs:
+                        from src.api.entitlements import (
+                            ConfigRow,
+                            config_run_violation,
+                            should_block_run,
+                        )
+                        _active = db.execute(
+                            select(
+                                ScraperConfig.id, ScraperConfig.state, ScraperConfig.county,
+                                ScraperConfig.record_type, ScraperConfig.created_at,
+                                ScraperConfig.active, ScraperConfig.paused_reason,
+                            ).where(ScraperConfig.user_id == c.user_id, ScraperConfig.active)
+                        ).all()
+                        _violation = config_run_violation(
+                            user.plan if user else "starter", c.state, c.county,
+                            c.record_type, [ConfigRow(*r) for r in _active],
+                        )
+                        if should_block_run(_violation, user_id=str(c.user_id),
+                                            plan=(user.plan if user else "starter"), context="batch_fanout"):
+                            continue
                         job = Job(
                             id=str(uuid.uuid4()),
                             user_id=c.user_id,

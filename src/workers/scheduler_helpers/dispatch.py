@@ -65,6 +65,23 @@ def _dispatch_scheduled_jobs_impl() -> None:
                 skipped_limit += 1
                 continue
 
+            # Execution-time entitlement guard (audit until ENTITLEMENT_ENFORCEMENT).
+            from src.api.entitlements import ConfigRow, config_run_violation, should_block_run
+            _active = db.execute(
+                select(
+                    ScraperConfig.id, ScraperConfig.state, ScraperConfig.county,
+                    ScraperConfig.record_type, ScraperConfig.created_at,
+                    ScraperConfig.active, ScraperConfig.paused_reason,
+                ).where(ScraperConfig.user_id == config.user_id, ScraperConfig.active)
+            ).all()
+            _violation = config_run_violation(
+                user.plan if user else "starter", config.state, config.county,
+                config.record_type, [ConfigRow(*r) for r in _active],
+            )
+            if should_block_run(_violation, user_id=str(config.user_id),
+                                 plan=(user.plan if user else "starter"), context="schedule_single"):
+                continue
+
             # Idempotency: skip if a job is already pending or running for this config
             existing = db.execute(
                 select(Job).where(

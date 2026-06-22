@@ -19,6 +19,34 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-22 — PR #76 merged: death-cert consolidation merged forward + record-type dispatch conflict resolved
+**Built / Shipped:** Squash-merged **PR #76** (death-certificate party orientation consolidated onto
+shared `src/scrapers/probate.py`) to `main` as `28bd98b`. The long-lived branch
+`chore/deathcert-multitenant-harden` (open since 2026-06-20) had fallen 30+ commits behind `main`
+(legal_description all-county #87–95, $199 pricing #90–94, King tax owner #80–84); merged
+`origin/main` forward into the branch as `f479887`, then merged the PR.
+**Tried / Decided:** The merge conflict was in the **record-type dispatch** path — the divorce
+classifier (gated, server-side) must bypass the generic keyword filter, while probate orientation
+must run **only after** the keyword filter. Resolved so: divorce bypasses the keyword filter;
+probate orients only after filtering; all/other types (tax/code-violation/eviction) append without
+grantor reorientation. Worktree at `../bridgeleads-deathcert-harden` (removed post-merge).
+**Caught & fixed:** Nothing new this pass — the resolution was the work.
+**Codex gate:** **PASS, no P1/P2.** Codex confirmed all three points logically correct (divorce
+bypass, probate-after-filter, no control-flow/indent bug, no un-oriented probate fallthrough). Its
+one note — all/other types append without orientation — is **pre-existing main behavior by design**
+(those types don't need grantor reorientation), not introduced by the merge.
+**Verified:** CI green (Test ✅, Dependency Audit ✅), `MERGEABLE`/`CLEAN`, 42 tests + ruff clean
+from the original PR. No migration → Railway auto-deploy of pure party-string diff, multi-tenant
+logic unchanged.
+**Pending / Handoff:** `tasks/BACKLOG.md` has an uncommitted, already-stale "§8 billing $199
+coupling" edit (the $199 migration shipped 2026-06-21 via PR #90) — needs reconciling/pruning.
+Untracked `diag_*/probe_*/live_*` scripts + `king_*.log` litter the tree (gitignore the logs).
+King tax owner-name paced backfill still parked (~1,017 done, King rate-limited us; resume with
+`--delay 0.6` when it cools). Stale agent worktree `.claude/worktrees/agent-a3defa10` can be pruned.
+**Facts learned:** A PR branch held open by a `git worktree` can't be `--delete-branch`'d by
+`gh pr merge` — the remote merge still succeeds; remove the worktree first, then delete the local
+branch.
+
 ## 2026-06-19 — Death-certificate orientation consolidation (single source of truth)
 **Built / Shipped:** Branch `chore/deathcert-multitenant-harden` off main@242eee3 (3 commits). Made
 `src/scrapers/probate.py::orient_probate_party` the SINGLE source of truth for death-cert party

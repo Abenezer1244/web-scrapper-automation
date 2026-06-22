@@ -245,6 +245,7 @@ These five patterns appear to cover most US counties (not proven — a generaliz
 | **Kitsap WA** | ❌ nothing usable published | — | — | ❌ | ❌ | — | — | **FAIL** | G1+G4+G5 fail — no usable bulk/structured data. SKIP |
 | **Spokane WA** | — | ❌ | ❌ **Cloudflare** | — | — | — | — | **FAIL** | G3 fails — bot wall. NON-STARTER #1; never build evasion. Route to BUY if high-value |
 | **King LandmarkWeb** (recorder portal) | ❌ per-doc | ❌ **ToS bans automation** | — | n/a (recorder, not tax) | — | — | — | **FAIL** | G1+G2 fail. NON-STARTER #4 |
+| **Clark WA** (LandmarkWeb recorder + Treasurer distraint) | ❌ recorder per-doc | ❌ **distraint list = RCW 42.56.070(8) commercial-use block** | — | ❌ recorder path = Federal Tax Lien only (no parcel, 0 leads — mig 066) | ❌ | — | — | **FAIL → ABANDONED 2026-06-21** | Recorder path yields federal liens / mislabeled deeds (BACKLOG §9); real Treasurer distraint list is compliance-blocked. King+Snoho stay the only WA tax sources |
 
 The Rubric reproduces all six **known WA outcomes**: King PASS-conditional, Snoho PASS-conditional, Pierce FAIL (G4), Kitsap FAIL (G1/G4/G5), Spokane FAIL (G3), King recorder FAIL (G1/G2). That is a **sanity check against the cases we already know**, NOT national validation — these are six hand-picked WA counties (and several FAIL inputs are themselves unverified, §0). The framework is unproven outside this set; treat its first ~5 real out-of-state applications as a calibration period and expect to revise gates.
 

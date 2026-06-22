@@ -138,3 +138,36 @@ repo (not this backend repo).
 - [x] ✅ **Marketing/billing price match — RESOLVED 2026-06-21.** Billing now charges $199 (Pro $199 / Business $499 / Agency $1499), so marketing pages showing $199 are no longer a bait-and-switch. No longer a launch blocker.
 - [x] ✅ **Billing migrated to the $199 strategy** — backend **PR #90** (`src/config/settings.py` PLAN_LIMITS + SKIP_TRACE_BUNDLED_QUOTAS, real `price_` Stripe ids on api+worker, onboarding copy $79→$199, annual + FOUNDING25 promo). Frontend **PR #39/#40** + BillingTab monthly/annual toggle **PR #42**. Entitlement validator **PR #93** (flagged OFF, audit-only). WTP playbook **PR #94**. Stripe ids in `docs/stripe-prices-2026-06.md`. All live + verified.
 - [ ] 🟢 **(FRONTEND REPO)** Re-wire the registered billing-API connection on the marketing `/pricing` page. Seam is BUILT + dormant at `bridgeleads-web/app/(marketing)/_monopo/pricingApi.ts` (`USE_LIVE_PRICING=false`, typed `fetchLivePricing()` + `toPlanCols()` mapper, endpoint `GET /billing/pricing`). Now that billing is $199: flip the flag, drive `/pricing` + landing from the live response, restore the "X of Y founding spots remaining" counter. Lives in `bridgeleads-web`, not this repo.
+
+## 9. Clark `tax_delinquent` — re-activation ABANDONED (decided 2026-06-21)
+
+A session was asked to re-activate Clark `tax_delinquent` ("Level 1": re-add the record_type to
+Clark's `county_connectors` row). **Investigated prod + re-read prior research + Codex consult →
+DECISION: do NOT re-activate. Clark tax_delinquent is unsupported and stays that way until a real
+property-tax source exists AND counsel clears the commercial-use restriction.** Blocked on three
+independent axes (any one fatal):
+
+1. **No usable data.** Clark's only recorder path (LandmarkWeb doc-type code `97`) searches *Federal
+   Tax Liens* only — IRS income-tax liens filed against a PERSON, no parcel. Migration
+   `066_drop_recorder_tax_delinquent.py` (2026-06-18) proved this live (159 found / 0 kept) and is
+   exactly why it removed Clark from the connector. There is no dollars-owed + tax-year in the recorder path.
+2. **Compliance.** The only real Clark property-tax-delinquency source (Treasurer distraint list) is
+   **BLOCKED under RCW 42.56.070(8)** commercial-list-use restriction — see `docs/compliance/wa-tax-delinquent.md`
+   (Clark = "Blocked"). Counsel sign-off required before any build. King + Snohomish remain the ONLY
+   qualified WA tax sources (`docs/research/record-type-fields/tax-delinquent-county-qualification.md`).
+3. **Honesty / no-mock.** Re-adding the connector would re-scrape federal liens (0 leads) or mislabel
+   generic recorder docs as "tax delinquent".
+
+- [x] ✅ **DECIDED: abandon Level 1.** (Investigation: `scripts/diag_clark_tax_rows.py`, read-only. Codex consult agreed.)
+- [ ] 🟠 **Quarantine the 1,968 mislabeled Clark `tax_delinquent` rows** (cleanup follow-up). They were
+  scraped 2026-04-10 by an immature scraper (before checkbox `97` was even discovered, 2026-04-18) and are
+  DEED / DEED OF TRUST / MODIFICATION recorder docs — `delinquent_amount`/`bill_year` 0%, mislabeled
+  `tax_delinquent`. They DO carry real owner+address (PR #95 enriched legals). Plan a **reversible,
+  tenant-scoped** pull from active lead lists/exports with an audit marker — NOT a silent relabel into
+  probate/pre_foreclosure (a deed is not a motivated-seller lead). Blast-radius to check first: billing
+  (were they billed per-lead/export?), dedup keys spanning record types, `property_list_membership`,
+  `property_key` overlap, already-delivered exports (can't claw back — document). Plan in `tasks/todo.md`.
+- [ ] 🔵 **Product invariant (Codex):** make `tax_delinquent` require `delinquent_amount` + `bill_year`
+  (or a documented exception) so this mislabel can't recur county-by-county under pressure to "add coverage".
+- [ ] 🔵 **Codex point C (worth a look, beyond Clark):** the mislabeled rows got **100% parcel_id** — check
+  whether the enrichment/parcel-match pipeline over-infers parcels from address/legal/party elsewhere too.

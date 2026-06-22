@@ -814,6 +814,8 @@ async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
         user.plan = plan_name
         user.records_limit = records_limit
         await db.flush()
+        from src.api.entitlements import apply_reconciliation_async
+        await apply_reconciliation_async(db, str(user.id), user.plan)
 
 
 async def _handle_subscription_deleted(data: dict, db: AsyncSession) -> None:
@@ -828,6 +830,8 @@ async def _handle_subscription_deleted(data: dict, db: AsyncSession) -> None:
         user.plan = "starter"
         user.records_limit = settings.PLAN_LIMITS["starter"]
         await db.flush()
+        from src.api.entitlements import apply_reconciliation_async
+        await apply_reconciliation_async(db, str(user.id), user.plan)
 
 
 async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:

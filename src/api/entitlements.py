@@ -305,3 +305,105 @@ def plan_reconciliation(
         elif (not r.active) and r.paused_reason == PAUSED_REASON_ENTITLEMENT and _permitted(r):
             revive_ids.add(r.id)
     return pause_ids, revive_ids
+
+
+# ── DB wrappers — thin persistence layer around plan_reconciliation ───────────
+
+async def apply_reconciliation_async(
+    db: AsyncSession,
+    user_id: str,
+    plan: str,
+) -> tuple[int, int]:
+    """Load all configs for *user_id*, run plan_reconciliation, persist changes.
+
+    Returns (paused_count, revived_count). Caller is responsible for committing.
+    Do NOT call inside a nested transaction that already holds row locks on
+    scraper_configs — this issues its own SELECT + individual UPDATEs."""
+    rows_result = await db.execute(
+        select(ScraperConfig).where(ScraperConfig.user_id == user_id)
+    )
+    configs = rows_result.scalars().all()
+
+    config_rows = [
+        ConfigRow(
+            id=str(c.id),
+            state=c.state or "",
+            county=c.county or "",
+            record_type=c.record_type or "",
+            created_at=c.created_at if c.created_at is not None else datetime.min.replace(tzinfo=None),
+            active=bool(c.active),
+            paused_reason=c.paused_reason,
+        )
+        for c in configs
+    ]
+
+    pause_ids, revive_ids = plan_reconciliation(config_rows, plan)
+
+    config_by_id = {str(c.id): c for c in configs}
+    for cid in pause_ids:
+        cfg = config_by_id.get(cid)
+        if cfg is not None:
+            cfg.active = False
+            cfg.paused_reason = PAUSED_REASON_ENTITLEMENT
+    for cid in revive_ids:
+        cfg = config_by_id.get(cid)
+        if cfg is not None:
+            cfg.active = True
+            cfg.paused_reason = None
+
+    if pause_ids or revive_ids:
+        _logger.info(
+            "reconciliation user=%s plan=%s paused=%d revived=%d",
+            user_id, plan, len(pause_ids), len(revive_ids),
+        )
+
+    return len(pause_ids), len(revive_ids)
+
+
+def apply_reconciliation_sync(
+    db: object,
+    user_id: str,
+    plan: str,
+) -> tuple[int, int]:
+    """Synchronous variant for Celery beat tasks (SyncSessionLocal context).
+
+    Returns (paused_count, revived_count). Caller is responsible for committing."""
+    from sqlalchemy import select as _select
+
+    rows_result = db.execute(_select(ScraperConfig).where(ScraperConfig.user_id == user_id))  # type: ignore[union-attr]
+    configs = rows_result.scalars().all()
+
+    config_rows = [
+        ConfigRow(
+            id=str(c.id),
+            state=c.state or "",
+            county=c.county or "",
+            record_type=c.record_type or "",
+            created_at=c.created_at if c.created_at is not None else datetime.min.replace(tzinfo=None),
+            active=bool(c.active),
+            paused_reason=c.paused_reason,
+        )
+        for c in configs
+    ]
+
+    pause_ids, revive_ids = plan_reconciliation(config_rows, plan)
+
+    config_by_id = {str(c.id): c for c in configs}
+    for cid in pause_ids:
+        cfg = config_by_id.get(cid)
+        if cfg is not None:
+            cfg.active = False
+            cfg.paused_reason = PAUSED_REASON_ENTITLEMENT
+    for cid in revive_ids:
+        cfg = config_by_id.get(cid)
+        if cfg is not None:
+            cfg.active = True
+            cfg.paused_reason = None
+
+    if pause_ids or revive_ids:
+        _logger.info(
+            "reconciliation user=%s plan=%s paused=%d revived=%d",
+            user_id, plan, len(pause_ids), len(revive_ids),
+        )
+
+    return len(pause_ids), len(revive_ids)

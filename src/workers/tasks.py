@@ -35,6 +35,7 @@ from src.workers.tasks_helpers.dedup import (  # noqa: F401  (re-export)
     _extract_tax_fields,
     _upsert_property_membership,
     _write_result_property_keys,
+    validate_tax_delinquent_records,
 )
 from src.workers.tasks_helpers.enrich import (  # noqa: F401  (re-export)
     _enqueue_skip_trace_rows,
@@ -553,6 +554,14 @@ def run_scrape_job(self, job_id: str) -> None:
                 (rec.property_address or "").strip(),
             )
             return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+        # Product invariant (BACKLOG §9): a tax_delinquent record set may only be
+        # persisted if EVERY row is from a qualified tax source AND carries both
+        # delinquent_amount + bill_year. Validate the WHOLE set before the batched
+        # insert loop below — a violation raises and fails the job atomically
+        # (on_failure → status=failed), so a mislabeled deed can never be written
+        # as a tax lead (the Clark 2026-04 incident). No-op for non-tax types.
+        validate_tax_delinquent_records(records, config.record_type)
 
         batch_size = 1000
         for i in range(0, len(records), batch_size):

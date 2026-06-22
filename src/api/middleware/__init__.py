@@ -1,5 +1,5 @@
 from .auth_hardening import BruteForceProtection, TokenBlacklist
-from .rate_limit import client_ip, rate_limit
+from .rate_limit import client_ip, once_per, rate_limit, release_once
 from .security import (
     SecurityHeadersMiddleware,
     add_http_allowed_host,
@@ -14,6 +14,8 @@ from .security import (
 
 __all__ = [
     "rate_limit",
+    "once_per",
+    "release_once",
     "TokenBlacklist",
     "BruteForceProtection",
     "SecurityHeadersMiddleware",

@@ -159,14 +159,14 @@ independent axes (any one fatal):
    generic recorder docs as "tax delinquent".
 
 - [x] ✅ **DECIDED: abandon Level 1.** (Investigation: `scripts/diag_clark_tax_rows.py`, read-only. Codex consult agreed.)
-- [ ] 🟠 **Quarantine the 1,968 mislabeled Clark `tax_delinquent` rows** (cleanup follow-up). They were
-  scraped 2026-04-10 by an immature scraper (before checkbox `97` was even discovered, 2026-04-18) and are
-  DEED / DEED OF TRUST / MODIFICATION recorder docs — `delinquent_amount`/`bill_year` 0%, mislabeled
-  `tax_delinquent`. They DO carry real owner+address (PR #95 enriched legals). Plan a **reversible,
-  tenant-scoped** pull from active lead lists/exports with an audit marker — NOT a silent relabel into
-  probate/pre_foreclosure (a deed is not a motivated-seller lead). Blast-radius to check first: billing
-  (were they billed per-lead/export?), dedup keys spanning record types, `property_list_membership`,
-  `property_key` overlap, already-delivered exports (can't claw back — document). Plan in `tasks/todo.md`.
+- [x] ✅ **Quarantine DONE 2026-06-21** (`scripts/quarantine_clark_tax_mislabeled.py --commit --stamp 20260621`,
+  owner DSN). Removed 1,968 mislabeled DEED/DEED OF TRUST/MODIFICATION rows (1 Agency tenant, 2 jobs from
+  2026-04-10) + 761 record_type-scoped `property_list_membership` sightings; zeroed the 2 now-empty jobs'
+  `record_count`. Blast radius confirmed benign first: 0 `delinquent_amount`/`bill_year`, 0 `dedup_hash`
+  (never billed), 0 `delivered_records`, 0 `dialer_deliveries`. **Preserved:** the tenant's 31,858 King tax
+  rows + 1,522 non-tax memberships for the same parcels (verified post-run). **Reversible:** full backup in
+  `_quarantine_clark_tax_{results,membership,jobs}_20260621` (owner-only); `--restore 20260621` re-inserts +
+  restores job counts (1161/807). Codex-reviewed (single-txn, exact-key, pinned shape; 7 findings fixed).
 - [ ] 🔵 **Product invariant (Codex):** make `tax_delinquent` require `delinquent_amount` + `bill_year`
   (or a documented exception) so this mislabel can't recur county-by-county under pressure to "add coverage".
 - [ ] 🔵 **Codex point C (worth a look, beyond Clark):** the mislabeled rows got **100% parcel_id** — check

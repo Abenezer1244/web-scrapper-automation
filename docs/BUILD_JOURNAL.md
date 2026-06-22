@@ -19,6 +19,50 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-21 — Clark tax_delinquent: abandon re-activation + quarantine 1,968 mislabeled rows
+
+**Scope:** A session was asked to re-activate Clark `tax_delinquent` ("Level 1": re-add the record_type
+to Clark's `county_connectors` row). Investigated prod + re-read prior research + Codex consult instead
+of building blind. Branch `docs/clark-tax-abandon-decision`. Codex on every move.
+
+**Decided / Shipped:** **ABANDON re-activation — permanently.** Blocked on three independent axes:
+(1) *No data* — Clark's recorder path (LandmarkWeb doc-type `97`) is Federal Tax Liens only (person-filed,
+no parcel, 0 leads); migration `066` (2026-06-18) already removed it for exactly this reason. (2) *Compliance*
+— the only real Clark property-tax-delinquency source (Treasurer distraint list) is RCW 42.56.070(8)
+commercial-use-BLOCKED (`docs/compliance/wa-tax-delinquent.md`); King+Snohomish stay the only qualified WA
+tax sources. (3) *Honesty* — re-adding would re-scrape federal liens or mislabel generic recorder docs.
+Recorded in BACKLOG §9 + the qualification rubric's worked-examples table.
+
+**The 1,968 existing rows — investigation (read-only `scripts/diag_clark_tax_rows.py`):** all from 2 jobs on
+2026-04-10 (BEFORE the `97` filter was even discovered, 2026-04-18 — an immature scraper), one Agency-plan
+tenant, `enrichment_data.source='clark_county_recorder'`, `doc_type` = **DEED / DEED OF TRUST / MODIFICATION**
+(ordinary recorder docs, NOT tax delinquency), `delinquent_amount`/`bill_year` 0%. PR #95 had enriched legals
+onto them (polished mislabeled data). This reconciled the apparent contradiction with 066 (which only tested
+the later federal-lien path).
+
+**Quarantine (built + APPLIED + verified):** `scripts/quarantine_clark_tax_mislabeled.py` — DRY-RUN default,
+`--commit` needs the owner DSN (worker role can't DELETE under RLS; used `DATABASE_URL_MIGRATE` =
+`postgres`, `rolbypassrls`). One transaction: backup EXACT rows → delete ONLY from the backup tables
+(delete-set == backup-set, no TOCTOU) → zero the 2 now-empty jobs. Removed **1,968 results + 761
+record_type-scoped memberships**; **preserved** the tenant's 31,858 King tax rows + 1,522 non-tax
+memberships for the same parcels (verified post-run = 0 Clark mislabeled remaining). **Reversible:**
+`_quarantine_clark_tax_{results,membership,jobs}_20260621` backups + `--restore 20260621`.
+
+**Caught & fixed (Codex review — 7 findings, all High/Medium, NO-GO until fixed):** first draft used
+predicate/stale-id deletes (TOCTOU over-delete risk), no shape/tenant asserts at commit,
+`CREATE TABLE IF NOT EXISTS` (stale-backup reuse), injectable `--stamp`, brittle restore. Rewrote to:
+single-txn exact-key deletes, pinned `_EXPECTED_TENANT`+counts (1968/2/761) asserted before any write,
+`CREATE TABLE` (fails on reused stamp), backup-count + delete-count rechecks, `--stamp` validated
+`^[A-Za-z0-9_]+$`, restore with explicit non-generated column lists + `jobs.record_count`. Re-review:
+Highs resolved; documented the county/state-scoped `property_key` invariant for the membership residual.
+
+**Facts learned:** `property_list_membership` is a per-tenant sighting index keyed (user_id, record_type,
+property_key) — record_type separates tax from probate/pre_foreclosure sightings of the same parcel, so a
+record_type-scoped delete preserves the legit ones. `property_key` is county/state-scoped (Clark keys never
+collide with King). Owner/admin DELETEs use `ADMIN_DATABASE_URL_SYNC` = Railway `DATABASE_URL_MIGRATE`
+(the `postgres` superuser the migrations run as). A concurrent session was building the §9 "tax_delinquent
+requires amount+year" persistence invariant in parallel — left untouched.
+
 ## 2026-06-22 — PR #76 merged: death-cert consolidation merged forward + record-type dispatch conflict resolved
 **Built / Shipped:** Squash-merged **PR #76** (death-certificate party orientation consolidated onto
 shared `src/scrapers/probate.py`) to `main` as `28bd98b`. The long-lived branch

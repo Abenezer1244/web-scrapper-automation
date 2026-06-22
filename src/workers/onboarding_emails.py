@@ -6,6 +6,7 @@ import resend
 
 from src.config import settings
 from src.utils.logger import setup_logger
+from src.workers import app
 
 _logger = setup_logger("worker.onboarding")
 
@@ -81,6 +82,66 @@ h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 12px; }}
         "4. Download CSV with addresses\n\n"
         f"Start here: {url}\n\n"
         "7-day free Pro trial. Questions? Reply to this email."
+    ))
+
+
+# ─── Duplicate signup: "you already have an account" ───────────────────────
+
+@app.task(name="src.workers.onboarding_emails.send_duplicate_signup_email")
+def send_duplicate_signup_email(email: str) -> None:
+    """Sent when someone submits /auth/register for an address that ALREADY has
+    an account (the duplicate-email branch returns a generic 400 to the client to
+    avoid user enumeration; this out-of-band note to the inbox owner is how a
+    legitimate returning user learns what to do instead).
+
+    Run as a Celery task (off the request path) so it adds NO latency to the
+    register response — keeping the response time of an existing-email attempt
+    indistinguishable from a new-email attempt (no timing/enumeration oracle).
+    The caller gates this to at most once per address per 24h.
+
+    The copy intentionally does not over-confirm: it states only that a signup
+    was ATTEMPTED for this address (which the inbox owner can see anyway) and
+    offers login + reset. It does not echo any other account detail.
+    """
+    login_url = f"{settings.FRONTEND_URL}/login"
+    reset_url = f"{settings.FRONTEND_URL}/forgot-password"
+    subject = "You already have a BridgeLeads account"
+
+    html_body = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+body {{ font-family: -apple-system, sans-serif; background: #0a0a0b; color: #f0efe8; margin: 0; padding: 40px 20px; }}
+.card {{ {_CARD_STYLE} }}
+.logo {{ font-size: 18px; font-weight: 600; color: #10b981; margin-bottom: 28px; }}
+h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 12px; }}
+.btn {{ {_BTN_STYLE} }}
+.alt {{ font-size: 14px; color: #c8c7cf; }}
+.alt a {{ color: #10b981; }}
+.foot {{ font-size: 12px; color: #55545e; border-top: 1px solid #2a2a32; padding-top: 20px; margin-top: 8px; }}
+</style></head><body>
+<div class="card">
+  <div class="logo">BridgeLeads</div>
+  <h1>Looks like you already have an account</h1>
+  <p style="color: #c8c7cf; font-size: 14px;">
+    Someone just tried to create a BridgeLeads account with this email address,
+    but one already exists. If that was you, there&rsquo;s no need to sign up
+    again &mdash; just log in.
+  </p>
+  <a href="{login_url}" class="btn">Log in</a>
+  <p class="alt">Forgot your password? <a href="{reset_url}">Reset it here</a>.</p>
+  <div class="foot">
+    If this wasn&rsquo;t you, you can safely ignore this email &mdash; no account
+    changes were made.
+  </div>
+</div></body></html>"""
+
+    _send(email, subject, html_body, (
+        "Looks like you already have a BridgeLeads account.\n\n"
+        "Someone just tried to create an account with this email address, but one\n"
+        "already exists. If that was you, there's no need to sign up again - just log in.\n\n"
+        f"Log in: {login_url}\n"
+        f"Forgot your password? Reset it here: {reset_url}\n\n"
+        "If this wasn't you, you can safely ignore this email - no account changes were made."
     ))
 
 

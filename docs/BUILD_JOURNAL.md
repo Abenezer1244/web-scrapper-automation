@@ -19,6 +19,47 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-22 — PR #98: register-failure observability + duplicate-signup notice (from a "Registration failed" report)
+**Built / Shipped:** **PR #98 OPEN** (`feat/register-dup-signup-notice` → main, commit `bc44dcd`, 5 files).
+Triggered by a user report of "Registration failed. Please try again." (1) Observability: register's
+two failure branches logged nothing — added an `api.auth.register` logger. Duplicate-email branch →
+`INFO` with PII-safe `email_fingerprint()`; `IntegrityError` branch → `WARNING` with an **allow-list**
+of asyncpg fields (`sqlstate/constraint_name/table_name/column_name`), never `str(err)`/detail.
+(2) Duplicate-signup email: new `send_duplicate_signup_email` **Celery task** (off request path) telling
+the inbox owner to log in/reset; gated by new `once_per()` in `rate_limit.py` (Redis `SET NX EX 86400`,
+keyed on email fingerprint not IP, fail-closed) + `release_once()` on enqueue failure. Fires on the
+pre-check duplicate branch and the `email_hmac` race branch only (`_is_duplicate_email_violation` =
+23505 + email_hmac substring; verified constraint `users_email_hmac_key`, mig 053).
+**Tried / Decided:** Diagnosed the actual report first (read-only prod lookup, `scripts/diag_check_user_email.py`
+via `railway run`): `mikitsegaye29@gmail.com` already had an account since 2026-03-23 → duplicate branch →
+**expected** generic 400, not a bug. Welcome email stays inline (success path, no enumeration concern);
+duplicate notice is Celery (failure path, must not leak timing). Gate kept in request path (~1ms, async
+redis client healthy there) rather than in the task (asyncio.run + cached aioredis client tied to a dead
+loop = fragile). diag script left local/uncommitted to match repo convention (all other `diag_*` untracked).
+**Caught & fixed (Codex review, 2 rounds):** Round 1 — [P1] inline email work would reintroduce the
+enumeration timing oracle the constant-time bcrypt burn exists to close → moved send off-path (Celery).
+[P2] gate consumed before enqueue could suppress notice 24h on a broker blip → `release_once()` on failure.
+[P2] race branch didn't notify → added, but scoped to email_hmac only (referral-code/not-null must NOT
+say "you already have an account"). [P3] bare `except: pass` → PII-safe warning log. Round 2 — em-dash in
+plaintext → ASCII; constraint-name brittleness → verified + documented. Final gate **PASS**.
+**Failed / Blocked:** Concurrent session in the shared OneDrive dir flipped HEAD mid-work
+(`feat/tax-delinquent-invariant` → `fix/clark-tax-quarantine`) and live-rewrote `tasks/todo.md`
+(blocked `git switch` on todo.md). Worked around: `git restore tasks/todo.md`, branch off `origin/main`,
+commit by **explicit pathspec** so the shared index couldn't leak other files in.
+**Verified:** `ruff` clean ×5 files; `railway run` import smoke test (task registered on Celery app, no
+circular import from `from src.workers import app`, violation matcher True for `users_email_hmac_key` /
+False for referral-code + not-null).
+**Pending / Handoff:** PR #98 needs review/merge. **Deploy must redeploy the WORKER too** (new Celery
+task) — not just the API. Accepted residual: a worker-side Resend failure *after* a successful enqueue
+leaves the 24h gate set (no retry) — fine for a non-critical notice.
+**Facts learned:** The generic "Registration failed. Please try again." is the EXACT 400 detail register
+returns for BOTH the duplicate-email pre-check and the email_hmac IntegrityError race (anti-enumeration by
+design) — a user hitting it almost always already has an account. `email_fingerprint()` (HMAC, 12-hex) is
+the PII-safe log primitive; `blind_index()` (casefold) is the email lookup key. The email_hmac UNIQUE
+constraint is `users_email_hmac_key` (mig 053).
+
+---
+
 ## 2026-06-22 — PR #76 merged: death-cert consolidation merged forward + record-type dispatch conflict resolved
 **Built / Shipped:** Squash-merged **PR #76** (death-certificate party orientation consolidated onto
 shared `src/scrapers/probate.py`) to `main` as `28bd98b`. The long-lived branch

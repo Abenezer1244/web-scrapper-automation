@@ -2,44 +2,70 @@
 
 import html
 
+import requests
 import resend
 
 from src.config import settings
 from src.utils.logger import setup_logger
+from src.workers import app
 
 _logger = setup_logger("worker.delivery")
 
 resend.api_key = settings.RESEND_API_KEY
 
+# Resend SDK errors that are worth retrying (transient) vs permanent. The lead
+# delivery email is a PURCHASED channel, not a courtesy ping, so a transient
+# Resend/network blip must not silently drop it (Codex). Permanent failures
+# (bad/missing key, validation) are NOT retried — retrying can't fix them.
+_PERMANENT_RESEND_ERRORS = (
+    "InvalidApiKeyError",
+    "MissingApiKeyError",
+    "MissingRequiredFieldsError",
+    "ValidationError",
+)
 
-def deliver_job_results(
-    job_id: str,
-    scraper_name: str,
-    record_count: int,
-    download_url: str,
-    recipient_emails: list[str],
-    fmt: str = "csv",
-) -> None:
-    """Send a lead delivery email via Resend.
+# Retry backoff base (seconds): waits ~5s, 25s, 125s between attempts.
+_BACKOFF_BASE = 5
 
-    Called by the Celery worker after a successful export upload to R2.
 
-    Args:
-        job_id: The job UUID (for reference in subject line).
-        scraper_name: Human-readable scraper name (e.g. 'Pierce County Probate').
-        record_count: Number of records in the export.
-        download_url: Pre-signed R2 URL (48hr expiry for email delivery).
-        recipient_emails: List of email addresses to send to.
-        fmt: Export format label shown in email ('csv', 'excel', 'json').
+def _is_retryable_email_error(exc: Exception) -> bool:
+    """True if a Resend send failure is transient and worth a Celery retry.
+
+    Retry: network/transport errors (requests.RequestException) and server-side
+    Resend errors whose HTTP status is 408/409/429 or 5xx. Do NOT retry permanent
+    client errors (auth, validation, malformed payload) — they fail identically
+    on every attempt and just waste the retry budget.
     """
-    if not recipient_emails:
-        _logger.info("No delivery emails configured for job %s — skipping", job_id)
-        return
+    if isinstance(exc, requests.RequestException):
+        return True
+    if type(exc).__name__ in _PERMANENT_RESEND_ERRORS:
+        return False
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code.isdigit():
+        code = int(code)
+    if isinstance(code, int):
+        return code in (408, 409, 429) or code >= 500
+    # Generic server-side ResendError without a numeric code → treat the
+    # explicitly server-side ApplicationError as transient; everything else
+    # (incl. client-side ValueError for a missing arg) as permanent.
+    return type(exc).__name__ == "ApplicationError"
 
-    if not settings.RESEND_API_KEY:
-        _logger.warning("RESEND_API_KEY not configured — skipping email delivery for job %s", job_id)
-        return
 
+def _email_error_summary(exc: Exception) -> str:
+    """Type + status only — never the raw Resend message, which can echo the
+    recipient/from/domain back (PII in logs, Codex)."""
+    code = getattr(exc, "code", None)
+    return f"{type(exc).__name__}" + (f" (code={code})" if code is not None else "")
+
+
+def _build_lead_delivery_email(
+    scraper_name: str, record_count: int, download_url: str, fmt: str,
+) -> tuple[str, str, str]:
+    """Build (subject, html_body, text_body) for the lead-delivery email.
+
+    Pure (no I/O) so it's unit-testable and the retryable send task can rebuild
+    the identical message on every attempt.
+    """
     safe_name = html.escape(scraper_name)
     subject = f"Your {scraper_name} leads are ready — {record_count:,} records"
 
@@ -105,6 +131,61 @@ def deliver_job_results(
         "Manage delivery settings at app.bridgeleads.io"
     )
 
+    return subject, html_body, text_body
+
+
+@app.task(
+    name="src.workers.delivery.deliver_job_email",
+    bind=True,
+    max_retries=3,
+    # Backoff is applied manually via the explicit countdown on self.retry below
+    # (status-aware), so the autoretry_for/retry_backoff machinery is intentionally
+    # NOT used here.
+    # The Resend SDK issues a requests call with NO timeout (Codex), so without a
+    # task time limit a hung POST could pin an email worker indefinitely. These
+    # caps bound a single attempt; Celery retries handle the transient case.
+    soft_time_limit=30,
+    time_limit=45,
+)
+def deliver_job_email(
+    self,
+    job_id: str,
+    scraper_name: str,
+    record_count: int,
+    download_url: str,
+    recipient_emails: list[str],
+    fmt: str = "csv",
+) -> None:
+    """Send the lead-delivery email via Resend, with retries.
+
+    Enqueued (``.delay()``) by run_scrape_job and the batch finalizer AFTER the
+    export is durably in R2. Email is a purchased delivery channel, so transient
+    Resend/network failures are retried (status-aware) instead of being swallowed
+    on the first blip like the old inline best-effort send. Enqueue is at-most-once
+    (the per-job done-CAS and per-batch delivery_started_at CAS each enqueue this
+    once), and Celery retries only on a raised exception. Delivery itself is
+    at-least-once like the webhook task: with acks_late a worker crash after a
+    successful Resend send but before ack could redeliver and re-send. That's an
+    accepted bar for an email channel (the export is the source of truth); a true
+    exactly-once would need provider idempotency or a durable outbox.
+
+    download_url is built by the caller (tokenized 48h link for a job; the in-app
+    batch page for a batch) — its TTL vastly exceeds the retry window.
+    """
+    if not recipient_emails:
+        _logger.info("No delivery emails for job %s — skipping", job_id)
+        return
+
+    if not settings.RESEND_API_KEY:
+        _logger.warning(
+            "RESEND_API_KEY not configured — skipping email delivery for job %s", job_id
+        )
+        return
+
+    subject, html_body, text_body = _build_lead_delivery_email(
+        scraper_name, record_count, download_url, fmt
+    )
+
     try:
         resend.Emails.send({
             "from": settings.EMAIL_FROM,
@@ -113,13 +194,37 @@ def deliver_job_results(
             "html": html_body,
             "text": text_body,
         })
-        _logger.info(
-            "Delivery email sent for job %s to %d recipients (%d records)",
-            job_id, len(recipient_emails), record_count,
-        )
     except Exception as exc:
-        # Log but don't raise — a failed email must not fail the job
-        _logger.error("Failed to send delivery email for job %s: %s", job_id, exc)
+        attempt = self.request.retries + 1
+        summary = _email_error_summary(exc)
+        if _is_retryable_email_error(exc) and attempt <= self.max_retries:
+            _logger.warning(
+                "Delivery email for job %s failed (attempt %d/%d, retryable): %s",
+                job_id, attempt, self.max_retries + 1, summary,
+            )
+            raise self.retry(exc=exc, countdown=_BACKOFF_BASE * (5 ** self.request.retries))
+        # Permanent failure, or retries exhausted — give up WITHOUT raising so a
+        # delivery failure never marks the (already-done) scrape job as errored.
+        # Surface it to ops so a silently-undelivered purchased email is visible
+        # (the export IS in storage; the user can still download in-app).
+        _logger.error(
+            "Delivery email for job %s GAVE UP after %d attempt(s): %s",
+            job_id, attempt, summary,
+        )
+        from src.workers.ops_alerts import send_ops_alert
+        send_ops_alert(
+            "email_delivery", job_id,
+            "Lead delivery email failed",
+            f"Delivery email for job {job_id} ({scraper_name}) gave up after "
+            f"{attempt} attempt(s): {summary}. The export is in storage; the "
+            f"user can still download it in-app.",
+        )
+        return
+
+    _logger.info(
+        "Delivery email sent for job %s to %d recipients (%d records)",
+        job_id, len(recipient_emails), record_count,
+    )
 
 
 def _send_payment_failed_email(email: str, attempt_count: int) -> None:

@@ -77,3 +77,17 @@ def test_reconciliation_ignores_user_paused_configs():
     rows = [_row(1, "King", rt="probate", active=False, paused=None)]  # user-paused
     pause, revive = plan_reconciliation(rows, "starter")
     assert pause == set() and revive == set()
+
+
+def test_active_county_not_evicted_by_older_paused():
+    # cap 1 (starter). King is entitlement-paused (older); Pierce is active (newer).
+    # The LIVE Pierce must keep the only slot; the dormant King must NOT evict it.
+    rows = [
+        _row(1, "King", mins=0, active=False, paused=PAUSED_REASON_ENTITLEMENT),
+        _row(2, "Pierce", mins=1, active=True),
+    ]
+    assert allowed_county_set(rows, "starter") == {("WA", "pierce")}
+    # And reconciliation must NOT pause the active Pierce nor revive the dormant King.
+    pause, revive = plan_reconciliation(rows, "starter")
+    assert pause == set()
+    assert revive == set()

@@ -171,34 +171,40 @@ class ConfigRow:
     paused_reason: str | None = None
 
 
-def _candidate_rows(rows: Iterable[ConfigRow]) -> list[ConfigRow]:
-    """Configs that may legitimately hold a county slot: currently active OR
-    previously paused BY entitlement (revival candidates). User-paused configs
-    (active=False, paused_reason None) are excluded — the user chose to stop them."""
-    return [
-        r for r in rows
-        if r.active or r.paused_reason == PAUSED_REASON_ENTITLEMENT
-    ]
-
-
 def allowed_county_set(
     rows: Iterable[ConfigRow], plan: str
 ) -> set[tuple[str, str]] | None:
     """Normalized (STATE, county) jurisdictions the plan permits, chosen
-    deterministically as the earliest-created `cap` distinct counties. Returns
-    None for unlimited plans (cap < 0)."""
+    deterministically. ACTIVE configs claim slots first (earliest created_at
+    wins); entitlement-paused configs fill only any REMAINING slots (revival
+    candidates) so a live config is never evicted in favor of a dormant one.
+    Returns None for unlimited plans (cap < 0)."""
     plan = (plan or "starter").lower()
     cap = COUNTY_LIMIT_BY_PLAN.get(plan, COUNTY_LIMIT_BY_PLAN["starter"])
     if cap < 0:
         return None
-    earliest: dict[tuple[str, str], datetime] = {}
-    for row in _candidate_rows(rows):
+    active_earliest: dict[tuple[str, str], datetime] = {}
+    paused_earliest: dict[tuple[str, str], datetime] = {}
+    for row in rows:
         key = _norm_county(row.state, row.county)
-        if key not in earliest or row.created_at < earliest[key]:
-            earliest[key] = row.created_at
-    # Sort by (created_at, key) so ties are deterministic.
-    ranked = sorted(earliest.items(), key=lambda kv: (kv[1], kv[0]))
-    return {key for key, _ in ranked[:cap]}
+        if row.active:
+            if key not in active_earliest or row.created_at < active_earliest[key]:
+                active_earliest[key] = row.created_at
+        elif row.paused_reason == PAUSED_REASON_ENTITLEMENT:
+            if key not in paused_earliest or row.created_at < paused_earliest[key]:
+                paused_earliest[key] = row.created_at
+    # Active counties claim slots first, ordered by age (then key for tie-determinism).
+    chosen = [k for k, _ in sorted(active_earliest.items(), key=lambda kv: (kv[1], kv[0]))]
+    chosen = chosen[:cap]
+    remaining = cap - len(chosen)
+    if remaining > 0:
+        chosen_set = set(chosen)
+        paused_ranked = sorted(
+            ((k, t) for k, t in paused_earliest.items() if k not in chosen_set),
+            key=lambda kv: (kv[1], kv[0]),
+        )
+        chosen.extend(k for k, _ in paused_ranked[:remaining])
+    return set(chosen)
 
 
 def config_run_violation(

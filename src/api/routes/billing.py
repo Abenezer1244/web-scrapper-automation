@@ -330,8 +330,11 @@ for _p in _PLANS:
 
 # ─── Plans catalog ────────────────────────────────────────────────────────────
 
-_FOUNDING_COUPON_ID = "8mX1xa35"
-_FOUNDING_CACHE_KEY = "founding_offer:8mX1xa35"
+# 2026-06 pricing migration: founding discount reduced 40% -> 25% so founding
+# prices stay above the $99 credibility floor (Pro ~$149.25). New Stripe coupon
+# id == "FOUNDING25"; the old 40% coupon "8mX1xa35" was retired in Stripe.
+_FOUNDING_COUPON_ID = "FOUNDING25"
+_FOUNDING_CACHE_KEY = "founding_offer:FOUNDING25"
 _FOUNDING_CACHE_TTL = 60  # seconds
 
 
@@ -349,7 +352,7 @@ async def _get_founding_offer() -> dict:
     inactive (fail-closed for a promo banner).
     """
     founding = {
-        "active": False, "code": "FOUNDING40", "percent_off": 40,
+        "active": False, "code": "FOUNDING25", "percent_off": 25,
         "spots_total": 25, "spots_remaining": 0,
     }
 

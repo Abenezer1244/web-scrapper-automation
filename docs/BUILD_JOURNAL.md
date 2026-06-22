@@ -19,6 +19,63 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-19 — Death-certificate orientation consolidation (single source of truth)
+**Built / Shipped:** Branch `chore/deathcert-multitenant-harden` off main@242eee3 (3 commits). Made
+`src/scrapers/probate.py::orient_probate_party` the SINGLE source of truth for death-cert party
+orientation across all probate connectors, eliminating three divergent agency-strip implementations.
+(5A `d400656`) extended the shared module into a strict SUPERSET of the per-template copies:
+`_AGENCY_DEPT_RE` now covers Vital Records/Statistics, Licensing, Revenue, Social&Health (not just
+Dept of Health); `_NON_PERSON_RE` rejects death-care institutions (funeral home/mortuary/crematory/
+coroner/medical examiner/DSHS) so an institution grantee is never promoted to the lead; new per-segment
+bare-state drop ("DOE, JOHN / STATE OF WASHINGTON" → "DOE, JOHN"). (5B/5C `d1e9dcf`) deleted
+`eagleweb._strip_filing_agency` (11 counties) and `skagit._is_filing_state_party`, replacing both with
+the shared helper GATED to per-row probate type. (`59c8cda`) Codex-review fixes.
+
+**Tried / Decided:** User chose "consolidate + harden ALL" + live-test via `railway run`. Orchestrated
+6 parallel read-only audit agents (EagleWeb/Skagit/Pierce divergence, multi-tenant persistence, scraper
+lifecycle, shared-module readiness), each cross-verified. Consulted Codex on the design BEFORE coding:
+folded in (a) gate the shared call to per-row PROBATE type — the helper now also collapses "ESTATE OF",
+so a global call would mutate pre_foreclosure/tax/divorce rows; (b) pass EagleWeb's raw `desc` as
+doc_type (record.doc_type is None at that point) so the TOD guard + Clallam abbrev codes resolve;
+(c) phrase-based agency tokens, not bare BUREAU/REVENUE, to avoid false-dropping real decedents.
+
+**Failed / Blocked:** `codex review --base` + a prompt arg is rejected on this CLI ("cannot be used
+with --base") — used `codex exec` with the diff fed inline instead (the reliable Windows path).
+pacific/spokane unreachable live (EagleWeb/Cloudflare block — correctly RAISE, not a bug); chelan
+Acclaim single-date timeout (known perf).
+
+**Caught & fixed (Codex diff-review, no P1s, 3 P2s):** (1) `_BARE_STATE_RE` matched ANY word ending
+in "STATE", so the per-segment drop could drop a real co-decedent ("MCKINLEY STATE") → enumerated the
+50 real US states (`_US_STATE`). (2) `_AGENCY_DEPT_RE` missed the "WASHINGTON STATE DEPARTMENT OF
+HEALTH" word order concatenated onto a decedent (left "...,  WASHINGTON STATE") → broadened the state
+prefix. (3) bare `CORONER` in `_NON_PERSON_RE` false-rejected "CORONER, JANE" → added a "LAST, FIRST"
+comma-form person fast-path. All 42 probate-party tests green, ruff clean.
+
+**Proof (live, non-persisting, prod, railway run --service api):** Full 21-county: 18/21 returned,
+**red_flags=0 on EVERY county** (the current scrapers already emit zero agency/state/court/org parties
+in the 45d window — this campaign is PREVENTIVE consolidation + latent-gap closure, not active-bug
+fixing). Migrated re-verify (13 counties) + final agency-affected re-verify (8 counties incl. the exact
+shapes the new regexes touch — thurston bare-state, king concatenated, skagit inverted): red_flags=0,
+no regression.
+
+**Pending / Handoff:** (1) **Pierce NOT wired** — pulled live [R]/[E] samples: [R] is always a person
+(court-probate data, no filing agency), so orient_probate_party is inapplicable; documented, not
+deferred-blindly. (2) **idocmarket/landmarkweb/ava_fidlar** left untouched (no-op / not in active
+probate set). (3) **Reliability false-empty (clark/acclaim/skagit-counter/tyler)** — tracked follow-up;
+orthogonal to party correctness, and the EagleWeb RAISE pattern already protects the majority
+(pacific/spokane proved it live). Fix direction: mirror eagleweb's results-marker-or-RAISE.
+
+**Facts learned:** (1) Multi-tenancy is CLEAN and UNCHANGED by this PR — the diff is pure party-string
+transforms (no persistence/user_id/RLS/SkipTraceCache touch); SkipTraceCache key IS per-tenant (memory's
+"global" worry is STALE, skip_trace.py:124). (2) EagleWeb/Skagit `active_record_type` always resolves to
+a concrete type in production (`record_type or record_types[0]`), never "all". (3) `raw_html_hash` is
+built from `record.to_dict()`, so any orientation change re-hashes already-scraped rows — billing dedup
+keys on parcel/address (`delivered_records`), not raw_html_hash, so no double-charge. (4) Pierce ARMS
+probate = court cases ([R]=executor/estate/decedent person, [E]=heir), structurally never a recorder
+death-cert with a Dept-of-Health grantor.
+
+---
+
 ## 2026-06-21 — Fill REAL legal_description on Snohomish + Clark tax leads from assessor data (PR #95)
 **Scope:** User: "build" real legal descriptions for Snohomish + Clark tax leads (after PR #92 nulled
 the stand-ins), Codex consulted on every move. Worktree `../bridgeleads-tax-assessor`.

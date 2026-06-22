@@ -32,13 +32,38 @@ import re
 
 # --- Filing-agency / issuing-authority detection -------------------------------
 
-# WA State Department of Health — the Certificate-of-Death issuing authority, not
-# the decedent. The optional "STATE OF WA[SHINGTON]," qualifier covers the shape
-# where the recorder concatenates the full agency name. No legitimate grantor is
-# "...DEPARTMENT OF HEALTH", so the phrase is stripped wherever it appears.
-_HEALTH_DEPT_RE = re.compile(
-    r"(?:(?:STATE\s+OF\s+)?WA(?:SH(?:INGTON)?)?\.?\s*,?\s*)?"
-    r"(?:DEPARTMENT|DEPT)\.?\s+OF\s+HEALTH\b",
+# US state names + USPS abbreviations. The state regexes match ONLY real states
+# (not any word ending in "STATE") so a co-decedent like "MCKINLEY STATE" / "JOHN
+# STATE" is never mistaken for the issuing state (Codex review). Two-letter
+# abbrevs come first; "WASH" covers the recorder's informal Washington abbrev.
+_US_STATE = (
+    r"(?:"
+    r"AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO"
+    r"|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY"
+    r"|ALABAMA|ALASKA|ARIZONA|ARKANSAS|CALIFORNIA|COLORADO|CONNECTICUT|DELAWARE"
+    r"|FLORIDA|GEORGIA|HAWAII|IDAHO|ILLINOIS|INDIANA|IOWA|KANSAS|KENTUCKY|LOUISIANA"
+    r"|MAINE|MARYLAND|MASSACHUSETTS|MICHIGAN|MINNESOTA|MISSISSIPPI|MISSOURI|MONTANA"
+    r"|NEBRASKA|NEVADA|NEW\s+HAMPSHIRE|NEW\s+JERSEY|NEW\s+MEXICO|NEW\s+YORK"
+    r"|NORTH\s+CAROLINA|NORTH\s+DAKOTA|OHIO|OKLAHOMA|OREGON|PENNSYLVANIA"
+    r"|RHODE\s+ISLAND|SOUTH\s+CAROLINA|SOUTH\s+DAKOTA|TENNESSEE|TEXAS|UTAH|VERMONT"
+    r"|VIRGINIA|WASHINGTON|WASH|WEST\s+VIRGINIA|WISCONSIN|WYOMING"
+    r")"
+)
+
+# The Certificate-of-Death / probate issuing authority a recorder may index as the
+# grantor instead of the decedent: a Dept/Bureau/Office of Health (the dominant live
+# shape) plus the vital-records-adjacent agencies seen across counties — Vital
+# Records/Statistics, Licensing, Revenue, Social & Health Services. The optional
+# leading state qualifier covers BOTH concatenated word orders the recorders emit:
+# "STATE OF WA, DEPT OF HEALTH" (benton) and "WASHINGTON STATE DEPARTMENT OF HEALTH"
+# (king). Every agency suffix is PHRASE-anchored ("(DEPT|BUREAU|OFFICE) OF <agency>")
+# so no bare ambiguous token (REVENUE, LICENSING, BUREAU) can strip a real surname.
+_AGENCY_DEPT_RE = re.compile(
+    rf"(?:(?:STATE\s+OF\s+)?{_US_STATE}\.?\s*(?:STATE\b\s*)?,?\s*)?"
+    r"(?:DEPARTMENT|DEPT|BUREAU|OFFICE)\.?\s+OF\s+"
+    r"(?:HEALTH|LICENSING|REVENUE"
+    r"|VITAL\s+(?:RECORDS|STATISTICS)"
+    r"|SOCIAL\s+(?:AND|&)\s+HEALTH(?:\s+SERVICES)?)\b",
     re.IGNORECASE,
 )
 
@@ -49,14 +74,14 @@ _LONE_STATE_RE = re.compile(r"^\s*(?:WA|WASH|WN|WASHINGTON)\.?\s*$", re.IGNORECA
 
 # A WHOLE value that is a bare filing state, in either order:
 #   "STATE OF WASHINGTON", "WASHINGTON STATE", "WASH. STATE OF", "STATE OF WA".
-# Anchored ^...$ and matched per " / "-split segment so it never fires on a real
-# entity that merely starts with a state name ("WASHINGTON STATE UNIVERSITY") or
-# contains the substring ("INTERSTATE ..." — guarded by \bSTATE). State-agnostic
-# so an out-of-state death certificate is corrected too.
+# Anchored ^...$ and matched per " / "-split segment, and restricted to REAL state
+# names (_US_STATE) so it never fires on "WASHINGTON STATE UNIVERSITY" (trailing
+# UNIVERSITY breaks the anchor) or a co-decedent like "MCKINLEY STATE". State-
+# agnostic across all 50 so an out-of-state death certificate is corrected too.
 _BARE_STATE_RE = re.compile(
-    r"^\s*(?:"
-    r"STATE\s+OF\s+[A-Z][A-Z.\s]*"          # STATE OF <state>
-    r"|[A-Z][A-Z.\s]*\bSTATE(?:\s+OF)?"      # <state> STATE [OF]
+    rf"^\s*(?:"
+    rf"STATE\s+OF\s+{_US_STATE}"              # STATE OF <state>
+    rf"|{_US_STATE}\.?\s+STATE(?:\s+OF)?"      # <state> STATE [OF]
     r")\s*$",
     re.IGNORECASE,
 )
@@ -71,9 +96,37 @@ _STATUS_ONLY_TOKENS = {"DECEASED", "DECEDENT", "DECD", "ESTATE", "OF", "THE"}
 _NON_PERSON_RE = re.compile(
     r"\bDEPARTMENT\b|\bDEPT\b|\bHEALTH\b|\bAUDITOR\b|\bRECORDER\b|\bASSESSOR\b"
     r"|\b(?:SUPERIOR|DISTRICT)\s+COURT\b|\bCOUNTY\s+CLERK\b|\bCLERK\s+OF\b"
+    # "STATE OF" (the issuing-state phrase, incl. a comma-inverted "WASHINGTON,
+    # STATE OF"). \bSTATE has no word boundary inside "eSTATE OF", so a decedent's
+    # "ESTATE OF" caption is unaffected.
+    r"|\bSTATE\s+OF\b"
     r"|\bVITAL\s+(?:RECORDS|STATISTICS)\b"
+    # Death-care / vital-records institutions that index as the death-cert party.
+    # Phrase-anchored (FUNERAL HOME, MEDICAL EXAMINER) or unambiguous occupational
+    # words (MORTUARY, CREMATORY, CORONER) that are not used as personal surnames.
+    r"|\bFUNERAL\s+(?:HOME|SERVICE|CHAPEL)\b|\bMORTUARY\b|\bCREMAT(?:ORY|ORIUM|ION)\b"
+    r"|\bCORONER\b|\bMEDICAL\s+EXAMINER\b|\bDSHS\b"
+    r"|\b(?:DEPARTMENT|DEPT|BUREAU|OFFICE)\s+OF\s+(?:LICENSING|REVENUE|VITAL|SOCIAL)\b"
     r"|\b(?:LLC|L\.?L\.?C|INC|CORP|CORPORATION|COMPANY|BANK|ESCROW|ASSOCIATION)\b"
     r"|\bTITLE\s+CO\b",
+    re.IGNORECASE,
+)
+
+# A "LAST, FIRST..." comma-form personal name. A recorder indexes a real decedent
+# as "SURNAME, GIVEN" — an institution is indexed as "<COUNTY> CORONER", "ACME
+# FUNERAL HOME", "DEPARTMENT OF ...", never in comma-first-name form. So a comma-
+# form value lacking an UNAMBIGUOUS org token is a person; this rescues a real
+# surname that collides with an institution word ("CORONER, JANE", "BANK, JOHN")
+# from being wrongly rejected by _NON_PERSON_RE (Codex review).
+_PERSON_COMMA_RE = re.compile(r"^[A-Z][A-Za-z.'’-]+\s*,\s+[A-Z]")
+# Tokens that NEVER form a personal surname/given-name — their presence in a comma-
+# form value means it is an institution (or a comma-inverted state), not a person.
+_UNAMBIGUOUS_ORG_RE = re.compile(
+    r"\bDEPARTMENT\b|\bDEPT\b|\bBUREAU\b|\bOFFICE\s+OF\b|\bSTATE\s+OF\b"
+    r"|\b(?:LLC|L\.?L\.?C|INC|CORP|CORPORATION|COMPANY|ESCROW|ASSOCIATION)\b"
+    r"|\bFUNERAL\s+(?:HOME|SERVICE|CHAPEL)\b|\bMORTUARY\b|\bCREMAT(?:ORY|ORIUM|ION)\b"
+    r"|\bMEDICAL\s+EXAMINER\b|\b(?:SUPERIOR|DISTRICT)\s+COURT\b|\bCLERK\s+OF\b"
+    r"|\bUNIVERSITY\b|\bTITLE\s+CO\b|\bDSHS\b",
     re.IGNORECASE,
 )
 
@@ -100,7 +153,7 @@ def strip_filing_agency(name: str | None) -> str:
     """
     if not name:
         return name or ""
-    cleaned = _HEALTH_DEPT_RE.sub("", name)
+    cleaned = _AGENCY_DEPT_RE.sub("", name)
     cleaned = re.sub(r"(?:\s*/\s*){2,}", " / ", cleaned)   # collapse left-behind separators
     cleaned = re.sub(r"(?:,\s*){2,}", ", ", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
@@ -114,6 +167,15 @@ def strip_filing_agency(name: str | None) -> str:
     parts = [p for p in cleaned.split(" / ") if p.strip()]
     if parts and all(_BARE_STATE_RE.match(p) for p in parts):
         return ""
+    # A stacked grantor where SOME (not all) " / "-segments are a bare filing state
+    # ("DOE, JOHN / STATE OF WASHINGTON"): drop only the exact bare-state/lone-state
+    # segments, keep the decedent. Limited to exact filing-state segments (Codex) so
+    # a genuine co-decedent ("SMITH JOHN / SMITH JANE") is never dropped.
+    if len(parts) > 1:
+        kept = [p for p in parts if not _BARE_STATE_RE.match(p) and not _LONE_STATE_RE.match(p)]
+        if kept and len(kept) != len(parts):
+            cleaned = " / ".join(kept)
+            parts = kept
     tokens = set(re.findall(r"[A-Z]+", cleaned.upper()))
     if tokens and tokens <= _STATUS_ONLY_TOKENS:
         return ""
@@ -128,10 +190,20 @@ def is_filing_agency_party(value: str | None) -> bool:
 
 
 def is_person_like_party(value: str | None) -> bool:
-    """True if ``value`` looks like a real person/decedent (not an agency/court/org)."""
+    """True if ``value`` looks like a real person/decedent (not an agency/court/org).
+
+    A "LAST, FIRST" comma-form value with no UNAMBIGUOUS org token is treated as a
+    person even if it contains an institution-word surname ("CORONER, JANE"); only
+    the non-comma institutional form ("PIERCE COUNTY CORONER") is rejected.
+    """
     if not value or not value.strip():
         return False
-    return not is_filing_agency_party(value) and not _NON_PERSON_RE.search(value.upper())
+    if is_filing_agency_party(value):
+        return False
+    v = value.strip()
+    if _PERSON_COMMA_RE.match(v) and not _UNAMBIGUOUS_ORG_RE.search(v.upper()):
+        return True
+    return not _NON_PERSON_RE.search(v.upper())
 
 
 def strip_estate_caption(name: str | None) -> str | None:

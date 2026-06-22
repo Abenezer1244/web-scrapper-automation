@@ -155,3 +155,5 @@ src/graphify-out/
 tests/live_qa_chelan.js
 tests/live_qa_chelan.mjs
 .gstack/
+.codex_consult.txt
+.codex_err.txt

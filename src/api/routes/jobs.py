@@ -88,6 +88,22 @@ async def create_job(
     if config is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
 
+    # Execution-time entitlement guard (audit-mode until ENTITLEMENT_ENFORCEMENT).
+    # An existing config can outlive a downgrade; re-validate against CURRENT plan.
+    from src.api.entitlements import ConfigRow, config_run_violation, enforce_runnable_http
+    active_rows = (await db.execute(
+        select(
+            ScraperConfig.id, ScraperConfig.state, ScraperConfig.county,
+            ScraperConfig.record_type, ScraperConfig.created_at,
+            ScraperConfig.active, ScraperConfig.paused_reason,
+        ).where(ScraperConfig.user_id == current_user.id, ScraperConfig.active)
+    )).all()
+    rows = [ConfigRow(*r) for r in active_rows]
+    enforce_runnable_http(
+        config_run_violation(current_user.plan, config.state, config.county, config.record_type, rows),
+        user=current_user, context="create_job",
+    )
+
     # Check if this is an AI-powered connector and enforce AI job limits
     connector_result = await db.execute(
         select(CountyConnector).where(

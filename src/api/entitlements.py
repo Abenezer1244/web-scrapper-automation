@@ -236,6 +236,34 @@ def config_run_violation(
     return None
 
 
+def enforce_runnable_http(violation: str | None, *, user: User, context: str) -> None:
+    """API call sites: raise 402 when enforcement is ON and a violation exists,
+    else audit-log. No-op when violation is None."""
+    if not violation:
+        return
+    if settings.ENTITLEMENT_ENFORCEMENT:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=f"Plan limit reached — {violation}. Upgrade your plan to continue.",
+        )
+    _logger.info(
+        "entitlement audit (NOT enforced) user=%s plan=%s context=%s would_block: %s",
+        user.id, _plan_of(user), context, violation,
+    )
+
+
+def should_block_run(violation: str | None, *, user_id: str, plan: str, context: str) -> bool:
+    """Worker/scheduler call sites: returns True (caller must block/skip/fail) only
+    when enforcement is ON and a violation exists; always audit-logs the would-block."""
+    if not violation:
+        return False
+    _logger.info(
+        "entitlement audit user=%s plan=%s context=%s would_block: %s",
+        user_id, plan, context, violation,
+    )
+    return settings.ENTITLEMENT_ENFORCEMENT
+
+
 def plan_reconciliation(
     rows: Iterable[ConfigRow], plan: str
 ) -> tuple[set[str], set[str]]:

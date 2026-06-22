@@ -45,6 +45,25 @@ def _r2_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {settings.R2_API_TOKEN}"}
 
 
+def _sanitize_json_value(value: Any) -> Any:
+    """Recursively CSV-sanitize every string in a JSON-serializable value.
+
+    JSON exports are a common hand-off into spreadsheet tools, so a formula
+    trigger anywhere in the tree (top-level column OR a string nested inside
+    enrichment_data / the phones-emails arrays) must be neutralized, not just
+    the top-level columns. dict keys are left untouched (export keys are
+    code-defined, never scraped); only values are walked. Non-str scalars keep
+    their native JSON type — they cannot carry a formula trigger.
+    """
+    if isinstance(value, str):
+        return sanitize_for_csv(value)
+    if isinstance(value, dict):
+        return {k: _sanitize_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json_value(v) for v in value]
+    return value
+
+
 def _canonical_dataframe(
     records: list[Any], hidden_fields: set[str] | None = None
 ) -> pd.DataFrame:
@@ -138,9 +157,13 @@ class DataExporter:
                 # old `and v` skipped "" and the leading-quote/embedded-tab
                 # bypass passed straight through. JSON is a common hand-off
                 # into spreadsheet tools, so the same neutralization applies.
-                # Non-str values (numbers/bools/None) keep their native JSON
-                # type — they cannot carry a formula trigger.
-                clean_row[k] = sanitize_for_csv(v) if isinstance(v, str) else v
+                # Sanitize RECURSIVELY: top-level-only sanitization let scraped
+                # free-text inside nested objects (e.g. enrichment_data, the
+                # phones/emails arrays) reach the file raw, so a formula-trigger
+                # string survived in the delivered JSON (Codex). Non-str scalars
+                # (numbers/bools/None) keep their native JSON type — they cannot
+                # carry a formula trigger.
+                clean_row[k] = _sanitize_json_value(v)
             sanitized.append(clean_row)
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(sanitized, f, ensure_ascii=False, indent=2, default=str)
@@ -160,14 +183,19 @@ class DataExporter:
         forwarded to every format so the delivered file honors the user's output
         visibility selection identically across csv/json/excel.
         """
+        from src.config.constants import SUPPORTED_EXPORT_FORMATS
         fmt = (fmt or settings.EXPORT_FORMAT).lower()
+        # Guard against drift: the accepted set is the shared
+        # SUPPORTED_EXPORT_FORMATS constant (same one the schema validator +
+        # worker use), so adding a format is a one-line constant change.
+        if fmt not in SUPPORTED_EXPORT_FORMATS:
+            raise ValueError(f"Unsupported export format: {fmt}")
         if fmt == "csv":
             return self.to_csv(records, filename, hidden_fields=hidden_fields)
         if fmt == "json":
             return self.to_json(records, filename, hidden_fields=hidden_fields)
-        if fmt in ("excel", "xlsx"):
-            return self.to_excel(records, filename, hidden_fields=hidden_fields)
-        raise ValueError(f"Unsupported export format: {fmt}")
+        # excel | xlsx
+        return self.to_excel(records, filename, hidden_fields=hidden_fields)
 
     # ─── R2 upload ────────────────────────────────────────────────────────────
 

@@ -940,8 +940,21 @@ async def download_export(
         # scheduled/R2 export uses, so every export path produces an identical file
         # (no "use the in-app download for dialers" caveat). This reads LIVE DB rows,
         # so skip-trace phone/email appear as soon as the dispatcher completes.
-        from src.utils.lead_export import write_lead_csv
-        write_lead_csv(records, output)
+        # Honor the user's output-field visibility for this job's config (blank
+        # deselected hideable columns; identity/derived columns always present).
+        # Loaded scoped to the owner (RLS belt + explicit user filter); a missing
+        # config or legacy/empty fields => show everything.
+        from src.utils.lead_export import resolve_hidden_output_fields, write_lead_csv
+        hidden_fields: set[str] = set()
+        if job.scraper_config_id:
+            cfg_fields_row = await db.execute(
+                select(ScraperConfig.fields).where(
+                    ScraperConfig.id == job.scraper_config_id,
+                    ScraperConfig.user_id == user.id,
+                )
+            )
+            hidden_fields = resolve_hidden_output_fields(cfg_fields_row.scalar_one_or_none())
+        write_lead_csv(records, output, hidden_fields=hidden_fields)
 
         csv_bytes = output.getvalue().encode("utf-8")
 

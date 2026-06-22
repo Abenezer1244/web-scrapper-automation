@@ -50,8 +50,14 @@ USAGE
     # RESTORE from a backup stamp:
     ADMIN_DATABASE_URL_SYNC=... python scripts/quarantine_clark_tax_mislabeled.py --restore 20260621T1530
 """
+# ruff: noqa: S608 — every interpolated fragment here is either a hardcoded module
+# constant (_SCOPE_WHERE), a backup-table identifier derived from a stamp validated
+# against ^[A-Za-z0-9_]+$ (_STAMP_RE), or a column list built from live
+# information_schema names. ALL row VALUES are passed as bound params. No user data
+# reaches the SQL string.
 import argparse
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -61,7 +67,14 @@ from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 from src.db.session import system_sync_session  # noqa: E402
 
-BATCH_SIZE = 500
+# This is a ONE-TENANT, one-shape cleanup. Pin the expected blast radius so --commit
+# REFUSES if the live data ever differs from what the dry-run + investigation proved
+# (a newly-matching row, a second tenant, a changed count = stop, do not sweep it in).
+_EXPECTED_TENANT = "46b75540-b2f7-4990-be29-05fb6f340b9d"
+_EXPECTED_RESULTS = 1968
+_EXPECTED_JOBS = 2
+_EXPECTED_TAX_MEMBERSHIP = 761
+_STAMP_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 # The canonical "mislabeled Clark tax row" predicate. enrichment_data->>'source'
 # pins it to the recorder pull; the record_type/county/state join pins it to the
@@ -148,7 +161,10 @@ def _print_plan(p: dict) -> None:
 
 
 def _unsafe(p: dict) -> list[str]:
+    """Hard refuse conditions for --commit. Includes the pinned blast-radius shape
+    (Codex High): a count/tenant that differs from the proven dry-run means STOP."""
     bad = []
+    # Content safety
     if p["with_amount"]:
         bad.append(f"{p['with_amount']} rows carry a real delinquent_amount/bill_year (NOT junk)")
     if p["with_dedup"]:
@@ -157,12 +173,17 @@ def _unsafe(p: dict) -> list[str]:
         bad.append(f"{p['delivered']} delivered_records point at these rows")
     if p["dialer"]:
         bad.append(f"{p['dialer']} dialer_deliveries reference these rows")
+    # Pinned shape — refuse if the live data drifted from the investigated scope.
+    tenants = [r.uid for r in p["tenants"]]
+    if tenants != [_EXPECTED_TENANT]:
+        bad.append(f"tenant set {tenants} != expected [{_EXPECTED_TENANT}] (single-tenant cleanup)")
+    if p["n_results"] != _EXPECTED_RESULTS:
+        bad.append(f"result count {p['n_results']} != expected {_EXPECTED_RESULTS}")
+    if len(p["jobs"]) != _EXPECTED_JOBS:
+        bad.append(f"job count {len(p['jobs'])} != expected {_EXPECTED_JOBS}")
+    if p["tax_membership"] != _EXPECTED_TAX_MEMBERSHIP:
+        bad.append(f"tax membership {p['tax_membership']} != expected {_EXPECTED_TAX_MEMBERSHIP}")
     return bad
-
-
-def _chunks(values, size=BATCH_SIZE):
-    for k in range(0, len(values), size):
-        yield values[k:k + size]
 
 
 def _nongenerated_cols(db, table: str) -> list[str]:
@@ -173,6 +194,9 @@ def _nongenerated_cols(db, table: str) -> list[str]:
 
 
 def _commit(stamp: str) -> None:
+    if not _STAMP_RE.match(stamp):
+        print("REFUSING --commit: --stamp must match ^[A-Za-z0-9_]+$ (identifier-safe).")
+        return
     admin_dsn = os.getenv("ADMIN_DATABASE_URL_SYNC")
     if not admin_dsn:
         print("\nREFUSING --commit: set ADMIN_DATABASE_URL_SYNC (owner/admin DSN). "
@@ -180,8 +204,14 @@ def _commit(stamp: str) -> None:
         return
     engine = create_engine(admin_dsn, pool_pre_ping=True)
     Session = sessionmaker(engine)
+    rtab = f"_quarantine_clark_tax_results_{stamp}"
+    mtab = f"_quarantine_clark_tax_membership_{stamp}"
+    jtab = f"_quarantine_clark_tax_jobs_{stamp}"
 
-    # Re-plan with the admin role immediately before writing (state could be stale).
+    # Everything in ONE transaction (Codex High): backup the EXACT rows, then delete
+    # ONLY from those backup tables, so delete-set == backup-set by construction (no
+    # TOCTOU between backup, membership-delete, result-delete). DDL is transactional in
+    # Postgres, so a failure rolls the whole thing back (backup tables included).
     with Session() as db:
         p = _plan(db)
         if not p["n_results"]:
@@ -189,72 +219,66 @@ def _commit(stamp: str) -> None:
             return
         bad = _unsafe(p)
         if bad:
-            print("REFUSING --commit — safety asserts failed (state changed?):")
+            print("REFUSING --commit — asserts failed (state changed since dry-run?):")
             for b in bad:
                 print(f"  - {b}")
             return
-        ids = p["result_ids"]
-        rtab = f"_quarantine_clark_tax_results_{stamp}"
-        mtab = f"_quarantine_clark_tax_membership_{stamp}"
 
-        # 1) Backup (CTAS materializes all columns incl. the generated one as plain).
-        db.execute(text(f'CREATE TABLE IF NOT EXISTS "{rtab}" AS '
-                        "SELECT * FROM results WHERE id = ANY(CAST(:ids AS uuid[]))"),
-                   {"ids": ids})
-        db.execute(text(f'CREATE TABLE IF NOT EXISTS "{mtab}" AS '
+        # 1) Backup EXACT sets. CREATE TABLE (no IF NOT EXISTS) → fails if the stamp
+        #    was already used, so we never silently reuse a stale backup.
+        db.execute(text(f'CREATE TABLE "{rtab}" AS '
+                        f"SELECT r.* {_SCOPE_WHERE}"))
+        # Membership is keyed (user_id, record_type, property_key) — ONE row per tuple
+        # — and property_key is COUNTY/STATE-scoped (compute_property_key), so a Clark
+        # parcel's key can never collide with King/Snohomish. This tenant's Clark
+        # tax_delinquent sightings came ONLY from these 2 jobs (Clark tax was never
+        # scraped otherwise), and a live check showed 0 overlap with their 31,858 King
+        # tax parcels. So every tax_delinquent membership at these property_keys IS a
+        # mislabeled-Clark sighting. The _EXPECTED_TAX_MEMBERSHIP=761 pin + the
+        # delete-set==backup-set join below enforce it; a drift aborts the whole txn.
+        db.execute(text(f'CREATE TABLE "{mtab}" AS '
                         "SELECT m.* FROM property_list_membership m "
                         "WHERE m.record_type='tax_delinquent' "
-                        "AND (m.user_id, m.property_key) IN ("
-                        f"  SELECT r.user_id, r.property_key {_SCOPE_WHERE} "
+                        f"AND (m.user_id, m.property_key) IN (SELECT r.user_id, r.property_key {_SCOPE_WHERE} "
                         "  AND r.property_key IS NOT NULL)"))
-        db.commit()
+        db.execute(text(f'CREATE TABLE "{jtab}" AS '
+                        "SELECT DISTINCT j.id, j.record_count FROM jobs j "
+                        "JOIN scraper_configs sc ON sc.id = j.scraper_config_id "
+                        "WHERE sc.record_type='tax_delinquent' "
+                        "AND lower(sc.county)='clark' AND upper(sc.state)='WA' "
+                        f"AND j.id IN (SELECT r.job_id {_SCOPE_WHERE})"))
         nb = db.execute(text(f'SELECT count(*) FROM "{rtab}"')).scalar()
-        print(f"Backed up {nb} result rows -> {rtab}; membership -> {mtab}")
+        nm = db.execute(text(f'SELECT count(*) FROM "{mtab}"')).scalar()
+        if nb != _EXPECTED_RESULTS or nm != _EXPECTED_TAX_MEMBERSHIP:
+            raise RuntimeError(f"backup count mismatch (results {nb}/{_EXPECTED_RESULTS}, "
+                               f"membership {nm}/{_EXPECTED_TAX_MEMBERSHIP}) — rolled back")
 
-    # 2) Delete membership (record_type-scoped → preserves non-tax sightings).
-    with Session() as db:
-        n = db.execute(text(
-            "DELETE FROM property_list_membership m "
-            "WHERE m.record_type='tax_delinquent' "
-            "AND (m.user_id, m.property_key) IN ("
-            f"  SELECT r.user_id, r.property_key {_SCOPE_WHERE} "
-            "  AND r.property_key IS NOT NULL)")).rowcount
+        # 2) Delete ONLY what is in the backup tables (exact-key, no predicate drift).
+        dm = db.execute(text(
+            f'DELETE FROM property_list_membership m USING "{mtab}" b '
+            "WHERE m.user_id=b.user_id AND m.record_type=b.record_type "
+            "AND m.property_key=b.property_key")).rowcount
+        dr = db.execute(text(
+            f'DELETE FROM results r USING "{rtab}" b WHERE r.id=b.id')).rowcount
+        if dr != nb or dm != nm:
+            raise RuntimeError(f"delete count != backup (results {dr}/{nb}, membership {dm}/{nm}) — rolled back")
+
+        # 3) Zero record_count on the now-empty jobs (history consistency).
+        dj = db.execute(text(
+            f'UPDATE jobs SET record_count=0 FROM "{jtab}" b '
+            "WHERE jobs.id=b.id AND jobs.record_count<>0 "
+            "AND NOT EXISTS (SELECT 1 FROM results r WHERE r.job_id=jobs.id)")).rowcount
+
         db.commit()
-        print(f"Deleted {n} tax_delinquent membership sighting(s).")
-
-    # 3) Delete result rows in committed batches.
-    deleted = 0
-    for chunk in _chunks(ids):
-        with Session() as db:
-            still = db.execute(text(
-                "SELECT count(*) FROM delivered_records "
-                "WHERE first_result_id = ANY(CAST(:ids AS uuid[]))"), {"ids": chunk}).scalar()
-            if still:
-                raise RuntimeError(f"{still} delivered_records now point at this batch — aborting")
-            n = db.execute(text(
-                "DELETE FROM results WHERE id = ANY(CAST(:ids AS uuid[]))"), {"ids": chunk}).rowcount
-            db.commit()
-            deleted += n
-    print(f"Deleted {deleted} mislabeled Clark tax result row(s).")
-
-    # 4) Keep the 2 jobs but zero their record_count so history stays consistent
-    #    (the job is now empty; we do NOT delete the job to minimize blast radius).
-    with Session() as db:
-        n = db.execute(text(f"""
-            UPDATE jobs SET record_count = 0
-            WHERE id IN (SELECT DISTINCT j.id FROM jobs j
-                         JOIN scraper_configs sc ON sc.id = j.scraper_config_id
-                         WHERE sc.record_type='tax_delinquent'
-                           AND lower(sc.county)='clark' AND upper(sc.state)='WA')
-              AND record_count <> 0
-              AND NOT EXISTS (SELECT 1 FROM results r WHERE r.job_id = jobs.id)
-        """)).rowcount
-        db.commit()
-        print(f"Zeroed record_count on {n} now-empty Clark tax job(s).")
-    print(f"\nCOMMITTED. Restore with: --restore {stamp}")
+        print(f"COMMITTED (one txn): backed up {nb} results + {nm} memberships + job counts; "
+              f"deleted {dr} results + {dm} memberships; zeroed {dj} job(s).")
+        print(f"Restore with: --restore {stamp}")
 
 
 def _restore(stamp: str) -> None:
+    if not _STAMP_RE.match(stamp):
+        print("REFUSING --restore: --stamp must match ^[A-Za-z0-9_]+$.")
+        return
     admin_dsn = os.getenv("ADMIN_DATABASE_URL_SYNC")
     if not admin_dsn:
         print("REFUSING --restore: set ADMIN_DATABASE_URL_SYNC (owner/admin DSN).")
@@ -263,22 +287,29 @@ def _restore(stamp: str) -> None:
     Session = sessionmaker(engine)
     rtab = f"_quarantine_clark_tax_results_{stamp}"
     mtab = f"_quarantine_clark_tax_membership_{stamp}"
-    with Session() as db:
-        rcols = _nongenerated_cols(db, "results")
-        # only columns the backup actually has
+    jtab = f"_quarantine_clark_tax_jobs_{stamp}"
+
+    def _collist(db, live_table: str, backup_table: str) -> str:
+        live = _nongenerated_cols(db, live_table)
         have = {r[0] for r in db.execute(text(
             "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema='public' AND table_name=:t"), {"t": rtab})}
-        cols = [c for c in rcols if c in have]
-        collist = ", ".join(f'"{c}"' for c in cols)
+            "WHERE table_schema='public' AND table_name=:t"), {"t": backup_table})}
+        return ", ".join(f'"{c}"' for c in live if c in have)
+
+    with Session() as db:
+        rcl = _collist(db, "results", rtab)
         n = db.execute(text(
-            f'INSERT INTO results ({collist}) SELECT {collist} FROM "{rtab}" '
+            f'INSERT INTO results ({rcl}) SELECT {rcl} FROM "{rtab}" '
             "ON CONFLICT (id) DO NOTHING")).rowcount
+        mcl = _collist(db, "property_list_membership", mtab)
         m = db.execute(text(
-            f'INSERT INTO property_list_membership SELECT * FROM "{mtab}" '
+            f'INSERT INTO property_list_membership ({mcl}) SELECT {mcl} FROM "{mtab}" '
             "ON CONFLICT DO NOTHING")).rowcount
+        # Restore the original job record_count too (commit zeroed it).
+        j = db.execute(text(
+            f'UPDATE jobs SET record_count=b.record_count FROM "{jtab}" b WHERE jobs.id=b.id')).rowcount
         db.commit()
-        print(f"Restored {n} result rows + {m} membership rows from stamp {stamp}.")
+        print(f"Restored {n} result rows + {m} membership rows + {j} job count(s) from stamp {stamp}.")
 
 
 def main() -> None:

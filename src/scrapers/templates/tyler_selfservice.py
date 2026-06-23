@@ -108,6 +108,13 @@ class TylerSelfServiceScraper(BridgeScraper):
     require_parcel_id=False to keep records.
     """
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor derived from this template's own _DOC_TYPE_MAP."""
+        from src.scrapers.doc_scope import from_keyword_map
+
+        return from_keyword_map(_DOC_TYPE_MAP, record_type)
+
     def __init__(
         self,
         base_url: str,

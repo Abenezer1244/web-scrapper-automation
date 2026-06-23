@@ -143,6 +143,7 @@ def dispatch_batch_run(run_id: str) -> None:
                         config_run_violation,
                         should_block_run,
                     )
+                    blocked_children = []
                     for c in configs:
                         _active = db.execute(
                             select(
@@ -157,6 +158,12 @@ def dispatch_batch_run(run_id: str) -> None:
                         )
                         if should_block_run(_violation, user_id=str(c.user_id),
                                             plan=(user.plan if user else "starter"), context="batch_fanout"):
+                            blocked_children.append({
+                                "config_id": str(c.id),
+                                "county": c.county,
+                                "record_type": c.record_type,
+                                "reason": "plan limit",
+                            })
                             continue
                         job = Job(
                             id=str(uuid.uuid4()),
@@ -174,13 +181,14 @@ def dispatch_batch_run(run_id: str) -> None:
                         # as failed (mirrors the monthly-record-limit branch above)
                         # instead of leaving the run "running" forever.
                         run.status = "failed"
-                        run.failed_children = [
+                        run.failed_children = blocked_children or [
                             {"reason": "all batch configs blocked by plan limits"}
                         ]
                         run.completed_at = datetime.now(UTC)
                         db.commit()
                     else:
                         run.child_job_ids = enqueued
+                        run.failed_children = blocked_children or None
                         run.status = "running"
                         run.running_at = datetime.now(UTC)  # stuck-time baseline (P1)
                         db.commit()

@@ -352,16 +352,27 @@ async def get_batch(
             .order_by(ScraperConfig.county, ScraperConfig.record_type)
         )
     ).all()
+    blocked_config_ids = {
+        e["config_id"]
+        for e in ((run.failed_children if run else None) or [])
+        if isinstance(e, dict) and e.get("config_id")
+    }
     children = []
     for cid, county, record_type in config_rows:
         job = job_by_config.get(cid)
+        if job:
+            child_status = job[1]
+        elif cid in blocked_config_ids:
+            child_status = "failed"  # blocked by plan limits (see failed_children)
+        else:
+            child_status = "pending"
         children.append(
             BatchChildSummary(
                 config_id=cid,
                 county=county,
                 record_type=record_type,
                 job_id=job[0] if job else None,
-                status=job[1] if job else "pending",
+                status=child_status,
                 record_count=job[2] if job else 0,
             )
         )

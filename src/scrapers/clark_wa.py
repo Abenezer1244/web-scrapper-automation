@@ -69,6 +69,20 @@ _DOC_TYPE_CHECKBOX_VALUES = {
     "tax_delinquent": ["97"],                       # FEDERAL TAX LIEN
 }
 
+# Verified checkbox-id -> raw portal label (live modal, 2026-06-22). This is the
+# AUTHORITATIVE "what Clark actually selects/collects" map: the portal filters
+# server-side by the selected codes, so collection_scope() derives display from
+# these IDs (NOT the broader client-side _DOC_TYPES allowlist, which can list
+# types that are never selected — e.g. tax selects only 97/FEDERAL TAX LIEN).
+_CHECKBOX_DOC_LABELS = {
+    "62": "DEATH CERTIFICATE", "316": "LACK OF PROBATE AFFIDAVIT",
+    "340": "TRANSFER ON DEATH DEED", "278": "WILL",
+    "167": "NOTICE OF TRUSTEE SALE", "129": "LIS PENDENS", "166": "NOTICE OF DEFAULT",
+    "157": "NOTICE OF FORECLOSURE", "93": "FORECLOSURE", "257": "TRUSTEES SALE",
+    "97": "FEDERAL TAX LIEN",
+    "68": "DISSOLUTION", "71": "DIVORCE",
+}
+
 # Record types where records don't have parcel IDs (e.g., divorce, probate)
 _NO_PID_RECORD_TYPES = {"divorce"}
 
@@ -81,13 +95,21 @@ class ClarkWAScraper(BridgeScraper):
     @classmethod
     def collection_scope(cls, record_type: str):
         """SHOW descriptor — Clark selects exact document-type modal checkboxes
-        (labels verified live 2026-06-22). Recorder holds no divorce decrees."""
+        (labels verified live 2026-06-22). Derived from the CHECKBOX selection
+        (what the portal actually filters to), not the broader client-side
+        allowlist. Recorder holds no divorce decrees."""
         from src.scrapers.doc_scope import from_keyword_map
 
         if record_type == "divorce":
             return None
+        ids = _DOC_TYPE_CHECKBOX_VALUES.get(record_type)
+        if not ids:
+            return None
+        labels = [_CHECKBOX_DOC_LABELS[i] for i in ids if i in _CHECKBOX_DOC_LABELS]
+        if not labels:
+            return None
         return from_keyword_map(
-            _DOC_TYPES,
+            {record_type: labels},
             record_type,
             exact=True,
             note="Selected by exact recorder document-type checkboxes (verified live).",

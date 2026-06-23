@@ -207,6 +207,20 @@ def test_all_allowlisted_scraper_classes_expose_collection_scope():
                 assert obj.collection_scope("nonexistent_type") is None
 
 
+def test_clark_scope_derives_from_checkbox_selection_not_client_filter():
+    """Clark's SHOW scope must reflect what the portal actually selects (checkbox
+    IDs), not the broader client-side allowlist. Clark tax selects only checkbox 97
+    (Federal Tax Lien), so the scope must NOT advertise Certificate of Delinquency /
+    Certificate of Sale (which the scraper never requests). Codex P2 regression."""
+    from src.scrapers.clark_wa import ClarkWAScraper
+
+    tax = ClarkWAScraper.collection_scope("tax_delinquent")
+    assert [i.label for i in tax.items] == ["Federal Tax Lien"]
+    assert all(i.exact for i in tax.items)
+    # divorce: Clark recorder holds no divorce decrees
+    assert ClarkWAScraper.collection_scope("divorce") is None
+
+
 def test_connector_scraper_class_resolves_and_blocks():
     from src.scrapers.registry import connector_scraper_class
 

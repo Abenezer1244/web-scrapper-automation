@@ -15,10 +15,12 @@ from decimal import Decimal
 import requests
 
 from src.scrapers.king_wa_tax_delinquent import (
+    _SOURCE,
     _is_retryable,
     _page_params,
     aggregate_delinquent_rows,
     is_parcel_legal_placeholder,
+    is_parse_break,
     is_tax_placeholder_party,
     tax_placeholder_party,
 )
@@ -225,6 +227,93 @@ def test_cap_keeps_parcel_at_boundary_year():
     )
     assert _by_parcel(records)["0333333333"].enrichment_data["bill_year"] == 2025
     assert stats["capped_out"] == 0
+
+
+# ─── King is EXEMPT from the recency cap (user decision 2026-06-23) ────────────
+
+def test_king_source_is_cap_exempt():
+    # The ingestion exemption is driven by membership in TAX_CAP_EXEMPT_SOURCES,
+    # keyed on the EXACT source the King scraper stamps — so ingestion and the
+    # query-side cap can never disagree.
+    from src.api.tax_filters import TAX_CAP_EXEMPT_SOURCES
+
+    assert _SOURCE == "king_county_delinquent_taxes"
+    assert _SOURCE in TAX_CAP_EXEMPT_SOURCES
+
+
+def test_cap_none_keeps_old_king_parcels():
+    # With the cap disabled (King's ingestion path: cap_min_year=None), a parcel
+    # whose oldest unpaid year is far back is KEPT — King's feed lists only
+    # currently-unpaid receivables, so an old bill_year is still a live lead.
+    records, stats = aggregate_delinquent_rows(
+        _CAP_ROWS, start_year=2000, effective_end_year=2025, cap_min_year=None
+    )
+    by = _by_parcel(records)
+    assert "0111111111" in by                  # oldest 2010 — kept (no cap)
+    assert by["0111111111"].enrichment_data["bill_year"] == 2010
+    assert stats["capped_out"] == 0
+
+
+# ─── aggregation funnel stats (drive the structural canary) ───────────────────
+
+def test_aggregated_parcels_and_net_zero_counts():
+    rows = [
+        _row("011111111100", 2024, "R", 100000, 0),    # owed -> candidate, emitted
+        _row("022222222200", 2024, "R", 100000, 100000),  # net zero -> candidate, dropped
+    ]
+    records, stats = aggregate_delinquent_rows(
+        rows, start_year=2000, effective_end_year=2024
+    )
+    assert stats["aggregated_parcels"] == 2   # both formed candidates
+    assert stats["net_zero_parcels"] == 1     # one fully paid -> dropped
+    assert {r.parcel_id for r in records} == {"0111111111"}
+
+
+# ─── structural canary: is_parse_break (Codex-reviewed funnel) ────────────────
+
+def _canary_stats(**over):
+    base = {"total_rows": 200, "aggregated_parcels": 50, "overflow": 0,
+            "capped_out": 0, "net_zero_parcels": 0}
+    base.update(over)
+    return base
+
+
+def test_canary_no_raise_when_records_emitted():
+    # Any emitted record means the parse worked — never a break.
+    assert is_parse_break(_canary_stats(), n_emitted=10) is False
+
+
+def test_canary_no_raise_on_small_scan():
+    # A tiny scan that yields nothing is legitimate (below the threshold).
+    assert is_parse_break(_canary_stats(total_rows=50, aggregated_parcels=0), 0) is False
+
+
+def test_canary_raises_when_nothing_parsed():
+    # Rows scanned but ZERO candidates -> every row hit a row-level gate
+    # (malformed/abatement/unknown) = schema/format drift -> parse break.
+    assert is_parse_break(_canary_stats(aggregated_parcels=0), 0) is True
+
+
+def test_canary_legitimate_empty_all_capped_does_not_raise():
+    # Candidates existed but were all removed by the recency cap -> legitimate
+    # business empty (the exact King pre-fix scenario) -> must NOT raise.
+    assert is_parse_break(_canary_stats(aggregated_parcels=50, capped_out=50), 0) is False
+
+
+def test_canary_legitimate_empty_all_net_zero_does_not_raise():
+    assert is_parse_break(_canary_stats(aggregated_parcels=50, net_zero_parcels=50), 0) is False
+
+
+def test_canary_raises_when_all_candidates_overflow():
+    # Every candidate was an absurd value -> unit change / corruption -> raise.
+    assert is_parse_break(_canary_stats(aggregated_parcels=50, overflow=50), 0) is True
+
+
+def test_canary_partial_overflow_with_cap_does_not_raise():
+    # Overflow present but NOT total (rest capped) -> still a legitimate empty.
+    assert is_parse_break(
+        _canary_stats(aggregated_parcels=50, overflow=2, capped_out=48), 0
+    ) is False
 
 
 def test_cap_none_disables_cap_back_compat():

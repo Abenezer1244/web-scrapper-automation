@@ -67,27 +67,23 @@ async def list_jobs(
     return responses
 
 
-@router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
-async def create_job(
-    body: JobCreate,
+async def enqueue_scrape_job(
+    db: AsyncSession,
+    current_user,
+    config: "ScraperConfig",
+    trigger: str,
     request: Request,
-    current_user: CurrentUser,
-    db: AsyncSession = Depends(get_rls_db),
-) -> JobResponse:
-    await rate_limit(request, zone="jobs", identifier=current_user.id)
+) -> "Job":
+    """Enforce AI/record-quota gates, create a pending Job for `config`, commit,
+    then enqueue the Celery scrape task. Shared by POST /jobs (manual/scheduled
+    runs against an ACTIVE config) and the scraper-preview endpoint (a one-off
+    `trigger="preview"` run against an inactive snapshot) so the entitlement,
+    quota, billing, and commit-then-enqueue contract can't drift between them.
 
-    # Verify scraper config belongs to user
-    config_result = await db.execute(
-        select(ScraperConfig).where(
-            ScraperConfig.id == body.scraper_config_id,
-            ScraperConfig.user_id == current_user.id,
-            ScraperConfig.active,
-        )
-    )
-    config = config_result.scalar_one_or_none()
-    if config is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
-
+    The caller owns config lookup/creation (and its active/inactive policy); this
+    helper never re-checks `config.active`, so it can run a deliberately-inactive
+    preview config the scheduler will never pick up.
+    """
     # Check if this is an AI-powered connector and enforce AI job limits
     connector_result = await db.execute(
         select(CountyConnector).where(
@@ -153,9 +149,9 @@ async def create_job(
     job = Job(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
-        scraper_config_id=body.scraper_config_id,
+        scraper_config_id=config.id,
         status="pending",
-        trigger=body.trigger,
+        trigger=trigger,
     )
     db.add(job)
     await db.flush()
@@ -194,6 +190,33 @@ async def create_job(
         )
 
     audit_log(request, "job_created", current_user.id, f"job_id={job.id}")
+    return job
+
+
+@router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
+async def create_job(
+    body: JobCreate,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_rls_db),
+) -> JobResponse:
+    await rate_limit(request, zone="jobs", identifier=current_user.id)
+
+    # Verify scraper config belongs to user AND is active (a manual "Run now"
+    # only targets a real, non-soft-deleted scraper). The preview endpoint
+    # deliberately does NOT go through here — it runs an inactive snapshot.
+    config_result = await db.execute(
+        select(ScraperConfig).where(
+            ScraperConfig.id == body.scraper_config_id,
+            ScraperConfig.user_id == current_user.id,
+            ScraperConfig.active,
+        )
+    )
+    config = config_result.scalar_one_or_none()
+    if config is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
+
+    job = await enqueue_scrape_job(db, current_user, config, body.trigger, request)
     return JobResponse.model_validate(job)
 
 

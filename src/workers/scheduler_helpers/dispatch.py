@@ -6,112 +6,206 @@ helpers. scheduler.py re-exports _should_run_now and _dispatch_due_batches so
 existing imports (and tests) keep resolving from src.workers.scheduler.
 """
 
-from datetime import UTC, datetime
+import calendar
+from datetime import UTC, datetime, timedelta
 
 from src.config.constants import ACTIVE_STATUSES
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("worker.scheduler")
 
+# Dedup window for scheduled single-config jobs. _should_run_now's ±1-minute
+# tolerance fires up to 3 adjacent beat ticks (target-1, target, target+1) ~60s
+# apart for one occurrence. The active-job check alone misses a duplicate when a
+# fast scrape finishes (-> terminal, no longer ACTIVE) before the next tick, so
+# we also block on a scheduled job CREATED within this window. 3 min covers the
+# ~2-min tick span with margin; under an unchanged schedule, occurrences of one
+# config are >=24h apart (daily/weekly/monthly) so it can never bridge two legit
+# occurrences (a run-time edit within the window may suppress one fire). This is a
+# single-beat mitigation, NOT a concurrency guarantee — the durable fix is a
+# (config, occurrence) unique key like batches' uq_batch_runs_occurrence.
+_SCHEDULED_DEDUP_MINUTES = 3
+
+
+def _scheduled_dispatch_blocker_exists(db, config_id: str, now: datetime) -> bool:
+    """True if dispatching a scheduled job for this config now would duplicate.
+
+    Skips when EITHER (a) any job is currently active for the config (any
+    trigger — the original overlap guard, so a scheduled run never starts on top
+    of a manual/test run), OR (b) a `scheduled` job for this config was created
+    within _SCHEDULED_DEDUP_MINUTES (catches the just-finished fast scrape so the
+    target / target+1 ticks no-op). The trigger filter keeps a manual "Run now"
+    from suppressing the scheduled occurrence and vice-versa.
+    """
+    from sqlalchemy import and_, or_, select
+
+    from src.db.models import Job
+
+    cutoff = now - timedelta(minutes=_SCHEDULED_DEDUP_MINUTES)
+    return db.execute(
+        select(Job.id)
+        .where(
+            Job.scraper_config_id == config_id,
+            or_(
+                Job.status.in_(ACTIVE_STATUSES),
+                and_(Job.trigger == "scheduled", Job.created_at >= cutoff),
+            ),
+        )
+        .limit(1)
+    ).scalar() is not None
+
+
+def _coerce_schedule_int(value: object, lo: int, hi: int, fallback: int) -> int:
+    """Coerce a persisted-JSON schedule value to an int clamped to [lo, hi].
+
+    Schedule values are range-validated by ScheduleConfig at the API boundary,
+    but the stored JSON column can also hold legacy / hand-edited junk. Coercing
+    here keeps a bad value from crashing the beat. Used by BOTH the run-time
+    matcher and the batch occurrence key, so a value that passes the matcher can
+    never then blow up `now.replace(hour=...)` (Codex P1).
+    """
+    try:
+        return min(max(int(value), lo), hi)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _dispatch_due_jobs(db, now: datetime) -> list[str]:
+    """Create a 'pending' Job for each active config whose schedule matches now.
+
+    Returns the created job ids; the caller enqueues AFTER commit
+    (commit-before-delay, mirroring _dispatch_due_batches). Skips configs that are
+    manual, not due, over the user's record limit, or already have an active /
+    recently-dispatched job (_scheduled_dispatch_blocker_exists). No broker I/O,
+    so it is unit-testable with a fixed `now`.
+    """
+    import uuid
+    from typing import cast
+
+    from sqlalchemy import select
+
+    from src.api.schemas import ScheduleConfigDict
+    from src.db.models import Job, ScraperConfig, User
+
+    created: list[str] = []
+    skipped_limit = 0
+    configs = db.execute(
+        select(ScraperConfig).where(ScraperConfig.active)
+    ).scalars().all()
+    for config in configs:
+        schedule: ScheduleConfigDict = cast(ScheduleConfigDict, config.schedule or {})
+        frequency = schedule.get("frequency", "manual")
+
+        if frequency == "manual":
+            continue
+
+        # Day/time selectors. run_at_weekday/run_at_day_of_month default to
+        # Monday / the 1st so configs saved before the day picker existed keep
+        # their old behavior (see ScheduleConfig contract).
+        if not _should_run_now(
+            frequency,
+            now,
+            schedule.get("run_at_hour", 6),
+            schedule.get("run_at_minute", 0),
+            schedule.get("run_at_weekday", 0),
+            schedule.get("run_at_day_of_month", 1),
+        ):
+            continue
+
+        # Record-limit gate BEFORE creating the job.
+        user = db.execute(select(User).where(User.id == config.user_id)).scalar_one_or_none()
+        if user and user.records_limit != -1 and user.records_used >= user.records_limit:
+            _logger.info(
+                "Skipping %s — user %s at record limit (%d/%d)",
+                config.name, user.email, user.records_used, user.records_limit,
+            )
+            skipped_limit += 1
+            continue
+
+        # Idempotency: skip if a job is already active for this config OR a
+        # scheduled job fired for it within the dedup window. The window guard
+        # stops the ±1-minute tolerance from double-firing a fast scrape that
+        # already finished (see _scheduled_dispatch_blocker_exists).
+        if _scheduled_dispatch_blocker_exists(db, config.id, now):
+            _logger.debug("Skipping %s — recent/active job for config", config.name)
+            continue
+
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=config.user_id,
+            scraper_config_id=config.id,
+            status="pending",
+            trigger="scheduled",
+        )
+        db.add(job)
+        db.flush()
+        created.append(job.id)
+        _logger.info("Scheduled job created: %s (job_id=%s)", config.name, job.id)
+
+    if created or skipped_limit:
+        _logger.info(
+            "dispatch_scheduled_jobs: created %d, skipped %d (over limit)",
+            len(created), skipped_limit,
+        )
+    return created
+
 
 def _dispatch_scheduled_jobs_impl() -> None:
     """Enqueue jobs for all active scraper configs whose schedule matches now.
 
-    Runs every minute. Idempotent — checks for an existing pending/running job
-    for the same config before enqueuing to prevent duplicates.
+    Runs every minute. Idempotent. COMMIT-BEFORE-ENQUEUE (was enqueue-before-
+    commit): the 'pending' rows commit FIRST, then the Celery tasks publish, so a
+    worker can never consume a task before its row is durably visible to
+    run_scrape_job's atomic pending->queued claim (the old order could strand a
+    job 'pending' if the message was consumed pre-commit). A lost publish leaves a
+    committed fresh-pending job that the watchdog re-delivers (health.py).
     """
-    import uuid
-
-    from sqlalchemy import select
-
-    from src.db.models import Job, ScraperConfig, User
     from src.db.session import SyncSessionLocal
     from src.workers.tasks import run_scrape_job
 
     now = datetime.now(UTC)
-    enqueued = 0
-    skipped_limit = 0
-
     with SyncSessionLocal() as db:
-        configs = db.execute(
-            select(ScraperConfig).where(ScraperConfig.active)
-        ).scalars().all()
-
-        from typing import cast
-
-        from src.api.schemas import ScheduleConfigDict
-        for config in configs:
-            schedule: ScheduleConfigDict = cast(ScheduleConfigDict, config.schedule or {})
-            frequency = schedule.get("frequency", "manual")
-
-            if frequency == "manual":
-                continue
-
-            # Build run time from run_at_hour/run_at_minute (frontend format)
-            run_hour = schedule.get("run_at_hour", 6)
-            run_minute = schedule.get("run_at_minute", 0)
-            run_time_str = f"{run_hour}:{run_minute:02d}"
-
-            if not _should_run_now(frequency, run_time_str, now):
-                continue
-
-            # Check user's record limit BEFORE creating the job
-            user = db.execute(select(User).where(User.id == config.user_id)).scalar_one_or_none()
-            if user and user.records_limit != -1 and user.records_used >= user.records_limit:
-                _logger.info(
-                    "Skipping %s — user %s at record limit (%d/%d)",
-                    config.name, user.email, user.records_used, user.records_limit,
-                )
-                skipped_limit += 1
-                continue
-
-            # Idempotency: skip if a job is already pending or running for this config
-            existing = db.execute(
-                select(Job).where(
-                    Job.scraper_config_id == config.id,
-                    Job.status.in_(ACTIVE_STATUSES),
-                )
-            ).scalar_one_or_none()
-
-            if existing:
-                _logger.debug("Skipping %s — job already active (%s)", config.name, existing.status)
-                continue
-
-            job = Job(
-                id=str(uuid.uuid4()),
-                user_id=config.user_id,
-                scraper_config_id=config.id,
-                status="pending",
-                trigger="scheduled",
-            )
-            db.add(job)
-            db.flush()
-            run_scrape_job.delay(job.id)
-            enqueued += 1
-            _logger.info("Scheduled job enqueued: %s (job_id=%s)", config.name, job.id)
-
+        created = _dispatch_due_jobs(db, now)
         db.commit()
 
-    if enqueued or skipped_limit:
-        _logger.info(
-            "dispatch_scheduled_jobs: enqueued %d, skipped %d (over limit)",
-            enqueued, skipped_limit,
-        )
+    # Enqueue AFTER commit. Per-item try/except: a broker failure on one must not
+    # abort the rest, and a lost publish is recovered by the watchdog.
+    for jid in created:
+        try:
+            run_scrape_job.delay(jid)
+        except Exception as exc:  # noqa: BLE001 — recovered by the watchdog
+            _logger.warning(
+                "dispatch_scheduled_jobs: enqueue of %s failed (watchdog recovers): %s",
+                jid, str(exc)[:200],
+            )
 
 
-def _should_run_now(frequency: str, run_time_str: str, now: datetime) -> bool:
-    """Return True if this frequency + run_time combination should fire at `now`.
+def _should_run_now(
+    frequency: str,
+    now: datetime,
+    run_hour: int = 6,
+    run_minute: int = 0,
+    run_weekday: int = 0,
+    run_day_of_month: int = 1,
+) -> bool:
+    """Return True if this schedule should fire at `now` (UTC).
 
-    Uses a ±1 minute tolerance window so that beat-tick drift (e.g. firing at
-    06:01 instead of 06:00) does not skip an entire day's scheduled jobs.
+    ±1-minute tolerance window so beat-tick drift (firing at 06:01 instead of
+    06:00) does not skip an occurrence. `run_weekday` (0=Mon..6=Sun, matching
+    datetime.weekday()) gates "weekly"; `run_day_of_month` (1..31, clamped to
+    the month's last day so "31" fires on the last day of short months) gates
+    "monthly". These come from a persisted JSON column, so they are coerced +
+    range-clamped defensively here — a hand-edited / legacy bad value can't
+    crash the beat or fire on a nonsense day. Defaults (Mon / 1st) reproduce
+    the pre-picker hardcoded behavior for configs that lack the new keys.
     """
-    try:
-        hour, minute = (int(x) for x in run_time_str.split(":"))
-    except (ValueError, AttributeError):
-        hour, minute = 6, 0
+    run_hour = _coerce_schedule_int(run_hour, 0, 23, 6)
+    run_minute = _coerce_schedule_int(run_minute, 0, 59, 0)
+    run_weekday = _coerce_schedule_int(run_weekday, 0, 6, 0)
+    run_day_of_month = _coerce_schedule_int(run_day_of_month, 1, 31, 1)
 
     # Check if we're within ±1 minute of the target time
-    target_minutes = hour * 60 + minute
+    target_minutes = run_hour * 60 + run_minute
     current_minutes = now.hour * 60 + now.minute
     if abs(current_minutes - target_minutes) > 1:
         return False
@@ -119,9 +213,10 @@ def _should_run_now(frequency: str, run_time_str: str, now: datetime) -> bool:
     if frequency == "daily":
         return True
     if frequency == "weekly":
-        return now.weekday() == 0  # Monday
+        return now.weekday() == run_weekday
     if frequency == "monthly":
-        return now.day == 1
+        last_day = calendar.monthrange(now.year, now.month)[1]
+        return now.day == min(run_day_of_month, last_day)
     return False
 
 
@@ -157,7 +252,16 @@ def _dispatch_due_batches(db, now: datetime) -> list[str]:
             continue
         run_hour = schedule.get("run_at_hour", 6)
         run_minute = schedule.get("run_at_minute", 0)
-        if not _should_run_now(frequency, f"{run_hour}:{run_minute:02d}", now):
+        # run_hour/run_minute are reused below for the occurrence key; weekday/
+        # day-of-month default to Monday / the 1st for pre-picker batches.
+        if not _should_run_now(
+            frequency,
+            now,
+            run_hour,
+            run_minute,
+            schedule.get("run_at_weekday", 0),
+            schedule.get("run_at_day_of_month", 1),
+        ):
             continue
 
         # Quota gate at fire time (same boundary as dispatch_scheduled_jobs);
@@ -174,11 +278,20 @@ def _dispatch_due_batches(db, now: datetime) -> list[str]:
         # is not midnight-wraparound-aware, so a 23:59 target matches ticks
         # 23:58/23:59 (not next-day 00:00) and a 00:00 target matches
         # 00:00/00:01 (not prior-day 23:59). The matching ticks are therefore
-        # always SAME-DAY as the target — this key is consistent for every tick
-        # that can reach it, and no occurrence is ever missed (2 ticks still
-        # match) or doubled. Fixing wraparound lives with the shared helper.
+        # always SAME-DAY as the target, so this key is consistent for every tick
+        # that can reach it and is never doubled. Under a healthy beat 2 same-day
+        # ticks still match (only the cross-midnight tick is dropped); an
+        # occurrence is missed only if the beat ALSO skips both same-day ticks.
+        # Fixing true wraparound tolerance lives with the shared helper.
+        # Coerce with the SAME helper the matcher used (Codex P1): a corrupted
+        # persisted hour/minute that slips past _should_run_now must not then
+        # crash now.replace(hour=...). Clamped here == clamped in the matcher,
+        # so the occurrence key stays consistent with what fired.
         occurrence = now.replace(
-            hour=int(run_hour), minute=int(run_minute), second=0, microsecond=0
+            hour=_coerce_schedule_int(run_hour, 0, 23, 6),
+            minute=_coerce_schedule_int(run_minute, 0, 59, 0),
+            second=0,
+            microsecond=0,
         )
         run_id = str(_uuid.uuid4())
         inserted = db.execute(

@@ -33,6 +33,11 @@ def test_valid_inputs_accepted():
     ConnectorCreate(county="king", state="WA", record_types=["probate"], base_url="https://x.gov")
     DeliverConfig(emails=["a@b.co"], formats=["csv", "excel"])
     ScheduleConfig(frequency="daily", run_at_hour=6, run_at_minute=30)
+    # A correctly-ordered custom range is accepted (ISO and US formats).
+    ScheduleConfig(date_range_mode="custom", date_from="2025-01-01", date_to="2025-06-30")
+    ScheduleConfig(date_range_mode="custom", date_from="01/01/2025", date_to="06/30/2025")
+    # Custom mode with only one date set is NOT rejected (falls back downstream).
+    ScheduleConfig(date_range_mode="custom", date_from="2025-01-01")
 
 
 @pytest.mark.parametrize(
@@ -50,6 +55,13 @@ def test_valid_inputs_accepted():
         lambda: DeliverConfig(formats=["z" * 100]),
         lambda: ScheduleConfig(run_at_hour=99),
         lambda: ScheduleConfig(run_at_minute=99),
+        lambda: ScheduleConfig(run_at_weekday=7),        # 0..6 only
+        lambda: ScheduleConfig(run_at_weekday=-1),
+        lambda: ScheduleConfig(run_at_day_of_month=0),   # 1..31 only
+        lambda: ScheduleConfig(run_at_day_of_month=32),
+        # Custom range with date_from after date_to is rejected at save time.
+        lambda: ScheduleConfig(date_range_mode="custom", date_from="2025-06-30", date_to="2025-01-01"),
+        lambda: ScheduleConfig(date_range_mode="custom", date_from="06/30/2025", date_to="01/01/2025"),
     ],
 )
 def test_abusive_inputs_rejected(fn):

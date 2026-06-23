@@ -56,11 +56,14 @@ _DOC_TYPES = {
 _DOC_TYPE_CHECKBOX_VALUES = {
     "probate": ["62", "316", "340", "278"],       # DEATH CERT, LACK OF PROBATE, TOD DEED, WILL
     # IDs verified against the live Clark doc-type modal (2026-06-22): 167=NOTICE OF
-    # TRUSTEE SALE, 129=LIS PENDENS, 166=NOTICE OF DEFAULT, 157=NOTICE OF FORECLOSURE,
-    # 93=FORECLOSURE, 257=TRUSTEES SALE. 257 was previously missing — it pairs with the
-    # "TRUSTEES SALE" keyword in _DOC_TYPES, so the two lists now align 6:6. (Output is
-    # not affected today because Clark's portal ignores checkbox selection and the
-    # client-side keyword filter is the real gate; this keeps best-effort selection correct.)
+    # TRUSTEE SALE (code NTS), 129=LIS PENDENS (LP), 166=NOTICE OF DEFAULT (NOTDEF),
+    # 157=NOTICE OF FORECLOSURE (NF), 93=FORECLOSURE (FORECL), 257=TRUSTEES SALE (TRSL).
+    # The modal checkboxes ARE load-bearing: selecting them sets the search to those
+    # doc-type codes and the portal filters server-side to exactly those types (verified
+    # live — selecting only "DEF" returned 0 records, not "everything"). 257=TRSL was
+    # previously missing; it is currently an empty category (0 records in the trailing
+    # 6 months — real trustee-sale leads are coded NTS/167), so adding it recovers no
+    # leads today but keeps the set complete if Clark ever files under TRSL.
     "pre_foreclosure": ["167", "129", "166", "157", "93", "257"],
     "divorce": ["68", "71"],                        # DISSOLUTION, DIVORCE
     "tax_delinquent": ["97"],                       # FEDERAL TAX LIEN
@@ -332,10 +335,12 @@ class ClarkWAScraper(BridgeScraper):
 
         _logger.info("Extracted %d rows", len(raw))
 
-        # Clark's portal-side Custom Selection filter is unreliable — the
-        # search returns every document type regardless of what we put in
-        # the textarea. Apply the doc-type filter client-side against the
-        # extracted docType cell to guarantee we only return matching records.
+        # Defense-in-depth doc-type filter. The modal-checkbox path DOES filter
+        # server-side by doc-type code (verified live 2026-06-22 — the portal honors
+        # the selected codes), so this client-side pass is normally redundant. It is
+        # kept deliberately as a guard: the legacy free-text "Custom Selection" textarea
+        # was unreliable, and this also lets is_cancellation_or_admin() drop cured/
+        # cancelled variants the portal would still return for a selected code.
         allowed_types_upper = [t.upper() for t in self._doc_types]
 
         dropped_no_pid = 0

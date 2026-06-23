@@ -45,6 +45,12 @@ LEAD_CSV_COLUMNS: list[str] = [
     # we already scrape into enrichment_data but never exported. Blank for record
     # types that don't carry the field (same convention as delinquent_amount).
     "assessed_value", "instrument_number",
+    # Probate honesty label (2026-06-23): the signal subtype set at insert —
+    # probate_death_inheritance vs tod_living_owner_estate_planning vs
+    # nonprobate_transfer. Blank for non-probate record types. Lets a customer see
+    # (and a dialer filter on) whether a "probate" row is a real death or a
+    # living-owner Transfer-on-Death estate-planning record.
+    "lead_subtype",
     "code_violation_type", "code_violation_status",
     "code_violation_description", "code_violation_last_inspection",
     "tax_billed_amount", "tax_paid_amount", "tax_account_status",
@@ -262,6 +268,8 @@ def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, s
         "instrument_number": _enrich_str(
             enr, "instrument_number", "recording_number", "record_number"
         ),
+        # Probate honesty label (blank for non-probate; set at insert in tasks.py).
+        "lead_subtype": _enrich_str(enr, "lead_subtype"),
         "code_violation_type": _enrich_str(enr, "record_type", "case_type"),
         "code_violation_status": _enrich_str(enr, "status"),
         "code_violation_description": _enrich_str(enr, "description"),

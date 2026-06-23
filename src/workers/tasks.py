@@ -13,6 +13,7 @@ from datetime import datetime
 from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
 
+from src.scrapers.probate import classify_probate_signal
 from src.utils.address_intel import compute_owner_flags
 from src.utils.logger import setup_logger
 from src.workers import app
@@ -640,6 +641,17 @@ def run_scrape_job(self, job_id: str) -> None:
                 # NULL here); the end-of-job recompute after _run_inline_enrichment
                 # is the authoritative pass once mailing is filled.
                 _owner = compute_owner_flags(rec.property_address, rec.mailing_address)
+                # Honesty label (probate only): tag every probate row with its signal
+                # subtype so a LIVING-owner Transfer-on-Death deed is never delivered
+                # disguised as a death/inheritance lead. New dict (never mutate the
+                # scraper's record); EXCLUDED from source_fingerprint/dedup_hash above,
+                # so labeling cannot affect identity, dedup, or billing.
+                _enrichment = rec.enrichment_data or {}
+                if config.record_type == "probate":
+                    _enrichment = {
+                        **_enrichment,
+                        "lead_subtype": classify_probate_signal(rec.doc_type).value,
+                    }
                 rows.append({
                     "id": str(_uuid.uuid4()),
                     "job_id": job_id,
@@ -652,7 +664,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     "parcel_id": _trunc(rec.parcel_id, 64),
                     "property_address": _trunc(rec.property_address, 512),
                     "mailing_address": _trunc(rec.mailing_address, 512),
-                    "enrichment_data": rec.enrichment_data or {},
+                    "enrichment_data": _enrichment,
                     "raw_html_hash": rec.raw_html_hash,
                     # Migration 062: per-job idempotency key (ON CONFLICT target).
                     "source_fingerprint": _fingerprint,

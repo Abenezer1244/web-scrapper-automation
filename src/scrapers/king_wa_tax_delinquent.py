@@ -336,6 +336,18 @@ class KingWATaxDelinquentScraper(BridgeScraper):
     years; bill_year = oldest delinquent year. No browser automation.
     """
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor — King tax delinquency comes from a dataset, not docs."""
+        from src.scrapers.doc_scope import dataset
+
+        if record_type != "tax_delinquent":
+            return None
+        return dataset(
+            "Collected from King County's delinquent-tax open dataset (Socrata); "
+            "recorder document-type filtering is not used."
+        )
+
     def __init__(self, record_type: str = "tax_delinquent"):
         super().__init__()
 

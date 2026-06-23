@@ -76,6 +76,18 @@ class PierceWACodeViolationScraper(BridgeScraper):
     Returns records with parcel ID, property address, case info.
     """
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor — Pierce code violations come from a dataset, not docs."""
+        from src.scrapers.doc_scope import dataset
+
+        if record_type != "code_violation":
+            return None
+        return dataset(
+            "Collected from Tacoma's code-enforcement dataset (ArcGIS); recorder "
+            "document-type filtering is not used."
+        )
+
     def __init__(self, record_type: str = "code_violation"):
         super().__init__()
 

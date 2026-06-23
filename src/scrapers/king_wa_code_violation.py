@@ -65,6 +65,18 @@ class KingWACodeViolationScraper(BridgeScraper):
     Parcel IDs are enriched via GIS from the address.
     """
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor — King code violations come from a dataset, not docs."""
+        from src.scrapers.doc_scope import dataset
+
+        if record_type != "code_violation":
+            return None
+        return dataset(
+            "Collected from Seattle's SDCI code-violation open dataset; recorder "
+            "document-type filtering is not used."
+        )
+
     def __init__(self, record_type: str = "code_violation"):
         super().__init__()
 

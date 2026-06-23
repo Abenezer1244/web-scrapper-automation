@@ -112,6 +112,22 @@ def test_bare_probate_is_death():
     assert classify_probate_signal("PROBATE") is ProbateSignal.DEATH_INHERITANCE
 
 
+def test_abbreviated_death_codes_are_death():
+    # Codex P2: EagleWeb (Clallam) + AcclaimWeb (Chelan) emit short whole-value codes.
+    for code in ("DEATH", "LETTR", "EXEC", "SUCC", "AFFD", "PTREC", "WILL", "HEIR"):
+        assert classify_probate_signal(code) is ProbateSignal.DEATH_INHERITANCE, code
+        # case-insensitive normalization
+        assert classify_probate_signal(code.title()) is ProbateSignal.DEATH_INHERITANCE, code
+
+
+def test_bare_death_code_does_not_leak_into_tod_label():
+    # The exact-value "DEATH" code must NOT make a multi-word TOD deed look like a
+    # death — "Transfer on Death Deed" stays a living-owner signal.
+    assert classify_probate_signal("Transfer on Death Deed") is ProbateSignal.TOD_LIVING_OWNER
+    # ...and a bare "TOD" code stays living-owner (it is not in the death-code set).
+    assert classify_probate_signal("TOD") is ProbateSignal.TOD_LIVING_OWNER
+
+
 # --- Lack of Probate affidavit -> nonprobate_transfer ----------------------------
 def test_lack_of_probate_affidavit_is_nonprobate_transfer():
     assert classify_probate_signal("LACK OF PROBATE AFFIDAVIT") is ProbateSignal.NONPROBATE_TRANSFER

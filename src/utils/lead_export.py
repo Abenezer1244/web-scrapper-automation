@@ -326,7 +326,7 @@ OVERLAP_LEAD_COLUMNS: list[str] = [
     "first_name", "last_name",
     "phone", "phone_type", "email", "phone_2", "phone_3", "email_2", "email_3",
     "property_street", "property_city", "property_state", "property_zip",
-    "filed_date", "doc_type", "delinquent_amount", "delinquent_bill_year",
+    "filed_date", "doc_type", "lead_subtype", "delinquent_amount", "delinquent_bill_year",
     "party_name", "mailing_address", "parcel_id", "heirs", "legal_description",
     "property_address",
 ]

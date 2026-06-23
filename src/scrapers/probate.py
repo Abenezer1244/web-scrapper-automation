@@ -327,6 +327,16 @@ _DEATH_MARKER_RE = re.compile(
 _LACK_OF_PROBATE_RE = re.compile(r"LACK\s+OF\s+PROBATE", re.IGNORECASE)
 _BARE_PROBATE_RE = re.compile(r"\bPROBATE\b", re.IGNORECASE)
 
+# Abbreviated probate/death doc CODES that some portals emit as the WHOLE doc_type
+# (Codex P2): EagleWeb/Clallam -> DEATH, LETTR, EXEC, SUCC; AcclaimWeb/Chelan ->
+# DEATH, AFFD, PTREC, WILL, HEIR. Matched by EXACT whole (normalized) value — NOT
+# substring/word — so the bare "DEATH" code is recognized as a death while
+# "TRANSFER ON DEATH DEED" (multi-word) stays on the TOD path. "TOD" is absent here
+# on purpose: a bare TOD code is a living-owner deed, handled by _TOD_DOC_RE.
+_ABBREV_DEATH_CODES: frozenset[str] = frozenset(
+    {"DEATH", "LETTR", "EXEC", "SUCC", "AFFD", "PTREC", "WILL", "HEIR"}
+)
+
 
 def _normalize_doc_type(doc_type: str) -> str:
     """Take the document label before any concatenated recording number.
@@ -367,7 +377,9 @@ def classify_probate_signal(doc_type: str | None) -> ProbateSignal:
     if _LACK_OF_PROBATE_RE.search(up):
         return ProbateSignal.NONPROBATE_TRANSFER
 
-    has_death = bool(_DEATH_MARKER_RE.search(up))
+    # Death if a phrase marker matches OR the WHOLE value is an abbreviated death
+    # code. Exact-value for the codes so it can't fire inside a multi-word TOD label.
+    has_death = bool(_DEATH_MARKER_RE.search(up)) or up in _ABBREV_DEATH_CODES
 
     if _TOD_DOC_RE.search(up):
         return ProbateSignal.DEATH_INHERITANCE if has_death else ProbateSignal.TOD_LIVING_OWNER

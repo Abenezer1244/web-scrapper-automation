@@ -6,7 +6,12 @@ real death or a living-owner Transfer-on-Death estate-planning record. Non-proba
 rows (no lead_subtype in enrichment_data) export it blank.
 """
 
-from src.utils.lead_export import LEAD_CSV_COLUMNS, build_lead_export_row
+from src.utils.lead_export import (
+    LEAD_CSV_COLUMNS,
+    OVERLAP_LEAD_COLUMNS,
+    build_lead_export_row,
+    build_overlap_export_row,
+)
 
 
 def _record(enrichment_data: dict) -> dict:
@@ -43,3 +48,15 @@ def test_row_keys_exactly_match_columns():
     # csv.DictWriter requires the row dict keys to match the declared fieldnames.
     out = build_lead_export_row(_record({"lead_subtype": "probate_death_inheritance"}))
     assert set(out.keys()) == set(LEAD_CSV_COLUMNS)
+
+
+def test_overlap_export_carries_lead_subtype():
+    # Codex P2: combined/overlap (segment + batch) CSVs whitelist OVERLAP_LEAD_COLUMNS
+    # and must NOT drop the honesty label.
+    assert "lead_subtype" in OVERLAP_LEAD_COLUMNS
+    out = build_overlap_export_row(
+        _record({"lead_subtype": "tod_living_owner_estate_planning"}),
+        {"lists_count": 2, "lists": "probate", "counties": "king"},
+    )
+    assert out["lead_subtype"] == "tod_living_owner_estate_planning"
+    assert set(out.keys()) == set(OVERLAP_LEAD_COLUMNS)

@@ -1265,9 +1265,13 @@ def run_scrape_job(self, job_id: str) -> None:
                     webhook_secret=webhook_secret,
                 )
                 deliver_job_webhook.delay(job_id, webhook_url, payload)
+                # Host-only — a webhook URL can carry secrets in its path/query,
+                # and this log line is surfaced to the user's job log (Codex).
+                from urllib.parse import urlparse
+                _wh_host = urlparse(webhook_url).hostname or "the configured endpoint"
                 _publish_log(
                     r, job_id, "info",
-                    f"Webhook queued for delivery to {webhook_url[:60]}",
+                    f"Webhook queued for delivery to {_wh_host}",
                     db=db,
                 )
             except Exception as webhook_exc:

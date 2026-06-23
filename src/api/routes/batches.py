@@ -69,13 +69,28 @@ async def create_batch(
             detail=f"This batch is {combos} scrapes; your plan allows up to {cap} per batch.",
         )
 
-    # 3. Delivery / skip-trace entitlement — SAME gates as a single scrape (a batch
-    #    must not let a lower plan exfiltrate PII via webhook or run paid skip trace).
-    if (body.deliver.webhook_url or body.deliver.dialer_webhook_url) and plan not in BUSINESS_FEATURES_PLANS:
+    # 3. Webhook / dialer delivery is NOT supported for batches: the finalizer only
+    #    sends the combined-export email, and child configs are created with
+    #    deliver={} so the dialer sweep never picks them up. Accepting these fields
+    #    persisted dead config the user thought was active (Codex). Reject them up
+    #    front with a clear message instead of silently dropping the delivery.
+    # dialer_type alone defaults to "generic_webhook" (the dropdown default), so it
+    # is NOT a "configured" signal — only an actual URL or PhoneBurner token is.
+    if (
+        body.deliver.webhook_url
+        or body.deliver.dialer_webhook_url
+        or body.deliver.phoneburner_access_token
+    ):
         raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail="Webhook delivery requires a Business or Agency plan",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Webhook and dialer delivery aren't available for batch scrapes — "
+                "set them on an individual scraper instead. A batch delivers one "
+                "combined CSV by email."
+            ),
         )
+    # 3b. Skip-trace entitlement — SAME gate as a single scrape (a batch must not
+    #     let a lower plan run paid skip trace).
     if body.enrichment.skip_tracing and plan not in BUSINESS_FEATURES_PLANS:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,

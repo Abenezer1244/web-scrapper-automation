@@ -32,6 +32,9 @@ def test_valid_inputs_accepted():
     JobCreate(scraper_config_id="550e8400-e29b-41d4-a716-446655440000")
     ConnectorCreate(county="king", state="WA", record_types=["probate"], base_url="https://x.gov")
     DeliverConfig(emails=["a@b.co"], formats=["csv", "excel"])
+    # An empty formats list normalizes to the default so API readback and the
+    # worker can't disagree (worker silently used csv, readback showed []).
+    assert DeliverConfig(formats=[]).formats == ["csv"]
     ScheduleConfig(frequency="daily", run_at_hour=6, run_at_minute=30)
 
 
@@ -48,6 +51,8 @@ def test_valid_inputs_accepted():
         lambda: ConnectorCreate(county="k", state="WA", record_types=["y" * 100], base_url="https://x.gov"),
         lambda: DeliverConfig(emails=["a@b.co"] * 50),
         lambda: DeliverConfig(formats=["z" * 100]),
+        lambda: DeliverConfig(formats=["pdf"]),       # short but unsupported
+        lambda: DeliverConfig(formats=["csv", "xml"]),  # one bad value rejects all
         lambda: ScheduleConfig(run_at_hour=99),
         lambda: ScheduleConfig(run_at_minute=99),
     ],

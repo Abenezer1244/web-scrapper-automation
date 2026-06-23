@@ -324,8 +324,19 @@ class DeliverConfig(BaseModel):
     @field_validator("formats")
     @classmethod
     def bound_formats(cls, v: list[str]) -> list[str]:
-        if any(len(f) > 16 for f in v):
-            raise ValueError("invalid format value")
+        # Allowlist the formats DataExporter.export() can actually produce.
+        # A length-only check let an unsupported value ("pdf", typo) persist
+        # on the config and then crash EVERY scrape later at export time with
+        # `ValueError: Unsupported export format` (Codex). Reject at save time
+        # instead, against the shared SUPPORTED_EXPORT_FORMATS set (case-
+        # insensitive). An empty list is normalized to the default so the API
+        # readback can't show `[]` while the worker silently exports CSV.
+        from src.config.constants import DEFAULT_EXPORT_FORMAT, SUPPORTED_EXPORT_FORMATS
+        if not v:
+            return [DEFAULT_EXPORT_FORMAT]
+        for f in v:
+            if len(f) > 16 or f.lower() not in SUPPORTED_EXPORT_FORMATS:
+                raise ValueError(f"unsupported export format: {f!r}")
         return v
 
     @field_validator("webhook_url", "dialer_webhook_url")

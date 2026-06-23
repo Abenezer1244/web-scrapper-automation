@@ -162,3 +162,63 @@ def _template_class(name: str):
         "laserfiche_weblink": laserfiche_weblink.LaserficheWebLinkScraper,
         "tyler_selfservice": tyler_selfservice.TylerSelfServiceScraper,
     }[name]
+
+
+# ─── SHOW vs SELECT separation + connector wiring ────────────────────────────
+
+def test_show_labels_are_never_select_canonical_tokens():
+    """SHOW labels are human-readable; they must never be the SELECT canonical
+    tokens (e.g. 'notice_of_trustee_sale'). Conflating the two would turn an
+    unverified display string into an accidental control-contract value."""
+    from src.scrapers.doc_scope import classify_keyword
+    from src.scrapers.doc_types import CANONICAL_DOC_TYPES
+
+    canonical = set(CANONICAL_DOC_TYPES)
+    for record_type, dmap_keys in (
+        ("probate", ["DEATH CERTIFICATE", "WILL", "PROBATE"]),
+        ("pre_foreclosure", ["NOTICE OF TRUSTEE SALE", "LIS PENDENS", "NOTICE OF DEFAULT"]),
+        ("tax_delinquent", ["TAX LIEN", "TAX"]),
+    ):
+        for kw in dmap_keys:
+            label = classify_keyword(record_type, kw)
+            assert label not in canonical, f"SHOW label {label!r} collides with a SELECT token"
+            assert label is None or "_" not in label  # human labels use spaces, not snake_case
+
+
+def test_all_allowlisted_scraper_classes_expose_collection_scope():
+    """Every manual-mode scraper the registry can resolve must answer
+    collection_scope() (inherited default is fine) so the API never AttributeErrors."""
+    from src.scrapers.registry import _ALLOWED_SCRAPER_MODULES
+
+    for module_path in _ALLOWED_SCRAPER_MODULES:
+        if module_path.endswith("base_scraper"):
+            continue
+        import importlib
+
+        mod = importlib.import_module(module_path)
+        # Find BridgeScraper subclasses defined in the module.
+        from src.scrapers.base_scraper import BridgeScraper
+
+        for name in dir(mod):
+            obj = getattr(mod, name)
+            if isinstance(obj, type) and issubclass(obj, BridgeScraper) and obj is not BridgeScraper:
+                assert callable(obj.collection_scope)
+                # Must not raise for an arbitrary record type.
+                assert obj.collection_scope("nonexistent_type") is None
+
+
+def test_connector_scraper_class_resolves_and_blocks():
+    from src.scrapers.registry import connector_scraper_class
+
+    class _Manual:
+        scraper_mode = "manual"
+        scraper_class = "src.scrapers.clark_wa.ClarkWAScraper"
+        base_url = ""
+
+    class _Blocked:
+        scraper_mode = "manual"
+        scraper_class = "os.system"
+        base_url = ""
+
+    assert connector_scraper_class(_Manual()).__name__ == "ClarkWAScraper"
+    assert connector_scraper_class(_Blocked()) is None

@@ -36,7 +36,7 @@ Note: okanogan = Tyler (NOT EagleWeb as brief guessed); grant = EagleWeb (its `/
 
 ## Phases (≤5 files each; live-verify + Codex review per phase)
 
-- [ ] **P0 — registry hardening, NO county flips (zero behavior change).**
+- [x] **P0 — registry hardening, NO county flips (zero behavior change). DONE + Codex-reviewed (commits 71cd826/959efcb/61211fb).**
   - `doc_types.py`: add `canonical_tokens_or_raise(county,state,doc_types)` (raises on unmappable explicit selection); keep `canonical_tokens_for` for None/legacy paths.
   - King + Pierce: migrate to fail-closed helper.
   - API: add `pre_foreclosure_doc_type_method` + `_confidence` (additive, non-breaking) to ConnectorResponse + populate in `list_connectors`.

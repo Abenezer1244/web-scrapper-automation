@@ -19,6 +19,70 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-22 — Delivery-step deep dive: export / email / webhook / "Run once" (Q1–Q4 from a UX review)
+**Built / Shipped:** A user walked the wizard's Delivery step and asked 4 skeptical questions; each surfaced
+real bugs, fixed root-cause with Codex on every step. Backend branch `feat/fields-output-visibility`,
+frontend branch `feat/schedule-day-picker` (whatever was checked out).
+- **Q1 export formats** (`67c0e49`, `8c6fd3e`; FE `8996c2a`): CSV/Excel = same data different container,
+  JSON = intentionally different shape. Fixed: `DeliverConfig.formats` allowlist via shared
+  `constants.SUPPORTED_EXPORT_FORMATS` (a bad value used to crash *every* scrape at export); **recursive
+  JSON CSV-sanitization** (`_sanitize_json_value`) — top-level-only sanitization let formula triggers
+  survive in nested `enrichment_data`; empty-list → default. FE: format toggle relabeled + single-select
+  (was multi-select but backend only delivers `formats[0]`).
+- **Q2 email delivery** (`9f67b9a`): wired right but unreliable. Phase A — R2-upload failure no longer
+  strands a billed user (retry → fail-loud *before* billing + release this job's `delivered_records` dedup
+  claims + added the DELETE grant the cleanup needs under the cutover role). Phase B — email is now a
+  **registered** retryable Celery task `deliver_job_email` (was inline best-effort; **and was missing from
+  the Celery `include` list, so it would never have run in prod**); status-aware Resend retry, task
+  timeout (SDK has none), PII-redacted error logs. Phase C — `send_ops_alert` on every delivery failure.
+- **Q3 webhook** (`2ca02d3`; FE `90cd37a`): the "Webhook URL" card is two mechanisms — `webhook_url`
+  (completion notification + signed download link, NOT the leads) and the dialer push (the actual leads).
+  Both wired right. Fixed: host-only logging of webhook URL + redirect `Location` (were leaking
+  path/query secrets into the user-visible job log); `POST /batches` now **rejects** webhook/dialer fields
+  (accepted-but-never-delivered dead config); FE relabel + hide card in batch mode.
+- **Q4 "Test run" vs "Save scraper"** (`d215d1c`; FE `f70d6fe`): they were **identical** — both persisted a
+  real active scheduled scraper + ran it, so "Test run" after picking a daily schedule silently created a
+  recurring scraper. Built a true one-off: new `POST /scrapers/preview` persists an **inactive** config
+  snapshot (the FK a Job needs; scheduler's `where(active)` + `GET /scrapers` filter both skip it) and runs
+  one `trigger="preview"` job; billed normally. Shared helpers `enqueue_scrape_job` (from create_job) +
+  `_build_scraper_config` (from create_scraper) so gates can't drift. FE: buttons now **"Run once"** vs
+  **"Save & run"**.
+**Tried / Decided:** No migration + no cleanup for previews (Codex: "ephemeral" = never scheduled, not
+"history vanishes"; hard-deleting would cascade-kill live jobs/exports/R2). Previews bill records (free =
+quota bypass). Marker = `Job.trigger="preview"` + `active=false`, not a new `is_preview` column (`active=false`
+already = soft-deleted, the job is the one-off entity). Kept the existing 2-call "Save & run" as-is (Codex
+flagged it mildly racy, but out of scope).
+**Caught & fixed (Codex review, multiple rounds):** Q2 Phase A — dedup-claim orphaning (would make
+never-delivered leads look like duplicates on re-scrape), missing `user_id` scope, missing DELETE grant,
+false "will retry" copy. Q2 Phase B — **task not in Celery `include`** (P1, would silently never run),
+dead `retry_backoff` config, over-strong "exactly-once" docstring. Q2 Phase C — batch enqueue-failure was
+silent + consumed the CAS. Q4 — `_build_scraper_config` audited *before* the quota check (false audit on a
+402) → moved audit after enqueue.
+**Failed / Blocked:** Codex CLI hit a **usage cap mid-session** (401 then "usage limit … try again Jun 24
+2:34 PM") — the high-effort reviews (some 600k–1.6M tokens) drained it; user restored access. Codex 0.139
+reads the prompt from **stdin**, not the positional arg (`echo "…" | codex exec`), and chokes on `!` in the
+prompt (bash history-expansion). Concurrent session edits the **same files** in both repos (`schemas.py`,
+`test_schema_bounds.py`, `page.tsx`) for a schedule-day-picker feature → my changes were interleaved in
+shared diff hunks. Isolated them to the index with a content-aware whitelist + `git apply --cached` (CRLF
+gotcha: Windows Python re-adds `\r` on stdout → must `tr -d '\r'` the patch).
+**Verified:** ruff clean throughout; new no-DB unit tests pass (`test_data_exporter` 48, `test_upload_retry`
+3, `test_email_delivery` 6, `test_schema_bounds`); FE tsc + eslint exit 0; `deliver_job_email` confirmed
+registered on the Celery app. Could NOT run DB-bound route tests locally (no test Postgres).
+**Pending / Handoff:** (1) `/scrapers/preview` route test — needs a live Postgres + a seeded `CountyConnector`
+(didn't write a blind one). (2) Regenerate the frontend OpenAPI types for `/scrapers/preview` (backend-first,
+pinned `.venv-schema`). (3) Decide whether previews count toward the county cap (entitlement enforcement is
+currently OFF, so not live). (4) `provision_rls_roles.sql` DELETE grant on `delivered_records` must be applied
+at the RLS cutover (works today via BYPASSRLS).
+**Facts learned:** A `.delay()`-ed Celery task that isn't in `src/workers/__init__.py`'s `include` list is
+silently dropped (the onboarding/webhook/batch comments warn this; the new email task hit it). A `Job`
+requires a persisted `ScraperConfig` (`scraper_config_id` is `nullable=False`), so a true preview must
+persist an inactive snapshot — there's no config-less job. The dispatcher runs `where(ScraperConfig.active)`
+and skips `frequency=="manual"`; `delete_scraper` sets `active=false` (soft delete). `Job.trigger` is a bare
+`String(32)` (no enum/CHECK), so new trigger values like `"preview"` are free. The export `delivered_records`
+dedup claim is committed *before* export, so any post-dedup failure must release it.
+
+---
+
 ## 2026-06-22 — PR #98: register-failure observability + duplicate-signup notice (from a "Registration failed" report)
 **Built / Shipped:** **PR #98 OPEN** (`feat/register-dup-signup-notice` → main, commit `bc44dcd`, 5 files).
 Triggered by a user report of "Registration failed. Please try again." (1) Observability: register's

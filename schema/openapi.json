@@ -170,8 +170,10 @@
             "default": {
               "date_range_mode": "rolling_90",
               "frequency": "manual",
+              "run_at_day_of_month": 1,
               "run_at_hour": 6,
-              "run_at_minute": 0
+              "run_at_minute": 0,
+              "run_at_weekday": 0
             }
           },
           "skip_trace_enabled": {
@@ -2254,6 +2256,14 @@
             "title": "Frequency",
             "type": "string"
           },
+          "run_at_day_of_month": {
+            "default": 1,
+            "description": "Monthly only. 1..31; the dispatcher clamps to the month's last day, so 31 fires on the last day of short months (Feb -> 28/29).",
+            "maximum": 31.0,
+            "minimum": 1.0,
+            "title": "Run At Day Of Month",
+            "type": "integer"
+          },
           "run_at_hour": {
             "default": 6,
             "maximum": 23.0,
@@ -2266,6 +2276,14 @@
             "maximum": 59.0,
             "minimum": 0.0,
             "title": "Run At Minute",
+            "type": "integer"
+          },
+          "run_at_weekday": {
+            "default": 0,
+            "description": "Weekly only. 0=Monday .. 6=Sunday (matches Python datetime.weekday()). Frontend must map its day labels to this; do NOT send JS Date.getDay().",
+            "maximum": 6.0,
+            "minimum": 0.0,
+            "title": "Run At Weekday",
             "type": "integer"
           }
         },
@@ -2337,8 +2355,10 @@
             "default": {
               "date_range_mode": "rolling_90",
               "frequency": "manual",
+              "run_at_day_of_month": 1,
               "run_at_hour": 6,
-              "run_at_minute": 0
+              "run_at_minute": 0,
+              "run_at_weekday": 0
             }
           },
           "skip_trace_enabled": {

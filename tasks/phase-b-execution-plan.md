@@ -42,7 +42,7 @@ Note: okanogan = Tyler (NOT EagleWeb as brief guessed); grant = EagleWeb (its `/
   - API: add `pre_foreclosure_doc_type_method` + `_confidence` (additive, non-breaking) to ConnectorResponse + populate in `list_connectors`.
   - Guard test: every `supported_for_selection=True` county resolves to a scraper whose `__init__` accepts `doc_types`.
   - OpenAPI regen for the additive fields.
-- [ ] **P1 — Clark** (server checkbox, already verified): wire `__init__` doc_types→narrow `_checkbox_values`; `_AVAILABILITY` entry `verified`; unit test; Codex review.
+- [x] **P1 — Clark** DONE + Codex-reviewed (commit 3c2c87d). All 5 canonical types, narrows both checkbox codes + client label allowlist. Verified vs live prod (active row = clark_wa.ClarkWAScraper). ⚠️ NOTE: prod has a DEAD inactive duplicate clark row (state 'wa' lc, ai-mode, king_wa_probate.ClarkWaProbateScraper, probate-only) — ignore it; list_connectors serves only the active 'WA' row.
 - [ ] **P2 — Skagit** (two-stage): wire both stages; `_AVAILABILITY` `verified`; live-verify dropdown; test; Codex.
 - [ ] **P3 — EagleWeb** (8 counties): wire `__init__`; per-county `keyword` entries; live histogram spot-check 2-3 (e.g. thurston/kitsap/grant); test; Codex.
 - [ ] **P4 — Acclaim/iDoc/Laserfiche/Tyler/Whatcom** (1 county each): wire each; per-county `keyword` entries; spot-check; test; Codex.

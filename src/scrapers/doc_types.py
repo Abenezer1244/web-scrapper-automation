@@ -83,6 +83,28 @@ _AVAILABILITY: dict[tuple[str, str], dict] = {
             "notice_of_trustee_sale": "324",
         },
     },
+    # Clark (LandmarkWeb) — exact server-side document-type checkboxes. The portal
+    # filters server-side to the selected codes (verified live 2026-06-22, codes in
+    # clark_wa._DOC_TYPE_CHECKBOX_VALUES / _CHECKBOX_DOC_LABELS). notice_of_trustee_sale
+    # maps to BOTH 167 (NOTICE OF TRUSTEE SALE) and 257 (TRUSTEES SALE) variants.
+    ("clark", "wa"): {
+        "available": [
+            "notice_of_default", "notice_of_trustee_sale",
+            "lis_pendens", "notice_of_foreclosure", "foreclosure",
+        ],
+        "method": "checkbox",
+        "confidence": "verified",
+        "default": "notice_of_trustee_sale",
+        "supported_for_selection": True,
+        "tokens": {
+            "notice_of_default": "166",
+            "notice_of_trustee_sale": ["167", "257"],
+            "lis_pendens": "129",
+            "notice_of_foreclosure": "157",
+            "foreclosure": "93",
+        },
+        "note": "Clark recorder LandmarkWeb — exact server-side document-type checkboxes (verified live 2026-06-22).",
+    },
 }
 
 # EagleWeb template default (kitsap + others). Hidden from selection until

@@ -27,7 +27,9 @@ from types import SimpleNamespace
 from src.scrapers.doc_types import _AVAILABILITY, _EAGLEWEB_COUNTIES, availability_for
 from src.scrapers.registry import connector_scraper_class
 
-# Real county_connectors config per selectable county (mirrors the prod DB seed). For
+# Real county_connectors config per selectable county. These mirror the ACTIVE prod
+# rows (verified live against bridgeleads-production 2026-06-23 — not the stale migration
+# 006 seed, which left a dead inactive clark row pointing at the old King subclass). For
 # manual mode, scraper_class is imported; for ai mode, base_url drives _detect_template.
 _CONNECTOR_CONFIG: dict[tuple[str, str], dict] = {
     ("king", "wa"): {
@@ -40,8 +42,13 @@ _CONNECTOR_CONFIG: dict[tuple[str, str], dict] = {
         "scraper_class": "src.scrapers.pierce_wa_probate.PierceWAARMSScraper",
         "base_url": "https://armsweb.co.pierce.wa.us/RealEstate/SearchEntry.aspx",
     },
-    # P1+: clark (manual clark_wa.ClarkWAScraper), skagit/eagleweb/acclaim/idoc/
-    # laserfiche/tyler (ai -> template via base_url), whatcom (manual whatcom_wa).
+    ("clark", "wa"): {
+        "scraper_mode": "manual",
+        "scraper_class": "src.scrapers.clark_wa.ClarkWAScraper",
+        "base_url": "https://e-docs.clark.wa.gov/LandmarkWeb",
+    },
+    # P2+: skagit/eagleweb/acclaim/idoc/laserfiche/tyler (ai -> template via
+    # base_url), whatcom (manual whatcom_wa).
 }
 
 

@@ -8,6 +8,7 @@ never silently broaden to the full legacy set (Phase B / Codex High).
 """
 import pytest
 
+from src.scrapers.clark_wa import ClarkWAScraper
 from src.scrapers.king_wa_probate import KingCountyLandmarkWebScraper
 from src.scrapers.pierce_wa_probate import PierceWAARMSScraper
 
@@ -48,6 +49,39 @@ def test_king_unmappable_selection_raises():
 def test_king_empty_selection_raises():
     with pytest.raises(ValueError):
         KingCountyLandmarkWebScraper(record_type="pre_foreclosure", doc_types=[])
+
+
+# ── Clark (server-side checkbox codes + client-side label allowlist) ──────────
+def test_clark_none_is_legacy_six_codes():
+    s = ClarkWAScraper(record_type="pre_foreclosure")
+    assert s._checkbox_values == ["167", "129", "166", "157", "93", "257"]
+
+
+def test_clark_selection_narrows_codes_and_labels():
+    # notice_of_trustee_sale expands to BOTH 167 and 257 (NTS + TRUSTEES SALE);
+    # both the server codes and the client label allowlist must narrow together.
+    s = ClarkWAScraper(
+        record_type="pre_foreclosure",
+        doc_types=["notice_of_trustee_sale", "lis_pendens"],
+    )
+    assert set(s._checkbox_values) == {"167", "257", "129"}
+    assert set(s._doc_types) == {"NOTICE OF TRUSTEE SALE", "TRUSTEES SALE", "LIS PENDENS"}
+
+
+def test_clark_single_foreclosure_narrows():
+    s = ClarkWAScraper(record_type="pre_foreclosure", doc_types=["foreclosure"])
+    assert s._checkbox_values == ["93"]
+    assert s._doc_types == ["FORECLOSURE"]
+
+
+def test_clark_empty_selection_raises():
+    with pytest.raises(ValueError):
+        ClarkWAScraper(record_type="pre_foreclosure", doc_types=[])
+
+
+def test_clark_doc_types_ignored_for_non_pre_foreclosure():
+    s = ClarkWAScraper(record_type="probate", doc_types=["foreclosure"])
+    assert s._checkbox_values == ["62", "316", "340", "278"]
 
 
 def test_king_none_is_legacy_nots():

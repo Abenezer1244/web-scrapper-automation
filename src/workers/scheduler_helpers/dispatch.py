@@ -122,6 +122,26 @@ def _dispatch_due_jobs(db, now: datetime) -> list[str]:
             skipped_limit += 1
             continue
 
+        # Execution-time entitlement guard (audit until ENTITLEMENT_ENFORCEMENT).
+        # A config can outlive a downgrade; re-validate against the CURRENT plan.
+        from src.api.entitlements import ConfigRow, config_run_violation, should_block_run
+        _active = db.execute(
+            select(
+                ScraperConfig.id, ScraperConfig.state, ScraperConfig.county,
+                ScraperConfig.record_type, ScraperConfig.created_at,
+                ScraperConfig.active, ScraperConfig.paused_reason,
+            ).where(ScraperConfig.user_id == config.user_id, ScraperConfig.active)
+        ).all()
+        if should_block_run(
+            config_run_violation(
+                user.plan if user else "starter", config.state, config.county,
+                config.record_type, [ConfigRow(*r) for r in _active],
+            ),
+            user_id=str(config.user_id), plan=(user.plan if user else "starter"),
+            context="schedule_single",
+        ):
+            continue
+
         # Idempotency: skip if a job is already active for this config OR a
         # scheduled job fired for it within the dedup window. The window guard
         # stops the ±1-minute tolerance from double-firing a fast scrape that

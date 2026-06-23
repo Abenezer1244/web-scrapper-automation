@@ -15,7 +15,7 @@ import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
-from sqlalchemy import text, update
+from sqlalchemy import select, text, update
 
 from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
 from src.db.models import BatchRun, Job, ScraperBatch
@@ -288,7 +288,18 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
     # the claim) makes rowcount 0 -> we must NOT overwrite 'cancelled' or deliver.
     # done = all succeeded; failed = ALL children failed; partial = a mix
     # (Codex: 100%-failure must not read as 'partial').
-    total_children = len(run.child_job_ids or [])
+
+    # Configs blocked by tier enforcement were recorded on the run at fan-out time;
+    # they never became child jobs, so child_rows can't see them. Read fresh (avoid
+    # identity-map staleness) and merge so the run reads partial/failed correctly and
+    # blocked configs stay visible in failed_children. Blocked entries have no job_id,
+    # so there's no overlap with the per-child `failed` list.
+    prior_blocked = db.execute(
+        select(BatchRun.failed_children).where(BatchRun.id == run.id)
+    ).scalar() or []
+    failed = prior_blocked + failed
+
+    total_children = len(run.child_job_ids or []) + len(prior_blocked)
     if not failed:
         new_status = "done"
     elif len(failed) >= total_children and total_children > 0:

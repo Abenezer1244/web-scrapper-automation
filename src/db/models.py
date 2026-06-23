@@ -235,6 +235,10 @@ class ScraperConfig(Base):
     doc_types = Column(JSON, nullable=True)
     skip_trace_enabled = Column(Boolean, nullable=False, default=False)
     active = Column(Boolean, nullable=False, default=True)
+    # Why a config is inactive. NULL = active or user-paused; 'entitlement' =
+    # auto-paused by downgrade reconciliation (revived on re-upgrade). Distinct
+    # from `active` so re-upgrade only revives what the system paused.
+    paused_reason = Column(String(32), nullable=True)
     # Piece 2 (batch scrape, migration 050): NULL for ordinary single scrapes; set
     # when this config is a child of a batch (one child per county x record_type).
     # The PARENT batch owns delivery + schedule; child configs are created with

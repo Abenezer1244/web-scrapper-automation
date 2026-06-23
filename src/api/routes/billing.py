@@ -247,13 +247,14 @@ _PLANS = [
         "price_monthly": 199,
         "price_annual": 1910,  # ~$159/mo, ~20% off
         "records_limit": 1000,
-        # Bullets describe ENFORCED entitlements only. Per-tier county /
-        # record-type gating is the value-metric build (separate phase); until
-        # it ships we do NOT advertise a county cap the backend does not honor.
+        # Bullets describe ENFORCED entitlements only (value-metric build,
+        # docs/pricing-strategy-2026-06.md §4): Pro = 3 counties + the 3 core
+        # distress lists. Premium lists + overlap are a Business feature.
         "features": [
             "1,000 records/month",
-            "All record types",
-            "Skip tracing (phone + email)",
+            "3 counties (your choice)",
+            "Probate, pre-foreclosure & tax-delinquent lists",
+            "Skip tracing (250 included, then $0.08/lookup)",
             "CSV + Excel export",
             "Daily/weekly schedule",
             "Email delivery",
@@ -271,13 +272,13 @@ _PLANS = [
         "records_limit": 5000,
         "features": [
             "5,000 records/month",
-            "All record types",
+            "10 counties (your choice)",
+            "All record types + overlap/intersection",
             "All export formats",
             "All schedules",
-            "Email + Webhook delivery",
+            "Email + Webhook + dialer delivery",
             "Skip tracing (1,000 included)",
             "API access",
-            "5 team members",
         ],
         "stripe_price_id": settings.STRIPE_PRICE_BUSINESS,
         "stripe_price_id_annual": settings.STRIPE_PRICE_BUSINESS_ANNUAL,
@@ -289,12 +290,11 @@ _PLANS = [
         "price_annual": 14390,  # ~$1,199/mo, ~20% off
         "records_limit": -1,
         "features": [
-            "Unlimited records",
-            "All features",
+            "Unlimited counties + records",
+            "All record types + overlap/intersection",
             "Skip tracing (2,000 included)",
-            "Unlimited team members",
             "White-label (coming soon)",
-            "Priority support",
+            "Priority queue + support",
             "Dedicated account manager",
         ],
         "stripe_price_id": settings.STRIPE_PRICE_AGENCY,
@@ -814,6 +814,8 @@ async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
         user.plan = plan_name
         user.records_limit = records_limit
         await db.flush()
+        from src.api.entitlements import apply_reconciliation_async
+        await apply_reconciliation_async(db, str(user.id), user.plan)
 
 
 async def _handle_subscription_deleted(data: dict, db: AsyncSession) -> None:
@@ -828,6 +830,8 @@ async def _handle_subscription_deleted(data: dict, db: AsyncSession) -> None:
         user.plan = "starter"
         user.records_limit = settings.PLAN_LIMITS["starter"]
         await db.flush()
+        from src.api.entitlements import apply_reconciliation_async
+        await apply_reconciliation_async(db, str(user.id), user.plan)
 
 
 async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:

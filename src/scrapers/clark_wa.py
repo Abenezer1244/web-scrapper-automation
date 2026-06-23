@@ -55,7 +55,13 @@ _DOC_TYPES = {
 # Discovered from the live portal on 2026-04-18.
 _DOC_TYPE_CHECKBOX_VALUES = {
     "probate": ["62", "316", "340", "278"],       # DEATH CERT, LACK OF PROBATE, TOD DEED, WILL
-    "pre_foreclosure": ["167", "129", "166", "157", "93"],  # TRUSTEE SALE, LIS PENDENS, DEFAULT, FORECL
+    # IDs verified against the live Clark doc-type modal (2026-06-22): 167=NOTICE OF
+    # TRUSTEE SALE, 129=LIS PENDENS, 166=NOTICE OF DEFAULT, 157=NOTICE OF FORECLOSURE,
+    # 93=FORECLOSURE, 257=TRUSTEES SALE. 257 was previously missing — it pairs with the
+    # "TRUSTEES SALE" keyword in _DOC_TYPES, so the two lists now align 6:6. (Output is
+    # not affected today because Clark's portal ignores checkbox selection and the
+    # client-side keyword filter is the real gate; this keeps best-effort selection correct.)
+    "pre_foreclosure": ["167", "129", "166", "157", "93", "257"],
     "divorce": ["68", "71"],                        # DISSOLUTION, DIVORCE
     "tax_delinquent": ["97"],                       # FEDERAL TAX LIEN
 }

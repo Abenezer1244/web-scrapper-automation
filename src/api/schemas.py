@@ -561,6 +561,96 @@ class ScraperConfigResponse(BaseModel):
             self.schedule = {}
 
 
+# Write-only deliver secrets — never returned in GET (redacted to *_set flags in
+# ScraperConfigResponse). The edit path keeps a stored secret when the client
+# leaves it blank, so these are the only fields a PATCH treats as "preserve on
+# omit" instead of "replace".
+DELIVER_SECRET_FIELDS: tuple[str, ...] = (
+    "webhook_secret",
+    "dialer_webhook_secret",
+    "phoneburner_access_token",
+)
+
+
+class DeliverUpdate(BaseModel):
+    """Deliver payload for PATCH /scrapers/{id} (edit). SHAPE-ONLY: every field is
+    lenient here because the route re-validates the merged result by constructing a
+    full DeliverConfig (single source of delivery validation). Two reasons this is
+    a dedicated model and not DeliverConfig:
+
+    1. Secret preservation — webhook_secret / dialer_webhook_secret /
+       phoneburner_access_token are write-only (GET redacts them to *_set bool
+       flags). On edit, omitted / null / blank means "keep the stored secret", a
+       non-blank value means "replace". DeliverConfig's min-length + cross-field
+       (require_connector_credentials) validators would wrongly reject a blank
+       "keep" token, so they must NOT run until the route has injected the stored
+       secrets back in.
+    2. The frontend pre-fills the edit form from GET, whose deliver dict carries
+       the write-only readback flags (webhook_secret_set, …). Those are declared
+       below (and excluded from model_dump so they never reach DeliverConfig) so
+       echoing them back is accepted — while extra="forbid" still rejects any OTHER
+       unknown key. That matters because this is a REPLACE-whole payload: a silent
+       typo like "webhook_ur" would otherwise drop the real webhook_url + its secret
+       (Codex). A misspelled field 422s instead.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    emails: list[str] = Field(default_factory=list, max_length=10)
+    formats: list[str] = Field(default=["csv"], max_length=5)
+    webhook_url: str | None = None
+    webhook_secret: str | None = None
+    dialer_webhook_url: str | None = None
+    dialer_webhook_secret: str | None = None
+    dialer_type: str | None = None
+    phoneburner_access_token: str | None = None
+    phoneburner_owner_id: str | None = None
+
+    # Write-only readback flags emitted by GET. Accepted (so a verbatim form echo
+    # doesn't 422) but excluded from model_dump — they are not real deliver fields
+    # and must never reach DeliverConfig.
+    webhook_secret_set: bool | None = Field(default=None, exclude=True)
+    dialer_webhook_secret_set: bool | None = Field(default=None, exclude=True)
+    phoneburner_access_token_set: bool | None = Field(default=None, exclude=True)
+
+
+class ScraperConfigUpdate(BaseModel):
+    """PATCH /scrapers/{id} — partial edit of an existing scraper config.
+
+    SEMANTICS: every editable top-level field is optional. A field that is OMITTED
+    keeps the stored value; a field that is PRESENT fully REPLACES it (sub-objects
+    are replace-whole, NOT deep-merged — the edit wizard pre-fills the complete
+    object). The one exception is deliver secrets (see DeliverUpdate): blank = keep.
+
+    Identity (county / state / record_type) is immutable — it ties the config to a
+    county_connector and to property_key/dedup/billing history. The fields are
+    declared here ONLY so an attempt to change them is rejected with a clear 422
+    (Codex P2: reject, don't silently ignore). extra="forbid" rejects any other
+    unknown key.
+
+    updated_at is REQUIRED: it is the optimistic-concurrency token (Codex P1). The
+    client echoes the value it read from GET; the route 409s if the stored row has
+    advanced since, preventing one edit session from silently clobbering another.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    updated_at: datetime
+
+    name: str | None = Field(default=None, max_length=120)
+    fields: FieldsConfig | None = None
+    enrichment: EnrichmentConfig | None = None
+    schedule: ScheduleConfig | None = None
+    deliver: DeliverUpdate | None = None
+    skip_trace_enabled: bool | None = None
+    doc_types: list[str] | None = Field(default=None, max_length=10)
+
+    # Identity — accepted only so the route can 422 if a client tries to change it.
+    county: str | None = None
+    state: str | None = None
+    record_type: str | None = None
+
+
 # ─── Batch scrape (Piece 2) ─────────────────────────────────────────────────
 
 class BatchCreateRequest(BaseModel):

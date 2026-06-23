@@ -981,6 +981,143 @@
         "title": "DeliverConfig",
         "type": "object"
       },
+      "DeliverUpdate": {
+        "additionalProperties": false,
+        "description": "Deliver payload for PATCH /scrapers/{id} (edit). SHAPE-ONLY: every field is\nlenient here because the route re-validates the merged result by constructing a\nfull DeliverConfig (single source of delivery validation). Two reasons this is\na dedicated model and not DeliverConfig:\n\n1. Secret preservation — webhook_secret / dialer_webhook_secret /\n   phoneburner_access_token are write-only (GET redacts them to *_set bool\n   flags). On edit, omitted / null / blank means \"keep the stored secret\", a\n   non-blank value means \"replace\". DeliverConfig's min-length + cross-field\n   (require_connector_credentials) validators would wrongly reject a blank\n   \"keep\" token, so they must NOT run until the route has injected the stored\n   secrets back in.\n2. The frontend pre-fills the edit form from GET, whose deliver dict carries\n   the write-only readback flags (webhook_secret_set, …). Those are declared\n   below (and excluded from model_dump so they never reach DeliverConfig) so\n   echoing them back is accepted — while extra=\"forbid\" still rejects any OTHER\n   unknown key. That matters because this is a REPLACE-whole payload: a silent\n   typo like \"webhook_ur\" would otherwise drop the real webhook_url + its secret\n   (Codex). A misspelled field 422s instead.",
+        "properties": {
+          "dialer_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dialer Type"
+          },
+          "dialer_webhook_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dialer Webhook Secret"
+          },
+          "dialer_webhook_secret_set": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dialer Webhook Secret Set"
+          },
+          "dialer_webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dialer Webhook Url"
+          },
+          "emails": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10,
+            "title": "Emails",
+            "type": "array"
+          },
+          "formats": {
+            "default": [
+              "csv"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 5,
+            "title": "Formats",
+            "type": "array"
+          },
+          "phoneburner_access_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phoneburner Access Token"
+          },
+          "phoneburner_access_token_set": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phoneburner Access Token Set"
+          },
+          "phoneburner_owner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phoneburner Owner Id"
+          },
+          "webhook_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Secret"
+          },
+          "webhook_secret_set": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Secret Set"
+          },
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url"
+          }
+        },
+        "title": "DeliverUpdate",
+        "type": "object"
+      },
       "EnrichmentConfig": {
         "properties": {
           "property_lookup": {
@@ -2503,6 +2640,133 @@
           "updated_at"
         ],
         "title": "ScraperConfigResponse",
+        "type": "object"
+      },
+      "ScraperConfigUpdate": {
+        "additionalProperties": false,
+        "description": "PATCH /scrapers/{id} — partial edit of an existing scraper config.\n\nSEMANTICS: every editable top-level field is optional. A field that is OMITTED\nkeeps the stored value; a field that is PRESENT fully REPLACES it (sub-objects\nare replace-whole, NOT deep-merged — the edit wizard pre-fills the complete\nobject). The one exception is deliver secrets (see DeliverUpdate): blank = keep.\n\nIdentity (county / state / record_type) is immutable — it ties the config to a\ncounty_connector and to property_key/dedup/billing history. The fields are\ndeclared here ONLY so an attempt to change them is rejected with a clear 422\n(Codex P2: reject, don't silently ignore). extra=\"forbid\" rejects any other\nunknown key.\n\nupdated_at is REQUIRED: it is the optimistic-concurrency token (Codex P1). The\nclient echoes the value it read from GET; the route 409s if the stored row has\nadvanced since, preventing one edit session from silently clobbering another.",
+        "properties": {
+          "county": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "County"
+          },
+          "deliver": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeliverUpdate"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "doc_types": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 10,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc Types"
+          },
+          "enrichment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EnrichmentConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "fields": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FieldsConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "record_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Record Type"
+          },
+          "schedule": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScheduleConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "skip_trace_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skip Trace Enabled"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "updated_at"
+        ],
+        "title": "ScraperConfigUpdate",
         "type": "object"
       },
       "SegmentIntersectionRequest": {
@@ -5832,6 +6096,62 @@
           }
         ],
         "summary": "Get Scraper",
+        "tags": [
+          "scrapers"
+        ]
+      },
+      "patch": {
+        "description": "Edit an existing scraper config in place (PATCH). Keeps the config id, so\njob history and a since_last_run cursor survive — unlike delete+recreate,\nwhich orphans history and resets the cursor.\n\nEditable: name, fields, enrichment, schedule, deliver, skip_trace_enabled,\ndoc_types. Identity (county/state/record_type) is immutable. Each PROVIDED\ntop-level field FULLY REPLACES the stored value (sub-objects are not\ndeep-merged — the edit wizard pre-fills the complete object); an OMITTED field\nis kept. Blank delivery secrets are kept (see _merge_deliver).",
+        "operationId": "update_scraper_scrapers__scraper_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scraper_id",
+            "required": true,
+            "schema": {
+              "title": "Scraper Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScraperConfigUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScraperConfigResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Update Scraper",
         "tags": [
           "scrapers"
         ]

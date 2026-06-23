@@ -13,15 +13,22 @@ from src.api.entitlements import enforce_entitlements
 from src.api.middleware.rate_limit import rate_limit
 from src.api.middleware.security import audit_log
 from src.api.schemas import (
+    DELIVER_SECRET_FIELDS,
     CachedRecordRow,
     CachedResultsPage,
     ConnectorCreate,
     ConnectorResponse,
+    DeliverConfig,
     JobResponse,
     ScraperConfigCreate,
     ScraperConfigResponse,
+    ScraperConfigUpdate,
 )
-from src.config.constants import BUSINESS_FEATURES_PLANS, SKIP_TRACE_ADDON_PLANS
+from src.config.constants import (
+    ACTIVE_STATUSES,
+    BUSINESS_FEATURES_PLANS,
+    SKIP_TRACE_ADDON_PLANS,
+)
 from src.db import CountyConnector, ScraperConfig, get_db
 
 router = APIRouter(prefix="/scrapers", tags=["scrapers"])
@@ -72,6 +79,99 @@ async def list_scrapers(
     return [ScraperConfigResponse.model_validate(s) for s in result.scalars().all()]
 
 
+async def _validate_connector_supports(
+    db: AsyncSession, county: str, state: str, record_type: str
+) -> None:
+    """Identity validation: an active connector for county+state exists and
+    supports record_type. Create-time only — on edit the identity is immutable
+    (validated once at create), and re-checking would falsely 422 an unrelated
+    edit (e.g. a rename) if the connector was later deactivated (Codex). Raises
+    422 on failure.
+    """
+    # county_connectors has no RLS — the rls db session can still query it.
+    result = await db.execute(
+        select(CountyConnector).where(
+            func.lower(CountyConnector.county) == county.lower(),
+            func.upper(CountyConnector.state) == state.upper(),
+            CountyConnector.active,
+        )
+    )
+    connectors = result.scalars().all()
+    if not connectors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"No active connector found for {county}, {state}",
+        )
+    supported_types = []
+    for c in connectors:
+        supported_types.extend(c.record_types)
+    if record_type not in supported_types:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Record type '{record_type}' not supported for {county}, {state}. "
+                   f"Supported: {list(set(supported_types))}",
+        )
+
+
+def _validate_doc_types(
+    county: str, state: str, record_type: str, doc_types: list[str]
+) -> None:
+    """Phase 2b: validate a pre-foreclosure document-type selection against the
+    capability registry (single source of truth). Only valid for pre_foreclosure
+    and must be available for this county; [] is rejected. Shared by create and
+    edit so the gate can't drift. Validation lives here (not in Pydantic) so
+    scraper code isn't imported into schemas. Raises 422 on failure.
+    """
+    from src.scrapers.doc_types import validate_selection
+    if record_type != "pre_foreclosure":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="doc_types is only valid for the pre_foreclosure record type",
+        )
+    ok, err = validate_selection(county, state, doc_types)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=err)
+
+
+def _enforce_plan_feature_gates(
+    current_user,
+    *,
+    has_webhook: bool,
+    skip_tracing: bool,
+    skip_trace_enabled: bool,
+) -> None:
+    """Plan/tier gates for the gated delivery + enrichment features. Shared by
+    create and edit so they can't drift. Create passes the payload's ABSOLUTE
+    values; edit passes the ENABLE-DELTA (only the features this PATCH is newly
+    turning on) so an edit can neither bypass a tier nor punish a config whose
+    owner downgraded after creating it (the feature stays grandfathered until the
+    user toggles it). Raises 402.
+    """
+    # Phase 5: the dialer push is a second outbound destination that POSTs lead
+    # PII, so it carries the SAME entitlement as the job-summary webhook — gate
+    # both, or a lower plan could exfiltrate PII via dialer_webhook_url (Codex).
+    if has_webhook and current_user.plan not in BUSINESS_FEATURES_PLANS:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="Webhook delivery requires a Business or Agency plan",
+        )
+    if skip_tracing and current_user.plan not in BUSINESS_FEATURES_PLANS:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="Skip tracing enrichment requires a Business or Agency plan",
+        )
+    # Sprint 4: dedicated skip_trace_enabled flag (metered add-on). Available on
+    # Pro/Business/Agency. Starter gets 402 with upsell text.
+    if skip_trace_enabled and (current_user.plan or "starter").lower() not in SKIP_TRACE_ADDON_PLANS:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=(
+                "Skip trace ($0.08/lookup) requires a Pro plan or higher. "
+                "Upgrade to Pro to unlock phone + email lookups."
+            ),
+        )
+
+
 async def _build_scraper_config(
     db: AsyncSession,
     current_user,
@@ -80,41 +180,17 @@ async def _build_scraper_config(
     *,
     active: bool,
 ) -> ScraperConfig:
-    """Validate the payload (connector/record-type, entitlements, doc-types,
-    plan gates) and persist a ScraperConfig, then return it (flushed, not
-    committed). Shared by POST /scrapers (an active scheduled scraper) and the
-    preview endpoint (an inactive one-off snapshot) so the gates can't drift.
+    """Validate the payload (connector/record-type, entitlements, doc-types, plan
+    gates) via the shared helpers and persist a ScraperConfig, then return it
+    (flushed, not committed). Shared by POST /scrapers (an active scheduled
+    scraper) and POST /scrapers/preview (an inactive one-off snapshot) so the gates
+    can't drift — and PATCH reuses the same helpers, so all three agree.
 
-    When ``active`` is False the config is a preview snapshot: its frequency is
-    forced to "manual" so that even if it were ever reactivated it wouldn't fire
-    on a schedule, and the dispatcher's ``where(ScraperConfig.active)`` filter
-    keeps it out of the beat entirely.
+    active=False → preview snapshot: frequency forced to "manual" (belt) and the
+    dispatcher's ``where(ScraperConfig.active)`` filter keeps it out of the beat
+    (suspenders).
     """
-    # Verify county + record_type exists in the connector registry
-    # county_connectors has no RLS — the rls db session can still query it
-    result = await db.execute(
-        select(CountyConnector).where(
-            func.lower(CountyConnector.county) == body.county.lower(),
-            func.upper(CountyConnector.state) == body.state.upper(),
-            CountyConnector.active,
-        )
-    )
-    connectors = result.scalars().all()
-    if not connectors:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"No active connector found for {body.county}, {body.state}",
-        )
-    # Find the connector that supports this record type
-    supported_types = []
-    for c in connectors:
-        supported_types.extend(c.record_types)
-    if body.record_type not in supported_types:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Record type '{body.record_type}' not supported for {body.county}, {body.state}. "
-                   f"Supported: {list(set(supported_types))}",
-        )
+    await _validate_connector_supports(db, body.county, body.state, body.record_type)
 
     # Value-metric entitlement gate (county count + record-type). Feature-flagged:
     # 402 when settings.ENTITLEMENT_ENFORCEMENT is on, else audit-log only.
@@ -127,49 +203,24 @@ async def _build_scraper_config(
         context="create_scraper",
     )
 
-    # Phase 2b: validate optional pre-foreclosure document-type selection against
-    # the capability registry (single source of truth). None = legacy/full output
-    # (no validation needed). A non-empty list is only valid for pre_foreclosure
-    # and must be available for this county; [] is rejected. Validation lives here
-    # in the route (not in Pydantic) so scraper code isn't imported into schemas.
+    # None = legacy/full output (no validation needed).
     if body.doc_types is not None:
-        from src.scrapers.doc_types import validate_selection
-        if body.record_type != "pre_foreclosure":
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="doc_types is only valid for the pre_foreclosure record type",
-            )
-        ok, err = validate_selection(body.county, body.state, body.doc_types)
-        if not ok:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=err)
+        _validate_doc_types(body.county, body.state, body.record_type, body.doc_types)
 
-    # Business+ feature gating. Phase 5: the dialer push is a second outbound
-    # destination that POSTs lead PII, so it carries the SAME entitlement as the
-    # job-summary webhook — gate both, or a lower plan could exfiltrate PII via
-    # dialer_webhook_url (Codex).
-    if (
-        body.deliver.webhook_url or body.deliver.dialer_webhook_url
-    ) and current_user.plan not in BUSINESS_FEATURES_PLANS:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail="Webhook delivery requires a Business or Agency plan",
-        )
-    if body.enrichment.skip_tracing and current_user.plan not in BUSINESS_FEATURES_PLANS:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail="Skip tracing enrichment requires a Business or Agency plan",
-        )
-
-    # Sprint 4: new dedicated skip_trace_enabled flag (metered add-on).
-    # Available on Pro/Business/Agency. Starter gets 402 with upsell text.
-    if body.skip_trace_enabled and (current_user.plan or "starter").lower() not in SKIP_TRACE_ADDON_PLANS:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=(
-                "Skip trace ($0.08/lookup) requires a Pro plan or higher. "
-                "Upgrade to Pro to unlock phone + email lookups."
-            ),
-        )
+    _enforce_plan_feature_gates(
+        current_user,
+        # A native dialer connector (dialer_type, e.g. phoneburner) pushes lead PII
+        # even without a dialer_webhook_url, so it is gated like the webhooks (Codex)
+        # — otherwise a non-Business user could save a config the worker then refuses
+        # to run.
+        has_webhook=bool(
+            body.deliver.webhook_url
+            or body.deliver.dialer_webhook_url
+            or body.deliver.dialer_type
+        ),
+        skip_tracing=body.enrichment.skip_tracing,
+        skip_trace_enabled=body.skip_trace_enabled,
+    )
 
     schedule = body.schedule.model_dump()
     if not active:
@@ -337,6 +388,293 @@ async def delete_scraper(
         request, "scraper_deleted", current_user.id,
         f"config_id={config.id} county={config.county}/{config.state}",
     )
+
+
+def _is_secret_placeholder(value: str) -> bool:
+    """A value made up only of asterisks is a redaction placeholder echoed back
+    from a UI, not a real secret. Treat it as 'keep stored' so a PATCH never
+    persists '******' over a real secret (Codex)."""
+    s = value.strip()
+    return bool(s) and set(s) == {"*"}
+
+
+def _merge_deliver(stored: dict, update) -> DeliverConfig:
+    """Build the effective delivery config for an edit.
+
+    Write-only secrets (webhook_secret / dialer_webhook_secret /
+    phoneburner_access_token) are PRESERVED when the client leaves them blank
+    (omitted / null / blank / a '****' placeholder) and REPLACED only when a real
+    new value arrives. Non-secret fields fully replace. When a destination URL (or
+    the PhoneBurner dialer) is removed, its now-orphaned secret is dropped so it
+    can't be silently reused if the destination is re-added later (Codex).
+
+    The merged dict is run through a full DeliverConfig so EVERY delivery validator
+    (URL scheme, secret length, dialer allowlist, require-connector-credentials)
+    fires on the result — we never model_dump() a None over a stored secret.
+    """
+    from pydantic import ValidationError
+
+    merged = update.model_dump()
+    for secret in DELIVER_SECRET_FIELDS:
+        new_val = merged.get(secret)
+        if not (isinstance(new_val, str) and new_val.strip()) or _is_secret_placeholder(new_val):
+            merged[secret] = stored.get(secret)  # keep stored
+    # Drop orphaned secrets when their destination is gone.
+    if not merged.get("webhook_url"):
+        merged["webhook_secret"] = None
+    if not merged.get("dialer_webhook_url"):
+        merged["dialer_webhook_secret"] = None
+    if merged.get("dialer_type") != "phoneburner":
+        merged["phoneburner_access_token"] = None
+        merged["phoneburner_owner_id"] = None
+    try:
+        return DeliverConfig(**merged)
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"deliver: {first.get('msg', 'invalid delivery config')}",
+        )
+
+
+@router.patch("/{scraper_id}", response_model=ScraperConfigResponse)
+async def update_scraper(
+    scraper_id: str,
+    body: ScraperConfigUpdate,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_rls_db),
+) -> ScraperConfigResponse:
+    """Edit an existing scraper config in place (PATCH). Keeps the config id, so
+    job history and a since_last_run cursor survive — unlike delete+recreate,
+    which orphans history and resets the cursor.
+
+    Editable: name, fields, enrichment, schedule, deliver, skip_trace_enabled,
+    doc_types. Identity (county/state/record_type) is immutable. Each PROVIDED
+    top-level field FULLY REPLACES the stored value (sub-objects are not
+    deep-merged — the edit wizard pre-fills the complete object); an OMITTED field
+    is kept. Blank delivery secrets are kept (see _merge_deliver).
+    """
+    from src.db.models import Job
+
+    # 1. Identity is immutable. county/state/record_type exist on the model only so
+    #    we can reject an attempt to change them with a clear 422 rather than
+    #    silently ignoring it (Codex P2). model_fields_set so an explicit null trips
+    #    it too.
+    locked = {"county", "state", "record_type"} & body.model_fields_set
+    if locked:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Cannot change identity field(s): "
+                f"{', '.join(sorted(locked))}. County, state, and record_type are "
+                "fixed for a scraper — create a new one instead."
+            ),
+        )
+
+    # 1b. Reject an explicit null on a non-nullable editable field (Codex P2). These
+    #     fields have no "unset" state — omit them to keep the stored value. Silently
+    #     treating null like omission would contradict the provided-vs-omitted
+    #     contract and mislead generated clients. (doc_types is genuinely nullable —
+    #     null there means "legacy/full output" — so it is intentionally excluded.)
+    explicit_nulls = sorted(
+        f
+        for f in ("name", "fields", "enrichment", "schedule", "deliver", "skip_trace_enabled")
+        if f in body.model_fields_set and getattr(body, f) is None
+    )
+    if explicit_nulls:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Field(s) cannot be null: {', '.join(explicit_nulls)}. Omit them to keep the current value.",
+        )
+
+    # 2. Load the OWNED, ACTIVE config. FOR UPDATE serializes concurrent edits on
+    #    the same row (belt for the updated_at token below). Soft-deleted configs
+    #    are not editable (active filter → 404). RLS is the belt, user_id the
+    #    suspenders.
+    config = (
+        await db.execute(
+            select(ScraperConfig)
+            .where(
+                ScraperConfig.id == scraper_id,
+                ScraperConfig.user_id == current_user.id,
+                ScraperConfig.active,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if config is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
+
+    # 2b. Batch children are owned by their parent batch, which suppresses their
+    #     schedule + delivery (Codex P1). Editing one directly would let a user set
+    #     a recurring schedule on a child (so the beat fires it independently of the
+    #     batch) or drift its fields/enrichment from siblings. Reject — batch config
+    #     is edited at the batch level, not here.
+    if config.batch_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This scraper belongs to a batch; edit it from its batch, not individually.",
+        )
+
+    # 3. Optimistic concurrency (Codex P1): the client echoes verbatim the
+    #    updated_at it read from GET; 409 unless it still EXACTLY equals the stored
+    #    token (compared as the same UTC instant, full microsecond precision). No
+    #    precision is discarded, so two commits in the same millisecond can't false-
+    #    match — the contract is "send back the exact string GET returned". (A true
+    #    version counter would be even stronger but needs a migration; deferred.)
+    stored_ts = config.updated_at
+    client_ts = body.updated_at
+    if stored_ts.tzinfo is None:
+        stored_ts = stored_ts.replace(tzinfo=UTC)
+    if client_ts.tzinfo is None:
+        client_ts = client_ts.replace(tzinfo=UTC)
+    if stored_ts != client_ts:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This scraper was changed elsewhere. Reload and re-apply your edits.",
+        )
+
+    # 4. In-flight guard (Codex P1): the worker re-reads the config at runtime, so
+    #    editing while a job is active would corrupt that job's fields/deliver/
+    #    enrichment output. Block until it finishes or is cancelled.
+    #
+    #    Start/edit race: the FOR UPDATE lock above (held until this txn commits)
+    #    closes it for same-DB job creation. Every execution path inserts a `jobs`
+    #    row that FK-references this config, and a child INSERT takes a FOR KEY SHARE
+    #    lock on the parent row — which CONFLICTS with our FOR UPDATE. So a job can't
+    #    be created mid-edit: a concurrent insert blocks until we commit (then it
+    #    reads the NEW config), and a job created first is seen by the check below
+    #    (→ 409). The plan's durable fix (snapshot the execution config onto the Job
+    #    at creation) is still worthwhile for cross-cutting safety but is not needed
+    #    to make THIS endpoint correct. Batch children (which the dispatcher inserts)
+    #    are rejected at step 2b.
+    active_job = (
+        await db.execute(
+            select(Job.id)
+            .where(
+                Job.scraper_config_id == scraper_id,
+                Job.user_id == current_user.id,
+                Job.status.in_(ACTIVE_STATUSES),
+            )
+            .limit(1)
+        )
+    ).first()
+    if active_job is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Cannot edit while a job is running for this scraper. "
+                "Wait for it to finish or cancel it, then try again."
+            ),
+        )
+
+    fields_set = body.model_fields_set
+    stored_deliver = dict(config.deliver or {})
+
+    # 5. Resolve effective values: a provided field replaces, an omitted one keeps
+    #    the stored value. Sub-objects are replace-whole (validated at the request
+    #    boundary); deliver is merged so blank secrets survive.
+    if "name" in fields_set:
+        if not (body.name and body.name.strip()):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="name cannot be empty",
+            )
+        eff_name = body.name.strip()
+    else:
+        eff_name = config.name
+
+    eff_fields = body.fields.model_dump() if body.fields is not None else config.fields
+    eff_enrichment = body.enrichment.model_dump() if body.enrichment is not None else config.enrichment
+    eff_schedule = body.schedule.model_dump() if body.schedule is not None else config.schedule
+    eff_skip_trace = (
+        bool(body.skip_trace_enabled)
+        if ("skip_trace_enabled" in fields_set and body.skip_trace_enabled is not None)
+        else bool(config.skip_trace_enabled)
+    )
+    eff_doc_types = body.doc_types if ("doc_types" in fields_set) else config.doc_types
+
+    if "deliver" in fields_set and body.deliver is not None:
+        eff_deliver = _merge_deliver(stored_deliver, body.deliver).model_dump()
+    else:
+        eff_deliver = stored_deliver
+
+    # 6. Re-validate the doc-type selection only when it actually changes — the
+    #    connector/record_type are immutable and were validated at create, so
+    #    re-checking them would falsely 422 an unrelated edit if the connector was
+    #    later deactivated (Codex).
+    if "doc_types" in fields_set and eff_doc_types is not None:
+        _validate_doc_types(config.county, config.state, config.record_type, eff_doc_types)
+
+    # 7. Plan/tier gates on the ENABLE-DELTA only: block a PATCH that newly turns
+    #    on a gated feature (so a downgraded user can't bypass tiers), but
+    #    grandfather a feature that was already on (so they can still rename, etc.).
+    stored_enrichment = config.enrichment if isinstance(config.enrichment, dict) else {}
+    eff_enrichment_dict = eff_enrichment if isinstance(eff_enrichment, dict) else {}
+    # Gate each outbound destination SEPARATELY (Codex P2): the webhook, the dialer
+    # webhook, and a native dialer connector (e.g. phoneburner) each independently
+    # send lead PII, so a downgraded user who already has one on must still be gated
+    # when ADDING another — collapsing them into one boolean would let the new one
+    # slip through and save a Business-only config the worker then refuses to run.
+    webhook_added = bool(eff_deliver.get("webhook_url")) and not bool(stored_deliver.get("webhook_url"))
+    dialer_url_added = bool(eff_deliver.get("dialer_webhook_url")) and not bool(stored_deliver.get("dialer_webhook_url"))
+    dialer_native_added = bool(eff_deliver.get("dialer_type")) and not bool(stored_deliver.get("dialer_type"))
+    _enforce_plan_feature_gates(
+        current_user,
+        has_webhook=webhook_added or dialer_url_added or dialer_native_added,
+        skip_tracing=bool(eff_enrichment_dict.get("skip_tracing")) and not bool(stored_enrichment.get("skip_tracing")),
+        skip_trace_enabled=eff_skip_trace and not bool(config.skip_trace_enabled),
+    )
+
+    # 8. Detect the changed fields (full value compare, incl. secret values so a
+    #    secret-only replace still counts). A no-op PATCH must not bump the
+    #    concurrency token or emit an audit record (Codex).
+    changed_fields: list[str] = []
+    if eff_name != config.name:
+        changed_fields.append("name")
+    if eff_fields != config.fields:
+        changed_fields.append("fields")
+    if eff_enrichment != config.enrichment:
+        changed_fields.append("enrichment")
+    if eff_schedule != config.schedule:
+        changed_fields.append("schedule")
+    if eff_deliver != stored_deliver:
+        changed_fields.append("deliver")
+    if eff_skip_trace != bool(config.skip_trace_enabled):
+        changed_fields.append("skip_trace_enabled")
+    if eff_doc_types != config.doc_types:
+        changed_fields.append("doc_types")
+
+    if not changed_fields:
+        return ScraperConfigResponse.model_validate(config)
+
+    # Build the audit detail BEFORE mutating: changed field names, plus old/new for
+    # the small non-secret scalars. Dict fields (fields/enrichment/schedule/deliver)
+    # are logged by name only — deliver carries write-only secrets that must never
+    # be logged (Codex), and the others are verbose booleans/dates.
+    audit_bits = [f"config_id={config.id}", "changed=" + ",".join(sorted(changed_fields))]
+    if "name" in changed_fields:
+        audit_bits.append(f"name={config.name!r}->{eff_name!r}")
+    if "skip_trace_enabled" in changed_fields:
+        audit_bits.append(f"skip_trace_enabled={bool(config.skip_trace_enabled)}->{eff_skip_trace}")
+    if "doc_types" in changed_fields:
+        audit_bits.append(f"doc_types={config.doc_types}->{eff_doc_types}")
+    audit_detail = " ".join(audit_bits)
+
+    # 9. Apply, flush, refresh (so the response carries the new updated_at token).
+    config.name = eff_name
+    config.fields = eff_fields
+    config.enrichment = eff_enrichment
+    config.schedule = eff_schedule
+    config.deliver = eff_deliver
+    config.skip_trace_enabled = eff_skip_trace
+    config.doc_types = eff_doc_types
+    await db.flush()
+    await db.refresh(config)
+
+    audit_log(request, "scraper_updated", current_user.id, audit_detail)
+    return ScraperConfigResponse.model_validate(config)
 
 
 # ─── Admin: County connector management ──────────────────────────────────────

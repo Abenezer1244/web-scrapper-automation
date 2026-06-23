@@ -1035,6 +1035,13 @@ class ConnectorResponse(BaseModel):
     # registry), present only for counties that support selection. Populated by
     # the /connectors handler, not the ORM. None = no selector (legacy/hidden).
     pre_foreclosure_doc_types: dict[str, Any] | None = None
+    # SHOW (read-only): what document types / dataset this connector collects, per
+    # record type, for the wizard's "documents collected" display. Shape per record
+    # type: {kind: "document_type"|"dataset", items: [{label, exact}], note}.
+    # Populated by the /connectors handler from each scraper's collection_scope().
+    # None when no record type declares a scope. Distinct from the SELECT-capability
+    # field pre_foreclosure_doc_types above.
+    collection_scope_by_record_type: dict[str, Any] | None = None
 
     model_config = {"from_attributes": True}
 

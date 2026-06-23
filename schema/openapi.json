@@ -755,6 +755,18 @@
             "title": "Base Url",
             "type": "string"
           },
+          "collection_scope_by_record_type": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collection Scope By Record Type"
+          },
           "county": {
             "title": "County",
             "type": "string"

@@ -29,6 +29,7 @@ Design guards (pressure-tested with Codex):
 from __future__ import annotations
 
 import re
+from enum import Enum
 
 # --- Filing-agency / issuing-authority detection -------------------------------
 
@@ -271,3 +272,116 @@ def orient_probate_party(
         party, heirs = (g or None), (e or None)
 
     return (strip_estate_caption(party), heirs)
+
+
+# --- Probate signal classification (lead-subtype labeling) ----------------------
+#
+# The live verification (2026-06-23) found ~47% of "probate" leads were actually
+# Transfer-on-Death deeds CREATED by a LIVING owner — a softer estate-planning
+# signal, NOT a death/inheritance event. Selling those as "probate (deceased
+# owner)" is a mislabel. This classifier sorts each document into an honest
+# subtype so the pipeline can tag every probate lead (and optionally let the
+# customer include/exclude the living-owner TOD bucket). It NEVER drops on its own
+# — it labels; callers decide what to keep.
+
+
+class ProbateSignal(str, Enum):
+    """Honest subtype of a probate-record-type document.
+
+    ``str`` mixin so ``.value`` is the stable slug the pipeline stores in
+    ``enrichment_data["lead_subtype"]`` and exports as a CSV column.
+    """
+
+    DEATH_INHERITANCE = "probate_death_inheritance"          # real death / inheritance
+    TOD_LIVING_OWNER = "tod_living_owner_estate_planning"    # LIVING owner TOD planning
+    NONPROBATE_TRANSFER = "nonprobate_transfer"              # Lack-of-Probate affidavit
+    UNKNOWN = "unknown_probate"                              # no confident signal
+
+
+# A Transfer-on-Death instrument by any of the names recorders use. "DEATH DEED"
+# is the colloquial TOD label some portals emit (Codex: don't require the exact
+# "TRANSFER ON DEATH" phrase). \bTOD\b is word-anchored so it never fires inside a
+# surname like "TODD".
+_TOD_DOC_RE = re.compile(
+    r"TRANSFER\s+ON\s+DEATH|\bTOD\b|\bDEATH\s+DEED\b", re.IGNORECASE
+)
+
+# Markers that PROVE a death / inheritance / post-death effectuation. When ANY of
+# these is present the document is a real lead even if it also names a TOD (a
+# death-triggered TOD effectuation: "Affidavit to Perfect TOD", "Death Cert to
+# Perfect Death Deed", "TOD Beneficiary Affidavit"). Phrase-anchored so no bare
+# ambiguous token promotes a living-owner deed.
+_DEATH_MARKER_RE = re.compile(
+    r"DEATH\s+CERT|CERTIFICATE\s+OF\s+DEATH|\bDECEASED\b|\bDECEDENT\b"
+    r"|AFFIDAVIT\s+OF\s+DEATH|DEATH\s+OF\s+(?:TRANSFEROR|GRANTOR|OWNER)"
+    r"|PROOF\s+OF\s+DEATH|EVIDENCE\s+OF\s+DEATH|TRANSFEROR\s+DECEASED"
+    r"|\bPERFECT|\bEFFECTUAT"
+    r"|LETTERS\s+TESTAMENTARY|LETTERS\s+OF\s+ADMINISTRATION|\bTESTAMENTARY\b"
+    r"|PERSONAL\s+REPRESENTATIVE|PERSONAL\s+REP\b"
+    r"|ADMINISTRAT(?:OR|RIX)|EXEC(?:UTOR|UTRIX)"
+    r"|AFFIDAVIT\s+OF\s+(?:HEIRSHIP|SUCCESSOR)|\bHEIRSHIP\b"
+    r"|BENEFICIARY\s+AFFIDAVIT|DECREE\s+OF\s+DISTRIBUTION|ESTATE\s+OF",
+    re.IGNORECASE,
+)
+
+_LACK_OF_PROBATE_RE = re.compile(r"LACK\s+OF\s+PROBATE", re.IGNORECASE)
+_BARE_PROBATE_RE = re.compile(r"\bPROBATE\b", re.IGNORECASE)
+
+
+def _normalize_doc_type(doc_type: str) -> str:
+    """Take the document label before any concatenated recording number.
+
+    Live recorder strings append the recording id after a newline
+    ("Transfer on Death Deed\\n2026-1482913"); keep only the label, uppercased and
+    whitespace-collapsed, so the matchers see a clean type.
+    """
+    head = doc_type.split("\n", 1)[0]
+    return re.sub(r"\s+", " ", head).strip().upper()
+
+
+def classify_probate_signal(doc_type: str | None) -> ProbateSignal:
+    """Sort a probate document-type string into an honest ``ProbateSignal``.
+
+    Order matters:
+      1. Lack-of-Probate affidavit -> NONPROBATE_TRANSFER (checked before the bare
+         "PROBATE" rule, which its text would otherwise trip).
+      2. A TOD instrument WITH a death/effectuation marker -> DEATH_INHERITANCE
+         (death-triggered TOD); WITHOUT one -> TOD_LIVING_OWNER (living owner).
+      3. Any other death/probate marker -> DEATH_INHERITANCE.
+      4. A bare "PROBATE" label (e.g. Pierce ARMS) -> DEATH_INHERITANCE.
+      5. Anything else (e.g. Community Property Agreement) -> UNKNOWN — labeled
+         honestly, never faked into a death.
+
+    Pure function: classifies only, never drops. Callers gate on the result.
+    """
+    if not doc_type or not doc_type.strip():
+        return ProbateSignal.UNKNOWN
+
+    up = _normalize_doc_type(doc_type)
+
+    if _LACK_OF_PROBATE_RE.search(up):
+        return ProbateSignal.NONPROBATE_TRANSFER
+
+    has_death = bool(_DEATH_MARKER_RE.search(up))
+
+    if _TOD_DOC_RE.search(up):
+        return ProbateSignal.DEATH_INHERITANCE if has_death else ProbateSignal.TOD_LIVING_OWNER
+
+    if has_death:
+        return ProbateSignal.DEATH_INHERITANCE
+
+    if _BARE_PROBATE_RE.search(up):
+        return ProbateSignal.DEATH_INHERITANCE
+
+    return ProbateSignal.UNKNOWN
+
+
+def is_living_owner_tod(doc_type: str | None) -> bool:
+    """True if ``doc_type`` is a LIVING-owner Transfer-on-Death planning doc.
+
+    Convenience predicate over :func:`classify_probate_signal` for the connector
+    filter: these are the rows excluded from probate unless the customer opts into
+    the estate-planning signal. Death-triggered TOD effectuations return False
+    (they are real ``DEATH_INHERITANCE`` leads).
+    """
+    return classify_probate_signal(doc_type) is ProbateSignal.TOD_LIVING_OWNER

@@ -1,0 +1,140 @@
+"""Tests for classify_probate_signal — the probate lead-subtype classifier.
+
+Pure-function tests (no DB, no network). Verifies that a recorder/court document
+type string is sorted into the correct probate signal bucket so the pipeline can
+label every probate lead honestly:
+
+  - probate_death_inheritance     -> a real death/inheritance event (the clean lead)
+  - tod_living_owner_estate_planning -> a LIVING owner's Transfer-on-Death planning
+                                        doc (a softer signal, must never be sold as
+                                        a death)
+  - nonprobate_transfer           -> Lack-of-Probate affidavit (deceased-owner title
+                                        clearing without formal probate)
+  - unknown_probate               -> no confident signal (e.g. Community Property
+                                        Agreement) — honestly labeled, not faked
+
+Strings below are REAL doc_type values observed in the 2026-06-23 live verification
+(some carry a "\\n<recording#>" suffix the classifier must normalize away), plus the
+Codex-supplied edge cases (revocation/amendment of a TOD, death-triggered TOD
+effectuations).
+"""
+
+from src.scrapers.probate import ProbateSignal, classify_probate_signal
+
+
+# --- Living-owner TOD creation/admin -> tod_living_owner_estate_planning ----------
+def test_plain_tod_deed_is_living_owner():
+    assert classify_probate_signal("Transfer on Death Deed") is ProbateSignal.TOD_LIVING_OWNER
+
+
+def test_uppercase_tod_deed_is_living_owner():
+    assert classify_probate_signal("TRANSFER ON DEATH DEED") is ProbateSignal.TOD_LIVING_OWNER
+
+
+def test_revocable_tod_is_living_owner():
+    # A revocable TOD is still a creation by a living owner.
+    assert classify_probate_signal("Revocable Transfer on Death Deed") is ProbateSignal.TOD_LIVING_OWNER
+
+
+def test_revocation_of_tod_is_living_owner():
+    # Revoking a TOD is living-owner estate-planning admin, not a death.
+    assert classify_probate_signal("Revocation of Transfer on Death Deed") is ProbateSignal.TOD_LIVING_OWNER
+
+
+def test_amendment_of_tod_is_living_owner():
+    assert classify_probate_signal("Amendment of Transfer on Death Deed") is ProbateSignal.TOD_LIVING_OWNER
+
+
+def test_bare_tod_abbreviation_is_living_owner():
+    assert classify_probate_signal("TOD") is ProbateSignal.TOD_LIVING_OWNER
+
+
+def test_tod_with_recording_number_suffix_normalized():
+    # Live strings concatenate the recording number after a newline.
+    assert classify_probate_signal("Transfer on Death Deed\n2026-1482913") is ProbateSignal.TOD_LIVING_OWNER
+
+
+# --- Death-TRIGGERED TOD effectuation -> probate_death_inheritance (KEEP) ---------
+def test_death_cert_to_perfect_death_deed_is_death():
+    # cowlitz live string — a death actually happened; this is a real lead.
+    assert classify_probate_signal("Death Certificate to Perfect Death Deed") is ProbateSignal.DEATH_INHERITANCE
+
+
+def test_affidavit_to_perfect_tod_is_death():
+    assert classify_probate_signal("Affidavit to Perfect Transfer on Death Deed") is ProbateSignal.DEATH_INHERITANCE
+
+
+def test_tod_beneficiary_affidavit_is_death():
+    assert classify_probate_signal("Transfer on Death Deed Beneficiary Affidavit") is ProbateSignal.DEATH_INHERITANCE
+
+
+def test_affidavit_of_death_of_transferor_is_death():
+    assert classify_probate_signal("Affidavit of Death of Transferor") is ProbateSignal.DEATH_INHERITANCE
+
+
+# --- Genuine death / probate docs -> probate_death_inheritance --------------------
+def test_death_certificate_is_death():
+    assert classify_probate_signal("DEATH CERTIFICATE") is ProbateSignal.DEATH_INHERITANCE
+
+
+def test_certificate_of_death_is_death():
+    assert classify_probate_signal("Certificate Of Death\n4600099") is ProbateSignal.DEATH_INHERITANCE
+
+
+def test_letters_testamentary_is_death():
+    assert classify_probate_signal("Letters Testamentary") is ProbateSignal.DEATH_INHERITANCE
+
+
+def test_letters_of_administration_is_death():
+    assert classify_probate_signal("Letters of Administration") is ProbateSignal.DEATH_INHERITANCE
+
+
+def test_personal_representative_deed_is_death():
+    assert classify_probate_signal("Personal Representative Deed\n4599799") is ProbateSignal.DEATH_INHERITANCE
+
+
+def test_administrators_deed_is_death():
+    assert classify_probate_signal("Administrator's Deed") is ProbateSignal.DEATH_INHERITANCE
+
+
+def test_affidavit_of_heirship_is_death():
+    assert classify_probate_signal("Affidavit of Heirship") is ProbateSignal.DEATH_INHERITANCE
+
+
+def test_bare_probate_is_death():
+    # Pierce ARMS emits a generic "PROBATE" doc_type; live data shows real
+    # estate/heir parties with parcels behind it.
+    assert classify_probate_signal("PROBATE") is ProbateSignal.DEATH_INHERITANCE
+
+
+# --- Lack of Probate affidavit -> nonprobate_transfer ----------------------------
+def test_lack_of_probate_affidavit_is_nonprobate_transfer():
+    assert classify_probate_signal("LACK OF PROBATE AFFIDAVIT") is ProbateSignal.NONPROBATE_TRANSFER
+
+
+def test_affidavit_lack_of_probate_is_nonprobate_transfer():
+    assert classify_probate_signal("Affidavit Lack of Probate") is ProbateSignal.NONPROBATE_TRANSFER
+
+
+# --- Unknown / out-of-scope -> unknown_probate (honest, not faked) ---------------
+def test_community_property_agreement_is_unknown():
+    # Living spouses' estate planning — deferred to a follow-up; must NOT be labeled
+    # a death, but also not silently treated as TOD. Honest "unknown".
+    assert classify_probate_signal("Community Property Agreement") is ProbateSignal.UNKNOWN
+
+
+def test_empty_is_unknown():
+    assert classify_probate_signal("") is ProbateSignal.UNKNOWN
+    assert classify_probate_signal(None) is ProbateSignal.UNKNOWN
+
+
+def test_whitespace_only_is_unknown():
+    assert classify_probate_signal("   \n  ") is ProbateSignal.UNKNOWN
+
+
+# --- Subtype values are the stable strings the pipeline exports -------------------
+def test_signal_values_are_stable_strings():
+    assert ProbateSignal.DEATH_INHERITANCE.value == "probate_death_inheritance"
+    assert ProbateSignal.TOD_LIVING_OWNER.value == "tod_living_owner_estate_planning"
+    assert ProbateSignal.NONPROBATE_TRANSFER.value == "nonprobate_transfer"
+    assert ProbateSignal.UNKNOWN.value == "unknown_probate"

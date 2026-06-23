@@ -66,6 +66,7 @@ WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
            r.mailing_address, r.phone, r.phone_type, r.email,
            r.property_key, r.is_duplicate,
+           r.enrichment_data->>'lead_subtype' AS lead_subtype,
            sc.record_type, sc.county, j.created_at AS job_created_at,
            COALESCE(r.property_key, r.dedup_hash, 'id:' || r.id::text) AS bucket
     FROM results r
@@ -97,7 +98,7 @@ ranked AS (
     FROM candidates c
 )
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
-       rk.mailing_address, rk.phone, rk.phone_type, rk.email,
+       rk.mailing_address, rk.phone, rk.phone_type, rk.email, rk.lead_subtype,
        a.matched_record_types, a.overlap_count, a.source_counties
 FROM ranked rk
 JOIN agg a ON a.bucket = rk.bucket

@@ -165,6 +165,14 @@ def test_whitespace_only_is_unknown():
 
 
 # --- Subtype values are the stable strings the pipeline exports -------------------
+def test_inheritance_marker_is_death():
+    # Codex P2: Skagit keeps probate rows whose comment is "INHERITANCE".
+    assert classify_probate_signal("INHERITANCE") is ProbateSignal.DEATH_INHERITANCE
+    assert classify_probate_signal_for_row(
+        "Affidavit", comment="INHERITANCE"
+    ) is ProbateSignal.DEATH_INHERITANCE
+
+
 def test_comment_fallback_when_doctype_unknown():
     # Codex P2: Skagit keeps a generic "Affidavit" row whose probate signal lives in
     # the recorder comment. doc_type alone is UNKNOWN -> the comment decides.

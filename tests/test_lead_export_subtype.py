@@ -44,6 +44,18 @@ def test_non_probate_row_subtype_is_blank():
     assert out["lead_subtype"] == ""
 
 
+def test_top_level_scalar_subtype_from_combined_export():
+    # Codex P2: combined/segment SQL exporters can't carry enrichment_data, so they
+    # SELECT lead_subtype as a top-level scalar. build_lead_export_row must read it.
+    rec = {
+        "party_name": "DOE JANE",
+        "doc_type": "Transfer on Death Deed",
+        "lead_subtype": "tod_living_owner_estate_planning",  # top-level (no enrichment_data)
+    }
+    out = build_lead_export_row(rec)
+    assert out["lead_subtype"] == "tod_living_owner_estate_planning"
+
+
 def test_row_keys_exactly_match_columns():
     # csv.DictWriter requires the row dict keys to match the declared fieldnames.
     out = build_lead_export_row(_record({"lead_subtype": "probate_death_inheritance"}))

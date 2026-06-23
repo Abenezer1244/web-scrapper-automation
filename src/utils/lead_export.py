@@ -267,8 +267,11 @@ def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, s
         "instrument_number": _enrich_str(
             enr, "instrument_number", "recording_number", "record_number"
         ),
-        # Probate honesty label (blank for non-probate; set at insert in tasks.py).
-        "lead_subtype": _enrich_str(enr, "lead_subtype"),
+        # Probate honesty label (blank for non-probate). Per-job exports read it from
+        # enrichment_data (set at insert in tasks.py); the combined/segment SQL
+        # exporters build SimpleNamespaces that don't carry enrichment_data, so they
+        # SELECT it as a top-level `lead_subtype` scalar — read whichever is present.
+        "lead_subtype": _enrich_str(enr, "lead_subtype") or sanitize_for_csv(_get(record, "lead_subtype")),
         "code_violation_type": _enrich_str(enr, "record_type", "case_type"),
         "code_violation_status": _enrich_str(enr, "status"),
         "code_violation_description": _enrich_str(enr, "description"),

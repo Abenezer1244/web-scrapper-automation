@@ -336,7 +336,12 @@ def _normalize_doc_type(doc_type: str) -> str:
     whitespace-collapsed, so the matchers see a clean type.
     """
     head = doc_type.split("\n", 1)[0]
-    return re.sub(r"\s+", " ", head).strip().upper()
+    # Treat hyphens/slashes as word separators so the phrase matchers see a canonical
+    # spaced form: "Lack-of-Probate Affidavit" -> "LACK OF PROBATE AFFIDAVIT",
+    # "Transfer-on-Death Deed" -> "TRANSFER ON DEATH DEED" (Codex P2 — hyphenated
+    # recorder labels were falling through to the bare-PROBATE rule and mislabeling
+    # Lack-of-Probate as a death/inheritance lead).
+    return re.sub(r"[\s\-/]+", " ", head).strip().upper()
 
 
 def classify_probate_signal(doc_type: str | None) -> ProbateSignal:

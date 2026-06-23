@@ -31,6 +31,11 @@ def test_uppercase_tod_deed_is_living_owner():
     assert classify_probate_signal("TRANSFER ON DEATH DEED") is ProbateSignal.TOD_LIVING_OWNER
 
 
+def test_hyphenated_transfer_on_death_is_living_owner():
+    # "Transfer-on-Death Deed" is a common recorder spelling (Codex P2 root-cause).
+    assert classify_probate_signal("Transfer-on-Death Deed") is ProbateSignal.TOD_LIVING_OWNER
+
+
 def test_revocable_tod_is_living_owner():
     # A revocable TOD is still a creation by a living owner.
     assert classify_probate_signal("Revocable Transfer on Death Deed") is ProbateSignal.TOD_LIVING_OWNER
@@ -114,6 +119,13 @@ def test_lack_of_probate_affidavit_is_nonprobate_transfer():
 
 def test_affidavit_lack_of_probate_is_nonprobate_transfer():
     assert classify_probate_signal("Affidavit Lack of Probate") is ProbateSignal.NONPROBATE_TRANSFER
+
+
+def test_hyphenated_lack_of_probate_is_nonprobate_transfer():
+    # Codex P2: recorders commonly hyphenate; the value must NOT fall through to the
+    # bare-PROBATE rule and get mislabeled as a death/inheritance lead.
+    assert classify_probate_signal("Lack-of-Probate Affidavit") is ProbateSignal.NONPROBATE_TRANSFER
+    assert classify_probate_signal("Affidavit of Lack-of-Probate") is ProbateSignal.NONPROBATE_TRANSFER
 
 
 # --- Unknown / out-of-scope -> unknown_probate (honest, not faked) ---------------

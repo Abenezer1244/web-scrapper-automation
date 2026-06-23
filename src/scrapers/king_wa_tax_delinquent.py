@@ -39,7 +39,7 @@ from decimal import Decimal
 import requests
 
 from src.api.middleware.security import add_scrape_domain
-from src.api.tax_filters import tax_cap_min_year
+from src.api.tax_filters import TAX_CAP_EXEMPT_SOURCES, tax_cap_min_year
 from src.config import settings
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.utils.logger import setup_logger
@@ -127,10 +127,36 @@ _AMOUNT_MAX = Decimal("99999999.99")
 
 _PAGE_SIZE = 5000
 
+# Structural-canary threshold: only a scan of at least this many rows that emits
+# 0 parcels is worth interrogating (a tiny scan legitimately yields nothing).
+_CANARY_MIN_ROWS = 100
+
 # Per-page fetch retries for transient Socrata failures (read timeout / 429 /
 # 5xx). Backoff seconds, indexed by attempt; jittered to desync shared-IP retries.
 _RETRY_BACKOFF = (1, 3, 7)
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+def is_parse_break(stats: dict, n_emitted: int) -> bool:
+    """True iff a 0-parcel result indicates a parse/source break, not a business empty.
+
+    Structural canary (Codex-reviewed funnel). Only meaningful when the scan
+    emitted nothing from a sizeable row set; returns False otherwise. RAISE-worthy
+    when:
+      * ``aggregated_parcels == 0`` — rows were scanned but NONE parsed into a
+        candidate parcel, i.e. every row hit a row-level gate (malformed account,
+        abatement, unknown charge type). That is schema/format drift.
+      * every candidate overflowed (``overflow == aggregated_parcels > 0``) — an
+        absurd-value wipeout that signals a unit change or corrupted parse.
+    A zero explained by DOCUMENTED business filters (all candidates net-not-owed
+    and/or past the recency cap) is legitimate and returns False — crashing on it
+    is the bug that failed every King scrape before the cap exemption.
+    """
+    if n_emitted or stats.get("total_rows", 0) < _CANARY_MIN_ROWS:
+        return False
+    aggregated = stats.get("aggregated_parcels", 0)
+    all_overflowed = aggregated > 0 and stats.get("overflow", 0) == aggregated
+    return aggregated == 0 or all_overflowed
 
 
 def _page_params(where: str, offset: int) -> dict:
@@ -212,6 +238,12 @@ def aggregate_delinquent_rows(
         "abatement_nonzero": 0,
         "unknown_type_rows": 0,
         "unknown_codes": set(),
+        # Candidate parcels formed from >=1 INCLUDED charge line (before the
+        # positive-balance / overflow / cap drops). The canary uses this to tell a
+        # true parse/source break (rows scanned but NOTHING parsed -> 0 candidates)
+        # from a legitimate business-empty (candidates existed but were filtered).
+        "aggregated_parcels": 0,
+        "net_zero_parcels": 0,  # candidate dropped: net (billed-paid) <= 0
         "overflow": 0,
         "capped_out": 0,
     }
@@ -269,12 +301,15 @@ def aggregate_delinquent_rows(
         entry["by_year_cents"][year] += owed_cents
         entry["accounts"].add(acct)
 
+    stats["aggregated_parcels"] = len(agg)
+
     records: list[ScrapedRecord] = []
     for parcel, entry in agg.items():
         # Floor at the PARCEL total (not per line) — preserves partial-payment /
         # credit math within the parcel before clamping.
         total_cents = entry["owed_cents"]
         if total_cents <= 0:
+            stats["net_zero_parcels"] += 1
             continue  # net not-owed (fully paid / credit-offset) = not a lead
         amount = (Decimal(total_cents) / 100).quantize(Decimal("0.01"))
         if amount > _AMOUNT_MAX:
@@ -427,9 +462,18 @@ class KingWATaxDelinquentScraper(BridgeScraper):
             start_year, effective_end,
         )
 
-        # Freeze "today" once (UTC, matching tax_filters.build_tax_conditions) so
-        # the 18-month cap can't drift mid-scrape.
-        cap_min_year = tax_cap_min_year(datetime.now(UTC).date())
+        # 18-month recency cap. King is EXEMPT (user decision 2026-06-23): its
+        # Socrata feed publishes only currently-unpaid receivables, so bill_year is
+        # the levy year, not a delinquency-age signal, and the feed lags ~1.5yr — a
+        # calendar cap would drop 100% of parcels. Driven by membership in
+        # TAX_CAP_EXEMPT_SOURCES so ingestion and the query-side cap (tax_filters)
+        # can never disagree. None disables the cap in aggregate_delinquent_rows.
+        # Frozen UTC (matching tax_filters.build_tax_conditions) so it can't drift
+        # mid-scrape for any non-exempt source.
+        cap_min_year = (
+            None if _SOURCE in TAX_CAP_EXEMPT_SOURCES
+            else tax_cap_min_year(datetime.now(UTC).date())
+        )
 
         records, stats = aggregate_delinquent_rows(
             self._iter_api_rows(where),
@@ -439,11 +483,12 @@ class KingWATaxDelinquentScraper(BridgeScraper):
         )
 
         _logger.info(
-            "King WA tax delinquent complete — %d rows scanned, %d parcels emitted "
-            "(%d malformed-acct skipped, %d abatement rows, %d unknown-type rows, "
-            "%d overflow, %d capped out >18mo, cap_min_year=%d)",
-            stats["total_rows"], len(records), stats["skipped_malformed_acct"],
-            stats["abatement_rows"], stats["unknown_type_rows"], stats["overflow"],
+            "King WA tax delinquent complete — %d rows scanned, %d candidate parcels, "
+            "%d emitted (%d malformed-acct skipped, %d abatement rows, %d unknown-type "
+            "rows, %d net-zero, %d overflow, %d capped out, cap_min_year=%s)",
+            stats["total_rows"], stats["aggregated_parcels"], len(records),
+            stats["skipped_malformed_acct"], stats["abatement_rows"],
+            stats["unknown_type_rows"], stats["net_zero_parcels"], stats["overflow"],
             stats["capped_out"], cap_min_year,
         )
         # Alerts (not silent): these signal a possible parse/decode/source change.
@@ -465,12 +510,27 @@ class KingWATaxDelinquentScraper(BridgeScraper):
                 "King tax delinquent: %d parcels exceeded $%s and were quarantined",
                 stats["overflow"], _AMOUNT_MAX,
             )
-        # Structural canary: a sizeable scan that yields zero parcels means the
-        # gate/parse broke or the source changed shape — fail loud, don't ship empty.
-        if stats["total_rows"] >= 100 and not records:
+        # Structural canary (see is_parse_break): a sizeable scan that emits 0
+        # parcels is a BUG only when nothing parsed into a candidate, or every
+        # candidate was an absurd overflow — both signal a parse/gate break or a
+        # source-format change. A zero from DOCUMENTED business filters (all
+        # candidates net-not-owed and/or past the recency cap) is a legitimate
+        # empty and must NOT crash the job — that false crash is exactly what
+        # failed every King scrape pre-fix, when the cap dropped 100% of parcels.
+        if is_parse_break(stats, len(records)):
             raise RuntimeError(
-                f"King tax delinquent scanned {stats['total_rows']} rows but produced "
-                f"0 parcels — likely a parse/gate bug or source-format change"
+                f"King tax delinquent scanned {stats['total_rows']} rows but "
+                f"produced {stats['aggregated_parcels']} candidate parcels "
+                f"(overflow={stats['overflow']}) — likely a parse/gate bug or "
+                f"source-format change"
+            )
+        if not records and stats["total_rows"] >= _CANARY_MIN_ROWS:
+            _logger.warning(
+                "King tax delinquent: %d rows scanned, %d candidate parcels, but 0 "
+                "emitted — all removed by business filters (net-zero=%d, capped=%d, "
+                "overflow=%d). Legitimate empty, not a parse error.",
+                stats["total_rows"], stats["aggregated_parcels"],
+                stats["net_zero_parcels"], stats["capped_out"], stats["overflow"],
             )
 
         if self.on_progress:

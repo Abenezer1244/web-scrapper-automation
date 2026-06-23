@@ -104,14 +104,14 @@ class PierceWAARMSScraper(BridgeScraper):
         cfg = self.RECORD_TYPE_CONFIG.get(record_type, self.RECORD_TYPE_CONFIG["probate"])
         self.DOC_TYPE_IDS: list[str] = cfg["ids"]
         self.DOC_TYPE_LABEL: str = cfg["label"]
-        # Phase 2b: narrow to selected canonical doc types' ARMS checkbox IDs when
-        # an explicit selection was made (None = legacy full set). Validated at
-        # config-create; empty/unmappable falls back to legacy (more, never nothing).
+        # Phase 2b/B: narrow to selected canonical doc types' ARMS checkbox IDs when
+        # an explicit selection was made (None = legacy full set). FAIL-CLOSED: an
+        # explicit selection that can't be mapped (stale config) RAISES rather than
+        # silently broadening to the full set — the user must never get types they
+        # didn't pick.
         if doc_types and record_type == "pre_foreclosure":
-            from src.scrapers.doc_types import canonical_tokens_for
-            _ids = canonical_tokens_for("pierce", "wa", doc_types)
-            if _ids:
-                self.DOC_TYPE_IDS = _ids
+            from src.scrapers.doc_types import canonical_tokens_or_raise
+            self.DOC_TYPE_IDS = canonical_tokens_or_raise("pierce", "wa", doc_types)
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         _logger.info("Pierce WA %s — scraping %s to %s", self.DOC_TYPE_LABEL, date_from, date_to)

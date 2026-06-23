@@ -186,3 +186,44 @@ def canonical_tokens_for(county: str, state: str, doc_types: list[str]) -> list:
         else:
             out.append(tok)
     return out
+
+
+def canonical_tokens_or_raise(county: str, state: str, doc_types: list[str]) -> list:
+    """Map an EXPLICIT canonical selection to the scraper's own tokens, FAIL-CLOSED.
+
+    Use this from scraper constructors when a non-None ``doc_types`` selection is
+    present. Unlike :func:`canonical_tokens_for` (which returns ``[]`` so a *legacy*
+    caller can fall back to its full set), an explicit user selection must NEVER
+    silently broaden: if the county is not selectable, the selection is empty, or any
+    selected token is unmappable (e.g. a stale config saved before a registry change),
+    raise ``ValueError`` so the job fails loud instead of scraping every document type
+    the user did NOT pick. ``doc_types is None`` means legacy/full and must not reach
+    this function.
+    """
+    a = availability_for(county, state)
+    if a is None or not a.get("supported_for_selection"):
+        raise ValueError(
+            f"{county}, {state} does not support pre-foreclosure document-type selection"
+        )
+    if not doc_types:
+        raise ValueError(
+            "explicit doc_types selection is empty (pass None for legacy/full output)"
+        )
+    tokens = a["tokens"]
+    out: list = []
+    for d in doc_types:
+        tok = tokens.get(d)
+        if tok is None:
+            raise ValueError(
+                f"document type {d!r} is not mappable for {county}, {state} "
+                f"(stale selection after a registry change?) — refusing to broaden output"
+            )
+        if isinstance(tok, list):
+            out.extend(tok)
+        else:
+            out.append(tok)
+    if not out:
+        raise ValueError(
+            f"no scraper tokens resolved for {county}, {state} selection {doc_types}"
+        )
+    return out

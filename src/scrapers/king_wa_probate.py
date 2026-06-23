@@ -140,15 +140,14 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         # cancellation/orientation guards only when actually scraping foreclosures.
         self._record_type = record_type if record_type in self.RECORD_TYPE_CONFIG else "probate"
         self.DOC_TYPE_SEARCH_TEXTS = cfg["search_texts"]
-        # Phase 2b: if an explicit pre-foreclosure doc-type selection was made,
+        # Phase 2b/B: if an explicit pre-foreclosure doc-type selection was made,
         # narrow to the chosen canonical types' search texts (registry-mapped).
-        # None = legacy (the full cfg search_texts above). Validated at config-create;
-        # an empty/unmappable result falls back to legacy (returns more, never nothing).
+        # None = legacy (the full cfg search_texts above). FAIL-CLOSED: an explicit
+        # selection that can't be mapped (stale config) RAISES rather than silently
+        # broadening to the full set — the user must never get types they didn't pick.
         if doc_types and record_type == "pre_foreclosure":
-            from src.scrapers.doc_types import canonical_tokens_for
-            _tokens = canonical_tokens_for(county, state, doc_types)
-            if _tokens:
-                self.DOC_TYPE_SEARCH_TEXTS = _tokens
+            from src.scrapers.doc_types import canonical_tokens_or_raise
+            self.DOC_TYPE_SEARCH_TEXTS = canonical_tokens_or_raise(county, state, doc_types)
         self.DOC_TYPE_LABEL = cfg["label"]
         self.GRANTOR_LABEL = cfg["grantor"]
         self.GRANTEE_LABEL = cfg["grantee"]

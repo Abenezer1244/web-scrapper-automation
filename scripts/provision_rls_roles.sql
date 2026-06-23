@@ -226,6 +226,11 @@ GRANT USAGE ON SCHEMA public TO bridgeleads_system;
 GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO bridgeleads_system;
 GRANT DELETE ON county_records TO bridgeleads_system;   -- scheduler.py:521 retention only
 GRANT DELETE ON property_list_membership TO bridgeleads_system;  -- overlap rollup retention prune
+-- tasks.py releases THIS job's cross-job dedup claims when the export upload to
+-- R2 fails (no deliverable produced) so the never-delivered, unbilled leads
+-- aren't treated as duplicates on a re-scrape. Without DELETE the cleanup would
+-- silently fail under the cutover role and orphan the claims.
+GRANT DELETE ON delivered_records TO bridgeleads_system;  -- upload-failure dedup-claim release
 -- H1: operator MFA reset (scripts/reset_user_mfa.py:92, runs via railway worker)
 -- physically DELETEs both MFA tables.
 GRANT DELETE ON mfa_backup_codes, mfa_break_glass_codes TO bridgeleads_system;

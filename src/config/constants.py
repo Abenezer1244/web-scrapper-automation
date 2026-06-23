@@ -175,6 +175,15 @@ RECORD_TYPES_BY_PLAN: dict[str, frozenset[str]] = {
 }
 
 
+# Export formats DataExporter.export() can actually produce — the single source
+# of truth shared by the DeliverConfig save-time validator (reject bad NEW
+# saves), the exporter dispatch (the runtime switch), and the worker (coerce a
+# legacy/bad persisted value to a safe default instead of failing every scrape).
+# "xlsx" is the on-disk alias of "excel"; both map to the same writer.
+SUPPORTED_EXPORT_FORMATS: frozenset[str] = frozenset({"csv", "json", "excel", "xlsx"})
+DEFAULT_EXPORT_FORMAT = "csv"
+
+
 class ScraperFrequency(str, Enum):
     """`schedule.frequency` values in ScraperConfig."""
 

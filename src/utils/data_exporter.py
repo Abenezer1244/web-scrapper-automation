@@ -19,7 +19,9 @@ import requests as _requests
 from src.api.middleware.security import sanitize_for_csv
 from src.config import settings
 from src.utils.lead_export import (
+    HIDEABLE_OUTPUT_FIELDS,
     LEAD_CSV_COLUMNS,
+    _apply_visibility,
     build_lead_export_row,
     write_lead_csv,
 )
@@ -43,7 +45,28 @@ def _r2_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {settings.R2_API_TOKEN}"}
 
 
-def _canonical_dataframe(records: list[Any]) -> pd.DataFrame:
+def _sanitize_json_value(value: Any) -> Any:
+    """Recursively CSV-sanitize every string in a JSON-serializable value.
+
+    JSON exports are a common hand-off into spreadsheet tools, so a formula
+    trigger anywhere in the tree (top-level column OR a string nested inside
+    enrichment_data / the phones-emails arrays) must be neutralized, not just
+    the top-level columns. dict keys are left untouched (export keys are
+    code-defined, never scraped); only values are walked. Non-str scalars keep
+    their native JSON type — they cannot carry a formula trigger.
+    """
+    if isinstance(value, str):
+        return sanitize_for_csv(value)
+    if isinstance(value, dict):
+        return {k: _sanitize_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json_value(v) for v in value]
+    return value
+
+
+def _canonical_dataframe(
+    records: list[Any], hidden_fields: set[str] | None = None
+) -> pd.DataFrame:
     """Build a DataFrame of canonical lead rows — the SAME columns + formatting
     (dialer split cols, normalized phones, sanitized values) as the CSV, so the
     Excel export matches the CSV exactly. No DNC footer; that lives in the email
@@ -51,9 +74,12 @@ def _canonical_dataframe(records: list[Any]) -> pd.DataFrame:
 
     One `today` for the whole frame so a large export crossing UTC midnight can't
     give two rows different freshness_days/months_delinquent (Codex review).
+
+    `hidden_fields` blanks the user-deselected hideable columns (header order is
+    unchanged), keeping Excel byte-identical to the CSV for the same config.
     """
     today = datetime.now(UTC).date()
-    rows = [build_lead_export_row(r, today) for r in records]
+    rows = [_apply_visibility(build_lead_export_row(r, today), hidden_fields) for r in records]
     return pd.DataFrame(rows, columns=LEAD_CSV_COLUMNS)
 
 
@@ -66,19 +92,25 @@ class DataExporter:
 
     # ─── Local file export ────────────────────────────────────────────────────
 
-    def to_csv(self, records: list[Any], filename: str = "export") -> Path:
+    def to_csv(
+        self, records: list[Any], filename: str = "export",
+        hidden_fields: set[str] | None = None,
+    ) -> Path:
         """Export records to the canonical dialer-ready CSV (shared builder)."""
         filepath = self._timestamped_path(filename, "csv")
         # newline="" so the csv writer doesn't emit blank lines between rows.
         with open(filepath, "w", encoding="utf-8", newline="") as f:
-            write_lead_csv(records, f)
+            write_lead_csv(records, f, hidden_fields=hidden_fields)
         _logger.info("CSV exported: %s (%d rows)", filepath.name, len(records))
         return filepath
 
-    def to_excel(self, records: list[Any], filename: str = "export") -> Path:
+    def to_excel(
+        self, records: list[Any], filename: str = "export",
+        hidden_fields: set[str] | None = None,
+    ) -> Path:
         """Export records to an Excel file (canonical columns) with amber header."""
         filepath = self._timestamped_path(filename, "xlsx")
-        df = _canonical_dataframe(records)
+        df = _canonical_dataframe(records, hidden_fields)
 
         with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Leads")
@@ -101,21 +133,37 @@ class DataExporter:
         _logger.info("Excel exported: %s (%d rows)", filepath.name, len(df))
         return filepath
 
-    def to_json(self, records: list[dict[str, Any]], filename: str = "export") -> Path:
-        """Export records to JSON (orient=records) with sanitization."""
+    def to_json(
+        self, records: list[dict[str, Any]], filename: str = "export",
+        hidden_fields: set[str] | None = None,
+    ) -> Path:
+        """Export records to JSON (orient=records) with sanitization.
+
+        `hidden_fields` blanks the user-deselected hideable keys (same set the CSV
+        suppresses), keeping every export format consistent for one config.
+        """
         filepath = self._timestamped_path(filename, "json")
+        # Only ever blank a genuinely hideable key (never an identity column).
+        blank_keys = (hidden_fields or set()) & HIDEABLE_OUTPUT_FIELDS
         # Sanitize string values before export
         sanitized = []
         for row in records:
             clean_row = {}
             for k, v in row.items():
+                if k in blank_keys:
+                    clean_row[k] = ""
+                    continue
                 # E4: sanitize EVERY string value, not just truthy ones — the
                 # old `and v` skipped "" and the leading-quote/embedded-tab
                 # bypass passed straight through. JSON is a common hand-off
                 # into spreadsheet tools, so the same neutralization applies.
-                # Non-str values (numbers/bools/None) keep their native JSON
-                # type — they cannot carry a formula trigger.
-                clean_row[k] = sanitize_for_csv(v) if isinstance(v, str) else v
+                # Sanitize RECURSIVELY: top-level-only sanitization let scraped
+                # free-text inside nested objects (e.g. enrichment_data, the
+                # phones/emails arrays) reach the file raw, so a formula-trigger
+                # string survived in the delivered JSON (Codex). Non-str scalars
+                # (numbers/bools/None) keep their native JSON type — they cannot
+                # carry a formula trigger.
+                clean_row[k] = _sanitize_json_value(v)
             sanitized.append(clean_row)
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(sanitized, f, ensure_ascii=False, indent=2, default=str)
@@ -127,16 +175,27 @@ class DataExporter:
         records: list[dict[str, Any]],
         filename: str = "export",
         fmt: str | None = None,
+        hidden_fields: set[str] | None = None,
     ) -> Path:
-        """Export to the given format. Single entry point for all callers."""
+        """Export to the given format. Single entry point for all callers.
+
+        `hidden_fields` (from `resolve_hidden_output_fields(config.fields)`) is
+        forwarded to every format so the delivered file honors the user's output
+        visibility selection identically across csv/json/excel.
+        """
+        from src.config.constants import SUPPORTED_EXPORT_FORMATS
         fmt = (fmt or settings.EXPORT_FORMAT).lower()
+        # Guard against drift: the accepted set is the shared
+        # SUPPORTED_EXPORT_FORMATS constant (same one the schema validator +
+        # worker use), so adding a format is a one-line constant change.
+        if fmt not in SUPPORTED_EXPORT_FORMATS:
+            raise ValueError(f"Unsupported export format: {fmt}")
         if fmt == "csv":
-            return self.to_csv(records, filename)
+            return self.to_csv(records, filename, hidden_fields=hidden_fields)
         if fmt == "json":
-            return self.to_json(records, filename)
-        if fmt in ("excel", "xlsx"):
-            return self.to_excel(records, filename)
-        raise ValueError(f"Unsupported export format: {fmt}")
+            return self.to_json(records, filename, hidden_fields=hidden_fields)
+        # excel | xlsx
+        return self.to_excel(records, filename, hidden_fields=hidden_fields)
 
     # ─── R2 upload ────────────────────────────────────────────────────────────
 

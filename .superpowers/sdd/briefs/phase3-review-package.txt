@@ -1,0 +1,390 @@
+=== PHASE 3 COMMITS e9cd3a6..HEAD ===
+cf73876 feat(entitlements): guard scheduler + batch fan-out + API-key use, audit mode (Phase 3)
+6025fd9 feat(entitlements): worker job-start backstop + webhook plan recheck, audit mode (Phase 3)
+d19a3d2 feat(entitlements): guard POST /jobs at execution time, audit mode (Phase 3)
+2b27e80 feat(db): migration 070 — scraper_configs.paused_reason (Phase 5 Task 10, pulled forward)
+
+=== DIFF --stat ===
+ .../versions/070_scraper_config_paused_reason.py   | 24 +++++++++++++++++++
+ src/api/auth.py                                    | 17 +++++++++++++
+ src/api/entitlements.py                            | 28 ++++++++++++++++++++++
+ src/api/routes/jobs.py                             | 16 +++++++++++++
+ src/db/models.py                                   |  4 ++++
+ src/workers/batch_tasks.py                         | 19 +++++++++++++++
+ src/workers/scheduler_helpers/dispatch.py          | 17 +++++++++++++
+ src/workers/tasks.py                               | 26 +++++++++++++++++++-
+ tests/test_api_key_plan_guard.py                   |  9 +++++++
+ tests/test_jobs_entitlement_guard.py               | 10 ++++++++
+ 10 files changed, 169 insertions(+), 1 deletion(-)
+
+=== FULL DIFF -U8 ===
+diff --git a/alembic/versions/070_scraper_config_paused_reason.py b/alembic/versions/070_scraper_config_paused_reason.py
+new file mode 100644
+index 0000000..a5fabe1
+--- /dev/null
++++ b/alembic/versions/070_scraper_config_paused_reason.py
+@@ -0,0 +1,24 @@
++"""scraper_configs.paused_reason for entitlement reconciliation (070)
++
++Nullable marker distinguishing system-paused (downgrade reconciliation) configs
++from user-paused ones, so re-upgrade revives only what entitlement enforcement
++paused. Additive; existing rows default NULL (no backfill).
++"""
++import sqlalchemy as sa
++from alembic import op
++
++revision = "070"
++down_revision = "069"
++branch_labels = None
++depends_on = None
++
++
++def upgrade() -> None:
++    op.add_column(
++        "scraper_configs",
++        sa.Column("paused_reason", sa.String(length=32), nullable=True),
++    )
++
++
++def downgrade() -> None:
++    op.drop_column("scraper_configs", "paused_reason")
+diff --git a/src/api/auth.py b/src/api/auth.py
+index 4c71e50..0043499 100644
+--- a/src/api/auth.py
++++ b/src/api/auth.py
+@@ -13,16 +13,19 @@ from fastapi import Depends, HTTPException, status
+ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+ from jwt.exceptions import InvalidTokenError as JWTError
+ from sqlalchemy import select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from src.api.middleware.auth_hardening import TokenBlacklist
+ from src.config import settings
+ from src.db import User, get_db
++from src.utils.logger import setup_logger
++
++_logger = setup_logger("api.auth")
+ 
+ # ─── Password hashing ─────────────────────────────────────────────────────────
+ # Direct pyca/bcrypt — we dropped passlib (the unmaintained 1.7.4 pin blocked
+ # every bcrypt>=5 upgrade: passlib's backend self-test hashes a >72-byte probe,
+ # which bcrypt 5.0 now rejects with ValueError). bcrypt's modular-crypt format
+ # is unchanged, so existing passlib-produced "$2b$12$..." hashes verify here
+ # identically, and cost 12 is preserved (gensalt default == passlib default).
+ 
+@@ -293,16 +296,30 @@ async def get_auth_context(
+             select(User).where(
+                 User.api_key_hash == key_hash,
+                 User.is_active,
+             )
+         )
+         user_match = result.scalar_one_or_none()
+         if user_match is None:
+             raise _CREDENTIALS_EXCEPTION
++        # API ACCESS is a Business+ capability. A key minted while on Business
++        # must stop working after a downgrade (gated by the enforcement flag so
++        # audit mode only logs). Mirrors the create-time require_plan gate.
++        from src.config.constants import BUSINESS_FEATURES_PLANS
++        if (user_match.plan or "starter").lower() not in BUSINESS_FEATURES_PLANS:
++            if settings.ENTITLEMENT_ENFORCEMENT:
++                raise HTTPException(
++                    status_code=status.HTTP_403_FORBIDDEN,
++                    detail="API access requires a Business or Agency plan.",
++                )
++            _logger.info(
++                "entitlement audit user=%s plan=%s context=api_key_use would_block: API access requires Business+",
++                user_match.id, (user_match.plan or "starter"),
++            )
+         return AuthContext(
+             user=user_match,
+             auth_method="api_key",
+             amr=[],
+             auth_time=None,
+             jti=None,
+             payload=None,
+         )
+diff --git a/src/api/entitlements.py b/src/api/entitlements.py
+index d8bdd58..5dfb725 100644
+--- a/src/api/entitlements.py
++++ b/src/api/entitlements.py
+@@ -231,16 +231,44 @@ def config_run_violation(
+             cap = COUNTY_LIMIT_BY_PLAN.get(plan, COUNTY_LIMIT_BY_PLAN["starter"])
+             return (
+                 f"county {key[1]}, {key[0]} is outside your '{plan}' plan's "
+                 f"{cap}-county limit"
+             )
+     return None
+ 
+ 
++def enforce_runnable_http(violation: str | None, *, user: User, context: str) -> None:
++    """API call sites: raise 402 when enforcement is ON and a violation exists,
++    else audit-log. No-op when violation is None."""
++    if not violation:
++        return
++    if settings.ENTITLEMENT_ENFORCEMENT:
++        raise HTTPException(
++            status_code=status.HTTP_402_PAYMENT_REQUIRED,
++            detail=f"Plan limit reached — {violation}. Upgrade your plan to continue.",
++        )
++    _logger.info(
++        "entitlement audit (NOT enforced) user=%s plan=%s context=%s would_block: %s",
++        user.id, _plan_of(user), context, violation,
++    )
++
++
++def should_block_run(violation: str | None, *, user_id: str, plan: str, context: str) -> bool:
++    """Worker/scheduler call sites: returns True (caller must block/skip/fail) only
++    when enforcement is ON and a violation exists; always audit-logs the would-block."""
++    if not violation:
++        return False
++    _logger.info(
++        "entitlement audit user=%s plan=%s context=%s would_block: %s",
++        user_id, plan, context, violation,
++    )
++    return settings.ENTITLEMENT_ENFORCEMENT
++
++
+ def plan_reconciliation(
+     rows: Iterable[ConfigRow], plan: str
+ ) -> tuple[set[str], set[str]]:
+     """Given ALL of a user's configs, return (pause_ids, revive_ids) for a plan.
+ 
+     pause_ids  = currently-active configs no longer permitted under `plan`.
+     revive_ids = entitlement-paused configs now permitted again.
+     User-paused configs (paused_reason None, active False) are never touched."""
+diff --git a/src/api/routes/jobs.py b/src/api/routes/jobs.py
+index 97a5abe..cdb2c82 100644
+--- a/src/api/routes/jobs.py
++++ b/src/api/routes/jobs.py
+@@ -83,16 +83,32 @@ async def create_job(
+             ScraperConfig.user_id == current_user.id,
+             ScraperConfig.active,
+         )
+     )
+     config = config_result.scalar_one_or_none()
+     if config is None:
+         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
+ 
++    # Execution-time entitlement guard (audit-mode until ENTITLEMENT_ENFORCEMENT).
++    # An existing config can outlive a downgrade; re-validate against CURRENT plan.
++    from src.api.entitlements import ConfigRow, config_run_violation, enforce_runnable_http
++    active_rows = (await db.execute(
++        select(
++            ScraperConfig.id, ScraperConfig.state, ScraperConfig.county,
++            ScraperConfig.record_type, ScraperConfig.created_at,
++            ScraperConfig.active, ScraperConfig.paused_reason,
++        ).where(ScraperConfig.user_id == current_user.id, ScraperConfig.active)
++    )).all()
++    rows = [ConfigRow(*r) for r in active_rows]
++    enforce_runnable_http(
++        config_run_violation(current_user.plan, config.state, config.county, config.record_type, rows),
++        user=current_user, context="create_job",
++    )
++
+     # Check if this is an AI-powered connector and enforce AI job limits
+     connector_result = await db.execute(
+         select(CountyConnector).where(
+             CountyConnector.county == config.county,
+             func.lower(CountyConnector.state) == config.state.lower(),
+             CountyConnector.active,
+         )
+     )
+diff --git a/src/db/models.py b/src/db/models.py
+index 5ed6afb..f7ff1f5 100644
+--- a/src/db/models.py
++++ b/src/db/models.py
+@@ -230,16 +230,20 @@ class ScraperConfig(Base):
+     schedule = Column(JSON, nullable=False, default=dict)
+     deliver = Column(JSON, nullable=False, default=dict)
+     # Phase 2b: optional pre-foreclosure document-type selection (canonical
+     # tokens, validated against the capability registry). NULL = legacy behavior
+     # (today's full output); a non-empty list NARROWS to the chosen types.
+     doc_types = Column(JSON, nullable=True)
+     skip_trace_enabled = Column(Boolean, nullable=False, default=False)
+     active = Column(Boolean, nullable=False, default=True)
++    # Why a config is inactive. NULL = active or user-paused; 'entitlement' =
++    # auto-paused by downgrade reconciliation (revived on re-upgrade). Distinct
++    # from `active` so re-upgrade only revives what the system paused.
++    paused_reason = Column(String(32), nullable=True)
+     # Piece 2 (batch scrape, migration 050): NULL for ordinary single scrapes; set
+     # when this config is a child of a batch (one child per county x record_type).
+     # The PARENT batch owns delivery + schedule; child configs are created with
+     # those suppressed. Tenant integrity is DB-enforced by a COMPOSITE FK
+     # (batch_id, user_id) -> scraper_batches(id, user_id) in __table_args__ (Codex
+     # P1) — a config can never point at another tenant's batch. MATCH SIMPLE: a
+     # NULL batch_id (single scrape) skips the check. ondelete CASCADE, so NEVER
+     # hard-delete a ScraperBatch (archive via status) — deleting it would cascade
+diff --git a/src/workers/batch_tasks.py b/src/workers/batch_tasks.py
+index b888c98..9c1560a 100644
+--- a/src/workers/batch_tasks.py
++++ b/src/workers/batch_tasks.py
+@@ -134,16 +134,35 @@ def dispatch_batch_run(run_id: str) -> None:
+                     )
+                 ).scalars().all()
+                 if not configs:
+                     run.status = "done"
+                     run.completed_at = datetime.now(UTC)
+                     db.commit()
+                 else:
+                     for c in configs:
++                        from src.api.entitlements import (
++                            ConfigRow,
++                            config_run_violation,
++                            should_block_run,
++                        )
++                        _active = db.execute(
++                            select(
++                                ScraperConfig.id, ScraperConfig.state, ScraperConfig.county,
++                                ScraperConfig.record_type, ScraperConfig.created_at,
++                                ScraperConfig.active, ScraperConfig.paused_reason,
++                            ).where(ScraperConfig.user_id == c.user_id, ScraperConfig.active)
++                        ).all()
++                        _violation = config_run_violation(
++                            user.plan if user else "starter", c.state, c.county,
++                            c.record_type, [ConfigRow(*r) for r in _active],
++                        )
++                        if should_block_run(_violation, user_id=str(c.user_id),
++                                            plan=(user.plan if user else "starter"), context="batch_fanout"):
++                            continue
+                         job = Job(
+                             id=str(uuid.uuid4()),
+                             user_id=c.user_id,
+                             scraper_config_id=c.id,
+                             status="pending",
+                             trigger="batch",
+                         )
+                         db.add(job)
+diff --git a/src/workers/scheduler_helpers/dispatch.py b/src/workers/scheduler_helpers/dispatch.py
+index 4ae9bfb..e3e4844 100644
+--- a/src/workers/scheduler_helpers/dispatch.py
++++ b/src/workers/scheduler_helpers/dispatch.py
+@@ -60,16 +60,33 @@ def _dispatch_scheduled_jobs_impl() -> None:
+             if user and user.records_limit != -1 and user.records_used >= user.records_limit:
+                 _logger.info(
+                     "Skipping %s — user %s at record limit (%d/%d)",
+                     config.name, user.email, user.records_used, user.records_limit,
+                 )
+                 skipped_limit += 1
+                 continue
+ 
++            # Execution-time entitlement guard (audit until ENTITLEMENT_ENFORCEMENT).
++            from src.api.entitlements import ConfigRow, config_run_violation, should_block_run
++            _active = db.execute(
++                select(
++                    ScraperConfig.id, ScraperConfig.state, ScraperConfig.county,
++                    ScraperConfig.record_type, ScraperConfig.created_at,
++                    ScraperConfig.active, ScraperConfig.paused_reason,
++                ).where(ScraperConfig.user_id == config.user_id, ScraperConfig.active)
++            ).all()
++            _violation = config_run_violation(
++                user.plan if user else "starter", config.state, config.county,
++                config.record_type, [ConfigRow(*r) for r in _active],
++            )
++            if should_block_run(_violation, user_id=str(config.user_id),
++                                 plan=(user.plan if user else "starter"), context="schedule_single"):
++                continue
++
+             # Idempotency: skip if a job is already pending or running for this config
+             existing = db.execute(
+                 select(Job).where(
+                     Job.scraper_config_id == config.id,
+                     Job.status.in_(ACTIVE_STATUSES),
+                 )
+             ).scalar_one_or_none()
+ 
+diff --git a/src/workers/tasks.py b/src/workers/tasks.py
+index e20811d..e9e21f2 100644
+--- a/src/workers/tasks.py
++++ b/src/workers/tasks.py
+@@ -249,16 +249,35 @@ def run_scrape_job(self, job_id: str) -> None:
+             return
+ 
+         config = db.execute(
+             select(ScraperConfig).where(ScraperConfig.id == job.scraper_config_id)
+         ).scalar_one()
+ 
+         user = db.execute(select(User).where(User.id == job.user_id)).scalar_one()
+ 
++        # Execution-time entitlement backstop (audit until ENTITLEMENT_ENFORCEMENT).
++        # Catches API/scheduled/retry/watchdog paths that bypassed create-time checks.
++        from src.api.entitlements import ConfigRow, config_run_violation, should_block_run
++        _active = db.execute(
++            select(
++                ScraperConfig.id, ScraperConfig.state, ScraperConfig.county,
++                ScraperConfig.record_type, ScraperConfig.created_at,
++                ScraperConfig.active, ScraperConfig.paused_reason,
++            ).where(ScraperConfig.user_id == job.user_id, ScraperConfig.active)
++        ).all()
++        _violation = config_run_violation(
++            user.plan, config.state, config.county, config.record_type,
++            [ConfigRow(*r) for r in _active],
++        )
++        if should_block_run(_violation, user_id=str(job.user_id), plan=(user.plan or "starter"), context="worker_run"):
++            _publish_log(r, job_id, "error", f"Plan limit — {_violation}", db=db)
++            _fail_job(db, job, r, job_id, f"Plan limit reached: {_violation}")
++            return
++
+         # ── QUEUED (atomic claim) ─────────────────────────────────────────────
+         # Compare-and-set pending->queued so a duplicate delivery of this job_id
+         # can't double-scrape. A duplicate can arrive from Celery redelivery OR a
+         # recovery re-enqueue of a child still in 'pending' (Track A). Only the
+         # worker that flips the row FROM 'pending' proceeds; rowcount 0 means
+         # another worker already owns it (or it was cancelled / already running),
+         # so we return without scraping. Every dispatch path (API trigger,
+         # scheduler, watchdog re-queue, batch fan-out) enqueues a 'pending' job,
+@@ -1105,18 +1124,23 @@ def run_scrape_job(self, job_id: str) -> None:
+                 _logger.warning("Email delivery failed (non-fatal): %s", email_exc)
+                 _publish_log(r, job_id, "warning", "Email delivery unavailable", db=db)
+ 
+         # ── SPRINT 6.5: WEBHOOK DELIVERY ───────────────────────────────────────
+         # Business+ plan feature (gated at scraper config creation time).
+         # Fire-and-forget via Celery so retries happen on the celery queue
+         # independently of the scrape job. Non-fatal: webhook failures
+         # must never mark the scrape job as errored.
++        from src.config.constants import BUSINESS_FEATURES_PLANS
+         webhook_url = deliver_config.get("webhook_url")
+-        if webhook_url and object_key:
++        _wh_plan_ok = (user.plan or "starter").lower() in BUSINESS_FEATURES_PLANS
++        if webhook_url and object_key and not _wh_plan_ok:
++            _publish_log(r, job_id, "warning",
++                         "Webhook delivery skipped — requires Business plan", db=db)
++        if webhook_url and object_key and _wh_plan_ok:
+             try:
+                 from src.workers.webhook_delivery import (
+                     build_webhook_payload,
+                     deliver_job_webhook,
+                 )
+                 signed_download = _delivery_download_url(job_id, job.user_id, object_key, exporter)
+                 webhook_secret = deliver_config.get("webhook_secret")
+                 payload = build_webhook_payload(
+diff --git a/tests/test_api_key_plan_guard.py b/tests/test_api_key_plan_guard.py
+new file mode 100644
+index 0000000..278553b
+--- /dev/null
++++ b/tests/test_api_key_plan_guard.py
+@@ -0,0 +1,9 @@
++# tests/test_api_key_plan_guard.py
++from src.config.constants import BUSINESS_FEATURES_PLANS
++
++
++def test_api_access_is_business_plus():
++    assert "business" in BUSINESS_FEATURES_PLANS
++    assert "agency" in BUSINESS_FEATURES_PLANS
++    assert "pro" not in BUSINESS_FEATURES_PLANS
++    assert "starter" not in BUSINESS_FEATURES_PLANS
+diff --git a/tests/test_jobs_entitlement_guard.py b/tests/test_jobs_entitlement_guard.py
+new file mode 100644
+index 0000000..3d60b4c
+--- /dev/null
++++ b/tests/test_jobs_entitlement_guard.py
+@@ -0,0 +1,10 @@
++# tests/test_jobs_entitlement_guard.py
++from src.api.entitlements import ConfigRow, config_run_violation
++
++
++def test_guard_blocks_starter_preforeclosure(monkeypatch):
++    # Pure-path assertion: the route delegates to config_run_violation, so verify
++    # the decision the route will make for a starter user with a pre_foreclosure config.
++    rows = [ConfigRow(id="1", state="WA", county="King", record_type="pre_foreclosure",
++                      created_at=__import__("datetime").datetime(2026,1,1,tzinfo=__import__("datetime").UTC))]
++    assert config_run_violation("starter", "WA", "King", "pre_foreclosure", rows) is not None

@@ -621,17 +621,29 @@ def test_send_payment_failed_email_soft_fails_gracefully():
     # If we reach here without an exception the test passes
 
 
-def test_deliver_job_results_soft_fails_gracefully():
-    """With a fake RESEND_API_KEY, delivery must not raise."""
-    from src.workers.delivery import deliver_job_results
-    deliver_job_results(
-        job_id=str(uuid.uuid4()),
-        scraper_name="Pierce County Probate",
-        record_count=10,
-        download_url="https://example.com/fake",
-        recipient_emails=["test@test.bridgeleads.io"],
-        fmt="csv",
-    )
+def test_deliver_job_email_soft_fails_gracefully(monkeypatch):
+    """A PERMANENT send failure (e.g. invalid key) must not raise out of the
+    task — a dropped delivery email never errors the (already-done) scrape job.
+    Forced deterministically (no network) via a permanent Resend error."""
+    import resend
+    from resend import exceptions as resend_ex
+
+    from src.workers import delivery
+
+    def _raise_permanent(*_a, **_k):
+        raise resend_ex.ValidationError(message="bad", error_type="validation_error", code=422)
+
+    monkeypatch.setattr(resend.Emails, "send", _raise_permanent)
+    # .apply() runs the task body eagerly (like test_webhook_ssrf).
+    result = delivery.deliver_job_email.apply(kwargs={
+        "job_id": str(uuid.uuid4()),
+        "scraper_name": "Pierce County Probate",
+        "record_count": 10,
+        "download_url": "https://example.com/fake",
+        "recipient_emails": ["test@test.bridgeleads.io"],
+        "fmt": "csv",
+    })
+    assert result.successful()  # permanent failure → returned, not raised
 
 
 def test_on_failure_terminalizes_stuck_non_terminal_job():

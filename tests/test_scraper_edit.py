@@ -151,19 +151,19 @@ def test_deliverconfig_and_update_share_field_names():
 
 async def _make_config(db, user, **overrides):
     from src.db.models import ScraperConfig
-    data = dict(
-        id=str(uuid.uuid4()),
-        user_id=user.id,
-        name="Edit Test",
-        county="pierce",
-        state="WA",
-        record_type="probate",
-        fields={"party_name": True, "parcel_id": True},
-        enrichment={"property_lookup": True, "skip_tracing": False},
-        schedule={"frequency": "manual"},
-        deliver={"formats": ["csv"], "emails": []},
-        skip_trace_enabled=False,
-    )
+    data = {
+        "id": str(uuid.uuid4()),
+        "user_id": user.id,
+        "name": "Edit Test",
+        "county": "pierce",
+        "state": "WA",
+        "record_type": "probate",
+        "fields": {"party_name": True, "parcel_id": True},
+        "enrichment": {"property_lookup": True, "skip_tracing": False},
+        "schedule": {"frequency": "manual"},
+        "deliver": {"formats": ["csv"], "emails": []},
+        "skip_trace_enabled": False,
+    }
     data.update(overrides)
     config = ScraperConfig(**data)
     db.add(config)
@@ -363,6 +363,33 @@ async def test_patch_replaces_webhook_secret_when_provided(client, db, business_
         ScraperConfig.__table__.select().where(ScraperConfig.id == config.id)
     )).fetchone()
     assert fresh.deliver["webhook_secret"] == _NEW_SECRET
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_patch_batch_child_409(client, db, starter_user, starter_token):
+    """A batch-owned child config can't be edited individually (batch invariants)."""
+    from src.db.models import ScraperBatch
+    batch = ScraperBatch(
+        id=str(uuid.uuid4()),
+        user_id=starter_user.id,
+        name="B",
+        state="WA",
+        fields={},
+        enrichment={},
+        schedule={},
+        deliver={},
+    )
+    db.add(batch)
+    await db.commit()
+    config = await _make_config(db, starter_user, batch_id=batch.id)
+    r = await client.patch(
+        f"/scrapers/{config.id}",
+        json={"updated_at": config.updated_at.isoformat(), "name": "x"},
+        headers=_auth(starter_token),
+    )
+    assert r.status_code == 409
+    assert "batch" in r.json()["detail"].lower()
 
 
 @pytest.mark.integration

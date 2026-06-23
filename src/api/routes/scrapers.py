@@ -488,9 +488,21 @@ async def update_scraper(
     if config is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
 
+    # 2b. Batch children are owned by their parent batch, which suppresses their
+    #     schedule + delivery (Codex P1). Editing one directly would let a user set
+    #     a recurring schedule on a child (so the beat fires it independently of the
+    #     batch) or drift its fields/enrichment from siblings. Reject — batch config
+    #     is edited at the batch level, not here.
+    if config.batch_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This scraper belongs to a batch; edit it from its batch, not individually.",
+        )
+
     # 3. Optimistic concurrency (Codex P1): the client echoes the updated_at it
-    #    read; 409 if the row has since advanced (another edit session won). The 1s
-    #    tolerance absorbs sub-second serialization truncation (e.g. a JS client
+    #    read; 409 if the stored row no longer matches. Compared with an ABSOLUTE 1s
+    #    tolerance so a future/forged token is rejected too (not just a stale one);
+    #    the tolerance absorbs sub-second serialization truncation (e.g. a JS client
     #    that drops microseconds) without masking a real concurrent edit.
     stored_ts = config.updated_at
     client_ts = body.updated_at
@@ -498,7 +510,7 @@ async def update_scraper(
         stored_ts = stored_ts.replace(tzinfo=UTC)
     if client_ts.tzinfo is None:
         client_ts = client_ts.replace(tzinfo=UTC)
-    if (stored_ts - client_ts).total_seconds() > 1.0:
+    if abs((stored_ts - client_ts).total_seconds()) > 1.0:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This scraper was changed elsewhere. Reload and re-apply your edits.",
@@ -572,11 +584,15 @@ async def update_scraper(
     #    grandfather a feature that was already on (so they can still rename, etc.).
     stored_enrichment = config.enrichment if isinstance(config.enrichment, dict) else {}
     eff_enrichment_dict = eff_enrichment if isinstance(eff_enrichment, dict) else {}
-    stored_webhook_on = bool(stored_deliver.get("webhook_url") or stored_deliver.get("dialer_webhook_url"))
-    eff_webhook_on = bool(eff_deliver.get("webhook_url") or eff_deliver.get("dialer_webhook_url"))
+    # Gate each outbound destination SEPARATELY (Codex P2): the webhook and the
+    # dialer webhook each independently send lead PII, so a downgraded user who
+    # already has one on must still be gated when ADDING the other — collapsing
+    # both into one boolean would let the second slip through.
+    webhook_added = bool(eff_deliver.get("webhook_url")) and not bool(stored_deliver.get("webhook_url"))
+    dialer_added = bool(eff_deliver.get("dialer_webhook_url")) and not bool(stored_deliver.get("dialer_webhook_url"))
     _enforce_plan_feature_gates(
         current_user,
-        has_webhook=eff_webhook_on and not stored_webhook_on,
+        has_webhook=webhook_added or dialer_added,
         skip_tracing=bool(eff_enrichment_dict.get("skip_tracing")) and not bool(stored_enrichment.get("skip_tracing")),
         skip_trace_enabled=eff_skip_trace and not bool(config.skip_trace_enabled),
     )

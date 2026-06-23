@@ -537,9 +537,18 @@ async def update_scraper(
 
     # 4. In-flight guard (Codex P1): the worker re-reads the config at runtime, so
     #    editing while a job is active would corrupt that job's fields/deliver/
-    #    enrichment output. Block until it finishes or is cancelled. (Residual
-    #    start/edit race accepted for MVP — the durable fix is to snapshot the
-    #    execution config onto the Job at creation.)
+    #    enrichment output. Block until it finishes or is cancelled.
+    #
+    #    Start/edit race: the FOR UPDATE lock above (held until this txn commits)
+    #    closes it for same-DB job creation. Every execution path inserts a `jobs`
+    #    row that FK-references this config, and a child INSERT takes a FOR KEY SHARE
+    #    lock on the parent row — which CONFLICTS with our FOR UPDATE. So a job can't
+    #    be created mid-edit: a concurrent insert blocks until we commit (then it
+    #    reads the NEW config), and a job created first is seen by the check below
+    #    (→ 409). The plan's durable fix (snapshot the execution config onto the Job
+    #    at creation) is still worthwhile for cross-cutting safety but is not needed
+    #    to make THIS endpoint correct. Batch children (which the dispatcher inserts)
+    #    are rejected at step 2b.
     active_job = (
         await db.execute(
             select(Job.id)

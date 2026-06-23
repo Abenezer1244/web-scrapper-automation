@@ -99,6 +99,34 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         },
     }
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor — King selects an exact recorder document-type category.
+
+        NTS is verified (doc_types.py); the death-certificate category label is
+        inferred from the search text, so it is shown as a signal (exact=False).
+        """
+        from src.scrapers.doc_scope import CollectionScope, DocTypeItem, divorce_scope
+
+        if record_type not in cls.RECORD_TYPE_CONFIG:
+            return None
+        if record_type == "divorce":
+            return divorce_scope()
+        _LABELS = {
+            "probate": ("Death Certificate", False),
+            "death_certificate": ("Death Certificate", False),
+            "pre_foreclosure": ("Notice of Trustee Sale", True),
+        }
+        pair = _LABELS.get(record_type)
+        if pair is None:
+            return None
+        label, exact = pair
+        return CollectionScope(
+            kind="document_type",
+            items=(DocTypeItem(label=label, exact=exact),),
+            note="Selected by the recorder's document-type category.",
+        )
+
     def __init__(self, base_url: str | None = None, county: str = "king", state: str = "WA", record_type: str = "probate", doc_types: list[str] | None = None):
         super().__init__()
         self._base_url = (base_url or _BASE_URL).rstrip("/")

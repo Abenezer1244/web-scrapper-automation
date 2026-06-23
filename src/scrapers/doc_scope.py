@@ -101,6 +101,8 @@ def dataset(note: str) -> CollectionScope:
 
 _PROBATE_LABELS: dict[str, str] = {
     "PROBATE": "Probate filings",
+    "LACK OF PROBATE": "Lack of Probate Affidavit",
+    "LACK OF PROBATE AFFIDAVIT": "Lack of Probate Affidavit",
     "LETTERS TESTAMENTARY": "Letters Testamentary",
     "TESTAMENTARY": "Letters Testamentary",
     "LETTERS OF ADMINISTRATION": "Letters of Administration",
@@ -117,6 +119,7 @@ _PROBATE_LABELS: dict[str, str] = {
     "AFFIDAVIT OF HEIRSHIP": "Affidavit of Heirship",
     "HEIR": "Heirship-related filings",
     "TRANSFER ON DEATH": "Transfer on Death Deed",
+    "TRANSFER ON DEATH DEED": "Transfer on Death Deed",
     "ESTATE OF": "Estate filings",
     "ESTATE": "Estate-related filings",
     "DECEDENT": "Decedent-related filings",
@@ -135,6 +138,7 @@ _PREFORECLOSURE_LABELS: dict[str, str] = {
     "NOTICE OF TRUSTEE": "Notice of Trustee Sale",
     "TRUSTEE SALE": "Notice of Trustee Sale",
     "TRUSTEE'S SALE": "Notice of Trustee Sale",
+    "TRUSTEES SALE": "Notice of Trustee Sale",
     "NOTICE OF DEFAULT": "Notice of Default",
     "NOTICE OF FORECLOSURE": "Notice of Foreclosure",
     "FORECLOSURE": "Foreclosure",
@@ -146,6 +150,7 @@ _TAX_LABELS: dict[str, str] = {
     "TAX LIEN": "Tax Lien",
     "FEDERAL TAX LIEN": "Federal Tax Lien",
     "CERTIFICATE OF DELINQUENCY": "Certificate of Delinquency",
+    "CERTIFICATE OF DELIQUENCY": "Certificate of Delinquency",  # Clark spells it this way
     "CERTIFICATE OF SALE": "Certificate of Sale",
     "TAX DELINQUENT": "Tax Delinquency filings",
     "TREASURER'S DEED": "Treasurer's Deed",
@@ -217,14 +222,22 @@ def divorce_scope() -> CollectionScope:
 def from_keyword_map(
     doc_type_map: dict[str, list[str]],
     record_type: str,
+    *,
+    exact: bool = False,
+    note: str | None = None,
 ) -> CollectionScope | None:
-    """Build a SHOW scope for `record_type` from a template's own keyword map.
+    """Build a SHOW scope for `record_type` from a connector's own keyword map.
 
     Divorce ignores the map and uses the shared classifier scope. For probate /
     pre_foreclosure / tax_delinquent, each keyword is mapped to a display label or
     the explicit county-specific-codes bucket; unknown keywords degrade to the
     bucket (never raise) so production stays safe while the coverage test catches
     drift. Returns None when the connector does not handle `record_type`.
+
+    `exact=True` is for connectors whose keyword list IS the set of exact portal
+    options selected (e.g. Clark's verified modal labels). The cryptic-codes bucket
+    item is always `exact=False` regardless, since it is a catch-all, not a label.
+    `note` overrides the default framing (signals vs selected options).
     """
     if record_type == "divorce":
         return divorce_scope() if record_type in doc_type_map else None
@@ -245,9 +258,13 @@ def from_keyword_map(
         key = label.upper()
         if key not in seen:
             seen.add(key)
-            items.append(DocTypeItem(label=label, exact=False))
+            items.append(DocTypeItem(label=label, exact=exact))
     if needs_bucket:
         items.append(DocTypeItem(label=bucket_label, exact=False))
     if not items:
         return None
-    return CollectionScope(kind="document_type", items=tuple(items), note=_SIGNALS_NOTE)
+    return CollectionScope(
+        kind="document_type",
+        items=tuple(items),
+        note=note if note is not None else _SIGNALS_NOTE,
+    )

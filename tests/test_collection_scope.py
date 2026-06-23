@@ -73,6 +73,8 @@ def test_base_scraper_default_scope_is_none():
 # ─── Template keyword coverage (Codex: fail on any newly unmapped keyword) ────
 
 def _all_template_doc_type_maps():
+    """Every keyword map that feeds from_keyword_map(), template + keyword-bespoke."""
+    from src.scrapers import clark_wa, whatcom_wa
     from src.scrapers.templates import (
         acclaimweb,
         ava_fidlar,
@@ -80,6 +82,7 @@ def _all_template_doc_type_maps():
         idocmarket,
         landmarkweb,
         laserfiche_weblink,
+        skagit_recording,
         tyler_selfservice,
     )
 
@@ -90,7 +93,10 @@ def _all_template_doc_type_maps():
         "idocmarket": idocmarket._DOC_TYPE_MAP,
         "landmarkweb": landmarkweb._DOC_TYPE_MAP,
         "laserfiche_weblink": laserfiche_weblink._DOC_TYPE_MAP,
+        "skagit_recording": skagit_recording._DOC_TYPE_MAP,
         "tyler_selfservice": tyler_selfservice._DOC_TYPE_MAP,
+        "whatcom_wa": whatcom_wa._DOC_TYPE_KEYWORDS,
+        "clark_wa": clark_wa._DOC_TYPES,
     }
 
 
@@ -111,12 +117,24 @@ def test_every_template_keyword_is_classified():
     assert not unmapped, f"Unclassified doc-type keywords (add to doc_scope presentation map): {unmapped}"
 
 
+_KEYWORD_TEMPLATE_NAMES = (
+    "acclaimweb",
+    "ava_fidlar",
+    "eagleweb",
+    "idocmarket",
+    "landmarkweb",
+    "laserfiche_weblink",
+    "tyler_selfservice",
+)
+
+
 def test_each_wired_template_returns_scope_for_its_record_types():
     from src.scrapers.doc_scope import CollectionScope
 
-    for template, dmap in _all_template_doc_type_maps().items():
+    maps = _all_template_doc_type_maps()
+    for template in _KEYWORD_TEMPLATE_NAMES:
         cls = _template_class(template)
-        for record_type in dmap:
+        for record_type in maps[template]:
             scope = cls.collection_scope(record_type)
             assert isinstance(scope, CollectionScope), f"{template}:{record_type} returned {scope!r}"
             assert scope.items, f"{template}:{record_type} produced no items"

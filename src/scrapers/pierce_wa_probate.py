@@ -74,6 +74,30 @@ class PierceWAARMSScraper(BridgeScraper):
         },
     }
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor — Pierce selects exact ARMS document-type checkboxes."""
+        from src.scrapers.doc_scope import CollectionScope, DocTypeItem
+
+        if record_type not in cls.RECORD_TYPE_CONFIG:
+            return None
+        _LABELS = {
+            "probate": ["Probate"],
+            "pre_foreclosure": [
+                "Notice of Default", "Notice of Foreclosure",
+                "Lis Pendens", "Notice of Trustee Sale",
+            ],
+            "divorce": ["Decree of Dissolution"],
+        }
+        labels = _LABELS.get(record_type)
+        if labels is None:
+            return None
+        return CollectionScope(
+            kind="document_type",
+            items=tuple(DocTypeItem(label=lbl, exact=True) for lbl in labels),
+            note="Selected by exact recorder document-type checkboxes.",
+        )
+
     def __init__(self, record_type: str = "probate", doc_types: list[str] | None = None):
         super().__init__()
         self._record_type = record_type

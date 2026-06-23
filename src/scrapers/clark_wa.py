@@ -78,6 +78,21 @@ add_scrape_domain("e-docs.clark.wa.gov")
 class ClarkWAScraper(BridgeScraper):
     """Clark County LandmarkWeb scraper — uses Document Type checkbox selection."""
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor — Clark selects exact document-type modal checkboxes
+        (labels verified live 2026-06-22). Recorder holds no divorce decrees."""
+        from src.scrapers.doc_scope import from_keyword_map
+
+        if record_type == "divorce":
+            return None
+        return from_keyword_map(
+            _DOC_TYPES,
+            record_type,
+            exact=True,
+            note="Selected by exact recorder document-type checkboxes (verified live).",
+        )
+
     def __init__(self, record_type: str = "probate"):
         super().__init__()
         self._record_type = record_type

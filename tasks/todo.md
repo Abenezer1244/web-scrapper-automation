@@ -1,73 +1,49 @@
-# Fix: "Fields to collect" checkboxes are cosmetic → make them functional at the output boundary
+# Doc-Type Visibility (SHOW) + Selection (SELECT) — Build Plan
 
-## Problem (verified in code, not assumed)
-The new-scraper wizard's "Fields to collect" checkboxes are 100% cosmetic. The selection is
-validated (`FieldsConfig`, `src/api/schemas.py:354`) and persisted (`scraper_configs.fields`,
-`src/db/models.py:228`), but **no worker or export code ever reads `config.fields`**. Every
-field is always scraped, stored, and written to the delivered CSV.
+Branch: `feat/doc-type-visibility` (worktree `.claude/worktrees/doc-type-visibility`, off origin/main @ 19f1ebc which includes #109).
+Origin: a customer asked "which pre-foreclosure type do you scrape per county, and why do most counties / all probate show no document types in the wizard?"
 
-Verified load-bearing map: `parcel_id`, `party_name`, `property_address`, `mailing_address`,
-`date_recorded` are consumed by enrichment / property_key / dedup / billing / skip-trace and
-**cannot** be dropped at scrape/storage time. Only `heirs` (pure display) and
-`legal_description` (only feeds the within-job idempotency fingerprint) are safe to suppress
-at output.
+Customer decisions (confirmed):
+- Deliver **Both, phased**: SHOW first (read-only, all counties + all record types incl. probate), then SELECT (control) layered county-by-county.
+- Record-type scope: all live record types (probate, pre_foreclosure, divorce, tax_delinquent, code_violation). NOTE: `eviction` is NOT live (excluded in `src/config/constants.py:156`).
 
-Skip-trace mapping was also checked: frontend "Skip trace" → top-level `skip_trace_enabled`
-(the field the worker honors). **No bug there** — verified, no change needed.
+Architecture (reconciled with Codex — its redesign won over my original central-catalog idea):
+- SHOW is driven by **scraper-owned pure descriptors**, NOT a duplicated central catalog (catalog would drift from real scrape behavior).
+- Each scraper/template exposes `collection_scope(record_type) -> CollectionScope` derived from its OWN existing constants. API resolves the scraper via the registry (as today) and calls the descriptor.
+- Honesty flags: items carry `exact: true/false` (portal dropdown/checkbox label = exact; keyword-derived = approximate). `kind: "document_type" | "dataset"` (tax/code_violation pull from Socrata/ArcGIS datasets, not recorder doc types).
+- SHOW and SELECT kept separate. Do NOT reuse the existing `doc_types` SELECT field/param for SHOW.
 
-## Decisions (user + Codex consult, 2026-06-22)
-- **Output-boundary filtering**, never gate scrape/enrichment on `config.fields`. (Codex + Claude agree.)
-- **Force identity fields ON** — only `mailing_address`, `heirs`, `legal_description` are hideable.
-  The 4 identity fields (`party_name`, `parcel_id`, `property_address`, `date_recorded`) always export.
-- **Blank values, keep headers** — do NOT drop columns (stable schema for dialer/webhook consumers).
-- **Empty/None/list `fields` → hide nothing** (legacy/default = all visible). Only an explicit
-  `False` on a hideable field hides it.
-- One **shared projection function** used by every export path (no per-path rules).
+---
 
-Codex session: `019ef0c7-1e11-7463-abca-e74018bfc2f6` (saved for follow-ups).
+## DONE
 
-## Phase 1 — single-job export (the 95% path)  [<=5 files]  ✅ DONE (commits af13b51, 30602f0)
-- [x] `src/utils/lead_export.py`: `HIDEABLE_OUTPUT_FIELDS`, `resolve_hidden_output_fields`,
-      `_apply_visibility`; `write_lead_csv` gains `hidden_fields`.
-- [x] `src/utils/data_exporter.py`: threaded `hidden_fields` through to_csv/to_excel/to_json/export.
-- [x] `src/workers/tasks.py:780,995`: pass `resolve_hidden_output_fields(config.fields)`.
-- [x] `src/api/routes/jobs.py`: load job's `ScraperConfig.fields` (owner-scoped), pass to `write_lead_csv`.
-- [x] Verify: py_compile + ruff clean; 75 export tests pass (+12 new). Codex review: gate PASS.
-      P1 (batch-child) verified theoretical (Job.scraper_config_id NOT NULL + children carry fields);
-      P2 (export-format tests) addressed.
+- [x] Map what each pre_foreclosure scraper actually collects (King=NTS only; Pierce=NOD default + others). Matches customer's ranking.
+- [x] Root-cause why most counties / all probate show no selector: `pre_foreclosure_doc_types` API field is gated to record_type==pre_foreclosure AND county supported_for_selection=True (king+pierce only). Probate has no doc-type machinery at all.
+- [x] **Clark mismatch investigated + fixed** (commits `82eb674` Codex PASS, `143ddb9` comment correction).
+  - Live-verified all 5 Clark pre_foreclosure checkbox IDs against the portal modal (2026-06-22): 167=NOTICE OF TRUSTEE SALE, 129=LIS PENDENS, 166=NOTICE OF DEFAULT, 157=NOTICE OF FORECLOSURE, 93=FORECLOSURE.
+  - Root cause of 6-labels-vs-5-IDs: ID **257=TRUSTEES SALE** was missing from the checkbox set. Added it → lists align 6:6.
+  - **Corrected a false codebase assumption:** the modal checkboxes ARE the primary server-side gate (portal filters by selected doc-type codes — verified: "DEF"→0 records; OLD 5-set and NEW 6-set both returned 137 records 01/01-06/22). The old comment claiming "portal returns everything regardless" was wrong; client-side keyword filter is defense-in-depth, not the sole gate.
+  - **257=TRSL is an empty category** (0 records in trailing 6 months; real trustee-sale leads coded NTS/167). So the 257 add is correct completeness but recovers no leads today → no production lead loss ever existed.
 
-## Phase 2 — batch combined export  ✅ DONE (commit e7dc5c4)
-- [x] `src/utils/lead_export.py`: threaded `hidden_fields` into `write_lead_csv_with_overlap` /
-      `build_overlap_export_row` (reuses `_apply_visibility`).
-- [x] `src/workers/batch_export.py`: `finalize_batch_run` resolves `ScraperBatch.fields`;
-      `render_combined_csv` accepts + threads `hidden_fields`.
-- [x] `src/api/routes/batches.py`: both download routes pass `batch.fields` via `_stream_run_csv`.
-- [x] Verify: py_compile + ruff clean; 77 export/batch tests pass (+2 new). Codex review: NO findings.
-- Note: the multi-config Lists/segments overlap export (`segments.py:111`) intentionally stays
-  show-all (no single config => default `hidden_fields=None`); backward compatible.
+## OPEN FINDING — RESOLVED
 
-## Follow-up (frontend repo `bridgeleads-web`, separate — note only)
-- [ ] Lock/disable the 4 identity checkboxes (they're now intentionally non-hideable).
-- [ ] Relabel "Fields to collect" → "Fields to include in export" (Codex: UI lies about scope;
-      backend semantics are output-visibility, not collection).
+- [x] **Clark `DEFAULT` (modal ID 66, code DEF):** sample-scraped live → **0 records** in 3.5 months. Dead/unused category. Decision: do NOT add. (Real notice-of-default leads come via 166=NOTICE OF DEFAULT, already collected.)
+- [ ] Latent (note, not this PR): since Clark filters server-side by checkbox codes, the *completeness* of `_DOC_TYPE_CHECKBOX_VALUES` is load-bearing for every record type. probate/divorce/tax code lists were NOT re-verified — worth a future audit pass.
+
+## PHASE A — SHOW (read-only transparency)  [each sub-phase <=5 files, verify between]
+
+- [ ] A1. Define `CollectionScope` shape + a base hook on the scraper interface (`base_scraper.py`) returning a safe default so unconverted scrapers degrade to null.
+- [ ] A2. Implement `collection_scope()` for the recorder TEMPLATES (eagleweb, acclaimweb, ava_fidlar, idocmarket, landmarkweb, laserfiche_weblink, skagit_recording, tyler_selfservice) deriving labels from each `_DOC_TYPE_MAP`; mark keyword-derived items `exact=false`.
+- [ ] A3. Implement for the bespoke recorder scrapers (king=search_text/exact, pierce=checkbox/exact-ish, clark=verified labels exact, whatcom, snohomish).
+- [ ] A4. Implement for dataset scrapers (tax_delinquent, code_violation) -> `kind:"dataset"`, empty items, honest `note`.
+- [ ] A5. API: add nullable `collection_scope_by_record_type` to the connector response, populated for ALL record types. Keep `pre_foreclosure_doc_types` (SELECT) untouched. Regenerate + commit `schema/openapi.json` backend-first.
+- [ ] A6. Coverage test: every active connector x record_type returns a scope (no silent gaps). Plus a test that SHOW never returns canonical SELECT tokens.
+- [ ] A7. Codex review the full Phase A diff; reconcile; ruff + pytest (unit-only under synthetic env — conftest wipes tables).
+- [ ] A8. Frontend (separate repo bridgeleads-web): wizard renders read-only "Document types collected" list for all counties + record types. (Separate session/PR.)
+
+## PHASE B — SELECT (control), later
+- [ ] Generalize the `doc_types` selection param + validation beyond pre_foreclosure, gated per (county, record_type) `supported_for_selection`.
+- [ ] Per-county live-portal verification before flipping each `supported_for_selection=True`.
 
 ## Review
-**Done (2026-06-22). Both phases shipped to local branch `feat/fields-output-visibility`
-(off origin/main), 3 commits: af13b51, 30602f0, e7dc5c4. NOT pushed — awaiting user.**
-
-What changed: the wizard's "Fields to collect" checkboxes are now functional at the OUTPUT
-boundary across every lead-export path (live download, scheduled/R2 + emailed delivery, batch
-combined download + delivery; csv/json/excel). config.fields is NEVER consulted before the
-output boundary, so scraping/enrichment/dedup/billing/skip-trace are untouched (5 of 7 fields
-are load-bearing upstream). Only `mailing_address`/`heirs`/`legal_description` are hideable;
-the 4 identity fields are force-on. Suppression blanks the value and keeps the header.
-
-Verification: py_compile + ruff clean on all 7 touched files; 77 export/batch tests pass
-(+14 new). Codex reviewed both phases — Phase 1 P1 (batch-child) verified theoretical +
-P2 (format tests) addressed; Phase 2 came back with zero findings.
-
-Not done / by design:
-- The skip-trace mapping was checked and is already correct (frontend → `skip_trace_enabled`).
-- FRONTEND follow-up still required (separate `bridgeleads-web` repo): lock the 4 identity
-  checkboxes + relabel "Fields to collect" → "Fields to include in export". Until then the UI
-  still shows 4 checkboxes that the backend intentionally ignores (narrowed from all 7).
+(to be filled in after Phase A)

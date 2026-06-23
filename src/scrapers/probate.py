@@ -402,3 +402,23 @@ def is_living_owner_tod(doc_type: str | None) -> bool:
     (they are real ``DEATH_INHERITANCE`` leads).
     """
     return classify_probate_signal(doc_type) is ProbateSignal.TOD_LIVING_OWNER
+
+
+def classify_probate_signal_for_row(
+    doc_type: str | None, comment: str | None = None
+) -> ProbateSignal:
+    """Classify a probate row, falling back to the recorder COMMENT when needed.
+
+    ``doc_type`` is primary. Some sources (e.g. Skagit) carry the probate signal in
+    the recorder comment rather than the document type — a generic "Affidavit" whose
+    comment reads "LACK OF PROBATE AFFIDAVIT". When ``doc_type`` alone is UNKNOWN and
+    the comment yields a confident signal, the comment wins; otherwise the doc_type
+    result stands. Mirrors how those scrapers themselves match on ``doc_type`` + the
+    comment to keep the row.
+    """
+    signal = classify_probate_signal(doc_type)
+    if signal is ProbateSignal.UNKNOWN and comment:
+        from_comment = classify_probate_signal(comment)
+        if from_comment is not ProbateSignal.UNKNOWN:
+            return from_comment
+    return signal

@@ -13,7 +13,7 @@ from datetime import datetime
 from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
 
-from src.scrapers.probate import classify_probate_signal
+from src.scrapers.probate import classify_probate_signal_for_row
 from src.utils.address_intel import compute_owner_flags
 from src.utils.logger import setup_logger
 from src.workers import app
@@ -648,10 +648,12 @@ def run_scrape_job(self, job_id: str) -> None:
                 # so labeling cannot affect identity, dedup, or billing.
                 _enrichment = rec.enrichment_data or {}
                 if config.record_type == "probate":
-                    _enrichment = {
-                        **_enrichment,
-                        "lead_subtype": classify_probate_signal(rec.doc_type).value,
-                    }
+                    # doc_type-primary, recorder-COMMENT fallback (Skagit stores the
+                    # probate signal in the comment, not doc_type — Codex P2).
+                    _subtype = classify_probate_signal_for_row(
+                        rec.doc_type, _enrichment.get("comment")
+                    )
+                    _enrichment = {**_enrichment, "lead_subtype": _subtype.value}
                 rows.append({
                     "id": str(_uuid.uuid4()),
                     "job_id": job_id,

@@ -45,12 +45,6 @@ LEAD_CSV_COLUMNS: list[str] = [
     # we already scrape into enrichment_data but never exported. Blank for record
     # types that don't carry the field (same convention as delinquent_amount).
     "assessed_value", "instrument_number",
-    # Probate honesty label (2026-06-23): the signal subtype set at insert —
-    # probate_death_inheritance vs tod_living_owner_estate_planning vs
-    # nonprobate_transfer. Blank for non-probate record types. Lets a customer see
-    # (and a dialer filter on) whether a "probate" row is a real death or a
-    # living-owner Transfer-on-Death estate-planning record.
-    "lead_subtype",
     "code_violation_type", "code_violation_status",
     "code_violation_description", "code_violation_last_inspection",
     "tax_billed_amount", "tax_paid_amount", "tax_account_status",
@@ -67,6 +61,11 @@ LEAD_CSV_COLUMNS: list[str] = [
     # auction_date + default_amount are stored columns; trustee/ts# from
     # enrichment_data["nts"]; days_to_auction is the derived urgency clock.
     "auction_date", "days_to_auction", "default_amount", "trustee", "ts_number",
+    # Probate honesty label (2026-06-23) — APPENDED at end (compatibility contract:
+    # new columns are extra/appended so ordinal consumers of the existing fields do
+    # not shift, Codex P2). Signal subtype set at insert: probate_death_inheritance
+    # vs tod_living_owner_estate_planning vs nonprobate_transfer. Blank for non-probate.
+    "lead_subtype",
 ]
 
 
@@ -326,9 +325,10 @@ OVERLAP_LEAD_COLUMNS: list[str] = [
     "first_name", "last_name",
     "phone", "phone_type", "email", "phone_2", "phone_3", "email_2", "email_3",
     "property_street", "property_city", "property_state", "property_zip",
-    "filed_date", "doc_type", "lead_subtype", "delinquent_amount", "delinquent_bill_year",
+    "filed_date", "doc_type", "delinquent_amount", "delinquent_bill_year",
     "party_name", "mailing_address", "parcel_id", "heirs", "legal_description",
     "property_address",
+    "lead_subtype",  # appended at end (compatibility contract, Codex P2)
 ]
 
 

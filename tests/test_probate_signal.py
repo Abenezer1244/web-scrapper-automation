@@ -19,7 +19,11 @@ Codex-supplied edge cases (revocation/amendment of a TOD, death-triggered TOD
 effectuations).
 """
 
-from src.scrapers.probate import ProbateSignal, classify_probate_signal
+from src.scrapers.probate import (
+    ProbateSignal,
+    classify_probate_signal,
+    classify_probate_signal_for_row,
+)
 
 
 # --- Living-owner TOD creation/admin -> tod_living_owner_estate_planning ----------
@@ -161,6 +165,27 @@ def test_whitespace_only_is_unknown():
 
 
 # --- Subtype values are the stable strings the pipeline exports -------------------
+def test_comment_fallback_when_doctype_unknown():
+    # Codex P2: Skagit keeps a generic "Affidavit" row whose probate signal lives in
+    # the recorder comment. doc_type alone is UNKNOWN -> the comment decides.
+    assert classify_probate_signal("Affidavit") is ProbateSignal.UNKNOWN
+    assert classify_probate_signal_for_row(
+        "Affidavit", comment="LACK OF PROBATE AFFIDAVIT"
+    ) is ProbateSignal.NONPROBATE_TRANSFER
+
+
+def test_comment_ignored_when_doctype_is_confident():
+    # A confident doc_type wins; the comment never downgrades/overrides it.
+    assert classify_probate_signal_for_row(
+        "DEATH CERTIFICATE", comment="Transfer on Death Deed"
+    ) is ProbateSignal.DEATH_INHERITANCE
+
+
+def test_no_comment_falls_back_to_doctype_result():
+    assert classify_probate_signal_for_row("Transfer on Death Deed", None) is ProbateSignal.TOD_LIVING_OWNER
+    assert classify_probate_signal_for_row("Affidavit", None) is ProbateSignal.UNKNOWN
+
+
 def test_signal_values_are_stable_strings():
     assert ProbateSignal.DEATH_INHERITANCE.value == "probate_death_inheritance"
     assert ProbateSignal.TOD_LIVING_OWNER.value == "tod_living_owner_estate_planning"

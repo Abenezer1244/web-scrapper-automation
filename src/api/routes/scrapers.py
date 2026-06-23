@@ -209,8 +209,10 @@ async def _build_scraper_config(
 
     _enforce_plan_feature_gates(
         current_user,
-        # A native dialer connector (dialer_type) pushes lead PII even without a
-        # dialer_webhook_url, so it is gated like the webhooks (Codex).
+        # A native dialer connector (dialer_type, e.g. phoneburner) pushes lead PII
+        # even without a dialer_webhook_url, so it is gated like the webhooks (Codex)
+        # — otherwise a non-Business user could save a config the worker then refuses
+        # to run.
         has_webhook=bool(
             body.deliver.webhook_url
             or body.deliver.dialer_webhook_url
@@ -470,6 +472,22 @@ async def update_scraper(
             ),
         )
 
+    # 1b. Reject an explicit null on a non-nullable editable field (Codex P2). These
+    #     fields have no "unset" state — omit them to keep the stored value. Silently
+    #     treating null like omission would contradict the provided-vs-omitted
+    #     contract and mislead generated clients. (doc_types is genuinely nullable —
+    #     null there means "legacy/full output" — so it is intentionally excluded.)
+    explicit_nulls = sorted(
+        f
+        for f in ("name", "fields", "enrichment", "schedule", "deliver", "skip_trace_enabled")
+        if f in body.model_fields_set and getattr(body, f) is None
+    )
+    if explicit_nulls:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Field(s) cannot be null: {', '.join(explicit_nulls)}. Omit them to keep the current value.",
+        )
+
     # 2. Load the OWNED, ACTIVE config. FOR UPDATE serializes concurrent edits on
     #    the same row (belt for the updated_at token below). Soft-deleted configs
     #    are not editable (active filter → 404). RLS is the belt, user_id the
@@ -500,17 +518,22 @@ async def update_scraper(
         )
 
     # 3. Optimistic concurrency (Codex P1): the client echoes the updated_at it
-    #    read; 409 if the stored row no longer matches. Compared with an ABSOLUTE 1s
-    #    tolerance so a future/forged token is rejected too (not just a stale one);
-    #    the tolerance absorbs sub-second serialization truncation (e.g. a JS client
-    #    that drops microseconds) without masking a real concurrent edit.
+    #    read; 409 unless it still EQUALS the stored token. Both are normalized to
+    #    UTC and truncated to milliseconds before comparing, so a client that drops
+    #    microseconds on the JSON round-trip (e.g. a JS Date) doesn't false-409 —
+    #    but any real concurrent commit (which advances updated_at by far more than
+    #    a millisecond) is still caught, even one less than a second later.
     stored_ts = config.updated_at
     client_ts = body.updated_at
     if stored_ts.tzinfo is None:
         stored_ts = stored_ts.replace(tzinfo=UTC)
     if client_ts.tzinfo is None:
         client_ts = client_ts.replace(tzinfo=UTC)
-    if abs((stored_ts - client_ts).total_seconds()) > 1.0:
+
+    def _floor_ms(dt: datetime) -> datetime:
+        return dt.astimezone(UTC).replace(microsecond=(dt.microsecond // 1000) * 1000)
+
+    if _floor_ms(stored_ts) != _floor_ms(client_ts):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This scraper was changed elsewhere. Reload and re-apply your edits.",
@@ -584,15 +607,17 @@ async def update_scraper(
     #    grandfather a feature that was already on (so they can still rename, etc.).
     stored_enrichment = config.enrichment if isinstance(config.enrichment, dict) else {}
     eff_enrichment_dict = eff_enrichment if isinstance(eff_enrichment, dict) else {}
-    # Gate each outbound destination SEPARATELY (Codex P2): the webhook and the
-    # dialer webhook each independently send lead PII, so a downgraded user who
-    # already has one on must still be gated when ADDING the other — collapsing
-    # both into one boolean would let the second slip through.
+    # Gate each outbound destination SEPARATELY (Codex P2): the webhook, the dialer
+    # webhook, and a native dialer connector (e.g. phoneburner) each independently
+    # send lead PII, so a downgraded user who already has one on must still be gated
+    # when ADDING another — collapsing them into one boolean would let the new one
+    # slip through and save a Business-only config the worker then refuses to run.
     webhook_added = bool(eff_deliver.get("webhook_url")) and not bool(stored_deliver.get("webhook_url"))
-    dialer_added = bool(eff_deliver.get("dialer_webhook_url")) and not bool(stored_deliver.get("dialer_webhook_url"))
+    dialer_url_added = bool(eff_deliver.get("dialer_webhook_url")) and not bool(stored_deliver.get("dialer_webhook_url"))
+    dialer_native_added = bool(eff_deliver.get("dialer_type")) and not bool(stored_deliver.get("dialer_type"))
     _enforce_plan_feature_gates(
         current_user,
-        has_webhook=webhook_added or dialer_added,
+        has_webhook=webhook_added or dialer_url_added or dialer_native_added,
         skip_tracing=bool(eff_enrichment_dict.get("skip_tracing")) and not bool(stored_enrichment.get("skip_tracing")),
         skip_trace_enabled=eff_skip_trace and not bool(config.skip_trace_enabled),
     )

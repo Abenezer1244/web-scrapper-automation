@@ -367,6 +367,43 @@ async def test_patch_replaces_webhook_secret_when_provided(client, db, business_
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_patch_explicit_null_422(client, db, starter_user, starter_token):
+    """An explicit null on a non-nullable field is rejected, not silently ignored."""
+    config = await _make_config(db, starter_user)
+    r = await client.patch(
+        f"/scrapers/{config.id}",
+        json={"updated_at": config.updated_at.isoformat(), "fields": None},
+        headers=_auth(starter_token),
+    )
+    assert r.status_code == 422
+    assert "null" in r.json()["detail"].lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_patch_starter_enabling_native_dialer_402(client, db, starter_user, starter_token):
+    """Enabling a native dialer (phoneburner) with no webhook URL still hits the
+    Business gate — it pushes lead PII on its own."""
+    config = await _make_config(db, starter_user)
+    r = await client.patch(
+        f"/scrapers/{config.id}",
+        json={
+            "updated_at": config.updated_at.isoformat(),
+            "deliver": {
+                "formats": ["csv"],
+                "emails": [],
+                "dialer_type": "phoneburner",
+                "phoneburner_access_token": "tok12345",
+                "phoneburner_owner_id": "42",
+            },
+        },
+        headers=_auth(starter_token),
+    )
+    assert r.status_code == 402
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_patch_batch_child_409(client, db, starter_user, starter_token):
     """A batch-owned child config can't be edited individually (batch invariants)."""
     from src.db.models import ScraperBatch

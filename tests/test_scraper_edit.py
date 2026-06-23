@@ -140,11 +140,21 @@ def test_deliverupdate_ignores_readback_set_flags():
     assert "webhook_secret_set" not in upd.model_dump()
 
 
+def test_deliverupdate_rejects_typo_key():
+    """A misspelled delivery key must 422, not silently drop (which would wipe the
+    real field on this replace-whole payload)."""
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        DeliverUpdate(webhook_ur="https://example.com/hook")  # typo of webhook_url
+
+
 def test_deliverconfig_and_update_share_field_names():
     """_merge_deliver round-trips DeliverUpdate.model_dump() into DeliverConfig, so
-    every DeliverUpdate field must be a real DeliverConfig field."""
-    extra = set(DeliverUpdate.model_fields) - set(DeliverConfig.model_fields)
-    assert not extra, f"DeliverUpdate has fields DeliverConfig lacks: {extra}"
+    every DUMPED DeliverUpdate key must be a real DeliverConfig field (the excluded
+    readback flags must not leak into the dump)."""
+    dumped = set(DeliverUpdate().model_dump())
+    extra = dumped - set(DeliverConfig.model_fields)
+    assert not extra, f"DeliverUpdate.model_dump() has keys DeliverConfig lacks: {extra}"
 
 
 # ─── Integration: PATCH /scrapers/{id} ────────────────────────────────────────

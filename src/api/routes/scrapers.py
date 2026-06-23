@@ -517,23 +517,19 @@ async def update_scraper(
             detail="This scraper belongs to a batch; edit it from its batch, not individually.",
         )
 
-    # 3. Optimistic concurrency (Codex P1): the client echoes the updated_at it
-    #    read; 409 unless it still EQUALS the stored token. Both are normalized to
-    #    UTC and truncated to milliseconds before comparing, so a client that drops
-    #    microseconds on the JSON round-trip (e.g. a JS Date) doesn't false-409 —
-    #    but any real concurrent commit (which advances updated_at by far more than
-    #    a millisecond) is still caught, even one less than a second later.
+    # 3. Optimistic concurrency (Codex P1): the client echoes verbatim the
+    #    updated_at it read from GET; 409 unless it still EXACTLY equals the stored
+    #    token (compared as the same UTC instant, full microsecond precision). No
+    #    precision is discarded, so two commits in the same millisecond can't false-
+    #    match — the contract is "send back the exact string GET returned". (A true
+    #    version counter would be even stronger but needs a migration; deferred.)
     stored_ts = config.updated_at
     client_ts = body.updated_at
     if stored_ts.tzinfo is None:
         stored_ts = stored_ts.replace(tzinfo=UTC)
     if client_ts.tzinfo is None:
         client_ts = client_ts.replace(tzinfo=UTC)
-
-    def _floor_ms(dt: datetime) -> datetime:
-        return dt.astimezone(UTC).replace(microsecond=(dt.microsecond // 1000) * 1000)
-
-    if _floor_ms(stored_ts) != _floor_ms(client_ts):
+    if stored_ts != client_ts:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This scraper was changed elsewhere. Reload and re-apply your edits.",

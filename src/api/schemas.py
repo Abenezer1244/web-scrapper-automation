@@ -585,12 +585,16 @@ class DeliverUpdate(BaseModel):
        (require_connector_credentials) validators would wrongly reject a blank
        "keep" token, so they must NOT run until the route has injected the stored
        secrets back in.
-    2. extra="ignore" — the frontend pre-fills the edit form from GET, whose
-       deliver dict carries the readback flags (webhook_secret_set, …). Echoing
-       those back must not 422; we drop them here so they never reach DeliverConfig.
+    2. The frontend pre-fills the edit form from GET, whose deliver dict carries
+       the write-only readback flags (webhook_secret_set, …). Those are declared
+       below (and excluded from model_dump so they never reach DeliverConfig) so
+       echoing them back is accepted — while extra="forbid" still rejects any OTHER
+       unknown key. That matters because this is a REPLACE-whole payload: a silent
+       typo like "webhook_ur" would otherwise drop the real webhook_url + its secret
+       (Codex). A misspelled field 422s instead.
     """
 
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "forbid"}
 
     emails: list[str] = Field(default_factory=list, max_length=10)
     formats: list[str] = Field(default=["csv"], max_length=5)
@@ -601,6 +605,13 @@ class DeliverUpdate(BaseModel):
     dialer_type: str | None = None
     phoneburner_access_token: str | None = None
     phoneburner_owner_id: str | None = None
+
+    # Write-only readback flags emitted by GET. Accepted (so a verbatim form echo
+    # doesn't 422) but excluded from model_dump — they are not real deliver fields
+    # and must never reach DeliverConfig.
+    webhook_secret_set: bool | None = Field(default=None, exclude=True)
+    dialer_webhook_secret_set: bool | None = Field(default=None, exclude=True)
+    phoneburner_access_token_set: bool | None = Field(default=None, exclude=True)
 
 
 class ScraperConfigUpdate(BaseModel):

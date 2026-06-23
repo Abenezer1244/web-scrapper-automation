@@ -1,58 +1,77 @@
-"""Phase B guard: every selectable pre_foreclosure county must resolve to a scraper
-whose constructor accepts ``doc_types``.
+"""Phase B guard: every selectable pre_foreclosure county must resolve — through the
+SAME registry path the worker uses — to a scraper whose constructor accepts ``doc_types``.
 
 Codex (Critical): ``list_connectors`` surfaces doc-type checkboxes from the registry
-alone, but the worker only passes ``doc_types`` to a scraper whose ``__init__``
-signature accepts it. If a county is flipped ``supported_for_selection=True`` before
-its scraper is wired, a user can save a selection the scraper silently ignores and it
-scrapes EVERY document type. This guard makes that mistake fail in CI: when you enable
-a new county you MUST register its wired scraper class here, and that class must accept
-``doc_types``.
+alone, but the worker only passes ``doc_types`` to a scraper whose ``__init__`` accepts
+it. If a county is flipped ``supported_for_selection=True`` before its scraper is wired,
+a user can save a selection the scraper silently ignores and it scrapes EVERY document
+type.
+
+This guard resolves each selectable county through ``connector_scraper_class`` (the real
+resolver: manual mode imports the configured class; ai mode runs ``_detect_template`` on
+the base_url) using the county's REAL connector config, then asserts the resolved class
+accepts ``doc_types``. So CI fails if the configured ``scraper_class``/``scraper_mode``/
+``base_url`` routes to a scraper that drops the selection — not merely if a hand map is
+stale.
+
+When you enable a county, add its REAL connector config to ``_CONNECTOR_CONFIG`` (county,
+state, scraper_mode, scraper_class for manual / base_url for ai), mirroring the prod
+``county_connectors`` row.
 
 Needs a synthetic env to import scraper modules (they pull settings). Run with throwaway
 SECRET_KEY/DATABASE_URL/REDIS_URL — never the prod .env (conftest wipes tables).
 """
-import importlib
 import inspect
+from types import SimpleNamespace
 
 from src.scrapers.doc_types import _AVAILABILITY, _EAGLEWEB_COUNTIES, availability_for
+from src.scrapers.registry import connector_scraper_class
 
-# When you flip supported_for_selection=True for a county (in _AVAILABILITY or via the
-# EagleWeb template path), add it here pointing at the scraper class that actually runs
-# it. ai-mode counties resolve to their recorder-platform template class; manual-mode
-# counties to their hand-coded class. This map is the contract the guard enforces.
-_SCRAPER_FOR_SELECTABLE_COUNTY: dict[tuple[str, str], str] = {
-    ("king", "wa"): "src.scrapers.king_wa_probate.KingCountyLandmarkWebScraper",
-    ("pierce", "wa"): "src.scrapers.pierce_wa_probate.PierceWAARMSScraper",
-    # P1+: ("clark","wa") -> clark_wa.ClarkWAScraper, ("skagit","wa") -> skagit template,
-    #      EagleWeb counties -> templates.eagleweb.EagleWebScraper, etc.
+# Real county_connectors config per selectable county (mirrors the prod DB seed). For
+# manual mode, scraper_class is imported; for ai mode, base_url drives _detect_template.
+_CONNECTOR_CONFIG: dict[tuple[str, str], dict] = {
+    ("king", "wa"): {
+        "scraper_mode": "manual",
+        "scraper_class": "src.scrapers.king_wa_probate.KingCountyLandmarkWebScraper",
+        "base_url": "https://dja-prd-ecexap1.kingcounty.gov/node/411",
+    },
+    ("pierce", "wa"): {
+        "scraper_mode": "manual",
+        "scraper_class": "src.scrapers.pierce_wa_probate.PierceWAARMSScraper",
+        "base_url": "https://armsweb.co.pierce.wa.us/RealEstate/SearchEntry.aspx",
+    },
+    # P1+: clark (manual clark_wa.ClarkWAScraper), skagit/eagleweb/acclaim/idoc/
+    # laserfiche/tyler (ai -> template via base_url), whatcom (manual whatcom_wa).
 }
 
 
 def _selectable_counties() -> list[tuple[str, str]]:
     """All (county,state) that currently expose the doc-type selector."""
     candidates = set(_AVAILABILITY.keys()) | {(c, "wa") for c in _EAGLEWEB_COUNTIES}
-    out = []
-    for county, state in candidates:
-        a = availability_for(county, state)
-        if a is not None and a.get("supported_for_selection"):
-            out.append((county, state))
-    return out
+    return [
+        (county, state)
+        for county, state in candidates
+        if (availability_for(county, state) or {}).get("supported_for_selection")
+    ]
 
 
-def test_every_selectable_county_is_registered_and_wired():
+def test_every_selectable_county_resolves_to_doc_types_aware_scraper():
     selectable = _selectable_counties()
     assert selectable, "expected at least king + pierce to be selectable"
     for key in selectable:
-        assert key in _SCRAPER_FOR_SELECTABLE_COUNTY, (
-            f"{key} is supported_for_selection=True but has no scraper registered in "
-            f"_SCRAPER_FOR_SELECTABLE_COUNTY — wire its scraper before enabling the county"
+        assert key in _CONNECTOR_CONFIG, (
+            f"{key} is supported_for_selection=True but has no connector config in "
+            f"_CONNECTOR_CONFIG — register its real county_connectors row before enabling"
         )
-        path = _SCRAPER_FOR_SELECTABLE_COUNTY[key]
-        module_path, class_name = path.rsplit(".", 1)
-        klass = getattr(importlib.import_module(module_path), class_name)
-        params = inspect.signature(klass.__init__).parameters
+        county, state = key
+        fake = SimpleNamespace(county=county, state=state, **_CONNECTOR_CONFIG[key])
+        cls = connector_scraper_class(fake)
+        assert cls is not None, (
+            f"{key} connector config did not resolve to a scraper class via the real "
+            f"registry resolver (bad scraper_class/base_url/mode?)"
+        )
+        params = inspect.signature(cls.__init__).parameters
         assert "doc_types" in params, (
-            f"{path}.__init__ must accept a doc_types parameter so the worker can pass "
-            f"the user's selection (county {key} is selectable)"
+            f"{key} resolves to {cls.__name__}.__init__ which does NOT accept doc_types — "
+            f"the worker will silently scrape ALL document types. Wire it before enabling."
         )

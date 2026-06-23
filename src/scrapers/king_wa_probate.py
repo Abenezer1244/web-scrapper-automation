@@ -145,7 +145,7 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         # None = legacy (the full cfg search_texts above). FAIL-CLOSED: an explicit
         # selection that can't be mapped (stale config) RAISES rather than silently
         # broadening to the full set — the user must never get types they didn't pick.
-        if doc_types and record_type == "pre_foreclosure":
+        if doc_types is not None and record_type == "pre_foreclosure":
             from src.scrapers.doc_types import canonical_tokens_or_raise
             self.DOC_TYPE_SEARCH_TEXTS = canonical_tokens_or_raise(county, state, doc_types)
         self.DOC_TYPE_LABEL = cfg["label"]

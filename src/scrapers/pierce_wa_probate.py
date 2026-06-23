@@ -109,7 +109,7 @@ class PierceWAARMSScraper(BridgeScraper):
         # explicit selection that can't be mapped (stale config) RAISES rather than
         # silently broadening to the full set — the user must never get types they
         # didn't pick.
-        if doc_types and record_type == "pre_foreclosure":
+        if doc_types is not None and record_type == "pre_foreclosure":
             from src.scrapers.doc_types import canonical_tokens_or_raise
             self.DOC_TYPE_IDS = canonical_tokens_or_raise("pierce", "wa", doc_types)
 

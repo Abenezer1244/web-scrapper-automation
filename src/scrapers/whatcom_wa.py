@@ -64,6 +64,13 @@ add_scrape_domain("recording.whatcomcounty.us")
 class WhatcomWAScraper(BridgeScraper):
     """Whatcom County Helion recording portal scraper."""
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor — Whatcom (Helion) filters results by keyword."""
+        from src.scrapers.doc_scope import from_keyword_map
+
+        return from_keyword_map(_DOC_TYPE_KEYWORDS, record_type)
+
     def __init__(self, record_type: str = "probate"):
         super().__init__()
         self._record_type = record_type

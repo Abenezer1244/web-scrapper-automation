@@ -19,6 +19,59 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-23 — Document-type visibility (SHOW) across all counties + record types
+**Built / Shipped:** A customer asked which pre-foreclosure document type we collect per county and why
+most counties (and ALL probate) show no document types in the wizard. Built **SHOW** — read-only
+transparency: every connector reports what it collects per record type. Backend branch
+`feat/doc-type-visibility` (**PR #114**, 10 commits, worktree off origin/main); frontend branch
+`feat/doc-type-show-ui` (**PR #50** in `bridgeleads-web`, off origin/master). Merge backend first, then
+`npm run gen:api-types`, then frontend.
+- **Scraper-owned descriptors** (`src/scrapers/doc_scope.py` + `BridgeScraper.collection_scope()`): each
+  scraper/template derives a `CollectionScope{kind:"document_type"|"dataset", items:[{label,exact}], note}`
+  from its OWN doc-type constants — so display can't drift from what's scraped. Wired into the 7 keyword
+  templates (A2), king/pierce/clark/whatcom/snohomish/skagit (A3), and the 4 dataset scrapers (A4).
+- **API** (A5): `ConnectorResponse.collection_scope_by_record_type`, populated in `list_connectors` via a new
+  non-raising `registry.connector_scraper_class()` (resolves a connector row to its scraper CLASS, reuses the
+  module import allowlist). `schema/openapi.json` HAND-EDITED (mirrors `pre_foreclosure_doc_types`), NOT
+  regenerated — local pydantic version drifts the whole file.
+- **Frontend** (A8): read-only "Documents collected" panel in the wizard CountyStep; `document_type` scopes
+  render badges (approximate keyword items get `~` + tooltip), `dataset` scopes show the source note; hidden
+  where the existing pre_foreclosure SELECT selector already covers it (King/Pierce). Precise local types
+  (`ConnectorWithScope`) bridge the field until `gen:api-types` runs post-merge.
+**Tried / Decided:** Codex pressure-tested the plan FIRST and **rejected my original central-catalog design**
+(it would become a second implementation of scraper behavior and drift). Adopted its scraper-owned-descriptor
+design + honesty rules: broad single-word predicates ("DEATH","TAX") → "X-related filings" (never a precise
+name); cryptic per-county codes (NTS/LETTR/TOD) → explicit "Other … (county-specific codes)" bucket; divorce
+derived from the shared `is_divorce_doc` classifier (NOT the coarse keyword list); datasets → `kind:"dataset"`.
+`eviction` confirmed not a live record type. SHOW kept strictly separate from the SELECT capability so an
+unverified display string can't become a control contract. Coverage test fails on any newly unmapped keyword.
+**Failed / Blocked:** `codex review --base` repeatedly timed out (gpt-5.5 high effort stalling on repo
+exploration) — switched to streaming `codex exec` with an embedded diff, which worked. Frontend `tsc`/`eslint`
+were initially un-runnable: the repo's `node_modules` in this env was an incomplete OneDrive partial-sync (no
+`@types/react`, empty `.bin`); a full `npm install` in the worktree (slow on OneDrive, one timeout) repaired
+it → tsc + eslint then ran clean.
+**Caught & fixed (Codex review):** **P2 — Clark's SHOW scope was dishonest:** it derived from `_DOC_TYPES`
+(the broad client-side allowlist), so tax advertised "Certificate of Delinquency"/"Certificate of Sale" as
+exact, but Clark tax only selects checkbox 97 (Federal Tax Lien) and the portal filters server-side to exactly
+that. Fixed (`85a97af`) by deriving from `_DOC_TYPE_CHECKBOX_VALUES` + a verified id→label map; Codex
+re-confirmed. FE P3 — `dataset` scope with `note:null` rendered a bare heading → content guard.
+**Clark sub-investigation (user: "investigate first"):** Codex flagged a 6-labels-vs-5-checkbox-IDs mismatch.
+Live-verified the portal: root cause = a MISSING checkbox **257 (TRUSTEES SALE)**, not a wrong one. Live runs
+also **disproved an existing comment** that claimed Clark's portal "returns every document type regardless of
+selection" — it actually filters server-side by the selected doc-type codes (selecting only "DEF" returned 0
+records; the OLD 5-set and NEW 6-set both returned 137). Bare `DEFAULT`(66) and `TRUSTEES SALE`(257) are both
+empty categories (0 records / 6 months), so **no production lead loss ever existed**; the fix is correctness/
+completeness. Corrected the false comment (`143ddb9`).
+**Pending / Handoff:** Merge #114 → `gen:api-types` → merge #50 → dogfood FE against live API. Deferred: Clark
+probate/divorce/tax checkbox-code completeness audit (server-side filtering makes the checkbox list load-
+bearing for ALL record types, not just pre_foreclosure); **Phase B (user-selectable doc types beyond
+King/Pierce, county-by-county after live verification)**.
+**Facts learned:** (1) Clark LandmarkWeb's modal checkboxes ARE the primary server-side filter (each maps to a
+short doc-type code: NTS/LP/NF/NOTDEF/FORECL/TRSL); the client-side keyword filter is defense-in-depth, not the
+sole gate. (2) King exposes NTS only (WA non-judicial foreclosures don't record a Notice of Default), Pierce's
+default is NOD — which matches the customer's own "NOD best, then NTS" ranking exactly. (3) `gen:api-types`
+pulls openapi.json from `web-scrapper-automation/main`, so backend must merge before FE types regenerate.
+
 ## 2026-06-22 — Delivery-step deep dive: export / email / webhook / "Run once" (Q1–Q4 from a UX review)
 **Built / Shipped:** A user walked the wizard's Delivery step and asked 4 skeptical questions; each surfaced
 real bugs, fixed root-cause with Codex on every step. Backend branch `feat/fields-output-visibility`,

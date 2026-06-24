@@ -20,6 +20,7 @@ from playwright.async_api import (
 
 from src.api.middleware.security import validate_scraping_target
 from src.config import settings
+from src.scrapers.doc_scope import CollectionScope
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
 
@@ -136,6 +137,25 @@ class BridgeScraper:
         self._context: BrowserContext | None = None
         self.page: Page | None = None
         self.on_progress: ProgressCallback | None = None
+
+    # ─── Collection scope (SHOW — read-only transparency) ─────────────────────
+
+    @classmethod
+    def collection_scope(cls, record_type: str) -> "CollectionScope | None":
+        """Describe the document types this connector collects for `record_type`.
+
+        Read-only, for the wizard's "documents collected" display — NOT the
+        selectable doc-type input (see `doc_types.py`). Returns None when this
+        connector has not declared a scope; the API then omits it, matching
+        today's behavior (no silent change for unconverted scrapers).
+
+        Subclasses override and derive the scope from their OWN doc-type
+        constants (the same ones they filter on), so display cannot drift from
+        what is actually scraped. This is a classmethod on purpose: the API
+        resolves a connector's class via the registry and queries it WITHOUT
+        instantiating a browser-backed scraper.
+        """
+        return None
 
     # ─── Lifecycle ────────────────────────────────────────────────────────────
 

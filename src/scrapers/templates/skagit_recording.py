@@ -92,6 +92,24 @@ class SkagitRecordingScraper(BridgeScraper):
     Parcel IDs are available directly in search results.
     """
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor — Skagit selects a coarse server dropdown then refines
+        results client-side against the document type AND recorder comments. The
+        client refinement (_DOC_TYPE_MAP) is what actually gets kept, so describe
+        that, with a note about the two-stage match."""
+        from src.scrapers.doc_scope import from_keyword_map
+
+        return from_keyword_map(
+            _DOC_TYPE_MAP,
+            record_type,
+            note=(
+                "Identified from a recorder document-type dropdown search, then "
+                "refined by document type and recorder comments; exact wording "
+                "varies."
+            ),
+        )
+
     def __init__(
         self,
         base_url: str,

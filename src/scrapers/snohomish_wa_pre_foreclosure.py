@@ -102,6 +102,19 @@ def _record_from_notice(parsed: dict) -> ScrapedRecord:
 class SnohomishWAPreForeclosureScraper(BridgeScraper):
     """Scrapes Notice-of-Trustee-Sale leads from the Snohomish County Tribune PDF."""
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor — Snohomish publishes Notice-of-Trustee-Sale legals only."""
+        from src.scrapers.doc_scope import CollectionScope, DocTypeItem
+
+        if record_type != "pre_foreclosure":
+            return None
+        return CollectionScope(
+            kind="document_type",
+            items=(DocTypeItem(label="Notice of Trustee Sale", exact=True),),
+            note="Published trustee-sale legal notices (Snohomish County Tribune).",
+        )
+
     def __init__(self, record_type: str = "pre_foreclosure") -> None:
         super().__init__()
 

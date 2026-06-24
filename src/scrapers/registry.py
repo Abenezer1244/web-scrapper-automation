@@ -25,6 +25,23 @@ class UnsupportedCountyError(ValueError):
     """Raised when no active connector exists for a county/state/record_type combination."""
 
 
+# SECURITY: only allow scraper-class imports from pre-approved modules to prevent
+# code injection via the DB-stored scraper_class string. Shared by get_scraper_class
+# (execution) and connector_scraper_class (read-only metadata).
+_ALLOWED_SCRAPER_MODULES = frozenset([
+    "src.scrapers.pierce_wa_probate",
+    "src.scrapers.pierce_wa_code_violation",
+    "src.scrapers.clark_wa",
+    "src.scrapers.whatcom_wa",
+    "src.scrapers.king_wa_code_violation",
+    "src.scrapers.king_wa_tax_delinquent",
+    "src.scrapers.king_wa_probate",
+    "src.scrapers.snohomish_wa_tax_delinquent",
+    "src.scrapers.snohomish_wa_pre_foreclosure",
+    "src.scrapers.base_scraper",
+])
+
+
 # Either a BridgeScraper subclass or a functools.partial that returns one.
 # Both are callables that, when invoked with no positional args, yield a
 # BridgeScraper instance — that's all the caller needs.
@@ -110,21 +127,8 @@ def get_scraper_class(
             record_types=connector.record_types,
         ), record_type
 
-    # Manual mode: dynamically import the hand-coded scraper class
-    # SECURITY: Only allow imports from pre-approved modules to prevent code injection
-    _ALLOWED_SCRAPER_MODULES = frozenset([
-        "src.scrapers.pierce_wa_probate",
-        "src.scrapers.pierce_wa_code_violation",
-        "src.scrapers.clark_wa",
-        "src.scrapers.whatcom_wa",
-        "src.scrapers.king_wa_code_violation",
-        "src.scrapers.king_wa_tax_delinquent",
-        "src.scrapers.king_wa_probate",
-        "src.scrapers.snohomish_wa_tax_delinquent",
-        "src.scrapers.snohomish_wa_pre_foreclosure",
-        "src.scrapers.base_scraper",
-    ])
-
+    # Manual mode: dynamically import the hand-coded scraper class from the
+    # module-level allowlist (_ALLOWED_SCRAPER_MODULES).
     module_path, class_name = connector.scraper_class.rsplit(".", 1)
 
     if module_path not in _ALLOWED_SCRAPER_MODULES:
@@ -145,6 +149,30 @@ def get_scraper_class(
         county, state, record_type, connector.scraper_class,
     )
     return scraper_class, record_type
+
+
+def connector_scraper_class(connector) -> type | None:
+    """Resolve a CountyConnector row to its scraper CLASS (not a partial), without a
+    DB lookup and without raising.
+
+    For read-only metadata callers (e.g. the SHOW collection_scope display) that
+    already hold the connector row and just need to query a classmethod. ai-mode
+    resolves to the recorder-platform template; manual mode imports the allowlisted
+    class. Returns None when the connector cannot be resolved.
+    """
+    if getattr(connector, "scraper_mode", "manual") == "ai":
+        return _detect_template(connector.base_url or "")
+    scraper_class = getattr(connector, "scraper_class", None)
+    if not scraper_class or "." not in scraper_class:
+        return None
+    module_path, class_name = scraper_class.rsplit(".", 1)
+    if module_path not in _ALLOWED_SCRAPER_MODULES:
+        return None
+    try:
+        module = importlib.import_module(module_path)
+        return getattr(module, class_name)
+    except (ImportError, AttributeError):
+        return None
 
 
 def _detect_template(base_url: str):

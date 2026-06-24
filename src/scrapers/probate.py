@@ -472,3 +472,23 @@ def should_include_probate_row(
         classify_probate_signal_for_row(doc_type, comment)
         is not ProbateSignal.TOD_LIVING_OWNER
     )
+
+
+def new_probate_config_tod_default(
+    record_type: str | None, provided: bool | None
+) -> bool | None:
+    """Resolve ``include_living_owner_tod`` for a NEWLY created scraper config.
+
+    New probate configs exclude living-owner TOD by default (probate = death), so an
+    omitted / null choice resolves to ``False``. An explicit ``True``/``False`` from
+    the client is honored. Non-probate configs are unaffected — the flag stays
+    whatever was provided (``None`` for the common case); it only governs probate.
+
+    Grandfathering (``None`` => include) is for PRE-EXISTING configs only. This makes
+    ``None`` on a stored row unambiguous: "created before the toggle existed" — never
+    "a new config that happens to want everything". Shared by the create, preview, and
+    batch paths so their default can never drift.
+    """
+    if record_type == "probate" and provided is None:
+        return False
+    return provided

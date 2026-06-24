@@ -30,8 +30,24 @@ from src.config.constants import (
     SKIP_TRACE_ADDON_PLANS,
 )
 from src.db import CountyConnector, ScraperConfig, get_db
+from src.scrapers.probate import new_probate_config_tod_default
 
 router = APIRouter(prefix="/scrapers", tags=["scrapers"])
+
+# Phase 3: the living-owner TOD toggle is a probate-only product control.
+_TOD_TOGGLE_RECORD_TYPE = "probate"
+
+
+def _validate_tod_toggle(record_type: str, include_living_owner_tod: bool | None) -> None:
+    """422 if include_living_owner_tod is explicitly set on a non-probate config.
+
+    Mirrors _validate_doc_types: the flag only governs probate output, so an explicit
+    value on any other record type is a client error, not a silent no-op."""
+    if include_living_owner_tod is not None and record_type != _TOD_TOGGLE_RECORD_TYPE:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="include_living_owner_tod is only valid for the probate record type",
+        )
 
 
 @router.get("/sample")
@@ -207,6 +223,13 @@ async def _build_scraper_config(
     if body.doc_types is not None:
         _validate_doc_types(body.county, body.state, body.record_type, body.doc_types)
 
+    # Phase 3: reject the TOD toggle on non-probate; resolve the NEW-config default
+    # (probate + omitted/null -> False = exclude living-owner TOD).
+    _validate_tod_toggle(body.record_type, body.include_living_owner_tod)
+    eff_include_living_owner_tod = new_probate_config_tod_default(
+        body.record_type, body.include_living_owner_tod
+    )
+
     _enforce_plan_feature_gates(
         current_user,
         # A native dialer connector (dialer_type, e.g. phoneburner) pushes lead PII
@@ -240,6 +263,7 @@ async def _build_scraper_config(
         deliver=body.deliver.model_dump(),
         skip_trace_enabled=body.skip_trace_enabled,
         doc_types=body.doc_types,  # Phase 2b: None = legacy/full output
+        include_living_owner_tod=eff_include_living_owner_tod,  # Phase 3
         active=active,
     )
     db.add(config)
@@ -613,6 +637,13 @@ async def update_scraper(
         else bool(config.skip_trace_enabled)
     )
     eff_doc_types = body.doc_types if ("doc_types" in fields_set) else config.doc_types
+    # Phase 3: OMITTED preserves the stored value (an old None config stays
+    # grandfathered — editing it must not silently flip TOD off); PRESENT replaces it.
+    eff_include_living_owner_tod = (
+        body.include_living_owner_tod
+        if ("include_living_owner_tod" in fields_set)
+        else config.include_living_owner_tod
+    )
 
     if "deliver" in fields_set and body.deliver is not None:
         eff_deliver = _merge_deliver(stored_deliver, body.deliver).model_dump()
@@ -625,6 +656,11 @@ async def update_scraper(
     #    later deactivated (Codex).
     if "doc_types" in fields_set and eff_doc_types is not None:
         _validate_doc_types(config.county, config.state, config.record_type, eff_doc_types)
+
+    # Phase 3: reject the TOD toggle when newly set on a non-probate config
+    # (record_type is immutable, so the stored type is authoritative).
+    if "include_living_owner_tod" in fields_set:
+        _validate_tod_toggle(config.record_type, body.include_living_owner_tod)
 
     # 7. Plan/tier gates on the ENABLE-DELTA only: block a PATCH that newly turns
     #    on a gated feature (so a downgraded user can't bypass tiers), but
@@ -664,6 +700,8 @@ async def update_scraper(
         changed_fields.append("skip_trace_enabled")
     if eff_doc_types != config.doc_types:
         changed_fields.append("doc_types")
+    if eff_include_living_owner_tod != config.include_living_owner_tod:
+        changed_fields.append("include_living_owner_tod")
 
     if not changed_fields:
         return ScraperConfigResponse.model_validate(config)
@@ -679,6 +717,11 @@ async def update_scraper(
         audit_bits.append(f"skip_trace_enabled={bool(config.skip_trace_enabled)}->{eff_skip_trace}")
     if "doc_types" in changed_fields:
         audit_bits.append(f"doc_types={config.doc_types}->{eff_doc_types}")
+    if "include_living_owner_tod" in changed_fields:
+        audit_bits.append(
+            f"include_living_owner_tod={config.include_living_owner_tod}"
+            f"->{eff_include_living_owner_tod}"
+        )
     audit_detail = " ".join(audit_bits)
 
     # 9. Apply, flush, refresh (so the response carries the new updated_at token).
@@ -689,6 +732,7 @@ async def update_scraper(
     config.deliver = eff_deliver
     config.skip_trace_enabled = eff_skip_trace
     config.doc_types = eff_doc_types
+    config.include_living_owner_tod = eff_include_living_owner_tod
     await db.flush()
     await db.refresh(config)
 

@@ -18,7 +18,10 @@ a recorder COMMENT can upgrade a bare TOD deed into a death-triggered (real) lea
 those must be KEPT even when the customer excluded living-owner TOD (Codex).
 """
 
-from src.scrapers.probate import should_include_probate_row
+from src.scrapers.probate import (
+    new_probate_config_tod_default,
+    should_include_probate_row,
+)
 
 
 # --- Non-probate record types are never touched by this filter -------------------
@@ -90,3 +93,29 @@ def test_false_flag_drops_tod_with_unrelated_comment():
 def test_false_flag_keeps_empty_doc_type():
     assert should_include_probate_row("probate", False, None, None) is True
     assert should_include_probate_row("probate", False, "", None) is True
+
+
+# --- new_probate_config_tod_default: NEW config default resolution ----------------
+def test_new_probate_omitted_defaults_to_exclude():
+    # A new probate config with no explicit choice excludes living-owner TOD.
+    assert new_probate_config_tod_default("probate", None) is False
+
+
+def test_new_probate_explicit_true_honored():
+    assert new_probate_config_tod_default("probate", True) is True
+
+
+def test_new_probate_explicit_false_honored():
+    assert new_probate_config_tod_default("probate", False) is False
+
+
+def test_new_non_probate_stays_none():
+    # Non-probate configs never get the flag defaulted on.
+    assert new_probate_config_tod_default("pre_foreclosure", None) is None
+    assert new_probate_config_tod_default("tax_delinquent", None) is None
+
+
+def test_new_non_probate_passes_through_provided():
+    # Pure pass-through for non-probate (route-level validation rejects a stray
+    # explicit value separately; the helper itself does not mutate it).
+    assert new_probate_config_tod_default("pre_foreclosure", True) is True

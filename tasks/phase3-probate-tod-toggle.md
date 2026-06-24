@@ -33,22 +33,27 @@ Codex materially improved the handoff plan. Adopted in full (Codex wins; docs si
 
 ## Phasing (each ≤5 files, each independently shippable)
 
-### Phase 3a — data model + worker enforcement (core honesty filter)  [zero behavior change]
+### Phase 3a — data model + worker enforcement (core honesty filter)  [zero behavior change]  ✅ DONE (commit 745da95)
 With no API writing the column, every config is `NULL` → include → identical output.
 Safe to merge/deploy before the frontend.
-- [ ] `src/db/models.py` — add `include_living_owner_tod = Column(Boolean, nullable=True)`
-- [ ] `alembic/versions/071_scraper_config_include_living_owner_tod.py` — nullable bool (down_revision `070`)
-- [ ] `src/scrapers/probate.py` — pure predicate `should_include_probate_row(record_type, include_living_owner_tod, doc_type, comment) -> bool`
-- [ ] `src/workers/tasks.py` — build `kept_records` (probate + flag is False), call predicate, log dropped count; reassign before validate/insert/export
-- [ ] `tests/test_probate_tod_filter.py` — predicate truth table (None/False/True × death/TOD/death-triggered-TOD/comment-upgrade)
-- [ ] Verify (synthetic-env importlib, NO bare pytest), ruff, then `codex review` the 3a diff
+- [x] `src/db/models.py` — add `include_living_owner_tod = Column(Boolean, nullable=True)`
+- [x] `alembic/versions/071_scraper_config_include_living_owner_tod.py` — nullable bool (down_revision `070`)
+- [x] `src/scrapers/probate.py` — pure predicate `should_include_probate_row(record_type, include_living_owner_tod, doc_type, comment) -> bool`
+- [x] `src/workers/tasks.py` — filter `records` (probate + flag is False) before quota-cap/validate/insert/export; log dropped count
+- [x] `tests/test_probate_tod_filter.py` — 13 cases (None/False/True × death/TOD/death-triggered-TOD-via-comment/unknown), all green
+- [x] Verify: 13/13 predicate + 78 existing probate tests pass (synthetic-env importlib); ruff clean; compiles. `codex review` = GATE PASS, zero findings.
 
 ### Phase 3b — API surface (lets customers choose)  [behavior change: new probate default = TOD off]
-- [ ] `src/api/schemas.py` — `include_living_owner_tod: bool | None` on ScraperCreate, response, batch-create, preview
-- [ ] `src/api/routes/scrapers.py` — create defaults NEW probate→False; validate (probate-only); PATCH preserves None; expose in response
-- [ ] `src/api/routes/batches.py` — batch-create defaults new probate children→False
-- [ ] tests for default-on-create + PATCH-preserve-None
-- [ ] Verify, ruff, `codex review` the 3b diff. Backend-first; FE regenerates OpenAPI types.
+- [x] `src/scrapers/probate.py` — shared pure `new_probate_config_tod_default` (no create/preview/batch drift)
+- [x] `src/api/schemas.py` — `include_living_owner_tod: bool | None` on Create, Response, Update, BatchCreate
+- [x] `src/api/routes/scrapers.py` — create+preview default NEW probate→False via shared helper; `_validate_tod_toggle` (probate-only 422); PATCH preserves omitted None + validates + audits + applies; Response exposes it
+- [x] `src/api/routes/batches.py` — probate children default→False (non-probate children stay None)
+- [x] `tests/test_probate_tod_filter.py` — +5 default-helper cases (probate None→False, explicit honored, non-probate→None passthrough)
+- [x] Verify: ruff clean; route modules import OK; 18/18 tests pass. `codex review` 3b diff = PENDING
+
+Batch asymmetry (documented for review): single create/PATCH 422 an explicit TOD flag on a
+non-probate config; a BATCH spans multiple types, so the flag applies only to probate
+children and is ignored (no 422) for the rest.
 
 ### Phase 4 — frontend (SEPARATE repo `bridgeleads-web`) — NOT this session.
 

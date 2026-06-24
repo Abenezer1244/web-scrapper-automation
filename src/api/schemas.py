@@ -489,6 +489,10 @@ class ScraperConfigCreate(BaseModel):
     # route (so we don't import scraper code into schemas). None = legacy/full
     # output; a non-empty list narrows. Bounded to prevent abuse.
     doc_types: list[str] | None = Field(default=None, max_length=10)
+    # Phase 3: probate living-owner Transfer-on-Death toggle. None/omitted on a NEW
+    # probate config resolves to False (exclude) at the route; True opts in. Only
+    # meaningful for record_type=='probate' (route 422s it otherwise).
+    include_living_owner_tod: bool | None = None
 
     @field_validator("state")
     @classmethod
@@ -517,6 +521,10 @@ class ScraperConfigResponse(BaseModel):
     deliver: dict[str, Any] | Any
     skip_trace_enabled: bool = False
     doc_types: list[str] | None = None  # Phase 2b: pre-foreclosure doc-type selection (None = legacy)
+    # Phase 3: None = legacy/grandfathered (include TOD), False = exclude living-owner
+    # TOD, True = opt-in. Frontend must NOT echo a default False for a None config (a
+    # null read means grandfathered — only a real user toggle should write a value).
+    include_living_owner_tod: bool | None = None
     active: bool
     created_at: datetime
     updated_at: datetime
@@ -644,6 +652,10 @@ class ScraperConfigUpdate(BaseModel):
     deliver: DeliverUpdate | None = None
     skip_trace_enabled: bool | None = None
     doc_types: list[str] | None = Field(default=None, max_length=10)
+    # Phase 3: OMITTED keeps the stored value (an old None config stays grandfathered —
+    # editing it must NOT silently flip TOD off); PRESENT replaces it. Only valid for a
+    # probate config (route 422s otherwise).
+    include_living_owner_tod: bool | None = None
 
     # Identity — accepted only so the route can 422 if a client tries to change it.
     county: str | None = None
@@ -673,6 +685,11 @@ class BatchCreateRequest(BaseModel):
     deliver: DeliverConfig = DeliverConfig()
     schedule: ScheduleConfig = ScheduleConfig()
     skip_trace_enabled: bool = False
+    # Phase 3: applies ONLY to probate children of this batch (None/omitted => the
+    # new probate default, exclude living-owner TOD; True => opt-in). Ignored for
+    # non-probate record types in the batch — no 422, since a batch legitimately
+    # spans multiple types.
+    include_living_owner_tod: bool | None = None
 
     @field_validator("state")
     @classmethod

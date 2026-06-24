@@ -53,8 +53,8 @@ Safe to merge/deploy before the frontend.
 - [x] `codex review` 3a = GATE PASS (zero findings). 3b = 1×P2 (PATCH explicit-null re-grandfathers
       a False config → re-enables TOD without opt-in). FIXED in `10e3300` via pure
       `effective_tod_on_update` (explicit null treated as omitted) + 6 targeted tests.
-- [ ] CONFIRMING codex re-review of the P2 fix — BLOCKED: Codex usage limit (resets ~11:26 PM). Re-run:
-      `codex review --base feat/probate-tod-signal -c 'model_reasoning_effort="high"'`
+- [x] CONFIRMING codex re-review of the P2 fix (`--base 20d0d79`) = CLEAN: "did not find any
+      introduced correctness issues." Phase 3 review gate satisfied — no outstanding Critical/High/P2.
 
 ## Commits (branch feat/probate-tod-toggle, NOT pushed, stacked on #115)
 - 745da95  Phase 3a — column + migration 071 + worker filter + predicate

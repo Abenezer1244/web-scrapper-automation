@@ -52,8 +52,17 @@ _CONNECTOR_CONFIG: dict[tuple[str, str], dict] = {
         "scraper_class": "",
         "base_url": "https://www.skagitcounty.net/Search/Recording/",
     },
-    # P3+: eagleweb/acclaim/idoc/laserfiche/tyler (ai -> template via base_url),
-    # whatcom (manual whatcom_wa).
+    # P3: EagleWeb family (ai-mode -> EagleWebScraper via _detect_template). base_urls
+    # from live /connectors 2026-06-23.
+    ("benton", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://erecording.co.benton.wa.us/recorder/web/"},
+    ("clallam", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://erecording.clallamcountywa.gov/recorder/web/"},
+    ("grant", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://grantcountywa-recorder.tylerhost.net/grantrecorder/web/"},
+    ("island", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://auditor.islandcountywa.gov/recorder/web/"},
+    ("jefferson", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://er-web.co.jefferson.wa.us/recorder/web/"},
+    ("kitsap", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://kcwaimg.kitsap.gov/recorder/web/"},
+    ("thurston", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://eagleweb.co.thurston.wa.us/thurstonrecorder/web/"},
+    ("whitman", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://whitmanwa.countygovernmentrecords.com/whitmanrecorder/web/"},
+    # P4: acclaim/idoc/laserfiche/tyler (ai -> template via base_url), whatcom (manual).
 }
 
 
@@ -67,6 +76,22 @@ def _selectable_counties() -> list[tuple[str, str]]:
     ]
 
 
+def _worker_factory(cfg: dict):
+    """Build the SAME callable the worker inspects, mirroring registry.get_scraper_class:
+    ai-mode -> functools.partial(template, base_url/county/state/record_types) so
+    inspect.signature() sees the remaining (unbound) params; manual -> the class itself.
+    _run_scraper does inspect.signature(factory) and passes doc_types only if present."""
+    from functools import partial
+    fake = SimpleNamespace(county="x", state="wa", **cfg)
+    cls = connector_scraper_class(fake)
+    if cls is None:
+        return None
+    if cfg.get("scraper_mode") == "ai":
+        return partial(cls, base_url=cfg["base_url"], county="x", state="wa",
+                       record_types=["pre_foreclosure"])
+    return cls
+
+
 def test_every_selectable_county_resolves_to_doc_types_aware_scraper():
     selectable = _selectable_counties()
     assert selectable, "expected at least king + pierce to be selectable"
@@ -75,15 +100,14 @@ def test_every_selectable_county_resolves_to_doc_types_aware_scraper():
             f"{key} is supported_for_selection=True but has no connector config in "
             f"_CONNECTOR_CONFIG — register its real county_connectors row before enabling"
         )
-        county, state = key
-        fake = SimpleNamespace(county=county, state=state, **_CONNECTOR_CONFIG[key])
-        cls = connector_scraper_class(fake)
-        assert cls is not None, (
-            f"{key} connector config did not resolve to a scraper class via the real "
-            f"registry resolver (bad scraper_class/base_url/mode?)"
+        factory = _worker_factory(_CONNECTOR_CONFIG[key])
+        assert factory is not None, (
+            f"{key} connector config did not resolve via the real registry resolver "
+            f"(bad scraper_class/base_url/mode?)"
         )
-        params = inspect.signature(cls.__init__).parameters
+        # Mirror _run_scraper: inspect the factory the worker actually constructs.
+        params = inspect.signature(factory).parameters
         assert "doc_types" in params, (
-            f"{key} resolves to {cls.__name__}.__init__ which does NOT accept doc_types — "
-            f"the worker will silently scrape ALL document types. Wire it before enabling."
+            f"{key} resolves to a factory that does NOT expose doc_types — the worker "
+            f"will silently scrape ALL document types. Wire it before enabling."
         )

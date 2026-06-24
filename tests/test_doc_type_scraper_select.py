@@ -11,6 +11,7 @@ import pytest
 from src.scrapers.clark_wa import ClarkWAScraper
 from src.scrapers.king_wa_probate import KingCountyLandmarkWebScraper
 from src.scrapers.pierce_wa_probate import PierceWAARMSScraper
+from src.scrapers.templates.eagleweb import EagleWebScraper
 from src.scrapers.templates.skagit_recording import SkagitRecordingScraper
 
 
@@ -18,6 +19,13 @@ def _skagit(**kw):
     return SkagitRecordingScraper(
         base_url="https://www.skagitcounty.net/Search/Recording/",
         county="skagit", state="WA", record_types=["pre_foreclosure"], **kw
+    )
+
+
+def _eagleweb(county="thurston", **kw):
+    return EagleWebScraper(
+        base_url="https://eagleweb.co.thurston.wa.us/thurstonrecorder/web/",
+        county=county, state="WA", record_types=["pre_foreclosure"], **kw
     )
 
 
@@ -142,6 +150,49 @@ def test_skagit_filter_by_type_applies_refine_override():
     kept_types = {r.doc_type for r in s._filter_by_type(recs)}
     assert "Lis Pendens" not in kept_types  # dropped by narrowed keyword gate
     assert "Notice Of Default" in kept_types  # matching person row survives
+
+
+# ── EagleWeb (client-side keyword filter, shared across 8 counties) ───────────
+def test_eagleweb_tokens_partition_scraper_map():
+    # The registry tokens MUST be an exact partition of the scraper's keyword map,
+    # so a narrowed selection is always a true subset of legacy output (never adds a
+    # keyword legacy wouldn't match, never drops one it would). Lockstep guard.
+    from src.scrapers.doc_types import _EAGLEWEB_TEMPLATE
+    from src.scrapers.templates.eagleweb import _DOC_TYPE_MAP
+    token_union = set()
+    for kws in _EAGLEWEB_TEMPLATE["tokens"].values():
+        token_union.update(kws)
+    assert token_union == set(_DOC_TYPE_MAP["pre_foreclosure"]), (
+        token_union ^ set(_DOC_TYPE_MAP["pre_foreclosure"])
+    )
+
+
+def test_eagleweb_none_is_legacy():
+    assert _eagleweb(record_type="pre_foreclosure")._doc_type_keyword_override is None
+
+
+def test_eagleweb_selection_narrows_keywords():
+    s = _eagleweb(record_type="pre_foreclosure", doc_types=["notice_of_trustee_sale"])
+    assert s._doc_type_keyword_override == [
+        "NOTICE OF TRUSTEE SALE", "TRUSTEE SALE", "TRUSTEE'S SALE", "NTS", "NTSCL"
+    ]
+    s2 = _eagleweb(record_type="pre_foreclosure", doc_types=["lis_pendens"])
+    assert s2._doc_type_keyword_override == ["LIS PENDENS", "LISP"]
+
+
+def test_eagleweb_unmappable_selection_raises():
+    # EagleWeb has no notice_of_foreclosure token — fail closed.
+    with pytest.raises(ValueError):
+        _eagleweb(record_type="pre_foreclosure", doc_types=["notice_of_foreclosure"])
+
+
+def test_eagleweb_empty_selection_raises():
+    with pytest.raises(ValueError):
+        _eagleweb(record_type="pre_foreclosure", doc_types=[])
+
+
+def test_eagleweb_doc_types_ignored_for_non_pre_foreclosure():
+    assert _eagleweb(record_type="probate", doc_types=["lis_pendens"])._doc_type_keyword_override is None
 
 
 def test_king_none_is_legacy_nots():

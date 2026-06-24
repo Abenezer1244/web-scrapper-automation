@@ -28,9 +28,21 @@ def test_pierce_labels_are_token_to_label_map():
 
 
 def test_unsupported_county_returns_none():
-    # Kitsap (EagleWeb template) is not supported_for_selection → hidden.
-    assert selectable_doc_type_labels("kitsap", "wa") is None
+    # lewis (EagleWeb, health=down) is deferred → not in _EAGLEWEB_COUNTIES → hidden.
+    assert selectable_doc_type_labels("lewis", "wa") is None
     assert selectable_doc_type_labels("nowhere", "zz") is None
+
+
+def test_kitsap_eagleweb_labels_are_token_to_label_map():
+    # Phase B: kitsap (EagleWeb) is now selectable (confidence=keyword) — 4 canonical
+    # types, no notice_of_foreclosure (EagleWeb keyword map has no such token).
+    labels = selectable_doc_type_labels("kitsap", "wa")
+    assert labels == {
+        "notice_of_default": "Notice of Default",
+        "notice_of_trustee_sale": "Notice of Trustee Sale",
+        "lis_pendens": "Lis Pendens",
+        "foreclosure": "Foreclosure",
+    }
 
 
 def test_labels_shape_is_flat_str_to_str():

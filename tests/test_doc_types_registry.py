@@ -66,10 +66,19 @@ def test_canonical_tokens_king_maps_to_search_text():
     assert toks == ["notice of trustee sale"]
 
 
-def test_validate_rejects_hidden_eagleweb_county():
-    # Kitsap (EagleWeb) is not yet supported_for_selection -> reject (Codex P2).
-    ok, err = validate_selection("kitsap", "wa", ["notice_of_default"])
+def test_validate_rejects_deferred_eagleweb_county():
+    # lewis (EagleWeb, health=down) is DEFERRED → not selectable → reject.
+    ok, err = validate_selection("lewis", "wa", ["notice_of_default"])
     assert ok is False and err is not None
+
+
+def test_validate_accepts_enabled_eagleweb_county():
+    # Phase B: kitsap (EagleWeb) is now selectable.
+    ok, err = validate_selection("kitsap", "wa", ["notice_of_default"])
+    assert ok is True and err is None
+    # but a type EagleWeb's keyword map doesn't cover is still rejected
+    ok2, _ = validate_selection("kitsap", "wa", ["notice_of_foreclosure"])
+    assert ok2 is False
 
 
 def test_canonical_tokens_all_or_nothing_on_unmapped():
@@ -95,7 +104,7 @@ def test_or_raise_raises_on_unmappable_token():
 
 def test_or_raise_raises_on_hidden_or_unknown_county():
     with pytest.raises(ValueError):
-        canonical_tokens_or_raise("kitsap", "wa", ["notice_of_default"])  # not yet selectable
+        canonical_tokens_or_raise("lewis", "wa", ["notice_of_default"])  # deferred (down)
     with pytest.raises(ValueError):
         canonical_tokens_or_raise("nowhere", "zz", ["notice_of_default"])
 

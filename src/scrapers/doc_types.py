@@ -130,9 +130,18 @@ _AVAILABILITY: dict[tuple[str, str], dict] = {
     },
 }
 
-# EagleWeb template default (kitsap + others). Hidden from selection until
-# per-county coverage is explicitly verified (Codex: don't assume 16 counties
-# share one truth). Keyword map mirrors eagleweb._DOC_TYPE_MAP entries.
+# EagleWeb template (Tyler EagleWeb recorder sites). CLIENT-SIDE keyword filter:
+# the scraper fetches broadly and keeps rows whose doc-type text matches the keyword
+# set, so selection NARROWS that keyword set — a weaker, best-effort filter than a
+# server-side checkbox/dropdown, hence confidence="keyword" (the UI labels it as a
+# post-collection text match, not a portal filter).
+#
+# `tokens` MUST exactly partition eagleweb._DOC_TYPE_MAP["pre_foreclosure"] so a
+# narrowed selection is a true SUBSET of legacy output — never matching a keyword the
+# full run wouldn't (would over-collect) and never dropping one it would (silent lead
+# loss). test_eagleweb_tokens_partition_scraper_map enforces this lockstep.
+# notice_of_foreclosure is intentionally absent: EagleWeb's keyword map has no
+# "NOTICE OF FORECLOSURE" token (only bare FORECLOSURE → canonical `foreclosure`).
 _EAGLEWEB_TEMPLATE = {
     "available": [
         "notice_of_default", "notice_of_trustee_sale",
@@ -140,16 +149,23 @@ _EAGLEWEB_TEMPLATE = {
     ],
     "method": "keyword",
     "confidence": "keyword",
-    "default": None,
-    "supported_for_selection": False,
+    "default": "notice_of_trustee_sale",
+    "supported_for_selection": True,
     "tokens": {
-        "notice_of_default": ["NOTICE OF DEFAULT", "NOD"],
-        "notice_of_trustee_sale": ["NOTICE OF TRUSTEE SALE", "TRUSTEE SALE", "TRUSTEE'S SALE", "NTS"],
+        "notice_of_default": ["NOTICE OF DEFAULT"],
+        "notice_of_trustee_sale": ["NOTICE OF TRUSTEE SALE", "TRUSTEE SALE", "TRUSTEE'S SALE", "NTS", "NTSCL"],
         "lis_pendens": ["LIS PENDENS", "LISP"],
         "foreclosure": ["FORECLOSURE"],
     },
 }
-_EAGLEWEB_COUNTIES = {"kitsap"}  # extend as coverage is verified
+# Healthy EagleWeb pre_foreclosure counties (live `/connectors` 2026-06-23). The 4
+# health=down EagleWeb counties (lewis, pacific, spokane) are deferred fail-closed
+# until their portals can be live-checked. grant sits on tylerhost.net but its
+# /grantrecorder/web/ path resolves to EagleWeb (see registry._detect_template).
+_EAGLEWEB_COUNTIES = {
+    "benton", "clallam", "grant", "island",
+    "jefferson", "kitsap", "thurston", "whitman",
+}
 
 
 def availability_for(county: str, state: str) -> dict | None:

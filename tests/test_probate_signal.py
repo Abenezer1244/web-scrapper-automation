@@ -195,11 +195,27 @@ def test_comment_fallback_when_doctype_unknown():
     ) is ProbateSignal.NONPROBATE_TRANSFER
 
 
-def test_comment_ignored_when_doctype_is_confident():
-    # A confident doc_type wins; the comment never downgrades/overrides it.
+def test_comment_never_downgrades_a_confident_doctype():
+    # A death doc_type stays death even if the comment looks like a living-owner TOD —
+    # the STRONGER signal wins (death > tod), the comment can't downgrade it.
     assert classify_probate_signal_for_row(
         "DEATH CERTIFICATE", comment="Transfer on Death Deed"
     ) is ProbateSignal.DEATH_INHERITANCE
+
+
+def test_death_triggered_tod_via_comment_is_death():
+    # Codex P2: TOD doc_type whose DEATH marker lives in the comment is a real
+    # death-triggered effectuation — the comment must UPGRADE tod -> death.
+    assert classify_probate_signal_for_row(
+        "Transfer on Death Deed", comment="Affidavit of Death"
+    ) is ProbateSignal.DEATH_INHERITANCE
+    assert classify_probate_signal_for_row(
+        "Transfer on Death Deed", comment="Beneficiary Affidavit"
+    ) is ProbateSignal.DEATH_INHERITANCE
+    # ...but a plain TOD with no death marker anywhere stays living-owner.
+    assert classify_probate_signal_for_row(
+        "Transfer on Death Deed", comment="recorded per request"
+    ) is ProbateSignal.TOD_LIVING_OWNER
 
 
 def test_no_comment_falls_back_to_doctype_result():

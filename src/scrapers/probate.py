@@ -409,21 +409,35 @@ def is_living_owner_tod(doc_type: str | None) -> bool:
     return classify_probate_signal(doc_type) is ProbateSignal.TOD_LIVING_OWNER
 
 
+# Signal strength for merging a doc_type result with a recorder-comment result —
+# lower = stronger. A row keeps the STRONGEST signal across its two fields.
+_SIGNAL_PRIORITY: dict[ProbateSignal, int] = {
+    ProbateSignal.DEATH_INHERITANCE: 0,
+    ProbateSignal.NONPROBATE_TRANSFER: 1,
+    ProbateSignal.TOD_LIVING_OWNER: 2,
+    ProbateSignal.UNKNOWN: 3,
+}
+
+
 def classify_probate_signal_for_row(
     doc_type: str | None, comment: str | None = None
 ) -> ProbateSignal:
-    """Classify a probate row, falling back to the recorder COMMENT when needed.
+    """Classify a probate row from its doc_type AND recorder comment together.
 
-    ``doc_type`` is primary. Some sources (e.g. Skagit) carry the probate signal in
-    the recorder comment rather than the document type — a generic "Affidavit" whose
-    comment reads "LACK OF PROBATE AFFIDAVIT". When ``doc_type`` alone is UNKNOWN and
-    the comment yields a confident signal, the comment wins; otherwise the doc_type
-    result stands. Mirrors how those scrapers themselves match on ``doc_type`` + the
-    comment to keep the row.
+    Recorders split the signal across the two fields, so neither alone is enough:
+      - Skagit keeps a generic "Affidavit" whose probate signal is in the comment
+        ("LACK OF PROBATE AFFIDAVIT" / "INHERITANCE") — the comment must be consulted.
+      - A "Transfer on Death Deed" doc_type with an "Affidavit of Death" / "Beneficiary
+        Affidavit" comment is a death-TRIGGERED TOD (a real inheritance), not a
+        living-owner deed — the comment's death marker must UPGRADE it.
+
+    So we classify each field and keep the STRONGER signal
+    (death > nonprobate > tod > unknown). This rescues a comment-only signal AND
+    upgrades a death-triggered TOD, while never letting the comment DOWNGRADE a
+    confident doc_type (Codex P2).
     """
-    signal = classify_probate_signal(doc_type)
-    if signal is ProbateSignal.UNKNOWN and comment:
-        from_comment = classify_probate_signal(comment)
-        if from_comment is not ProbateSignal.UNKNOWN:
-            return from_comment
-    return signal
+    base = classify_probate_signal(doc_type)
+    if not comment or not comment.strip():
+        return base
+    from_comment = classify_probate_signal(comment)
+    return min(base, from_comment, key=_SIGNAL_PRIORITY.__getitem__)

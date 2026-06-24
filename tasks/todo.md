@@ -37,9 +37,9 @@ with it; never fall back to the email stub.
 - [x] `DashboardHeader.tsx`: greet with `me.name`, else drop the name (never email stub); removed dead `emailFirstPart` + `userEmail`
 - [x] `User` type gains `name`; `page.tsx` passes `me?.name`
 - [x] tsc --noEmit CLEAN + eslint CLEAN (exit 0)
-- [~] Codex review FE diff — **DEFERRED: Codex usage limit hit (resets ~23:26)**; Claude self-review clean, no Critical/High. Re-run `codex review --base origin/master` after reset.
+- [x] Codex review FE diff — DONE (via bounded `codex exec` on the diff). Found P2×2 (useEffect reseed clobbers typing; untrimmed dirty-check) + P3 (seed-once survives account switch). ALL FIXED + re-review confirmed resolved.
 - [ ] regen `api-types.generated.ts` via `gen:api-types` AFTER backend merges to main (pulls schema from GitHub main)
-- Commit: 0d14ebb. NOT pushed, no PR yet.
+- Commits: 0d14ebb (feat) + cb4b445 (P2 fixes) + 872c773 (P3 fix). NOT pushed, no PR yet.
 
 ## Review
 

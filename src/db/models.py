@@ -233,6 +233,13 @@ class ScraperConfig(Base):
     # tokens, validated against the capability registry). NULL = legacy behavior
     # (today's full output); a non-empty list NARROWS to the chosen types.
     doc_types = Column(JSON, nullable=True)
+    # Phase 3: customer toggle for LIVING-owner Transfer-on-Death deeds in probate.
+    # Tri-state: NULL = legacy/grandfathered (include, but Phase 2 labels it);
+    # False = new probate default (exclude living-owner TOD planning docs);
+    # True = explicit opt-in (include). Enforced once at the worker chokepoint via
+    # scrapers.probate.should_include_probate_row. NOT routed through doc_types
+    # (that is recorder-side portal-token selection — a different mechanism).
+    include_living_owner_tod = Column(Boolean, nullable=True)
     skip_trace_enabled = Column(Boolean, nullable=False, default=False)
     active = Column(Boolean, nullable=False, default=True)
     # Why a config is inactive. NULL = active or user-paused; 'entitlement' =

@@ -441,3 +441,34 @@ def classify_probate_signal_for_row(
         return base
     from_comment = classify_probate_signal(comment)
     return min(base, from_comment, key=_SIGNAL_PRIORITY.__getitem__)
+
+
+def should_include_probate_row(
+    record_type: str | None,
+    include_living_owner_tod: bool | None,
+    doc_type: str | None,
+    comment: str | None = None,
+) -> bool:
+    """Phase 3 worker filter: keep this row in the delivered probate lead set?
+
+    Tri-state ``include_living_owner_tod`` (persisted on ``ScraperConfig``):
+      - ``None``  legacy / grandfathered  -> include everything (Phase 2 labels it).
+      - ``False`` new probate default      -> exclude LIVING-owner TOD planning docs.
+      - ``True``  explicit customer opt-in -> include everything.
+
+    Drops a row ONLY when it is a living-owner TOD AND the flag is exactly ``False``.
+    Death, death-triggered TOD (a recorder comment upgrades it), nonprobate, and
+    unknown signals always survive — the filter narrows honestly, it never widens a
+    death claim. No-op for non-probate record types.
+
+    Uses :func:`classify_probate_signal_for_row` (doc_type + comment) rather than the
+    bare doc_type predicate so a death marker in the comment rescues a real lead.
+    """
+    if record_type != "probate":
+        return True
+    if include_living_owner_tod is not False:
+        return True
+    return (
+        classify_probate_signal_for_row(doc_type, comment)
+        is not ProbateSignal.TOD_LIVING_OWNER
+    )

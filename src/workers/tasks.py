@@ -13,7 +13,10 @@ from datetime import datetime
 from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
 
-from src.scrapers.probate import classify_probate_signal_for_row
+from src.scrapers.probate import (
+    classify_probate_signal_for_row,
+    should_include_probate_row,
+)
 from src.utils.address_intel import compute_owner_flags
 from src.utils.logger import setup_logger
 from src.workers import app
@@ -531,6 +534,34 @@ def run_scrape_job(self, job_id: str) -> None:
             return
 
         _publish_log(r, job_id, "success", f"Scrape complete — {len(records)} records found", db=db)
+
+        # ── Phase 3: honest probate output ────────────────────────────────────
+        # Drop LIVING-owner Transfer-on-Death estate-planning deeds unless the
+        # customer opted in (include_living_owner_tod is False = new probate
+        # default; NULL = grandfathered → keep; True = explicit opt-in → keep).
+        # Done ONCE here, before the plan-quota cap / DB insert / in-memory R2
+        # export / counts — all of which derive from `records` — so a filtered
+        # row never reaches persistence, export, dedup, enrichment, billing, or
+        # property membership (the first export is built from this in-memory list,
+        # not persisted rows — Codex). Death-triggered TOD (a recorder comment
+        # carries the death marker) is kept by should_include_probate_row.
+        if config.record_type == "probate" and config.include_living_owner_tod is False:
+            _before_tod = len(records)
+            records = [
+                rec for rec in records
+                if should_include_probate_row(
+                    "probate", False, rec.doc_type,
+                    (rec.enrichment_data or {}).get("comment"),
+                )
+            ]
+            _dropped_tod = _before_tod - len(records)
+            if _dropped_tod:
+                _publish_log(
+                    r, job_id, "info",
+                    f"Excluded {_dropped_tod} living-owner Transfer-on-Death "
+                    "estate-planning record(s) per scraper settings.",
+                    db=db,
+                )
 
         # ── Cap records to user's remaining plan quota ────────────────────────
         if user.records_limit != -1:

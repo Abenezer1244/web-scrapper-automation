@@ -68,6 +68,12 @@ _CONNECTOR_CONFIG: dict[tuple[str, str], dict] = {
     ("cowlitz", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://www.cowlitzinfo.net/WLAudPublic/welcome.aspx?dbid=0&repo=CCIMAGES"},
     ("okanogan", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://okanogancountywa-web.tylerhost.net/Web"},
     ("whatcom", "wa"): {"scraper_mode": "manual", "scraper_class": "src.scrapers.whatcom_wa.WhatcomWAScraper", "base_url": "https://recording.whatcomcounty.us/"},
+    # Pre-staged health=down counties (hidden in the picker until health recovers).
+    # chelan=AcclaimWeb (like douglas); lewis/pacific/spokane=EagleWeb.
+    ("chelan", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://acclaim.co.chelan.wa.us/acclaimweb"},
+    ("lewis", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://quickdocs.lewiscountywa.gov/recorder/web/"},
+    ("pacific", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://pacificwa.countygovernmentrecords.com/"},
+    ("spokane", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://recording.spokanecounty.org/recorder/web/"},
 }
 
 

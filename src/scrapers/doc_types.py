@@ -105,6 +105,29 @@ _AVAILABILITY: dict[tuple[str, str], dict] = {
         },
         "note": "Clark recorder LandmarkWeb — exact server-side document-type checkboxes (verified live 2026-06-22).",
     },
+    # Skagit (custom ASP.NET recorder) — server-side document-type DROPDOWN
+    # (content_ddlDocumentType) selected per search, then a client-side comment
+    # refine. tokens map canonical -> the EXACT dropdown option label. The dropdown
+    # has no generic "Foreclosure" option, so `foreclosure` is not offered (the four
+    # specific notice types are). The scraper additionally narrows its client-refine
+    # keyword set via its own canonical->keyword map (both stages narrow together).
+    ("skagit", "wa"): {
+        "available": [
+            "notice_of_default", "notice_of_trustee_sale",
+            "lis_pendens", "notice_of_foreclosure",
+        ],
+        "method": "dropdown",
+        "confidence": "verified",
+        "default": "notice_of_trustee_sale",
+        "supported_for_selection": True,
+        "tokens": {
+            "notice_of_default": "Notice Of Default",
+            "notice_of_trustee_sale": "Notice Of Trustees Sale",
+            "lis_pendens": "Lis Pendens",
+            "notice_of_foreclosure": "Notice Of Foreclosure",
+        },
+        "note": "Skagit recorder document-type dropdown (server-side), refined client-side by comment.",
+    },
 }
 
 # EagleWeb template default (kitsap + others). Hidden from selection until

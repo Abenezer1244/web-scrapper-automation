@@ -47,8 +47,13 @@ _CONNECTOR_CONFIG: dict[tuple[str, str], dict] = {
         "scraper_class": "src.scrapers.clark_wa.ClarkWAScraper",
         "base_url": "https://e-docs.clark.wa.gov/LandmarkWeb",
     },
-    # P2+: skagit/eagleweb/acclaim/idoc/laserfiche/tyler (ai -> template via
-    # base_url), whatcom (manual whatcom_wa).
+    ("skagit", "wa"): {
+        "scraper_mode": "ai",  # resolves to SkagitRecordingScraper via _detect_template
+        "scraper_class": "",
+        "base_url": "https://www.skagitcounty.net/Search/Recording/",
+    },
+    # P3+: eagleweb/acclaim/idoc/laserfiche/tyler (ai -> template via base_url),
+    # whatcom (manual whatcom_wa).
 }
 
 

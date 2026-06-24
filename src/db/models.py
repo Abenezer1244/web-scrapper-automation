@@ -89,6 +89,11 @@ class User(Base):
     # + UNIQUE (migration 053) after the P4 reconcile backfill populated every row.
     # Dual-written via @validates below so it can never drift from email.
     email_hmac = Column(String(64), nullable=False, unique=True)
+    # Optional self-entered display name for the dashboard greeting. Encrypted at
+    # rest like email (it is user-provided identity PII); never indexed/unique —
+    # we never query by name. NULL until the user sets it; the greeting then
+    # falls back to no personal identifier (never the email local-part).
+    name = Column(EncryptedString, nullable=True)
     password_hash = Column(String(255), nullable=False)
     api_key_hash = Column(String(64), nullable=True, index=True)
     plan = Column(String(32), nullable=False, default="starter")

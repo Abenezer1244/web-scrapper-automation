@@ -71,12 +71,27 @@ class WhatcomWAScraper(BridgeScraper):
 
         return from_keyword_map(_DOC_TYPE_KEYWORDS, record_type)
 
-    def __init__(self, record_type: str = "probate"):
+    def __init__(self, record_type: str = "probate", doc_types: list[str] | None = None):
         super().__init__()
         self._record_type = record_type
         self._keywords = [
             k.upper() for k in _DOC_TYPE_KEYWORDS.get(record_type, _DOC_TYPE_KEYWORDS["probate"])
         ]
+        # Phase B: narrow the client-side keyword filter to an explicit pre-foreclosure
+        # selection. Whatcom is the ONLY keyword family exposing BOTH `foreclosure` and
+        # `notice_of_foreclosure`, and "FORECLOSURE" substring-matches "NOTICE OF
+        # FORECLOSURE" — so an explicit selection matches by EXACT canonical
+        # normalization (self._selected_canonical) instead of substring keywords, to
+        # avoid leaking a deselected type (Codex High). None = legacy/full;
+        # unmappable/empty raises (fail-closed).
+        self._selected_canonical: set[str] | None = None
+        if doc_types is not None and record_type == "pre_foreclosure":
+            from src.scrapers.doc_types import canonical_tokens_or_raise
+            selected = list(dict.fromkeys(doc_types))
+            # canonical_tokens_or_raise validates the selection (raises on
+            # empty/unmappable) even though we match by canonical token below.
+            canonical_tokens_or_raise("whatcom", "wa", selected)
+            self._selected_canonical = set(selected)
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         start = datetime.strptime(date_from, "%m/%d/%Y")
@@ -293,6 +308,14 @@ class WhatcomWAScraper(BridgeScraper):
                 # 3-state classifier (keeps corporate/entity dissolutions and bare
                 # separations out of divorce results).
                 if not is_divorce_doc(doc_type, precise_source=False):
+                    dropped_wrong_doctype += 1
+                    continue
+            elif self._selected_canonical is not None:
+                # Explicit pre-foreclosure selection: exact canonical match. Avoids the
+                # FORECLOSURE-substring-leaks-into-NOTICE-OF-FORECLOSURE bug that plain
+                # keyword matching would cause for this family (Codex High).
+                from src.scrapers.doc_types import normalize_doc_type
+                if normalize_doc_type(doc_type_upper) not in self._selected_canonical:
                     dropped_wrong_doctype += 1
                     continue
             else:

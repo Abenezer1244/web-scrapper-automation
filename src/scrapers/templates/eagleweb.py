@@ -110,6 +110,7 @@ class EagleWebScraper(BridgeScraper):
         record_types: list[str] | None = None,
         record_type: str | None = None,
         require_parcel_id: bool | None = None,
+        doc_types: list[str] | None = None,
     ):
         super().__init__()
         self.base_url = base_url
@@ -117,6 +118,18 @@ class EagleWebScraper(BridgeScraper):
         self.state = state
         self.record_types = record_types or []
         self.active_record_type = record_type or (self.record_types[0] if self.record_types else None)
+        # Phase B: narrow the client-side keyword filter to an explicit pre-foreclosure
+        # selection. EagleWeb fetches broadly and keeps rows whose doc-type text matches
+        # this keyword set, so overriding it with the selected canonical types' keywords
+        # restricts output to those types (a SUBSET of legacy — the registry tokens are
+        # an exact partition of _DOC_TYPE_MAP). FAIL-CLOSED: unmappable/empty explicit
+        # selection raises; None = legacy/full.
+        self._doc_type_keyword_override: list[str] | None = None
+        if doc_types is not None and self.active_record_type == "pre_foreclosure":
+            from src.scrapers.doc_types import canonical_tokens_or_raise
+            self._doc_type_keyword_override = canonical_tokens_or_raise(
+                county, state, list(dict.fromkeys(doc_types))
+            )
         # Parcel-ID requirement policy:
         #   - Probate records are estate/name filings (Cert of Death, Letters
         #     Testamentary, Personal Rep Deed, Transfer-on-Death, etc.) that
@@ -843,7 +856,12 @@ class EagleWebScraper(BridgeScraper):
                                 record.party_name, record.heirs, desc
                             )
                         else:
-                            kws = _DOC_TYPE_MAP.get(active_rt, [])
+                            # Phase B: a narrowed selection overrides the full keyword
+                            # set (subset of legacy); None = legacy/full.
+                            if self._doc_type_keyword_override is not None:
+                                kws = self._doc_type_keyword_override
+                            else:
+                                kws = _DOC_TYPE_MAP.get(active_rt, [])
                             if not _doc_type_matches(doc_upper, kws):
                                 continue  # Skip non-matching doc types
                             excludes = _DOC_TYPE_EXCLUDE.get(active_rt, [])

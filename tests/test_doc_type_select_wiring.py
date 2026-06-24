@@ -1,0 +1,118 @@
+"""Phase B guard: every selectable pre_foreclosure county must resolve — through the
+SAME registry path the worker uses — to a scraper whose constructor accepts ``doc_types``.
+
+Codex (Critical): ``list_connectors`` surfaces doc-type checkboxes from the registry
+alone, but the worker only passes ``doc_types`` to a scraper whose ``__init__`` accepts
+it. If a county is flipped ``supported_for_selection=True`` before its scraper is wired,
+a user can save a selection the scraper silently ignores and it scrapes EVERY document
+type.
+
+This guard resolves each selectable county through ``connector_scraper_class`` (the real
+resolver: manual mode imports the configured class; ai mode runs ``_detect_template`` on
+the base_url) using the county's REAL connector config, then asserts the resolved class
+accepts ``doc_types``. So CI fails if the configured ``scraper_class``/``scraper_mode``/
+``base_url`` routes to a scraper that drops the selection — not merely if a hand map is
+stale.
+
+When you enable a county, add its REAL connector config to ``_CONNECTOR_CONFIG`` (county,
+state, scraper_mode, scraper_class for manual / base_url for ai), mirroring the prod
+``county_connectors`` row.
+
+Needs a synthetic env to import scraper modules (they pull settings). Run with throwaway
+SECRET_KEY/DATABASE_URL/REDIS_URL — never the prod .env (conftest wipes tables).
+"""
+import inspect
+from types import SimpleNamespace
+
+from src.scrapers.doc_types import _AVAILABILITY, _EAGLEWEB_COUNTIES, availability_for
+from src.scrapers.registry import connector_scraper_class
+
+# Real county_connectors config per selectable county. These mirror the ACTIVE prod
+# rows (verified live against bridgeleads-production 2026-06-23 — not the stale migration
+# 006 seed, which left a dead inactive clark row pointing at the old King subclass). For
+# manual mode, scraper_class is imported; for ai mode, base_url drives _detect_template.
+_CONNECTOR_CONFIG: dict[tuple[str, str], dict] = {
+    ("king", "wa"): {
+        "scraper_mode": "manual",
+        "scraper_class": "src.scrapers.king_wa_probate.KingCountyLandmarkWebScraper",
+        "base_url": "https://dja-prd-ecexap1.kingcounty.gov/node/411",
+    },
+    ("pierce", "wa"): {
+        "scraper_mode": "manual",
+        "scraper_class": "src.scrapers.pierce_wa_probate.PierceWAARMSScraper",
+        "base_url": "https://armsweb.co.pierce.wa.us/RealEstate/SearchEntry.aspx",
+    },
+    ("clark", "wa"): {
+        "scraper_mode": "manual",
+        "scraper_class": "src.scrapers.clark_wa.ClarkWAScraper",
+        "base_url": "https://e-docs.clark.wa.gov/LandmarkWeb",
+    },
+    ("skagit", "wa"): {
+        "scraper_mode": "ai",  # resolves to SkagitRecordingScraper via _detect_template
+        "scraper_class": "",
+        "base_url": "https://www.skagitcounty.net/Search/Recording/",
+    },
+    # P3: EagleWeb family (ai-mode -> EagleWebScraper via _detect_template). base_urls
+    # from live /connectors 2026-06-23.
+    ("benton", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://erecording.co.benton.wa.us/recorder/web/"},
+    ("clallam", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://erecording.clallamcountywa.gov/recorder/web/"},
+    ("grant", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://grantcountywa-recorder.tylerhost.net/grantrecorder/web/"},
+    ("island", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://auditor.islandcountywa.gov/recorder/web/"},
+    ("jefferson", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://er-web.co.jefferson.wa.us/recorder/web/"},
+    ("kitsap", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://kcwaimg.kitsap.gov/recorder/web/"},
+    ("thurston", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://eagleweb.co.thurston.wa.us/thurstonrecorder/web/"},
+    ("whitman", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://whitmanwa.countygovernmentrecords.com/whitmanrecorder/web/"},
+    # P4: one county per remaining keyword family (live /connectors 2026-06-23).
+    ("douglas", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://edocs.douglascountywa.gov/AcclaimWeb"},
+    ("columbia", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://www.idocmarket.com/COLWA1/Document/Search"},
+    ("cowlitz", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://www.cowlitzinfo.net/WLAudPublic/welcome.aspx?dbid=0&repo=CCIMAGES"},
+    ("okanogan", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://okanogancountywa-web.tylerhost.net/Web"},
+    ("whatcom", "wa"): {"scraper_mode": "manual", "scraper_class": "src.scrapers.whatcom_wa.WhatcomWAScraper", "base_url": "https://recording.whatcomcounty.us/"},
+}
+
+
+def _selectable_counties() -> list[tuple[str, str]]:
+    """All (county,state) that currently expose the doc-type selector."""
+    candidates = set(_AVAILABILITY.keys()) | {(c, "wa") for c in _EAGLEWEB_COUNTIES}
+    return [
+        (county, state)
+        for county, state in candidates
+        if (availability_for(county, state) or {}).get("supported_for_selection")
+    ]
+
+
+def _worker_factory(cfg: dict):
+    """Build the SAME callable the worker inspects, mirroring registry.get_scraper_class:
+    ai-mode -> functools.partial(template, base_url/county/state/record_types) so
+    inspect.signature() sees the remaining (unbound) params; manual -> the class itself.
+    _run_scraper does inspect.signature(factory) and passes doc_types only if present."""
+    from functools import partial
+    fake = SimpleNamespace(county="x", state="wa", **cfg)
+    cls = connector_scraper_class(fake)
+    if cls is None:
+        return None
+    if cfg.get("scraper_mode") == "ai":
+        return partial(cls, base_url=cfg["base_url"], county="x", state="wa",
+                       record_types=["pre_foreclosure"])
+    return cls
+
+
+def test_every_selectable_county_resolves_to_doc_types_aware_scraper():
+    selectable = _selectable_counties()
+    assert selectable, "expected at least king + pierce to be selectable"
+    for key in selectable:
+        assert key in _CONNECTOR_CONFIG, (
+            f"{key} is supported_for_selection=True but has no connector config in "
+            f"_CONNECTOR_CONFIG — register its real county_connectors row before enabling"
+        )
+        factory = _worker_factory(_CONNECTOR_CONFIG[key])
+        assert factory is not None, (
+            f"{key} connector config did not resolve via the real registry resolver "
+            f"(bad scraper_class/base_url/mode?)"
+        )
+        # Mirror _run_scraper: inspect the factory the worker actually constructs.
+        params = inspect.signature(factory).parameters
+        assert "doc_types" in params, (
+            f"{key} resolves to a factory that does NOT expose doc_types — the worker "
+            f"will silently scrape ALL document types. Wire it before enabling."
+        )

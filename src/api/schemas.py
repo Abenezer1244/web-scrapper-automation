@@ -1035,6 +1035,15 @@ class ConnectorResponse(BaseModel):
     # registry), present only for counties that support selection. Populated by
     # the /connectors handler, not the ORM. None = no selector (legacy/hidden).
     pre_foreclosure_doc_types: dict[str, Any] | None = None
+    # Phase B: how this county's doc-type selection is enforced and how confident we
+    # are. method: "checkbox"/"search_text" (server-side, the portal filters) vs
+    # "keyword" (client-side text match after a broad fetch). confidence: "verified"
+    # (server-side, live-verified) vs "keyword" (best-effort text match). Lets the UI
+    # honestly distinguish a true portal filter from a post-collection text filter.
+    # Both None when the county does not support selection. Additive — the checkbox
+    # map above is unchanged, so existing clients keep working.
+    pre_foreclosure_doc_type_method: str | None = None
+    pre_foreclosure_doc_type_confidence: str | None = None
     # SHOW (read-only): what document types / dataset this connector collects, per
     # record type, for the wizard's "documents collected" display. Shape per record
     # type: {kind: "document_type"|"dataset", items: [{label, exact}], note}.

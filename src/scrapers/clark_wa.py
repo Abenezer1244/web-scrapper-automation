@@ -115,12 +115,26 @@ class ClarkWAScraper(BridgeScraper):
             note="Selected by exact recorder document-type checkboxes (verified live).",
         )
 
-    def __init__(self, record_type: str = "probate"):
+    def __init__(self, record_type: str = "probate", doc_types: list[str] | None = None):
         super().__init__()
         self._record_type = record_type
         self._doc_types = _DOC_TYPES.get(record_type, _DOC_TYPES["probate"])
         self._checkbox_values = _DOC_TYPE_CHECKBOX_VALUES.get(record_type, [])
         self._skip_pid = record_type in _NO_PID_RECORD_TYPES
+        # Phase B: narrow to an explicit pre-foreclosure doc-type selection. Clark
+        # filters server-side by checkbox CODE, so narrow self._checkbox_values to the
+        # selected codes; ALSO narrow the client-side defense-in-depth allowlist
+        # (self._doc_types) to the matching labels so both stages stay consistent
+        # (Codex). FAIL-CLOSED: an unmappable/empty explicit selection raises; None =
+        # legacy/full.
+        if doc_types is not None and record_type == "pre_foreclosure":
+            from src.scrapers.doc_types import canonical_tokens_or_raise
+            codes = canonical_tokens_or_raise("clark", "wa", doc_types)
+            self._checkbox_values = codes
+            # Strict index (no `if c in ...` guard): if a registry code ever drifts
+            # out of _CHECKBOX_DOC_LABELS, raise loudly rather than silently shrink
+            # the client allowlist to nothing and drop every row (Codex, fail-closed).
+            self._doc_types = [_CHECKBOX_DOC_LABELS[c] for c in codes]
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         start = datetime.strptime(date_from, "%m/%d/%Y")

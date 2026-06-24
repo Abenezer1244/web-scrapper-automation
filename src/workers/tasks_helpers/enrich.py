@@ -39,7 +39,10 @@ async def _run_scraper(
     """Run the async scraper and stream progress logs back to Redis."""
     # Pass record_type / doc_types ONLY to scrapers whose constructor accepts
     # them (template/AI/partial scrapers may not). doc_types=None means legacy
-    # behavior — we never pass it unless an explicit selection exists.
+    # behavior. An EXPLICIT selection (including the degenerate [] of a stale
+    # config) must reach the constructor so it can fail closed — hence
+    # `is not None`, not truthiness, so [] is passed through rather than silently
+    # treated as legacy/full (Codex High).
     import inspect
     kwargs = {}
     try:
@@ -48,7 +51,7 @@ async def _run_scraper(
         params = {}
     if record_type and "record_type" in params:
         kwargs["record_type"] = record_type
-    if doc_types and "doc_types" in params:
+    if doc_types is not None and "doc_types" in params:
         kwargs["doc_types"] = doc_types
     async with scraper_class(**kwargs) as scraper:
         if on_progress:

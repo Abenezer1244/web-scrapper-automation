@@ -334,7 +334,7 @@ async def list_connectors(
         )
     query = query.order_by(CountyConnector.state, CountyConnector.county)
     result = await db.execute(query)
-    from src.scrapers.doc_types import selectable_doc_type_labels
+    from src.scrapers.doc_types import selectable_availability, selectable_doc_type_labels
     from src.scrapers.registry import connector_scraper_class
     out: list[ConnectorResponse] = []
     for c in result.scalars().all():
@@ -344,6 +344,13 @@ async def list_connectors(
         # checkbox selector renders. Only where this county supports selection.
         if "pre_foreclosure" in (c.record_types or []):
             resp.pre_foreclosure_doc_types = selectable_doc_type_labels(c.county, c.state)
+            # Phase B: surface method/confidence so the UI can honestly distinguish a
+            # server-side portal filter ("verified") from a client-side text match
+            # ("keyword"). None when the county isn't selectable.
+            _sel = selectable_availability(c.county, c.state)
+            if _sel is not None:
+                resp.pre_foreclosure_doc_type_method = _sel.get("method")
+                resp.pre_foreclosure_doc_type_confidence = _sel.get("confidence")
         # SHOW (read-only): what document types / dataset this connector collects,
         # per record type, for the wizard's "documents collected" display. Derived
         # from each scraper's own collection_scope(); None when nothing declared.

@@ -21,21 +21,48 @@ with it; never fall back to the email stub.
 - Extras adopted: nullable (no server_default/backfill), no JWT reissue,
   own-row-only update, **audit logs the action not the value**.
 
-## Phase 1 — Backend (worktree `feat/user-display-name`, max 5 files)
-- [ ] 1. `alembic/versions/071_user_display_name.py` — add `users.name` (Text, nullable)
-- [ ] 2. `src/db/models.py` — `name = Column(EncryptedString, nullable=True)`
-- [ ] 3. `src/api/schemas.py` — `_validate_display_name` + `UserRegister.name` + `UserResponse.name` + `ProfileUpdate`
-- [ ] 4. `src/api/routes/auth_helpers/registration.py` — set `name` on insert
-- [ ] 5. `src/api/routes/auth.py` — `PUT /auth/profile`
-- [ ] Verify: import schemas, alembic head linear, unit-test the validator
-- [ ] Codex `codex review` the diff (gate) — fix any P1/P2
+## Phase 1 — Backend (worktree `feat/user-display-name`, DONE + Codex-clean)
+- [x] 1. `alembic/versions/071_user_display_name.py` — add `users.name` (Text, nullable)
+- [x] 2. `src/db/models.py` — `name = Column(EncryptedString, nullable=True)`
+- [x] 3. `src/api/schemas.py` — `_validate_display_name` + `UserRegister.name` + `UserResponse.name` + `ProfileUpdate`
+- [x] 4. `src/api/routes/auth_helpers/registration.py` — set `name` on insert
+- [x] 5. `src/api/routes/auth.py` — `PUT /auth/profile`
+- [x] Verify: 16/16 validator+schema assertions pass; alembic single head 071→070
+- [x] Codex review: caught **P1** (stale `schema/openapi.json` — CI gate) → regenerated (commit 4d14d86, pure additions, 0 drift) → re-review CLEAN
+- Commits: 7e98a80 (feature) + 4d14d86 (schema). NOT pushed, no PR yet.
 
-## Phase 2 — Frontend (`bridgeleads-web`, separate worktree, max 5 files)
-- [ ] register page: optional Name field → send in body
-- [ ] Settings → Account: editable Name + `updateProfile()` in `lib/api.ts`
-- [ ] `DashboardHeader.tsx`: greet with `me.name`, else drop the name (never email stub)
-- [ ] regen api-types after backend merges; tsc + eslint clean
-- [ ] Codex review FE diff
+## Phase 2 — Frontend (`bridgeleads-web`, worktree `feat/user-display-name-fe`, DONE)
+- [x] register page: optional Name field → sent in body
+- [x] Settings → Account: editable Name + `updateProfile()` in `lib/api.ts`
+- [x] `DashboardHeader.tsx`: greet with `me.name`, else drop the name (never email stub); removed dead `emailFirstPart` + `userEmail`
+- [x] `User` type gains `name`; `page.tsx` passes `me?.name`
+- [x] tsc --noEmit CLEAN + eslint CLEAN (exit 0)
+- [~] Codex review FE diff — **DEFERRED: Codex usage limit hit (resets ~23:26)**; Claude self-review clean, no Critical/High. Re-run `codex review --base origin/master` after reset.
+- [ ] regen `api-types.generated.ts` via `gen:api-types` AFTER backend merges to main (pulls schema from GitHub main)
+- Commit: 0d14ebb. NOT pushed, no PR yet.
 
 ## Review
-_(filled at end)_
+
+**Root cause:** No name stored anywhere — greeting fell back to the email
+local-part (`emailFirstPart(userEmail)` → "mikitsegaye29").
+
+**Built (two isolated worktrees, no collision with concurrent sessions):**
+- Backend `feat/user-display-name`: encrypted nullable `users.name` (mig 071),
+  shared hardened validator, `UserRegister.name`/`UserResponse.name`/
+  `ProfileUpdate`, `PUT /auth/profile`, regenerated openapi schema.
+- Frontend `feat/user-display-name-fe`: optional name at signup, editable in
+  Settings→Account, greeting uses the name or no identifier (never the stub).
+
+**Codex:** consulted on design (encrypt column, PUT /auth/profile, harden
+validation against bidi/zero-width/control chars). Backend review caught a P1
+(stale openapi schema) → fixed → re-review clean. FE review deferred (rate limit).
+
+**Verification:** backend 16/16 validator+schema asserts pass, alembic head
+linear; FE tsc + eslint clean.
+
+**Deploy order (when shipping):** backend first (migration 071 + API on
+Railway) → then `gen:api-types` + FE on Vercel. Greeting degrades gracefully if
+FE ships first (name reads `undefined` → no identifier).
+
+**Not done:** push / PRs (awaiting your go); FE Codex pass (rate-limited);
+api-types regen (needs backend on main).

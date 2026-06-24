@@ -323,6 +323,23 @@ def write_lead_csv(
 # (decrypted arrays) so phone_2/3 + email_2/3 populate; columns the segment
 # query doesn't provide (heirs, legal_description, doc_type, tax) come through
 # blank — kept for header parity with the per-job CSV.
+# Combined/segment exports dedup to ONE representative row per property, which may
+# be a non-probate row even when the property also has a probate hit. Deriving
+# lead_subtype from that representative row would blank it for those buckets (Codex
+# P2). Instead aggregate the subtype across the bucket's probate candidates,
+# preferring the stronger signal (death > nonprobate > tod > unknown). References
+# the `lead_subtype` column selected in each query's candidates CTE; goes in the agg
+# CTE. NULL when the bucket has no probate row -> exported blank.
+PROBATE_SUBTYPE_AGG_SQL: str = (
+    "(array_agg(lead_subtype ORDER BY CASE lead_subtype "
+    "WHEN 'probate_death_inheritance' THEN 1 "
+    "WHEN 'nonprobate_transfer' THEN 2 "
+    "WHEN 'tod_living_owner_estate_planning' THEN 3 "
+    "ELSE 4 END) "
+    "FILTER (WHERE lead_subtype IS NOT NULL AND lead_subtype <> ''))[1] AS lead_subtype"
+)
+
+
 OVERLAP_LEAD_COLUMNS: list[str] = [
     "overlap", "lists_count", "lists", "counties",
     "first_name", "last_name",

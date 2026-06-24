@@ -43,7 +43,7 @@ from src.api.schemas import (
 )
 from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
 from src.utils.crypto import decrypt_field
-from src.utils.lead_export import write_lead_csv_with_overlap
+from src.utils.lead_export import PROBATE_SUBTYPE_AGG_SQL, write_lead_csv_with_overlap
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("api.segments")
@@ -164,7 +164,8 @@ WITH candidates AS (
 agg AS (
     SELECT property_key,
            array_agg(DISTINCT record_type ORDER BY record_type) AS matched_record_types,
-           count(DISTINCT record_type) AS overlap_count
+           count(DISTINCT record_type) AS overlap_count,
+           {PROBATE_SUBTYPE_AGG_SQL}
     FROM candidates
     GROUP BY property_key
     HAVING count(DISTINCT record_type) = :n
@@ -182,8 +183,8 @@ ranked AS (
 )
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
        rk.mailing_address, rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
-       rk.phones, rk.emails, rk.lead_subtype,
-       a.matched_record_types, a.overlap_count
+       rk.phones, rk.emails,
+       a.matched_record_types, a.overlap_count, a.lead_subtype
 FROM ranked rk
 JOIN agg a ON a.property_key = rk.property_key
 WHERE rk.rn = 1
@@ -240,6 +241,7 @@ agg AS (
     SELECT bucket,
            array_agg(DISTINCT record_type ORDER BY record_type) AS matched_record_types,
            count(DISTINCT record_type) AS overlap_count,
+           {PROBATE_SUBTYPE_AGG_SQL},
            CASE WHEN bool_or(property_key IS NOT NULL) THEN 'strong' ELSE 'weak' END
                AS identity_strength
     FROM candidates
@@ -264,8 +266,8 @@ ranked AS (
 )
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
        rk.mailing_address, rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
-       rk.phones, rk.emails, rk.lead_subtype,
-       a.matched_record_types, a.overlap_count, a.identity_strength
+       rk.phones, rk.emails,
+       a.matched_record_types, a.overlap_count, a.identity_strength, a.lead_subtype
 FROM ranked rk
 JOIN agg a ON a.bucket = rk.bucket
 WHERE rk.rn = 1
@@ -302,7 +304,8 @@ WITH candidates AS (
 agg AS (
     SELECT property_key,
            array_agg(DISTINCT record_type ORDER BY record_type) AS matched_record_types,
-           count(DISTINCT record_type) AS overlap_count
+           count(DISTINCT record_type) AS overlap_count,
+           {PROBATE_SUBTYPE_AGG_SQL}
     FROM candidates
     GROUP BY property_key
     HAVING count(DISTINCT record_type) = :n
@@ -320,8 +323,8 @@ ranked AS (
 )
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
        rk.mailing_address, rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
-       rk.phones, rk.emails, rk.lead_subtype,
-       a.matched_record_types, a.overlap_count
+       rk.phones, rk.emails,
+       a.matched_record_types, a.overlap_count, a.lead_subtype
 FROM ranked rk
 JOIN agg a ON a.property_key = rk.property_key
 WHERE rk.rn = 1

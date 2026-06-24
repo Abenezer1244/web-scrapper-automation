@@ -319,7 +319,11 @@ _DEATH_MARKER_RE = re.compile(
     r"|LETTERS\s+TESTAMENTARY|LETTERS\s+OF\s+ADMINISTRATION|\bTESTAMENTARY\b"
     r"|PERSONAL\s+REPRESENTATIVE|PERSONAL\s+REP\b"
     r"|ADMINISTRAT(?:OR|RIX)|EXEC(?:UTOR|UTRIX)"
-    r"|AFFIDAVIT\s+OF\s+(?:HEIRSHIP|SUCCESSOR)|\bHEIRSHIP\b|\bINHERITANCE\b"
+    r"|AFFIDAVIT\s+OF\s+(?:HEIRSHIP|SUCCESSOR)|\bHEIRSHIP\b|\bHEIRS?\b|\bINHERITANCE\b"
+    # WILL / TESTAMENT as words so multi-word/punctuated labels classify too
+    # ("LAST WILL AND TESTAMENT", "WILL/TESTAMENT" -> normalized "WILL TESTAMENT").
+    # Safe within the probate-gated caller: a TOD deed never contains these (Codex P2).
+    r"|\bWILL\b|\bTESTAMENT\b"
     r"|BENEFICIARY\s+AFFIDAVIT|DECREE\s+OF\s+DISTRIBUTION|ESTATE\s+OF",
     re.IGNORECASE,
 )
@@ -329,12 +333,13 @@ _BARE_PROBATE_RE = re.compile(r"\bPROBATE\b", re.IGNORECASE)
 
 # Abbreviated probate/death doc CODES that some portals emit as the WHOLE doc_type
 # (Codex P2): EagleWeb/Clallam -> DEATH, LETTR, EXEC, SUCC; AcclaimWeb/Chelan ->
-# DEATH, AFFD, PTREC, WILL, HEIR. Matched by EXACT whole (normalized) value — NOT
-# substring/word — so the bare "DEATH" code is recognized as a death while
-# "TRANSFER ON DEATH DEED" (multi-word) stays on the TOD path. "TOD" is absent here
-# on purpose: a bare TOD code is a living-owner deed, handled by _TOD_DOC_RE.
+# DEATH, AFFD, PTREC. Matched by EXACT whole (normalized) value — NOT substring/word
+# — so the bare "DEATH" code is recognized as a death while "TRANSFER ON DEATH DEED"
+# (multi-word) stays on the TOD path. "TOD" is absent here on purpose: a bare TOD code
+# is a living-owner deed, handled by _TOD_DOC_RE. (WILL/HEIR are NOT here — they are
+# words that also appear in multi-word labels, so _DEATH_MARKER_RE handles them.)
 _ABBREV_DEATH_CODES: frozenset[str] = frozenset(
-    {"DEATH", "LETTR", "EXEC", "SUCC", "AFFD", "PTREC", "WILL", "HEIR"}
+    {"DEATH", "LETTR", "EXEC", "SUCC", "AFFD", "PTREC"}
 )
 
 

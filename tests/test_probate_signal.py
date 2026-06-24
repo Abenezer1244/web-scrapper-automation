@@ -124,6 +124,19 @@ def test_abbreviated_death_codes_are_death():
         assert classify_probate_signal(code.title()) is ProbateSignal.DEATH_INHERITANCE, code
 
 
+def test_will_variants_are_death():
+    # Codex P2: Clark/Whatcom emit multi-word/punctuated Will labels; the exact-value
+    # code set only caught a bare WILL, so the marker regex must handle the variants.
+    for label in ("WILL", "Will", "LAST WILL AND TESTAMENT", "WILL/TESTAMENT",
+                  "Last Will & Testament", "Will and Testament"):
+        assert classify_probate_signal(label) is ProbateSignal.DEATH_INHERITANCE, label
+
+
+def test_heir_variants_are_death():
+    for label in ("HEIR", "HEIRS", "Affidavit of Heirs"):
+        assert classify_probate_signal(label) is ProbateSignal.DEATH_INHERITANCE, label
+
+
 def test_bare_death_code_does_not_leak_into_tod_label():
     # The exact-value "DEATH" code must NOT make a multi-word TOD deed look like a
     # death — "Transfer on Death Deed" stays a living-owner signal.

@@ -30,7 +30,10 @@ from src.config.constants import (
     SKIP_TRACE_ADDON_PLANS,
 )
 from src.db import CountyConnector, ScraperConfig, get_db
-from src.scrapers.probate import new_probate_config_tod_default
+from src.scrapers.probate import (
+    effective_tod_on_update,
+    new_probate_config_tod_default,
+)
 
 router = APIRouter(prefix="/scrapers", tags=["scrapers"])
 
@@ -639,10 +642,13 @@ async def update_scraper(
     eff_doc_types = body.doc_types if ("doc_types" in fields_set) else config.doc_types
     # Phase 3: OMITTED preserves the stored value (an old None config stays
     # grandfathered — editing it must not silently flip TOD off); PRESENT replaces it.
-    eff_include_living_owner_tod = (
-        body.include_living_owner_tod
-        if ("include_living_owner_tod" in fields_set)
-        else config.include_living_owner_tod
+    # An EXPLICIT null is treated as omitted (None is not a user-selectable state), so a
+    # `"include_living_owner_tod": null` PATCH cannot downgrade a False/True probate
+    # config back to grandfathered/include-all without an explicit `true` opt-in (Codex P2).
+    eff_include_living_owner_tod = effective_tod_on_update(
+        "include_living_owner_tod" in fields_set,
+        body.include_living_owner_tod,
+        config.include_living_owner_tod,
     )
 
     if "deliver" in fields_set and body.deliver is not None:

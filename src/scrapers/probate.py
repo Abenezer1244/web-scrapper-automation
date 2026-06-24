@@ -492,3 +492,20 @@ def new_probate_config_tod_default(
     if record_type == "probate" and provided is None:
         return False
     return provided
+
+
+def effective_tod_on_update(
+    field_provided: bool, provided_value: bool | None, stored_value: bool | None
+) -> bool | None:
+    """Resolve ``include_living_owner_tod`` on a PATCH edit.
+
+    An OMITTED field — or an EXPLICIT ``null``, which is not a user-selectable state
+    (``None`` marks pre-toggle configs only) — preserves the stored value, so editing
+    a config never silently flips its TOD policy. In particular a
+    ``"include_living_owner_tod": null`` PATCH must NOT downgrade a ``False``/``True``
+    probate config back to grandfathered/include-all and re-enable living-owner TOD
+    without an explicit ``true`` opt-in (Codex P2). A real ``True``/``False`` replaces it.
+    """
+    if field_provided and provided_value is not None:
+        return provided_value
+    return stored_value

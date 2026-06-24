@@ -19,6 +19,7 @@ those must be KEPT even when the customer excluded living-owner TOD (Codex).
 """
 
 from src.scrapers.probate import (
+    effective_tod_on_update,
     new_probate_config_tod_default,
     should_include_probate_row,
 )
@@ -119,3 +120,32 @@ def test_new_non_probate_passes_through_provided():
     # Pure pass-through for non-probate (route-level validation rejects a stray
     # explicit value separately; the helper itself does not mutate it).
     assert new_probate_config_tod_default("pre_foreclosure", True) is True
+
+
+# --- effective_tod_on_update: PATCH edit resolution (Codex P2) --------------------
+def test_patch_omitted_preserves_stored_false():
+    # Editing an unrelated field on a False config keeps it False.
+    assert effective_tod_on_update(False, None, False) is False
+
+
+def test_patch_omitted_preserves_stored_none():
+    # Editing an old grandfathered (None) config never flips it to a value.
+    assert effective_tod_on_update(False, None, None) is None
+
+
+def test_patch_explicit_null_does_not_downgrade_false_to_none():
+    # The bug: `"include_living_owner_tod": null` (field present, value None) must
+    # NOT overwrite a stored False back to grandfathered/include-all.
+    assert effective_tod_on_update(True, None, False) is False
+
+
+def test_patch_explicit_null_keeps_stored_true():
+    assert effective_tod_on_update(True, None, True) is True
+
+
+def test_patch_explicit_true_opts_in():
+    assert effective_tod_on_update(True, True, False) is True
+
+
+def test_patch_explicit_false_opts_out():
+    assert effective_tod_on_update(True, False, None) is False

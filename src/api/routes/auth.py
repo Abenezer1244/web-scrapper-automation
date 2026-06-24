@@ -68,6 +68,7 @@ from src.api.schemas import (
     MfaStatusResponse,
     NotificationPrefsUpdate,
     PasswordChange,
+    ProfileUpdate,
     ResetPasswordRequest,
     TokenResponse,
     UserLogin,
@@ -197,6 +198,31 @@ async def update_notification_preferences(
     await db.commit()
     await db.refresh(user)
     audit_log(request, "notification_prefs_updated", current_user.id)
+    return UserResponse.model_validate(user)
+
+
+@router.put("/profile", response_model=UserResponse)
+async def update_profile(
+    body: ProfileUpdate,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    """Persist the user's editable profile (settings → Account → display name).
+
+    `body.name` is already sanitized + None-on-blank by ProfileUpdate; a
+    null/blank value CLEARS the name. The WHERE id == current_user.id filter is
+    the tenant guard — RLS on `users` is permissive under the app role, so the
+    query filter is the real own-row constraint (belt-and-suspenders per the
+    project rules). The audit log records the action only, never the name value
+    (it is PII).
+    """
+    result = await db.execute(select(User).where(User.id == current_user.id))
+    user = result.scalar_one()
+    user.name = body.name
+    await db.commit()
+    await db.refresh(user)
+    audit_log(request, "profile_updated", current_user.id)
     return UserResponse.model_validate(user)
 
 

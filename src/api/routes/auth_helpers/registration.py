@@ -169,6 +169,8 @@ async def register_user(
     user = User(
         id=str(uuid.uuid4()),
         email=body.email,
+        # Already sanitized + None-on-blank by UserRegister.name_validation.
+        name=body.name,
         password_hash=hash_password(body.password),
         plan="pro",
         records_limit=settings.PLAN_LIMITS["pro"],  # Pro limit during the 7-day trial

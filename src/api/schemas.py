@@ -1,4 +1,5 @@
 import re
+import unicodedata
 from datetime import UTC, date, datetime
 from typing import Any, TypedDict
 from urllib.parse import urlparse
@@ -23,9 +24,53 @@ def _validate_password_rules(v: str) -> str:
     return v
 
 
+# Display-name bounds. 120 code points is generous for any real name; the
+# 255-byte cap guards the encrypted-column path against multi-byte abuse.
+_NAME_MAX_CHARS = 120
+_NAME_MAX_BYTES = 255
+# Coarse pre-normalization bound so a pathological multi-MB string can't drive
+# normalization/regex CPU before the precise checks run.
+_NAME_RAW_MAX = 1000
+
+
+def _validate_display_name(v: str | None) -> str | None:
+    """Sanitize a self-entered display name. Single source of truth so
+    registration (UserRegister) and edit (ProfileUpdate) enforce IDENTICAL
+    rules. Returns None when empty after stripping — the column is never stored
+    as "" and the greeting falls back cleanly to no personal identifier.
+
+    Per the security review: NFC-normalize, collapse any run of Unicode
+    whitespace (tabs/newlines/nbsp included) to a single ASCII space, then reject
+    any remaining control/format char. After whitespace is collapsed, a leftover
+    category-C char is a non-whitespace control (NUL/escape), a Unicode bidi
+    override (U+202A-202E / U+2066-2069) or a zero-width/invisible formatter
+    (U+200B/C/D, U+FEFF) — all UI-spoofing footguns with no display-name value.
+    Length is bounded in both code points and UTF-8 bytes.
+    """
+    if v is None:
+        return None
+    if len(v) > _NAME_RAW_MAX:
+        raise ValueError("Name is too long")
+    v = unicodedata.normalize("NFC", v)
+    v = re.sub(r"\s+", " ", v).strip()
+    if not v:
+        return None  # empty after strip => NULL, never stored as ""
+    if any(unicodedata.category(ch).startswith("C") for ch in v):
+        raise ValueError("Name contains disallowed characters")
+    if len(v) > _NAME_MAX_CHARS:
+        raise ValueError(f"Name must not exceed {_NAME_MAX_CHARS} characters")
+    if len(v.encode("utf-8")) > _NAME_MAX_BYTES:
+        raise ValueError("Name is too long")
+    return v
+
+
 class UserRegister(BaseModel):
     email: EmailStr
     password: str
+    # Optional self-entered display name (shown in the dashboard greeting).
+    # Sanitized through the SAME validator as ProfileUpdate so signup can't be a
+    # back door around the edit-time rules. Empty/blank => None (stored NULL).
+    name: str | None = None
     # Sprint 7.3: optional referral code passed from the ?ref= URL
     # parameter. When present and valid, the new user gets linked to
     # the referrer and the referrer earns $20 credit on paid
@@ -37,6 +82,11 @@ class UserRegister(BaseModel):
     @classmethod
     def password_validation(cls, v: str) -> str:
         return _validate_password_rules(v)
+
+    @field_validator("name")
+    @classmethod
+    def name_validation(cls, v: str | None) -> str | None:
+        return _validate_display_name(v)
 
     @field_validator("ref")
     @classmethod
@@ -142,6 +192,9 @@ class BreakGlassLoginRequest(BaseModel):
 class UserResponse(BaseModel):
     id: str
     email: str
+    # Optional display name; None until the user sets it. The frontend greeting
+    # uses this and NEVER derives a name from the email when it is None.
+    name: str | None = None
     plan: str
     records_used: int
     records_limit: int
@@ -162,6 +215,22 @@ class UserResponse(BaseModel):
             if remaining > 0:
                 self.is_trial = True
                 self.trial_days_remaining = max(0, int(remaining / 86400))
+
+
+class ProfileUpdate(BaseModel):
+    """Editable profile fields (Settings -> Account). `name` may be null/blank to
+    CLEAR the display name. Sanitized through the SAME validator as registration.
+    extra='forbid' so a caller cannot smuggle other user columns (plan,
+    records_limit, is_admin, ...) through the profile endpoint."""
+
+    name: str | None = None
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("name")
+    @classmethod
+    def name_validation(cls, v: str | None) -> str | None:
+        return _validate_display_name(v)
 
 
 class NotificationPrefsUpdate(BaseModel):

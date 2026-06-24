@@ -123,6 +123,7 @@ class TylerSelfServiceScraper(BridgeScraper):
         record_types: list[str] | None = None,
         record_type: str | None = None,
         require_parcel_id: bool = False,
+        doc_types: list[str] | None = None,
     ):
         super().__init__()
         # Normalise base_url so the rest of the template can build sub-paths
@@ -153,6 +154,15 @@ class TylerSelfServiceScraper(BridgeScraper):
         # so callers must opt INTO parcel dropping. Default is False, which
         # is the opposite of EagleWebScraper.
         self.require_parcel_id = require_parcel_id
+        # Phase B: narrow the client-side keyword filter to an explicit pre-foreclosure
+        # selection (subset of _DOC_TYPE_MAP — registry tokens are an exact partition).
+        # None = legacy/full; unmappable/empty raises (fail-closed).
+        self._doc_type_keyword_override: list[str] | None = None
+        if doc_types is not None and self.active_record_type == "pre_foreclosure":
+            from src.scrapers.doc_types import canonical_tokens_or_raise
+            self._doc_type_keyword_override = canonical_tokens_or_raise(
+                county, state, list(dict.fromkeys(doc_types))
+            )
 
         from urllib.parse import urlparse
         domain = urlparse(base_url).hostname
@@ -652,7 +662,7 @@ class TylerSelfServiceScraper(BridgeScraper):
         """
         if not self.active_record_type or self.active_record_type == "all":
             return records
-        keywords = _DOC_TYPE_MAP.get(self.active_record_type, [])
+        keywords = self._doc_type_keyword_override or _DOC_TYPE_MAP.get(self.active_record_type, [])
         if not keywords:
             return records
         is_preforeclosure = self.active_record_type == "pre_foreclosure"

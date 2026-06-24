@@ -6,10 +6,17 @@ the richer selectable_availability() metadata object (whose keys would render as
 bogus "available"/"default"/... checkboxes).
 """
 from src.scrapers.doc_types import (
+    _AVAILABILITY,
+    _EAGLEWEB_COUNTIES,
     CANONICAL_DOC_TYPE_LABELS,
     availability_for,
     selectable_doc_type_labels,
 )
+
+
+def _all_selectable():
+    cands = set(_AVAILABILITY.keys()) | {(c, "wa") for c in _EAGLEWEB_COUNTIES}
+    return [k for k in cands if (availability_for(*k) or {}).get("supported_for_selection")]
 
 
 def test_king_labels_are_token_to_label_map():
@@ -46,10 +53,13 @@ def test_kitsap_eagleweb_labels_are_token_to_label_map():
 
 
 def test_labels_shape_is_flat_str_to_str():
-    """Guards against regressing back to the metadata object the UI can't render."""
-    for county in ("king", "pierce"):
-        labels = selectable_doc_type_labels(county, "wa")
-        assert isinstance(labels, dict)
+    """Guards against regressing back to the metadata object the UI can't render.
+    Covers EVERY selectable county, not just king/pierce (Codex)."""
+    selectable = _all_selectable()
+    assert len(selectable) >= 17
+    for county, state in selectable:
+        labels = selectable_doc_type_labels(county, state)
+        assert isinstance(labels, dict) and labels
         for token, label in labels.items():
             assert isinstance(token, str) and isinstance(label, str)
         # Must NOT contain metadata keys.
@@ -58,9 +68,9 @@ def test_labels_shape_is_flat_str_to_str():
 
 
 def test_every_selectable_token_has_a_label_and_matches_availability():
-    for county in ("king", "pierce"):
-        avail = availability_for(county, "wa")["available"]
-        labels = selectable_doc_type_labels(county, "wa")
+    for county, state in _all_selectable():
+        avail = availability_for(county, state)["available"]
+        labels = selectable_doc_type_labels(county, state)
         assert set(labels.keys()) == set(avail)
         for token in avail:
             assert token in CANONICAL_DOC_TYPE_LABELS

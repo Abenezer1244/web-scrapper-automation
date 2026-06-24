@@ -62,7 +62,12 @@ _CONNECTOR_CONFIG: dict[tuple[str, str], dict] = {
     ("kitsap", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://kcwaimg.kitsap.gov/recorder/web/"},
     ("thurston", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://eagleweb.co.thurston.wa.us/thurstonrecorder/web/"},
     ("whitman", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://whitmanwa.countygovernmentrecords.com/whitmanrecorder/web/"},
-    # P4: acclaim/idoc/laserfiche/tyler (ai -> template via base_url), whatcom (manual).
+    # P4: one county per remaining keyword family (live /connectors 2026-06-23).
+    ("douglas", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://edocs.douglascountywa.gov/AcclaimWeb"},
+    ("columbia", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://www.idocmarket.com/COLWA1/Document/Search"},
+    ("cowlitz", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://www.cowlitzinfo.net/WLAudPublic/welcome.aspx?dbid=0&repo=CCIMAGES"},
+    ("okanogan", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://okanogancountywa-web.tylerhost.net/Web"},
+    ("whatcom", "wa"): {"scraper_mode": "manual", "scraper_class": "src.scrapers.whatcom_wa.WhatcomWAScraper", "base_url": "https://recording.whatcomcounty.us/"},
 }
 
 

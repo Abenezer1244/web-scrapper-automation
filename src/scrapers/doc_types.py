@@ -128,6 +128,81 @@ _AVAILABILITY: dict[tuple[str, str], dict] = {
         },
         "note": "Skagit recorder document-type dropdown (server-side), refined client-side by comment.",
     },
+    # ── P4: client-side KEYWORD families (confidence="keyword"). Each tokens map
+    # EXACTLY partitions that scraper's _DOC_TYPE_MAP["pre_foreclosure"] so a narrowed
+    # selection is a true subset (enforced by test_*_tokens_partition_scraper_map).
+    # "NOTICE OF INTENT TO FORFEIT" (real-estate-contract forfeiture, iDoc/Tyler) is
+    # grouped under `foreclosure` (generic foreclosure-stage), the closest canonical.
+    # Douglas — AcclaimWeb (chelan, the other Acclaim county, is health=down/deferred).
+    ("douglas", "wa"): {
+        "available": ["notice_of_default", "notice_of_trustee_sale", "lis_pendens", "foreclosure"],
+        "method": "keyword", "confidence": "keyword", "default": "notice_of_trustee_sale",
+        "supported_for_selection": True,
+        "tokens": {
+            "notice_of_default": ["NOTICE OF DEFAULT", "NOD"],
+            "notice_of_trustee_sale": ["NOTICE OF TRUSTEE", "TRUSTEE SALE", "TRUSTEE'S SALE", "NTS"],
+            "lis_pendens": ["LIS PENDENS"],
+            "foreclosure": ["FORECLOSURE"],
+        },
+        "note": "AcclaimWeb recorder — best-effort document-type text match (client-side).",
+    },
+    # Columbia — iDocMarket.
+    ("columbia", "wa"): {
+        "available": ["notice_of_default", "notice_of_trustee_sale", "lis_pendens", "foreclosure"],
+        "method": "keyword", "confidence": "keyword", "default": "notice_of_trustee_sale",
+        "supported_for_selection": True,
+        "tokens": {
+            "notice_of_trustee_sale": ["NOTICE OF TRUSTEE", "TRUSTEE'S SALE", "TRUSTEE SALE"],
+            "notice_of_default": ["NOTICE OF DEFAULT"],
+            "lis_pendens": ["LIS PENDENS"],
+            "foreclosure": ["FORECLOSURE", "NOTICE OF INTENT TO FORFEIT"],
+        },
+        "note": "iDocMarket recorder — best-effort document-type text match (client-side).",
+    },
+    # Cowlitz — Laserfiche WebLink.
+    ("cowlitz", "wa"): {
+        "available": ["notice_of_default", "notice_of_trustee_sale", "lis_pendens", "foreclosure"],
+        "method": "keyword", "confidence": "keyword", "default": "notice_of_trustee_sale",
+        "supported_for_selection": True,
+        "tokens": {
+            "lis_pendens": ["LIS PENDENS"],
+            "notice_of_trustee_sale": ["NOTICE OF TRUSTEE", "TRUSTEE SALE", "TRUSTEE'S SALE"],
+            "notice_of_default": ["NOTICE OF DEFAULT"],
+            "foreclosure": ["FORECLOSURE"],
+        },
+        "note": "Laserfiche WebLink recorder — best-effort document-type text match (client-side).",
+    },
+    # Okanogan — Tyler SelfService.
+    ("okanogan", "wa"): {
+        "available": ["notice_of_default", "notice_of_trustee_sale", "lis_pendens", "foreclosure"],
+        "method": "keyword", "confidence": "keyword", "default": "notice_of_trustee_sale",
+        "supported_for_selection": True,
+        "tokens": {
+            "lis_pendens": ["LIS PENDENS"],
+            "notice_of_trustee_sale": ["NOTICE OF TRUSTEE", "TRUSTEE'S SALE"],
+            "notice_of_default": ["NOTICE OF DEFAULT"],
+            "foreclosure": ["FORECLOSURE", "NOTICE OF INTENT TO FORFEIT"],
+        },
+        "note": "Tyler SelfService recorder — best-effort document-type text match (client-side).",
+    },
+    # Whatcom — Helion (manual). The only keyword family that exposes all 5 canonical
+    # types (its map has a distinct NOTICE OF FORECLOSURE token).
+    ("whatcom", "wa"): {
+        "available": [
+            "notice_of_default", "notice_of_trustee_sale", "lis_pendens",
+            "notice_of_foreclosure", "foreclosure",
+        ],
+        "method": "keyword", "confidence": "keyword", "default": "notice_of_trustee_sale",
+        "supported_for_selection": True,
+        "tokens": {
+            "notice_of_trustee_sale": ["NOTICE OF TRUSTEE SALE"],
+            "lis_pendens": ["LIS PENDENS"],
+            "notice_of_default": ["NOTICE OF DEFAULT"],
+            "notice_of_foreclosure": ["NOTICE OF FORECLOSURE"],
+            "foreclosure": ["FORECLOSURE"],
+        },
+        "note": "Whatcom Helion recorder — best-effort document-type text match (client-side).",
+    },
 }
 
 # EagleWeb template (Tyler EagleWeb recorder sites). CLIENT-SIDE keyword filter:

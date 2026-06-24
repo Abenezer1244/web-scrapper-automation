@@ -195,6 +195,79 @@ def test_eagleweb_doc_types_ignored_for_non_pre_foreclosure():
     assert _eagleweb(record_type="probate", doc_types=["lis_pendens"])._doc_type_keyword_override is None
 
 
+# ── P4 keyword families: partition-invariant + narrowing + fail-closed ────────
+def _kw_map(modpath, attr="_DOC_TYPE_MAP"):
+    import importlib
+    return getattr(importlib.import_module(modpath), attr)["pre_foreclosure"]
+
+
+# (county, scraper module, keyword-attr) — registry tokens must EXACTLY partition
+# the scraper's pre_foreclosure keyword set (no over-collect, no silent drop).
+_PARTITION_CASES = [
+    ("douglas", "src.scrapers.templates.acclaimweb", "_DOC_TYPE_MAP"),
+    ("columbia", "src.scrapers.templates.idocmarket", "_DOC_TYPE_MAP"),
+    ("cowlitz", "src.scrapers.templates.laserfiche_weblink", "_DOC_TYPE_MAP"),
+    ("okanogan", "src.scrapers.templates.tyler_selfservice", "_DOC_TYPE_MAP"),
+    ("whatcom", "src.scrapers.whatcom_wa", "_DOC_TYPE_KEYWORDS"),
+]
+
+
+@pytest.mark.parametrize("county,modpath,attr", _PARTITION_CASES)
+def test_keyword_family_tokens_partition_scraper_map(county, modpath, attr):
+    from src.scrapers.doc_types import availability_for
+    a = availability_for(county, "wa")
+    assert a and a.get("supported_for_selection")
+    token_union = set()
+    for kws in a["tokens"].values():
+        token_union.update(kws)
+    scraper_kw = set(_kw_map(modpath, attr))
+    assert token_union == scraper_kw, token_union ^ scraper_kw
+
+
+def test_acclaim_douglas_narrows_and_fails_closed():
+    from src.scrapers.templates.acclaimweb import AcclaimWebScraper
+    def mk(**kw):
+        return AcclaimWebScraper(base_url="https://edocs.douglascountywa.gov/AcclaimWeb",
+                                 county="douglas", state="WA", record_types=["pre_foreclosure"], **kw)
+    assert mk(record_type="pre_foreclosure")._doc_type_keyword_override is None
+    assert mk(record_type="pre_foreclosure", doc_types=["lis_pendens"])._doc_type_keyword_override == ["LIS PENDENS"]
+    with pytest.raises(ValueError):
+        mk(record_type="pre_foreclosure", doc_types=["notice_of_foreclosure"])  # not available for Acclaim
+    with pytest.raises(ValueError):
+        mk(record_type="pre_foreclosure", doc_types=[])
+
+
+def test_tyler_okanogan_groups_forfeit_under_foreclosure():
+    from src.scrapers.templates.tyler_selfservice import TylerSelfServiceScraper
+    s = TylerSelfServiceScraper(base_url="https://okanogancountywa-web.tylerhost.net/Web",
+                                county="okanogan", state="WA", record_types=["pre_foreclosure"],
+                                record_type="pre_foreclosure", doc_types=["foreclosure"])
+    assert s._doc_type_keyword_override == ["FORECLOSURE", "NOTICE OF INTENT TO FORFEIT"]
+
+
+def test_whatcom_explicit_selection_uses_canonical_set():
+    from src.scrapers.whatcom_wa import WhatcomWAScraper
+    # whatcom is the only keyword family exposing notice_of_foreclosure; an explicit
+    # selection matches by canonical token (set), NOT substring keywords.
+    s = WhatcomWAScraper(record_type="pre_foreclosure", doc_types=["notice_of_foreclosure"])
+    assert s._selected_canonical == {"notice_of_foreclosure"}
+    with pytest.raises(ValueError):
+        WhatcomWAScraper(record_type="pre_foreclosure", doc_types=[])
+    # legacy (no selection): keyword set, no canonical override
+    legacy = WhatcomWAScraper(record_type="pre_foreclosure")
+    assert legacy._selected_canonical is None and "FORECLOSURE" in legacy._keywords
+
+
+def test_whatcom_foreclosure_does_not_leak_notice_of_foreclosure():
+    # Codex High: a `foreclosure`-only selection must NOT pull NOTICE OF FORECLOSURE
+    # rows. Canonical normalization keeps them distinct (longest-match-first).
+    from src.scrapers.doc_types import normalize_doc_type
+    selected = {"foreclosure"}
+    assert normalize_doc_type("NOTICE OF FORECLOSURE") == "notice_of_foreclosure"
+    assert normalize_doc_type("NOTICE OF FORECLOSURE") not in selected  # dropped
+    assert normalize_doc_type("FORECLOSURE") in selected  # kept
+
+
 def test_king_none_is_legacy_nots():
     s = KingCountyLandmarkWebScraper(record_type="pre_foreclosure")
     assert s.DOC_TYPE_SEARCH_TEXTS == ["notice of trustee sale"]

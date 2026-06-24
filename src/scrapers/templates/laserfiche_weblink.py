@@ -101,6 +101,7 @@ class LaserficheWebLinkScraper(BridgeScraper):
         record_types: list[str] | None = None,
         record_type: str | None = None,
         require_parcel_id: bool = True,
+        doc_types: list[str] | None = None,
     ):
         super().__init__()
         # Normalise base_url to the WLAudPublic root
@@ -118,6 +119,15 @@ class LaserficheWebLinkScraper(BridgeScraper):
         self.record_types = record_types or []
         self.active_record_type = record_type or (self.record_types[0] if self.record_types else None)
         self.require_parcel_id = require_parcel_id
+        # Phase B: narrow the client-side keyword filter to an explicit pre-foreclosure
+        # selection (subset of _DOC_TYPE_MAP — registry tokens are an exact partition).
+        # None = legacy/full; unmappable/empty raises (fail-closed).
+        self._doc_type_keyword_override: list[str] | None = None
+        if doc_types is not None and self.active_record_type == "pre_foreclosure":
+            from src.scrapers.doc_types import canonical_tokens_or_raise
+            self._doc_type_keyword_override = canonical_tokens_or_raise(
+                county, state, list(dict.fromkeys(doc_types))
+            )
 
         if host:
             add_scrape_domain(host)
@@ -509,7 +519,7 @@ class LaserficheWebLinkScraper(BridgeScraper):
         """Keep only records whose doc_type matches the active record type."""
         if not self.active_record_type or self.active_record_type == "all":
             return records
-        keywords = _DOC_TYPE_MAP.get(self.active_record_type, [])
+        keywords = self._doc_type_keyword_override or _DOC_TYPE_MAP.get(self.active_record_type, [])
         if not keywords:
             return records
         is_divorce = self.active_record_type == "divorce"

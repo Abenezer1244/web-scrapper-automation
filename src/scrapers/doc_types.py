@@ -133,8 +133,26 @@ _AVAILABILITY: dict[tuple[str, str], dict] = {
     # selection is a true subset (enforced by test_*_tokens_partition_scraper_map).
     # "NOTICE OF INTENT TO FORFEIT" (real-estate-contract forfeiture, iDoc/Tyler) is
     # grouped under `foreclosure` (generic foreclosure-stage), the closest canonical.
-    # Douglas — AcclaimWeb (chelan, the other Acclaim county, is health=down/deferred).
+    # Douglas — AcclaimWeb. Chelan uses the same partition and is pre-staged below.
     ("douglas", "wa"): {
+        "available": ["notice_of_default", "notice_of_trustee_sale", "lis_pendens", "foreclosure"],
+        "method": "keyword", "confidence": "keyword", "default": "notice_of_trustee_sale",
+        "supported_for_selection": True,
+        "tokens": {
+            "notice_of_default": ["NOTICE OF DEFAULT", "NOD"],
+            "notice_of_trustee_sale": ["NOTICE OF TRUSTEE", "TRUSTEE SALE", "TRUSTEE'S SALE", "NTS"],
+            "lis_pendens": ["LIS PENDENS"],
+            "foreclosure": ["FORECLOSURE"],
+        },
+        "note": "AcclaimWeb recorder — best-effort document-type text match (client-side).",
+    },
+    # Chelan — AcclaimWeb (same family/partition as douglas). health=down at enable
+    # time (portal reachable but the scraper stalls — the condition causing the down
+    # status), so PRE-STAGED: list_connectors hides down connectors, so the selector
+    # appears only once chelan's health recovers. Rests on the verified AcclaimWeb
+    # family mechanism + the partition-invariant test (a per-county live spot-check
+    # wasn't possible while the scraper times out).
+    ("chelan", "wa"): {
         "available": ["notice_of_default", "notice_of_trustee_sale", "lis_pendens", "foreclosure"],
         "method": "keyword", "confidence": "keyword", "default": "notice_of_trustee_sale",
         "supported_for_selection": True,
@@ -233,13 +251,16 @@ _EAGLEWEB_TEMPLATE = {
         "foreclosure": ["FORECLOSURE"],
     },
 }
-# Healthy EagleWeb pre_foreclosure counties (live `/connectors` 2026-06-23). The 4
-# health=down EagleWeb counties (lewis, pacific, spokane) are deferred fail-closed
-# until their portals can be live-checked. grant sits on tylerhost.net but its
-# /grantrecorder/web/ path resolves to EagleWeb (see registry._detect_template).
+# EagleWeb pre_foreclosure counties (live `/connectors`). grant sits on tylerhost.net
+# but its /grantrecorder/web/ path resolves to EagleWeb (see registry._detect_template).
+# lewis/pacific/spokane were health=down when enabled (portals reachable but the
+# scraper stalls — the condition behind the down status); they are PRE-STAGED on the
+# verified EagleWeb family mechanism + partition-invariant test. list_connectors hides
+# down connectors, so their selector appears only once each county's health recovers.
 _EAGLEWEB_COUNTIES = {
     "benton", "clallam", "grant", "island",
     "jefferson", "kitsap", "thurston", "whitman",
+    "lewis", "pacific", "spokane",
 }
 
 

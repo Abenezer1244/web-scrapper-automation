@@ -66,9 +66,10 @@ def test_canonical_tokens_king_maps_to_search_text():
     assert toks == ["notice of trustee sale"]
 
 
-def test_validate_rejects_deferred_eagleweb_county():
-    # lewis (EagleWeb, health=down) is DEFERRED → not selectable → reject.
-    ok, err = validate_selection("lewis", "wa", ["notice_of_default"])
+def test_validate_rejects_non_selectable_pre_foreclosure_county():
+    # snohomish is a pre_foreclosure county but single-type (NTS newspaper) — it has
+    # no doc-type selector, so a selection must be rejected (fail-closed).
+    ok, err = validate_selection("snohomish", "wa", ["notice_of_default"])
     assert ok is False and err is not None
 
 
@@ -104,7 +105,7 @@ def test_or_raise_raises_on_unmappable_token():
 
 def test_or_raise_raises_on_hidden_or_unknown_county():
     with pytest.raises(ValueError):
-        canonical_tokens_or_raise("lewis", "wa", ["notice_of_default"])  # deferred (down)
+        canonical_tokens_or_raise("snohomish", "wa", ["notice_of_default"])  # single-type, not selectable
     with pytest.raises(ValueError):
         canonical_tokens_or_raise("nowhere", "zz", ["notice_of_default"])
 

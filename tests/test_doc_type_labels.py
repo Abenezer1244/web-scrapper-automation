@@ -35,8 +35,8 @@ def test_pierce_labels_are_token_to_label_map():
 
 
 def test_unsupported_county_returns_none():
-    # lewis (EagleWeb, health=down) is deferred → not in _EAGLEWEB_COUNTIES → hidden.
-    assert selectable_doc_type_labels("lewis", "wa") is None
+    # snohomish is pre_foreclosure but single-type (no doc-type selector) → None.
+    assert selectable_doc_type_labels("snohomish", "wa") is None
     assert selectable_doc_type_labels("nowhere", "zz") is None
 
 

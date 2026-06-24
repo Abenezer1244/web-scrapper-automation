@@ -65,7 +65,17 @@ Batch asymmetry (documented for review): single create/PATCH 422 an explicit TOD
 non-probate config; a BATCH spans multiple types, so the flag applies only to probate
 children and is ignored (no 422) for the rest.
 
-### Phase 4 — frontend (SEPARATE repo `bridgeleads-web`) — NOT this session.
+### Phase 4 — frontend (SEPARATE repo `bridgeleads-web`) — HELD until backend merges (user decision 2026-06-23).
+Gated by the backend-first rule: regen `npm run gen:api-types` only after #117 merges to main + deploys,
+so the generated contract carries `include_living_owner_tod`. Then build wizard checkbox + existing-user
+notice. FE must NOT echo default `false` for a null config (null = grandfathered; only a real toggle writes).
+
+## SHIPPED THIS SESSION
+- **PR #117 OPEN** https://github.com/Abenezer1244/web-scrapper-automation/pull/117 — stacked on #115
+  (base `feat/probate-tod-signal`, auto-retargets to main when #115 merges). 6 commits, Codex-clean.
+- Migration 071 graph validated: single head, linear `071→070`, no collisions.
+- ⏭️ USER/OPS: (1) merge #115 then #117; (2) run **migration 071 BEFORE** worker+api deploy;
+  (3) Phase 4 FE after merge+regen.
 
 ## Safety / gotchas
 - Shared OneDrive repo: never delete/force-move branches; additive worktree + push only.

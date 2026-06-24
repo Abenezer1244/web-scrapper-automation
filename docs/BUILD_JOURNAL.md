@@ -19,6 +19,60 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-23 — Phase B: user-selectable pre-foreclosure doc types for ALL healthy counties (SELECT)
+**Built / Shipped:** Turned the wizard's "Document types to scrape" checkbox selector ON for **all 15
+healthy pre_foreclosure counties** (was King/Pierce only). Branch `feat/doctype-select-allcounty`
+(worktree `.claude/worktrees/doctype-select-allcounty`), **stacked on PR #114** (`feat/doc-type-visibility`)
+because Phase B reuses #114's `_CHECKBOX_DOC_LABELS` + `connector_scraper_class` — rebase onto main after
+#114 merges. Backend-only (the FE already renders checkboxes for any county whose `/connectors` returns
+`pre_foreclosure_doc_types`). 6 phases, all Codex-reviewed:
+- **P0 foundation (zero behavior change):** `canonical_tokens_or_raise()` — explicit selections FAIL CLOSED
+  (raise) instead of silently broadening to the full set; King/Pierce migrated; `is not None` gates so a
+  degenerate `[]` also fails closed. Additive `ConnectorResponse.pre_foreclosure_doc_type_method/_confidence`
+  so the UI can honestly distinguish a server-side portal filter (`verified`) from a client-side text match
+  (`keyword`). A wiring **guard test** resolves every selectable county through the REAL registry factory
+  (`partial` for ai-mode, class for manual) and asserts it accepts `doc_types`.
+- **P1 Clark / P2 Skagit (server-side, `verified`):** Clark narrows both the checkbox codes AND the
+  client-side label allowlist; Skagit narrows BOTH its server dropdown searches AND its client refine.
+- **P3 EagleWeb ×8 + P4 Acclaim/iDoc/Laserfiche/Tyler/Whatcom (client-side, `keyword`):** each scraper's
+  keyword set is narrowed to the selection; registry tokens are an EXACT partition of each scraper's
+  `_DOC_TYPE_MAP` (parametrized partition-invariant test → narrowing is always a true subset).
+- **P5:** 58 doc-type tests pass under synthetic env; `schema/openapi.json` hand-edited for the 2 new fields.
+
+**Tried / Decided:** Authoritative scope came from the LIVE `GET /scrapers/connectors` (22 pre_foreclosure
+connectors), NOT migrations (which seed only 3 — connectors were updated out-of-band). Keyword counties are
+`confidence:"keyword"` + still selectable (user choice over server-only). `available` = each county's
+verified portal vocabulary (capability), not a recent-histogram intersection (rare types stay selectable).
+Per-family verification + 2-3 county live spot-checks (user choice). 4 health=down counties
+(chelan/lewis/pacific/spokane) deferred fail-closed.
+
+**Failed / Blocked:** Broad-histogram live recon on the slow Acclaim (douglas) and EagleWeb (clallam) portals
+timed out at 140s — not a code defect; those families rest on production-proven daily scrapes + the
+partition-invariant tests. Snohomish stays single-type (NTS newspaper), no selector.
+
+**Caught & fixed (Codex per phase):** P0 — `[]` truthiness gap (gates → `is not None`); guard test originally
+checked a hand-map not the real resolver. P1 — Clark migration-006 row points at the OLD King subclass, but
+the LIVE active connector already uses `clark_wa.ClarkWAScraper` (verified via direct prod-DB query; the
+migration row is a dead inactive duplicate). P3 — `_EAGLEWEB_TEMPLATE` token DRIFT: had `NOD` (not in scraper
+map → would over-collect) and was missing `NTSCL` (→ would silently drop NTSCL leads); reconciled + locked by
+the partition test. Stale tests asserting kitsap was hidden, fixed. P4 — **Whatcom `foreclosure` selection
+substring-leaked `NOTICE OF FORECLOSURE`** (the only family with both as distinct types) → fixed by matching
+explicit Whatcom selections via exact canonical normalization instead of keyword substring.
+
+**Pending / Handoff:** (1) Merge order: #114 first, then rebase this branch onto main + `gen:api-types` for the
+FE. (2) FE honesty label for `confidence:"keyword"` counties ("matched by document text") — small follow-up.
+(3) Enable the 4 deferred down counties once their portals are live-checkable. (4) SHOW-vs-SELECT panel drift
+(SHOW shows the full family; SELECT narrows) — cosmetic follow-up.
+
+**Facts learned:** ai-mode connectors resolve to a recorder-platform TEMPLATE via `_detect_template(base_url)`
+and the worker constructs them as a `functools.partial(...)` — `inspect.signature(partial)` exposes the unbound
+`doc_types`, so adding it to a template `__init__` is enough for the worker to pass it. okanogan = Tyler
+SelfService (NOT EagleWeb); grant = EagleWeb (its `/grantrecorder/web/` path wins over the tylerhost domain).
+There's a DEAD inactive duplicate `clark` connector row (lowercase `wa`, ai-mode, old King subclass) — always
+query the live DB to confirm a connector's real `scraper_class`; the public endpoint hides it.
+
+---
+
 ## 2026-06-23 — Document-type visibility (SHOW) across all counties + record types
 **Built / Shipped:** A customer asked which pre-foreclosure document type we collect per county and why
 most counties (and ALL probate) show no document types in the wizard. Built **SHOW** — read-only

@@ -45,8 +45,8 @@ Note: okanogan = Tyler (NOT EagleWeb as brief guessed); grant = EagleWeb (its `/
 - [x] **P1 — Clark** DONE + Codex-reviewed (commit 3c2c87d). All 5 canonical types, narrows both checkbox codes + client label allowlist. Verified vs live prod (active row = clark_wa.ClarkWAScraper). ⚠️ NOTE: prod has a DEAD inactive duplicate clark row (state 'wa' lc, ai-mode, king_wa_probate.ClarkWaProbateScraper, probate-only) — ignore it; list_connectors serves only the active 'WA' row.
 - [x] **P2 — Skagit** DONE + LIVE-recon-verified (4 dropdown labels confirmed 2026-06-23) + Codex-reviewed (commit 19950eb). Narrows BOTH server dropdown + client refine; no generic foreclosure option. 4 canonical types.
 - [x] **P3 — EagleWeb** (8 counties) DONE + Codex-reviewed (commit 3b9cdc3). Reconciled token drift (removed NOD, added NTSCL) → partition-invariant test. confidence=keyword. LIVE-verified kitsap broad histogram (all 4 types appear). Guard strengthened to inspect worker partial. Fixed stale kitsap-hidden tests. 4 down EagleWeb (lewis/pacific/spokane) deferred.
-- [ ] **P4 — Acclaim/iDoc/Laserfiche/Tyler/Whatcom** (1 county each): wire each; per-county `keyword` entries; spot-check; test; Codex.
-- [ ] **P5 — finalize:** full test pass, OpenAPI, BUILD_JOURNAL entry, PR. Track follow-ups: defer-4 counties, FE honesty label, SHOW-drift.
+- [x] **P4 — Acclaim/iDoc/Laserfiche/Tyler/Whatcom** DONE + Codex-reviewed (commit 8bbfd21). All 5 + partition-invariant tests. Codex High: whatcom fc/nof substring leak → fixed via canonical-normalize matching. 15/15 counties enabled.
+- [x] **P5 — finalize:** 58 tests pass (synthetic env); openapi.json hand-edited (method/confidence fields); BUILD_JOURNAL appended; PR opened.
 
 ## Hard constraints
 - FAIL-CLOSED: never flip a county to selectable without live verification of its mechanism + vocabulary.

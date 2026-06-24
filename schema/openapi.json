@@ -813,6 +813,28 @@
             ],
             "title": "Max Date Range Days"
           },
+          "pre_foreclosure_doc_type_confidence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pre Foreclosure Doc Type Confidence"
+          },
+          "pre_foreclosure_doc_type_method": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pre Foreclosure Doc Type Method"
+          },
           "pre_foreclosure_doc_types": {
             "anyOf": [
               {

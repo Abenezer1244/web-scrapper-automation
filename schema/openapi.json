@@ -1884,6 +1884,25 @@
         "title": "PhoneContact",
         "type": "object"
       },
+      "ProfileUpdate": {
+        "additionalProperties": false,
+        "description": "Editable profile fields (Settings -> Account). `name` may be null/blank to\nCLEAR the display name. Sanitized through the SAME validator as registration.\nextra='forbid' so a caller cannot smuggle other user columns (plan,\nrecords_limit, is_admin, ...) through the profile endpoint.",
+        "properties": {
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "title": "ProfileUpdate",
+        "type": "object"
+      },
       "ReadAllResponse": {
         "properties": {
           "updated": {
@@ -3315,6 +3334,17 @@
             "title": "Email",
             "type": "string"
           },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
           "password": {
             "title": "Password",
             "type": "string"
@@ -3362,6 +3392,17 @@
             "default": false,
             "title": "Is Trial",
             "type": "boolean"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
           },
           "notification_prefs": {
             "additionalProperties": {
@@ -4060,6 +4101,53 @@
           }
         ],
         "summary": "Onboarding Status",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/profile": {
+      "put": {
+        "description": "Persist the user's editable profile (settings → Account → display name).\n\n`body.name` is already sanitized + None-on-blank by ProfileUpdate; a\nnull/blank value CLEARS the name. The WHERE id == current_user.id filter is\nthe tenant guard — RLS on `users` is permissive under the app role, so the\nquery filter is the real own-row constraint (belt-and-suspenders per the\nproject rules). The audit log records the action only, never the name value\n(it is PII).",
+        "operationId": "update_profile_auth_profile_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Update Profile",
         "tags": [
           "auth"
         ]

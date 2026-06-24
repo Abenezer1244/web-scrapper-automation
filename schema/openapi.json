@@ -144,6 +144,17 @@
               "property_address": true
             }
           },
+          "include_living_owner_tod": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Include Living Owner Tod"
+          },
           "name": {
             "anyOf": [
               {
@@ -2530,6 +2541,17 @@
               "property_address": true
             }
           },
+          "include_living_owner_tod": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Include Living Owner Tod"
+          },
           "name": {
             "maxLength": 120,
             "title": "Name",
@@ -2639,6 +2661,17 @@
           "id": {
             "title": "Id",
             "type": "string"
+          },
+          "include_living_owner_tod": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Include Living Owner Tod"
           },
           "name": {
             "title": "Name",
@@ -2754,6 +2787,17 @@
                 "type": "null"
               }
             ]
+          },
+          "include_living_owner_tod": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Include Living Owner Tod"
           },
           "name": {
             "anyOf": [

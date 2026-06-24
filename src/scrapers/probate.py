@@ -29,6 +29,7 @@ Design guards (pressure-tested with Codex):
 from __future__ import annotations
 
 import re
+from enum import Enum
 
 # --- Filing-agency / issuing-authority detection -------------------------------
 
@@ -271,3 +272,172 @@ def orient_probate_party(
         party, heirs = (g or None), (e or None)
 
     return (strip_estate_caption(party), heirs)
+
+
+# --- Probate signal classification (lead-subtype labeling) ----------------------
+#
+# The live verification (2026-06-23) found ~47% of "probate" leads were actually
+# Transfer-on-Death deeds CREATED by a LIVING owner — a softer estate-planning
+# signal, NOT a death/inheritance event. Selling those as "probate (deceased
+# owner)" is a mislabel. This classifier sorts each document into an honest
+# subtype so the pipeline can tag every probate lead (and optionally let the
+# customer include/exclude the living-owner TOD bucket). It NEVER drops on its own
+# — it labels; callers decide what to keep.
+
+
+class ProbateSignal(str, Enum):
+    """Honest subtype of a probate-record-type document.
+
+    ``str`` mixin so ``.value`` is the stable slug the pipeline stores in
+    ``enrichment_data["lead_subtype"]`` and exports as a CSV column.
+    """
+
+    DEATH_INHERITANCE = "probate_death_inheritance"          # real death / inheritance
+    TOD_LIVING_OWNER = "tod_living_owner_estate_planning"    # LIVING owner TOD planning
+    NONPROBATE_TRANSFER = "nonprobate_transfer"              # Lack-of-Probate affidavit
+    UNKNOWN = "unknown_probate"                              # no confident signal
+
+
+# A Transfer-on-Death instrument by any of the names recorders use. "DEATH DEED"
+# is the colloquial TOD label some portals emit (Codex: don't require the exact
+# "TRANSFER ON DEATH" phrase). \bTOD\b is word-anchored so it never fires inside a
+# surname like "TODD".
+_TOD_DOC_RE = re.compile(
+    r"TRANSFER\s+ON\s+DEATH|\bTOD\b|\bDEATH\s+DEED\b", re.IGNORECASE
+)
+
+# Markers that PROVE a death / inheritance / post-death effectuation. When ANY of
+# these is present the document is a real lead even if it also names a TOD (a
+# death-triggered TOD effectuation: "Affidavit to Perfect TOD", "Death Cert to
+# Perfect Death Deed", "TOD Beneficiary Affidavit"). Phrase-anchored so no bare
+# ambiguous token promotes a living-owner deed.
+_DEATH_MARKER_RE = re.compile(
+    r"DEATH\s+CERT|CERTIFICATE\s+OF\s+DEATH|\bDECEASED\b|\bDECEDENT\b"
+    r"|AFFIDAVIT\s+OF\s+DEATH|DEATH\s+OF\s+(?:TRANSFEROR|GRANTOR|OWNER)"
+    r"|PROOF\s+OF\s+DEATH|EVIDENCE\s+OF\s+DEATH|TRANSFEROR\s+DECEASED"
+    r"|\bPERFECT|\bEFFECTUAT"
+    r"|LETTERS\s+TESTAMENTARY|LETTERS\s+OF\s+ADMINISTRATION|\bTESTAMENTARY\b"
+    r"|PERSONAL\s+REPRESENTATIVE|PERSONAL\s+REP\b"
+    r"|ADMINISTRAT(?:OR|RIX)|EXEC(?:UTOR|UTRIX)"
+    r"|AFFIDAVIT\s+OF\s+(?:HEIRSHIP|SUCCESSOR)|\bHEIRSHIP\b|\bHEIRS?\b|\bINHERITANCE\b"
+    # WILL / TESTAMENT as words so multi-word/punctuated labels classify too
+    # ("LAST WILL AND TESTAMENT", "WILL/TESTAMENT" -> normalized "WILL TESTAMENT").
+    # Safe within the probate-gated caller: a TOD deed never contains these (Codex P2).
+    r"|\bWILL\b|\bTESTAMENT\b"
+    r"|BENEFICIARY\s+AFFIDAVIT|DECREE\s+OF\s+DISTRIBUTION|ESTATE\s+OF",
+    re.IGNORECASE,
+)
+
+_LACK_OF_PROBATE_RE = re.compile(r"LACK\s+OF\s+PROBATE", re.IGNORECASE)
+_BARE_PROBATE_RE = re.compile(r"\bPROBATE\b", re.IGNORECASE)
+
+# Abbreviated probate/death doc CODES that some portals emit as the WHOLE doc_type
+# (Codex P2): EagleWeb/Clallam -> DEATH, LETTR, EXEC, SUCC; AcclaimWeb/Chelan ->
+# DEATH, AFFD, PTREC. Matched by EXACT whole (normalized) value — NOT substring/word
+# — so the bare "DEATH" code is recognized as a death while "TRANSFER ON DEATH DEED"
+# (multi-word) stays on the TOD path. "TOD" is absent here on purpose: a bare TOD code
+# is a living-owner deed, handled by _TOD_DOC_RE. (WILL/HEIR are NOT here — they are
+# words that also appear in multi-word labels, so _DEATH_MARKER_RE handles them.)
+_ABBREV_DEATH_CODES: frozenset[str] = frozenset(
+    {"DEATH", "LETTR", "EXEC", "SUCC", "AFFD", "PTREC"}
+)
+
+
+def _normalize_doc_type(doc_type: str) -> str:
+    """Take the document label before any concatenated recording number.
+
+    Live recorder strings append the recording id after a newline
+    ("Transfer on Death Deed\\n2026-1482913"); keep only the label, uppercased and
+    whitespace-collapsed, so the matchers see a clean type.
+    """
+    head = doc_type.split("\n", 1)[0]
+    # Treat hyphens/slashes as word separators so the phrase matchers see a canonical
+    # spaced form: "Lack-of-Probate Affidavit" -> "LACK OF PROBATE AFFIDAVIT",
+    # "Transfer-on-Death Deed" -> "TRANSFER ON DEATH DEED" (Codex P2 — hyphenated
+    # recorder labels were falling through to the bare-PROBATE rule and mislabeling
+    # Lack-of-Probate as a death/inheritance lead).
+    return re.sub(r"[\s\-/]+", " ", head).strip().upper()
+
+
+def classify_probate_signal(doc_type: str | None) -> ProbateSignal:
+    """Sort a probate document-type string into an honest ``ProbateSignal``.
+
+    Order matters:
+      1. Lack-of-Probate affidavit -> NONPROBATE_TRANSFER (checked before the bare
+         "PROBATE" rule, which its text would otherwise trip).
+      2. A TOD instrument WITH a death/effectuation marker -> DEATH_INHERITANCE
+         (death-triggered TOD); WITHOUT one -> TOD_LIVING_OWNER (living owner).
+      3. Any other death/probate marker -> DEATH_INHERITANCE.
+      4. A bare "PROBATE" label (e.g. Pierce ARMS) -> DEATH_INHERITANCE.
+      5. Anything else (e.g. Community Property Agreement) -> UNKNOWN — labeled
+         honestly, never faked into a death.
+
+    Pure function: classifies only, never drops. Callers gate on the result.
+    """
+    if not doc_type or not doc_type.strip():
+        return ProbateSignal.UNKNOWN
+
+    up = _normalize_doc_type(doc_type)
+
+    if _LACK_OF_PROBATE_RE.search(up):
+        return ProbateSignal.NONPROBATE_TRANSFER
+
+    # Death if a phrase marker matches OR the WHOLE value is an abbreviated death
+    # code. Exact-value for the codes so it can't fire inside a multi-word TOD label.
+    has_death = bool(_DEATH_MARKER_RE.search(up)) or up in _ABBREV_DEATH_CODES
+
+    if _TOD_DOC_RE.search(up):
+        return ProbateSignal.DEATH_INHERITANCE if has_death else ProbateSignal.TOD_LIVING_OWNER
+
+    if has_death:
+        return ProbateSignal.DEATH_INHERITANCE
+
+    if _BARE_PROBATE_RE.search(up):
+        return ProbateSignal.DEATH_INHERITANCE
+
+    return ProbateSignal.UNKNOWN
+
+
+def is_living_owner_tod(doc_type: str | None) -> bool:
+    """True if ``doc_type`` is a LIVING-owner Transfer-on-Death planning doc.
+
+    Convenience predicate over :func:`classify_probate_signal` for the connector
+    filter: these are the rows excluded from probate unless the customer opts into
+    the estate-planning signal. Death-triggered TOD effectuations return False
+    (they are real ``DEATH_INHERITANCE`` leads).
+    """
+    return classify_probate_signal(doc_type) is ProbateSignal.TOD_LIVING_OWNER
+
+
+# Signal strength for merging a doc_type result with a recorder-comment result —
+# lower = stronger. A row keeps the STRONGEST signal across its two fields.
+_SIGNAL_PRIORITY: dict[ProbateSignal, int] = {
+    ProbateSignal.DEATH_INHERITANCE: 0,
+    ProbateSignal.NONPROBATE_TRANSFER: 1,
+    ProbateSignal.TOD_LIVING_OWNER: 2,
+    ProbateSignal.UNKNOWN: 3,
+}
+
+
+def classify_probate_signal_for_row(
+    doc_type: str | None, comment: str | None = None
+) -> ProbateSignal:
+    """Classify a probate row from its doc_type AND recorder comment together.
+
+    Recorders split the signal across the two fields, so neither alone is enough:
+      - Skagit keeps a generic "Affidavit" whose probate signal is in the comment
+        ("LACK OF PROBATE AFFIDAVIT" / "INHERITANCE") — the comment must be consulted.
+      - A "Transfer on Death Deed" doc_type with an "Affidavit of Death" / "Beneficiary
+        Affidavit" comment is a death-TRIGGERED TOD (a real inheritance), not a
+        living-owner deed — the comment's death marker must UPGRADE it.
+
+    So we classify each field and keep the STRONGER signal
+    (death > nonprobate > tod > unknown). This rescues a comment-only signal AND
+    upgrades a death-triggered TOD, while never letting the comment DOWNGRADE a
+    confident doc_type (Codex P2).
+    """
+    base = classify_probate_signal(doc_type)
+    if not comment or not comment.strip():
+        return base
+    from_comment = classify_probate_signal(comment)
+    return min(base, from_comment, key=_SIGNAL_PRIORITY.__getitem__)

@@ -61,6 +61,11 @@ LEAD_CSV_COLUMNS: list[str] = [
     # auction_date + default_amount are stored columns; trustee/ts# from
     # enrichment_data["nts"]; days_to_auction is the derived urgency clock.
     "auction_date", "days_to_auction", "default_amount", "trustee", "ts_number",
+    # Probate honesty label (2026-06-23) — APPENDED at end (compatibility contract:
+    # new columns are extra/appended so ordinal consumers of the existing fields do
+    # not shift, Codex P2). Signal subtype set at insert: probate_death_inheritance
+    # vs tod_living_owner_estate_planning vs nonprobate_transfer. Blank for non-probate.
+    "lead_subtype",
 ]
 
 
@@ -262,6 +267,11 @@ def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, s
         "instrument_number": _enrich_str(
             enr, "instrument_number", "recording_number", "record_number"
         ),
+        # Probate honesty label (blank for non-probate). Per-job exports read it from
+        # enrichment_data (set at insert in tasks.py); the combined/segment SQL
+        # exporters build SimpleNamespaces that don't carry enrichment_data, so they
+        # SELECT it as a top-level `lead_subtype` scalar — read whichever is present.
+        "lead_subtype": _enrich_str(enr, "lead_subtype") or sanitize_for_csv(_get(record, "lead_subtype")),
         "code_violation_type": _enrich_str(enr, "record_type", "case_type"),
         "code_violation_status": _enrich_str(enr, "status"),
         "code_violation_description": _enrich_str(enr, "description"),
@@ -313,6 +323,23 @@ def write_lead_csv(
 # (decrypted arrays) so phone_2/3 + email_2/3 populate; columns the segment
 # query doesn't provide (heirs, legal_description, doc_type, tax) come through
 # blank — kept for header parity with the per-job CSV.
+# Combined/segment exports dedup to ONE representative row per property, which may
+# be a non-probate row even when the property also has a probate hit. Deriving
+# lead_subtype from that representative row would blank it for those buckets (Codex
+# P2). Instead aggregate the subtype across the bucket's probate candidates,
+# preferring the stronger signal (death > nonprobate > tod > unknown). References
+# the `lead_subtype` column selected in each query's candidates CTE; goes in the agg
+# CTE. NULL when the bucket has no probate row -> exported blank.
+PROBATE_SUBTYPE_AGG_SQL: str = (
+    "(array_agg(lead_subtype ORDER BY CASE lead_subtype "
+    "WHEN 'probate_death_inheritance' THEN 1 "
+    "WHEN 'nonprobate_transfer' THEN 2 "
+    "WHEN 'tod_living_owner_estate_planning' THEN 3 "
+    "ELSE 4 END) "
+    "FILTER (WHERE lead_subtype IS NOT NULL AND lead_subtype <> ''))[1] AS lead_subtype"
+)
+
+
 OVERLAP_LEAD_COLUMNS: list[str] = [
     "overlap", "lists_count", "lists", "counties",
     "first_name", "last_name",
@@ -321,6 +348,7 @@ OVERLAP_LEAD_COLUMNS: list[str] = [
     "filed_date", "doc_type", "delinquent_amount", "delinquent_bill_year",
     "party_name", "mailing_address", "parcel_id", "heirs", "legal_description",
     "property_address",
+    "lead_subtype",  # appended at end (compatibility contract, Codex P2)
 ]
 
 

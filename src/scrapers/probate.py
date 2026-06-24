@@ -441,3 +441,71 @@ def classify_probate_signal_for_row(
         return base
     from_comment = classify_probate_signal(comment)
     return min(base, from_comment, key=_SIGNAL_PRIORITY.__getitem__)
+
+
+def should_include_probate_row(
+    record_type: str | None,
+    include_living_owner_tod: bool | None,
+    doc_type: str | None,
+    comment: str | None = None,
+) -> bool:
+    """Phase 3 worker filter: keep this row in the delivered probate lead set?
+
+    Tri-state ``include_living_owner_tod`` (persisted on ``ScraperConfig``):
+      - ``None``  legacy / grandfathered  -> include everything (Phase 2 labels it).
+      - ``False`` new probate default      -> exclude LIVING-owner TOD planning docs.
+      - ``True``  explicit customer opt-in -> include everything.
+
+    Drops a row ONLY when it is a living-owner TOD AND the flag is exactly ``False``.
+    Death, death-triggered TOD (a recorder comment upgrades it), nonprobate, and
+    unknown signals always survive — the filter narrows honestly, it never widens a
+    death claim. No-op for non-probate record types.
+
+    Uses :func:`classify_probate_signal_for_row` (doc_type + comment) rather than the
+    bare doc_type predicate so a death marker in the comment rescues a real lead.
+    """
+    if record_type != "probate":
+        return True
+    if include_living_owner_tod is not False:
+        return True
+    return (
+        classify_probate_signal_for_row(doc_type, comment)
+        is not ProbateSignal.TOD_LIVING_OWNER
+    )
+
+
+def new_probate_config_tod_default(
+    record_type: str | None, provided: bool | None
+) -> bool | None:
+    """Resolve ``include_living_owner_tod`` for a NEWLY created scraper config.
+
+    New probate configs exclude living-owner TOD by default (probate = death), so an
+    omitted / null choice resolves to ``False``. An explicit ``True``/``False`` from
+    the client is honored. Non-probate configs are unaffected — the flag stays
+    whatever was provided (``None`` for the common case); it only governs probate.
+
+    Grandfathering (``None`` => include) is for PRE-EXISTING configs only. This makes
+    ``None`` on a stored row unambiguous: "created before the toggle existed" — never
+    "a new config that happens to want everything". Shared by the create, preview, and
+    batch paths so their default can never drift.
+    """
+    if record_type == "probate" and provided is None:
+        return False
+    return provided
+
+
+def effective_tod_on_update(
+    field_provided: bool, provided_value: bool | None, stored_value: bool | None
+) -> bool | None:
+    """Resolve ``include_living_owner_tod`` on a PATCH edit.
+
+    An OMITTED field — or an EXPLICIT ``null``, which is not a user-selectable state
+    (``None`` marks pre-toggle configs only) — preserves the stored value, so editing
+    a config never silently flips its TOD policy. In particular a
+    ``"include_living_owner_tod": null`` PATCH must NOT downgrade a ``False``/``True``
+    probate config back to grandfathered/include-all and re-enable living-owner TOD
+    without an explicit ``true`` opt-in (Codex P2). A real ``True``/``False`` replaces it.
+    """
+    if field_provided and provided_value is not None:
+        return provided_value
+    return stored_value

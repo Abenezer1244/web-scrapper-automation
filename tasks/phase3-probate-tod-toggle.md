@@ -49,7 +49,17 @@ Safe to merge/deploy before the frontend.
 - [x] `src/api/routes/scrapers.py` — create+preview default NEW probate→False via shared helper; `_validate_tod_toggle` (probate-only 422); PATCH preserves omitted None + validates + audits + applies; Response exposes it
 - [x] `src/api/routes/batches.py` — probate children default→False (non-probate children stay None)
 - [x] `tests/test_probate_tod_filter.py` — +5 default-helper cases (probate None→False, explicit honored, non-probate→None passthrough)
-- [x] Verify: ruff clean; route modules import OK; 18/18 tests pass. `codex review` 3b diff = PENDING
+- [x] Verify: ruff clean; route modules import OK; 24/24 tests pass.
+- [x] `codex review` 3a = GATE PASS (zero findings). 3b = 1×P2 (PATCH explicit-null re-grandfathers
+      a False config → re-enables TOD without opt-in). FIXED in `10e3300` via pure
+      `effective_tod_on_update` (explicit null treated as omitted) + 6 targeted tests.
+- [ ] CONFIRMING codex re-review of the P2 fix — BLOCKED: Codex usage limit (resets ~11:26 PM). Re-run:
+      `codex review --base feat/probate-tod-signal -c 'model_reasoning_effort="high"'`
+
+## Commits (branch feat/probate-tod-toggle, NOT pushed, stacked on #115)
+- 745da95  Phase 3a — column + migration 071 + worker filter + predicate
+- 20d0d79  Phase 3b — API surface (create/preview/PATCH/batch)
+- 10e3300  fix — PATCH explicit-null re-grandfather (Codex P2)
 
 Batch asymmetry (documented for review): single create/PATCH 422 an explicit TOD flag on a
 non-probate config; a BATCH spans multiple types, so the flag applies only to probate

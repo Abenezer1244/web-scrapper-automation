@@ -1897,20 +1897,21 @@
       },
       "ProfileUpdate": {
         "additionalProperties": false,
-        "description": "Editable profile fields (Settings -> Account). `name` may be null/blank to\nCLEAR the display name. Sanitized through the SAME validator as registration.\nextra='forbid' so a caller cannot smuggle other user columns (plan,\nrecords_limit, is_admin, ...) through the profile endpoint.",
+        "description": "Editable profile fields — used by BOTH Settings>Account and the\nrequired-name gate. first_name + last_name are REQUIRED (non-empty after\nsanitization) so this endpoint is how an incomplete-profile user satisfies\nthe gate. Sanitized through the SAME validator as registration. extra='forbid'\nso a caller cannot smuggle other user columns (plan, records_limit,\nis_admin, ...) through the profile endpoint.",
         "properties": {
-          "name": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Name"
+          "first_name": {
+            "title": "First Name",
+            "type": "string"
+          },
+          "last_name": {
+            "title": "Last Name",
+            "type": "string"
           }
         },
+        "required": [
+          "first_name",
+          "last_name"
+        ],
         "title": "ProfileUpdate",
         "type": "object"
       },
@@ -3378,16 +3379,13 @@
             "title": "Email",
             "type": "string"
           },
-          "name": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Name"
+          "first_name": {
+            "title": "First Name",
+            "type": "string"
+          },
+          "last_name": {
+            "title": "Last Name",
+            "type": "string"
           },
           "password": {
             "title": "Password",
@@ -3407,7 +3405,9 @@
         },
         "required": [
           "email",
-          "password"
+          "password",
+          "first_name",
+          "last_name"
         ],
         "title": "UserRegister",
         "type": "object"
@@ -3423,6 +3423,17 @@
             "title": "Email",
             "type": "string"
           },
+          "first_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Name"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -3437,7 +3448,7 @@
             "title": "Is Trial",
             "type": "boolean"
           },
-          "name": {
+          "last_name": {
             "anyOf": [
               {
                 "type": "string"
@@ -3446,7 +3457,7 @@
                 "type": "null"
               }
             ],
-            "title": "Name"
+            "title": "Last Name"
           },
           "notification_prefs": {
             "additionalProperties": {
@@ -3459,6 +3470,11 @@
           "plan": {
             "title": "Plan",
             "type": "string"
+          },
+          "profile_complete": {
+            "default": false,
+            "title": "Profile Complete",
+            "type": "boolean"
           },
           "records_limit": {
             "title": "Records Limit",
@@ -4152,7 +4168,7 @@
     },
     "/auth/profile": {
       "put": {
-        "description": "Persist the user's editable profile (settings → Account → display name).\n\n`body.name` is already sanitized + None-on-blank by ProfileUpdate; a\nnull/blank value CLEARS the name. The WHERE id == current_user.id filter is\nthe tenant guard — RLS on `users` is permissive under the app role, so the\nquery filter is the real own-row constraint (belt-and-suspenders per the\nproject rules). The audit log records the action only, never the name value\n(it is PII).",
+        "description": "Persist the user's editable profile (Settings → Account AND the required-\nname gate): first_name + last_name.\n\nBoth are already sanitized + required (non-empty) by ProfileUpdate. This is\nthe endpoint a legacy incomplete-profile user calls to satisfy the gate, so\nit MUST stay reachable while the profile is incomplete (no auth gate on it\nbeyond normal login). The WHERE id == current_user.id filter is the tenant\nguard — RLS on `users` is permissive under the app role, so the query filter\nis the real own-row constraint (belt-and-suspenders per the project rules).\nThe audit log records the action only, never the name values (they are PII).",
         "operationId": "update_profile_auth_profile_put",
         "requestBody": {
           "content": {

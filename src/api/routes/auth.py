@@ -208,18 +208,21 @@ async def update_profile(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> UserResponse:
-    """Persist the user's editable profile (settings → Account → display name).
+    """Persist the user's editable profile (Settings → Account AND the required-
+    name gate): first_name + last_name.
 
-    `body.name` is already sanitized + None-on-blank by ProfileUpdate; a
-    null/blank value CLEARS the name. The WHERE id == current_user.id filter is
-    the tenant guard — RLS on `users` is permissive under the app role, so the
-    query filter is the real own-row constraint (belt-and-suspenders per the
-    project rules). The audit log records the action only, never the name value
-    (it is PII).
+    Both are already sanitized + required (non-empty) by ProfileUpdate. This is
+    the endpoint a legacy incomplete-profile user calls to satisfy the gate, so
+    it MUST stay reachable while the profile is incomplete (no auth gate on it
+    beyond normal login). The WHERE id == current_user.id filter is the tenant
+    guard — RLS on `users` is permissive under the app role, so the query filter
+    is the real own-row constraint (belt-and-suspenders per the project rules).
+    The audit log records the action only, never the name values (they are PII).
     """
     result = await db.execute(select(User).where(User.id == current_user.id))
     user = result.scalar_one()
-    user.name = body.name
+    user.first_name = body.first_name
+    user.last_name = body.last_name
     await db.commit()
     await db.refresh(user)
     audit_log(request, "profile_updated", current_user.id)

@@ -64,13 +64,25 @@ def _validate_display_name(v: str | None) -> str | None:
     return v
 
 
+def _validate_required_name(v: str | None, label: str) -> str:
+    """Required variant of _validate_display_name for first/last name. Same
+    sanitization + bounds, but blank/empty after normalization is a 422 (the
+    field is mandatory) rather than None. Single source of truth so registration
+    and the profile/gate edit enforce identical rules per field."""
+    cleaned = _validate_display_name(v)
+    if cleaned is None:
+        raise ValueError(f"{label} is required")
+    return cleaned
+
+
 class UserRegister(BaseModel):
     email: EmailStr
     password: str
-    # Optional self-entered display name (shown in the dashboard greeting).
-    # Sanitized through the SAME validator as ProfileUpdate so signup can't be a
-    # back door around the edit-time rules. Empty/blank => None (stored NULL).
-    name: str | None = None
+    # Required first + last name (the dashboard greeting uses the first name).
+    # Sanitized + bounded per-field through the SAME validator as the profile
+    # edit so signup can't bypass the edit-time rules.
+    first_name: str
+    last_name: str
     # Sprint 7.3: optional referral code passed from the ?ref= URL
     # parameter. When present and valid, the new user gets linked to
     # the referrer and the referrer earns $20 credit on paid
@@ -83,10 +95,15 @@ class UserRegister(BaseModel):
     def password_validation(cls, v: str) -> str:
         return _validate_password_rules(v)
 
-    @field_validator("name")
+    @field_validator("first_name")
     @classmethod
-    def name_validation(cls, v: str | None) -> str | None:
-        return _validate_display_name(v)
+    def first_name_validation(cls, v: str) -> str:
+        return _validate_required_name(v, "First name")
+
+    @field_validator("last_name")
+    @classmethod
+    def last_name_validation(cls, v: str) -> str:
+        return _validate_required_name(v, "Last name")
 
     @field_validator("ref")
     @classmethod
@@ -192,9 +209,13 @@ class BreakGlassLoginRequest(BaseModel):
 class UserResponse(BaseModel):
     id: str
     email: str
-    # Optional display name; None until the user sets it. The frontend greeting
-    # uses this and NEVER derives a name from the email when it is None.
-    name: str | None = None
+    # First + last name. None for legacy users created before the required-name
+    # gate; the greeting uses first_name and NEVER derives a name from the email.
+    # profile_complete is the SERVER-OWNED truth the frontend gate keys on (so the
+    # "both names present" rule lives in one place and can't drift).
+    first_name: str | None = None
+    last_name: str | None = None
+    profile_complete: bool = False
     plan: str
     records_used: int
     records_limit: int
@@ -208,6 +229,8 @@ class UserResponse(BaseModel):
     model_config = {"from_attributes": True}
 
     def model_post_init(self, __context: Any) -> None:
+        # Server-owned profile-complete rule: both names present.
+        self.profile_complete = bool(self.first_name and self.last_name)
         if self.trial_ends_at:
             now = datetime.now(UTC)
             ends = self.trial_ends_at if self.trial_ends_at.tzinfo else self.trial_ends_at.replace(tzinfo=UTC)
@@ -218,19 +241,27 @@ class UserResponse(BaseModel):
 
 
 class ProfileUpdate(BaseModel):
-    """Editable profile fields (Settings -> Account). `name` may be null/blank to
-    CLEAR the display name. Sanitized through the SAME validator as registration.
-    extra='forbid' so a caller cannot smuggle other user columns (plan,
-    records_limit, is_admin, ...) through the profile endpoint."""
+    """Editable profile fields — used by BOTH Settings>Account and the
+    required-name gate. first_name + last_name are REQUIRED (non-empty after
+    sanitization) so this endpoint is how an incomplete-profile user satisfies
+    the gate. Sanitized through the SAME validator as registration. extra='forbid'
+    so a caller cannot smuggle other user columns (plan, records_limit,
+    is_admin, ...) through the profile endpoint."""
 
-    name: str | None = None
+    first_name: str
+    last_name: str
 
     model_config = {"extra": "forbid"}
 
-    @field_validator("name")
+    @field_validator("first_name")
     @classmethod
-    def name_validation(cls, v: str | None) -> str | None:
-        return _validate_display_name(v)
+    def first_name_validation(cls, v: str) -> str:
+        return _validate_required_name(v, "First name")
+
+    @field_validator("last_name")
+    @classmethod
+    def last_name_validation(cls, v: str) -> str:
+        return _validate_required_name(v, "Last name")
 
 
 class NotificationPrefsUpdate(BaseModel):

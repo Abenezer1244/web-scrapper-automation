@@ -100,12 +100,24 @@ _VERIFY_TOKEN_ALGORITHM = "HS256"
 _VERIFY_TOKEN_EXPIRE_SECONDS = 24 * 60 * 60  # ~24 hours
 
 
-def _mint_verify_token(pending_id: str) -> str:
-    """Mint a short-lived, single-use-able email-verification JWT.
+def _mint_verify_token(pending_id: str, expires_at: datetime) -> str:
+    """Mint an email-verification JWT whose exp matches the pending row's deadline.
 
-    `sub` is the pending_registrations row id (not a user id). Fresh jti so
-    TokenBlacklist.consume_once can burn it exactly once on redemption.
+    `sub` is the pending_registrations row id (not a user id). `exp` is pinned to
+    the row's own `expires_at` — NOT now()+24h — because the token is minted at
+    SEND time by the dispatcher, which may be well after signup (a delayed/
+    recovered send). Deriving exp from the row guarantees the link can never
+    outlive the row it redeems (a JWT valid after the row is purged would 400
+    confusingly) nor under-live it.
+
+    Single use is structural, not jti-based: redeeming the link creates the
+    account and deletes every pending row for the address, so any later click
+    finds no row -> 400, and UNIQUE(users.email_hmac) blocks a second account
+    under any race. The jti is kept only as a unique nonce / for future
+    blacklist use; verify_user_email does NOT call consume_once.
     """
+    import math
+
     import jwt
 
     now = int(time.time())
@@ -116,7 +128,10 @@ def _mint_verify_token(pending_id: str) -> str:
         "aud": _VERIFY_TOKEN_AUDIENCE,
         "purpose": _VERIFY_TOKEN_PURPOSE,
         "iat": now,
-        "exp": now + _VERIFY_TOKEN_EXPIRE_SECONDS,
+        # Round UP so the JWT exp is never EARLIER than the row's expires_at
+        # (sub-second floor could make the token reject a hair before the
+        # verify endpoint's `expires_at > now` row check — Codex).
+        "exp": math.ceil(expires_at.timestamp()),
     }
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=_VERIFY_TOKEN_ALGORITHM)
 

@@ -202,6 +202,22 @@ class PendingRegistration(Base):
     expires_at = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
+    # ─── Verification-email outbox (migration 075) ────────────────────────────
+    # The row IS the outbox: a beat dispatcher sends the verification email and
+    # records the outcome here, so a signup made while Redis (the Celery broker)
+    # is down is drained and sent once Redis recovers — never lost on a
+    # fire-and-forget enqueue. See the 075 migration for the full rationale.
+    #   state: 'pending' -> 'sent' | 'suppressed' (rapid duplicate, NOT sent) |
+    #          'failed' (permanent error after the attempt cap).
+    #   verification_email_sent_at: provider-confirmed send time; only 'sent'
+    #   rows set it, and only it counts toward the per-address bomb-guard window.
+    email_dispatch_state = Column(String(16), nullable=False, server_default="pending")
+    verification_email_sent_at = Column(DateTime(timezone=True), nullable=True)
+    email_attempts = Column(Integer, nullable=False, server_default="0")
+    next_email_attempt_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
     @validates("email")
     def _sync_email_hmac(self, _key, value):
         """Keep email_hmac in lockstep with email (mirrors User._sync_email_hmac)."""

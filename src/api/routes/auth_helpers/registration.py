@@ -32,19 +32,12 @@ from src.db import PendingRegistration, User
 from src.utils.crypto import blind_index
 from src.utils.logger import email_fingerprint, setup_logger
 
-from .tokens import _VERIFY_TOKEN_EXPIRE_SECONDS, _decode_verify_token, _mint_verify_token
+from .tokens import _VERIFY_TOKEN_EXPIRE_SECONDS, _decode_verify_token
 
 _logger = setup_logger("api.auth.register")
 
 # At most one duplicate-signup notice per address per 24h (email-bomb guard).
 _DUP_SIGNUP_NOTICE_TTL = 86400
-
-# At most one verification email per address per this window. Each register
-# attempt inserts its own pending row, so without this gate an attacker could
-# spray /auth/register for a victim's address and bomb their inbox with
-# 'confirm your email' messages. A legitimate user who re-submits within the
-# window just reuses the link from the first email.
-_VERIFY_EMAIL_RESEND_TTL = 120
 
 # Referral-code alphabet: excludes ambiguous chars (0/O, 1/I/L) so a shared code
 # is unambiguous when read aloud.
@@ -324,26 +317,22 @@ async def _register_user_verified(
         first_name=body.first_name,
         last_name=body.last_name,
         expires_at=datetime.now(UTC) + timedelta(seconds=_VERIFY_TOKEN_EXPIRE_SECONDS),
+        # email_dispatch_state='pending' + next_email_attempt_at=now() come from
+        # the column server-defaults: the row IS the outbox. The verification
+        # email is sent by the `dispatch_pending_verification_emails` beat (mints
+        # the token + sends + records the outcome on this row), NOT enqueued from
+        # the request path. That deliberately keeps Redis (the Celery broker)
+        # OFF the signup path entirely: a `.delay()` here would be LOST if Redis
+        # were down at signup time AND its connection-retry could perturb the
+        # neutral-200 timing. With the DB row as the durable record, a signup
+        # made during a Redis outage is simply drained and sent on the next beat
+        # tick after Redis recovers. The per-address email-bomb guard also moves
+        # to the dispatcher (a Postgres advisory lock over real sends), so it no
+        # longer depends on Redis being up either.
     )
     db.add(pending)
     await db.commit()
 
-    token = _mint_verify_token(pending.id)
-    verify_link = f"{settings.FRONTEND_URL}/verify-email?token={token}"
-    # Email-bomb guard: at most one verification email per address per window
-    # (once_per is an atomic Redis SET NX that fails CLOSED, so a Redis outage
-    # skips the send rather than allowing a bomb). Enqueued off the request path
-    # so the Resend latency can't become a timing oracle and a broker blip can't
-    # break the response.
-    if await once_per(f"verifyemail:{blind_index(body.email)}", _VERIFY_EMAIL_RESEND_TTL):
-        try:
-            from src.workers.onboarding_emails import send_verification_email
-            send_verification_email.delay(body.email, verify_link)
-        except Exception as exc:  # noqa: BLE001 — never break the neutral 200
-            _logger.warning(
-                "verification email enqueue failed (fp=%s): %s",
-                email_fingerprint(body.email), type(exc).__name__,
-            )
     audit_log(request, "register_pending", None)
     return RegisterResponse()
 

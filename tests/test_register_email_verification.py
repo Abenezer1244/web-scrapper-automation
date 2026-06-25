@@ -110,7 +110,7 @@ async def test_verify_sets_the_verifier_password_and_auto_logs_in(client: AsyncC
 
     ehmac = blind_index(email)
     pending = (await _pending_for(db, email))[0]
-    token = _mint_verify_token(pending.id)
+    token = _mint_verify_token(pending.id, pending.expires_at)
 
     rv = await client.post("/auth/verify-email", json={"token": token, "new_password": chosen_pw})
     assert rv.status_code == 200
@@ -128,7 +128,7 @@ async def test_verify_link_is_single_use(client: AsyncClient, db, monkeypatch):
     email = _email()
     await client.post("/auth/register", json=_verified_body(email))
     pending = (await _pending_for(db, email))[0]
-    token = _mint_verify_token(pending.id)
+    token = _mint_verify_token(pending.id, pending.expires_at)
 
     assert (
         await client.post("/auth/verify-email", json={"token": token, "new_password": _PASSWORD})
@@ -155,4 +155,141 @@ async def test_reregistration_creates_separate_pending_rows(client: AsyncClient,
     await client.post("/auth/register", json=_verified_body(email))
     await client.post("/auth/register", json=_verified_body(email))
     assert len(await _pending_for(db, email)) == 2  # SEPARATE rows, not an overwrite
+    await _clear_pending(db, email)
+
+
+def _patch_recording_sender(monkeypatch) -> list:
+    """Replace the real Resend send with an in-memory recorder.
+
+    Not a data mock — it only intercepts the external email side effect (so the
+    suite never actually hits Resend), which the testing rules permit for an
+    external API. Returns the list that receives (email, verify_link) tuples.
+    """
+    import src.workers.onboarding_emails as oe
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(oe, "send_verification_email", lambda email, link: sent.append((email, link)))
+    monkeypatch.setattr(settings, "RESEND_API_KEY", "re_test_key")
+    return sent
+
+
+async def test_dispatcher_sends_due_row_and_marks_sent(client: AsyncClient, db, monkeypatch):
+    """The outbox dispatcher sends a fresh pending row's verification email and
+    records 'sent' + verification_email_sent_at on the row."""
+    from src.workers.scheduler_helpers.registration import (
+        _dispatch_pending_verification_emails_impl,
+    )
+
+    monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", True)
+    sent = _patch_recording_sender(monkeypatch)
+    email = _email()
+    await client.post("/auth/register", json=_verified_body(email))
+
+    _dispatch_pending_verification_emails_impl()
+
+    assert len(sent) == 1 and sent[0][0] == email
+    assert "/verify-email?token=" in sent[0][1]
+    rows = await _pending_for(db, email)
+    assert len(rows) == 1
+    assert rows[0].email_dispatch_state == "sent"
+    assert rows[0].verification_email_sent_at is not None
+    await _clear_pending(db, email)
+
+
+async def test_dispatcher_suppresses_rapid_duplicate_address(client: AsyncClient, db, monkeypatch):
+    """Email-bomb guard: two pending rows for the SAME address within the window
+    yield exactly ONE real send; the duplicate is marked 'suppressed' (no send)
+    and does not poison the guard."""
+    from src.workers.scheduler_helpers.registration import (
+        _dispatch_pending_verification_emails_impl,
+    )
+
+    monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", True)
+    sent = _patch_recording_sender(monkeypatch)
+    email = _email()
+    await client.post("/auth/register", json=_verified_body(email))
+    await client.post("/auth/register", json=_verified_body(email))
+
+    _dispatch_pending_verification_emails_impl()
+
+    assert len(sent) == 1  # only ONE email despite two rows
+    states = sorted(r.email_dispatch_state for r in await _pending_for(db, email))
+    assert states == ["sent", "suppressed"]
+    await _clear_pending(db, email)
+
+
+async def test_dispatcher_retries_transient_failure(client: AsyncClient, db, monkeypatch):
+    """A transient send error keeps the row 'pending', bumps email_attempts, and
+    pushes next_email_attempt_at into the future (backoff) for the next tick."""
+    import requests
+
+    import src.workers.onboarding_emails as oe
+    from src.workers.scheduler_helpers.registration import (
+        _dispatch_pending_verification_emails_impl,
+    )
+
+    monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", True)
+    monkeypatch.setattr(settings, "RESEND_API_KEY", "re_test_key")
+
+    def _boom(email, link):
+        raise requests.RequestException("transient")
+
+    monkeypatch.setattr(oe, "send_verification_email", _boom)
+    email = _email()
+    await client.post("/auth/register", json=_verified_body(email))
+
+    _dispatch_pending_verification_emails_impl()
+
+    row = (await _pending_for(db, email))[0]
+    assert row.email_dispatch_state == "pending"  # not sent, not failed — will retry
+    assert row.email_attempts == 1
+    assert row.verification_email_sent_at is None
+    await _clear_pending(db, email)
+
+
+async def test_dispatcher_permanent_failure_marks_failed(client: AsyncClient, db, monkeypatch):
+    """A permanent (non-retryable) send error marks the row 'failed' so the beat
+    stops retrying it."""
+    import src.workers.onboarding_emails as oe
+    from src.workers.scheduler_helpers.registration import (
+        _dispatch_pending_verification_emails_impl,
+    )
+
+    monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", True)
+    monkeypatch.setattr(settings, "RESEND_API_KEY", "re_test_key")
+
+    def _permanent(email, link):
+        raise ValueError("malformed payload")  # non-retryable per _is_retryable_email_error
+
+    monkeypatch.setattr(oe, "send_verification_email", _permanent)
+    email = _email()
+    await client.post("/auth/register", json=_verified_body(email))
+
+    _dispatch_pending_verification_emails_impl()
+
+    row = (await _pending_for(db, email))[0]
+    assert row.email_dispatch_state == "failed"
+    assert row.email_attempts == 1
+    await _clear_pending(db, email)
+
+
+async def test_dispatcher_noop_when_flag_off(client: AsyncClient, db, monkeypatch):
+    """With the flag off the dispatcher sends nothing, even if a pending row
+    exists from a prior on-period."""
+    from src.workers.scheduler_helpers.registration import (
+        _dispatch_pending_verification_emails_impl,
+    )
+
+    # Create a pending row with the flag ON, then turn it OFF before dispatch.
+    monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", True)
+    sent = _patch_recording_sender(monkeypatch)
+    email = _email()
+    await client.post("/auth/register", json=_verified_body(email))
+
+    monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", False)
+    _dispatch_pending_verification_emails_impl()
+
+    assert sent == []
+    rows = await _pending_for(db, email)
+    assert rows[0].email_dispatch_state == "pending"  # untouched
     await _clear_pending(db, email)

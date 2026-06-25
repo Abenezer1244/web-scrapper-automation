@@ -33,6 +33,9 @@ _GRANTS = [
     "GRANT SELECT, INSERT ON scraper_batches, batch_runs TO bridgeleads_app",
     "GRANT INSERT ON audit_events TO bridgeleads_app",
     "GRANT SELECT, UPDATE ON dialer_deliveries TO bridgeleads_app",
+    # pending_registrations (074): register INSERT + verify SELECT/DELETE (2nd
+    # allowlisted app DELETE — verify drops the address's sibling staging rows).
+    "GRANT SELECT, INSERT, DELETE ON pending_registrations TO bridgeleads_app",
     "REVOKE DELETE ON users, scraper_configs, jobs, user_record_views FROM bridgeleads_app",
     "REVOKE UPDATE, DELETE ON county_connectors, password_history FROM bridgeleads_app",
     "REVOKE INSERT, UPDATE, DELETE ON results, job_logs, county_records, referral_events, "
@@ -51,6 +54,8 @@ _GRANTS = [
     "GRANT DELETE ON property_list_membership TO bridgeleads_system",
     # H1: operator MFA reset (scripts/reset_user_mfa.py) deletes both MFA tables
     "GRANT DELETE ON mfa_backup_codes, mfa_break_glass_codes TO bridgeleads_system",
+    # pending_registrations (074): worker dispatch SELECT/UPDATE (ALL TABLES) + purge DELETE
+    "GRANT DELETE ON pending_registrations TO bridgeleads_system",
     "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_system",
 ]
 
@@ -58,7 +63,8 @@ _VERIFY_APP_GRANTS = """
     SELECT COUNT(*) FROM information_schema.role_table_grants
     WHERE grantee = 'bridgeleads_app'
       AND (
-        (privilege_type = 'DELETE' AND table_name <> 'mfa_backup_codes')
+        (privilege_type = 'DELETE'
+            AND table_name NOT IN ('mfa_backup_codes','pending_registrations'))
         OR (privilege_type IN ('INSERT','UPDATE')
             AND table_name IN ('results','job_logs','county_records','referral_events',
                                'property_list_membership'))

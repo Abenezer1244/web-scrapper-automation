@@ -102,6 +102,11 @@ async def auth_config() -> dict:
             # 500 when Pro became 1000 (limits-drift fix, 2026-06-12).
             "records_limit": settings.PLAN_LIMITS["pro"],
         },
+        # Lets the frontend render the right signup flow without guessing the
+        # backend's posture: when true, /auth/register collects NO password (it
+        # is set at /auth/verify-email) and returns a neutral "check your email"
+        # response; when false, register takes a password and logs in immediately.
+        "email_verification_enabled": settings.EMAIL_VERIFICATION_ENABLED,
     }
 
 

@@ -79,6 +79,86 @@ def _decode_reset_token(token: str) -> dict:
     return payload
 
 
+# ─── Email-verification token (stateless) ─────────────────────────────────────
+# Issued by /auth/register (EMAIL_VERIFICATION_ENABLED flow) and emailed to the
+# address being registered. Redeemed at /auth/verify-email to turn a
+# pending_registrations row into a real account. Like the reset token it reuses
+# the app SECRET_KEY/HS256 under a DISTINCT audience so the families can't cross
+# over: a verify token cannot authenticate an API request (decode_secure_token
+# pins aud="bridgeleads-api") and a session/reset token cannot redeem a
+# verification (_decode_verify_token pins aud="bridgeleads-verify").
+#   sub = pending_registrations.id  (NOT a users.id — the account doesn't exist
+#         yet). jti enables single-use burn via TokenBlacklist.consume_once.
+# TTL ~24h: a verification link is less sensitive than a reset link and users
+# often confirm later (different inbox, mobile), so it is longer-lived than the
+# 30-min reset token but still bounded.
+
+_VERIFY_TOKEN_PURPOSE = "verify"
+_VERIFY_TOKEN_AUDIENCE = "bridgeleads-verify"
+_VERIFY_TOKEN_ISSUER = "bridgeleads"
+_VERIFY_TOKEN_ALGORITHM = "HS256"
+_VERIFY_TOKEN_EXPIRE_SECONDS = 24 * 60 * 60  # ~24 hours
+
+
+def _mint_verify_token(pending_id: str, expires_at: datetime) -> str:
+    """Mint an email-verification JWT whose exp matches the pending row's deadline.
+
+    `sub` is the pending_registrations row id (not a user id). `exp` is pinned to
+    the row's own `expires_at` — NOT now()+24h — because the token is minted at
+    SEND time by the dispatcher, which may be well after signup (a delayed/
+    recovered send). Deriving exp from the row guarantees the link can never
+    outlive the row it redeems (a JWT valid after the row is purged would 400
+    confusingly) nor under-live it.
+
+    Single use is structural, not jti-based: redeeming the link creates the
+    account and deletes every pending row for the address, so any later click
+    finds no row -> 400, and UNIQUE(users.email_hmac) blocks a second account
+    under any race. The jti is kept only as a unique nonce / for future
+    blacklist use; verify_user_email does NOT call consume_once.
+    """
+    import math
+
+    import jwt
+
+    now = int(time.time())
+    payload = {
+        "sub": pending_id,
+        "jti": str(uuid.uuid4()),
+        "iss": _VERIFY_TOKEN_ISSUER,
+        "aud": _VERIFY_TOKEN_AUDIENCE,
+        "purpose": _VERIFY_TOKEN_PURPOSE,
+        "iat": now,
+        # Round UP so the JWT exp is never EARLIER than the row's expires_at
+        # (sub-second floor could make the token reject a hair before the
+        # verify endpoint's `expires_at > now` row check — Codex).
+        "exp": math.ceil(expires_at.timestamp()),
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=_VERIFY_TOKEN_ALGORITHM)
+
+
+def _decode_verify_token(token: str) -> dict:
+    """Decode + verify an email-verification JWT. Raises jwt.InvalidTokenError.
+
+    Pins audience="bridgeleads-verify" + issuer="bridgeleads" (so a session/reset
+    token cannot be used here) and checks purpose=="verify". Caller catches
+    jwt.InvalidTokenError ONLY and maps it to a generic error — any non-JWT error
+    must surface, not be masked as "invalid link".
+    """
+    import jwt
+
+    payload = jwt.decode(
+        token,
+        settings.SECRET_KEY,
+        algorithms=[_VERIFY_TOKEN_ALGORITHM],
+        audience=_VERIFY_TOKEN_AUDIENCE,
+        issuer=_VERIFY_TOKEN_ISSUER,
+        options={"verify_exp": True},
+    )
+    if payload.get("purpose") != _VERIFY_TOKEN_PURPOSE:
+        raise jwt.InvalidTokenError("not a verification token")
+    return payload
+
+
 # ─── H2-P3: MFA login-challenge token (stateless) ─────────────────────────────
 # Issued by /auth/login after a CORRECT password when the account has MFA
 # enabled. It carries NO access privilege — it only proves "the password step

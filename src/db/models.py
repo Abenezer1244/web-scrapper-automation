@@ -170,6 +170,67 @@ class User(Base):
     jobs = relationship("Job", back_populates="user", cascade="all, delete-orphan")
 
 
+class PendingRegistration(Base):
+    """A signup awaiting email verification (EMAIL_VERIFICATION_ENABLED flow).
+
+    NOT a real account: storing unverified signups here instead of in `users`
+    is what closes the account-squatting hole — an attacker cannot pre-create a
+    real users row (with their own password/trial) for someone else's address.
+    The real users row is created only when the emailed verification link is
+    redeemed; unredeemed rows expire via `expires_at` and are purged.
+
+    email / first_name / last_name are encrypted at rest exactly like users.* ;
+    the searchable key is email_hmac (kept in lockstep with email via the
+    @validates hook below, same as User). email_hmac is INDEXED but NOT unique on
+    purpose: each registration attempt inserts its own row, so an attacker
+    submitting a victim's address cannot overwrite the password on the victim's
+    pending row (account pre-hijacking). First verification wins via
+    UNIQUE(users.email_hmac); siblings are dropped at verify time.
+    """
+    __tablename__ = "pending_registrations"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    email = Column(EncryptedString, nullable=False)
+    email_hmac = Column(String(64), nullable=False, index=True)
+    # Nullable as of migration 076: the first/last name is collected at
+    # /auth/verify-email (by the verifier), NOT at register, so an attacker-
+    # initiated signup can't set a victim-verified account's display name. The
+    # verified-register insert leaves these NULL; they are unused going forward
+    # (a later migration may drop them once all instances stop referencing them).
+    first_name = Column(EncryptedString, nullable=True)
+    last_name = Column(EncryptedString, nullable=True)
+    # No password column on purpose: the password is set at /auth/verify-email by
+    # whoever proves email control, never carried from the unverified register
+    # step (prevents account pre-hijacking). No referral column either — carrying
+    # an attacker-supplied ref into a victim-verified account would enable
+    # self-referral abuse; referral attribution is not supported in this flow.
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    # ─── Verification-email outbox (migration 075) ────────────────────────────
+    # The row IS the outbox: a beat dispatcher sends the verification email and
+    # records the outcome here, so a signup made while Redis (the Celery broker)
+    # is down is drained and sent once Redis recovers — never lost on a
+    # fire-and-forget enqueue. See the 075 migration for the full rationale.
+    #   state: 'pending' -> 'sent' | 'suppressed' (rapid duplicate, NOT sent) |
+    #          'failed' (permanent error after the attempt cap).
+    #   verification_email_sent_at: provider-confirmed send time; only 'sent'
+    #   rows set it, and only it counts toward the per-address bomb-guard window.
+    email_dispatch_state = Column(String(16), nullable=False, server_default="pending")
+    verification_email_sent_at = Column(DateTime(timezone=True), nullable=True)
+    email_attempts = Column(Integer, nullable=False, server_default="0")
+    next_email_attempt_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    @validates("email")
+    def _sync_email_hmac(self, _key, value):
+        """Keep email_hmac in lockstep with email (mirrors User._sync_email_hmac)."""
+        from src.utils.crypto import blind_index
+        self.email_hmac = blind_index(value) if value is not None else None
+        return value
+
+
 class PasswordHistory(Base):
     """Stores recent password hashes to prevent reuse."""
     __tablename__ = "password_history"

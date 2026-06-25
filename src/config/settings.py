@@ -169,6 +169,18 @@ class Settings(BaseSettings):
     RESEND_API_KEY: str = ""
     EMAIL_FROM: str = "leads@bridgeleads.io"
 
+    # Registration email-verification flow (anti-enumeration). Default FALSE =
+    # legacy behavior: /auth/register creates the account immediately and returns
+    # session tokens (201), so a deploy of this backend is a NO-OP until the flag
+    # is flipped. When TRUE, register is enumeration-safe: it returns the SAME
+    # neutral 200 for a new vs existing email, stores the signup in
+    # pending_registrations (NOT a real users row — closes account-squatting),
+    # and the account is created only when the emailed verification link is
+    # redeemed at /auth/verify-email. Flip ONLY after the frontend signup +
+    # verify pages ship (the new flow returns no tokens, so the old frontend
+    # would break on signup with the flag on).
+    EMAIL_VERIFICATION_ENABLED: bool = False
+
     # ─── App ──────────────────────────────────────────────────────────────────
     DEBUG: bool = False
     ENVIRONMENT: str = "production"

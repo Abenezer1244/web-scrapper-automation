@@ -165,3 +165,6 @@ tests/live_qa_chelan.mjs
 scripts/audit_out/
 scripts/audit_out_saas/
 scripts/audit_out_ui/
+
+# Local schema-regen venv (pinned deps for export_openapi.py)
+.venv-schema/

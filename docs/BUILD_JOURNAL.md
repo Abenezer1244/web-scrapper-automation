@@ -19,6 +19,109 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-25 — Verification-email durability: cross-check → Codex-driven outbox + hardening
+**Built / Shipped:** Cross-checked the login-security build (BE #125/#126, FE #59) independently + with three
+adversarial Codex passes. Build was sound and merge-safe (flag off). Then fixed the real gaps Codex surfaced,
+on `feat/register-email-verification` (worktree `register-email-verify`):
+- **Durable verification-email OUTBOX (`9a41ebd`).** The verification email is the signup critical path, but
+  it could silently never send: `once_per` fails CLOSED on a Redis outage AND the Celery broker IS Redis (so
+  the `.delay` enqueue fails too), `_send` swallowed Resend errors with no retry, and the verified path
+  skipped `release_once`. Root-cause fix = the `pending_registrations` row is the outbox. Register just
+  commits it (migration **075** adds `email_dispatch_state`/`verification_email_sent_at`/`email_attempts`/
+  `next_email_attempt_at` + partial dispatch index) — NO broker/`once_per` in the request path. A 60s beat
+  `dispatch_pending_verification_emails` sends each due row and records the outcome, so a signup made while
+  Redis is down is drained + sent on recovery. Per-row `FOR UPDATE SKIP LOCKED` + non-blocking per-address
+  `pg_try_advisory_xact_lock`; bomb guard over REAL ('sent') sends only — 120s window + 10/day cap; classified
+  retry/backoff (beat = sole retry owner) → 'failed' + ops-alert. Email RAISES on failure; token `exp ==
+  row.expires_at`.
+- **Timing oracle (`2c86840`).** Removing `once_per` from the new-email path left the existing-email path
+  awaiting Redis inline via `_notify_existing_account` → a Redis outage made existing-email hang while
+  new-email returned fast. Now a post-response `BackgroundTask` (verified path returns, so it runs); legacy
+  unchanged (raises 400, already status-enumerable).
+- **Daily-cap retention (`a4d0b6c`).** Successful send bumps `expires_at = now+24h` so a delayed/recovered
+  send gives a fresh window AND the row is retained a real 24h for the rolling cap, purge stays indexed.
+
+**Tried / Decided:** User chose the **durable outbox** over the lighter tactical fix after I flagged the
+broker==Redis fact (during an outage nothing async sends, so only a durable Postgres path survives). Decided
+the tri-state `once_per` was moot (broker==once_per Redis) and dropped it. Kept RLS policies deferred-by-design
+(027 precedent; app roles don't exist pre-cutover). Left two cross-repo items as product decisions (collect
+name-at-verify; token-in-query hardening) — both were explicitly accepted earlier and can't ship backend-only.
+
+**Caught & fixed (Codex review):** per-row `next_email_attempt_at` recheck (concurrent backoff bypass); token
+`math.ceil` (sub-second JWT-vs-row expiry skew); purge `FOR UPDATE SKIP LOCKED` (concurrent same-batch);
+daily-cap retention vs early purge. At-least-once delivery documented (Resend 2.7.0 has no idempotency key).
+
+**Pending / Handoff:** OPS runs migrations **074 + 075** and (when ready) flips `EMAIL_VERIFICATION_ENABLED`;
+the dispatcher beat must run on the worker. Two open product decisions (name-at-verify, token-in-query).
+`tasks/email-verification-preflip-followups.md` has the full status.
+
+**Facts learned:** Celery broker == rate-limit/`once_per` Redis == `settings.REDIS_URL`, so a Redis outage
+takes down the entire async stack at once — durability for any critical email needs a Postgres-backed path,
+not a second Redis. `send_password_reset_email` is itself best-effort fire-and-forget; `deliver_job_email` is
+the codebase's reliable-email pattern (bind, retries, `_is_retryable_email_error`, ops-alert). FastAPI
+`BackgroundTasks` run only when the handler RETURNS, not when it raises.
+
+---
+
+## 2026-06-25 — Login-screen security audit → brute-force lockout fix + enumeration-safe registration
+**Built / Shipped:** Cross-checked the build against a 5-item "Login Screen Security" guide (validate input,
+rate-limit + lockout, hash passwords, generic errors, trusted auth provider), Codex as independent reviewer.
+Items 1/3 already exceed the guide; item 5 = custom auth is sound (keep it). Two real gaps → two PRs:
+- **Fix A — brute-force lockout duration (PR #125, branch `feat/login-lockout-fix`, worktree).** Root cause:
+  `BruteForceProtection` derived the lockout straight from the failure COUNTER, and a plain Redis `INCR`
+  never decays below a threshold — so 5 fat-fingered passwords locked an IP for the counter's ~24h TTL, not
+  the documented 1 min; the progressive 1/5/30-min/24h ladder was fiction (only the `Retry-After` header
+  changed); and because `check()` raises BEFORE `record_failure()`, a single IP froze the count at 5 so the
+  lockout-notification email (threshold 10) never fired. Fix: separate the COUNTER from a short-lived,
+  MONOTONIC LOCK key computed atomically in one Lua script (`_RECORD_FAILURE_LUA`); `check()` reads only the
+  lock; `clear()` wipes both; IP escalates fully, email capped 15 min. No migration.
+- **Fix B — enumeration-safe registration + email verification (PR #126, branch
+  `feat/register-email-verification`, worktree), flag-gated `EMAIL_VERIFICATION_ENABLED` (default false).**
+  Closes the `201+tokens` vs `400` status-code enumeration oracle on `/auth/register`. New-email signups are
+  staged in a new `pending_registrations` table (migration 074); the real `users` row is created only when
+  the emailed single-use link is redeemed at the new `POST /auth/verify-email`, where the user SETS their
+  password and is auto-logged-in. Both register paths return an identical neutral 200.
+
+**Tried / Decided:** Fix B design changed three times under Codex pressure (each a real hole): (1) my first
+plan put a nullable `email_verified_at` on `users` → **account squatting** (attacker pre-creates a real row
+for a victim's email) → switched to a `pending_registrations` table. (2) A single upserted pending row let
+an attacker **overwrite** a victim's pending password → switched to independent rows per attempt. (3) Even
+then, STORING the registrant's password meant an attacker-initiated signup the victim confirms yields an
+attacker-known password (**pre-hijacking**) → moved password-setting to the verify step (user-approved).
+(4) Dropped `ref_code` from the verify flow (attacker self-referral). The cosmetic display-name residual is
+documented + accepted (user-editable, grants no access).
+
+**Failed / Blocked:** `.env` here points at PROD (Upstash/Supabase) and conftest can wipe tables, so the
+real-Redis/Postgres tests could not run locally — verified instead **in-memory against the exact Lua via
+fakeredis+lupa** (Fix A, 11/11) and with synthetic-env smoke tests (Fix B: routes, OpenAPI union, schema
+shapes, token roundtrip, purge wiring). `codex review --base` hangs/quotas on this CLI; used `codex exec`
+streaming instead. Hit a Codex usage-limit mid-session (recovered).
+
+**Caught & fixed (Codex):** Fix A — a P3 sub-second `TTL` floor leaking one early guess (now `ttl >= 0` =
+locked). Fix B — squatting, password-overwrite, trusted-registrant-password (all P1, all fixed); a
+referral-abuse P2 (dropped ref); a P3 referral-collision IntegrityError mishandled as "already verified"
+(narrowed to the `email_hmac` race); a missing **purge** of expired pending rows (added hourly beat task);
+a final **RLS P1** on the public `pending_registrations` table → added `ENABLE ROW LEVEL SECURITY` mirroring
+migration 027. Codex's follow-up "the app role is NOBYPASSRLS" P1 was a **misread of M5's "post-RLS-cutover"
+role table** — refuted with evidence (027 is live with RLS-no-policy on `users` and login still works ⇒
+current role bypasses RLS; `RLS_ENFORCE` default false) and Codex **withdrew it**.
+
+**Pending / Handoff:** **OPS** — Fix A: deploy api+worker (no migration). Fix B: run **migration 074** first,
+then flip `EMAIL_VERIFICATION_ENABLED=true` on api+worker ONLY AFTER the frontend ships. **FRONTEND**
+(separate `bridgeleads-web` repo, not started): register → "check your email" screen; new `/verify-email`
+page that collects + sets the password; `gen:api-types` after #126 merges (register `response_model` is now a
+union). **DEFERRED:** `pending_registrations` needs app/system RLS policies at the non-BYPASSRLS cutover
+(documented in 074, same as all 027 tables).
+
+**Facts learned:** The current prod DB role is **BYPASSRLS**; `bridgeleads_app/system (NOBYPASSRLS)` are the
+**post-cutover** targets gated by `RLS_ENFORCE` (default false) — a new `public` table just needs
+`ENABLE ROW LEVEL SECURITY` (no policy) to lock out the Supabase anon PostgREST API today, with policies
+deferred to the cutover. Auth stack is far beyond a "vibe-coded" login (encrypted email at rest + blind
+index, MFA + break-glass, single-use refresh rotation, password history, timing-safe enumeration). A
+union `response_model` (`TokenResponse | RegisterResponse`) serializes by the returned instance's type.
+
+---
+
 ## 2026-06-23 — Phase B: user-selectable pre-foreclosure doc types for ALL healthy counties (SELECT)
 **Built / Shipped:** Turned the wizard's "Document types to scrape" checkbox selector ON for **all 15
 healthy pre_foreclosure counties** (was King/Pierce only). Branch `feat/doctype-select-allcounty`

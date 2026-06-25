@@ -16,7 +16,7 @@ the wrappers keep working unchanged.
 import time
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Request, Response, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -69,11 +69,13 @@ from src.api.schemas import (
     NotificationPrefsUpdate,
     PasswordChange,
     ProfileUpdate,
+    RegisterResponse,
     ResetPasswordRequest,
     TokenResponse,
     UserLogin,
     UserRegister,
     UserResponse,
+    VerifyEmailRequest,
 )
 from src.config import settings
 from src.db import User, get_db  # noqa: F401 (User used in Annotated type)
@@ -100,16 +102,48 @@ async def auth_config() -> dict:
             # 500 when Pro became 1000 (limits-drift fix, 2026-06-12).
             "records_limit": settings.PLAN_LIMITS["pro"],
         },
+        # Lets the frontend render the right signup flow without guessing the
+        # backend's posture: when true, /auth/register collects NO password (it
+        # is set at /auth/verify-email) and returns a neutral "check your email"
+        # response; when false, register takes a password and logs in immediately.
+        "email_verification_enabled": settings.EMAIL_VERIFICATION_ENABLED,
     }
 
 
-@router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/register",
+    response_model=TokenResponse | RegisterResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 async def register(
     body: UserRegister,
     request: Request,
+    response: Response,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+) -> TokenResponse | RegisterResponse:
+    """Register a new account.
+
+    Legacy (EMAIL_VERIFICATION_ENABLED off): creates the account and returns
+    session tokens (201). Enumeration-safe mode (on): returns a neutral 200 with
+    no tokens (same body for new vs existing email) and emails a verification
+    link; the handler overrides the status to 200 on that path.
+    """
+    return await _registration_helpers.register_user(
+        body, request, response, background_tasks, db
+    )
+
+
+@router.post("/verify-email", response_model=TokenResponse)
+async def verify_email(
+    body: VerifyEmailRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
-    return await _registration_helpers.register_user(body, request, db)
+    """Redeem the email-verification link (EMAIL_VERIFICATION_ENABLED flow):
+    validate the single-use token, create the account from the staged pending
+    registration, and auto-login (mint session tokens)."""
+    return await _registration_helpers.verify_user_email(body, request, db)
 
 
 @router.post("/login", response_model=LoginResponse)

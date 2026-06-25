@@ -1959,6 +1959,23 @@
         "title": "RefreshRequest",
         "type": "object"
       },
+      "RegisterResponse": {
+        "description": "POST /auth/register response when EMAIL_VERIFICATION_ENABLED is on.\n\nEnumeration-safe: the SAME neutral body is returned whether the email is new\n(a verification link was sent) or already registered (a 'you already have an\naccount' note was sent). No tokens — the account is created only after the\nverification link is redeemed at /auth/verify-email. `verification_required`\nlets the frontend show a 'check your email' screen instead of logging in.",
+        "properties": {
+          "message": {
+            "default": "Check your email to finish creating your account.",
+            "title": "Message",
+            "type": "string"
+          },
+          "verification_required": {
+            "default": true,
+            "title": "Verification Required",
+            "type": "boolean"
+          }
+        },
+        "title": "RegisterResponse",
+        "type": "object"
+      },
       "ResetPasswordRequest": {
         "description": "A3: complete a password reset. Body for POST /auth/reset-password.\n\n`token` is the short-lived single-use reset JWT (aud=bridgeleads-reset)\nminted by /auth/forgot-password. `new_password` is validated against\nthe SAME policy as registration/change-password via the shared\nvalidator so the reset path cannot weaken the password rules.",
         "properties": {
@@ -3380,16 +3397,37 @@
             "type": "string"
           },
           "first_name": {
-            "title": "First Name",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Name"
           },
           "last_name": {
-            "title": "Last Name",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Name"
           },
           "password": {
-            "title": "Password",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Password"
           },
           "ref": {
             "anyOf": [
@@ -3404,10 +3442,7 @@
           }
         },
         "required": [
-          "email",
-          "password",
-          "first_name",
-          "last_name"
+          "email"
         ],
         "title": "UserRegister",
         "type": "object"
@@ -3557,6 +3592,36 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "VerifyEmailRequest": {
+        "description": "POST /auth/verify-email — redeem the emailed verification link.\n\n`token` is the short-lived single-use verification JWT (aud=bridgeleads-verify)\nminted by /auth/register. `new_password` AND the first/last name are set HERE,\nby whoever proves control of the email — NOT at register — so an attacker-\ninitiated signup that the address owner confirms cannot end up with an\nattacker-known password OR an attacker-chosen display name. Names + password\nare validated against the SAME policies as registration.",
+        "properties": {
+          "first_name": {
+            "title": "First Name",
+            "type": "string"
+          },
+          "last_name": {
+            "title": "Last Name",
+            "type": "string"
+          },
+          "new_password": {
+            "title": "New Password",
+            "type": "string"
+          },
+          "token": {
+            "maxLength": 4096,
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "new_password",
+          "first_name",
+          "last_name"
+        ],
+        "title": "VerifyEmailRequest",
         "type": "object"
       }
     },
@@ -4257,6 +4322,7 @@
     },
     "/auth/register": {
       "post": {
+        "description": "Register a new account.\n\nLegacy (EMAIL_VERIFICATION_ENABLED off): creates the account and returns\nsession tokens (201). Enumeration-safe mode (on): returns a neutral 200 with\nno tokens (same body for new vs existing email) and emails a verification\nlink; the handler overrides the status to 200 on that path.",
         "operationId": "register_auth_register_post",
         "requestBody": {
           "content": {
@@ -4273,7 +4339,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/TokenResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/TokenResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RegisterResponse"
+                    }
+                  ],
+                  "title": "Response Register Auth Register Post"
                 }
               }
             },
@@ -4335,6 +4409,48 @@
           }
         },
         "summary": "Reset Password",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/verify-email": {
+      "post": {
+        "description": "Redeem the email-verification link (EMAIL_VERIFICATION_ENABLED flow):\nvalidate the single-use token, create the account from the staged pending\nregistration, and auto-login (mint session tokens).",
+        "operationId": "verify_email_auth_verify_email_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyEmailRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Verify Email",
         "tags": [
           "auth"
         ]

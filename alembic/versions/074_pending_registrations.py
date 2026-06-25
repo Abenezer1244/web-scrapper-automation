@@ -78,7 +78,20 @@ def upgrade() -> None:
     # anon key shipped in the frontend could read/delete pending rows directly —
     # a signup-verification DoS + a (encrypted-but-present) leak of signup
     # attempts. NO policy => default-deny for every RLS-subject role; the FastAPI
-    # app + workers connect with the BYPASSRLS role, so nothing in the app breaks.
+    # app + workers connect with the CURRENT BYPASSRLS role (RLS_ENFORCE is still
+    # False — see migration 027 + settings.RLS_ENFORCE), so nothing in the app
+    # breaks today.
+    #
+    # DEFERRED (non-BYPASSRLS cutover, the HIGH-2 work gated by RLS_ENFORCE):
+    # when the app/workers move to the bridgeleads_app / bridgeleads_system
+    # NOBYPASSRLS roles, this table — exactly like users / county_records from
+    # 027 — needs grants + policies or the flow will be denied:
+    #   * bridgeleads_app: INSERT (register), SELECT + DELETE (verify);
+    #   * bridgeleads_system: DELETE (the hourly purge task);
+    #   * anon / authenticated: stay default-denied (no policy).
+    # There is no per-tenant column here (pending_registrations is pre-account),
+    # so the policies are role-scoped, not app.current_user_id-scoped. This is
+    # tracked with the same deferred cutover as the other 027 tables.
     op.execute("ALTER TABLE IF EXISTS public.pending_registrations ENABLE ROW LEVEL SECURITY")
 
 

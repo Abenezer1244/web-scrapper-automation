@@ -145,6 +145,54 @@ h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 12px; }}
     ))
 
 
+# ─── Email verification: "confirm your email to finish signing up" ─────────
+
+@app.task(name="src.workers.onboarding_emails.send_verification_email")
+def send_verification_email(email: str, verify_link: str) -> None:
+    """Sent when someone registers under the EMAIL_VERIFICATION_ENABLED flow.
+
+    Carries the single-use, ~24h verification link that, when clicked, creates
+    the real account (POST /auth/verify-email) and logs the user in. Run as a
+    Celery task (off the request path) so the Resend latency can't become an
+    existing-vs-new timing oracle on /auth/register.
+    """
+    safe_link = html.escape(verify_link, quote=True)
+    subject = "Confirm your email to finish signing up"
+
+    html_body = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+body {{ font-family: -apple-system, sans-serif; background: #0a0a0b; color: #f0efe8; margin: 0; padding: 40px 20px; }}
+.card {{ {_CARD_STYLE} }}
+.logo {{ font-size: 18px; font-weight: 600; color: #10b981; margin-bottom: 28px; }}
+h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 12px; }}
+.btn {{ {_BTN_STYLE} }}
+.alt {{ font-size: 13px; color: #9998a0; word-break: break-all; }}
+.foot {{ font-size: 12px; color: #55545e; border-top: 1px solid #2a2a32; padding-top: 20px; margin-top: 8px; }}
+</style></head><body>
+<div class="card">
+  <div class="logo">BridgeLeads</div>
+  <h1>Confirm your email</h1>
+  <p style="color: #c8c7cf; font-size: 14px;">
+    You&rsquo;re one click away from your BridgeLeads account. Confirm this email
+    address to finish signing up and start your 7-day free Pro trial.
+  </p>
+  <a href="{safe_link}" class="btn">Confirm email &amp; start trial</a>
+  <p class="alt">Or paste this link into your browser:<br>{safe_link}</p>
+  <div class="foot">
+    This link expires in 24 hours. If you didn&rsquo;t try to sign up for
+    BridgeLeads, you can safely ignore this email &mdash; no account was created.
+  </div>
+</div></body></html>"""
+
+    _send(email, subject, html_body, (
+        "Confirm your email to finish signing up for BridgeLeads.\n\n"
+        f"Click to confirm and start your 7-day free Pro trial:\n{verify_link}\n\n"
+        "This link expires in 24 hours. If you didn't try to sign up, you can\n"
+        "safely ignore this email - no account was created."
+    ))
+
+
 # ─── Day 1: "Having trouble getting started?" ──────────────────────────────
 
 def send_day1_nudge(email: str) -> None:

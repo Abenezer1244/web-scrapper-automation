@@ -170,6 +170,41 @@ class User(Base):
     jobs = relationship("Job", back_populates="user", cascade="all, delete-orphan")
 
 
+class PendingRegistration(Base):
+    """A signup awaiting email verification (EMAIL_VERIFICATION_ENABLED flow).
+
+    NOT a real account: storing unverified signups here instead of in `users`
+    is what closes the account-squatting hole — an attacker cannot pre-create a
+    real users row (with their own password/trial) for someone else's address.
+    The real users row is created only when the emailed verification link is
+    redeemed; unredeemed rows expire via `expires_at` and are purged.
+
+    email / first_name / last_name are encrypted at rest exactly like users.* ;
+    equality + uniqueness live on email_hmac (kept in lockstep with email via the
+    @validates hook below, same as User). UNIQUE(email_hmac) makes register's
+    upsert race-safe (at most one pending row per address).
+    """
+    __tablename__ = "pending_registrations"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    email = Column(EncryptedString, nullable=False)
+    email_hmac = Column(String(64), nullable=False, unique=True)
+    first_name = Column(EncryptedString, nullable=False)
+    last_name = Column(EncryptedString, nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    # Raw validated referral code, resolved to a referrer at verify time.
+    ref_code = Column(String(16), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    @validates("email")
+    def _sync_email_hmac(self, _key, value):
+        """Keep email_hmac in lockstep with email (mirrors User._sync_email_hmac)."""
+        from src.utils.crypto import blind_index
+        self.email_hmac = blind_index(value) if value is not None else None
+        return value
+
+
 class PasswordHistory(Base):
     """Stores recent password hashes to prevent reuse."""
     __tablename__ = "password_history"

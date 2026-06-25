@@ -79,6 +79,71 @@ def _decode_reset_token(token: str) -> dict:
     return payload
 
 
+# ─── Email-verification token (stateless) ─────────────────────────────────────
+# Issued by /auth/register (EMAIL_VERIFICATION_ENABLED flow) and emailed to the
+# address being registered. Redeemed at /auth/verify-email to turn a
+# pending_registrations row into a real account. Like the reset token it reuses
+# the app SECRET_KEY/HS256 under a DISTINCT audience so the families can't cross
+# over: a verify token cannot authenticate an API request (decode_secure_token
+# pins aud="bridgeleads-api") and a session/reset token cannot redeem a
+# verification (_decode_verify_token pins aud="bridgeleads-verify").
+#   sub = pending_registrations.id  (NOT a users.id — the account doesn't exist
+#         yet). jti enables single-use burn via TokenBlacklist.consume_once.
+# TTL ~24h: a verification link is less sensitive than a reset link and users
+# often confirm later (different inbox, mobile), so it is longer-lived than the
+# 30-min reset token but still bounded.
+
+_VERIFY_TOKEN_PURPOSE = "verify"
+_VERIFY_TOKEN_AUDIENCE = "bridgeleads-verify"
+_VERIFY_TOKEN_ISSUER = "bridgeleads"
+_VERIFY_TOKEN_ALGORITHM = "HS256"
+_VERIFY_TOKEN_EXPIRE_SECONDS = 24 * 60 * 60  # ~24 hours
+
+
+def _mint_verify_token(pending_id: str) -> str:
+    """Mint a short-lived, single-use-able email-verification JWT.
+
+    `sub` is the pending_registrations row id (not a user id). Fresh jti so
+    TokenBlacklist.consume_once can burn it exactly once on redemption.
+    """
+    import jwt
+
+    now = int(time.time())
+    payload = {
+        "sub": pending_id,
+        "jti": str(uuid.uuid4()),
+        "iss": _VERIFY_TOKEN_ISSUER,
+        "aud": _VERIFY_TOKEN_AUDIENCE,
+        "purpose": _VERIFY_TOKEN_PURPOSE,
+        "iat": now,
+        "exp": now + _VERIFY_TOKEN_EXPIRE_SECONDS,
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=_VERIFY_TOKEN_ALGORITHM)
+
+
+def _decode_verify_token(token: str) -> dict:
+    """Decode + verify an email-verification JWT. Raises jwt.InvalidTokenError.
+
+    Pins audience="bridgeleads-verify" + issuer="bridgeleads" (so a session/reset
+    token cannot be used here) and checks purpose=="verify". Caller catches
+    jwt.InvalidTokenError ONLY and maps it to a generic error — any non-JWT error
+    must surface, not be masked as "invalid link".
+    """
+    import jwt
+
+    payload = jwt.decode(
+        token,
+        settings.SECRET_KEY,
+        algorithms=[_VERIFY_TOKEN_ALGORITHM],
+        audience=_VERIFY_TOKEN_AUDIENCE,
+        issuer=_VERIFY_TOKEN_ISSUER,
+        options={"verify_exp": True},
+    )
+    if payload.get("purpose") != _VERIFY_TOKEN_PURPOSE:
+        raise jwt.InvalidTokenError("not a verification token")
+    return payload
+
+
 # ─── H2-P3: MFA login-challenge token (stateless) ─────────────────────────────
 # Issued by /auth/login after a CORRECT password when the account has MFA
 # enabled. It carries NO access privilege — it only proves "the password step

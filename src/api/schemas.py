@@ -289,6 +289,27 @@ class TokenResponse(BaseModel):
     expires_in: int = 3600
 
 
+class RegisterResponse(BaseModel):
+    """POST /auth/register response when EMAIL_VERIFICATION_ENABLED is on.
+
+    Enumeration-safe: the SAME neutral body is returned whether the email is new
+    (a verification link was sent) or already registered (a 'you already have an
+    account' note was sent). No tokens — the account is created only after the
+    verification link is redeemed at /auth/verify-email. `verification_required`
+    lets the frontend show a 'check your email' screen instead of logging in."""
+    message: str = "Check your email to finish creating your account."
+    verification_required: bool = True
+
+
+class VerifyEmailRequest(BaseModel):
+    """POST /auth/verify-email — redeem the emailed verification link.
+
+    `token` is the short-lived single-use verification JWT (aud=bridgeleads-verify)
+    minted by /auth/register. Bounded like the reset token; a JWT is ~hundreds of
+    bytes."""
+    token: str = Field(max_length=4096)
+
+
 class LoginResponse(BaseModel):
     """POST /auth/login (and /auth/login/mfa) response. Two mutually exclusive
     shapes, discriminated by `mfa_required`:

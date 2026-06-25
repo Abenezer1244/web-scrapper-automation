@@ -65,26 +65,33 @@ recheck, token ceil, purge `SKIP LOCKED`, cap retention) were applied.
 
 ---
 
-## OPEN — cross-repo / cross-cutting decisions (need product call)
+## FIXED — the two cross-repo items (BE `51a3bd1` + FE `c1fa8d9`)
 
-* **Attacker-set display NAME (Codex #8).** An attacker-initiated signup the victim
-  verifies can set the victim's cosmetic display name (user-editable, grants no
-  access). Closing it = collect first/last name at **verify** instead of register —
-  a coordinated change to the backend (`VerifyEmailRequest` + `verify_user_email` +
-  drop name from the pending row) AND the frontend (`bridgeleads-web`: register form
-  stops collecting name, verify form starts). Cannot ship backend-only without
-  breaking the current FE.
+* **Attacker-set display NAME (Codex #8) — CLOSED.** First/last name is now collected
+  at **/auth/verify-email** (by whoever proves email control), not at register:
+  `UserRegister` names Optional (legacy 422s if missing); `VerifyEmailRequest` requires
+  them; `verify_user_email` uses the request names; the pending row stores no name
+  (migration **076** makes the columns nullable — nullable-not-drop, since re-adding
+  NOT NULL on encrypted rows isn't backfillable). FE: verified-mode register collects
+  email+terms only; the verify form collects name+password.
 
-* **Token in the URL query string (Codex #2).** `/verify-email?token=` matches the
-  already-shipped `/reset-password?token=` pattern, and the FE scrubs it from the
-  address bar on mount. Hardening (fragment + `Referrer-Policy: no-referrer`, or a
-  one-time server nonce) would also have to change reset-password to stay consistent.
+* **Token in the URL query string (Codex #2) — CLOSED.** Verify + reset links now put
+  the token in the URL **fragment** (`#token=`, never sent to the server — RFC 3986
+  §3.5) instead of the query. FE `useLinkToken` hook dual-reads `#token=` or legacy
+  `?token=` (so reset links already in inboxes still work), scrubs the URL, and
+  resolves once (Strict-Mode-safe). Both pages set `Referrer-Policy: no-referrer`.
 
 ---
 
-## OPS sequence (unchanged) — flip is no longer gated on reliability
+## OPS sequence — flip is no longer gated on reliability
 
 1. Merge #125 → deploy api+worker.
-2. Merge #126 + FE #59 → `gen:api-types` → deploy both. **Run migration 074 AND 075.**
+2. Merge #126 + FE #59 → `gen:api-types` → deploy both. **Run migrations 074 + 075 + 076.**
 3. Flip `EMAIL_VERIFICATION_ENABLED=true` on api AND worker; the dispatcher beat must
-   run on the worker. Live-verify signup → (≤60s) email → verify → login.
+   run on the worker. Live-verify signup → (≤60s) email → verify (set name+password) → login.
+
+**Deploy ORDER for the #7 fragment change (touches the LIVE reset flow):** ship the
+**frontend first** (it dual-reads `#token=` and `?token=`), THEN the backend (which
+starts emitting `#token=` links). Reverse order would hand a `#token=` link to an old
+query-only frontend and break it. The verify flow is flag-gated so it's unaffected
+either way.

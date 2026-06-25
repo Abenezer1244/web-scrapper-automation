@@ -76,5 +76,5 @@ def test_abusive_inputs_rejected(fn):
 
 def test_oversized_referral_code_silently_dropped():
     # By design ref codes are dropped (not rejected) so existing codes aren't leaked.
-    u = UserRegister(email="a@b.co", password="secret1234", ref="Z" * 100_000)
+    u = UserRegister(email="a@b.co", password="secret1234", first_name="Test", last_name="User", ref="Z" * 100_000)
     assert u.ref is None

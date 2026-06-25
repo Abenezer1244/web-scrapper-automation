@@ -89,10 +89,16 @@ class User(Base):
     # + UNIQUE (migration 053) after the P4 reconcile backfill populated every row.
     # Dual-written via @validates below so it can never drift from email.
     email_hmac = Column(String(64), nullable=False, unique=True)
-    # Optional self-entered display name for the dashboard greeting. Encrypted at
-    # rest like email (it is user-provided identity PII); never indexed/unique —
-    # we never query by name. NULL until the user sets it; the greeting then
-    # falls back to no personal identifier (never the email local-part).
+    # First + last name (dashboard greeting uses first_name). Encrypted at rest
+    # like email (user-provided identity PII); never indexed/unique. Nullable at
+    # the DB level: legacy users created before the required-name gate have NULL
+    # until they complete the gate; requiredness is enforced at the API layer
+    # (UserRegister / ProfileUpdate) + the frontend profile-complete gate.
+    first_name = Column(EncryptedString, nullable=True)
+    last_name = Column(EncryptedString, nullable=True)
+    # DEPRECATED single display name — superseded by first_name/last_name. Kept
+    # (always NULL in prod) for a rollback window; drop in a later cleanup
+    # migration. Do NOT read/write from new code.
     name = Column(EncryptedString, nullable=True)
     password_hash = Column(String(255), nullable=False)
     api_key_hash = Column(String(64), nullable=True, index=True)

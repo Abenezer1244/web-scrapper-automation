@@ -180,15 +180,18 @@ class PendingRegistration(Base):
     redeemed; unredeemed rows expire via `expires_at` and are purged.
 
     email / first_name / last_name are encrypted at rest exactly like users.* ;
-    equality + uniqueness live on email_hmac (kept in lockstep with email via the
-    @validates hook below, same as User). UNIQUE(email_hmac) makes register's
-    upsert race-safe (at most one pending row per address).
+    the searchable key is email_hmac (kept in lockstep with email via the
+    @validates hook below, same as User). email_hmac is INDEXED but NOT unique on
+    purpose: each registration attempt inserts its own row, so an attacker
+    submitting a victim's address cannot overwrite the password on the victim's
+    pending row (account pre-hijacking). First verification wins via
+    UNIQUE(users.email_hmac); siblings are dropped at verify time.
     """
     __tablename__ = "pending_registrations"
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
     email = Column(EncryptedString, nullable=False)
-    email_hmac = Column(String(64), nullable=False, unique=True)
+    email_hmac = Column(String(64), nullable=False, index=True)
     first_name = Column(EncryptedString, nullable=False)
     last_name = Column(EncryptedString, nullable=False)
     password_hash = Column(String(255), nullable=False)

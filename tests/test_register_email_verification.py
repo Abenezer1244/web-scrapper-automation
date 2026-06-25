@@ -137,3 +137,43 @@ async def test_verify_rejects_invalid_token(client: AsyncClient, monkeypatch):
     monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", True)
     r = await client.post("/auth/verify-email", json={"token": "not-a-jwt"})
     assert r.status_code == 400
+
+
+async def test_reregistration_cannot_overwrite_first_pending_password(client: AsyncClient, db, monkeypatch):
+    """Account pre-hijacking guard (Codex P1): a second submission for an
+    already-pending address must NOT overwrite the first registrant's password.
+    Each attempt is its own row, so redeeming the FIRST registrant's link
+    activates the FIRST password — the second submitter's password never takes."""
+    monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", True)
+    email = _email()
+    first_pw, second_pw = "FirstPass123!", "SecondPass456!"
+
+    await client.post(
+        "/auth/register",
+        json={"first_name": "A", "last_name": "One", "email": email, "password": first_pw},
+    )
+    ehmac = blind_index(email)
+    rows = (
+        await db.execute(select(PendingRegistration).where(PendingRegistration.email_hmac == ehmac))
+    ).scalars().all()
+    assert len(rows) == 1
+    first_pending_id = rows[0].id
+
+    # A would-be attacker submits the SAME address with a different password.
+    await client.post(
+        "/auth/register",
+        json={"first_name": "B", "last_name": "Two", "email": email, "password": second_pw},
+    )
+    rows = (
+        await db.execute(select(PendingRegistration).where(PendingRegistration.email_hmac == ehmac))
+    ).scalars().all()
+    assert len(rows) == 2  # SEPARATE rows, not an overwrite
+
+    # Redeem the FIRST registrant's link.
+    rv = await client.post("/auth/verify-email", json={"token": _mint_verify_token(first_pending_id)})
+    assert rv.status_code == 200
+
+    # The account uses the FIRST password; the second submitter's password is rejected.
+    assert (await client.post("/auth/login", json={"email": email, "password": first_pw})).status_code == 200
+    assert (await client.post("/auth/login", json={"email": email, "password": second_pw})).status_code == 401
+    await _clear_pending(db, email)  # belt-and-suspenders (verify already drops siblings)

@@ -16,13 +16,11 @@ The route decorators + signatures stay in auth.py; this holds the moved bodies.
 """
 
 import secrets
-import time
 import uuid
 from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException, Request, Response, status
 from sqlalchemy import delete, select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,6 +38,13 @@ _logger = setup_logger("api.auth.register")
 
 # At most one duplicate-signup notice per address per 24h (email-bomb guard).
 _DUP_SIGNUP_NOTICE_TTL = 86400
+
+# At most one verification email per address per this window. Each register
+# attempt inserts its own pending row, so without this gate an attacker could
+# spray /auth/register for a victim's address and bomb their inbox with
+# 'confirm your email' messages. A legitimate user who re-submits within the
+# window just reuses the link from the first email.
+_VERIFY_EMAIL_RESEND_TTL = 120
 
 # Referral-code alphabet: excludes ambiguous chars (0/O, 1/I/L) so a shared code
 # is unambiguous when read aloud.
@@ -172,7 +177,7 @@ async def register_user(
     """Dispatch to the legacy or the enumeration-safe registration flow."""
     await rate_limit(request, zone="auth")
     if settings.EMAIL_VERIFICATION_ENABLED:
-        return await _register_user_verified(body, request, db)
+        return await _register_user_verified(body, request, response, db)
     return await _register_user_legacy(body, request, response, db)
 
 
@@ -253,15 +258,27 @@ async def _register_user_legacy(
 async def _register_user_verified(
     body: UserRegister,
     request: Request,
+    response: Response,
     db: AsyncSession,
 ) -> RegisterResponse:
     """Enumeration-safe flow (EMAIL_VERIFICATION_ENABLED on): NEVER reveal whether
     the email exists. Both paths return the SAME neutral 200 with NO tokens.
 
     Existing email -> 'you already have an account' email. New email -> stage a
-    pending_registrations row (upsert) and email a verification link. The bcrypt
-    burn is on BOTH paths so response latency cannot distinguish them.
+    fresh pending_registrations row and email a verification link. The bcrypt
+    burn is on BOTH paths so the status/body/message oracle is closed.
+
+    TIMING NOTE (Codex P2, accepted residual): the new-email path additionally
+    does one DB insert + commit + token mint that the existing-email path does
+    not, so the two are not byte-for-byte timing-identical. The primary oracle
+    (status, body, message) IS closed and the bcrypt burn dominates; closing the
+    residual one-insert delta would need constant-time padding and is tracked as
+    a follow-up rather than blocking this change.
     """
+    # The neutral 200 status (vs the legacy 201): set it on BOTH the existing and
+    # the new path so they are identical.
+    response.status_code = status.HTTP_200_OK
+
     existing = await db.execute(
         select(User).where(User.email_hmac == blind_index(body.email))
     )
@@ -274,51 +291,41 @@ async def _register_user_verified(
         await _notify_existing_account(body.email)
         return RegisterResponse()  # neutral 200 — identical to the new-email path
 
-    # New email: stage the signup (NOT a real users row). UPSERT by email_hmac so
-    # a repeat signup before verifying replaces the pending data (and re-sends a
-    # link) without creating a second row; UNIQUE(email_hmac) makes it race-safe.
+    # New email: stage the signup as its OWN pending row (NOT a real users row,
+    # and NOT an upsert). Independent rows per attempt are what prevent account
+    # pre-hijacking — an attacker submitting this address lands in a SEPARATE row
+    # whose link is emailed to the address owner, so it can never overwrite the
+    # password on a legitimate owner's pending row. First verification wins via
+    # UNIQUE(users.email_hmac); siblings are dropped at verify time.
     password_hash = hash_password(body.password)
-    expires_at = datetime.now(UTC) + timedelta(seconds=_VERIFY_TOKEN_EXPIRE_SECONDS)
-    table = PendingRegistration.__table__
-    ins = pg_insert(table).values(
+    pending = PendingRegistration(
         id=str(uuid.uuid4()),
-        email=body.email,
-        email_hmac=blind_index(body.email),
+        email=body.email,  # @validates fills email_hmac
         first_name=body.first_name,
         last_name=body.last_name,
         password_hash=password_hash,
         ref_code=body.ref,
-        expires_at=expires_at,
+        expires_at=datetime.now(UTC) + timedelta(seconds=_VERIFY_TOKEN_EXPIRE_SECONDS),
     )
-    stmt = ins.on_conflict_do_update(
-        index_elements=[table.c.email_hmac],
-        set_={
-            # Keep the existing row id (so an already-emailed earlier link for
-            # this address still resolves); refresh everything else + the expiry.
-            "email": ins.excluded.email,
-            "first_name": ins.excluded.first_name,
-            "last_name": ins.excluded.last_name,
-            "password_hash": ins.excluded.password_hash,
-            "ref_code": ins.excluded.ref_code,
-            "expires_at": ins.excluded.expires_at,
-        },
-    ).returning(table.c.id)
-    result = await db.execute(stmt)
-    pending_id = result.scalar_one()
+    db.add(pending)
     await db.commit()
 
-    token = _mint_verify_token(pending_id)
+    token = _mint_verify_token(pending.id)
     verify_link = f"{settings.FRONTEND_URL}/verify-email?token={token}"
-    # Enqueue off the request path (Celery) so the Resend latency can't become an
-    # existing-vs-new timing oracle and a broker blip can't break the response.
-    try:
-        from src.workers.onboarding_emails import send_verification_email
-        send_verification_email.delay(body.email, verify_link)
-    except Exception as exc:  # noqa: BLE001 — never break the neutral 200
-        _logger.warning(
-            "verification email enqueue failed (fp=%s): %s",
-            email_fingerprint(body.email), type(exc).__name__,
-        )
+    # Email-bomb guard: at most one verification email per address per window
+    # (once_per is an atomic Redis SET NX that fails CLOSED, so a Redis outage
+    # skips the send rather than allowing a bomb). Enqueued off the request path
+    # so the Resend latency can't become a timing oracle and a broker blip can't
+    # break the response.
+    if await once_per(f"verifyemail:{blind_index(body.email)}", _VERIFY_EMAIL_RESEND_TTL):
+        try:
+            from src.workers.onboarding_emails import send_verification_email
+            send_verification_email.delay(body.email, verify_link)
+        except Exception as exc:  # noqa: BLE001 — never break the neutral 200
+            _logger.warning(
+                "verification email enqueue failed (fp=%s): %s",
+                email_fingerprint(body.email), type(exc).__name__,
+            )
     audit_log(request, "register_pending", None)
     return RegisterResponse()
 
@@ -345,10 +352,7 @@ async def verify_user_email(
         )
 
     pending_id: str = payload.get("sub", "")
-    jti: str = payload.get("jti", "")
-    exp: int = payload.get("exp", 0)
-    ttl = max(0, exp - int(time.time()))
-    if not pending_id or not jti or ttl <= 0:
+    if not pending_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid or expired verification link.",
@@ -364,56 +368,57 @@ async def verify_user_email(
     pending = res.scalar_one_or_none()
     if pending is None:
         # Already redeemed (row deleted), expired, or never existed — all generic.
+        # NOTE: no separate Redis single-use gate is needed. The token's `sub` is
+        # THIS pending row; once a verify creates the account it deletes every
+        # pending row for the address, so any later click of the same (or a
+        # sibling) link finds no row and lands here. UNIQUE(users.email_hmac) is
+        # the authority that prevents a second account under any race.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid or expired verification link.",
         )
 
-    # Single-use gate (atomic, fail-closed). Burning the jti FIRST means exactly
-    # one of N concurrent redemptions of the SAME token proceeds; the rest get
-    # "already used". consume_once raises on Redis error -> 503 (never create an
-    # account we can't prove the link was un-redeemed for).
-    import redis.exceptions as _redis_exceptions
-
-    from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
-    try:
-        if not await TokenBlacklist.consume_once(jti, ttl):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="This verification link has already been used. Please log in.",
-            )
-    except _redis_exceptions.RedisError:
-        raise revocation_unavailable_503()
-
-    # Read the (decrypted) pending fields before any write that could detach it.
+    # Capture the (decrypted) pending fields BEFORE the create attempt — a later
+    # rollback would expire the ORM object and a re-access could re-query/fail.
     email = pending.email
-    referred_by_id = await _resolve_referrer_id(db, pending.ref_code)
+    email_hmac = pending.email_hmac
+    first_name = pending.first_name
+    last_name = pending.last_name
+    password_hash = pending.password_hash
+    ref_code = pending.ref_code
+
+    referred_by_id = await _resolve_referrer_id(db, ref_code)
     referral_code = await _generate_referral_code(db)
     try:
         user = await _create_real_user(
             db,
             email=email,
-            first_name=pending.first_name,
-            last_name=pending.last_name,
-            password_hash=pending.password_hash,
+            first_name=first_name,
+            last_name=last_name,
+            password_hash=password_hash,
             referred_by_id=referred_by_id,
             referral_code=referral_code,
         )
     except IntegrityError:
-        # A real account for this email already exists (a different verification
-        # link for the same address won, or the user registered another way).
-        # Clean up the pending row and send them to login — never two accounts.
+        # A real account for this email already exists (a concurrent verify of a
+        # sibling link won, or the user registered another way). Drop ALL pending
+        # rows for the address and send them to login — never two accounts.
         await db.rollback()
-        await db.execute(delete(PendingRegistration).where(PendingRegistration.id == pending_id))
+        await db.execute(
+            delete(PendingRegistration).where(PendingRegistration.email_hmac == email_hmac)
+        )
         await db.commit()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This email is already verified. Please log in.",
         ) from None
 
-    # Consume the pending row in the SAME transaction as the user insert so a
-    # crash can't leave both a real user and a redeemable pending row.
-    await db.execute(delete(PendingRegistration).where(PendingRegistration.id == pending_id))
+    # Drop every pending row for this address (this attempt + any siblings) in the
+    # SAME transaction as the user insert, so a crash can't leave a real user AND
+    # a redeemable pending row, and a sibling link can't mint a second session.
+    await db.execute(
+        delete(PendingRegistration).where(PendingRegistration.email_hmac == email_hmac)
+    )
     await db.commit()
 
     token = create_secure_token(user.id, amr=["pwd"])

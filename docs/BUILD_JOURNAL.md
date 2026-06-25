@@ -19,6 +19,65 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-25 — Login-screen security audit → brute-force lockout fix + enumeration-safe registration
+**Built / Shipped:** Cross-checked the build against a 5-item "Login Screen Security" guide (validate input,
+rate-limit + lockout, hash passwords, generic errors, trusted auth provider), Codex as independent reviewer.
+Items 1/3 already exceed the guide; item 5 = custom auth is sound (keep it). Two real gaps → two PRs:
+- **Fix A — brute-force lockout duration (PR #125, branch `feat/login-lockout-fix`, worktree).** Root cause:
+  `BruteForceProtection` derived the lockout straight from the failure COUNTER, and a plain Redis `INCR`
+  never decays below a threshold — so 5 fat-fingered passwords locked an IP for the counter's ~24h TTL, not
+  the documented 1 min; the progressive 1/5/30-min/24h ladder was fiction (only the `Retry-After` header
+  changed); and because `check()` raises BEFORE `record_failure()`, a single IP froze the count at 5 so the
+  lockout-notification email (threshold 10) never fired. Fix: separate the COUNTER from a short-lived,
+  MONOTONIC LOCK key computed atomically in one Lua script (`_RECORD_FAILURE_LUA`); `check()` reads only the
+  lock; `clear()` wipes both; IP escalates fully, email capped 15 min. No migration.
+- **Fix B — enumeration-safe registration + email verification (PR #126, branch
+  `feat/register-email-verification`, worktree), flag-gated `EMAIL_VERIFICATION_ENABLED` (default false).**
+  Closes the `201+tokens` vs `400` status-code enumeration oracle on `/auth/register`. New-email signups are
+  staged in a new `pending_registrations` table (migration 074); the real `users` row is created only when
+  the emailed single-use link is redeemed at the new `POST /auth/verify-email`, where the user SETS their
+  password and is auto-logged-in. Both register paths return an identical neutral 200.
+
+**Tried / Decided:** Fix B design changed three times under Codex pressure (each a real hole): (1) my first
+plan put a nullable `email_verified_at` on `users` → **account squatting** (attacker pre-creates a real row
+for a victim's email) → switched to a `pending_registrations` table. (2) A single upserted pending row let
+an attacker **overwrite** a victim's pending password → switched to independent rows per attempt. (3) Even
+then, STORING the registrant's password meant an attacker-initiated signup the victim confirms yields an
+attacker-known password (**pre-hijacking**) → moved password-setting to the verify step (user-approved).
+(4) Dropped `ref_code` from the verify flow (attacker self-referral). The cosmetic display-name residual is
+documented + accepted (user-editable, grants no access).
+
+**Failed / Blocked:** `.env` here points at PROD (Upstash/Supabase) and conftest can wipe tables, so the
+real-Redis/Postgres tests could not run locally — verified instead **in-memory against the exact Lua via
+fakeredis+lupa** (Fix A, 11/11) and with synthetic-env smoke tests (Fix B: routes, OpenAPI union, schema
+shapes, token roundtrip, purge wiring). `codex review --base` hangs/quotas on this CLI; used `codex exec`
+streaming instead. Hit a Codex usage-limit mid-session (recovered).
+
+**Caught & fixed (Codex):** Fix A — a P3 sub-second `TTL` floor leaking one early guess (now `ttl >= 0` =
+locked). Fix B — squatting, password-overwrite, trusted-registrant-password (all P1, all fixed); a
+referral-abuse P2 (dropped ref); a P3 referral-collision IntegrityError mishandled as "already verified"
+(narrowed to the `email_hmac` race); a missing **purge** of expired pending rows (added hourly beat task);
+a final **RLS P1** on the public `pending_registrations` table → added `ENABLE ROW LEVEL SECURITY` mirroring
+migration 027. Codex's follow-up "the app role is NOBYPASSRLS" P1 was a **misread of M5's "post-RLS-cutover"
+role table** — refuted with evidence (027 is live with RLS-no-policy on `users` and login still works ⇒
+current role bypasses RLS; `RLS_ENFORCE` default false) and Codex **withdrew it**.
+
+**Pending / Handoff:** **OPS** — Fix A: deploy api+worker (no migration). Fix B: run **migration 074** first,
+then flip `EMAIL_VERIFICATION_ENABLED=true` on api+worker ONLY AFTER the frontend ships. **FRONTEND**
+(separate `bridgeleads-web` repo, not started): register → "check your email" screen; new `/verify-email`
+page that collects + sets the password; `gen:api-types` after #126 merges (register `response_model` is now a
+union). **DEFERRED:** `pending_registrations` needs app/system RLS policies at the non-BYPASSRLS cutover
+(documented in 074, same as all 027 tables).
+
+**Facts learned:** The current prod DB role is **BYPASSRLS**; `bridgeleads_app/system (NOBYPASSRLS)` are the
+**post-cutover** targets gated by `RLS_ENFORCE` (default false) — a new `public` table just needs
+`ENABLE ROW LEVEL SECURITY` (no policy) to lock out the Supabase anon PostgREST API today, with policies
+deferred to the cutover. Auth stack is far beyond a "vibe-coded" login (encrypted email at rest + blind
+index, MFA + break-glass, single-use refresh rotation, password history, timing-safe enumeration). A
+union `response_model` (`TokenResponse | RegisterResponse`) serializes by the returned instance's type.
+
+---
+
 ## 2026-06-23 — Phase B: user-selectable pre-foreclosure doc types for ALL healthy counties (SELECT)
 **Built / Shipped:** Turned the wizard's "Document types to scrape" checkbox selector ON for **all 15
 healthy pre_foreclosure counties** (was King/Pierce only). Branch `feat/doctype-select-allcounty`

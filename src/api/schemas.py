@@ -229,8 +229,12 @@ class UserResponse(BaseModel):
     model_config = {"from_attributes": True}
 
     def model_post_init(self, __context: Any) -> None:
-        # Server-owned profile-complete rule: both names present.
-        self.profile_complete = bool(self.first_name and self.last_name)
+        # Server-owned profile-complete rule: both names present and non-blank.
+        # Strip so a whitespace-only value that slipped in via any non-validated
+        # path (manual/import) does NOT read as complete (Codex hardening).
+        self.profile_complete = bool(
+            (self.first_name or "").strip() and (self.last_name or "").strip()
+        )
         if self.trial_ends_at:
             now = datetime.now(UTC)
             ends = self.trial_ends_at if self.trial_ends_at.tzinfo else self.trial_ends_at.replace(tzinfo=UTC)

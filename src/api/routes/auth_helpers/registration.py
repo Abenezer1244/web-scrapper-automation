@@ -306,18 +306,23 @@ async def _register_user_verified(
         return RegisterResponse()  # neutral 200 — identical to the new-email path
 
     # New email: stage the signup as its OWN pending row (NOT a real users row,
-    # and NOT an upsert). NO password is stored — it is set at verify by whoever
-    # proves email control. Independent rows per attempt mean an attacker
-    # submitting this address lands in a SEPARATE row whose link is emailed to the
-    # address owner; first verification wins via UNIQUE(users.email_hmac) and
-    # siblings are dropped at verify time.
+    # and NOT an upsert). NO password and NO referral are stored — the password is
+    # set at verify by whoever proves email control (closes pre-hijacking), and an
+    # attacker-supplied referral must never benefit from a victim-verified account
+    # (the financial vector Codex flagged). The first/last name ARE carried so the
+    # account/greeting has them; an attacker who initiates a signup for a victim's
+    # address could thus set a wrong display NAME on a victim-verified account —
+    # an accepted COSMETIC residual (the value is non-sensitive and the user edits
+    # it from profile settings; nothing about it grants the attacker access).
+    # Independent rows per attempt mean an attacker submitting this address lands
+    # in a SEPARATE row whose link is emailed to the address owner; first
+    # verification wins via UNIQUE(users.email_hmac) and siblings drop at verify.
     hash_password(_TIMING_DUMMY_PASSWORD)  # timing parity with the existing path
     pending = PendingRegistration(
         id=str(uuid.uuid4()),
         email=body.email,  # @validates fills email_hmac
         first_name=body.first_name,
         last_name=body.last_name,
-        ref_code=body.ref,
         expires_at=datetime.now(UTC) + timedelta(seconds=_VERIFY_TOKEN_EXPIRE_SECONDS),
     )
     db.add(pending)
@@ -399,9 +404,10 @@ async def verify_user_email(
     email_hmac = pending.email_hmac
     first_name = pending.first_name
     last_name = pending.last_name
-    ref_code = pending.ref_code
 
-    referred_by_id = await _resolve_referrer_id(db, ref_code)
+    # No referral attribution in the verification flow: the pending row carries no
+    # ref, so an attacker-supplied code can never credit a victim-verified account.
+    referred_by_id = None
     referral_code = await _generate_referral_code(db)
     try:
         user = await _create_real_user(

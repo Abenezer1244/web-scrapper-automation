@@ -48,9 +48,10 @@ def upgrade() -> None:
         # NOTE: no password column. The password is set at /auth/verify-email by
         # whoever proves email control, never carried from the (unverified)
         # register step — that is what prevents account pre-hijacking.
-        # Raw (validated) referral code, resolved to a referrer at verify time so
-        # a referrer who deactivates between signup and verify is handled then.
-        sa.Column("ref_code", sa.String(16), nullable=True),
+        # NOTE: no referral column either. Carrying an attacker-supplied referral
+        # code into a victim-verified account would let an attacker self-refer
+        # (financial abuse, Codex). Referral attribution is simply not supported
+        # in the verification flow for now.
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column(
             "created_at",
@@ -72,6 +73,13 @@ def upgrade() -> None:
         "pending_registrations",
         ["expires_at"],
     )
+    # RLS lockout for the Supabase anon/authenticated PostgREST API (mirrors
+    # migration 027). This table sits in the public schema, so without RLS the
+    # anon key shipped in the frontend could read/delete pending rows directly —
+    # a signup-verification DoS + a (encrypted-but-present) leak of signup
+    # attempts. NO policy => default-deny for every RLS-subject role; the FastAPI
+    # app + workers connect with the BYPASSRLS role, so nothing in the app breaks.
+    op.execute("ALTER TABLE IF EXISTS public.pending_registrations ENABLE ROW LEVEL SECURITY")
 
 
 def downgrade() -> None:

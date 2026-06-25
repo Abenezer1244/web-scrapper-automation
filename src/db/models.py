@@ -196,9 +196,9 @@ class PendingRegistration(Base):
     last_name = Column(EncryptedString, nullable=False)
     # No password column on purpose: the password is set at /auth/verify-email by
     # whoever proves email control, never carried from the unverified register
-    # step (prevents account pre-hijacking).
-    # Raw validated referral code, resolved to a referrer at verify time.
-    ref_code = Column(String(16), nullable=True)
+    # step (prevents account pre-hijacking). No referral column either — carrying
+    # an attacker-supplied ref into a victim-verified account would enable
+    # self-referral abuse; referral attribution is not supported in this flow.
     expires_at = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 

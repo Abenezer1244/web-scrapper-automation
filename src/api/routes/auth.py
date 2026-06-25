@@ -119,6 +119,7 @@ async def register(
     body: UserRegister,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse | RegisterResponse:
     """Register a new account.
@@ -128,7 +129,9 @@ async def register(
     no tokens (same body for new vs existing email) and emails a verification
     link; the handler overrides the status to 200 on that path.
     """
-    return await _registration_helpers.register_user(body, request, response, db)
+    return await _registration_helpers.register_user(
+        body, request, response, background_tasks, db
+    )
 
 
 @router.post("/verify-email", response_model=TokenResponse)

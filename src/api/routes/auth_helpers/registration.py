@@ -19,7 +19,7 @@ import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from fastapi import HTTPException, Request, Response, status
+from fastapi import BackgroundTasks, HTTPException, Request, Response, status
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -171,12 +171,13 @@ async def register_user(
     body: UserRegister,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
     db: AsyncSession,
 ) -> TokenResponse | RegisterResponse:
     """Dispatch to the legacy or the enumeration-safe registration flow."""
     await rate_limit(request, zone="auth")
     if settings.EMAIL_VERIFICATION_ENABLED:
-        return await _register_user_verified(body, request, response, db)
+        return await _register_user_verified(body, request, response, background_tasks, db)
     return await _register_user_legacy(body, request, response, db)
 
 
@@ -266,6 +267,7 @@ async def _register_user_verified(
     body: UserRegister,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
     db: AsyncSession,
 ) -> RegisterResponse:
     """Enumeration-safe flow (EMAIL_VERIFICATION_ENABLED on): NEVER reveal whether
@@ -275,12 +277,15 @@ async def _register_user_verified(
     fresh pending_registrations row and email a verification link. The bcrypt
     burn is on BOTH paths so the status/body/message oracle is closed.
 
-    TIMING NOTE (Codex P2, accepted residual): the new-email path additionally
-    does one DB insert + commit + token mint that the existing-email path does
-    not, so the two are not byte-for-byte timing-identical. The primary oracle
-    (status, body, message) IS closed and the bcrypt burn dominates; closing the
-    residual one-insert delta would need constant-time padding and is tracked as
-    a follow-up rather than blocking this change.
+    TIMING NOTE (accepted residual): both paths burn bcrypt (the ~250ms dominant
+    cost) and touch ONLY Postgres inline — the existing-account notice runs as a
+    post-response BACKGROUND task (not awaited), so neither path blocks on Redis.
+    That matters because Redis can be down while Postgres is up: awaiting the
+    notice's once_per inline (the prior behavior) made the existing-email path
+    HANG on a Redis outage while the new-email path returned fast — a real,
+    outage-amplified timing oracle (Codex). The only remaining asymmetry is the
+    new path's extra ~2ms Postgres insert, a stable sub-bcrypt constant; fully
+    flattening it needs measured constant-time padding (tracked as a follow-up).
     """
     # The neutral 200 status (vs the legacy 201): set it on BOTH the existing and
     # the new path so they are identical.
@@ -295,7 +300,11 @@ async def _register_user_verified(
             "register (verify flow) rejected: account already exists (fp=%s)",
             email_fingerprint(body.email),
         )
-        await _notify_existing_account(body.email)
+        # Off the request path: scheduled AFTER the response is sent so its Redis
+        # once_per + Celery enqueue can't add inline latency (and a Redis outage
+        # can't stall the existing-email response). This branch returns (does not
+        # raise), so the background task actually runs.
+        background_tasks.add_task(_notify_existing_account, body.email)
         return RegisterResponse()  # neutral 200 — identical to the new-email path
 
     # New email: stage the signup as its OWN pending row (NOT a real users row,

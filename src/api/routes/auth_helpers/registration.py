@@ -50,6 +50,12 @@ _VERIFY_EMAIL_RESEND_TTL = 120
 # is unambiguous when read aloud.
 _REF_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
+# Verified-flow registration never hashes a real password (the password is set at
+# verify), so both the new-email and existing-email branches burn one bcrypt over
+# this fixed dummy. The ~250ms constant dwarfs the one-DB-insert delta between the
+# two branches, shrinking the residual timing oracle (Codex P2).
+_TIMING_DUMMY_PASSWORD = "timing-parity-burn-not-a-real-password"
+
 
 def _integrity_error_fields(exc: IntegrityError) -> dict[str, str]:
     """Pull ONLY schema-controlled, PII-free diagnostics off an asyncpg
@@ -190,6 +196,14 @@ async def _register_user_legacy(
     """Legacy flow (EMAIL_VERIFICATION_ENABLED off): create the account
     immediately and return session tokens (201). Behavior is unchanged from
     before the verification feature."""
+    # The password is REQUIRED in the legacy flow (it is now Optional on the
+    # schema only to support the verified flow, which sets it at verify time).
+    if body.password is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Password is required.",
+        )
+
     # Check for duplicate — generic error (no user enumeration). The DB
     # UNIQUE(email_hmac) is the race-safe authority (IntegrityError catch below).
     existing = await db.execute(
@@ -283,7 +297,7 @@ async def _register_user_verified(
         select(User).where(User.email_hmac == blind_index(body.email))
     )
     if existing.scalar_one_or_none():
-        hash_password(body.password)  # timing parity with the new-email path
+        hash_password(_TIMING_DUMMY_PASSWORD)  # timing parity with the new path
         _logger.info(
             "register (verify flow) rejected: account already exists (fp=%s)",
             email_fingerprint(body.email),
@@ -292,18 +306,17 @@ async def _register_user_verified(
         return RegisterResponse()  # neutral 200 — identical to the new-email path
 
     # New email: stage the signup as its OWN pending row (NOT a real users row,
-    # and NOT an upsert). Independent rows per attempt are what prevent account
-    # pre-hijacking — an attacker submitting this address lands in a SEPARATE row
-    # whose link is emailed to the address owner, so it can never overwrite the
-    # password on a legitimate owner's pending row. First verification wins via
-    # UNIQUE(users.email_hmac); siblings are dropped at verify time.
-    password_hash = hash_password(body.password)
+    # and NOT an upsert). NO password is stored — it is set at verify by whoever
+    # proves email control. Independent rows per attempt mean an attacker
+    # submitting this address lands in a SEPARATE row whose link is emailed to the
+    # address owner; first verification wins via UNIQUE(users.email_hmac) and
+    # siblings are dropped at verify time.
+    hash_password(_TIMING_DUMMY_PASSWORD)  # timing parity with the existing path
     pending = PendingRegistration(
         id=str(uuid.uuid4()),
         email=body.email,  # @validates fills email_hmac
         first_name=body.first_name,
         last_name=body.last_name,
-        password_hash=password_hash,
         ref_code=body.ref,
         expires_at=datetime.now(UTC) + timedelta(seconds=_VERIFY_TOKEN_EXPIRE_SECONDS),
     )
@@ -380,11 +393,12 @@ async def verify_user_email(
 
     # Capture the (decrypted) pending fields BEFORE the create attempt — a later
     # rollback would expire the ORM object and a re-access could re-query/fail.
+    # NOTE: there is no stored password to read; the password comes from the
+    # request (set by whoever proves email control), closing pre-hijacking.
     email = pending.email
     email_hmac = pending.email_hmac
     first_name = pending.first_name
     last_name = pending.last_name
-    password_hash = pending.password_hash
     ref_code = pending.ref_code
 
     referred_by_id = await _resolve_referrer_id(db, ref_code)
@@ -395,15 +409,25 @@ async def verify_user_email(
             email=email,
             first_name=first_name,
             last_name=last_name,
-            password_hash=password_hash,
+            password_hash=hash_password(body.new_password),
             referred_by_id=referred_by_id,
             referral_code=referral_code,
         )
-    except IntegrityError:
+    except IntegrityError as exc:
+        await db.rollback()
+        fields = _integrity_error_fields(exc)
+        if not _is_duplicate_email_violation(fields):
+            # NOT the users.email_hmac race (e.g. a referral_code unique
+            # collision). Do NOT claim the email is verified or drop the pending
+            # rows — surface it (the generic 500 handler returns a reference id).
+            _logger.warning(
+                "verify user-insert IntegrityError (non-duplicate): %s",
+                fields or "no structured driver fields",
+            )
+            raise
         # A real account for this email already exists (a concurrent verify of a
         # sibling link won, or the user registered another way). Drop ALL pending
         # rows for the address and send them to login — never two accounts.
-        await db.rollback()
         await db.execute(
             delete(PendingRegistration).where(PendingRegistration.email_hmac == email_hmac)
         )

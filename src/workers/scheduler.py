@@ -51,6 +51,9 @@ from src.workers.scheduler_helpers.health import (  # noqa: F401
 from src.workers.scheduler_helpers.meter import _flush_skip_trace_meter_outbox_impl
 from src.workers.scheduler_helpers.onboarding import _send_onboarding_emails_impl
 from src.workers.scheduler_helpers.public_cache import _refresh_public_sample_cache_impl
+from src.workers.scheduler_helpers.registration import (
+    _purge_expired_pending_registrations_impl,
+)
 
 _logger = setup_logger("worker.scheduler")
 
@@ -95,6 +98,12 @@ app.conf.beat_schedule = {
     },
     "expire-trials": {
         "task": "src.workers.scheduler.expire_trials",
+        "schedule": 3600.0,  # every 1 hour
+    },
+    "purge-expired-pending-registrations": {
+        # Email-verification flow: delete pending_registrations rows whose verify
+        # window lapsed so the table can't grow from abandoned/sprayed signups.
+        "task": "src.workers.scheduler.purge_expired_pending_registrations",
         "schedule": 3600.0,  # every 1 hour
     },
     "onboarding-emails": {
@@ -268,6 +277,16 @@ def expire_trials() -> None:
     with no stripe_customer_id (paying users keep their plan).
     """
     return _expire_trials_impl()
+
+
+@app.task(name="src.workers.scheduler.purge_expired_pending_registrations")
+def purge_expired_pending_registrations() -> None:
+    """Delete expired pending_registrations rows (email-verification flow).
+
+    Hourly. Removes rows whose verify window lapsed so the table can't grow
+    unbounded from abandoned or sprayed signups.
+    """
+    return _purge_expired_pending_registrations_impl()
 
 
 # ─── Task 6: Daily county scrape ────────────────────────────────────────────

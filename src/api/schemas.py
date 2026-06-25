@@ -77,7 +77,14 @@ def _validate_required_name(v: str | None, label: str) -> str:
 
 class UserRegister(BaseModel):
     email: EmailStr
-    password: str
+    # Optional because the registration flow depends on EMAIL_VERIFICATION_ENABLED:
+    #   * legacy (off): the password is REQUIRED and creates the account now (the
+    #     legacy handler rejects a missing password).
+    #   * verified (on): the password is set at /auth/verify-email by whoever
+    #     proves email control — it is NOT collected/stored at register (storing a
+    #     register-time password is what enabled account pre-hijacking). Any value
+    #     sent here in verified mode is ignored.
+    password: str | None = None
     # Required first + last name (the dashboard greeting uses the first name).
     # Sanitized + bounded per-field through the SAME validator as the profile
     # edit so signup can't bypass the edit-time rules.
@@ -92,7 +99,11 @@ class UserRegister(BaseModel):
 
     @field_validator("password")
     @classmethod
-    def password_validation(cls, v: str) -> str:
+    def password_validation(cls, v: str | None) -> str | None:
+        # None is allowed at the schema layer (see field comment); the legacy
+        # handler enforces presence. A provided password must meet the policy.
+        if v is None:
+            return None
         return _validate_password_rules(v)
 
     @field_validator("first_name")
@@ -305,9 +316,17 @@ class VerifyEmailRequest(BaseModel):
     """POST /auth/verify-email — redeem the emailed verification link.
 
     `token` is the short-lived single-use verification JWT (aud=bridgeleads-verify)
-    minted by /auth/register. Bounded like the reset token; a JWT is ~hundreds of
-    bytes."""
-    token: str = Field(max_length=4096)
+    minted by /auth/register. `new_password` is set HERE, by whoever proves
+    control of the email — NOT at register — so an attacker-initiated signup that
+    the address owner confirms cannot end up with an attacker-known password. It
+    is validated against the SAME policy as registration."""
+    token: str = Field(max_length=4096)  # bound — a JWT is ~hundreds of bytes
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def password_policy(cls, v: str) -> str:
+        return _validate_password_rules(v)
 
 
 class LoginResponse(BaseModel):

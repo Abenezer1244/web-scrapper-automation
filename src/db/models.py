@@ -194,7 +194,9 @@ class PendingRegistration(Base):
     email_hmac = Column(String(64), nullable=False, index=True)
     first_name = Column(EncryptedString, nullable=False)
     last_name = Column(EncryptedString, nullable=False)
-    password_hash = Column(String(255), nullable=False)
+    # No password column on purpose: the password is set at /auth/verify-email by
+    # whoever proves email control, never carried from the unverified register
+    # step (prevents account pre-hijacking).
     # Raw validated referral code, resolved to a referrer at verify time.
     ref_code = Column(String(16), nullable=True)
     expires_at = Column(DateTime(timezone=True), nullable=False)

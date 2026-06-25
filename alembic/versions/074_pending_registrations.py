@@ -45,7 +45,9 @@ def upgrade() -> None:
         sa.Column("email", sa.Text(), nullable=False),
         sa.Column("first_name", sa.Text(), nullable=False),
         sa.Column("last_name", sa.Text(), nullable=False),
-        sa.Column("password_hash", sa.String(255), nullable=False),
+        # NOTE: no password column. The password is set at /auth/verify-email by
+        # whoever proves email control, never carried from the (unverified)
+        # register step — that is what prevents account pre-hijacking.
         # Raw (validated) referral code, resolved to a referrer at verify time so
         # a referrer who deactivates between signup and verify is handled then.
         sa.Column("ref_code", sa.String(16), nullable=True),

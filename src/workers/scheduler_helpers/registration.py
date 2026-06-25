@@ -70,7 +70,10 @@ def _dispatch_pending_verification_emails_impl() -> None:
 
     from sqlalchemy import select, text
 
-    from src.api.routes.auth_helpers.tokens import _mint_verify_token
+    from src.api.routes.auth_helpers.tokens import (
+        _VERIFY_TOKEN_EXPIRE_SECONDS,
+        _mint_verify_token,
+    )
     from src.db.models import PendingRegistration
     from src.db.session import system_sync_session
     from src.workers.delivery import _is_retryable_email_error
@@ -153,7 +156,15 @@ def _dispatch_pending_verification_emails_impl() -> None:
                     suppressed += 1
                     continue
 
-                token = _mint_verify_token(row.id, row.expires_at)
+                # Deadline = 24h from THIS send, applied ONLY on success below. A
+                # delayed/recovered send (post-outage) thus gives the user a full
+                # fresh window instead of the stale remainder of the original
+                # signup+24h, and — because purge keys off expires_at — the row is
+                # retained for a real 24h after send so the rolling-24h bomb-guard
+                # count can't be truncated by an early purge (Codex). The token is
+                # minted against this same deadline.
+                new_deadline = now + timedelta(seconds=_VERIFY_TOKEN_EXPIRE_SECONDS)
+                token = _mint_verify_token(row.id, new_deadline)
                 verify_link = f"{settings.FRONTEND_URL}/verify-email?token={token}"
                 # Delivery is at-least-once: the send is committed to the provider
                 # BEFORE we record 'sent', so a worker crash (or a provider-success
@@ -204,6 +215,7 @@ def _dispatch_pending_verification_emails_impl() -> None:
                         pass
                     continue
 
+                row.expires_at = new_deadline  # fresh 24h window from the actual send
                 row.email_dispatch_state = "sent"
                 row.verification_email_sent_at = now
                 db.commit()

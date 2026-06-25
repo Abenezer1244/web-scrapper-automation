@@ -19,6 +19,50 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-25 — Verification-email durability: cross-check → Codex-driven outbox + hardening
+**Built / Shipped:** Cross-checked the login-security build (BE #125/#126, FE #59) independently + with three
+adversarial Codex passes. Build was sound and merge-safe (flag off). Then fixed the real gaps Codex surfaced,
+on `feat/register-email-verification` (worktree `register-email-verify`):
+- **Durable verification-email OUTBOX (`9a41ebd`).** The verification email is the signup critical path, but
+  it could silently never send: `once_per` fails CLOSED on a Redis outage AND the Celery broker IS Redis (so
+  the `.delay` enqueue fails too), `_send` swallowed Resend errors with no retry, and the verified path
+  skipped `release_once`. Root-cause fix = the `pending_registrations` row is the outbox. Register just
+  commits it (migration **075** adds `email_dispatch_state`/`verification_email_sent_at`/`email_attempts`/
+  `next_email_attempt_at` + partial dispatch index) — NO broker/`once_per` in the request path. A 60s beat
+  `dispatch_pending_verification_emails` sends each due row and records the outcome, so a signup made while
+  Redis is down is drained + sent on recovery. Per-row `FOR UPDATE SKIP LOCKED` + non-blocking per-address
+  `pg_try_advisory_xact_lock`; bomb guard over REAL ('sent') sends only — 120s window + 10/day cap; classified
+  retry/backoff (beat = sole retry owner) → 'failed' + ops-alert. Email RAISES on failure; token `exp ==
+  row.expires_at`.
+- **Timing oracle (`2c86840`).** Removing `once_per` from the new-email path left the existing-email path
+  awaiting Redis inline via `_notify_existing_account` → a Redis outage made existing-email hang while
+  new-email returned fast. Now a post-response `BackgroundTask` (verified path returns, so it runs); legacy
+  unchanged (raises 400, already status-enumerable).
+- **Daily-cap retention (`a4d0b6c`).** Successful send bumps `expires_at = now+24h` so a delayed/recovered
+  send gives a fresh window AND the row is retained a real 24h for the rolling cap, purge stays indexed.
+
+**Tried / Decided:** User chose the **durable outbox** over the lighter tactical fix after I flagged the
+broker==Redis fact (during an outage nothing async sends, so only a durable Postgres path survives). Decided
+the tri-state `once_per` was moot (broker==once_per Redis) and dropped it. Kept RLS policies deferred-by-design
+(027 precedent; app roles don't exist pre-cutover). Left two cross-repo items as product decisions (collect
+name-at-verify; token-in-query hardening) — both were explicitly accepted earlier and can't ship backend-only.
+
+**Caught & fixed (Codex review):** per-row `next_email_attempt_at` recheck (concurrent backoff bypass); token
+`math.ceil` (sub-second JWT-vs-row expiry skew); purge `FOR UPDATE SKIP LOCKED` (concurrent same-batch);
+daily-cap retention vs early purge. At-least-once delivery documented (Resend 2.7.0 has no idempotency key).
+
+**Pending / Handoff:** OPS runs migrations **074 + 075** and (when ready) flips `EMAIL_VERIFICATION_ENABLED`;
+the dispatcher beat must run on the worker. Two open product decisions (name-at-verify, token-in-query).
+`tasks/email-verification-preflip-followups.md` has the full status.
+
+**Facts learned:** Celery broker == rate-limit/`once_per` Redis == `settings.REDIS_URL`, so a Redis outage
+takes down the entire async stack at once — durability for any critical email needs a Postgres-backed path,
+not a second Redis. `send_password_reset_email` is itself best-effort fire-and-forget; `deliver_job_email` is
+the codebase's reliable-email pattern (bind, retries, `_is_retryable_email_error`, ops-alert). FastAPI
+`BackgroundTasks` run only when the handler RETURNS, not when it raises.
+
+---
+
 ## 2026-06-25 — Login-screen security audit → brute-force lockout fix + enumeration-safe registration
 **Built / Shipped:** Cross-checked the build against a 5-item "Login Screen Security" guide (validate input,
 rate-limit + lockout, hash passwords, generic errors, trusted auth provider), Codex as independent reviewer.

@@ -97,6 +97,18 @@ async def test_email_lock_capped_ip_lock_full_escalation(redis_client):
     assert 0 < email_lock_ttl <= 15 * 60, f"email lock should be capped at 15min, got {email_lock_ttl}s"
 
 
+async def test_sub_second_lock_still_treated_as_locked(redis_client):
+    """Redis TTL floors to whole seconds, so a lock with <1s left reports 0.
+    check() must still treat that as locked (ttl >= 0), not leak one early
+    guess in the lock's final sub-second (Codex P3)."""
+    ip = "203.0.113.44"
+    redis_client.set(_ip_lock(ip), "1", px=500)  # 0.5s -> ttl() rounds to 0
+    with pytest.raises(HTTPException) as exc:
+        await BruteForceProtection.check(ip, "subsecond@test.bridgeleads.io")
+    assert exc.value.status_code == 429
+    assert int(exc.value.headers["Retry-After"]) >= 1
+
+
 def test_lockout_ladder_durations():
     """Pure ladder check — the readable mirror of the Lua computation."""
     f = BruteForceProtection._lockout_duration

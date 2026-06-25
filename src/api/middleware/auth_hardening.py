@@ -507,13 +507,16 @@ class BruteForceProtection:
             for key_suffix in [f"ip:{ip}", f"email:{ekey}"]:
                 lock_key = f"{BruteForceProtection._LOCK_PREFIX}{key_suffix}"
                 ttl = await r.ttl(lock_key)
-                # ttl >= 0 only for a live lock key (we always SET … EX, so a
-                # persistent -1 never occurs); -2 means no key. Treat > 0 as locked.
-                if ttl and ttl > 0:
+                # A live lock key returns ttl >= 0 (we always SET … EX). Redis TTL
+                # floors to whole seconds, so a key with under 1s left reports 0 —
+                # treat ttl >= 0 (key still exists) as locked, NOT just ttl > 0, so
+                # the final sub-second of a lock can't leak one early guess (Codex
+                # P3). -2 (no key) and the never-written -1 are "not locked".
+                if ttl is not None and ttl >= 0:
                     raise HTTPException(
                         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                         detail="Too many failed login attempts. Try again later.",
-                        headers={"Retry-After": str(ttl)},
+                        headers={"Retry-After": str(ttl if ttl > 0 else 1)},
                     )
         except redis_exceptions.RedisError as exc:
             _logger.warning(

@@ -190,12 +190,19 @@ async def _register_user_legacy(
     """Legacy flow (EMAIL_VERIFICATION_ENABLED off): create the account
     immediately and return session tokens (201). Behavior is unchanged from
     before the verification feature."""
-    # The password is REQUIRED in the legacy flow (it is now Optional on the
-    # schema only to support the verified flow, which sets it at verify time).
+    # Password AND name are REQUIRED in the legacy flow (all three are Optional on
+    # the schema only to support the verified flow, which collects them at verify
+    # time). Reject a missing one with 422 BEFORE any duplicate lookup / bcrypt /
+    # insert, mirroring the password guard.
     if body.password is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Password is required.",
+        )
+    if body.first_name is None or body.last_name is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="First and last name are required.",
         )
 
     # Check for duplicate — generic error (no user enumeration). The DB
@@ -308,23 +315,21 @@ async def _register_user_verified(
         return RegisterResponse()  # neutral 200 — identical to the new-email path
 
     # New email: stage the signup as its OWN pending row (NOT a real users row,
-    # and NOT an upsert). NO password and NO referral are stored — the password is
-    # set at verify by whoever proves email control (closes pre-hijacking), and an
-    # attacker-supplied referral must never benefit from a victim-verified account
-    # (the financial vector Codex flagged). The first/last name ARE carried so the
-    # account/greeting has them; an attacker who initiates a signup for a victim's
-    # address could thus set a wrong display NAME on a victim-verified account —
-    # an accepted COSMETIC residual (the value is non-sensitive and the user edits
-    # it from profile settings; nothing about it grants the attacker access).
-    # Independent rows per attempt mean an attacker submitting this address lands
-    # in a SEPARATE row whose link is emailed to the address owner; first
-    # verification wins via UNIQUE(users.email_hmac) and siblings drop at verify.
+    # and NOT an upsert). NO password, NO name, and NO referral are stored — ALL
+    # of those are set at verify by whoever proves email control. Carrying the
+    # password closed account pre-hijacking; carrying the NAME is what let an
+    # attacker-initiated signup set a victim-verified account's display name, so
+    # the name now also comes from the verifier (the columns are nullable as of
+    # migration 076 and left NULL here). An attacker-supplied referral must never
+    # benefit from a victim-verified account (the financial vector Codex flagged),
+    # so it is dropped too. Independent rows per attempt mean an attacker
+    # submitting this address lands in a SEPARATE row whose link is emailed to the
+    # address owner; first verification wins via UNIQUE(users.email_hmac) and
+    # siblings drop at verify.
     hash_password(_TIMING_DUMMY_PASSWORD)  # timing parity with the existing path
     pending = PendingRegistration(
         id=str(uuid.uuid4()),
         email=body.email,  # @validates fills email_hmac
-        first_name=body.first_name,
-        last_name=body.last_name,
         expires_at=datetime.now(UTC) + timedelta(seconds=_VERIFY_TOKEN_EXPIRE_SECONDS),
         # email_dispatch_state='pending' + next_email_attempt_at=now() come from
         # the column server-defaults: the row IS the outbox. The verification
@@ -394,14 +399,15 @@ async def verify_user_email(
             detail="Invalid or expired verification link.",
         )
 
-    # Capture the (decrypted) pending fields BEFORE the create attempt — a later
-    # rollback would expire the ORM object and a re-access could re-query/fail.
-    # NOTE: there is no stored password to read; the password comes from the
-    # request (set by whoever proves email control), closing pre-hijacking.
+    # Capture the (decrypted) pending email/hmac BEFORE the create attempt — a
+    # later rollback would expire the ORM object and a re-access could re-query/
+    # fail. NOTE: neither the password NOR the name is read from the pending row;
+    # both come from the request (set by whoever proves email control), which is
+    # what closes pre-hijacking AND attacker-chosen display names.
     email = pending.email
     email_hmac = pending.email_hmac
-    first_name = pending.first_name
-    last_name = pending.last_name
+    first_name = body.first_name
+    last_name = body.last_name
 
     # No referral attribution in the verification flow: the pending row carries no
     # ref, so an attacker-supplied code can never credit a victim-verified account.

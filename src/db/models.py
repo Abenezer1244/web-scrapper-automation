@@ -192,8 +192,13 @@ class PendingRegistration(Base):
     id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
     email = Column(EncryptedString, nullable=False)
     email_hmac = Column(String(64), nullable=False, index=True)
-    first_name = Column(EncryptedString, nullable=False)
-    last_name = Column(EncryptedString, nullable=False)
+    # Nullable as of migration 076: the first/last name is collected at
+    # /auth/verify-email (by the verifier), NOT at register, so an attacker-
+    # initiated signup can't set a victim-verified account's display name. The
+    # verified-register insert leaves these NULL; they are unused going forward
+    # (a later migration may drop them once all instances stop referencing them).
+    first_name = Column(EncryptedString, nullable=True)
+    last_name = Column(EncryptedString, nullable=True)
     # No password column on purpose: the password is set at /auth/verify-email by
     # whoever proves email control, never carried from the unverified register
     # step (prevents account pre-hijacking). No referral column either — carrying

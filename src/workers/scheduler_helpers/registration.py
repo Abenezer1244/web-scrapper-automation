@@ -165,7 +165,11 @@ def _dispatch_pending_verification_emails_impl() -> None:
                 # minted against this same deadline.
                 new_deadline = now + timedelta(seconds=_VERIFY_TOKEN_EXPIRE_SECONDS)
                 token = _mint_verify_token(row.id, new_deadline)
-                verify_link = f"{settings.FRONTEND_URL}/verify-email?token={token}"
+                # Token in the URL FRAGMENT (#), not the query (?): a fragment is
+                # never sent to a server (RFC 3986 §3.5), so the bearer token can't
+                # leak via access logs or the Referer header. The FE reads it from
+                # location.hash and scrubs it. (Same change applied to reset links.)
+                verify_link = f"{settings.FRONTEND_URL}/verify-email#token={token}"
                 # Delivery is at-least-once: the send is committed to the provider
                 # BEFORE we record 'sent', so a worker crash (or a provider-success
                 # / client-timeout) between the two re-sends next tick. Resend 2.7.0

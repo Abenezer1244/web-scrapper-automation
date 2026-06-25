@@ -85,11 +85,15 @@ class UserRegister(BaseModel):
     #     register-time password is what enabled account pre-hijacking). Any value
     #     sent here in verified mode is ignored.
     password: str | None = None
-    # Required first + last name (the dashboard greeting uses the first name).
-    # Sanitized + bounded per-field through the SAME validator as the profile
-    # edit so signup can't bypass the edit-time rules.
-    first_name: str
-    last_name: str
+    # Optional for the SAME reason as password: in the verified flow the first +
+    # last name are collected at /auth/verify-email (by whoever proves email
+    # control), NOT at register — so an attacker-initiated signup can't even set a
+    # victim-verified account's display name. Legacy (flag off) still REQUIRES
+    # both (the handler rejects a missing name, like it does a missing password).
+    # When provided, each is sanitized + bounded through the SAME validator as the
+    # profile edit so signup can't bypass the edit-time rules.
+    first_name: str | None = None
+    last_name: str | None = None
     # Sprint 7.3: optional referral code passed from the ?ref= URL
     # parameter. When present and valid, the new user gets linked to
     # the referrer and the referrer earns $20 credit on paid
@@ -108,12 +112,18 @@ class UserRegister(BaseModel):
 
     @field_validator("first_name")
     @classmethod
-    def first_name_validation(cls, v: str) -> str:
+    def first_name_validation(cls, v: str | None) -> str | None:
+        # None allowed at the schema layer (verified flow sets it at verify); the
+        # legacy handler enforces presence. A provided value must meet the rules.
+        if v is None:
+            return None
         return _validate_required_name(v, "First name")
 
     @field_validator("last_name")
     @classmethod
-    def last_name_validation(cls, v: str) -> str:
+    def last_name_validation(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
         return _validate_required_name(v, "Last name")
 
     @field_validator("ref")
@@ -316,17 +326,30 @@ class VerifyEmailRequest(BaseModel):
     """POST /auth/verify-email — redeem the emailed verification link.
 
     `token` is the short-lived single-use verification JWT (aud=bridgeleads-verify)
-    minted by /auth/register. `new_password` is set HERE, by whoever proves
-    control of the email — NOT at register — so an attacker-initiated signup that
-    the address owner confirms cannot end up with an attacker-known password. It
-    is validated against the SAME policy as registration."""
+    minted by /auth/register. `new_password` AND the first/last name are set HERE,
+    by whoever proves control of the email — NOT at register — so an attacker-
+    initiated signup that the address owner confirms cannot end up with an
+    attacker-known password OR an attacker-chosen display name. Names + password
+    are validated against the SAME policies as registration."""
     token: str = Field(max_length=4096)  # bound — a JWT is ~hundreds of bytes
     new_password: str
+    first_name: str
+    last_name: str
 
     @field_validator("new_password")
     @classmethod
     def password_policy(cls, v: str) -> str:
         return _validate_password_rules(v)
+
+    @field_validator("first_name")
+    @classmethod
+    def first_name_policy(cls, v: str) -> str:
+        return _validate_required_name(v, "First name")
+
+    @field_validator("last_name")
+    @classmethod
+    def last_name_policy(cls, v: str) -> str:
+        return _validate_required_name(v, "Last name")
 
 
 class LoginResponse(BaseModel):

@@ -23,6 +23,8 @@ from src.db import PendingRegistration, User
 from src.utils.crypto import blind_index
 
 _PASSWORD = "SecurePass1!"
+_VERIFY_FIRST = "Verifier"
+_VERIFY_LAST = "Owner"
 
 
 def _email() -> str:
@@ -30,13 +32,23 @@ def _email() -> str:
 
 
 def _legacy_body(email: str) -> dict:
-    """Legacy flow requires a password at register."""
+    """Legacy flow requires a password AND name at register."""
     return {"first_name": "Test", "last_name": "User", "email": email, "password": _PASSWORD}
 
 
 def _verified_body(email: str) -> dict:
-    """Verified flow collects NO password at register (set at verify)."""
-    return {"first_name": "Test", "last_name": "User", "email": email}
+    """Verified flow collects ONLY email at register (password + name set at verify)."""
+    return {"email": email}
+
+
+def _verify_body(token: str, password: str = _PASSWORD) -> dict:
+    """Verify body: password AND name are set HERE by the verifier (not at register)."""
+    return {
+        "token": token,
+        "new_password": password,
+        "first_name": _VERIFY_FIRST,
+        "last_name": _VERIFY_LAST,
+    }
 
 
 async def _clear_pending(db, email: str) -> None:
@@ -112,11 +124,15 @@ async def test_verify_sets_the_verifier_password_and_auto_logs_in(client: AsyncC
     pending = (await _pending_for(db, email))[0]
     token = _mint_verify_token(pending.id, pending.expires_at)
 
-    rv = await client.post("/auth/verify-email", json={"token": token, "new_password": chosen_pw})
+    rv = await client.post("/auth/verify-email", json=_verify_body(token, chosen_pw))
     assert rv.status_code == 200
     assert rv.json().get("access_token")
 
-    assert (await db.execute(select(User).where(User.email_hmac == ehmac))).scalar_one_or_none() is not None
+    # The created account's NAME comes from the verifier (set at verify), NOT from
+    # whatever was submitted at register — closes the attacker-set-display-name gap.
+    user = (await db.execute(select(User).where(User.email_hmac == ehmac))).scalar_one_or_none()
+    assert user is not None
+    assert user.first_name == _VERIFY_FIRST and user.last_name == _VERIFY_LAST
     assert len(await _pending_for(db, email)) == 0
 
     rl = await client.post("/auth/login", json={"email": email, "password": chosen_pw})
@@ -131,18 +147,76 @@ async def test_verify_link_is_single_use(client: AsyncClient, db, monkeypatch):
     token = _mint_verify_token(pending.id, pending.expires_at)
 
     assert (
-        await client.post("/auth/verify-email", json={"token": token, "new_password": _PASSWORD})
+        await client.post("/auth/verify-email", json=_verify_body(token))
     ).status_code == 200
     # Second redemption of the same link must fail (pending consumed).
     assert (
-        await client.post("/auth/verify-email", json={"token": token, "new_password": _PASSWORD})
+        await client.post("/auth/verify-email", json=_verify_body(token))
     ).status_code == 400
 
 
 async def test_verify_rejects_invalid_token(client: AsyncClient, monkeypatch):
     monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", True)
-    r = await client.post("/auth/verify-email", json={"token": "not-a-jwt", "new_password": _PASSWORD})
+    r = await client.post("/auth/verify-email", json=_verify_body("not-a-jwt"))
     assert r.status_code == 400
+
+
+async def test_verified_register_does_not_persist_submitted_name(client: AsyncClient, db, monkeypatch):
+    """Even if a name is submitted at register, the verified flow must NOT store it
+    on the pending row — the name is set by the verifier. Otherwise an attacker
+    could seed a victim-verified account's display name (the gap #6 closes)."""
+    monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", True)
+    email = _email()
+    r = await client.post(
+        "/auth/register",
+        json={"email": email, "first_name": "Attacker", "last_name": "Chosen"},
+    )
+    assert r.status_code == 200
+    pending = (await _pending_for(db, email))[0]
+    assert pending.first_name is None and pending.last_name is None
+    await _clear_pending(db, email)
+
+
+async def test_reset_link_uses_url_fragment(client: AsyncClient, db, monkeypatch):
+    """#7: the password-reset link carries the token in the URL fragment (#token=),
+    not the query string, so it can't leak via server logs / Referer."""
+    import src.workers.delivery as delivery
+
+    monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", False)
+    captured: list[str] = []
+    monkeypatch.setattr(delivery, "send_password_reset_email", lambda email, link: captured.append(link))
+    email = _email()
+    assert (await client.post("/auth/register", json=_legacy_body(email))).status_code == 201
+
+    r = await client.post("/auth/forgot-password", json={"email": email})
+    assert r.status_code == 200
+    assert captured and "/reset-password#token=" in captured[0]
+    assert "/reset-password?token=" not in captured[0]
+
+
+async def test_legacy_register_requires_name(client: AsyncClient, monkeypatch):
+    """Legacy flow (flag off): a missing first/last name is a 422, like a missing
+    password — name is only Optional on the schema to support the verified flow."""
+    monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", False)
+    r = await client.post(
+        "/auth/register",
+        json={"email": _email(), "password": _PASSWORD},  # no first/last name
+    )
+    assert r.status_code == 422
+
+
+async def test_verify_requires_name(client: AsyncClient, db, monkeypatch):
+    """Verified flow: the verify body must carry first/last name (422 if absent)."""
+    monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", True)
+    email = _email()
+    await client.post("/auth/register", json=_verified_body(email))
+    pending = (await _pending_for(db, email))[0]
+    token = _mint_verify_token(pending.id, pending.expires_at)
+    r = await client.post(
+        "/auth/verify-email", json={"token": token, "new_password": _PASSWORD}  # no name
+    )
+    assert r.status_code == 422
+    await _clear_pending(db, email)
 
 
 async def test_reregistration_creates_separate_pending_rows(client: AsyncClient, db, monkeypatch):
@@ -188,7 +262,7 @@ async def test_dispatcher_sends_due_row_and_marks_sent(client: AsyncClient, db, 
     _dispatch_pending_verification_emails_impl()
 
     assert len(sent) == 1 and sent[0][0] == email
-    assert "/verify-email?token=" in sent[0][1]
+    assert "/verify-email#token=" in sent[0][1]  # token in fragment, not query
     rows = await _pending_for(db, email)
     assert len(rows) == 1
     assert rows[0].email_dispatch_state == "sent"

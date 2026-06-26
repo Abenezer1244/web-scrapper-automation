@@ -19,7 +19,6 @@ from src.api.schemas import (
     ConnectorCreate,
     ConnectorResponse,
     DeliverConfig,
-    JobResponse,
     ScraperConfigCreate,
     ScraperConfigResponse,
     ScraperConfigUpdate,
@@ -196,18 +195,17 @@ async def _build_scraper_config(
     current_user,
     body: ScraperConfigCreate,
     request: Request,
-    *,
-    active: bool,
 ) -> ScraperConfig:
     """Validate the payload (connector/record-type, entitlements, doc-types, plan
     gates) via the shared helpers and persist a ScraperConfig, then return it
-    (flushed, not committed). Shared by POST /scrapers (an active scheduled
-    scraper) and POST /scrapers/preview (an inactive one-off snapshot) so the gates
-    can't drift — and PATCH reuses the same helpers, so all three agree.
+    (flushed, not committed). Used by POST /scrapers; PATCH reuses the same
+    validation helpers, so create and edit can't drift.
 
-    active=False → preview snapshot: frequency forced to "manual" (belt) and the
-    dispatcher's ``where(ScraperConfig.active)`` filter keeps it out of the beat
-    (suspenders).
+    The config is always ``active=True`` (visible on the dashboard, usable). Whether
+    it auto-runs is governed solely by ``schedule.frequency``: the dispatcher skips
+    ``frequency == "manual"`` (see scheduler_helpers/dispatch.py), so a manual config
+    is visible but never fires on the beat. "active" = visible/usable; "frequency" =
+    recurrence — the two are independent.
     """
     await _validate_connector_supports(db, body.county, body.state, body.record_type)
 
@@ -249,10 +247,6 @@ async def _build_scraper_config(
     )
 
     schedule = body.schedule.model_dump()
-    if not active:
-        # A preview snapshot must never schedule — force manual (belt; the
-        # active=False filter is the suspenders).
-        schedule["frequency"] = "manual"
     config = ScraperConfig(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
@@ -267,7 +261,7 @@ async def _build_scraper_config(
         skip_trace_enabled=body.skip_trace_enabled,
         doc_types=body.doc_types,  # Phase 2b: None = legacy/full output
         include_living_owner_tod=eff_include_living_owner_tod,  # Phase 3
-        active=active,
+        active=True,  # visible/usable; recurrence is governed by schedule.frequency
     )
     db.add(config)
     await db.flush()
@@ -275,10 +269,9 @@ async def _build_scraper_config(
 
 
 def _audit_config(request: Request, action: str, user_id: str, config: ScraperConfig) -> None:
-    """Audit a scraper-config creation. Called by the endpoints AFTER all gates
-    pass (and, for previews, after the run is enqueued) so a 402 / failed commit
-    can never leave a false 'created' audit record (audit_log commits its own
-    transaction, so it must fire only on the success path — Codex)."""
+    """Audit a scraper-config creation. Called AFTER all gates pass so a 402 /
+    failed commit can never leave a false 'created' audit record (audit_log commits
+    its own transaction, so it must fire only on the success path — Codex)."""
     audit_log(
         request, action, user_id,
         f"config_id={config.id} county={config.county}/{config.state} "
@@ -293,37 +286,13 @@ async def create_scraper(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> ScraperConfigResponse:
-    """Create a real, active, scheduled scraper. The frontend then POSTs /jobs
-    to kick off the first run ("Save & run")."""
-    config = await _build_scraper_config(db, current_user, body, request, active=True)
+    """Create a scraper config and return it. The frontend then POSTs /jobs to kick
+    off the first run ("Start run"). The config is always active (visible on the
+    dashboard); it only auto-runs if its schedule.frequency is recurring (the
+    dispatcher skips frequency="manual")."""
+    config = await _build_scraper_config(db, current_user, body, request)
     _audit_config(request, "scraper_created", current_user.id, config)
     return ScraperConfigResponse.model_validate(config)
-
-
-@router.post("/preview", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
-async def preview_scraper(
-    body: ScraperConfigCreate,
-    request: Request,
-    current_user: CurrentUser,
-    db: AsyncSession = Depends(get_rls_db),
-) -> JobResponse:
-    """"Run once": run the configured scrape a SINGLE time without creating a
-    scheduled scraper. Persists an INACTIVE config snapshot (the FK target a Job
-    requires), then runs a ``trigger="preview"`` job against it. The scheduler's
-    active-only filter never picks the snapshot up, so the user gets results now
-    without a surprise recurring scraper. Billed/quota-gated exactly like a
-    normal run (it scrapes real records) via the shared enqueue helper.
-    """
-    await rate_limit(request, zone="jobs", identifier=current_user.id)
-    config = await _build_scraper_config(db, current_user, body, request, active=False)
-    # Import here to avoid a route-module import cycle at load time.
-    from src.api.routes.jobs import enqueue_scrape_job
-    # enqueue_scrape_job enforces the AI/record quota gates and commits the
-    # config+job atomically; audit only AFTER it succeeds (it also emits its own
-    # job_created audit), so a 402 leaves no false "preview created" record.
-    job = await enqueue_scrape_job(db, current_user, config, "preview", request)
-    _audit_config(request, "scraper_preview_created", current_user.id, config)
-    return JobResponse.model_validate(job)
 
 
 @router.get("/connectors", response_model=list[ConnectorResponse])

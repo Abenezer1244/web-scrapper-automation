@@ -5959,7 +5959,7 @@
         ]
       },
       "post": {
-        "description": "Create a real, active, scheduled scraper. The frontend then POSTs /jobs\nto kick off the first run (\"Save & run\").",
+        "description": "Create a scraper config and return it. The frontend then POSTs /jobs to kick\noff the first run (\"Start run\"). The config is always active (visible on the\ndashboard); it only auto-runs if its schedule.frequency is recurring (the\ndispatcher skips frequency=\"manual\").",
         "operationId": "create_scraper_scrapers_post",
         "requestBody": {
           "content": {
@@ -6092,53 +6092,6 @@
           }
         ],
         "summary": "Create Connector",
-        "tags": [
-          "scrapers"
-        ]
-      }
-    },
-    "/scrapers/preview": {
-      "post": {
-        "description": "\"Run once\": run the configured scrape a SINGLE time without creating a\nscheduled scraper. Persists an INACTIVE config snapshot (the FK target a Job\nrequires), then runs a ``trigger=\"preview\"`` job against it. The scheduler's\nactive-only filter never picks the snapshot up, so the user gets results now\nwithout a surprise recurring scraper. Billed/quota-gated exactly like a\nnormal run (it scrapes real records) via the shared enqueue helper.",
-        "operationId": "preview_scraper_scrapers_preview_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ScraperConfigCreate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/JobResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
-        "summary": "Preview Scraper",
         "tags": [
           "scrapers"
         ]

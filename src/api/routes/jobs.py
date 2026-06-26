@@ -75,20 +75,15 @@ async def enqueue_scrape_job(
     request: Request,
 ) -> "Job":
     """Enforce AI/record-quota gates, create a pending Job for `config`, commit,
-    then enqueue the Celery scrape task. Shared by POST /jobs (manual/scheduled
-    runs against an ACTIVE config) and the scraper-preview endpoint (a one-off
-    `trigger="preview"` run against an inactive snapshot) so the entitlement,
-    quota, billing, and commit-then-enqueue contract can't drift between them.
+    then enqueue the Celery scrape task. The single entry point for POST /jobs
+    (manual + scheduled runs) so the entitlement, quota, billing, and
+    commit-then-enqueue contract is enforced in exactly one place.
 
-    The caller owns config lookup/creation (and its active/inactive policy); this
-    helper never re-checks `config.active`, so it can run a deliberately-inactive
-    preview config the scheduler will never pick up.
+    The caller owns config lookup/creation; this helper never re-checks
+    `config.active`.
     """
     # Execution-time entitlement guard (audit-mode until ENTITLEMENT_ENFORCEMENT).
     # An existing config can outlive a downgrade; re-validate against CURRENT plan.
-    # Shared helper => this also gates the one-off preview run, which is correct:
-    # a preview is a real scrape (trigger="preview"), so it must obey the same
-    # county/record-type entitlement as a normal run.
     from datetime import UTC, datetime
 
     from src.api.entitlements import ConfigRow, config_run_violation, enforce_runnable_http
@@ -100,13 +95,11 @@ async def enqueue_scrape_job(
         ).where(ScraperConfig.user_id == current_user.id, ScraperConfig.active)
     )).all()
     rows = [ConfigRow(*r) for r in active_rows]
-    # The config being run must count toward its OWN county claim. On the preview
-    # path the config is INACTIVE (a one-off snapshot, absent from active_rows), so
-    # without this a brand-new preview county would be judged outside the allowed
-    # set even when the user is under their county cap. Treat it as an active claim;
-    # allowed_county_set dedupes by county, so this is a no-op when the config is
-    # already active (the normal create_job path). created_at may be unset on a
-    # freshly-flushed preview snapshot — fall back to now so slot ordering is sane.
+    # The config being run must count toward its OWN county claim. Defensive: if a
+    # visibility/replication gap left it out of active_rows, this still judges it
+    # inside the allowed set when the user is under their county cap. allowed_county_set
+    # dedupes by county, so this is a no-op on the normal path (the config is already
+    # active and present). created_at falls back to now if unset so slot ordering is sane.
     rows.append(ConfigRow(
         config.id, config.state, config.county, config.record_type,
         config.created_at or datetime.now(UTC), True, None,
@@ -234,8 +227,7 @@ async def create_job(
     await rate_limit(request, zone="jobs", identifier=current_user.id)
 
     # Verify scraper config belongs to user AND is active (a manual "Run now"
-    # only targets a real, non-soft-deleted scraper). The preview endpoint
-    # deliberately does NOT go through here — it runs an inactive snapshot.
+    # only targets a real, non-soft-deleted scraper).
     config_result = await db.execute(
         select(ScraperConfig).where(
             ScraperConfig.id == body.scraper_config_id,

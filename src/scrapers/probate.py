@@ -486,7 +486,7 @@ def new_probate_config_tod_default(
 
     Grandfathering (``None`` => include) is for PRE-EXISTING configs only. This makes
     ``None`` on a stored row unambiguous: "created before the toggle existed" — never
-    "a new config that happens to want everything". Shared by the create, preview, and
+    "a new config that happens to want everything". Shared by the create and
     batch paths so their default can never drift.
     """
     if record_type == "probate" and provided is None:

@@ -19,6 +19,21 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-26 — Dashboard recency order + "View" opens the scraper's real records
+**Built / Shipped (frontend-only, bridgeleads-web PR #68 → master):** Two follow-up fixes after the single-Start-run ship, both from user reports on the admin account.
+- **Recency-first scraper list.** The dashboard "Scrapers / Live status" table caps at 8 and sorted by `attentionRank` (running first), so a fresh *completed* scrape sank to the bottom and, at 8 active scrapers, fell off the visible list — the user ran "sno pre" and "didn't see it". Now it sorts by the newest job's `created_at` (fallback `config.created_at`) descending, so a new or re-run scrape is always row 1 and pushes the oldest into "All scrapers". Removed the now-dead `attentionRank` helper.
+- **"View" opens the scraper's ACTUAL records.** Both the dashboard table and the `/scrapers` list linked View to `/scrapers/{id}/records`, which reads the shared `county_records` cache keyed by county (not the config/job). Verified against prod: that cache is **empty** for many counties (snohomish → 0) and stale/unrelated for others (pierce → 647 rows, all `doc_type` NULL), so "View opened but showed no records". Now View → `/results/{latestDoneJob.id}` (the job's real `results` via `GET /jobs/{id}/results`). Live-verified: View on "sno pre" now shows its 3 records (party names, parcels, mailing addrs, phones).
+
+**Tried / Decided:** Root-caused with a read-only prod query (county_records vs results counts) before touching code — the records were never missing, the link pointed at the wrong store. Kept the `county_records` cache page as the fallback for genuinely never-run configs (it IS a county-cache browser); did NOT rip it out. Pure-recency sort per the user's explicit ask (dropped the attention-priority float).
+
+**Caught & fixed (Codex review):** P2 — the View link fell back to the empty cache whenever `doneJob`/`latestDone` was transiently `undefined`, i.e. during the window before the `jobs` query resolves (or on error), which would re-introduce the empty-cache bug for scrapers that HAVE completed runs. Fixed by gating the cache fallback on the jobs query's `isSuccess` (threaded `jobsLoaded` through dashboard page → ScrapersTable → ScraperRow, and added it to the `/scrapers` list); during loading, View routes to the `/results` index instead of the empty cache. Codex re-review came back CLEAN.
+
+**Failed / Blocked:** none. CI green first try; live-verified in prod (recency order correct, View shows records). Headless browse session dropped to about:blank / logged out twice mid-check (re-login fixed it) — screenshots were the reliable verification, not JS evals.
+
+**Facts learned:** `/scrapers/{id}/records` (county_records) and `/results/{job_id}` (results) are DIFFERENT data stores — county_records is a shared, inconsistently-populated county cache; per-user scrape output lives in `results` keyed by `job_id`. For "show me what THIS scraper produced", always use `/results/{job}`. The dashboard's `MAX_ROWS = 8` cap with a "View all N" overflow means ordering matters: recency keeps the user's latest run visible.
+
+---
+
 ## 2026-06-26 — Single "Start run": kill the invisible one-off preview path
 **Built / Shipped:** User reported "I scraped and nothing showed on the dashboard." Cross-checked the live DB: the run (`new test pro`, Pierce/probate) actually succeeded — job `daab0414` `done`, 9 records. It was created via **"Run once"** (`POST /scrapers/preview`, shipped same day), which persists the config `active=False`. `GET /scrapers` is active-only, and the dashboard Scrapers table + ACTIVE-scrapers KPI both derive from it, so the run was invisible forever (no run-history page exists). Fix shipped both repos:
 - **Backend PR #128 → main (`493072a`):** deleted `POST /scrapers/preview`; `_build_scraper_config` dropped its `active` param (always `active=True`); removed `JobResponse` import; cleaned stale preview comments (`jobs.py`/`probate.py`); regenerated `schema/openapi.json` (60→59 paths). Test `tests/test_scraper_single_start_run.py`: preview endpoint 404/405; `_build_scraper_config` has no `active` param. Railway auto-deploy (no migration).

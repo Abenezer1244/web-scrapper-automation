@@ -19,6 +19,24 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-06-26 — Single "Start run": kill the invisible one-off preview path
+**Built / Shipped:** User reported "I scraped and nothing showed on the dashboard." Cross-checked the live DB: the run (`new test pro`, Pierce/probate) actually succeeded — job `daab0414` `done`, 9 records. It was created via **"Run once"** (`POST /scrapers/preview`, shipped same day), which persists the config `active=False`. `GET /scrapers` is active-only, and the dashboard Scrapers table + ACTIVE-scrapers KPI both derive from it, so the run was invisible forever (no run-history page exists). Fix shipped both repos:
+- **Backend PR #128 → main (`493072a`):** deleted `POST /scrapers/preview`; `_build_scraper_config` dropped its `active` param (always `active=True`); removed `JobResponse` import; cleaned stale preview comments (`jobs.py`/`probate.py`); regenerated `schema/openapi.json` (60→59 paths). Test `tests/test_scraper_single_start_run.py`: preview endpoint 404/405; `_build_scraper_config` has no `active` param. Railway auto-deploy (no migration).
+- **Frontend PR #67 → master (bridgeleads-web):** wizard collapsed to one **"Start run"** button (removed "Run once" + dead `handleTestRun`/`testRunLoading`/`previewScraper`); dashboard `["scrapers"]` query now `refetchInterval:5000` (was no polling → a new scraper stayed invisible until refocus); regenerated `lib/api-types.generated.ts` from backend main. Vercel auto-deploy.
+- **Data:** flipped admin's `new test pro` `active=False→True` (frequency `manual`, won't auto-run) so the user's run surfaces.
+
+**Tried / Decided:** My first instinct ("just collapse to Save & run") was wrong — Codex's consult sharpened it: the real defect is that `active` conflated *visible/usable* with *scheduled/recurring*. They're already independent — the dispatcher skips `frequency=="manual"` (`scheduler_helpers/dispatch.py:99`). So the single button creates `active=True` + default `frequency=manual`: visible on the dashboard, run once, never auto-runs unless the user picks a schedule. Avoids surprise recurring billing. Deleted the preview endpoint rather than leaving it dormant (Codex: keeping it preserves the footgun; no tests/callers/external clients depend on it; `POST /jobs` only accepts `manual|test`, never `preview`).
+
+**Failed / Blocked:** none. Both CI suites green first try (BE Test 3m37s; FE drift-check + tsc + lint + build). No force-merge.
+
+**Caught & fixed:** `User.email` is an `EncryptedString` — my reactivation guard's `WHERE email==...` matched nothing; fixed by finding the config by (plaintext) name and decrypting the owner email in Python. Sequenced the cross-repo merge correctly (backend→main first, THEN `gen:api-types` pulls main, commit types, merge frontend) so the frontend drift-check gate passed.
+
+**Pending / Handoff:** none — both deployed. Built in isolated worktrees off origin/main + origin/master (other sessions held `feat/fields-output-visibility` BE / `feat/schedule-day-picker` FE); worktrees removed after merge, branches left intact (no-delete rule).
+
+**Facts learned:** `active` = visible/usable; `schedule.frequency` = recurrence — strictly independent, the dispatcher is the only thing that reads frequency for auto-dispatch (`==manual` → skip). The frontend's `gen:api-types` pulls `schema/openapi.json` from the backend **main** raw URL, so any endpoint change is a strict ordering dependency: merge backend first or the frontend drift gate fails. The conftest `db` fixture teardown deletes ScraperConfig/Job/test-user rows and runs against the prod `.env` locally — tests that must run locally have to avoid the `db` fixture entirely.
+
+---
+
 ## 2026-06-25 — Verification-email durability: cross-check → Codex-driven outbox + hardening
 **Built / Shipped:** Cross-checked the login-security build (BE #125/#126, FE #59) independently + with three
 adversarial Codex passes. Build was sound and merge-safe (flag off). Then fixed the real gaps Codex surfaced,

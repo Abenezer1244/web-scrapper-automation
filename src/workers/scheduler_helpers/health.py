@@ -22,10 +22,22 @@ _WATCHDOG_REDELIVER_LIMIT = 500
 # exist further back) from a genuinely broken scraper (nothing anywhere). Some WA
 # recorder portals publish on a delay — e.g. Chelan's AcclaimWeb banner reads
 # "Released through 04/21/2026" ~2 months behind — so the current week is
-# legitimately empty while the portal is fine. Ordered nearest-first; the probe
-# stops at the first window that yields a record. A single fixed window would
-# false-flag low-volume rural counties, so we span ~2-month to ~9-month lag.
-_CANARY_HISTORICAL_WINDOWS = [(90, 60), (270, 240)]
+# legitimately empty while the portal is fine.
+#
+# Cost (Codex review P2): scrape() extracts the WHOLE window before returning, so
+# a wide window on a busy county pages through everything just to confirm >=1
+# record. We therefore order CHEAP-FIRST and stop at the first hit: a 7-day window
+# (~1 chunk, same cost as the live probe) catches busy/medium counties
+# immediately; only sparse or broken counties fall through to the wider safety-net
+# windows, and those have few/no rows so extraction stays cheap. A single fixed
+# window would false-flag low-volume rural counties (verified: clallam files <1
+# probate/pre_foreclosure in some 30-day spans), so a 30-day safety net at ~8
+# months backstops the cheap probe. We deliberately cap the net at 30 days (not
+# wider): these scrapers chunk by 7 days, so a 90+ day window pages through 13-26
+# sequential loads regardless of row count — exactly the cost we are avoiding.
+# Stage 2 runs ONLY for non-healthy connectors, bounding how often this fires; the
+# 30-day net (~4 chunks) is the proven clallam-recovery window.
+_CANARY_HISTORICAL_WINDOWS = [(90, 83), (270, 240)]
 
 
 def _watchdog_stuck_jobs_impl() -> None:

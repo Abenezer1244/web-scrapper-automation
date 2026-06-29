@@ -370,6 +370,14 @@ class EagleWebScraper(BridgeScraper):
         # Leave "Search All Types" checked — filter by type during extraction
         _logger.info("Searching all types, will filter '%s' during extraction", record_type)
 
+        # Lag-aware date submit state (consumed by _submit_search). Default: the
+        # typed dates stuck, so the normal click-submit path runs. If a "text
+        # calendar" widget reverts typed input to its min default (Lewis), we flip
+        # _eagleweb_date_reverted and _submit_search raw-sets+submits instead.
+        self._eagleweb_date_field_ids = None
+        self._eagleweb_date_reverted = False
+        self._eagleweb_search_window = (date_from, date_to)
+
         # Fill dates using pressSequentially (simulates real keystrokes).
         # This is critical — fill() doesn't trigger EagleWeb's internal JS
         # event handlers, but pressSequentially does.
@@ -393,12 +401,19 @@ class EagleWebScraper(BridgeScraper):
             filled = False
             for start_id, end_id in [
                 ("RecDateIDStart", "RecDateIDEnd"),
+                # Lewis uses #RecordingDateIDStart (capital R/D). CSS #id and
+                # getElementById are case-sensitive, so the lowercase variant
+                # below never matched it — Lewis fell to the fragile fallback.
+                ("RecordingDateIDStart", "RecordingDateIDEnd"),
                 ("recordingDateIDStart", "recordingDateIDEnd"),
                 ("StartDate", "EndDate"),
             ]:
                 start_el = self.page.locator(f"#{start_id}")
                 end_el = self.page.locator(f"#{end_id}")
                 if await start_el.count() > 0 and await end_el.count() > 0:
+                    # Capture the pre-fill default so we can tell a value that
+                    # STUCK from one the widget reverted (see below).
+                    default_start = (await start_el.get_attribute("value") or "").strip()
                     # Clear and type start date
                     await start_el.click()
                     await start_el.fill("")  # clear first
@@ -408,7 +423,23 @@ class EagleWebScraper(BridgeScraper):
                     await end_el.fill("")  # clear first
                     await end_el.press_sequentially(date_to, delay=30)
                     filled = True
-                    _logger.info("Date range typed: %s to %s", date_from, date_to)
+                    self._eagleweb_date_field_ids = (start_id, end_id)
+                    # Did it stick? Lewis's "text calendar" widget reverts typed
+                    # input to its min default (07/04/1848) on each input/blur, so
+                    # the field still shows the default here. Compare against the
+                    # PRE-FILL default (robust to harmless reformatting like
+                    # 06/22 -> 6/22 that other counties do). On revert, flag for
+                    # the raw-set+submit path; clallam/thurston stick and keep the
+                    # normal keystroke flow unchanged.
+                    after_start = (await start_el.get_attribute("value") or "").strip()
+                    if after_start == default_start and default_start != date_from:
+                        self._eagleweb_date_reverted = True
+                        _logger.info(
+                            "Date field #%s reverted to default %r — will raw-set+submit",
+                            start_id, default_start,
+                        )
+                    else:
+                        _logger.info("Date range typed: %s to %s", date_from, date_to)
                     break
 
             if not filled:
@@ -477,6 +508,41 @@ class EagleWebScraper(BridgeScraper):
         unlike clicking the submit button which gets stuck on the
         intermediate docSearchPOST.jsp page in headless mode.
         """
+        # Lewis-style "text calendar" path: when _configure_search detected the
+        # typed dates reverting to the widget min, the field currently shows the
+        # full 1848->today default range. Set the raw field values and submit in
+        # ONE JS transaction so no input/change/blur fires before the POST — that
+        # is what makes the date stick (verified against Lewis). Falls through to
+        # the normal submit on any failure.
+        if getattr(self, "_eagleweb_date_reverted", False) and getattr(
+            self, "_eagleweb_date_field_ids", None
+        ):
+            start_id, end_id = self._eagleweb_date_field_ids
+            df, dt = self._eagleweb_search_window
+            try:
+                async with self.page.expect_navigation(
+                    url="**/docSearchResults*", timeout=60_000, wait_until="domcontentloaded"
+                ):
+                    await self.page.evaluate(
+                        """(d) => {
+                            const s = document.getElementById(d.s);
+                            const e = document.getElementById(d.e);
+                            s.value = d.a;
+                            e.value = d.b;
+                            const form = s.form || document.querySelector('form');
+                            HTMLFormElement.prototype.submit.call(form);
+                        }""",
+                        {"s": start_id, "e": end_id, "a": df, "b": dt},
+                    )
+                _logger.info("Raw-set+submit reached results: %s", self.page.url)
+                await self.page.wait_for_timeout(2_000)
+                return
+            except Exception as exc:
+                _logger.warning(
+                    "Raw-set+submit did not reach results (%s); using normal submit",
+                    str(exc)[:80],
+                )
+
         try:
             submit = self.page.locator("input[type='submit'][value='Search']")
             if await submit.count() == 0:

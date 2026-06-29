@@ -370,12 +370,11 @@ class EagleWebScraper(BridgeScraper):
         # Leave "Search All Types" checked — filter by type during extraction
         _logger.info("Searching all types, will filter '%s' during extraction", record_type)
 
-        # Lag-aware date submit state (consumed by _submit_search). Default: the
-        # typed dates stuck, so the normal click-submit path runs. If a "text
-        # calendar" widget reverts typed input to its min default (Lewis), we flip
-        # _eagleweb_date_reverted and _submit_search raw-sets+submits instead.
+        # Date-submit state (consumed by _submit_search). When a known date-field
+        # id pair is matched below, _submit_search uses an atomic raw-set+submit
+        # (no blur) so the date window actually posts; an unmatched/fallback
+        # layout leaves ids None and uses the normal click/form.submit path.
         self._eagleweb_date_field_ids = None
-        self._eagleweb_date_reverted = False
         self._eagleweb_search_window = (date_from, date_to)
 
         # Fill dates using pressSequentially (simulates real keystrokes).
@@ -411,35 +410,27 @@ class EagleWebScraper(BridgeScraper):
                 start_el = self.page.locator(f"#{start_id}")
                 end_el = self.page.locator(f"#{end_id}")
                 if await start_el.count() > 0 and await end_el.count() > 0:
-                    # Capture the pre-fill default so we can tell a value that
-                    # STUCK from one the widget reverted (see below).
-                    default_start = (await start_el.get_attribute("value") or "").strip()
-                    # Clear and type start date
+                    # Type the dates into the live input value. This alone is NOT
+                    # enough: clicking the Search button blurs the date field, and
+                    # some EagleWeb date widgets (Lewis's "text calendar", and the
+                    # plain inputs on clallam/thurston) reset .value to their min
+                    # default on blur — so the form then posts the full
+                    # 1848->today range (slow, intermittently bounces) or an empty
+                    # window. When the field ids are known, _submit_search instead
+                    # sets the raw values and submits in ONE JS transaction (no
+                    # blur), which is the reliable path (verified Lewis/thurston/
+                    # clallam). The typing here is harmless belt-and-suspenders.
                     await start_el.click()
                     await start_el.fill("")  # clear first
                     await start_el.press_sequentially(date_from, delay=30)
-                    # Clear and type end date
                     await end_el.click()
                     await end_el.fill("")  # clear first
                     await end_el.press_sequentially(date_to, delay=30)
                     filled = True
                     self._eagleweb_date_field_ids = (start_id, end_id)
-                    # Did it stick? Lewis's "text calendar" widget reverts typed
-                    # input to its min default (07/04/1848) on each input/blur, so
-                    # the field still shows the default here. Compare against the
-                    # PRE-FILL default (robust to harmless reformatting like
-                    # 06/22 -> 6/22 that other counties do). On revert, flag for
-                    # the raw-set+submit path; clallam/thurston stick and keep the
-                    # normal keystroke flow unchanged.
-                    after_start = (await start_el.get_attribute("value") or "").strip()
-                    if after_start == default_start and default_start != date_from:
-                        self._eagleweb_date_reverted = True
-                        _logger.info(
-                            "Date field #%s reverted to default %r — will raw-set+submit",
-                            start_id, default_start,
-                        )
-                    else:
-                        _logger.info("Date range typed: %s to %s", date_from, date_to)
+                    _logger.info(
+                        "Date range entered: %s to %s (#%s)", date_from, date_to, start_id
+                    )
                     break
 
             if not filled:
@@ -508,15 +499,15 @@ class EagleWebScraper(BridgeScraper):
         unlike clicking the submit button which gets stuck on the
         intermediate docSearchPOST.jsp page in headless mode.
         """
-        # Lewis-style "text calendar" path: when _configure_search detected the
-        # typed dates reverting to the widget min, the field currently shows the
-        # full 1848->today default range. Set the raw field values and submit in
-        # ONE JS transaction so no input/change/blur fires before the POST — that
-        # is what makes the date stick (verified against Lewis). Falls through to
-        # the normal submit on any failure.
-        if getattr(self, "_eagleweb_date_reverted", False) and getattr(
-            self, "_eagleweb_date_field_ids", None
-        ):
+        # Reliable EagleWeb date submit: clicking the Search button blurs the date
+        # field, and these date widgets reset .value to their min default on blur,
+        # so the normal click-submit posts the full 1848->today range (slow,
+        # intermittently bounces to docSearchPOST) or an empty window. When the
+        # date-field ids are known, set the raw values and submit in ONE JS
+        # transaction so no input/change/blur fires before the POST — verified to
+        # post the correct window on Lewis (0->12), thurston (0->38), clallam (1).
+        # Falls through to the normal submit on any failure.
+        if getattr(self, "_eagleweb_date_field_ids", None):
             start_id, end_id = self._eagleweb_date_field_ids
             df, dt = self._eagleweb_search_window
             try:

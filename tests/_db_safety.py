@@ -33,8 +33,12 @@ from urllib.parse import parse_qsl, urlparse
 #   1. its name ends with one of these suffixes, and
 #   2. its host is localhost OR explicitly allowlisted (TEST_DB_HOST_ALLOWLIST).
 TEST_DB_NAME_SUFFIXES: tuple[str, ...] = ("_test", "_testing")
-# "" covers a UNIX-socket / hostless DSN, which is inherently local.
-_LOCAL_HOSTS: frozenset[str] = frozenset({"localhost", "127.0.0.1", "::1", ""})
+# An EXPLICIT local host is required. A hostless DSN (e.g.
+# ``postgresql+asyncpg:///bridgeleads_test``) is rejected, NOT treated as local:
+# PostgreSQL drivers fill a missing host from ``PGHOST``, which could point at a
+# remote/prod DB and silently bypass this allowlist. An explicit host below also
+# overrides any ``PGHOST``, so it is the only safe signal.
+_LOCAL_HOSTS: frozenset[str] = frozenset({"localhost", "127.0.0.1", "::1"})
 # libpq / asyncpg / psycopg2 honour these DSN query params and they OVERRIDE the
 # host/db parsed from the URL authority+path. A DSN like
 #   postgresql+asyncpg://localhost/bridgeleads_test?host=prod&dbname=postgres
@@ -78,6 +82,11 @@ def _classify(url: str) -> tuple[bool, str]:
     if not any(name.endswith(s) for s in TEST_DB_NAME_SUFFIXES):
         return False, (
             f"database name {name!r} does not end with one of {TEST_DB_NAME_SUFFIXES}"
+        )
+    if not host:
+        return False, (
+            "DSN has no explicit host; a hostless DSN can resolve to a remote DB "
+            "via PGHOST — set an explicit local host (localhost/127.0.0.1)"
         )
     if host not in _LOCAL_HOSTS and host not in _host_allowlist():
         return False, (

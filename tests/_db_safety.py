@@ -113,13 +113,6 @@ def _abort(reason: str) -> None:
     )
 
 
-def _derive_sync(async_url: str) -> str:
-    """Best-effort async->sync DSN for the optional TEST_DATABASE_URL_SYNC
-    default: swap the asyncpg driver for psycopg2. The result is validated by
-    the same test-DB classifier, so a bad derivation still aborts."""
-    return async_url.replace("+asyncpg", "+psycopg2")
-
-
 def enforce_test_database() -> str:
     """Validate ``TEST_DATABASE_URL`` and pin the environment to it.
 
@@ -134,7 +127,14 @@ def enforce_test_database() -> str:
     if not ok:
         _abort(f"TEST_DATABASE_URL is not a recognised test database: {why}.")
 
-    test_sync = os.environ.get("TEST_DATABASE_URL_SYNC", "").strip() or _derive_sync(test_url)
+    # Require the sync URL explicitly — do NOT derive it. src.db.session rewrites
+    # ":5432/"->":6543/" (Supabase pooler) on the sync URL, so a silently-derived
+    # localhost:5432 sync URL would target a port a plain local Postgres doesn't
+    # expose and break every SyncSessionLocal/sync_engine test. The dev/CI provide
+    # it exactly as they provide DATABASE_URL_SYNC.
+    test_sync = os.environ.get("TEST_DATABASE_URL_SYNC", "").strip()
+    if not test_sync:
+        _abort("TEST_DATABASE_URL_SYNC is not set.")
     ok_sync, why_sync = _classify(test_sync)
     if not ok_sync:
         _abort(f"TEST_DATABASE_URL_SYNC is not a recognised test database: {why_sync}.")

@@ -19,9 +19,16 @@ from src.db.models import User
 from src.db.session import SyncSessionLocal
 from src.workers.scheduler_helpers.billing import _expire_trials_impl
 
+
 # Injected Stripe lookups (replace the live stripe.Subscription.list call).
-LOOKUP_NONE = lambda customer_id: None          # no entitled subscription
-LOOKUP_ACTIVE = lambda customer_id: "active"     # entitled subscriber
+def _lookup_none(customer_id):
+    """No entitled subscription."""
+    return None
+
+
+def _lookup_active(customer_id):
+    """Entitled subscriber."""
+    return "active"
 
 
 def _boom(customer_id):
@@ -85,7 +92,7 @@ def _create(cleanup_users, **kw) -> str:
 
 def test_expired_trial_no_stripe_is_downgraded(cleanup_users):
     uid = _create(cleanup_users, trial_offset_days=-1)
-    _expire_trials_impl(subscription_lookup=LOOKUP_NONE)
+    _expire_trials_impl(subscription_lookup=_lookup_none)
     with SyncSessionLocal() as db:
         assert _get(db, uid).plan == "starter"
 
@@ -97,7 +104,7 @@ def test_ambiguous_row_with_entitled_stripe_sub_is_protected(cleanup_users):
         cleanup_users, trial_offset_days=-1,
         stripe_customer_id="cus_legacy_payer", subscription_status=None,
     )
-    _expire_trials_impl(subscription_lookup=LOOKUP_ACTIVE)
+    _expire_trials_impl(subscription_lookup=_lookup_active)
     with SyncSessionLocal() as db:
         u = _get(db, uid)
         assert u.plan == "pro", "legacy payer must NOT be downgraded"
@@ -111,7 +118,7 @@ def test_ambiguous_row_abandoned_checkout_is_downgraded(cleanup_users):
         cleanup_users, trial_offset_days=-1,
         stripe_customer_id="cus_abandoned", subscription_status=None,
     )
-    _expire_trials_impl(subscription_lookup=LOOKUP_NONE)
+    _expire_trials_impl(subscription_lookup=_lookup_none)
     with SyncSessionLocal() as db:
         u = _get(db, uid)
         assert u.plan == "starter"

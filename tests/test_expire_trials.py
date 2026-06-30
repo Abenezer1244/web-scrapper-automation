@@ -1,10 +1,11 @@
 """expire_trials gates on durable Stripe ENTITLEMENT, not stripe_customer_id.
 
 The old gate (`stripe_customer_id IS NULL`) let a trial user who merely OPENED
-checkout — which creates a customer id but no payment — keep Pro forever after
-their trial. The fix (migration 077) keys on stripe_subscription_id +
-subscription_status: only an entitled status (active/trialing/past_due) protects
-a user from trial expiry.
+checkout — which creates a customer id but no payment — keep Pro forever. The fix
+(migration 077) keys on stripe_subscription_id + subscription_status, and for an
+AMBIGUOUS row (customer id present but status NULL — a legacy payer OR an abandoned
+checkout) it asks Stripe (the source of truth). The Stripe lookup is dependency-
+injected here so tests never hit the network (no mocks).
 
 DB-backed (real Postgres, sync — like test_batch_dispatch). No mocks.
 """
@@ -17,6 +18,14 @@ from src.api.auth import hash_password
 from src.db.models import User
 from src.db.session import SyncSessionLocal
 from src.workers.scheduler_helpers.billing import _expire_trials_impl
+
+# Injected Stripe lookups (replace the live stripe.Subscription.list call).
+LOOKUP_NONE = lambda customer_id: None          # no entitled subscription
+LOOKUP_ACTIVE = lambda customer_id: "active"     # entitled subscriber
+
+
+def _boom(customer_id):
+    raise RuntimeError("stripe down")
 
 
 def _make_user(
@@ -50,8 +59,8 @@ def _make_user(
     return user.id
 
 
-def _plan_of(db, user_id: str) -> str:
-    return db.get(User, user_id).plan
+def _get(db, user_id: str) -> User:
+    return db.get(User, user_id)
 
 
 @pytest.fixture
@@ -66,95 +75,93 @@ def cleanup_users():
         db.commit()
 
 
+def _create(cleanup_users, **kw) -> str:
+    with SyncSessionLocal() as db:
+        uid = _make_user(db, **kw)
+        cleanup_users.append(uid)
+        db.commit()
+    return uid
+
+
 def test_expired_trial_no_stripe_is_downgraded(cleanup_users):
+    uid = _create(cleanup_users, trial_offset_days=-1)
+    _expire_trials_impl(subscription_lookup=LOOKUP_NONE)
     with SyncSessionLocal() as db:
-        uid = _make_user(db, trial_offset_days=-1)
-        cleanup_users.append(uid)
-        db.commit()
+        assert _get(db, uid).plan == "starter"
 
-    _expire_trials_impl()
 
+def test_ambiguous_row_with_entitled_stripe_sub_is_protected(cleanup_users):
+    """Legacy payer: customer id present, status NULL, but Stripe says active.
+    Must be protected AND self-healed (status backfilled so we skip Stripe next run)."""
+    uid = _create(
+        cleanup_users, trial_offset_days=-1,
+        stripe_customer_id="cus_legacy_payer", subscription_status=None,
+    )
+    _expire_trials_impl(subscription_lookup=LOOKUP_ACTIVE)
     with SyncSessionLocal() as db:
-        assert _plan_of(db, uid) == "starter"
+        u = _get(db, uid)
+        assert u.plan == "pro", "legacy payer must NOT be downgraded"
+        assert u.subscription_status == "active", "status should be self-healed"
 
 
-def test_ambiguous_legacy_row_is_not_downgraded(cleanup_users):
-    """Codex P1: a row with a stripe_customer_id but NULL subscription_status is
-    AMBIGUOUS — it could be a legacy payer not yet backfilled. The gate must NOT
-    downgrade it (wrongly downgrading a payer is worse than briefly retaining a
-    freeloader). The Stripe backfill resolves these rows authoritatively; once it
-    sets a non-entitled status, test_..._canceled_subscription covers the downgrade."""
+def test_ambiguous_row_abandoned_checkout_is_downgraded(cleanup_users):
+    """Abandoned checkout: customer id present, status NULL, Stripe shows no
+    entitled sub -> downgrade (this is the original bug, now fixed automatically)."""
+    uid = _create(
+        cleanup_users, trial_offset_days=-1,
+        stripe_customer_id="cus_abandoned", subscription_status=None,
+    )
+    _expire_trials_impl(subscription_lookup=LOOKUP_NONE)
     with SyncSessionLocal() as db:
-        uid = _make_user(
-            db, trial_offset_days=-1,
-            stripe_customer_id="cus_ambiguous_null_status",
-            stripe_subscription_id=None,
-            subscription_status=None,
-        )
-        cleanup_users.append(uid)
-        db.commit()
+        u = _get(db, uid)
+        assert u.plan == "starter"
+        assert u.subscription_status == "canceled", "non-entitlement recorded"
 
-    _expire_trials_impl()
 
+def test_ambiguous_row_is_not_downgraded_on_stripe_error(cleanup_users):
+    """Transient Stripe failure -> never downgrade a possible payer."""
+    uid = _create(
+        cleanup_users, trial_offset_days=-1,
+        stripe_customer_id="cus_x", subscription_status=None,
+    )
+    _expire_trials_impl(subscription_lookup=_boom)
     with SyncSessionLocal() as db:
-        assert _plan_of(db, uid) == "pro", "ambiguous legacy row must be protected"
+        assert _get(db, uid).plan == "pro"
 
 
 @pytest.mark.parametrize("status", ["active", "trialing", "past_due"])
-def test_expired_trial_with_entitled_subscription_is_protected(cleanup_users, status):
+def test_entitled_status_is_protected(cleanup_users, status):
+    uid = _create(
+        cleanup_users, trial_offset_days=-1,
+        stripe_customer_id="cus_paying", stripe_subscription_id="sub_1",
+        subscription_status=status,
+    )
+    _expire_trials_impl(subscription_lookup=_boom)  # must not even call Stripe
     with SyncSessionLocal() as db:
-        uid = _make_user(
-            db, trial_offset_days=-1,
-            stripe_customer_id="cus_paying",
-            stripe_subscription_id="sub_123",
-            subscription_status=status,
-        )
-        cleanup_users.append(uid)
-        db.commit()
+        assert _get(db, uid).plan == "pro", f"{status} must protect from expiry"
 
-    _expire_trials_impl()
 
+def test_canceled_status_is_downgraded(cleanup_users):
+    uid = _create(
+        cleanup_users, trial_offset_days=-1,
+        stripe_customer_id="cus_x", stripe_subscription_id="sub_dead",
+        subscription_status="canceled",
+    )
+    _expire_trials_impl(subscription_lookup=_boom)  # known non-entitled, no Stripe
     with SyncSessionLocal() as db:
-        assert _plan_of(db, uid) == "pro", f"{status} must protect from trial expiry"
-
-
-def test_expired_trial_with_canceled_subscription_is_downgraded(cleanup_users):
-    with SyncSessionLocal() as db:
-        uid = _make_user(
-            db, trial_offset_days=-1,
-            stripe_customer_id="cus_x",
-            stripe_subscription_id="sub_dead",
-            subscription_status="canceled",
-        )
-        cleanup_users.append(uid)
-        db.commit()
-
-    _expire_trials_impl()
-
-    with SyncSessionLocal() as db:
-        assert _plan_of(db, uid) == "starter"
+        assert _get(db, uid).plan == "starter"
 
 
 def test_active_trial_is_not_downgraded(cleanup_users):
+    uid = _create(cleanup_users, trial_offset_days=3)  # trial still running
+    _expire_trials_impl(subscription_lookup=_boom)
     with SyncSessionLocal() as db:
-        uid = _make_user(db, trial_offset_days=3)  # trial still running
-        cleanup_users.append(uid)
-        db.commit()
-
-    _expire_trials_impl()
-
-    with SyncSessionLocal() as db:
-        assert _plan_of(db, uid) == "pro"
+        assert _get(db, uid).plan == "pro"
 
 
 def test_user_without_trial_is_untouched(cleanup_users):
     """e.g. admin/agency with trial_ends_at NULL — gate requires a trial date."""
+    uid = _create(cleanup_users, trial_offset_days=None, plan="agency")
+    _expire_trials_impl(subscription_lookup=_boom)
     with SyncSessionLocal() as db:
-        uid = _make_user(db, trial_offset_days=None, plan="agency")
-        cleanup_users.append(uid)
-        db.commit()
-
-    _expire_trials_impl()
-
-    with SyncSessionLocal() as db:
-        assert _plan_of(db, uid) == "agency"
+        assert _get(db, uid).plan == "agency"

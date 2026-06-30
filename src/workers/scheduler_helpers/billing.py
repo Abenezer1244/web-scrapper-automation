@@ -70,62 +70,104 @@ def _reset_monthly_usage_impl() -> None:
 _ENTITLED_SUB_STATUSES = ("active", "trialing", "past_due")
 
 
-def _expire_trials_impl() -> None:
-    """Downgrade expired trial users from Pro to Starter.
+def _stripe_entitled_status(customer_id: str) -> str | None:
+    """Return the customer's current ENTITLED Stripe subscription status
+    (active/trialing/past_due), or None if they have no entitled subscription.
 
-    Runs hourly. Finds users whose app-side trial has expired and who do NOT have
-    an entitled Stripe subscription. The gate keys on the durable subscription
-    state (migration 077), NOT on stripe_customer_id: a customer id is created
-    when a user merely OPENS checkout, so the old `stripe_customer_id IS NULL`
-    gate let a trial user who never paid keep Pro forever. A real subscriber
-    (active/trialing/past_due) is protected.
+    Raises on Stripe/transport errors — the caller treats that as 'unknown' and
+    does NOT downgrade (never downgrade a possible payer on a transient failure)."""
+    import stripe
 
-    SAFETY (Codex P1): an AMBIGUOUS legacy row — has a `stripe_customer_id` but a
-    NULL `subscription_status` (e.g. paid BEFORE migration 077 and not yet touched
-    by a webhook/backfill) — is NEVER downgraded here. We downgrade only with
-    POSITIVE non-payment evidence: no customer id at all (never reached Stripe), or
-    a known non-entitled status. This makes the gate safe regardless of deploy
-    order; ambiguous rows are resolved authoritatively by the Stripe backfill
-    (scripts/backfill_subscription_status.py), never by guessing. Wrongly
-    downgrading a paying customer is worse than briefly retaining one freeloader.
+    from src.config import settings
+
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+    subs = stripe.Subscription.list(customer=customer_id, status="all", limit=20)
+    for s in subs.get("data", []):
+        if s.get("status") in _ENTITLED_SUB_STATUSES:
+            return s.get("status")
+    return None
+
+
+def _expire_trials_impl(subscription_lookup=None) -> None:
+    """Downgrade expired-trial users from Pro to Starter — unless they are paying.
+
+    Runs hourly. `stripe_customer_id` is NOT an entitlement signal (it is created
+    when a user merely OPENS checkout), so the gate uses the durable subscription
+    state (migration 077). Per-row decision:
+      * known-entitled status (active/trialing/past_due) -> excluded by the query.
+      * known non-entitled status (e.g. canceled)        -> downgrade.
+      * no stripe_customer_id (never reached Stripe)      -> downgrade.
+      * AMBIGUOUS (customer id present, status NULL — a legacy payer OR an
+        abandoned checkout) -> ask Stripe (the source of truth): entitled ->
+        protect + record the status (self-heal); not entitled -> downgrade +
+        record; Stripe error -> SKIP (never downgrade a possible payer).
+
+    This resolves BOTH Codex P1s: legacy payers are never wrongly downgraded, and
+    future abandoned-checkout trials DO expire — automatically, no manual backfill.
+    `subscription_lookup` is injectable for tests (default = live Stripe).
     """
     from sqlalchemy import or_, select
 
+    from src.api.entitlements import apply_reconciliation_sync
     from src.config import settings
     from src.db.models import User
     from src.db.session import SyncSessionLocal
 
+    lookup = subscription_lookup or _stripe_entitled_status
     now = datetime.now(UTC)
 
+    def _downgrade(db, user) -> None:
+        user.plan = "starter"
+        user.records_limit = settings.PLAN_LIMITS["starter"]  # post-trial Starter limit
+        _logger.info("Trial expired for %s — downgraded to starter", user.email)
+        apply_reconciliation_sync(db, str(user.id), "starter")
+
     with SyncSessionLocal() as db:
-        expired = db.execute(
+        # Candidates: expired trial, still on a paid tier, NOT known-entitled.
+        candidates = db.execute(
             select(User).where(
                 User.trial_ends_at.isnot(None),
                 User.trial_ends_at < now,
                 User.plan != "starter",
-                # (A) NOT entitled — no active/trialing/past_due subscription.
                 or_(
                     User.subscription_status.is_(None),
                     User.subscription_status.notin_(_ENTITLED_SUB_STATUSES),
                 ),
-                # (B) POSITIVE non-payment evidence — never expire an ambiguous
-                # legacy row (customer id present but status still NULL).
-                or_(
-                    User.stripe_customer_id.is_(None),
-                    User.subscription_status.isnot(None),
-                ),
             )
         ).scalars().all()
 
-        from src.api.entitlements import apply_reconciliation_sync
-        for user in expired:
-            user.plan = "starter"
-            user.records_limit = settings.PLAN_LIMITS["starter"]  # post-trial Starter limit
-            _logger.info("Trial expired for %s — downgraded to starter", user.email)
-            apply_reconciliation_sync(db, str(user.id), "starter")
+        downgraded = 0
+        for user in candidates:
+            if user.subscription_status is not None:
+                _downgrade(db, user)  # known non-entitled (canceled/unpaid/…)
+                downgraded += 1
+            elif not user.stripe_customer_id:
+                _downgrade(db, user)  # never reached Stripe -> genuine unpaid trial
+                downgraded += 1
+            else:
+                # AMBIGUOUS: customer id present, status NULL. Stripe is the truth.
+                try:
+                    status = lookup(user.stripe_customer_id)
+                except Exception as exc:  # noqa: BLE001 - any failure = unknown
+                    _logger.warning(
+                        "expire_trials: Stripe lookup failed for user %s (customer "
+                        "%s) — skipping, NOT downgrading: %s",
+                        user.id, user.stripe_customer_id, exc,
+                    )
+                    continue
+                if status in _ENTITLED_SUB_STATUSES:
+                    user.subscription_status = status  # legacy payer: protect + self-heal
+                    _logger.info(
+                        "expire_trials: user %s has entitled Stripe status %s — "
+                        "protected + backfilled", user.id, status,
+                    )
+                else:
+                    user.subscription_status = "canceled"  # record non-entitlement
+                    _downgrade(db, user)
+                    downgraded += 1
 
-        if expired:
+        if candidates:
             db.commit()
-            _logger.info("Expired %d trials", len(expired))
-        else:
-            _logger.info("No expired trials to process")
+        _logger.info(
+            "expire_trials: %d candidates, %d downgraded", len(candidates), downgraded
+        )

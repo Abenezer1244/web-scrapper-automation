@@ -29,14 +29,18 @@ a customer id, no subscription, expired trial, stuck on Pro.)
 - [x] tests/test_expire_trials.py: bug case + all entitled/non-entitled statuses +
       active-trial + no-trial(admin) — 8 cases, real Postgres, no mocks.
 - [x] py_compile clean; single alembic head 077. (No local PG → CI validates suite.)
-- [x] Codex review #1 → **[P1]** the gate could downgrade a LEGACY payer whose new
-      fields are still NULL (paid before mig 077). FIXED: gate now downgrades only
-      with POSITIVE non-payment evidence — never an ambiguous (customer id + NULL
-      status) row. Safe regardless of deploy order.
-- [x] scripts/backfill_subscription_status.py: resolve ambiguous rows from Stripe
-      (entitled → store + clear trial; else → set status so the gate can downgrade).
-- [x] tests updated: ambiguous row is PROTECTED; canceled-status row downgrades.
-- [ ] Codex review #2 (confirm P1 closed).
+- [x] Codex review #1 → **[P1]** gate could downgrade a LEGACY payer (NULL fields).
+- [x] Codex review #2 → **[P1]** protecting ambiguous rows reintroduced the bug for
+      FUTURE abandoned checkouts (customer id at checkout-start, status stays NULL).
+- [x] FINAL design (resolves BOTH): the hourly task asks STRIPE for ambiguous rows
+      (customer id present, status NULL). Entitled → protect + self-heal (record
+      status). Not entitled → downgrade + record "canceled". Stripe error → SKIP
+      (never downgrade a possible payer). Stripe lookup is dependency-injected so
+      tests never hit the network (no mocks). Self-healing → NO manual backfill
+      (script removed); ambiguous rows resolve automatically each run.
+- [x] tests: 9 cases incl. ambiguous-entitled (protected+healed), ambiguous-
+      abandoned (downgraded), ambiguous-stripe-error (protected).
+- [ ] Codex review #3 (confirm both P1s closed).
 
 ## Failure modes (Codex) — addressed
 - Wrongly downgraded mid-cycle: protected statuses + webhook keeps state current;

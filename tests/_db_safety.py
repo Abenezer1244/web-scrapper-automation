@@ -27,7 +27,7 @@ Policy (all enforced; any failure aborts collection BEFORE a fixture can run):
 from __future__ import annotations
 
 import os
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 # A database is accepted as a test DB only if BOTH hold:
 #   1. its name ends with one of these suffixes, and
@@ -35,6 +35,14 @@ from urllib.parse import urlparse
 TEST_DB_NAME_SUFFIXES: tuple[str, ...] = ("_test", "_testing")
 # "" covers a UNIX-socket / hostless DSN, which is inherently local.
 _LOCAL_HOSTS: frozenset[str] = frozenset({"localhost", "127.0.0.1", "::1", ""})
+# libpq / asyncpg / psycopg2 honour these DSN query params and they OVERRIDE the
+# host/db parsed from the URL authority+path. A DSN like
+#   postgresql+asyncpg://localhost/bridgeleads_test?host=prod&dbname=postgres
+# would pass a naive authority/path check yet actually connect to prod. We refuse
+# any of them outright — a test DSN never needs to redirect host/db via query.
+_FORBIDDEN_QUERY_KEYS: frozenset[str] = frozenset(
+    {"host", "hostaddr", "port", "dbname", "database"}
+)
 
 
 def _host_allowlist() -> set[str]:
@@ -51,8 +59,20 @@ def _host(url: str) -> str:
     return (urlparse(url).hostname or "").lower()
 
 
+def _forbidden_query_keys(url: str) -> set[str]:
+    """Connection-overriding query keys present in the DSN (case-insensitive)."""
+    keys = {k.lower() for k, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)}
+    return keys & _FORBIDDEN_QUERY_KEYS
+
+
 def _classify(url: str) -> tuple[bool, str]:
     """Return ``(is_test_db, reason_if_not)``."""
+    bad_keys = _forbidden_query_keys(url)
+    if bad_keys:
+        return False, (
+            f"DSN query overrides the connection target via {sorted(bad_keys)} — "
+            "host/db redirection in a test DSN is refused"
+        )
     name = _db_name(url)
     host = _host(url)
     if not any(name.endswith(s) for s in TEST_DB_NAME_SUFFIXES):

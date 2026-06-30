@@ -32,7 +32,10 @@ non-test DB — don't just make teardown "more careful".
 - [x] Verify: 8/8 guard unit cases pass; conftest import hard-aborts on
       missing + prod-like TEST_DATABASE_URL (exit 1) before any DB connect;
       `py_compile` clean.
-- [ ] Codex review of the diff (gate). Any Critical/High = NO-GO.
+- [x] Codex review of the diff (gate). 4 passes. No Critical/High at any point.
+      3 P2s found + fixed: (1) reject DSN query host/db overrides; (2) reject
+      hostless DSNs (PGHOST bypass); (3) require explicit TEST_DATABASE_URL_SYNC
+      (the :5432->:6543 rewrite breaks a derived sync URL). Final review: CLEAN.
 - [ ] `.env.example`: add TEST_DATABASE_URL(_SYNC) — BLOCKED: harness denies
       all `.env*` access. **User to add manually** (see testing.md for values).
 

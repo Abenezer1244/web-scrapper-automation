@@ -795,6 +795,12 @@ async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
 
     user.plan = plan_name
     user.records_limit = records_limit
+    # Durable entitlement (migration 077) + end the app-side 7-day trial: a
+    # converted user is no longer "on trial", so expire_trials must not consider
+    # them. subscription["status"] is authoritative (retrieved above).
+    user.stripe_subscription_id = subscription_id
+    user.subscription_status = subscription.get("status")
+    user.trial_ends_at = None
     await db.flush()
 
     # Sprint 7.3: grant referral credit if this is the referee's
@@ -872,6 +878,12 @@ async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
         return
     user.plan = plan_name
     user.records_limit = records_limit
+    # Keep the durable entitlement state in sync (migration 077). An entitled
+    # status ends the app-side trial so expire_trials won't downgrade a payer.
+    user.stripe_subscription_id = data.get("id")
+    user.subscription_status = data.get("status")
+    if data.get("status") in ("active", "trialing"):
+        user.trial_ends_at = None
     await db.flush()
     from src.api.entitlements import apply_reconciliation_async
     await apply_reconciliation_async(db, str(user.id), user.plan)
@@ -888,6 +900,9 @@ async def _handle_subscription_deleted(data: dict, db: AsyncSession) -> None:
     if user:
         user.plan = "starter"
         user.records_limit = settings.PLAN_LIMITS["starter"]
+        # Clear the entitlement so any future trial logic treats them as unpaid.
+        user.stripe_subscription_id = None
+        user.subscription_status = "canceled"
         await db.flush()
         from src.api.entitlements import apply_reconciliation_async
         await apply_reconciliation_async(db, str(user.id), user.plan)

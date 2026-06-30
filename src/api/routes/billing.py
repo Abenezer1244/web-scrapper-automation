@@ -703,6 +703,35 @@ async def stripe_webhook(
 
 # ─── Webhook handlers ─────────────────────────────────────────────────────────
 
+def _alert_billing_gap(reason: str, dedup_key: str, **ctx: object) -> None:
+    """Loudly surface a webhook event that silently dropped payment/entitlement state.
+
+    The handlers below used to ``return`` silently when a Stripe price wasn't in
+    _PRICE_TO_PLAN — so a PAID subscription whose price drifted out of the
+    STRIPE_PRICE_* env (new/changed/legacy price) would never activate the user's
+    plan, with no log or alert. This logs at ERROR with full recovery identifiers
+    (Stripe price/customer/session/subscription ids + our user_id — all non-PII,
+    never email) and fires a deduped ops alert. Defensive: an alerting failure must
+    NEVER propagate — the webhook must still return 200, else Stripe retries an
+    event we already processed. The ops dedup key is per price so one bad price
+    can't spam ops, while the per-occurrence ERROR log keeps every affected user
+    visible. NEVER grants a fallback plan — wrong entitlement is worse than missing.
+    """
+    ctx_str = " ".join(f"{k}={v}" for k, v in ctx.items() if v)
+    _logger.error("billing webhook gap: %s — %s", reason, ctx_str)
+    try:
+        from src.workers.ops_alerts import send_ops_alert
+
+        send_ops_alert(
+            "billing",
+            dedup_key,
+            f"Billing webhook gap: {reason}",
+            f"{reason}\n{ctx_str}\n\nManual recovery may be needed.",
+        )
+    except Exception:  # alerting must never fail the webhook (Stripe would retry)
+        _logger.exception("failed to send billing-gap ops alert (%s)", reason)
+
+
 async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
     """Activate new plan after a successful checkout session."""
     user_id = (data.get("metadata") or {}).get("user_id")
@@ -720,6 +749,18 @@ async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
     plan_info = _PRICE_TO_PLAN.get(price_id)
 
     if not plan_info:
+        # Paid checkout but the price isn't in our plan map — entitlement would be
+        # silently lost. Alert with recovery ids; do NOT grant a fallback plan.
+        _alert_billing_gap(
+            "checkout.session.completed price not in plan map — user PAID but "
+            "plan NOT activated",
+            f"unmapped-price:{price_id}",
+            event=data.get("id"),
+            price_id=price_id,
+            customer=session_customer_id,
+            subscription=subscription_id,
+            user_id=user_id,
+        )
         return
 
     plan_name, records_limit = plan_info
@@ -805,17 +846,35 @@ async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
     plan_info = _PRICE_TO_PLAN.get(price_id)
 
     if not plan_info:
+        # Subscription changed to a price we don't map — the plan change would be
+        # silently lost. Alert with recovery ids; do NOT guess a plan.
+        _alert_billing_gap(
+            "customer.subscription.updated price not in plan map — plan change "
+            "NOT applied",
+            f"unmapped-price:{price_id}",
+            price_id=price_id,
+            customer=customer_id,
+        )
         return
 
     plan_name, records_limit = plan_info
     result = await db.execute(select(User).where(User.stripe_customer_id == customer_id))
     user = result.scalar_one_or_none()
-    if user:
-        user.plan = plan_name
-        user.records_limit = records_limit
-        await db.flush()
-        from src.api.entitlements import apply_reconciliation_async
-        await apply_reconciliation_async(db, str(user.id), user.plan)
+    if user is None:
+        # A real plan change for a customer we can't resolve to a user — lost
+        # silently before. Loud warning (no ops page: often a benign unknown
+        # customer, lower severity than a paid-but-unmapped price).
+        _logger.warning(
+            "customer.subscription.updated: no user for stripe_customer_id=%s — "
+            "plan change to %s (limit %s) NOT applied",
+            customer_id, plan_name, records_limit,
+        )
+        return
+    user.plan = plan_name
+    user.records_limit = records_limit
+    await db.flush()
+    from src.api.entitlements import apply_reconciliation_async
+    await apply_reconciliation_async(db, str(user.id), user.plan)
 
 
 async def _handle_subscription_deleted(data: dict, db: AsyncSession) -> None:

@@ -51,6 +51,10 @@ from src.workers.scheduler_helpers.health import (  # noqa: F401
 from src.workers.scheduler_helpers.meter import _flush_skip_trace_meter_outbox_impl
 from src.workers.scheduler_helpers.onboarding import _send_onboarding_emails_impl
 from src.workers.scheduler_helpers.public_cache import _refresh_public_sample_cache_impl
+from src.workers.scheduler_helpers.registration import (
+    _dispatch_pending_verification_emails_impl,
+    _purge_expired_pending_registrations_impl,
+)
 
 _logger = setup_logger("worker.scheduler")
 
@@ -96,6 +100,21 @@ app.conf.beat_schedule = {
     "expire-trials": {
         "task": "src.workers.scheduler.expire_trials",
         "schedule": 3600.0,  # every 1 hour
+    },
+    "purge-expired-pending-registrations": {
+        # Email-verification flow: delete pending_registrations rows whose verify
+        # window lapsed so the table can't grow from abandoned/sprayed signups.
+        "task": "src.workers.scheduler.purge_expired_pending_registrations",
+        "schedule": 3600.0,  # every 1 hour
+    },
+    "dispatch-pending-verification-emails": {
+        # Email-verification OUTBOX: send the verification email for each due
+        # pending_registrations row and record the outcome on the row. The row is
+        # the durable record, so a signup made while Redis (the broker) was down
+        # is drained and sent here once Redis recovers — never lost on a
+        # fire-and-forget enqueue from the request path.
+        "task": "src.workers.scheduler.dispatch_pending_verification_emails",
+        "schedule": 60.0,  # every 60s — verification emails should feel prompt
     },
     "onboarding-emails": {
         "task": "src.workers.scheduler.send_onboarding_emails",
@@ -268,6 +287,27 @@ def expire_trials() -> None:
     with no stripe_customer_id (paying users keep their plan).
     """
     return _expire_trials_impl()
+
+
+@app.task(name="src.workers.scheduler.purge_expired_pending_registrations")
+def purge_expired_pending_registrations() -> None:
+    """Delete expired pending_registrations rows (email-verification flow).
+
+    Hourly. Removes rows whose verify window lapsed so the table can't grow
+    unbounded from abandoned or sprayed signups.
+    """
+    return _purge_expired_pending_registrations_impl()
+
+
+@app.task(name="src.workers.scheduler.dispatch_pending_verification_emails")
+def dispatch_pending_verification_emails() -> None:
+    """Send due verification emails from the pending_registrations outbox.
+
+    Every 60s. Sends each due row's verification email and records the outcome on
+    the row, so a signup made while Redis (the broker) was down is sent once it
+    recovers. No-op when EMAIL_VERIFICATION_ENABLED is off.
+    """
+    return _dispatch_pending_verification_emails_impl()
 
 
 # ─── Task 6: Daily county scrape ────────────────────────────────────────────

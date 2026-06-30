@@ -39,11 +39,78 @@ def is_pacs_url(url: str | None) -> bool:
     return "/propertyaccess" in low or "propertyaccess/" in low
 
 
+def parse_pacs_result_html(html_text: str) -> dict | None:
+    """Parse a PACS PropertyAccess search-results page into {address, mailing, value}.
+
+    Over-inference guard (Codex point C). An owner-name search can match MANY
+    properties; the old parser flattened ALL result rows' cells and trusted the
+    first parcel/address it saw — silently picking row 1 of an ambiguous match.
+    An owner-name match is WEAK evidence, so:
+      1. Require EXACTLY ONE plausible result row in resultsTable; on 0 or >1,
+         return None (we can't know which property is the filing party's).
+      2. NEVER return parcel_id from this path. parcel_id is identity/billing/
+         dedup input (``compute_property_key`` is parcel-primary, and the FROZEN
+         ``legacy_strong_signature`` keys billing dedup) — a name-derived parcel
+         could corrupt cross-list overlap. The PACS columns are
+         ``checkbox, account, parcel, ...`` (account AND parcel are both long
+         numbers), so the old "first 10+ digit cell" even risked storing the
+         ACCOUNT as the parcel. Address/mailing still hydrate (the feature's
+         purpose: unlock skip-trace on probate estate filings).
+
+    Pure function (no HTTP) so the guard is unit-testable. Returns None on no
+    usable single-row address.
+    """
+    table_start = html_text.find("resultsTable")
+    if table_start == -1:
+        return None
+    table_end = html_text.find("</table>", table_start)
+    chunk = (html_text[table_start:table_end]
+             if table_end > table_start
+             else html_text[table_start:table_start + 5000])
+
+    def _row_cells(row_html: str) -> list[str]:
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", row_html, re.DOTALL | re.IGNORECASE)
+        cleaned = [re.sub(r"<[^>]+>", " ", td).strip().replace("&nbsp;", "").strip()
+                   for td in tds]
+        return [c for c in cleaned if c]
+
+    # Count only PLAUSIBLE result rows, not "any <tr> with a <td>" (Codex P2): a
+    # real PACS result row has ~10 columns INCLUDING long account/parcel numbers.
+    # Filtering on (>=5 cells AND a 6+ digit number) before the uniqueness check
+    # means a stray pager/footer row, or a header rendered with <td> instead of
+    # <th>, can't turn a single genuine match into a false miss. Case-insensitive
+    # so an uppercase-tag portal isn't mis-read as zero rows.
+    candidate_rows = []
+    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", chunk, re.DOTALL | re.IGNORECASE):
+        cells = _row_cells(row)
+        if len(cells) >= 5 and any(re.search(r"\d{6,}", c) for c in cells):
+            candidate_rows.append(cells)
+    if len(candidate_rows) != 1:
+        return None
+    cells = candidate_rows[0]
+
+    result: dict[str, str] = {}
+    for cell in cells:
+        cell_clean = cell.replace("\r\n", "\n").replace("\r", "\n")
+        # Address: number + street, possibly with city/state on the next line.
+        if re.search(r"\d+\s+[A-Z].*WA\s+\d{5}", cell_clean, re.I | re.DOTALL):
+            lines = [ln.strip() for ln in cell_clean.split("\n") if ln.strip()]
+            result["address"] = lines[0]
+            if len(lines) > 1:
+                result["mailing"] = ", ".join(lines)
+        elif cell.startswith("$") and "value" not in result:
+            result["value"] = cell
+
+    # parcel_id intentionally NOT extracted from owner-name search (see above).
+    return result if result.get("address") else None
+
+
 def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> dict | None:
     """Search a PACS PropertyAccess portal by owner name.
 
-    Returns a dict with any of: address, parcel_id, mailing, value.
-    Returns None on no match or error.
+    Returns a dict with any of: address, mailing, value (NEVER parcel_id — an
+    owner-name match is weak evidence; see ``parse_pacs_result_html``).
+    Returns None on no unique match or error.
 
     Blocks on HTTP; call from a thread pool when batching.
     """
@@ -104,39 +171,7 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> dict | None:
         if r is None or r.status_code != 200 or "None found" in r.text:
             return None
 
-        table_start = r.text.find("resultsTable")
-        if table_start == -1:
-            return None
-        table_end = r.text.find("</table>", table_start)
-        chunk = (r.text[table_start:table_end]
-                 if table_end > table_start
-                 else r.text[table_start:table_start + 5000])
-
-        tds = re.findall(r"<td[^>]*>(.*?)</td>", chunk, re.DOTALL)
-        cells = [re.sub(r"<[^>]+>", " ", td).strip().replace("&nbsp;", "").strip()
-                 for td in tds]
-        cells = [c for c in cells if c]
-        if len(cells) < 5:
-            return None
-
-        result: dict[str, str] = {}
-        for cell in cells:
-            cell_clean = cell.replace("\r\n", "\n").replace("\r", "\n")
-            # Parcel ID: 10+ digit contiguous number
-            if re.match(r"^\d{10,}$", cell.replace(" ", "")) and "parcel_id" not in result:
-                result["parcel_id"] = cell.replace(" ", "")
-            # Address: number + street, possibly with city/state
-            elif re.search(r"\d+\s+[A-Z].*WA\s+\d{5}", cell_clean, re.I | re.DOTALL):
-                lines = [ln.strip() for ln in cell_clean.split("\n") if ln.strip()]
-                result["address"] = lines[0]
-                if len(lines) > 1:
-                    result["mailing"] = ", ".join(lines)
-            elif cell.startswith("$") and "value" not in result:
-                result["value"] = cell
-
-        if result.get("address") or result.get("parcel_id"):
-            return result
-        return None
+        return parse_pacs_result_html(r.text)
     except Exception as exc:
         _logger.warning("PACS name lookup failed for %r: %s", owner_name[:30], str(exc)[:80])
         return None

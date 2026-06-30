@@ -61,7 +61,53 @@ LEAD_CSV_COLUMNS: list[str] = [
     # auction_date + default_amount are stored columns; trustee/ts# from
     # enrichment_data["nts"]; days_to_auction is the derived urgency clock.
     "auction_date", "days_to_auction", "default_amount", "trustee", "ts_number",
+    # Probate honesty label (2026-06-23) — APPENDED at end (compatibility contract:
+    # new columns are extra/appended so ordinal consumers of the existing fields do
+    # not shift, Codex P2). Signal subtype set at insert: probate_death_inheritance
+    # vs tod_living_owner_estate_planning vs nonprobate_transfer. Blank for non-probate.
+    "lead_subtype",
 ]
+
+
+# User-controllable OUTPUT visibility (delivery/view preference — NOT scrape scope;
+# the scraper always collects everything because the rest of the pipeline needs it).
+# Only these three columns may be suppressed from the delivered file. The wizard's
+# other four "identity" fields (party_name, parcel_id, property_address,
+# date_recorded) are deliberately NOT hideable: they are what make a lead callable,
+# mailable, and county-reconcilable, and several are load-bearing for
+# enrichment/dedup/skip-trace upstream. Suppression BLANKS the value and KEEPS the
+# header, so dialer/webhook consumers bound to a fixed column set never break.
+HIDEABLE_OUTPUT_FIELDS: frozenset[str] = frozenset(
+    {"mailing_address", "heirs", "legal_description"}
+)
+
+
+def resolve_hidden_output_fields(config_fields: Any) -> set[str]:
+    """Which hideable columns the user deselected on a scraper config.
+
+    `config_fields` is the persisted `ScraperConfig.fields` JSON — a dict like
+    ``{"party_name": True, ..., "legal_description": False}``. Legacy/empty values
+    (None, [], {}) mean "show everything": only an EXPLICIT ``False`` on a hideable
+    field suppresses it. Identity fields are never hideable, so a stray ``False`` on
+    one is ignored here (the UI should lock them; the backend refuses regardless).
+    """
+    if not isinstance(config_fields, dict):
+        return set()
+    return {f for f in HIDEABLE_OUTPUT_FIELDS if config_fields.get(f) is False}
+
+
+def _apply_visibility(row: dict[str, str], hidden_fields: set[str] | None) -> dict[str, str]:
+    """Blank the deselected hideable columns in a built export row (header stays).
+
+    Mutates and returns ``row``. Defensive: intersects with HIDEABLE_OUTPUT_FIELDS
+    so a miswired caller can never blank an identity or derived column.
+    """
+    if not hidden_fields:
+        return row
+    for col in hidden_fields & HIDEABLE_OUTPUT_FIELDS:
+        if col in row:
+            row[col] = ""
+    return row
 
 
 def _yes_no_blank(val: object) -> str:
@@ -221,6 +267,11 @@ def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, s
         "instrument_number": _enrich_str(
             enr, "instrument_number", "recording_number", "record_number"
         ),
+        # Probate honesty label (blank for non-probate). Per-job exports read it from
+        # enrichment_data (set at insert in tasks.py); the combined/segment SQL
+        # exporters build SimpleNamespaces that don't carry enrichment_data, so they
+        # SELECT it as a top-level `lead_subtype` scalar — read whichever is present.
+        "lead_subtype": _enrich_str(enr, "lead_subtype") or sanitize_for_csv(_get(record, "lead_subtype")),
         "code_violation_type": _enrich_str(enr, "record_type", "case_type"),
         "code_violation_status": _enrich_str(enr, "status"),
         "code_violation_description": _enrich_str(enr, "description"),
@@ -246,17 +297,22 @@ def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, s
     }
 
 
-def write_lead_csv(records: list[Any], filelike) -> None:
+def write_lead_csv(
+    records: list[Any], filelike, hidden_fields: set[str] | None = None
+) -> None:
     """Write the canonical lead CSV (header + rows) to an open text file/StringIO.
 
     No footer rows — the machine-import file stays clean (the DNC disclaimer lives
     in the delivery email + download UI). Caller owns opening/closing the stream.
+
+    `hidden_fields` (from `resolve_hidden_output_fields`) blanks the user-deselected
+    hideable columns; the header set is unchanged. None/empty = show everything.
     """
     today = datetime.now(UTC).date()  # one consistent "today" for the whole file
     writer = csv.DictWriter(filelike, fieldnames=LEAD_CSV_COLUMNS)
     writer.writeheader()
     for rec in records:
-        writer.writerow(build_lead_export_row(rec, today))
+        writer.writerow(_apply_visibility(build_lead_export_row(rec, today), hidden_fields))
 
 
 # Overlap/combine CSV (Lists page + batch scrape). Same dialer-ready semantics as
@@ -267,6 +323,23 @@ def write_lead_csv(records: list[Any], filelike) -> None:
 # (decrypted arrays) so phone_2/3 + email_2/3 populate; columns the segment
 # query doesn't provide (heirs, legal_description, doc_type, tax) come through
 # blank — kept for header parity with the per-job CSV.
+# Combined/segment exports dedup to ONE representative row per property, which may
+# be a non-probate row even when the property also has a probate hit. Deriving
+# lead_subtype from that representative row would blank it for those buckets (Codex
+# P2). Instead aggregate the subtype across the bucket's probate candidates,
+# preferring the stronger signal (death > nonprobate > tod > unknown). References
+# the `lead_subtype` column selected in each query's candidates CTE; goes in the agg
+# CTE. NULL when the bucket has no probate row -> exported blank.
+PROBATE_SUBTYPE_AGG_SQL: str = (
+    "(array_agg(lead_subtype ORDER BY CASE lead_subtype "
+    "WHEN 'probate_death_inheritance' THEN 1 "
+    "WHEN 'nonprobate_transfer' THEN 2 "
+    "WHEN 'tod_living_owner_estate_planning' THEN 3 "
+    "ELSE 4 END) "
+    "FILTER (WHERE lead_subtype IS NOT NULL AND lead_subtype <> ''))[1] AS lead_subtype"
+)
+
+
 OVERLAP_LEAD_COLUMNS: list[str] = [
     "overlap", "lists_count", "lists", "counties",
     "first_name", "last_name",
@@ -275,10 +348,13 @@ OVERLAP_LEAD_COLUMNS: list[str] = [
     "filed_date", "doc_type", "delinquent_amount", "delinquent_bill_year",
     "party_name", "mailing_address", "parcel_id", "heirs", "legal_description",
     "property_address",
+    "lead_subtype",  # appended at end (compatibility contract, Codex P2)
 ]
 
 
-def build_overlap_export_row(record: Any, overlap: dict[str, Any]) -> dict[str, str]:
+def build_overlap_export_row(
+    record: Any, overlap: dict[str, Any], hidden_fields: set[str] | None = None
+) -> dict[str, str]:
     """One overlap-CSV row from a lead record + its overlap metadata.
 
     `overlap` carries `lists_count` (distinct record types this property is on),
@@ -286,8 +362,11 @@ def build_overlap_export_row(record: Any, overlap: dict[str, Any]) -> dict[str, 
     flag is the WORD "Overlap" when on 2+ lists, else blank (more scannable than
     TRUE/FALSE). All other fields come straight from the canonical dialer-ready
     row so formatting stays identical across exports.
+
+    `hidden_fields` (from the batch's `fields`) blanks the user-deselected hideable
+    columns; the header set is unchanged, matching the per-job CSV's behavior.
     """
-    base = build_lead_export_row(record)
+    base = _apply_visibility(build_lead_export_row(record), hidden_fields)
     try:
         count = int(overlap.get("lists_count") or 0)
     except (TypeError, ValueError):
@@ -306,10 +385,16 @@ def build_overlap_export_row(record: Any, overlap: dict[str, Any]) -> dict[str, 
     return row
 
 
-def write_lead_csv_with_overlap(rows: list[tuple[Any, dict[str, Any]]], filelike) -> None:
+def write_lead_csv_with_overlap(
+    rows: list[tuple[Any, dict[str, Any]]], filelike, hidden_fields: set[str] | None = None
+) -> None:
     """Write the overlap/combine CSV. `rows` = iterable of (record, overlap_dict),
-    already ordered by the caller (hottest-first). Header + rows, no footer."""
+    already ordered by the caller (hottest-first). Header + rows, no footer.
+
+    `hidden_fields` (from the batch's shared `fields`) blanks the user-deselected
+    hideable columns, keeping the combined CSV consistent with each per-job export.
+    """
     writer = csv.DictWriter(filelike, fieldnames=OVERLAP_LEAD_COLUMNS)
     writer.writeheader()
     for record, overlap in rows:
-        writer.writerow(build_overlap_export_row(record, overlap))
+        writer.writerow(build_overlap_export_row(record, overlap, hidden_fields))

@@ -133,6 +133,28 @@ def test_export_json_is_valid_and_correct_count(exporter):
     assert len(data) == len(LEAD_RECORDS)
 
 
+def test_export_json_sanitizes_nested_enrichment_strings(exporter):
+    """Formula triggers inside nested objects (enrichment_data) and the
+    phones/emails arrays must be neutralized, not just top-level columns."""
+    records = [
+        {
+            "party_name": "Smith, John",
+            "enrichment_data": {
+                "description": "=cmd|'/c calc'!A1",
+                "nested": {"deep": "+SUM(A1)"},
+            },
+            "emails": ["=HYPERLINK(\"http://evil\")"],
+        }
+    ]
+    path = exporter.to_json(records, filename="nested_injection")
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    enr = data[0]["enrichment_data"]
+    assert enr["description"].startswith("'"), enr["description"]
+    assert enr["nested"]["deep"].startswith("'"), enr["nested"]["deep"]
+    assert data[0]["emails"][0].startswith("'"), data[0]["emails"][0]
+
+
 def test_export_excel_creates_file(exporter):
     path = exporter.to_excel(LEAD_RECORDS, filename="test")
     assert path.exists()
@@ -166,3 +188,64 @@ def test_timestamped_filenames_are_unique(exporter):
     # Same base name but timestamps differ — both exist, names differ or same
     assert p1.exists()
     assert p2.exists()
+
+
+# ─── Output-field visibility through DataExporter.export() (all formats) ───────
+
+def test_export_csv_blanks_hidden_keeps_header(exporter):
+    """CSV via export() blanks deselected hideable cols, header set unchanged."""
+    path = exporter.export(
+        LEAD_RECORDS, filename="vis_csv", fmt="csv",
+        hidden_fields={"legal_description", "heirs"},
+    )
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+        f.seek(0)
+        header = next(csv.reader(f))
+    assert header == LEAD_CSV_COLUMNS  # columns kept, not dropped
+    for r in rows:
+        assert r["legal_description"] == "" and r["heirs"] == ""
+        # mailing_address NOT hidden here -> still present.
+        assert r["mailing_address"] != "" or r["party_name"]  # sanity: untouched
+    assert rows[0]["mailing_address"] == "456 Oak Ave, Seattle WA 98101"
+    assert rows[0]["party_name"] == "Smith, John"  # identity untouched
+
+
+def test_export_json_blanks_hidden(exporter):
+    path = exporter.export(
+        LEAD_RECORDS, filename="vis_json", fmt="json",
+        hidden_fields={"mailing_address"},
+    )
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    for row in data:
+        assert row["mailing_address"] == ""
+    # Non-hidden hideable + identity remain.
+    assert data[0]["legal_description"] == "LOT 4 BLOCK 2 SUNSET RIDGE"
+    assert data[0]["party_name"] == "Smith, John"
+
+
+def test_export_excel_blanks_hidden(exporter):
+    from openpyxl import load_workbook
+    path = exporter.export(
+        LEAD_RECORDS, filename="vis_xlsx", fmt="excel",
+        hidden_fields={"legal_description"},
+    )
+    wb = load_workbook(path)
+    ws = wb["Leads"]
+    header = [c.value for c in ws[1]]
+    legal_idx = header.index("legal_description")
+    party_idx = header.index("party_name")
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        assert (row[legal_idx] or "") == ""        # hidden -> blank
+        assert row[party_idx]                        # identity -> intact
+
+
+def test_export_no_hidden_unchanged(exporter):
+    """No hidden_fields => identical to the existing behavior (all values present)."""
+    path = exporter.export(LEAD_RECORDS, filename="vis_none", fmt="csv")
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert rows[0]["legal_description"] == "LOT 4 BLOCK 2 SUNSET RIDGE"
+    assert rows[0]["heirs"] == "Jane Smith"
+    assert rows[0]["mailing_address"] == "456 Oak Ave, Seattle WA 98101"

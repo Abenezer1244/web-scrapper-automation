@@ -12,7 +12,7 @@ from src.utils.mfa import _TOTP_INTERVAL
 # ─── Register ─────────────────────────────────────────────────────────────────
 
 async def test_register_creates_user(client: AsyncClient):
-    resp = await client.post("/auth/register", json={
+    resp = await client.post("/auth/register", json={"first_name": "Test", "last_name": "User",
         "email": "newuser@test.bridgeleads.io",
         "password": "SecurePass1!",
     })
@@ -33,7 +33,7 @@ async def test_register_creates_user(client: AsyncClient):
 
 
 async def test_register_duplicate_returns_generic_error(client: AsyncClient):
-    payload = {"email": "dup@test.bridgeleads.io", "password": "SecurePass1!"}
+    payload = {"first_name": "Test", "last_name": "User", "email": "dup@test.bridgeleads.io", "password": "SecurePass1!"}
     await client.post("/auth/register", json=payload)
     resp = await client.post("/auth/register", json=payload)
     # Must be 400 with a generic message — never reveal "already exists"
@@ -42,7 +42,7 @@ async def test_register_duplicate_returns_generic_error(client: AsyncClient):
 
 
 async def test_register_short_password_rejected(client: AsyncClient):
-    resp = await client.post("/auth/register", json={
+    resp = await client.post("/auth/register", json={"first_name": "Test", "last_name": "User",
         "email": "short@test.bridgeleads.io",
         "password": "abc",
     })
@@ -50,7 +50,7 @@ async def test_register_short_password_rejected(client: AsyncClient):
 
 
 async def test_register_invalid_email_rejected(client: AsyncClient):
-    resp = await client.post("/auth/register", json={
+    resp = await client.post("/auth/register", json={"first_name": "Test", "last_name": "User",
         "email": "not-an-email",
         "password": "SecurePass1!",
     })
@@ -60,7 +60,7 @@ async def test_register_invalid_email_rejected(client: AsyncClient):
 # ─── Login ────────────────────────────────────────────────────────────────────
 
 async def test_login_returns_token(client: AsyncClient):
-    await client.post("/auth/register", json={
+    await client.post("/auth/register", json={"first_name": "Test", "last_name": "User",
         "email": "login_ok@test.bridgeleads.io",
         "password": "SecurePass1!",
     })
@@ -75,7 +75,7 @@ async def test_login_returns_token(client: AsyncClient):
 
 
 async def test_login_wrong_password_generic_error(client: AsyncClient):
-    await client.post("/auth/register", json={
+    await client.post("/auth/register", json={"first_name": "Test", "last_name": "User",
         "email": "wrongpass@test.bridgeleads.io",
         "password": "SecurePass1!",
     })
@@ -100,7 +100,7 @@ async def test_login_unknown_email_same_generic_error(client: AsyncClient):
 # ─── Refresh-token isolation (CRITICAL: refresh tokens must NOT be access tokens)
 
 async def test_refresh_token_cannot_authenticate_requests(client: AsyncClient):
-    reg = await client.post("/auth/register", json={
+    reg = await client.post("/auth/register", json={"first_name": "Test", "last_name": "User",
         "email": "refresh_iso@test.bridgeleads.io", "password": "SecurePass1!",
     })
     refresh = reg.json()["refresh_token"]
@@ -111,7 +111,7 @@ async def test_refresh_token_cannot_authenticate_requests(client: AsyncClient):
 
 
 async def test_refresh_endpoint_rotates_and_new_access_works(client: AsyncClient):
-    reg = await client.post("/auth/register", json={
+    reg = await client.post("/auth/register", json={"first_name": "Test", "last_name": "User",
         "email": "refresh_rot@test.bridgeleads.io", "password": "SecurePass1!",
     })
     r = await client.post("/auth/refresh", json={"refresh_token": reg.json()["refresh_token"]})
@@ -127,7 +127,7 @@ async def test_refresh_endpoint_rotates_and_new_access_works(client: AsyncClient
 
 
 async def test_access_token_cannot_be_used_to_refresh(client: AsyncClient):
-    reg = await client.post("/auth/register", json={
+    reg = await client.post("/auth/register", json={"first_name": "Test", "last_name": "User",
         "email": "refresh_xacc@test.bridgeleads.io", "password": "SecurePass1!",
     })
     r = await client.post("/auth/refresh", json={"refresh_token": reg.json()["access_token"]})
@@ -184,7 +184,7 @@ async def test_get_me_with_invalid_token_returns_401(client: AsyncClient):
 
 async def test_logout_blacklists_token(client: AsyncClient):
     # Register + login to get a fresh token
-    await client.post("/auth/register", json={
+    await client.post("/auth/register", json={"first_name": "Test", "last_name": "User",
         "email": "logout_test@test.bridgeleads.io",
         "password": "SecurePass1!",
     })
@@ -210,7 +210,7 @@ async def test_logout_blacklists_token(client: AsyncClient):
 
 async def test_brute_force_lockout_after_five_failures(client: AsyncClient, redis_client):
     email = "brute@test.bridgeleads.io"
-    await client.post("/auth/register", json={"email": email, "password": "SecurePass1!"})
+    await client.post("/auth/register", json={"first_name": "Test", "last_name": "User", "email": email, "password": "SecurePass1!"})
 
     # Clear any existing brute-force state for this email
     for key in redis_client.scan_iter(f"bf:email:{email}*"):
@@ -283,7 +283,7 @@ async def _register_and_enable_mfa(client: AsyncClient, redis_client, email: str
     """Enroll MFA for a fresh user via the real endpoints. Returns
     (totp_secret, backup_codes)."""
     _clear_auth_limits(redis_client)
-    reg = await client.post("/auth/register", json={"email": email, "password": password})
+    reg = await client.post("/auth/register", json={"first_name": "Test", "last_name": "User", "email": email, "password": password})
     assert reg.status_code == 201, reg.text
     headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
 
@@ -308,7 +308,7 @@ async def _register_and_enable_mfa(client: AsyncClient, redis_client, email: str
 async def test_login_without_mfa_has_no_challenge(client: AsyncClient, redis_client):
     _clear_auth_limits(redis_client)
     email = _mfa_email()
-    await client.post("/auth/register", json={"email": email, "password": "SecurePass1!"})
+    await client.post("/auth/register", json={"first_name": "Test", "last_name": "User", "email": email, "password": "SecurePass1!"})
     resp = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
     assert resp.status_code == 200
     data = resp.json()
@@ -422,7 +422,7 @@ async def test_access_token_cannot_redeem_mfa_challenge(client: AsyncClient, red
     # the two token families pin different audiences.
     _clear_auth_limits(redis_client)
     email = _mfa_email()
-    reg = await client.post("/auth/register", json={"email": email, "password": "SecurePass1!"})
+    reg = await client.post("/auth/register", json={"first_name": "Test", "last_name": "User", "email": email, "password": "SecurePass1!"})
     access = reg.json()["access_token"]
     resp = await client.post("/auth/login/mfa", json={"mfa_token": access, "code": "123456"})
     assert resp.status_code == 401
@@ -506,7 +506,7 @@ async def test_enrollment_totp_code_cannot_be_replayed_at_login(client: AsyncCli
     # login — enable seeds mfa_last_totp_counter with that code's counter.
     email = _mfa_email()
     _clear_auth_limits(redis_client)
-    reg = await client.post("/auth/register", json={"email": email, "password": "SecurePass1!"})
+    reg = await client.post("/auth/register", json={"first_name": "Test", "last_name": "User", "email": email, "password": "SecurePass1!"})
     headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
     secret = (await client.post("/auth/mfa/setup", headers=headers)).json()["secret"]
 

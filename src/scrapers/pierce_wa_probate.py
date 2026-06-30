@@ -74,20 +74,44 @@ class PierceWAARMSScraper(BridgeScraper):
         },
     }
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor — Pierce selects exact ARMS document-type checkboxes."""
+        from src.scrapers.doc_scope import CollectionScope, DocTypeItem
+
+        if record_type not in cls.RECORD_TYPE_CONFIG:
+            return None
+        _LABELS = {
+            "probate": ["Probate"],
+            "pre_foreclosure": [
+                "Notice of Default", "Notice of Foreclosure",
+                "Lis Pendens", "Notice of Trustee Sale",
+            ],
+            "divorce": ["Decree of Dissolution"],
+        }
+        labels = _LABELS.get(record_type)
+        if labels is None:
+            return None
+        return CollectionScope(
+            kind="document_type",
+            items=tuple(DocTypeItem(label=lbl, exact=True) for lbl in labels),
+            note="Selected by exact recorder document-type checkboxes.",
+        )
+
     def __init__(self, record_type: str = "probate", doc_types: list[str] | None = None):
         super().__init__()
         self._record_type = record_type
         cfg = self.RECORD_TYPE_CONFIG.get(record_type, self.RECORD_TYPE_CONFIG["probate"])
         self.DOC_TYPE_IDS: list[str] = cfg["ids"]
         self.DOC_TYPE_LABEL: str = cfg["label"]
-        # Phase 2b: narrow to selected canonical doc types' ARMS checkbox IDs when
-        # an explicit selection was made (None = legacy full set). Validated at
-        # config-create; empty/unmappable falls back to legacy (more, never nothing).
-        if doc_types and record_type == "pre_foreclosure":
-            from src.scrapers.doc_types import canonical_tokens_for
-            _ids = canonical_tokens_for("pierce", "wa", doc_types)
-            if _ids:
-                self.DOC_TYPE_IDS = _ids
+        # Phase 2b/B: narrow to selected canonical doc types' ARMS checkbox IDs when
+        # an explicit selection was made (None = legacy full set). FAIL-CLOSED: an
+        # explicit selection that can't be mapped (stale config) RAISES rather than
+        # silently broadening to the full set — the user must never get types they
+        # didn't pick.
+        if doc_types is not None and record_type == "pre_foreclosure":
+            from src.scrapers.doc_types import canonical_tokens_or_raise
+            self.DOC_TYPE_IDS = canonical_tokens_or_raise("pierce", "wa", doc_types)
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         _logger.info("Pierce WA %s — scraping %s to %s", self.DOC_TYPE_LABEL, date_from, date_to)

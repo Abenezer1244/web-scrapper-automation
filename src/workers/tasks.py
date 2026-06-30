@@ -7,11 +7,16 @@ State machine:
 
 import asyncio
 import json
+import time
 from datetime import datetime
 
 from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
 
+from src.scrapers.probate import (
+    classify_probate_signal_for_row,
+    should_include_probate_row,
+)
 from src.utils.address_intel import compute_owner_flags
 from src.utils.logger import setup_logger
 from src.workers import app
@@ -35,6 +40,7 @@ from src.workers.tasks_helpers.dedup import (  # noqa: F401  (re-export)
     _extract_tax_fields,
     _upsert_property_membership,
     _write_result_property_keys,
+    validate_tax_delinquent_records,
 )
 from src.workers.tasks_helpers.enrich import (  # noqa: F401  (re-export)
     _enqueue_skip_trace_rows,
@@ -56,6 +62,37 @@ from src.workers.tasks_helpers.status import (
 )
 
 _logger = setup_logger("worker.task")
+
+# R2 export-upload retry policy. A failed upload means no deliverable (the local
+# file is deleted and both delivery paths need the object key), so we retry a few
+# times before failing the job rather than stranding a paying user.
+_R2_UPLOAD_ATTEMPTS = 3
+_R2_UPLOAD_BACKOFF = 2  # seconds, multiplied by attempt number (2s, 4s)
+
+
+def _upload_export_with_retry(exporter, local_file, object_key) -> tuple[bool, Exception | None]:
+    """Upload an export to R2 with bounded retries. Never raises.
+
+    Returns ``(ok, last_exception)``: ``(True, None)`` on the first successful
+    upload, else ``(False, <last error>)`` after exhausting the attempts. R2
+    blips are usually transient, so a few spaced retries recover most of them
+    before the caller has to fail the job. Pure (no DB / no file deletion) so it
+    can be unit-tested without live R2 or Postgres.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, _R2_UPLOAD_ATTEMPTS + 1):
+        try:
+            exporter.upload_to_r2(local_file, object_key)
+            return True, None
+        except Exception as exc:
+            last_exc = exc
+            _logger.warning(
+                "R2 upload attempt %d/%d failed: %s",
+                attempt, _R2_UPLOAD_ATTEMPTS, str(exc)[:200],
+            )
+            if attempt < _R2_UPLOAD_ATTEMPTS:
+                time.sleep(_R2_UPLOAD_BACKOFF * attempt)
+    return False, last_exc
 
 
 @app.task(
@@ -196,7 +233,8 @@ def run_scrape_job(self, job_id: str) -> None:
     from src.db.session import rls_sync_session, system_sync_session
     from src.scrapers.registry import UnsupportedCountyError, get_scraper_class
     from src.utils.data_exporter import DataExporter
-    from src.workers.delivery import deliver_job_results
+    from src.utils.lead_export import resolve_hidden_output_fields
+    from src.workers.delivery import deliver_job_email
 
     # Refresh the in-process SSRF allowlist from the connectors table before
     # scraping. A connector added through POST /scrapers/connectors after this
@@ -302,6 +340,29 @@ def run_scrape_job(self, job_id: str) -> None:
             self.request.scrape_started_at = job.started_at
         except Exception:  # request context unavailable (e.g. direct call) — non-fatal
             pass
+
+        # Execution-time entitlement backstop (audit until ENTITLEMENT_ENFORCEMENT).
+        # Catches API/scheduled/retry/watchdog paths that bypassed create-time checks.
+        # IMPORTANT: runs AFTER the ownership CAS (pending->queued) so that only the
+        # owning worker can act — a duplicate/redelivered task would have returned at
+        # `if not claimed` above and never reach this guard.
+        from src.api.entitlements import ConfigRow, config_run_violation, should_block_run
+        _active = db.execute(
+            select(
+                ScraperConfig.id, ScraperConfig.state, ScraperConfig.county,
+                ScraperConfig.record_type, ScraperConfig.created_at,
+                ScraperConfig.active, ScraperConfig.paused_reason,
+            ).where(ScraperConfig.user_id == job.user_id, ScraperConfig.active)
+        ).all()
+        _violation = config_run_violation(
+            user.plan, config.state, config.county, config.record_type,
+            [ConfigRow(*r) for r in _active],
+        )
+        if should_block_run(_violation, user_id=str(job.user_id), plan=(user.plan or "starter"), context="worker_run"):
+            _publish_log(r, job_id, "error", f"Plan limit — {_violation}", db=db)
+            _fail_job(db, job, r, job_id, f"Plan limit reached: {_violation}")
+            return
+
         # Liveness heartbeat DISABLED (rollback 2026-06-18). The daemon thread shared
         # the worker's small sync connection pool (pool_size=2) with the main work
         # session + _publish_log; during the DB-heavy insert phase the main thread and
@@ -474,6 +535,34 @@ def run_scrape_job(self, job_id: str) -> None:
 
         _publish_log(r, job_id, "success", f"Scrape complete — {len(records)} records found", db=db)
 
+        # ── Phase 3: honest probate output ────────────────────────────────────
+        # Drop LIVING-owner Transfer-on-Death estate-planning deeds unless the
+        # customer opted in (include_living_owner_tod is False = new probate
+        # default; NULL = grandfathered → keep; True = explicit opt-in → keep).
+        # Done ONCE here, before the plan-quota cap / DB insert / in-memory R2
+        # export / counts — all of which derive from `records` — so a filtered
+        # row never reaches persistence, export, dedup, enrichment, billing, or
+        # property membership (the first export is built from this in-memory list,
+        # not persisted rows — Codex). Death-triggered TOD (a recorder comment
+        # carries the death marker) is kept by should_include_probate_row.
+        if config.record_type == "probate" and config.include_living_owner_tod is False:
+            _before_tod = len(records)
+            records = [
+                rec for rec in records
+                if should_include_probate_row(
+                    "probate", False, rec.doc_type,
+                    (rec.enrichment_data or {}).get("comment"),
+                )
+            ]
+            _dropped_tod = _before_tod - len(records)
+            if _dropped_tod:
+                _publish_log(
+                    r, job_id, "info",
+                    f"Excluded {_dropped_tod} living-owner Transfer-on-Death "
+                    "estate-planning record(s) per scraper settings.",
+                    db=db,
+                )
+
         # ── Cap records to user's remaining plan quota ────────────────────────
         if user.records_limit != -1:
             remaining = max(0, user.records_limit - (user.records_used or 0))
@@ -554,6 +643,14 @@ def run_scrape_job(self, job_id: str) -> None:
             )
             return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
+        # Product invariant (BACKLOG §9): a tax_delinquent record set may only be
+        # persisted if EVERY row is from a qualified tax source AND carries both
+        # delinquent_amount + bill_year. Validate the WHOLE set before the batched
+        # insert loop below — a violation raises and fails the job atomically
+        # (on_failure → status=failed), so a mislabeled deed can never be written
+        # as a tax lead (the Clark 2026-04 incident). No-op for non-tax types.
+        validate_tax_delinquent_records(records, config.record_type)
+
         batch_size = 1000
         for i in range(0, len(records), batch_size):
             batch = records[i:i + batch_size]
@@ -575,6 +672,19 @@ def run_scrape_job(self, job_id: str) -> None:
                 # NULL here); the end-of-job recompute after _run_inline_enrichment
                 # is the authoritative pass once mailing is filled.
                 _owner = compute_owner_flags(rec.property_address, rec.mailing_address)
+                # Honesty label (probate only): tag every probate row with its signal
+                # subtype so a LIVING-owner Transfer-on-Death deed is never delivered
+                # disguised as a death/inheritance lead. New dict (never mutate the
+                # scraper's record); EXCLUDED from source_fingerprint/dedup_hash above,
+                # so labeling cannot affect identity, dedup, or billing.
+                _enrichment = rec.enrichment_data or {}
+                if config.record_type == "probate":
+                    # doc_type-primary, recorder-COMMENT fallback (Skagit stores the
+                    # probate signal in the comment, not doc_type — Codex P2).
+                    _subtype = classify_probate_signal_for_row(
+                        rec.doc_type, _enrichment.get("comment")
+                    )
+                    _enrichment = {**_enrichment, "lead_subtype": _subtype.value}
                 rows.append({
                     "id": str(_uuid.uuid4()),
                     "job_id": job_id,
@@ -587,7 +697,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     "parcel_id": _trunc(rec.parcel_id, 64),
                     "property_address": _trunc(rec.property_address, 512),
                     "mailing_address": _trunc(rec.mailing_address, 512),
-                    "enrichment_data": rec.enrichment_data or {},
+                    "enrichment_data": _enrichment,
                     "raw_html_hash": rec.raw_html_hash,
                     # Migration 062: per-job idempotency key (ON CONFLICT target).
                     "source_fingerprint": _fingerprint,
@@ -761,25 +871,102 @@ def run_scrape_job(self, job_id: str) -> None:
         # `format` (singular) key that schemas.DeliverConfig never sets,
         # so every export silently came out as CSV regardless of the
         # user's selection — flagged by Codex adversarial review.
-        formats = deliver_config.get("formats") or ["csv"]
+        from src.config.constants import (
+            DEFAULT_EXPORT_FORMAT,
+            SUPPORTED_EXPORT_FORMATS,
+        )
+        formats = deliver_config.get("formats") or [DEFAULT_EXPORT_FORMAT]
         fmt = formats[0]
+        # Belt to the schema validator's suspenders: a config saved BEFORE the
+        # formats allowlist landed (or via any path that skips validation) can
+        # still hold an unsupported value. Coerce it to the default here rather
+        # than let DataExporter.export() raise and fail every scrape for that
+        # config (Codex). New saves are rejected up front by bound_formats.
+        if fmt.lower() not in SUPPORTED_EXPORT_FORMATS:
+            _logger.warning(
+                "Job %s: unsupported export format %r on config %s — falling back to %s",
+                job_id, fmt, getattr(config, "id", "?"), DEFAULT_EXPORT_FORMAT,
+            )
+            fmt = DEFAULT_EXPORT_FORMAT
 
         _publish_log(r, job_id, "info", f"Building {fmt.upper()} export...", db=db)
 
         record_dicts = [r_obj.to_dict() for r_obj in records]
+        # Honor the user's output-field visibility (blank deselected hideable
+        # columns; identity/derived columns always present). Legacy/empty => all.
+        hidden_fields = resolve_hidden_output_fields(config.fields)
         exporter = DataExporter()
-        local_file = exporter.export(record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt)
+        local_file = exporter.export(
+            record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt, hidden_fields=hidden_fields
+        )
 
         object_key = f"exports/{job.user_id}/{job_id}/leads.{local_file.suffix.lstrip('.')}"
+        # Upload the deliverable to R2 with a few retries (transient R2 blips are
+        # common). A FAILED upload is NOT non-fatal: the local file is deleted in
+        # `finally`, and BOTH delivery paths (email + in-app download) require
+        # object_key — so a swallowed failure marked the job done+billed with no
+        # deliverable anywhere, stranding a paying user (Codex High). Treat "no
+        # deliverable" as a job FAILURE instead (see the not-upload_ok branch).
         try:
-            exporter.upload_to_r2(local_file, object_key)
-            _publish_log(r, job_id, "success", "Export uploaded to cloud storage", db=db)
-        except Exception as upload_exc:
-            _logger.warning("R2 upload failed (non-fatal): %s", upload_exc)
-            _publish_log(r, job_id, "warning", "Cloud upload unavailable — export saved locally", db=db)
-            object_key = None  # No cloud export available
+            upload_ok, upload_exc = _upload_export_with_retry(
+                exporter, local_file, object_key
+            )
         finally:
             local_file.unlink(missing_ok=True)
+
+        if upload_ok:
+            _publish_log(r, job_id, "success", "Export uploaded to cloud storage", db=db)
+        else:
+            # No deliverable produced. Release this job's cross-job dedup claims
+            # (committed at the dedup step BEFORE export) so the never-delivered,
+            # unbilled leads are not treated as duplicates on a future re-scrape
+            # (Codex). Then fail loudly: billing has NOT run yet (it's below), so
+            # the user is not charged, and a FAILED job is visible + retryable.
+            _logger.error(
+                "Job %s: R2 upload failed after %d attempts — failing job (no deliverable): %s",
+                job_id, _R2_UPLOAD_ATTEMPTS, str(upload_exc)[:200],
+            )
+            try:
+                db.rollback()
+                # Tenant-scoped DELETE (user_id alongside first_job_id) per the
+                # repo's mandatory user_id-filter rule. NOTE: this needs DELETE on
+                # delivered_records for the worker role; granted to
+                # bridgeleads_system in provision_rls_roles.sql. Works today (prod
+                # role still BYPASSRLS); the grant covers the RLS cutover.
+                db.execute(
+                    sa_text(
+                        "DELETE FROM delivered_records "
+                        "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
+                    ),
+                    {"jid": job_id, "uid": str(job.user_id)},
+                )
+                db.commit()
+            except Exception as cleanup_exc:
+                db.rollback()
+                _logger.error(
+                    "Job %s: failed to release dedup claims after upload failure: %s",
+                    job_id, str(cleanup_exc)[:200],
+                )
+            # Honest message: a FAILED job is terminal — the watchdog does NOT
+            # re-queue it (it only requeues stuck active/pending jobs). A
+            # scheduled scraper makes a fresh job on its next occurrence; a manual
+            # run must be re-triggered by the user. Don't promise auto-retry.
+            reason = (
+                "Export upload to cloud storage failed after multiple attempts — "
+                "no file was produced and you were not charged. Please run the "
+                "scraper again; contact support if it keeps failing."
+            )
+            if _fail_job(db, job, r, job_id, reason):
+                from src.workers.notification_emit import create_notification
+                create_notification(
+                    user_id=job.user_id, type="job_failed", job_id=job_id,
+                    detail={
+                        "scraper_name": getattr(config, "name", None),
+                        "county": getattr(config, "county", None),
+                        "error_summary": reason[:200],
+                    },
+                )
+            return
 
         # Force-finalize guard (Codex P2): a batch force-finalize may have
         # cancelled this child while it was exporting. Re-check the live DB
@@ -983,7 +1170,10 @@ def run_scrape_job(self, job_id: str) -> None:
                     ]}
                     for res in refreshed
                 ]
-                enriched_file = exporter.export(record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt)
+                enriched_file = exporter.export(
+                    record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt,
+                    hidden_fields=resolve_hidden_output_fields(config.fields),
+                )
                 if object_key:
                     exporter.upload_to_r2(enriched_file, object_key)
                     _logger.info("Re-exported CSV with enriched data")
@@ -1080,11 +1270,17 @@ def run_scrape_job(self, job_id: str) -> None:
         )
 
         # ── EMAIL DELIVERY ─────────────────────────────────────────────────────
+        # Build the tokenized 48h download link here (it needs the worker's
+        # exporter + API_BASE_URL), then enqueue the send on Celery so a transient
+        # Resend blip is RETRIED off the scrape task instead of dropped on the
+        # first failure (Fix 3). Building the URL can still raise in prod when
+        # API_BASE_URL is unset — that's a delivery-config failure, kept non-fatal
+        # for the (already-done) scrape job and surfaced to ops.
         emails = deliver_config.get("emails", [])
         if emails and object_key:
             try:
                 download_url = _delivery_download_url(job_id, job.user_id, object_key, exporter)
-                deliver_job_results(
+                deliver_job_email.delay(
                     job_id=job_id,
                     scraper_name=config.name,
                     record_count=display_count,
@@ -1093,16 +1289,31 @@ def run_scrape_job(self, job_id: str) -> None:
                     fmt=fmt,
                 )
             except Exception as email_exc:
-                _logger.warning("Email delivery failed (non-fatal): %s", email_exc)
+                # Most common cause: API_BASE_URL unset in prod (the URL builder
+                # raises). Was silently swallowed — now surfaced to ops so a
+                # configured-but-undelivered email is never invisible.
+                _logger.warning("Email delivery enqueue failed (non-fatal): %s", email_exc)
                 _publish_log(r, job_id, "warning", "Email delivery unavailable", db=db)
+                from src.workers.ops_alerts import send_ops_alert
+                send_ops_alert(
+                    "email_enqueue", job_id,
+                    "Lead email could not be queued",
+                    f"Could not queue the delivery email for job {job_id}: "
+                    f"{str(email_exc)[:200]}",
+                )
 
         # ── SPRINT 6.5: WEBHOOK DELIVERY ───────────────────────────────────────
         # Business+ plan feature (gated at scraper config creation time).
         # Fire-and-forget via Celery so retries happen on the celery queue
         # independently of the scrape job. Non-fatal: webhook failures
         # must never mark the scrape job as errored.
+        from src.config.constants import BUSINESS_FEATURES_PLANS
         webhook_url = deliver_config.get("webhook_url")
-        if webhook_url and object_key:
+        _wh_plan_ok = (user.plan or "starter").lower() in BUSINESS_FEATURES_PLANS
+        if webhook_url and object_key and not _wh_plan_ok:
+            _publish_log(r, job_id, "warning",
+                         "Webhook delivery skipped — requires Business plan", db=db)
+        if webhook_url and object_key and _wh_plan_ok:
             try:
                 from src.workers.webhook_delivery import (
                     build_webhook_payload,
@@ -1127,9 +1338,13 @@ def run_scrape_job(self, job_id: str) -> None:
                     webhook_secret=webhook_secret,
                 )
                 deliver_job_webhook.delay(job_id, webhook_url, payload)
+                # Host-only — a webhook URL can carry secrets in its path/query,
+                # and this log line is surfaced to the user's job log (Codex).
+                from urllib.parse import urlparse
+                _wh_host = urlparse(webhook_url).hostname or "the configured endpoint"
                 _publish_log(
                     r, job_id, "info",
-                    f"Webhook queued for delivery to {webhook_url[:60]}",
+                    f"Webhook queued for delivery to {_wh_host}",
                     db=db,
                 )
             except Exception as webhook_exc:
@@ -1141,6 +1356,13 @@ def run_scrape_job(self, job_id: str) -> None:
                     r, job_id, "warning",
                     "Webhook queue unavailable — job completed successfully",
                     db=db,
+                )
+                from src.workers.ops_alerts import send_ops_alert
+                send_ops_alert(
+                    "webhook_enqueue", job_id,
+                    "Webhook could not be queued",
+                    f"Could not queue the completion webhook for job {job_id}: "
+                    f"{str(webhook_exc)[:200]}",
                 )
 
         # ── PHASE 5: DIALER PUSH ──────────────────────────────────────────────

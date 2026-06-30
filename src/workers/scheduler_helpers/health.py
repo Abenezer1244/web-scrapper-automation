@@ -16,6 +16,29 @@ _logger = setup_logger("worker.scheduler")
 # few cycles since the rows persist until claimed.
 _WATCHDOG_REDELIVER_LIMIT = 500
 
+# Lag-aware canary: historical fallback windows as (days_ago_start, days_ago_end).
+# When the current-week probe returns 0 records for a NON-healthy connector, we
+# re-probe these older windows to tell a data-LAGGED but working portal (records
+# exist further back) from a genuinely broken scraper (nothing anywhere). Some WA
+# recorder portals publish on a delay — e.g. Chelan's AcclaimWeb banner reads
+# "Released through 04/21/2026" ~2 months behind — so the current week is
+# legitimately empty while the portal is fine.
+#
+# Cost (Codex review P2): scrape() extracts the WHOLE window before returning, so
+# a wide window on a busy county pages through everything just to confirm >=1
+# record. We therefore order CHEAP-FIRST and stop at the first hit: a 7-day window
+# (~1 chunk, same cost as the live probe) catches busy/medium counties
+# immediately; only sparse or broken counties fall through to the wider safety-net
+# windows, and those have few/no rows so extraction stays cheap. A single fixed
+# window would false-flag low-volume rural counties (verified: clallam files <1
+# probate/pre_foreclosure in some 30-day spans), so a 30-day safety net at ~8
+# months backstops the cheap probe. We deliberately cap the net at 30 days (not
+# wider): these scrapers chunk by 7 days, so a 90+ day window pages through 13-26
+# sequential loads regardless of row count — exactly the cost we are avoiding.
+# Stage 2 runs ONLY for non-healthy connectors, bounding how often this fires; the
+# 30-day net (~4 chunks) is the proven clallam-recovery window.
+_CANARY_HISTORICAL_WINDOWS = [(90, 83), (270, 240)]
+
 
 def _watchdog_stuck_jobs_impl() -> None:
     """Re-queue jobs that have been stuck in an ACTIVE state past the task budget.
@@ -291,10 +314,28 @@ def _canary_check_impl() -> None:
                 if records:
                     connector.health_status = "healthy"
                 elif connector.health_status != "healthy":
-                    # Was degraded/down/unknown and is still empty —
-                    # stay in whatever non-healthy state we had, or
-                    # move to 'degraded' if we were 'unknown'.
-                    if connector.health_status in ("unknown", "down"):
+                    # Current-week probe empty AND not sticky-healthy. Before
+                    # settling on a non-healthy status, distinguish a data-LAGGED
+                    # but working portal from a broken scraper by re-probing
+                    # historical windows (see _canary_probe_historical). A hit
+                    # means the scraper works and the empty current week is just
+                    # source lag (e.g. AcclaimWeb "released through" ~2mo behind),
+                    # so we fold it into 'healthy' to keep the connector visible.
+                    # No DB/enum change: the lag reason is logged, not persisted.
+                    # Stage 2 runs ONLY here (non-healthy + empty), bounding cost,
+                    # and only ever UPGRADES — a historical-probe error never
+                    # downgrades (it just counts as "no hit").
+                    if _canary_probe_historical(scraper_class, today):
+                        connector.health_status = "healthy"
+                        _logger.info(
+                            "Canary %s/%s: source_lagged (current week empty, "
+                            "historical records OK) -> healthy",
+                            connector.county, connector.state,
+                        )
+                    elif connector.health_status in ("unknown", "down"):
+                        # No records now or historically — genuinely empty or a
+                        # broken scraper/extraction. Move 'unknown'/'down' to
+                        # 'degraded'; leave an existing 'degraded' as-is.
                         connector.health_status = "degraded"
                 _logger.info(
                     "Canary %s/%s: %s (%d records)",
@@ -334,3 +375,35 @@ def _canary_check_impl() -> None:
 async def _canary_scrape(scraper_class, date_from: str, date_to: str) -> list:
     async with scraper_class() as scraper:
         return await scraper.scrape(date_from, date_to)
+
+
+def _canary_probe_historical(scraper_class, today) -> bool:
+    """True if the scraper retrieves >=1 record in any historical fallback window.
+
+    Read-only: uses the same scrape() path as the live probe (returns records,
+    persists nothing). Swallows per-window exceptions and stops at the first hit.
+    This runs ONLY for already-non-healthy connectors whose current-week probe was
+    empty, and only ever UPGRADES them to 'healthy' — so a transient historical
+    error must never downgrade a connector; it simply counts as "no hit" and the
+    caller keeps the current non-healthy status. Bounded by _CANARY_HISTORICAL_WINDOWS.
+    """
+    import asyncio
+
+    for days_start, days_end in _CANARY_HISTORICAL_WINDOWS:
+        win_from = (today - timedelta(days=days_start)).strftime("%m/%d/%Y")
+        win_to = (today - timedelta(days=days_end)).strftime("%m/%d/%Y")
+        try:
+            records = asyncio.run(_canary_scrape(scraper_class, win_from, win_to))
+        except Exception as exc:  # transient/blocked historical probe — never downgrades
+            _logger.info(
+                "Canary historical probe %s-%s errored (ignored): %s",
+                win_from, win_to, str(exc)[:80],
+            )
+            continue
+        if records:
+            _logger.info(
+                "Canary historical probe hit %s-%s: %d records",
+                win_from, win_to, len(records),
+            )
+            return True
+    return False

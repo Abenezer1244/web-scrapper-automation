@@ -186,3 +186,44 @@ async def rate_limit(request: Request, zone: str = "general", identifier: str | 
             detail="Too many requests. Please slow down.",
             headers={"Retry-After": str(window_seconds)},
         )
+
+
+async def once_per(key: str, ttl_seconds: int) -> bool:
+    """Idempotency gate: True the FIRST time `key` is seen within `ttl_seconds`,
+    False on every repeat until the key expires.
+
+    Backed by Redis ``SET key 1 NX EX ttl`` (atomic test-and-set). Use to throttle
+    a side effect that must fire at most once per window per subject — e.g. one
+    duplicate-signup email per email-address per day, regardless of how many times
+    the address is submitted (an email-bomb guard that, unlike per-IP limiting,
+    an attacker cannot evade by rotating IPs).
+
+    Fails CLOSED (returns False) if Redis is unavailable: the gated side effect is
+    non-critical, so skipping it during an outage is strictly safer than letting it
+    fire unthrottled. This is the opposite of rate_limit()'s fail-OPEN posture,
+    which protects availability of the request path; here we protect the subject
+    from spam.
+    """
+    redis_key = f"once:{key}"
+    try:
+        # nx=True -> only set if absent; returns True when set, None when it existed.
+        was_set = await _get_redis().set(redis_key, "1", nx=True, ex=ttl_seconds)
+    except redis_exceptions.RedisError as exc:
+        _logger.warning("once_per fail-closed: Redis error for key=%s: %s", redis_key, exc)
+        return False
+    return bool(was_set)
+
+
+async def release_once(key: str) -> None:
+    """Release a gate previously claimed by once_per(), so the NEXT call for the
+    same key can fire again immediately.
+
+    Use when the side effect that once_per() gated could not actually be started
+    (e.g. the task enqueue raised right after the gate was claimed) — otherwise a
+    single transient failure would suppress the side effect for the whole TTL.
+    Best-effort: a failed delete just means the gate expires on its own TTL.
+    """
+    try:
+        await _get_redis().delete(f"once:{key}")
+    except redis_exceptions.RedisError as exc:
+        _logger.warning("release_once: Redis error for key=once:%s: %s", key, exc)

@@ -83,11 +83,158 @@ _AVAILABILITY: dict[tuple[str, str], dict] = {
             "notice_of_trustee_sale": "324",
         },
     },
+    # Clark (LandmarkWeb) — exact server-side document-type checkboxes. The portal
+    # filters server-side to the selected codes (verified live 2026-06-22, codes in
+    # clark_wa._DOC_TYPE_CHECKBOX_VALUES / _CHECKBOX_DOC_LABELS). notice_of_trustee_sale
+    # maps to BOTH 167 (NOTICE OF TRUSTEE SALE) and 257 (TRUSTEES SALE) variants.
+    ("clark", "wa"): {
+        "available": [
+            "notice_of_default", "notice_of_trustee_sale",
+            "lis_pendens", "notice_of_foreclosure", "foreclosure",
+        ],
+        "method": "checkbox",
+        "confidence": "verified",
+        "default": "notice_of_trustee_sale",
+        "supported_for_selection": True,
+        "tokens": {
+            "notice_of_default": "166",
+            "notice_of_trustee_sale": ["167", "257"],
+            "lis_pendens": "129",
+            "notice_of_foreclosure": "157",
+            "foreclosure": "93",
+        },
+        "note": "Clark recorder LandmarkWeb — exact server-side document-type checkboxes (verified live 2026-06-22).",
+    },
+    # Skagit (custom ASP.NET recorder) — server-side document-type DROPDOWN
+    # (content_ddlDocumentType) selected per search, then a client-side comment
+    # refine. tokens map canonical -> the EXACT dropdown option label. The dropdown
+    # has no generic "Foreclosure" option, so `foreclosure` is not offered (the four
+    # specific notice types are). The scraper additionally narrows its client-refine
+    # keyword set via its own canonical->keyword map (both stages narrow together).
+    ("skagit", "wa"): {
+        "available": [
+            "notice_of_default", "notice_of_trustee_sale",
+            "lis_pendens", "notice_of_foreclosure",
+        ],
+        "method": "dropdown",
+        "confidence": "verified",
+        "default": "notice_of_trustee_sale",
+        "supported_for_selection": True,
+        "tokens": {
+            "notice_of_default": "Notice Of Default",
+            "notice_of_trustee_sale": "Notice Of Trustees Sale",
+            "lis_pendens": "Lis Pendens",
+            "notice_of_foreclosure": "Notice Of Foreclosure",
+        },
+        "note": "Skagit recorder document-type dropdown (server-side), refined client-side by comment.",
+    },
+    # ── P4: client-side KEYWORD families (confidence="keyword"). Each tokens map
+    # EXACTLY partitions that scraper's _DOC_TYPE_MAP["pre_foreclosure"] so a narrowed
+    # selection is a true subset (enforced by test_*_tokens_partition_scraper_map).
+    # "NOTICE OF INTENT TO FORFEIT" (real-estate-contract forfeiture, iDoc/Tyler) is
+    # grouped under `foreclosure` (generic foreclosure-stage), the closest canonical.
+    # Douglas — AcclaimWeb. Chelan uses the same partition and is pre-staged below.
+    ("douglas", "wa"): {
+        "available": ["notice_of_default", "notice_of_trustee_sale", "lis_pendens", "foreclosure"],
+        "method": "keyword", "confidence": "keyword", "default": "notice_of_trustee_sale",
+        "supported_for_selection": True,
+        "tokens": {
+            "notice_of_default": ["NOTICE OF DEFAULT", "NOD"],
+            "notice_of_trustee_sale": ["NOTICE OF TRUSTEE", "TRUSTEE SALE", "TRUSTEE'S SALE", "NTS"],
+            "lis_pendens": ["LIS PENDENS"],
+            "foreclosure": ["FORECLOSURE"],
+        },
+        "note": "AcclaimWeb recorder — best-effort document-type text match (client-side).",
+    },
+    # Chelan — AcclaimWeb (same family/partition as douglas). health=down at enable
+    # time (portal reachable but the scraper stalls — the condition causing the down
+    # status), so PRE-STAGED: list_connectors hides down connectors, so the selector
+    # appears only once chelan's health recovers. Rests on the verified AcclaimWeb
+    # family mechanism + the partition-invariant test (a per-county live spot-check
+    # wasn't possible while the scraper times out).
+    ("chelan", "wa"): {
+        "available": ["notice_of_default", "notice_of_trustee_sale", "lis_pendens", "foreclosure"],
+        "method": "keyword", "confidence": "keyword", "default": "notice_of_trustee_sale",
+        "supported_for_selection": True,
+        "tokens": {
+            "notice_of_default": ["NOTICE OF DEFAULT", "NOD"],
+            "notice_of_trustee_sale": ["NOTICE OF TRUSTEE", "TRUSTEE SALE", "TRUSTEE'S SALE", "NTS"],
+            "lis_pendens": ["LIS PENDENS"],
+            "foreclosure": ["FORECLOSURE"],
+        },
+        "note": "AcclaimWeb recorder — best-effort document-type text match (client-side).",
+    },
+    # Columbia — iDocMarket.
+    ("columbia", "wa"): {
+        "available": ["notice_of_default", "notice_of_trustee_sale", "lis_pendens", "foreclosure"],
+        "method": "keyword", "confidence": "keyword", "default": "notice_of_trustee_sale",
+        "supported_for_selection": True,
+        "tokens": {
+            "notice_of_trustee_sale": ["NOTICE OF TRUSTEE", "TRUSTEE'S SALE", "TRUSTEE SALE"],
+            "notice_of_default": ["NOTICE OF DEFAULT"],
+            "lis_pendens": ["LIS PENDENS"],
+            "foreclosure": ["FORECLOSURE", "NOTICE OF INTENT TO FORFEIT"],
+        },
+        "note": "iDocMarket recorder — best-effort document-type text match (client-side).",
+    },
+    # Cowlitz — Laserfiche WebLink.
+    ("cowlitz", "wa"): {
+        "available": ["notice_of_default", "notice_of_trustee_sale", "lis_pendens", "foreclosure"],
+        "method": "keyword", "confidence": "keyword", "default": "notice_of_trustee_sale",
+        "supported_for_selection": True,
+        "tokens": {
+            "lis_pendens": ["LIS PENDENS"],
+            "notice_of_trustee_sale": ["NOTICE OF TRUSTEE", "TRUSTEE SALE", "TRUSTEE'S SALE"],
+            "notice_of_default": ["NOTICE OF DEFAULT"],
+            "foreclosure": ["FORECLOSURE"],
+        },
+        "note": "Laserfiche WebLink recorder — best-effort document-type text match (client-side).",
+    },
+    # Okanogan — Tyler SelfService.
+    ("okanogan", "wa"): {
+        "available": ["notice_of_default", "notice_of_trustee_sale", "lis_pendens", "foreclosure"],
+        "method": "keyword", "confidence": "keyword", "default": "notice_of_trustee_sale",
+        "supported_for_selection": True,
+        "tokens": {
+            "lis_pendens": ["LIS PENDENS"],
+            "notice_of_trustee_sale": ["NOTICE OF TRUSTEE", "TRUSTEE'S SALE"],
+            "notice_of_default": ["NOTICE OF DEFAULT"],
+            "foreclosure": ["FORECLOSURE", "NOTICE OF INTENT TO FORFEIT"],
+        },
+        "note": "Tyler SelfService recorder — best-effort document-type text match (client-side).",
+    },
+    # Whatcom — Helion (manual). The only keyword family that exposes all 5 canonical
+    # types (its map has a distinct NOTICE OF FORECLOSURE token).
+    ("whatcom", "wa"): {
+        "available": [
+            "notice_of_default", "notice_of_trustee_sale", "lis_pendens",
+            "notice_of_foreclosure", "foreclosure",
+        ],
+        "method": "keyword", "confidence": "keyword", "default": "notice_of_trustee_sale",
+        "supported_for_selection": True,
+        "tokens": {
+            "notice_of_trustee_sale": ["NOTICE OF TRUSTEE SALE"],
+            "lis_pendens": ["LIS PENDENS"],
+            "notice_of_default": ["NOTICE OF DEFAULT"],
+            "notice_of_foreclosure": ["NOTICE OF FORECLOSURE"],
+            "foreclosure": ["FORECLOSURE"],
+        },
+        "note": "Whatcom Helion recorder — best-effort document-type text match (client-side).",
+    },
 }
 
-# EagleWeb template default (kitsap + others). Hidden from selection until
-# per-county coverage is explicitly verified (Codex: don't assume 16 counties
-# share one truth). Keyword map mirrors eagleweb._DOC_TYPE_MAP entries.
+# EagleWeb template (Tyler EagleWeb recorder sites). CLIENT-SIDE keyword filter:
+# the scraper fetches broadly and keeps rows whose doc-type text matches the keyword
+# set, so selection NARROWS that keyword set — a weaker, best-effort filter than a
+# server-side checkbox/dropdown, hence confidence="keyword" (the UI labels it as a
+# post-collection text match, not a portal filter).
+#
+# `tokens` MUST exactly partition eagleweb._DOC_TYPE_MAP["pre_foreclosure"] so a
+# narrowed selection is a true SUBSET of legacy output — never matching a keyword the
+# full run wouldn't (would over-collect) and never dropping one it would (silent lead
+# loss). test_eagleweb_tokens_partition_scraper_map enforces this lockstep.
+# notice_of_foreclosure is intentionally absent: EagleWeb's keyword map has no
+# "NOTICE OF FORECLOSURE" token (only bare FORECLOSURE → canonical `foreclosure`).
 _EAGLEWEB_TEMPLATE = {
     "available": [
         "notice_of_default", "notice_of_trustee_sale",
@@ -95,16 +242,26 @@ _EAGLEWEB_TEMPLATE = {
     ],
     "method": "keyword",
     "confidence": "keyword",
-    "default": None,
-    "supported_for_selection": False,
+    "default": "notice_of_trustee_sale",
+    "supported_for_selection": True,
     "tokens": {
-        "notice_of_default": ["NOTICE OF DEFAULT", "NOD"],
-        "notice_of_trustee_sale": ["NOTICE OF TRUSTEE SALE", "TRUSTEE SALE", "TRUSTEE'S SALE", "NTS"],
+        "notice_of_default": ["NOTICE OF DEFAULT"],
+        "notice_of_trustee_sale": ["NOTICE OF TRUSTEE SALE", "TRUSTEE SALE", "TRUSTEE'S SALE", "NTS", "NTSCL"],
         "lis_pendens": ["LIS PENDENS", "LISP"],
         "foreclosure": ["FORECLOSURE"],
     },
 }
-_EAGLEWEB_COUNTIES = {"kitsap"}  # extend as coverage is verified
+# EagleWeb pre_foreclosure counties (live `/connectors`). grant sits on tylerhost.net
+# but its /grantrecorder/web/ path resolves to EagleWeb (see registry._detect_template).
+# lewis/pacific/spokane were health=down when enabled (portals reachable but the
+# scraper stalls — the condition behind the down status); they are PRE-STAGED on the
+# verified EagleWeb family mechanism + partition-invariant test. list_connectors hides
+# down connectors, so their selector appears only once each county's health recovers.
+_EAGLEWEB_COUNTIES = {
+    "benton", "clallam", "grant", "island",
+    "jefferson", "kitsap", "thurston", "whitman",
+    "lewis", "pacific", "spokane",
+}
 
 
 def availability_for(county: str, state: str) -> dict | None:
@@ -185,4 +342,45 @@ def canonical_tokens_for(county: str, state: str, doc_types: list[str]) -> list:
             out.extend(tok)
         else:
             out.append(tok)
+    return out
+
+
+def canonical_tokens_or_raise(county: str, state: str, doc_types: list[str]) -> list:
+    """Map an EXPLICIT canonical selection to the scraper's own tokens, FAIL-CLOSED.
+
+    Use this from scraper constructors when a non-None ``doc_types`` selection is
+    present. Unlike :func:`canonical_tokens_for` (which returns ``[]`` so a *legacy*
+    caller can fall back to its full set), an explicit user selection must NEVER
+    silently broaden: if the county is not selectable, the selection is empty, or any
+    selected token is unmappable (e.g. a stale config saved before a registry change),
+    raise ``ValueError`` so the job fails loud instead of scraping every document type
+    the user did NOT pick. ``doc_types is None`` means legacy/full and must not reach
+    this function.
+    """
+    a = availability_for(county, state)
+    if a is None or not a.get("supported_for_selection"):
+        raise ValueError(
+            f"{county}, {state} does not support pre-foreclosure document-type selection"
+        )
+    if not doc_types:
+        raise ValueError(
+            "explicit doc_types selection is empty (pass None for legacy/full output)"
+        )
+    tokens = a["tokens"]
+    out: list = []
+    for d in doc_types:
+        tok = tokens.get(d)
+        if tok is None:
+            raise ValueError(
+                f"document type {d!r} is not mappable for {county}, {state} "
+                f"(stale selection after a registry change?) — refusing to broaden output"
+            )
+        if isinstance(tok, list):
+            out.extend(tok)
+        else:
+            out.append(tok)
+    if not out:
+        raise ValueError(
+            f"no scraper tokens resolved for {county}, {state} selection {doc_types}"
+        )
     return out

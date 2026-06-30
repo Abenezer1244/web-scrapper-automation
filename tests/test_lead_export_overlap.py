@@ -53,6 +53,34 @@ class TestOverlapCsvBuilder:
         assert lines[0].split(",")[0] == "overlap"
         assert lines[1].startswith("Overlap,2,")
 
+    def test_hidden_fields_blank_in_overlap_row(self):
+        # Batch field-visibility applies to the combined CSV too (header kept).
+        rec = {
+            "party_name": "DOE, JOHN",
+            "property_address": "123 MAIN ST, KENT WA 98031",
+            "mailing_address": "PO BOX 7, KENT WA 98031",
+            "heirs": "DOE, JANE",
+            "legal_description": "LOT 9 BLK 1",
+        }
+        ov = {"lists_count": 1, "lists": "Probate", "counties": "King"}
+        row = build_overlap_export_row(rec, ov, hidden_fields={"legal_description", "mailing_address"})
+        assert row["legal_description"] == "" and row["mailing_address"] == ""
+        assert row["heirs"] == "DOE, JANE"           # not hidden -> kept
+        assert row["party_name"] == "DOE, JOHN"      # identity -> intact
+
+    def test_writer_threads_hidden_fields(self):
+        rec = {"party_name": "DOE, JANE", "property_address": "5 OAK AVE, TACOMA WA 98402",
+               "legal_description": "LOT 4"}
+        buf = StringIO()
+        write_lead_csv_with_overlap(
+            [(rec, {"lists_count": 1, "lists": "Probate", "counties": "Pierce"})],
+            buf, hidden_fields={"legal_description"},
+        )
+        import csv as _csv
+        row = next(_csv.DictReader(StringIO(buf.getvalue())))
+        assert row["legal_description"] == ""
+        assert row["party_name"] == "DOE, JANE"
+
 
 class TestSegmentSortHelpers:
     def test_label_known_and_fallback(self):

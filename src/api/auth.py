@@ -298,6 +298,15 @@ async def get_auth_context(
         user_match = result.scalar_one_or_none()
         if user_match is None:
             raise _CREDENTIALS_EXCEPTION
+        # API access is a Business+ capability — an always-on feature gate (mirrors
+        # the create-time require_plan("business","agency") gate and the generic-
+        # webhook gate). A key minted while on Business stops working after downgrade.
+        from src.config.constants import BUSINESS_FEATURES_PLANS
+        if (user_match.plan or "starter").lower() not in BUSINESS_FEATURES_PLANS:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="API access requires a Business or Agency plan.",
+            )
         return AuthContext(
             user=user_match,
             auth_method="api_key",

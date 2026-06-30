@@ -36,6 +36,7 @@ from src.config.constants import (
 )
 from src.db import CountyConnector
 from src.db.models import BatchRun, Job, ScraperBatch, ScraperConfig
+from src.scrapers.probate import new_probate_config_tod_default
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("api.batches")
@@ -69,13 +70,28 @@ async def create_batch(
             detail=f"This batch is {combos} scrapes; your plan allows up to {cap} per batch.",
         )
 
-    # 3. Delivery / skip-trace entitlement — SAME gates as a single scrape (a batch
-    #    must not let a lower plan exfiltrate PII via webhook or run paid skip trace).
-    if (body.deliver.webhook_url or body.deliver.dialer_webhook_url) and plan not in BUSINESS_FEATURES_PLANS:
+    # 3. Webhook / dialer delivery is NOT supported for batches: the finalizer only
+    #    sends the combined-export email, and child configs are created with
+    #    deliver={} so the dialer sweep never picks them up. Accepting these fields
+    #    persisted dead config the user thought was active (Codex). Reject them up
+    #    front with a clear message instead of silently dropping the delivery.
+    # dialer_type alone defaults to "generic_webhook" (the dropdown default), so it
+    # is NOT a "configured" signal — only an actual URL or PhoneBurner token is.
+    if (
+        body.deliver.webhook_url
+        or body.deliver.dialer_webhook_url
+        or body.deliver.phoneburner_access_token
+    ):
         raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail="Webhook delivery requires a Business or Agency plan",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Webhook and dialer delivery aren't available for batch scrapes — "
+                "set them on an individual scraper instead. A batch delivers one "
+                "combined CSV by email."
+            ),
         )
+    # 3b. Skip-trace entitlement — SAME gate as a single scrape (a batch must not
+    #     let a lower plan run paid skip trace).
     if body.enrichment.skip_tracing and plan not in BUSINESS_FEATURES_PLANS:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -175,6 +191,12 @@ async def create_batch(
                     schedule={},   # suppressed — batch owns scheduling
                     deliver={},    # suppressed — batch owns delivery
                     skip_trace_enabled=body.skip_trace_enabled,
+                    # Phase 3: probate children get the new TOD default (False) or the
+                    # batch-level opt-in; non-probate children leave the flag NULL.
+                    include_living_owner_tod=(
+                        new_probate_config_tod_default("probate", body.include_living_owner_tod)
+                        if rt == "probate" else None
+                    ),
                 )
             )
     # Durable dispatch intent (Track A): create the BatchRun 'pending' in the SAME
@@ -352,16 +374,27 @@ async def get_batch(
             .order_by(ScraperConfig.county, ScraperConfig.record_type)
         )
     ).all()
+    blocked_config_ids = {
+        e["config_id"]
+        for e in ((run.failed_children if run else None) or [])
+        if isinstance(e, dict) and e.get("config_id")
+    }
     children = []
     for cid, county, record_type in config_rows:
         job = job_by_config.get(cid)
+        if job:
+            child_status = job[1]
+        elif cid in blocked_config_ids:
+            child_status = "failed"  # blocked by plan limits (see failed_children)
+        else:
+            child_status = "pending"
         children.append(
             BatchChildSummary(
                 config_id=cid,
                 county=county,
                 record_type=record_type,
                 job_id=job[0] if job else None,
-                status=job[1] if job else "pending",
+                status=child_status,
                 record_count=job[2] if job else 0,
             )
         )
@@ -392,15 +425,21 @@ async def download_batch(
     # full-CSV buffer), so rate-limit to keep concurrent downloads from starving
     # API capacity (Codex).
     await rate_limit(request, zone="general", identifier=current_user.id)
-    await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
+    batch = await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
     run = await _run_for(db, batch_id, current_user.id)
-    return await _stream_run_csv(batch_id, run)
+    return await _stream_run_csv(batch_id, run, batch.fields)
 
 
-async def _stream_run_csv(batch_id: str, run: BatchRun | None) -> StreamingResponse:
+async def _stream_run_csv(
+    batch_id: str, run: BatchRun | None, batch_fields: object = None
+) -> StreamingResponse:
     """Rebuild + stream one run's combined CSV. Caller must have verified batch
     ownership AND that `run` belongs to that batch (run.user_id is then the
-    verified owner — safe to pass to the system-session renderer)."""
+    verified owner — safe to pass to the system-session renderer).
+
+    `batch_fields` is the owning batch's `ScraperConfig`-shape `fields` JSON; it
+    resolves to the hideable columns to blank so the combined CSV honors the same
+    output-field visibility as the per-job exports (legacy/empty => show all)."""
     if run is None or not run.combined_export_key:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -408,13 +447,15 @@ async def _stream_run_csv(batch_id: str, run: BatchRun | None) -> StreamingRespo
         )
     from starlette.concurrency import run_in_threadpool
 
+    from src.utils.lead_export import resolve_hidden_output_fields
     from src.workers.batch_export import render_combined_csv
 
+    hidden_fields = resolve_hidden_output_fields(batch_fields)
     try:
         # render_combined_csv opens a sync session + builds the CSV — run off the
         # event loop so the DB/CSV work can't block other requests.
         data = await run_in_threadpool(
-            render_combined_csv, run.user_id, run.child_job_ids or []
+            render_combined_csv, run.user_id, run.child_job_ids or [], hidden_fields
         )
     except Exception as exc:  # build failure — surface a clean 503
         _logger.error("batch %s download failed: %s", batch_id, str(exc)[:200])
@@ -483,7 +524,7 @@ async def download_batch_run(
     """Run-scoped combined-CSV download (2B): history downloads must not drift to
     the latest run the way /download (latest-run semantics) does."""
     await rate_limit(request, zone="general", identifier=current_user.id)
-    await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
+    batch = await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
     run = (
         await db.execute(
             select(BatchRun).where(
@@ -495,4 +536,4 @@ async def download_batch_run(
     ).scalar_one_or_none()
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
-    return await _stream_run_csv(batch_id, run)
+    return await _stream_run_csv(batch_id, run, batch.fields)

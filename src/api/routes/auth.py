@@ -16,7 +16,7 @@ the wrappers keep working unchanged.
 import time
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Request, Response, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -68,11 +68,14 @@ from src.api.schemas import (
     MfaStatusResponse,
     NotificationPrefsUpdate,
     PasswordChange,
+    ProfileUpdate,
+    RegisterResponse,
     ResetPasswordRequest,
     TokenResponse,
     UserLogin,
     UserRegister,
     UserResponse,
+    VerifyEmailRequest,
 )
 from src.config import settings
 from src.db import User, get_db  # noqa: F401 (User used in Annotated type)
@@ -99,16 +102,48 @@ async def auth_config() -> dict:
             # 500 when Pro became 1000 (limits-drift fix, 2026-06-12).
             "records_limit": settings.PLAN_LIMITS["pro"],
         },
+        # Lets the frontend render the right signup flow without guessing the
+        # backend's posture: when true, /auth/register collects NO password (it
+        # is set at /auth/verify-email) and returns a neutral "check your email"
+        # response; when false, register takes a password and logs in immediately.
+        "email_verification_enabled": settings.EMAIL_VERIFICATION_ENABLED,
     }
 
 
-@router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/register",
+    response_model=TokenResponse | RegisterResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 async def register(
     body: UserRegister,
     request: Request,
+    response: Response,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+) -> TokenResponse | RegisterResponse:
+    """Register a new account.
+
+    Legacy (EMAIL_VERIFICATION_ENABLED off): creates the account and returns
+    session tokens (201). Enumeration-safe mode (on): returns a neutral 200 with
+    no tokens (same body for new vs existing email) and emails a verification
+    link; the handler overrides the status to 200 on that path.
+    """
+    return await _registration_helpers.register_user(
+        body, request, response, background_tasks, db
+    )
+
+
+@router.post("/verify-email", response_model=TokenResponse)
+async def verify_email(
+    body: VerifyEmailRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
-    return await _registration_helpers.register_user(body, request, db)
+    """Redeem the email-verification link (EMAIL_VERIFICATION_ENABLED flow):
+    validate the single-use token, create the account from the staged pending
+    registration, and auto-login (mint session tokens)."""
+    return await _registration_helpers.verify_user_email(body, request, db)
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -197,6 +232,34 @@ async def update_notification_preferences(
     await db.commit()
     await db.refresh(user)
     audit_log(request, "notification_prefs_updated", current_user.id)
+    return UserResponse.model_validate(user)
+
+
+@router.put("/profile", response_model=UserResponse)
+async def update_profile(
+    body: ProfileUpdate,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    """Persist the user's editable profile (Settings → Account AND the required-
+    name gate): first_name + last_name.
+
+    Both are already sanitized + required (non-empty) by ProfileUpdate. This is
+    the endpoint a legacy incomplete-profile user calls to satisfy the gate, so
+    it MUST stay reachable while the profile is incomplete (no auth gate on it
+    beyond normal login). The WHERE id == current_user.id filter is the tenant
+    guard — RLS on `users` is permissive under the app role, so the query filter
+    is the real own-row constraint (belt-and-suspenders per the project rules).
+    The audit log records the action only, never the name values (they are PII).
+    """
+    result = await db.execute(select(User).where(User.id == current_user.id))
+    user = result.scalar_one()
+    user.first_name = body.first_name
+    user.last_name = body.last_name
+    await db.commit()
+    await db.refresh(user)
+    audit_log(request, "profile_updated", current_user.id)
     return UserResponse.model_validate(user)
 
 

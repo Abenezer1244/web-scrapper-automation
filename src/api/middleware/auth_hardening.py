@@ -372,14 +372,70 @@ _LOCKOUT_THRESHOLDS = [
 ]
 
 
+# Lua: atomically (1) increment the failure counter, (2) refresh its sliding
+# TTL, (3) compute the progressive lock duration from the NEW count, and (4)
+# write a SEPARATE lock key whose TTL only ever moves UP (monotonic). Doing all
+# four in one script is what makes the lockout correct:
+#   * The counter and the lock are now DISTINCT keys. The old code derived the
+#     lockout straight from the counter, so a count stuck at 5 (the counter only
+#     expires via its key TTL, it never decays below a threshold) kept check()
+#     returning a lockout for the WHOLE counter TTL — 5 fat-fingered passwords
+#     locked an IP for ~24h instead of the documented 1 min, and the progressive
+#     1/5/30-min tiers were pure fiction (only the Retry-After header changed).
+#   * Monotonic SET (only when the new duration exceeds the lock's remaining
+#     TTL) closes the race Codex flagged: a slow low-count request can no longer
+#     overwrite — and shorten — a lock a high-count request already set.
+#   * INCR+EXPIRE+SET in one script means a crash/interleave can't leave the
+#     counter bumped with no lock, nor a lock written from a stale count.
+#   KEYS[1] = counter key       KEYS[2] = lock key
+#   ARGV[1] = counter TTL (s)   ARGV[2] = lock cap (s, 0 = uncapped)
+#   ARGV[3..] = threshold, duration pairs (ascending)
+# Returns the new counter value.
+_RECORD_FAILURE_LUA = """
+local count = redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+local cap = tonumber(ARGV[2])
+local duration = 0
+local i = 3
+while i < #ARGV do
+    if count >= tonumber(ARGV[i]) then
+        duration = tonumber(ARGV[i + 1])
+    end
+    i = i + 2
+end
+if cap > 0 and duration > cap then
+    duration = cap
+end
+if duration > 0 then
+    local remaining = redis.call('TTL', KEYS[2])
+    if remaining < 0 then
+        remaining = 0
+    end
+    if duration > remaining then
+        redis.call('SET', KEYS[2], '1', 'EX', duration)
+    end
+end
+return count
+"""
+
+
 class BruteForceProtection:
     """Per-IP and per-email progressive lockout.
 
     Tracks failure counts independently for the client IP and the target
     email so that distributed attacks (many IPs, one email) are also caught.
+
+    The failure COUNTER and the LOCK are deliberately separate keys (see
+    _RECORD_FAILURE_LUA): record_failure() increments the counter and, when a
+    threshold is crossed, arms a short-lived lock; check() consults ONLY the
+    lock. That is what makes the progressive ladder real — the lowest tier now
+    releases after 1 min instead of persisting for the counter's whole TTL.
     """
 
     _KEY_PREFIX = "bf:"
+    # Lock keys live under a distinct prefix so they never collide with the
+    # counter keys (bf:ip:… / bf:email:…) that drive escalation.
+    _LOCK_PREFIX = "bf:lock:"
 
     # A6: the per-email counter exists to catch distributed attacks (many
     # IPs, one email). But an unauthenticated attacker who knows a victim's
@@ -392,9 +448,22 @@ class BruteForceProtection:
     # attack, where a long lockout is the desired outcome.
     _EMAIL_LOCKOUT_CAP_SECONDS = 15 * 60
 
+    # Counter memory windows (sliding — refreshed on each failure). The IP
+    # counter remembers for 24h so a persistent single source escalates to the
+    # 24h tier; the email counter is kept short (Codex: a long email memory lets
+    # a low-traffic attacker hold a victim near-permanently locked).
+    _IP_COUNTER_TTL = 24 * 3600
+    _EMAIL_COUNTER_TTL = _EMAIL_LOCKOUT_CAP_SECONDS
+
     @staticmethod
     def _lockout_duration(failures: int, *, is_email: bool = False) -> int:
-        """Return lockout seconds for a given failure count (0 = not locked out)."""
+        """Return lockout seconds for a given failure count (0 = not locked out).
+
+        Pure mirror of the ladder the Lua script applies — used by the tests to
+        assert expected durations. The production lock is computed INSIDE
+        _RECORD_FAILURE_LUA so the compute+set is atomic; this stays the single
+        readable definition of the ladder.
+        """
         duration = 0
         for threshold, seconds in _LOCKOUT_THRESHOLDS:
             if failures >= threshold:
@@ -404,8 +473,20 @@ class BruteForceProtection:
         return duration
 
     @staticmethod
+    def _flat_thresholds() -> list[int]:
+        """Flatten _LOCKOUT_THRESHOLDS into [th, sec, th, sec, …] for the Lua ARGV."""
+        flat: list[int] = []
+        for threshold, seconds in _LOCKOUT_THRESHOLDS:
+            flat.extend((threshold, seconds))
+        return flat
+
+    @staticmethod
     async def check(ip: str, email: str) -> None:
-        """Raise HTTP 429 if either the IP or email is locked out.
+        """Raise HTTP 429 if either the IP or email is currently locked out.
+
+        Reads ONLY the lock keys (not the counters), so the lockout lasts
+        exactly the duration record_failure() armed — not the counter's TTL.
+        Retry-After is the lock's real remaining TTL.
 
         Fails OPEN on Redis errors. Brute-force lockout is best-effort
         defense layered on top of the password hash check; if Redis is
@@ -424,17 +505,18 @@ class BruteForceProtection:
         ekey = blind_index(email)
         try:
             for key_suffix in [f"ip:{ip}", f"email:{ekey}"]:
-                key = f"{BruteForceProtection._KEY_PREFIX}{key_suffix}"
-                val = await r.get(key)
-                failures = int(val) if val else 0
-                lockout = BruteForceProtection._lockout_duration(
-                    failures, is_email=key_suffix.startswith("email:")
-                )
-                if lockout > 0:
+                lock_key = f"{BruteForceProtection._LOCK_PREFIX}{key_suffix}"
+                ttl = await r.ttl(lock_key)
+                # A live lock key returns ttl >= 0 (we always SET … EX). Redis TTL
+                # floors to whole seconds, so a key with under 1s left reports 0 —
+                # treat ttl >= 0 (key still exists) as locked, NOT just ttl > 0, so
+                # the final sub-second of a lock can't leak one early guess (Codex
+                # P3). -2 (no key) and the never-written -1 are "not locked".
+                if ttl is not None and ttl >= 0:
                     raise HTTPException(
                         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                         detail="Too many failed login attempts. Try again later.",
-                        headers={"Retry-After": str(lockout)},
+                        headers={"Retry-After": str(ttl if ttl > 0 else 1)},
                     )
         except redis_exceptions.RedisError as exc:
             _logger.warning(
@@ -447,44 +529,46 @@ class BruteForceProtection:
 
     @staticmethod
     async def record_failure(ip: str, email: str) -> None:
-        """Increment failure counters for both the IP and email.
+        """Increment the IP and email failure counters and arm the lock.
+
+        Both the increment and the (monotonic) lock write happen atomically
+        inside _RECORD_FAILURE_LUA — see that script for why counter and lock
+        are separate keys. The IP path escalates fully (uncapped, 24h memory);
+        the email path caps the lock at _EMAIL_LOCKOUT_CAP_SECONDS to stay a
+        speed bump rather than a weaponisable account-lockout DoS.
 
         Sends a one-time lockout notification email when the email-based
         counter crosses the notification threshold. Best-effort: any
         Redis error is logged and swallowed so the outer login handler
         can still return its normal 401 response instead of 500-ing.
-
-        Each (incr, expire) pair runs inside a MULTI/EXEC transactional
-        pipeline so they are applied atomically. Without this, a Redis
-        blip that lands BETWEEN the two commands would leave the
-        counter incremented but with no TTL — when Redis recovers,
-        check() would observe a counter that never decays and lock the
-        user out indefinitely.
         """
         r = _get_redis()
         ekey = blind_index(email)  # H3: full-length keyed HMAC, never plaintext email
+        thresholds = BruteForceProtection._flat_thresholds()
         email_failures = 0
         try:
-            # A6: the IP counter persists 24h (punish a single attacking
-            # source). The EMAIL counter expires after the cap so a targeted
-            # lockout actually DECAYS — without this, capping only the
-            # returned Retry-After is cosmetic: check() still rejects while
-            # the count is over threshold and a 24h key TTL would keep the
-            # victim blocked for a full day (Codex review). With a short TTL
-            # the email key (and therefore the lockout) clears within the cap
-            # window after the last failed attempt.
-            for key_suffix, ttl in [
-                (f"ip:{ip}", 24 * 3600),
-                (f"email:{ekey}", BruteForceProtection._EMAIL_LOCKOUT_CAP_SECONDS),
-            ]:
-                key = f"{BruteForceProtection._KEY_PREFIX}{key_suffix}"
-                pipe = r.pipeline(transaction=True)
-                pipe.incr(key)
-                pipe.expire(key, ttl)
-                results = await pipe.execute()
-                count = int(results[0])
-                if key_suffix.startswith("email:"):
-                    email_failures = count
+            # IP: full escalation, 24h counter memory, uncapped lock (cap arg 0).
+            await r.eval(
+                _RECORD_FAILURE_LUA,
+                2,
+                f"{BruteForceProtection._KEY_PREFIX}ip:{ip}",
+                f"{BruteForceProtection._LOCK_PREFIX}ip:{ip}",
+                BruteForceProtection._IP_COUNTER_TTL,
+                0,
+                *thresholds,
+            )
+            # Email: capped lock + short counter memory (anti-DoS).
+            email_failures = int(
+                await r.eval(
+                    _RECORD_FAILURE_LUA,
+                    2,
+                    f"{BruteForceProtection._KEY_PREFIX}email:{ekey}",
+                    f"{BruteForceProtection._LOCK_PREFIX}email:{ekey}",
+                    BruteForceProtection._EMAIL_COUNTER_TTL,
+                    BruteForceProtection._EMAIL_LOCKOUT_CAP_SECONDS,
+                    *thresholds,
+                )
+            )
         except redis_exceptions.RedisError as exc:
             _logger.warning(
                 "BruteForceProtection.record_failure skipped (Redis error) ip=%s email_fp=%s: %s",
@@ -492,7 +576,10 @@ class BruteForceProtection:
             )
             return
 
-        # Send lockout notification once when threshold is first crossed
+        # Send lockout notification once when threshold is first crossed.
+        # Reachable from a single IP now: check() only blocks while the short
+        # lock is live, so once it expires record_failure() runs again and the
+        # email counter keeps climbing toward _NOTIFY_THRESHOLD.
         if email_failures == BruteForceProtection._NOTIFY_THRESHOLD:
             dedup_key = f"{BruteForceProtection._KEY_PREFIX}notified:{ekey}"
             try:
@@ -527,11 +614,15 @@ class BruteForceProtection:
 
     @staticmethod
     async def clear(ip: str, email: str) -> None:
-        """Clear failure counters on successful login.
+        """Clear BOTH failure counters AND both lock keys on successful login.
 
-        Best-effort — if Redis is unavailable the stale counter just
-        decays via its 24h TTL. Failing the login because the counters
-        could not be cleared would be a worse user experience.
+        Must delete the lock keys too (Codex): otherwise a user who failed,
+        got locked, then succeeded on the next allowed attempt would stay
+        locked for the remainder of the armed lock TTL despite a valid login.
+
+        Best-effort — if Redis is unavailable the stale keys just decay via
+        their own TTLs. Failing the login because the keys could not be cleared
+        would be a worse user experience.
         """
         r = _get_redis()
         ekey = blind_index(email)  # H3: must match check()/record_failure()
@@ -539,6 +630,8 @@ class BruteForceProtection:
             await r.delete(
                 f"{BruteForceProtection._KEY_PREFIX}ip:{ip}",
                 f"{BruteForceProtection._KEY_PREFIX}email:{ekey}",
+                f"{BruteForceProtection._LOCK_PREFIX}ip:{ip}",
+                f"{BruteForceProtection._LOCK_PREFIX}email:{ekey}",
             )
         except redis_exceptions.RedisError as exc:
             _logger.warning(

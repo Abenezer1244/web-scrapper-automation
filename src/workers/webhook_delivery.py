@@ -256,6 +256,14 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
             "Webhook %s blocked by SSRF guard (host=%s): %s",
             job_id[:8], host, exc,
         )
+        from src.workers.ops_alerts import send_ops_alert
+        send_ops_alert(
+            "webhook_blocked", job_id,
+            "Webhook target blocked (SSRF guard)",
+            f"Completion webhook for job {job_id} was blocked: host {host} is "
+            f"not a permitted target. The user's configured webhook will never "
+            f"fire until they fix the URL.",
+        )
         return {
             "status": "blocked",
             "reason": "webhook target not permitted",
@@ -298,9 +306,12 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
     # success — and following the Location is exactly the SSRF vector we
     # are closing. Treat as a permanent (non-retryable) failure.
     if 300 <= resp.status_code < 400:
+        # Log the redirect target HOST only — a Location header can itself carry
+        # query-string secrets (same log-leak class as the webhook URL, Codex).
+        _loc_host = urlparse(resp.headers.get("Location") or "").hostname or "?"
         _logger.warning(
-            "Webhook %s endpoint returned redirect %d to %s — not following",
-            job_id[:8], resp.status_code, (resp.headers.get("Location") or "?")[:80],
+            "Webhook %s endpoint returned redirect %d to host %s — not following",
+            job_id[:8], resp.status_code, _loc_host,
         )
         return {
             "status": "failed",
@@ -322,6 +333,13 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
             _logger.error(
                 "Webhook %s giving up after %d attempts (final %d)",
                 job_id[:8], attempt, resp.status_code,
+            )
+            from src.workers.ops_alerts import send_ops_alert
+            send_ops_alert(
+                "webhook_delivery", job_id,
+                "Webhook delivery failed",
+                f"Completion webhook for job {job_id} gave up after {attempt} "
+                f"attempts (last status {resp.status_code}, host {host}).",
             )
             return {
                 "status": "failed",

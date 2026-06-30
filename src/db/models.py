@@ -89,6 +89,17 @@ class User(Base):
     # + UNIQUE (migration 053) after the P4 reconcile backfill populated every row.
     # Dual-written via @validates below so it can never drift from email.
     email_hmac = Column(String(64), nullable=False, unique=True)
+    # First + last name (dashboard greeting uses first_name). Encrypted at rest
+    # like email (user-provided identity PII); never indexed/unique. Nullable at
+    # the DB level: legacy users created before the required-name gate have NULL
+    # until they complete the gate; requiredness is enforced at the API layer
+    # (UserRegister / ProfileUpdate) + the frontend profile-complete gate.
+    first_name = Column(EncryptedString, nullable=True)
+    last_name = Column(EncryptedString, nullable=True)
+    # DEPRECATED single display name — superseded by first_name/last_name. Kept
+    # (always NULL in prod) for a rollback window; drop in a later cleanup
+    # migration. Do NOT read/write from new code.
+    name = Column(EncryptedString, nullable=True)
     password_hash = Column(String(255), nullable=False)
     api_key_hash = Column(String(64), nullable=True, index=True)
     plan = Column(String(32), nullable=False, default="starter")
@@ -157,6 +168,67 @@ class User(Base):
 
     scraper_configs = relationship("ScraperConfig", back_populates="user", cascade="all, delete-orphan")
     jobs = relationship("Job", back_populates="user", cascade="all, delete-orphan")
+
+
+class PendingRegistration(Base):
+    """A signup awaiting email verification (EMAIL_VERIFICATION_ENABLED flow).
+
+    NOT a real account: storing unverified signups here instead of in `users`
+    is what closes the account-squatting hole — an attacker cannot pre-create a
+    real users row (with their own password/trial) for someone else's address.
+    The real users row is created only when the emailed verification link is
+    redeemed; unredeemed rows expire via `expires_at` and are purged.
+
+    email / first_name / last_name are encrypted at rest exactly like users.* ;
+    the searchable key is email_hmac (kept in lockstep with email via the
+    @validates hook below, same as User). email_hmac is INDEXED but NOT unique on
+    purpose: each registration attempt inserts its own row, so an attacker
+    submitting a victim's address cannot overwrite the password on the victim's
+    pending row (account pre-hijacking). First verification wins via
+    UNIQUE(users.email_hmac); siblings are dropped at verify time.
+    """
+    __tablename__ = "pending_registrations"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    email = Column(EncryptedString, nullable=False)
+    email_hmac = Column(String(64), nullable=False, index=True)
+    # Nullable as of migration 076: the first/last name is collected at
+    # /auth/verify-email (by the verifier), NOT at register, so an attacker-
+    # initiated signup can't set a victim-verified account's display name. The
+    # verified-register insert leaves these NULL; they are unused going forward
+    # (a later migration may drop them once all instances stop referencing them).
+    first_name = Column(EncryptedString, nullable=True)
+    last_name = Column(EncryptedString, nullable=True)
+    # No password column on purpose: the password is set at /auth/verify-email by
+    # whoever proves email control, never carried from the unverified register
+    # step (prevents account pre-hijacking). No referral column either — carrying
+    # an attacker-supplied ref into a victim-verified account would enable
+    # self-referral abuse; referral attribution is not supported in this flow.
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    # ─── Verification-email outbox (migration 075) ────────────────────────────
+    # The row IS the outbox: a beat dispatcher sends the verification email and
+    # records the outcome here, so a signup made while Redis (the Celery broker)
+    # is down is drained and sent once Redis recovers — never lost on a
+    # fire-and-forget enqueue. See the 075 migration for the full rationale.
+    #   state: 'pending' -> 'sent' | 'suppressed' (rapid duplicate, NOT sent) |
+    #          'failed' (permanent error after the attempt cap).
+    #   verification_email_sent_at: provider-confirmed send time; only 'sent'
+    #   rows set it, and only it counts toward the per-address bomb-guard window.
+    email_dispatch_state = Column(String(16), nullable=False, server_default="pending")
+    verification_email_sent_at = Column(DateTime(timezone=True), nullable=True)
+    email_attempts = Column(Integer, nullable=False, server_default="0")
+    next_email_attempt_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    @validates("email")
+    def _sync_email_hmac(self, _key, value):
+        """Keep email_hmac in lockstep with email (mirrors User._sync_email_hmac)."""
+        from src.utils.crypto import blind_index
+        self.email_hmac = blind_index(value) if value is not None else None
+        return value
 
 
 class PasswordHistory(Base):
@@ -233,8 +305,19 @@ class ScraperConfig(Base):
     # tokens, validated against the capability registry). NULL = legacy behavior
     # (today's full output); a non-empty list NARROWS to the chosen types.
     doc_types = Column(JSON, nullable=True)
+    # Phase 3: customer toggle for LIVING-owner Transfer-on-Death deeds in probate.
+    # Tri-state: NULL = legacy/grandfathered (include, but Phase 2 labels it);
+    # False = new probate default (exclude living-owner TOD planning docs);
+    # True = explicit opt-in (include). Enforced once at the worker chokepoint via
+    # scrapers.probate.should_include_probate_row. NOT routed through doc_types
+    # (that is recorder-side portal-token selection — a different mechanism).
+    include_living_owner_tod = Column(Boolean, nullable=True)
     skip_trace_enabled = Column(Boolean, nullable=False, default=False)
     active = Column(Boolean, nullable=False, default=True)
+    # Why a config is inactive. NULL = active or user-paused; 'entitlement' =
+    # auto-paused by downgrade reconciliation (revived on re-upgrade). Distinct
+    # from `active` so re-upgrade only revives what the system paused.
+    paused_reason = Column(String(32), nullable=True)
     # Piece 2 (batch scrape, migration 050): NULL for ordinary single scrapes; set
     # when this config is a child of a batch (one child per county x record_type).
     # The PARENT batch owns delivery + schedule; child configs are created with

@@ -295,6 +295,18 @@ class SnohomishWATaxDelinquentScraper(BridgeScraper):
     parses it streaming, and returns one aggregated record per delinquent parcel.
     """
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor — Snohomish tax delinquency comes from a bulk file."""
+        from src.scrapers.doc_scope import dataset
+
+        if record_type != "tax_delinquent":
+            return None
+        return dataset(
+            "Collected from Snohomish County Treasurer's delinquent-tax list; "
+            "recorder document-type filtering is not used."
+        )
+
     def __init__(self, record_type: str = "tax_delinquent") -> None:
         super().__init__()
 

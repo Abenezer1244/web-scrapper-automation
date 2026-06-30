@@ -205,3 +205,56 @@ def _extract_tax_fields(
             year = None
 
     return (amount, year)
+
+
+class TaxDelinquentInvariantError(RuntimeError):
+    """A ``tax_delinquent`` job produced a record that violates the product
+    invariant: either its source is not a qualified tax source, or it is missing
+    the defining structured fields (delinquent_amount + bill_year).
+
+    Raised so the job is marked FAILED rather than persisting recorder docs
+    (deeds, etc.) as tax leads — the Clark 2026-04 incident, where an immature
+    scraper wrote 1,968 DEED rows as ``tax_delinquent`` with no amount/year.
+    """
+
+
+def validate_tax_delinquent_records(records, record_type: str) -> None:
+    """Enforce the ``tax_delinquent`` product invariant BEFORE any DB insert.
+
+    No-op for every non-tax record type. For ``tax_delinquent``, every record
+    MUST (1) come from a source in ``_TRUSTED_TAX_SOURCES`` — the curated,
+    doc-commented registry that IS the "documented exception" mechanism (adding a
+    tax county = add its source id there) — and (2) yield both a non-null
+    ``delinquent_amount`` and ``bill_year`` via ``_extract_tax_fields`` (same
+    coercion + bounds the persist path uses, so "has the keys" is not enough).
+
+    Raises ``TaxDelinquentInvariantError`` on the FIRST violation. Callers run
+    this over the COMPLETE record set before the batched insert loop, so a
+    violation fails the whole job atomically — never a partially-committed batch
+    (Codex: validate before insert; canary threshold is > 0, not a percentage,
+    because a percentage threshold invites the very regression this prevents).
+    """
+    if record_type != "tax_delinquent":
+        return
+    for idx, rec in enumerate(records):
+        enrichment = getattr(rec, "enrichment_data", None)
+        enrichment = enrichment if isinstance(enrichment, dict) else {}
+        source = enrichment.get("source")
+        parcel = getattr(rec, "parcel_id", None)
+        if source not in _TRUSTED_TAX_SOURCES:
+            raise TaxDelinquentInvariantError(
+                f"tax_delinquent record #{idx} from untrusted source {source!r} "
+                f"(parcel={parcel!r}). Only {sorted(_TRUSTED_TAX_SOURCES)} are "
+                f"qualified tax sources — a tax_delinquent job must never run an "
+                f"unregistered connector. Add the source id to _TRUSTED_TAX_SOURCES "
+                f"(with county-qualification sign-off + fixtures) before enabling it."
+            )
+        amount, year = _extract_tax_fields(enrichment, record_type)
+        if amount is None or year is None:
+            raise TaxDelinquentInvariantError(
+                f"tax_delinquent record #{idx} from {source!r} is missing required "
+                f"structured tax fields (delinquent_amount={amount!r}, "
+                f"bill_year={year!r}; parcel={parcel!r}, "
+                f"date={getattr(rec, 'date_recorded', None)!r}). A tax lead must "
+                f"carry both an owed amount and a bill year."
+            )

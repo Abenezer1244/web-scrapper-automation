@@ -67,27 +67,47 @@ async def list_jobs(
     return responses
 
 
-@router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
-async def create_job(
-    body: JobCreate,
+async def enqueue_scrape_job(
+    db: AsyncSession,
+    current_user,
+    config: "ScraperConfig",
+    trigger: str,
     request: Request,
-    current_user: CurrentUser,
-    db: AsyncSession = Depends(get_rls_db),
-) -> JobResponse:
-    await rate_limit(request, zone="jobs", identifier=current_user.id)
+) -> "Job":
+    """Enforce AI/record-quota gates, create a pending Job for `config`, commit,
+    then enqueue the Celery scrape task. The single entry point for POST /jobs
+    (manual + scheduled runs) so the entitlement, quota, billing, and
+    commit-then-enqueue contract is enforced in exactly one place.
 
-    # Verify scraper config belongs to user
-    config_result = await db.execute(
-        select(ScraperConfig).where(
-            ScraperConfig.id == body.scraper_config_id,
-            ScraperConfig.user_id == current_user.id,
-            ScraperConfig.active,
-        )
+    The caller owns config lookup/creation; this helper never re-checks
+    `config.active`.
+    """
+    # Execution-time entitlement guard (audit-mode until ENTITLEMENT_ENFORCEMENT).
+    # An existing config can outlive a downgrade; re-validate against CURRENT plan.
+    from datetime import UTC, datetime
+
+    from src.api.entitlements import ConfigRow, config_run_violation, enforce_runnable_http
+    active_rows = (await db.execute(
+        select(
+            ScraperConfig.id, ScraperConfig.state, ScraperConfig.county,
+            ScraperConfig.record_type, ScraperConfig.created_at,
+            ScraperConfig.active, ScraperConfig.paused_reason,
+        ).where(ScraperConfig.user_id == current_user.id, ScraperConfig.active)
+    )).all()
+    rows = [ConfigRow(*r) for r in active_rows]
+    # The config being run must count toward its OWN county claim. Defensive: if a
+    # visibility/replication gap left it out of active_rows, this still judges it
+    # inside the allowed set when the user is under their county cap. allowed_county_set
+    # dedupes by county, so this is a no-op on the normal path (the config is already
+    # active and present). created_at falls back to now if unset so slot ordering is sane.
+    rows.append(ConfigRow(
+        config.id, config.state, config.county, config.record_type,
+        config.created_at or datetime.now(UTC), True, None,
+    ))
+    enforce_runnable_http(
+        config_run_violation(current_user.plan, config.state, config.county, config.record_type, rows),
+        user=current_user, context="create_job",
     )
-    config = config_result.scalar_one_or_none()
-    if config is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
-
     # Check if this is an AI-powered connector and enforce AI job limits
     connector_result = await db.execute(
         select(CountyConnector).where(
@@ -153,9 +173,9 @@ async def create_job(
     job = Job(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
-        scraper_config_id=body.scraper_config_id,
+        scraper_config_id=config.id,
         status="pending",
-        trigger=body.trigger,
+        trigger=trigger,
     )
     db.add(job)
     await db.flush()
@@ -194,6 +214,32 @@ async def create_job(
         )
 
     audit_log(request, "job_created", current_user.id, f"job_id={job.id}")
+    return job
+
+
+@router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
+async def create_job(
+    body: JobCreate,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_rls_db),
+) -> JobResponse:
+    await rate_limit(request, zone="jobs", identifier=current_user.id)
+
+    # Verify scraper config belongs to user AND is active (a manual "Run now"
+    # only targets a real, non-soft-deleted scraper).
+    config_result = await db.execute(
+        select(ScraperConfig).where(
+            ScraperConfig.id == body.scraper_config_id,
+            ScraperConfig.user_id == current_user.id,
+            ScraperConfig.active,
+        )
+    )
+    config = config_result.scalar_one_or_none()
+    if config is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
+
+    job = await enqueue_scrape_job(db, current_user, config, body.trigger, request)
     return JobResponse.model_validate(job)
 
 
@@ -940,8 +986,24 @@ async def download_export(
         # scheduled/R2 export uses, so every export path produces an identical file
         # (no "use the in-app download for dialers" caveat). This reads LIVE DB rows,
         # so skip-trace phone/email appear as soon as the dispatcher completes.
-        from src.utils.lead_export import write_lead_csv
-        write_lead_csv(records, output)
+        # Honor the user's output-field visibility for this job's config (blank
+        # deselected hideable columns; identity/derived columns always present).
+        # Loaded scoped to the owner (RLS belt + explicit user filter); legacy/empty
+        # fields => show everything. Covers batch children too: each child is its OWN
+        # ScraperConfig carrying the batch's `fields` (batches.py), and Job.scraper_
+        # config_id is NOT NULL, so the guard's None branch is defensive only. (The
+        # batch COMBINED export is a separate path — see batch_export.py.)
+        from src.utils.lead_export import resolve_hidden_output_fields, write_lead_csv
+        hidden_fields: set[str] = set()
+        if job.scraper_config_id:
+            cfg_fields_row = await db.execute(
+                select(ScraperConfig.fields).where(
+                    ScraperConfig.id == job.scraper_config_id,
+                    ScraperConfig.user_id == user.id,
+                )
+            )
+            hidden_fields = resolve_hidden_output_fields(cfg_fields_row.scalar_one_or_none())
+        write_lead_csv(records, output, hidden_fields=hidden_fields)
 
         csv_bytes = output.getvalue().encode("utf-8")
 

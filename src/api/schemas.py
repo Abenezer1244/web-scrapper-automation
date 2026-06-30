@@ -1,4 +1,5 @@
 import re
+import unicodedata
 from datetime import UTC, date, datetime
 from typing import Any, TypedDict
 from urllib.parse import urlparse
@@ -23,9 +24,76 @@ def _validate_password_rules(v: str) -> str:
     return v
 
 
+# Display-name bounds. 120 code points is generous for any real name; the
+# 255-byte cap guards the encrypted-column path against multi-byte abuse.
+_NAME_MAX_CHARS = 120
+_NAME_MAX_BYTES = 255
+# Coarse pre-normalization bound so a pathological multi-MB string can't drive
+# normalization/regex CPU before the precise checks run.
+_NAME_RAW_MAX = 1000
+
+
+def _validate_display_name(v: str | None) -> str | None:
+    """Sanitize a self-entered display name. Single source of truth so
+    registration (UserRegister) and edit (ProfileUpdate) enforce IDENTICAL
+    rules. Returns None when empty after stripping — the column is never stored
+    as "" and the greeting falls back cleanly to no personal identifier.
+
+    Per the security review: NFC-normalize, collapse any run of Unicode
+    whitespace (tabs/newlines/nbsp included) to a single ASCII space, then reject
+    any remaining control/format char. After whitespace is collapsed, a leftover
+    category-C char is a non-whitespace control (NUL/escape), a Unicode bidi
+    override (U+202A-202E / U+2066-2069) or a zero-width/invisible formatter
+    (U+200B/C/D, U+FEFF) — all UI-spoofing footguns with no display-name value.
+    Length is bounded in both code points and UTF-8 bytes.
+    """
+    if v is None:
+        return None
+    if len(v) > _NAME_RAW_MAX:
+        raise ValueError("Name is too long")
+    v = unicodedata.normalize("NFC", v)
+    v = re.sub(r"\s+", " ", v).strip()
+    if not v:
+        return None  # empty after strip => NULL, never stored as ""
+    if any(unicodedata.category(ch).startswith("C") for ch in v):
+        raise ValueError("Name contains disallowed characters")
+    if len(v) > _NAME_MAX_CHARS:
+        raise ValueError(f"Name must not exceed {_NAME_MAX_CHARS} characters")
+    if len(v.encode("utf-8")) > _NAME_MAX_BYTES:
+        raise ValueError("Name is too long")
+    return v
+
+
+def _validate_required_name(v: str | None, label: str) -> str:
+    """Required variant of _validate_display_name for first/last name. Same
+    sanitization + bounds, but blank/empty after normalization is a 422 (the
+    field is mandatory) rather than None. Single source of truth so registration
+    and the profile/gate edit enforce identical rules per field."""
+    cleaned = _validate_display_name(v)
+    if cleaned is None:
+        raise ValueError(f"{label} is required")
+    return cleaned
+
+
 class UserRegister(BaseModel):
     email: EmailStr
-    password: str
+    # Optional because the registration flow depends on EMAIL_VERIFICATION_ENABLED:
+    #   * legacy (off): the password is REQUIRED and creates the account now (the
+    #     legacy handler rejects a missing password).
+    #   * verified (on): the password is set at /auth/verify-email by whoever
+    #     proves email control — it is NOT collected/stored at register (storing a
+    #     register-time password is what enabled account pre-hijacking). Any value
+    #     sent here in verified mode is ignored.
+    password: str | None = None
+    # Optional for the SAME reason as password: in the verified flow the first +
+    # last name are collected at /auth/verify-email (by whoever proves email
+    # control), NOT at register — so an attacker-initiated signup can't even set a
+    # victim-verified account's display name. Legacy (flag off) still REQUIRES
+    # both (the handler rejects a missing name, like it does a missing password).
+    # When provided, each is sanitized + bounded through the SAME validator as the
+    # profile edit so signup can't bypass the edit-time rules.
+    first_name: str | None = None
+    last_name: str | None = None
     # Sprint 7.3: optional referral code passed from the ?ref= URL
     # parameter. When present and valid, the new user gets linked to
     # the referrer and the referrer earns $20 credit on paid
@@ -35,8 +103,28 @@ class UserRegister(BaseModel):
 
     @field_validator("password")
     @classmethod
-    def password_validation(cls, v: str) -> str:
+    def password_validation(cls, v: str | None) -> str | None:
+        # None is allowed at the schema layer (see field comment); the legacy
+        # handler enforces presence. A provided password must meet the policy.
+        if v is None:
+            return None
         return _validate_password_rules(v)
+
+    @field_validator("first_name")
+    @classmethod
+    def first_name_validation(cls, v: str | None) -> str | None:
+        # None allowed at the schema layer (verified flow sets it at verify); the
+        # legacy handler enforces presence. A provided value must meet the rules.
+        if v is None:
+            return None
+        return _validate_required_name(v, "First name")
+
+    @field_validator("last_name")
+    @classmethod
+    def last_name_validation(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return _validate_required_name(v, "Last name")
 
     @field_validator("ref")
     @classmethod
@@ -142,6 +230,13 @@ class BreakGlassLoginRequest(BaseModel):
 class UserResponse(BaseModel):
     id: str
     email: str
+    # First + last name. None for legacy users created before the required-name
+    # gate; the greeting uses first_name and NEVER derives a name from the email.
+    # profile_complete is the SERVER-OWNED truth the frontend gate keys on (so the
+    # "both names present" rule lives in one place and can't drift).
+    first_name: str | None = None
+    last_name: str | None = None
+    profile_complete: bool = False
     plan: str
     records_used: int
     records_limit: int
@@ -155,6 +250,12 @@ class UserResponse(BaseModel):
     model_config = {"from_attributes": True}
 
     def model_post_init(self, __context: Any) -> None:
+        # Server-owned profile-complete rule: both names present and non-blank.
+        # Strip so a whitespace-only value that slipped in via any non-validated
+        # path (manual/import) does NOT read as complete (Codex hardening).
+        self.profile_complete = bool(
+            (self.first_name or "").strip() and (self.last_name or "").strip()
+        )
         if self.trial_ends_at:
             now = datetime.now(UTC)
             ends = self.trial_ends_at if self.trial_ends_at.tzinfo else self.trial_ends_at.replace(tzinfo=UTC)
@@ -162,6 +263,30 @@ class UserResponse(BaseModel):
             if remaining > 0:
                 self.is_trial = True
                 self.trial_days_remaining = max(0, int(remaining / 86400))
+
+
+class ProfileUpdate(BaseModel):
+    """Editable profile fields — used by BOTH Settings>Account and the
+    required-name gate. first_name + last_name are REQUIRED (non-empty after
+    sanitization) so this endpoint is how an incomplete-profile user satisfies
+    the gate. Sanitized through the SAME validator as registration. extra='forbid'
+    so a caller cannot smuggle other user columns (plan, records_limit,
+    is_admin, ...) through the profile endpoint."""
+
+    first_name: str
+    last_name: str
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("first_name")
+    @classmethod
+    def first_name_validation(cls, v: str) -> str:
+        return _validate_required_name(v, "First name")
+
+    @field_validator("last_name")
+    @classmethod
+    def last_name_validation(cls, v: str) -> str:
+        return _validate_required_name(v, "Last name")
 
 
 class NotificationPrefsUpdate(BaseModel):
@@ -183,6 +308,48 @@ class TokenResponse(BaseModel):
     refresh_token: str | None = None
     token_type: str = "bearer"
     expires_in: int = 3600
+
+
+class RegisterResponse(BaseModel):
+    """POST /auth/register response when EMAIL_VERIFICATION_ENABLED is on.
+
+    Enumeration-safe: the SAME neutral body is returned whether the email is new
+    (a verification link was sent) or already registered (a 'you already have an
+    account' note was sent). No tokens — the account is created only after the
+    verification link is redeemed at /auth/verify-email. `verification_required`
+    lets the frontend show a 'check your email' screen instead of logging in."""
+    message: str = "Check your email to finish creating your account."
+    verification_required: bool = True
+
+
+class VerifyEmailRequest(BaseModel):
+    """POST /auth/verify-email — redeem the emailed verification link.
+
+    `token` is the short-lived single-use verification JWT (aud=bridgeleads-verify)
+    minted by /auth/register. `new_password` AND the first/last name are set HERE,
+    by whoever proves control of the email — NOT at register — so an attacker-
+    initiated signup that the address owner confirms cannot end up with an
+    attacker-known password OR an attacker-chosen display name. Names + password
+    are validated against the SAME policies as registration."""
+    token: str = Field(max_length=4096)  # bound — a JWT is ~hundreds of bytes
+    new_password: str
+    first_name: str
+    last_name: str
+
+    @field_validator("new_password")
+    @classmethod
+    def password_policy(cls, v: str) -> str:
+        return _validate_password_rules(v)
+
+    @field_validator("first_name")
+    @classmethod
+    def first_name_policy(cls, v: str) -> str:
+        return _validate_required_name(v, "First name")
+
+    @field_validator("last_name")
+    @classmethod
+    def last_name_policy(cls, v: str) -> str:
+        return _validate_required_name(v, "Last name")
 
 
 class LoginResponse(BaseModel):
@@ -214,6 +381,25 @@ class ScheduleConfig(BaseModel):
     frequency: str = Field(default="manual", max_length=16)      # manual | daily | weekly | monthly
     run_at_hour: int = Field(default=6, ge=0, le=23)             # UTC
     run_at_minute: int = Field(default=0, ge=0, le=59)
+    # Day selectors for recurring schedules. run_at_weekday applies ONLY to
+    # frequency="weekly", run_at_day_of_month ONLY to "monthly" (both ignored
+    # otherwise). CONTRACT: run_at_weekday is 0=Monday .. 6=Sunday — it matches
+    # Python's datetime.weekday(), NOT JS getDay() (the frontend select must map
+    # its labels to this, it must not send getDay() raw). Defaults (0=Monday,
+    # 1st) reproduce the pre-picker hardcoded behavior, so configs saved before
+    # these fields existed keep firing Monday / the 1st with no migration.
+    # day_of_month accepts 1..31; the dispatcher clamps to the month's last day,
+    # so "31" fires on the last day of short months (Feb -> 28/29).
+    run_at_weekday: int = Field(
+        default=0, ge=0, le=6,
+        description="Weekly only. 0=Monday .. 6=Sunday (matches Python datetime.weekday()). "
+                    "Frontend must map its day labels to this; do NOT send JS Date.getDay().",
+    )
+    run_at_day_of_month: int = Field(
+        default=1, ge=1, le=31,
+        description="Monthly only. 1..31; the dispatcher clamps to the month's last day, "
+                    "so 31 fires on the last day of short months (Feb -> 28/29).",
+    )
     date_range_mode: str = Field(default="rolling_90", max_length=24)  # rolling_90 | custom | since_last_run
     date_from: str | None = Field(default=None, max_length=32)   # ISO date string
     date_to: str | None = Field(default=None, max_length=32)
@@ -229,6 +415,36 @@ class ScheduleConfig(BaseModel):
         if v not in {"manual", "daily", "weekly", "monthly"}:
             raise ValueError("frequency must be manual, daily, weekly, or monthly")
         return v
+
+    @model_validator(mode="after")
+    def validate_custom_range(self) -> "ScheduleConfig":
+        # Reject a backwards custom window at SAVE time (Codex) so the user gets a
+        # clear error instead of a silently-wrong scrape. The worker's
+        # _ordered_window is the belt for legacy / direct-DB rows; this is the
+        # suspenders. Only enforced when mode is custom AND both dates parse —
+        # a half-filled form falls back to rolling_90 downstream, not an error.
+        if self.date_range_mode == "custom" and self.date_from and self.date_to:
+            d0 = _parse_schedule_date(self.date_from)
+            d1 = _parse_schedule_date(self.date_to)
+            if d0 and d1 and d0 > d1:
+                raise ValueError("date_from must be on or before date_to")
+        return self
+
+
+def _parse_schedule_date(value: str) -> date | None:
+    """Parse a schedule date string (ISO YYYY-MM-DD or US MM/DD/YYYY) to a date.
+
+    Returns None when it can't be parsed — the caller treats that as "can't
+    compare", not as an error, so a malformed string is left to the worker's
+    normalizer rather than blocking the save on a format technicality.
+    """
+    value = value.strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(value[:10], fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 def _validate_https_webhook_url(v: str | None) -> str | None:
@@ -324,8 +540,19 @@ class DeliverConfig(BaseModel):
     @field_validator("formats")
     @classmethod
     def bound_formats(cls, v: list[str]) -> list[str]:
-        if any(len(f) > 16 for f in v):
-            raise ValueError("invalid format value")
+        # Allowlist the formats DataExporter.export() can actually produce.
+        # A length-only check let an unsupported value ("pdf", typo) persist
+        # on the config and then crash EVERY scrape later at export time with
+        # `ValueError: Unsupported export format` (Codex). Reject at save time
+        # instead, against the shared SUPPORTED_EXPORT_FORMATS set (case-
+        # insensitive). An empty list is normalized to the default so the API
+        # readback can't show `[]` while the worker silently exports CSV.
+        from src.config.constants import DEFAULT_EXPORT_FORMAT, SUPPORTED_EXPORT_FORMATS
+        if not v:
+            return [DEFAULT_EXPORT_FORMAT]
+        for f in v:
+            if len(f) > 16 or f.lower() not in SUPPORTED_EXPORT_FORMATS:
+                raise ValueError(f"unsupported export format: {f!r}")
         return v
 
     @field_validator("webhook_url", "dialer_webhook_url")
@@ -393,6 +620,8 @@ class ScheduleConfigDict(TypedDict, total=False):
     frequency: str           # one of: manual, daily, weekly, monthly
     run_at_hour: int
     run_at_minute: int
+    run_at_weekday: int      # 0=Mon..6=Sun, weekly only (see ScheduleConfig)
+    run_at_day_of_month: int  # 1..31 (clamped to month length), monthly only
     date_range_mode: str     # one of: rolling_90, custom, since_last_run
     date_from: str | None
     date_to: str | None
@@ -427,6 +656,10 @@ class ScraperConfigCreate(BaseModel):
     # route (so we don't import scraper code into schemas). None = legacy/full
     # output; a non-empty list narrows. Bounded to prevent abuse.
     doc_types: list[str] | None = Field(default=None, max_length=10)
+    # Phase 3: probate living-owner Transfer-on-Death toggle. None/omitted on a NEW
+    # probate config resolves to False (exclude) at the route; True opts in. Only
+    # meaningful for record_type=='probate' (route 422s it otherwise).
+    include_living_owner_tod: bool | None = None
 
     @field_validator("state")
     @classmethod
@@ -455,6 +688,10 @@ class ScraperConfigResponse(BaseModel):
     deliver: dict[str, Any] | Any
     skip_trace_enabled: bool = False
     doc_types: list[str] | None = None  # Phase 2b: pre-foreclosure doc-type selection (None = legacy)
+    # Phase 3: None = legacy/grandfathered (include TOD), False = exclude living-owner
+    # TOD, True = opt-in. Frontend must NOT echo a default False for a None config (a
+    # null read means grandfathered — only a real user toggle should write a value).
+    include_living_owner_tod: bool | None = None
     active: bool
     created_at: datetime
     updated_at: datetime
@@ -499,6 +736,100 @@ class ScraperConfigResponse(BaseModel):
             self.schedule = {}
 
 
+# Write-only deliver secrets — never returned in GET (redacted to *_set flags in
+# ScraperConfigResponse). The edit path keeps a stored secret when the client
+# leaves it blank, so these are the only fields a PATCH treats as "preserve on
+# omit" instead of "replace".
+DELIVER_SECRET_FIELDS: tuple[str, ...] = (
+    "webhook_secret",
+    "dialer_webhook_secret",
+    "phoneburner_access_token",
+)
+
+
+class DeliverUpdate(BaseModel):
+    """Deliver payload for PATCH /scrapers/{id} (edit). SHAPE-ONLY: every field is
+    lenient here because the route re-validates the merged result by constructing a
+    full DeliverConfig (single source of delivery validation). Two reasons this is
+    a dedicated model and not DeliverConfig:
+
+    1. Secret preservation — webhook_secret / dialer_webhook_secret /
+       phoneburner_access_token are write-only (GET redacts them to *_set bool
+       flags). On edit, omitted / null / blank means "keep the stored secret", a
+       non-blank value means "replace". DeliverConfig's min-length + cross-field
+       (require_connector_credentials) validators would wrongly reject a blank
+       "keep" token, so they must NOT run until the route has injected the stored
+       secrets back in.
+    2. The frontend pre-fills the edit form from GET, whose deliver dict carries
+       the write-only readback flags (webhook_secret_set, …). Those are declared
+       below (and excluded from model_dump so they never reach DeliverConfig) so
+       echoing them back is accepted — while extra="forbid" still rejects any OTHER
+       unknown key. That matters because this is a REPLACE-whole payload: a silent
+       typo like "webhook_ur" would otherwise drop the real webhook_url + its secret
+       (Codex). A misspelled field 422s instead.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    emails: list[str] = Field(default_factory=list, max_length=10)
+    formats: list[str] = Field(default=["csv"], max_length=5)
+    webhook_url: str | None = None
+    webhook_secret: str | None = None
+    dialer_webhook_url: str | None = None
+    dialer_webhook_secret: str | None = None
+    dialer_type: str | None = None
+    phoneburner_access_token: str | None = None
+    phoneburner_owner_id: str | None = None
+
+    # Write-only readback flags emitted by GET. Accepted (so a verbatim form echo
+    # doesn't 422) but excluded from model_dump — they are not real deliver fields
+    # and must never reach DeliverConfig.
+    webhook_secret_set: bool | None = Field(default=None, exclude=True)
+    dialer_webhook_secret_set: bool | None = Field(default=None, exclude=True)
+    phoneburner_access_token_set: bool | None = Field(default=None, exclude=True)
+
+
+class ScraperConfigUpdate(BaseModel):
+    """PATCH /scrapers/{id} — partial edit of an existing scraper config.
+
+    SEMANTICS: every editable top-level field is optional. A field that is OMITTED
+    keeps the stored value; a field that is PRESENT fully REPLACES it (sub-objects
+    are replace-whole, NOT deep-merged — the edit wizard pre-fills the complete
+    object). The one exception is deliver secrets (see DeliverUpdate): blank = keep.
+
+    Identity (county / state / record_type) is immutable — it ties the config to a
+    county_connector and to property_key/dedup/billing history. The fields are
+    declared here ONLY so an attempt to change them is rejected with a clear 422
+    (Codex P2: reject, don't silently ignore). extra="forbid" rejects any other
+    unknown key.
+
+    updated_at is REQUIRED: it is the optimistic-concurrency token (Codex P1). The
+    client echoes the value it read from GET; the route 409s if the stored row has
+    advanced since, preventing one edit session from silently clobbering another.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    updated_at: datetime
+
+    name: str | None = Field(default=None, max_length=120)
+    fields: FieldsConfig | None = None
+    enrichment: EnrichmentConfig | None = None
+    schedule: ScheduleConfig | None = None
+    deliver: DeliverUpdate | None = None
+    skip_trace_enabled: bool | None = None
+    doc_types: list[str] | None = Field(default=None, max_length=10)
+    # Phase 3: OMITTED keeps the stored value (an old None config stays grandfathered —
+    # editing it must NOT silently flip TOD off); PRESENT replaces it. Only valid for a
+    # probate config (route 422s otherwise).
+    include_living_owner_tod: bool | None = None
+
+    # Identity — accepted only so the route can 422 if a client tries to change it.
+    county: str | None = None
+    state: str | None = None
+    record_type: str | None = None
+
+
 # ─── Batch scrape (Piece 2) ─────────────────────────────────────────────────
 
 class BatchCreateRequest(BaseModel):
@@ -521,6 +852,11 @@ class BatchCreateRequest(BaseModel):
     deliver: DeliverConfig = DeliverConfig()
     schedule: ScheduleConfig = ScheduleConfig()
     skip_trace_enabled: bool = False
+    # Phase 3: applies ONLY to probate children of this batch (None/omitted => the
+    # new probate default, exclude living-owner TOD; True => opt-in). Ignored for
+    # non-probate record types in the batch — no 422, since a batch legitimately
+    # spans multiple types.
+    include_living_owner_tod: bool | None = None
 
     @field_validator("state")
     @classmethod
@@ -883,6 +1219,22 @@ class ConnectorResponse(BaseModel):
     # registry), present only for counties that support selection. Populated by
     # the /connectors handler, not the ORM. None = no selector (legacy/hidden).
     pre_foreclosure_doc_types: dict[str, Any] | None = None
+    # Phase B: how this county's doc-type selection is enforced and how confident we
+    # are. method: "checkbox"/"search_text" (server-side, the portal filters) vs
+    # "keyword" (client-side text match after a broad fetch). confidence: "verified"
+    # (server-side, live-verified) vs "keyword" (best-effort text match). Lets the UI
+    # honestly distinguish a true portal filter from a post-collection text filter.
+    # Both None when the county does not support selection. Additive — the checkbox
+    # map above is unchanged, so existing clients keep working.
+    pre_foreclosure_doc_type_method: str | None = None
+    pre_foreclosure_doc_type_confidence: str | None = None
+    # SHOW (read-only): what document types / dataset this connector collects, per
+    # record type, for the wizard's "documents collected" display. Shape per record
+    # type: {kind: "document_type"|"dataset", items: [{label, exact}], note}.
+    # Populated by the /connectors handler from each scraper's collection_scope().
+    # None when no record type declares a scope. Distinct from the SELECT-capability
+    # field pre_foreclosure_doc_types above.
+    collection_scope_by_record_type: dict[str, Any] | None = None
 
     model_config = {"from_attributes": True}
 

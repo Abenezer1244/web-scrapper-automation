@@ -76,6 +76,19 @@ _DOC_TYPE_MAP = {
     ],
 }
 
+# Phase B: partition of the pre_foreclosure client-refine keywords (above) by
+# canonical doc type, so an explicit selection narrows the client refine to match
+# the narrowed server dropdown. Every canonical type Skagit offers for selection
+# (see doc_types._AVAILABILITY[("skagit","wa")]) MUST appear here — a missing key
+# raises KeyError at construction (fail loud), keeping the server-label map and this
+# refine map in lockstep (Codex: require both mappings or fail closed).
+_CANONICAL_REFINE_KEYWORDS: dict[str, list[str]] = {
+    "lis_pendens": ["LIS PENDENS"],
+    "notice_of_trustee_sale": ["NOTICE OF TRUSTEE", "TRUSTEE SALE", "TRUSTEE'S SALE"],
+    "notice_of_default": ["NOTICE OF DEFAULT"],
+    "notice_of_foreclosure": ["FORECLOSURE"],
+}
+
 
 # Death-certificate party orientation is delegated to the shared
 # src/scrapers/probate.py::orient_probate_party (single source of truth). Skagit's
@@ -92,6 +105,24 @@ class SkagitRecordingScraper(BridgeScraper):
     Parcel IDs are available directly in search results.
     """
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor — Skagit selects a coarse server dropdown then refines
+        results client-side against the document type AND recorder comments. The
+        client refinement (_DOC_TYPE_MAP) is what actually gets kept, so describe
+        that, with a note about the two-stage match."""
+        from src.scrapers.doc_scope import from_keyword_map
+
+        return from_keyword_map(
+            _DOC_TYPE_MAP,
+            record_type,
+            note=(
+                "Identified from a recorder document-type dropdown search, then "
+                "refined by document type and recorder comments; exact wording "
+                "varies."
+            ),
+        )
+
     def __init__(
         self,
         base_url: str,
@@ -100,6 +131,7 @@ class SkagitRecordingScraper(BridgeScraper):
         record_types: list[str] | None = None,
         record_type: str | None = None,
         require_parcel_id: bool = True,
+        doc_types: list[str] | None = None,
     ):
         super().__init__()
         self.base_url = base_url.rstrip("/")
@@ -108,6 +140,25 @@ class SkagitRecordingScraper(BridgeScraper):
         self.record_types = record_types or []
         self.active_record_type = record_type or (self.record_types[0] if self.record_types else None)
         self.require_parcel_id = require_parcel_id
+
+        # Phase B: narrow BOTH Skagit stages on an explicit pre-foreclosure selection.
+        # Stage 1 (server dropdown): restrict the per-type searches to the selected
+        # canonical types' EXACT dropdown labels. Stage 2 (client refine): restrict
+        # _filter_by_type's keyword set to those same types. Narrowing only one stage
+        # would contradict the checkbox (Codex). FAIL-CLOSED: an unmappable/empty
+        # explicit selection raises; None = legacy/full.
+        self._server_label_override: list[str] | None = None
+        self._refine_keyword_override: list[str] | None = None
+        if doc_types is not None and self.active_record_type == "pre_foreclosure":
+            from src.scrapers.doc_types import canonical_tokens_or_raise
+            # Dedup the selection (order-preserving) so a repeated canonical type
+            # doesn't trigger duplicate dropdown searches / refine keywords (Codex).
+            selected = list(dict.fromkeys(doc_types))
+            self._server_label_override = canonical_tokens_or_raise(county, state, selected)
+            kws: list[str] = []
+            for d in selected:
+                kws.extend(_CANONICAL_REFINE_KEYWORDS[d])  # strict: KeyError = fail loud
+            self._refine_keyword_override = kws
 
         from urllib.parse import urlparse
         domain = urlparse(base_url).hostname
@@ -143,7 +194,10 @@ class SkagitRecordingScraper(BridgeScraper):
         # via the dropdown so each search returns a small result set that
         # fits on page 1. This avoids the ASP.NET pagination issue entirely.
         doc_types_to_search = []
-        if self.active_record_type and self.active_record_type in self._SERVER_DOC_TYPES:
+        if self._server_label_override is not None:
+            # Phase B: explicit user selection — search only the chosen dropdown labels.
+            doc_types_to_search = self._server_label_override
+        elif self.active_record_type and self.active_record_type in self._SERVER_DOC_TYPES:
             doc_types_to_search = self._SERVER_DOC_TYPES[self.active_record_type]
         else:
             # No filter or unknown type — search all mapped types
@@ -507,7 +561,12 @@ class SkagitRecordingScraper(BridgeScraper):
         """
         if not self.active_record_type or self.active_record_type == "all":
             return records
-        keywords = _DOC_TYPE_MAP.get(self.active_record_type, [])
+        # Phase B: an explicit selection narrows the refine keyword set to the chosen
+        # canonical types (kept in lockstep with the server-label narrowing above).
+        if self._refine_keyword_override is not None:
+            keywords = self._refine_keyword_override
+        else:
+            keywords = _DOC_TYPE_MAP.get(self.active_record_type, [])
         if not keywords:
             return records
         is_preforeclosure = self.active_record_type == "pre_foreclosure"

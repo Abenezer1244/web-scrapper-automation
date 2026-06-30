@@ -25,6 +25,7 @@ from src.scrapers.base_scraper import (
     normalize_party_text,
 )
 from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
+from src.scrapers.enrichment.pacs import parse_pacs_result_html
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
@@ -117,6 +118,13 @@ class AcclaimWebScraper(BridgeScraper):
     shared AcclaimWeb interface.
     """
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor derived from this template's own _DOC_TYPE_MAP."""
+        from src.scrapers.doc_scope import from_keyword_map
+
+        return from_keyword_map(_DOC_TYPE_MAP, record_type)
+
     def __init__(
         self,
         base_url: str,
@@ -124,6 +132,7 @@ class AcclaimWebScraper(BridgeScraper):
         state: str,
         record_types: list[str] | None = None,
         record_type: str | None = None,
+        doc_types: list[str] | None = None,
     ):
         super().__init__()
         self.base_url = base_url.rstrip("/")
@@ -132,6 +141,15 @@ class AcclaimWebScraper(BridgeScraper):
         self.record_types = record_types or []
         self.active_record_type = record_type or (self.record_types[0] if self.record_types else None)
         self._single_date_mode = False  # Set by _fill_dates when only 1 date input exists
+        # Phase B: narrow the client-side keyword filter to an explicit pre-foreclosure
+        # selection (subset of _DOC_TYPE_MAP — registry tokens are an exact partition).
+        # is not None gate; None = legacy/full; unmappable/empty raises (fail-closed).
+        self._doc_type_keyword_override: list[str] | None = None
+        if doc_types is not None and self.active_record_type == "pre_foreclosure":
+            from src.scrapers.doc_types import canonical_tokens_or_raise
+            self._doc_type_keyword_override = canonical_tokens_or_raise(
+                county, state, list(dict.fromkeys(doc_types))
+            )
 
         from urllib.parse import urlparse
         domain = urlparse(base_url).hostname
@@ -890,7 +908,7 @@ class AcclaimWebScraper(BridgeScraper):
                     if not doc_type or not is_divorce_doc(doc_type, precise_source=False):
                         continue
                 elif active_rt:
-                    keywords = _DOC_TYPE_MAP.get(active_rt, [])
+                    keywords = self._doc_type_keyword_override or _DOC_TYPE_MAP.get(active_rt, [])
                     if keywords:
                         if not doc_type or not _doc_type_matches(doc_type, keywords):
                             continue
@@ -1033,7 +1051,10 @@ class AcclaimWebScraper(BridgeScraper):
             return
 
         def _lookup_one(name: str) -> dict | None:
-            """Search PACS by owner name, return {address, parcel_id, mailing} or None."""
+            """Search PACS by owner name, return {address, mailing, value} or None.
+
+            parcel_id is intentionally NOT returned (owner-name match is weak
+            evidence — see parse_pacs_result_html / Codex point C)."""
             try:
                 # Each lookup needs its own session (shared sessions cause
                 # VIEWSTATE conflicts under concurrency). M8: trust_env=False +
@@ -1063,38 +1084,13 @@ class AcclaimWebScraper(BridgeScraper):
                 if "None found" in r.text:
                     return None
 
-                # Extract from search results table (ID: propertySearchResults_resultsTable)
-                table_start = r.text.find("resultsTable")
-                if table_start == -1:
-                    return None
-                table_end = r.text.find("</table>", table_start)
-                chunk = r.text[table_start:table_end] if table_end > table_start else r.text[table_start:table_start + 5000]
-
-                tds = re.findall(r"<td[^>]*>(.*?)</td>", chunk, re.DOTALL)
-                cells = [re.sub(r"<[^>]+>", " ", td).strip().replace("&nbsp;", "").strip() for td in tds]
-                cells = [c for c in cells if c]
-
-                if len(cells) < 5:
-                    return None
-
-                # PACS table order: checkbox, account, parcel, type, tax_code, address, legal, owner, value, view
-                result = {}
-                for cell in cells:
-                    cell_clean = cell.replace("\r\n", "\n").replace("\r", "\n")
-                    # Parcel ID: 10-12 digit number
-                    if re.match(r"^\d{10,}$", cell.replace(" ", "")) and "parcel_id" not in result:
-                        result["parcel_id"] = cell.replace(" ", "")
-                    # Address: number + street, may have city/state on next line
-                    elif re.search(r"\d+\s+[A-Z].*WA\s+\d{5}", cell_clean, re.I | re.DOTALL):
-                        lines = [ln.strip() for ln in cell_clean.split("\n") if ln.strip()]
-                        result["address"] = lines[0]
-                        if len(lines) > 1:
-                            result["mailing"] = ", ".join(lines)
-                    # Value: dollar amount
-                    elif cell.startswith("$") and "value" not in result:
-                        result["value"] = cell
-
-                return result if result.get("address") or result.get("parcel_id") else None
+                # Shared hardened parser (Codex point C): requires exactly ONE
+                # plausible result row and never returns parcel_id — an owner-name
+                # match is weak evidence and parcel_id is the identity/dedup/billing
+                # key. Replaces the old flatten-all-rows / first-10-digit-cell parse
+                # that could trust row 1 of an ambiguous match (and mislabel the
+                # account number as the parcel).
+                return parse_pacs_result_html(r.text)
             except Exception:
                 return None
 
@@ -1113,8 +1109,8 @@ class AcclaimWebScraper(BridgeScraper):
                             record.property_address = result["address"]
                         if result.get("mailing"):
                             record.mailing_address = result["mailing"]
-                        if result.get("parcel_id"):
-                            record.parcel_id = result["parcel_id"]
+                        # parcel_id intentionally NOT set from owner-name PACS
+                        # lookup (Codex point C — weak evidence, identity key).
                         if result.get("value"):
                             record.enrichment_data = record.enrichment_data or {}
                             record.enrichment_data["assessed_value"] = result["value"]

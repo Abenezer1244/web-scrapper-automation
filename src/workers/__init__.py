@@ -24,6 +24,14 @@ app = Celery(
         "src.workers.nts_crawler",
         # NTS Tier 1: the matcher beat that attaches auction data onto leads.
         "src.workers.nts_matcher_task",
+        # Duplicate-signup notice: send_duplicate_signup_email is .delay()-ed from
+        # POST /auth/register. Must be imported here or the task is unregistered
+        # and the enqueue is silently dropped.
+        "src.workers.onboarding_emails",
+        # Lead delivery email: deliver_job_email is .delay()-ed from run_scrape_job
+        # and the batch finalizer. Must be imported here or the task is
+        # unregistered and the enqueue is silently dropped (same trap as above).
+        "src.workers.delivery",
     ],
 )
 

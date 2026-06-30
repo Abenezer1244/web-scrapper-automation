@@ -39,7 +39,10 @@ async def _run_scraper(
     """Run the async scraper and stream progress logs back to Redis."""
     # Pass record_type / doc_types ONLY to scrapers whose constructor accepts
     # them (template/AI/partial scrapers may not). doc_types=None means legacy
-    # behavior — we never pass it unless an explicit selection exists.
+    # behavior. An EXPLICIT selection (including the degenerate [] of a stale
+    # config) must reach the constructor so it can fail closed — hence
+    # `is not None`, not truthiness, so [] is passed through rather than silently
+    # treated as legacy/full (Codex High).
     import inspect
     kwargs = {}
     try:
@@ -48,7 +51,7 @@ async def _run_scraper(
         params = {}
     if record_type and "record_type" in params:
         kwargs["record_type"] = record_type
-    if doc_types and "doc_types" in params:
+    if doc_types is not None and "doc_types" in params:
         kwargs["doc_types"] = doc_types
     async with scraper_class(**kwargs) as scraper:
         if on_progress:
@@ -332,8 +335,11 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                     res.property_address = pacs["address"]
                 if pacs.get("mailing") and not res.mailing_address:
                     res.mailing_address = pacs["mailing"]
-                if pacs.get("parcel_id") and not res.parcel_id:
-                    res.parcel_id = pacs["parcel_id"]
+                # parcel_id is intentionally NOT taken from the owner-name PACS
+                # lookup (Codex point C): it's weak evidence and parcel_id is the
+                # identity/billing/dedup key (parcel-primary compute_property_key).
+                # _parse_pacs_result_html no longer returns it; this is the
+                # explicit provenance boundary at the consumer.
                 name_hits += 1
             if name_hits:
                 try:

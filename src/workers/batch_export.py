@@ -15,13 +15,13 @@ import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
-from sqlalchemy import text, update
+from sqlalchemy import select, text, update
 
 from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
 from src.db.models import BatchRun, Job, ScraperBatch
 from src.utils.crypto import decrypt_field
 from src.utils.data_exporter import DataExporter
-from src.utils.lead_export import write_lead_csv_with_overlap
+from src.utils.lead_export import PROBATE_SUBTYPE_AGG_SQL, write_lead_csv_with_overlap
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("worker.batch_export")
@@ -66,6 +66,7 @@ WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
            r.mailing_address, r.phone, r.phone_type, r.email,
            r.property_key, r.is_duplicate,
+           r.enrichment_data->>'lead_subtype' AS lead_subtype,
            sc.record_type, sc.county, j.created_at AS job_created_at,
            COALESCE(r.property_key, r.dedup_hash, 'id:' || r.id::text) AS bucket
     FROM results r
@@ -80,6 +81,7 @@ agg AS (
     SELECT bucket,
            array_agg(DISTINCT record_type ORDER BY record_type) AS matched_record_types,
            count(DISTINCT record_type) AS overlap_count,
+           {PROBATE_SUBTYPE_AGG_SQL},
            array_agg(DISTINCT county ORDER BY county) AS source_counties
     FROM candidates
     GROUP BY bucket
@@ -98,7 +100,7 @@ ranked AS (
 )
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
        rk.mailing_address, rk.phone, rk.phone_type, rk.email,
-       a.matched_record_types, a.overlap_count, a.source_counties
+       a.matched_record_types, a.overlap_count, a.source_counties, a.lead_subtype
 FROM ranked rk
 JOIN agg a ON a.bucket = rk.bucket
 WHERE rk.rn = 1
@@ -166,7 +168,9 @@ def _combined_pairs(db, user_id: str, job_ids: list[str]) -> list[tuple]:
     ]
 
 
-def render_combined_csv(user_id: str, job_ids: list[str]) -> bytes:
+def render_combined_csv(
+    user_id: str, job_ids: list[str], hidden_fields: set[str] | None = None
+) -> bytes:
     """Build the combined, deduped, overlap-flagged CSV ON DEMAND from the DB
     (NOT the stored R2 snapshot). Used by the download endpoint so:
       - a re-download reflects later async skip-trace fills (fresh contacts), and
@@ -175,13 +179,16 @@ def render_combined_csv(user_id: str, job_ids: list[str]) -> bytes:
     Opens its own SYNC psycopg2 session like the worker. Tenant isolation is the
     explicit user_id filter baked into _COMBINED_SQL — callers MUST pass the
     verified owner's id + that batch_run's own child_job_ids.
+
+    `hidden_fields` (from the batch's shared `fields`) blanks the user-deselected
+    hideable columns so the combined download matches the per-job exports.
     """
     from src.db.session import system_sync_session
 
     with system_sync_session() as db:
         pairs = _combined_pairs(db, user_id, job_ids)
         buf = io.StringIO()
-        write_lead_csv_with_overlap(pairs, buf)
+        write_lead_csv_with_overlap(pairs, buf, hidden_fields=hidden_fields)
         db.rollback()  # read-only
         return buf.getvalue().encode("utf-8")
 
@@ -251,6 +258,13 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
 
     pairs = _combined_pairs(db, run.user_id, run.child_job_ids or [])
 
+    # Honor the batch's shared output-field visibility (blank deselected hideable
+    # columns; identity/derived columns always present). The batch parent owns
+    # `fields` (children copy it); legacy/empty => show everything.
+    from src.utils.lead_export import resolve_hidden_output_fields
+    _batch = db.get(ScraperBatch, run.batch_id)
+    hidden_fields = resolve_hidden_output_fields(_batch.fields if _batch else None)
+
     object_key = None
     if pairs:
         exporter = DataExporter()
@@ -264,7 +278,7 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
         exporter.export_dir.mkdir(parents=True, exist_ok=True)
         try:
             with open(local_path, "w", newline="", encoding="utf-8") as fh:
-                write_lead_csv_with_overlap(pairs, fh)
+                write_lead_csv_with_overlap(pairs, fh, hidden_fields=hidden_fields)
             object_key = exporter.upload_to_r2(
                 local_path, f"exports/{run.user_id}/batch/{run.id}/combined.csv"
             )
@@ -276,7 +290,18 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
     # the claim) makes rowcount 0 -> we must NOT overwrite 'cancelled' or deliver.
     # done = all succeeded; failed = ALL children failed; partial = a mix
     # (Codex: 100%-failure must not read as 'partial').
-    total_children = len(run.child_job_ids or [])
+
+    # Configs blocked by tier enforcement were recorded on the run at fan-out time;
+    # they never became child jobs, so child_rows can't see them. Read fresh (avoid
+    # identity-map staleness) and merge so the run reads partial/failed correctly and
+    # blocked configs stay visible in failed_children. Blocked entries have no job_id,
+    # so there's no overlap with the per-child `failed` list.
+    prior_blocked = db.execute(
+        select(BatchRun.failed_children).where(BatchRun.id == run.id)
+    ).scalar() or []
+    failed = prior_blocked + failed
+
+    total_children = len(run.child_job_ids or []) + len(prior_blocked)
     if not failed:
         new_status = "done"
     elif len(failed) >= total_children and total_children > 0:
@@ -345,16 +370,32 @@ def _deliver(db, run, lead_count: int, object_key: str | None) -> None:
         return
     try:
         from src.config import settings
-        from src.workers.delivery import deliver_job_results
+        from src.workers.delivery import deliver_job_email
         # Link to the in-app batch page (authed streaming download), NOT an R2
         # presigned URL — that S3-presign path 401s in this R2 config (Codex).
         url = f"{settings.FRONTEND_URL.rstrip('/')}/batches/{run.batch_id}"
-        deliver_job_results(
+        # Enqueue on Celery so a transient Resend failure is retried instead of
+        # dropped. The delivery_started_at CAS above already guarantees this runs
+        # at most once per batch, so enqueue-once + retry-on-failure is safe.
+        deliver_job_email.delay(
             job_id=str(run.id),
             scraper_name=batch.name or "Batch scrape",
             record_count=lead_count,
             download_url=url,
             recipient_emails=emails,
         )
-    except Exception as exc:  # delivery is best-effort — the CSV is in R2 either way
-        _logger.warning("batch %s delivery email failed: %s", run.id, str(exc)[:200])
+    except Exception as exc:  # enqueue is best-effort — the CSV is in R2 either way
+        # The delivery_started_at CAS above is already consumed, so no future
+        # finalizer will retry this batch email — surface the miss to ops (the
+        # per-job path alerts on the same failure mode).
+        _logger.warning("batch %s delivery email enqueue failed: %s", run.id, str(exc)[:200])
+        try:
+            from src.workers.ops_alerts import send_ops_alert
+            send_ops_alert(
+                "batch_email_enqueue", str(run.id),
+                "Batch lead email could not be queued",
+                f"Could not queue the delivery email for batch run {run.id}: "
+                f"{str(exc)[:200]}. The combined export is available in-app.",
+            )
+        except Exception:  # ops alert is best-effort — never mask the original miss
+            pass

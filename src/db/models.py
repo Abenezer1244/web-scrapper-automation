@@ -112,6 +112,15 @@ class User(Base):
     # month's records_used forward.
     records_period_start = Column(DateTime(timezone=True), nullable=True)
     stripe_customer_id = Column(String(64), nullable=True)
+    # Durable Stripe ENTITLEMENT (migration 077). stripe_customer_id only means
+    # "has touched Stripe" (created at checkout START, not at payment) — it is NOT
+    # an entitlement signal. These two record the authoritative paying state,
+    # populated by the billing webhooks: subscription id + Stripe status where
+    # "active"/"trialing"/"past_due" = entitled and "canceled"/None = not. Used by
+    # expire_trials so a trial user who opened checkout but never paid is still
+    # downgraded, while a real subscriber is protected.
+    stripe_subscription_id = Column(String(64), nullable=True)
+    subscription_status = Column(String(32), nullable=True)
     trial_ends_at = Column(DateTime(timezone=True), nullable=True)
     # Sprint 4: skip-trace usage counter for bundled-quota + overage billing
     skip_trace_used_this_month = Column(Integer, nullable=False, default=0)

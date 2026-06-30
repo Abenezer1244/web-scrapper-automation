@@ -63,13 +63,24 @@ def _reset_monthly_usage_impl() -> None:
         )
 
 
+#: Stripe subscription statuses that GRANT entitlement — a user in any of these
+#: is paying (or in a Stripe-side trial / dunning grace) and must NOT have their
+#: app-side trial expired out from under them. Everything else (canceled, unpaid,
+#: incomplete, incomplete_expired, paused, or NULL) is treated as not entitled.
+_ENTITLED_SUB_STATUSES = ("active", "trialing", "past_due")
+
+
 def _expire_trials_impl() -> None:
     """Downgrade expired trial users from Pro to Starter.
 
-    Runs hourly. Finds users where trial_ends_at < now and plan is still 'pro'
-    with no stripe_customer_id (paying users keep their plan).
+    Runs hourly. Finds users whose app-side trial has expired and who do NOT have
+    an entitled Stripe subscription. The gate keys on the durable subscription
+    state (migration 077), NOT on stripe_customer_id: a customer id is created
+    when a user merely OPENS checkout, so the old `stripe_customer_id IS NULL`
+    gate let a trial user who never paid keep Pro forever. A real subscriber
+    (active/trialing/past_due) is protected.
     """
-    from sqlalchemy import select
+    from sqlalchemy import or_, select
 
     from src.config import settings
     from src.db.models import User
@@ -78,13 +89,17 @@ def _expire_trials_impl() -> None:
     now = datetime.now(UTC)
 
     with SyncSessionLocal() as db:
-        # Find trial users whose trial has expired and who haven't paid
+        # Expired trial + NOT entitled (no active subscription).
         expired = db.execute(
             select(User).where(
                 User.trial_ends_at.isnot(None),
                 User.trial_ends_at < now,
                 User.plan != "starter",
-                User.stripe_customer_id.is_(None),  # Not a paying customer
+                or_(
+                    User.stripe_subscription_id.is_(None),
+                    User.subscription_status.is_(None),
+                    User.subscription_status.notin_(_ENTITLED_SUB_STATUSES),
+                ),
             )
         ).scalars().all()
 

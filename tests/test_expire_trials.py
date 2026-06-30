@@ -78,12 +78,16 @@ def test_expired_trial_no_stripe_is_downgraded(cleanup_users):
         assert _plan_of(db, uid) == "starter"
 
 
-def test_expired_trial_with_customer_but_no_subscription_is_downgraded(cleanup_users):
-    """THE BUG: opened checkout (has customer id) but never paid -> must downgrade."""
+def test_ambiguous_legacy_row_is_not_downgraded(cleanup_users):
+    """Codex P1: a row with a stripe_customer_id but NULL subscription_status is
+    AMBIGUOUS — it could be a legacy payer not yet backfilled. The gate must NOT
+    downgrade it (wrongly downgrading a payer is worse than briefly retaining a
+    freeloader). The Stripe backfill resolves these rows authoritatively; once it
+    sets a non-entitled status, test_..._canceled_subscription covers the downgrade."""
     with SyncSessionLocal() as db:
         uid = _make_user(
             db, trial_offset_days=-1,
-            stripe_customer_id="cus_opened_checkout_no_pay",
+            stripe_customer_id="cus_ambiguous_null_status",
             stripe_subscription_id=None,
             subscription_status=None,
         )
@@ -93,7 +97,7 @@ def test_expired_trial_with_customer_but_no_subscription_is_downgraded(cleanup_u
     _expire_trials_impl()
 
     with SyncSessionLocal() as db:
-        assert _plan_of(db, uid) == "starter"
+        assert _plan_of(db, uid) == "pro", "ambiguous legacy row must be protected"
 
 
 @pytest.mark.parametrize("status", ["active", "trialing", "past_due"])

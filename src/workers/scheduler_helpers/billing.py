@@ -79,6 +79,15 @@ def _expire_trials_impl() -> None:
     when a user merely OPENS checkout, so the old `stripe_customer_id IS NULL`
     gate let a trial user who never paid keep Pro forever. A real subscriber
     (active/trialing/past_due) is protected.
+
+    SAFETY (Codex P1): an AMBIGUOUS legacy row — has a `stripe_customer_id` but a
+    NULL `subscription_status` (e.g. paid BEFORE migration 077 and not yet touched
+    by a webhook/backfill) — is NEVER downgraded here. We downgrade only with
+    POSITIVE non-payment evidence: no customer id at all (never reached Stripe), or
+    a known non-entitled status. This makes the gate safe regardless of deploy
+    order; ambiguous rows are resolved authoritatively by the Stripe backfill
+    (scripts/backfill_subscription_status.py), never by guessing. Wrongly
+    downgrading a paying customer is worse than briefly retaining one freeloader.
     """
     from sqlalchemy import or_, select
 
@@ -89,16 +98,21 @@ def _expire_trials_impl() -> None:
     now = datetime.now(UTC)
 
     with SyncSessionLocal() as db:
-        # Expired trial + NOT entitled (no active subscription).
         expired = db.execute(
             select(User).where(
                 User.trial_ends_at.isnot(None),
                 User.trial_ends_at < now,
                 User.plan != "starter",
+                # (A) NOT entitled — no active/trialing/past_due subscription.
                 or_(
-                    User.stripe_subscription_id.is_(None),
                     User.subscription_status.is_(None),
                     User.subscription_status.notin_(_ENTITLED_SUB_STATUSES),
+                ),
+                # (B) POSITIVE non-payment evidence — never expire an ambiguous
+                # legacy row (customer id present but status still NULL).
+                or_(
+                    User.stripe_customer_id.is_(None),
+                    User.subscription_status.isnot(None),
                 ),
             )
         ).scalars().all()

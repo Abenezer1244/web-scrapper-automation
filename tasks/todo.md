@@ -29,7 +29,14 @@ a customer id, no subscription, expired trial, stuck on Pro.)
 - [x] tests/test_expire_trials.py: bug case + all entitled/non-entitled statuses +
       active-trial + no-trial(admin) — 8 cases, real Postgres, no mocks.
 - [x] py_compile clean; single alembic head 077. (No local PG → CI validates suite.)
-- [ ] Codex review (gate). Any Critical/High = NO-GO.
+- [x] Codex review #1 → **[P1]** the gate could downgrade a LEGACY payer whose new
+      fields are still NULL (paid before mig 077). FIXED: gate now downgrades only
+      with POSITIVE non-payment evidence — never an ambiguous (customer id + NULL
+      status) row. Safe regardless of deploy order.
+- [x] scripts/backfill_subscription_status.py: resolve ambiguous rows from Stripe
+      (entitled → store + clear trial; else → set status so the gate can downgrade).
+- [x] tests updated: ambiguous row is PROTECTED; canceled-status row downgrades.
+- [ ] Codex review #2 (confirm P1 closed).
 
 ## Failure modes (Codex) — addressed
 - Wrongly downgraded mid-cycle: protected statuses + webhook keeps state current;

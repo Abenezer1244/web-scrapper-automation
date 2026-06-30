@@ -176,6 +176,11 @@ class EagleWebScraper(BridgeScraper):
 
         await self.navigate(self.base_url)
 
+        # Step 0: some EagleWeb sites (Spokane) sit behind a Cloudflare managed JS
+        # challenge. It auto-clears for a normal browser in ~15-20s; we just have
+        # to wait for the real page instead of acting on the interstitial.
+        await self._wait_through_cloudflare()
+
         # Step 1: Accept disclaimer (only once)
         await self._accept_disclaimer()
 
@@ -260,6 +265,84 @@ class EagleWebScraper(BridgeScraper):
         # them inline (county_gis + AI assessor) before saving Result rows.
         _logger.info("EagleWeb complete — %d records (enrichment runs after save)", len(all_records))
         return all_records
+
+    async def _wait_through_cloudflare(self, timeout_s: int = 35) -> None:
+        """Wait for a Cloudflare managed JS challenge to auto-clear after navigate.
+
+        Spokane's EagleWeb sits behind a Cloudflare "Performing security
+        verification" interstitial. It is a managed JS challenge (NOT a CAPTCHA):
+        a normal browser passes it on its own in ~15-20s, so the scraper just has
+        to wait for the real page instead of acting on the interstitial. This is
+        not evasion — no solver, proxy, or spoofing beyond the browser already in
+        use. Detection is state-based (Codex): the challenge is "cleared" only
+        when a positive EagleWeb marker appears, never merely when the CF text is
+        gone. If the challenge escalates to interactive verification (Turnstile),
+        we stop waiting and let the downstream fail-loud path report it honestly
+        (expected on some datacenter IPs). No-op (returns fast) when the first
+        page is already the app — other EagleWeb counties have no CF wall.
+        """
+        saw_challenge = False
+        for _ in range(max(1, timeout_s // 2)):
+            try:
+                title = (await self.page.title()).lower()
+                body = (
+                    await self.page.evaluate(
+                        "() => document.body ? document.body.innerText.slice(0, 400) : ''"
+                    )
+                ).lower()
+            except Exception:
+                await self.page.wait_for_timeout(2_000)
+                continue
+
+            # Escalated to an interactive challenge — cannot auto-clear; bail so
+            # the caller's fail-loud path surfaces it with the CF page body.
+            try:
+                interactive = await self.page.locator(
+                    "iframe[src*='challenges.cloudflare.com'], "
+                    "iframe[title*='challenge' i], input[type='checkbox'][name*='cf' i]"
+                ).count()
+            except Exception:
+                interactive = 0
+            if interactive:
+                _logger.warning(
+                    "Cloudflare interactive challenge present — cannot auto-clear"
+                )
+                return
+
+            on_challenge = (
+                "just a moment" in title
+                or "security verification" in body
+                or "verifying you are" in body
+                or "verify you are human" in body
+            )
+            if on_challenge:
+                saw_challenge = True
+                await self.page.wait_for_timeout(2_000)
+                continue
+
+            # Not on the CF interstitial. If we never saw one, this is a normal
+            # (non-CF) EagleWeb page — proceed immediately. If we did, confirm a
+            # positive app marker before declaring the challenge cleared.
+            if not saw_challenge:
+                return
+            try:
+                cleared = await self.page.locator(
+                    "input[type='submit'][value*='Acknowledge' i], "
+                    "input[type='submit'][value*='Login' i], "
+                    "button:has-text('Login'), a[href*='docSearch']"
+                ).count()
+            except Exception:
+                cleared = 0
+            if cleared or "auditor" in title or "public record" in title:
+                _logger.info("Cloudflare challenge cleared — real page loaded")
+                return
+            await self.page.wait_for_timeout(2_000)
+
+        if saw_challenge:
+            _logger.warning(
+                "Cloudflare challenge did not clear within %ss (likely blocked "
+                "from this IP)", timeout_s,
+            )
 
     async def _accept_disclaimer(self) -> None:
         """Click 'I Acknowledge' disclaimer if present.

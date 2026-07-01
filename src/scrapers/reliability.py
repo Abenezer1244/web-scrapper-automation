@@ -69,8 +69,75 @@ class ScraperExecutionError(RuntimeError):
         super().__init__(msg)
 
 
-class ScraperBlockedError(ScraperExecutionError):
-    """Captcha / bot-block / login / session-timeout wall (a kind of failure)."""
+class TransientScrapeError(ScraperExecutionError):
+    """A scrape failure that is LIKELY TRANSIENT and worth RETRYING.
+
+    Page that never rendered, a pagination step that flaked, a momentary block
+    wall, a portal timeout — conditions that usually clear on a re-run minutes
+    later. The worker re-queues the job a bounded number of times (see
+    ``SCRAPE_TRANSIENT_MAX_RETRIES``) before giving up. It still subclasses
+    ``ScraperExecutionError``, so once retries are exhausted the job fails LOUD
+    exactly like any other execution error — never scored DONE-with-0. Raising
+    this instead of a bare ``RuntimeError`` is what tells the worker "retry me".
+    """
+
+
+class ScraperBlockedError(TransientScrapeError):
+    """Captcha / bot-block / login / session-timeout wall.
+
+    Transient by default — a bot-challenge / rate-limit wall frequently clears on
+    a spaced re-run, so it is retried (bounded) before the job is failed.
+    """
+
+
+# Substrings that mark a Playwright base ``Error`` (non-timeout) as INFRA/transient:
+# browser/page/context teardown or a network drop, which usually clear on a re-run.
+# Deterministic bugs (strict-mode violations, bad selectors, non-actionable
+# elements) do NOT match, so they fail fast instead of burning the retry budget.
+_TRANSIENT_PW_MARKERS: tuple[str, ...] = (
+    "target closed",
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "browser has been disconnected",
+    "context or browser has been closed",
+    "page has been closed",
+    "connection closed",
+    "websocket",
+    "net::err",
+    "crashed",
+)
+
+
+def is_transient_scrape_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a transient scrape failure the worker should RETRY.
+
+    Transient =
+      - an explicit ``TransientScrapeError`` raised by a scraper, OR
+      - a Playwright ``TimeoutError`` (navigation/action timeout — the classic
+        momentary portal hiccup), OR
+      - a Playwright base ``Error`` whose message matches an INFRA/network marker
+        (browser/page/context closed, connection dropped, net::ERR, crash).
+
+    Everything else — config errors, data-invariant violations, and DETERMINISTIC
+    Playwright bugs (strict-mode / bad selector / not actionable) — is PERMANENT:
+    retrying only burns worker time + backoff before hitting the same wall (Codex).
+
+    Playwright is imported lazily so this stays importable in non-scrape contexts
+    (and returns False there, since a non-Playwright exception can't be one).
+    """
+    if isinstance(exc, TransientScrapeError):
+        return True
+    try:
+        from playwright.async_api import Error as _PWError
+        from playwright.async_api import TimeoutError as _PWTimeout
+    except Exception:  # playwright unavailable — exc can't be a Playwright error
+        return False
+    if isinstance(exc, _PWTimeout):
+        return True
+    if isinstance(exc, _PWError):
+        msg = str(exc).lower()
+        return any(m in msg for m in _TRANSIENT_PW_MARKERS)
+    return False
 
 
 # HIGH-CONFIDENCE block fingerprints only. Each is unlikely to appear on a normal

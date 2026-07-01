@@ -152,11 +152,13 @@ def crawl_nts_snoho_tribune() -> dict:
 @app.task(name="src.workers.nts_crawler.crawl_nts_king_queenanne")
 def crawl_nts_king_queenanne() -> dict:
     """Crawl the Queen Anne & Magnolia News weekly Legals PDF into nts_notices (King)."""
+    from src.scrapers.sources.nts_king_pdf import parse_king_notice
     return _crawl_pacific_publishing_pdf(
         page_url=_KING_PAGE,
         pdf_path_prefix=_KING_PDF_PREFIX,
         source=_KING_SOURCE,
         county="king",
+        parse_fn=parse_king_notice,
     )
 
 
@@ -200,7 +202,7 @@ def _discover_latest_legals_pdf(page_url: str, pdf_path_prefix: str) -> str | No
 
 
 def _crawl_pacific_publishing_pdf(
-    *, page_url: str, pdf_path_prefix: str, source: str, county: str
+    *, page_url: str, pdf_path_prefix: str, source: str, county: str, parse_fn=None
 ) -> dict:
     """Discover → download → extract → split → parse → upsert one weekly Legals PDF.
 
@@ -220,6 +222,12 @@ def _crawl_pacific_publishing_pdf(
     from src.scrapers.sources import nts_pdf
     from src.scrapers.sources import nts_tacoma_index as nts
     from src.utils.safe_http import safe_download_to_file
+
+    # Parser variance is isolated per paper (Codex): Snohomish uses the shared
+    # colon parser; King passes parse_king_notice for its no-colon/surrogate-key
+    # layouts. Default preserves existing (Snohomish/Tacoma) behavior.
+    if parse_fn is None:
+        parse_fn = nts.parse_nts_notice
 
     today = datetime.now(UTC).date()
     summary = {"source": source, "pdf_url": None, "blocks": 0,
@@ -257,7 +265,7 @@ def _crawl_pacific_publishing_pdf(
     with system_sync_session() as db:
         for block in blocks:
             try:
-                parsed = nts.parse_nts_notice(block)
+                parsed = parse_fn(block)
                 row = nts.notice_to_row(
                     parsed, source_url=pdf_url, today=today, source=source, county=county
                 )

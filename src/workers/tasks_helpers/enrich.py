@@ -357,6 +357,73 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 db=db,
             )
 
+    # Pierce probate: repair a typo'd parcel_id from the legal description.
+    # ARMS occasionally indexes a non-existent parcel (wrong plat prefix), so the
+    # GIS-by-parcel pass above yields no address. Recover the property from the
+    # legal and replace the CONFIRMED-nonexistent parcel with the assessor's own,
+    # under strict single-match + shared-lot-suffix guards
+    # (src/scrapers/enrichment/pierce_legal_repair.py). Pierce/WA/probate only.
+    if (config.county.lower() == "pierce" and config.state.upper() == "WA"
+            and config.record_type == "probate"):
+        from src.scrapers.enrichment.pierce_legal_repair import (
+            find_pierce_parcels_by_legal,
+            parcel_hard_negative,
+            same_lot_suffix,
+        )
+        repair_targets = [
+            res for res in all_results
+            if res.legal_description and not res.property_address
+            and res.parcel_id and len(res.parcel_id.strip()) >= 6
+        ]
+        repaired = 0
+        for res in repair_targets:
+            # Only touch a parcel Pierce GIS PROVABLY lacks (hard negative) —
+            # never a transient lookup failure (Codex P1).
+            if not parcel_hard_negative(res.parcel_id):
+                continue
+            # A bare plat+lot legal can match several subdivisions; disambiguate
+            # by the scraped parcel's lot suffix and require EXACTLY ONE assessor
+            # parcel that shares it (differs only in the plat prefix — the
+            # confirmed typo class). 0 or >1 -> leave the row untouched.
+            legal_matches = find_pierce_parcels_by_legal(res.legal_description)
+            candidates = [
+                m for m in legal_matches
+                if m.get("property_address") and same_lot_suffix(res.parcel_id, m["parcel_id"])
+            ]
+            if len(candidates) != 1:
+                continue
+            match = candidates[0]
+            old_parcel = res.parcel_id
+            res.property_address = match["property_address"]
+            if match.get("mailing_address"):
+                res.mailing_address = match["mailing_address"]
+            res.parcel_id = match["parcel_id"]
+            ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+            ed.update({
+                "parcel_source": "gis_legal_match",
+                "raw_scraped_parcel": old_parcel,
+                "gis_match_parcel": match["parcel_id"],
+                "gis_match_method": "plat_lot_unique_suffix",
+                "gis_legal_description": match.get("gis_legal_description"),
+                "gis_legal_survivors": len(legal_matches),  # audit: exact-lot survivors
+                "gis_suffix_matches": len(candidates),       # audit: after suffix disambiguation
+                "gis_parcel_hard_negative": True,            # scraped parcel confirmed absent
+            })
+            res.enrichment_data = ed  # reassign so SQLAlchemy flags the JSON dirty
+            repaired += 1
+        if repair_targets:
+            try:
+                db.commit()
+            except Exception as exc:
+                _logger.warning("Job %s: Pierce legal-repair commit failed: %s", job_id, str(exc)[:120])
+                db.rollback()
+            _publish_log(
+                r, job_id, "info",
+                f"Pierce legal repair: recovered {repaired}/{len(repair_targets)} "
+                "addresses + corrected parcel typos from legal description",
+                db=db,
+            )
+
     # King County: eRealProperty + Tax Bill for property + mailing
     if config.county.lower() == "king" and config.state.upper() == "WA":
         needs = [
@@ -513,15 +580,33 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
         and not res.mailing_address
     ]
     if unactionable:
+        # Break down WHY so a genuinely-unrecoverable row (no parcel AND no legal
+        # — e.g. a probate court filing with no property recorded) is
+        # distinguished from an enrichment gap. The "legal but no parcel" bucket
+        # is the signal to revisit a parcel-less legal fallback if it ever grows
+        # (today it is 0 for Pierce probate) — Codex.
+        def _has(v) -> bool:
+            return bool(v and str(v).strip())
+        no_parcel_no_legal = sum(
+            1 for res in unactionable
+            if not _has(res.parcel_id) and not _has(res.legal_description)
+        )
+        has_parcel = sum(1 for res in unactionable if _has(res.parcel_id))
+        legal_no_parcel = sum(
+            1 for res in unactionable
+            if _has(res.legal_description) and not _has(res.parcel_id)
+        )
         _publish_log(
             r, job_id, "info",
             f"{len(unactionable)} records have no deliverable address "
-            f"(upstream data gap — parcel had no GIS address)",
+            f"(no parcel+legal: {no_parcel_no_legal}, has parcel: {has_parcel}, "
+            f"legal-only: {legal_no_parcel})",
             db=db,
         )
         _logger.info(
-            "Job %s: %d/%d records have no deliverable address (kept for visibility)",
+            "Job %s: %d/%d unactionable — no_parcel_no_legal=%d has_parcel=%d legal_no_parcel=%d",
             job_id, len(unactionable), len(fresh),
+            no_parcel_no_legal, has_parcel, legal_no_parcel,
         )
 
     # ── Sprint 4: skip trace enqueue ─────────────────────────────────────

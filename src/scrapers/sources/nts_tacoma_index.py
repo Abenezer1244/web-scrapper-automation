@@ -123,6 +123,35 @@ _NOTE_AMOUNT = re.compile(r"Note\s+Amount\s*:?\s*\$?([\d,]+\.\d{2})", re.I)
 # ── NOD transmittal date ("by both first class and certified mail on 1/20/2026")
 _NOD_DATE = re.compile(r"certified\s+mail\s+on\s+(\d{1,2}/\d{1,2}/\d{4})", re.I)
 
+# ── King (Queen Anne & Magnolia News) auction layouts use MONTH-NAME dates, which
+# the numeric _AUCTION above misses. Two phrasings seen live:
+#   Affinia: "...will on July 24, 2026, at 9:00 AM sell at public auction located <loc>..."
+#   MTC:     "...will sell at public auction ... on July 24, 2026, 09:00 AM, <loc>..."
+# Capture DATE + TIME (the load-bearing is_valid_nts fields) via the shared
+# "on <month date>[,] [at] <time>" shape. Requiring the trailing TIME keeps this from
+# matching the deed's recording/mailing dates (those carry no time). Tried ONLY when
+# the numeric _AUCTION misses, so Tacoma/Snohomish parsing is unchanged.
+_MONTHS = ("January|February|March|April|May|June|July|August|September|October|"
+           "November|December")
+_MONTH_DATE = rf"(?:{_MONTHS})\.?\s+\d{{1,2}},?\s+\d{{4}}"
+_MONTH_NUM = {m.lower(): i for i, m in enumerate(_MONTHS.split("|"), start=1)}
+_TIME = r"\d{1,2}:\d{2}\s*[AP]\.?M\.?"
+# Both King layouts put the sale DATE + TIME just BEFORE "sell at public auction"
+# (Affinia adjacent: "will on <date>, at <time> sell…"; MTC ~200 chars before:
+# "on <date>, <time>, <loc> … the undersigned Trustee, will sell…"). Requiring the
+# auction verb WITHIN 600 chars after the time ANCHORS the match to the sale so a
+# stray dated timestamp elsewhere in the notice can't be read as the auction (Codex).
+# group(1)=date, group(2)=time. The matched span (group 0) also carries the location.
+_AUCTION_KING = re.compile(
+    rf"\bon\s+({_MONTH_DATE})\s*,?\s*(?:at\s+)?({_TIME})"
+    r"[\s\S]{0,600}?sell\s+at\s+public\s+auction", re.I)
+# Best-effort location within the matched span: Affinia "…located <loc> to the highest";
+# MTC "<time>, <loc>…". Not required for validity/matching.
+_AUCTION_KING_LOC_A = re.compile(r"located\s+(.+?)\s+to\s+the\s+highest", re.I | re.S)
+_AUCTION_KING_LOC_B = re.compile(
+    rf"{_TIME}\s*,\s*(.+?)(?=,\s*to\s+the\s+highest|the\s+undersigned|will\s+sell|$)",
+    re.I | re.S)
+
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
     m = pattern.search(text)
@@ -186,6 +215,25 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
             auction_time = " ".join(am.group(2).split())
             auction_location = loc or None
 
+    # King fallback (month-name dates) — ONLY when the numeric _AUCTION did not match
+    # at all (am is None), so Tacoma/Snohomish behavior is byte-identical even for a
+    # numeric notice whose location drift-guard rejected it (Codex). Date+time are
+    # load-bearing; location (same anchored match) is best-effort.
+    if am is None:
+        km = _AUCTION_KING.search(text)
+        if km:
+            auction_date = " ".join(km.group(1).split()).strip().rstrip(",")
+            auction_time = " ".join(km.group(2).split())
+            # Location from a BOUNDED window around the anchored match (no whole-notice
+            # drift, Codex P3) — extend ~200 chars past the verb to reach Affinia's
+            # "…sell at public auction located <loc> to the highest". Best-effort.
+            span = text[km.start():km.end() + 200]
+            lm = _AUCTION_KING_LOC_A.search(span) or _AUCTION_KING_LOC_B.search(span)
+            if lm:
+                loc = " ".join(lm.group(1).split()).strip().rstrip(".,")
+                if "NOTICE OF TRUSTEE" not in loc.upper() and 0 < len(loc) <= 300:
+                    auction_location = loc
+
     return {
         "ts_number": _first(_TS_NUMBER, text),
         "title_order": _first(_TITLE_ORDER, text),
@@ -245,17 +293,26 @@ def extract_article_text(notice_html: str) -> str:
 
 
 def _to_date(mdy: str | None) -> date | None:
-    """Parse an M/D/YYYY auction date string to a date; None if unparseable."""
+    """Parse an auction date string to a date; None if unparseable.
+
+    Accepts M/D/YYYY (Tacoma/Snohomish) OR "Month D, YYYY" (King papers).
+    """
     if not mdy:
         return None
     m = re.match(r"\s*(\d{1,2})/(\d{1,2})/(\d{4})\b", mdy)
-    if not m:
-        return None
-    mm, dd, yyyy = (int(g) for g in m.groups())
-    try:
-        return date(yyyy, mm, dd)
-    except ValueError:
-        return None
+    if m:
+        mm, dd, yyyy = (int(g) for g in m.groups())
+        try:
+            return date(yyyy, mm, dd)
+        except ValueError:
+            return None
+    mn = re.match(rf"\s*({_MONTHS})\.?\s+(\d{{1,2}}),?\s+(\d{{4}})", mdy, re.I)
+    if mn:
+        try:
+            return date(int(mn.group(3)), _MONTH_NUM[mn.group(1).lower()], int(mn.group(2)))
+        except (ValueError, KeyError):
+            return None
+    return None
 
 
 def notice_to_row(

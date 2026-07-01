@@ -380,10 +380,24 @@ class PierceWAARMSScraper(BridgeScraper):
             const sel = document.getElementById('cphNoMargin_cphNoMargin_OptionsBar1_ItemList');
             return sel ? sel.options.length : 1;
         }""")
-        # Genuine last page (or no dropdown) → done, not a failure.
-        if start_idx < 0 or start_idx >= opts_len - 1:
+        # Positive last-page confirmation only: dropdown readable AND on the last
+        # option → genuinely done, not a failure.
+        if start_idx >= 0 and start_idx >= opts_len - 1:
             _logger.info("Last page reached")
             return False
+        # A Next control exists but the page-index dropdown did not render
+        # (start_idx == -1): we CANNOT prove this is the last page. Treat it as a
+        # transient render failure (the worker retries the whole job) instead of
+        # silently stopping mid-pagination and under-delivering (Codex P2). A
+        # genuine single-page result renders a 1-option dropdown (index 0, caught
+        # above), so this only fires on a real render glitch with more pages behind.
+        if start_idx < 0:
+            raise TransientScrapeError(
+                "pierce", "arms",
+                "next control present but page-index dropdown did not render — "
+                "cannot confirm last page (prevented a silent partial scrape)",
+                record_type=self._record_type,
+            )
 
         last_exc: Exception | None = None
         for attempt in range(1, _PAGE_RETRY_ATTEMPTS + 1):

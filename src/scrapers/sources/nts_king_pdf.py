@@ -20,28 +20,38 @@ from src.scrapers.sources.nts_tacoma_index import parse_nts_notice
 # Affinia is gated on the ORDERED no-colon header labels (Codex Q3) — never on a
 # trustee name — so it can't fire on a colon layout (whose labels carry colons /
 # the "of the Deed of Trust" variant).
+# The negative lookaheads (?!\s*:) and (?!\s+of\s+the\s+Deed) make the gate reject the
+# COLON layout's "…: value" and "…of the Deed of Trust:" labels, so it can never fire
+# on an MTC/colon block and clobber its correctly colon-parsed fields (Codex).
 _AFFINIA_SHAPE = re.compile(
-    r"Grantor\(s\)\s+of\s+Deed\s+of\s+Trust\b[\s\S]{0,400}?Current\s+Beneficiary\b"
-    r"[\s\S]{0,200}?Current\s+Trustee\b", re.I)
+    r"Grantor\(s\)\s+of\s+Deed\s+of\s+Trust(?!\s*:)\b[\s\S]{0,400}?"
+    r"Current\s+Beneficiary(?!\s*:)(?!\s+of\s+the\s+Deed)\b[\s\S]{0,200}?"
+    r"Current\s+Trustee(?!\s*:)(?!\s+of\s+the\s+Deed)\b", re.I)
 
+# Value regexes carry the SAME negative guards (defense-in-depth: even if the gate
+# ever passed on a mixed block, these won't capture a "of the Deed of Trust:" label).
 _AFF_GRANTOR = re.compile(
-    r"Grantor\(s\)\s+of\s+Deed\s+of\s+Trust\s+(.+?)\s+Current\s+Beneficiary\b", re.I | re.S)
-_AFF_BENEF = re.compile(r"Current\s+Beneficiary\s+(.+?)\s+Current\s+Trustee\b", re.I | re.S)
+    r"Grantor\(s\)\s+of\s+Deed\s+of\s+Trust(?!\s*:)\s+(.+?)\s+Current\s+Beneficiary\b", re.I | re.S)
+_AFF_BENEF = re.compile(
+    r"Current\s+Beneficiary(?!\s*:)(?!\s+of\s+the\s+Deed)\s+(.+?)\s+Current\s+Trustee\b", re.I | re.S)
 _AFF_TRUSTEE = re.compile(
-    r"Current\s+Trustee\s+(.+?)\s+Current\s+(?:Mortgage|Loan)\s+Servicer\b", re.I | re.S)
+    r"Current\s+Trustee(?!\s*:)(?!\s+of\s+the\s+Deed)\s+(.+?)\s+Current\s+(?:Mortgage|Loan)\s+Servicer\b",
+    re.I | re.S)
 _AFF_SERVICER = re.compile(
-    r"Current\s+(?:Mortgage|Loan)\s+Servicer\s+(.+?)\s+Deed\s+of\s+Trust\s+Recording\b", re.I | re.S)
+    r"Current\s+(?:Mortgage|Loan)\s+Servicer(?!\s*:)\s+(.+?)\s+Deed\s+of\s+Trust\s+Recording\b",
+    re.I | re.S)
 _AFF_DEEDREF = re.compile(
     r"Deed\s+of\s+Trust\s+Recording\s+Number\s*\(Ref\.?\s*#?\)?\s*(\d{6,})", re.I)
-# Parcel must be EXACT digits/dashes only — a garbage parcel auto-matches at 0.90 (Codex).
-_AFF_PARCEL = re.compile(r"Parcel\s+Number\(s\)\s+(\d[\d\-]{4,})\b", re.I)
+# Parcel must be an EXACT digits/dashes token — a garbage parcel auto-matches at 0.90
+# (Codex). (?![-\w]) (not \b) rejects "12345-EXHIBIT" -> would else capture "12345".
+_AFF_PARCEL = re.compile(r"Parcel\s+Number\(s\)\s+(\d[\d\-]{4,})(?![-\w])", re.I)
 
 # Surrogate-key sources for ANY King layout (used only when no trustee TS# was parsed).
 _KING_DEEDREF_ANY = re.compile(
     r"(?:Deed\s+of\s+Trust\s+Recording\s+Number\s*\(Ref\.?\s*#?\)?|Instrument\s+No\.?)\s*(\d{8,})",
     re.I)
 _KING_APN_ANY = re.compile(
-    r"(?:\bAPN\b|Parcel\s+Number\(?s?\)?|Tax\s+Parcel(?:\s+Number)?)\s*[:#]?\s*(\d[\d\-]{4,})\b",
+    r"(?:\bAPN\b|Parcel\s+Number\(?s?\)?|Tax\s+Parcel(?:\s+Number)?)\s*[:#]?\s*(\d[\d\-]{4,})(?![-\w])",
     re.I)
 
 

@@ -31,7 +31,9 @@ class TestParsePierceLegal:
     def test_rejects_unmodeled_qualifiers(self):
         for lg in ["PARKWOOD DIV 3 LT 11", "PARKWOOD LTS 11-12",
                    "PARKWOOD BLK 2 LT 11", "PARKWOOD ADD LT 11",
-                   "PARKWOOD LT 11 LESS S 10FT"]:
+                   "PARKWOOD LT 11 LESS S 10FT",
+                   "PARKWOOD LOT 11 / 12", "PARKWOOD LT 11, 12",
+                   "PARKWOOD LOTS 11 TO 14"]:
             assert parse_pierce_legal(lg) is None, lg
 
     def test_rejects_no_lot_or_no_plat(self):
@@ -82,6 +84,7 @@ class TestCollectLegalMatches:
             _feat("6776000100", "PARKWOOD L 10 EASE", site="2320 BRYCE CANYON CT"),
             _feat("6776001100", "PARKWOOD L 110 EASE", site="9 OTHER ST"),
             _feat("6776009911", "PARKWOOD L 11-12 EASE", site="9 RANGE ST"),
+            _feat("6776009912", "PARKWOOD L 11 / 12 EASE", site="9 SLASH ST"),
             _feat("6776000110", "PARKWOOD L 11 EASE", site=""),  # no situs
         ]
         assert collect_legal_matches(feats, "PARKWOOD", "11") == []

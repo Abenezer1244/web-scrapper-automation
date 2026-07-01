@@ -385,8 +385,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             # by the scraped parcel's lot suffix and require EXACTLY ONE assessor
             # parcel that shares it (differs only in the plat prefix — the
             # confirmed typo class). 0 or >1 -> leave the row untouched.
+            legal_matches = find_pierce_parcels_by_legal(res.legal_description)
             candidates = [
-                m for m in find_pierce_parcels_by_legal(res.legal_description)
+                m for m in legal_matches
                 if m.get("property_address") and same_lot_suffix(res.parcel_id, m["parcel_id"])
             ]
             if len(candidates) != 1:
@@ -404,6 +405,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 "gis_match_parcel": match["parcel_id"],
                 "gis_match_method": "plat_lot_unique_suffix",
                 "gis_legal_description": match.get("gis_legal_description"),
+                "gis_legal_survivors": len(legal_matches),  # audit: exact-lot survivors
+                "gis_suffix_matches": len(candidates),       # audit: after suffix disambiguation
+                "gis_parcel_hard_negative": True,            # scraped parcel confirmed absent
             })
             res.enrichment_data = ed  # reassign so SQLAlchemy flags the JSON dirty
             repaired += 1

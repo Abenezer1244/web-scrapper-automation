@@ -47,7 +47,8 @@ _PLUS = re.compile(r"\s*\(\+\)\s*")
 # pair is NOT a unique property identity, so we refuse to guess (Codex).
 _UNMODELED = re.compile(
     r"\b(?:BLK|BLOCK|DIV|DIVISION|ADD|ADDITION|LESS|EXC|EXCEPT|POR|PORTION|"
-    r"TRACT|TR|UNIT|PARCEL|SEC|SECTION|LOTS|LTS|THRU|AND)\b|\d\s*[-&]\s*\d",
+    r"TRACT|TR|UNIT|PARCEL|SEC|SECTION|LOTS|LTS|THRU|THROUGH|TO|AND)\b"
+    r"|\d\s*[-&/,]\s*\d",  # multi-lot list/range: 11-12, 11 & 12, 11/12, 11,12
     re.IGNORECASE,
 )
 
@@ -93,7 +94,7 @@ def _lot_token_re(lot: str) -> re.Pattern:
     """Exact singular-lot matcher for a candidate GIS legal: matches "L 11" /
     "LT 11" / "LOT 011" but NOT "L 110" (different lot) nor "L 11-12" (range)."""
     return re.compile(
-        rf"\bL(?:OT|T)?\s*#?\s*0*{re.escape(lot)}\b(?!\s*[-&]\s*\d)",
+        rf"\bL(?:OT|T)?\s*#?\s*0*{re.escape(lot)}\b(?!\s*[-&/,]\s*\d)",
         re.IGNORECASE,
     )
 
@@ -144,7 +145,10 @@ def parcel_hard_negative(parcel_id: str | None) -> bool:
     """True ONLY on a definitive Pierce GIS 200/0-features response for this
     parcel (i.e. the parcel genuinely does not exist). False if it resolves;
     False on any error/timeout (never treat a transient failure as 'absent')."""
-    apn = re.sub(r"\s", "", (parcel_id or "").replace("-", ""))
+    # Digits-only: the parcel is external scraped data going into an ArcGIS
+    # where-clause, so strip everything non-numeric — no quote/metachar can
+    # survive to break out of TaxParcelNumber='<apn>' (Codex).
+    apn = re.sub(r"\D", "", parcel_id or "")
     if len(apn) < 6:
         return False
     try:

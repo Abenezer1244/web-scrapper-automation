@@ -6,10 +6,9 @@ the numeric-only auction parser silently dropped, leaving King with zero notices
 though the PDF is full of RCW 61.24 trustee sales. This locks the month-name support
 (Step A) and its zero-regression contract for the numeric (Tacoma/Snohomish) path.
 """
+import re
 from datetime import date
 from pathlib import Path
-
-import re
 
 from src.scrapers.sources import nts_pdf
 from src.scrapers.sources.nts_king_pdf import parse_king_notice

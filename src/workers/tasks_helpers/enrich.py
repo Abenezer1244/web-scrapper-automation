@@ -580,15 +580,33 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
         and not res.mailing_address
     ]
     if unactionable:
+        # Break down WHY so a genuinely-unrecoverable row (no parcel AND no legal
+        # — e.g. a probate court filing with no property recorded) is
+        # distinguished from an enrichment gap. The "legal but no parcel" bucket
+        # is the signal to revisit a parcel-less legal fallback if it ever grows
+        # (today it is 0 for Pierce probate) — Codex.
+        def _has(v) -> bool:
+            return bool(v and str(v).strip())
+        no_parcel_no_legal = sum(
+            1 for res in unactionable
+            if not _has(res.parcel_id) and not _has(res.legal_description)
+        )
+        has_parcel = sum(1 for res in unactionable if _has(res.parcel_id))
+        legal_no_parcel = sum(
+            1 for res in unactionable
+            if _has(res.legal_description) and not _has(res.parcel_id)
+        )
         _publish_log(
             r, job_id, "info",
             f"{len(unactionable)} records have no deliverable address "
-            f"(upstream data gap — parcel had no GIS address)",
+            f"(no parcel+legal: {no_parcel_no_legal}, has parcel: {has_parcel}, "
+            f"legal-only: {legal_no_parcel})",
             db=db,
         )
         _logger.info(
-            "Job %s: %d/%d records have no deliverable address (kept for visibility)",
+            "Job %s: %d/%d unactionable — no_parcel_no_legal=%d has_parcel=%d legal_no_parcel=%d",
             job_id, len(unactionable), len(fresh),
+            no_parcel_no_legal, has_parcel, legal_no_parcel,
         )
 
     # ── Sprint 4: skip trace enqueue ─────────────────────────────────────

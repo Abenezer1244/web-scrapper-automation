@@ -357,6 +357,69 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 db=db,
             )
 
+    # Pierce probate: repair a typo'd parcel_id from the legal description.
+    # ARMS occasionally indexes a non-existent parcel (wrong plat prefix), so the
+    # GIS-by-parcel pass above yields no address. Recover the property from the
+    # legal and replace the CONFIRMED-nonexistent parcel with the assessor's own,
+    # under strict single-match + shared-lot-suffix guards
+    # (src/scrapers/enrichment/pierce_legal_repair.py). Pierce/WA/probate only.
+    if (config.county.lower() == "pierce" and config.state.upper() == "WA"
+            and config.record_type == "probate"):
+        from src.scrapers.enrichment.pierce_legal_repair import (
+            find_pierce_parcels_by_legal,
+            parcel_hard_negative,
+            same_lot_suffix,
+        )
+        repair_targets = [
+            res for res in all_results
+            if res.legal_description and not res.property_address
+            and res.parcel_id and len(res.parcel_id.strip()) >= 6
+        ]
+        repaired = 0
+        for res in repair_targets:
+            # Only touch a parcel Pierce GIS PROVABLY lacks (hard negative) —
+            # never a transient lookup failure (Codex P1).
+            if not parcel_hard_negative(res.parcel_id):
+                continue
+            # A bare plat+lot legal can match several subdivisions; disambiguate
+            # by the scraped parcel's lot suffix and require EXACTLY ONE assessor
+            # parcel that shares it (differs only in the plat prefix — the
+            # confirmed typo class). 0 or >1 -> leave the row untouched.
+            candidates = [
+                m for m in find_pierce_parcels_by_legal(res.legal_description)
+                if m.get("property_address") and same_lot_suffix(res.parcel_id, m["parcel_id"])
+            ]
+            if len(candidates) != 1:
+                continue
+            match = candidates[0]
+            old_parcel = res.parcel_id
+            res.property_address = match["property_address"]
+            if match.get("mailing_address"):
+                res.mailing_address = match["mailing_address"]
+            res.parcel_id = match["parcel_id"]
+            ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+            ed.update({
+                "parcel_source": "gis_legal_match",
+                "raw_scraped_parcel": old_parcel,
+                "gis_match_parcel": match["parcel_id"],
+                "gis_match_method": "plat_lot_unique_suffix",
+                "gis_legal_description": match.get("gis_legal_description"),
+            })
+            res.enrichment_data = ed  # reassign so SQLAlchemy flags the JSON dirty
+            repaired += 1
+        if repair_targets:
+            try:
+                db.commit()
+            except Exception as exc:
+                _logger.warning("Job %s: Pierce legal-repair commit failed: %s", job_id, str(exc)[:120])
+                db.rollback()
+            _publish_log(
+                r, job_id, "info",
+                f"Pierce legal repair: recovered {repaired}/{len(repair_targets)} "
+                "addresses + corrected parcel typos from legal description",
+                db=db,
+            )
+
     # King County: eRealProperty + Tax Bill for property + mailing
     if config.county.lower() == "king" and config.state.upper() == "WA":
         needs = [

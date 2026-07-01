@@ -217,6 +217,18 @@ def _fail_job(db, job, r, job_id: str, reason: str, expected_started_at=None) ->
             "Job %s: _set_status failed during _fail_job: %s",
             job_id, str(exc)[:200],
         )
+    # Attempt-scoped no-op: when expected_started_at was supplied and the CAS did
+    # NOT fire, a NEWER attempt re-claimed this job (started_at moved). Suppress the
+    # failure log + 'failed' SSE so a superseded attempt can't emit a false failure
+    # against the live newer attempt (Codex P2). Unscoped callers are unchanged:
+    # there cas_ok=False means the job was already terminal, where re-publishing the
+    # failure is harmless/expected.
+    if expected_started_at is not None and not cas_ok:
+        _logger.info(
+            "Job %s: fail suppressed — attempt superseded by a newer one "
+            "(started_at moved); not emitting a failure event", job_id,
+        )
+        return cas_ok
     # Publish the failure log via a fresh session (db=None) so it
     # is not coupled to the main session's transaction state.
     _publish_log(r, job_id, "error", reason, db=None)

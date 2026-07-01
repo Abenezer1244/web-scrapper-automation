@@ -208,6 +208,88 @@ class TestNoticeToRow:
         assert a == b  # hash is over content, not URL
 
 
+class TestNoticeToRowFieldSafety:
+    """2026-07-01: a live King notice was LOST to a varchar(512) INSERT error when a
+    layout drift made the colon parser capture 810 chars of boilerplate. notice_to_row
+    is the shared chokepoint: display fields are clamped to their column widths,
+    identity fields (ts_number, parcel) are NEVER truncated — an overlong ts_number
+    skips the row, an overlong parcel is nulled (a truncated key could false-match)."""
+
+    def _parsed(self):
+        return parse_nts_notice(_FIXTURE.read_text(encoding="utf-8"))
+
+    def test_display_fields_clamped_to_column_widths(self):
+        p = dict(self._parsed())
+        p["grantor"] = "G" * 900
+        p["beneficiary"] = "B" * 900
+        p["trustee"] = "T" * 900
+        p["auction_location"] = "L" * 900
+        p["property_address"] = "A" * 900
+        row = notice_to_row(p, "http://x/", today=date(2026, 6, 12))
+        assert row is not None  # the notice SURVIVES — that is the whole point
+        assert len(row["grantor"]) == 512
+        assert len(row["beneficiary"]) == 255
+        assert len(row["trustee"]) == 255
+        assert len(row["auction_location"]) == 512
+        assert len(row["property_address"]) == 512
+        assert len(row["property_address_normalized"] or "") <= 512
+
+    def test_overlong_parcel_nulled_not_truncated(self):
+        p = dict(self._parsed())
+        p["parcel"] = "1" * 80
+        row = notice_to_row(p, "http://x/", today=date(2026, 6, 12))
+        assert row["parcel"] is None
+
+    def test_overlong_ts_number_skips_row(self):
+        p = dict(self._parsed())
+        p["ts_number"] = "X" * 65
+        assert notice_to_row(p, "http://x/", today=date(2026, 6, 12)) is None
+
+    def test_identical_party_blob_nulled(self):
+        # Colon regexes on a no-colon layout scan to the same first colon (inside
+        # "10:00 AM") and assign ONE boilerplate blob to grantor/beneficiary/servicer.
+        p = dict(self._parsed())
+        blob = "00 AM sell at public auction located At the 4th Ave. entrance " * 3
+        p["grantor"] = p["beneficiary"] = p["servicer"] = blob
+        row = notice_to_row(p, "http://x/", today=date(2026, 6, 12))
+        assert row["grantor"] is None
+        assert row["beneficiary"] is None
+
+    def test_legit_short_identical_parties_survive(self):
+        # A short benign coincidence must NOT be nulled by the mis-parse detector.
+        p = dict(self._parsed())
+        p["grantor"] = p["beneficiary"] = p["servicer"] = "ACME LLC"
+        row = notice_to_row(p, "http://x/", today=date(2026, 6, 12))
+        assert row["grantor"] == "ACME LLC"
+        assert row["beneficiary"] == "ACME LLC"
+
+
+class TestCommonlyKnownAsBoundaries:
+    """2026-07-01 live King layouts (real notice text). The Affinia phrasing leaked
+    'The above property is' into the address (poisoning the normalized match key);
+    the MTC phrasing has NO colon after 'commonly known as' and lost the address."""
+
+    def test_above_property_boilerplate_excluded(self):
+        text = (
+            "T.S. No. 25-1 NOTICE OF TRUSTEE'S SALE will on 7/10/2026, at 10:00 AM "
+            "Main Entrance sell at public auction the following-described real property "
+            "Commonly known as: 2416 South 128th Street, Seatac, WA 98168 The above "
+            "property is subject to that certain Deed of Trust dated December 12, 2005"
+        )
+        p = parse_nts_notice(text)
+        assert p["property_address"] == "2416 South 128th Street, Seatac, WA 98168"
+
+    def test_colonless_more_commonly_known_as(self):
+        text = (
+            "T.S. No. 25-2 NOTICE OF TRUSTEE'S SALE will on 7/10/2026, at 10:00 AM "
+            "Main Entrance sell at public auction the following described real property "
+            "APN: 338390-0045 More commonly known as 1814 FRANKLIN AVE E, SEATTLE, WA "
+            "98102 which is subject to that certain Deed of Trust dated July 8, 2020"
+        )
+        p = parse_nts_notice(text)
+        assert p["property_address"] == "1814 FRANKLIN AVE E, SEATTLE, WA 98102"
+
+
 class TestQualityLoanFormat:
     """Second REAL fixture: Quality Loan layout (whole header on one line, 'More
     commonly known as', 'Subject to' stop) — the CURRENT Tacoma Daily Index format."""

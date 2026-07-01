@@ -100,12 +100,16 @@ _AUCTION = re.compile(
     r"(.+?)\s+sell\s+at\s+public\s+auction",
     re.I | re.S,
 )
-# ── Property: "[More] commonly known as: <addr> [Subject to|which is subject…]".
-# Stop at "Subject to" (Quality Loan) OR "which is subject" (North Star) OR section
+# ── Property: "[More] commonly known as[:] <addr> [Subject to|which is subject…]".
+# Stop at "Subject to" (Quality Loan) OR "which is subject" (North Star) OR
+# "The above property is …" (Affinia — without this the boilerplate words before
+# "subject" leak into the address and poison the normalized match key) OR section
 # II, same line or next (a one-line layout would otherwise swallow the deed body).
+# The colon is OPTIONAL: MTC notices say "More commonly known as 1814 FRANKLIN AVE E…"
+# with no colon at all (live 2026-07-01) — requiring it silently dropped the address.
 _COMMONLY_KNOWN = re.compile(
-    r"commonly\s+known\s+as\s*:\s*(.+?)"
-    r"(?=\s+(?:which\s+is\s+)?[Ss]ubject\s+to\b|\s+II\.\s|\n\n|\Z)",
+    r"commonly\s+known\s+as\s*:?\s*(.+?)"
+    r"(?=\s+The\s+above\s+property\b|\s+(?:which\s+is\s+)?[Ss]ubject\s+to\b|\s+II\.\s|\n\n|\Z)",
     re.I | re.S,
 )
 # ── Section IV "sum owing on the obligation": two real phrasings —
@@ -169,6 +173,18 @@ def _money(pattern: re.Pattern, text: str) -> Decimal | None:
         return Decimal(m.group(1).replace(",", ""))
     except (InvalidOperation, ValueError):
         return None
+
+
+def _truncate(value: str | None, limit: int) -> str | None:
+    """Bound a display-only field to its nts_notices column width (None-safe).
+
+    Never use this on a match/identity field (parcel, ts_number) — a truncated key
+    can silently collide with or false-match a real value; those are nulled/skipped
+    in notice_to_row instead.
+    """
+    if value is None:
+        return None
+    return value[:limit].rstrip() or None
 
 
 def _clean_address(raw: str | None) -> str | None:
@@ -338,11 +354,40 @@ def notice_to_row(
     """
     if not is_valid_nts(parsed):
         return None
+    # ts_number is IDENTITY (the (source, ts_number) upsert key), not display: an
+    # overlong value is parser garbage, and truncating it could collide two distinct
+    # notices under one key — treat it as missing and skip cleanly (Codex 2026-07-01).
+    # Source-specific surrogate logic (King REF-/APN-) runs BEFORE this and already
+    # bounds its keys to 64.
+    if len(parsed["ts_number"]) > 64:
+        return None
     from src.utils.address_intel import address_match_key
 
     auction = _to_date(parsed.get("auction_date"))
-    addr = parsed.get("property_address")
-    norm = address_match_key(addr)
+    # Mis-parse detector (live 2026-07-01): on a no-colon layout the colon field
+    # regexes scan to the SAME first colon (e.g. inside "10:00 AM") and assign one
+    # identical boilerplate blob to grantor, beneficiary AND servicer. Identical
+    # multi-field captures are a structural parse failure — null the poisoned
+    # enrichment fields but KEEP the notice (its ts_number/date/address/parcel still
+    # match leads). Length/boilerplate guard so a legitimate short coincidence survives.
+    grantor = parsed.get("grantor")
+    beneficiary = parsed.get("beneficiary")
+    if (
+        grantor is not None
+        and grantor == beneficiary == parsed.get("servicer")
+        and (len(grantor) >= 100 or "public auction" in grantor.lower()
+             or "notice is hereby given" in grantor.lower())
+    ):
+        grantor = beneficiary = None
+    # Clamp display-only fields to their nts_notices column widths so one runaway
+    # capture can never abort the whole notice's INSERT again (a live varchar(512)
+    # error lost a notice). parcel is a MATCH key — a truncated parcel could
+    # false-match a real lead, so an overlong one becomes None instead.
+    addr = _truncate(parsed.get("property_address"), 512)
+    norm = _truncate(address_match_key(addr), 512)
+    parcel = parsed.get("parcel")
+    if parcel and len(parcel) > 64:
+        parcel = None
     # Hash the load-bearing parsed fields so a re-crawl of an unchanged notice is a
     # no-op and a source/parser change is observable.
     payload = "|".join(
@@ -356,19 +401,19 @@ def notice_to_row(
         "ts_number": parsed["ts_number"],
         "county": county,
         "state": STATE,
-        "parcel": parsed.get("parcel"),
+        "parcel": parcel,
         "property_address": addr,
         "property_address_normalized": norm,
         "auction_date": auction,
-        "auction_time": parsed.get("auction_time"),
-        "auction_location": parsed.get("auction_location"),
-        "grantor": parsed.get("grantor"),
-        "trustee": parsed.get("trustee"),
-        "beneficiary": parsed.get("beneficiary"),
+        "auction_time": _truncate(parsed.get("auction_time"), 16),
+        "auction_location": _truncate(parsed.get("auction_location"), 512),
+        "grantor": _truncate(grantor, 512),
+        "trustee": _truncate(parsed.get("trustee"), 255),
+        "beneficiary": _truncate(beneficiary, 255),
         "principal_owing": parsed.get("principal_owing"),
         "note_amount": parsed.get("note_amount"),
-        "nod_date": parsed.get("nod_date"),
-        "source_url": source_url,
+        "nod_date": _truncate(parsed.get("nod_date"), 32),
+        "source_url": _truncate(source_url, 512),
         "raw_hash": raw_hash,
         "is_active": bool(auction and auction >= today),
     }

@@ -62,3 +62,9 @@ class TestParseNameCell:
         party, heirs = PierceWAARMSScraper._parse_name_cell(_cell("[E] WALKER ZOYA S"))
         assert party is None
         assert heirs == "WALKER ZOYA S"
+
+    def test_empty_r_slot_does_not_promote_heir(self):
+        # Empty [R] then [E]: the [E] party must NOT be promoted to decedent.
+        assert PierceWAARMSScraper._parse_name_cell(
+            _cell("[R] [E] WALKER ZOYA S")
+        ) == (None, "WALKER ZOYA S")

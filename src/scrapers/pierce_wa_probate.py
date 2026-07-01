@@ -658,7 +658,10 @@ class PierceWAARMSScraper(BridgeScraper):
         party_name = None
         heirs = None
 
-        r_match = re.search(r"\[R\]\s*(.+?)(?=\s*\[E\]|$)", full_text)
+        # ``.*?`` (not ``.+?``) so an EMPTY [R] slot ("[R] [E] JONES") captures ""
+        # rather than greedily swallowing the following "[E] JONES" — otherwise the
+        # associated [E] party would be promoted into party_name (Codex).
+        r_match = re.search(r"\[R\]\s*(.*?)(?=\s*\[E\]|$)", full_text)
         if r_match:
             party_name = r_match.group(1).strip()
 

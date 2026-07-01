@@ -20,6 +20,7 @@ from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.scrapers.divorce import orient_divorce_party
 from src.scrapers.enrichment.county_gis import batch_enrich_parcels_gis
 from src.scrapers.preforeclosure import orient_pre_foreclosure_party
+from src.scrapers.probate import orient_probate_party
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.pierce_wa_probate")
@@ -50,6 +51,31 @@ def _strip_arms_plus(value: str | None) -> str | None:
     if not value:
         return value
     return _ARMS_PLUS.sub(" ", value).strip() or None
+
+
+# ARMS party-role markers: "[R]" (reverse/primary party) and "[E]" (associated/
+# estate party). They label a name — they are NEVER a name themselves. A cell that
+# carries only a marker (e.g. an "[E]" with no associated name indexed) must NOT
+# become a lead named "[E]".
+_ARMS_ROLE_MARKER = re.compile(r"\[(?:R|E)\]", re.IGNORECASE)
+
+
+def _clean_arms_name(value: str | None) -> str | None:
+    """Return a real party name, or None when the value carries no actual name.
+
+    Strips ONLY the ARMS role markers ("[R]", "[E]") and the "(+)" more-parties
+    marker (never arbitrary bracketed text — a real name may legitimately contain
+    brackets). A value that reduces to no alphabetic character (a bare marker such
+    as "[E]", punctuation, or empty) is treated as no-name and returns None.
+    """
+    if not value:
+        return None
+    cleaned = _ARMS_ROLE_MARKER.sub(" ", value)
+    cleaned = _ARMS_PLUS.sub(" ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    if not any(c.isalpha() for c in cleaned):
+        return None
+    return cleaned
 
 
 class PierceWAARMSScraper(BridgeScraper):
@@ -569,6 +595,21 @@ class PierceWAARMSScraper(BridgeScraper):
                         record.party_name = None  # dropped by the party-name guard below
                     else:
                         record.party_name, record.heirs = oriented
+                elif self._record_type == "probate":
+                    # Probate: ARMS indexes the decedent/estate as [R] (party_name)
+                    # and the heir/personal-rep as [E] (heirs). Route through the
+                    # shared probate orientation so a Certificate-of-Death filing
+                    # agency ("STATE OF WASHINGTON, DEPT OF HEALTH") in the [R] slot
+                    # is stripped and a person-like [E] promoted — the SAME rule the
+                    # other probate scrapers use. Strip the "(+)" marker first. A
+                    # no-op for the common case where [R] is already the decedent;
+                    # (None, None) when neither role is a real person -> dropped by
+                    # the party-name guard below.
+                    party = _strip_arms_plus(record.party_name)
+                    heirs = _strip_arms_plus(record.heirs)
+                    record.party_name, record.heirs = orient_probate_party(
+                        party, heirs, self.DOC_TYPE_LABEL
+                    )
                 break
 
         # Legal description
@@ -617,7 +658,10 @@ class PierceWAARMSScraper(BridgeScraper):
         party_name = None
         heirs = None
 
-        r_match = re.search(r"\[R\]\s*(.+?)(?=\s*\[E\]|$)", full_text)
+        # ``.*?`` (not ``.+?``) so an EMPTY [R] slot ("[R] [E] JONES") captures ""
+        # rather than greedily swallowing the following "[E] JONES" — otherwise the
+        # associated [E] party would be promoted into party_name (Codex).
+        r_match = re.search(r"\[R\]\s*(.*?)(?=\s*\[E\]|$)", full_text)
         if r_match:
             party_name = r_match.group(1).strip()
 
@@ -626,11 +670,11 @@ class PierceWAARMSScraper(BridgeScraper):
             heirs = e_match.group(1).strip()
 
         if not party_name and not heirs:
-            cleaned = full_text.strip()
-            if cleaned:
-                party_name = cleaned
+            party_name = full_text.strip() or None
 
-        return party_name, heirs
+        # Reject bare role markers / no-name residue ("[E]" alone must not become a
+        # lead). _clean_arms_name returns None when only markers/punctuation remain.
+        return _clean_arms_name(party_name), _clean_arms_name(heirs)
 
 
 # ─── Record-type-pinned subclasses ───────────────────────────────────────────

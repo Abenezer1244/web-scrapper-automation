@@ -123,6 +123,27 @@ _NOTE_AMOUNT = re.compile(r"Note\s+Amount\s*:?\s*\$?([\d,]+\.\d{2})", re.I)
 # ── NOD transmittal date ("by both first class and certified mail on 1/20/2026")
 _NOD_DATE = re.compile(r"certified\s+mail\s+on\s+(\d{1,2}/\d{1,2}/\d{4})", re.I)
 
+# ── King (Queen Anne & Magnolia News) auction layouts use MONTH-NAME dates, which
+# the numeric _AUCTION above misses. Two phrasings seen live:
+#   Affinia: "...will on July 24, 2026, at 9:00 AM sell at public auction located <loc>..."
+#   MTC:     "...will sell at public auction ... on July 24, 2026, 09:00 AM, <loc>..."
+# Capture DATE + TIME (the load-bearing is_valid_nts fields) via the shared
+# "on <month date>[,] [at] <time>" shape. Requiring the trailing TIME keeps this from
+# matching the deed's recording/mailing dates (those carry no time). Tried ONLY when
+# the numeric _AUCTION misses, so Tacoma/Snohomish parsing is unchanged.
+_MONTHS = ("January|February|March|April|May|June|July|August|September|October|"
+           "November|December")
+_MONTH_DATE = rf"(?:{_MONTHS})\.?\s+\d{{1,2}},?\s+\d{{4}}"
+_MONTH_NUM = {m.lower(): i for i, m in enumerate(_MONTHS.split("|"), start=1)}
+_AUCTION_MONTHNAME = re.compile(
+    rf"\bon\s+({_MONTH_DATE})\s*,?\s*(?:at\s+)?(\d{{1,2}}:\d{{2}}\s*[AP]\.?M\.?)", re.I)
+# Best-effort location for the two King layouts (NOT required for validity/matching).
+_AUCTION_LOC_LOCATED = re.compile(
+    r"sell\s+at\s+public\s+auction\s+located\s+(.+?)\s+to\s+the\s+highest", re.I | re.S)
+_AUCTION_LOC_AFTERTIME = re.compile(
+    rf"\bon\s+{_MONTH_DATE}\s*,?\s*(?:at\s+)?\d{{1,2}}:\d{{2}}\s*[AP]\.?M\.?\s*,\s*"
+    r"(.+?)(?=\s*,?\s*to\s+the\s+highest|\.\s|$)", re.I | re.S)
+
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
     m = pattern.search(text)
@@ -186,6 +207,20 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
             auction_time = " ".join(am.group(2).split())
             auction_location = loc or None
 
+    # King fallback (month-name dates) — ONLY when the numeric _AUCTION missed, so
+    # Tacoma/Snohomish behavior is unchanged. Date+time are load-bearing; location
+    # is best-effort (one of the two King layouts).
+    if auction_date is None:
+        km = _AUCTION_MONTHNAME.search(text)
+        if km:
+            auction_date = " ".join(km.group(1).split()).strip().rstrip(",")
+            auction_time = " ".join(km.group(2).split())
+            lm = _AUCTION_LOC_LOCATED.search(text) or _AUCTION_LOC_AFTERTIME.search(text)
+            if lm:
+                loc = " ".join(lm.group(1).split()).strip().rstrip(".,")
+                if "NOTICE OF TRUSTEE" not in loc.upper() and 0 < len(loc) <= 300:
+                    auction_location = loc
+
     return {
         "ts_number": _first(_TS_NUMBER, text),
         "title_order": _first(_TITLE_ORDER, text),
@@ -245,17 +280,26 @@ def extract_article_text(notice_html: str) -> str:
 
 
 def _to_date(mdy: str | None) -> date | None:
-    """Parse an M/D/YYYY auction date string to a date; None if unparseable."""
+    """Parse an auction date string to a date; None if unparseable.
+
+    Accepts M/D/YYYY (Tacoma/Snohomish) OR "Month D, YYYY" (King papers).
+    """
     if not mdy:
         return None
     m = re.match(r"\s*(\d{1,2})/(\d{1,2})/(\d{4})\b", mdy)
-    if not m:
-        return None
-    mm, dd, yyyy = (int(g) for g in m.groups())
-    try:
-        return date(yyyy, mm, dd)
-    except ValueError:
-        return None
+    if m:
+        mm, dd, yyyy = (int(g) for g in m.groups())
+        try:
+            return date(yyyy, mm, dd)
+        except ValueError:
+            return None
+    mn = re.match(rf"\s*({_MONTHS})\.?\s+(\d{{1,2}}),?\s+(\d{{4}})", mdy, re.I)
+    if mn:
+        try:
+            return date(int(mn.group(3)), _MONTH_NUM[mn.group(1).lower()], int(mn.group(2)))
+        except (ValueError, KeyError):
+            return None
+    return None
 
 
 def notice_to_row(

@@ -255,6 +255,16 @@ class TestNoticeToRowFieldSafety:
         assert row["grantor"] is None
         assert row["beneficiary"] is None
 
+    def test_identical_grantor_beneficiary_without_servicer_nulled(self):
+        # Codex Medium: a drifted layout may poison grantor+beneficiary while the
+        # servicer regex misses entirely — the detector must still fire.
+        p = dict(self._parsed())
+        p["grantor"] = p["beneficiary"] = "NOTICE IS HEREBY GIVEN that the Trustee will sell at public auction"
+        p["servicer"] = None
+        row = notice_to_row(p, "http://x/", today=date(2026, 6, 12))
+        assert row["grantor"] is None
+        assert row["beneficiary"] is None
+
     def test_legit_short_identical_parties_survive(self):
         # A short benign coincidence must NOT be nulled by the mis-parse detector.
         p = dict(self._parsed())
@@ -262,6 +272,18 @@ class TestNoticeToRowFieldSafety:
         row = notice_to_row(p, "http://x/", today=date(2026, 6, 12))
         assert row["grantor"] == "ACME LLC"
         assert row["beneficiary"] == "ACME LLC"
+
+    def test_raw_hash_reflects_stored_values_not_discarded_garbage(self):
+        # Codex Low: hash the sanitized/stored values — a nulled-out overlong parcel
+        # must hash the same as a notice that never had one, or every re-crawl of
+        # the same garbage churns the drift signal.
+        base = dict(self._parsed())
+        base["parcel"] = None
+        with_garbage = dict(self._parsed())
+        with_garbage["parcel"] = "9" * 80  # nulled by the clamp
+        a = notice_to_row(base, "http://x/", today=date(2026, 6, 12))["raw_hash"]
+        b = notice_to_row(with_garbage, "http://x/", today=date(2026, 6, 12))["raw_hash"]
+        assert a == b
 
 
 class TestCommonlyKnownAsBoundaries:
@@ -288,6 +310,20 @@ class TestCommonlyKnownAsBoundaries:
         )
         p = parse_nts_notice(text)
         assert p["property_address"] == "1814 FRANKLIN AVE E, SEATTLE, WA 98102"
+
+    def test_bare_colonless_prose_does_not_hijack_address(self):
+        # Codex High (2026-07-01 review): the colon must stay REQUIRED for bare
+        # "commonly known as" — entity prose like "…commonly known as Fannie Mae"
+        # appearing BEFORE the real address label must not capture.
+        text = (
+            "T.S. No. 25-3 Current Beneficiary of the Deed of Trust: Federal National "
+            "Mortgage Association commonly known as Fannie Mae Current Trustee of the "
+            "Deed of Trust: X will on 7/10/2026, at 10:00 AM Main Entrance sell at "
+            "public auction More commonly known as: 123 MAIN ST, TACOMA, WA 98402 "
+            "Subject to that certain Deed of Trust"
+        )
+        p = parse_nts_notice(text)
+        assert p["property_address"] == "123 MAIN ST, TACOMA, WA 98402"
 
 
 class TestQualityLoanFormat:

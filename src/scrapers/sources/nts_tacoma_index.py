@@ -105,10 +105,14 @@ _AUCTION = re.compile(
 # "The above property is …" (Affinia — without this the boilerplate words before
 # "subject" leak into the address and poison the normalized match key) OR section
 # II, same line or next (a one-line layout would otherwise swallow the deed body).
-# The colon is OPTIONAL: MTC notices say "More commonly known as 1814 FRANKLIN AVE E…"
-# with no colon at all (live 2026-07-01) — requiring it silently dropped the address.
+# The colon is optional ONLY behind "More commonly known as" (MTC notices say
+# "More commonly known as 1814 FRANKLIN AVE E…" with no colon — live 2026-07-01;
+# requiring it silently dropped the address). Bare "commonly known as" KEEPS the
+# colon requirement: prose like "Federal National Mortgage Association commonly
+# known as Fannie Mae" would otherwise hijack the capture and poison the match key
+# (Codex High, 2026-07-01 review).
 _COMMONLY_KNOWN = re.compile(
-    r"commonly\s+known\s+as\s*:?\s*(.+?)"
+    r"(?:More\s+commonly\s+known\s+as\s*:?|commonly\s+known\s+as\s*:)\s*(.+?)"
     r"(?=\s+The\s+above\s+property\b|\s+(?:which\s+is\s+)?[Ss]ubject\s+to\b|\s+II\.\s|\n\n|\Z)",
     re.I | re.S,
 )
@@ -366,17 +370,20 @@ def notice_to_row(
     auction = _to_date(parsed.get("auction_date"))
     # Mis-parse detector (live 2026-07-01): on a no-colon layout the colon field
     # regexes scan to the SAME first colon (e.g. inside "10:00 AM") and assign one
-    # identical boilerplate blob to grantor, beneficiary AND servicer. Identical
-    # multi-field captures are a structural parse failure — null the poisoned
-    # enrichment fields but KEEP the notice (its ts_number/date/address/parcel still
-    # match leads). Length/boilerplate guard so a legitimate short coincidence survives.
-    grantor = parsed.get("grantor")
-    beneficiary = parsed.get("beneficiary")
+    # identical boilerplate blob to grantor + beneficiary (usually servicer too, but
+    # grantor==beneficiary alone is already a structural parse failure — Codex
+    # Medium: don't require the servicer to also be present/identical). Null the
+    # poisoned enrichment fields but KEEP the notice (its ts_number/date/address/
+    # parcel still match leads). Length/boilerplate guard so a legitimate short
+    # coincidence survives.
+    grantor = _truncate(parsed.get("grantor"), 512)
+    beneficiary = _truncate(parsed.get("beneficiary"), 255)
+    raw_grantor = parsed.get("grantor")
     if (
-        grantor is not None
-        and grantor == beneficiary == parsed.get("servicer")
-        and (len(grantor) >= 100 or "public auction" in grantor.lower()
-             or "notice is hereby given" in grantor.lower())
+        raw_grantor is not None
+        and raw_grantor == parsed.get("beneficiary")
+        and (len(raw_grantor) >= 100 or "public auction" in raw_grantor.lower()
+             or "notice is hereby given" in raw_grantor.lower())
     ):
         grantor = beneficiary = None
     # Clamp display-only fields to their nts_notices column widths so one runaway
@@ -388,12 +395,15 @@ def notice_to_row(
     parcel = parsed.get("parcel")
     if parcel and len(parcel) > 64:
         parcel = None
-    # Hash the load-bearing parsed fields so a re-crawl of an unchanged notice is a
-    # no-op and a source/parser change is observable.
+    trustee = _truncate(parsed.get("trustee"), 255)
+    # Hash the load-bearing STORED values (post-clamp/null — Codex Low: hashing the
+    # raw parsed values made discarded garbage churn raw_hash even when the stored
+    # row was unchanged) so a re-crawl of an unchanged notice is a no-op and a
+    # source/parser change is observable.
     payload = "|".join(
-        str(parsed.get(k) or "")
-        for k in ("ts_number", "auction_date", "property_address", "trustee",
-                  "beneficiary", "principal_owing", "parcel")
+        str(v or "")
+        for v in (parsed["ts_number"], parsed.get("auction_date"), addr, trustee,
+                  beneficiary, parsed.get("principal_owing"), parcel)
     )
     raw_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return {
@@ -407,9 +417,9 @@ def notice_to_row(
         "auction_date": auction,
         "auction_time": _truncate(parsed.get("auction_time"), 16),
         "auction_location": _truncate(parsed.get("auction_location"), 512),
-        "grantor": _truncate(grantor, 512),
-        "trustee": _truncate(parsed.get("trustee"), 255),
-        "beneficiary": _truncate(beneficiary, 255),
+        "grantor": grantor,
+        "trustee": trustee,
+        "beneficiary": beneficiary,
         "principal_owing": parsed.get("principal_owing"),
         "note_amount": parsed.get("note_amount"),
         "nod_date": _truncate(parsed.get("nod_date"), 32),

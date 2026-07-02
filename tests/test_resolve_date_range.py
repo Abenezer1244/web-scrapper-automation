@@ -7,6 +7,7 @@ from datetime import datetime
 
 from src.workers.tasks_helpers.dates import (
     _TAX_DELINQUENT_DEFAULT_DAYS,
+    _ordered_window,
     _resolve_date_range,
 )
 
@@ -50,3 +51,21 @@ def test_explicit_custom_dates_honored_for_tax():
     )
     assert df == "01/01/2025"
     assert dt == "06/30/2025"
+
+
+def test_ordered_window_collapses_inverted_range():
+    # A backwards window collapses to a single day at date_to (never inverted).
+    assert _ordered_window("06/30/2025", "01/01/2025") == ("01/01/2025", "01/01/2025")
+    # A correct window is untouched.
+    assert _ordered_window("01/01/2025", "06/30/2025") == ("01/01/2025", "06/30/2025")
+    # Equal dates (single day) are fine.
+    assert _ordered_window("03/15/2025", "03/15/2025") == ("03/15/2025", "03/15/2025")
+
+
+def test_custom_inverted_range_never_reaches_scraper():
+    # The repro from the audit: 6/30 -> 1/1 must not pass through inverted.
+    df, dt = _resolve_date_range(
+        {"date_range_mode": "custom", "date_from": "2025-06-30", "date_to": "2025-01-01"},
+    )
+    assert df <= dt
+    assert (df, dt) == ("01/01/2025", "01/01/2025")

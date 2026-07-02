@@ -945,6 +945,35 @@ class BatchDetailResponse(BatchSummaryResponse):
     delivery_counts: BatchDeliveryCounts | None = None
 
 
+class BatchLeadRow(BaseModel):
+    """One combined-view lead — mirrors the combined CSV's columns."""
+
+    id: str
+    date_recorded: str | None = None
+    party_name: str | None = None
+    parcel_id: str | None = None
+    property_address: str | None = None
+    mailing_address: str | None = None
+    phone: str | None = None
+    phone_type: str | None = None
+    email: str | None = None
+    matched_record_types: list[str] = Field(default_factory=list)
+    overlap_count: int = 1
+    source_counties: list[str] = Field(default_factory=list)
+    lead_subtype: str | None = None
+
+
+class BatchLeadsPage(BaseModel):
+    """A page of the combined batch view + live honest counts."""
+
+    leads: list[BatchLeadRow]
+    counts: BatchDeliveryCounts
+    delivery_mode: str
+    page: int
+    page_size: int
+    total: int  # rows in the CURRENT mode (overlaps_only => overlaps_delivered)
+
+
 # ─── Jobs ─────────────────────────────────────────────────────────────────────
 
 class JobCreate(BaseModel):

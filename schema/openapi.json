@@ -364,6 +364,179 @@
         "title": "BatchDetailResponse",
         "type": "object"
       },
+      "BatchLeadRow": {
+        "description": "One combined-view lead — mirrors the combined CSV's columns.",
+        "properties": {
+          "date_recorded": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date Recorded"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "lead_subtype": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lead Subtype"
+          },
+          "mailing_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mailing Address"
+          },
+          "matched_record_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Matched Record Types",
+            "type": "array"
+          },
+          "overlap_count": {
+            "default": 1,
+            "title": "Overlap Count",
+            "type": "integer"
+          },
+          "parcel_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parcel Id"
+          },
+          "party_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Party Name"
+          },
+          "phone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phone"
+          },
+          "phone_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phone Type"
+          },
+          "property_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Property Address"
+          },
+          "source_counties": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Source Counties",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "BatchLeadRow",
+        "type": "object"
+      },
+      "BatchLeadsPage": {
+        "description": "A page of the combined batch view + live honest counts.",
+        "properties": {
+          "counts": {
+            "$ref": "#/components/schemas/BatchDeliveryCounts"
+          },
+          "delivery_mode": {
+            "title": "Delivery Mode",
+            "type": "string"
+          },
+          "leads": {
+            "items": {
+              "$ref": "#/components/schemas/BatchLeadRow"
+            },
+            "title": "Leads",
+            "type": "array"
+          },
+          "page": {
+            "title": "Page",
+            "type": "integer"
+          },
+          "page_size": {
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "leads",
+          "counts",
+          "delivery_mode",
+          "page",
+          "page_size",
+          "total"
+        ],
+        "title": "BatchLeadsPage",
+        "type": "object"
+      },
       "BatchRunResponse": {
         "properties": {
           "batch_id": {
@@ -4692,6 +4865,77 @@
         ]
       }
     },
+    "/batches/{batch_id}/leads": {
+      "get": {
+        "description": "The combined (deduped, overlap-first, mode-filtered) lead list of the\nLATEST run — the in-app equivalent of the combined CSV.",
+        "operationId": "list_batch_leads_batches__batch_id__leads_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "batch_id",
+            "required": true,
+            "schema": {
+              "title": "Batch Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "minimum": 1,
+              "title": "Page",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchLeadsPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Batch Leads",
+        "tags": [
+          "batches"
+        ]
+      }
+    },
     "/batches/{batch_id}/runs": {
       "get": {
         "description": "Run history for a batch, newest first (2B: runs are plural). The combined\nCSV per run is fetched via the run-scoped download below — never the R2 key.",
@@ -4794,6 +5038,86 @@
           }
         ],
         "summary": "Download Batch Run",
+        "tags": [
+          "batches"
+        ]
+      }
+    },
+    "/batches/{batch_id}/runs/{run_id}/leads": {
+      "get": {
+        "description": "Run-scoped combined lead list (2B history parity with the CSV download).",
+        "operationId": "list_batch_run_leads_batches__batch_id__runs__run_id__leads_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "batch_id",
+            "required": true,
+            "schema": {
+              "title": "Batch Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "minimum": 1,
+              "title": "Page",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchLeadsPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Batch Run Leads",
         "tags": [
           "batches"
         ]

@@ -9,10 +9,11 @@ by the dispatch worker (system-written), so this route only persists the parent
 """
 import io
 import uuid
+from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
@@ -23,10 +24,14 @@ from src.api.schemas import (
     BatchChildSummary,
     BatchCreateRequest,
     BatchCreateResponse,
+    BatchDeliveryCounts,
     BatchDetailResponse,
+    BatchLeadRow,
+    BatchLeadsPage,
     BatchRunResponse,
     BatchSummaryResponse,
 )
+from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year
 from src.config.constants import (
     BATCH_HARD_CEILING,
     BATCH_MAX_COMBINATIONS,
@@ -37,7 +42,10 @@ from src.config.constants import (
 from src.db import CountyConnector
 from src.db.models import BatchRun, Job, ScraperBatch, ScraperConfig
 from src.scrapers.probate import new_probate_config_tod_default
+from src.utils.crypto import decrypt_field
+from src.utils.lead_export import resolve_hidden_output_fields
 from src.utils.logger import setup_logger
+from src.workers.batch_export import _COMBINED_SQL, _DELIVERY_COUNTS_SQL
 
 _logger = setup_logger("api.batches")
 
@@ -551,3 +559,133 @@ async def download_batch_run(
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
     return await _stream_run_csv(batch_id, run, batch.fields, batch.delivery_mode or "everything")
+
+
+# ─── Combined leads view (in-app "one list") ─────────────────────────────────
+
+async def _leads_page(
+    db: AsyncSession,
+    batch: ScraperBatch,
+    run: BatchRun | None,
+    page: int,
+    page_size: int,
+    response: Response,
+) -> BatchLeadsPage:
+    """Shared body for the latest-run and run-scoped leads endpoints. Caller has
+    verified batch ownership and (for the run-scoped variant) run membership.
+
+    Same SQL, mode, and hidden-field semantics as the CSV rebuild, on the async
+    RLS session (precedent: per-job results + segments return decrypted contacts
+    through get_rls_db). Counts are LIVE (current mode) — never the stored
+    snapshot, which reflects the mode at finalize time (Codex P2).
+    """
+    if run is None or run.status not in _DOWNLOADABLE_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="The combined lead list is not ready yet.",
+        )
+    response.headers["Cache-Control"] = "no-store"  # decrypted PII — never cache
+    delivery_mode = batch.delivery_mode or "everything"
+    job_ids = [str(j) for j in (run.child_job_ids or [])]
+    tax_bind = tax_cap_min_year(datetime.now(UTC).date())
+
+    counts_row = (await db.execute(
+        text(_DELIVERY_COUNTS_SQL),
+        {"uid": run.user_id, "job_ids": job_ids, TAX_CAP_BIND: tax_bind},
+    )).one() if job_ids else None
+    counts = BatchDeliveryCounts(
+        leads_total=int(counts_row.leads_total) if counts_row else 0,
+        overlaps_delivered=int(counts_row.overlaps_delivered) if counts_row else 0,
+        singletons_suppressed=int(counts_row.singletons_suppressed) if counts_row else 0,
+        unmatchable_no_parcel=int(counts_row.unmatchable_no_parcel) if counts_row else 0,
+    )
+    total = (
+        counts.overlaps_delivered
+        if delivery_mode == "overlaps_only"
+        else counts.leads_total
+    )
+
+    rows = []
+    if job_ids:
+        result = await db.execute(
+            text(_COMBINED_SQL),
+            {
+                "uid": run.user_id,
+                "job_ids": job_ids,
+                "limit": page_size,
+                "offset": (page - 1) * page_size,
+                "overlaps_only": delivery_mode == "overlaps_only",
+                TAX_CAP_BIND: tax_bind,
+            },
+        )
+        rows = result.fetchall()
+
+    hidden = resolve_hidden_output_fields(batch.fields)
+    leads = []
+    for r in rows:
+        data = dict(r._mapping)
+        data["id"] = str(data["id"])
+        data["phone"] = decrypt_field(data["phone"]) if data.get("phone") else None
+        data["email"] = decrypt_field(data["email"]) if data.get("email") else None
+        # Honor the batch's output-field visibility exactly like the CSV
+        # (of the hideable set, only mailing_address is a combined-view column).
+        if "mailing_address" in hidden:
+            data["mailing_address"] = None
+        data["matched_record_types"] = list(data.get("matched_record_types") or [])
+        data["source_counties"] = list(data.get("source_counties") or [])
+        leads.append(BatchLeadRow(**data))
+
+    return BatchLeadsPage(
+        leads=leads,
+        counts=counts,
+        delivery_mode=delivery_mode,
+        page=page,
+        page_size=page_size,
+        total=total,
+    )
+
+
+@router.get("/{batch_id}/leads", response_model=BatchLeadsPage)
+async def list_batch_leads(
+    batch_id: str,
+    request: Request,
+    response: Response,
+    current_user: CurrentUser,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    db: AsyncSession = Depends(get_rls_db),
+) -> BatchLeadsPage:
+    """The combined (deduped, overlap-first, mode-filtered) lead list of the
+    LATEST run — the in-app equivalent of the combined CSV."""
+    await rate_limit(request, zone="general", identifier=current_user.id)
+    batch = await _owned_batch(db, batch_id, current_user.id)
+    run = await _run_for(db, batch_id, current_user.id)
+    return await _leads_page(db, batch, run, page, page_size, response)
+
+
+@router.get("/{batch_id}/runs/{run_id}/leads", response_model=BatchLeadsPage)
+async def list_batch_run_leads(
+    batch_id: str,
+    run_id: str,
+    request: Request,
+    response: Response,
+    current_user: CurrentUser,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    db: AsyncSession = Depends(get_rls_db),
+) -> BatchLeadsPage:
+    """Run-scoped combined lead list (2B history parity with the CSV download)."""
+    await rate_limit(request, zone="general", identifier=current_user.id)
+    batch = await _owned_batch(db, batch_id, current_user.id)
+    run = (
+        await db.execute(
+            select(BatchRun).where(
+                BatchRun.id == run_id,
+                BatchRun.batch_id == batch_id,  # run must belong to THIS batch
+                BatchRun.user_id == current_user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+    return await _leads_page(db, batch, run, page, page_size, response)

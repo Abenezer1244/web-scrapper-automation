@@ -233,6 +233,31 @@ def _combined_pairs(
     ]
 
 
+def _combined_pairs_all(
+    db, user_id: str, job_ids: list[str], delivery_mode: str = "everything"
+) -> list[tuple]:
+    """ALL combined pairs for the delivered CSV — pages `_combined_pairs` until
+    exhausted so a batch with more than EXPORT_CAP deduped leads is never SILENTLY
+    truncated (the old default limit=EXPORT_CAP dropped rows past 50k while the
+    email/UI counts reported the true, larger total — a broken paid export).
+    EXPORT_CAP is now a PAGE size, not a hard ceiling. The delivered batch's jobs
+    are terminal, so the dataset is stable across pages; the deterministic ORDER BY
+    (…, id DESC) makes OFFSET paging repeatable."""
+    if not job_ids:
+        return []
+    out: list[tuple] = []
+    offset = 0
+    while True:
+        page = _combined_pairs(
+            db, user_id, job_ids,
+            delivery_mode=delivery_mode, limit=EXPORT_CAP, offset=offset,
+        )
+        out.extend(page)
+        if len(page) < EXPORT_CAP:
+            return out
+        offset += EXPORT_CAP
+
+
 def compute_delivery_counts(db, user_id: str, job_ids: list[str]) -> dict[str, int]:
     """Uncapped, mode-independent dataset facts for honest delivery messaging."""
     if not job_ids:
@@ -274,7 +299,7 @@ def render_combined_csv(
     from src.db.session import system_sync_session
 
     with system_sync_session() as db:
-        pairs = _combined_pairs(db, user_id, job_ids, delivery_mode=delivery_mode)
+        pairs = _combined_pairs_all(db, user_id, job_ids, delivery_mode=delivery_mode)
         buf = io.StringIO()
         write_lead_csv_with_overlap(pairs, buf, hidden_fields=hidden_fields)
         db.rollback()  # read-only
@@ -351,7 +376,7 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
     delivery_mode = (_batch.delivery_mode if _batch else None) or "everything"
     hidden_fields = resolve_hidden_output_fields(_batch.fields if _batch else None)
 
-    pairs = _combined_pairs(
+    pairs = _combined_pairs_all(
         db, run.user_id, run.child_job_ids or [], delivery_mode=delivery_mode
     )
     # Honest accounting (uncapped, mode-independent). Stored on the run as the

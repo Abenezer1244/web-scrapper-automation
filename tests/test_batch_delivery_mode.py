@@ -287,3 +287,23 @@ class TestCombinedExportColumns:
         assert len(rows) == 1  # one bucket (pk bridges both)
         assert rows[0]["lead_subtype"] == "probate_death_inheritance"
         assert rows[0]["filed_date"] == ""  # tax winner → bill_year present → blanked
+
+
+class TestNoSilentTruncation:
+    def test_combined_pairs_all_pages_past_the_cap(self, monkeypatch):
+        """#2: >EXPORT_CAP deduped leads must NOT be silently truncated. With the
+        cap monkeypatched to 2, three distinct-bucket leads still all come back."""
+        import src.workers.batch_export as be
+        monkeypatch.setattr(be, "EXPORT_CAP", 2)
+        with SyncSessionLocal() as db:
+            user = _user(db)
+            batch, j1, _j2 = _two_type_batch(db, user, "everything")
+            for i in range(3):
+                _result(db, user.id, j1.id, party=f"OWNER {i}",
+                        property_key=f"WA|pierce|00000C{i}")
+            db.flush()
+            capped = be._combined_pairs(db, user.id, [j1.id], delivery_mode="everything")
+            full = be._combined_pairs_all(db, user.id, [j1.id], delivery_mode="everything")
+            db.rollback()
+        assert len(capped) == 2           # single query is still page-bounded
+        assert len(full) == 3             # paging accumulates every lead

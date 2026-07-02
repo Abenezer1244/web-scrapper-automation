@@ -333,3 +333,98 @@ python -c "import sys; import src.api.routes.batches; assert 'src.workers' not i
 2. The run-scoped endpoint's tenant boundary is now explicitly tested, preventing
    regression if the ownership check is accidentally weakened or skipped in
    future refactors.
+
+## Fix: Codex P2 — no-store on exception paths
+
+**Commit:** (pending in this session, `chore/xcheck-session`)
+
+### Issue addressed
+The previous fix (above) set `response.headers["Cache-Control"] = "no-store"` on
+the **injected** `Response` object as the first statement in both endpoint
+handlers. That covers the 200-OK path, but FastAPI builds the response for a
+raised `HTTPException` **separately** from the injected `Response` — the
+default `http_exception_handler` constructs a brand-new `JSONResponse`/`Response`
+from `exc.headers`, never touching the `response` param the route mutated. So
+when `_owned_batch`, the run lookup, or `_leads_page`'s ready-gate raised
+`HTTPException` (the 404 "not ready yet" / "not found" cases), the resulting
+error response carried **no** `Cache-Control` header — a private/browser cache
+could retain that "not ready" 404 and keep serving it after the run finished
+and data became available (Codex P2).
+
+Also fixed (Claude final-review Minor): `_leads_page(..., response: Response)`
+took a `response` param that no callsite used — it was dead until this fix.
+
+### Fixes applied
+
+**`src/api/routes/batches.py`:**
+1. `_leads_page`: now uses the `response` param — sets
+   `response.headers["Cache-Control"] = "no-store"` as the first statement in
+   the function body, with comment `# decrypted-PII route family — never
+   cacheable (200 path; endpoints stamp exception paths)`. This covers the
+   200-OK path (the param is no longer dead).
+2. `list_batch_leads` and `list_batch_run_leads`: removed the unconditional
+   `response.headers["Cache-Control"] = "no-store"` line from each handler.
+   Wrapped the entire handler body (from the `rate_limit` await through the
+   `return`) in `try: ... except HTTPException as exc: exc.headers =
+   {**(exc.headers or {}), "Cache-Control": "no-store"}; raise`. This stamps
+   `no-store` onto the exception object itself — verified against FastAPI's
+   `fastapi.exception_handlers.http_exception_handler` source
+   (`headers = getattr(exc, "headers", None)` then passed straight into the
+   `Response`/`JSONResponse` constructor), and confirmed `main.py` has no
+   custom `HTTPException` handler that would bypass this (only a catch-all for
+   unhandled `Exception`) — so mutating `exc.headers` before re-raising is the
+   correct, verified mechanism to get `no-store` onto 404/402/429/etc.
+   responses built from this exception.
+
+**`tests/test_batch_leads_endpoint.py`:**
+1. `test_not_ready_while_running_404`: added
+   `assert resp.headers["cache-control"] == "no-store"` after the 404 assert.
+2. `test_tenant_isolation` and `test_run_scoped_tenant_isolation`: added the
+   same one-line `no-store` header assertion after each 404 assert.
+
+**`src/api/schemas.py`:**
+1. `BatchCreateRequest.delivery_mode` comment: appended a clarifying line —
+   `overlaps_first` and `everything` currently produce identical output
+   (the SQL sort already ranks overlaps first); the distinct mode is reserved
+   for a future sectioned-export format. Comment-only change; does not alter
+   the OpenAPI schema (confirmed below).
+
+### Verification
+```bash
+python -m py_compile src/api/routes/batches.py src/api/schemas.py tests/test_batch_leads_endpoint.py
+# -> exit 0, no output
+
+python -m ruff check src/api/routes/batches.py src/api/schemas.py tests/test_batch_leads_endpoint.py
+# -> All checks passed!
+
+# Boot-clean check with env recipe:
+DATABASE_URL="postgresql+asyncpg://x:x@localhost:5432/x_test" \
+DATABASE_URL_SYNC="postgresql+psycopg2://x:x@localhost:5432/x_test" \
+REDIS_URL="redis://localhost:6379/0" \
+SECRET_KEY="ci-test-secret-key-minimum-32-characters-long" \
+R2_ENDPOINT_URL="https://fake.r2.cloudflarestorage.com" \
+R2_ACCESS_KEY_ID=fake R2_SECRET_ACCESS_KEY=fake R2_BUCKET_NAME=b \
+STRIPE_SECRET_KEY=sk_test_fake STRIPE_WEBHOOK_SECRET=whsec_fake \
+STRIPE_PRICE_PRO=p STRIPE_PRICE_BUSINESS=p STRIPE_PRICE_AGENCY=p \
+RESEND_API_KEY=re_fake EMAIL_FROM=noreply@bridgeleads.io \
+FRONTEND_URL=http://localhost:3000 ENVIRONMENT=test \
+python -c "import sys; import src.api.routes.batches; assert 'src.workers' not in sys.modules; print('BOOT_CLEAN')"
+# Output: BOOT_CLEAN
+
+# OpenAPI staleness check (pinned venv, per scripts/export_openapi.py's own
+# WARNING that output is dependency-version-sensitive):
+"C:\...\web-scrapper-automation\.venv-schema\Scripts\python.exe" scripts/export_openapi.py --check
+# -> OK: schema/openapi.json is up to date.  (comment-only schemas.py change,
+#    as expected — no commit to schema/openapi.json needed)
+```
+
+### Net effect
+1. Every response from either leads endpoint — 200-OK **and** every
+   `HTTPException` path (404 not-ready, 404 not-found, 404 tenant-mismatch,
+   and any future 402/429 raised inside the `try` block) — now carries
+   `Cache-Control: no-store`. A cache can no longer retain a stale "not ready"
+   404 past the point where the run actually finishes and data is available.
+2. `_leads_page`'s `response` parameter is live code, not dead weight.
+3. The `delivery_mode` docstring now tells the next reader why
+   `overlaps_first` and `everything` look identical today, instead of leaving
+   that as a silent surprise.

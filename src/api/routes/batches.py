@@ -578,6 +578,9 @@ async def _leads_page(
     through get_rls_db). Counts are LIVE (current mode) — never the stored
     snapshot, which reflects the mode at finalize time (Codex P2).
     """
+    # decrypted-PII route family — never cacheable (200 path; endpoints stamp
+    # exception paths)
+    response.headers["Cache-Control"] = "no-store"
     # Lazy import (matches create_batch/_stream_run_csv) — keep the Celery app
     # out of the API BOOT import graph; first use constructs it, same as the
     # dispatch path.
@@ -660,12 +663,17 @@ async def list_batch_leads(
 ) -> BatchLeadsPage:
     """The combined (deduped, overlap-first, mode-filtered) lead list of the
     LATEST run — the in-app equivalent of the combined CSV."""
-    await rate_limit(request, zone="general", identifier=current_user.id)
-    # decrypted-PII route family — never cacheable, on every path
-    response.headers["Cache-Control"] = "no-store"
-    batch = await _owned_batch(db, batch_id, current_user.id)
-    run = await _run_for(db, batch_id, current_user.id)
-    return await _leads_page(db, batch, run, page, page_size, response)
+    try:
+        await rate_limit(request, zone="general", identifier=current_user.id)
+        batch = await _owned_batch(db, batch_id, current_user.id)
+        run = await _run_for(db, batch_id, current_user.id)
+        return await _leads_page(db, batch, run, page, page_size, response)
+    except HTTPException as exc:
+        # Codex P2: FastAPI builds exception responses separately from the
+        # injected Response, so the no-store must ride the exception itself —
+        # else a cache can serve a stale "not ready" 404 after the run finishes.
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
 
 
 @router.get("/{batch_id}/runs/{run_id}/leads", response_model=BatchLeadsPage)
@@ -680,19 +688,24 @@ async def list_batch_run_leads(
     db: AsyncSession = Depends(get_rls_db),
 ) -> BatchLeadsPage:
     """Run-scoped combined lead list (2B history parity with the CSV download)."""
-    await rate_limit(request, zone="general", identifier=current_user.id)
-    # decrypted-PII route family — never cacheable, on every path
-    response.headers["Cache-Control"] = "no-store"
-    batch = await _owned_batch(db, batch_id, current_user.id)
-    run = (
-        await db.execute(
-            select(BatchRun).where(
-                BatchRun.id == run_id,
-                BatchRun.batch_id == batch_id,  # run must belong to THIS batch
-                BatchRun.user_id == current_user.id,
+    try:
+        await rate_limit(request, zone="general", identifier=current_user.id)
+        batch = await _owned_batch(db, batch_id, current_user.id)
+        run = (
+            await db.execute(
+                select(BatchRun).where(
+                    BatchRun.id == run_id,
+                    BatchRun.batch_id == batch_id,  # run must belong to THIS batch
+                    BatchRun.user_id == current_user.id,
+                )
             )
-        )
-    ).scalar_one_or_none()
-    if run is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
-    return await _leads_page(db, batch, run, page, page_size, response)
+        ).scalar_one_or_none()
+        if run is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+        return await _leads_page(db, batch, run, page, page_size, response)
+    except HTTPException as exc:
+        # Codex P2: FastAPI builds exception responses separately from the
+        # injected Response, so the no-store must ride the exception itself —
+        # else a cache can serve a stale "not ready" 404 after the run finishes.
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise

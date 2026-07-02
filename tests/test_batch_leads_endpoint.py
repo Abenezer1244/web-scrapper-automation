@@ -128,6 +128,7 @@ class TestBatchLeads:
             f"/batches/{batch.id}/leads", headers=_auth(starter_token)
         )
         assert resp.status_code == 404
+        assert resp.headers["cache-control"] == "no-store"  # Codex P2: 404s must not cache
 
     async def test_tenant_isolation(self, client, business_token, overlap_batch):
         batch, _ = overlap_batch
@@ -135,6 +136,7 @@ class TestBatchLeads:
             f"/batches/{batch.id}/leads", headers=_auth(business_token)
         )
         assert resp.status_code == 404
+        assert resp.headers["cache-control"] == "no-store"  # Codex P2: 404s must not cache
 
     async def test_run_scoped_tenant_isolation(self, client, business_token, overlap_batch):
         batch, run = overlap_batch
@@ -142,3 +144,4 @@ class TestBatchLeads:
             f"/batches/{batch.id}/runs/{run.id}/leads", headers=_auth(business_token)
         )
         assert resp.status_code == 404
+        assert resp.headers["cache-control"] == "no-store"  # Codex P2: 404s must not cache

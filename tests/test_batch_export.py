@@ -8,7 +8,6 @@ import uuid
 from src.workers.batch_export import (
     _COMBINED_SQL,
     _FAILED_CHILDREN_SQL,
-    _filing_sort_key,
     _label,
 )
 
@@ -21,10 +20,36 @@ class TestCombinedSql:
         assert "r.job_id = ANY(CAST(:job_ids AS uuid[]))" in _COMBINED_SQL
         assert "r.user_id = CAST(:uid AS uuid)" in _COMBINED_SQL  # tenant-scoped + cast
 
-    def test_dedup_and_overlap_and_counties(self):
-        assert "COALESCE(r.property_key, r.dedup_hash, 'id:' || r.id::text)" in _COMBINED_SQL
-        assert "count(DISTINCT record_type) AS overlap_count" in _COMBINED_SQL
-        assert "source_counties" in _COMBINED_SQL
+    def test_buckets_are_prefixed_and_type_scoped(self):
+        # Overlap identity is property_key ONLY. dedup_hash buckets carry the
+        # record_type so a weak name+date hash can never merge two record types
+        # (fake overlap + silently dropped row — Codex P1).
+        assert "'pk:' || r.property_key" in _COMBINED_SQL
+        assert "'dh:' || sc.record_type || ':' || r.dedup_hash" in _COMBINED_SQL
+        assert "'id:' || r.id::text" in _COMBINED_SQL
+        assert "COALESCE(r.property_key, r.dedup_hash" not in _COMBINED_SQL
+
+    def test_overlap_count_is_property_key_only(self):
+        assert (
+            "CASE WHEN bucket LIKE 'pk:%' THEN count(DISTINCT record_type) ELSE 1 END"
+            in _COMBINED_SQL
+        )
+
+    def test_mode_filter_and_deterministic_order(self):
+        # overlaps_only filters in SQL BEFORE LIMIT (Codex P1: a Python filter
+        # after the 50k cap could miss real overlaps + lie in counts).
+        assert ":overlaps_only" in _COMBINED_SQL
+        assert "ORDER BY a.overlap_count DESC" in _COMBINED_SQL
+        assert "LIMIT :limit OFFSET :offset" in _COMBINED_SQL
+
+    def test_counts_sql_shape(self):
+        from src.workers.batch_export import _DELIVERY_COUNTS_SQL
+
+        assert "count(*) AS leads_total" in _DELIVERY_COUNTS_SQL
+        assert "overlaps_delivered" in _DELIVERY_COUNTS_SQL
+        assert "singletons_suppressed" in _DELIVERY_COUNTS_SQL
+        assert "unmatchable_no_parcel" in _DELIVERY_COUNTS_SQL
+        assert "LIMIT" not in _DELIVERY_COUNTS_SQL  # counts are UNCAPPED
 
 
 class TestRawSqlExecutesOnPostgres:
@@ -47,12 +72,11 @@ class TestRawSqlExecutesOnPostgres:
         with system_sync_session() as db:
             for job_ids in ([str(uuid.uuid4())], []):
                 params = {"uid": str(uuid.uuid4()), "job_ids": job_ids}
-                if ":limit" in sql or "LIMIT :limit" in sql:
+                if "LIMIT :limit" in sql:
                     params["limit"] = 10
-                # Bind the 18-month tax cap only for SQL that carries the fragment
-                # (_COMBINED_SQL does; _FAILED_CHILDREN_SQL does not). text() raises
-                # InvalidRequestError on a missing bind, so the placeholder presence
-                # check keeps the shared helper correct for BOTH constants.
+                    params["offset"] = 0
+                if ":overlaps_only" in sql:
+                    params["overlaps_only"] = True
                 if f":{TAX_CAP_BIND}" in sql:
                     params[TAX_CAP_BIND] = tax_cap_min_year(datetime.now(UTC).date())
                 db.execute(text(sql), params).fetchall()
@@ -60,6 +84,11 @@ class TestRawSqlExecutesOnPostgres:
 
     def test_combined_sql_executes(self):
         self._run(_COMBINED_SQL)
+
+    def test_delivery_counts_sql_executes(self):
+        from src.workers.batch_export import _DELIVERY_COUNTS_SQL
+
+        self._run(_DELIVERY_COUNTS_SQL)
 
     def test_failed_children_sql_executes(self):
         self._run(_FAILED_CHILDREN_SQL)
@@ -70,11 +99,6 @@ class TestHelpers:
         assert _label("pre_foreclosure") == "Pre-Foreclosure"
         assert _label("tax_delinquent") == "Tax Delinquent"
         assert _label("unknown_x") == "Unknown X"
-
-    def test_filing_sort_recent_first(self):
-        assert _filing_sort_key("06/01/2026") < _filing_sort_key("01/01/2026")
-        assert _filing_sort_key("") == 0
-        assert _filing_sort_key("nope") == 0
 
 
 def test_sweep_registered_and_imports():

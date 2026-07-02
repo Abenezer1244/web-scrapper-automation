@@ -19,6 +19,67 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-07-01 — Batch overlaps-first delivery: delivery_mode + honest counts + /leads
+**Context:** Product owner clarified the WHOLE POINT of batch scraping is leads on 2+ record
+types (the intersection = hottest signal); singletons are noise reproducible via single
+scrapes. Brainstormed → Codex consult (3 rounds: concept @medium, concrete plan @high, /leads
+endpoint @high) → spec → 7-task subagent-driven build in worktree `chore/xcheck-session`
+(off `origin/main` @ 5bc4b74), **draft PR #136**. No local Postgres on this machine — the
+suite verified via GitHub Actions CI on every push (draft PR opened purely to trigger CI).
+
+**Built / Shipped (branch pushed, PR #136 draft):** per-batch
+`delivery_mode = overlaps_only (NEW-batch default) | overlaps_first | everything`
+(migration 078: existing batches backfill `everything` — a recurring schedule must not
+silently change output on deploy); property_key-ONLY overlap identity with prefixed
+type-scoped buckets in `_COMBINED_SQL`; SQL-side mode filter + deterministic ordering +
+uncapped `_DELIVERY_COUNTS_SQL`; `finalize_batch_run` stores honest `delivery_counts`
+{leads_total, overlaps_delivered, singletons_suppressed, unmatchable_no_parcel} and emails
+an honest empty-state summary; status-based download readiness; paginated
+`GET /batches/{id}/leads` (+ run-scoped) for the in-app one-list view; email builder gains
+`summary_message`/`link_expires` (batch emails lose the false "expires in 48 hours" copy).
+
+**Tried / Decided:** Codex recommended `overlaps_first` as default (parcel-weak counties can
+legitimately return zero overlaps); product owner overrode to `overlaps_only` + honest
+empty-state — Codex's guardrails all adopted as mandatory. Spec §7 originally said
+"always upload even empty CSV"; amended during implementation to status-based readiness
+(the R2 object is never served — downloads rebuild from DB; forcing an empty PUT adds an
+R2-outage failure mode for an object nothing reads). Tertiary CSV sort filing-date →
+job-recency (SQL to_date on M/D/YYYY strings breaks the export on garbage rows).
+
+**Failed / Blocked:** none blocking. Local pytest impossible (no Postgres; `_db_safety`
+guard) — CI-per-push was the loop, cost ~4min/cycle. Codex CLI hit its usage quota mid-design
+(resumed when it reset).
+
+**Caught & fixed (three pre-existing PROD bugs found at design time by Codex, fixed here):**
+- **Bug A:** weak `dedup_hash` (party_name+date) merged records across record types → fake
+  `overlap_count=2` "hot" leads AND silently dropped one row from the export.
+- **Bug B:** zero-row finalize never set `combined_export_key` → paid batch with no email
+  and a 404 download (would have been overlaps_only's COMMON case).
+- **Bug C:** `LIMIT 50k` with no ORDER BY ran before any filtering — a Python-side
+  overlaps filter could miss real overlaps and produce sample-counts.
+Review loop also caught: new-batch default silently becoming `everything` (route omitted
+the column → DB default wins); email default-path not byte-identical (stray whitespace
+line — fixed + proven by old-vs-new full-string equality); module-level worker import
+putting Celery into the API boot graph (fixed lazy, `BOOT_CLEAN` proven); ruff I001;
+stale `schema/openapi.json` (drift gate — regen with pinned `.venv-schema` is part of any
+API-surface task).
+
+**Pending / Handoff:** Codex final diff review gate + whole-branch review, then un-draft
+PR #136. OPS deploy order: migration 078 via `scripts/migrate.py` BEFORE api+worker deploy;
+redeploy BOTH services. FE follow-up (separate repo, backend-first): wizard mode picker,
+batch-page combined leads table + counts banner + empty-state, regen TS types.
+
+**Facts learned:** (1) `Result.dedup_hash` weak branch is name+date — NEVER a cross-type
+property identity; `property_key` is the only bridge, and it's best-effort (parcel-less
+sources can't cross-match — surface it, don't hide it). (2) The batch R2 object is only a
+ready-marker/ops artifact; API has no R2 creds and downloads rebuild from DB. (3) CI is the
+only pytest environment on this machine (postgres:16 service in ci-cd.yml; guard hard-aborts
+locally). (4) Any API-surface change must regen `schema/openapi.json` in the pinned
+`.venv-schema` or the drift gate fails. (5) `import src.workers.<anything>` constructs the
+Celery app (`src/workers/__init__.py`) — API-layer imports of worker modules must be
+function-level lazy.
+---
+
 ## 2026-07-01 — Cross-check of the delivery build + mailing-address split columns
 **Built / Shipped:** Branch `chore/xcheck-delivery-build` (worktree, stacked on `feat/fields-output-visibility`).
 - **Cross-check of the delivery-step build** (Q1–Q4 commits, full diff vs main): Claude self-review +
@@ -45,6 +106,9 @@ blank there; that's data availability, not a parser bug. Also: SQLAlchemy-scheme
 **Pending / Handoff:** batch delivery email reuses "expires in 48 hours" copy though the batch link is a
 non-expiring in-app page (cosmetic). FE: nothing required for the new columns (CSV-only). PR stacked on
 `feat/fields-output-visibility` — merge that first.
+
+---
+
 ## 2026-07-01 — PR #133 end-to-end verification → live King parser defects found & fixed (PR #134) + prod backfills
 **Built / Shipped:** Verification session for the Pierce/King fixes (PR #133) turned into a live bug hunt.
 Manual King NTS crawl against the brand-new QA Legals 07-01-26.pdf: 3 blocks, **1 notice LOST to a

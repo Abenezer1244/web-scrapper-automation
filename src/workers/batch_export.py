@@ -45,30 +45,33 @@ def _label(slug: str) -> str:
     return _RECORD_TYPE_LABELS.get(slug, slug.replace("_", " ").title())
 
 
-def _filing_sort_key(date_recorded: str | None) -> int:
-    """-(ordinal) of 'M/D/YYYY' so most-recent sorts first; blank/garbage -> 0."""
-    if not date_recorded:
-        return 0
-    from datetime import date as _date
-    try:
-        m, d, y = date_recorded.strip().split("/")
-        return -_date(int(y), int(m), int(d)).toordinal()
-    except (ValueError, OverflowError):
-        return 0
-
-
-# Combined set over the batch's jobs: dedup by COALESCE(property_key, dedup_hash,
-# id), overlap_count = distinct record types within the batch, source_counties
-# aggregated. Tenant-scoped (every join carries :uid). Same dedup/ranking as the
-# /segments union, scoped to job_ids instead of record_type-over-history.
-_COMBINED_SQL = f"""
+# Combined set over the batch's jobs. Dedup bucket (prefixed — the prefixes make
+# overlap classification unambiguous and kill cross-key collisions):
+#   'pk:' || property_key                      — the ONLY cross-record-type identity
+#   'dh:' || record_type || ':' || dedup_hash  — within-type dedup ONLY. dedup_hash's
+#       weak branch is party_name+date_recorded (tasks.py), so an un-scoped hash
+#       would merge two record types into one fake-overlap row and silently drop
+#       one of them (Codex P1).
+#   'id:' || id                                — no identity; never groups.
+# overlap_count counts DISTINCT record types for pk: buckets only; everything
+# else is 1 by construction. Tenant-scoped (every join carries :uid).
+# Mode filter (:overlaps_only) and deterministic ORDER BY happen in SQL, BEFORE
+# LIMIT/OFFSET — a Python filter after the cap could return zero overlaps even
+# when overlaps exist past the 50k sample (Codex P1). Ordering: hottest first
+# (overlap_count DESC), then contactable, then newest job, then id (stable).
+_COMBINED_CTES = f"""
 WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
            r.mailing_address, r.phone, r.phone_type, r.email,
            r.property_key, r.is_duplicate,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
            sc.record_type, sc.county, j.created_at AS job_created_at,
-           COALESCE(r.property_key, r.dedup_hash, 'id:' || r.id::text) AS bucket
+           CASE
+               WHEN r.property_key IS NOT NULL THEN 'pk:' || r.property_key
+               WHEN r.dedup_hash IS NOT NULL
+                   THEN 'dh:' || sc.record_type || ':' || r.dedup_hash
+               ELSE 'id:' || r.id::text
+           END AS bucket
     FROM results r
     JOIN jobs j ON j.id = r.job_id AND j.user_id = CAST(:uid AS uuid)
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = CAST(:uid AS uuid)
@@ -80,12 +83,14 @@ WITH candidates AS (
 agg AS (
     SELECT bucket,
            array_agg(DISTINCT record_type ORDER BY record_type) AS matched_record_types,
-           count(DISTINCT record_type) AS overlap_count,
+           CASE WHEN bucket LIKE 'pk:%' THEN count(DISTINCT record_type) ELSE 1 END AS overlap_count,
            {PROBATE_SUBTYPE_AGG_SQL},
            array_agg(DISTINCT county ORDER BY county) AS source_counties
     FROM candidates
     GROUP BY bucket
-),
+)"""
+
+_COMBINED_SQL = _COMBINED_CTES + """,
 ranked AS (
     SELECT c.*,
            row_number() OVER (
@@ -104,7 +109,23 @@ SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address
 FROM ranked rk
 JOIN agg a ON a.bucket = rk.bucket
 WHERE rk.rn = 1
-LIMIT :limit
+  AND (NOT :overlaps_only OR (rk.bucket LIKE 'pk:%' AND a.overlap_count >= 2))
+ORDER BY a.overlap_count DESC,
+         (CASE WHEN rk.phone IS NOT NULL OR rk.email IS NOT NULL THEN 0 ELSE 1 END),
+         rk.job_created_at DESC NULLS LAST,
+         rk.id DESC
+LIMIT :limit OFFSET :offset
+"""
+
+# Honest delivery accounting over the SAME dedup/aggregation — UNCAPPED (counts
+# must be batch facts, not capped-sample facts — Codex P1). Mode-independent:
+# these are dataset facts; delivery interprets them per mode.
+_DELIVERY_COUNTS_SQL = _COMBINED_CTES + """
+SELECT count(*) AS leads_total,
+       count(*) FILTER (WHERE bucket LIKE 'pk:%' AND overlap_count >= 2) AS overlaps_delivered,
+       count(*) FILTER (WHERE bucket LIKE 'pk:%' AND overlap_count < 2) AS singletons_suppressed,
+       count(*) FILTER (WHERE bucket NOT LIKE 'pk:%') AS unmatchable_no_parcel
+FROM agg
 """
 
 
@@ -120,9 +141,25 @@ WHERE j.user_id = CAST(:uid AS uuid) AND j.id = ANY(CAST(:job_ids AS uuid[]))
 """
 
 
-def _combined_pairs(db, user_id: str, job_ids: list[str]) -> list[tuple]:
+_EMPTY_COUNTS = {
+    "leads_total": 0,
+    "overlaps_delivered": 0,
+    "singletons_suppressed": 0,
+    "unmatchable_no_parcel": 0,
+}
+
+
+def _combined_pairs(
+    db,
+    user_id: str,
+    job_ids: list[str],
+    delivery_mode: str = "everything",
+    limit: int = EXPORT_CAP,
+    offset: int = 0,
+) -> list[tuple]:
     """Return (record_namespace, overlap_dict) pairs for the batch, hottest-first.
 
+    Ordering + mode filtering are SQL-side (deterministic; pagination-safe).
     PII (phone/email) is decrypted here — the raw text() query bypasses the
     EncryptedString type. matched_record_types are humanized for the `lists` col.
     """
@@ -133,9 +170,9 @@ def _combined_pairs(db, user_id: str, job_ids: list[str]) -> list[tuple]:
         {
             "uid": user_id,
             "job_ids": job_ids,
-            "limit": EXPORT_CAP,
-            # Hard 18-month tax-delinquent cap — bound for the tax_cap_sql fragment.
-            # today frozen UTC, matching the api/tax_filters contract.
+            "limit": limit,
+            "offset": offset,
+            "overlaps_only": delivery_mode == "overlaps_only",
             TAX_CAP_BIND: tax_cap_min_year(datetime.now(UTC).date()),
         },
     )
@@ -147,14 +184,6 @@ def _combined_pairs(db, user_id: str, job_ids: list[str]) -> list[tuple]:
         if data.get("email") is not None:
             data["email"] = decrypt_field(data["email"])
         rows.append(SimpleNamespace(**data))
-
-    rows.sort(
-        key=lambda r: (
-            -(r.overlap_count or 0),
-            0 if (r.phone or r.email) else 1,
-            _filing_sort_key(r.date_recorded),
-        )
-    )
     return [
         (
             r,
@@ -168,8 +197,31 @@ def _combined_pairs(db, user_id: str, job_ids: list[str]) -> list[tuple]:
     ]
 
 
+def compute_delivery_counts(db, user_id: str, job_ids: list[str]) -> dict[str, int]:
+    """Uncapped, mode-independent dataset facts for honest delivery messaging."""
+    if not job_ids:
+        return dict(_EMPTY_COUNTS)
+    row = db.execute(
+        text(_DELIVERY_COUNTS_SQL),
+        {
+            "uid": user_id,
+            "job_ids": job_ids,
+            TAX_CAP_BIND: tax_cap_min_year(datetime.now(UTC).date()),
+        },
+    ).one()
+    return {
+        "leads_total": int(row.leads_total),
+        "overlaps_delivered": int(row.overlaps_delivered),
+        "singletons_suppressed": int(row.singletons_suppressed),
+        "unmatchable_no_parcel": int(row.unmatchable_no_parcel),
+    }
+
+
 def render_combined_csv(
-    user_id: str, job_ids: list[str], hidden_fields: set[str] | None = None
+    user_id: str,
+    job_ids: list[str],
+    hidden_fields: set[str] | None = None,
+    delivery_mode: str = "everything",
 ) -> bytes:
     """Build the combined, deduped, overlap-flagged CSV ON DEMAND from the DB
     (NOT the stored R2 snapshot). Used by the download endpoint so:
@@ -186,7 +238,7 @@ def render_combined_csv(
     from src.db.session import system_sync_session
 
     with system_sync_session() as db:
-        pairs = _combined_pairs(db, user_id, job_ids)
+        pairs = _combined_pairs(db, user_id, job_ids, delivery_mode=delivery_mode)
         buf = io.StringIO()
         write_lead_csv_with_overlap(pairs, buf, hidden_fields=hidden_fields)
         db.rollback()  # read-only
@@ -256,14 +308,19 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
             if row.status in ("failed", "cancelled")
         ]
 
-    pairs = _combined_pairs(db, run.user_id, run.child_job_ids or [])
-
-    # Honor the batch's shared output-field visibility (blank deselected hideable
-    # columns; identity/derived columns always present). The batch parent owns
-    # `fields` (children copy it); legacy/empty => show everything.
+    # The parent batch owns output shape: delivery_mode (what the combined
+    # export contains) + fields (hideable-column visibility).
     from src.utils.lead_export import resolve_hidden_output_fields
     _batch = db.get(ScraperBatch, run.batch_id)
+    delivery_mode = (_batch.delivery_mode if _batch else None) or "everything"
     hidden_fields = resolve_hidden_output_fields(_batch.fields if _batch else None)
+
+    pairs = _combined_pairs(
+        db, run.user_id, run.child_job_ids or [], delivery_mode=delivery_mode
+    )
+    # Honest accounting (uncapped, mode-independent). Stored on the run as the
+    # as-delivered snapshot; live reads recompute with the current mode.
+    counts = compute_delivery_counts(db, run.user_id, run.child_job_ids or [])
 
     object_key = None
     if pairs:
@@ -322,6 +379,7 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
             failed_children=failed or None,
             status=new_status,
             completed_at=datetime.now(UTC),
+            delivery_counts=counts,
         )
     ).rowcount
     db.commit()
@@ -333,22 +391,54 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
         )
         return
 
-    _deliver(db, run, len(pairs), object_key)
+    _deliver(
+        db, run, len(pairs), object_key,
+        new_status=new_status,
+        summary=_delivery_summary(delivery_mode, counts),
+    )
     _logger.info(
         "finalize_batch_run %s: %d leads, status=%s, failed_children=%d",
         run.id, len(pairs), new_status, len(failed),
     )
 
 
-def _deliver(db, run, lead_count: int, object_key: str | None) -> None:
-    """Send the one combined-CSV delivery email (best-effort, non-fatal).
+def _delivery_summary(mode: str, counts: dict) -> str:
+    """One honest sentence for the delivery email. The empty overlaps_only case
+    must read as 'no overlaps found' (with the why), never as 'broken'."""
+    total = counts.get("leads_total", 0)
+    overlaps = counts.get("overlaps_delivered", 0)
+    no_parcel = counts.get("unmatchable_no_parcel", 0)
+    if mode == "overlaps_only":
+        if overlaps == 0:
+            return (
+                f"0 cross-list overlap leads found across {total:,} scraped leads. "
+                f"{no_parcel:,} lead(s) had no parcel number and couldn't be "
+                "cross-matched. Switch the batch to 'Everything' to receive all leads."
+            )
+        return (
+            f"{overlaps:,} lead(s) found on 2 or more lists. "
+            f"{total - overlaps:,} single-list lead(s) not included in this delivery."
+        )
+    return f"{overlaps:,} of {total:,} lead(s) appear on 2 or more lists."
+
+
+def _deliver(
+    db, run, lead_count: int, object_key: str | None,
+    new_status: str = "done", summary: str | None = None,
+) -> None:
+    """Send the one combined-CSV delivery email (best-effort, non-fatal),
+    including the honest delivery summary message.
 
     At-most-once: a re-finalize (lease steal / retry after a crash) must not
     re-send. The status-guarded final write protects DB state, not this
     post-commit email, so we CAS delivery_started_at NULL->now and only the winner
     sends (Codex: duplicate delivery is not tolerable; a missed email is
     recoverable because the CSV is always downloadable in-app)."""
-    if not object_key:
+    # Email on every successful finalize — including a zero-row overlaps_only
+    # run (the honest empty-state IS the delivery). Fully-failed runs don't
+    # email (ops alerts cover failures); the old `if not object_key` gate would
+    # have silently skipped exactly the empty-state case this feature exists for.
+    if new_status not in ("done", "partial"):
         return
     claimed = db.execute(
         update(BatchRun)
@@ -383,6 +473,8 @@ def _deliver(db, run, lead_count: int, object_key: str | None) -> None:
             record_count=lead_count,
             download_url=url,
             recipient_emails=emails,
+            summary_message=summary,
+            link_expires=False,  # in-app batch page — not a presigned URL (Codex P2)
         )
     except Exception as exc:  # enqueue is best-effort — the CSV is in R2 either way
         # The delivery_started_at CAS above is already consumed, so no future

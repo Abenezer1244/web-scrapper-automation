@@ -5,6 +5,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     Computed,
     Date,
@@ -379,6 +380,13 @@ class ScraperBatch(Base):
     # this composite-unique exists solely to be the FK target.
     __table_args__ = (
         UniqueConstraint("id", "user_id", name="uq_scraper_batches_id_user"),
+        # Delivery-mode allowlist at the DB layer (Codex P2): scraper_batches is
+        # also written by tests/scheduler paths, so bad data must fail early —
+        # API validation alone doesn't cover non-API writers.
+        CheckConstraint(
+            "delivery_mode IN ('overlaps_only', 'overlaps_first', 'everything')",
+            name="ck_scraper_batches_delivery_mode",
+        ),
     )
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
@@ -395,6 +403,15 @@ class ScraperBatch(Base):
     enrichment = Column(JSON, nullable=False, default=list)
     schedule = Column(JSON, nullable=False, default=dict)
     deliver = Column(JSON, nullable=False, default=dict)
+    # What the combined export/leads view contains. 'everything' = all deduped
+    # leads (legacy behavior — existing batches are backfilled to this so a
+    # recurring schedule never silently changes output on deploy). New batches
+    # default to 'overlaps_only' at the API layer (BatchCreateRequest), NOT here:
+    # the server_default exists for migration/back-compat safety only, and every
+    # app writer must set the mode explicitly (Codex P1/P3).
+    delivery_mode = Column(
+        String(16), nullable=False, default="everything", server_default="everything"
+    )
     status = Column(String(16), nullable=False, default="active")  # active | archived
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -470,6 +487,13 @@ class BatchRun(Base):
     # final write protects DB state, not the post-commit best-effort email. A CAS
     # on this column makes "only the winner delivers" durable across a re-finalize.
     delivery_started_at = Column(DateTime(timezone=True), nullable=True)
+    # Honest delivery accounting, worker-written at finalize (RLS cutover: app
+    # role has no UPDATE on batch_runs; the system session writes this).
+    # {"leads_total", "overlaps_delivered", "singletons_suppressed",
+    #  "unmatchable_no_parcel"} — the as-delivered snapshot for email/history.
+    # Live reads (UI/download) recompute with the batch's CURRENT mode instead of
+    # trusting this blob (Codex P2).
+    delivery_counts = Column(JSON, nullable=True)
     # 2B: the schedule occurrence this run satisfies (minute-truncated due tick).
     # NULL = on-demand (POST /batches). Backed by uq_batch_runs_occurrence.
     scheduled_for = Column(DateTime(timezone=True), nullable=True)

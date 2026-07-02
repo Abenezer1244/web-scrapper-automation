@@ -9,10 +9,11 @@ by the dispatch worker (system-written), so this route only persists the parent
 """
 import io
 import uuid
+from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
@@ -23,10 +24,14 @@ from src.api.schemas import (
     BatchChildSummary,
     BatchCreateRequest,
     BatchCreateResponse,
+    BatchDeliveryCounts,
     BatchDetailResponse,
+    BatchLeadRow,
+    BatchLeadsPage,
     BatchRunResponse,
     BatchSummaryResponse,
 )
+from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year
 from src.config.constants import (
     BATCH_HARD_CEILING,
     BATCH_MAX_COMBINATIONS,
@@ -37,6 +42,8 @@ from src.config.constants import (
 from src.db import CountyConnector
 from src.db.models import BatchRun, Job, ScraperBatch, ScraperConfig
 from src.scrapers.probate import new_probate_config_tod_default
+from src.utils.crypto import decrypt_field
+from src.utils.lead_export import resolve_hidden_output_fields
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("api.batches")
@@ -172,6 +179,7 @@ async def create_batch(
         ),
         deliver=body.deliver.model_dump(),
         status="active",
+        delivery_mode=body.delivery_mode,
     )
     db.add(batch)
     await db.flush()
@@ -256,7 +264,8 @@ def _summary(batch: ScraperBatch, run: BatchRun | None, child_count: int) -> Bat
         state=batch.state,
         run_status=run.status if run else "pending",
         child_count=child_count,
-        combined_export_ready=bool(run and run.combined_export_key),
+        combined_export_ready=bool(run and run.status in _DOWNLOADABLE_STATUSES),
+        delivery_mode=batch.delivery_mode or "everything",
         created_at=batch.created_at,
         completed_at=run.completed_at if run else None,
     )
@@ -403,6 +412,7 @@ async def get_batch(
         **_summary(batch, run, len(children)).model_dump(),
         failed_children=run.failed_children if run else None,
         children=children,
+        delivery_counts=run.delivery_counts if run else None,
     )
 
 
@@ -418,8 +428,9 @@ async def download_batch(
     The CSV is REBUILT from the DB on demand (not fetched from R2): the api has
     no R2 credentials (those live on the worker), and rebuilding means a
     re-download reflects later async skip-trace fills. Tenant-scoped by the
-    verified owner's id. 404 until the barrier has finished (combined_export_key
-    is the 'ready' marker).
+    verified owner's id. 404 until the run terminalizes into a downloadable
+    status (`_DOWNLOADABLE_STATUSES`) — a zero-row overlaps_only run is still
+    'done' and downloads a headers-only CSV.
     """
     # Each download rebuilds the CSV (a threadpool worker + sync DB connection +
     # full-CSV buffer), so rate-limit to keep concurrent downloads from starving
@@ -427,11 +438,12 @@ async def download_batch(
     await rate_limit(request, zone="general", identifier=current_user.id)
     batch = await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
     run = await _run_for(db, batch_id, current_user.id)
-    return await _stream_run_csv(batch_id, run, batch.fields)
+    return await _stream_run_csv(batch_id, run, batch.fields, batch.delivery_mode or "everything")
 
 
 async def _stream_run_csv(
-    batch_id: str, run: BatchRun | None, batch_fields: object = None
+    batch_id: str, run: BatchRun | None, batch_fields: object = None,
+    delivery_mode: str = "everything",
 ) -> StreamingResponse:
     """Rebuild + stream one run's combined CSV. Caller must have verified batch
     ownership AND that `run` belongs to that batch (run.user_id is then the
@@ -440,7 +452,7 @@ async def _stream_run_csv(
     `batch_fields` is the owning batch's `ScraperConfig`-shape `fields` JSON; it
     resolves to the hideable columns to blank so the combined CSV honors the same
     output-field visibility as the per-job exports (legacy/empty => show all)."""
-    if run is None or not run.combined_export_key:
+    if run is None or run.status not in _DOWNLOADABLE_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="The combined CSV is not ready yet.",
@@ -455,7 +467,8 @@ async def _stream_run_csv(
         # render_combined_csv opens a sync session + builds the CSV — run off the
         # event loop so the DB/CSV work can't block other requests.
         data = await run_in_threadpool(
-            render_combined_csv, run.user_id, run.child_job_ids or [], hidden_fields
+            render_combined_csv, run.user_id, run.child_job_ids or [],
+            hidden_fields, delivery_mode,
         )
     except Exception as exc:  # build failure — surface a clean 503
         _logger.error("batch %s download failed: %s", batch_id, str(exc)[:200])
@@ -476,6 +489,13 @@ async def _stream_run_csv(
 
 _RUN_HISTORY_CAP = 100  # newest-first page bound — recurring dailies grow forever
 
+# A run's combined output is downloadable once it TERMINALIZES with data intact
+# — including a zero-row overlaps_only run (Bug B: the old combined_export_key
+# gate 404'd exactly the honest-empty case; the R2 object is an ops artifact,
+# never served — downloads rebuild from the DB). 'failed' = ALL children failed:
+# nothing was produced, so it stays not-ready (matches the UI's copy).
+_DOWNLOADABLE_STATUSES = ("done", "partial")
+
 
 def _run_response(run: BatchRun) -> BatchRunResponse:
     return BatchRunResponse(
@@ -485,7 +505,8 @@ def _run_response(run: BatchRun) -> BatchRunResponse:
         child_job_ids=list(run.child_job_ids or []),
         excluded_no_date_count=run.excluded_no_date_count or 0,
         failed_children=run.failed_children,
-        combined_export_ready=bool(run.combined_export_key),
+        combined_export_ready=run.status in _DOWNLOADABLE_STATUSES,
+        delivery_counts=run.delivery_counts,
         created_at=run.created_at,
         completed_at=run.completed_at,
     )
@@ -536,4 +557,155 @@ async def download_batch_run(
     ).scalar_one_or_none()
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
-    return await _stream_run_csv(batch_id, run, batch.fields)
+    return await _stream_run_csv(batch_id, run, batch.fields, batch.delivery_mode or "everything")
+
+
+# ─── Combined leads view (in-app "one list") ─────────────────────────────────
+
+async def _leads_page(
+    db: AsyncSession,
+    batch: ScraperBatch,
+    run: BatchRun | None,
+    page: int,
+    page_size: int,
+    response: Response,
+) -> BatchLeadsPage:
+    """Shared body for the latest-run and run-scoped leads endpoints. Caller has
+    verified batch ownership and (for the run-scoped variant) run membership.
+
+    Same SQL, mode, and hidden-field semantics as the CSV rebuild, on the async
+    RLS session (precedent: per-job results + segments return decrypted contacts
+    through get_rls_db). Counts are LIVE (current mode) — never the stored
+    snapshot, which reflects the mode at finalize time (Codex P2).
+    """
+    # decrypted-PII route family — never cacheable (200 path; endpoints stamp
+    # exception paths)
+    response.headers["Cache-Control"] = "no-store"
+    # Lazy import (matches create_batch/_stream_run_csv) — keep the Celery app
+    # out of the API BOOT import graph; first use constructs it, same as the
+    # dispatch path.
+    from src.workers.batch_export import _COMBINED_SQL, _DELIVERY_COUNTS_SQL
+
+    if run is None or run.status not in _DOWNLOADABLE_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="The combined lead list is not ready yet.",
+        )
+    delivery_mode = batch.delivery_mode or "everything"
+    job_ids = [str(j) for j in (run.child_job_ids or [])]
+    tax_bind = tax_cap_min_year(datetime.now(UTC).date())
+
+    counts_row = (await db.execute(
+        text(_DELIVERY_COUNTS_SQL),
+        {"uid": run.user_id, "job_ids": job_ids, TAX_CAP_BIND: tax_bind},
+    )).one() if job_ids else None
+    counts = BatchDeliveryCounts(
+        leads_total=int(counts_row.leads_total) if counts_row else 0,
+        overlaps_delivered=int(counts_row.overlaps_delivered) if counts_row else 0,
+        singletons_suppressed=int(counts_row.singletons_suppressed) if counts_row else 0,
+        unmatchable_no_parcel=int(counts_row.unmatchable_no_parcel) if counts_row else 0,
+    )
+    total = (
+        counts.overlaps_delivered
+        if delivery_mode == "overlaps_only"
+        else counts.leads_total
+    )
+
+    rows = []
+    if job_ids:
+        result = await db.execute(
+            text(_COMBINED_SQL),
+            {
+                "uid": run.user_id,
+                "job_ids": job_ids,
+                "limit": page_size,
+                "offset": (page - 1) * page_size,
+                "overlaps_only": delivery_mode == "overlaps_only",
+                TAX_CAP_BIND: tax_bind,
+            },
+        )
+        rows = result.fetchall()
+
+    hidden = resolve_hidden_output_fields(batch.fields)
+    leads = []
+    for r in rows:
+        data = dict(r._mapping)
+        data["id"] = str(data["id"])
+        data["phone"] = decrypt_field(data["phone"]) if data.get("phone") else None
+        data["email"] = decrypt_field(data["email"]) if data.get("email") else None
+        # Honor the batch's output-field visibility exactly like the CSV
+        # (of the hideable set, only mailing_address is a combined-view column).
+        if "mailing_address" in hidden:
+            data["mailing_address"] = None
+        data["matched_record_types"] = list(data.get("matched_record_types") or [])
+        data["source_counties"] = list(data.get("source_counties") or [])
+        leads.append(BatchLeadRow(**data))
+
+    return BatchLeadsPage(
+        leads=leads,
+        counts=counts,
+        delivery_mode=delivery_mode,
+        page=page,
+        page_size=page_size,
+        total=total,
+    )
+
+
+@router.get("/{batch_id}/leads", response_model=BatchLeadsPage)
+async def list_batch_leads(
+    batch_id: str,
+    request: Request,
+    response: Response,
+    current_user: CurrentUser,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    db: AsyncSession = Depends(get_rls_db),
+) -> BatchLeadsPage:
+    """The combined (deduped, overlap-first, mode-filtered) lead list of the
+    LATEST run — the in-app equivalent of the combined CSV."""
+    try:
+        await rate_limit(request, zone="general", identifier=current_user.id)
+        batch = await _owned_batch(db, batch_id, current_user.id)
+        run = await _run_for(db, batch_id, current_user.id)
+        return await _leads_page(db, batch, run, page, page_size, response)
+    except HTTPException as exc:
+        # Codex P2: FastAPI builds exception responses separately from the
+        # injected Response, so the no-store must ride the exception itself —
+        # else a cache can serve a stale "not ready" 404 after the run finishes.
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+
+
+@router.get("/{batch_id}/runs/{run_id}/leads", response_model=BatchLeadsPage)
+async def list_batch_run_leads(
+    batch_id: str,
+    run_id: str,
+    request: Request,
+    response: Response,
+    current_user: CurrentUser,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    db: AsyncSession = Depends(get_rls_db),
+) -> BatchLeadsPage:
+    """Run-scoped combined lead list (2B history parity with the CSV download)."""
+    try:
+        await rate_limit(request, zone="general", identifier=current_user.id)
+        batch = await _owned_batch(db, batch_id, current_user.id)
+        run = (
+            await db.execute(
+                select(BatchRun).where(
+                    BatchRun.id == run_id,
+                    BatchRun.batch_id == batch_id,  # run must belong to THIS batch
+                    BatchRun.user_id == current_user.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if run is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+        return await _leads_page(db, batch, run, page, page_size, response)
+    except HTTPException as exc:
+        # Codex P2: FastAPI builds exception responses separately from the
+        # injected Response, so the no-store must ride the exception itself —
+        # else a cache can serve a stale "not ready" 404 after the run finishes.
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise

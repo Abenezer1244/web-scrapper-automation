@@ -125,6 +125,16 @@
               ]
             }
           },
+          "delivery_mode": {
+            "default": "overlaps_only",
+            "enum": [
+              "overlaps_only",
+              "overlaps_first",
+              "everything"
+            ],
+            "title": "Delivery Mode",
+            "type": "string"
+          },
           "enrichment": {
             "$ref": "#/components/schemas/EnrichmentConfig",
             "default": {
@@ -228,6 +238,33 @@
         "title": "BatchCreateResponse",
         "type": "object"
       },
+      "BatchDeliveryCounts": {
+        "description": "Honest delivery accounting (uncapped dataset facts, mode-interpreted).",
+        "properties": {
+          "leads_total": {
+            "default": 0,
+            "title": "Leads Total",
+            "type": "integer"
+          },
+          "overlaps_delivered": {
+            "default": 0,
+            "title": "Overlaps Delivered",
+            "type": "integer"
+          },
+          "singletons_suppressed": {
+            "default": 0,
+            "title": "Singletons Suppressed",
+            "type": "integer"
+          },
+          "unmatchable_no_parcel": {
+            "default": 0,
+            "title": "Unmatchable No Parcel",
+            "type": "integer"
+          }
+        },
+        "title": "BatchDeliveryCounts",
+        "type": "object"
+      },
       "BatchDetailResponse": {
         "description": "A batch with its per-child summary + failed-child detail — for the run view.",
         "properties": {
@@ -263,6 +300,21 @@
           "created_at": {
             "format": "date-time",
             "title": "Created At",
+            "type": "string"
+          },
+          "delivery_counts": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BatchDeliveryCounts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "delivery_mode": {
+            "default": "everything",
+            "title": "Delivery Mode",
             "type": "string"
           },
           "failed_children": {
@@ -312,6 +364,179 @@
         "title": "BatchDetailResponse",
         "type": "object"
       },
+      "BatchLeadRow": {
+        "description": "One combined-view lead — mirrors the combined CSV's columns.",
+        "properties": {
+          "date_recorded": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date Recorded"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "lead_subtype": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lead Subtype"
+          },
+          "mailing_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mailing Address"
+          },
+          "matched_record_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Matched Record Types",
+            "type": "array"
+          },
+          "overlap_count": {
+            "default": 1,
+            "title": "Overlap Count",
+            "type": "integer"
+          },
+          "parcel_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parcel Id"
+          },
+          "party_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Party Name"
+          },
+          "phone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phone"
+          },
+          "phone_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phone Type"
+          },
+          "property_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Property Address"
+          },
+          "source_counties": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Source Counties",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "BatchLeadRow",
+        "type": "object"
+      },
+      "BatchLeadsPage": {
+        "description": "A page of the combined batch view + live honest counts.",
+        "properties": {
+          "counts": {
+            "$ref": "#/components/schemas/BatchDeliveryCounts"
+          },
+          "delivery_mode": {
+            "title": "Delivery Mode",
+            "type": "string"
+          },
+          "leads": {
+            "items": {
+              "$ref": "#/components/schemas/BatchLeadRow"
+            },
+            "title": "Leads",
+            "type": "array"
+          },
+          "page": {
+            "title": "Page",
+            "type": "integer"
+          },
+          "page_size": {
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "leads",
+          "counts",
+          "delivery_mode",
+          "page",
+          "page_size",
+          "total"
+        ],
+        "title": "BatchLeadsPage",
+        "type": "object"
+      },
       "BatchRunResponse": {
         "properties": {
           "batch_id": {
@@ -347,6 +572,16 @@
             "format": "date-time",
             "title": "Created At",
             "type": "string"
+          },
+          "delivery_counts": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BatchDeliveryCounts"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "excluded_no_date_count": {
             "default": 0,
@@ -426,6 +661,11 @@
           "created_at": {
             "format": "date-time",
             "title": "Created At",
+            "type": "string"
+          },
+          "delivery_mode": {
+            "default": "everything",
+            "title": "Delivery Mode",
             "type": "string"
           },
           "id": {
@@ -4581,7 +4821,7 @@
     },
     "/batches/{batch_id}/download": {
       "get": {
-        "description": "Stream the batch's combined CSV through this authed endpoint.\n\nThe CSV is REBUILT from the DB on demand (not fetched from R2): the api has\nno R2 credentials (those live on the worker), and rebuilding means a\nre-download reflects later async skip-trace fills. Tenant-scoped by the\nverified owner's id. 404 until the barrier has finished (combined_export_key\nis the 'ready' marker).",
+        "description": "Stream the batch's combined CSV through this authed endpoint.\n\nThe CSV is REBUILT from the DB on demand (not fetched from R2): the api has\nno R2 credentials (those live on the worker), and rebuilding means a\nre-download reflects later async skip-trace fills. Tenant-scoped by the\nverified owner's id. 404 until the run terminalizes into a downloadable\nstatus (`_DOWNLOADABLE_STATUSES`) — a zero-row overlaps_only run is still\n'done' and downloads a headers-only CSV.",
         "operationId": "download_batch_batches__batch_id__download_get",
         "parameters": [
           {
@@ -4620,6 +4860,77 @@
           }
         ],
         "summary": "Download Batch",
+        "tags": [
+          "batches"
+        ]
+      }
+    },
+    "/batches/{batch_id}/leads": {
+      "get": {
+        "description": "The combined (deduped, overlap-first, mode-filtered) lead list of the\nLATEST run — the in-app equivalent of the combined CSV.",
+        "operationId": "list_batch_leads_batches__batch_id__leads_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "batch_id",
+            "required": true,
+            "schema": {
+              "title": "Batch Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "minimum": 1,
+              "title": "Page",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchLeadsPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Batch Leads",
         "tags": [
           "batches"
         ]
@@ -4727,6 +5038,86 @@
           }
         ],
         "summary": "Download Batch Run",
+        "tags": [
+          "batches"
+        ]
+      }
+    },
+    "/batches/{batch_id}/runs/{run_id}/leads": {
+      "get": {
+        "description": "Run-scoped combined lead list (2B history parity with the CSV download).",
+        "operationId": "list_batch_run_leads_batches__batch_id__runs__run_id__leads_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "batch_id",
+            "required": true,
+            "schema": {
+              "title": "Batch Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "minimum": 1,
+              "title": "Page",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchLeadsPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Batch Run Leads",
         "tags": [
           "batches"
         ]

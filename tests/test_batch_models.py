@@ -37,3 +37,32 @@ def test_batch_run_durability_columns():
     assert cols["dispatch_attempts"].nullable is False
     assert cols["delivery_started_at"].nullable is True
     assert cols["claim_token"].nullable is True
+
+
+class TestDeliveryModeColumns:
+    def test_scraper_batch_delivery_mode_default(self):
+        from src.db.models import ScraperBatch
+
+        col = ScraperBatch.__table__.c.delivery_mode
+        assert col.nullable is False
+        assert col.server_default is not None
+        # Python-side default protects non-API writers (tests/scheduler).
+        assert col.default.arg == "everything"
+
+    def test_scraper_batch_delivery_mode_check_constraint(self):
+        from sqlalchemy import CheckConstraint
+
+        from src.db.models import ScraperBatch
+
+        checks = [
+            c for c in ScraperBatch.__table__.constraints
+            if isinstance(c, CheckConstraint)
+            and c.name == "ck_scraper_batches_delivery_mode"
+        ]
+        assert len(checks) == 1
+
+    def test_batch_run_delivery_counts_column(self):
+        from src.db.models import BatchRun
+
+        col = BatchRun.__table__.c.delivery_counts
+        assert col.nullable is True

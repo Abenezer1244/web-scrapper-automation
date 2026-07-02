@@ -1,79 +1,68 @@
-# Session: cross-check delivery build + mailing-address split columns
-Branch: `chore/xcheck-delivery-build` (worktree off `feat/fields-output-visibility` @ 1311448 — separate from the other active session)
+# Batch overlaps-first delivery (spec + plan: docs/superpowers/{specs,plans}/2026-07-01-*)
 
-## Part A — Cross-check the delivery-step build (Q1–Q4 commits)
-- [x] Read full diff origin/main...HEAD (22 files)
-- [x] Claude self-review — candidate findings below
-- [ ] Codex `review --base origin/main` (running in background)
-- [ ] Reconcile findings, fix anything Critical/High, Codex re-verify
+Branch `chore/xcheck-session` (worktree off origin/main @ 5bc4b74), draft PR #136.
+Executed subagent-driven: fresh implementer + reviewer per task; no local Postgres, so
+tests verified via GitHub Actions CI on every push; Codex consulted at design (2 rounds)
+and gates the final diff.
 
-### Claude self-review findings (pending reconciliation with Codex)
-1. **[Medium] delivery.py — SoftTimeLimitExceeded treated as permanent.** The task sets
-   `soft_time_limit=30` explicitly to bound a hung Resend POST (the SDK sends with no
-   timeout), but `_is_retryable_email_error()` classifies `SoftTimeLimitExceeded` as
-   permanent (not a RequestException, no `code`, not `ApplicationError`) → the exact
-   transient case the limit exists for is never retried. Fix: classify
-   `SoftTimeLimitExceeded` as retryable.
-2. **[Low] batch delivery email copy says "expires in 48 hours"** but the batch path
-   sends an in-app page URL that doesn't expire (pre-existing; cosmetic).
-3. Verified OK: `sa_text`/`ScraperBatch`/`_fail_job` imports; `trigger="preview"` fits
-   `Job.trigger` String(32) w/ no constraint (JobCreate validator only guards POST /jobs);
-   dedup-claim DELETE is tenant-scoped; upload retry bounded; rollback-then-attribute-
-   access refreshes `job` safely (committed row exists).
+## Plan
 
-## Part B — Feature: split mailing/property address into own columns (user request)
-User: downloadable CSVs should have e.g. `10301 greenwood ave n` / `seattle` / `wa` / `98115`
-as separate columns.
-
-**Already exists:** `property_street/city/state/zip` split columns (parse_property_for_display).
-**Missing:** the same for `mailing_address`.
-
-### Plan
-- [ ] 1. Add `mailing_street`, `mailing_city`, `mailing_state`, `mailing_zip` to the END of
-      `LEAD_CSV_COLUMNS` (append-at-end = the file's backward-compat convention).
-- [ ] 2. `build_lead_export_row`: parse `mailing_address` with the same (address-generic)
-      parser; emit sanitized parts.
-- [ ] 3. **Visibility dependency:** `mailing_address` is HIDEABLE — hiding it must ALSO blank
-      the 4 new split columns or the hide feature leaks the mailing address. Add a
-      dependent-columns map in `_apply_visibility`.
-- [ ] 4. Append the 4 columns to `OVERLAP_LEAD_COLUMNS` (combined/batch CSV picks them up
-      automatically via `base.get`).
-- [ ] 5. Excel inherits via `_canonical_dataframe` (LEAD_CSV_COLUMNS). JSON export is raw
-      record dicts — unchanged.
-- [ ] 6. Tests: new-column presence, parse correctness (comma + no-comma + PO Box), hide-
-      mailing blanks split cols, overlap CSV parity.
-
-### Open design question (consult Codex)
-- No-comma addresses ("10301 GREENWOOD AVE N SEATTLE WA 98115"): current parser leaves
-  city blank (street/city boundary "unknowable"). User's example implies they want city
-  extracted. Option A: ship parser as-is (city blank for comma-less, same as existing
-  property_city today). Option B: add a conservative street-suffix heuristic
-  (suffix + optional directional/unit → remaining pre-state tokens = city) used by BOTH
-  property + mailing splits. Decide with Codex.
+- [x] Task 1 — Migration 078 + model columns (`delivery_mode` on scraper_batches,
+      `delivery_counts` on batch_runs) — `38243c1` (+ ruff import-order fix `eae4287`)
+- [x] Task 2 — `_COMBINED_SQL` rework: prefixed type-scoped buckets, property_key-only
+      overlap identity, SQL-side mode filter + deterministic ORDER BY/LIMIT/OFFSET,
+      uncapped `_DELIVERY_COUNTS_SQL` — `c9eddcd` (fixes Bugs A & C)
+- [x] Task 3 — mode-aware `finalize_batch_run` + `delivery_counts` stored + empty-state
+      email gating (`_delivery_summary`; `_deliver` gates on done/partial) — `1a01ab9`
+- [x] Task 4 — `deliver_job_email`/`_build_lead_delivery_email` optional
+      `summary_message` + `link_expires` (batch emails lose the wrong "expires in 48
+      hours" copy) — `9b2e543` + byte-identity fix `6552702`
+- [x] Task 5 — API: persist `delivery_mode` on create, **status-based readiness**
+      (`_DOWNLOADABLE_STATUSES`), mode-aware download rebuild, response fields —
+      `8eac41e` (fixes Bug B) + OpenAPI regen `3f753fc`
+- [x] Task 6 — paginated `GET /batches/{id}/leads` + `/runs/{run_id}/leads`
+      (async RLS session, live counts, no-store, hidden-fields) — `e52edb5`
+      + lazy-import fix `17fbb7e` + review-minors fix (uniform no-store,
+      run-scoped tenant test)
+- [x] Task 7 — docs (spec §7 amendment, this file, BUILD_JOURNAL), full CI, security
+      self-review, Codex review gate
 
 ## Review
 
-### Part A — cross-check verdict
-- Codex `review --base origin/main` on the delivery-step build: **one finding, P2**, and it
-  was the SAME issue Claude self-review flagged → consensus: `SoftTimeLimitExceeded`
-  classified permanent in `_is_retryable_email_error()`, defeating the retry the soft
-  time limit exists for. **Fixed** in commit `1a021fa` (+ regression test). No
-  Critical/High from either reviewer → rest of the build is a GO.
-- Self-review items verified clean: imports (`sa_text`, `ScraperBatch`, `_fail_job`),
-  `trigger="preview"` vs Job.trigger String(32), tenant-scoped dedup-claim DELETE,
-  bounded upload retry, rollback-then-refresh session handling.
-- Known cosmetic (not fixed): batch delivery email reuses the "expires in 48 hours" copy
-  though the batch link is a non-expiring in-app page.
+**The three pre-existing bugs fixed:**
+- **Bug A (fake overlaps):** weak `dedup_hash` (party_name+date) could merge two
+  DIFFERENT record types into one bucket — counted as a hot overlap AND silently
+  dropped one row. Now `dh:` buckets are record_type-scoped; only `property_key`
+  bridges types.
+- **Bug B (empty export = 404):** `combined_export_key` gated readiness, and zero-row
+  finalizes never set it — paid batch, no email, download 404. Readiness is now
+  status-based (done/partial); zero-row runs stream a headers-only CSV and email the
+  honest empty-state summary.
+- **Bug C (50k cap before filter):** mode filtering/ordering moved into SQL before
+  LIMIT; honest counts come from a separate uncapped aggregate.
 
-### Part B — feature shipped (commit 94867f8)
-- 4 new columns `mailing_street/city/state/zip` in per-job CSV, Excel, and combined/batch
-  CSV; appended at end (back-compat). JSON/webhook/dialer/skip-trace untouched.
-- Hide-mailing_address now blanks the split columns too (dependent-columns map) — the
-  visibility feature cannot leak the mailing address.
-- Prod address census (read-only, latest 1000 rows): mailing 100% comma-separated →
-  splits cleanly. property_address in recent rows is STREET-ONLY (no city/state/zip in
-  the source data) → property_city/state/zip stay blank for those rows; not a parser
-  issue, a data-availability one. Codex verdict: keep conservative parser (Option A);
-  a validated city-list heuristic is a possible later enhancement.
-- Tests: 136 passed (12 new). DB-fixture tests deliberately NOT run in this worktree
-  (conftest teardown deletes rows; no TEST_DATABASE_URL guard at this commit).
+**Feature:** per-batch `delivery_mode` = `overlaps_only` (default for NEW batches;
+existing batches backfilled `everything` — no behavior change on deploy) |
+`overlaps_first` | `everything`; honest `delivery_counts`
+{leads_total, overlaps_delivered, singletons_suppressed, unmatchable_no_parcel};
+paginated combined-leads JSON for the in-app one-list view.
+
+**Security self-review (Master Review scope for this diff):**
+- Every new query binds `:uid` from an ownership-verified batch/run; `/leads` chains
+  rate_limit → `_owned_batch` (404 non-owner) → run-membership check → RLS session.
+- Decrypted PII only in page rows; `Cache-Control: no-store` on every leads-route
+  path; no row payloads logged anywhere.
+- No new secrets; no user-supplied URLs; CSV path still goes through
+  `build_overlap_export_row`/`sanitize_for_csv`.
+- Migration additive-only; `CHECK` constraint guards non-API writers.
+
+**Notes / deviations:**
+- Spec §7 amended (see spec): readiness re-keyed to run status instead of forcing an
+  empty-file R2 PUT (the object is never served; API has no R2 creds).
+- Tertiary CSV sort changed filing-date → job-recency (SQL date-parse of M/D/YYYY
+  strings would break the export on garbage rows).
+- CSV ordering now fully SQL-side; `_filing_sort_key` (batch_export copy) deleted.
+- Deploy order: run migration 078 via `scripts/migrate.py` BEFORE deploying api+worker;
+  redeploy BOTH (delivery email kwargs span worker+api).
+- Frontend follow-up (separate repo, backend-first): wizard mode picker, batch-page
+  combined leads table + counts banner, regen TS types from schema/openapi.json.

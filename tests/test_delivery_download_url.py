@@ -83,3 +83,36 @@ def test_falls_back_to_presign_in_non_production(restore_settings):
 
     assert exporter.called_with == ("exports/x.csv", _DELIVERY_TOKEN_TTL)
     assert url.startswith("https://r2.example/presigned/")
+
+
+class TestDeliverySummaryMessage:
+    def test_summary_message_rendered_in_both_bodies(self):
+        from src.workers.delivery import _build_lead_delivery_email
+
+        subject, html_body, text_body = _build_lead_delivery_email(
+            "My Batch", 0, "https://app.bridgeleads.io/batches/abc", "csv",
+            summary_message="0 cross-list overlap leads found across 12 scraped leads.",
+            link_expires=False,
+        )
+        assert "0 cross-list overlap leads" in html_body
+        assert "0 cross-list overlap leads" in text_body
+
+    def test_batch_link_has_no_expiry_copy(self):
+        from src.workers.delivery import _build_lead_delivery_email
+
+        _, html_body, text_body = _build_lead_delivery_email(
+            "My Batch", 5, "https://app.bridgeleads.io/batches/abc", "csv",
+            link_expires=False,
+        )
+        # The in-app batch page never expires — the 48h line is presign-only copy.
+        assert "expires in 48 hours" not in html_body
+        assert "expires in 48 hours" not in text_body
+
+    def test_default_keeps_expiry_and_no_summary(self):
+        from src.workers.delivery import _build_lead_delivery_email
+
+        _, html_body, text_body = _build_lead_delivery_email(
+            "Scraper", 5, "https://x/dl", "csv",
+        )
+        assert "expires in 48 hours" in html_body
+        assert "expires in 48 hours" in text_body

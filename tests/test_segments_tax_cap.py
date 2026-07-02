@@ -222,6 +222,8 @@ async def test_combined_sql_excludes_out_of_window(
         "uid": starter_user.id,
         "job_ids": [job_id],
         "limit": 1000,
+        "offset": 0,
+        "overlaps_only": False,
         TAX_CAP_BIND: _CAP_BIND_VALUE,
     })
     returned = {str(r._mapping["id"]) for r in result.fetchall()}

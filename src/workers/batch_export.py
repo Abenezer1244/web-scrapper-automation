@@ -308,14 +308,19 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
             if row.status in ("failed", "cancelled")
         ]
 
-    pairs = _combined_pairs(db, run.user_id, run.child_job_ids or [])
-
-    # Honor the batch's shared output-field visibility (blank deselected hideable
-    # columns; identity/derived columns always present). The batch parent owns
-    # `fields` (children copy it); legacy/empty => show everything.
+    # The parent batch owns output shape: delivery_mode (what the combined
+    # export contains) + fields (hideable-column visibility).
     from src.utils.lead_export import resolve_hidden_output_fields
     _batch = db.get(ScraperBatch, run.batch_id)
+    delivery_mode = (_batch.delivery_mode if _batch else None) or "everything"
     hidden_fields = resolve_hidden_output_fields(_batch.fields if _batch else None)
+
+    pairs = _combined_pairs(
+        db, run.user_id, run.child_job_ids or [], delivery_mode=delivery_mode
+    )
+    # Honest accounting (uncapped, mode-independent). Stored on the run as the
+    # as-delivered snapshot; live reads recompute with the current mode.
+    counts = compute_delivery_counts(db, run.user_id, run.child_job_ids or [])
 
     object_key = None
     if pairs:
@@ -374,6 +379,7 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
             failed_children=failed or None,
             status=new_status,
             completed_at=datetime.now(UTC),
+            delivery_counts=counts,
         )
     ).rowcount
     db.commit()
@@ -385,22 +391,54 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
         )
         return
 
-    _deliver(db, run, len(pairs), object_key)
+    _deliver(
+        db, run, len(pairs), object_key,
+        new_status=new_status,
+        summary=_delivery_summary(delivery_mode, counts),
+    )
     _logger.info(
         "finalize_batch_run %s: %d leads, status=%s, failed_children=%d",
         run.id, len(pairs), new_status, len(failed),
     )
 
 
-def _deliver(db, run, lead_count: int, object_key: str | None) -> None:
-    """Send the one combined-CSV delivery email (best-effort, non-fatal).
+def _delivery_summary(mode: str, counts: dict) -> str:
+    """One honest sentence for the delivery email. The empty overlaps_only case
+    must read as 'no overlaps found' (with the why), never as 'broken'."""
+    total = counts.get("leads_total", 0)
+    overlaps = counts.get("overlaps_delivered", 0)
+    no_parcel = counts.get("unmatchable_no_parcel", 0)
+    if mode == "overlaps_only":
+        if overlaps == 0:
+            return (
+                f"0 cross-list overlap leads found across {total:,} scraped leads. "
+                f"{no_parcel:,} lead(s) had no parcel number and couldn't be "
+                "cross-matched. Switch the batch to 'Everything' to receive all leads."
+            )
+        return (
+            f"{overlaps:,} lead(s) found on 2 or more lists. "
+            f"{total - overlaps:,} single-list lead(s) not included in this delivery."
+        )
+    return f"{overlaps:,} of {total:,} lead(s) appear on 2 or more lists."
+
+
+def _deliver(
+    db, run, lead_count: int, object_key: str | None,
+    new_status: str = "done", summary: str | None = None,
+) -> None:
+    """Send the one combined-CSV delivery email (best-effort, non-fatal),
+    including the honest delivery summary message.
 
     At-most-once: a re-finalize (lease steal / retry after a crash) must not
     re-send. The status-guarded final write protects DB state, not this
     post-commit email, so we CAS delivery_started_at NULL->now and only the winner
     sends (Codex: duplicate delivery is not tolerable; a missed email is
     recoverable because the CSV is always downloadable in-app)."""
-    if not object_key:
+    # Email on every successful finalize — including a zero-row overlaps_only
+    # run (the honest empty-state IS the delivery). Fully-failed runs don't
+    # email (ops alerts cover failures); the old `if not object_key` gate would
+    # have silently skipped exactly the empty-state case this feature exists for.
+    if new_status not in ("done", "partial"):
         return
     claimed = db.execute(
         update(BatchRun)
@@ -435,6 +473,8 @@ def _deliver(db, run, lead_count: int, object_key: str | None) -> None:
             record_count=lead_count,
             download_url=url,
             recipient_emails=emails,
+            summary_message=summary,
+            link_expires=False,  # in-app batch page — not a presigned URL (Codex P2)
         )
     except Exception as exc:  # enqueue is best-effort — the CSV is in R2 either way
         # The delivery_started_at CAS above is already consumed, so no future

@@ -9,9 +9,9 @@ import csv
 import io
 
 from src.utils.lead_export import (
+    _TYPE_EXTRA_COLUMNS,
     LEAD_CSV_COLUMNS,
     LEAN_BASE_COLUMNS,
-    _TYPE_EXTRA_COLUMNS,
     resolve_lead_export_columns,
     write_lead_csv,
 )

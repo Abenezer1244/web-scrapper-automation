@@ -57,11 +57,22 @@ keep a nameless junk lead in UI/exports).
 **Caught & fixed (Codex, 3 rounds):** diff review FAIL → colon-hijack High + detector-too-narrow Medium
 + raw_hash-churn Low, all adopted with tests; script review → rowcount guard before membership move,
 delivered_records anchor preflight.
-**Failed / Blocked:** Task 1 (fresh Pierce probate scrape, both accounts) + Task 4 (UI check) still
-waiting on the user (Claude can't enter passwords; no new jobs by session end). First cleanup --apply
-died on `InsufficientPrivilege` (expected under least-privilege) → owner-conn rerun.
-**Pending / Handoff:** Task 1 + Task 4 (user). Cosmetic: MTC beneficiary swallows "Original Trustee of
-the Deed of Trust: X" (shared `_STOP` lacks that label) — deferred with Codex agreement.
+**Task 1 + Task 4 COMPLETED (same day, headed-Playwright session):** launched a headed Chromium
+(Playwright, CDP 9333, detached via Start-Process — a Bash-backgrounded launcher gets killed at the
+10-min tool cap and takes the browser with it); the user typed passwords, Claude drove everything
+else. Runs triggered via the app's own `POST /jobs` from the logged-in page context (Bearer token
+from `/api/auth/session`, never left the browser) — the UI itself has no run-existing button (only
+the wizard's "New Run"). Admin `new test pro` job `202e9686`: 3/3 clean rows (no junk names; BERNATH
+= parcel-less, correctly audited "no parcel+legal: 1"; 2 rows fully enriched). Starter `Quick Start`
+job `a79865ef`: 123 scraped → plan-capped 50 → **all 50 duplicates, 0 billed**, "Reused prior
+enrichment for 49 duplicate leads" (no double skip-trace), unactionable audit fired. Tenant isolation
+incidentally proven: admin session POSTing the starter's config id → 404. UI verified on BOTH
+accounts: HANSON renders `6776000110 / 2322 BRYCE CANYON CT, PUYALLUP 98374`, `[E]` gone, King
+RAMIREZ rows show `Jul 24, 2026` + `$300,754.23` in the AUCTION DATE / DEFAULT OWED columns.
+**Failed / Blocked:** First cleanup --apply died on `InsufficientPrivilege` (expected under
+least-privilege) → owner-conn rerun.
+**Pending / Handoff:** Cosmetic: MTC beneficiary swallows "Original Trustee of the Deed of Trust: X"
+(shared `_STOP` lacks that label) — deferred with Codex agreement.
 **Facts learned:** `railway run` executes LOCAL code with prod env — a merged fix can be exercised
 against prod before Railway redeploys (deploy still required for scheduled beat runs). The weekly King
 paper is a NEW PDF every issue — a parser validated on one issue can die on the next; the notice_to_row

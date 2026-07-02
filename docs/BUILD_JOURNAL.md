@@ -78,6 +78,98 @@ locally). (4) Any API-surface change must regen `schema/openapi.json` in the pin
 `.venv-schema` or the drift gate fails. (5) `import src.workers.<anything>` constructs the
 Celery app (`src/workers/__init__.py`) — API-layer imports of worker modules must be
 function-level lazy.
+---
+
+## 2026-07-01 — Cross-check of the delivery build + mailing-address split columns
+**Built / Shipped:** Branch `chore/xcheck-delivery-build` (worktree, stacked on `feat/fields-output-visibility`).
+- **Cross-check of the delivery-step build** (Q1–Q4 commits, full diff vs main): Claude self-review +
+  independent `codex review --base origin/main`. **Consensus finding (P2, both reviewers independently):**
+  `deliver_job_email` sets `soft_time_limit=30` to bound a hung Resend POST, but
+  `_is_retryable_email_error()` classified `SoftTimeLimitExceeded` as permanent — the exact transient case
+  the limit exists for was never retried. Fixed (`1a021fa`) + regression test. Everything else verified
+  clean (imports, `trigger="preview"` fits Job.trigger, tenant-scoped dedup-claim DELETE, bounded upload
+  retry, rollback/refresh session handling). No Critical/High → build is a GO.
+- **Feature (user request): mailing-address split columns** (`94867f8`). `mailing_street/city/state/zip`
+  in per-job CSV + Excel + combined/batch/segments CSV, appended at END (back-compat). Same conservative
+  address parser as the property split. **Hiding `mailing_address` now blanks its split columns too**
+  (dependent-columns map in `_apply_visibility`) — the visibility feature can't leak the mailing address.
+  JSON shape / webhook / dialer push / skip-trace parser deliberately untouched (Codex consult verdict).
+  136 tests pass (12 new). Codex gate on the final diff: clean.
+**Tried / Decided:** Comma-less city extraction (user's example was comma-less) — Codex verdict Option A:
+keep the conservative parser; a wrong city silently corrupts CRM fields, a blank one falls back to the
+full-address column. A validated city-list heuristic is a possible later parser enhancement.
+**Facts learned (prod census, read-only, latest 1000 rows):** `mailing_address` is **100% comma-separated**
+(splits cleanly — e.g. `5520 SEELEY LAKE DR SW, LAKEWOOD, WA, 98499-2817`). `property_address` in recent
+rows is **street-only** (no city/state/zip in the county source at all) → property_city/state/zip stay
+blank there; that's data availability, not a parser bug. Also: SQLAlchemy-scheme URLs
+(`postgresql+psycopg2://`) must be stripped for raw psycopg2 in diag scripts.
+**Pending / Handoff:** batch delivery email reuses "expires in 48 hours" copy though the batch link is a
+non-expiring in-app page (cosmetic). FE: nothing required for the new columns (CSV-only). PR stacked on
+`feat/fields-output-visibility` — merge that first.
+
+---
+
+## 2026-07-01 — PR #133 end-to-end verification → live King parser defects found & fixed (PR #134) + prod backfills
+**Built / Shipped:** Verification session for the Pierce/King fixes (PR #133) turned into a live bug hunt.
+Manual King NTS crawl against the brand-new QA Legals 07-01-26.pdf: 3 blocks, **1 notice LOST to a
+varchar(512) INSERT crash, 1 address corrupted**. Root-caused all three defects and shipped **PR #134**
+(squash `a973b80`, CI green, no migrations, api+worker redeployed 16:57): (1) `_AFFINIA_SHAPE` gap
+`{0,200}` too tight for a ~201-char securitization-trust beneficiary ("Wilmington Trust … Series
+2006-5") → gate missed → colon regexes scanned to the first colon (inside "10:00 AM") and captured
+the SAME 810-char boilerplate into grantor/beneficiary/servicer → widened to `{0,800}`/`{0,1000}` (the
+negative lookaheads, not the bounds, exclude colon layouts). (2) `_COMMONLY_KNOWN` leaked "The above
+property is" into the address + normalized match key (a parcel-less notice became unmatchable) → added
+stop phrase. (3) MTC's colon-less "More commonly known as 1814 FRANKLIN AVE E…" dropped the address →
+colon optional ONLY behind "More…" (Codex High: bare "commonly known as" keeps the colon, else prose
+like "…commonly known as Fannie Mae" hijacks the capture — its repro is now a test). Defense-in-depth at
+the shared `notice_to_row` chokepoint: display fields clamped to column widths, parcel>64 → NULL (a
+truncated parcel could false-match at 0.90), ts_number>64 → row skipped (identity never truncated),
+grantor==beneficiary poison detector, raw_hash over STORED values. New real fixture
+`nts_queen_anne_news_2026-07-01.pdf`; 73 tests, zero Pierce/Snohomish regression.
+**Prod repairs (all Codex-gated, dry-run → --apply → read-back verified):** (a) HANSON backfill
+(`scripts/backfill_pierce_probate_legal_repair.py`): both rows (starter+admin) repaired via the same
+pierce_legal_repair guards the pipeline uses — parcel `6779000110`→`6776000110`, addr 2322 BRYCE CANYON
+CT, mailing, `property_key` recomputed, membership merge-moved (PK user_id+record_type+property_key).
+(b) `[E]` junk row deleted (`scripts/cleanup_pierce_probate_junk_party.py`) — Codex P1 was REAL: the row
+anchored 1 `delivered_records.first_result_id`; follow-up consult confirmed delete-with-SET-NULL is the
+designed semantics (claim + billing history retained). Delete required the OWNER connection
+(`DATABASE_URL_MIGRATE`) — `results.DELETE` is revoked from the app role under least-privilege.
+(c) Backfilled the MISSED 06-24 King issue (5 notices, all auction 7/24, via the exact crawler upsert
+path; Codex PASS) → **matcher enriched 2 admin King leads** (RAMIREZ, parcel 7398900940): auction_date
+2026-07-24 + default_amount $300,754.23 + nts ref/trustee — **fix #4 proven end-to-end on prod data**.
+Re-crawl of 07-01 after the fix: **3/3 upserted, 0 errored** (the lost $282k notice landed with parcel
+`025700-0175-09` + clean address).
+**Tried / Decided:** This week's 3 notices legitimately match 0 of the 280 King pre_foreclosure leads
+(no parcel/street overlap — NOD-stage leads vs this week's auctions are different populations); proven
+read-only before touching anything. WALKER confirmed correctly kept-but-empty (no parcel + no legal =
+unactionable by design). DELETE over NULL for the junk row (forward fix never re-emits it; NULL would
+keep a nameless junk lead in UI/exports).
+**Caught & fixed (Codex, 3 rounds):** diff review FAIL → colon-hijack High + detector-too-narrow Medium
++ raw_hash-churn Low, all adopted with tests; script review → rowcount guard before membership move,
+delivered_records anchor preflight.
+**Task 1 + Task 4 COMPLETED (same day, headed-Playwright session):** launched a headed Chromium
+(Playwright, CDP 9333, detached via Start-Process — a Bash-backgrounded launcher gets killed at the
+10-min tool cap and takes the browser with it); the user typed passwords, Claude drove everything
+else. Runs triggered via the app's own `POST /jobs` from the logged-in page context (Bearer token
+from `/api/auth/session`, never left the browser) — the UI itself has no run-existing button (only
+the wizard's "New Run"). Admin `new test pro` job `202e9686`: 3/3 clean rows (no junk names; BERNATH
+= parcel-less, correctly audited "no parcel+legal: 1"; 2 rows fully enriched). Starter `Quick Start`
+job `a79865ef`: 123 scraped → plan-capped 50 → **all 50 duplicates, 0 billed**, "Reused prior
+enrichment for 49 duplicate leads" (no double skip-trace), unactionable audit fired. Tenant isolation
+incidentally proven: admin session POSTing the starter's config id → 404. UI verified on BOTH
+accounts: HANSON renders `6776000110 / 2322 BRYCE CANYON CT, PUYALLUP 98374`, `[E]` gone, King
+RAMIREZ rows show `Jul 24, 2026` + `$300,754.23` in the AUCTION DATE / DEFAULT OWED columns.
+**Failed / Blocked:** First cleanup --apply died on `InsufficientPrivilege` (expected under
+least-privilege) → owner-conn rerun.
+**Pending / Handoff:** Cosmetic: MTC beneficiary swallows "Original Trustee of the Deed of Trust: X"
+(shared `_STOP` lacks that label) — deferred with Codex agreement.
+**Facts learned:** `railway run` executes LOCAL code with prod env — a merged fix can be exercised
+against prod before Railway redeploys (deploy still required for scheduled beat runs). The weekly King
+paper is a NEW PDF every issue — a parser validated on one issue can die on the next; the notice_to_row
+clamps now make that a degraded-field event, not a lost notice. `delivered_records.first_result_id` is
+`ON DELETE SET NULL` by design; the durable dedup claim is (user_id, dedup_hash) and a no-parcel/
+no-address row still gets a dedup_hash via the party+date fallback. `results.DELETE` needs
+`DATABASE_URL_MIGRATE`. nts_notices natural key (source, ts_number) makes issue backfills upsert-safe.
 
 ---
 

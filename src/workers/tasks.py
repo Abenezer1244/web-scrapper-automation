@@ -13,6 +13,11 @@ from datetime import datetime
 from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
 
+from src.config.constants import (
+    PRIORITY_QUEUE_PLANS,
+    SCRAPE_TRANSIENT_BACKOFF_SECONDS,
+    SCRAPE_TRANSIENT_MAX_RETRIES,
+)
 from src.scrapers.probate import (
     classify_probate_signal_for_row,
     should_include_probate_row,
@@ -58,6 +63,7 @@ from src.workers.tasks_helpers.status import (
     _now,
     _publish_log,
     _redis,
+    _retry_scrape_job,
     _set_status,
 )
 
@@ -513,15 +519,71 @@ def run_scrape_job(self, job_id: str) -> None:
                     },
                 )
             return
-        except Exception:
+        except Exception as exc:
             _logger.exception("Scraper error for job %s", job_id)
+            # Capture THIS attempt's started_at BEFORE the rollback — rollback
+            # expires ORM attributes, and a re-fetch could return a NEWER attempt's
+            # value. It attempt-scopes BOTH the retry CAS and the terminal fail
+            # below so a stale/superseded attempt never clobbers a live re-claimed
+            # one (Codex P1).
+            attempt_started_at = job.started_at
             # Reconnect DB session if it went stale during long scrape
             try:
                 db.rollback()
             except Exception:
                 pass
+            # Transient portal hiccup (page never rendered, pagination flaked, block
+            # wall, Playwright timeout) → re-queue this job with backoff instead of
+            # permanently failing the whole day's scrape on ONE flaky page. Bounded by
+            # SCRAPE_TRANSIENT_MAX_RETRIES; once exhausted (or a PERMANENT error) we
+            # fall through and fail loud as before. Billing has NOT run at this point,
+            # so a re-run cannot double-bill (guarded inside _retry_scrape_job).
+            from src.scrapers.reliability import is_transient_scrape_error
+            if is_transient_scrape_error(exc):
+                countdown = _retry_scrape_job(
+                    db, job, job_id, attempt_started_at,
+                    max_retries=SCRAPE_TRANSIENT_MAX_RETRIES,
+                    backoffs=SCRAPE_TRANSIENT_BACKOFF_SECONDS,
+                )
+                if countdown is not None:
+                    queue = (
+                        "scrape-priority"
+                        if user.plan in PRIORITY_QUEUE_PLANS
+                        else "scrape"
+                    )
+                    try:
+                        run_scrape_job.apply_async(
+                            args=[job_id], queue=queue, countdown=countdown
+                        )
+                    except Exception:
+                        # Broker publish failed — the row is durably 'pending' with
+                        # retry_count>0 and started_at NULL, which watchdog_stuck_jobs
+                        # re-delivers via its stranded-retry branch (retry_count>0,
+                        # started_at IS NULL) once the row ages past the stuck cutoff.
+                        # Recovery is bounded (not immediate), but no retry is lost.
+                        _logger.warning(
+                            "run_scrape_job retry publish failed for job %s; left "
+                            "'pending' for watchdog re-delivery", job_id, exc_info=True,
+                        )
+                    _publish_log(
+                        r, job_id, "warning",
+                        f"Transient error — retrying in ~{max(1, countdown // 60)} min "
+                        f"(retry {job.retry_count} of {SCRAPE_TRANSIENT_MAX_RETRIES}).",
+                        db=db,
+                    )
+                    _logger.warning(
+                        "Job %s: transient scrape error — re-queued (retry %d/%d, "
+                        "countdown %ds): %s",
+                        job_id, job.retry_count, SCRAPE_TRANSIENT_MAX_RETRIES,
+                        countdown, str(exc)[:200],
+                    )
+                    return
             reason = "Scraper encountered an error — our team has been notified."
-            if _fail_job(db, job, r, job_id, reason):
+            # Attempt-scoped: only fail the job if THIS attempt still owns it
+            # (started_at unchanged). If a newer attempt re-claimed it — or the
+            # retry CAS above no-oped on an ownership change — this no-ops instead
+            # of terminalizing a live newer attempt (Codex P1).
+            if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_started_at):
                 from src.workers.notification_emit import create_notification
                 create_notification(
                     user_id=job.user_id, type="job_failed", job_id=job_id,
@@ -822,9 +884,10 @@ def run_scrape_job(self, job_id: str) -> None:
             # return nothing here, so this is a no-op on the normal path.
             owned = db.execute(
                 sa_text(
-                    "SELECT dedup_hash FROM delivered_records WHERE first_job_id = :jid"
+                    "SELECT dedup_hash FROM delivered_records "
+                    "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
                 ),
-                {"jid": job_id},
+                {"jid": job_id, "uid": str(job.user_id)},
             ).fetchall()
             for row in owned:
                 claimed_hashes.add(row.dedup_hash)

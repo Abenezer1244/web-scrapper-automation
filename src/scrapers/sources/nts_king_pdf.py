@@ -23,9 +23,13 @@ from src.scrapers.sources.nts_tacoma_index import parse_nts_notice
 # The negative lookaheads (?!\s*:) and (?!\s+of\s+the\s+Deed) make the gate reject the
 # COLON layout's "…: value" and "…of the Deed of Trust:" labels, so it can never fire
 # on an MTC/colon block and clobber its correctly colon-parsed fields (Codex).
+# Gap bounds are generous on purpose (Codex 2026-07-01): grantor lists run long and
+# securitization-trust beneficiary names ("Wilmington Trust … as Trustee to Lehman XS
+# Trust … Series 2006-5") exceed 200 chars in the wild — a live notice was lost to a
+# {0,200} bound. The lookaheads, not the bounds, are what keep colon layouts out.
 _AFFINIA_SHAPE = re.compile(
-    r"Grantor\(s\)\s+of\s+Deed\s+of\s+Trust(?!\s*:)\b[\s\S]{0,400}?"
-    r"Current\s+Beneficiary(?!\s*:)(?!\s+of\s+the\s+Deed)\b[\s\S]{0,200}?"
+    r"Grantor\(s\)\s+of\s+Deed\s+of\s+Trust(?!\s*:)\b[\s\S]{0,800}?"
+    r"Current\s+Beneficiary(?!\s*:)(?!\s+of\s+the\s+Deed)\b[\s\S]{0,1000}?"
     r"Current\s+Trustee(?!\s*:)(?!\s+of\s+the\s+Deed)\b", re.I)
 
 # Value regexes carry the SAME negative guards (defense-in-depth: even if the gate

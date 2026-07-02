@@ -7,6 +7,7 @@ is byte-identical to the originals in tasks.py.
 """
 
 import json
+import random
 import threading
 import time
 from datetime import UTC, datetime
@@ -124,7 +125,14 @@ def _publish_log(r: sync_redis.Redis, job_id: str, level: str, message: str, db=
 _TERMINAL_STATUSES = ("done", "failed", "cancelled")
 
 
-def _set_status(db, job, status: str, **kwargs: Unpack[JobUpdateFields]) -> bool:
+def _set_status(
+    db,
+    job,
+    status: str,
+    *,
+    expected_started_at: datetime | None = None,
+    **kwargs: Unpack[JobUpdateFields],
+) -> bool:
     """Update job status and any extra fields, then commit.
 
     Terminal-write guard (Track A, Codex P2): the write is a CAS that only
@@ -135,6 +143,13 @@ def _set_status(db, job, status: str, **kwargs: Unpack[JobUpdateFields]) -> bool
     billing/emailing for it). The ORM object is refreshed either way, so
     `job.status` reflects the DB after the call.
 
+    ``expected_started_at`` (optional) makes the CAS ATTEMPT-scoped: the UPDATE
+    also requires ``started_at`` to still equal this attempt's value. A caller
+    that only wants to terminalize the attempt it is running (e.g. the scrape
+    failure path) passes it so a STALE attempt can't fail a NEWER live attempt
+    that already re-claimed the job (watchdog re-queue / redelivery). Omitted =
+    status-only guard (unchanged behaviour for every existing caller).
+
     `kwargs` keys are constrained by the JobUpdateFields TypedDict so a
     typo like `started=...` (instead of `started_at=...`) fails type
     checking instead of silently doing nothing.
@@ -143,18 +158,25 @@ def _set_status(db, job, status: str, **kwargs: Unpack[JobUpdateFields]) -> bool
 
     from src.db.models import Job
 
+    where = [Job.id == job.id, Job.status.not_in(_TERMINAL_STATUSES)]
+    if expected_started_at is not None:
+        where.append(Job.started_at == expected_started_at)
     rowcount = db.execute(
-        _sa_update(Job)
-        .where(Job.id == job.id, Job.status.not_in(_TERMINAL_STATUSES))
-        .values(status=status, **kwargs)
+        _sa_update(Job).where(*where).values(status=status, **kwargs)
     ).rowcount
     db.commit()
     db.refresh(job)
     return rowcount == 1
 
 
-def _fail_job(db, job, r, job_id: str, reason: str) -> bool:
+def _fail_job(db, job, r, job_id: str, reason: str, expected_started_at=None) -> bool:
     """Transition job to FAILED with a human-readable error message.
+
+    ``expected_started_at`` (optional) forwards to _set_status to make the FAILED
+    transition ATTEMPT-scoped — pass this attempt's started_at from any long-running
+    phase (e.g. the scrape failure path) so a stale/superseded attempt cannot fail a
+    newer live attempt that already re-claimed the job. Omitted = status-only CAS
+    (unchanged for existing callers).
 
     H3 (full-SaaS review): the previous implementation rolled back
     the main session before calling _set_status and _publish_log.
@@ -185,18 +207,90 @@ def _fail_job(db, job, r, job_id: str, reason: str) -> bool:
         pass
     cas_ok = False
     try:
-        cas_ok = _set_status(db, job, "failed", finished_at=_now(), error_message=reason)
+        cas_ok = _set_status(
+            db, job, "failed",
+            expected_started_at=expected_started_at,
+            finished_at=_now(), error_message=reason,
+        )
     except Exception as exc:
         _logger.error(
             "Job %s: _set_status failed during _fail_job: %s",
             job_id, str(exc)[:200],
         )
+    # Attempt-scoped no-op: when expected_started_at was supplied and the CAS did
+    # NOT fire, a NEWER attempt re-claimed this job (started_at moved). Suppress the
+    # failure log + 'failed' SSE so a superseded attempt can't emit a false failure
+    # against the live newer attempt (Codex P2). Unscoped callers are unchanged:
+    # there cas_ok=False means the job was already terminal, where re-publishing the
+    # failure is harmless/expected.
+    if expected_started_at is not None and not cas_ok:
+        _logger.info(
+            "Job %s: fail suppressed — attempt superseded by a newer one "
+            "(started_at moved); not emitting a failure event", job_id,
+        )
+        return cas_ok
     # Publish the failure log via a fresh session (db=None) so it
     # is not coupled to the main session's transaction state.
     _publish_log(r, job_id, "error", reason, db=None)
     r.publish(f"job_logs:{job_id}", json.dumps({"type": "failed", "error": reason}))
     _logger.error("Job %s failed: %s", job_id, reason)
     return cas_ok
+
+
+def _retry_scrape_job(
+    db,
+    job,
+    job_id: str,
+    started_at,
+    *,
+    max_retries: int,
+    backoffs: tuple[int, ...],
+) -> int | None:
+    """Attempt-scoped CAS re-queue of a job whose scrape phase raised a TRANSIENT
+    error. Resets the row to a fresh ``pending`` attempt so the worker's own claim
+    CAS (``pending``->``queued``) can re-run it, and returns the backoff COUNTDOWN
+    in seconds for the caller to pass to ``apply_async``. Returns ``None`` when
+    retries are exhausted OR the CAS no-ops — the caller then fails the job.
+
+    The UPDATE is guarded on (id, started_at, retry_count < max_retries,
+    non-terminal status, ``billing_applied_at IS NULL``) so it can only ever
+    re-queue THIS attempt and NEVER a job that:
+      - was terminalized externally (batch force-finalize / cancel),
+      - was already re-claimed by a newer attempt (started_at moved), or
+      - already reached billing (``billing_applied_at`` set) — the double-bill
+        guard. Billing runs only AFTER a successful scrape, so at a scrape-phase
+        failure this is always NULL; the predicate is belt-and-suspenders.
+
+    Resets the progress + liveness columns too (``started_at``/``finished_at``/
+    ``error_message``/page counters/``last_heartbeat_at``) so the retried attempt
+    starts clean and the watchdog sees a fresh un-started pending row.
+    """
+    from sqlalchemy import text as _text
+
+    attempt = int(job.retry_count or 0)
+    if attempt >= max_retries:
+        return None
+
+    rowcount = db.execute(
+        _text(
+            "UPDATE jobs SET status='pending', retry_count=retry_count+1, "
+            "started_at=NULL, finished_at=NULL, error_message=NULL, "
+            "page_current=0, page_total=0, record_count=0, last_heartbeat_at=NULL "
+            "WHERE id=:j AND started_at=:sa AND retry_count < :mx "
+            "AND status NOT IN ('done','failed','cancelled') "
+            "AND billing_applied_at IS NULL"
+        ),
+        {"j": str(job_id), "sa": started_at, "mx": max_retries},
+    ).rowcount
+    db.commit()
+    if rowcount != 1:
+        return None
+    db.refresh(job)
+
+    base = backoffs[min(attempt, len(backoffs) - 1)] if backoffs else 300
+    # Jitter (0-60s) so a fleet of jobs that all fail at the same instant (e.g. a
+    # portal-wide outage) don't re-hit the portal in lockstep.
+    return base + random.randint(0, 60)
 
 
 # ── Liveness heartbeat (watchdog input) ──────────────────────────────────────

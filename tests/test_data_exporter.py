@@ -241,6 +241,36 @@ def test_export_excel_blanks_hidden(exporter):
         assert row[party_idx]                        # identity -> intact
 
 
+def test_export_excel_mailing_split_present_and_hides_with_parent(exporter):
+    """Excel inherits the mailing split via the canonical dataframe; hiding
+    mailing_address blanks the split columns there too (no leak)."""
+    from openpyxl import load_workbook
+    path = exporter.export(
+        LEAD_RECORDS, filename="vis_mail_xlsx", fmt="excel",
+        hidden_fields={"mailing_address"},
+    )
+    ws = load_workbook(path)["Leads"]
+    header = [c.value for c in ws[1]]
+    for col in ("mailing_street", "mailing_city", "mailing_state", "mailing_zip"):
+        assert col in header, col
+    idxs = [header.index(c) for c in
+            ("mailing_address", "mailing_street", "mailing_city", "mailing_state", "mailing_zip")]
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        for i in idxs:
+            assert (row[i] or "") == ""
+
+
+def test_export_csv_mailing_split_values(exporter):
+    """Unhidden export splits the mailing address into the new columns."""
+    path = exporter.export(LEAD_RECORDS, filename="mail_split_csv", fmt="csv")
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert rows[0]["mailing_street"] == "456 Oak Ave"
+    assert rows[0]["mailing_city"] == "Seattle"
+    assert rows[0]["mailing_state"] == "WA"
+    assert rows[0]["mailing_zip"] == "98101"
+
+
 def test_export_no_hidden_unchanged(exporter):
     """No hidden_fields => identical to the existing behavior (all values present)."""
     path = exporter.export(LEAD_RECORDS, filename="vis_none", fmt="csv")

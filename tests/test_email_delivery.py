@@ -28,6 +28,14 @@ def test_network_errors_are_retryable():
     assert _is_retryable_email_error(requests.Timeout("slow")) is True
 
 
+def test_soft_time_limit_is_retryable():
+    # A hung Resend POST cut off by the task's soft_time_limit is the exact
+    # transient case the limit exists to bound — it must be retried, not
+    # classified permanent (Claude + Codex consensus finding, 2026-07-01).
+    from celery.exceptions import SoftTimeLimitExceeded
+    assert _is_retryable_email_error(SoftTimeLimitExceeded()) is True
+
+
 def test_transient_status_codes_are_retryable():
     for code in (408, 409, 429, 500, 502, 503):
         assert _is_retryable_email_error(_base_error(code)) is True, code

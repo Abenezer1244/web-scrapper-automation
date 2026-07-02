@@ -60,6 +60,7 @@ def _email_error_summary(exc: Exception) -> str:
 
 def _build_lead_delivery_email(
     scraper_name: str, record_count: int, download_url: str, fmt: str,
+    summary_message: str | None = None, link_expires: bool = True,
 ) -> tuple[str, str, str]:
     """Build (subject, html_body, text_body) for the lead-delivery email.
 
@@ -74,6 +75,20 @@ def _build_lead_delivery_email(
     # constants so every surface shows identical copy.
     from src.config.constants import DNC_DISCLAIMER
     safe_disclaimer = html.escape(DNC_DISCLAIMER)
+
+    # Batch deliveries link to the in-app batch page (no expiry); per-job links
+    # are 48h presigns. Wrong copy on a batch email erodes trust (Codex P2).
+    expiry_html = (
+        '<p class="expiry">This download link expires in 48 hours.</p>'
+        if link_expires else ""
+    )
+    expiry_text = "This link expires in 48 hours.\n\n" if link_expires else ""
+    summary_html = (
+        f'<p class="meta" style="margin-top:-16px; margin-bottom:24px;">'
+        f"{html.escape(summary_message)}</p>"
+        if summary_message else ""
+    )
+    summary_text = f"{summary_message}\n\n" if summary_message else ""
 
     html_body = f"""
 <!DOCTYPE html>
@@ -105,9 +120,10 @@ def _build_lead_delivery_email(
       <div class="stat-label">Records found</div>
     </div>
 
+    {summary_html}
     <a href="{html.escape(download_url)}" class="btn">Download {fmt.upper()}</a>
 
-    <p class="expiry">This download link expires in 48 hours.</p>
+    {expiry_html}
 
     <div class="notice" style="font-size:12px; color:#d9b13a; background:#1a1208; border:1px solid #7a4f08; border-radius:8px; padding:12px 16px; margin-bottom:20px; line-height:1.5;">
       {safe_disclaimer}
@@ -125,8 +141,9 @@ def _build_lead_delivery_email(
     text_body = (
         f"Your {scraper_name} leads are ready.\n\n"
         f"{record_count:,} records found.\n\n"
+        f"{summary_text}"
         f"Download ({fmt.upper()}): {download_url}\n\n"
-        "This link expires in 48 hours.\n\n"
+        f"{expiry_text}"
         f"{DNC_DISCLAIMER}\n\n"
         "Manage delivery settings at app.bridgeleads.io"
     )
@@ -155,6 +172,8 @@ def deliver_job_email(
     download_url: str,
     recipient_emails: list[str],
     fmt: str = "csv",
+    summary_message: str | None = None,
+    link_expires: bool = True,
 ) -> None:
     """Send the lead-delivery email via Resend, with retries.
 
@@ -183,7 +202,7 @@ def deliver_job_email(
         return
 
     subject, html_body, text_body = _build_lead_delivery_email(
-        scraper_name, record_count, download_url, fmt
+        scraper_name, record_count, download_url, fmt, summary_message=summary_message, link_expires=link_expires
     )
 
     try:

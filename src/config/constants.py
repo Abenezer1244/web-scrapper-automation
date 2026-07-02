@@ -95,6 +95,16 @@ class Plan(str, Enum):
 # Plans that get the high-priority Celery queue. Business+ paid tiers.
 PRIORITY_QUEUE_PLANS: frozenset[str] = frozenset({Plan.BUSINESS.value, Plan.AGENCY.value})
 
+# Transient scrape-failure retry policy (Codex-reconciled). When a scrape phase
+# raises a TransientScrapeError / Playwright infra error, the worker re-queues the
+# job with escalating backoff instead of permanently failing the whole day's run
+# on one flaky page. 2 retries = 3 total attempts. The Nth retry waits
+# SCRAPE_TRANSIENT_BACKOFF_SECONDS[N-1] (last value reused if retries ever exceed
+# the tuple length); a small random jitter is added at enqueue time to avoid a
+# thundering herd when many jobs fail at once.
+SCRAPE_TRANSIENT_MAX_RETRIES: int = 2
+SCRAPE_TRANSIENT_BACKOFF_SECONDS: tuple[int, ...] = (300, 1200)  # 5 min, then 20 min
+
 # Plans allowed to use the per-config webhook delivery feature and the
 # `enrichment.skip_tracing` toggle (the always-on enrichment, included
 # with the plan).

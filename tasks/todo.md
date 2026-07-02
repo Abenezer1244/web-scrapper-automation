@@ -1,55 +1,63 @@
-# expire_trials: gate on Stripe entitlement, not stripe_customer_id
+# Pierce pre_foreclosure run failure — 2026-07-01
 
-## Bug
-The hourly `expire_trials` task downgraded expired trials Pro→Starter UNLESS
-`stripe_customer_id IS NULL`. But a `stripe_customer_id` is created when a user
-merely OPENS Stripe checkout — not when they pay. So a trial user who opened
-checkout but never paid kept Pro forever. (Confirmed in prod: mikitsegaye29 — has
-a customer id, no subscription, expired trial, stuck on Pro.)
+## Context / trigger
+Admin dashboard "Records · month" showed 0. Investigation proved:
+- **NOT data loss.** Prod (owner role): 19,142 results, 52,716 delivered_records — all present.
+- "Records · month" KPI = `users.records_used` (usage meter), reset to 0 at the
+  July-1 calendar-month rollover (`records_period_start = 2026-07-01`, by design).
+- The `diag_data_inventory.py` "0 everywhere" was an **RLS artifact** — the prod
+  app role `bridgeleads_app` is now non-BYPASSRLS, so RLS fails closed to 0 with
+  no user context set. (Follow-up: that diag script is now misleading — see below.)
 
-## Codex consult (reconciled — Codex's pick adopted)
-- Don't use `stripe_customer_id` as an entitlement signal ("touched Stripe" ≠ "paid").
-- Add durable `stripe_subscription_id` + `subscription_status`; gate on an entitled
-  status. Protect `active`/`trialing`/`past_due` (past_due avoids downgrading mid
-  dunning). Final entitlement loss comes from `subscription.deleted`.
-- Deploy order: migration → webhook population → backfill → THEN gate. Safe to ship
-  together NOW because prod has no active paid subscriber (admin trial_ends_at=NULL
-  so untouched; the one expired-trial user correctly downgrades). No backfill needed.
+## The real problem
+Pierce `pre_foreclosure` scraper has produced **no new results since 2026-06-26**.
+Today's scheduled run (07-01 05:59 UTC) scraped `record_count=170` but committed 0
+and `status=failed`. DB stores only the sanitized message; real traceback logged via
+`tasks.py:517 _logger.exception` (rotated out of Railway buffer).
 
-## Changes
-- [x] mig 077: add `stripe_subscription_id` + `subscription_status` (nullable).
-- [x] models.py: 2 columns on User.
-- [x] billing.py webhooks:
-      - checkout.session.completed: set sub id + authoritative `subscription.status`
-        (already retrieved) + clear `trial_ends_at` (converted ≠ on trial).
-      - subscription.updated: set sub id + status; clear trial if active/trialing.
-      - subscription.deleted: clear sub id, status="canceled".
-- [x] scheduler_helpers/billing.py: gate = trial_ends_at<now AND plan!=starter AND
-      (sub_id IS NULL OR status IS NULL OR status NOT IN active/trialing/past_due).
-- [x] tests/test_expire_trials.py: bug case + all entitled/non-entitled statuses +
-      active-trial + no-trial(admin) — 8 cases, real Postgres, no mocks.
-- [x] py_compile clean; single alembic head 077. (No local PG → CI validates suite.)
-- [x] Codex review #1 → **[P1]** gate could downgrade a LEGACY payer (NULL fields).
-- [x] Codex review #2 → **[P1]** protecting ambiguous rows reintroduced the bug for
-      FUTURE abandoned checkouts (customer id at checkout-start, status stays NULL).
-- [x] FINAL design (resolves BOTH): the hourly task asks STRIPE for ambiguous rows
-      (customer id present, status NULL). Entitled → protect + self-heal (record
-      status). Not entitled → downgrade + record "canceled". Stripe error → SKIP
-      (never downgrade a possible payer). Stripe lookup is dependency-injected so
-      tests never hit the network (no mocks). Self-healing → NO manual backfill
-      (script removed); ambiguous rows resolve automatically each run.
-- [x] tests: 9 cases incl. ambiguous-entitled (protected+healed), ambiguous-
-      abandoned (downgraded), ambiguous-stripe-error (protected).
-- [ ] Codex review #3 (confirm both P1s closed).
+- Failing component (VERIFIED via connector row): `PierceWAARMSScraper`
+  (`src/scrapers/pierce_wa_probate.py`), base_url `armsweb.co.pierce.wa.us`.
+  (NOT AcclaimWeb — the 19:40 AcclaimWeb logs were a different county.)
+- **Leading hypothesis (UNCONFIRMED):** fail-loud `raise RuntimeError` at
+  `pierce_wa_probate.py:469` — a day/week chunk's ARMS results page didn't render
+  the record-count marker (`_record_count == "unknown"`), so the whole multi-chunk
+  job raised and discarded the 170 already-scraped records.
 
-## Failure modes (Codex) — addressed
-- Wrongly downgraded mid-cycle: protected statuses + webhook keeps state current;
-  expire logs each downgrade. past_due covered.
-- Keeps Pro free: status cleared on subscription.deleted; gate treats NULL/unknown
-  status as not-entitled. Follow-up: periodic Stripe reconciliation job (out of scope).
+## Root cause (CONFIRMED by reproduction)
+Re-ran the exact failing config+window on the PROD worker → **SUCCEEDED** (172 records,
+20 net-new billed, job done). So the June-26/July-1 failures were **TRANSIENT** (portal
+hiccup), NOT a deterministic bug. Brittleness: `tasks.py` scrape handler does
+`except Exception → _fail_job → return` = PERMANENT fail with no same-day retry (watchdog
+only re-runs pending/stuck jobs, never failed). One flaky page = 0 leads for the day.
+Re-run also repaired today's symptom: admin records_used 0 → 20.
 
-## Out of scope (follow-ups)
-- Backfill existing paying users from Stripe (none exist now).
-- Periodic Stripe↔DB reconciliation job for drift.
-- Deploy: run migration 077 BEFORE the worker picks up the new gate (additive
-  nullable cols → safe; gate already tolerates NULL).
+## Codex-reconciled design (consulted; agreed)
+Approach **C**: job-level retry (real fix) + page-level retry (Pierce damage reduction).
+Retry policy: **3 total attempts, backoff ~5min → ~20min + jitter** (user-approved).
+
+## Plan (all 3 phases approved)
+### Phase 1 — county-agnostic reliability core ✅ DONE (py_compile+ruff clean, classifier tested)
+- [x] Typed exceptions in `reliability.py`: `TransientScrapeError` (+ `ScraperBlockedError` reparented) + `is_transient_scrape_error()`.
+- [x] Job-level retry helper `_retry_scrape_job` (status.py): attempt-scoped CAS reset + backoff countdown.
+- [x] Wire into `tasks.py` scrape `except`: transient + attempts remaining → re-queue w/ backoff; else fail. Constants in constants.py (2 retries, 300s/1200s + jitter).
+### Phase 2 — Pierce hardening
+- [ ] Page-level retry (2x, 5s/15s) around ARMS result-page/pagination render; raise
+      TransientScrapeError after retries (never return [] unless explicit "0 records" marker).
+- [ ] Fix silent partial-success in `_go_to_next_page()` (Codex catch): if more pages
+      expected and next-page nav fails after retries, RAISE transient — don't quietly stop.
+### Phase 3 — tenant-filter fix (Codex catch)
+- [ ] Add `user_id` to the Step-2b owned-claims query in `tasks.py` (currently filters only first_job_id).
+### Verify / gate
+- [ ] Idempotency verify: `uq_results_job_fingerprint` + `uq_delivered_records_user_hash`
+      exist in prod; `raw_html_hash` stable across reruns.
+- [ ] Codex reviews the diff — Critical/High from either reviewer = NO-GO.
+- [ ] Security Master Review (§14); prove with a test; BUILD_JOURNAL entry.
+
+## Follow-ups (separate, not this branch)
+- `scripts/diag_data_inventory.py` is misleading under the non-BYPASSRLS prod role
+  (counts through `system_sync_session` → RLS zeros). Should use the owner/migrate
+  role or set user context. File a note so it doesn't cause a future false alarm.
+
+## Notes
+- Worktree: `.claude/worktrees/pierce-run-failure` on `fix/pierce-preforeclosure-run-failure` (off origin/main).
+- All prod queries this session were read-only SELECTs (owner role for ground truth).

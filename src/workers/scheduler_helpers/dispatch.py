@@ -83,6 +83,7 @@ def _dispatch_due_jobs(db, now: datetime) -> list[str]:
     from typing import cast
 
     from sqlalchemy import select
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     from src.api.schemas import ScheduleConfigDict
     from src.db.models import Job, ScraperConfig, User
@@ -101,12 +102,15 @@ def _dispatch_due_jobs(db, now: datetime) -> list[str]:
 
         # Day/time selectors. run_at_weekday/run_at_day_of_month default to
         # Monday / the 1st so configs saved before the day picker existed keep
-        # their old behavior (see ScheduleConfig contract).
+        # their old behavior (see ScheduleConfig contract). run_hour/run_minute
+        # are captured here because they also form the occurrence key below.
+        run_hour = schedule.get("run_at_hour", 6)
+        run_minute = schedule.get("run_at_minute", 0)
         if not _should_run_now(
             frequency,
             now,
-            schedule.get("run_at_hour", 6),
-            schedule.get("run_at_minute", 0),
+            run_hour,
+            run_minute,
             schedule.get("run_at_weekday", 0),
             schedule.get("run_at_day_of_month", 1),
         ):
@@ -142,25 +146,62 @@ def _dispatch_due_jobs(db, now: datetime) -> list[str]:
         ):
             continue
 
-        # Idempotency: skip if a job is already active for this config OR a
-        # scheduled job fired for it within the dedup window. The window guard
-        # stops the ±1-minute tolerance from double-firing a fast scrape that
-        # already finished (see _scheduled_dispatch_blocker_exists).
+        # Idempotency, two layers:
+        #  1. Cheap pre-check (_scheduled_dispatch_blocker_exists): skip if a job
+        #     is already active for this config (overlap guard, any trigger) OR a
+        #     scheduled job fired within the dedup window — avoids a wasted insert
+        #     on every duplicate tick and stops a scheduled run starting on top of
+        #     a manual one. This is read-then-check, so it can lose a race.
+        #  2. Durable backstop: the unique (scraper_config_id, scheduled_for) so
+        #     even two CONCURRENT beats that both pass the pre-check can't both
+        #     create a job for the same occurrence — the second insert no-ops at
+        #     the DB (Codex P1). Mirrors the batch path's uq_batch_runs_occurrence.
         if _scheduled_dispatch_blocker_exists(db, config.id, now):
             _logger.debug("Skipping %s — recent/active job for config", config.name)
             continue
 
-        job = Job(
-            id=str(uuid.uuid4()),
-            user_id=config.user_id,
-            scraper_config_id=config.id,
-            status="pending",
-            trigger="scheduled",
+        # Occurrence key = now truncated to the (coerced) run minute. Coerce with
+        # the SAME helper the matcher used so a corrupted persisted hour/minute
+        # that slipped past _should_run_now can't crash now.replace(), and the key
+        # stays consistent with what actually fired.
+        occurrence = now.replace(
+            hour=_coerce_schedule_int(run_hour, 0, 23, 6),
+            minute=_coerce_schedule_int(run_minute, 0, 59, 0),
+            second=0,
+            microsecond=0,
         )
-        db.add(job)
-        db.flush()
-        created.append(job.id)
-        _logger.info("Scheduled job created: %s (job_id=%s)", config.name, job.id)
+        job_id = str(uuid.uuid4())
+        # pg_insert (not ORM add/flush) so ON CONFLICT DO NOTHING is atomic at the
+        # DB. It bypasses ORM Python-side default=, so every NOT-NULL column
+        # without a server_default is set explicitly here (created_at and
+        # billed_count have server_defaults; all other cols are nullable).
+        inserted = db.execute(
+            pg_insert(Job.__table__)
+            .values(
+                id=job_id,
+                user_id=config.user_id,
+                scraper_config_id=config.id,
+                status="pending",
+                trigger="scheduled",
+                page_current=0,
+                page_total=0,
+                record_count=0,
+                retry_count=0,
+                scheduled_for=occurrence,
+            )
+            .on_conflict_do_nothing()  # dup (config, occurrence) -> no-op
+        ).rowcount
+        if inserted:
+            created.append(job_id)
+            _logger.info(
+                "Scheduled job created: %s (job_id=%s, occurrence=%s)",
+                config.name, job_id, occurrence.isoformat(),
+            )
+        else:
+            _logger.debug(
+                "Skipping %s — occurrence %s already dispatched (unique key)",
+                config.name, occurrence.isoformat(),
+            )
 
     if created or skipped_limit:
         _logger.info(

@@ -1,63 +1,79 @@
-# Pierce pre_foreclosure run failure — 2026-07-01
+# Session: cross-check delivery build + mailing-address split columns
+Branch: `chore/xcheck-delivery-build` (worktree off `feat/fields-output-visibility` @ 1311448 — separate from the other active session)
 
-## Context / trigger
-Admin dashboard "Records · month" showed 0. Investigation proved:
-- **NOT data loss.** Prod (owner role): 19,142 results, 52,716 delivered_records — all present.
-- "Records · month" KPI = `users.records_used` (usage meter), reset to 0 at the
-  July-1 calendar-month rollover (`records_period_start = 2026-07-01`, by design).
-- The `diag_data_inventory.py` "0 everywhere" was an **RLS artifact** — the prod
-  app role `bridgeleads_app` is now non-BYPASSRLS, so RLS fails closed to 0 with
-  no user context set. (Follow-up: that diag script is now misleading — see below.)
+## Part A — Cross-check the delivery-step build (Q1–Q4 commits)
+- [x] Read full diff origin/main...HEAD (22 files)
+- [x] Claude self-review — candidate findings below
+- [ ] Codex `review --base origin/main` (running in background)
+- [ ] Reconcile findings, fix anything Critical/High, Codex re-verify
 
-## The real problem
-Pierce `pre_foreclosure` scraper has produced **no new results since 2026-06-26**.
-Today's scheduled run (07-01 05:59 UTC) scraped `record_count=170` but committed 0
-and `status=failed`. DB stores only the sanitized message; real traceback logged via
-`tasks.py:517 _logger.exception` (rotated out of Railway buffer).
+### Claude self-review findings (pending reconciliation with Codex)
+1. **[Medium] delivery.py — SoftTimeLimitExceeded treated as permanent.** The task sets
+   `soft_time_limit=30` explicitly to bound a hung Resend POST (the SDK sends with no
+   timeout), but `_is_retryable_email_error()` classifies `SoftTimeLimitExceeded` as
+   permanent (not a RequestException, no `code`, not `ApplicationError`) → the exact
+   transient case the limit exists for is never retried. Fix: classify
+   `SoftTimeLimitExceeded` as retryable.
+2. **[Low] batch delivery email copy says "expires in 48 hours"** but the batch path
+   sends an in-app page URL that doesn't expire (pre-existing; cosmetic).
+3. Verified OK: `sa_text`/`ScraperBatch`/`_fail_job` imports; `trigger="preview"` fits
+   `Job.trigger` String(32) w/ no constraint (JobCreate validator only guards POST /jobs);
+   dedup-claim DELETE is tenant-scoped; upload retry bounded; rollback-then-attribute-
+   access refreshes `job` safely (committed row exists).
 
-- Failing component (VERIFIED via connector row): `PierceWAARMSScraper`
-  (`src/scrapers/pierce_wa_probate.py`), base_url `armsweb.co.pierce.wa.us`.
-  (NOT AcclaimWeb — the 19:40 AcclaimWeb logs were a different county.)
-- **Leading hypothesis (UNCONFIRMED):** fail-loud `raise RuntimeError` at
-  `pierce_wa_probate.py:469` — a day/week chunk's ARMS results page didn't render
-  the record-count marker (`_record_count == "unknown"`), so the whole multi-chunk
-  job raised and discarded the 170 already-scraped records.
+## Part B — Feature: split mailing/property address into own columns (user request)
+User: downloadable CSVs should have e.g. `10301 greenwood ave n` / `seattle` / `wa` / `98115`
+as separate columns.
 
-## Root cause (CONFIRMED by reproduction)
-Re-ran the exact failing config+window on the PROD worker → **SUCCEEDED** (172 records,
-20 net-new billed, job done). So the June-26/July-1 failures were **TRANSIENT** (portal
-hiccup), NOT a deterministic bug. Brittleness: `tasks.py` scrape handler does
-`except Exception → _fail_job → return` = PERMANENT fail with no same-day retry (watchdog
-only re-runs pending/stuck jobs, never failed). One flaky page = 0 leads for the day.
-Re-run also repaired today's symptom: admin records_used 0 → 20.
+**Already exists:** `property_street/city/state/zip` split columns (parse_property_for_display).
+**Missing:** the same for `mailing_address`.
 
-## Codex-reconciled design (consulted; agreed)
-Approach **C**: job-level retry (real fix) + page-level retry (Pierce damage reduction).
-Retry policy: **3 total attempts, backoff ~5min → ~20min + jitter** (user-approved).
+### Plan
+- [ ] 1. Add `mailing_street`, `mailing_city`, `mailing_state`, `mailing_zip` to the END of
+      `LEAD_CSV_COLUMNS` (append-at-end = the file's backward-compat convention).
+- [ ] 2. `build_lead_export_row`: parse `mailing_address` with the same (address-generic)
+      parser; emit sanitized parts.
+- [ ] 3. **Visibility dependency:** `mailing_address` is HIDEABLE — hiding it must ALSO blank
+      the 4 new split columns or the hide feature leaks the mailing address. Add a
+      dependent-columns map in `_apply_visibility`.
+- [ ] 4. Append the 4 columns to `OVERLAP_LEAD_COLUMNS` (combined/batch CSV picks them up
+      automatically via `base.get`).
+- [ ] 5. Excel inherits via `_canonical_dataframe` (LEAD_CSV_COLUMNS). JSON export is raw
+      record dicts — unchanged.
+- [ ] 6. Tests: new-column presence, parse correctness (comma + no-comma + PO Box), hide-
+      mailing blanks split cols, overlap CSV parity.
 
-## Plan (all 3 phases approved)
-### Phase 1 — county-agnostic reliability core ✅ DONE (py_compile+ruff clean, classifier tested)
-- [x] Typed exceptions in `reliability.py`: `TransientScrapeError` (+ `ScraperBlockedError` reparented) + `is_transient_scrape_error()`.
-- [x] Job-level retry helper `_retry_scrape_job` (status.py): attempt-scoped CAS reset + backoff countdown.
-- [x] Wire into `tasks.py` scrape `except`: transient + attempts remaining → re-queue w/ backoff; else fail. Constants in constants.py (2 retries, 300s/1200s + jitter).
-### Phase 2 — Pierce hardening
-- [ ] Page-level retry (2x, 5s/15s) around ARMS result-page/pagination render; raise
-      TransientScrapeError after retries (never return [] unless explicit "0 records" marker).
-- [ ] Fix silent partial-success in `_go_to_next_page()` (Codex catch): if more pages
-      expected and next-page nav fails after retries, RAISE transient — don't quietly stop.
-### Phase 3 — tenant-filter fix (Codex catch)
-- [ ] Add `user_id` to the Step-2b owned-claims query in `tasks.py` (currently filters only first_job_id).
-### Verify / gate
-- [ ] Idempotency verify: `uq_results_job_fingerprint` + `uq_delivered_records_user_hash`
-      exist in prod; `raw_html_hash` stable across reruns.
-- [ ] Codex reviews the diff — Critical/High from either reviewer = NO-GO.
-- [ ] Security Master Review (§14); prove with a test; BUILD_JOURNAL entry.
+### Open design question (consult Codex)
+- No-comma addresses ("10301 GREENWOOD AVE N SEATTLE WA 98115"): current parser leaves
+  city blank (street/city boundary "unknowable"). User's example implies they want city
+  extracted. Option A: ship parser as-is (city blank for comma-less, same as existing
+  property_city today). Option B: add a conservative street-suffix heuristic
+  (suffix + optional directional/unit → remaining pre-state tokens = city) used by BOTH
+  property + mailing splits. Decide with Codex.
 
-## Follow-ups (separate, not this branch)
-- `scripts/diag_data_inventory.py` is misleading under the non-BYPASSRLS prod role
-  (counts through `system_sync_session` → RLS zeros). Should use the owner/migrate
-  role or set user context. File a note so it doesn't cause a future false alarm.
+## Review
 
-## Notes
-- Worktree: `.claude/worktrees/pierce-run-failure` on `fix/pierce-preforeclosure-run-failure` (off origin/main).
-- All prod queries this session were read-only SELECTs (owner role for ground truth).
+### Part A — cross-check verdict
+- Codex `review --base origin/main` on the delivery-step build: **one finding, P2**, and it
+  was the SAME issue Claude self-review flagged → consensus: `SoftTimeLimitExceeded`
+  classified permanent in `_is_retryable_email_error()`, defeating the retry the soft
+  time limit exists for. **Fixed** in commit `1a021fa` (+ regression test). No
+  Critical/High from either reviewer → rest of the build is a GO.
+- Self-review items verified clean: imports (`sa_text`, `ScraperBatch`, `_fail_job`),
+  `trigger="preview"` vs Job.trigger String(32), tenant-scoped dedup-claim DELETE,
+  bounded upload retry, rollback-then-refresh session handling.
+- Known cosmetic (not fixed): batch delivery email reuses the "expires in 48 hours" copy
+  though the batch link is a non-expiring in-app page.
+
+### Part B — feature shipped (commit 94867f8)
+- 4 new columns `mailing_street/city/state/zip` in per-job CSV, Excel, and combined/batch
+  CSV; appended at end (back-compat). JSON/webhook/dialer/skip-trace untouched.
+- Hide-mailing_address now blanks the split columns too (dependent-columns map) — the
+  visibility feature cannot leak the mailing address.
+- Prod address census (read-only, latest 1000 rows): mailing 100% comma-separated →
+  splits cleanly. property_address in recent rows is STREET-ONLY (no city/state/zip in
+  the source data) → property_city/state/zip stay blank for those rows; not a parser
+  issue, a data-availability one. Codex verdict: keep conservative parser (Option A);
+  a validated city-list heuristic is a possible later enhancement.
+- Tests: 136 passed (12 new). DB-fixture tests deliberately NOT run in this worktree
+  (conftest teardown deletes rows; no TEST_DATABASE_URL guard at this commit).

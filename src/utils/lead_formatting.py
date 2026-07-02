@@ -80,13 +80,45 @@ def normalize_phone_for_dialer(raw: str | None) -> str:
         digits = digits[1:]
     return digits if len(digits) == 10 else ""
 
-# Secondary-unit designators — a comma part starting with one of these is an
-# apartment/suite/lot line, NOT a city. Folded into street, never emitted as city.
+# Secondary-unit / delivery-line designators — a chunk starting with one of
+# these is an apartment/suite/box/rural-route line, NOT a city. Folded into
+# street, never emitted as city. (PMB/POB/P.O. BOX/RR/RFD/HC/GENERAL DELIVERY
+# added per Codex — postal delivery lines that are digitless yet not cities.)
 _UNIT_RE = re.compile(
     r"^(?:#|APT|APARTMENT|UNIT|STE|SUITE|BLDG|BLD|FL|FLR|FLOOR|RM|ROOM|"
-    r"SPC|SPACE|LOT|TRLR|TRAILER|DEPT|NO|BOX|PO\s+BOX)\b",
+    r"SPC|SPACE|LOT|TRLR|TRAILER|DEPT|NO|BOX|PO\s+BOX|P\.?\s?O\.?\s+BOX|"
+    r"PMB|POB|RR|RFD|HC|GENERAL\s+DELIVERY)\b",
     re.IGNORECASE,
 )
+
+# Street-suffix tokens (abbreviated + unabbreviated) — used ONLY to disambiguate
+# the 'NE' directional-vs-Nebraska collision in comma-less addresses: a 2-letter
+# 'NE' right after a street suffix is a Seattle-style grid directional
+# ('6504 108TH AVE NE 98033'), not a state. NEVER used to guess a street/city
+# boundary (that inference stays out — Codex).
+_STREET_SUFFIXES = frozenset({
+    "AVE", "AVENUE", "ST", "STREET", "RD", "ROAD", "DR", "DRIVE",
+    "BLVD", "BOULEVARD", "WAY", "LN", "LANE", "CT", "COURT", "PL", "PLACE",
+    "HWY", "HIGHWAY", "TER", "TERRACE", "CIR", "CIRCLE", "LOOP",
+    "PKWY", "PARKWAY", "SQ", "SQUARE", "TRL", "TRAIL",
+})
+
+# Trailing bare ZIP (no state token): '1420 E PINE ST 98122'. The zip is
+# validated-confident on its own; the rest stays street.
+_TRAILING_ZIP_RE = re.compile(r"^(?P<street>.+?)\s+(?P<zip>\d{5}(?:-\d{4})?)$")
+
+# Tokens that make a trailing 5-digit number a BOX/UNIT number, not a zip —
+# 'PO BOX 98292' must not be read as zip 98292.
+_ZIP_LIFT_BLOCKERS = frozenset({
+    "BOX", "PMB", "POB", "NO", "APT", "UNIT", "STE", "SUITE", "SPC", "SPACE",
+    "LOT", "RM", "ROOM", "TRLR", "#", "RR", "RFD", "HC",
+})
+
+
+def _last_word(chunk: str) -> str:
+    """Uppercased, punctuation-stripped final token ('AVE.' -> 'AVE'); '' if none."""
+    toks = chunk.split()
+    return re.sub(r"[^A-Za-z#]", "", toks[-1]).upper() if toks else ""
 # Surname particles (compound last names): keep them attached to the surname so
 # 'VAN DYKE JOHN' -> last 'VAN DYKE', not 'VAN'.
 _SURNAME_PARTICLES = frozenset({
@@ -186,12 +218,43 @@ def parse_property_for_display(addr: str | None) -> dict:
     if "," not in clean:
         m = _NO_COMMA_TAIL_RE.match(clean)
         if m and m.group("state").upper() in _US_STATES and _ZIP_RE.match(m.group("zip")):
+            head = m.group("street").strip()
+            state = m.group("state").upper()
+            if state == "NE" and _last_word(head) in _STREET_SUFFIXES:
+                # Directional/Nebraska collision: 'NE' right after a street
+                # suffix is a grid directional ('6504 108TH AVE NE 98033'), not
+                # a state. Fold it back into street, lift only the validated
+                # zip, and leave state blank — never guess the real one.
+                # ('123 MAIN ST OMAHA NE 68102' keeps NE: OMAHA is no suffix.)
+                out["street"] = f"{head} {m.group('state')}"
+                out["zip"] = m.group("zip")
+                return out
+            if not any(ch.isdigit() for ch in head) and not _UNIT_RE.match(head):
+                # A digitless chunk before 'ST ZIP' is a CITY, not a street —
+                # street lines carry a house number or box digits. Snohomish
+                # tax mailing addresses are city-only ('STANWOOD WA 98292');
+                # emitting them as street put a city in the street column.
+                out["city"] = head
+                out["state"] = state
+                out["zip"] = m.group("zip")
+                return out
             # state+zip are confident; city is unknowable without a comma -> blank.
-            out["street"] = m.group("street").strip() or None
-            out["state"] = m.group("state").upper()
+            out["street"] = head or None
+            out["state"] = state
             out["zip"] = m.group("zip")
-        else:
-            out["street"] = clean or None
+            return out
+        m2 = _TRAILING_ZIP_RE.match(clean)
+        if m2 and _ZIP_RE.match(m2.group("zip")) and (
+            _last_word(m2.group("street")) not in _ZIP_LIFT_BLOCKERS
+        ):
+            # Trailing bare ZIP, no state token ('1420 E PINE ST 98122',
+            # '27323 218TH AVE SE 98038' — SE/SW/NW are not state codes). The
+            # zip validates on its own; the rest stays street. Blocked when the
+            # preceding token makes the number a box/unit number, not a zip.
+            out["street"] = m2.group("street").strip() or None
+            out["zip"] = m2.group("zip")
+            return out
+        out["street"] = clean or None
         return out
 
     parts = [p for p in (x.strip() for x in clean.split(",")) if p]

@@ -4,6 +4,7 @@ import html
 
 import requests
 import resend
+from celery.exceptions import SoftTimeLimitExceeded
 
 from src.config import settings
 from src.utils.logger import setup_logger
@@ -31,12 +32,14 @@ _BACKOFF_BASE = 5
 def _is_retryable_email_error(exc: Exception) -> bool:
     """True if a Resend send failure is transient and worth a Celery retry.
 
-    Retry: network/transport errors (requests.RequestException) and server-side
-    Resend errors whose HTTP status is 408/409/429 or 5xx. Do NOT retry permanent
+    Retry: network/transport errors (requests.RequestException), a hung send cut
+    off by the task's soft time limit (the Resend SDK POSTs with no timeout — a
+    hang IS the transient case the limit exists for), and server-side Resend
+    errors whose HTTP status is 408/409/429 or 5xx. Do NOT retry permanent
     client errors (auth, validation, malformed payload) — they fail identically
     on every attempt and just waste the retry budget.
     """
-    if isinstance(exc, requests.RequestException):
+    if isinstance(exc, (requests.RequestException, SoftTimeLimitExceeded)):
         return True
     if type(exc).__name__ in _PERMANENT_RESEND_ERRORS:
         return False

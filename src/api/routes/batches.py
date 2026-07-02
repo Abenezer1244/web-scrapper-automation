@@ -588,7 +588,6 @@ async def _leads_page(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="The combined lead list is not ready yet.",
         )
-    response.headers["Cache-Control"] = "no-store"  # decrypted PII — never cache
     delivery_mode = batch.delivery_mode or "everything"
     job_ids = [str(j) for j in (run.child_job_ids or [])]
     tax_bind = tax_cap_min_year(datetime.now(UTC).date())
@@ -662,6 +661,8 @@ async def list_batch_leads(
     """The combined (deduped, overlap-first, mode-filtered) lead list of the
     LATEST run — the in-app equivalent of the combined CSV."""
     await rate_limit(request, zone="general", identifier=current_user.id)
+    # decrypted-PII route family — never cacheable, on every path
+    response.headers["Cache-Control"] = "no-store"
     batch = await _owned_batch(db, batch_id, current_user.id)
     run = await _run_for(db, batch_id, current_user.id)
     return await _leads_page(db, batch, run, page, page_size, response)
@@ -680,6 +681,8 @@ async def list_batch_run_leads(
 ) -> BatchLeadsPage:
     """Run-scoped combined lead list (2B history parity with the CSV download)."""
     await rate_limit(request, zone="general", identifier=current_user.id)
+    # decrypted-PII route family — never cacheable, on every path
+    response.headers["Cache-Control"] = "no-store"
     batch = await _owned_batch(db, batch_id, current_user.id)
     run = (
         await db.execute(

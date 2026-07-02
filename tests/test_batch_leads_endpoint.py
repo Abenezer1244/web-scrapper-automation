@@ -135,3 +135,10 @@ class TestBatchLeads:
             f"/batches/{batch.id}/leads", headers=_auth(business_token)
         )
         assert resp.status_code == 404
+
+    async def test_run_scoped_tenant_isolation(self, client, business_token, overlap_batch):
+        batch, run = overlap_batch
+        resp = await client.get(
+            f"/batches/{batch.id}/runs/{run.id}/leads", headers=_auth(business_token)
+        )
+        assert resp.status_code == 404

@@ -234,3 +234,91 @@ async def test_download_tenant_isolation(
         f"/batches/{starter_batch.batch_id}/download", headers=_auth(business_token)
     )
     assert resp.status_code == 404
+
+
+# ─── Status-based readiness (Bug B) ────────────────────────────────────────────
+#
+# Readiness/downloadability is now `run.status in _DOWNLOADABLE_STATUSES`, not
+# `bool(run.combined_export_key)`. A 'done' zero-row overlaps_only run never
+# gets a combined_export_key written (nothing to upload) but must still read
+# ready and download a headers-only CSV — the old key-presence gate 404'd
+# exactly that honest-empty case.
+
+class TestStatusBasedReadiness:
+    async def test_done_run_without_key_is_ready_and_downloadable(
+        self, client: AsyncClient, starter_token: str, db: AsyncSession, starter_user: User
+    ):
+        """Bug B end-to-end: a 'done' run with NO combined_export_key (zero-row
+        overlaps_only) must read ready and stream a headers-only CSV."""
+        batch = ScraperBatch(
+            id=str(uuid.uuid4()),
+            user_id=starter_user.id,
+            name="Empty",
+            state="WA",
+            fields=[],
+            enrichment=[],
+            schedule={},
+            deliver={},
+            status="active",
+            delivery_mode="overlaps_only",
+        )
+        db.add(batch)
+        await db.flush()
+        run = BatchRun(
+            id=str(uuid.uuid4()),
+            batch_id=batch.id,
+            user_id=starter_user.id,
+            status="done",
+            child_job_ids=[],
+            combined_export_key=None,
+            delivery_counts={
+                "leads_total": 0,
+                "overlaps_delivered": 0,
+                "singletons_suppressed": 0,
+                "unmatchable_no_parcel": 0,
+            },
+        )
+        db.add(run)
+        await db.commit()
+
+        detail = await client.get(f"/batches/{batch.id}", headers=_auth(starter_token))
+        assert detail.status_code == 200
+        body = detail.json()
+        assert body["combined_export_ready"] is True
+        assert body["delivery_mode"] == "overlaps_only"
+        assert body["delivery_counts"]["leads_total"] == 0
+
+        dl = await client.get(f"/batches/{batch.id}/download", headers=_auth(starter_token))
+        assert dl.status_code == 200
+        lines = [ln for ln in dl.text.splitlines() if ln.strip()]
+        assert len(lines) == 1  # header only
+
+    async def test_running_run_not_ready(
+        self, client: AsyncClient, starter_token: str, db: AsyncSession, starter_user: User
+    ):
+        batch = ScraperBatch(
+            id=str(uuid.uuid4()),
+            user_id=starter_user.id,
+            name="Running",
+            state="WA",
+            fields=[],
+            enrichment=[],
+            schedule={},
+            deliver={},
+            status="active",
+        )
+        db.add(batch)
+        await db.flush()
+        db.add(
+            BatchRun(
+                id=str(uuid.uuid4()),
+                batch_id=batch.id,
+                user_id=starter_user.id,
+                status="running",
+                child_job_ids=[],
+            )
+        )
+        await db.commit()
+
+        dl = await client.get(f"/batches/{batch.id}/download", headers=_auth(starter_token))
+        assert dl.status_code == 404

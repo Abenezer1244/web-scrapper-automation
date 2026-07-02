@@ -3,7 +3,9 @@
 Pure tests (no DB). The fan-out / gating SQL paths are exercised in CI.
 """
 import pytest
+from httpx import AsyncClient
 from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.schemas import BatchCreateRequest
 from src.config.constants import (
@@ -12,6 +14,10 @@ from src.config.constants import (
     BATCH_PLANS,
     Plan,
 )
+
+
+def _auth(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
 
 
 class TestBatchCreateRequest:
@@ -64,3 +70,71 @@ def test_dispatch_batch_run_registered_with_worker():
     import src.workers.batch_tasks  # noqa: F401  (registers the @app.task)
 
     assert "src.workers.batch_tasks.dispatch_batch_run" in app.tasks
+
+
+class TestDeliveryModeCreate:
+    """create_batch must persist body.delivery_mode onto the ScraperBatch row
+    (Codex P1) — without that explicit write, the DB's 'everything' default
+    silently wins for every new batch, undoing the Pydantic default flip.
+
+    Batch-create is Pro+ gated (BATCH_PLANS); no `pro_user` fixture exists in
+    conftest, so `business_user`/`business_token` (also Pro+) stand in — same
+    entitlement tier for this gate. king/WA/probate is a real, active
+    county_connectors row seeded by migration 006, exercised elsewhere in this
+    suite via the same county/record_type/state combination."""
+
+    @staticmethod
+    def _payload(**overrides: object) -> dict:
+        payload: dict = {
+            "state": "WA",
+            "counties": ["king"],
+            "record_types": ["probate"],
+        }
+        payload.update(overrides)
+        return payload
+
+    async def test_default_is_overlaps_only(
+        self, client: AsyncClient, business_token: str, db: AsyncSession
+    ):
+        resp = await client.post(
+            "/batches", json=self._payload(), headers=_auth(business_token)
+        )
+        assert resp.status_code == 201
+        from sqlalchemy import select
+
+        from src.db.models import ScraperBatch
+
+        batch = (
+            await db.execute(
+                select(ScraperBatch).where(ScraperBatch.id == resp.json()["batch_id"])
+            )
+        ).scalar_one()
+        assert batch.delivery_mode == "overlaps_only"
+
+    async def test_explicit_mode_persisted(
+        self, client: AsyncClient, business_token: str, db: AsyncSession
+    ):
+        resp = await client.post(
+            "/batches",
+            json=self._payload(delivery_mode="everything"),
+            headers=_auth(business_token),
+        )
+        assert resp.status_code == 201
+        from sqlalchemy import select
+
+        from src.db.models import ScraperBatch
+
+        batch = (
+            await db.execute(
+                select(ScraperBatch).where(ScraperBatch.id == resp.json()["batch_id"])
+            )
+        ).scalar_one()
+        assert batch.delivery_mode == "everything"
+
+    async def test_invalid_mode_422(self, client: AsyncClient, business_token: str):
+        resp = await client.post(
+            "/batches",
+            json=self._payload(delivery_mode="bogus"),
+            headers=_auth(business_token),
+        )
+        assert resp.status_code == 422

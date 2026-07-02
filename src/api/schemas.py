@@ -1,7 +1,7 @@
 import re
 import unicodedata
 from datetime import UTC, date, datetime
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
@@ -857,6 +857,13 @@ class BatchCreateRequest(BaseModel):
     # non-probate record types in the batch — no 422, since a batch legitimately
     # spans multiple types.
     include_living_owner_tod: bool | None = None
+    # What the combined export contains. Default overlaps_only: the product
+    # point of a batch is leads on 2+ lists — singletons are obtainable from
+    # single scrapes. Existing batches (created before this field) stay
+    # 'everything' via the DB default; the route persists this value explicitly.
+    delivery_mode: Literal["overlaps_only", "overlaps_first", "everything"] = (
+        "overlaps_only"
+    )
 
     @field_validator("state")
     @classmethod
@@ -881,6 +888,15 @@ class BatchCreateResponse(BaseModel):
     status: BatchRunStatus  # "pending" — the run + child jobs are created async by the worker
 
 
+class BatchDeliveryCounts(BaseModel):
+    """Honest delivery accounting (uncapped dataset facts, mode-interpreted)."""
+
+    leads_total: int = 0
+    overlaps_delivered: int = 0
+    singletons_suppressed: int = 0
+    unmatchable_no_parcel: int = 0
+
+
 class BatchRunResponse(BaseModel):
     id: str
     batch_id: str
@@ -888,7 +904,8 @@ class BatchRunResponse(BaseModel):
     child_job_ids: list[str] = []
     excluded_no_date_count: int = 0
     failed_children: list[dict[str, Any]] | None = None
-    combined_export_ready: bool = False  # presence flag — never expose the R2 key
+    combined_export_ready: bool = False  # status-derived — never expose the R2 key
+    delivery_counts: BatchDeliveryCounts | None = None
     created_at: datetime
     completed_at: datetime | None = None
 
@@ -914,7 +931,8 @@ class BatchSummaryResponse(BaseModel):
     state: str
     run_status: BatchRunStatus = BatchRunStatus.PENDING
     child_count: int = 0
-    combined_export_ready: bool = False  # presence flag — never expose the R2 key
+    combined_export_ready: bool = False  # status-derived — never expose the R2 key
+    delivery_mode: str = "everything"
     created_at: datetime
     completed_at: datetime | None = None
 
@@ -924,6 +942,7 @@ class BatchDetailResponse(BatchSummaryResponse):
 
     failed_children: list[dict[str, Any]] | None = None
     children: list[BatchChildSummary] = Field(default_factory=list)
+    delivery_counts: BatchDeliveryCounts | None = None
 
 
 # ─── Jobs ─────────────────────────────────────────────────────────────────────

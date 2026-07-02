@@ -172,6 +172,7 @@ async def create_batch(
         ),
         deliver=body.deliver.model_dump(),
         status="active",
+        delivery_mode=body.delivery_mode,
     )
     db.add(batch)
     await db.flush()
@@ -256,7 +257,8 @@ def _summary(batch: ScraperBatch, run: BatchRun | None, child_count: int) -> Bat
         state=batch.state,
         run_status=run.status if run else "pending",
         child_count=child_count,
-        combined_export_ready=bool(run and run.combined_export_key),
+        combined_export_ready=bool(run and run.status in _DOWNLOADABLE_STATUSES),
+        delivery_mode=batch.delivery_mode or "everything",
         created_at=batch.created_at,
         completed_at=run.completed_at if run else None,
     )
@@ -403,6 +405,7 @@ async def get_batch(
         **_summary(batch, run, len(children)).model_dump(),
         failed_children=run.failed_children if run else None,
         children=children,
+        delivery_counts=run.delivery_counts if run else None,
     )
 
 
@@ -418,8 +421,9 @@ async def download_batch(
     The CSV is REBUILT from the DB on demand (not fetched from R2): the api has
     no R2 credentials (those live on the worker), and rebuilding means a
     re-download reflects later async skip-trace fills. Tenant-scoped by the
-    verified owner's id. 404 until the barrier has finished (combined_export_key
-    is the 'ready' marker).
+    verified owner's id. 404 until the run terminalizes into a downloadable
+    status (`_DOWNLOADABLE_STATUSES`) — a zero-row overlaps_only run is still
+    'done' and downloads a headers-only CSV.
     """
     # Each download rebuilds the CSV (a threadpool worker + sync DB connection +
     # full-CSV buffer), so rate-limit to keep concurrent downloads from starving
@@ -427,11 +431,12 @@ async def download_batch(
     await rate_limit(request, zone="general", identifier=current_user.id)
     batch = await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
     run = await _run_for(db, batch_id, current_user.id)
-    return await _stream_run_csv(batch_id, run, batch.fields)
+    return await _stream_run_csv(batch_id, run, batch.fields, batch.delivery_mode or "everything")
 
 
 async def _stream_run_csv(
-    batch_id: str, run: BatchRun | None, batch_fields: object = None
+    batch_id: str, run: BatchRun | None, batch_fields: object = None,
+    delivery_mode: str = "everything",
 ) -> StreamingResponse:
     """Rebuild + stream one run's combined CSV. Caller must have verified batch
     ownership AND that `run` belongs to that batch (run.user_id is then the
@@ -440,7 +445,7 @@ async def _stream_run_csv(
     `batch_fields` is the owning batch's `ScraperConfig`-shape `fields` JSON; it
     resolves to the hideable columns to blank so the combined CSV honors the same
     output-field visibility as the per-job exports (legacy/empty => show all)."""
-    if run is None or not run.combined_export_key:
+    if run is None or run.status not in _DOWNLOADABLE_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="The combined CSV is not ready yet.",
@@ -455,7 +460,8 @@ async def _stream_run_csv(
         # render_combined_csv opens a sync session + builds the CSV — run off the
         # event loop so the DB/CSV work can't block other requests.
         data = await run_in_threadpool(
-            render_combined_csv, run.user_id, run.child_job_ids or [], hidden_fields
+            render_combined_csv, run.user_id, run.child_job_ids or [],
+            hidden_fields, delivery_mode,
         )
     except Exception as exc:  # build failure — surface a clean 503
         _logger.error("batch %s download failed: %s", batch_id, str(exc)[:200])
@@ -476,6 +482,13 @@ async def _stream_run_csv(
 
 _RUN_HISTORY_CAP = 100  # newest-first page bound — recurring dailies grow forever
 
+# A run's combined output is downloadable once it TERMINALIZES with data intact
+# — including a zero-row overlaps_only run (Bug B: the old combined_export_key
+# gate 404'd exactly the honest-empty case; the R2 object is an ops artifact,
+# never served — downloads rebuild from the DB). 'failed' = ALL children failed:
+# nothing was produced, so it stays not-ready (matches the UI's copy).
+_DOWNLOADABLE_STATUSES = ("done", "partial")
+
 
 def _run_response(run: BatchRun) -> BatchRunResponse:
     return BatchRunResponse(
@@ -485,7 +498,8 @@ def _run_response(run: BatchRun) -> BatchRunResponse:
         child_job_ids=list(run.child_job_ids or []),
         excluded_no_date_count=run.excluded_no_date_count or 0,
         failed_children=run.failed_children,
-        combined_export_ready=bool(run.combined_export_key),
+        combined_export_ready=run.status in _DOWNLOADABLE_STATUSES,
+        delivery_counts=run.delivery_counts,
         created_at=run.created_at,
         completed_at=run.completed_at,
     )
@@ -536,4 +550,4 @@ async def download_batch_run(
     ).scalar_one_or_none()
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
-    return await _stream_run_csv(batch_id, run, batch.fields)
+    return await _stream_run_csv(batch_id, run, batch.fields, batch.delivery_mode or "everything")

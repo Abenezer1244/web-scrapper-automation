@@ -220,9 +220,17 @@ class TestEmptyStateFinalize:
 
 import csv as _csv  # noqa: E402
 import io as _io  # noqa: E402
+from datetime import UTC, datetime  # noqa: E402
 from decimal import Decimal  # noqa: E402
 
+from src.api.tax_filters import tax_cap_min_year  # noqa: E402
 from src.utils.lead_export import write_lead_csv_with_overlap  # noqa: E402
+
+
+def _tax_year_in_window() -> int:
+    """A delinquent_bill_year that PASSES the 18-month tax-delinquent cap — older
+    years are filtered out of the combined export by design (self-scoping cap)."""
+    return tax_cap_min_year(datetime.now(UTC).date())
 
 
 def _render(pairs) -> list[dict]:
@@ -240,12 +248,14 @@ class TestCombinedExportColumns:
             _result(db, user.id, j1.id, party="PROBATE OWNER",
                     property_key="WA|pierce|000000A1")
             # tax_delinquent row: synthetic county date_recorded + real bill_year
-            # + plaintext extras the old SELECT dropped.
+            # + plaintext extras the old SELECT dropped. bill_year must be WITHIN
+            # the 18-month cap or the row is (correctly) filtered out of the export.
+            by = _tax_year_in_window()
             db.add(Result(
                 id=str(uuid.uuid4()), user_id=user.id, job_id=j2.id,
-                date_recorded="01/01/2024",  # synthetic — county tax has no event date
+                date_recorded=f"01/01/{by}",  # synthetic — county tax has no event date
                 party_name="TAX OWNER", property_key="WA|pierce|000000A2",
-                delinquent_bill_year=2024, delinquent_amount=Decimal("1234.56"),
+                delinquent_bill_year=by, delinquent_amount=Decimal("1234.56"),
                 heirs="ESTATE OF X", legal_description="LOT 1 BLK 2", doc_type="TAXLIEN",
             ))
             db.flush()
@@ -253,8 +263,8 @@ class TestCombinedExportColumns:
             db.rollback()
 
         tax = next(r for r in rows if r["party_name"] == "TAX OWNER")
-        assert tax["filed_date"] == ""            # NO fabricated 01/01/2024
-        assert tax["delinquent_bill_year"] == "2024"
+        assert tax["filed_date"] == ""            # NO fabricated 01/01/{year}
+        assert tax["delinquent_bill_year"] == str(by)
         assert tax["delinquent_amount"] == "1234.56"
         assert tax["heirs"] == "ESTATE OF X"
         assert tax["legal_description"] == "LOT 1 BLK 2"
@@ -274,11 +284,12 @@ class TestCombinedExportColumns:
                 date_recorded="06/01/2026", party_name="OWNER", property_key=pk,
                 enrichment_data={"lead_subtype": "probate_death_inheritance"},
             ))
-            # tax row: no subtype, newer job → likely the representative winner
+            # tax row: no subtype, newer job → likely the representative winner.
+            # Cap-safe bill_year so the row isn't filtered by the 18-month cap.
             db.add(Result(
                 id=str(uuid.uuid4()), user_id=user.id, job_id=j2.id,
                 date_recorded="06/02/2026", party_name="OWNER", property_key=pk,
-                delinquent_bill_year=2025,
+                delinquent_bill_year=_tax_year_in_window(),
             ))
             db.flush()
             rows = _render(_combined_pairs(db, user.id, [j1.id, j2.id], delivery_mode="everything"))
@@ -292,7 +303,8 @@ class TestCombinedExportColumns:
 class TestNoSilentTruncation:
     def test_combined_pairs_all_pages_past_the_cap(self, monkeypatch):
         """#2: >EXPORT_CAP deduped leads must NOT be silently truncated. With the
-        cap monkeypatched to 2, three distinct-bucket leads still all come back."""
+        page size monkeypatched to 2, three distinct-bucket leads still all come
+        back via paging (a single bounded query only returns the first 2)."""
         import src.workers.batch_export as be
         monkeypatch.setattr(be, "EXPORT_CAP", 2)
         with SyncSessionLocal() as db:
@@ -302,10 +314,12 @@ class TestNoSilentTruncation:
                 _result(db, user.id, j1.id, party=f"OWNER {i}",
                         property_key=f"WA|pierce|00000C{i}")
             db.flush()
-            capped = be._combined_pairs(db, user.id, [j1.id], delivery_mode="everything")
+            # Explicit limit=2 — the default arg is bound at def-time so the
+            # monkeypatched module constant wouldn't reach it.
+            capped = be._combined_pairs(db, user.id, [j1.id], delivery_mode="everything", limit=2)
             full = be._combined_pairs_all(db, user.id, [j1.id], delivery_mode="everything")
             db.rollback()
-        assert len(capped) == 2           # single query is still page-bounded
+        assert len(capped) == 2           # single bounded query returns one page
         assert len(full) == 3             # paging accumulates every lead
 
 

@@ -52,4 +52,28 @@ as separate columns.
   property + mailing splits. Decide with Codex.
 
 ## Review
-(to fill at end)
+
+### Part A — cross-check verdict
+- Codex `review --base origin/main` on the delivery-step build: **one finding, P2**, and it
+  was the SAME issue Claude self-review flagged → consensus: `SoftTimeLimitExceeded`
+  classified permanent in `_is_retryable_email_error()`, defeating the retry the soft
+  time limit exists for. **Fixed** in commit `1a021fa` (+ regression test). No
+  Critical/High from either reviewer → rest of the build is a GO.
+- Self-review items verified clean: imports (`sa_text`, `ScraperBatch`, `_fail_job`),
+  `trigger="preview"` vs Job.trigger String(32), tenant-scoped dedup-claim DELETE,
+  bounded upload retry, rollback-then-refresh session handling.
+- Known cosmetic (not fixed): batch delivery email reuses the "expires in 48 hours" copy
+  though the batch link is a non-expiring in-app page.
+
+### Part B — feature shipped (commit 94867f8)
+- 4 new columns `mailing_street/city/state/zip` in per-job CSV, Excel, and combined/batch
+  CSV; appended at end (back-compat). JSON/webhook/dialer/skip-trace untouched.
+- Hide-mailing_address now blanks the split columns too (dependent-columns map) — the
+  visibility feature cannot leak the mailing address.
+- Prod address census (read-only, latest 1000 rows): mailing 100% comma-separated →
+  splits cleanly. property_address in recent rows is STREET-ONLY (no city/state/zip in
+  the source data) → property_city/state/zip stay blank for those rows; not a parser
+  issue, a data-availability one. Codex verdict: keep conservative parser (Option A);
+  a validated city-list heuristic is a possible later enhancement.
+- Tests: 136 passed (12 new). DB-fixture tests deliberately NOT run in this worktree
+  (conftest teardown deletes rows; no TEST_DATABASE_URL guard at this commit).

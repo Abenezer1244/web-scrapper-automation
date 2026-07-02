@@ -116,9 +116,12 @@ class TestParsePropertyForDisplay:
 
     def test_no_comma_invalid_state_stays_street_only(self):
         # 'XX' is not a real state code -> do NOT split out a bogus state column.
+        # The trailing bare ZIP still lifts (it validates on its own, 2026-07-01);
+        # the unvalidated 'XX' honestly stays in street.
         out = parse_property_for_display("123 MAIN ST SOMETOWN XX 98101")
-        assert out["street"] == "123 MAIN ST SOMETOWN XX 98101"
-        assert out["state"] is None and out["city"] is None and out["zip"] is None
+        assert out["street"] == "123 MAIN ST SOMETOWN XX"
+        assert out["state"] is None and out["city"] is None
+        assert out["zip"] == "98101"
 
     def test_street_only(self):
         out = parse_property_for_display("123 MAIN ST")
@@ -145,3 +148,66 @@ class TestParsePropertyForDisplay:
     def test_empty_and_none(self):
         assert parse_property_for_display(None)["street"] is None
         assert parse_property_for_display("")["street"] is None
+
+    # ── No-comma fixes (2026-07-01, evidence-backed from prod census) ─────────
+
+    def test_ne_after_street_suffix_is_directional_not_nebraska(self):
+        # REAL prod row shape: '6504 108TH AVE NE 98033' is Kirkland WA — 'NE'
+        # is a grid directional. Emitting state=NE (Nebraska) corrupts a
+        # dialer-authoritative column. street keeps NE; zip lifts; state blank.
+        out = parse_property_for_display("6504 108TH AVE NE 98033")
+        assert out["street"] == "6504 108TH AVE NE"
+        assert out["state"] is None
+        assert out["zip"] == "98033"
+        assert out["city"] is None
+
+    def test_ne_after_punctuated_suffix(self):
+        out = parse_property_for_display("6504 108TH AVE. NE 98033")
+        assert out["state"] is None and out["zip"] == "98033"
+
+    def test_real_nebraska_kept(self):
+        # Pre-state token OMAHA is not a street suffix -> NE is really Nebraska.
+        out = parse_property_for_display("123 MAIN ST OMAHA NE 68102")
+        assert out["state"] == "NE" and out["zip"] == "68102"
+        assert out["street"] == "123 MAIN ST OMAHA"
+
+    def test_city_only_line_goes_to_city_not_street(self):
+        # Snohomish tax mailing bulk file has NO street — 'STANWOOD WA 98292'.
+        # A digitless pre-state chunk is a city; street stays blank.
+        out = parse_property_for_display("STANWOOD WA 98292")
+        assert out == {"street": None, "city": "STANWOOD", "state": "WA", "zip": "98292"}
+
+    def test_city_only_multiword(self):
+        out = parse_property_for_display("MOUNT VERNON WA 98273")
+        assert out["city"] == "MOUNT VERNON" and out["state"] == "WA" and out["zip"] == "98273"
+        assert out["street"] is None
+
+    def test_city_only_nebraska(self):
+        out = parse_property_for_display("OMAHA NE 68102")
+        assert out["city"] == "OMAHA" and out["state"] == "NE"
+
+    def test_general_delivery_not_a_city(self):
+        # Digitless but a postal delivery line -> street, never city.
+        out = parse_property_for_display("GENERAL DELIVERY WA 98292")
+        assert out["city"] is None
+        assert out["street"] == "GENERAL DELIVERY"
+        assert out["state"] == "WA" and out["zip"] == "98292"
+
+    def test_trailing_bare_zip_lifted(self):
+        # REAL prod shapes (King pre-foreclosure/probate): bare zip, no state.
+        out = parse_property_for_display("1420 E PINE ST 98122")
+        assert out["street"] == "1420 E PINE ST" and out["zip"] == "98122"
+        assert out["state"] is None and out["city"] is None
+        out2 = parse_property_for_display("27323 218TH AVE SE 98038")
+        assert out2["street"] == "27323 218TH AVE SE" and out2["zip"] == "98038"
+
+    def test_po_box_number_not_read_as_zip(self):
+        out = parse_property_for_display("PO BOX 98292")
+        assert out["zip"] is None
+        assert out["street"] == "PO BOX 98292"
+
+    def test_no_comma_with_digits_still_street(self):
+        # Unchanged conservative behavior: digits in the chunk -> street, city blank.
+        out = parse_property_for_display("123 MAIN ST SEATTLE WA 98101")
+        assert out["street"] == "123 MAIN ST SEATTLE" and out["city"] is None
+        assert out["state"] == "WA" and out["zip"] == "98101"

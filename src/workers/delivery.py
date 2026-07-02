@@ -78,14 +78,16 @@ def _build_lead_delivery_email(
 
     # Batch deliveries link to the in-app batch page (no expiry); per-job links
     # are 48h presigns. Wrong copy on a batch email erodes trust (Codex P2).
+    # Fragments carry their own full line including indent + trailing newline,
+    # or empty string — so when empty, no stray whitespace line in the template.
     expiry_html = (
-        '<p class="expiry">This download link expires in 48 hours.</p>'
+        "    <p class=\"expiry\">This download link expires in 48 hours.</p>\n"
         if link_expires else ""
     )
     expiry_text = "This link expires in 48 hours.\n\n" if link_expires else ""
     summary_html = (
-        f'<p class="meta" style="margin-top:-16px; margin-bottom:24px;">'
-        f"{html.escape(summary_message)}</p>"
+        f"    <p class=\"meta\" style=\"margin-top:-16px; margin-bottom:24px;\">"
+        f"{html.escape(summary_message)}</p>\n"
         if summary_message else ""
     )
     summary_text = f"{summary_message}\n\n" if summary_message else ""
@@ -120,11 +122,9 @@ def _build_lead_delivery_email(
       <div class="stat-label">Records found</div>
     </div>
 
-    {summary_html}
-    <a href="{html.escape(download_url)}" class="btn">Download {fmt.upper()}</a>
+{summary_html}    <a href="{html.escape(download_url)}" class="btn">Download {fmt.upper()}</a>
 
-    {expiry_html}
-
+{expiry_html}
     <div class="notice" style="font-size:12px; color:#d9b13a; background:#1a1208; border:1px solid #7a4f08; border-radius:8px; padding:12px 16px; margin-bottom:20px; line-height:1.5;">
       {safe_disclaimer}
     </div>

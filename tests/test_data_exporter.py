@@ -133,26 +133,53 @@ def test_export_json_is_valid_and_correct_count(exporter):
     assert len(data) == len(LEAD_RECORDS)
 
 
-def test_export_json_sanitizes_nested_enrichment_strings(exporter):
-    """Formula triggers inside nested objects (enrichment_data) and the
-    phones/emails arrays must be neutralized, not just top-level columns."""
+def test_export_json_is_canonical_no_raw_artifacts(exporter):
+    """JSON now uses the canonical builder: keys are the canonical columns; the
+    raw input artifacts (enrichment_data blob, raw_html_hash) never reach the file.
+    A formula trigger in a canonical field is neutralized by the shared builder."""
     records = [
         {
-            "party_name": "Smith, John",
-            "enrichment_data": {
-                "description": "=cmd|'/c calc'!A1",
-                "nested": {"deep": "+SUM(A1)"},
-            },
-            "emails": ["=HYPERLINK(\"http://evil\")"],
+            "party_name": "=cmd|'/c calc'!A1",
+            "parcel_id": "1234567890",
+            "enrichment_data": {"description": "+SUM(A1)"},
+            "raw_html_hash": "deadbeef",
         }
     ]
-    path = exporter.to_json(records, filename="nested_injection")
+    path = exporter.to_json(records, filename="canonical_json")
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
-    enr = data[0]["enrichment_data"]
-    assert enr["description"].startswith("'"), enr["description"]
-    assert enr["nested"]["deep"].startswith("'"), enr["nested"]["deep"]
-    assert data[0]["emails"][0].startswith("'"), data[0]["emails"][0]
+    keys = set(data[0].keys())
+    assert keys == set(LEAD_CSV_COLUMNS)          # flat canonical schema
+    assert "enrichment_data" not in keys          # no raw blob leaked
+    assert "raw_html_hash" not in keys            # no internal artifact leaked
+    assert data[0]["party_name"].startswith("'")  # formula trigger neutralized
+
+
+def test_export_json_matches_csv_values(exporter):
+    """JSON and CSV are the same builder: identical keys + values per record."""
+    json_path = exporter.to_json(LEAD_RECORDS, filename="parity_json")
+    csv_path = exporter.to_csv(LEAD_RECORDS, filename="parity_csv")
+    with open(json_path, encoding="utf-8") as f:
+        jrows = json.load(f)
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        crows = list(csv.DictReader(f))
+    assert len(jrows) == len(crows)
+    for jrow, crow in zip(jrows, crows, strict=True):
+        assert jrow == crow  # DictReader yields strings; builder emits strings
+
+
+def test_export_json_lean_columns_applied(exporter):
+    """export(fmt='json', columns=lean) trims JSON to the lean per-record-type set."""
+    from src.utils.lead_export import resolve_lead_export_columns
+    lean = resolve_lead_export_columns("probate")
+    path = exporter.export(
+        LEAD_RECORDS, filename="lean_json", fmt="json", columns=lean,
+    )
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    assert set(data[0].keys()) == set(lean)
+    assert "delinquent_amount" not in data[0]  # tax column dropped for probate
+    assert "heirs" in data[0]                   # base column kept
 
 
 def test_export_excel_creates_file(exporter):

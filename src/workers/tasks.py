@@ -13,6 +13,15 @@ from datetime import datetime
 from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
 
+from src.config.constants import (
+    PRIORITY_QUEUE_PLANS,
+    SCRAPE_TRANSIENT_BACKOFF_SECONDS,
+    SCRAPE_TRANSIENT_MAX_RETRIES,
+)
+from src.scrapers.probate import (
+    classify_probate_signal_for_row,
+    should_include_probate_row,
+)
 from src.utils.address_intel import compute_owner_flags
 from src.utils.logger import setup_logger
 from src.workers import app
@@ -54,6 +63,7 @@ from src.workers.tasks_helpers.status import (
     _now,
     _publish_log,
     _redis,
+    _retry_scrape_job,
     _set_status,
 )
 
@@ -336,6 +346,29 @@ def run_scrape_job(self, job_id: str) -> None:
             self.request.scrape_started_at = job.started_at
         except Exception:  # request context unavailable (e.g. direct call) — non-fatal
             pass
+
+        # Execution-time entitlement backstop (audit until ENTITLEMENT_ENFORCEMENT).
+        # Catches API/scheduled/retry/watchdog paths that bypassed create-time checks.
+        # IMPORTANT: runs AFTER the ownership CAS (pending->queued) so that only the
+        # owning worker can act — a duplicate/redelivered task would have returned at
+        # `if not claimed` above and never reach this guard.
+        from src.api.entitlements import ConfigRow, config_run_violation, should_block_run
+        _active = db.execute(
+            select(
+                ScraperConfig.id, ScraperConfig.state, ScraperConfig.county,
+                ScraperConfig.record_type, ScraperConfig.created_at,
+                ScraperConfig.active, ScraperConfig.paused_reason,
+            ).where(ScraperConfig.user_id == job.user_id, ScraperConfig.active)
+        ).all()
+        _violation = config_run_violation(
+            user.plan, config.state, config.county, config.record_type,
+            [ConfigRow(*r) for r in _active],
+        )
+        if should_block_run(_violation, user_id=str(job.user_id), plan=(user.plan or "starter"), context="worker_run"):
+            _publish_log(r, job_id, "error", f"Plan limit — {_violation}", db=db)
+            _fail_job(db, job, r, job_id, f"Plan limit reached: {_violation}")
+            return
+
         # Liveness heartbeat DISABLED (rollback 2026-06-18). The daemon thread shared
         # the worker's small sync connection pool (pool_size=2) with the main work
         # session + _publish_log; during the DB-heavy insert phase the main thread and
@@ -486,15 +519,71 @@ def run_scrape_job(self, job_id: str) -> None:
                     },
                 )
             return
-        except Exception:
+        except Exception as exc:
             _logger.exception("Scraper error for job %s", job_id)
+            # Capture THIS attempt's started_at BEFORE the rollback — rollback
+            # expires ORM attributes, and a re-fetch could return a NEWER attempt's
+            # value. It attempt-scopes BOTH the retry CAS and the terminal fail
+            # below so a stale/superseded attempt never clobbers a live re-claimed
+            # one (Codex P1).
+            attempt_started_at = job.started_at
             # Reconnect DB session if it went stale during long scrape
             try:
                 db.rollback()
             except Exception:
                 pass
+            # Transient portal hiccup (page never rendered, pagination flaked, block
+            # wall, Playwright timeout) → re-queue this job with backoff instead of
+            # permanently failing the whole day's scrape on ONE flaky page. Bounded by
+            # SCRAPE_TRANSIENT_MAX_RETRIES; once exhausted (or a PERMANENT error) we
+            # fall through and fail loud as before. Billing has NOT run at this point,
+            # so a re-run cannot double-bill (guarded inside _retry_scrape_job).
+            from src.scrapers.reliability import is_transient_scrape_error
+            if is_transient_scrape_error(exc):
+                countdown = _retry_scrape_job(
+                    db, job, job_id, attempt_started_at,
+                    max_retries=SCRAPE_TRANSIENT_MAX_RETRIES,
+                    backoffs=SCRAPE_TRANSIENT_BACKOFF_SECONDS,
+                )
+                if countdown is not None:
+                    queue = (
+                        "scrape-priority"
+                        if user.plan in PRIORITY_QUEUE_PLANS
+                        else "scrape"
+                    )
+                    try:
+                        run_scrape_job.apply_async(
+                            args=[job_id], queue=queue, countdown=countdown
+                        )
+                    except Exception:
+                        # Broker publish failed — the row is durably 'pending' with
+                        # retry_count>0 and started_at NULL, which watchdog_stuck_jobs
+                        # re-delivers via its stranded-retry branch (retry_count>0,
+                        # started_at IS NULL) once the row ages past the stuck cutoff.
+                        # Recovery is bounded (not immediate), but no retry is lost.
+                        _logger.warning(
+                            "run_scrape_job retry publish failed for job %s; left "
+                            "'pending' for watchdog re-delivery", job_id, exc_info=True,
+                        )
+                    _publish_log(
+                        r, job_id, "warning",
+                        f"Transient error — retrying in ~{max(1, countdown // 60)} min "
+                        f"(retry {job.retry_count} of {SCRAPE_TRANSIENT_MAX_RETRIES}).",
+                        db=db,
+                    )
+                    _logger.warning(
+                        "Job %s: transient scrape error — re-queued (retry %d/%d, "
+                        "countdown %ds): %s",
+                        job_id, job.retry_count, SCRAPE_TRANSIENT_MAX_RETRIES,
+                        countdown, str(exc)[:200],
+                    )
+                    return
             reason = "Scraper encountered an error — our team has been notified."
-            if _fail_job(db, job, r, job_id, reason):
+            # Attempt-scoped: only fail the job if THIS attempt still owns it
+            # (started_at unchanged). If a newer attempt re-claimed it — or the
+            # retry CAS above no-oped on an ownership change — this no-ops instead
+            # of terminalizing a live newer attempt (Codex P1).
+            if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_started_at):
                 from src.workers.notification_emit import create_notification
                 create_notification(
                     user_id=job.user_id, type="job_failed", job_id=job_id,
@@ -507,6 +596,34 @@ def run_scrape_job(self, job_id: str) -> None:
             return
 
         _publish_log(r, job_id, "success", f"Scrape complete — {len(records)} records found", db=db)
+
+        # ── Phase 3: honest probate output ────────────────────────────────────
+        # Drop LIVING-owner Transfer-on-Death estate-planning deeds unless the
+        # customer opted in (include_living_owner_tod is False = new probate
+        # default; NULL = grandfathered → keep; True = explicit opt-in → keep).
+        # Done ONCE here, before the plan-quota cap / DB insert / in-memory R2
+        # export / counts — all of which derive from `records` — so a filtered
+        # row never reaches persistence, export, dedup, enrichment, billing, or
+        # property membership (the first export is built from this in-memory list,
+        # not persisted rows — Codex). Death-triggered TOD (a recorder comment
+        # carries the death marker) is kept by should_include_probate_row.
+        if config.record_type == "probate" and config.include_living_owner_tod is False:
+            _before_tod = len(records)
+            records = [
+                rec for rec in records
+                if should_include_probate_row(
+                    "probate", False, rec.doc_type,
+                    (rec.enrichment_data or {}).get("comment"),
+                )
+            ]
+            _dropped_tod = _before_tod - len(records)
+            if _dropped_tod:
+                _publish_log(
+                    r, job_id, "info",
+                    f"Excluded {_dropped_tod} living-owner Transfer-on-Death "
+                    "estate-planning record(s) per scraper settings.",
+                    db=db,
+                )
 
         # ── Cap records to user's remaining plan quota ────────────────────────
         if user.records_limit != -1:
@@ -617,6 +734,19 @@ def run_scrape_job(self, job_id: str) -> None:
                 # NULL here); the end-of-job recompute after _run_inline_enrichment
                 # is the authoritative pass once mailing is filled.
                 _owner = compute_owner_flags(rec.property_address, rec.mailing_address)
+                # Honesty label (probate only): tag every probate row with its signal
+                # subtype so a LIVING-owner Transfer-on-Death deed is never delivered
+                # disguised as a death/inheritance lead. New dict (never mutate the
+                # scraper's record); EXCLUDED from source_fingerprint/dedup_hash above,
+                # so labeling cannot affect identity, dedup, or billing.
+                _enrichment = rec.enrichment_data or {}
+                if config.record_type == "probate":
+                    # doc_type-primary, recorder-COMMENT fallback (Skagit stores the
+                    # probate signal in the comment, not doc_type — Codex P2).
+                    _subtype = classify_probate_signal_for_row(
+                        rec.doc_type, _enrichment.get("comment")
+                    )
+                    _enrichment = {**_enrichment, "lead_subtype": _subtype.value}
                 rows.append({
                     "id": str(_uuid.uuid4()),
                     "job_id": job_id,
@@ -629,7 +759,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     "parcel_id": _trunc(rec.parcel_id, 64),
                     "property_address": _trunc(rec.property_address, 512),
                     "mailing_address": _trunc(rec.mailing_address, 512),
-                    "enrichment_data": rec.enrichment_data or {},
+                    "enrichment_data": _enrichment,
                     "raw_html_hash": rec.raw_html_hash,
                     # Migration 062: per-job idempotency key (ON CONFLICT target).
                     "source_fingerprint": _fingerprint,
@@ -754,9 +884,10 @@ def run_scrape_job(self, job_id: str) -> None:
             # return nothing here, so this is a no-op on the normal path.
             owned = db.execute(
                 sa_text(
-                    "SELECT dedup_hash FROM delivered_records WHERE first_job_id = :jid"
+                    "SELECT dedup_hash FROM delivered_records "
+                    "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
                 ),
-                {"jid": job_id},
+                {"jid": job_id, "uid": str(job.user_id)},
             ).fetchall()
             for row in owned:
                 claimed_hashes.add(row.dedup_hash)
@@ -1239,8 +1370,13 @@ def run_scrape_job(self, job_id: str) -> None:
         # Fire-and-forget via Celery so retries happen on the celery queue
         # independently of the scrape job. Non-fatal: webhook failures
         # must never mark the scrape job as errored.
+        from src.config.constants import BUSINESS_FEATURES_PLANS
         webhook_url = deliver_config.get("webhook_url")
-        if webhook_url and object_key:
+        _wh_plan_ok = (user.plan or "starter").lower() in BUSINESS_FEATURES_PLANS
+        if webhook_url and object_key and not _wh_plan_ok:
+            _publish_log(r, job_id, "warning",
+                         "Webhook delivery skipped — requires Business plan", db=db)
+        if webhook_url and object_key and _wh_plan_ok:
             try:
                 from src.workers.webhook_delivery import (
                     build_webhook_payload,

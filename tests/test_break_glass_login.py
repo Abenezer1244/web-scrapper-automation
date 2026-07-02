@@ -36,7 +36,7 @@ def _clear_auth_limits(redis_client) -> None:
 
 async def _register_and_enable_mfa(client: AsyncClient, redis_client, email: str) -> str:
     _clear_auth_limits(redis_client)
-    reg = await client.post("/auth/register", json={"email": email, "password": _PW})
+    reg = await client.post("/auth/register", json={"first_name": "Test", "last_name": "User", "email": email, "password": _PW})
     assert reg.status_code == 201, reg.text
     headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
     setup = await client.post("/auth/mfa/setup", headers=headers)

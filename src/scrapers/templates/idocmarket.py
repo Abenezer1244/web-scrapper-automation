@@ -151,6 +151,13 @@ class IDocMarketScraper(BridgeScraper):
     extraction shared by every iDocMarket county.
     """
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor derived from this template's own _DOC_TYPE_MAP."""
+        from src.scrapers.doc_scope import from_keyword_map
+
+        return from_keyword_map(_DOC_TYPE_MAP, record_type)
+
     def __init__(
         self,
         base_url: str,
@@ -158,6 +165,7 @@ class IDocMarketScraper(BridgeScraper):
         state: str,
         record_types: list[str] | None = None,
         record_type: str | None = None,
+        doc_types: list[str] | None = None,
     ):
         super().__init__()
         self.base_url = base_url.rstrip("/")
@@ -167,6 +175,15 @@ class IDocMarketScraper(BridgeScraper):
         self.active_record_type = record_type or (
             self.record_types[0] if self.record_types else None
         )
+        # Phase B: narrow the client-side keyword filter to an explicit pre-foreclosure
+        # selection (subset of _DOC_TYPE_MAP — registry tokens are an exact partition).
+        # None = legacy/full; unmappable/empty raises (fail-closed).
+        self._doc_type_keyword_override: list[str] | None = None
+        if doc_types is not None and self.active_record_type == "pre_foreclosure":
+            from src.scrapers.doc_types import canonical_tokens_or_raise
+            self._doc_type_keyword_override = canonical_tokens_or_raise(
+                county, state, list(dict.fromkeys(doc_types))
+            )
 
         domain = urlparse(base_url).hostname
         if domain:
@@ -394,7 +411,7 @@ class IDocMarketScraper(BridgeScraper):
                 shown, total,
             )
 
-        keywords = _DOC_TYPE_MAP[active_rt]
+        keywords = self._doc_type_keyword_override or _DOC_TYPE_MAP[active_rt]
 
         records: list[ScrapedRecord] = []
         for item in rows:

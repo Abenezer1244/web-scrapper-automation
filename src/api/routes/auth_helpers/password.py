@@ -115,7 +115,12 @@ async def forgot_user_password(
 
     if user is not None:
         token = _mint_reset_token(user.id)
-        reset_link = f"{settings.FRONTEND_URL}/reset-password?token={token}"
+        # Token in the URL FRAGMENT (#), not the query (?): a fragment is never
+        # sent to a server (RFC 3986 §3.5), so this bearer reset token can't leak
+        # via access logs or the Referer header. The FE reads it from
+        # location.hash (and still accepts the legacy ?token= for links already in
+        # inboxes) and scrubs it from the address bar.
+        reset_link = f"{settings.FRONTEND_URL}/reset-password#token={token}"
         # Queue the email AFTER the response so the Resend call's latency can't
         # distinguish an existing account from a missing one. send_password_
         # reset_email soft-fails internally, so a delivery failure never

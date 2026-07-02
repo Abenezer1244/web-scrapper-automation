@@ -55,9 +55,32 @@ _DOC_TYPES = {
 # Discovered from the live portal on 2026-04-18.
 _DOC_TYPE_CHECKBOX_VALUES = {
     "probate": ["62", "316", "340", "278"],       # DEATH CERT, LACK OF PROBATE, TOD DEED, WILL
-    "pre_foreclosure": ["167", "129", "166", "157", "93"],  # TRUSTEE SALE, LIS PENDENS, DEFAULT, FORECL
+    # IDs verified against the live Clark doc-type modal (2026-06-22): 167=NOTICE OF
+    # TRUSTEE SALE (code NTS), 129=LIS PENDENS (LP), 166=NOTICE OF DEFAULT (NOTDEF),
+    # 157=NOTICE OF FORECLOSURE (NF), 93=FORECLOSURE (FORECL), 257=TRUSTEES SALE (TRSL).
+    # The modal checkboxes ARE load-bearing: selecting them sets the search to those
+    # doc-type codes and the portal filters server-side to exactly those types (verified
+    # live — selecting only "DEF" returned 0 records, not "everything"). 257=TRSL was
+    # previously missing; it is currently an empty category (0 records in the trailing
+    # 6 months — real trustee-sale leads are coded NTS/167), so adding it recovers no
+    # leads today but keeps the set complete if Clark ever files under TRSL.
+    "pre_foreclosure": ["167", "129", "166", "157", "93", "257"],
     "divorce": ["68", "71"],                        # DISSOLUTION, DIVORCE
     "tax_delinquent": ["97"],                       # FEDERAL TAX LIEN
+}
+
+# Verified checkbox-id -> raw portal label (live modal, 2026-06-22). This is the
+# AUTHORITATIVE "what Clark actually selects/collects" map: the portal filters
+# server-side by the selected codes, so collection_scope() derives display from
+# these IDs (NOT the broader client-side _DOC_TYPES allowlist, which can list
+# types that are never selected — e.g. tax selects only 97/FEDERAL TAX LIEN).
+_CHECKBOX_DOC_LABELS = {
+    "62": "DEATH CERTIFICATE", "316": "LACK OF PROBATE AFFIDAVIT",
+    "340": "TRANSFER ON DEATH DEED", "278": "WILL",
+    "167": "NOTICE OF TRUSTEE SALE", "129": "LIS PENDENS", "166": "NOTICE OF DEFAULT",
+    "157": "NOTICE OF FORECLOSURE", "93": "FORECLOSURE", "257": "TRUSTEES SALE",
+    "97": "FEDERAL TAX LIEN",
+    "68": "DISSOLUTION", "71": "DIVORCE",
 }
 
 # Record types where records don't have parcel IDs (e.g., divorce, probate)
@@ -69,12 +92,49 @@ add_scrape_domain("e-docs.clark.wa.gov")
 class ClarkWAScraper(BridgeScraper):
     """Clark County LandmarkWeb scraper — uses Document Type checkbox selection."""
 
-    def __init__(self, record_type: str = "probate"):
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor — Clark selects exact document-type modal checkboxes
+        (labels verified live 2026-06-22). Derived from the CHECKBOX selection
+        (what the portal actually filters to), not the broader client-side
+        allowlist. Recorder holds no divorce decrees."""
+        from src.scrapers.doc_scope import from_keyword_map
+
+        if record_type == "divorce":
+            return None
+        ids = _DOC_TYPE_CHECKBOX_VALUES.get(record_type)
+        if not ids:
+            return None
+        labels = [_CHECKBOX_DOC_LABELS[i] for i in ids if i in _CHECKBOX_DOC_LABELS]
+        if not labels:
+            return None
+        return from_keyword_map(
+            {record_type: labels},
+            record_type,
+            exact=True,
+            note="Selected by exact recorder document-type checkboxes (verified live).",
+        )
+
+    def __init__(self, record_type: str = "probate", doc_types: list[str] | None = None):
         super().__init__()
         self._record_type = record_type
         self._doc_types = _DOC_TYPES.get(record_type, _DOC_TYPES["probate"])
         self._checkbox_values = _DOC_TYPE_CHECKBOX_VALUES.get(record_type, [])
         self._skip_pid = record_type in _NO_PID_RECORD_TYPES
+        # Phase B: narrow to an explicit pre-foreclosure doc-type selection. Clark
+        # filters server-side by checkbox CODE, so narrow self._checkbox_values to the
+        # selected codes; ALSO narrow the client-side defense-in-depth allowlist
+        # (self._doc_types) to the matching labels so both stages stay consistent
+        # (Codex). FAIL-CLOSED: an unmappable/empty explicit selection raises; None =
+        # legacy/full.
+        if doc_types is not None and record_type == "pre_foreclosure":
+            from src.scrapers.doc_types import canonical_tokens_or_raise
+            codes = canonical_tokens_or_raise("clark", "wa", doc_types)
+            self._checkbox_values = codes
+            # Strict index (no `if c in ...` guard): if a registry code ever drifts
+            # out of _CHECKBOX_DOC_LABELS, raise loudly rather than silently shrink
+            # the client allowlist to nothing and drop every row (Codex, fail-closed).
+            self._doc_types = [_CHECKBOX_DOC_LABELS[c] for c in codes]
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         start = datetime.strptime(date_from, "%m/%d/%Y")
@@ -326,10 +386,12 @@ class ClarkWAScraper(BridgeScraper):
 
         _logger.info("Extracted %d rows", len(raw))
 
-        # Clark's portal-side Custom Selection filter is unreliable — the
-        # search returns every document type regardless of what we put in
-        # the textarea. Apply the doc-type filter client-side against the
-        # extracted docType cell to guarantee we only return matching records.
+        # Defense-in-depth doc-type filter. The modal-checkbox path DOES filter
+        # server-side by doc-type code (verified live 2026-06-22 — the portal honors
+        # the selected codes), so this client-side pass is normally redundant. It is
+        # kept deliberately as a guard: the legacy free-text "Custom Selection" textarea
+        # was unreliable, and this also lets is_cancellation_or_admin() drop cured/
+        # cancelled variants the portal would still return for a selected code.
         allowed_types_upper = [t.upper() for t in self._doc_types]
 
         dropped_no_pid = 0

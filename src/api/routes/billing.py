@@ -247,13 +247,14 @@ _PLANS = [
         "price_monthly": 199,
         "price_annual": 1910,  # ~$159/mo, ~20% off
         "records_limit": 1000,
-        # Bullets describe ENFORCED entitlements only. Per-tier county /
-        # record-type gating is the value-metric build (separate phase); until
-        # it ships we do NOT advertise a county cap the backend does not honor.
+        # Bullets describe ENFORCED entitlements only (value-metric build,
+        # docs/pricing-strategy-2026-06.md §4): Pro = 3 counties + the 3 core
+        # distress lists. Premium lists + overlap are a Business feature.
         "features": [
             "1,000 records/month",
-            "All record types",
-            "Skip tracing (phone + email)",
+            "3 counties (your choice)",
+            "Probate, pre-foreclosure & tax-delinquent lists",
+            "Skip tracing (250 included, then $0.08/lookup)",
             "CSV + Excel export",
             "Daily/weekly schedule",
             "Email delivery",
@@ -271,13 +272,13 @@ _PLANS = [
         "records_limit": 5000,
         "features": [
             "5,000 records/month",
-            "All record types",
+            "10 counties (your choice)",
+            "All record types + overlap/intersection",
             "All export formats",
             "All schedules",
-            "Email + Webhook delivery",
+            "Email + Webhook + dialer delivery",
             "Skip tracing (1,000 included)",
             "API access",
-            "5 team members",
         ],
         "stripe_price_id": settings.STRIPE_PRICE_BUSINESS,
         "stripe_price_id_annual": settings.STRIPE_PRICE_BUSINESS_ANNUAL,
@@ -289,12 +290,11 @@ _PLANS = [
         "price_annual": 14390,  # ~$1,199/mo, ~20% off
         "records_limit": -1,
         "features": [
-            "Unlimited records",
-            "All features",
+            "Unlimited counties + records",
+            "All record types + overlap/intersection",
             "Skip tracing (2,000 included)",
-            "Unlimited team members",
             "White-label (coming soon)",
-            "Priority support",
+            "Priority queue + support",
             "Dedicated account manager",
         ],
         "stripe_price_id": settings.STRIPE_PRICE_AGENCY,
@@ -703,6 +703,35 @@ async def stripe_webhook(
 
 # ─── Webhook handlers ─────────────────────────────────────────────────────────
 
+def _alert_billing_gap(reason: str, dedup_key: str, **ctx: object) -> None:
+    """Loudly surface a webhook event that silently dropped payment/entitlement state.
+
+    The handlers below used to ``return`` silently when a Stripe price wasn't in
+    _PRICE_TO_PLAN — so a PAID subscription whose price drifted out of the
+    STRIPE_PRICE_* env (new/changed/legacy price) would never activate the user's
+    plan, with no log or alert. This logs at ERROR with full recovery identifiers
+    (Stripe price/customer/session/subscription ids + our user_id — all non-PII,
+    never email) and fires a deduped ops alert. Defensive: an alerting failure must
+    NEVER propagate — the webhook must still return 200, else Stripe retries an
+    event we already processed. The ops dedup key is per price so one bad price
+    can't spam ops, while the per-occurrence ERROR log keeps every affected user
+    visible. NEVER grants a fallback plan — wrong entitlement is worse than missing.
+    """
+    ctx_str = " ".join(f"{k}={v}" for k, v in ctx.items() if v)
+    _logger.error("billing webhook gap: %s — %s", reason, ctx_str)
+    try:
+        from src.workers.ops_alerts import send_ops_alert
+
+        send_ops_alert(
+            "billing",
+            dedup_key,
+            f"Billing webhook gap: {reason}",
+            f"{reason}\n{ctx_str}\n\nManual recovery may be needed.",
+        )
+    except Exception:  # alerting must never fail the webhook (Stripe would retry)
+        _logger.exception("failed to send billing-gap ops alert (%s)", reason)
+
+
 async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
     """Activate new plan after a successful checkout session."""
     user_id = (data.get("metadata") or {}).get("user_id")
@@ -720,6 +749,18 @@ async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
     plan_info = _PRICE_TO_PLAN.get(price_id)
 
     if not plan_info:
+        # Paid checkout but the price isn't in our plan map — entitlement would be
+        # silently lost. Alert with recovery ids; do NOT grant a fallback plan.
+        _alert_billing_gap(
+            "checkout.session.completed price not in plan map — user PAID but "
+            "plan NOT activated",
+            f"unmapped-price:{price_id}",
+            event=data.get("id"),
+            price_id=price_id,
+            customer=session_customer_id,
+            subscription=subscription_id,
+            user_id=user_id,
+        )
         return
 
     plan_name, records_limit = plan_info
@@ -754,6 +795,12 @@ async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
 
     user.plan = plan_name
     user.records_limit = records_limit
+    # Durable entitlement (migration 077) + end the app-side 7-day trial: a
+    # converted user is no longer "on trial", so expire_trials must not consider
+    # them. subscription["status"] is authoritative (retrieved above).
+    user.stripe_subscription_id = subscription_id
+    user.subscription_status = subscription.get("status")
+    user.trial_ends_at = None
     await db.flush()
 
     # Sprint 7.3: grant referral credit if this is the referee's
@@ -805,15 +852,41 @@ async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
     plan_info = _PRICE_TO_PLAN.get(price_id)
 
     if not plan_info:
+        # Subscription changed to a price we don't map — the plan change would be
+        # silently lost. Alert with recovery ids; do NOT guess a plan.
+        _alert_billing_gap(
+            "customer.subscription.updated price not in plan map — plan change "
+            "NOT applied",
+            f"unmapped-price:{price_id}",
+            price_id=price_id,
+            customer=customer_id,
+        )
         return
 
     plan_name, records_limit = plan_info
     result = await db.execute(select(User).where(User.stripe_customer_id == customer_id))
     user = result.scalar_one_or_none()
-    if user:
-        user.plan = plan_name
-        user.records_limit = records_limit
-        await db.flush()
+    if user is None:
+        # A real plan change for a customer we can't resolve to a user — lost
+        # silently before. Loud warning (no ops page: often a benign unknown
+        # customer, lower severity than a paid-but-unmapped price).
+        _logger.warning(
+            "customer.subscription.updated: no user for stripe_customer_id=%s — "
+            "plan change to %s (limit %s) NOT applied",
+            customer_id, plan_name, records_limit,
+        )
+        return
+    user.plan = plan_name
+    user.records_limit = records_limit
+    # Keep the durable entitlement state in sync (migration 077). An entitled
+    # status ends the app-side trial so expire_trials won't downgrade a payer.
+    user.stripe_subscription_id = data.get("id")
+    user.subscription_status = data.get("status")
+    if data.get("status") in ("active", "trialing"):
+        user.trial_ends_at = None
+    await db.flush()
+    from src.api.entitlements import apply_reconciliation_async
+    await apply_reconciliation_async(db, str(user.id), user.plan)
 
 
 async def _handle_subscription_deleted(data: dict, db: AsyncSession) -> None:
@@ -827,7 +900,12 @@ async def _handle_subscription_deleted(data: dict, db: AsyncSession) -> None:
     if user:
         user.plan = "starter"
         user.records_limit = settings.PLAN_LIMITS["starter"]
+        # Clear the entitlement so any future trial logic treats them as unpaid.
+        user.stripe_subscription_id = None
+        user.subscription_status = "canceled"
         await db.flush()
+        from src.api.entitlements import apply_reconciliation_async
+        await apply_reconciliation_async(db, str(user.id), user.plan)
 
 
 async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:

@@ -1,17 +1,22 @@
 """Shared fixtures for BridgeLeads test suite.
 
 All fixtures use real infrastructure (Postgres, Redis) — no mocks.
-The CI environment sets DATABASE_URL and DATABASE_URL_SYNC to a dedicated
-test database so production data is never touched.
+The suite connects ONLY to TEST_DATABASE_URL; the guard below makes a non-test
+(e.g. production) database connection impossible, so production data is never
+touched even if a shared/synced .env's DATABASE_URL points at prod.
 """
-import os
+# ─── TEST DATABASE SAFETY GUARD (must run before ANY src.* / main import) ────
+# enforce_test_database() validates TEST_DATABASE_URL, pins DATABASE_URL and
+# DATABASE_URL_SYNC to it, and forces ENVIRONMENT="test" — BEFORE src.config.
+# settings (and therefore the DB engine in src.db.session) read the environment.
+# This is the root-cause fix for the 2026-06-29 production-data wipe: it makes it
+# impossible for the suite to connect to a non-test database no matter what a
+# synced .env's DATABASE_URL points at. It also subsumes the old requirement
+# (declare ENVIRONMENT=test before settings import) that crypto._build_fernet()
+# relies on when the suite runs with no FIELD_ENCRYPTION_KEY.
+from tests._db_safety import assert_engine_is_test, enforce_test_database
 
-# Align local test runs with CI (.github/workflows/ci-cd.yml sets ENVIRONMENT=test).
-# settings defaults ENVIRONMENT="production", and crypto._build_fernet() now REFUSES
-# the SECRET_KEY-derived fallback in production/strict mode — so the suite, which
-# runs with no FIELD_ENCRYPTION_KEY, must declare the test environment BEFORE
-# src.config.settings is imported below. setdefault respects an explicit override.
-os.environ.setdefault("ENVIRONMENT", "test")
+enforce_test_database()
 
 import uuid
 
@@ -28,6 +33,15 @@ import src.db.session as _db_session
 from src.api.auth import create_secure_token, hash_password
 from src.config import settings
 from src.db.models import Job, JobLog, PropertyListMembership, Result, ScraperConfig, User
+
+
+def pytest_configure(config):
+    """Final import-time belt: once settings + the module engine exist, confirm
+    the live engine really resolved to the validated test DB before any test (or
+    its destructive teardown) runs. enforce_test_database() above already pinned
+    the env; this catches any path that rebuilt the engine from another source."""
+    assert_engine_is_test(str(_db_session.async_engine.url))
+
 
 # ─── Event loop scope ─────────────────────────────────────────────────────────
 # pytest-asyncio 1.x REMOVED support for redefining the `event_loop` fixture (it
@@ -99,6 +113,11 @@ async def db() -> AsyncSession:
     # installed by _setup_test_engine above, not the original pooled one.
     async with _db_session.AsyncSessionLocal() as session:
         yield session
+        # Belt-and-suspenders: re-verify the live engine is a test DB IMMEDIATELY
+        # before issuing destructive DELETEs. enforce_test_database() already made
+        # a prod connection impossible at import; this is the last line of defence
+        # right at the point of destruction.
+        assert_engine_is_test(str(_db_session.async_engine.url))
         # Clean up in FK-safe order; cascade handles children
         await session.execute(delete(JobLog))
         await session.execute(delete(Result))

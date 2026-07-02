@@ -100,12 +100,20 @@ _AUCTION = re.compile(
     r"(.+?)\s+sell\s+at\s+public\s+auction",
     re.I | re.S,
 )
-# ── Property: "[More] commonly known as: <addr> [Subject to|which is subject…]".
-# Stop at "Subject to" (Quality Loan) OR "which is subject" (North Star) OR section
+# ── Property: "[More] commonly known as[:] <addr> [Subject to|which is subject…]".
+# Stop at "Subject to" (Quality Loan) OR "which is subject" (North Star) OR
+# "The above property is …" (Affinia — without this the boilerplate words before
+# "subject" leak into the address and poison the normalized match key) OR section
 # II, same line or next (a one-line layout would otherwise swallow the deed body).
+# The colon is optional ONLY behind "More commonly known as" (MTC notices say
+# "More commonly known as 1814 FRANKLIN AVE E…" with no colon — live 2026-07-01;
+# requiring it silently dropped the address). Bare "commonly known as" KEEPS the
+# colon requirement: prose like "Federal National Mortgage Association commonly
+# known as Fannie Mae" would otherwise hijack the capture and poison the match key
+# (Codex High, 2026-07-01 review).
 _COMMONLY_KNOWN = re.compile(
-    r"commonly\s+known\s+as\s*:\s*(.+?)"
-    r"(?=\s+(?:which\s+is\s+)?[Ss]ubject\s+to\b|\s+II\.\s|\n\n|\Z)",
+    r"(?:More\s+commonly\s+known\s+as\s*:?|commonly\s+known\s+as\s*:)\s*(.+?)"
+    r"(?=\s+The\s+above\s+property\b|\s+(?:which\s+is\s+)?[Ss]ubject\s+to\b|\s+II\.\s|\n\n|\Z)",
     re.I | re.S,
 )
 # ── Section IV "sum owing on the obligation": two real phrasings —
@@ -122,6 +130,35 @@ _PRINCIPAL_OWING = re.compile(
 _NOTE_AMOUNT = re.compile(r"Note\s+Amount\s*:?\s*\$?([\d,]+\.\d{2})", re.I)
 # ── NOD transmittal date ("by both first class and certified mail on 1/20/2026")
 _NOD_DATE = re.compile(r"certified\s+mail\s+on\s+(\d{1,2}/\d{1,2}/\d{4})", re.I)
+
+# ── King (Queen Anne & Magnolia News) auction layouts use MONTH-NAME dates, which
+# the numeric _AUCTION above misses. Two phrasings seen live:
+#   Affinia: "...will on July 24, 2026, at 9:00 AM sell at public auction located <loc>..."
+#   MTC:     "...will sell at public auction ... on July 24, 2026, 09:00 AM, <loc>..."
+# Capture DATE + TIME (the load-bearing is_valid_nts fields) via the shared
+# "on <month date>[,] [at] <time>" shape. Requiring the trailing TIME keeps this from
+# matching the deed's recording/mailing dates (those carry no time). Tried ONLY when
+# the numeric _AUCTION misses, so Tacoma/Snohomish parsing is unchanged.
+_MONTHS = ("January|February|March|April|May|June|July|August|September|October|"
+           "November|December")
+_MONTH_DATE = rf"(?:{_MONTHS})\.?\s+\d{{1,2}},?\s+\d{{4}}"
+_MONTH_NUM = {m.lower(): i for i, m in enumerate(_MONTHS.split("|"), start=1)}
+_TIME = r"\d{1,2}:\d{2}\s*[AP]\.?M\.?"
+# Both King layouts put the sale DATE + TIME just BEFORE "sell at public auction"
+# (Affinia adjacent: "will on <date>, at <time> sell…"; MTC ~200 chars before:
+# "on <date>, <time>, <loc> … the undersigned Trustee, will sell…"). Requiring the
+# auction verb WITHIN 600 chars after the time ANCHORS the match to the sale so a
+# stray dated timestamp elsewhere in the notice can't be read as the auction (Codex).
+# group(1)=date, group(2)=time. The matched span (group 0) also carries the location.
+_AUCTION_KING = re.compile(
+    rf"\bon\s+({_MONTH_DATE})\s*,?\s*(?:at\s+)?({_TIME})"
+    r"[\s\S]{0,600}?sell\s+at\s+public\s+auction", re.I)
+# Best-effort location within the matched span: Affinia "…located <loc> to the highest";
+# MTC "<time>, <loc>…". Not required for validity/matching.
+_AUCTION_KING_LOC_A = re.compile(r"located\s+(.+?)\s+to\s+the\s+highest", re.I | re.S)
+_AUCTION_KING_LOC_B = re.compile(
+    rf"{_TIME}\s*,\s*(.+?)(?=,\s*to\s+the\s+highest|the\s+undersigned|will\s+sell|$)",
+    re.I | re.S)
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -140,6 +177,18 @@ def _money(pattern: re.Pattern, text: str) -> Decimal | None:
         return Decimal(m.group(1).replace(",", ""))
     except (InvalidOperation, ValueError):
         return None
+
+
+def _truncate(value: str | None, limit: int) -> str | None:
+    """Bound a display-only field to its nts_notices column width (None-safe).
+
+    Never use this on a match/identity field (parcel, ts_number) — a truncated key
+    can silently collide with or false-match a real value; those are nulled/skipped
+    in notice_to_row instead.
+    """
+    if value is None:
+        return None
+    return value[:limit].rstrip() or None
 
 
 def _clean_address(raw: str | None) -> str | None:
@@ -185,6 +234,25 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
             auction_date = am.group(1).strip()
             auction_time = " ".join(am.group(2).split())
             auction_location = loc or None
+
+    # King fallback (month-name dates) — ONLY when the numeric _AUCTION did not match
+    # at all (am is None), so Tacoma/Snohomish behavior is byte-identical even for a
+    # numeric notice whose location drift-guard rejected it (Codex). Date+time are
+    # load-bearing; location (same anchored match) is best-effort.
+    if am is None:
+        km = _AUCTION_KING.search(text)
+        if km:
+            auction_date = " ".join(km.group(1).split()).strip().rstrip(",")
+            auction_time = " ".join(km.group(2).split())
+            # Location from a BOUNDED window around the anchored match (no whole-notice
+            # drift, Codex P3) — extend ~200 chars past the verb to reach Affinia's
+            # "…sell at public auction located <loc> to the highest". Best-effort.
+            span = text[km.start():km.end() + 200]
+            lm = _AUCTION_KING_LOC_A.search(span) or _AUCTION_KING_LOC_B.search(span)
+            if lm:
+                loc = " ".join(lm.group(1).split()).strip().rstrip(".,")
+                if "NOTICE OF TRUSTEE" not in loc.upper() and 0 < len(loc) <= 300:
+                    auction_location = loc
 
     return {
         "ts_number": _first(_TS_NUMBER, text),
@@ -245,17 +313,26 @@ def extract_article_text(notice_html: str) -> str:
 
 
 def _to_date(mdy: str | None) -> date | None:
-    """Parse an M/D/YYYY auction date string to a date; None if unparseable."""
+    """Parse an auction date string to a date; None if unparseable.
+
+    Accepts M/D/YYYY (Tacoma/Snohomish) OR "Month D, YYYY" (King papers).
+    """
     if not mdy:
         return None
     m = re.match(r"\s*(\d{1,2})/(\d{1,2})/(\d{4})\b", mdy)
-    if not m:
-        return None
-    mm, dd, yyyy = (int(g) for g in m.groups())
-    try:
-        return date(yyyy, mm, dd)
-    except ValueError:
-        return None
+    if m:
+        mm, dd, yyyy = (int(g) for g in m.groups())
+        try:
+            return date(yyyy, mm, dd)
+        except ValueError:
+            return None
+    mn = re.match(rf"\s*({_MONTHS})\.?\s+(\d{{1,2}}),?\s+(\d{{4}})", mdy, re.I)
+    if mn:
+        try:
+            return date(int(mn.group(3)), _MONTH_NUM[mn.group(1).lower()], int(mn.group(2)))
+        except (ValueError, KeyError):
+            return None
+    return None
 
 
 def notice_to_row(
@@ -281,17 +358,52 @@ def notice_to_row(
     """
     if not is_valid_nts(parsed):
         return None
+    # ts_number is IDENTITY (the (source, ts_number) upsert key), not display: an
+    # overlong value is parser garbage, and truncating it could collide two distinct
+    # notices under one key — treat it as missing and skip cleanly (Codex 2026-07-01).
+    # Source-specific surrogate logic (King REF-/APN-) runs BEFORE this and already
+    # bounds its keys to 64.
+    if len(parsed["ts_number"]) > 64:
+        return None
     from src.utils.address_intel import address_match_key
 
     auction = _to_date(parsed.get("auction_date"))
-    addr = parsed.get("property_address")
-    norm = address_match_key(addr)
-    # Hash the load-bearing parsed fields so a re-crawl of an unchanged notice is a
-    # no-op and a source/parser change is observable.
+    # Mis-parse detector (live 2026-07-01): on a no-colon layout the colon field
+    # regexes scan to the SAME first colon (e.g. inside "10:00 AM") and assign one
+    # identical boilerplate blob to grantor + beneficiary (usually servicer too, but
+    # grantor==beneficiary alone is already a structural parse failure — Codex
+    # Medium: don't require the servicer to also be present/identical). Null the
+    # poisoned enrichment fields but KEEP the notice (its ts_number/date/address/
+    # parcel still match leads). Length/boilerplate guard so a legitimate short
+    # coincidence survives.
+    grantor = _truncate(parsed.get("grantor"), 512)
+    beneficiary = _truncate(parsed.get("beneficiary"), 255)
+    raw_grantor = parsed.get("grantor")
+    if (
+        raw_grantor is not None
+        and raw_grantor == parsed.get("beneficiary")
+        and (len(raw_grantor) >= 100 or "public auction" in raw_grantor.lower()
+             or "notice is hereby given" in raw_grantor.lower())
+    ):
+        grantor = beneficiary = None
+    # Clamp display-only fields to their nts_notices column widths so one runaway
+    # capture can never abort the whole notice's INSERT again (a live varchar(512)
+    # error lost a notice). parcel is a MATCH key — a truncated parcel could
+    # false-match a real lead, so an overlong one becomes None instead.
+    addr = _truncate(parsed.get("property_address"), 512)
+    norm = _truncate(address_match_key(addr), 512)
+    parcel = parsed.get("parcel")
+    if parcel and len(parcel) > 64:
+        parcel = None
+    trustee = _truncate(parsed.get("trustee"), 255)
+    # Hash the load-bearing STORED values (post-clamp/null — Codex Low: hashing the
+    # raw parsed values made discarded garbage churn raw_hash even when the stored
+    # row was unchanged) so a re-crawl of an unchanged notice is a no-op and a
+    # source/parser change is observable.
     payload = "|".join(
-        str(parsed.get(k) or "")
-        for k in ("ts_number", "auction_date", "property_address", "trustee",
-                  "beneficiary", "principal_owing", "parcel")
+        str(v or "")
+        for v in (parsed["ts_number"], parsed.get("auction_date"), addr, trustee,
+                  beneficiary, parsed.get("principal_owing"), parcel)
     )
     raw_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return {
@@ -299,19 +411,19 @@ def notice_to_row(
         "ts_number": parsed["ts_number"],
         "county": county,
         "state": STATE,
-        "parcel": parsed.get("parcel"),
+        "parcel": parcel,
         "property_address": addr,
         "property_address_normalized": norm,
         "auction_date": auction,
-        "auction_time": parsed.get("auction_time"),
-        "auction_location": parsed.get("auction_location"),
-        "grantor": parsed.get("grantor"),
-        "trustee": parsed.get("trustee"),
-        "beneficiary": parsed.get("beneficiary"),
+        "auction_time": _truncate(parsed.get("auction_time"), 16),
+        "auction_location": _truncate(parsed.get("auction_location"), 512),
+        "grantor": grantor,
+        "trustee": trustee,
+        "beneficiary": beneficiary,
         "principal_owing": parsed.get("principal_owing"),
         "note_amount": parsed.get("note_amount"),
-        "nod_date": parsed.get("nod_date"),
-        "source_url": source_url,
+        "nod_date": _truncate(parsed.get("nod_date"), 32),
+        "source_url": _truncate(source_url, 512),
         "raw_hash": raw_hash,
         "is_active": bool(auction and auction >= today),
     }

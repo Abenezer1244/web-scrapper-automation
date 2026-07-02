@@ -43,6 +43,31 @@ def _to_mmddyyyy(date_str: str) -> str:
     return date_str  # Return as-is if nothing works
 
 
+def _ordered_window(date_from: str, date_to: str) -> tuple[str, str]:
+    """Never hand a scraper an inverted (date_from > date_to) window.
+
+    An inverted range reaches county portals as garbage — empty results or a
+    portal error — and is silently passed through downstream (the max-days trim
+    only fires when a range is too LONG, never on negative days). Collapse an
+    inverted window to a single day at date_to: the safe "nothing to scrape up to
+    date_to" reading for a since_last_run same-day rerun, the starter 7-day-delay
+    edge, or a backwards custom range that slipped past API validation (legacy
+    rows / direct DB edits). Unparseable strings are returned untouched.
+    """
+    try:
+        d0 = datetime.strptime(date_from, "%m/%d/%Y").date()
+        d1 = datetime.strptime(date_to, "%m/%d/%Y").date()
+    except (ValueError, TypeError):
+        return date_from, date_to
+    if d0 > d1:
+        _logger.warning(
+            "date range inverted (%s > %s) — collapsing to single day %s",
+            date_from, date_to, date_to,
+        )
+        return date_to, date_to
+    return date_from, date_to
+
+
 def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: str | None = None, user_plan: str = "starter", record_type: str | None = None) -> tuple[str, str]:
     """Compute date_from and date_to from a scraper's schedule config.
 
@@ -72,41 +97,68 @@ def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: st
         date_from = schedule.get("date_from", "")
         date_to = schedule.get("date_to", "")
         if date_from and date_to:
-            # Normalize to MM/DD/YYYY — frontend may send YYYY-MM-DD (ISO)
-            return _to_mmddyyyy(date_from), _to_mmddyyyy(date_to)
+            # Normalize to MM/DD/YYYY — frontend may send YYYY-MM-DD (ISO) — and
+            # guard against a backwards custom range slipping through.
+            return _ordered_window(_to_mmddyyyy(date_from), _to_mmddyyyy(date_to))
         # Fall through to rolling_90 if custom dates are missing
 
     if range_mode == "since_last_run":
-        # Look up the last completed job for this scraper config and use
-        # its date range end as our start. If no previous job exists,
-        # fall back to 30 days (not 90 — avoids massive duplicate sets).
+        # Resume the day AFTER the GLOBAL max covered window end (date_to) across
+        # ALL completed runs for this config — NOT the most-recently-FINISHED
+        # job's date_to (Codex P1). A backfill/custom run can finish later while
+        # covering an OLDER window, so keying on finish time (or even a bounded
+        # "recent" scan) would rewind the start and re-scrape months. We compute
+        # the max in Python (see the inner comment for why not Postgres to_date).
+        # Fall back to the latest finish date, then 30 days, when no parseable
+        # date_to exists. The +1 day avoids re-scraping the overlap day.
         from sqlalchemy import select
 
         from src.db.models import Job
         from src.db.session import SyncSessionLocal
         try:
             with SyncSessionLocal() as _db:
-                last_job = _db.execute(
-                    select(Job).where(
-                        Job.scraper_config_id == config_id,
-                        Job.status == "done",
-                        Job.id != job_id,  # exclude current job
-                    ).order_by(Job.finished_at.desc()).limit(1)
-                ).scalar()
-                if last_job and last_job.finished_at:
-                    # Start from the day AFTER the last job finished to
-                    # avoid re-scraping records already in that job's
-                    # results. Without +1 day, every record from the
-                    # overlap day is a guaranteed duplicate.
-                    date_from = last_job.finished_at.date() + timedelta(days=1)
+                _base = (
+                    Job.scraper_config_id == config_id,
+                    Job.status == "done",
+                    Job.id != job_id,  # exclude current job
+                )
+                # Reduce in PYTHON, not via Postgres to_date: this DB runs strict
+                # datetime mode, where to_date('11/31/2026') RAISES instead of
+                # normalizing — one corrupt row would poison the whole aggregate
+                # and silently drop us to the 30-day fallback (Codex). strptime
+                # rejects an invalid calendar date cleanly (that row is skipped,
+                # not fatal). date_to is one tiny column, so loading the config's
+                # done-job set is cheap; no row-scan bound, so the max is GLOBAL.
+                date_tos = _db.execute(
+                    select(Job.date_to).where(*_base, Job.date_to.isnot(None))
+                ).scalars().all()
+                covered_to = None
+                for d_to in date_tos:
+                    try:
+                        parsed = datetime.strptime(d_to, "%m/%d/%Y").date()
+                    except (ValueError, TypeError):
+                        continue  # shaped-but-invalid / junk — skip, don't poison
+                    if covered_to is None or parsed > covered_to:
+                        covered_to = parsed
+                if covered_to is None:
+                    # No parseable date_to on any run → latest finish date.
+                    latest_finish = _db.execute(
+                        select(Job.finished_at)
+                        .where(*_base, Job.finished_at.isnot(None))
+                        .order_by(Job.finished_at.desc())
+                        .limit(1)
+                    ).scalar()
+                    covered_to = latest_finish.date() if latest_finish else None
+                if covered_to is not None:
+                    date_from = covered_to + timedelta(days=1)
                     _logger.info(
-                        "since_last_run: last job %s finished %s, scraping from %s",
-                        last_job.id, last_job.finished_at.date(), date_from,
+                        "since_last_run: resuming from %s (day after max covered window end)",
+                        date_from,
                     )
                 else:
                     date_from = today - timedelta(days=30)
                     _logger.info(
-                        "since_last_run: no previous done job for config_id=%s, defaulting to 30 days",
+                        "since_last_run: no usable previous window for config_id=%s, defaulting to 30 days",
                         config_id,
                     )
         except Exception as exc:
@@ -122,4 +174,4 @@ def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: st
         default_days = _TAX_DELINQUENT_DEFAULT_DAYS if record_type == "tax_delinquent" else 90
         date_from = end_date - timedelta(days=default_days)
 
-    return date_from.strftime("%m/%d/%Y"), end_date.strftime("%m/%d/%Y")
+    return _ordered_window(date_from.strftime("%m/%d/%Y"), end_date.strftime("%m/%d/%Y"))

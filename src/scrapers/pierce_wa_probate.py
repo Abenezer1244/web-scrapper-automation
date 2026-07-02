@@ -20,12 +20,29 @@ from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.scrapers.divorce import orient_divorce_party
 from src.scrapers.enrichment.county_gis import batch_enrich_parcels_gis
 from src.scrapers.preforeclosure import orient_pre_foreclosure_party
+from src.scrapers.probate import orient_probate_party
+from src.scrapers.reliability import TransientScrapeError
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.pierce_wa_probate")
 
 # Register approved domains for SSRF allowlist
 add_scrape_domain("armsweb.co.pierce.wa.us")
+
+# Page-level render/nav retry (Codex-reconciled). A paginated ARMS page can
+# transiently fail to render its "N records found" marker or its Next-page click.
+# Retry a couple times with short backoff; if it still fails while MORE pages
+# remain, raise TransientScrapeError so the worker re-runs the whole job rather
+# than the scraper silently stopping mid-pagination and scoring a PARTIAL scrape
+# as a healthy DONE. Never returns [] / stops early on a transient fault.
+_PAGE_RETRY_ATTEMPTS = 3                       # 1 initial attempt + 2 retries
+_PAGE_RETRY_BACKOFF_MS: tuple[int, ...] = (5_000, 15_000)  # waits between attempts
+# After a Next click, ARMS' "load" event can time out even though the POST already
+# advanced the results page. We confirm the advance via the page-dropdown
+# selectedIndex (polled) and NEVER click Next a second time on an already-advanced
+# page — a double click would skip a full results page (silent partial scrape).
+_PAGE_ADVANCE_POLLS = 5
+_PAGE_ADVANCE_POLL_MS = 1_500
 
 # ─── Patterns ─────────────────────────────────────────────────────────────────
 
@@ -52,6 +69,31 @@ def _strip_arms_plus(value: str | None) -> str | None:
     return _ARMS_PLUS.sub(" ", value).strip() or None
 
 
+# ARMS party-role markers: "[R]" (reverse/primary party) and "[E]" (associated/
+# estate party). They label a name — they are NEVER a name themselves. A cell that
+# carries only a marker (e.g. an "[E]" with no associated name indexed) must NOT
+# become a lead named "[E]".
+_ARMS_ROLE_MARKER = re.compile(r"\[(?:R|E)\]", re.IGNORECASE)
+
+
+def _clean_arms_name(value: str | None) -> str | None:
+    """Return a real party name, or None when the value carries no actual name.
+
+    Strips ONLY the ARMS role markers ("[R]", "[E]") and the "(+)" more-parties
+    marker (never arbitrary bracketed text — a real name may legitimately contain
+    brackets). A value that reduces to no alphabetic character (a bare marker such
+    as "[E]", punctuation, or empty) is treated as no-name and returns None.
+    """
+    if not value:
+        return None
+    cleaned = _ARMS_ROLE_MARKER.sub(" ", value)
+    cleaned = _ARMS_PLUS.sub(" ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    if not any(c.isalpha() for c in cleaned):
+        return None
+    return cleaned
+
+
 class PierceWAARMSScraper(BridgeScraper):
     """Pierce County ARMS Web portal scraper — supports multiple record types.
 
@@ -74,20 +116,44 @@ class PierceWAARMSScraper(BridgeScraper):
         },
     }
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor — Pierce selects exact ARMS document-type checkboxes."""
+        from src.scrapers.doc_scope import CollectionScope, DocTypeItem
+
+        if record_type not in cls.RECORD_TYPE_CONFIG:
+            return None
+        _LABELS = {
+            "probate": ["Probate"],
+            "pre_foreclosure": [
+                "Notice of Default", "Notice of Foreclosure",
+                "Lis Pendens", "Notice of Trustee Sale",
+            ],
+            "divorce": ["Decree of Dissolution"],
+        }
+        labels = _LABELS.get(record_type)
+        if labels is None:
+            return None
+        return CollectionScope(
+            kind="document_type",
+            items=tuple(DocTypeItem(label=lbl, exact=True) for lbl in labels),
+            note="Selected by exact recorder document-type checkboxes.",
+        )
+
     def __init__(self, record_type: str = "probate", doc_types: list[str] | None = None):
         super().__init__()
         self._record_type = record_type
         cfg = self.RECORD_TYPE_CONFIG.get(record_type, self.RECORD_TYPE_CONFIG["probate"])
         self.DOC_TYPE_IDS: list[str] = cfg["ids"]
         self.DOC_TYPE_LABEL: str = cfg["label"]
-        # Phase 2b: narrow to selected canonical doc types' ARMS checkbox IDs when
-        # an explicit selection was made (None = legacy full set). Validated at
-        # config-create; empty/unmappable falls back to legacy (more, never nothing).
-        if doc_types and record_type == "pre_foreclosure":
-            from src.scrapers.doc_types import canonical_tokens_for
-            _ids = canonical_tokens_for("pierce", "wa", doc_types)
-            if _ids:
-                self.DOC_TYPE_IDS = _ids
+        # Phase 2b/B: narrow to selected canonical doc types' ARMS checkbox IDs when
+        # an explicit selection was made (None = legacy full set). FAIL-CLOSED: an
+        # explicit selection that can't be mapped (stale config) RAISES rather than
+        # silently broadening to the full set — the user must never get types they
+        # didn't pick.
+        if doc_types is not None and record_type == "pre_foreclosure":
+            from src.scrapers.doc_types import canonical_tokens_or_raise
+            self.DOC_TYPE_IDS = canonical_tokens_or_raise("pierce", "wa", doc_types)
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         _logger.info("Pierce WA %s — scraping %s to %s", self.DOC_TYPE_LABEL, date_from, date_to)
@@ -241,14 +307,28 @@ class PierceWAARMSScraper(BridgeScraper):
         await page.wait_for_load_state("domcontentloaded")
         await page.wait_for_timeout(2_000)
 
-        record_count = await page.evaluate(r"""() => {
+        # Read the "N records found" marker. "0" = genuine empty (search ran);
+        # "unknown" = the marker never rendered, i.e. the page never loaded / was
+        # blocked, so a missing results table must FAIL the job (see
+        # _extract_records) rather than be scored as a healthy 0. If it hasn't
+        # rendered yet the page may just be slow — re-wait and re-read a couple
+        # times before accepting "unknown". No page.reload(): this is an ASP.NET
+        # POST result; reloading triggers a form-resubmit prompt and loses state.
+        _count_js = r"""() => {
             const m = document.body.innerText.match(/(\d+) records found/);
             return m ? m[1] : 'unknown';
-        }""")
-        # Persist for _extract_records: "0" = genuine empty (search ran);
-        # "unknown" = the "N records found" marker never rendered, i.e. the page
-        # never loaded / was blocked, so a missing results table must FAIL the
-        # job rather than be scored as a healthy 0.
+        }"""
+        record_count = await page.evaluate(_count_js)
+        for attempt in range(1, _PAGE_RETRY_ATTEMPTS):
+            if record_count != "unknown":
+                break
+            wait_ms = _PAGE_RETRY_BACKOFF_MS[min(attempt - 1, len(_PAGE_RETRY_BACKOFF_MS) - 1)]
+            _logger.warning(
+                "Record-count marker not rendered (attempt %d/%d) — waiting %dms, re-reading",
+                attempt, _PAGE_RETRY_ATTEMPTS, wait_ms,
+            )
+            await page.wait_for_timeout(wait_ms)
+            record_count = await page.evaluate(_count_js)
         self._record_count = record_count
         _logger.info("Search: %s records found", record_count)
 
@@ -261,37 +341,108 @@ class PierceWAARMSScraper(BridgeScraper):
         _logger.info("Total pages: %d", page_total)
 
     async def _go_to_next_page(self) -> bool:
-        """Click the Next arrow to go to the next results page."""
+        """Advance to the next results page.
+
+        Returns False ONLY when this is genuinely the last page (no Next button, or
+        the page dropdown says we are on the last option). A transient nav failure
+        while MORE pages remain is retried and then RAISES TransientScrapeError —
+        never a silent ``return False``, which would stop pagination early and score
+        a PARTIAL scrape as a healthy DONE (Codex catch).
+
+        Advance is confirmed via the page-dropdown ``selectedIndex``, NOT the
+        "load" event — ARMS' load can time out even after the POST already advanced
+        the page. We re-check the index before every click and treat an
+        already-moved page as success, so a click whose wait raised is never
+        double-issued — a second click would skip a whole results page (Codex P1).
+        """
         page = self.page
-        try:
-            # ARMS uses input[type=image] with title="Next" for pagination
-            next_btn = page.locator("#OptionsBar1_imgNext")
-            if await next_btn.count() == 0:
-                next_btn = page.locator("input[title='Next']").first
+        # ARMS uses input[type=image] with title="Next" for pagination
+        next_btn = page.locator("#OptionsBar1_imgNext")
+        if await next_btn.count() == 0:
+            next_btn = page.locator("input[title='Next']").first
+        if await next_btn.count() == 0:
+            _logger.info("No next button — last page")
+            return False
 
-            if await next_btn.count() == 0:
-                _logger.info("No next button — last page")
-                return False
+        _idx_js = """() => {
+            const sel = document.getElementById('cphNoMargin_cphNoMargin_OptionsBar1_ItemList');
+            return sel ? sel.selectedIndex : -1;
+        }"""
 
-            # Check if we're on the last page via the page dropdown
-            is_last = await page.evaluate("""() => {
-                const sel = document.getElementById('cphNoMargin_cphNoMargin_OptionsBar1_ItemList');
-                if (!sel) return true;
-                return sel.selectedIndex >= sel.options.length - 1;
-            }""")
-            if is_last:
-                _logger.info("Last page reached")
-                return False
+        async def _page_index() -> int:
+            try:
+                return int(await page.evaluate(_idx_js))
+            except Exception:
+                return -1
 
-            await next_btn.click(timeout=5_000)
-            await page.wait_for_load_state("load")
+        start_idx = await _page_index()
+        opts_len = await page.evaluate("""() => {
+            const sel = document.getElementById('cphNoMargin_cphNoMargin_OptionsBar1_ItemList');
+            return sel ? sel.options.length : 1;
+        }""")
+        # Positive last-page confirmation only: dropdown readable AND on the last
+        # option → genuinely done, not a failure.
+        if start_idx >= 0 and start_idx >= opts_len - 1:
+            _logger.info("Last page reached")
+            return False
+        # A Next control exists but the page-index dropdown did not render
+        # (start_idx == -1): we CANNOT prove this is the last page. Treat it as a
+        # transient render failure (the worker retries the whole job) instead of
+        # silently stopping mid-pagination and under-delivering (Codex P2). A
+        # genuine single-page result renders a 1-option dropdown (index 0, caught
+        # above), so this only fires on a real render glitch with more pages behind.
+        if start_idx < 0:
+            raise TransientScrapeError(
+                "pierce", "arms",
+                "next control present but page-index dropdown did not render — "
+                "cannot confirm last page (prevented a silent partial scrape)",
+                record_type=self._record_type,
+            )
+
+        last_exc: Exception | None = None
+        for attempt in range(1, _PAGE_RETRY_ATTEMPTS + 1):
+            # Never click if the page already advanced (a prior attempt's click may
+            # have landed even though its wait raised) — re-clicking skips a page.
+            if await _page_index() > start_idx:
+                break
+            try:
+                await next_btn.click(timeout=5_000)
+            except Exception as exc:
+                last_exc = exc
+                _logger.warning(
+                    "Next-page click attempt %d/%d failed: %s",
+                    attempt, _PAGE_RETRY_ATTEMPTS, str(exc)[:80],
+                )
+            # Confirm the advance via the dropdown index, not the load event.
+            for _ in range(_PAGE_ADVANCE_POLLS):
+                await page.wait_for_timeout(_PAGE_ADVANCE_POLL_MS)
+                if await _page_index() > start_idx:
+                    break
+            if await _page_index() > start_idx:
+                break
+            if attempt < _PAGE_RETRY_ATTEMPTS:
+                wait_ms = _PAGE_RETRY_BACKOFF_MS[
+                    min(attempt - 1, len(_PAGE_RETRY_BACKOFF_MS) - 1)
+                ]
+                await page.wait_for_timeout(wait_ms)
+
+        if await _page_index() > start_idx:
+            try:
+                await page.wait_for_load_state("load")
+            except Exception:
+                pass  # index already confirms the advance; load-settle is best-effort
             await page.wait_for_timeout(2_000)
             _logger.info("Navigated to next page")
             return True
 
-        except Exception as exc:
-            _logger.warning("Next page failed: %s", str(exc)[:60])
-            return False
+        raise TransientScrapeError(
+            "pierce", "arms",
+            "next-page navigation did not advance while more result pages remain "
+            "(prevented a silent partial scrape)",
+            record_type=self._record_type,
+            page=getattr(self, "_page_total", None),
+            context=last_exc,
+        )
 
     async def _fetch_parcels_from_detail(self, records: list[ScrapedRecord]) -> None:
         """Extract parcel IDs from the Legal Description tab on each detail page.
@@ -442,9 +593,11 @@ class PierceWAARMSScraper(BridgeScraper):
             if count == "0":
                 _logger.info("No results table — '0 records found' marker present (genuine empty)")
                 return []
-            raise RuntimeError(
-                f"Pierce ARMS: results table missing and record-count marker is "
-                f"{count!r} (not '0') — search page never loaded / blocked / errored"
+            raise TransientScrapeError(
+                "pierce", "arms",
+                f"results table missing and record-count marker is {count!r} "
+                "(not '0') — search page never loaded / blocked / errored",
+                record_type=self._record_type,
             )
 
         rows = data_table.find_all("tr")
@@ -545,6 +698,21 @@ class PierceWAARMSScraper(BridgeScraper):
                         record.party_name = None  # dropped by the party-name guard below
                     else:
                         record.party_name, record.heirs = oriented
+                elif self._record_type == "probate":
+                    # Probate: ARMS indexes the decedent/estate as [R] (party_name)
+                    # and the heir/personal-rep as [E] (heirs). Route through the
+                    # shared probate orientation so a Certificate-of-Death filing
+                    # agency ("STATE OF WASHINGTON, DEPT OF HEALTH") in the [R] slot
+                    # is stripped and a person-like [E] promoted — the SAME rule the
+                    # other probate scrapers use. Strip the "(+)" marker first. A
+                    # no-op for the common case where [R] is already the decedent;
+                    # (None, None) when neither role is a real person -> dropped by
+                    # the party-name guard below.
+                    party = _strip_arms_plus(record.party_name)
+                    heirs = _strip_arms_plus(record.heirs)
+                    record.party_name, record.heirs = orient_probate_party(
+                        party, heirs, self.DOC_TYPE_LABEL
+                    )
                 break
 
         # Legal description
@@ -593,7 +761,10 @@ class PierceWAARMSScraper(BridgeScraper):
         party_name = None
         heirs = None
 
-        r_match = re.search(r"\[R\]\s*(.+?)(?=\s*\[E\]|$)", full_text)
+        # ``.*?`` (not ``.+?``) so an EMPTY [R] slot ("[R] [E] JONES") captures ""
+        # rather than greedily swallowing the following "[E] JONES" — otherwise the
+        # associated [E] party would be promoted into party_name (Codex).
+        r_match = re.search(r"\[R\]\s*(.*?)(?=\s*\[E\]|$)", full_text)
         if r_match:
             party_name = r_match.group(1).strip()
 
@@ -602,11 +773,11 @@ class PierceWAARMSScraper(BridgeScraper):
             heirs = e_match.group(1).strip()
 
         if not party_name and not heirs:
-            cleaned = full_text.strip()
-            if cleaned:
-                party_name = cleaned
+            party_name = full_text.strip() or None
 
-        return party_name, heirs
+        # Reject bare role markers / no-name residue ("[E]" alone must not become a
+        # lead). _clean_arms_name returns None when only markers/punctuation remain.
+        return _clean_arms_name(party_name), _clean_arms_name(heirs)
 
 
 # ─── Record-type-pinned subclasses ───────────────────────────────────────────

@@ -127,6 +127,12 @@ GRANT SELECT, UPDATE ON notifications TO bridgeleads_app;
 -- user's FAILED outbox rows to pending (UPDATE needs SELECT for its WHERE).
 -- INSERT/DELETE stay worker-only.
 GRANT SELECT, UPDATE ON dialer_deliveries TO bridgeleads_app;
+-- pending_registrations (migration 074): the email-verified signup staging
+-- table. The app (register) INSERTs a row; verify SELECTs the row and DELETEs
+-- all sibling rows for the address. Pre-account (no user_id) so it is broad
+-- like users. This is the SECOND allowlisted app DELETE (see the verify block) —
+-- the row is unverified pre-account staging, not tenant data.
+GRANT SELECT, INSERT, DELETE ON pending_registrations TO bridgeleads_app;
 
 -- Converge to least privilege regardless of any prior (over-)grant: GRANT does
 -- not remove privileges an earlier version of this script handed out, so
@@ -151,16 +157,18 @@ REVOKE INSERT, DELETE ON dialer_deliveries FROM bridgeleads_app;
 -- notifications (065): app gets SELECT + UPDATE only; system writes the feed.
 REVOKE INSERT, DELETE ON notifications FROM bridgeleads_app;
 
--- Hard-fail if the app role still holds any DELETE (single allowlisted
--- exception: mfa_backup_codes — see the H1 grant block above), or any write on
--- the read-only / no-app tables — so a stale over-grant cannot survive a rerun.
+-- Hard-fail if the app role still holds any DELETE (allowlisted exceptions:
+-- mfa_backup_codes — H1 grant block; pending_registrations — verify drops the
+-- address's sibling staging rows), or any write on the read-only / no-app
+-- tables — so a stale over-grant cannot survive a rerun.
 DO $verify$
 DECLARE bad int;
 BEGIN
     SELECT COUNT(*) INTO bad FROM information_schema.role_table_grants
     WHERE grantee = 'bridgeleads_app'
       AND (
-        (privilege_type = 'DELETE' AND table_name <> 'mfa_backup_codes')
+        (privilege_type = 'DELETE'
+            AND table_name NOT IN ('mfa_backup_codes', 'pending_registrations'))
         OR (privilege_type IN ('INSERT', 'UPDATE')
             AND table_name IN ('results', 'job_logs', 'county_records', 'referral_events',
                                'property_list_membership'))
@@ -234,6 +242,10 @@ GRANT DELETE ON delivered_records TO bridgeleads_system;  -- upload-failure dedu
 -- H1: operator MFA reset (scripts/reset_user_mfa.py:92, runs via railway worker)
 -- physically DELETEs both MFA tables.
 GRANT DELETE ON mfa_backup_codes, mfa_break_glass_codes TO bridgeleads_system;
+-- pending_registrations (074): the worker dispatcher SELECTs + UPDATEs rows
+-- (outbox send) and the hourly purge DELETEs expired rows. SELECT/UPDATE come
+-- from the ALL TABLES grant above; DELETE is granted explicitly here.
+GRANT DELETE ON pending_registrations TO bridgeleads_system;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_system;
 
 -- ── Role 3: owner / migration role ──────────────────────────────────────────
@@ -262,8 +274,8 @@ COMMIT;
 -- Both roles must be rolsuper=f, rolbypassrls=f:
 SELECT rolname, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole
 FROM pg_roles WHERE rolname LIKE 'bridgeleads_%';
--- bridgeleads_app DELETE rows: expect EXACTLY ONE (mfa_backup_codes — the H1
--- allowlisted exception):
+-- bridgeleads_app DELETE rows: expect EXACTLY TWO (mfa_backup_codes — the H1
+-- allowlisted exception; pending_registrations — verify drops sibling staging rows):
 SELECT grantee, table_name, privilege_type
 FROM information_schema.role_table_grants
 WHERE grantee = 'bridgeleads_app' AND privilege_type = 'DELETE';

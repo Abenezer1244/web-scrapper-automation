@@ -15,13 +15,13 @@ import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
-from sqlalchemy import text, update
+from sqlalchemy import select, text, update
 
 from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
 from src.db.models import BatchRun, Job, ScraperBatch
 from src.utils.crypto import decrypt_field
 from src.utils.data_exporter import DataExporter
-from src.utils.lead_export import write_lead_csv_with_overlap
+from src.utils.lead_export import PROBATE_SUBTYPE_AGG_SQL, write_lead_csv_with_overlap
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("worker.batch_export")
@@ -66,6 +66,7 @@ WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
            r.mailing_address, r.phone, r.phone_type, r.email,
            r.property_key, r.is_duplicate,
+           r.enrichment_data->>'lead_subtype' AS lead_subtype,
            sc.record_type, sc.county, j.created_at AS job_created_at,
            COALESCE(r.property_key, r.dedup_hash, 'id:' || r.id::text) AS bucket
     FROM results r
@@ -80,6 +81,7 @@ agg AS (
     SELECT bucket,
            array_agg(DISTINCT record_type ORDER BY record_type) AS matched_record_types,
            count(DISTINCT record_type) AS overlap_count,
+           {PROBATE_SUBTYPE_AGG_SQL},
            array_agg(DISTINCT county ORDER BY county) AS source_counties
     FROM candidates
     GROUP BY bucket
@@ -98,7 +100,7 @@ ranked AS (
 )
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
        rk.mailing_address, rk.phone, rk.phone_type, rk.email,
-       a.matched_record_types, a.overlap_count, a.source_counties
+       a.matched_record_types, a.overlap_count, a.source_counties, a.lead_subtype
 FROM ranked rk
 JOIN agg a ON a.bucket = rk.bucket
 WHERE rk.rn = 1
@@ -288,7 +290,18 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
     # the claim) makes rowcount 0 -> we must NOT overwrite 'cancelled' or deliver.
     # done = all succeeded; failed = ALL children failed; partial = a mix
     # (Codex: 100%-failure must not read as 'partial').
-    total_children = len(run.child_job_ids or [])
+
+    # Configs blocked by tier enforcement were recorded on the run at fan-out time;
+    # they never became child jobs, so child_rows can't see them. Read fresh (avoid
+    # identity-map staleness) and merge so the run reads partial/failed correctly and
+    # blocked configs stay visible in failed_children. Blocked entries have no job_id,
+    # so there's no overlap with the per-child `failed` list.
+    prior_blocked = db.execute(
+        select(BatchRun.failed_children).where(BatchRun.id == run.id)
+    ).scalar() or []
+    failed = prior_blocked + failed
+
+    total_children = len(run.child_job_ids or []) + len(prior_blocked)
     if not failed:
         new_status = "done"
     elif len(failed) >= total_children and total_children > 0:

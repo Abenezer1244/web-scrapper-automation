@@ -95,6 +95,13 @@ class EagleWebScraper(BridgeScraper):
     EagleWeb interface used by 16+ WA counties.
     """
 
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """SHOW descriptor derived from this template's own _DOC_TYPE_MAP."""
+        from src.scrapers.doc_scope import from_keyword_map
+
+        return from_keyword_map(_DOC_TYPE_MAP, record_type)
+
     def __init__(
         self,
         base_url: str,
@@ -103,6 +110,7 @@ class EagleWebScraper(BridgeScraper):
         record_types: list[str] | None = None,
         record_type: str | None = None,
         require_parcel_id: bool | None = None,
+        doc_types: list[str] | None = None,
     ):
         super().__init__()
         self.base_url = base_url
@@ -110,6 +118,18 @@ class EagleWebScraper(BridgeScraper):
         self.state = state
         self.record_types = record_types or []
         self.active_record_type = record_type or (self.record_types[0] if self.record_types else None)
+        # Phase B: narrow the client-side keyword filter to an explicit pre-foreclosure
+        # selection. EagleWeb fetches broadly and keeps rows whose doc-type text matches
+        # this keyword set, so overriding it with the selected canonical types' keywords
+        # restricts output to those types (a SUBSET of legacy — the registry tokens are
+        # an exact partition of _DOC_TYPE_MAP). FAIL-CLOSED: unmappable/empty explicit
+        # selection raises; None = legacy/full.
+        self._doc_type_keyword_override: list[str] | None = None
+        if doc_types is not None and self.active_record_type == "pre_foreclosure":
+            from src.scrapers.doc_types import canonical_tokens_or_raise
+            self._doc_type_keyword_override = canonical_tokens_or_raise(
+                county, state, list(dict.fromkeys(doc_types))
+            )
         # Parcel-ID requirement policy:
         #   - Probate records are estate/name filings (Cert of Death, Letters
         #     Testamentary, Personal Rep Deed, Transfer-on-Death, etc.) that
@@ -155,6 +175,11 @@ class EagleWebScraper(BridgeScraper):
         )
 
         await self.navigate(self.base_url)
+
+        # Step 0: some EagleWeb sites (Spokane) sit behind a Cloudflare managed JS
+        # challenge. It auto-clears for a normal browser in ~15-20s; we just have
+        # to wait for the real page instead of acting on the interstitial.
+        await self._wait_through_cloudflare()
 
         # Step 1: Accept disclaimer (only once)
         await self._accept_disclaimer()
@@ -240,6 +265,84 @@ class EagleWebScraper(BridgeScraper):
         # them inline (county_gis + AI assessor) before saving Result rows.
         _logger.info("EagleWeb complete — %d records (enrichment runs after save)", len(all_records))
         return all_records
+
+    async def _wait_through_cloudflare(self, timeout_s: int = 35) -> None:
+        """Wait for a Cloudflare managed JS challenge to auto-clear after navigate.
+
+        Spokane's EagleWeb sits behind a Cloudflare "Performing security
+        verification" interstitial. It is a managed JS challenge (NOT a CAPTCHA):
+        a normal browser passes it on its own in ~15-20s, so the scraper just has
+        to wait for the real page instead of acting on the interstitial. This is
+        not evasion — no solver, proxy, or spoofing beyond the browser already in
+        use. Detection is state-based (Codex): the challenge is "cleared" only
+        when a positive EagleWeb marker appears, never merely when the CF text is
+        gone. If the challenge escalates to interactive verification (Turnstile),
+        we stop waiting and let the downstream fail-loud path report it honestly
+        (expected on some datacenter IPs). No-op (returns fast) when the first
+        page is already the app — other EagleWeb counties have no CF wall.
+        """
+        saw_challenge = False
+        for _ in range(max(1, timeout_s // 2)):
+            try:
+                title = (await self.page.title()).lower()
+                body = (
+                    await self.page.evaluate(
+                        "() => document.body ? document.body.innerText.slice(0, 400) : ''"
+                    )
+                ).lower()
+            except Exception:
+                await self.page.wait_for_timeout(2_000)
+                continue
+
+            # Escalated to an interactive challenge — cannot auto-clear; bail so
+            # the caller's fail-loud path surfaces it with the CF page body.
+            try:
+                interactive = await self.page.locator(
+                    "iframe[src*='challenges.cloudflare.com'], "
+                    "iframe[title*='challenge' i], input[type='checkbox'][name*='cf' i]"
+                ).count()
+            except Exception:
+                interactive = 0
+            if interactive:
+                _logger.warning(
+                    "Cloudflare interactive challenge present — cannot auto-clear"
+                )
+                return
+
+            on_challenge = (
+                "just a moment" in title
+                or "security verification" in body
+                or "verifying you are" in body
+                or "verify you are human" in body
+            )
+            if on_challenge:
+                saw_challenge = True
+                await self.page.wait_for_timeout(2_000)
+                continue
+
+            # Not on the CF interstitial. If we never saw one, this is a normal
+            # (non-CF) EagleWeb page — proceed immediately. If we did, confirm a
+            # positive app marker before declaring the challenge cleared.
+            if not saw_challenge:
+                return
+            try:
+                cleared = await self.page.locator(
+                    "input[type='submit'][value*='Acknowledge' i], "
+                    "input[type='submit'][value*='Login' i], "
+                    "button:has-text('Login'), a[href*='docSearch']"
+                ).count()
+            except Exception:
+                cleared = 0
+            if cleared or "auditor" in title or "public record" in title:
+                _logger.info("Cloudflare challenge cleared — real page loaded")
+                return
+            await self.page.wait_for_timeout(2_000)
+
+        if saw_challenge:
+            _logger.warning(
+                "Cloudflare challenge did not clear within %ss (likely blocked "
+                "from this IP)", timeout_s,
+            )
 
     async def _accept_disclaimer(self) -> None:
         """Click 'I Acknowledge' disclaimer if present.
@@ -350,6 +453,13 @@ class EagleWebScraper(BridgeScraper):
         # Leave "Search All Types" checked — filter by type during extraction
         _logger.info("Searching all types, will filter '%s' during extraction", record_type)
 
+        # Date-submit state (consumed by _submit_search). When a known date-field
+        # id pair is matched below, _submit_search uses an atomic raw-set+submit
+        # (no blur) so the date window actually posts; an unmatched/fallback
+        # layout leaves ids None and uses the normal click/form.submit path.
+        self._eagleweb_date_field_ids = None
+        self._eagleweb_search_window = (date_from, date_to)
+
         # Fill dates using pressSequentially (simulates real keystrokes).
         # This is critical — fill() doesn't trigger EagleWeb's internal JS
         # event handlers, but pressSequentially does.
@@ -373,22 +483,37 @@ class EagleWebScraper(BridgeScraper):
             filled = False
             for start_id, end_id in [
                 ("RecDateIDStart", "RecDateIDEnd"),
+                # Lewis uses #RecordingDateIDStart (capital R/D). CSS #id and
+                # getElementById are case-sensitive, so the lowercase variant
+                # below never matched it — Lewis fell to the fragile fallback.
+                ("RecordingDateIDStart", "RecordingDateIDEnd"),
                 ("recordingDateIDStart", "recordingDateIDEnd"),
                 ("StartDate", "EndDate"),
             ]:
                 start_el = self.page.locator(f"#{start_id}")
                 end_el = self.page.locator(f"#{end_id}")
                 if await start_el.count() > 0 and await end_el.count() > 0:
-                    # Clear and type start date
+                    # Type the dates into the live input value. This alone is NOT
+                    # enough: clicking the Search button blurs the date field, and
+                    # some EagleWeb date widgets (Lewis's "text calendar", and the
+                    # plain inputs on clallam/thurston) reset .value to their min
+                    # default on blur — so the form then posts the full
+                    # 1848->today range (slow, intermittently bounces) or an empty
+                    # window. When the field ids are known, _submit_search instead
+                    # sets the raw values and submits in ONE JS transaction (no
+                    # blur), which is the reliable path (verified Lewis/thurston/
+                    # clallam). The typing here is harmless belt-and-suspenders.
                     await start_el.click()
                     await start_el.fill("")  # clear first
                     await start_el.press_sequentially(date_from, delay=30)
-                    # Clear and type end date
                     await end_el.click()
                     await end_el.fill("")  # clear first
                     await end_el.press_sequentially(date_to, delay=30)
                     filled = True
-                    _logger.info("Date range typed: %s to %s", date_from, date_to)
+                    self._eagleweb_date_field_ids = (start_id, end_id)
+                    _logger.info(
+                        "Date range entered: %s to %s (#%s)", date_from, date_to, start_id
+                    )
                     break
 
             if not filled:
@@ -457,6 +582,41 @@ class EagleWebScraper(BridgeScraper):
         unlike clicking the submit button which gets stuck on the
         intermediate docSearchPOST.jsp page in headless mode.
         """
+        # Reliable EagleWeb date submit: clicking the Search button blurs the date
+        # field, and these date widgets reset .value to their min default on blur,
+        # so the normal click-submit posts the full 1848->today range (slow,
+        # intermittently bounces to docSearchPOST) or an empty window. When the
+        # date-field ids are known, set the raw values and submit in ONE JS
+        # transaction so no input/change/blur fires before the POST — verified to
+        # post the correct window on Lewis (0->12), thurston (0->38), clallam (1).
+        # Falls through to the normal submit on any failure.
+        if getattr(self, "_eagleweb_date_field_ids", None):
+            start_id, end_id = self._eagleweb_date_field_ids
+            df, dt = self._eagleweb_search_window
+            try:
+                async with self.page.expect_navigation(
+                    url="**/docSearchResults*", timeout=60_000, wait_until="domcontentloaded"
+                ):
+                    await self.page.evaluate(
+                        """(d) => {
+                            const s = document.getElementById(d.s);
+                            const e = document.getElementById(d.e);
+                            s.value = d.a;
+                            e.value = d.b;
+                            const form = s.form || document.querySelector('form');
+                            HTMLFormElement.prototype.submit.call(form);
+                        }""",
+                        {"s": start_id, "e": end_id, "a": df, "b": dt},
+                    )
+                _logger.info("Raw-set+submit reached results: %s", self.page.url)
+                await self.page.wait_for_timeout(2_000)
+                return
+            except Exception as exc:
+                _logger.warning(
+                    "Raw-set+submit did not reach results (%s); using normal submit",
+                    str(exc)[:80],
+                )
+
         try:
             submit = self.page.locator("input[type='submit'][value='Search']")
             if await submit.count() == 0:
@@ -836,7 +996,12 @@ class EagleWebScraper(BridgeScraper):
                                 record.party_name, record.heirs, desc
                             )
                         else:
-                            kws = _DOC_TYPE_MAP.get(active_rt, [])
+                            # Phase B: a narrowed selection overrides the full keyword
+                            # set (subset of legacy); None = legacy/full.
+                            if self._doc_type_keyword_override is not None:
+                                kws = self._doc_type_keyword_override
+                            else:
+                                kws = _DOC_TYPE_MAP.get(active_rt, [])
                             if not _doc_type_matches(doc_upper, kws):
                                 continue  # Skip non-matching doc types
                             excludes = _DOC_TYPE_EXCLUDE.get(active_rt, [])

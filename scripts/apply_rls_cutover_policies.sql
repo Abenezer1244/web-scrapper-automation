@@ -135,6 +135,17 @@ DROP POLICY IF EXISTS users_system ON public.users;
 CREATE POLICY users_system ON public.users
     FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
 
+-- ── pending_registrations (074): email-verified signup STAGING (pre-account, no
+--    user_id) — broad app like users (register INSERT + verify SELECT/DELETE);
+--    system FOR ALL (worker dispatch SELECT/UPDATE + purge DELETE). Grant-gated:
+--    app has no UPDATE grant, system no INSERT grant. ───────────────────────────
+DROP POLICY IF EXISTS pending_registrations_app ON public.pending_registrations;
+CREATE POLICY pending_registrations_app ON public.pending_registrations
+    FOR ALL TO bridgeleads_app USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS pending_registrations_system ON public.pending_registrations;
+CREATE POLICY pending_registrations_system ON public.pending_registrations
+    FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
+
 -- ── county_connectors: app SELECT + INSERT (POST /connectors); system FOR ALL ─
 DROP POLICY IF EXISTS county_connectors_app_read ON public.county_connectors;
 CREATE POLICY county_connectors_app_read ON public.county_connectors

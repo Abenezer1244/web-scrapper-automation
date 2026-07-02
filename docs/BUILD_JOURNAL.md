@@ -45,6 +45,332 @@ blank there; that's data availability, not a parser bug. Also: SQLAlchemy-scheme
 **Pending / Handoff:** batch delivery email reuses "expires in 48 hours" copy though the batch link is a
 non-expiring in-app page (cosmetic). FE: nothing required for the new columns (CSV-only). PR stacked on
 `feat/fields-output-visibility` — merge that first.
+## 2026-07-01 — PR #133 end-to-end verification → live King parser defects found & fixed (PR #134) + prod backfills
+**Built / Shipped:** Verification session for the Pierce/King fixes (PR #133) turned into a live bug hunt.
+Manual King NTS crawl against the brand-new QA Legals 07-01-26.pdf: 3 blocks, **1 notice LOST to a
+varchar(512) INSERT crash, 1 address corrupted**. Root-caused all three defects and shipped **PR #134**
+(squash `a973b80`, CI green, no migrations, api+worker redeployed 16:57): (1) `_AFFINIA_SHAPE` gap
+`{0,200}` too tight for a ~201-char securitization-trust beneficiary ("Wilmington Trust … Series
+2006-5") → gate missed → colon regexes scanned to the first colon (inside "10:00 AM") and captured
+the SAME 810-char boilerplate into grantor/beneficiary/servicer → widened to `{0,800}`/`{0,1000}` (the
+negative lookaheads, not the bounds, exclude colon layouts). (2) `_COMMONLY_KNOWN` leaked "The above
+property is" into the address + normalized match key (a parcel-less notice became unmatchable) → added
+stop phrase. (3) MTC's colon-less "More commonly known as 1814 FRANKLIN AVE E…" dropped the address →
+colon optional ONLY behind "More…" (Codex High: bare "commonly known as" keeps the colon, else prose
+like "…commonly known as Fannie Mae" hijacks the capture — its repro is now a test). Defense-in-depth at
+the shared `notice_to_row` chokepoint: display fields clamped to column widths, parcel>64 → NULL (a
+truncated parcel could false-match at 0.90), ts_number>64 → row skipped (identity never truncated),
+grantor==beneficiary poison detector, raw_hash over STORED values. New real fixture
+`nts_queen_anne_news_2026-07-01.pdf`; 73 tests, zero Pierce/Snohomish regression.
+**Prod repairs (all Codex-gated, dry-run → --apply → read-back verified):** (a) HANSON backfill
+(`scripts/backfill_pierce_probate_legal_repair.py`): both rows (starter+admin) repaired via the same
+pierce_legal_repair guards the pipeline uses — parcel `6779000110`→`6776000110`, addr 2322 BRYCE CANYON
+CT, mailing, `property_key` recomputed, membership merge-moved (PK user_id+record_type+property_key).
+(b) `[E]` junk row deleted (`scripts/cleanup_pierce_probate_junk_party.py`) — Codex P1 was REAL: the row
+anchored 1 `delivered_records.first_result_id`; follow-up consult confirmed delete-with-SET-NULL is the
+designed semantics (claim + billing history retained). Delete required the OWNER connection
+(`DATABASE_URL_MIGRATE`) — `results.DELETE` is revoked from the app role under least-privilege.
+(c) Backfilled the MISSED 06-24 King issue (5 notices, all auction 7/24, via the exact crawler upsert
+path; Codex PASS) → **matcher enriched 2 admin King leads** (RAMIREZ, parcel 7398900940): auction_date
+2026-07-24 + default_amount $300,754.23 + nts ref/trustee — **fix #4 proven end-to-end on prod data**.
+Re-crawl of 07-01 after the fix: **3/3 upserted, 0 errored** (the lost $282k notice landed with parcel
+`025700-0175-09` + clean address).
+**Tried / Decided:** This week's 3 notices legitimately match 0 of the 280 King pre_foreclosure leads
+(no parcel/street overlap — NOD-stage leads vs this week's auctions are different populations); proven
+read-only before touching anything. WALKER confirmed correctly kept-but-empty (no parcel + no legal =
+unactionable by design). DELETE over NULL for the junk row (forward fix never re-emits it; NULL would
+keep a nameless junk lead in UI/exports).
+**Caught & fixed (Codex, 3 rounds):** diff review FAIL → colon-hijack High + detector-too-narrow Medium
++ raw_hash-churn Low, all adopted with tests; script review → rowcount guard before membership move,
+delivered_records anchor preflight.
+**Task 1 + Task 4 COMPLETED (same day, headed-Playwright session):** launched a headed Chromium
+(Playwright, CDP 9333, detached via Start-Process — a Bash-backgrounded launcher gets killed at the
+10-min tool cap and takes the browser with it); the user typed passwords, Claude drove everything
+else. Runs triggered via the app's own `POST /jobs` from the logged-in page context (Bearer token
+from `/api/auth/session`, never left the browser) — the UI itself has no run-existing button (only
+the wizard's "New Run"). Admin `new test pro` job `202e9686`: 3/3 clean rows (no junk names; BERNATH
+= parcel-less, correctly audited "no parcel+legal: 1"; 2 rows fully enriched). Starter `Quick Start`
+job `a79865ef`: 123 scraped → plan-capped 50 → **all 50 duplicates, 0 billed**, "Reused prior
+enrichment for 49 duplicate leads" (no double skip-trace), unactionable audit fired. Tenant isolation
+incidentally proven: admin session POSTing the starter's config id → 404. UI verified on BOTH
+accounts: HANSON renders `6776000110 / 2322 BRYCE CANYON CT, PUYALLUP 98374`, `[E]` gone, King
+RAMIREZ rows show `Jul 24, 2026` + `$300,754.23` in the AUCTION DATE / DEFAULT OWED columns.
+**Failed / Blocked:** First cleanup --apply died on `InsufficientPrivilege` (expected under
+least-privilege) → owner-conn rerun.
+**Pending / Handoff:** Cosmetic: MTC beneficiary swallows "Original Trustee of the Deed of Trust: X"
+(shared `_STOP` lacks that label) — deferred with Codex agreement.
+**Facts learned:** `railway run` executes LOCAL code with prod env — a merged fix can be exercised
+against prod before Railway redeploys (deploy still required for scheduled beat runs). The weekly King
+paper is a NEW PDF every issue — a parser validated on one issue can die on the next; the notice_to_row
+clamps now make that a degraded-field event, not a lost notice. `delivered_records.first_result_id` is
+`ON DELETE SET NULL` by design; the durable dedup claim is (user_id, dedup_hash) and a no-parcel/
+no-address row still gets a dedup_hash via the party+date fallback. `results.DELETE` needs
+`DATABASE_URL_MIGRATE`. nts_notices natural key (source, ts_number) makes issue backfills upsert-safe.
+
+---
+
+## 2026-06-30 — Canary log triage: lag-aware health + EagleWeb date/Cloudflare fixes
+**Context:** User handed a 47-min Railway canary log flagging chelan=degraded, lewis=down, spokane=down, thurston=healthy(0). Worked in isolated worktree `fix/canary-scraper-health` off `origin/main`; Codex consulted on every design + reviewed every diff (all GATE=PASS).
+
+**Built / Shipped (5 commits, branch NOT pushed):**
+- **Lag-aware canary** (`src/workers/scheduler_helpers/health.py`, `58b30ae`+`a266a8a`). Canary probed the current week and marked "0 records = degraded", so data-lagged portals (Chelan AcclaimWeb publishes ~2mo behind, banner "Released through 04/21/2026") false-alarmed. Added Stage-2 historical re-probe: when current week is empty AND connector is non-healthy, re-probe older windows (cheap-first `[(90,83),(270,240)]`, stop at first hit); any hit ⇒ scraper works, empty week is just source lag ⇒ fold into 'healthy'. Runs ONLY for non-healthy connectors (bounds cost), only UPGRADES (a historical-probe error never downgrades). Live-verified clallam recovers via the 270-240d net (90-83d was empty — proved Codex's multi-window insistence).
+- **EagleWeb date fix** (`src/scrapers/templates/eagleweb.py`, `d3efcc6`+`ef576f7`). Lewis 0→12, **Thurston 0→38** (was falsely "healthy 0"), Clallam 1 (no regression).
+- **Spokane Cloudflare wait** (`eagleweb.py`, `bd04528`). `_wait_through_cloudflare()` passes the landing-page managed JS challenge (verified). Groundwork only — see Failed/Blocked.
+
+**Tried / Decided:** Two of my OWN first hypotheses were wrong and live-probes caught them before any code shipped: (1) Chelan "degraded" looked like a Kendo DatePicker id-mismatch — live probe showed it's classic **Telerik `tDatePicker`** (`t-input`), no Kendo at all; my proposed fix would've been a no-op. (2) Lewis looked like a 1-line case-sensitive selector fix (`#recordingDateIDStart` vs live `#RecordingDateIDStart`) — but filling the correct-case id still "reverted". Empirical probe (`input_value()` vs `get_attribute('value')`) then proved the REAL mechanism: press_sequentially DOES set the live `.value`, but clicking Search **blurs the field → the date widget resets `.value` to its min default → POST runs the full 1848→today range** (slow, bounces). Fix: when ids known, set raw values + `HTMLFormElement.submit()` in ONE tick (no blur). Generalizes to all 3 EagleWeb counties. **Chelan deferred** (user decision): hostile Telerik portal (reverts every set incl. the proper `tDatePicker.value(Date)`, no results page) — Phase 1 already hides it gracefully; not worth multi-hour reverse-eng for a 2mo-lagged rural county.
+
+**Caught & fixed (Codex review):** (1) Canary cost P2 — historical re-probe could page through a busy county's whole window; reordered windows cheap-first (7-day first, busy counties exit immediately). (2) **Major P2** — my revert-detection read `get_attribute("value")` (the STATIC HTML attribute, not live `.value`), so it fired for every county; an empirical probe then overturned my whole "widget reverts the value" theory (it's the blur-on-submit, not the typing). Refactored so the atomic raw-set+submit is simply the primary path whenever date-field ids are known. Re-verified all 3 counties; Codex re-review CLEAN.
+
+**Failed / Blocked:** **Spokane end-to-end still blocked.** Landing-page Cloudflare passes, login works, dates enter — but **Cloudflare RE-CHALLENGES the search POST** (`docSearchPOST.jsp`, "Ray ID …") and a POST does not survive the challenge round-trip (retries as GET, search lost). That's CF-solver / GET-search territory (brittle/paid) — user chose NOT to pursue. CF-wait committed as groundwork + honest observability. `tests/test_scraper_edit.py` 16×503 failures are pre-existing/environmental (imports none of the changed files).
+
+**Pending / Handoff:** 👤 Push branch + open PR (not pushed — other Claude sessions active in shared OneDrive repo). 👤 Confirm CF-wait behavior from Railway's datacenter IP (may face a harder challenge than my residential IP; fix degrades honestly to 'down' with a clear log, never false success). ⏭️ Optional: Chelan Telerik scraping; Spokane CF-on-POST.
+
+**Facts learned:** (1) Playwright `locator.get_attribute("value")` returns the STATIC HTML attribute; use `input_value()` for the live control value — they differ after typing. (2) The canary samples 5 random connectors/hour; "0 records" alone ≠ scraper health for lagged sources. (3) EagleWeb date widgets reset on blur — set raw `.value` + `form.submit()` atomically (no blur). (4) Spokane's Cloudflare is a passable managed JS challenge on GET, but re-challenges POST. (5) AcclaimWeb has TWO families: Kendo (Douglas/PendOreille) and classic Telerik `t-input`/`tDatePicker` (Chelan) — don't assume Kendo.
+
+---
+
+## 2026-06-26 — Dashboard recency order + "View" opens the scraper's real records
+**Built / Shipped (frontend-only, bridgeleads-web PR #68 → master):** Two follow-up fixes after the single-Start-run ship, both from user reports on the admin account.
+- **Recency-first scraper list.** The dashboard "Scrapers / Live status" table caps at 8 and sorted by `attentionRank` (running first), so a fresh *completed* scrape sank to the bottom and, at 8 active scrapers, fell off the visible list — the user ran "sno pre" and "didn't see it". Now it sorts by the newest job's `created_at` (fallback `config.created_at`) descending, so a new or re-run scrape is always row 1 and pushes the oldest into "All scrapers". Removed the now-dead `attentionRank` helper.
+- **"View" opens the scraper's ACTUAL records.** Both the dashboard table and the `/scrapers` list linked View to `/scrapers/{id}/records`, which reads the shared `county_records` cache keyed by county (not the config/job). Verified against prod: that cache is **empty** for many counties (snohomish → 0) and stale/unrelated for others (pierce → 647 rows, all `doc_type` NULL), so "View opened but showed no records". Now View → `/results/{latestDoneJob.id}` (the job's real `results` via `GET /jobs/{id}/results`). Live-verified: View on "sno pre" now shows its 3 records (party names, parcels, mailing addrs, phones).
+
+**Tried / Decided:** Root-caused with a read-only prod query (county_records vs results counts) before touching code — the records were never missing, the link pointed at the wrong store. Kept the `county_records` cache page as the fallback for genuinely never-run configs (it IS a county-cache browser); did NOT rip it out. Pure-recency sort per the user's explicit ask (dropped the attention-priority float).
+
+**Caught & fixed (Codex review):** P2 — the View link fell back to the empty cache whenever `doneJob`/`latestDone` was transiently `undefined`, i.e. during the window before the `jobs` query resolves (or on error), which would re-introduce the empty-cache bug for scrapers that HAVE completed runs. Fixed by gating the cache fallback on the jobs query's `isSuccess` (threaded `jobsLoaded` through dashboard page → ScrapersTable → ScraperRow, and added it to the `/scrapers` list); during loading, View routes to the `/results` index instead of the empty cache. Codex re-review came back CLEAN.
+
+**Failed / Blocked:** none. CI green first try; live-verified in prod (recency order correct, View shows records). Headless browse session dropped to about:blank / logged out twice mid-check (re-login fixed it) — screenshots were the reliable verification, not JS evals.
+
+**Facts learned:** `/scrapers/{id}/records` (county_records) and `/results/{job_id}` (results) are DIFFERENT data stores — county_records is a shared, inconsistently-populated county cache; per-user scrape output lives in `results` keyed by `job_id`. For "show me what THIS scraper produced", always use `/results/{job}`. The dashboard's `MAX_ROWS = 8` cap with a "View all N" overflow means ordering matters: recency keeps the user's latest run visible.
+
+---
+
+## 2026-06-26 — Single "Start run": kill the invisible one-off preview path
+**Built / Shipped:** User reported "I scraped and nothing showed on the dashboard." Cross-checked the live DB: the run (`new test pro`, Pierce/probate) actually succeeded — job `daab0414` `done`, 9 records. It was created via **"Run once"** (`POST /scrapers/preview`, shipped same day), which persists the config `active=False`. `GET /scrapers` is active-only, and the dashboard Scrapers table + ACTIVE-scrapers KPI both derive from it, so the run was invisible forever (no run-history page exists). Fix shipped both repos:
+- **Backend PR #128 → main (`493072a`):** deleted `POST /scrapers/preview`; `_build_scraper_config` dropped its `active` param (always `active=True`); removed `JobResponse` import; cleaned stale preview comments (`jobs.py`/`probate.py`); regenerated `schema/openapi.json` (60→59 paths). Test `tests/test_scraper_single_start_run.py`: preview endpoint 404/405; `_build_scraper_config` has no `active` param. Railway auto-deploy (no migration).
+- **Frontend PR #67 → master (bridgeleads-web):** wizard collapsed to one **"Start run"** button (removed "Run once" + dead `handleTestRun`/`testRunLoading`/`previewScraper`); dashboard `["scrapers"]` query now `refetchInterval:5000` (was no polling → a new scraper stayed invisible until refocus); regenerated `lib/api-types.generated.ts` from backend main. Vercel auto-deploy.
+- **Data:** flipped admin's `new test pro` `active=False→True` (frequency `manual`, won't auto-run) so the user's run surfaces.
+
+**Tried / Decided:** My first instinct ("just collapse to Save & run") was wrong — Codex's consult sharpened it: the real defect is that `active` conflated *visible/usable* with *scheduled/recurring*. They're already independent — the dispatcher skips `frequency=="manual"` (`scheduler_helpers/dispatch.py:99`). So the single button creates `active=True` + default `frequency=manual`: visible on the dashboard, run once, never auto-runs unless the user picks a schedule. Avoids surprise recurring billing. Deleted the preview endpoint rather than leaving it dormant (Codex: keeping it preserves the footgun; no tests/callers/external clients depend on it; `POST /jobs` only accepts `manual|test`, never `preview`).
+
+**Failed / Blocked:** none. Both CI suites green first try (BE Test 3m37s; FE drift-check + tsc + lint + build). No force-merge.
+
+**Caught & fixed:** `User.email` is an `EncryptedString` — my reactivation guard's `WHERE email==...` matched nothing; fixed by finding the config by (plaintext) name and decrypting the owner email in Python. Sequenced the cross-repo merge correctly (backend→main first, THEN `gen:api-types` pulls main, commit types, merge frontend) so the frontend drift-check gate passed.
+
+**Pending / Handoff:** none — both deployed. Built in isolated worktrees off origin/main + origin/master (other sessions held `feat/fields-output-visibility` BE / `feat/schedule-day-picker` FE); worktrees removed after merge, branches left intact (no-delete rule).
+
+**Facts learned:** `active` = visible/usable; `schedule.frequency` = recurrence — strictly independent, the dispatcher is the only thing that reads frequency for auto-dispatch (`==manual` → skip). The frontend's `gen:api-types` pulls `schema/openapi.json` from the backend **main** raw URL, so any endpoint change is a strict ordering dependency: merge backend first or the frontend drift gate fails. The conftest `db` fixture teardown deletes ScraperConfig/Job/test-user rows and runs against the prod `.env` locally — tests that must run locally have to avoid the `db` fixture entirely.
+
+---
+
+## 2026-06-25 — Verification-email durability: cross-check → Codex-driven outbox + hardening
+**Built / Shipped:** Cross-checked the login-security build (BE #125/#126, FE #59) independently + with three
+adversarial Codex passes. Build was sound and merge-safe (flag off). Then fixed the real gaps Codex surfaced,
+on `feat/register-email-verification` (worktree `register-email-verify`):
+- **Durable verification-email OUTBOX (`9a41ebd`).** The verification email is the signup critical path, but
+  it could silently never send: `once_per` fails CLOSED on a Redis outage AND the Celery broker IS Redis (so
+  the `.delay` enqueue fails too), `_send` swallowed Resend errors with no retry, and the verified path
+  skipped `release_once`. Root-cause fix = the `pending_registrations` row is the outbox. Register just
+  commits it (migration **075** adds `email_dispatch_state`/`verification_email_sent_at`/`email_attempts`/
+  `next_email_attempt_at` + partial dispatch index) — NO broker/`once_per` in the request path. A 60s beat
+  `dispatch_pending_verification_emails` sends each due row and records the outcome, so a signup made while
+  Redis is down is drained + sent on recovery. Per-row `FOR UPDATE SKIP LOCKED` + non-blocking per-address
+  `pg_try_advisory_xact_lock`; bomb guard over REAL ('sent') sends only — 120s window + 10/day cap; classified
+  retry/backoff (beat = sole retry owner) → 'failed' + ops-alert. Email RAISES on failure; token `exp ==
+  row.expires_at`.
+- **Timing oracle (`2c86840`).** Removing `once_per` from the new-email path left the existing-email path
+  awaiting Redis inline via `_notify_existing_account` → a Redis outage made existing-email hang while
+  new-email returned fast. Now a post-response `BackgroundTask` (verified path returns, so it runs); legacy
+  unchanged (raises 400, already status-enumerable).
+- **Daily-cap retention (`a4d0b6c`).** Successful send bumps `expires_at = now+24h` so a delayed/recovered
+  send gives a fresh window AND the row is retained a real 24h for the rolling cap, purge stays indexed.
+
+**Tried / Decided:** User chose the **durable outbox** over the lighter tactical fix after I flagged the
+broker==Redis fact (during an outage nothing async sends, so only a durable Postgres path survives). Decided
+the tri-state `once_per` was moot (broker==once_per Redis) and dropped it. Kept RLS policies deferred-by-design
+(027 precedent; app roles don't exist pre-cutover). Left two cross-repo items as product decisions (collect
+name-at-verify; token-in-query hardening) — both were explicitly accepted earlier and can't ship backend-only.
+
+**Caught & fixed (Codex review):** per-row `next_email_attempt_at` recheck (concurrent backoff bypass); token
+`math.ceil` (sub-second JWT-vs-row expiry skew); purge `FOR UPDATE SKIP LOCKED` (concurrent same-batch);
+daily-cap retention vs early purge. At-least-once delivery documented (Resend 2.7.0 has no idempotency key).
+
+**Pending / Handoff:** OPS runs migrations **074 + 075** and (when ready) flips `EMAIL_VERIFICATION_ENABLED`;
+the dispatcher beat must run on the worker. Two open product decisions (name-at-verify, token-in-query).
+`tasks/email-verification-preflip-followups.md` has the full status.
+
+**Facts learned:** Celery broker == rate-limit/`once_per` Redis == `settings.REDIS_URL`, so a Redis outage
+takes down the entire async stack at once — durability for any critical email needs a Postgres-backed path,
+not a second Redis. `send_password_reset_email` is itself best-effort fire-and-forget; `deliver_job_email` is
+the codebase's reliable-email pattern (bind, retries, `_is_retryable_email_error`, ops-alert). FastAPI
+`BackgroundTasks` run only when the handler RETURNS, not when it raises.
+
+---
+
+## 2026-06-25 — Login-screen security audit → brute-force lockout fix + enumeration-safe registration
+**Built / Shipped:** Cross-checked the build against a 5-item "Login Screen Security" guide (validate input,
+rate-limit + lockout, hash passwords, generic errors, trusted auth provider), Codex as independent reviewer.
+Items 1/3 already exceed the guide; item 5 = custom auth is sound (keep it). Two real gaps → two PRs:
+- **Fix A — brute-force lockout duration (PR #125, branch `feat/login-lockout-fix`, worktree).** Root cause:
+  `BruteForceProtection` derived the lockout straight from the failure COUNTER, and a plain Redis `INCR`
+  never decays below a threshold — so 5 fat-fingered passwords locked an IP for the counter's ~24h TTL, not
+  the documented 1 min; the progressive 1/5/30-min/24h ladder was fiction (only the `Retry-After` header
+  changed); and because `check()` raises BEFORE `record_failure()`, a single IP froze the count at 5 so the
+  lockout-notification email (threshold 10) never fired. Fix: separate the COUNTER from a short-lived,
+  MONOTONIC LOCK key computed atomically in one Lua script (`_RECORD_FAILURE_LUA`); `check()` reads only the
+  lock; `clear()` wipes both; IP escalates fully, email capped 15 min. No migration.
+- **Fix B — enumeration-safe registration + email verification (PR #126, branch
+  `feat/register-email-verification`, worktree), flag-gated `EMAIL_VERIFICATION_ENABLED` (default false).**
+  Closes the `201+tokens` vs `400` status-code enumeration oracle on `/auth/register`. New-email signups are
+  staged in a new `pending_registrations` table (migration 074); the real `users` row is created only when
+  the emailed single-use link is redeemed at the new `POST /auth/verify-email`, where the user SETS their
+  password and is auto-logged-in. Both register paths return an identical neutral 200.
+
+**Tried / Decided:** Fix B design changed three times under Codex pressure (each a real hole): (1) my first
+plan put a nullable `email_verified_at` on `users` → **account squatting** (attacker pre-creates a real row
+for a victim's email) → switched to a `pending_registrations` table. (2) A single upserted pending row let
+an attacker **overwrite** a victim's pending password → switched to independent rows per attempt. (3) Even
+then, STORING the registrant's password meant an attacker-initiated signup the victim confirms yields an
+attacker-known password (**pre-hijacking**) → moved password-setting to the verify step (user-approved).
+(4) Dropped `ref_code` from the verify flow (attacker self-referral). The cosmetic display-name residual is
+documented + accepted (user-editable, grants no access).
+
+**Failed / Blocked:** `.env` here points at PROD (Upstash/Supabase) and conftest can wipe tables, so the
+real-Redis/Postgres tests could not run locally — verified instead **in-memory against the exact Lua via
+fakeredis+lupa** (Fix A, 11/11) and with synthetic-env smoke tests (Fix B: routes, OpenAPI union, schema
+shapes, token roundtrip, purge wiring). `codex review --base` hangs/quotas on this CLI; used `codex exec`
+streaming instead. Hit a Codex usage-limit mid-session (recovered).
+
+**Caught & fixed (Codex):** Fix A — a P3 sub-second `TTL` floor leaking one early guess (now `ttl >= 0` =
+locked). Fix B — squatting, password-overwrite, trusted-registrant-password (all P1, all fixed); a
+referral-abuse P2 (dropped ref); a P3 referral-collision IntegrityError mishandled as "already verified"
+(narrowed to the `email_hmac` race); a missing **purge** of expired pending rows (added hourly beat task);
+a final **RLS P1** on the public `pending_registrations` table → added `ENABLE ROW LEVEL SECURITY` mirroring
+migration 027. Codex's follow-up "the app role is NOBYPASSRLS" P1 was a **misread of M5's "post-RLS-cutover"
+role table** — refuted with evidence (027 is live with RLS-no-policy on `users` and login still works ⇒
+current role bypasses RLS; `RLS_ENFORCE` default false) and Codex **withdrew it**.
+
+**Pending / Handoff:** **OPS** — Fix A: deploy api+worker (no migration). Fix B: run **migration 074** first,
+then flip `EMAIL_VERIFICATION_ENABLED=true` on api+worker ONLY AFTER the frontend ships. **FRONTEND**
+(separate `bridgeleads-web` repo, not started): register → "check your email" screen; new `/verify-email`
+page that collects + sets the password; `gen:api-types` after #126 merges (register `response_model` is now a
+union). **DEFERRED:** `pending_registrations` needs app/system RLS policies at the non-BYPASSRLS cutover
+(documented in 074, same as all 027 tables).
+
+**Facts learned:** The current prod DB role is **BYPASSRLS**; `bridgeleads_app/system (NOBYPASSRLS)` are the
+**post-cutover** targets gated by `RLS_ENFORCE` (default false) — a new `public` table just needs
+`ENABLE ROW LEVEL SECURITY` (no policy) to lock out the Supabase anon PostgREST API today, with policies
+deferred to the cutover. Auth stack is far beyond a "vibe-coded" login (encrypted email at rest + blind
+index, MFA + break-glass, single-use refresh rotation, password history, timing-safe enumeration). A
+union `response_model` (`TokenResponse | RegisterResponse`) serializes by the returned instance's type.
+
+---
+
+## 2026-06-23 — Phase B: user-selectable pre-foreclosure doc types for ALL healthy counties (SELECT)
+**Built / Shipped:** Turned the wizard's "Document types to scrape" checkbox selector ON for **all 15
+healthy pre_foreclosure counties** (was King/Pierce only). Branch `feat/doctype-select-allcounty`
+(worktree `.claude/worktrees/doctype-select-allcounty`), **stacked on PR #114** (`feat/doc-type-visibility`)
+because Phase B reuses #114's `_CHECKBOX_DOC_LABELS` + `connector_scraper_class` — rebase onto main after
+#114 merges. Backend-only (the FE already renders checkboxes for any county whose `/connectors` returns
+`pre_foreclosure_doc_types`). 6 phases, all Codex-reviewed:
+- **P0 foundation (zero behavior change):** `canonical_tokens_or_raise()` — explicit selections FAIL CLOSED
+  (raise) instead of silently broadening to the full set; King/Pierce migrated; `is not None` gates so a
+  degenerate `[]` also fails closed. Additive `ConnectorResponse.pre_foreclosure_doc_type_method/_confidence`
+  so the UI can honestly distinguish a server-side portal filter (`verified`) from a client-side text match
+  (`keyword`). A wiring **guard test** resolves every selectable county through the REAL registry factory
+  (`partial` for ai-mode, class for manual) and asserts it accepts `doc_types`.
+- **P1 Clark / P2 Skagit (server-side, `verified`):** Clark narrows both the checkbox codes AND the
+  client-side label allowlist; Skagit narrows BOTH its server dropdown searches AND its client refine.
+- **P3 EagleWeb ×8 + P4 Acclaim/iDoc/Laserfiche/Tyler/Whatcom (client-side, `keyword`):** each scraper's
+  keyword set is narrowed to the selection; registry tokens are an EXACT partition of each scraper's
+  `_DOC_TYPE_MAP` (parametrized partition-invariant test → narrowing is always a true subset).
+- **P5:** 58 doc-type tests pass under synthetic env; `schema/openapi.json` hand-edited for the 2 new fields.
+
+**Tried / Decided:** Authoritative scope came from the LIVE `GET /scrapers/connectors` (22 pre_foreclosure
+connectors), NOT migrations (which seed only 3 — connectors were updated out-of-band). Keyword counties are
+`confidence:"keyword"` + still selectable (user choice over server-only). `available` = each county's
+verified portal vocabulary (capability), not a recent-histogram intersection (rare types stay selectable).
+Per-family verification + 2-3 county live spot-checks (user choice). 4 health=down counties
+(chelan/lewis/pacific/spokane) deferred fail-closed.
+
+**Failed / Blocked:** Broad-histogram live recon on the slow Acclaim (douglas) and EagleWeb (clallam) portals
+timed out at 140s — not a code defect; those families rest on production-proven daily scrapes + the
+partition-invariant tests. Snohomish stays single-type (NTS newspaper), no selector.
+
+**Caught & fixed (Codex per phase):** P0 — `[]` truthiness gap (gates → `is not None`); guard test originally
+checked a hand-map not the real resolver. P1 — Clark migration-006 row points at the OLD King subclass, but
+the LIVE active connector already uses `clark_wa.ClarkWAScraper` (verified via direct prod-DB query; the
+migration row is a dead inactive duplicate). P3 — `_EAGLEWEB_TEMPLATE` token DRIFT: had `NOD` (not in scraper
+map → would over-collect) and was missing `NTSCL` (→ would silently drop NTSCL leads); reconciled + locked by
+the partition test. Stale tests asserting kitsap was hidden, fixed. P4 — **Whatcom `foreclosure` selection
+substring-leaked `NOTICE OF FORECLOSURE`** (the only family with both as distinct types) → fixed by matching
+explicit Whatcom selections via exact canonical normalization instead of keyword substring.
+
+**Pending / Handoff:** (1) Merge order: #114 first, then rebase this branch onto main + `gen:api-types` for the
+FE. (2) FE honesty label for `confidence:"keyword"` counties ("matched by document text") — small follow-up.
+(3) Enable the 4 deferred down counties once their portals are live-checkable. (4) SHOW-vs-SELECT panel drift
+(SHOW shows the full family; SELECT narrows) — cosmetic follow-up.
+
+**Facts learned:** ai-mode connectors resolve to a recorder-platform TEMPLATE via `_detect_template(base_url)`
+and the worker constructs them as a `functools.partial(...)` — `inspect.signature(partial)` exposes the unbound
+`doc_types`, so adding it to a template `__init__` is enough for the worker to pass it. okanogan = Tyler
+SelfService (NOT EagleWeb); grant = EagleWeb (its `/grantrecorder/web/` path wins over the tylerhost domain).
+There's a DEAD inactive duplicate `clark` connector row (lowercase `wa`, ai-mode, old King subclass) — always
+query the live DB to confirm a connector's real `scraper_class`; the public endpoint hides it.
+
+---
+
+## 2026-06-23 — Document-type visibility (SHOW) across all counties + record types
+**Built / Shipped:** A customer asked which pre-foreclosure document type we collect per county and why
+most counties (and ALL probate) show no document types in the wizard. Built **SHOW** — read-only
+transparency: every connector reports what it collects per record type. Backend branch
+`feat/doc-type-visibility` (**PR #114**, 10 commits, worktree off origin/main); frontend branch
+`feat/doc-type-show-ui` (**PR #50** in `bridgeleads-web`, off origin/master). Merge backend first, then
+`npm run gen:api-types`, then frontend.
+- **Scraper-owned descriptors** (`src/scrapers/doc_scope.py` + `BridgeScraper.collection_scope()`): each
+  scraper/template derives a `CollectionScope{kind:"document_type"|"dataset", items:[{label,exact}], note}`
+  from its OWN doc-type constants — so display can't drift from what's scraped. Wired into the 7 keyword
+  templates (A2), king/pierce/clark/whatcom/snohomish/skagit (A3), and the 4 dataset scrapers (A4).
+- **API** (A5): `ConnectorResponse.collection_scope_by_record_type`, populated in `list_connectors` via a new
+  non-raising `registry.connector_scraper_class()` (resolves a connector row to its scraper CLASS, reuses the
+  module import allowlist). `schema/openapi.json` HAND-EDITED (mirrors `pre_foreclosure_doc_types`), NOT
+  regenerated — local pydantic version drifts the whole file.
+- **Frontend** (A8): read-only "Documents collected" panel in the wizard CountyStep; `document_type` scopes
+  render badges (approximate keyword items get `~` + tooltip), `dataset` scopes show the source note; hidden
+  where the existing pre_foreclosure SELECT selector already covers it (King/Pierce). Precise local types
+  (`ConnectorWithScope`) bridge the field until `gen:api-types` runs post-merge.
+**Tried / Decided:** Codex pressure-tested the plan FIRST and **rejected my original central-catalog design**
+(it would become a second implementation of scraper behavior and drift). Adopted its scraper-owned-descriptor
+design + honesty rules: broad single-word predicates ("DEATH","TAX") → "X-related filings" (never a precise
+name); cryptic per-county codes (NTS/LETTR/TOD) → explicit "Other … (county-specific codes)" bucket; divorce
+derived from the shared `is_divorce_doc` classifier (NOT the coarse keyword list); datasets → `kind:"dataset"`.
+`eviction` confirmed not a live record type. SHOW kept strictly separate from the SELECT capability so an
+unverified display string can't become a control contract. Coverage test fails on any newly unmapped keyword.
+**Failed / Blocked:** `codex review --base` repeatedly timed out (gpt-5.5 high effort stalling on repo
+exploration) — switched to streaming `codex exec` with an embedded diff, which worked. Frontend `tsc`/`eslint`
+were initially un-runnable: the repo's `node_modules` in this env was an incomplete OneDrive partial-sync (no
+`@types/react`, empty `.bin`); a full `npm install` in the worktree (slow on OneDrive, one timeout) repaired
+it → tsc + eslint then ran clean.
+**Caught & fixed (Codex review):** **P2 — Clark's SHOW scope was dishonest:** it derived from `_DOC_TYPES`
+(the broad client-side allowlist), so tax advertised "Certificate of Delinquency"/"Certificate of Sale" as
+exact, but Clark tax only selects checkbox 97 (Federal Tax Lien) and the portal filters server-side to exactly
+that. Fixed (`85a97af`) by deriving from `_DOC_TYPE_CHECKBOX_VALUES` + a verified id→label map; Codex
+re-confirmed. FE P3 — `dataset` scope with `note:null` rendered a bare heading → content guard.
+**Clark sub-investigation (user: "investigate first"):** Codex flagged a 6-labels-vs-5-checkbox-IDs mismatch.
+Live-verified the portal: root cause = a MISSING checkbox **257 (TRUSTEES SALE)**, not a wrong one. Live runs
+also **disproved an existing comment** that claimed Clark's portal "returns every document type regardless of
+selection" — it actually filters server-side by the selected doc-type codes (selecting only "DEF" returned 0
+records; the OLD 5-set and NEW 6-set both returned 137). Bare `DEFAULT`(66) and `TRUSTEES SALE`(257) are both
+empty categories (0 records / 6 months), so **no production lead loss ever existed**; the fix is correctness/
+completeness. Corrected the false comment (`143ddb9`).
+**Pending / Handoff:** Merge #114 → `gen:api-types` → merge #50 → dogfood FE against live API. Deferred: Clark
+probate/divorce/tax checkbox-code completeness audit (server-side filtering makes the checkbox list load-
+bearing for ALL record types, not just pre_foreclosure); **Phase B (user-selectable doc types beyond
+King/Pierce, county-by-county after live verification)**.
+**Facts learned:** (1) Clark LandmarkWeb's modal checkboxes ARE the primary server-side filter (each maps to a
+short doc-type code: NTS/LP/NF/NOTDEF/FORECL/TRSL); the client-side keyword filter is defense-in-depth, not the
+sole gate. (2) King exposes NTS only (WA non-judicial foreclosures don't record a Notice of Default), Pierce's
+default is NOD — which matches the customer's own "NOD best, then NTS" ranking exactly. (3) `gen:api-types`
+pulls openapi.json from `web-scrapper-automation/main`, so backend must merge before FE types regenerate.
 
 ## 2026-06-22 — Delivery-step deep dive: export / email / webhook / "Run once" (Q1–Q4 from a UX review)
 **Built / Shipped:** A user walked the wizard's Delivery step and asked 4 skeptical questions; each surfaced

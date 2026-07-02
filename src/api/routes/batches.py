@@ -36,6 +36,7 @@ from src.config.constants import (
 )
 from src.db import CountyConnector
 from src.db.models import BatchRun, Job, ScraperBatch, ScraperConfig
+from src.scrapers.probate import new_probate_config_tod_default
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("api.batches")
@@ -190,6 +191,12 @@ async def create_batch(
                     schedule={},   # suppressed — batch owns scheduling
                     deliver={},    # suppressed — batch owns delivery
                     skip_trace_enabled=body.skip_trace_enabled,
+                    # Phase 3: probate children get the new TOD default (False) or the
+                    # batch-level opt-in; non-probate children leave the flag NULL.
+                    include_living_owner_tod=(
+                        new_probate_config_tod_default("probate", body.include_living_owner_tod)
+                        if rt == "probate" else None
+                    ),
                 )
             )
     # Durable dispatch intent (Track A): create the BatchRun 'pending' in the SAME
@@ -367,16 +374,27 @@ async def get_batch(
             .order_by(ScraperConfig.county, ScraperConfig.record_type)
         )
     ).all()
+    blocked_config_ids = {
+        e["config_id"]
+        for e in ((run.failed_children if run else None) or [])
+        if isinstance(e, dict) and e.get("config_id")
+    }
     children = []
     for cid, county, record_type in config_rows:
         job = job_by_config.get(cid)
+        if job:
+            child_status = job[1]
+        elif cid in blocked_config_ids:
+            child_status = "failed"  # blocked by plan limits (see failed_children)
+        else:
+            child_status = "pending"
         children.append(
             BatchChildSummary(
                 config_id=cid,
                 county=county,
                 record_type=record_type,
                 job_id=job[0] if job else None,
-                status=job[1] if job else "pending",
+                status=child_status,
                 record_count=job[2] if job else 0,
             )
         )

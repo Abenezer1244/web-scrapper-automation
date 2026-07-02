@@ -144,6 +144,17 @@
               "property_address": true
             }
           },
+          "include_living_owner_tod": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Include Living Owner Tod"
+          },
           "name": {
             "anyOf": [
               {
@@ -170,8 +181,10 @@
             "default": {
               "date_range_mode": "rolling_90",
               "frequency": "manual",
+              "run_at_day_of_month": 1,
               "run_at_hour": 6,
-              "run_at_minute": 0
+              "run_at_minute": 0,
+              "run_at_weekday": 0
             }
           },
           "skip_trace_enabled": {
@@ -753,6 +766,18 @@
             "title": "Base Url",
             "type": "string"
           },
+          "collection_scope_by_record_type": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collection Scope By Record Type"
+          },
           "county": {
             "title": "County",
             "type": "string"
@@ -798,6 +823,28 @@
               }
             ],
             "title": "Max Date Range Days"
+          },
+          "pre_foreclosure_doc_type_confidence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pre Foreclosure Doc Type Confidence"
+          },
+          "pre_foreclosure_doc_type_method": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pre Foreclosure Doc Type Method"
           },
           "pre_foreclosure_doc_types": {
             "anyOf": [
@@ -977,6 +1024,143 @@
           }
         },
         "title": "DeliverConfig",
+        "type": "object"
+      },
+      "DeliverUpdate": {
+        "additionalProperties": false,
+        "description": "Deliver payload for PATCH /scrapers/{id} (edit). SHAPE-ONLY: every field is\nlenient here because the route re-validates the merged result by constructing a\nfull DeliverConfig (single source of delivery validation). Two reasons this is\na dedicated model and not DeliverConfig:\n\n1. Secret preservation — webhook_secret / dialer_webhook_secret /\n   phoneburner_access_token are write-only (GET redacts them to *_set bool\n   flags). On edit, omitted / null / blank means \"keep the stored secret\", a\n   non-blank value means \"replace\". DeliverConfig's min-length + cross-field\n   (require_connector_credentials) validators would wrongly reject a blank\n   \"keep\" token, so they must NOT run until the route has injected the stored\n   secrets back in.\n2. The frontend pre-fills the edit form from GET, whose deliver dict carries\n   the write-only readback flags (webhook_secret_set, …). Those are declared\n   below (and excluded from model_dump so they never reach DeliverConfig) so\n   echoing them back is accepted — while extra=\"forbid\" still rejects any OTHER\n   unknown key. That matters because this is a REPLACE-whole payload: a silent\n   typo like \"webhook_ur\" would otherwise drop the real webhook_url + its secret\n   (Codex). A misspelled field 422s instead.",
+        "properties": {
+          "dialer_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dialer Type"
+          },
+          "dialer_webhook_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dialer Webhook Secret"
+          },
+          "dialer_webhook_secret_set": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dialer Webhook Secret Set"
+          },
+          "dialer_webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dialer Webhook Url"
+          },
+          "emails": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10,
+            "title": "Emails",
+            "type": "array"
+          },
+          "formats": {
+            "default": [
+              "csv"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 5,
+            "title": "Formats",
+            "type": "array"
+          },
+          "phoneburner_access_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phoneburner Access Token"
+          },
+          "phoneburner_access_token_set": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phoneburner Access Token Set"
+          },
+          "phoneburner_owner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phoneburner Owner Id"
+          },
+          "webhook_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Secret"
+          },
+          "webhook_secret_set": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Secret Set"
+          },
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url"
+          }
+        },
+        "title": "DeliverUpdate",
         "type": "object"
       },
       "EnrichmentConfig": {
@@ -1711,6 +1895,26 @@
         "title": "PhoneContact",
         "type": "object"
       },
+      "ProfileUpdate": {
+        "additionalProperties": false,
+        "description": "Editable profile fields — used by BOTH Settings>Account and the\nrequired-name gate. first_name + last_name are REQUIRED (non-empty after\nsanitization) so this endpoint is how an incomplete-profile user satisfies\nthe gate. Sanitized through the SAME validator as registration. extra='forbid'\nso a caller cannot smuggle other user columns (plan, records_limit,\nis_admin, ...) through the profile endpoint.",
+        "properties": {
+          "first_name": {
+            "title": "First Name",
+            "type": "string"
+          },
+          "last_name": {
+            "title": "Last Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "first_name",
+          "last_name"
+        ],
+        "title": "ProfileUpdate",
+        "type": "object"
+      },
       "ReadAllResponse": {
         "properties": {
           "updated": {
@@ -1753,6 +1957,23 @@
           "refresh_token"
         ],
         "title": "RefreshRequest",
+        "type": "object"
+      },
+      "RegisterResponse": {
+        "description": "POST /auth/register response when EMAIL_VERIFICATION_ENABLED is on.\n\nEnumeration-safe: the SAME neutral body is returned whether the email is new\n(a verification link was sent) or already registered (a 'you already have an\naccount' note was sent). No tokens — the account is created only after the\nverification link is redeemed at /auth/verify-email. `verification_required`\nlets the frontend show a 'check your email' screen instead of logging in.",
+        "properties": {
+          "message": {
+            "default": "Check your email to finish creating your account.",
+            "title": "Message",
+            "type": "string"
+          },
+          "verification_required": {
+            "default": true,
+            "title": "Verification Required",
+            "type": "boolean"
+          }
+        },
+        "title": "RegisterResponse",
         "type": "object"
       },
       "ResetPasswordRequest": {
@@ -2254,6 +2475,14 @@
             "title": "Frequency",
             "type": "string"
           },
+          "run_at_day_of_month": {
+            "default": 1,
+            "description": "Monthly only. 1..31; the dispatcher clamps to the month's last day, so 31 fires on the last day of short months (Feb -> 28/29).",
+            "maximum": 31.0,
+            "minimum": 1.0,
+            "title": "Run At Day Of Month",
+            "type": "integer"
+          },
           "run_at_hour": {
             "default": 6,
             "maximum": 23.0,
@@ -2266,6 +2495,14 @@
             "maximum": 59.0,
             "minimum": 0.0,
             "title": "Run At Minute",
+            "type": "integer"
+          },
+          "run_at_weekday": {
+            "default": 0,
+            "description": "Weekly only. 0=Monday .. 6=Sunday (matches Python datetime.weekday()). Frontend must map its day labels to this; do NOT send JS Date.getDay().",
+            "maximum": 6.0,
+            "minimum": 0.0,
+            "title": "Run At Weekday",
             "type": "integer"
           }
         },
@@ -2322,6 +2559,17 @@
               "property_address": true
             }
           },
+          "include_living_owner_tod": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Include Living Owner Tod"
+          },
           "name": {
             "maxLength": 120,
             "title": "Name",
@@ -2337,8 +2585,10 @@
             "default": {
               "date_range_mode": "rolling_90",
               "frequency": "manual",
+              "run_at_day_of_month": 1,
               "run_at_hour": 6,
-              "run_at_minute": 0
+              "run_at_minute": 0,
+              "run_at_weekday": 0
             }
           },
           "skip_trace_enabled": {
@@ -2430,6 +2680,17 @@
             "title": "Id",
             "type": "string"
           },
+          "include_living_owner_tod": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Include Living Owner Tod"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -2483,6 +2744,144 @@
           "updated_at"
         ],
         "title": "ScraperConfigResponse",
+        "type": "object"
+      },
+      "ScraperConfigUpdate": {
+        "additionalProperties": false,
+        "description": "PATCH /scrapers/{id} — partial edit of an existing scraper config.\n\nSEMANTICS: every editable top-level field is optional. A field that is OMITTED\nkeeps the stored value; a field that is PRESENT fully REPLACES it (sub-objects\nare replace-whole, NOT deep-merged — the edit wizard pre-fills the complete\nobject). The one exception is deliver secrets (see DeliverUpdate): blank = keep.\n\nIdentity (county / state / record_type) is immutable — it ties the config to a\ncounty_connector and to property_key/dedup/billing history. The fields are\ndeclared here ONLY so an attempt to change them is rejected with a clear 422\n(Codex P2: reject, don't silently ignore). extra=\"forbid\" rejects any other\nunknown key.\n\nupdated_at is REQUIRED: it is the optimistic-concurrency token (Codex P1). The\nclient echoes the value it read from GET; the route 409s if the stored row has\nadvanced since, preventing one edit session from silently clobbering another.",
+        "properties": {
+          "county": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "County"
+          },
+          "deliver": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeliverUpdate"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "doc_types": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 10,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc Types"
+          },
+          "enrichment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EnrichmentConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "fields": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FieldsConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "include_living_owner_tod": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Include Living Owner Tod"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "record_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Record Type"
+          },
+          "schedule": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScheduleConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "skip_trace_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skip Trace Enabled"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "updated_at"
+        ],
+        "title": "ScraperConfigUpdate",
         "type": "object"
       },
       "SegmentIntersectionRequest": {
@@ -2997,9 +3396,38 @@
             "title": "Email",
             "type": "string"
           },
+          "first_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Name"
+          },
+          "last_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Name"
+          },
           "password": {
-            "title": "Password",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Password"
           },
           "ref": {
             "anyOf": [
@@ -3014,8 +3442,7 @@
           }
         },
         "required": [
-          "email",
-          "password"
+          "email"
         ],
         "title": "UserRegister",
         "type": "object"
@@ -3031,6 +3458,17 @@
             "title": "Email",
             "type": "string"
           },
+          "first_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Name"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -3045,6 +3483,17 @@
             "title": "Is Trial",
             "type": "boolean"
           },
+          "last_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Name"
+          },
           "notification_prefs": {
             "additionalProperties": {
               "type": "boolean"
@@ -3056,6 +3505,11 @@
           "plan": {
             "title": "Plan",
             "type": "string"
+          },
+          "profile_complete": {
+            "default": false,
+            "title": "Profile Complete",
+            "type": "boolean"
           },
           "records_limit": {
             "title": "Records Limit",
@@ -3138,6 +3592,36 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "VerifyEmailRequest": {
+        "description": "POST /auth/verify-email — redeem the emailed verification link.\n\n`token` is the short-lived single-use verification JWT (aud=bridgeleads-verify)\nminted by /auth/register. `new_password` AND the first/last name are set HERE,\nby whoever proves control of the email — NOT at register — so an attacker-\ninitiated signup that the address owner confirms cannot end up with an\nattacker-known password OR an attacker-chosen display name. Names + password\nare validated against the SAME policies as registration.",
+        "properties": {
+          "first_name": {
+            "title": "First Name",
+            "type": "string"
+          },
+          "last_name": {
+            "title": "Last Name",
+            "type": "string"
+          },
+          "new_password": {
+            "title": "New Password",
+            "type": "string"
+          },
+          "token": {
+            "maxLength": 4096,
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "new_password",
+          "first_name",
+          "last_name"
+        ],
+        "title": "VerifyEmailRequest",
         "type": "object"
       }
     },
@@ -3747,6 +4231,53 @@
         ]
       }
     },
+    "/auth/profile": {
+      "put": {
+        "description": "Persist the user's editable profile (Settings → Account AND the required-\nname gate): first_name + last_name.\n\nBoth are already sanitized + required (non-empty) by ProfileUpdate. This is\nthe endpoint a legacy incomplete-profile user calls to satisfy the gate, so\nit MUST stay reachable while the profile is incomplete (no auth gate on it\nbeyond normal login). The WHERE id == current_user.id filter is the tenant\nguard — RLS on `users` is permissive under the app role, so the query filter\nis the real own-row constraint (belt-and-suspenders per the project rules).\nThe audit log records the action only, never the name values (they are PII).",
+        "operationId": "update_profile_auth_profile_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Update Profile",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
     "/auth/refresh": {
       "post": {
         "description": "Exchange a valid refresh token for a new access + refresh token pair.",
@@ -3791,6 +4322,7 @@
     },
     "/auth/register": {
       "post": {
+        "description": "Register a new account.\n\nLegacy (EMAIL_VERIFICATION_ENABLED off): creates the account and returns\nsession tokens (201). Enumeration-safe mode (on): returns a neutral 200 with\nno tokens (same body for new vs existing email) and emails a verification\nlink; the handler overrides the status to 200 on that path.",
         "operationId": "register_auth_register_post",
         "requestBody": {
           "content": {
@@ -3807,7 +4339,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/TokenResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/TokenResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RegisterResponse"
+                    }
+                  ],
+                  "title": "Response Register Auth Register Post"
                 }
               }
             },
@@ -3869,6 +4409,48 @@
           }
         },
         "summary": "Reset Password",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/verify-email": {
+      "post": {
+        "description": "Redeem the email-verification link (EMAIL_VERIFICATION_ENABLED flow):\nvalidate the single-use token, create the account from the staged pending\nregistration, and auto-login (mint session tokens).",
+        "operationId": "verify_email_auth_verify_email_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyEmailRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Verify Email",
         "tags": [
           "auth"
         ]
@@ -5377,6 +5959,7 @@
         ]
       },
       "post": {
+        "description": "Create a scraper config and return it. The frontend then POSTs /jobs to kick\noff the first run (\"Start run\"). The config is always active (visible on the\ndashboard); it only auto-runs if its schedule.frequency is recurring (the\ndispatcher skips frequency=\"manual\").",
         "operationId": "create_scraper_scrapers_post",
         "requestBody": {
           "content": {
@@ -5764,6 +6347,62 @@
           }
         ],
         "summary": "Get Scraper",
+        "tags": [
+          "scrapers"
+        ]
+      },
+      "patch": {
+        "description": "Edit an existing scraper config in place (PATCH). Keeps the config id, so\njob history and a since_last_run cursor survive — unlike delete+recreate,\nwhich orphans history and resets the cursor.\n\nEditable: name, fields, enrichment, schedule, deliver, skip_trace_enabled,\ndoc_types. Identity (county/state/record_type) is immutable. Each PROVIDED\ntop-level field FULLY REPLACES the stored value (sub-objects are not\ndeep-merged — the edit wizard pre-fills the complete object); an OMITTED field\nis kept. Blank delivery secrets are kept (see _merge_deliver).",
+        "operationId": "update_scraper_scrapers__scraper_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scraper_id",
+            "required": true,
+            "schema": {
+              "title": "Scraper Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScraperConfigUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScraperConfigResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Update Scraper",
         "tags": [
           "scrapers"
         ]

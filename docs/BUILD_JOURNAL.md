@@ -19,6 +19,59 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-07-01 — PR #133 end-to-end verification → live King parser defects found & fixed (PR #134) + prod backfills
+**Built / Shipped:** Verification session for the Pierce/King fixes (PR #133) turned into a live bug hunt.
+Manual King NTS crawl against the brand-new QA Legals 07-01-26.pdf: 3 blocks, **1 notice LOST to a
+varchar(512) INSERT crash, 1 address corrupted**. Root-caused all three defects and shipped **PR #134**
+(squash `a973b80`, CI green, no migrations, api+worker redeployed 16:57): (1) `_AFFINIA_SHAPE` gap
+`{0,200}` too tight for a ~201-char securitization-trust beneficiary ("Wilmington Trust … Series
+2006-5") → gate missed → colon regexes scanned to the first colon (inside "10:00 AM") and captured
+the SAME 810-char boilerplate into grantor/beneficiary/servicer → widened to `{0,800}`/`{0,1000}` (the
+negative lookaheads, not the bounds, exclude colon layouts). (2) `_COMMONLY_KNOWN` leaked "The above
+property is" into the address + normalized match key (a parcel-less notice became unmatchable) → added
+stop phrase. (3) MTC's colon-less "More commonly known as 1814 FRANKLIN AVE E…" dropped the address →
+colon optional ONLY behind "More…" (Codex High: bare "commonly known as" keeps the colon, else prose
+like "…commonly known as Fannie Mae" hijacks the capture — its repro is now a test). Defense-in-depth at
+the shared `notice_to_row` chokepoint: display fields clamped to column widths, parcel>64 → NULL (a
+truncated parcel could false-match at 0.90), ts_number>64 → row skipped (identity never truncated),
+grantor==beneficiary poison detector, raw_hash over STORED values. New real fixture
+`nts_queen_anne_news_2026-07-01.pdf`; 73 tests, zero Pierce/Snohomish regression.
+**Prod repairs (all Codex-gated, dry-run → --apply → read-back verified):** (a) HANSON backfill
+(`scripts/backfill_pierce_probate_legal_repair.py`): both rows (starter+admin) repaired via the same
+pierce_legal_repair guards the pipeline uses — parcel `6779000110`→`6776000110`, addr 2322 BRYCE CANYON
+CT, mailing, `property_key` recomputed, membership merge-moved (PK user_id+record_type+property_key).
+(b) `[E]` junk row deleted (`scripts/cleanup_pierce_probate_junk_party.py`) — Codex P1 was REAL: the row
+anchored 1 `delivered_records.first_result_id`; follow-up consult confirmed delete-with-SET-NULL is the
+designed semantics (claim + billing history retained). Delete required the OWNER connection
+(`DATABASE_URL_MIGRATE`) — `results.DELETE` is revoked from the app role under least-privilege.
+(c) Backfilled the MISSED 06-24 King issue (5 notices, all auction 7/24, via the exact crawler upsert
+path; Codex PASS) → **matcher enriched 2 admin King leads** (RAMIREZ, parcel 7398900940): auction_date
+2026-07-24 + default_amount $300,754.23 + nts ref/trustee — **fix #4 proven end-to-end on prod data**.
+Re-crawl of 07-01 after the fix: **3/3 upserted, 0 errored** (the lost $282k notice landed with parcel
+`025700-0175-09` + clean address).
+**Tried / Decided:** This week's 3 notices legitimately match 0 of the 280 King pre_foreclosure leads
+(no parcel/street overlap — NOD-stage leads vs this week's auctions are different populations); proven
+read-only before touching anything. WALKER confirmed correctly kept-but-empty (no parcel + no legal =
+unactionable by design). DELETE over NULL for the junk row (forward fix never re-emits it; NULL would
+keep a nameless junk lead in UI/exports).
+**Caught & fixed (Codex, 3 rounds):** diff review FAIL → colon-hijack High + detector-too-narrow Medium
++ raw_hash-churn Low, all adopted with tests; script review → rowcount guard before membership move,
+delivered_records anchor preflight.
+**Failed / Blocked:** Task 1 (fresh Pierce probate scrape, both accounts) + Task 4 (UI check) still
+waiting on the user (Claude can't enter passwords; no new jobs by session end). First cleanup --apply
+died on `InsufficientPrivilege` (expected under least-privilege) → owner-conn rerun.
+**Pending / Handoff:** Task 1 + Task 4 (user). Cosmetic: MTC beneficiary swallows "Original Trustee of
+the Deed of Trust: X" (shared `_STOP` lacks that label) — deferred with Codex agreement.
+**Facts learned:** `railway run` executes LOCAL code with prod env — a merged fix can be exercised
+against prod before Railway redeploys (deploy still required for scheduled beat runs). The weekly King
+paper is a NEW PDF every issue — a parser validated on one issue can die on the next; the notice_to_row
+clamps now make that a degraded-field event, not a lost notice. `delivered_records.first_result_id` is
+`ON DELETE SET NULL` by design; the durable dedup claim is (user_id, dedup_hash) and a no-parcel/
+no-address row still gets a dedup_hash via the party+date fallback. `results.DELETE` needs
+`DATABASE_URL_MIGRATE`. nts_notices natural key (source, ts_number) makes issue backfills upsert-safe.
+
+---
+
 ## 2026-06-30 — Canary log triage: lag-aware health + EagleWeb date/Cloudflare fixes
 **Context:** User handed a 47-min Railway canary log flagging chelan=degraded, lewis=down, spokane=down, thurston=healthy(0). Worked in isolated worktree `fix/canary-scraper-health` off `origin/main`; Codex consulted on every design + reviewed every diff (all GATE=PASS).
 

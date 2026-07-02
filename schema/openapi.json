@@ -125,6 +125,16 @@
               ]
             }
           },
+          "delivery_mode": {
+            "default": "overlaps_only",
+            "enum": [
+              "overlaps_only",
+              "overlaps_first",
+              "everything"
+            ],
+            "title": "Delivery Mode",
+            "type": "string"
+          },
           "enrichment": {
             "$ref": "#/components/schemas/EnrichmentConfig",
             "default": {
@@ -228,6 +238,33 @@
         "title": "BatchCreateResponse",
         "type": "object"
       },
+      "BatchDeliveryCounts": {
+        "description": "Honest delivery accounting (uncapped dataset facts, mode-interpreted).",
+        "properties": {
+          "leads_total": {
+            "default": 0,
+            "title": "Leads Total",
+            "type": "integer"
+          },
+          "overlaps_delivered": {
+            "default": 0,
+            "title": "Overlaps Delivered",
+            "type": "integer"
+          },
+          "singletons_suppressed": {
+            "default": 0,
+            "title": "Singletons Suppressed",
+            "type": "integer"
+          },
+          "unmatchable_no_parcel": {
+            "default": 0,
+            "title": "Unmatchable No Parcel",
+            "type": "integer"
+          }
+        },
+        "title": "BatchDeliveryCounts",
+        "type": "object"
+      },
       "BatchDetailResponse": {
         "description": "A batch with its per-child summary + failed-child detail — for the run view.",
         "properties": {
@@ -263,6 +300,21 @@
           "created_at": {
             "format": "date-time",
             "title": "Created At",
+            "type": "string"
+          },
+          "delivery_counts": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BatchDeliveryCounts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "delivery_mode": {
+            "default": "everything",
+            "title": "Delivery Mode",
             "type": "string"
           },
           "failed_children": {
@@ -348,6 +400,16 @@
             "title": "Created At",
             "type": "string"
           },
+          "delivery_counts": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BatchDeliveryCounts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "excluded_no_date_count": {
             "default": 0,
             "title": "Excluded No Date Count",
@@ -426,6 +488,11 @@
           "created_at": {
             "format": "date-time",
             "title": "Created At",
+            "type": "string"
+          },
+          "delivery_mode": {
+            "default": "everything",
+            "title": "Delivery Mode",
             "type": "string"
           },
           "id": {
@@ -4581,7 +4648,7 @@
     },
     "/batches/{batch_id}/download": {
       "get": {
-        "description": "Stream the batch's combined CSV through this authed endpoint.\n\nThe CSV is REBUILT from the DB on demand (not fetched from R2): the api has\nno R2 credentials (those live on the worker), and rebuilding means a\nre-download reflects later async skip-trace fills. Tenant-scoped by the\nverified owner's id. 404 until the barrier has finished (combined_export_key\nis the 'ready' marker).",
+        "description": "Stream the batch's combined CSV through this authed endpoint.\n\nThe CSV is REBUILT from the DB on demand (not fetched from R2): the api has\nno R2 credentials (those live on the worker), and rebuilding means a\nre-download reflects later async skip-trace fills. Tenant-scoped by the\nverified owner's id. 404 until the run terminalizes into a downloadable\nstatus (`_DOWNLOADABLE_STATUSES`) — a zero-row overlaps_only run is still\n'done' and downloads a headers-only CSV.",
         "operationId": "download_batch_batches__batch_id__download_get",
         "parameters": [
           {

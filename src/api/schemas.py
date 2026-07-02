@@ -936,6 +936,12 @@ class BatchSummaryResponse(BaseModel):
     child_count: int = 0
     combined_export_ready: bool = False  # status-derived — never expose the R2 key
     delivery_mode: str = "everything"
+    # Rows in the combined export as-delivered (mode-aware: overlaps_delivered for
+    # overlaps_only, else leads_total). NULL until the run finalizes + writes
+    # delivery_counts — so the Results page renders a batch as ONE row with the
+    # deduped combined count, never the sum of child record_counts (overlaps are
+    # collapsed, so a naive sum over-counts).
+    combined_record_count: int | None = None
     created_at: datetime
     completed_at: datetime | None = None
 
@@ -1013,6 +1019,11 @@ class JobResponse(BaseModel):
     county: str | None = None
     state: str | None = None
     record_type: str | None = None
+    # Set when this job is a child of a batch scrape (its config carries batch_id).
+    # The Results page uses this to HIDE batch children from the per-job export list
+    # (a batch delivers ONE combined row, not one row per child — child delivery is
+    # suppressed at create time). NULL for a standalone scrape.
+    batch_id: str | None = None
     # Computed progress fields (not stored in DB)
     progress_pct: int | None = None
     estimated_total_records: int | None = None

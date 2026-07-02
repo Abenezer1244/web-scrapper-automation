@@ -63,6 +63,7 @@ async def list_jobs(
             resp.county = sc.county
             resp.state = sc.state
             resp.record_type = sc.record_type
+            resp.batch_id = sc.batch_id  # None for standalone; set for batch children
         responses.append(resp)
     return responses
 

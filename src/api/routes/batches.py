@@ -257,6 +257,19 @@ async def create_batch(
 # (scraper_configs, jobs). A run is at-most-one per batch in on-demand 2A.
 
 
+def _combined_record_count(batch: ScraperBatch, run: BatchRun | None) -> int | None:
+    """Rows in the combined export as-delivered, mode-aware, from the run's
+    finalized delivery_counts snapshot. NULL until finalize writes it — the
+    Results page then shows a batch as ONE row with the deduped combined count
+    (never the sum of child record_counts, which double-counts overlaps)."""
+    counts = run.delivery_counts if run else None
+    if not counts:
+        return None
+    if (batch.delivery_mode or "everything") == "overlaps_only":
+        return counts.get("overlaps_delivered")
+    return counts.get("leads_total")
+
+
 def _summary(batch: ScraperBatch, run: BatchRun | None, child_count: int) -> BatchSummaryResponse:
     return BatchSummaryResponse(
         id=batch.id,
@@ -266,6 +279,7 @@ def _summary(batch: ScraperBatch, run: BatchRun | None, child_count: int) -> Bat
         child_count=child_count,
         combined_export_ready=bool(run and run.status in _DOWNLOADABLE_STATUSES),
         delivery_mode=batch.delivery_mode or "everything",
+        combined_record_count=_combined_record_count(batch, run),
         created_at=batch.created_at,
         completed_at=run.completed_at if run else None,
     )

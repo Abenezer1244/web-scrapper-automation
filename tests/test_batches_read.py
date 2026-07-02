@@ -322,3 +322,69 @@ class TestStatusBasedReadiness:
 
         dl = await client.get(f"/batches/{batch.id}/download", headers=_auth(starter_token))
         assert dl.status_code == 404
+
+
+# ─── combined_record_count (Results-page batch collapse) ─────────────────────
+# The Results page shows a batch as ONE row with the deduped combined count
+# (never the sum of child record_counts). combined_record_count is mode-aware,
+# from the run's finalized delivery_counts snapshot, and NULL until finalize.
+
+class TestCombinedRecordCount:
+    async def _mk(
+        self, db: AsyncSession, user: User, *, mode: str, counts: dict | None
+    ) -> str:
+        batch = ScraperBatch(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            name="Counted",
+            state="WA",
+            fields=[],
+            enrichment=[],
+            schedule={},
+            deliver={},
+            status="active",
+            delivery_mode=mode,
+        )
+        db.add(batch)
+        await db.flush()
+        db.add(
+            BatchRun(
+                id=str(uuid.uuid4()),
+                batch_id=batch.id,
+                user_id=user.id,
+                status="done",
+                child_job_ids=[],
+                delivery_counts=counts,
+            )
+        )
+        await db.commit()
+        return batch.id
+
+    async def test_overlaps_only_uses_overlaps_delivered(
+        self, client: AsyncClient, starter_token: str, db: AsyncSession, starter_user: User
+    ):
+        bid = await self._mk(
+            db, starter_user, mode="overlaps_only",
+            counts={"leads_total": 30, "overlaps_delivered": 7,
+                    "singletons_suppressed": 21, "unmatchable_no_parcel": 2},
+        )
+        body = (await client.get(f"/batches/{bid}", headers=_auth(starter_token))).json()
+        assert body["combined_record_count"] == 7  # overlaps_delivered, not leads_total
+
+    async def test_everything_uses_leads_total(
+        self, client: AsyncClient, starter_token: str, db: AsyncSession, starter_user: User
+    ):
+        bid = await self._mk(
+            db, starter_user, mode="everything",
+            counts={"leads_total": 30, "overlaps_delivered": 7,
+                    "singletons_suppressed": 21, "unmatchable_no_parcel": 2},
+        )
+        body = (await client.get(f"/batches/{bid}", headers=_auth(starter_token))).json()
+        assert body["combined_record_count"] == 30  # leads_total
+
+    async def test_null_until_finalized(
+        self, client: AsyncClient, starter_token: str, db: AsyncSession, starter_user: User
+    ):
+        bid = await self._mk(db, starter_user, mode="overlaps_only", counts=None)
+        body = (await client.get(f"/batches/{bid}", headers=_auth(starter_token))).json()
+        assert body["combined_record_count"] is None

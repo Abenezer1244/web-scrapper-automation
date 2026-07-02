@@ -285,6 +285,17 @@
             "title": "Combined Export Ready",
             "type": "boolean"
           },
+          "combined_record_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Combined Record Count"
+          },
           "completed_at": {
             "anyOf": [
               {
@@ -645,6 +656,17 @@
             "default": false,
             "title": "Combined Export Ready",
             "type": "boolean"
+          },
+          "combined_record_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Combined Record Count"
           },
           "completed_at": {
             "anyOf": [
@@ -1511,6 +1533,17 @@
       },
       "JobResponse": {
         "properties": {
+          "batch_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Batch Id"
+          },
           "county": {
             "anyOf": [
               {

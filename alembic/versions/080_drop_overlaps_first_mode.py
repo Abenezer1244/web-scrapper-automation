@@ -1,4 +1,4 @@
-"""Drop the dead 'overlaps_first' delivery mode (079)
+"""Drop the dead 'overlaps_first' delivery mode (080)
 
 `overlaps_first` was a reserved delivery_mode that produced output IDENTICAL to
 `everything` (the combined export already ranks overlaps first) and was never
@@ -15,8 +15,8 @@ client sending 'overlaps_first' then gets a clean 422 instead of a DB violation.
 """
 from alembic import op
 
-revision = "079"
-down_revision = "078"
+revision = "080"
+down_revision = "079"
 branch_labels = None
 depends_on = None
 

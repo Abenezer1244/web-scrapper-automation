@@ -19,6 +19,33 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-07-01 — Cross-check of the delivery build + mailing-address split columns
+**Built / Shipped:** Branch `chore/xcheck-delivery-build` (worktree, stacked on `feat/fields-output-visibility`).
+- **Cross-check of the delivery-step build** (Q1–Q4 commits, full diff vs main): Claude self-review +
+  independent `codex review --base origin/main`. **Consensus finding (P2, both reviewers independently):**
+  `deliver_job_email` sets `soft_time_limit=30` to bound a hung Resend POST, but
+  `_is_retryable_email_error()` classified `SoftTimeLimitExceeded` as permanent — the exact transient case
+  the limit exists for was never retried. Fixed (`1a021fa`) + regression test. Everything else verified
+  clean (imports, `trigger="preview"` fits Job.trigger, tenant-scoped dedup-claim DELETE, bounded upload
+  retry, rollback/refresh session handling). No Critical/High → build is a GO.
+- **Feature (user request): mailing-address split columns** (`94867f8`). `mailing_street/city/state/zip`
+  in per-job CSV + Excel + combined/batch/segments CSV, appended at END (back-compat). Same conservative
+  address parser as the property split. **Hiding `mailing_address` now blanks its split columns too**
+  (dependent-columns map in `_apply_visibility`) — the visibility feature can't leak the mailing address.
+  JSON shape / webhook / dialer push / skip-trace parser deliberately untouched (Codex consult verdict).
+  136 tests pass (12 new). Codex gate on the final diff: clean.
+**Tried / Decided:** Comma-less city extraction (user's example was comma-less) — Codex verdict Option A:
+keep the conservative parser; a wrong city silently corrupts CRM fields, a blank one falls back to the
+full-address column. A validated city-list heuristic is a possible later parser enhancement.
+**Facts learned (prod census, read-only, latest 1000 rows):** `mailing_address` is **100% comma-separated**
+(splits cleanly — e.g. `5520 SEELEY LAKE DR SW, LAKEWOOD, WA, 98499-2817`). `property_address` in recent
+rows is **street-only** (no city/state/zip in the county source at all) → property_city/state/zip stay
+blank there; that's data availability, not a parser bug. Also: SQLAlchemy-scheme URLs
+(`postgresql+psycopg2://`) must be stripped for raw psycopg2 in diag scripts.
+**Pending / Handoff:** batch delivery email reuses "expires in 48 hours" copy though the batch link is a
+non-expiring in-app page (cosmetic). FE: nothing required for the new columns (CSV-only). PR stacked on
+`feat/fields-output-visibility` — merge that first.
+
 ## 2026-06-22 — Delivery-step deep dive: export / email / webhook / "Run once" (Q1–Q4 from a UX review)
 **Built / Shipped:** A user walked the wizard's Delivery step and asked 4 skeptical questions; each surfaced
 real bugs, fixed root-cause with Codex on every step. Backend branch `feat/fields-output-visibility`,

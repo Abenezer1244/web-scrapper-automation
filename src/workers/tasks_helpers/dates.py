@@ -151,10 +151,26 @@ def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: st
                     covered_to = latest_finish.date() if latest_finish else None
                 if covered_to is not None:
                     date_from = covered_to + timedelta(days=1)
-                    _logger.info(
-                        "since_last_run: resuming from %s (day after max covered window end)",
-                        date_from,
-                    )
+                    if date_from > end_date:
+                        # The last covered window already reaches end_date — the
+                        # config is caught up, or a custom/backfill run covered
+                        # into the future. There is no new forward day, so re-scan
+                        # only the current end_date for late filings. Do it
+                        # EXPLICITLY here rather than leaning on _ordered_window's
+                        # inverted-range collapse below to produce the same window
+                        # (Codex P2): the intent is auditable and a future refactor
+                        # of _ordered_window can't silently break this path.
+                        _logger.info(
+                            "since_last_run: already covered through %s (>= end_date %s); "
+                            "re-scanning end_date only for late filings",
+                            covered_to, end_date,
+                        )
+                        date_from = end_date
+                    else:
+                        _logger.info(
+                            "since_last_run: resuming from %s (day after max covered window end)",
+                            date_from,
+                        )
                 else:
                     date_from = today - timedelta(days=30)
                     _logger.info(

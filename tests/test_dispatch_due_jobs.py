@@ -147,3 +147,66 @@ def test_inactive_config_not_dispatched():
         db.commit()
         assert created == []
         assert _jobs(db, config.id) == []
+
+
+def test_scheduled_job_stamps_occurrence_key():
+    # Migration 079: a dispatched scheduled job carries scheduled_for = the tick
+    # truncated to the run minute (TICK is already 06:00:00), so the durable
+    # unique (scraper_config_id, scheduled_for) can dedupe it.
+    with SyncSessionLocal() as db:
+        config = _config(db, _user(db).id, {"frequency": "daily", "run_at_hour": 6, "run_at_minute": 0})
+        _dispatch_due_jobs(db, TICK)
+        db.commit()
+        jobs = _jobs(db, config.id)
+        assert len(jobs) == 1
+        assert jobs[0].scheduled_for == TICK
+
+
+def test_duplicate_occurrence_insert_is_noop():
+    # Durable backstop (Codex P1): even if the read-then-check pre-check is lost
+    # to a concurrent race, the unique (scraper_config_id, scheduled_for) index
+    # makes a SECOND insert for the same occurrence a no-op. Insert two rows for
+    # the same (config, occurrence) directly (mimicking two racing beats) and
+    # assert only one survives.
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    def _occurrence_insert(db, config_id, user_id, occurrence):
+        return db.execute(
+            pg_insert(Job.__table__)
+            .values(
+                id=str(uuid.uuid4()), user_id=user_id, scraper_config_id=config_id,
+                status="pending", trigger="scheduled", page_current=0, page_total=0,
+                record_count=0, retry_count=0, scheduled_for=occurrence,
+            )
+            .on_conflict_do_nothing()
+        ).rowcount
+
+    with SyncSessionLocal() as db:
+        user = _user(db)
+        config = _config(db, user.id, {"frequency": "daily", "run_at_hour": 6, "run_at_minute": 0})
+        first = _occurrence_insert(db, config.id, user.id, TICK)
+        second = _occurrence_insert(db, config.id, user.id, TICK)
+        db.commit()
+        assert first == 1
+        assert second == 0  # dup occurrence rejected by the unique index
+        assert len(_jobs(db, config.id)) == 1
+
+
+def test_null_occurrence_never_conflicts():
+    # Manual / test / on-demand jobs (scheduled_for = NULL) are NULL-distinct, so
+    # any number of them coexist — the occurrence index must not block them.
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    with SyncSessionLocal() as db:
+        user = _user(db)
+        config = _config(db, user.id, {"frequency": "manual"})
+        for _ in range(3):
+            db.execute(
+                pg_insert(Job.__table__).values(
+                    id=str(uuid.uuid4()), user_id=user.id, scraper_config_id=config.id,
+                    status="pending", trigger="manual", page_current=0, page_total=0,
+                    record_count=0, retry_count=0, scheduled_for=None,
+                ).on_conflict_do_nothing()
+            )
+        db.commit()
+        assert len(_jobs(db, config.id)) == 3

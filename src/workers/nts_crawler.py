@@ -24,9 +24,13 @@ from src.workers import app
 
 _logger = setup_logger("workers.nts_crawler")
 
-_MAX_PAGES = 5            # listing pages per run (newest first)
+_MAX_PAGES = 10           # listing pages per run (newest first). NTS are a MINORITY of
+                          # the mixed legal-notices feed, so we must scan several pages
+                          # to reach the trustee sales behind the day's probate/bids.
 _MAX_NOTICES = 200        # hard cap on fetches per run
 _FETCH_DELAY_S = 1.0      # polite delay between notice fetches
+_LISTING_DELAY_S = 0.5    # polite delay between listing-page fetches (we now always
+                          # walk multiple pages per run — Bug A fix)
 _CACHE_DAYS = 90          # expire notices not seen in this window
 
 # ── Pacific Publishing weekly-PDF crawlers (Snohomish Tribune, Queen Anne News) ──
@@ -68,27 +72,26 @@ def crawl_nts_tacoma_index() -> dict:
     from src.utils.safe_http import safe_get
 
     today = datetime.now(UTC).date()
-    notice_urls: list[str] = []
-    for page in range(1, _MAX_PAGES + 1):
+
+    def _fetch_listing(page: int):
+        """I/O for one listing page: returns (status_code, html) or None on failure.
+
+        A transient failure returns None so collect_notice_urls skips just this page
+        (a later page may still carry trustee sales) instead of abandoning the crawl.
+        """
+        if page > 1:
+            time.sleep(_LISTING_DELAY_S)  # polite: we now walk multiple pages every run
         url = nts.BASE_URL + nts.LEGAL_NOTICES_PATH + (f"page/{page}/" if page > 1 else "")
         try:
             resp = safe_get(url, timeout=20, headers={"User-Agent": "BridgeLeadsBot/1.0"})
         except Exception as exc:  # noqa: BLE001 — a bad page must not kill the crawl
             _logger.warning("NTS listing page %d fetch failed: %s", page, str(exc)[:120])
-            continue
-        if resp.status_code != 200:
-            _logger.info("NTS listing page %d -> HTTP %d; stopping pagination", page, resp.status_code)
-            break
-        found = nts.extract_notice_urls(resp.text)
-        if not found:
-            break  # no more notices on this/later pages
-        for u in found:
-            if u not in notice_urls:
-                notice_urls.append(u)
-        if len(notice_urls) >= _MAX_NOTICES:
-            break
+            return None
+        return (resp.status_code, resp.text)
 
-    notice_urls = notice_urls[:_MAX_NOTICES]
+    notice_urls = nts.collect_notice_urls(
+        _fetch_listing, max_pages=_MAX_PAGES, max_notices=_MAX_NOTICES
+    )
     _logger.info("NTS crawl: %d candidate notice URLs", len(notice_urls))
 
     upserted = skipped = errored = 0

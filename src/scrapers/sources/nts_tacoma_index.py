@@ -45,6 +45,14 @@ _NOTICE_HREF = re.compile(
     r'(?:ts-|[^"/]*trustee)[^"]*)"',
     re.I,
 )
+# ANY dated legal-notice article link on a listing page (NTS or not). Used only to
+# tell "this listing page still has entries" from "we've paginated past the last page"
+# — the mixed feed interleaves probate/bids/name-changes/trustee-sales, so a page with
+# zero NTS is NOT the end of the listing (Bug A: the old crawler treated it as the end).
+_ANY_DATED_ARTICLE = re.compile(
+    r'href="https?://(?:www\.)?tacomadailyindex\.com/\d{4}/\d{2}/\d{2}/[^"]+"',
+    re.I,
+)
 _ARTICLE = re.compile(r"<article[^>]*>(.*?)</article>", re.S | re.I)
 _TAGS = re.compile(r"<[^>]+>")
 _SCRIPT_STYLE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.S | re.I)
@@ -299,6 +307,51 @@ def extract_notice_urls(listing_html: str) -> list[str]:
         if url not in seen:
             seen.append(url)
     return seen
+
+
+def listing_has_entries(listing_html: str) -> bool:
+    """True if the listing page carries ANY dated legal-notice article link.
+
+    Distinguishes a normal page (probate/bids/NTS interleaved) from a page past the
+    end of the listing (empty). The crawler keeps paginating while this is True and a
+    page yields no NTS — a zero-NTS page mid-listing is expected, NOT the end.
+    """
+    return bool(_ANY_DATED_ARTICLE.search(listing_html))
+
+
+def collect_notice_urls(fetch_page, *, max_pages: int, max_notices: int) -> list[str]:
+    """Walk the mixed legal-notices listing, collecting NTS URLs across ALL pages.
+
+    `fetch_page(page:int)` returns either ``(status_code, html)`` or ``None`` (fetch
+    failed — a transient failure on one page must not abandon later pages). Pure: the
+    caller injects I/O, so the pagination logic is unit-tested with a real in-memory
+    fetcher (no mocks).
+
+    Bug A fix: the previous crawler stopped at the FIRST page with no NTS notice. But
+    the feed interleaves notice types in reverse-chron order, so page 1 is routinely
+    all probate/bids while trustee sales sit on later pages. We now stop only on a
+    genuine end signal:
+      * a page that fetched non-200 (the CMS 404s beyond the last page), or
+      * a page with zero dated article links (listing_has_entries False), or
+      * the max_notices cap, or
+      * max_pages exhausted.
+    """
+    urls: list[str] = []
+    for page in range(1, max_pages + 1):
+        result = fetch_page(page)
+        if result is None:
+            continue  # transient fetch failure — a later page may still succeed
+        status, html = result
+        if status != 200:
+            break  # past the last listing page, or blocked — stop paginating
+        for u in extract_notice_urls(html):
+            if u not in urls:
+                urls.append(u)
+        if len(urls) >= max_notices:
+            break
+        if not listing_has_entries(html):
+            break  # genuine end of the listing (empty page)
+    return urls[:max_notices]
 
 
 def extract_article_text(notice_html: str) -> str:

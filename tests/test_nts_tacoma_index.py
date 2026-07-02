@@ -9,9 +9,11 @@ from decimal import Decimal
 from pathlib import Path
 
 from src.scrapers.sources.nts_tacoma_index import (
+    collect_notice_urls,
     extract_article_text,
     extract_notice_urls,
     is_valid_nts,
+    listing_has_entries,
     notice_to_row,
     parse_nts_notice,
 )
@@ -174,6 +176,102 @@ class TestCrawlExtraction:
         text = extract_article_text(html)
         assert "TS #: 25-1" in text and "Body" in text
         assert "junk()" not in text and "Menu" not in text
+
+
+def _dated(slug: str) -> str:
+    return f'<a href="https://www.tacomadailyindex.com/2026/07/02/{slug}/">x</a>'
+
+
+def _ts(n: str) -> str:
+    # a real current-format trustee-sale slug
+    return _dated(f"ts-wa-26-{n}-rm-idx{n}")
+
+
+def _probate(n: str) -> str:
+    return _dated(f"no-26-4-{n}-probate-notice-to-creditors-idx{n}")
+
+
+class TestListingHasEntries:
+    def test_page_with_dated_articles(self):
+        assert listing_has_entries(_probate("01") + _ts("100")) is True
+
+    def test_empty_page(self):
+        # site chrome only, no dated article links -> past the end of the listing
+        assert listing_has_entries("<html><nav>Menu</nav><footer>f</footer></html>") is False
+
+    def test_offsite_dated_link_does_not_count(self):
+        assert listing_has_entries('<a href="https://evil.com/2026/07/02/ts-x/">x</a>') is False
+
+
+class TestCollectNoticeUrls:
+    """Bug A regression: NTS notices sit BEHIND probate/bids on later listing pages.
+    The old crawler broke at the first page with no NTS, harvesting nothing on the
+    (common) days page 1 was all probate. collect_notice_urls must scan through."""
+
+    def _fetcher(self, pages: dict[int, str]):
+        # a real in-memory fetcher (no mock framework): page -> (status, html).
+        # a page absent from the dict is treated as past-the-end (404-style).
+        def fetch(page: int):
+            if page in pages:
+                return (200, pages[page])
+            return (404, "")
+        return fetch
+
+    def test_scans_past_pages_with_zero_nts(self):
+        # page1 = all probate (0 NTS), page2 = 1 NTS, page3 = 0 NTS, page4 = 5 NTS.
+        # Mirrors the live 2026-07-02 listing where the old code harvested 0.
+        pages = {
+            1: _probate("01") + _probate("02") + _probate("03"),
+            2: _probate("04") + _ts("200"),
+            3: _probate("05") + _probate("06"),
+            4: _ts("400") + _ts("401") + _ts("402") + _ts("403") + _ts("404"),
+        }
+        urls = collect_notice_urls(self._fetcher(pages), max_pages=10, max_notices=200)
+        assert len(urls) == 6  # 1 from page2 + 5 from page4 — NONE lost to the page1 break
+        assert any("ts-wa-26-200" in u for u in urls)
+        assert sum("ts-wa-26-40" in u for u in urls) == 5
+
+    def test_stops_at_end_of_listing_empty_page(self):
+        # page3 has no dated links at all -> genuine end; page4 (would have NTS) not reached.
+        pages = {
+            1: _ts("100"),
+            2: _ts("200"),
+            3: "<html><nav>Menu</nav></html>",  # empty listing page (past the end)
+            4: _ts("400"),
+        }
+        urls = collect_notice_urls(self._fetcher(pages), max_pages=10, max_notices=200)
+        assert len(urls) == 2
+        assert not any("ts-wa-26-400" in u for u in urls)
+
+    def test_stops_on_non_200(self):
+        pages = {1: _ts("100"), 2: _ts("200")}  # page 3+ -> 404 via fetcher default
+        urls = collect_notice_urls(self._fetcher(pages), max_pages=10, max_notices=200)
+        assert len(urls) == 2
+
+    def test_transient_failure_skips_page_but_continues(self):
+        # page2 fetch fails (None) -> we must still reach page3's NTS, not abandon.
+        pages = {1: _probate("01"), 3: _ts("300")}
+
+        def fetch(page: int):
+            if page == 2:
+                return None  # transient failure
+            if page in pages:
+                return (200, pages[page])
+            return (404, "")
+
+        urls = collect_notice_urls(fetch, max_pages=10, max_notices=200)
+        assert len(urls) == 1
+        assert "ts-wa-26-300" in urls[0]
+
+    def test_respects_max_notices_cap(self):
+        pages = {1: "".join(_ts(f"1{i:02d}") for i in range(10))}
+        urls = collect_notice_urls(self._fetcher(pages), max_pages=10, max_notices=3)
+        assert len(urls) == 3
+
+    def test_respects_max_pages(self):
+        pages = {p: _ts(f"{p}00") for p in range(1, 20)}
+        urls = collect_notice_urls(self._fetcher(pages), max_pages=4, max_notices=200)
+        assert len(urls) == 4  # only pages 1-4 walked
 
 
 class TestNoticeToRow:

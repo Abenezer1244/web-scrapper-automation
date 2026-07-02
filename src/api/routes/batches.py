@@ -45,7 +45,6 @@ from src.scrapers.probate import new_probate_config_tod_default
 from src.utils.crypto import decrypt_field
 from src.utils.lead_export import resolve_hidden_output_fields
 from src.utils.logger import setup_logger
-from src.workers.batch_export import _COMBINED_SQL, _DELIVERY_COUNTS_SQL
 
 _logger = setup_logger("api.batches")
 
@@ -579,6 +578,11 @@ async def _leads_page(
     through get_rls_db). Counts are LIVE (current mode) — never the stored
     snapshot, which reflects the mode at finalize time (Codex P2).
     """
+    # Lazy import (matches create_batch/_stream_run_csv) — keep the Celery app
+    # out of the API BOOT import graph; first use constructs it, same as the
+    # dispatch path.
+    from src.workers.batch_export import _COMBINED_SQL, _DELIVERY_COUNTS_SQL
+
     if run is None or run.status not in _DOWNLOADABLE_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

@@ -51,4 +51,30 @@ delivery (`deliver={}` — the batch owns the combined CSV), so they must NOT ap
 - Consult Codex on design BEFORE coding. Codex reviews EACH phase diff. Critical/High = NO-GO.
 - No local Postgres -> tests run via PR CI. Backend-first; FE after BE merges + type regen.
 
-## Review (fill at end)
+## Review
+
+Status: all 4 findings + the two-listings fix IMPLEMENTED, committed on both branches.
+Local gates green: ruff (src+tests), FE tsc + eslint, openapi regen (no drift), single
+alembic head (080). NOT pushed/PR'd yet (test loop = CI on a PR — no local Postgres).
+
+BE commits (branch chore/overlaps-xcheck-2026-07-02, off origin/main, merged w/ #142):
+- Phase 1  774c4b1  JobResponse.batch_id + BatchSummaryResponse.combined_record_count
+- Ph2 #1/#3 247407a  combined export selects FULL column set (kills blank cols + fabricated
+                     tax date) + phones/emails decrypt + aggregated lead_subtype preserved;
+                     _delivery_summary reports singletons vs no-parcel separately
+- Ph3 #2   cb52255  _combined_pairs_all pages until exhausted (no silent 50k truncation)
+- Ph4 #4   c061b59  remove dead overlaps_first (Literal + CHECK + migration 080)
+- merge 5ff04b3 (origin/main #142) + 5672e65 (migration 079->080 collision fix)
+
+FE commits (branch chore/results-batch-collapse-2026-07-02, off origin/master):
+- c1724f4  Results page collapses a batch into ONE row (listBatches + exclude batch children)
+- 77c9014  drop dead overlaps_first from FE types + stale comments
+
+Codex: DESIGN consult completed — validated all 4 (guardrails folded in: sanitize
+enrichment copy, page-until-exhausted, batch-row-only-when-downloadable, migrate-before-
+reject). Final DIFF review BLOCKED — Codex quota exhausted mid-session ("try again 5:50 PM").
+⏭️ Resume `codex review --base origin/main` (BE) + `--base origin/master` (FE) when reset.
+
+⏭️ Next (user/ops): push both branches, open PRs (BE first), read CI; migrate 080 BEFORE
+deploying api+worker; regen FE types from BE main after merge; then FE PR CI/deploy.
+Note: partial-status batches show a "Complete" badge (minor) — possible follow-up polish.

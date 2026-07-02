@@ -278,17 +278,22 @@ class TestCombinedExportColumns:
             user = _user(db)
             batch, j1, j2 = _two_type_batch(db, user, "everything")
             pk = "WA|pierce|000000B7"
-            # probate row carries the subtype in enrichment_data
+            # probate row carries the subtype in enrichment_data. Marked
+            # is_duplicate so the NON-probate (tax) row deterministically wins the
+            # bucket's representative-row ranking (is_duplicate ASC) — both rows
+            # share the transaction's now() so job_created_at can't decide it.
             db.add(Result(
                 id=str(uuid.uuid4()), user_id=user.id, job_id=j1.id,
                 date_recorded="06/01/2026", party_name="OWNER", property_key=pk,
+                is_duplicate=True,
                 enrichment_data={"lead_subtype": "probate_death_inheritance"},
             ))
-            # tax row: no subtype, newer job → likely the representative winner.
-            # Cap-safe bill_year so the row isn't filtered by the 18-month cap.
+            # tax row: no subtype → the representative winner. Cap-safe bill_year so
+            # the row isn't filtered by the 18-month tax cap.
             db.add(Result(
                 id=str(uuid.uuid4()), user_id=user.id, job_id=j2.id,
                 date_recorded="06/02/2026", party_name="OWNER", property_key=pk,
+                is_duplicate=False,
                 delinquent_bill_year=_tax_year_in_window(),
             ))
             db.flush()

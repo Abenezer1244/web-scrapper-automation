@@ -61,6 +61,12 @@ LEAD_CSV_COLUMNS: list[str] = [
     # auction_date + default_amount are stored columns; trustee/ts# from
     # enrichment_data["nts"]; days_to_auction is the derived urgency clock.
     "auction_date", "days_to_auction", "default_amount", "trustee", "ts_number",
+    # Mailing-address split (2026-07-01, user request): same street/city/state/zip
+    # split the property address already gets, for the owner's MAILING address
+    # (direct-mail lists need it structured). Appended at END per this file's
+    # backward-compat convention. Blank parts mean "couldn't parse confidently" —
+    # the full mailing_address column above remains authoritative.
+    "mailing_street", "mailing_city", "mailing_state", "mailing_zip",
 ]
 
 
@@ -75,6 +81,14 @@ LEAD_CSV_COLUMNS: list[str] = [
 HIDEABLE_OUTPUT_FIELDS: frozenset[str] = frozenset(
     {"mailing_address", "heirs", "legal_description"}
 )
+
+# Columns DERIVED from a hideable field: hiding the parent must blank these too,
+# or the hide would leak the value through its split columns. Deliberately NOT in
+# HIDEABLE_OUTPUT_FIELDS themselves — they are never independently selectable;
+# they follow their parent.
+_HIDEABLE_DEPENDENT_COLUMNS: dict[str, tuple[str, ...]] = {
+    "mailing_address": ("mailing_street", "mailing_city", "mailing_state", "mailing_zip"),
+}
 
 
 def resolve_hidden_output_fields(config_fields: Any) -> set[str]:
@@ -95,13 +109,16 @@ def _apply_visibility(row: dict[str, str], hidden_fields: set[str] | None) -> di
     """Blank the deselected hideable columns in a built export row (header stays).
 
     Mutates and returns ``row``. Defensive: intersects with HIDEABLE_OUTPUT_FIELDS
-    so a miswired caller can never blank an identity or derived column.
+    so a miswired caller can never blank an identity or derived column. A hidden
+    field's dependent split columns (_HIDEABLE_DEPENDENT_COLUMNS) are blanked with
+    it — hiding mailing_address must not leak it through mailing_street/city/….
     """
     if not hidden_fields:
         return row
     for col in hidden_fields & HIDEABLE_OUTPUT_FIELDS:
-        if col in row:
-            row[col] = ""
+        for dep in (col, *_HIDEABLE_DEPENDENT_COLUMNS.get(col, ())):
+            if dep in row:
+                row[dep] = ""
     return row
 
 
@@ -219,6 +236,10 @@ def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, s
         today = datetime.now(UTC).date()
     first, last = split_owner_for_display(_get(record, "party_name"))
     prop = parse_property_for_display(_get(record, "property_address"))
+    # Same parser for the mailing address — it is address-generic (validated
+    # state/zip, PO-Box/unit aware) despite the property-flavored name. Parts it
+    # can't read confidently stay blank; the full mailing_address column is kept.
+    mail = parse_property_for_display(_get(record, "mailing_address"))
 
     amt = _get(record, "delinquent_amount")
     year = _get(record, "delinquent_bill_year")
@@ -284,6 +305,11 @@ def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, s
         "default_amount": _plain(_get(record, "default_amount")),
         "trustee": _enrich_str(_nts(enr), "trustee"),
         "ts_number": _enrich_str(_nts(enr), "ts_number"),
+        # Mailing-address split (kept in sync with the property split above).
+        "mailing_street": sanitize_for_csv(mail["street"]),
+        "mailing_city": sanitize_for_csv(mail["city"]),
+        "mailing_state": sanitize_for_csv(mail["state"]),
+        "mailing_zip": sanitize_for_csv(mail["zip"]),
     }
 
 
@@ -321,6 +347,9 @@ OVERLAP_LEAD_COLUMNS: list[str] = [
     "filed_date", "doc_type", "delinquent_amount", "delinquent_bill_year",
     "party_name", "mailing_address", "parcel_id", "heirs", "legal_description",
     "property_address",
+    # Mailing split — appended at end (same back-compat convention as the
+    # canonical CSV); values auto-copied from the canonical row below.
+    "mailing_street", "mailing_city", "mailing_state", "mailing_zip",
 ]
 
 

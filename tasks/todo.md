@@ -1,73 +1,55 @@
-# Fix: "Fields to collect" checkboxes are cosmetic → make them functional at the output boundary
+# Session: cross-check delivery build + mailing-address split columns
+Branch: `chore/xcheck-delivery-build` (worktree off `feat/fields-output-visibility` @ 1311448 — separate from the other active session)
 
-## Problem (verified in code, not assumed)
-The new-scraper wizard's "Fields to collect" checkboxes are 100% cosmetic. The selection is
-validated (`FieldsConfig`, `src/api/schemas.py:354`) and persisted (`scraper_configs.fields`,
-`src/db/models.py:228`), but **no worker or export code ever reads `config.fields`**. Every
-field is always scraped, stored, and written to the delivered CSV.
+## Part A — Cross-check the delivery-step build (Q1–Q4 commits)
+- [x] Read full diff origin/main...HEAD (22 files)
+- [x] Claude self-review — candidate findings below
+- [ ] Codex `review --base origin/main` (running in background)
+- [ ] Reconcile findings, fix anything Critical/High, Codex re-verify
 
-Verified load-bearing map: `parcel_id`, `party_name`, `property_address`, `mailing_address`,
-`date_recorded` are consumed by enrichment / property_key / dedup / billing / skip-trace and
-**cannot** be dropped at scrape/storage time. Only `heirs` (pure display) and
-`legal_description` (only feeds the within-job idempotency fingerprint) are safe to suppress
-at output.
+### Claude self-review findings (pending reconciliation with Codex)
+1. **[Medium] delivery.py — SoftTimeLimitExceeded treated as permanent.** The task sets
+   `soft_time_limit=30` explicitly to bound a hung Resend POST (the SDK sends with no
+   timeout), but `_is_retryable_email_error()` classifies `SoftTimeLimitExceeded` as
+   permanent (not a RequestException, no `code`, not `ApplicationError`) → the exact
+   transient case the limit exists for is never retried. Fix: classify
+   `SoftTimeLimitExceeded` as retryable.
+2. **[Low] batch delivery email copy says "expires in 48 hours"** but the batch path
+   sends an in-app page URL that doesn't expire (pre-existing; cosmetic).
+3. Verified OK: `sa_text`/`ScraperBatch`/`_fail_job` imports; `trigger="preview"` fits
+   `Job.trigger` String(32) w/ no constraint (JobCreate validator only guards POST /jobs);
+   dedup-claim DELETE is tenant-scoped; upload retry bounded; rollback-then-attribute-
+   access refreshes `job` safely (committed row exists).
 
-Skip-trace mapping was also checked: frontend "Skip trace" → top-level `skip_trace_enabled`
-(the field the worker honors). **No bug there** — verified, no change needed.
+## Part B — Feature: split mailing/property address into own columns (user request)
+User: downloadable CSVs should have e.g. `10301 greenwood ave n` / `seattle` / `wa` / `98115`
+as separate columns.
 
-## Decisions (user + Codex consult, 2026-06-22)
-- **Output-boundary filtering**, never gate scrape/enrichment on `config.fields`. (Codex + Claude agree.)
-- **Force identity fields ON** — only `mailing_address`, `heirs`, `legal_description` are hideable.
-  The 4 identity fields (`party_name`, `parcel_id`, `property_address`, `date_recorded`) always export.
-- **Blank values, keep headers** — do NOT drop columns (stable schema for dialer/webhook consumers).
-- **Empty/None/list `fields` → hide nothing** (legacy/default = all visible). Only an explicit
-  `False` on a hideable field hides it.
-- One **shared projection function** used by every export path (no per-path rules).
+**Already exists:** `property_street/city/state/zip` split columns (parse_property_for_display).
+**Missing:** the same for `mailing_address`.
 
-Codex session: `019ef0c7-1e11-7463-abca-e74018bfc2f6` (saved for follow-ups).
+### Plan
+- [ ] 1. Add `mailing_street`, `mailing_city`, `mailing_state`, `mailing_zip` to the END of
+      `LEAD_CSV_COLUMNS` (append-at-end = the file's backward-compat convention).
+- [ ] 2. `build_lead_export_row`: parse `mailing_address` with the same (address-generic)
+      parser; emit sanitized parts.
+- [ ] 3. **Visibility dependency:** `mailing_address` is HIDEABLE — hiding it must ALSO blank
+      the 4 new split columns or the hide feature leaks the mailing address. Add a
+      dependent-columns map in `_apply_visibility`.
+- [ ] 4. Append the 4 columns to `OVERLAP_LEAD_COLUMNS` (combined/batch CSV picks them up
+      automatically via `base.get`).
+- [ ] 5. Excel inherits via `_canonical_dataframe` (LEAD_CSV_COLUMNS). JSON export is raw
+      record dicts — unchanged.
+- [ ] 6. Tests: new-column presence, parse correctness (comma + no-comma + PO Box), hide-
+      mailing blanks split cols, overlap CSV parity.
 
-## Phase 1 — single-job export (the 95% path)  [<=5 files]  ✅ DONE (commits af13b51, 30602f0)
-- [x] `src/utils/lead_export.py`: `HIDEABLE_OUTPUT_FIELDS`, `resolve_hidden_output_fields`,
-      `_apply_visibility`; `write_lead_csv` gains `hidden_fields`.
-- [x] `src/utils/data_exporter.py`: threaded `hidden_fields` through to_csv/to_excel/to_json/export.
-- [x] `src/workers/tasks.py:780,995`: pass `resolve_hidden_output_fields(config.fields)`.
-- [x] `src/api/routes/jobs.py`: load job's `ScraperConfig.fields` (owner-scoped), pass to `write_lead_csv`.
-- [x] Verify: py_compile + ruff clean; 75 export tests pass (+12 new). Codex review: gate PASS.
-      P1 (batch-child) verified theoretical (Job.scraper_config_id NOT NULL + children carry fields);
-      P2 (export-format tests) addressed.
-
-## Phase 2 — batch combined export  ✅ DONE (commit e7dc5c4)
-- [x] `src/utils/lead_export.py`: threaded `hidden_fields` into `write_lead_csv_with_overlap` /
-      `build_overlap_export_row` (reuses `_apply_visibility`).
-- [x] `src/workers/batch_export.py`: `finalize_batch_run` resolves `ScraperBatch.fields`;
-      `render_combined_csv` accepts + threads `hidden_fields`.
-- [x] `src/api/routes/batches.py`: both download routes pass `batch.fields` via `_stream_run_csv`.
-- [x] Verify: py_compile + ruff clean; 77 export/batch tests pass (+2 new). Codex review: NO findings.
-- Note: the multi-config Lists/segments overlap export (`segments.py:111`) intentionally stays
-  show-all (no single config => default `hidden_fields=None`); backward compatible.
-
-## Follow-up (frontend repo `bridgeleads-web`, separate — note only)
-- [ ] Lock/disable the 4 identity checkboxes (they're now intentionally non-hideable).
-- [ ] Relabel "Fields to collect" → "Fields to include in export" (Codex: UI lies about scope;
-      backend semantics are output-visibility, not collection).
+### Open design question (consult Codex)
+- No-comma addresses ("10301 GREENWOOD AVE N SEATTLE WA 98115"): current parser leaves
+  city blank (street/city boundary "unknowable"). User's example implies they want city
+  extracted. Option A: ship parser as-is (city blank for comma-less, same as existing
+  property_city today). Option B: add a conservative street-suffix heuristic
+  (suffix + optional directional/unit → remaining pre-state tokens = city) used by BOTH
+  property + mailing splits. Decide with Codex.
 
 ## Review
-**Done (2026-06-22). Both phases shipped to local branch `feat/fields-output-visibility`
-(off origin/main), 3 commits: af13b51, 30602f0, e7dc5c4. NOT pushed — awaiting user.**
-
-What changed: the wizard's "Fields to collect" checkboxes are now functional at the OUTPUT
-boundary across every lead-export path (live download, scheduled/R2 + emailed delivery, batch
-combined download + delivery; csv/json/excel). config.fields is NEVER consulted before the
-output boundary, so scraping/enrichment/dedup/billing/skip-trace are untouched (5 of 7 fields
-are load-bearing upstream). Only `mailing_address`/`heirs`/`legal_description` are hideable;
-the 4 identity fields are force-on. Suppression blanks the value and keeps the header.
-
-Verification: py_compile + ruff clean on all 7 touched files; 77 export/batch tests pass
-(+14 new). Codex reviewed both phases — Phase 1 P1 (batch-child) verified theoretical +
-P2 (format tests) addressed; Phase 2 came back with zero findings.
-
-Not done / by design:
-- The skip-trace mapping was checked and is already correct (frontend → `skip_trace_enabled`).
-- FRONTEND follow-up still required (separate `bridgeleads-web` repo): lock the 4 identity
-  checkboxes + relabel "Fields to collect" → "Fields to include in export". Until then the UI
-  still shows 4 checkboxes that the backend intentionally ignores (narrowed from all 7).
+(to fill at end)

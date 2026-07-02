@@ -370,3 +370,96 @@ class TestOutputFieldVisibility:
 
     def test_hideable_set_is_exactly_the_three(self):
         assert HIDEABLE_OUTPUT_FIELDS == frozenset({"mailing_address", "heirs", "legal_description"})
+
+
+class TestMailingAddressSplit:
+    """mailing_street/city/state/zip split columns (2026-07-01 user request).
+
+    Shapes mirror REAL prod rows (address-shape census 2026-07-01): mailing
+    addresses arrive comma-separated, either ', WA, 98499-2817' (state and zip in
+    separate comma parts) or ', WA 98270-7817' (jammed in one part).
+    """
+
+    def test_columns_appended_to_csv(self):
+        for col in ("mailing_street", "mailing_city", "mailing_state", "mailing_zip"):
+            assert col in LEAD_CSV_COLUMNS, col
+        # Appended at END (back-compat convention: existing importers by position
+        # keep working, new columns are extra).
+        assert LEAD_CSV_COLUMNS[-4:] == [
+            "mailing_street", "mailing_city", "mailing_state", "mailing_zip",
+        ]
+
+    def test_split_comma_separated_state_and_zip_parts(self):
+        row = build_lead_export_row(
+            {"mailing_address": "5520 SEELEY LAKE DR SW, LAKEWOOD, WA, 98499-2817"}
+        )
+        assert row["mailing_street"] == "5520 SEELEY LAKE DR SW"
+        assert row["mailing_city"] == "LAKEWOOD"
+        assert row["mailing_state"] == "WA"
+        assert row["mailing_zip"] == "98499-2817"
+
+    def test_split_state_zip_jammed_in_last_part(self):
+        row = build_lead_export_row(
+            {"mailing_address": "9025 67TH AVE NE, MARYSVILLE, WA 98270-7817"}
+        )
+        assert row["mailing_street"] == "9025 67TH AVE NE"
+        assert row["mailing_city"] == "MARYSVILLE"
+        assert row["mailing_state"] == "WA"
+        assert row["mailing_zip"] == "98270-7817"
+
+    def test_split_po_box(self):
+        row = build_lead_export_row({"mailing_address": "PO BOX 9, TACOMA, WA 98401"})
+        assert row["mailing_street"] == "PO BOX 9"
+        assert row["mailing_city"] == "TACOMA"
+        assert row["mailing_state"] == "WA"
+        assert row["mailing_zip"] == "98401"
+
+    def test_no_comma_lifts_state_zip_only(self):
+        # Honest split: without a comma the street/city boundary is unknowable —
+        # state+zip are lifted, city stays blank, full mailing_address is kept.
+        row = build_lead_export_row(
+            {"mailing_address": "10301 GREENWOOD AVE N SEATTLE WA 98115"}
+        )
+        assert row["mailing_state"] == "WA"
+        assert row["mailing_zip"] == "98115"
+        assert row["mailing_city"] == ""
+        assert row["mailing_street"] == "10301 GREENWOOD AVE N SEATTLE"
+
+    def test_missing_mailing_address_all_blank(self):
+        row = build_lead_export_row({"party_name": "X"})
+        for col in ("mailing_street", "mailing_city", "mailing_state", "mailing_zip"):
+            assert row[col] == "", col
+
+    def test_hiding_mailing_address_blanks_split_columns_too(self):
+        # The hide feature must not leak the mailing address via its split columns.
+        rec = {
+            "party_name": "SMITH JOHN",
+            "property_address": "123 MAIN ST, TACOMA, WA 98401",
+            "mailing_address": "5520 SEELEY LAKE DR SW, LAKEWOOD, WA, 98499-2817",
+        }
+        out = io.StringIO()
+        write_lead_csv([rec], out, hidden_fields={"mailing_address"})
+        out.seek(0)
+        row = next(csv.DictReader(out))
+        assert row["mailing_address"] == ""
+        for col in ("mailing_street", "mailing_city", "mailing_state", "mailing_zip"):
+            assert row[col] == "", col
+        # Property split columns (not hidden, not hideable) stay intact.
+        assert row["property_street"] == "123 MAIN ST"
+        assert row["property_city"] == "TACOMA"
+        assert row["property_state"] == "WA"
+        assert row["property_zip"] == "98401"
+
+    def test_hiding_other_fields_keeps_mailing_split(self):
+        rec = {
+            "mailing_address": "PO BOX 9, TACOMA, WA 98401",
+            "heirs": "DOE JANE",
+            "legal_description": "LOT 4",
+        }
+        out = io.StringIO()
+        write_lead_csv([rec], out, hidden_fields={"heirs", "legal_description"})
+        out.seek(0)
+        row = next(csv.DictReader(out))
+        assert row["mailing_street"] == "PO BOX 9"
+        assert row["mailing_city"] == "TACOMA"
+        assert row["mailing_zip"] == "98401"

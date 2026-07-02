@@ -68,6 +68,25 @@ class TestOverlapCsvBuilder:
         assert row["heirs"] == "DOE, JANE"           # not hidden -> kept
         assert row["party_name"] == "DOE, JOHN"      # identity -> intact
 
+    def test_mailing_split_columns_in_overlap_csv(self):
+        # Combined/batch CSV carries the mailing split too (auto-copied from the
+        # canonical row); hiding mailing_address blanks the splits here as well.
+        rec = {
+            "party_name": "DOE, JOHN",
+            "property_address": "123 MAIN ST, KENT WA 98031",
+            "mailing_address": "5520 SEELEY LAKE DR SW, LAKEWOOD, WA, 98499-2817",
+        }
+        ov = {"lists_count": 1, "lists": "Probate", "counties": "King"}
+        row = build_overlap_export_row(rec, ov)
+        assert row["mailing_street"] == "5520 SEELEY LAKE DR SW"
+        assert row["mailing_city"] == "LAKEWOOD"
+        assert row["mailing_state"] == "WA"
+        assert row["mailing_zip"] == "98499-2817"
+        hidden = build_overlap_export_row(rec, ov, hidden_fields={"mailing_address"})
+        assert hidden["mailing_address"] == ""
+        for col in ("mailing_street", "mailing_city", "mailing_state", "mailing_zip"):
+            assert hidden[col] == "", col
+
     def test_writer_threads_hidden_fields(self):
         rec = {"party_name": "DOE, JANE", "property_address": "5 OAK AVE, TACOMA WA 98402",
                "legal_description": "LOT 4"}

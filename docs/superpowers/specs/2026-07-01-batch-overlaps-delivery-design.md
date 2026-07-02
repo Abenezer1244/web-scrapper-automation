@@ -101,11 +101,19 @@ row selection — Codex P1) and stored on the run at finalize as `delivery_count
 ## 7. Worker changes (`src/workers/batch_export.py`)
 
 - `_COMBINED_SQL`: prefixed/type-scoped buckets (§3); mode predicate + deterministic
-  `ORDER BY` (overlap_count DESC, contactable first, filing date DESC, id) + `LIMIT`
-  **in SQL**; companion uncapped counts query.
-- `finalize_batch_run`: **always** builds + uploads the CSV (headers-only when zero
-  rows — verified `write_lead_csv_with_overlap([])` emits headers), always sets
-  `combined_export_key`, stores `delivery_counts`.
+  `ORDER BY` (overlap_count DESC, contactable first, job recency, id) + `LIMIT`
+  **in SQL**; companion uncapped counts query. *(Amended: tertiary sort is job
+  recency, not filing date — SQL date-parsing of the M/D/YYYY string column would
+  error on garbage rows and break the whole export.)*
+- `finalize_batch_run`: always finalizes with honest `delivery_counts`; uploads to
+  R2 only when there are rows (the object is an ops artifact — downloads rebuild
+  from the DB; the API has no R2 creds). **Readiness is status-based**
+  (`done`/`partial`), not key-based — this is the ready-marker-path fix for Bug B
+  (Codex P1): a zero-row overlaps_only run is downloadable (headers-only CSV,
+  verified `write_lead_csv_with_overlap([])` emits headers) and emails its honest
+  empty-state summary. *(Amended from "always uploads + always sets
+  combined_export_key": forcing an empty-file R2 PUT would add a new failure mode
+  — an R2 outage blocking empty-run finalize — for an object nothing ever reads.)*
 - `_deliver` / `deliver_job_email`: new optional `summary_message` kwarg (default
   preserves existing per-job emails — Codex P2); batch email carries the counts line
   (e.g. "0 cross-type overlaps; 37 leads had no parcel to cross-match — view all in

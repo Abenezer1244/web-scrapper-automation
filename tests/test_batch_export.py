@@ -94,6 +94,47 @@ class TestRawSqlExecutesOnPostgres:
         self._run(_FAILED_CHILDREN_SQL)
 
 
+class TestCombinedSqlColumnCompleteness:
+    """The combined SELECT must carry every column the CSV builder consumes —
+    an under-selected set silently blanks populated columns AND (missing
+    delinquent_bill_year) ships a fabricated synthetic tax date."""
+
+    def test_selects_full_lead_column_set(self):
+        for col in (
+            "r.delinquent_bill_year", "r.delinquent_amount", "r.heirs",
+            "r.legal_description", "r.doc_type", "r.phones", "r.emails",
+            "r.absentee_owner", "r.out_of_state_owner", "r.owner_state",
+            "r.auction_date", "r.default_amount", "r.enrichment_data",
+            "r.date_recorded_parsed",
+        ):
+            assert col in _COMBINED_SQL, f"combined SELECT is missing {col}"
+
+
+class TestDeliverySummary:
+    """#3: the overlaps_only summary must not lump no-parcel rows into 'single-list'."""
+
+    def test_no_parcel_reported_separately_not_as_single_list(self):
+        from src.workers.batch_export import _delivery_summary
+        msg = _delivery_summary(
+            "overlaps_only",
+            {"leads_total": 30, "overlaps_delivered": 7,
+             "singletons_suppressed": 21, "unmatchable_no_parcel": 2},
+        )
+        assert "7 lead(s) found on 2 or more lists." in msg
+        assert "21 single-list lead(s)" in msg
+        assert "2 lead(s) had no parcel number" in msg
+        assert "23 single-list" not in msg  # would be the old (total-overlaps) bug
+
+    def test_zero_overlap_message_unchanged(self):
+        from src.workers.batch_export import _delivery_summary
+        msg = _delivery_summary(
+            "overlaps_only",
+            {"leads_total": 5, "overlaps_delivered": 0,
+             "singletons_suppressed": 3, "unmatchable_no_parcel": 2},
+        )
+        assert "0 cross-list overlap leads found across 5 scraped leads." in msg
+
+
 class TestHelpers:
     def test_label(self):
         assert _label("pre_foreclosure") == "Pre-Foreclosure"

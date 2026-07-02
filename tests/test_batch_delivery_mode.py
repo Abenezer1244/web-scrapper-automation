@@ -211,3 +211,79 @@ class TestEmptyStateFinalize:
                 "singletons_suppressed": 0,
                 "unmatchable_no_parcel": 2,
             }
+
+
+# ─── Combined-export column completeness (Phase 2 / cross-check #1) ───────────
+# The combined SQL under-selected columns, so the CSV builder blanked populated
+# fields AND (missing delinquent_bill_year) shipped a fabricated 01/01/{year}
+# tax date. The fix selects the full lead column set.
+
+import csv as _csv  # noqa: E402
+import io as _io  # noqa: E402
+from decimal import Decimal  # noqa: E402
+
+from src.utils.lead_export import write_lead_csv_with_overlap  # noqa: E402
+
+
+def _render(pairs) -> list[dict]:
+    buf = _io.StringIO()
+    write_lead_csv_with_overlap(pairs, buf)
+    buf.seek(0)
+    return list(_csv.DictReader(buf))
+
+
+class TestCombinedExportColumns:
+    def test_tax_row_no_fabricated_filed_date_and_full_columns(self):
+        with SyncSessionLocal() as db:
+            user = _user(db)
+            batch, j1, j2 = _two_type_batch(db, user, "everything")
+            _result(db, user.id, j1.id, party="PROBATE OWNER",
+                    property_key="WA|pierce|000000A1")
+            # tax_delinquent row: synthetic county date_recorded + real bill_year
+            # + plaintext extras the old SELECT dropped.
+            db.add(Result(
+                id=str(uuid.uuid4()), user_id=user.id, job_id=j2.id,
+                date_recorded="01/01/2024",  # synthetic — county tax has no event date
+                party_name="TAX OWNER", property_key="WA|pierce|000000A2",
+                delinquent_bill_year=2024, delinquent_amount=Decimal("1234.56"),
+                heirs="ESTATE OF X", legal_description="LOT 1 BLK 2", doc_type="TAXLIEN",
+            ))
+            db.flush()
+            rows = _render(_combined_pairs(db, user.id, [j1.id, j2.id], delivery_mode="everything"))
+            db.rollback()
+
+        tax = next(r for r in rows if r["party_name"] == "TAX OWNER")
+        assert tax["filed_date"] == ""            # NO fabricated 01/01/2024
+        assert tax["delinquent_bill_year"] == "2024"
+        assert tax["delinquent_amount"] == "1234.56"
+        assert tax["heirs"] == "ESTATE OF X"
+        assert tax["legal_description"] == "LOT 1 BLK 2"
+        assert tax["doc_type"] == "TAXLIEN"
+
+    def test_aggregated_lead_subtype_survives_nonprobate_winner(self):
+        """A pk bucket bridging probate + tax: the winning (representative) row may
+        be the tax row, but the bucket's aggregated probate subtype must still be
+        exported (the per-row enrichment subtype is popped so the scalar wins)."""
+        with SyncSessionLocal() as db:
+            user = _user(db)
+            batch, j1, j2 = _two_type_batch(db, user, "everything")
+            pk = "WA|pierce|000000B7"
+            # probate row carries the subtype in enrichment_data
+            db.add(Result(
+                id=str(uuid.uuid4()), user_id=user.id, job_id=j1.id,
+                date_recorded="06/01/2026", party_name="OWNER", property_key=pk,
+                enrichment_data={"lead_subtype": "probate_death_inheritance"},
+            ))
+            # tax row: no subtype, newer job → likely the representative winner
+            db.add(Result(
+                id=str(uuid.uuid4()), user_id=user.id, job_id=j2.id,
+                date_recorded="06/02/2026", party_name="OWNER", property_key=pk,
+                delinquent_bill_year=2025,
+            ))
+            db.flush()
+            rows = _render(_combined_pairs(db, user.id, [j1.id, j2.id], delivery_mode="everything"))
+            db.rollback()
+
+        assert len(rows) == 1  # one bucket (pk bridges both)
+        assert rows[0]["lead_subtype"] == "probate_death_inheritance"
+        assert rows[0]["filed_date"] == ""  # tax winner → bill_year present → blanked

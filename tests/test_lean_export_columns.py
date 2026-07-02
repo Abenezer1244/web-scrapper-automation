@@ -63,13 +63,12 @@ def test_probate_keeps_heirs_subtype_drops_other_type_blocks():
     assert not (_NTS_BLOCK & cols)
 
 
-def test_tax_keeps_tax_block_drops_probate_and_others():
+def test_tax_keeps_tax_block_drops_probate_only_subtype():
     cols = set(resolve_lead_export_columns("tax_delinquent"))
     assert _TAX_BLOCK.issubset(cols)
     assert not (_CODE_BLOCK & cols)
     assert not (_NTS_BLOCK & cols)
-    # probate-only columns are dropped for tax
-    assert "heirs" not in cols
+    # lead_subtype is probate-only; tax drops it
     assert "lead_subtype" not in cols
 
 
@@ -78,15 +77,24 @@ def test_code_violation_keeps_only_its_block():
     assert _CODE_BLOCK.issubset(cols)
     assert not (_TAX_BLOCK & cols)
     assert not (_NTS_BLOCK & cols)
-    assert "heirs" not in cols
+    assert "lead_subtype" not in cols
 
 
-def test_pre_foreclosure_keeps_only_nts_block():
+def test_pre_foreclosure_keeps_nts_block_and_heirs():
     cols = set(resolve_lead_export_columns("pre_foreclosure"))
     assert _NTS_BLOCK.issubset(cols)
     assert not (_TAX_BLOCK & cols)
     assert not (_CODE_BLOCK & cols)
-    assert "heirs" not in cols
+    # heirs is BASE: pre_foreclosure populates it (opposite party) — must NOT drop.
+    assert "heirs" in cols
+    assert "lead_subtype" not in cols
+
+
+def test_heirs_is_base_kept_for_every_type():
+    # heirs is a shared secondary-party column (probate heirs / other spouse /
+    # pre_foreclosure opposite party) — kept for every record type, never dropped.
+    for rt in _TYPE_EXTRA_COLUMNS:
+        assert "heirs" in resolve_lead_export_columns(rt), rt
 
 
 def test_divorce_and_death_cert_keep_heirs_not_subtype():

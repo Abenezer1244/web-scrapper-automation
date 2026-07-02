@@ -88,17 +88,26 @@ LEAD_CSV_COLUMNS: list[str] = [
 # data. Only the FIELDNAMES are restricted; build_lead_export_row stays full-width.
 #
 # Column applicability verified against the scrapers/enrichment/signals:
-#   heirs            -> probate / death_certificate / divorce (2nd spouse)
-#   lead_subtype     -> probate only (blank for non-probate at insert, tasks.py)
+#   heirs            -> BASE (NOT type-specific). It is a shared "secondary party"
+#                       column that many recorded-document types populate: actual
+#                       heirs (probate), the other spouse (divorce), AND the
+#                       opposite party/company on a pre_foreclosure filing
+#                       (orient_pre_foreclosure_party -> record.heirs in clark_wa,
+#                       king_wa_probate, pierce_wa_probate). Because it can be
+#                       populated by more types than a naive map predicts, it is
+#                       kept for EVERY type (dropping it risked customer data loss —
+#                       Codex review flagged pre_foreclosure specifically).
+#   lead_subtype     -> probate only (set at insert ONLY when record_type=='probate',
+#                       tasks.py; blank for every other type incl. death_certificate)
 #   tax block        -> tax_delinquent (delinquent_* stored, tax_* enrichment,
 #                       months_delinquent/wa_foreclosure_eligible derived)
 #   code_violation_* -> code_violation enrichment
 #   NTS/auction block-> pre_foreclosure (auction_date/default_amount stored,
 #                       trustee/ts_number from enrichment_data["nts"], days_to_auction derived)
 _TYPE_EXTRA_COLUMNS: dict[str, tuple[str, ...]] = {
-    "probate": ("heirs", "lead_subtype"),
-    "death_certificate": ("heirs",),
-    "divorce": ("heirs",),
+    "probate": ("lead_subtype",),
+    "death_certificate": (),
+    "divorce": (),
     "eviction": (),
     "tax_delinquent": (
         "delinquent_amount", "delinquent_bill_year",

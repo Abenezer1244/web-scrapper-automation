@@ -223,7 +223,9 @@ class DataExporter:
         if fmt == "csv":
             return self.to_csv(records, filename, hidden_fields=hidden_fields, columns=columns)
         if fmt == "json":
-            return self.to_json(records, filename, hidden_fields=hidden_fields, columns=columns)
+            # JSON is intentionally NOT column-trimmed (raw dict namespace) — do
+            # not forward `columns`; to_json has no such parameter.
+            return self.to_json(records, filename, hidden_fields=hidden_fields)
         # excel | xlsx
         return self.to_excel(records, filename, hidden_fields=hidden_fields, columns=columns)
 

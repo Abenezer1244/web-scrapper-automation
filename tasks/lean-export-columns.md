@@ -23,14 +23,19 @@ can NEVER populate. Combined/batch + segment exports stay the FULL superset.
 - Do NOT touch webhook/dialer push JSON (separate contract).
 
 ## Per-type column map (code-grounded)
-BASE (31, all types): date_recorded, party_name, parcel_id, property_address,
-mailing_address, legal_description, doc_type, phone, phone_type, email, phone_2,
-phone_3, email_2, email_3, first_name, last_name, property_street/city/state/zip,
-assessed_value, instrument_number, freshness_days, contactability_score,
-absentee_owner, out_of_state_owner, owner_state, mailing_street/city/state/zip.
-- probate: +heirs +lead_subtype
-- death_certificate: +heirs
-- divorce: +heirs
+BASE (32, all types): date_recorded, party_name, heirs, parcel_id,
+property_address, mailing_address, legal_description, doc_type, phone, phone_type,
+email, phone_2, phone_3, email_2, email_3, first_name, last_name,
+property_street/city/state/zip, assessed_value, instrument_number, freshness_days,
+contactability_score, absentee_owner, out_of_state_owner, owner_state,
+mailing_street/city/state/zip.
+  NOTE heirs is BASE (kept for every type): it is a shared secondary-party column
+  populated as heirs (probate), other spouse (divorce), OR the opposite party on a
+  pre_foreclosure filing (orient_pre_foreclosure_party -> record.heirs). Dropping
+  it lost pre_foreclosure data — Codex [P1], fixed.
+- probate: +lead_subtype
+- death_certificate: (base only)
+- divorce: (base only)
 - eviction: (base only)
 - tax_delinquent: +delinquent_amount, delinquent_bill_year, tax_billed_amount,
   tax_paid_amount, tax_account_status, months_delinquent, wa_foreclosure_eligible

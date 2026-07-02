@@ -146,3 +146,48 @@ def test_since_last_run_no_previous_job_defaults_to_30_days():
         )
         expected_from = (datetime.now(ZoneInfo("US/Pacific")).date() - timedelta(days=30)).strftime("%m/%d/%Y")
         assert df == expected_from
+
+
+def test_since_last_run_caught_up_scans_end_date_not_inverted():
+    # Codex P2: when the last covered window already reaches end_date (today),
+    # the resume start (covered_to + 1) is > end_date. The window must collapse
+    # EXPLICITLY to a single non-inverted day at end_date (re-scan today for late
+    # filings), never an inverted (tomorrow -> today) range.
+    from zoneinfo import ZoneInfo
+    with SyncSessionLocal() as db:
+        config = _config(db, _user(db).id)
+        today = datetime.now(ZoneInfo("US/Pacific")).date()
+        _done_job(
+            db, config,
+            date_to=today.strftime("%m/%d/%Y"),
+            finished_at=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+        )
+        db.commit()
+        df, dt = _resolve_date_range(
+            {"date_range_mode": "since_last_run"},
+            config_id=config.id, job_id=str(uuid.uuid4()), user_plan="pro",
+        )
+        assert df == dt == today.strftime("%m/%d/%Y")
+        assert datetime.strptime(df, "%m/%d/%Y") <= datetime.strptime(dt, "%m/%d/%Y")
+
+
+def test_since_last_run_future_coverage_clamps_to_end_date():
+    # A custom/backfill run whose date_to is in the FUTURE must not yield an
+    # inverted window nor a day beyond end_date — it clamps to end_date (today).
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+    with SyncSessionLocal() as db:
+        config = _config(db, _user(db).id)
+        today = datetime.now(ZoneInfo("US/Pacific")).date()
+        future = today + timedelta(days=10)
+        _done_job(
+            db, config,
+            date_to=future.strftime("%m/%d/%Y"),
+            finished_at=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+        )
+        db.commit()
+        df, dt = _resolve_date_range(
+            {"date_range_mode": "since_last_run"},
+            config_id=config.id, job_id=str(uuid.uuid4()), user_plan="pro",
+        )
+        assert df == dt == today.strftime("%m/%d/%Y")

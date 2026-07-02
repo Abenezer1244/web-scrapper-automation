@@ -593,10 +593,31 @@ class Job(Base):
     # only done jobs with a dialer_webhook_url whose skip-trace is settled and
     # this is NULL, so each job is pushed at most once.
     dialer_pushed_at = Column(DateTime(timezone=True), nullable=True)
+    # Migration 079: durable occurrence idempotency for SCHEDULED single-config
+    # dispatch (Codex P1). The scheduler's ±1-minute due window can fire adjacent
+    # beat ticks and its active-run dedupe dies once a fast scrape reaches a
+    # terminal status — so two ticks (or two beats) could both create a job for
+    # the same occurrence. scheduled_for is the occurrence timestamp (UTC,
+    # truncated to the run minute); a unique (scraper_config_id, scheduled_for)
+    # makes the second insert a no-op at the DB. NULL = on-demand (manual / test /
+    # POST /jobs / run-once), exempt because Postgres treats NULLs as distinct.
+    # Mirrors BatchRun.scheduled_for + uq_batch_runs_occurrence.
+    scheduled_for = Column(DateTime(timezone=True), nullable=True)
 
     # PERF (migration 033): list_jobs filters user_id and orders by created_at.
     __table_args__ = (
         Index("ix_jobs_user_created", "user_id", "created_at"),
+        # Migration 079: unique INDEX (not a table constraint) so prod can build
+        # it CREATE UNIQUE INDEX CONCURRENTLY without an ACCESS EXCLUSIVE lock on
+        # the hot jobs table. ON CONFLICT DO NOTHING arbitrates against a unique
+        # index the same as a constraint, and a unique index treats NULLs as
+        # distinct, so NULL scheduled_for (manual/test/on-demand) stays exempt.
+        Index(
+            "uq_jobs_scheduled_occurrence",
+            "scraper_config_id",
+            "scheduled_for",
+            unique=True,
+        ),
     )
 
     user = relationship("User", back_populates="jobs")

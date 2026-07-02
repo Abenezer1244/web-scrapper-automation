@@ -993,17 +993,29 @@ async def download_export(
         # ScraperConfig carrying the batch's `fields` (batches.py), and Job.scraper_
         # config_id is NOT NULL, so the guard's None branch is defensive only. (The
         # batch COMBINED export is a separate path — see batch_export.py.)
-        from src.utils.lead_export import resolve_hidden_output_fields, write_lead_csv
+        from src.utils.lead_export import (
+            resolve_hidden_output_fields,
+            resolve_lead_export_columns,
+            write_lead_csv,
+        )
         hidden_fields: set[str] = set()
+        # Lean per-record-type columns: this download is a SINGLE record type (each
+        # job — batch child or standalone — has one ScraperConfig.record_type). The
+        # combined batch export is a separate superset path (batch_export.py). None
+        # scraper_config_id (defensive; Job.scraper_config_id is NOT NULL) -> full.
+        columns: list[str] | None = None
         if job.scraper_config_id:
-            cfg_fields_row = await db.execute(
-                select(ScraperConfig.fields).where(
+            cfg_row = await db.execute(
+                select(ScraperConfig.fields, ScraperConfig.record_type).where(
                     ScraperConfig.id == job.scraper_config_id,
                     ScraperConfig.user_id == user.id,
                 )
             )
-            hidden_fields = resolve_hidden_output_fields(cfg_fields_row.scalar_one_or_none())
-        write_lead_csv(records, output, hidden_fields=hidden_fields)
+            cfg = cfg_row.one_or_none()
+            if cfg is not None:
+                hidden_fields = resolve_hidden_output_fields(cfg.fields)
+                columns = resolve_lead_export_columns(cfg.record_type)
+        write_lead_csv(records, output, hidden_fields=hidden_fields, columns=columns)
 
         csv_bytes = output.getvalue().encode("utf-8")
 

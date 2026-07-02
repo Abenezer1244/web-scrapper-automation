@@ -65,7 +65,8 @@ def _sanitize_json_value(value: Any) -> Any:
 
 
 def _canonical_dataframe(
-    records: list[Any], hidden_fields: set[str] | None = None
+    records: list[Any], hidden_fields: set[str] | None = None,
+    columns: list[str] | None = None,
 ) -> pd.DataFrame:
     """Build a DataFrame of canonical lead rows — the SAME columns + formatting
     (dialer split cols, normalized phones, sanitized values) as the CSV, so the
@@ -77,10 +78,15 @@ def _canonical_dataframe(
 
     `hidden_fields` blanks the user-deselected hideable columns (header order is
     unchanged), keeping Excel byte-identical to the CSV for the same config.
+
+    `columns` (from `resolve_lead_export_columns`) restricts the frame to a lean
+    per-record-type subset, keeping Excel in lockstep with the CSV. None => full
+    `LEAD_CSV_COLUMNS`. Selecting a subset of the full-width rows can't drift from
+    the CSV because both project the SAME built rows.
     """
     today = datetime.now(UTC).date()
     rows = [_apply_visibility(build_lead_export_row(r, today), hidden_fields) for r in records]
-    return pd.DataFrame(rows, columns=LEAD_CSV_COLUMNS)
+    return pd.DataFrame(rows, columns=columns or LEAD_CSV_COLUMNS)
 
 
 class DataExporter:
@@ -95,22 +101,33 @@ class DataExporter:
     def to_csv(
         self, records: list[Any], filename: str = "export",
         hidden_fields: set[str] | None = None,
+        columns: list[str] | None = None,
     ) -> Path:
-        """Export records to the canonical dialer-ready CSV (shared builder)."""
+        """Export records to the canonical dialer-ready CSV (shared builder).
+
+        `columns` restricts the header to a lean per-record-type subset (None =
+        full superset). Single-type callers resolve it via
+        `resolve_lead_export_columns`; combined/batch callers omit it.
+        """
         filepath = self._timestamped_path(filename, "csv")
         # newline="" so the csv writer doesn't emit blank lines between rows.
         with open(filepath, "w", encoding="utf-8", newline="") as f:
-            write_lead_csv(records, f, hidden_fields=hidden_fields)
+            write_lead_csv(records, f, hidden_fields=hidden_fields, columns=columns)
         _logger.info("CSV exported: %s (%d rows)", filepath.name, len(records))
         return filepath
 
     def to_excel(
         self, records: list[Any], filename: str = "export",
         hidden_fields: set[str] | None = None,
+        columns: list[str] | None = None,
     ) -> Path:
-        """Export records to an Excel file (canonical columns) with amber header."""
+        """Export records to an Excel file (canonical columns) with amber header.
+
+        `columns` restricts the sheet to a lean per-record-type subset (None =
+        full superset), keeping Excel in lockstep with the CSV.
+        """
         filepath = self._timestamped_path(filename, "xlsx")
-        df = _canonical_dataframe(records, hidden_fields)
+        df = _canonical_dataframe(records, hidden_fields, columns)
 
         with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Leads")
@@ -141,6 +158,13 @@ class DataExporter:
 
         `hidden_fields` blanks the user-deselected hideable keys (same set the CSV
         suppresses), keeping every export format consistent for one config.
+
+        NOTE: the lean per-record-type column trim (`columns=`) is deliberately NOT
+        applied here. Unlike CSV/Excel — which pass raw rows through
+        `build_lead_export_row` to the CANONICAL column schema — this path dumps the
+        raw DB dicts as-is (keys like `enrichment_data`/`phones`, a different key
+        namespace). A canonical-column allowlist would wrongly drop those raw keys,
+        so JSON is left at full fidelity (its schema already diverges from the CSV).
         """
         filepath = self._timestamped_path(filename, "json")
         # Only ever blank a genuinely hideable key (never an identity column).
@@ -176,12 +200,18 @@ class DataExporter:
         filename: str = "export",
         fmt: str | None = None,
         hidden_fields: set[str] | None = None,
+        columns: list[str] | None = None,
     ) -> Path:
         """Export to the given format. Single entry point for all callers.
 
         `hidden_fields` (from `resolve_hidden_output_fields(config.fields)`) is
         forwarded to every format so the delivered file honors the user's output
         visibility selection identically across csv/json/excel.
+
+        `columns` (from `resolve_lead_export_columns(record_type)`) selects the lean
+        per-record-type column subset for the CANONICAL formats (csv/excel). None =
+        full superset (combined/batch callers omit it). JSON is intentionally NOT
+        trimmed — it dumps raw DB dicts, a different key namespace (see `to_json`).
         """
         from src.config.constants import SUPPORTED_EXPORT_FORMATS
         fmt = (fmt or settings.EXPORT_FORMAT).lower()
@@ -191,11 +221,11 @@ class DataExporter:
         if fmt not in SUPPORTED_EXPORT_FORMATS:
             raise ValueError(f"Unsupported export format: {fmt}")
         if fmt == "csv":
-            return self.to_csv(records, filename, hidden_fields=hidden_fields)
+            return self.to_csv(records, filename, hidden_fields=hidden_fields, columns=columns)
         if fmt == "json":
-            return self.to_json(records, filename, hidden_fields=hidden_fields)
+            return self.to_json(records, filename, hidden_fields=hidden_fields, columns=columns)
         # excel | xlsx
-        return self.to_excel(records, filename, hidden_fields=hidden_fields)
+        return self.to_excel(records, filename, hidden_fields=hidden_fields, columns=columns)
 
     # ─── R2 upload ────────────────────────────────────────────────────────────
 

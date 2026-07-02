@@ -239,7 +239,10 @@ def run_scrape_job(self, job_id: str) -> None:
     from src.db.session import rls_sync_session, system_sync_session
     from src.scrapers.registry import UnsupportedCountyError, get_scraper_class
     from src.utils.data_exporter import DataExporter
-    from src.utils.lead_export import resolve_hidden_output_fields
+    from src.utils.lead_export import (
+        resolve_hidden_output_fields,
+        resolve_lead_export_columns,
+    )
     from src.workers.delivery import deliver_job_email
 
     # Refresh the in-process SSRF allowlist from the connectors table before
@@ -958,9 +961,16 @@ def run_scrape_job(self, job_id: str) -> None:
         # Honor the user's output-field visibility (blank deselected hideable
         # columns; identity/derived columns always present). Legacy/empty => all.
         hidden_fields = resolve_hidden_output_fields(config.fields)
+        # Lean per-record-type columns: a single scrape job is ONE record type, so
+        # the emitted file drops columns that type can never populate (probate ships
+        # no tax/code-violation/auction columns). Same subset for the enriched
+        # re-export below, keeping the R2 file and the in-app download identical. The
+        # batch COMBINED export is a separate superset path (batch_export.py).
+        export_columns = resolve_lead_export_columns(config.record_type)
         exporter = DataExporter()
         local_file = exporter.export(
-            record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt, hidden_fields=hidden_fields
+            record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt,
+            hidden_fields=hidden_fields, columns=export_columns,
         )
 
         object_key = f"exports/{job.user_id}/{job_id}/leads.{local_file.suffix.lstrip('.')}"
@@ -1236,6 +1246,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 enriched_file = exporter.export(
                     record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt,
                     hidden_fields=resolve_hidden_output_fields(config.fields),
+                    columns=export_columns,
                 )
                 if object_key:
                     exporter.upload_to_r2(enriched_file, object_key)

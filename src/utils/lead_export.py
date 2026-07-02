@@ -75,6 +75,79 @@ LEAD_CSV_COLUMNS: list[str] = [
 ]
 
 
+# ── Lean per-record-type export profile ─────────────────────────────────────
+# A SINGLE-record-type export drops the columns that record type can NEVER
+# populate (a probate CSV shouldn't ship tax/code-violation/auction columns).
+# This is STRUCTURAL, not data-driven: a column is dropped for a type only when
+# no scraper/enrichment/derived-signal for that type can ever fill it. "All rows
+# empty in this export" is NOT a reason to drop — that can mean failed enrichment,
+# a view-filter excluding populated rows, or async data (skip-trace/NTS) not landed
+# yet (Codex, consult 019f23f0). Combined/batch + segment exports intentionally
+# keep the FULL superset (they merge multiple record types) — they never call the
+# resolver. Unknown/new record types fall back to FULL so we never silently drop
+# data. Only the FIELDNAMES are restricted; build_lead_export_row stays full-width.
+#
+# Column applicability verified against the scrapers/enrichment/signals:
+#   heirs            -> BASE (NOT type-specific). It is a shared "secondary party"
+#                       column that many recorded-document types populate: actual
+#                       heirs (probate), the other spouse (divorce), AND the
+#                       opposite party/company on a pre_foreclosure filing
+#                       (orient_pre_foreclosure_party -> record.heirs in clark_wa,
+#                       king_wa_probate, pierce_wa_probate). Because it can be
+#                       populated by more types than a naive map predicts, it is
+#                       kept for EVERY type (dropping it risked customer data loss —
+#                       Codex review flagged pre_foreclosure specifically).
+#   lead_subtype     -> probate only (set at insert ONLY when record_type=='probate',
+#                       tasks.py; blank for every other type incl. death_certificate)
+#   tax block        -> tax_delinquent (delinquent_* stored, tax_* enrichment,
+#                       months_delinquent/wa_foreclosure_eligible derived)
+#   code_violation_* -> code_violation enrichment
+#   NTS/auction block-> pre_foreclosure (auction_date/default_amount stored,
+#                       trustee/ts_number from enrichment_data["nts"], days_to_auction derived)
+_TYPE_EXTRA_COLUMNS: dict[str, tuple[str, ...]] = {
+    "probate": ("lead_subtype",),
+    "death_certificate": (),
+    "divorce": (),
+    "eviction": (),
+    "tax_delinquent": (
+        "delinquent_amount", "delinquent_bill_year",
+        "tax_billed_amount", "tax_paid_amount", "tax_account_status",
+        "months_delinquent", "wa_foreclosure_eligible",
+    ),
+    "code_violation": (
+        "code_violation_type", "code_violation_status",
+        "code_violation_description", "code_violation_last_inspection",
+    ),
+    "pre_foreclosure": (
+        "auction_date", "days_to_auction", "default_amount", "trustee", "ts_number",
+    ),
+}
+
+# BASE = columns common to EVERY type = the canonical set minus every column that
+# is type-specific to SOME type. Derived from the map above so the two can't drift.
+_ALL_TYPE_SPECIFIC_COLUMNS: frozenset[str] = frozenset(
+    col for cols in _TYPE_EXTRA_COLUMNS.values() for col in cols
+)
+LEAN_BASE_COLUMNS: tuple[str, ...] = tuple(
+    c for c in LEAD_CSV_COLUMNS if c not in _ALL_TYPE_SPECIFIC_COLUMNS
+)
+
+
+def resolve_lead_export_columns(record_type: str | None) -> list[str]:
+    """Ordered CSV columns for a SINGLE-record-type (lean) export.
+
+    Returns the canonical column order filtered to those a record type can ever
+    populate. Unknown/None ``record_type`` returns the FULL ``LEAD_CSV_COLUMNS``
+    (never silently drop data). The result is always an ordered subset of
+    ``LEAD_CSV_COLUMNS`` — callers pass it as ``columns=`` to ``write_lead_csv`` /
+    ``DataExporter``. Combined/batch/segment exports do NOT call this (superset).
+    """
+    if record_type not in _TYPE_EXTRA_COLUMNS:
+        return list(LEAD_CSV_COLUMNS)
+    allowed = set(LEAN_BASE_COLUMNS) | set(_TYPE_EXTRA_COLUMNS[record_type])
+    return [c for c in LEAD_CSV_COLUMNS if c in allowed]
+
+
 # User-controllable OUTPUT visibility (delivery/view preference — NOT scrape scope;
 # the scraper always collects everything because the rest of the pipeline needs it).
 # Only these three columns may be suppressed from the delivered file. The wizard's
@@ -324,7 +397,8 @@ def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, s
 
 
 def write_lead_csv(
-    records: list[Any], filelike, hidden_fields: set[str] | None = None
+    records: list[Any], filelike, hidden_fields: set[str] | None = None,
+    columns: list[str] | None = None,
 ) -> None:
     """Write the canonical lead CSV (header + rows) to an open text file/StringIO.
 
@@ -333,9 +407,17 @@ def write_lead_csv(
 
     `hidden_fields` (from `resolve_hidden_output_fields`) blanks the user-deselected
     hideable columns; the header set is unchanged. None/empty = show everything.
+
+    `columns` (from `resolve_lead_export_columns`) restricts the HEADER/fieldnames to
+    a lean per-record-type subset. None => full `LEAD_CSV_COLUMNS`. The row is still
+    built full-width; `extrasaction="ignore"` drops the keys not in `columns`, so the
+    lean file and the full file share identical values for the columns they have in
+    common (no separate builder, no drift).
     """
     today = datetime.now(UTC).date()  # one consistent "today" for the whole file
-    writer = csv.DictWriter(filelike, fieldnames=LEAD_CSV_COLUMNS)
+    writer = csv.DictWriter(
+        filelike, fieldnames=columns or LEAD_CSV_COLUMNS, extrasaction="ignore"
+    )
     writer.writeheader()
     for rec in records:
         writer.writerow(_apply_visibility(build_lead_export_row(rec, today), hidden_fields))

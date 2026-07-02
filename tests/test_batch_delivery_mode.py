@@ -307,3 +307,24 @@ class TestNoSilentTruncation:
             db.rollback()
         assert len(capped) == 2           # single query is still page-bounded
         assert len(full) == 3             # paging accumulates every lead
+
+
+class TestOverlapsFirstRemoved:
+    def test_delivery_mode_literal_excludes_overlaps_first(self):
+        """#4: the dead 'overlaps_first' mode is gone from the request contract."""
+        import json as _json
+
+        from src.api.schemas import BatchCreateRequest
+        schema = _json.dumps(BatchCreateRequest.model_json_schema())
+        assert "overlaps_first" not in schema
+        assert "overlaps_only" in schema
+        assert "everything" in schema
+
+    def test_model_check_constraint_excludes_overlaps_first(self):
+        from src.db.models import ScraperBatch
+        checks = [
+            c for c in ScraperBatch.__table__.constraints
+            if getattr(c, "name", "") == "ck_scraper_batches_delivery_mode"
+        ]
+        assert checks, "delivery_mode CHECK constraint missing"
+        assert "overlaps_first" not in str(checks[0].sqltext)

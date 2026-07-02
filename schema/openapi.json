@@ -129,7 +129,6 @@
             "default": "overlaps_only",
             "enum": [
               "overlaps_only",
-              "overlaps_first",
               "everything"
             ],
             "title": "Delivery Mode",

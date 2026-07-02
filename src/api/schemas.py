@@ -861,12 +861,7 @@ class BatchCreateRequest(BaseModel):
     # point of a batch is leads on 2+ lists — singletons are obtainable from
     # single scrapes. Existing batches (created before this field) stay
     # 'everything' via the DB default; the route persists this value explicitly.
-    # NOTE: overlaps_first and everything currently produce identical output (the
-    # sort already ranks overlaps first); the distinct mode is reserved for
-    # future sectioned exports.
-    delivery_mode: Literal["overlaps_only", "overlaps_first", "everything"] = (
-        "overlaps_only"
-    )
+    delivery_mode: Literal["overlaps_only", "everything"] = "overlaps_only"
 
     @field_validator("state")
     @classmethod

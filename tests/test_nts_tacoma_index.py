@@ -9,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from src.scrapers.sources.nts_tacoma_index import (
+    _to_date,
     collect_notice_urls,
     extract_article_text,
     extract_notice_urls,
@@ -16,6 +17,7 @@ from src.scrapers.sources.nts_tacoma_index import (
     listing_has_entries,
     notice_to_row,
     parse_nts_notice,
+    parse_tacoma_notice,
 )
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "nts_tacoma_25-76127.txt"
@@ -272,6 +274,68 @@ class TestCollectNoticeUrls:
         pages = {p: _ts(f"{p}00") for p in range(1, 20)}
         urls = collect_notice_urls(self._fetcher(pages), max_pages=4, max_notices=200)
         assert len(urls) == 4  # only pages 1-4 walked
+
+
+class TestSurrogateTsNumberAndWordedDate:
+    """Bug B regression (real notices, live 2026-06-26): trustees that print NO
+    'Trustee Sale No.' (Clear Recon 'In re …') and older law-firm notices using an
+    ORDINAL worded auction date ('17th day of July, 2026') + 'Tax Parcel No' labels
+    were dropped whole. parse_tacoma_notice must recover them (surrogate ts# + worded
+    date + parcel labels) WITHOUT changing any real-TS# notice."""
+
+    def _fx(self, name: str) -> str:
+        return (Path(__file__).parent / "fixtures" / name).read_text(encoding="utf-8")
+
+    def test_clearrecon_no_tsnum_recovered_via_ref_surrogate(self):
+        # $661,481.84 Clear Recon sale — no TS# label; deed reference -> REF- surrogate.
+        p = parse_tacoma_notice(self._fx("nts_tacoma_clearrecon_no_tsnum.txt"))
+        assert p["ts_number"] == "REF-202204180696"
+        assert p["auction_date"] == "7/31/2026"
+        assert p["parcel"] == "9260000622"
+        assert p["principal_owing"] == Decimal("661481.84")
+        assert is_valid_nts(p) is True
+        row = notice_to_row(p, "http://x/", today=date(2026, 7, 2))
+        assert row is not None and row["is_active"] is True
+        assert row["auction_date"] == date(2026, 7, 31)
+
+    def test_worded_ordinal_date_tax_parcel_nos(self):
+        # "will on the 17th day of July, 2026 ... Tax Parcel Nos: 031715-3007, ..."
+        p = parse_tacoma_notice(self._fx("nts_tacoma_worded_date_a.txt"))
+        assert p["auction_date"] == "July 17, 2026"
+        assert _to_date(p["auction_date"]) == date(2026, 7, 17)
+        assert p["parcel"] == "031715-3007"       # first of the multi-parcel list
+        assert p["ts_number"] == "APN-031715-3007"  # no deed ref -> APN surrogate
+        assert is_valid_nts(p) is True
+
+    def test_worded_ordinal_date_assessor_tax_parcel(self):
+        # "will on the 24th day of July 2026 ... ASSESSOR'S TAX PARCEL NO.: 031713-2-024"
+        p = parse_tacoma_notice(self._fx("nts_tacoma_worded_date_b.txt"))
+        assert _to_date(p["auction_date"]) == date(2026, 7, 24)
+        assert p["parcel"] == "031713-2-024"
+        assert p["ts_number"] == "APN-031713-2-024"
+        assert is_valid_nts(p) is True
+
+    def test_wrapper_does_not_alter_real_tsnumber_notices(self):
+        # The two existing REAL fixtures carry real TS#s — the wrapper must be a no-op
+        # (identical dict) so the surrogate path never rewrites a genuine trustee id.
+        for fn in ("nts_tacoma_25-76127.txt", "nts_tacoma_quality_loan.txt"):
+            text = self._fx(fn)
+            assert parse_tacoma_notice(text) == parse_nts_notice(text)
+            assert not parse_tacoma_notice(text)["ts_number"].startswith(("REF-", "APN-"))
+
+    def test_tax_parcel_label_does_not_break_numeric_parcel_label(self):
+        # The widened _PARCEL alternation must still parse the plain "Parcel Number(s):".
+        assert parse_nts_notice(
+            "Parcel Number(s): 5005002880\nwill on 7/1/2026, at 9:00 AM at X sell at public auction"
+        )["parcel"] == "5005002880"
+
+    def test_worded_date_not_used_when_numeric_present(self):
+        # A numeric-format notice must NOT be re-parsed by the worded fallback (gated on
+        # am is None) — behavior byte-identical for the dominant Tacoma format.
+        p = parse_nts_notice(
+            "TS #: 25-1\nwill on 7/10/2026, at 10:00 AM at Courthouse sell at public auction"
+        )
+        assert p["auction_date"] == "7/10/2026"
 
 
 class TestNoticeToRow:

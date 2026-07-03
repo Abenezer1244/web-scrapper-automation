@@ -93,7 +93,15 @@ _DEED_REF = re.compile(
     r"Reference\s+Number\s+(?:of\s+(?:the\s+)?)?Deed\s+of\s+Trust\s*:\s*(?:Instrument\s+No\.?\s*)?([\w\-]+)",
     re.I,
 )
-_PARCEL = re.compile(r"Parcel\s+Number\(?s?\)?\s*:\s*([\w\-]+)", re.I)
+# Parcel label variants: "Parcel Number(s):" (North Star / Quality Loan / Affinia),
+# plus "[Assessor's] Tax Parcel No(s).:" (Clear Recon / older law-firm notices — live
+# 2026-06-26). A multi-parcel notice lists several after the colon; we capture the
+# FIRST (a valid match key — the matcher keys on any one exact parcel).
+_PARCEL = re.compile(
+    r"(?:Parcel\s+Number\(?s?\)?|(?:Assessor'?s\s+)?Tax\s+Parcel\s+(?:No|Number)s?\.?)"
+    r"\s*:\s*([\w\-]+)",
+    re.I,
+)
 
 # ── Auction: "will on 7/10/2026, at 10:00 A.M. <location> sell at public auction"
 # Accept AM / A.M. / a.m. (dotted, Codex P1) and a multi-line location (.+? with re.S).
@@ -167,6 +175,22 @@ _AUCTION_KING_LOC_A = re.compile(r"located\s+(.+?)\s+to\s+the\s+highest", re.I |
 _AUCTION_KING_LOC_B = re.compile(
     rf"{_TIME}\s*,\s*(.+?)(?=,\s*to\s+the\s+highest|the\s+undersigned|will\s+sell|$)",
     re.I | re.S)
+
+# ── Ordinal worded auction date (Clear Recon / older law-firm Tacoma notices, live
+# 2026-06-26): "...Trustee will on the 17th day of July, 2026, at the hour of 10:00
+# o'clock AM <loc> ... sell at public auction". Neither the numeric _AUCTION nor the
+# King month-name _AUCTION_KING matches this shape, so these real Pierce sales were
+# dropped (auction_date None). Anchored to "sell at public auction" within 600 chars
+# (like _AUCTION_KING) so a stray dated line can't be read as the sale. Tried ONLY
+# when _AUCTION missed (am is None), so numeric-format parsing is byte-identical.
+# group(1)=day, (2)=month, (3)=year, (4)=HH:MM, (5)=A|P. Normalized to "Month D, YYYY"
+# so it reuses the existing _to_date month-name path.
+_AUCTION_WORDED = re.compile(
+    rf"will\s+on\s+the\s+(\d{{1,2}})(?:st|nd|rd|th)\s+day\s+of\s+({_MONTHS})\.?,?\s+(\d{{4}})"
+    r"\s*,?\s*at\s+(?:the\s+hour\s+of\s+)?(\d{1,2}:\d{2})\s*o'?clock\s*([AP])\.?\s*M\.?"
+    r"[\s\S]{0,600}?sell\s+at\s+public\s+auction",
+    re.I,
+)
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -261,6 +285,15 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
                 loc = " ".join(lm.group(1).split()).strip().rstrip(".,")
                 if "NOTICE OF TRUSTEE" not in loc.upper() and 0 < len(loc) <= 300:
                     auction_location = loc
+        else:
+            # Ordinal worded date fallback ("17th day of July, 2026" — Clear Recon /
+            # older law-firm notices). Normalize to "Month D, YYYY" for _to_date;
+            # time to "HH:MM AM". Location left None (these notices vary; not required).
+            wm = _AUCTION_WORDED.search(text)
+            if wm:
+                day, month, year, hhmm, ampm = wm.groups()
+                auction_date = f"{month.title()} {int(day)}, {year}"
+                auction_time = f"{hhmm} {ampm.upper()}M"
 
     return {
         "ts_number": _first(_TS_NUMBER, text),
@@ -280,6 +313,31 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
         "note_amount": _money(_NOTE_AMOUNT, text),
         "nod_date": _first(_NOD_DATE, text),
     }
+
+
+def parse_tacoma_notice(text: str) -> dict[str, Any]:
+    """parse_nts_notice + a SURROGATE ts_number for notices that carry no trustee TS#.
+
+    Drop-in for the crawler (parallels nts_king_pdf.parse_king_notice). Several real
+    Pierce trustees (Clear Recon, "In re …" law-firm notices — live 2026-06-26) print
+    NO "Trustee Sale No.", so parse_nts_notice returns ts_number=None and is_valid_nts
+    drops the notice — losing a real, actionable sale (e.g. a $661k Clear Recon sale).
+
+    The nts_notices natural key is (source, ts_number), so a storable notice needs one.
+    REF-<deed recording #> is unique per deed of trust (an amended NTS for the same loan
+    collapses to one row — matches the upsert's latest-wins). APN-<parcel> is a DEGRADED
+    fallback (repeat foreclosures on one parcel over time collapse into a row); used only
+    when no deed reference exists. This is a CACHE dedup key, NOT a real trustee-sale id;
+    the matcher keys on parcel/address, never ts_number, so a surrogate is match-safe.
+    """
+    parsed = parse_nts_notice(text)
+    if not parsed.get("ts_number"):
+        ref = parsed.get("deed_reference")
+        if ref:
+            parsed["ts_number"] = f"REF-{ref}"[:64]
+        elif parsed.get("parcel"):
+            parsed["ts_number"] = f"APN-{parsed['parcel']}"[:64]
+    return parsed
 
 
 def is_valid_nts(parsed: dict[str, Any]) -> bool:

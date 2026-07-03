@@ -107,7 +107,7 @@ def crawl_nts_tacoma_index() -> dict:
                 if resp.status_code != 200:
                     errored += 1
                     continue
-                parsed = nts.parse_nts_notice(nts.extract_article_text(resp.text))
+                parsed = nts.parse_tacoma_notice(nts.extract_article_text(resp.text))
                 row = nts.notice_to_row(parsed, source_url=u, today=today)
                 if row is None:
                     skipped += 1  # not a parseable NTS body
@@ -138,6 +138,7 @@ def crawl_nts_tacoma_index() -> dict:
     summary = {"candidates": len(notice_urls), "upserted": upserted,
                "skipped": skipped, "errored": errored, "expired": expired or 0}
     _logger.info("NTS crawl done: %s", summary)
+    _alert_if_crawl_barren("tacoma_daily_index", discovered=len(notice_urls), upserted=upserted)
     return summary
 
 
@@ -240,6 +241,7 @@ def _crawl_pacific_publishing_pdf(
     summary["pdf_url"] = pdf_url
     if not pdf_url:
         _logger.warning("NTS PDF crawl (%s): no current legals PDF found", source)
+        _alert_if_crawl_barren(source, discovered=0, upserted=0)
         return summary
 
     fd, path = tempfile.mkstemp(suffix=".pdf")
@@ -300,6 +302,7 @@ def _crawl_pacific_publishing_pdf(
         db.commit()
 
     _logger.info("NTS PDF crawl done (%s): %s", source, summary)
+    _alert_if_crawl_barren(source, discovered=summary["blocks"], upserted=summary["upserted"])
     return summary
 
 
@@ -323,6 +326,50 @@ def _upsert_notice(db, model, row: dict) -> None:
         constraint="uq_nts_notices_source_ts", set_=update_cols
     )
     db.execute(stmt)
+
+
+def _barren_alert_reason(discovered: int, upserted: int) -> str | None:
+    """Pure decision: the reason string to alert on a barren crawl, or None if healthy.
+
+    discovered == 0 -> discovery broke; discovered > 0 but upserted == 0 -> parse broke;
+    any upsert -> healthy (no alert).
+    """
+    if discovered == 0:
+        return "0 notices discovered — listing/PDF discovery may have broken"
+    if upserted == 0:
+        return f"{discovered} notices discovered but 0 upserted — parser may have broken"
+    return None
+
+
+def _alert_if_crawl_barren(source: str, *, discovered: int, upserted: int) -> None:
+    """OPS alert when a crawl run produced no usable notices.
+
+    This is the silent-failure mode that let the Pierce NTS cache go stale for a week
+    unnoticed (the crawler bailed at page 1 on days page 1 had no trustee sale). Two
+    barren conditions warrant a page:
+      * discovered == 0 — listing/PDF discovery broke (layout change, block, or the
+        old page-1 break bug), so nothing was even fetched to parse.
+      * discovered > 0 but upserted == 0 — everything failed to parse/validate (a
+        parser/format drift), so no auction data reaches leads.
+    No-op unless OPS_ALERT_EMAIL is configured; send_ops_alert carries its own cooldown
+    and never raises. A healthy run (upserted > 0) sends nothing.
+    """
+    reason = _barren_alert_reason(discovered, upserted)
+    if reason is None:
+        return
+    from src.workers.ops_alerts import send_ops_alert
+
+    send_ops_alert(
+        kind="nts_crawl_barren",
+        key=f"nts_crawl_barren:{source}",
+        subject=f"NTS crawler produced nothing ({source})",
+        body=(
+            f"The NTS crawler '{source}' {reason}.\n\n"
+            "auction_date / default_amount enrichment for pre_foreclosure leads in this "
+            "county will go stale until this is fixed. Check the source site layout and "
+            "the crawler logs."
+        ),
+    )
 
 
 def _td_days(days: int):

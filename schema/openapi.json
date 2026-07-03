@@ -129,7 +129,6 @@
             "default": "overlaps_only",
             "enum": [
               "overlaps_only",
-              "overlaps_first",
               "everything"
             ],
             "title": "Delivery Mode",
@@ -285,6 +284,17 @@
             "title": "Combined Export Ready",
             "type": "boolean"
           },
+          "combined_record_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Combined Record Count"
+          },
           "completed_at": {
             "anyOf": [
               {
@@ -346,6 +356,13 @@
               }
             ],
             "title": "Name"
+          },
+          "record_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Record Types",
+            "type": "array"
           },
           "run_status": {
             "$ref": "#/components/schemas/BatchRunStatus",
@@ -646,6 +663,17 @@
             "title": "Combined Export Ready",
             "type": "boolean"
           },
+          "combined_record_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Combined Record Count"
+          },
           "completed_at": {
             "anyOf": [
               {
@@ -682,6 +710,13 @@
               }
             ],
             "title": "Name"
+          },
+          "record_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Record Types",
+            "type": "array"
           },
           "run_status": {
             "$ref": "#/components/schemas/BatchRunStatus",
@@ -1511,6 +1546,17 @@
       },
       "JobResponse": {
         "properties": {
+          "batch_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Batch Id"
+          },
           "county": {
             "anyOf": [
               {
@@ -5487,6 +5533,20 @@
     "/jobs": {
       "get": {
         "operationId": "list_jobs_jobs_get",
+        "parameters": [
+          {
+            "description": "Exclude jobs that belong to a batch (their config carries a batch_id). The Results page sets this so a batch's child scrapes don't consume the newest-100 window — the batch shows as one combined row instead.",
+            "in": "query",
+            "name": "exclude_batch_children",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Exclude jobs that belong to a batch (their config carries a batch_id). The Results page sets this so a batch's child scrapes don't consume the newest-100 window — the batch shows as one combined row instead.",
+              "title": "Exclude Batch Children",
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -5501,6 +5561,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "security": [

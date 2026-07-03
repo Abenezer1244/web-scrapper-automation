@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import src.db.session as _db_session
-from src.db.models import Job, JobLog, ScraperConfig, User
+from src.db.models import Job, JobLog, ScraperBatch, ScraperConfig, User
 
 # ─── List jobs ────────────────────────────────────────────────────────────────
 
@@ -28,6 +28,61 @@ async def test_list_jobs_returns_own_jobs_only(
     assert resp.status_code == 200
     job_ids = [j["id"] for j in resp.json()]
     assert pending_job.id in job_ids
+
+
+async def test_list_jobs_exposes_batch_id(
+    client: AsyncClient,
+    db: AsyncSession,
+    starter_user: User,
+    starter_token: str,
+):
+    """The Results page collapses a batch into ONE row; it needs each child job's
+    batch_id to hide the children. A standalone job's config carries no batch_id."""
+    batch = ScraperBatch(
+        id=str(uuid.uuid4()), user_id=starter_user.id, name="Batch",
+        state="WA", fields=[], enrichment=[], schedule={}, deliver={},
+        status="active",
+    )
+    db.add(batch)
+    await db.flush()  # parent must exist before the child config's composite FK
+    standalone_cfg = ScraperConfig(
+        id=str(uuid.uuid4()), user_id=starter_user.id, name="Solo",
+        county="king", state="WA", record_type="probate",
+        fields=[], enrichment=[], schedule={}, deliver={},
+    )
+    child_cfg = ScraperConfig(
+        id=str(uuid.uuid4()), user_id=starter_user.id, name="King probate (batch)",
+        county="king", state="WA", record_type="probate",
+        fields=[], enrichment=[], schedule={}, deliver={},
+        batch_id=batch.id,  # marks this config as a batch child
+    )
+    db.add_all([standalone_cfg, child_cfg])
+    await db.flush()
+    solo_job = Job(
+        id=str(uuid.uuid4()), user_id=starter_user.id,
+        scraper_config_id=standalone_cfg.id, status="done", trigger="manual",
+    )
+    child_job = Job(
+        id=str(uuid.uuid4()), user_id=starter_user.id,
+        scraper_config_id=child_cfg.id, status="done", trigger="batch",
+    )
+    db.add_all([solo_job, child_job])
+    await db.commit()
+
+    rows = {j["id"]: j for j in (await client.get(
+        "/jobs", headers={"Authorization": f"Bearer {starter_token}"}
+    )).json()}
+    assert rows[solo_job.id]["batch_id"] is None
+    assert rows[child_job.id]["batch_id"] == child_cfg.batch_id
+
+    # exclude_batch_children filters children BEFORE the limit (Codex P1) so a big
+    # batch can't push standalone exports out of the newest-100 window.
+    excluded = {j["id"] for j in (await client.get(
+        "/jobs?exclude_batch_children=true",
+        headers={"Authorization": f"Bearer {starter_token}"},
+    )).json()}
+    assert solo_job.id in excluded
+    assert child_job.id not in excluded
 
 
 # ─── Get single job ───────────────────────────────────────────────────────────

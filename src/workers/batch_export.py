@@ -11,6 +11,7 @@ CSV is re-downloadable once they land. The CSV is built on property identity,
 which is ready at child-job enrichment.
 """
 import io
+import json
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -61,8 +62,19 @@ def _label(slug: str) -> str:
 # (overlap_count DESC), then contactable, then newest job, then id (stable).
 _COMBINED_CTES = f"""
 WITH candidates AS (
-    SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
-           r.mailing_address, r.phone, r.phone_type, r.email,
+    -- Full column set the CSV builder (build_lead_export_row + derive_signals)
+    -- consumes — an under-selected set silently blanks populated columns AND, by
+    -- omitting delinquent_bill_year, ships a FABRICATED synthetic tax date (the
+    -- per-job guard in build_lead_export_row only blanks it when bill_year is
+    -- present). phones/emails are decrypted in Python (raw text() bypasses
+    -- EncryptedJSON), mirroring segments._decrypt_pii_rows.
+    SELECT r.id, r.date_recorded, r.date_recorded_parsed, r.party_name, r.heirs,
+           r.parcel_id, r.property_address, r.mailing_address,
+           r.legal_description, r.doc_type,
+           r.delinquent_amount, r.delinquent_bill_year,
+           r.phone, r.phone_type, r.email, r.phones, r.emails,
+           r.absentee_owner, r.out_of_state_owner, r.owner_state,
+           r.auction_date, r.default_amount, r.enrichment_data,
            r.property_key, r.is_duplicate,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
            sc.record_type, sc.county, j.created_at AS job_created_at,
@@ -103,8 +115,13 @@ ranked AS (
            ) AS rn
     FROM candidates c
 )
-SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
-       rk.mailing_address, rk.phone, rk.phone_type, rk.email,
+SELECT rk.id, rk.date_recorded, rk.date_recorded_parsed, rk.party_name, rk.heirs,
+       rk.parcel_id, rk.property_address, rk.mailing_address,
+       rk.legal_description, rk.doc_type,
+       rk.delinquent_amount, rk.delinquent_bill_year,
+       rk.phone, rk.phone_type, rk.email, rk.phones, rk.emails,
+       rk.absentee_owner, rk.out_of_state_owner, rk.owner_state,
+       rk.auction_date, rk.default_amount, rk.enrichment_data,
        a.matched_record_types, a.overlap_count, a.source_counties, a.lead_subtype
 FROM ranked rk
 JOIN agg a ON a.bucket = rk.bucket
@@ -154,12 +171,13 @@ def _combined_pairs(
     user_id: str,
     job_ids: list[str],
     delivery_mode: str = "everything",
-    limit: int = EXPORT_CAP,
+    limit: int | None = EXPORT_CAP,
     offset: int = 0,
 ) -> list[tuple]:
     """Return (record_namespace, overlap_dict) pairs for the batch, hottest-first.
 
     Ordering + mode filtering are SQL-side (deterministic; pagination-safe).
+    `limit=None` binds SQL `LIMIT NULL` (unbounded — the whole set in one snapshot).
     PII (phone/email) is decrypted here — the raw text() query bypasses the
     EncryptedString type. matched_record_types are humanized for the `lists` col.
     """
@@ -183,6 +201,25 @@ def _combined_pairs(
             data["phone"] = decrypt_field(data["phone"])
         if data.get("email") is not None:
             data["email"] = decrypt_field(data["email"])
+        # Multi-contact arrays (EncryptedJSON over raw text()) — decrypt + parse so
+        # phone_2/3 + email_2/3 populate, exactly like segments._decrypt_pii_rows.
+        # Unparseable → None (CSV then emits blank secondaries, never a 500).
+        for key in ("phones", "emails"):
+            raw = data.get(key)
+            if raw is None:
+                continue
+            try:
+                data[key] = json.loads(decrypt_field(raw))
+            except (ValueError, TypeError):
+                data[key] = None
+        # The winning row's own enrichment_data carries a lead_subtype, but the
+        # bucket-AGGREGATED subtype (a.lead_subtype via PROBATE_SUBTYPE_AGG_SQL) is
+        # authoritative — a bucket's representative row may be non-probate. Drop the
+        # per-row subtype from a COPY (never mutate the fetched row) so
+        # build_lead_export_row falls back to the aggregated scalar (Codex P2).
+        enr = data.get("enrichment_data")
+        if isinstance(enr, dict) and "lead_subtype" in enr:
+            data["enrichment_data"] = {k: v for k, v in enr.items() if k != "lead_subtype"}
         rows.append(SimpleNamespace(**data))
     return [
         (
@@ -195,6 +232,23 @@ def _combined_pairs(
         )
         for r in rows
     ]
+
+
+def _combined_pairs_all(
+    db, user_id: str, job_ids: list[str], delivery_mode: str = "everything"
+) -> list[tuple]:
+    """ALL combined pairs for the delivered CSV, in ONE query (limit=None -> SQL
+    `LIMIT NULL` = unbounded). Two properties we need together:
+      - no SILENT truncation: the old default limit=EXPORT_CAP dropped rows past 50k
+        while the email/UI counts reported the true, larger total (a broken paid
+        export).
+      - a CONSISTENT snapshot: a single statement reads one MVCC snapshot, so a
+        skip-trace contact fill landing mid-read can't reorder rows across pages and
+        duplicate/drop them the way OFFSET paging could (Codex P2 — the ORDER BY
+        keys on contactable status, which async enrichment mutates).
+    EXPORT_CAP stays the API page size for the interactive /leads view; this
+    delivered-export path is intentionally uncapped."""
+    return _combined_pairs(db, user_id, job_ids, delivery_mode=delivery_mode, limit=None)
 
 
 def compute_delivery_counts(db, user_id: str, job_ids: list[str]) -> dict[str, int]:
@@ -238,7 +292,7 @@ def render_combined_csv(
     from src.db.session import system_sync_session
 
     with system_sync_session() as db:
-        pairs = _combined_pairs(db, user_id, job_ids, delivery_mode=delivery_mode)
+        pairs = _combined_pairs_all(db, user_id, job_ids, delivery_mode=delivery_mode)
         buf = io.StringIO()
         write_lead_csv_with_overlap(pairs, buf, hidden_fields=hidden_fields)
         db.rollback()  # read-only
@@ -315,7 +369,7 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
     delivery_mode = (_batch.delivery_mode if _batch else None) or "everything"
     hidden_fields = resolve_hidden_output_fields(_batch.fields if _batch else None)
 
-    pairs = _combined_pairs(
+    pairs = _combined_pairs_all(
         db, run.user_id, run.child_job_ids or [], delivery_mode=delivery_mode
     )
     # Honest accounting (uncapped, mode-independent). Stored on the run as the
@@ -407,6 +461,7 @@ def _delivery_summary(mode: str, counts: dict) -> str:
     must read as 'no overlaps found' (with the why), never as 'broken'."""
     total = counts.get("leads_total", 0)
     overlaps = counts.get("overlaps_delivered", 0)
+    singletons = counts.get("singletons_suppressed", 0)
     no_parcel = counts.get("unmatchable_no_parcel", 0)
     if mode == "overlaps_only":
         if overlaps == 0:
@@ -415,10 +470,16 @@ def _delivery_summary(mode: str, counts: dict) -> str:
                 f"{no_parcel:,} lead(s) had no parcel number and couldn't be "
                 "cross-matched. Switch the batch to 'Everything' to receive all leads."
             )
-        return (
-            f"{overlaps:,} lead(s) found on 2 or more lists. "
-            f"{total - overlaps:,} single-list lead(s) not included in this delivery."
-        )
+        # Report singletons and unmatchable-no-parcel SEPARATELY — lumping the
+        # no-parcel rows into "single-list" (total - overlaps) mislabels them.
+        parts = [f"{overlaps:,} lead(s) found on 2 or more lists."]
+        if singletons:
+            parts.append(f"{singletons:,} single-list lead(s) not included in this delivery.")
+        if no_parcel:
+            parts.append(
+                f"{no_parcel:,} lead(s) had no parcel number and couldn't be cross-matched."
+            )
+        return " ".join(parts)
     return f"{overlaps:,} of {total:,} lead(s) appear on 2 or more lists."
 
 

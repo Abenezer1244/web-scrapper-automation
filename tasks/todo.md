@@ -1,68 +1,80 @@
-# Batch overlaps-first delivery (spec + plan: docs/superpowers/{specs,plans}/2026-07-01-*)
+# Batch Results collapse + overlaps-export cross-check fixes (2026-07-02)
 
-Branch `chore/xcheck-session` (worktree off origin/main @ 5bc4b74), draft PR #136.
-Executed subagent-driven: fresh implementer + reviewer per task; no local Postgres, so
-tests verified via GitHub Actions CI on every push; Codex consulted at design (2 rounds)
-and gates the final diff.
+Branch (BE): `chore/overlaps-xcheck-2026-07-02` (worktree `.claude/worktrees/overlaps-xcheck`, off origin/main)
+Branch (FE): `chore/results-batch-collapse-2026-07-02` (worktree `bridgeleads-web/.claude/worktrees/results-batch-collapse`, off origin/master)
 
-## Plan
+## Root cause (user's reported bug)
+`GET /jobs` (`list_jobs`, jobs.py) returns every job incl. batch children; the Results page
+(`app/(dashboard)/results/page.tsx`) renders one row per done job -> a batch shows N rows
+(probate=2, pre_foreclosure=3) instead of ONE combined listing. Batch children have suppressed
+delivery (`deliver={}` — the batch owns the combined CSV), so they must NOT appear as standalone
+"exports ready to download". The batch should be ONE row with both, linking to the combined view.
 
-- [x] Task 1 — Migration 078 + model columns (`delivery_mode` on scraper_batches,
-      `delivery_counts` on batch_runs) — `38243c1` (+ ruff import-order fix `eae4287`)
-- [x] Task 2 — `_COMBINED_SQL` rework: prefixed type-scoped buckets, property_key-only
-      overlap identity, SQL-side mode filter + deterministic ORDER BY/LIMIT/OFFSET,
-      uncapped `_DELIVERY_COUNTS_SQL` — `c9eddcd` (fixes Bugs A & C)
-- [x] Task 3 — mode-aware `finalize_batch_run` + `delivery_counts` stored + empty-state
-      email gating (`_delivery_summary`; `_deliver` gates on done/partial) — `1a01ab9`
-- [x] Task 4 — `deliver_job_email`/`_build_lead_delivery_email` optional
-      `summary_message` + `link_expires` (batch emails lose the wrong "expires in 48
-      hours" copy) — `9b2e543` + byte-identity fix `6552702`
-- [x] Task 5 — API: persist `delivery_mode` on create, **status-based readiness**
-      (`_DOWNLOADABLE_STATUSES`), mode-aware download rebuild, response fields —
-      `8eac41e` (fixes Bug B) + OpenAPI regen `3f753fc`
-- [x] Task 6 — paginated `GET /batches/{id}/leads` + `/runs/{run_id}/leads`
-      (async RLS session, live counts, no-store, hidden-fields) — `e52edb5`
-      + lazy-import fix `17fbb7e` + review-minors fix (uniform no-store,
-      run-scoped tenant test)
-- [x] Task 7 — docs (spec §7 amendment, this file, BUILD_JOURNAL), full CI, security
-      self-review, Codex review gate
+## Scope: user chose ALL 4 cross-check findings + the two-listings fix.
+
+### Phase 1 — Two-listings collapse (BE additive + FE) — the reported bug
+- [ ] BE `JobResponse.batch_id: str | None` (schemas.py) populated in `list_jobs` from `sc.batch_id`
+- [ ] BE `BatchSummaryResponse.combined_record_count: int | None` computed in `_summary` from the
+      latest run's `delivery_counts` (mode-aware: overlaps_delivered if overlaps_only else leads_total)
+- [ ] Regen `schema/openapi.json` (.venv-schema)
+- [ ] FE `listBatches()` in lib/api.ts
+- [ ] FE Results page: exclude done-jobs with `batch_id`; add batch rows (from listBatches, run downloadable)
+      -> row links to `/batches/[id]`, download via `downloadBatchCsv(id)`; merge + sort by date
+- [ ] Tests (BE): jobs list carries batch_id; batch summary carries combined_record_count
+
+### Phase 2 — Combined-export correctness (#1 + #3)
+- [ ] BE `_COMBINED_CTES`/`_COMBINED_SQL` (batch_export.py): select the FULL column set
+      `build_overlap_export_row` consumes — delinquent_amount, delinquent_bill_year (KILLS the
+      fabricated 01/01/{year} tax date), heirs, legal_description, doc_type, phones, emails,
+      absentee_owner, out_of_state_owner, owner_state, property_state, auction_date, default_amount,
+      enrichment_data (assessed_value/instrument/code_violation/tax/nts)
+- [ ] `_combined_pairs`: decrypt phones/emails like segments `_decrypt_pii_rows`; pop enrichment
+      `lead_subtype` so the bucket-aggregated `a.lead_subtype` scalar still wins (preserve Codex P2)
+- [ ] #3: `_delivery_summary` overlaps_only branch uses explicit singletons_suppressed +
+      unmatchable_no_parcel instead of `total - overlaps`
+- [ ] Tests: combined CSV populates heirs/tax/phones_2; tax row filed_date is BLANK (no fake date)
+- [ ] NOTE: segments.py shares the same fabricated-tax-date bug (out of stated scope) — flag/decide
+
+### Phase 3 — 50k silent truncation (#2)
+- [ ] BE finalize/download: page `_COMBINED_SQL` until exhausted (no silent 50k cap) OR surface a
+      `truncated` signal + honest email copy. Decide with Codex (memory: "No silent caps").
+
+### Phase 4 — Remove dead `overlaps_first` mode (#4)
+- [ ] BE schemas Literal -> drop overlaps_first; models CheckConstraint update; alembic migration to
+      alter the CHECK (no existing rows use it); regen openapi
+- [ ] FE type regen
+
+### Phase 5 — FE finalize
+- [ ] Regen FE api-types from BE openapi; typecheck + lint; QA the Results page collapse
+
+## Codex/verification
+- Consult Codex on design BEFORE coding. Codex reviews EACH phase diff. Critical/High = NO-GO.
+- No local Postgres -> tests run via PR CI. Backend-first; FE after BE merges + type regen.
 
 ## Review
 
-**The three pre-existing bugs fixed:**
-- **Bug A (fake overlaps):** weak `dedup_hash` (party_name+date) could merge two
-  DIFFERENT record types into one bucket — counted as a hot overlap AND silently
-  dropped one row. Now `dh:` buckets are record_type-scoped; only `property_key`
-  bridges types.
-- **Bug B (empty export = 404):** `combined_export_key` gated readiness, and zero-row
-  finalizes never set it — paid batch, no email, download 404. Readiness is now
-  status-based (done/partial); zero-row runs stream a headers-only CSV and email the
-  honest empty-state summary.
-- **Bug C (50k cap before filter):** mode filtering/ordering moved into SQL before
-  LIMIT; honest counts come from a separate uncapped aggregate.
+Status: all 4 findings + the two-listings fix IMPLEMENTED, committed on both branches.
+Local gates green: ruff (src+tests), FE tsc + eslint, openapi regen (no drift), single
+alembic head (080). NOT pushed/PR'd yet (test loop = CI on a PR — no local Postgres).
 
-**Feature:** per-batch `delivery_mode` = `overlaps_only` (default for NEW batches;
-existing batches backfilled `everything` — no behavior change on deploy) |
-`overlaps_first` | `everything`; honest `delivery_counts`
-{leads_total, overlaps_delivered, singletons_suppressed, unmatchable_no_parcel};
-paginated combined-leads JSON for the in-app one-list view.
+BE commits (branch chore/overlaps-xcheck-2026-07-02, off origin/main, merged w/ #142):
+- Phase 1  774c4b1  JobResponse.batch_id + BatchSummaryResponse.combined_record_count
+- Ph2 #1/#3 247407a  combined export selects FULL column set (kills blank cols + fabricated
+                     tax date) + phones/emails decrypt + aggregated lead_subtype preserved;
+                     _delivery_summary reports singletons vs no-parcel separately
+- Ph3 #2   cb52255  _combined_pairs_all pages until exhausted (no silent 50k truncation)
+- Ph4 #4   c061b59  remove dead overlaps_first (Literal + CHECK + migration 080)
+- merge 5ff04b3 (origin/main #142) + 5672e65 (migration 079->080 collision fix)
 
-**Security self-review (Master Review scope for this diff):**
-- Every new query binds `:uid` from an ownership-verified batch/run; `/leads` chains
-  rate_limit → `_owned_batch` (404 non-owner) → run-membership check → RLS session.
-- Decrypted PII only in page rows; `Cache-Control: no-store` on every leads-route
-  path; no row payloads logged anywhere.
-- No new secrets; no user-supplied URLs; CSV path still goes through
-  `build_overlap_export_row`/`sanitize_for_csv`.
-- Migration additive-only; `CHECK` constraint guards non-API writers.
+FE commits (branch chore/results-batch-collapse-2026-07-02, off origin/master):
+- c1724f4  Results page collapses a batch into ONE row (listBatches + exclude batch children)
+- 77c9014  drop dead overlaps_first from FE types + stale comments
 
-**Notes / deviations:**
-- Spec §7 amended (see spec): readiness re-keyed to run status instead of forcing an
-  empty-file R2 PUT (the object is never served; API has no R2 creds).
-- Tertiary CSV sort changed filing-date → job-recency (SQL date-parse of M/D/YYYY
-  strings would break the export on garbage rows).
-- CSV ordering now fully SQL-side; `_filing_sort_key` (batch_export copy) deleted.
-- Deploy order: run migration 078 via `scripts/migrate.py` BEFORE deploying api+worker;
-  redeploy BOTH (delivery email kwargs span worker+api).
-- Frontend follow-up (separate repo, backend-first): wizard mode picker, batch-page
-  combined leads table + counts banner, regen TS types from schema/openapi.json.
+Codex: DESIGN consult completed — validated all 4 (guardrails folded in: sanitize
+enrichment copy, page-until-exhausted, batch-row-only-when-downloadable, migrate-before-
+reject). Final DIFF review BLOCKED — Codex quota exhausted mid-session ("try again 5:50 PM").
+⏭️ Resume `codex review --base origin/main` (BE) + `--base origin/master` (FE) when reset.
+
+⏭️ Next (user/ops): push both branches, open PRs (BE first), read CI; migrate 080 BEFORE
+deploying api+worker; regen FE types from BE main after merge; then FE PR CI/deploy.
+Note: partial-status batches show a "Complete" badge (minor) — possible follow-up polish.

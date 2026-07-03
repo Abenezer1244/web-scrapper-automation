@@ -211,3 +211,138 @@ class TestEmptyStateFinalize:
                 "singletons_suppressed": 0,
                 "unmatchable_no_parcel": 2,
             }
+
+
+# ─── Combined-export column completeness (Phase 2 / cross-check #1) ───────────
+# The combined SQL under-selected columns, so the CSV builder blanked populated
+# fields AND (missing delinquent_bill_year) shipped a fabricated 01/01/{year}
+# tax date. The fix selects the full lead column set.
+
+import csv as _csv  # noqa: E402
+import io as _io  # noqa: E402
+from datetime import UTC, datetime  # noqa: E402
+from decimal import Decimal  # noqa: E402
+
+from src.api.tax_filters import tax_cap_min_year  # noqa: E402
+from src.utils.lead_export import write_lead_csv_with_overlap  # noqa: E402
+
+
+def _tax_year_in_window() -> int:
+    """A delinquent_bill_year that PASSES the 18-month tax-delinquent cap — older
+    years are filtered out of the combined export by design (self-scoping cap)."""
+    return tax_cap_min_year(datetime.now(UTC).date())
+
+
+def _render(pairs) -> list[dict]:
+    buf = _io.StringIO()
+    write_lead_csv_with_overlap(pairs, buf)
+    buf.seek(0)
+    return list(_csv.DictReader(buf))
+
+
+class TestCombinedExportColumns:
+    def test_tax_row_no_fabricated_filed_date_and_full_columns(self):
+        with SyncSessionLocal() as db:
+            user = _user(db)
+            batch, j1, j2 = _two_type_batch(db, user, "everything")
+            _result(db, user.id, j1.id, party="PROBATE OWNER",
+                    property_key="WA|pierce|000000A1")
+            # tax_delinquent row: synthetic county date_recorded + real bill_year
+            # + plaintext extras the old SELECT dropped. bill_year must be WITHIN
+            # the 18-month cap or the row is (correctly) filtered out of the export.
+            by = _tax_year_in_window()
+            db.add(Result(
+                id=str(uuid.uuid4()), user_id=user.id, job_id=j2.id,
+                date_recorded=f"01/01/{by}",  # synthetic — county tax has no event date
+                party_name="TAX OWNER", property_key="WA|pierce|000000A2",
+                delinquent_bill_year=by, delinquent_amount=Decimal("1234.56"),
+                heirs="ESTATE OF X", legal_description="LOT 1 BLK 2", doc_type="TAXLIEN",
+            ))
+            db.flush()
+            rows = _render(_combined_pairs(db, user.id, [j1.id, j2.id], delivery_mode="everything"))
+            db.rollback()
+
+        tax = next(r for r in rows if r["party_name"] == "TAX OWNER")
+        assert tax["filed_date"] == ""            # NO fabricated 01/01/{year}
+        assert tax["delinquent_bill_year"] == str(by)
+        assert tax["delinquent_amount"] == "1234.56"
+        assert tax["heirs"] == "ESTATE OF X"
+        assert tax["legal_description"] == "LOT 1 BLK 2"
+        assert tax["doc_type"] == "TAXLIEN"
+
+    def test_aggregated_lead_subtype_survives_nonprobate_winner(self):
+        """A pk bucket bridging probate + tax: the winning (representative) row may
+        be the tax row, but the bucket's aggregated probate subtype must still be
+        exported (the per-row enrichment subtype is popped so the scalar wins)."""
+        with SyncSessionLocal() as db:
+            user = _user(db)
+            batch, j1, j2 = _two_type_batch(db, user, "everything")
+            pk = "WA|pierce|000000B7"
+            # probate row carries the subtype in enrichment_data. Marked
+            # is_duplicate so the NON-probate (tax) row deterministically wins the
+            # bucket's representative-row ranking (is_duplicate ASC) — both rows
+            # share the transaction's now() so job_created_at can't decide it.
+            db.add(Result(
+                id=str(uuid.uuid4()), user_id=user.id, job_id=j1.id,
+                date_recorded="06/01/2026", party_name="OWNER", property_key=pk,
+                is_duplicate=True,
+                enrichment_data={"lead_subtype": "probate_death_inheritance"},
+            ))
+            # tax row: no subtype → the representative winner. Cap-safe bill_year so
+            # the row isn't filtered by the 18-month tax cap.
+            db.add(Result(
+                id=str(uuid.uuid4()), user_id=user.id, job_id=j2.id,
+                date_recorded="06/02/2026", party_name="OWNER", property_key=pk,
+                is_duplicate=False,
+                delinquent_bill_year=_tax_year_in_window(),
+            ))
+            db.flush()
+            rows = _render(_combined_pairs(db, user.id, [j1.id, j2.id], delivery_mode="everything"))
+            db.rollback()
+
+        assert len(rows) == 1  # one bucket (pk bridges both)
+        assert rows[0]["lead_subtype"] == "probate_death_inheritance"
+        assert rows[0]["filed_date"] == ""  # tax winner → bill_year present → blanked
+
+
+class TestNoSilentTruncation:
+    def test_combined_pairs_all_is_uncapped_single_snapshot(self):
+        """#2 + Codex P2: the delivered export reads ALL rows in ONE unbounded
+        query (limit=None -> SQL LIMIT NULL). A bounded query would truncate; a
+        multi-query OFFSET walk could dup/skip rows if skip-trace reordered them
+        mid-read. Three distinct-bucket leads all come back; a limit=2 query
+        returns only 2, proving _combined_pairs_all isn't silently capped."""
+        import src.workers.batch_export as be
+        with SyncSessionLocal() as db:
+            user = _user(db)
+            batch, j1, _j2 = _two_type_batch(db, user, "everything")
+            for i in range(3):
+                _result(db, user.id, j1.id, party=f"OWNER {i}",
+                        property_key=f"WA|pierce|00000C{i}")
+            db.flush()
+            capped = be._combined_pairs(db, user.id, [j1.id], delivery_mode="everything", limit=2)
+            full = be._combined_pairs_all(db, user.id, [j1.id], delivery_mode="everything")
+            db.rollback()
+        assert len(capped) == 2           # a bounded query truncates
+        assert len(full) == 3             # the delivered export is uncapped
+
+
+class TestOverlapsFirstRemoved:
+    def test_delivery_mode_literal_excludes_overlaps_first(self):
+        """#4: the dead 'overlaps_first' mode is gone from the request contract."""
+        import json as _json
+
+        from src.api.schemas import BatchCreateRequest
+        schema = _json.dumps(BatchCreateRequest.model_json_schema())
+        assert "overlaps_first" not in schema
+        assert "overlaps_only" in schema
+        assert "everything" in schema
+
+    def test_model_check_constraint_excludes_overlaps_first(self):
+        from src.db.models import ScraperBatch
+        checks = [
+            c for c in ScraperBatch.__table__.constraints
+            if getattr(c, "name", "") == "ck_scraper_batches_delivery_mode"
+        ]
+        assert checks, "delivery_mode CHECK constraint missing"
+        assert "overlaps_first" not in str(checks[0].sqltext)

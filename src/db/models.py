@@ -384,7 +384,7 @@ class ScraperBatch(Base):
         # also written by tests/scheduler paths, so bad data must fail early —
         # API validation alone doesn't cover non-API writers.
         CheckConstraint(
-            "delivery_mode IN ('overlaps_only', 'overlaps_first', 'everything')",
+            "delivery_mode IN ('overlaps_only', 'everything')",
             name="ck_scraper_batches_delivery_mode",
         ),
     )

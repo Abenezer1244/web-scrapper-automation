@@ -32,14 +32,31 @@ router = APIRouter(prefix="/jobs", tags=["jobs"])
 @router.get("", response_model=list[JobResponse])
 async def list_jobs(
     current_user: CurrentUser,
+    exclude_batch_children: bool = Query(
+        False,
+        description=(
+            "Exclude jobs that belong to a batch (their config carries a batch_id). "
+            "The Results page sets this so a batch's child scrapes don't consume the "
+            "newest-100 window — the batch shows as one combined row instead."
+        ),
+    ),
     db: AsyncSession = Depends(get_rls_db),
 ) -> list[JobResponse]:
-    result = await db.execute(
-        select(Job)
-        .where(Job.user_id == current_user.id)
-        .order_by(Job.created_at.desc())
-        .limit(100)
-    )
+    stmt = select(Job).where(Job.user_id == current_user.id)
+    if exclude_batch_children:
+        # Filter batch children out BEFORE the LIMIT (Codex P1) — annotating
+        # batch_id post-fetch would let a large batch's children fill the window
+        # and push standalone exports out of the response.
+        stmt = stmt.join(
+            ScraperConfig, ScraperConfig.id == Job.scraper_config_id
+        ).where(
+            # Belt-and-suspenders tenant scope on the join (Codex): RLS + the
+            # Job.user_id filter already bound it, but every joined table carries
+            # its own user_id predicate in this codebase.
+            ScraperConfig.user_id == current_user.id,
+            ScraperConfig.batch_id.is_(None),
+        )
+    result = await db.execute(stmt.order_by(Job.created_at.desc()).limit(100))
     jobs = result.scalars().all()
 
     # Batch-load scraper configs for all jobs in one query
@@ -63,6 +80,7 @@ async def list_jobs(
             resp.county = sc.county
             resp.state = sc.state
             resp.record_type = sc.record_type
+            resp.batch_id = sc.batch_id  # None for standalone; set for batch children
         responses.append(resp)
     return responses
 

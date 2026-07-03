@@ -257,15 +257,35 @@ async def create_batch(
 # (scraper_configs, jobs). A run is at-most-one per batch in on-demand 2A.
 
 
-def _summary(batch: ScraperBatch, run: BatchRun | None, child_count: int) -> BatchSummaryResponse:
+def _combined_record_count(batch: ScraperBatch, run: BatchRun | None) -> int | None:
+    """Rows in the combined export as-delivered, mode-aware, from the run's
+    finalized delivery_counts snapshot. NULL until finalize writes it — the
+    Results page then shows a batch as ONE row with the deduped combined count
+    (never the sum of child record_counts, which double-counts overlaps)."""
+    counts = run.delivery_counts if run else None
+    if not counts:
+        return None
+    if (batch.delivery_mode or "everything") == "overlaps_only":
+        return counts.get("overlaps_delivered")
+    return counts.get("leads_total")
+
+
+def _summary(
+    batch: ScraperBatch,
+    run: BatchRun | None,
+    child_count: int,
+    record_types: list[str] | None = None,
+) -> BatchSummaryResponse:
     return BatchSummaryResponse(
         id=batch.id,
         name=batch.name,
         state=batch.state,
         run_status=run.status if run else "pending",
         child_count=child_count,
+        record_types=record_types or [],
         combined_export_ready=bool(run and run.status in _DOWNLOADABLE_STATUSES),
         delivery_mode=batch.delivery_mode or "everything",
+        combined_record_count=_combined_record_count(batch, run),
         created_at=batch.created_at,
         completed_at=run.completed_at if run else None,
     )
@@ -335,19 +355,25 @@ async def list_batches(
         )
     ).scalars().all()
     run_by_batch = {r.batch_id: r for r in runs}
-    counts = dict(
-        (
-            await db.execute(
-                select(ScraperConfig.batch_id, func.count())
-                .where(
-                    ScraperConfig.user_id == current_user.id,
-                    ScraperConfig.batch_id.in_(batch_ids),
-                )
-                .group_by(ScraperConfig.batch_id)
+    # Child config (batch_id, record_type) rows → per-batch count + distinct types.
+    cfg_rows = (
+        await db.execute(
+            select(ScraperConfig.batch_id, ScraperConfig.record_type).where(
+                ScraperConfig.user_id == current_user.id,
+                ScraperConfig.batch_id.in_(batch_ids),
             )
-        ).all()
-    )
-    return [_summary(b, run_by_batch.get(b.id), counts.get(b.id, 0)) for b in batches]
+        )
+    ).all()
+    counts: dict[str, int] = {}
+    rtypes: dict[str, set[str]] = {}
+    for bid, rt in cfg_rows:
+        counts[bid] = counts.get(bid, 0) + 1
+        if rt:
+            rtypes.setdefault(bid, set()).add(rt)
+    return [
+        _summary(b, run_by_batch.get(b.id), counts.get(b.id, 0), sorted(rtypes.get(b.id, set())))
+        for b in batches
+    ]
 
 
 @router.get("/{batch_id}", response_model=BatchDetailResponse)
@@ -408,8 +434,9 @@ async def get_batch(
             )
         )
 
+    record_types = sorted({rt for _, _, rt in config_rows if rt})
     return BatchDetailResponse(
-        **_summary(batch, run, len(children)).model_dump(),
+        **_summary(batch, run, len(children), record_types).model_dump(),
         failed_children=run.failed_children if run else None,
         children=children,
         delivery_counts=run.delivery_counts if run else None,

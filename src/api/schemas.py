@@ -861,12 +861,7 @@ class BatchCreateRequest(BaseModel):
     # point of a batch is leads on 2+ lists — singletons are obtainable from
     # single scrapes. Existing batches (created before this field) stay
     # 'everything' via the DB default; the route persists this value explicitly.
-    # NOTE: overlaps_first and everything currently produce identical output (the
-    # sort already ranks overlaps first); the distinct mode is reserved for
-    # future sectioned exports.
-    delivery_mode: Literal["overlaps_only", "overlaps_first", "everything"] = (
-        "overlaps_only"
-    )
+    delivery_mode: Literal["overlaps_only", "everything"] = "overlaps_only"
 
     @field_validator("state")
     @classmethod
@@ -934,8 +929,19 @@ class BatchSummaryResponse(BaseModel):
     state: str
     run_status: BatchRunStatus = BatchRunStatus.PENDING
     child_count: int = 0
+    # Distinct record types across the batch's child scrapes (sorted). Lets the
+    # Results page label a collapsed batch row ("Probate + Pre-foreclosure")
+    # without reconstructing it from child jobs — which it can't, since those are
+    # excluded from GET /jobs to keep the newest-100 window for standalone exports.
+    record_types: list[str] = Field(default_factory=list)
     combined_export_ready: bool = False  # status-derived — never expose the R2 key
     delivery_mode: str = "everything"
+    # Rows in the combined export as-delivered (mode-aware: overlaps_delivered for
+    # overlaps_only, else leads_total). NULL until the run finalizes + writes
+    # delivery_counts — so the Results page renders a batch as ONE row with the
+    # deduped combined count, never the sum of child record_counts (overlaps are
+    # collapsed, so a naive sum over-counts).
+    combined_record_count: int | None = None
     created_at: datetime
     completed_at: datetime | None = None
 
@@ -1013,6 +1019,11 @@ class JobResponse(BaseModel):
     county: str | None = None
     state: str | None = None
     record_type: str | None = None
+    # Set when this job is a child of a batch scrape (its config carries batch_id).
+    # The Results page uses this to HIDE batch children from the per-job export list
+    # (a batch delivers ONE combined row, not one row per child — child delivery is
+    # suppressed at create time). NULL for a standalone scrape.
+    batch_id: str | None = None
     # Computed progress fields (not stored in DB)
     progress_pct: int | None = None
     estimated_total_records: int | None = None

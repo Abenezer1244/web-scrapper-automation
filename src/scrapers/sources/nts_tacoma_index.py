@@ -129,7 +129,13 @@ _AUCTION = re.compile(
 # (Codex High, 2026-07-01 review).
 _COMMONLY_KNOWN = re.compile(
     r"(?:More\s+commonly\s+known\s+as\s*:?|commonly\s+known\s+as\s*:)\s*(.+?)"
-    r"(?=\s+The\s+above\s+property\b|\s+(?:which\s+is\s+)?[Ss]ubject\s+to\b|\s+II\.\s|\n\n|\Z)",
+    r"(?=\s+The\s+above\s+property\b|\s+(?:which\s+is\s+)?[Ss]ubject\s+to\b"
+    # Stop before a trailing parcel line (Codex P2): some layouts print "Commonly
+    # known as: <addr> Tax Parcel Nos.: <apn> which is subject to…" — without this the
+    # parcel text leaks INTO property_address and poisons the normalized match key, so
+    # a lead at that address won't attach by address.
+    r"|\s+(?:Assessor'?s\s+)?Tax\s+Parcel\b|\s+Parcel\s+Number\b"
+    r"|\s+II\.\s|\n\n|\Z)",
     re.I | re.S,
 )
 # ── Section IV "sum owing on the obligation": two real phrasings —

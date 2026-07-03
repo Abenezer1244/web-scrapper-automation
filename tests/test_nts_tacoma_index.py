@@ -315,6 +315,16 @@ class TestSurrogateTsNumberAndWordedDate:
         assert p["ts_number"] == "APN-031713-2-024"
         assert is_valid_nts(p) is True
 
+    def test_tax_parcel_line_not_leaked_into_address(self):
+        # Codex P2: "Commonly known as: <addr> Tax Parcel Nos.: <apn> which is subject…"
+        # must NOT leak the parcel line into property_address / the normalized match key,
+        # or the notice can't attach to a lead by address.
+        p = parse_tacoma_notice(self._fx("nts_tacoma_worded_date_b.txt"))
+        assert p["property_address"] == "4122 320th Street East, Eatonville, WA 98328"
+        assert "Tax Parcel" not in (p["property_address"] or "")
+        row = notice_to_row(p, "http://x/", today=date(2026, 7, 2))
+        assert "PARCEL" not in (row["property_address_normalized"] or "").upper()
+
     def test_wrapper_does_not_alter_real_tsnumber_notices(self):
         # The two existing REAL fixtures carry real TS#s — the wrapper must be a no-op
         # (identical dict) so the surrogate path never rewrites a genuine trustee id.

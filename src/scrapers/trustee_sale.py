@@ -87,10 +87,11 @@ def _record_from_notice(notice: NtsNotice) -> ScrapedRecord:
     # trustee_sale too (product decision 2026-07-03), matching the whole app's "one
     # charge per property across all lists" model — so a property already delivered on
     # another list won't re-bill as an auction lead (its auction date/amount still
-    # reaches that lead via the pre_foreclosure NTS matcher), and two distinct auctions
-    # on one parcel collapse to one billed lead — enforced by finalize_trustee_sale_job's
-    # same-parcel collapse (the shared cross-job dedup scan alone misses same-JOB
-    # siblings). Do NOT make dedup_hash notice-based here without revisiting that decision.
+    # reaches that lead via the pre_foreclosure NTS matcher). trustee_sale dedups
+    # EXACTLY like every other list (parcel|address), no more aggressively — same-hash
+    # siblings within a job collapse in finalize_trustee_sale_job (the shared cross-job
+    # scan alone misses same-JOB siblings); cross-job is the existing delivered_records
+    # claim. Do NOT make dedup notice- or parcel-only here without revisiting that decision.
     rec.raw_html_hash = hashlib.sha256(
         f"nts|{notice.source}|{notice.ts_number}".encode()
     ).hexdigest()[:32]

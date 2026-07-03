@@ -68,45 +68,37 @@ class TestParamMapping:
 
 
 class TestSiblingCollapse:
-    def _row(self, id_, parcel, dhash, d):
-        return {"id": id_, "parcel_id": parcel, "dedup_hash": dhash, "auction_date": d}
+    # Collapse by dedup_hash (the app-wide billing key) — trustee_sale dedups exactly
+    # like every other list, no more aggressively (product decision 2026-07-03).
+    def _row(self, id_, dhash, d):
+        return {"id": id_, "dedup_hash": dhash, "auction_date": d}
 
-    def test_same_parcel_diff_address_collapses_keeping_soonest(self):
-        # Same parcel, DIFFERENT dedup_hash (situs text drift) -> still one property.
+    def test_same_hash_collapses_keeping_soonest(self):
         rows = [
-            self._row("a", "0519285029", "hashA", date(2026, 9, 1)),
-            self._row("b", "051928-5029", "hashB", date(2026, 8, 1)),  # soonest -> kept
+            self._row("a", "hashX", date(2026, 9, 1)),
+            self._row("b", "hashX", date(2026, 8, 1)),  # soonest -> kept
         ]
-        # keeps 'b' (soonest auction), marks 'a' duplicate
         assert _sibling_duplicate_ids(rows) == ["a"]
 
-    def test_different_parcels_do_not_collapse(self):
+    def test_different_hashes_do_not_collapse(self):
+        # Different dedup_hash (incl. same parcel + drifted address) => distinct leads,
+        # matching how every other list bills them.
         rows = [
-            self._row("a", "0519285029", "hashA", date(2026, 9, 1)),
-            self._row("b", "9999999999", "hashB", date(2026, 8, 1)),
+            self._row("a", "hashA", date(2026, 9, 1)),
+            self._row("b", "hashB", date(2026, 8, 1)),
         ]
         assert _sibling_duplicate_ids(rows) == []
 
-    def test_parcelless_rows_fall_back_to_dedup_hash(self):
-        # No usable parcel -> group by dedup_hash. Same hash collapses; different not.
-        same = [
-            self._row("a", None, "hashX", date(2026, 9, 1)),
-            self._row("b", "", "hashX", date(2026, 8, 1)),
-        ]
-        assert _sibling_duplicate_ids(same) == ["a"]  # 'b' soonest kept
-        diff = [
-            self._row("a", None, "hashX", date(2026, 9, 1)),
-            self._row("b", None, "hashY", date(2026, 8, 1)),
-        ]
-        assert _sibling_duplicate_ids(diff) == []
-
-    def test_three_same_parcel_keeps_one(self):
+    def test_three_same_hash_keeps_one(self):
         rows = [
-            self._row("a", "P100", "h1", date(2026, 9, 1)),
-            self._row("b", "P100", "h2", date(2026, 7, 1)),  # soonest -> kept
-            self._row("c", "P100", "h3", date(2026, 8, 1)),
+            self._row("a", "hashX", date(2026, 9, 1)),
+            self._row("b", "hashX", date(2026, 7, 1)),  # soonest -> kept
+            self._row("c", "hashX", date(2026, 8, 1)),
         ]
         assert sorted(_sibling_duplicate_ids(rows)) == ["a", "c"]
+
+    def test_single_row_is_noop(self):
+        assert _sibling_duplicate_ids([self._row("a", "hashX", date(2026, 9, 1))]) == []
 
 
 class TestModule:

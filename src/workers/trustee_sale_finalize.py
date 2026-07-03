@@ -24,7 +24,6 @@ from typing import Any
 from sqlalchemy import text as _sa_text
 
 from src.utils.logger import setup_logger
-from src.workers.property_identity import normalize_parcel
 
 _logger = setup_logger("workers.trustee_sale_finalize")
 
@@ -69,21 +68,18 @@ def _nts_update_params(row_id: Any, src: dict) -> dict:
 
 
 def _sibling_duplicate_ids(rows: list[dict]) -> list:
-    """Ids to mark duplicate so each PROPERTY keeps ONE (soonest-auction) lead.
+    """Ids to mark duplicate so each ``dedup_hash`` keeps ONE (soonest-auction) row.
 
-    Groups by a parcel-primary key: the normalized parcel when it is a usable identity
-    (the app's own canonical property key — ``compute_property_key`` is parcel-primary
-    because situs text drifts between pipelines), else the ``dedup_hash`` for parcel-less
-    rows. So two notices on the same parcel collapse even when their address strings
-    differ. Pure (no DB) so the collapse rule is unit-testable. Each row is a dict with
-    ``id`` / ``parcel_id`` / ``dedup_hash`` / ``auction_date``.
+    Groups by ``dedup_hash`` — the app-wide billing key (parcel|address) — because the
+    product decision (2026-07-03) is that Auction Leads dedups EXACTLY like every other
+    list, no more aggressively. The shared cross-job scan enforces one-per-hash ACROSS
+    jobs but leaves same-JOB rows sharing a hash all is_duplicate=false, so this
+    collapses them. Pure (no DB) so the rule is unit-testable. Each row is a dict with
+    ``id`` / ``dedup_hash`` / ``auction_date``.
     """
     groups: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
-        parcel = normalize_parcel(row.get("parcel_id"))
-        parcel_ok = len(parcel) >= 4 and any(c.isdigit() for c in parcel)
-        key = f"P|{parcel}" if parcel_ok else f"H|{row.get('dedup_hash')}"
-        groups[key].append(row)
+        groups[row.get("dedup_hash")].append(row)
     dup_ids: list = []
     for grp in groups.values():
         if len(grp) <= 1:
@@ -136,19 +132,19 @@ def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
         )
         populated += res.rowcount or 0
 
-    # Collapse same-parcel siblings to ONE billed lead (product decision 2026-07-03:
-    # parcel-based dedup — two distinct auctions on one parcel bill once). The scraper
-    # gives each notice a distinct insert fingerprint so both SURVIVE insert (we must
-    # not silently drop a real auction), but the shared cross-job dedup scan leaves
-    # same-JOB rows all is_duplicate=false (it only records the hash was claimed once),
-    # so without this BOTH would bill. Group by a PARCEL-primary key (not dedup_hash =
-    # parcel|address) so same-parcel notices collapse even when their situs text differs
-    # (Codex). Only rows still is_duplicate=false are candidates, so the count is
-    # NET-NEW (a parcel already delivered in a prior job stays suppressed) and folds
-    # cleanly into the caller's dup_count. Runs before billing.
+    # Collapse same-dedup_hash siblings to ONE billed lead. The scraper gives each
+    # notice a distinct insert fingerprint so both SURVIVE insert (never silently drop
+    # a real auction), but the shared cross-job dedup scan leaves same-JOB rows sharing
+    # a dedup_hash all is_duplicate=false (it only records the hash was claimed once),
+    # so without this BOTH would bill. dedup_hash IS the app-wide billing key
+    # (parcel|address) — trustee_sale dedups EXACTLY like every other list, no more
+    # aggressively (product decision 2026-07-03); cross-job dedup is already handled by
+    # the shared delivered_records claim on the same key. Only rows still
+    # is_duplicate=false are candidates, so the count is NET-NEW and folds cleanly into
+    # the caller's dup_count. Runs before billing.
     sib_rows = db.execute(
         _sa_text(
-            "SELECT id, parcel_id, dedup_hash, auction_date FROM results "
+            "SELECT id, dedup_hash, auction_date FROM results "
             "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
             "AND dedup_hash IS NOT NULL AND is_duplicate = false"
         ),

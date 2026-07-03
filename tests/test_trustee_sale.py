@@ -41,7 +41,7 @@ def _notice(**over) -> NtsNotice:
         "trustee": "Quality Loan Service",
         "beneficiary": "Wells Fargo",
         "principal_owing": Decimal("282345.67"),
-        "nod_date": "2026-01-15",
+        "nod_date": "1/15/2026",
         "source_url": "https://example.com/notice",
     }
     base.update(over)
@@ -103,8 +103,19 @@ class TestRecordMapping:
         # grantor vesting boilerplate stripped, owner name preserved
         assert "SMITH" in (rec.party_name or "")
         assert "SOLE AND SEPARATE" not in (rec.party_name or "")
-        # date_recorded prefers the NOD transmittal date
-        assert rec.date_recorded == "2026-01-15"
+        # date_recorded prefers an already-M/D/YYYY nod_date (parseable by the
+        # generated date_recorded_parsed column)
+        assert rec.date_recorded == "1/15/2026"
+
+    def test_raw_html_hash_is_stable_and_notice_unique(self):
+        # Per-notice idempotency key so two active notices on the same property/date
+        # with different TS#s don't collide on the insert ON CONFLICT.
+        h1 = _record_from_notice(_notice()).raw_html_hash
+        h1b = _record_from_notice(_notice()).raw_html_hash
+        h2 = _record_from_notice(_notice(ts_number="WA-24-000")).raw_html_hash
+        assert h1 and len(h1) <= 32  # fits Result.raw_html_hash String(32)
+        assert h1 == h1b  # stable across re-runs (same source+ts_number)
+        assert h1 != h2  # distinct notice -> distinct fingerprint
 
     def test_nts_source_contract(self):
         rec = _record_from_notice(_notice())
@@ -117,10 +128,18 @@ class TestRecordMapping:
         # auction_date carried as ISO string
         assert src["auction_date"] == (date.today() + timedelta(days=30)).isoformat()
 
-    def test_date_recorded_falls_back_to_auction_date(self):
-        d = date.today() + timedelta(days=10)
+    def test_date_recorded_falls_back_to_auction_date_as_mdy(self):
+        # No usable nod_date -> the real auction Date, formatted M/D/YYYY (parseable).
+        d = date(2026, 8, 5)
         rec = _record_from_notice(_notice(nod_date=None, auction_date=d))
-        assert rec.date_recorded == d.isoformat()
+        assert rec.date_recorded == "8/5/2026"
+
+    def test_date_recorded_ignores_non_mdy_nod_date(self):
+        # An ISO nod_date is NOT M/D/YYYY -> fall back to auction date (parseable),
+        # never emit an unparseable ISO date_recorded.
+        d = date(2026, 8, 5)
+        rec = _record_from_notice(_notice(nod_date="2026-01-15", auction_date=d))
+        assert rec.date_recorded == "8/5/2026"
 
     def test_null_principal_owing_is_none(self):
         rec = _record_from_notice(_notice(principal_owing=None))

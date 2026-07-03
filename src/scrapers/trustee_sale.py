@@ -25,6 +25,8 @@ fuzzy matching). See ``tasks/todo.md``.
 """
 from __future__ import annotations
 
+import hashlib
+import re
 from datetime import date
 
 from sqlalchemy import func, select
@@ -38,6 +40,26 @@ from src.utils.logger import setup_logger
 _logger = setup_logger("scraper.trustee_sale")
 
 RECORD_TYPE = "trustee_sale"
+
+# The generated results.date_recorded_parsed column (result_parse_filing_date) ONLY
+# accepts M/D/YYYY; any other format (incl. ISO) parses to NULL and drops the row from
+# date-windowed Lists/overlap + blanks its freshness signal.
+_MDY_RE = re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$")
+
+
+def _filing_date_mdy(notice: NtsNotice) -> str | None:
+    """A parseable M/D/YYYY filing date for ``date_recorded``.
+
+    nts_notices.nod_date is a free-form parser string of unreliable format, so use it
+    only when it already matches M/D/YYYY; otherwise fall back to the notice's real
+    ``auction_date`` (a Date, always present — the scrape filters auction_date>=today)
+    formatted M/D/YYYY.
+    """
+    nod = (notice.nod_date or "").strip()
+    if _MDY_RE.match(nod):
+        return nod
+    d = notice.auction_date
+    return f"{d.month}/{d.day}/{d.year}" if d else None
 
 
 def _record_from_notice(notice: NtsNotice) -> ScrapedRecord:
@@ -54,10 +76,16 @@ def _record_from_notice(notice: NtsNotice) -> ScrapedRecord:
     rec.property_address = notice.property_address
     rec.parcel_id = notice.parcel
     rec.doc_type = "Notice of Trustee Sale"
-    # date_recorded feeds the date window + "new" badge (parity with pre_foreclosure):
-    # the NOD transmittal date if present, else the (future) auction date.
+    rec.date_recorded = _filing_date_mdy(notice)
+    # Per-notice identity as the within-job idempotency key (Result.raw_html_hash,
+    # String(32)). _source_fingerprint excludes enrichment_data, so without this two
+    # active notices on the same property/date with different TS#s would collide on
+    # ON CONFLICT and the 2nd lead would be dropped (Codex P2). Stable across re-runs
+    # (same source+ts_number), so a job re-run still no-op-conflicts idempotently.
+    rec.raw_html_hash = hashlib.sha256(
+        f"nts|{notice.source}|{notice.ts_number}".encode()
+    ).hexdigest()[:32]
     _auction_iso = notice.auction_date.isoformat() if notice.auction_date else None
-    rec.date_recorded = notice.nod_date or _auction_iso
     rec.enrichment_data = {
         "source": notice.source,
         "county": notice.county,

@@ -926,6 +926,58 @@ def run_scrape_job(self, job_id: str) -> None:
             db=db,
         )
 
+        # ── AUCTION LEADS (trustee_sale) FINALIZE ───────────────────────────────
+        # An Auction Lead IS a known Notice-of-Trustee-Sale row; the scraper stamped
+        # its id + auction fields into enrichment_data["nts_source"]. Populate the
+        # typed Result auction columns DIRECTLY from that (no fuzzy matching, unlike
+        # pre_foreclosure's nts_matcher). Runs HERE — before billing below — so a
+        # broken finalize fails the job WITHOUT charging, and before the post-
+        # enrichment re-export so the delivered CSV carries auction data. FAIL-CLOSED
+        # (Codex): never deliver an Auction Lead with blank auction/default/trustee
+        # data. On failure, release this job's dedup claims (committed at the dedup
+        # step above) and fail loudly — mirrors the R2-upload-failure handler below.
+        if config.record_type == "trustee_sale":
+            from src.workers.trustee_sale_finalize import finalize_trustee_sale_job
+            try:
+                finalize_trustee_sale_job(db, job_id, job.user_id)
+            except Exception as exc:
+                _logger.error(
+                    "Job %s: trustee_sale finalize FAILED — failing job (no blank "
+                    "auction leads): %s", job_id, str(exc)[:200],
+                )
+                try:
+                    db.rollback()
+                    db.execute(
+                        sa_text(
+                            "DELETE FROM delivered_records "
+                            "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
+                        ),
+                        {"jid": job_id, "uid": str(job.user_id)},
+                    )
+                    db.commit()
+                except Exception as cleanup_exc:
+                    db.rollback()
+                    _logger.error(
+                        "Job %s: failed to release dedup claims after finalize "
+                        "failure: %s", job_id, str(cleanup_exc)[:200],
+                    )
+                reason = (
+                    "Auction data could not be attached to your Auction Leads, so the "
+                    "run was stopped and you were not charged. Please try again; "
+                    "contact support if it keeps failing."
+                )
+                if _fail_job(db, job, r, job_id, reason):
+                    from src.workers.notification_emit import create_notification
+                    create_notification(
+                        user_id=job.user_id, type="job_failed", job_id=job_id,
+                        detail={
+                            "scraper_name": getattr(config, "name", None),
+                            "county": getattr(config, "county", None),
+                            "error_summary": reason[:200],
+                        },
+                    )
+                return
+
         # ── EXPORT ────────────────────────────────────────────────────────────
         from src.api.schemas import DeliverConfigDict
         deliver_config: DeliverConfigDict = cast(DeliverConfigDict, config.deliver or {})

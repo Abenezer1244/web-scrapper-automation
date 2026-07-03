@@ -17,12 +17,14 @@ raise fails the job without charging the user.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from collections import defaultdict
+from datetime import UTC, date, datetime
 from typing import Any
 
 from sqlalchemy import text as _sa_text
 
 from src.utils.logger import setup_logger
+from src.workers.property_identity import normalize_parcel
 
 _logger = setup_logger("workers.trustee_sale_finalize")
 
@@ -64,6 +66,32 @@ def _nts_update_params(row_id: Any, src: dict) -> dict:
         "nts": json.dumps(nts_blob),
         "rid": row_id,
     }
+
+
+def _sibling_duplicate_ids(rows: list[dict]) -> list:
+    """Ids to mark duplicate so each PROPERTY keeps ONE (soonest-auction) lead.
+
+    Groups by a parcel-primary key: the normalized parcel when it is a usable identity
+    (the app's own canonical property key — ``compute_property_key`` is parcel-primary
+    because situs text drifts between pipelines), else the ``dedup_hash`` for parcel-less
+    rows. So two notices on the same parcel collapse even when their address strings
+    differ. Pure (no DB) so the collapse rule is unit-testable. Each row is a dict with
+    ``id`` / ``parcel_id`` / ``dedup_hash`` / ``auction_date``.
+    """
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        parcel = normalize_parcel(row.get("parcel_id"))
+        parcel_ok = len(parcel) >= 4 and any(c.isdigit() for c in parcel)
+        key = f"P|{parcel}" if parcel_ok else f"H|{row.get('dedup_hash')}"
+        groups[key].append(row)
+    dup_ids: list = []
+    for grp in groups.values():
+        if len(grp) <= 1:
+            continue
+        # Keep the most-urgent (soonest auction_date; None sorts last), stable by id.
+        ordered = sorted(grp, key=lambda r: (r.get("auction_date") or date.max, str(r.get("id"))))
+        dup_ids.extend(r.get("id") for r in ordered[1:])
+    return dup_ids
 
 
 def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
@@ -111,35 +139,31 @@ def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
     # Collapse same-parcel siblings to ONE billed lead (product decision 2026-07-03:
     # parcel-based dedup — two distinct auctions on one parcel bill once). The scraper
     # gives each notice a distinct insert fingerprint so both SURVIVE insert (we must
-    # not silently drop a real auction), but the shared cross-job dedup scan then
-    # leaves same-JOB rows that share a dedup_hash all is_duplicate=false (it only
-    # records that the hash was claimed once), so without this BOTH would bill. Keep
-    # the most-urgent (soonest auction_date) row per dedup_hash; mark the rest
-    # is_duplicate. Only ADDS is_duplicate (never clears), so a parcel already
-    # delivered in a prior job stays fully suppressed. Runs before billing.
-    # ``AND is_duplicate = false`` so rowcount is the NET-NEW duplicates this collapse
-    # created (rows the cross-job scan already marked stay put, uncounted) — the caller
-    # adds it to the job's dup_count so the user-facing record_count/notifications don't
-    # over-report collapsed siblings as new leads (Codex).
-    collapse_res = db.execute(
+    # not silently drop a real auction), but the shared cross-job dedup scan leaves
+    # same-JOB rows all is_duplicate=false (it only records the hash was claimed once),
+    # so without this BOTH would bill. Group by a PARCEL-primary key (not dedup_hash =
+    # parcel|address) so same-parcel notices collapse even when their situs text differs
+    # (Codex). Only rows still is_duplicate=false are candidates, so the count is
+    # NET-NEW (a parcel already delivered in a prior job stays suppressed) and folds
+    # cleanly into the caller's dup_count. Runs before billing.
+    sib_rows = db.execute(
         _sa_text(
-            """
-            UPDATE results SET is_duplicate = true
-            WHERE job_id = :jid AND user_id = CAST(:uid AS uuid)
-              AND dedup_hash IS NOT NULL
-              AND is_duplicate = false
-              AND id NOT IN (
-                SELECT DISTINCT ON (dedup_hash) id
-                FROM results
-                WHERE job_id = :jid AND user_id = CAST(:uid AS uuid)
-                  AND dedup_hash IS NOT NULL
-                ORDER BY dedup_hash, auction_date ASC NULLS LAST, id
-              )
-            """
+            "SELECT id, parcel_id, dedup_hash, auction_date FROM results "
+            "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
+            "AND dedup_hash IS NOT NULL AND is_duplicate = false"
         ),
         {"jid": job_id, "uid": str(user_id)},
-    )
-    collapsed = collapse_res.rowcount or 0
+    ).fetchall()
+    dup_ids = _sibling_duplicate_ids([dict(r._mapping) for r in sib_rows])
+    collapsed = len(dup_ids)
+    if dup_ids:
+        db.execute(
+            _sa_text(
+                "UPDATE results SET is_duplicate = true "
+                "WHERE id = ANY(CAST(:ids AS uuid[]))"
+            ),
+            {"ids": [str(i) for i in dup_ids]},
+        )
 
     # Fail-closed verification: no trustee_sale result may reach delivery without the
     # two load-bearing fields — auction_date (the urgency signal + freshness gate) and

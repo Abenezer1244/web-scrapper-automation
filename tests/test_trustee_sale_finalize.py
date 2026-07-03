@@ -6,12 +6,14 @@ mapping, the required-notice_id fail-closed guard, and the nts blob shape (must 
 what nts_matcher_task writes so exports read enrichment_data['nts'] identically).
 """
 import json
+from datetime import date
 
 import pytest
 
 from src.workers.trustee_sale_finalize import (
     TrusteeSaleFinalizeError,
     _nts_update_params,
+    _sibling_duplicate_ids,
     finalize_trustee_sale_job,
 )
 
@@ -63,6 +65,48 @@ class TestParamMapping:
         assert blob["trustee"] == "Quality Loan Service"
         # Exact source row, not a fuzzy match.
         assert blob["confidence"] == 1.0
+
+
+class TestSiblingCollapse:
+    def _row(self, id_, parcel, dhash, d):
+        return {"id": id_, "parcel_id": parcel, "dedup_hash": dhash, "auction_date": d}
+
+    def test_same_parcel_diff_address_collapses_keeping_soonest(self):
+        # Same parcel, DIFFERENT dedup_hash (situs text drift) -> still one property.
+        rows = [
+            self._row("a", "0519285029", "hashA", date(2026, 9, 1)),
+            self._row("b", "051928-5029", "hashB", date(2026, 8, 1)),  # soonest -> kept
+        ]
+        # keeps 'b' (soonest auction), marks 'a' duplicate
+        assert _sibling_duplicate_ids(rows) == ["a"]
+
+    def test_different_parcels_do_not_collapse(self):
+        rows = [
+            self._row("a", "0519285029", "hashA", date(2026, 9, 1)),
+            self._row("b", "9999999999", "hashB", date(2026, 8, 1)),
+        ]
+        assert _sibling_duplicate_ids(rows) == []
+
+    def test_parcelless_rows_fall_back_to_dedup_hash(self):
+        # No usable parcel -> group by dedup_hash. Same hash collapses; different not.
+        same = [
+            self._row("a", None, "hashX", date(2026, 9, 1)),
+            self._row("b", "", "hashX", date(2026, 8, 1)),
+        ]
+        assert _sibling_duplicate_ids(same) == ["a"]  # 'b' soonest kept
+        diff = [
+            self._row("a", None, "hashX", date(2026, 9, 1)),
+            self._row("b", None, "hashY", date(2026, 8, 1)),
+        ]
+        assert _sibling_duplicate_ids(diff) == []
+
+    def test_three_same_parcel_keeps_one(self):
+        rows = [
+            self._row("a", "P100", "h1", date(2026, 9, 1)),
+            self._row("b", "P100", "h2", date(2026, 7, 1)),  # soonest -> kept
+            self._row("c", "P100", "h3", date(2026, 8, 1)),
+        ]
+        assert sorted(_sibling_duplicate_ids(rows)) == ["a", "c"]
 
 
 class TestModule:

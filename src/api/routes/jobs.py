@@ -524,11 +524,12 @@ async def get_results(
     # NTS Tier 1: show the Auction Date / Default Owed columns for EVERY
     # pre_foreclosure job (user pref: consistent columns across scrapes — the cells
     # read '—' where a lead has no matched trustee sale, rather than the whole columns
-    # vanishing on a job that happened to match zero). Auction data only ever exists
-    # for pre_foreclosure, so the record type IS the rule; other types keep the row
-    # probe (defensive — nothing else populates auction today). Job-wide, not
-    # page-scoped, so the columns don't flicker by page when matches are sparse (Codex).
-    if config is not None and config.record_type == "pre_foreclosure":
+    # vanishing on a job that happened to match zero). trustee_sale (Auction Leads) is
+    # sourced FROM the NTS cache, so every row has auction data — the record type IS
+    # the rule for both; other types keep the row probe (defensive — nothing else
+    # populates auction today). Job-wide, not page-scoped, so the columns don't
+    # flicker by page when matches are sparse (Codex).
+    if config is not None and config.record_type in ("pre_foreclosure", "trustee_sale"):
         has_auction_data = True
     else:
         auction_probe = await db.execute(

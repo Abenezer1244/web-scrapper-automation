@@ -121,6 +121,13 @@ _TYPE_EXTRA_COLUMNS: dict[str, tuple[str, ...]] = {
     "pre_foreclosure": (
         "auction_date", "days_to_auction", "default_amount", "trustee", "ts_number",
     ),
+    # trustee_sale (Auction Leads) is sourced FROM the NTS cache, so every row has the
+    # same auction block as a matched pre_foreclosure lead. heirs/legal_description are
+    # BASE (shared, not per-type droppable — see the note above); they stay present but
+    # blank for auction leads, matching how pre_foreclosure handles them.
+    "trustee_sale": (
+        "auction_date", "days_to_auction", "default_amount", "trustee", "ts_number",
+    ),
 }
 
 # BASE = columns common to EVERY type = the canonical set minus every column that

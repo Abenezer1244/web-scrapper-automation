@@ -82,6 +82,14 @@ def _record_from_notice(notice: NtsNotice) -> ScrapedRecord:
     # active notices on the same property/date with different TS#s would collide on
     # ON CONFLICT and the 2nd lead would be dropped (Codex P2). Stable across re-runs
     # (same source+ts_number), so a job re-run still no-op-conflicts idempotently.
+    # NOTE: this only guards the within-job insert. CROSS-JOB billing dedup
+    # (dedup_hash -> delivered_records) intentionally stays parcel|address for
+    # trustee_sale too (product decision 2026-07-03), matching the whole app's "one
+    # charge per property across all lists" model — so a property already delivered on
+    # another list won't re-bill as an auction lead (its auction date/amount still
+    # reaches that lead via the pre_foreclosure NTS matcher), and two distinct auctions
+    # on one parcel collapse to one billed lead. Do NOT make dedup_hash notice-based
+    # here without revisiting that decision.
     rec.raw_html_hash = hashlib.sha256(
         f"nts|{notice.source}|{notice.ts_number}".encode()
     ).hexdigest()[:32]

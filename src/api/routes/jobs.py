@@ -503,19 +503,26 @@ async def get_results(
             if prev_row:
                 previous_job_id = prev_row
 
-    # NTS Tier 1: does this JOB have any auction-matched lead? Job-wide (NOT
-    # page/filter-scoped) so the auction columns don't flicker by page when matches
-    # are sparse (Codex). LIMIT 1 over ix_results_job_auction_date — cheap.
-    auction_probe = await db.execute(
-        select(Result.id)
-        .where(
-            Result.job_id == job_id,
-            Result.user_id == current_user.id,
-            Result.auction_date.isnot(None),
+    # NTS Tier 1: show the Auction Date / Default Owed columns for EVERY
+    # pre_foreclosure job (user pref: consistent columns across scrapes — the cells
+    # read '—' where a lead has no matched trustee sale, rather than the whole columns
+    # vanishing on a job that happened to match zero). Auction data only ever exists
+    # for pre_foreclosure, so the record type IS the rule; other types keep the row
+    # probe (defensive — nothing else populates auction today). Job-wide, not
+    # page-scoped, so the columns don't flicker by page when matches are sparse (Codex).
+    if config is not None and config.record_type == "pre_foreclosure":
+        has_auction_data = True
+    else:
+        auction_probe = await db.execute(
+            select(Result.id)
+            .where(
+                Result.job_id == job_id,
+                Result.user_id == current_user.id,
+                Result.auction_date.isnot(None),
+            )
+            .limit(1)
         )
-        .limit(1)
-    )
-    has_auction_data = auction_probe.scalar_one_or_none() is not None
+        has_auction_data = auction_probe.scalar_one_or_none() is not None
 
     return ResultsPage(
         job_id=job_id, total=total, page=page, page_size=page_size,

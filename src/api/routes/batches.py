@@ -51,6 +51,59 @@ _logger = setup_logger("api.batches")
 router = APIRouter(prefix="/batches", tags=["batches"])
 
 
+def _parse_user_date(value: str):
+    """Parse a user-supplied date (ISO YYYY-MM-DD, or legacy MM/DD/YYYY) into a
+    date. 422s on anything unparseable so a bad custom range fails at the boundary
+    instead of silently falling back to the default window at scrape time."""
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            continue
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail="Enter a valid date (YYYY-MM-DD).",
+    )
+
+
+def _resolve_batch_child_schedule(
+    mode: str | None, raw_from: str | None, raw_to: str | None
+) -> dict[str, str]:
+    """Map the batch's date-range choice to the per-CHILD schedule dict.
+
+    ONLY "custom" and "since_last_run" are explicit overrides; everything else
+    (incl. the ScheduleConfig "rolling_90" default and the "recommended" sentinel)
+    returns {} so _resolve_date_range keeps the per-record-type default
+    (tax_delinquent ~18mo, others 90d). Never force a uniform 90d here — that would
+    silently shrink tax-delinquent history on a mixed batch (Codex-reviewed).
+    Raises HTTPException(422) on an incomplete or inverted custom range.
+    """
+    mode = (mode or "").strip().lower()
+    if mode == "custom":
+        rf, rt = (raw_from or "").strip(), (raw_to or "").strip()
+        if not rf or not rt:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="A custom date range needs both a start and an end date.",
+            )
+        d_from, d_to = _parse_user_date(rf), _parse_user_date(rt)
+        if d_from > d_to:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="The start date must be on or before the end date.",
+            )
+        # Store ISO — _resolve_date_range normalizes to MM/DD/YYYY at scrape time,
+        # and each child's own max_date_range_days clamp still applies per job.
+        return {
+            "date_range_mode": "custom",
+            "date_from": d_from.isoformat(),
+            "date_to": d_to.isoformat(),
+        }
+    if mode == "since_last_run":
+        return {"date_range_mode": "since_last_run"}
+    return {}
+
+
 @router.post("", response_model=BatchCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_batch(
     body: BatchCreateRequest,
@@ -158,9 +211,17 @@ async def create_batch(
         context="create_batch",
     )
 
-    # 6. Persist the parent batch (shared config) + child configs (delivery +
-    #    schedule SUPPRESSED — the batch owns them). BatchRun + jobs are created by
-    #    the dispatch worker (system-written).
+    # 5c. Resolve the batch date-range window into the per-child schedule
+    #     (Codex-reviewed). "recommended"/default → {} (per-type default preserved);
+    #     "custom"/"since_last_run" → applied uniformly to every child.
+    child_schedule = _resolve_batch_child_schedule(
+        body.schedule.date_range_mode, body.schedule.date_from, body.schedule.date_to
+    )
+
+    # 6. Persist the parent batch (shared config) + child configs (delivery
+    #    suppressed — the batch owns it; the resolved date-range window is pushed
+    #    into each child's schedule below). BatchRun + jobs are created by the
+    #    dispatch worker (system-written).
     batch = ScraperBatch(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
@@ -170,12 +231,14 @@ async def create_batch(
         enrichment=body.enrichment.model_dump(),
         # 2B: the PARENT carries the recurrence; dispatch_scheduled_batches fires
         # off it. frequency='manual' (the default) = no recurrence (2A behavior).
-        # ONLY the recurrence subset is stored — ScheduleConfig's date-range
-        # fields are NOT applied to batch children (they scrape the 2A default
-        # window), so persisting them would imply support that doesn't exist
-        # (Codex P2). Extend to date ranges deliberately, not accidentally.
+        # The date-range fields are stored too — they record the user's CHOSEN
+        # window for audit/inspection (the authoritative per-child window lives in
+        # each child's schedule; the recommended default resolves per record type).
         schedule=body.schedule.model_dump(
-            include={"frequency", "run_at_hour", "run_at_minute"}
+            include={
+                "frequency", "run_at_hour", "run_at_minute",
+                "date_range_mode", "date_from", "date_to",
+            }
         ),
         deliver=body.deliver.model_dump(),
         status="active",
@@ -196,7 +259,7 @@ async def create_batch(
                     record_type=rt,
                     fields=body.fields.model_dump(),
                     enrichment=body.enrichment.model_dump(),
-                    schedule={},   # suppressed — batch owns scheduling
+                    schedule=dict(child_schedule),   # batch-chosen window ({} = per-type default)
                     deliver={},    # suppressed — batch owns delivery
                     skip_trace_enabled=body.skip_trace_enabled,
                     # Phase 3: probate children get the new TOD default (False) or the

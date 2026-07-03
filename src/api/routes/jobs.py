@@ -49,7 +49,13 @@ async def list_jobs(
         # and push standalone exports out of the response.
         stmt = stmt.join(
             ScraperConfig, ScraperConfig.id == Job.scraper_config_id
-        ).where(ScraperConfig.batch_id.is_(None))
+        ).where(
+            # Belt-and-suspenders tenant scope on the join (Codex): RLS + the
+            # Job.user_id filter already bound it, but every joined table carries
+            # its own user_id predicate in this codebase.
+            ScraperConfig.user_id == current_user.id,
+            ScraperConfig.batch_id.is_(None),
+        )
     result = await db.execute(stmt.order_by(Job.created_at.desc()).limit(100))
     jobs = result.scalars().all()
 

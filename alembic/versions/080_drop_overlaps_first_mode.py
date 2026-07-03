@@ -10,8 +10,15 @@ exposed in the UI — a public API/CHECK trap. Removing it:
      overlaps_only/everything).
   2. Recreate the CHECK allowing only ('overlaps_only', 'everything').
 
-Migrate BEFORE deploying the API that narrows the Pydantic Literal — an old
-client sending 'overlaps_first' then gets a clean 422 instead of a DB violation.
+ROLLOUT ORDER (Codex P2): deploy the narrowed API FIRST, then run this migration.
+This is the REVERSE of the usual "migrate before deploy" rule (which is about
+additive columns the ORM selects) because this is a constraint TIGHTENING. If the
+CHECK is tightened while old API workers are still live, an old worker that accepts
+'overlaps_first' would hit the new CHECK and 500. Deploying the narrowed Literal
+first means the value is rejected with a clean 422 at the API boundary; once old
+workers are drained, tightening the CHECK is a safe no-op (no writer emits it).
+In practice the wizard never sent 'overlaps_first', so no client traffic carries it
+either way — this ordering just removes the theoretical 500 window.
 """
 from alembic import op
 

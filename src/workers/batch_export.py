@@ -171,12 +171,13 @@ def _combined_pairs(
     user_id: str,
     job_ids: list[str],
     delivery_mode: str = "everything",
-    limit: int = EXPORT_CAP,
+    limit: int | None = EXPORT_CAP,
     offset: int = 0,
 ) -> list[tuple]:
     """Return (record_namespace, overlap_dict) pairs for the batch, hottest-first.
 
     Ordering + mode filtering are SQL-side (deterministic; pagination-safe).
+    `limit=None` binds SQL `LIMIT NULL` (unbounded — the whole set in one snapshot).
     PII (phone/email) is decrypted here — the raw text() query bypasses the
     EncryptedString type. matched_record_types are humanized for the `lists` col.
     """
@@ -236,26 +237,18 @@ def _combined_pairs(
 def _combined_pairs_all(
     db, user_id: str, job_ids: list[str], delivery_mode: str = "everything"
 ) -> list[tuple]:
-    """ALL combined pairs for the delivered CSV — pages `_combined_pairs` until
-    exhausted so a batch with more than EXPORT_CAP deduped leads is never SILENTLY
-    truncated (the old default limit=EXPORT_CAP dropped rows past 50k while the
-    email/UI counts reported the true, larger total — a broken paid export).
-    EXPORT_CAP is now a PAGE size, not a hard ceiling. The delivered batch's jobs
-    are terminal, so the dataset is stable across pages; the deterministic ORDER BY
-    (…, id DESC) makes OFFSET paging repeatable."""
-    if not job_ids:
-        return []
-    out: list[tuple] = []
-    offset = 0
-    while True:
-        page = _combined_pairs(
-            db, user_id, job_ids,
-            delivery_mode=delivery_mode, limit=EXPORT_CAP, offset=offset,
-        )
-        out.extend(page)
-        if len(page) < EXPORT_CAP:
-            return out
-        offset += EXPORT_CAP
+    """ALL combined pairs for the delivered CSV, in ONE query (limit=None -> SQL
+    `LIMIT NULL` = unbounded). Two properties we need together:
+      - no SILENT truncation: the old default limit=EXPORT_CAP dropped rows past 50k
+        while the email/UI counts reported the true, larger total (a broken paid
+        export).
+      - a CONSISTENT snapshot: a single statement reads one MVCC snapshot, so a
+        skip-trace contact fill landing mid-read can't reorder rows across pages and
+        duplicate/drop them the way OFFSET paging could (Codex P2 — the ORDER BY
+        keys on contactable status, which async enrichment mutates).
+    EXPORT_CAP stays the API page size for the interactive /leads view; this
+    delivered-export path is intentionally uncapped."""
+    return _combined_pairs(db, user_id, job_ids, delivery_mode=delivery_mode, limit=None)
 
 
 def compute_delivery_counts(db, user_id: str, job_ids: list[str]) -> dict[str, int]:

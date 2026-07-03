@@ -929,6 +929,11 @@ class BatchSummaryResponse(BaseModel):
     state: str
     run_status: BatchRunStatus = BatchRunStatus.PENDING
     child_count: int = 0
+    # Distinct record types across the batch's child scrapes (sorted). Lets the
+    # Results page label a collapsed batch row ("Probate + Pre-foreclosure")
+    # without reconstructing it from child jobs — which it can't, since those are
+    # excluded from GET /jobs to keep the newest-100 window for standalone exports.
+    record_types: list[str] = Field(default_factory=list)
     combined_export_ready: bool = False  # status-derived — never expose the R2 key
     delivery_mode: str = "everything"
     # Rows in the combined export as-delivered (mode-aware: overlaps_delivered for

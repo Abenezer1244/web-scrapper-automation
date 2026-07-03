@@ -75,6 +75,15 @@ async def test_list_jobs_exposes_batch_id(
     assert rows[solo_job.id]["batch_id"] is None
     assert rows[child_job.id]["batch_id"] == child_cfg.batch_id
 
+    # exclude_batch_children filters children BEFORE the limit (Codex P1) so a big
+    # batch can't push standalone exports out of the newest-100 window.
+    excluded = {j["id"] for j in (await client.get(
+        "/jobs?exclude_batch_children=true",
+        headers={"Authorization": f"Bearer {starter_token}"},
+    )).json()}
+    assert solo_job.id in excluded
+    assert child_job.id not in excluded
+
 
 # ─── Get single job ───────────────────────────────────────────────────────────
 

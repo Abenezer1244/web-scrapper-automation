@@ -357,6 +357,13 @@
             ],
             "title": "Name"
           },
+          "record_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Record Types",
+            "type": "array"
+          },
           "run_status": {
             "$ref": "#/components/schemas/BatchRunStatus",
             "default": "pending"
@@ -703,6 +710,13 @@
               }
             ],
             "title": "Name"
+          },
+          "record_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Record Types",
+            "type": "array"
           },
           "run_status": {
             "$ref": "#/components/schemas/BatchRunStatus",
@@ -5519,6 +5533,20 @@
     "/jobs": {
       "get": {
         "operationId": "list_jobs_jobs_get",
+        "parameters": [
+          {
+            "description": "Exclude jobs that belong to a batch (their config carries a batch_id). The Results page sets this so a batch's child scrapes don't consume the newest-100 window — the batch shows as one combined row instead.",
+            "in": "query",
+            "name": "exclude_batch_children",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Exclude jobs that belong to a batch (their config carries a batch_id). The Results page sets this so a batch's child scrapes don't consume the newest-100 window — the batch shows as one combined row instead.",
+              "title": "Exclude Batch Children",
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -5533,6 +5561,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "security": [

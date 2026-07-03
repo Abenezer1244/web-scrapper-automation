@@ -306,12 +306,13 @@ class TestCombinedExportColumns:
 
 
 class TestNoSilentTruncation:
-    def test_combined_pairs_all_pages_past_the_cap(self, monkeypatch):
-        """#2: >EXPORT_CAP deduped leads must NOT be silently truncated. With the
-        page size monkeypatched to 2, three distinct-bucket leads still all come
-        back via paging (a single bounded query only returns the first 2)."""
+    def test_combined_pairs_all_is_uncapped_single_snapshot(self):
+        """#2 + Codex P2: the delivered export reads ALL rows in ONE unbounded
+        query (limit=None -> SQL LIMIT NULL). A bounded query would truncate; a
+        multi-query OFFSET walk could dup/skip rows if skip-trace reordered them
+        mid-read. Three distinct-bucket leads all come back; a limit=2 query
+        returns only 2, proving _combined_pairs_all isn't silently capped."""
         import src.workers.batch_export as be
-        monkeypatch.setattr(be, "EXPORT_CAP", 2)
         with SyncSessionLocal() as db:
             user = _user(db)
             batch, j1, _j2 = _two_type_batch(db, user, "everything")
@@ -319,13 +320,11 @@ class TestNoSilentTruncation:
                 _result(db, user.id, j1.id, party=f"OWNER {i}",
                         property_key=f"WA|pierce|00000C{i}")
             db.flush()
-            # Explicit limit=2 — the default arg is bound at def-time so the
-            # monkeypatched module constant wouldn't reach it.
             capped = be._combined_pairs(db, user.id, [j1.id], delivery_mode="everything", limit=2)
             full = be._combined_pairs_all(db, user.id, [j1.id], delivery_mode="everything")
             db.rollback()
-        assert len(capped) == 2           # single bounded query returns one page
-        assert len(full) == 3             # paging accumulates every lead
+        assert len(capped) == 2           # a bounded query truncates
+        assert len(full) == 3             # the delivered export is uncapped
 
 
 class TestOverlapsFirstRemoved:

@@ -135,6 +135,7 @@ async def test_list_returns_own_batch(
     assert item["id"] == starter_batch.batch_id
     assert item["run_status"] == "done"
     assert item["child_count"] == 1
+    assert item["record_types"] == ["probate"]  # collapsed-row label source
     assert item["combined_export_ready"] is True
 
 

@@ -69,10 +69,12 @@ def _nts_update_params(row_id: Any, src: dict) -> dict:
 def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
     """Populate auction columns on every trustee_sale Result of ``job_id``.
 
-    Returns the number of results populated. Raises ``TrusteeSaleFinalizeError`` if a
-    result is missing its ``nts_source`` contract, or if any result still lacks
-    ``auction_date`` / ``nts_notice_id`` after the pass (fail-closed verification).
-    Does NOT commit — the caller's transaction owns the write (committed with billing).
+    Returns the number of same-parcel siblings NEWLY collapsed to duplicates (so the
+    caller can fold it into the job's dup_count for correct user-facing counts). Raises
+    ``TrusteeSaleFinalizeError`` if a result is missing its ``nts_source`` contract, or
+    if any result still lacks ``auction_date`` / ``nts_notice_id`` after the pass
+    (fail-closed). Does NOT commit — the caller's transaction owns the write (committed
+    with billing).
     """
     rows = db.execute(
         _sa_text(
@@ -115,12 +117,17 @@ def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
     # the most-urgent (soonest auction_date) row per dedup_hash; mark the rest
     # is_duplicate. Only ADDS is_duplicate (never clears), so a parcel already
     # delivered in a prior job stays fully suppressed. Runs before billing.
-    db.execute(
+    # ``AND is_duplicate = false`` so rowcount is the NET-NEW duplicates this collapse
+    # created (rows the cross-job scan already marked stay put, uncounted) — the caller
+    # adds it to the job's dup_count so the user-facing record_count/notifications don't
+    # over-report collapsed siblings as new leads (Codex).
+    collapse_res = db.execute(
         _sa_text(
             """
             UPDATE results SET is_duplicate = true
             WHERE job_id = :jid AND user_id = CAST(:uid AS uuid)
               AND dedup_hash IS NOT NULL
+              AND is_duplicate = false
               AND id NOT IN (
                 SELECT DISTINCT ON (dedup_hash) id
                 FROM results
@@ -132,6 +139,7 @@ def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
         ),
         {"jid": job_id, "uid": str(user_id)},
     )
+    collapsed = collapse_res.rowcount or 0
 
     # Fail-closed verification: no trustee_sale result may reach delivery without the
     # two load-bearing fields — auction_date (the urgency signal + freshness gate) and
@@ -158,6 +166,7 @@ def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
         )
 
     _logger.info(
-        "Job %s: trustee_sale finalize populated auction data on %d leads", job_id, populated
+        "Job %s: trustee_sale finalize populated %d leads, collapsed %d same-parcel siblings",
+        job_id, populated, collapsed,
     )
-    return populated
+    return collapsed

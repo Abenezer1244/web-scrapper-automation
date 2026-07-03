@@ -961,7 +961,11 @@ def run_scrape_job(self, job_id: str) -> None:
         if config.record_type == "trustee_sale":
             from src.workers.trustee_sale_finalize import finalize_trustee_sale_job
             try:
-                finalize_trustee_sale_job(db, job_id, job.user_id)
+                # Fold the same-parcel collapse into dup_count so the user-facing
+                # record_count / completion log / notification / email reflect it
+                # (billing reads a fresh DB non-dup count and is already correct;
+                # display_count = len(records) - dup_count was not) (Codex).
+                dup_count += finalize_trustee_sale_job(db, job_id, job.user_id)
             except Exception as exc:
                 _logger.error(
                     "Job %s: trustee_sale finalize FAILED — failing job (no blank "

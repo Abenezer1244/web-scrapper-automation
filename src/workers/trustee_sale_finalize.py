@@ -106,7 +106,16 @@ def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
         )
         populated += res.rowcount or 0
 
-    # Fail-closed verification: no trustee_sale result may reach delivery blank.
+    # Fail-closed verification: no trustee_sale result may reach delivery without the
+    # two load-bearing fields — auction_date (the urgency signal + freshness gate) and
+    # nts_notice_id (the source identity). These are exactly the fields is_valid_nts
+    # gates on, so this contract matches the codebase's own definition of a usable NTS
+    # notice. default_amount (principal_owing) and trustee are DELIBERATELY excluded:
+    # both are nullable in nts_notices and optional throughout the NTS system (the
+    # crawler and _write_match accept null principal_owing; the UI/CSV render "—"), so
+    # a parser that couldn't extract an amount must not drop a real upcoming auction or
+    # fail the whole job. Requiring them here would contradict is_valid_nts and diverge
+    # from pre_foreclosure. (Codex flagged the gap; kept optional by is_valid_nts.)
     missing = db.execute(
         _sa_text(
             "SELECT count(*) FROM results "

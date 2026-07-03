@@ -106,6 +106,33 @@ def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
         )
         populated += res.rowcount or 0
 
+    # Collapse same-parcel siblings to ONE billed lead (product decision 2026-07-03:
+    # parcel-based dedup — two distinct auctions on one parcel bill once). The scraper
+    # gives each notice a distinct insert fingerprint so both SURVIVE insert (we must
+    # not silently drop a real auction), but the shared cross-job dedup scan then
+    # leaves same-JOB rows that share a dedup_hash all is_duplicate=false (it only
+    # records that the hash was claimed once), so without this BOTH would bill. Keep
+    # the most-urgent (soonest auction_date) row per dedup_hash; mark the rest
+    # is_duplicate. Only ADDS is_duplicate (never clears), so a parcel already
+    # delivered in a prior job stays fully suppressed. Runs before billing.
+    db.execute(
+        _sa_text(
+            """
+            UPDATE results SET is_duplicate = true
+            WHERE job_id = :jid AND user_id = CAST(:uid AS uuid)
+              AND dedup_hash IS NOT NULL
+              AND id NOT IN (
+                SELECT DISTINCT ON (dedup_hash) id
+                FROM results
+                WHERE job_id = :jid AND user_id = CAST(:uid AS uuid)
+                  AND dedup_hash IS NOT NULL
+                ORDER BY dedup_hash, auction_date ASC NULLS LAST, id
+              )
+            """
+        ),
+        {"jid": job_id, "uid": str(user_id)},
+    )
+
     # Fail-closed verification: no trustee_sale result may reach delivery without the
     # two load-bearing fields — auction_date (the urgency signal + freshness gate) and
     # nts_notice_id (the source identity). These are exactly the fields is_valid_nts

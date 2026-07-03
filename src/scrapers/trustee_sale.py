@@ -88,8 +88,9 @@ def _record_from_notice(notice: NtsNotice) -> ScrapedRecord:
     # charge per property across all lists" model — so a property already delivered on
     # another list won't re-bill as an auction lead (its auction date/amount still
     # reaches that lead via the pre_foreclosure NTS matcher), and two distinct auctions
-    # on one parcel collapse to one billed lead. Do NOT make dedup_hash notice-based
-    # here without revisiting that decision.
+    # on one parcel collapse to one billed lead — enforced by finalize_trustee_sale_job's
+    # same-parcel collapse (the shared cross-job dedup scan alone misses same-JOB
+    # siblings). Do NOT make dedup_hash notice-based here without revisiting that decision.
     rec.raw_html_hash = hashlib.sha256(
         f"nts|{notice.source}|{notice.ts_number}".encode()
     ).hexdigest()[:32]

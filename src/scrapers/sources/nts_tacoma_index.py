@@ -45,6 +45,14 @@ _NOTICE_HREF = re.compile(
     r'(?:ts-|[^"/]*trustee)[^"]*)"',
     re.I,
 )
+# ANY dated legal-notice article link on a listing page (NTS or not). Used only to
+# tell "this listing page still has entries" from "we've paginated past the last page"
+# — the mixed feed interleaves probate/bids/name-changes/trustee-sales, so a page with
+# zero NTS is NOT the end of the listing (Bug A: the old crawler treated it as the end).
+_ANY_DATED_ARTICLE = re.compile(
+    r'href="https?://(?:www\.)?tacomadailyindex\.com/\d{4}/\d{2}/\d{2}/[^"]+"',
+    re.I,
+)
 _ARTICLE = re.compile(r"<article[^>]*>(.*?)</article>", re.S | re.I)
 _TAGS = re.compile(r"<[^>]+>")
 _SCRIPT_STYLE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.S | re.I)
@@ -85,7 +93,15 @@ _DEED_REF = re.compile(
     r"Reference\s+Number\s+(?:of\s+(?:the\s+)?)?Deed\s+of\s+Trust\s*:\s*(?:Instrument\s+No\.?\s*)?([\w\-]+)",
     re.I,
 )
-_PARCEL = re.compile(r"Parcel\s+Number\(?s?\)?\s*:\s*([\w\-]+)", re.I)
+# Parcel label variants: "Parcel Number(s):" (North Star / Quality Loan / Affinia),
+# plus "[Assessor's] Tax Parcel No(s).:" (Clear Recon / older law-firm notices — live
+# 2026-06-26). A multi-parcel notice lists several after the colon; we capture the
+# FIRST (a valid match key — the matcher keys on any one exact parcel).
+_PARCEL = re.compile(
+    r"(?:Parcel\s+Number\(?s?\)?|(?:Assessor'?s\s+)?Tax\s+Parcel\s+(?:No|Number)s?\.?)"
+    r"\s*:\s*([\w\-]+)",
+    re.I,
+)
 
 # ── Auction: "will on 7/10/2026, at 10:00 A.M. <location> sell at public auction"
 # Accept AM / A.M. / a.m. (dotted, Codex P1) and a multi-line location (.+? with re.S).
@@ -113,7 +129,13 @@ _AUCTION = re.compile(
 # (Codex High, 2026-07-01 review).
 _COMMONLY_KNOWN = re.compile(
     r"(?:More\s+commonly\s+known\s+as\s*:?|commonly\s+known\s+as\s*:)\s*(.+?)"
-    r"(?=\s+The\s+above\s+property\b|\s+(?:which\s+is\s+)?[Ss]ubject\s+to\b|\s+II\.\s|\n\n|\Z)",
+    r"(?=\s+The\s+above\s+property\b|\s+(?:which\s+is\s+)?[Ss]ubject\s+to\b"
+    # Stop before a trailing parcel line (Codex P2): some layouts print "Commonly
+    # known as: <addr> Tax Parcel Nos.: <apn> which is subject to…" — without this the
+    # parcel text leaks INTO property_address and poisons the normalized match key, so
+    # a lead at that address won't attach by address.
+    r"|\s+(?:Assessor'?s\s+)?Tax\s+Parcel\b|\s+Parcel\s+Number\b"
+    r"|\s+II\.\s|\n\n|\Z)",
     re.I | re.S,
 )
 # ── Section IV "sum owing on the obligation": two real phrasings —
@@ -159,6 +181,22 @@ _AUCTION_KING_LOC_A = re.compile(r"located\s+(.+?)\s+to\s+the\s+highest", re.I |
 _AUCTION_KING_LOC_B = re.compile(
     rf"{_TIME}\s*,\s*(.+?)(?=,\s*to\s+the\s+highest|the\s+undersigned|will\s+sell|$)",
     re.I | re.S)
+
+# ── Ordinal worded auction date (Clear Recon / older law-firm Tacoma notices, live
+# 2026-06-26): "...Trustee will on the 17th day of July, 2026, at the hour of 10:00
+# o'clock AM <loc> ... sell at public auction". Neither the numeric _AUCTION nor the
+# King month-name _AUCTION_KING matches this shape, so these real Pierce sales were
+# dropped (auction_date None). Anchored to "sell at public auction" within 600 chars
+# (like _AUCTION_KING) so a stray dated line can't be read as the sale. Tried ONLY
+# when _AUCTION missed (am is None), so numeric-format parsing is byte-identical.
+# group(1)=day, (2)=month, (3)=year, (4)=HH:MM, (5)=A|P. Normalized to "Month D, YYYY"
+# so it reuses the existing _to_date month-name path.
+_AUCTION_WORDED = re.compile(
+    rf"will\s+on\s+the\s+(\d{{1,2}})(?:st|nd|rd|th)\s+day\s+of\s+({_MONTHS})\.?,?\s+(\d{{4}})"
+    r"\s*,?\s*at\s+(?:the\s+hour\s+of\s+)?(\d{1,2}:\d{2})\s*o'?clock\s*([AP])\.?\s*M\.?"
+    r"[\s\S]{0,600}?sell\s+at\s+public\s+auction",
+    re.I,
+)
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -253,6 +291,15 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
                 loc = " ".join(lm.group(1).split()).strip().rstrip(".,")
                 if "NOTICE OF TRUSTEE" not in loc.upper() and 0 < len(loc) <= 300:
                     auction_location = loc
+        else:
+            # Ordinal worded date fallback ("17th day of July, 2026" — Clear Recon /
+            # older law-firm notices). Normalize to "Month D, YYYY" for _to_date;
+            # time to "HH:MM AM". Location left None (these notices vary; not required).
+            wm = _AUCTION_WORDED.search(text)
+            if wm:
+                day, month, year, hhmm, ampm = wm.groups()
+                auction_date = f"{month.title()} {int(day)}, {year}"
+                auction_time = f"{hhmm} {ampm.upper()}M"
 
     return {
         "ts_number": _first(_TS_NUMBER, text),
@@ -272,6 +319,31 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
         "note_amount": _money(_NOTE_AMOUNT, text),
         "nod_date": _first(_NOD_DATE, text),
     }
+
+
+def parse_tacoma_notice(text: str) -> dict[str, Any]:
+    """parse_nts_notice + a SURROGATE ts_number for notices that carry no trustee TS#.
+
+    Drop-in for the crawler (parallels nts_king_pdf.parse_king_notice). Several real
+    Pierce trustees (Clear Recon, "In re …" law-firm notices — live 2026-06-26) print
+    NO "Trustee Sale No.", so parse_nts_notice returns ts_number=None and is_valid_nts
+    drops the notice — losing a real, actionable sale (e.g. a $661k Clear Recon sale).
+
+    The nts_notices natural key is (source, ts_number), so a storable notice needs one.
+    REF-<deed recording #> is unique per deed of trust (an amended NTS for the same loan
+    collapses to one row — matches the upsert's latest-wins). APN-<parcel> is a DEGRADED
+    fallback (repeat foreclosures on one parcel over time collapse into a row); used only
+    when no deed reference exists. This is a CACHE dedup key, NOT a real trustee-sale id;
+    the matcher keys on parcel/address, never ts_number, so a surrogate is match-safe.
+    """
+    parsed = parse_nts_notice(text)
+    if not parsed.get("ts_number"):
+        ref = parsed.get("deed_reference")
+        if ref:
+            parsed["ts_number"] = f"REF-{ref}"[:64]
+        elif parsed.get("parcel"):
+            parsed["ts_number"] = f"APN-{parsed['parcel']}"[:64]
+    return parsed
 
 
 def is_valid_nts(parsed: dict[str, Any]) -> bool:
@@ -299,6 +371,51 @@ def extract_notice_urls(listing_html: str) -> list[str]:
         if url not in seen:
             seen.append(url)
     return seen
+
+
+def listing_has_entries(listing_html: str) -> bool:
+    """True if the listing page carries ANY dated legal-notice article link.
+
+    Distinguishes a normal page (probate/bids/NTS interleaved) from a page past the
+    end of the listing (empty). The crawler keeps paginating while this is True and a
+    page yields no NTS — a zero-NTS page mid-listing is expected, NOT the end.
+    """
+    return bool(_ANY_DATED_ARTICLE.search(listing_html))
+
+
+def collect_notice_urls(fetch_page, *, max_pages: int, max_notices: int) -> list[str]:
+    """Walk the mixed legal-notices listing, collecting NTS URLs across ALL pages.
+
+    `fetch_page(page:int)` returns either ``(status_code, html)`` or ``None`` (fetch
+    failed — a transient failure on one page must not abandon later pages). Pure: the
+    caller injects I/O, so the pagination logic is unit-tested with a real in-memory
+    fetcher (no mocks).
+
+    Bug A fix: the previous crawler stopped at the FIRST page with no NTS notice. But
+    the feed interleaves notice types in reverse-chron order, so page 1 is routinely
+    all probate/bids while trustee sales sit on later pages. We now stop only on a
+    genuine end signal:
+      * a page that fetched non-200 (the CMS 404s beyond the last page), or
+      * a page with zero dated article links (listing_has_entries False), or
+      * the max_notices cap, or
+      * max_pages exhausted.
+    """
+    urls: list[str] = []
+    for page in range(1, max_pages + 1):
+        result = fetch_page(page)
+        if result is None:
+            continue  # transient fetch failure — a later page may still succeed
+        status, html = result
+        if status != 200:
+            break  # past the last listing page, or blocked — stop paginating
+        for u in extract_notice_urls(html):
+            if u not in urls:
+                urls.append(u)
+        if len(urls) >= max_notices:
+            break
+        if not listing_has_entries(html):
+            break  # genuine end of the listing (empty page)
+    return urls[:max_notices]
 
 
 def extract_article_text(notice_html: str) -> str:

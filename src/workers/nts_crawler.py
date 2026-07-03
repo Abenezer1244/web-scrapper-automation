@@ -24,9 +24,13 @@ from src.workers import app
 
 _logger = setup_logger("workers.nts_crawler")
 
-_MAX_PAGES = 5            # listing pages per run (newest first)
+_MAX_PAGES = 10           # listing pages per run (newest first). NTS are a MINORITY of
+                          # the mixed legal-notices feed, so we must scan several pages
+                          # to reach the trustee sales behind the day's probate/bids.
 _MAX_NOTICES = 200        # hard cap on fetches per run
 _FETCH_DELAY_S = 1.0      # polite delay between notice fetches
+_LISTING_DELAY_S = 0.5    # polite delay between listing-page fetches (we now always
+                          # walk multiple pages per run — Bug A fix)
 _CACHE_DAYS = 90          # expire notices not seen in this window
 
 # ── Pacific Publishing weekly-PDF crawlers (Snohomish Tribune, Queen Anne News) ──
@@ -68,27 +72,26 @@ def crawl_nts_tacoma_index() -> dict:
     from src.utils.safe_http import safe_get
 
     today = datetime.now(UTC).date()
-    notice_urls: list[str] = []
-    for page in range(1, _MAX_PAGES + 1):
+
+    def _fetch_listing(page: int):
+        """I/O for one listing page: returns (status_code, html) or None on failure.
+
+        A transient failure returns None so collect_notice_urls skips just this page
+        (a later page may still carry trustee sales) instead of abandoning the crawl.
+        """
+        if page > 1:
+            time.sleep(_LISTING_DELAY_S)  # polite: we now walk multiple pages every run
         url = nts.BASE_URL + nts.LEGAL_NOTICES_PATH + (f"page/{page}/" if page > 1 else "")
         try:
             resp = safe_get(url, timeout=20, headers={"User-Agent": "BridgeLeadsBot/1.0"})
         except Exception as exc:  # noqa: BLE001 — a bad page must not kill the crawl
             _logger.warning("NTS listing page %d fetch failed: %s", page, str(exc)[:120])
-            continue
-        if resp.status_code != 200:
-            _logger.info("NTS listing page %d -> HTTP %d; stopping pagination", page, resp.status_code)
-            break
-        found = nts.extract_notice_urls(resp.text)
-        if not found:
-            break  # no more notices on this/later pages
-        for u in found:
-            if u not in notice_urls:
-                notice_urls.append(u)
-        if len(notice_urls) >= _MAX_NOTICES:
-            break
+            return None
+        return (resp.status_code, resp.text)
 
-    notice_urls = notice_urls[:_MAX_NOTICES]
+    notice_urls = nts.collect_notice_urls(
+        _fetch_listing, max_pages=_MAX_PAGES, max_notices=_MAX_NOTICES
+    )
     _logger.info("NTS crawl: %d candidate notice URLs", len(notice_urls))
 
     upserted = skipped = errored = 0
@@ -104,7 +107,7 @@ def crawl_nts_tacoma_index() -> dict:
                 if resp.status_code != 200:
                     errored += 1
                     continue
-                parsed = nts.parse_nts_notice(nts.extract_article_text(resp.text))
+                parsed = nts.parse_tacoma_notice(nts.extract_article_text(resp.text))
                 row = nts.notice_to_row(parsed, source_url=u, today=today)
                 if row is None:
                     skipped += 1  # not a parseable NTS body
@@ -135,6 +138,7 @@ def crawl_nts_tacoma_index() -> dict:
     summary = {"candidates": len(notice_urls), "upserted": upserted,
                "skipped": skipped, "errored": errored, "expired": expired or 0}
     _logger.info("NTS crawl done: %s", summary)
+    _alert_if_crawl_barren("tacoma_daily_index", discovered=len(notice_urls), upserted=upserted)
     return summary
 
 
@@ -237,6 +241,7 @@ def _crawl_pacific_publishing_pdf(
     summary["pdf_url"] = pdf_url
     if not pdf_url:
         _logger.warning("NTS PDF crawl (%s): no current legals PDF found", source)
+        _alert_if_crawl_barren(source, discovered=0, upserted=0)
         return summary
 
     fd, path = tempfile.mkstemp(suffix=".pdf")
@@ -297,6 +302,7 @@ def _crawl_pacific_publishing_pdf(
         db.commit()
 
     _logger.info("NTS PDF crawl done (%s): %s", source, summary)
+    _alert_if_crawl_barren(source, discovered=summary["blocks"], upserted=summary["upserted"])
     return summary
 
 
@@ -320,6 +326,50 @@ def _upsert_notice(db, model, row: dict) -> None:
         constraint="uq_nts_notices_source_ts", set_=update_cols
     )
     db.execute(stmt)
+
+
+def _barren_alert_reason(discovered: int, upserted: int) -> str | None:
+    """Pure decision: the reason string to alert on a barren crawl, or None if healthy.
+
+    discovered == 0 -> discovery broke; discovered > 0 but upserted == 0 -> parse broke;
+    any upsert -> healthy (no alert).
+    """
+    if discovered == 0:
+        return "0 notices discovered — listing/PDF discovery may have broken"
+    if upserted == 0:
+        return f"{discovered} notices discovered but 0 upserted — parser may have broken"
+    return None
+
+
+def _alert_if_crawl_barren(source: str, *, discovered: int, upserted: int) -> None:
+    """OPS alert when a crawl run produced no usable notices.
+
+    This is the silent-failure mode that let the Pierce NTS cache go stale for a week
+    unnoticed (the crawler bailed at page 1 on days page 1 had no trustee sale). Two
+    barren conditions warrant a page:
+      * discovered == 0 — listing/PDF discovery broke (layout change, block, or the
+        old page-1 break bug), so nothing was even fetched to parse.
+      * discovered > 0 but upserted == 0 — everything failed to parse/validate (a
+        parser/format drift), so no auction data reaches leads.
+    No-op unless OPS_ALERT_EMAIL is configured; send_ops_alert carries its own cooldown
+    and never raises. A healthy run (upserted > 0) sends nothing.
+    """
+    reason = _barren_alert_reason(discovered, upserted)
+    if reason is None:
+        return
+    from src.workers.ops_alerts import send_ops_alert
+
+    send_ops_alert(
+        kind="nts_crawl_barren",
+        key=f"nts_crawl_barren:{source}",
+        subject=f"NTS crawler produced nothing ({source})",
+        body=(
+            f"The NTS crawler '{source}' {reason}.\n\n"
+            "auction_date / default_amount enrichment for pre_foreclosure leads in this "
+            "county will go stale until this is fixed. Check the source site layout and "
+            "the crawler logs."
+        ),
+    )
 
 
 def _td_days(days: int):

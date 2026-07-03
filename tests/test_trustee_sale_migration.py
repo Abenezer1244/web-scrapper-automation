@@ -37,6 +37,14 @@ def test_seeds_exactly_the_three_nts_counties():
     assert counties == {"pierce", "snohomish", "king"}
 
 
+def test_seeds_visible_health_status():
+    # GET /scrapers/connectors hides unknown/down connectors, so the seed MUST use a
+    # visible status ('healthy'/'degraded') or Auction Leads is absent from the picker
+    # until a canary samples the rows. DB-backed connector => deterministically healthy.
+    mig = _load_migration()
+    assert mig._HEALTH_STATUS in ("healthy", "degraded")
+
+
 def test_every_connector_points_at_a_real_allowlisted_subclass():
     mig = _load_migration()
     for county, base_url, scraper_class in mig._CONNECTORS:

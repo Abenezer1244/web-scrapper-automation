@@ -11,6 +11,14 @@ AI template detection) + render_mode='static'. base_url is the county's stable l
 notice source page for reference only — the scraper never fetches it (it queries
 nts_notices), but county_connectors.base_url is NOT NULL.
 
+health_status is seeded 'healthy' (NOT the usual 'unknown'): GET /scrapers/connectors
+hides unknown/down connectors, so an 'unknown' seed would keep Auction Leads out of the
+picker until a canary samples each row. A DB-backed connector's health is deterministic
+— it works whenever the cache has data, which it does for these three crawled counties —
+so 'healthy' is honest and makes the type selectable immediately after migration. The
+canary re-verifies on its schedule and flips a county to degraded/down if its active
+auctions empty out.
+
 Only these three counties have an NTS crawler feeding the cache; expanding to more
 counties = adding an NTS crawler per county's legal paper (see tasks/todo.md).
 
@@ -29,6 +37,12 @@ revision = "081"
 down_revision = "080"
 branch_labels = None
 depends_on = None
+
+# Seed VISIBLE (not the usual 'unknown'): GET /scrapers/connectors hides unknown/down,
+# so an unknown seed would keep Auction Leads out of the picker until a canary samples
+# each row. A DB-backed connector is deterministically healthy whenever the cache has
+# data (it does for these crawled counties); the canary re-verifies on its schedule.
+_HEALTH_STATUS = "healthy"
 
 # (county, base_url, scraper_class) — base_url is the stable legal-notice source page
 # (reference only; the scraper reads nts_notices, never this URL).
@@ -68,7 +82,7 @@ def upgrade() -> None:
                 'manual',
                 'static',
                 '{base_url}',
-                'unknown',
+                '{_HEALTH_STATUS}',
                 true
             WHERE NOT EXISTS (
                 SELECT 1 FROM county_connectors

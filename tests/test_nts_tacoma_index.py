@@ -9,11 +9,15 @@ from decimal import Decimal
 from pathlib import Path
 
 from src.scrapers.sources.nts_tacoma_index import (
+    _to_date,
+    collect_notice_urls,
     extract_article_text,
     extract_notice_urls,
     is_valid_nts,
+    listing_has_entries,
     notice_to_row,
     parse_nts_notice,
+    parse_tacoma_notice,
 )
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "nts_tacoma_25-76127.txt"
@@ -174,6 +178,174 @@ class TestCrawlExtraction:
         text = extract_article_text(html)
         assert "TS #: 25-1" in text and "Body" in text
         assert "junk()" not in text and "Menu" not in text
+
+
+def _dated(slug: str) -> str:
+    return f'<a href="https://www.tacomadailyindex.com/2026/07/02/{slug}/">x</a>'
+
+
+def _ts(n: str) -> str:
+    # a real current-format trustee-sale slug
+    return _dated(f"ts-wa-26-{n}-rm-idx{n}")
+
+
+def _probate(n: str) -> str:
+    return _dated(f"no-26-4-{n}-probate-notice-to-creditors-idx{n}")
+
+
+class TestListingHasEntries:
+    def test_page_with_dated_articles(self):
+        assert listing_has_entries(_probate("01") + _ts("100")) is True
+
+    def test_empty_page(self):
+        # site chrome only, no dated article links -> past the end of the listing
+        assert listing_has_entries("<html><nav>Menu</nav><footer>f</footer></html>") is False
+
+    def test_offsite_dated_link_does_not_count(self):
+        assert listing_has_entries('<a href="https://evil.com/2026/07/02/ts-x/">x</a>') is False
+
+
+class TestCollectNoticeUrls:
+    """Bug A regression: NTS notices sit BEHIND probate/bids on later listing pages.
+    The old crawler broke at the first page with no NTS, harvesting nothing on the
+    (common) days page 1 was all probate. collect_notice_urls must scan through."""
+
+    def _fetcher(self, pages: dict[int, str]):
+        # a real in-memory fetcher (no mock framework): page -> (status, html).
+        # a page absent from the dict is treated as past-the-end (404-style).
+        def fetch(page: int):
+            if page in pages:
+                return (200, pages[page])
+            return (404, "")
+        return fetch
+
+    def test_scans_past_pages_with_zero_nts(self):
+        # page1 = all probate (0 NTS), page2 = 1 NTS, page3 = 0 NTS, page4 = 5 NTS.
+        # Mirrors the live 2026-07-02 listing where the old code harvested 0.
+        pages = {
+            1: _probate("01") + _probate("02") + _probate("03"),
+            2: _probate("04") + _ts("200"),
+            3: _probate("05") + _probate("06"),
+            4: _ts("400") + _ts("401") + _ts("402") + _ts("403") + _ts("404"),
+        }
+        urls = collect_notice_urls(self._fetcher(pages), max_pages=10, max_notices=200)
+        assert len(urls) == 6  # 1 from page2 + 5 from page4 — NONE lost to the page1 break
+        assert any("ts-wa-26-200" in u for u in urls)
+        assert sum("ts-wa-26-40" in u for u in urls) == 5
+
+    def test_stops_at_end_of_listing_empty_page(self):
+        # page3 has no dated links at all -> genuine end; page4 (would have NTS) not reached.
+        pages = {
+            1: _ts("100"),
+            2: _ts("200"),
+            3: "<html><nav>Menu</nav></html>",  # empty listing page (past the end)
+            4: _ts("400"),
+        }
+        urls = collect_notice_urls(self._fetcher(pages), max_pages=10, max_notices=200)
+        assert len(urls) == 2
+        assert not any("ts-wa-26-400" in u for u in urls)
+
+    def test_stops_on_non_200(self):
+        pages = {1: _ts("100"), 2: _ts("200")}  # page 3+ -> 404 via fetcher default
+        urls = collect_notice_urls(self._fetcher(pages), max_pages=10, max_notices=200)
+        assert len(urls) == 2
+
+    def test_transient_failure_skips_page_but_continues(self):
+        # page2 fetch fails (None) -> we must still reach page3's NTS, not abandon.
+        pages = {1: _probate("01"), 3: _ts("300")}
+
+        def fetch(page: int):
+            if page == 2:
+                return None  # transient failure
+            if page in pages:
+                return (200, pages[page])
+            return (404, "")
+
+        urls = collect_notice_urls(fetch, max_pages=10, max_notices=200)
+        assert len(urls) == 1
+        assert "ts-wa-26-300" in urls[0]
+
+    def test_respects_max_notices_cap(self):
+        pages = {1: "".join(_ts(f"1{i:02d}") for i in range(10))}
+        urls = collect_notice_urls(self._fetcher(pages), max_pages=10, max_notices=3)
+        assert len(urls) == 3
+
+    def test_respects_max_pages(self):
+        pages = {p: _ts(f"{p}00") for p in range(1, 20)}
+        urls = collect_notice_urls(self._fetcher(pages), max_pages=4, max_notices=200)
+        assert len(urls) == 4  # only pages 1-4 walked
+
+
+class TestSurrogateTsNumberAndWordedDate:
+    """Bug B regression (real notices, live 2026-06-26): trustees that print NO
+    'Trustee Sale No.' (Clear Recon 'In re …') and older law-firm notices using an
+    ORDINAL worded auction date ('17th day of July, 2026') + 'Tax Parcel No' labels
+    were dropped whole. parse_tacoma_notice must recover them (surrogate ts# + worded
+    date + parcel labels) WITHOUT changing any real-TS# notice."""
+
+    def _fx(self, name: str) -> str:
+        return (Path(__file__).parent / "fixtures" / name).read_text(encoding="utf-8")
+
+    def test_clearrecon_no_tsnum_recovered_via_ref_surrogate(self):
+        # $661,481.84 Clear Recon sale — no TS# label; deed reference -> REF- surrogate.
+        p = parse_tacoma_notice(self._fx("nts_tacoma_clearrecon_no_tsnum.txt"))
+        assert p["ts_number"] == "REF-202204180696"
+        assert p["auction_date"] == "7/31/2026"
+        assert p["parcel"] == "9260000622"
+        assert p["principal_owing"] == Decimal("661481.84")
+        assert is_valid_nts(p) is True
+        row = notice_to_row(p, "http://x/", today=date(2026, 7, 2))
+        assert row is not None and row["is_active"] is True
+        assert row["auction_date"] == date(2026, 7, 31)
+
+    def test_worded_ordinal_date_tax_parcel_nos(self):
+        # "will on the 17th day of July, 2026 ... Tax Parcel Nos: 031715-3007, ..."
+        p = parse_tacoma_notice(self._fx("nts_tacoma_worded_date_a.txt"))
+        assert p["auction_date"] == "July 17, 2026"
+        assert _to_date(p["auction_date"]) == date(2026, 7, 17)
+        assert p["parcel"] == "031715-3007"       # first of the multi-parcel list
+        assert p["ts_number"] == "APN-031715-3007"  # no deed ref -> APN surrogate
+        assert is_valid_nts(p) is True
+
+    def test_worded_ordinal_date_assessor_tax_parcel(self):
+        # "will on the 24th day of July 2026 ... ASSESSOR'S TAX PARCEL NO.: 031713-2-024"
+        p = parse_tacoma_notice(self._fx("nts_tacoma_worded_date_b.txt"))
+        assert _to_date(p["auction_date"]) == date(2026, 7, 24)
+        assert p["parcel"] == "031713-2-024"
+        assert p["ts_number"] == "APN-031713-2-024"
+        assert is_valid_nts(p) is True
+
+    def test_tax_parcel_line_not_leaked_into_address(self):
+        # Codex P2: "Commonly known as: <addr> Tax Parcel Nos.: <apn> which is subject…"
+        # must NOT leak the parcel line into property_address / the normalized match key,
+        # or the notice can't attach to a lead by address.
+        p = parse_tacoma_notice(self._fx("nts_tacoma_worded_date_b.txt"))
+        assert p["property_address"] == "4122 320th Street East, Eatonville, WA 98328"
+        assert "Tax Parcel" not in (p["property_address"] or "")
+        row = notice_to_row(p, "http://x/", today=date(2026, 7, 2))
+        assert "PARCEL" not in (row["property_address_normalized"] or "").upper()
+
+    def test_wrapper_does_not_alter_real_tsnumber_notices(self):
+        # The two existing REAL fixtures carry real TS#s — the wrapper must be a no-op
+        # (identical dict) so the surrogate path never rewrites a genuine trustee id.
+        for fn in ("nts_tacoma_25-76127.txt", "nts_tacoma_quality_loan.txt"):
+            text = self._fx(fn)
+            assert parse_tacoma_notice(text) == parse_nts_notice(text)
+            assert not parse_tacoma_notice(text)["ts_number"].startswith(("REF-", "APN-"))
+
+    def test_tax_parcel_label_does_not_break_numeric_parcel_label(self):
+        # The widened _PARCEL alternation must still parse the plain "Parcel Number(s):".
+        assert parse_nts_notice(
+            "Parcel Number(s): 5005002880\nwill on 7/1/2026, at 9:00 AM at X sell at public auction"
+        )["parcel"] == "5005002880"
+
+    def test_worded_date_not_used_when_numeric_present(self):
+        # A numeric-format notice must NOT be re-parsed by the worded fallback (gated on
+        # am is None) — behavior byte-identical for the dominant Tacoma format.
+        p = parse_nts_notice(
+            "TS #: 25-1\nwill on 7/10/2026, at 10:00 AM at Courthouse sell at public auction"
+        )
+        assert p["auction_date"] == "7/10/2026"
 
 
 class TestNoticeToRow:

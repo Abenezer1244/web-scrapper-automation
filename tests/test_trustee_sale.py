@@ -26,24 +26,24 @@ from src.scrapers.trustee_sale import (
 
 def _notice(**over) -> NtsNotice:
     """A realistic active, future-dated NTS notice row (in-memory, no session)."""
-    base = dict(
-        id="notice-abc-123",
-        source="tacoma_daily_index",
-        ts_number="WA-24-999",
-        county="pierce",
-        state="WA",
-        parcel="0519285029",
-        property_address="123 MAIN ST, TACOMA, WA 98401",
-        auction_date=date.today() + timedelta(days=30),
-        auction_time="10:00 AM",
-        auction_location="County Courthouse",
-        grantor="JOHN SMITH, A MARRIED MAN, AS HIS SOLE AND SEPARATE PROPERTY",
-        trustee="Quality Loan Service",
-        beneficiary="Wells Fargo",
-        principal_owing=Decimal("282345.67"),
-        nod_date="2026-01-15",
-        source_url="https://example.com/notice",
-    )
+    base = {
+        "id": "notice-abc-123",
+        "source": "tacoma_daily_index",
+        "ts_number": "WA-24-999",
+        "county": "pierce",
+        "state": "WA",
+        "parcel": "0519285029",
+        "property_address": "123 MAIN ST, TACOMA, WA 98401",
+        "auction_date": date.today() + timedelta(days=30),
+        "auction_time": "10:00 AM",
+        "auction_location": "County Courthouse",
+        "grantor": "JOHN SMITH, A MARRIED MAN, AS HIS SOLE AND SEPARATE PROPERTY",
+        "trustee": "Quality Loan Service",
+        "beneficiary": "Wells Fargo",
+        "principal_owing": Decimal("282345.67"),
+        "nod_date": "2026-01-15",
+        "source_url": "https://example.com/notice",
+    }
     base.update(over)
     return NtsNotice(**base)
 

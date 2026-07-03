@@ -25,7 +25,7 @@ fuzzy matching). See ``tasks/todo.md``.
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 
 from sqlalchemy import func, select
 
@@ -152,7 +152,7 @@ class _TrusteeSaleScraper(BridgeScraper):
             self.on_progress(1, 1, len(records))
         return records
 
-    async def __aenter__(self) -> "_TrusteeSaleScraper":
+    async def __aenter__(self) -> _TrusteeSaleScraper:
         return self
 
     async def __aexit__(self, *args) -> None:

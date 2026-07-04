@@ -65,6 +65,12 @@ _SCRIPT_STYLE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.S | re.I)
 # _STOP. This handles both layouts and never lets a value swallow the next field.
 _STOP = (
     r"(?=\s+(?:Title\s+Order|Reference\s+Number|Parcel\s+Number|Grantor|"
+    # A second common Pierce layout puts "Grantee(s): <trustee> ... Original
+    # beneficiary of the deed of trust: <lender>" right after the grantor NAME on the
+    # same line. Those labels weren't in _STOP, so the non-greedy grantor value ran
+    # past the owner into the trustee/beneficiary text. Colon-anchored so an odd
+    # entity/trust name containing the word can't truncate a real grantor (Codex).
+    r"Grantee\(?s?\)?\s*:|Original\s+beneficiary(?:\s+of\s+the\s+deed\s+of\s+trust)?\s*:|"
     r"Current\s+Beneficiary|Current\s+Trustee|Current\s+(?:Loan\s+)?Mortgage|"
     r"which\s+is\s+subject|Subject\s+to\b|I\.\s*NOTICE|II\.)|\n|\Z)"
 )

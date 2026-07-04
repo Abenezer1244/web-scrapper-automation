@@ -157,8 +157,15 @@ def _match_and_write(
 
     matched = 0
     used_result_ids: set = set()
+    from src.scrapers.preforeclosure import strip_trailing_labels
+
     for n in notices:
         nm = dict(n._mapping)
+        # An already-cached grantor may have bled-in downstream labels appended to the
+        # owner name ("<owner> Grantee(s): <trustee> ..."). Strip them before scoring so
+        # the name signal matches on the real owner — self-heals stale rows without a
+        # backfill. (The parser _STOP fix keeps freshly-crawled grantors clean.)
+        nm["grantor"] = strip_trailing_labels(nm.get("grantor"))
         # Candidate Results for this notice = union of same addr_key + same parcel.
         pool: dict[Any, dict] = {}
         if nm.get("property_address_normalized"):

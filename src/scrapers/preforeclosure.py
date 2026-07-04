@@ -134,6 +134,26 @@ _VESTING_CLAUSE = re.compile(
 )
 
 
+# A second NTS layout appends downstream labels onto the grantor NAME
+# ("<owner> Grantee(s): <trustee> ... Original beneficiary of the deed of trust:
+# <lender>"). Truncate at the first such label so the lead name is just the owner.
+# Colon-anchored and deliberately NOT "as Trustee" — a real owner can legitimately be
+# "JOHN DOE, AS TRUSTEE OF THE DOE FAMILY TRUST" (Codex). The parser _STOP fix keeps
+# fresh grantors clean; this also cleans already-cached nts_notices.grantor at read time.
+_TRAILING_LABEL = re.compile(
+    r"\s+(?:Grantee\(?s?\)?\s*:|Original\s+beneficiary(?:\s+of\s+the\s+deed\s+of\s+trust)?\s*:)",
+    re.I,
+)
+
+
+def strip_trailing_labels(name: str | None) -> str | None:
+    """Cut a grantor name at the first bled-in downstream NTS label (Grantee(s)/
+    Original beneficiary). Returns the input unchanged when no such label is present."""
+    if not name:
+        return name
+    return _TRAILING_LABEL.split(name, maxsplit=1)[0].strip() or None
+
+
 def strip_vesting_clause(name: str | None) -> str | None:
     """Remove trailing vesting/tenancy boilerplate from an NTS grantor name.
 
@@ -143,6 +163,9 @@ def strip_vesting_clause(name: str | None) -> str | None:
         -> 'VADAD SOLEIMANZADEH AND YAHYA KAZEMIKARANI'
     Returns the input unchanged when no vesting phrase is present.
     """
+    if not name:
+        return name
+    name = strip_trailing_labels(name)  # drop bled-in Grantee(s)/beneficiary labels first
     if not name:
         return name
     s = _VESTING_CLAUSE.sub("", name)

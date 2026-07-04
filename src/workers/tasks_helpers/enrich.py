@@ -660,13 +660,19 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
         )
         return
 
-    # Reload the surviving results after the unactionable drop
+    # Reload the surviving results after the unactionable drop. Exclude is_duplicate
+    # rows: a duplicate is never delivered or billed as a lead, so paying Tracerfy for
+    # it is pure waste. _reuse_enrichment_for_duplicates (run first) already copies a
+    # SETTLED prior trace onto cross-job dupes that have one; the remainder — including
+    # the same-job siblings the trustee_sale collapse marks, which have no prior row to
+    # copy from — must NOT be enqueued for a fresh paid lookup (Codex).
     eligible = db.execute(
         sa_select(Result).where(
             Result.job_id == job_id,
             Result.user_id == job.user_id,
             Result.property_address.isnot(None),
             Result.skip_trace_status == "not_attempted",
+            Result.is_duplicate.is_(False),
         )
     ).scalars().all()
 

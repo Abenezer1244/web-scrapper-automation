@@ -101,6 +101,28 @@ def _upload_export_with_retry(exporter, local_file, object_key) -> tuple[bool, E
     return False, last_exc
 
 
+# Columns pulled off a persisted Result row to build a deliverable export dict. The
+# canonical exporter reads typed columns (auction_date/default_amount/...) AND
+# enrichment_data; this is the single source of truth shared by the post-enrichment
+# re-export and the trustee_sale first-deliverable build (whose auction data lives
+# ONLY on the finalized DB rows, never on the in-memory ScrapedRecord).
+_RESULT_EXPORT_COLUMNS: tuple[str, ...] = (
+    "date_recorded", "party_name", "heirs", "parcel_id",
+    "property_address", "mailing_address", "legal_description", "doc_type",
+    "delinquent_amount", "delinquent_bill_year",
+    "absentee_owner", "out_of_state_owner", "owner_state",
+    "auction_date", "default_amount",
+    "enrichment_data", "date_recorded_parsed",
+    "phone", "phone_type", "email", "skip_trace_status",
+    "phones", "emails",
+)
+
+
+def _result_rows_to_export_dicts(rows) -> list[dict]:
+    """Project persisted Result rows onto the exporter's expected dict shape."""
+    return [{c: getattr(res, c) for c in _RESULT_EXPORT_COLUMNS} for res in rows]
+
+
 @app.task(
     name="src.workers.tasks.emit_payment_notification",
     bind=True,
@@ -926,6 +948,62 @@ def run_scrape_job(self, job_id: str) -> None:
             db=db,
         )
 
+        # ── AUCTION LEADS (trustee_sale) FINALIZE ───────────────────────────────
+        # An Auction Lead IS a known Notice-of-Trustee-Sale row; the scraper stamped
+        # its id + auction fields into enrichment_data["nts_source"]. Populate the
+        # typed Result auction columns DIRECTLY from that (no fuzzy matching, unlike
+        # pre_foreclosure's nts_matcher). Runs HERE — before billing below — so a
+        # broken finalize fails the job WITHOUT charging, and before the post-
+        # enrichment re-export so the delivered CSV carries auction data. FAIL-CLOSED
+        # (Codex): never deliver an Auction Lead with blank auction/default/trustee
+        # data. On failure, release this job's dedup claims (committed at the dedup
+        # step above) and fail loudly — mirrors the R2-upload-failure handler below.
+        if config.record_type == "trustee_sale":
+            from src.workers.trustee_sale_finalize import finalize_trustee_sale_job
+            try:
+                # Fold the same-parcel collapse into dup_count so the user-facing
+                # record_count / completion log / notification / email reflect it
+                # (billing reads a fresh DB non-dup count and is already correct;
+                # display_count = len(records) - dup_count was not) (Codex).
+                dup_count += finalize_trustee_sale_job(db, job_id, job.user_id)
+            except Exception as exc:
+                _logger.error(
+                    "Job %s: trustee_sale finalize FAILED — failing job (no blank "
+                    "auction leads): %s", job_id, str(exc)[:200],
+                )
+                try:
+                    db.rollback()
+                    db.execute(
+                        sa_text(
+                            "DELETE FROM delivered_records "
+                            "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
+                        ),
+                        {"jid": job_id, "uid": str(job.user_id)},
+                    )
+                    db.commit()
+                except Exception as cleanup_exc:
+                    db.rollback()
+                    _logger.error(
+                        "Job %s: failed to release dedup claims after finalize "
+                        "failure: %s", job_id, str(cleanup_exc)[:200],
+                    )
+                reason = (
+                    "Auction data could not be attached to your Auction Leads, so the "
+                    "run was stopped and you were not charged. Please try again; "
+                    "contact support if it keeps failing."
+                )
+                if _fail_job(db, job, r, job_id, reason):
+                    from src.workers.notification_emit import create_notification
+                    create_notification(
+                        user_id=job.user_id, type="job_failed", job_id=job_id,
+                        detail={
+                            "scraper_name": getattr(config, "name", None),
+                            "county": getattr(config, "county", None),
+                            "error_summary": reason[:200],
+                        },
+                    )
+                return
+
         # ── EXPORT ────────────────────────────────────────────────────────────
         from src.api.schemas import DeliverConfigDict
         deliver_config: DeliverConfigDict = cast(DeliverConfigDict, config.deliver or {})
@@ -957,7 +1035,20 @@ def run_scrape_job(self, job_id: str) -> None:
 
         _publish_log(r, job_id, "info", f"Building {fmt.upper()} export...", db=db)
 
-        record_dicts = [r_obj.to_dict() for r_obj in records]
+        if config.record_type == "trustee_sale":
+            # Auction data lives ONLY on the finalized DB rows (the in-memory
+            # ScrapedRecords carry nts_source, not the typed auction columns), so
+            # build the FIRST deliverable from the DB rows too — otherwise a skipped
+            # non-fatal re-export could ship blank auction columns (Codex). Mailing is
+            # NULL pre-enrichment; the later re-export refreshes it.
+            _ts_rows = db.execute(
+                select(Result)
+                .where(Result.job_id == job_id, Result.user_id == job.user_id)
+                .order_by(Result.party_name, Result.date_recorded, Result.id)
+            ).scalars().all()
+            record_dicts = _result_rows_to_export_dicts(_ts_rows)
+        else:
+            record_dicts = [r_obj.to_dict() for r_obj in records]
         # Honor the user's output-field visibility (blank deselected hideable
         # columns; identity/derived columns always present). Legacy/empty => all.
         hidden_fields = resolve_hidden_output_fields(config.fields)
@@ -1219,30 +1310,7 @@ def run_scrape_job(self, job_id: str) -> None:
         if refreshed is not None:
             enriched_file = None
             try:
-                record_dicts = [
-                    {c: getattr(res, c) for c in [
-                        "date_recorded", "party_name", "heirs", "parcel_id",
-                        "property_address", "mailing_address", "legal_description",
-                        "doc_type",
-                        # Structured tax fields (King tax_delinquent; null elsewhere).
-                        "delinquent_amount", "delinquent_bill_year",
-                        # Owner-location flags (057) so the emailed/R2 CSV carries
-                        # absentee/out_of_state/owner_state too (canonical builder reads these).
-                        "absentee_owner", "out_of_state_owner", "owner_state",
-                        # NTS auction data (059) so the emailed/R2 CSV carries it too.
-                        "auction_date", "default_amount",
-                        # enrichment_data drives the passthrough cols + derived signals.
-                        "enrichment_data", "date_recorded_parsed",
-                        # Sprint 4: skip trace fields (may be null on first export
-                        # if dispatcher hasn't submitted or webhook hasn't fired).
-                        "phone", "phone_type", "email", "skip_trace_status",
-                        # Multi-contact arrays so the scheduled/emailed export gets
-                        # phone_2/3 + email_2/3 too (canonical builder reads these),
-                        # matching the in-app download exactly.
-                        "phones", "emails",
-                    ]}
-                    for res in refreshed
-                ]
+                record_dicts = _result_rows_to_export_dicts(refreshed)
                 enriched_file = exporter.export(
                     record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt,
                     hidden_fields=resolve_hidden_output_fields(config.fields),

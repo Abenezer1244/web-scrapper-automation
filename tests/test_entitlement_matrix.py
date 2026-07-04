@@ -19,6 +19,7 @@ LIVE_RECORD_TYPE_SLUGS = {
     "code_violation",
     "divorce",
     "death_certificate",
+    "trustee_sale",
 }
 
 
@@ -52,6 +53,10 @@ def test_tiers_are_monotonic():
     assert COUNTY_LIMIT_BY_PLAN["agency"] == -1
 
 
-def test_starter_is_probate_only_and_pro_core_three():
+def test_starter_is_probate_only_and_pro_core_lists():
     assert RECORD_TYPES_BY_PLAN["starter"] == {"probate"}
-    assert RECORD_TYPES_BY_PLAN["pro"] == {"probate", "pre_foreclosure", "tax_delinquent"}
+    # Pro = the core distress lists incl. trustee_sale (Auction Leads); NOT all types.
+    assert RECORD_TYPES_BY_PLAN["pro"] == {
+        "probate", "pre_foreclosure", "tax_delinquent", "trustee_sale"
+    }
+    assert RECORD_TYPES_BY_PLAN["pro"] != ALL_RECORD_TYPES

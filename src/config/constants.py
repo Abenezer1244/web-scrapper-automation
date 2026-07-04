@@ -173,13 +173,17 @@ ALL_RECORD_TYPES: frozenset[str] = frozenset({
     "code_violation",
     "divorce",
     "death_certificate",
+    "trustee_sale",
 })
 
-# Per-plan allowed record types. Starter = probate sample; Pro = the three
-# broadly-available "core" distress lists; Business/Agency = every live type.
+# Per-plan allowed record types. Starter = probate sample; Pro = the core distress
+# lists (incl. trustee_sale "Auction Leads"); Business/Agency = every live type.
+# trustee_sale is added to PRO explicitly — Pro does NOT inherit ALL_RECORD_TYPES.
 RECORD_TYPES_BY_PLAN: dict[str, frozenset[str]] = {
     Plan.STARTER.value: frozenset({"probate"}),
-    Plan.PRO.value: frozenset({"probate", "pre_foreclosure", "tax_delinquent"}),
+    Plan.PRO.value: frozenset(
+        {"probate", "pre_foreclosure", "tax_delinquent", "trustee_sale"}
+    ),
     Plan.BUSINESS.value: ALL_RECORD_TYPES,
     Plan.AGENCY.value: ALL_RECORD_TYPES,
 }

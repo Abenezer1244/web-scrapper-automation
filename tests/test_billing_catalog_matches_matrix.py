@@ -9,9 +9,9 @@ def _plan(pid: str) -> dict:
 
 def test_pro_does_not_claim_all_record_types():
     feats = " ".join(_plan("pro")["features"]).lower()
-    # Pro is the 3 core lists, NOT all types.
+    # Pro is the 4 core lists (incl. Auction Leads), NOT all types.
     assert "all record types" not in feats
-    assert len(RECORD_TYPES_BY_PLAN["pro"]) == 3
+    assert len(RECORD_TYPES_BY_PLAN["pro"]) == 4
 
 
 def test_pro_advertises_its_three_county_cap():

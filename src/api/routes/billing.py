@@ -248,12 +248,13 @@ _PLANS = [
         "price_annual": 1910,  # ~$159/mo, ~20% off
         "records_limit": 1000,
         # Bullets describe ENFORCED entitlements only (value-metric build,
-        # docs/pricing-strategy-2026-06.md §4): Pro = 3 counties + the 3 core
-        # distress lists. Premium lists + overlap are a Business feature.
+        # docs/pricing-strategy-2026-06.md §4): Pro = 3 counties + the 4 core
+        # distress lists (incl. Auction Leads). Premium lists + overlap are a
+        # Business feature.
         "features": [
             "1,000 records/month",
             "3 counties (your choice)",
-            "Probate, pre-foreclosure & tax-delinquent lists",
+            "Probate, pre-foreclosure, tax-delinquent & auction lists",
             "Skip tracing (250 included, then $0.08/lookup)",
             "CSV + Excel export",
             "Daily/weekly schedule",

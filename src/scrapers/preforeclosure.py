@@ -121,10 +121,15 @@ _KNOWN_ORG_PHRASE_RE = re.compile(r"\bWESTERN\s+PROGRESSIVE\b")
 # PROPERTY"). It is legal vesting language, not part of the name, and pollutes the
 # displayed lead + the skip-trace key. Removed; the " AND " connector BETWEEN two
 # owner names is preserved so co-borrowers survive.
+# The status noun-phrase carries an OPTIONAL article: real prod grantors write it both
+# WITH ("ERNEST BIRD, AN UNMARRIED MAN" / "AUDRA B CHAVEZ, SINGLE WOMAN") — so the
+# leading comma also stays OPTIONAL to keep the comma-less "TORYIAN M CARTER AN
+# UNMARRIED MAN" working. The prefix also eats a leading ';' ("...; AS JOINT TENANTS").
+_STATUS = r"(?:MARRIED|UNMARRIED|WIDOWED|DIVORCED|SINGLE)"
+_STATUS_NOUN = r"(?:MAN|WOMAN|PERSON|COUPLE)"
 _VESTING_CLAUSE = re.compile(
-    r"\s*,?\s*(?:"
-    r"AN?\s+(?:MARRIED|UNMARRIED|WIDOWED|DIVORCED|SINGLE)\s+(?:MAN|WOMAN|PERSON|COUPLE)\b"
-    r"|A\s+SINGLE\s+(?:MAN|WOMAN|PERSON)\b"
+    r"\s*[,;]?\s*(?:"
+    rf"(?:AN?\s+)?{_STATUS}\s+{_STATUS_NOUN}\b"
     r"|AS\s+(?:HIS|HER|THEIR|ITS)\s+(?:SOLE\s+AND\s+)?SEPARATE\s+(?:PROPERTY|ESTATE)\b"
     r"|(?:AS\s+)?(?:HUSBAND\s+AND\s+WIFE|WIFE\s+AND\s+HUSBAND)\b"
     r"|AS\s+JOINT\s+TENANTS(?:\s+WITH\s+(?:THE\s+)?RIGHTS?\s+OF\s+SURVIVORSHIP)?\b"
@@ -132,6 +137,26 @@ _VESTING_CLAUSE = re.compile(
     r")",
     re.I,
 )
+
+
+# A bare vesting status adjective left after the noun-phrase clause is removed
+# ("KENNETH E LEE, UNMARRIED, AS HIS SEPARATE ESTATE" -> "... , UNMARRIED"). Anchored
+# to a comma + a clause boundary (comma / ';' / AND / end) so it only ever strips a
+# trailing legal-status word, never a real name token (a comma-preceded bare surname
+# followed by AND is not a realistic grantor form). Applied AFTER _VESTING_CLAUSE.
+_BARE_STATUS_CLAUSE = re.compile(rf",\s*{_STATUS}\b(?=\s*(?:,|;|\bAND\b|$))", re.I)
+
+
+# Repair a COLLAPSED soft-hyphen column wrap left in an already-cached grantor
+# ("WINIFRED R LUD -WIG", "AS JOINT TEN -ANTS"). nts_pdf.normalize_pdf_text fixes the
+# newline-present form ("LUD -\nWIG" -> "LUDWIG") at parse time, but notices crawled
+# before that fix shipped store the collapsed form (newline already gone) and never
+# get re-parsed (weekly legals PDF rotates). This is the read-time defensive net that
+# also cleans them, the same way strip_trailing_labels cleans already-cached label
+# bleed. Only whitespace-BEFORE-hyphen with a letter immediately AFTER is the wrap
+# artifact — it leaves "WHEELER-JAMES" (no space), "WHEELER - JAMES" (space after),
+# and identifiers like "WA-25-1012820" untouched.
+_COLLAPSED_DEHYPHEN = re.compile(r"(?<=[A-Za-z])[ \t]+-(?=[A-Za-z])")
 
 
 # A second NTS layout appends downstream labels onto the grantor NAME
@@ -161,6 +186,7 @@ def strip_vesting_clause(name: str | None) -> str | None:
         -> 'MICHAEL A. BRANDT'
     'VADAD SOLEIMANZADEH, AN UNMARRIED PERSON, AND YAHYA KAZEMIKARANI, AN UNMARRIED PERSON'
         -> 'VADAD SOLEIMANZADEH AND YAHYA KAZEMIKARANI'
+    'WINIFRED R LUD -WIG, HUSBAND AND WIFE' -> 'WINIFRED R LUDWIG'  (stale wrap repair)
     Returns the input unchanged when no vesting phrase is present.
     """
     if not name:
@@ -168,11 +194,13 @@ def strip_vesting_clause(name: str | None) -> str | None:
     name = strip_trailing_labels(name)  # drop bled-in Grantee(s)/beneficiary labels first
     if not name:
         return name
+    name = _COLLAPSED_DEHYPHEN.sub("", name)  # repair stale collapsed soft-hyphen wraps first
     s = _VESTING_CLAUSE.sub("", name)
+    s = _BARE_STATUS_CLAUSE.sub("", s)      # strip any leftover bare status adjective
     s = re.sub(r",\s*,", ",", s)            # collapse the comma left where a clause was
     s = re.sub(r",\s*(?=AND\b)", " ", s, flags=re.I)  # ", AND NAME2" -> " AND NAME2"
-    s = re.sub(r"[\s,]+$", "", s)           # trailing commas/space
-    s = re.sub(r"^[\s,]+", "", s)           # leading commas/space
+    s = re.sub(r"[\s,;]+$", "", s)          # trailing commas/semicolons/space
+    s = re.sub(r"^[\s,;]+", "", s)          # leading commas/semicolons/space
     s = re.sub(r"\s{2,}", " ", s)
     return s.strip() or None
 

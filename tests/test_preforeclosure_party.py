@@ -71,6 +71,27 @@ _VESTING = [
     ("JANE DOE AND JOHN DOE, HUSBAND AND WIFE", "JANE DOE AND JOHN DOE"),
     # no vesting → unchanged
     ("ACME HOLDINGS LLC", "ACME HOLDINGS LLC"),
+    # --- article-less status noun-phrase (real prod: article omitted) ---
+    ("AUDRA B CHAVEZ, SINGLE WOMAN AND YVONNE L NIKITAS, SINGLE WOMAN",
+     "AUDRA B CHAVEZ AND YVONNE L NIKITAS"),
+    ("CORY P SIMMONSEN AND HEATHER L. SIMMONSEN, A MARRIED COUPLE",
+     "CORY P SIMMONSEN AND HEATHER L. SIMMONSEN"),
+    # --- bare trailing status adjective, no noun ("... , UNMARRIED") ---
+    ("KENNETH E LEE, UNMARRIED, AS HIS SEPARATE ESTATE", "KENNETH E LEE"),
+    # --- collapsed stale soft-hyphen wrap (crawled before the de-hyphen fix) ---
+    ("CHRISTIAN J LUDWIG AND WINIFRED R LUD -WIG, HUSBAND AND WIFE",
+     "CHRISTIAN J LUDWIG AND WINIFRED R LUDWIG"),
+    ("ZAVANNAH BULLARD AND DAVID TAYLOR, WIFE AND HUSBAND AND KARIN GAILLARDET, "
+     "A SINGLE WOMAN; AS JOINT TEN -ANTS",
+     "ZAVANNAH BULLARD AND DAVID TAYLOR AND KARIN GAILLARDET"),
+    # --- regression guards: comma-less status must still strip ... ---
+    ("TORYIAN M CARTER AN UNMARRIED MAN", "TORYIAN M CARTER"),
+    # ... and a real hyphenated surname must NOT be de-hyphenated ---
+    ("DEONDRE E. JAMES AND SHAUNIE J. WHEELER-JAMES, HUSBAND AND WIFE",
+     "DEONDRE E. JAMES AND SHAUNIE J. WHEELER-JAMES"),
+    # a real owner who is a trust trustee must survive intact
+    ("JOHN DOE, AS TRUSTEE OF THE DOE FAMILY TRUST",
+     "JOHN DOE, AS TRUSTEE OF THE DOE FAMILY TRUST"),
 ]
 
 

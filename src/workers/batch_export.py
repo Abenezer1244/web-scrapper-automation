@@ -97,6 +97,16 @@ agg AS (
            array_agg(DISTINCT record_type ORDER BY record_type) AS matched_record_types,
            CASE WHEN bucket LIKE 'pk:%' THEN count(DISTINCT record_type) ELSE 1 END AS overlap_count,
            {PROBATE_SUBTYPE_AGG_SQL},
+           -- Coalesce the tax-delinquency fields ACROSS the bucket (like the probate
+           -- subtype above): a cross-matched property's representative row is usually
+           -- the PROBATE row (it carries the owner name, so it is the one skip-trace
+           -- reaches and rn=1 picks), which leaves delinquent_amount/bill_year NULL.
+           -- The tax figures live on the sibling tax_delinquent row. max() over the
+           -- bucket lifts them onto the combined lead so it shows BOTH the death cert
+           -- AND the delinquency (the whole point of a combined lead). Single-source
+           -- by nature (only tax rows populate them), so max() can't cross-contaminate.
+           max(delinquent_amount) AS delinquent_amount,
+           max(delinquent_bill_year) AS delinquent_bill_year,
            array_agg(DISTINCT county ORDER BY county) AS source_counties
     FROM candidates
     GROUP BY bucket
@@ -118,10 +128,14 @@ ranked AS (
 SELECT rk.id, rk.date_recorded, rk.date_recorded_parsed, rk.party_name, rk.heirs,
        rk.parcel_id, rk.property_address, rk.mailing_address,
        rk.legal_description, rk.doc_type,
-       rk.delinquent_amount, rk.delinquent_bill_year,
+       -- Bucket-coalesced (agg), NOT the representative row's own — see agg CTE.
+       a.delinquent_amount, a.delinquent_bill_year,
        rk.phone, rk.phone_type, rk.email, rk.phones, rk.emails,
        rk.absentee_owner, rk.out_of_state_owner, rk.owner_state,
        rk.auction_date, rk.default_amount, rk.enrichment_data,
+       -- The representative row's own type — lets the CSV builder tell a real date
+       -- from the synthetic tax date after the tax bill_year is coalesced in (Codex).
+       rk.record_type,
        a.matched_record_types, a.overlap_count, a.source_counties, a.lead_subtype
 FROM ranked rk
 JOIN agg a ON a.bucket = rk.bucket

@@ -232,6 +232,44 @@ class TestTaxRowDateBlanked:
         row = build_lead_export_row({"date_recorded": "03/15/2026", "doc_type": "probate"})
         assert row["date_recorded"] == "03/15/2026"
 
+    def test_coalesced_overlap_row_keeps_real_probate_date(self):
+        # Batch combined export: a probate representative row gets an overlapping tax
+        # hit's delinquent_bill_year coalesced in. Its REAL death-cert date must survive
+        # AND the tax amount/year must show (the whole point of a combined lead).
+        rec = {
+            "record_type": "probate",
+            "doc_type": "DEATH CERTIFICATE",
+            "date_recorded": "05/07/2026",
+            "delinquent_amount": "1290.41",
+            "delinquent_bill_year": 2026,
+        }
+        row = build_lead_export_row(rec)
+        assert row["date_recorded"] == "05/07/2026"  # real date kept, not blanked
+        assert row["delinquent_amount"] == "1290.41"
+        assert row["delinquent_bill_year"] == "2026"
+
+    def test_coalesced_real_jan1_date_survives(self):
+        # Codex P2 edge case: a GENUINE Jan-1 event date that happens to equal the
+        # synthetic pattern must NOT be blanked when the row is a non-tax type carrying
+        # a coalesced bill_year — the record_type gate distinguishes it from a tax row.
+        rec = {
+            "record_type": "probate",
+            "date_recorded": "01/01/2026",  # a real (if unusual) Jan-1 event
+            "delinquent_bill_year": 2026,  # coalesced from the tax sibling
+        }
+        row = build_lead_export_row(rec)
+        assert row["date_recorded"] == "01/01/2026"  # real date survives the gate
+
+    def test_tax_typed_row_synthetic_date_still_blanked(self):
+        # A row KNOWN to be tax_delinquent still blanks its synthetic date.
+        rec = {
+            "record_type": "tax_delinquent",
+            "date_recorded": "01/01/2026",
+            "delinquent_bill_year": 2026,
+        }
+        row = build_lead_export_row(rec)
+        assert row["date_recorded"] == ""
+
 
 class TestOwnerFlagColumns:
     """Tier 0 (057): absentee / out_of_state / owner_state tri-state CSV columns."""

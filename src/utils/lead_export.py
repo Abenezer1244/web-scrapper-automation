@@ -307,6 +307,30 @@ def _nth_email(record: Any, i: int) -> Any:
     return _get(record, f"email_{i + 1}")  # email_2 for i=1, email_3 for i=2
 
 
+def _is_synthetic_tax_date(raw_date: Any, bill_year: Any, record_type: Any = None) -> bool:
+    """True iff date_recorded is the SYNTHETIC tax date the tax scrapers write —
+    the exact string ``f"01/01/{bill_year}"`` (king_wa_tax_delinquent.py + Snohomish).
+
+    Two guards, both required, so the fabricated tax date blanks but a REAL date never
+    does (Codex):
+      1. record_type: only a ``tax_delinquent`` row's date is synthetic. The batch
+         combined export coalesces an overlapping tax hit's delinquent_bill_year onto
+         a PROBATE representative row whose date is a real death-cert date — even a
+         genuine Jan-1 death date must survive. When record_type is known and is NOT
+         tax_delinquent, the date is real regardless of the string. ``None`` (per-job
+         Result rows carry no record_type) falls through to the pattern check, keeping
+         the existing per-job tax behavior.
+      2. exact pattern: keying on ``01/01/{bill_year}`` (not merely "bill_year present")
+         is what lets enrich.py's copied bill_year on a real-date duplicate row survive.
+    A genuine tax row is unaffected — its date IS "01/01/{bill_year}", so it blanks.
+    """
+    if bill_year in (None, ""):
+        return False
+    if record_type is not None and record_type != "tax_delinquent":
+        return False
+    return str(raw_date).strip() == f"01/01/{bill_year}"
+
+
 def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, str]:
     """Build one canonical CSV row dict from an ORM Result or a plain dict.
 
@@ -338,8 +362,17 @@ def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, s
         # dedupe, and trigger campaigns off it (Codex Critical). The honest tax
         # temporal signal is the separate `delinquent_bill_year` + derived
         # `months_delinquent` columns. `sig` above is derived from the record
-        # (date_recorded intact), so only the emitted string is blanked.
-        "date_recorded": "" if year is not None else sanitize_for_csv(_get(record, "date_recorded")),
+        # (date_recorded intact), so only the emitted string is blanked. Blank ONLY
+        # the exact synthetic "01/01/{bill_year}" string, not any row that merely has a
+        # bill_year — a coalesced overlap row (probate death-cert date + tax bill_year)
+        # keeps its real date (Codex).
+        "date_recorded": (
+            ""
+            if _is_synthetic_tax_date(
+                _get(record, "date_recorded"), year, _get(record, "record_type")
+            )
+            else sanitize_for_csv(_get(record, "date_recorded"))
+        ),
         "party_name": sanitize_for_csv(_get(record, "party_name")),
         "heirs": sanitize_for_csv(_get(record, "heirs")),
         "parcel_id": sanitize_for_csv(_get(record, "parcel_id")),

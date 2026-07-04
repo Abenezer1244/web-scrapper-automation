@@ -289,12 +289,16 @@ class TestCombinedExportColumns:
                 enrichment_data={"lead_subtype": "probate_death_inheritance"},
             ))
             # tax row: no subtype → the representative winner. Cap-safe bill_year so
-            # the row isn't filtered by the 18-month tax cap.
+            # the row isn't filtered by the 18-month tax cap. Real tax rows carry the
+            # SYNTHETIC county date "01/01/{bill_year}" (no per-record event date) —
+            # that exact string is what the export blanks, now gated on record_type so
+            # a REAL date on a coalesced row can't be erased.
+            tax_year = _tax_year_in_window()
             db.add(Result(
                 id=str(uuid.uuid4()), user_id=user.id, job_id=j2.id,
-                date_recorded="06/02/2026", party_name="OWNER", property_key=pk,
+                date_recorded=f"01/01/{tax_year}", party_name="OWNER", property_key=pk,
                 is_duplicate=False,
-                delinquent_bill_year=_tax_year_in_window(),
+                delinquent_bill_year=tax_year,
             ))
             db.flush()
             rows = _render(_combined_pairs(db, user.id, [j1.id, j2.id], delivery_mode="everything"))
@@ -302,7 +306,7 @@ class TestCombinedExportColumns:
 
         assert len(rows) == 1  # one bucket (pk bridges both)
         assert rows[0]["lead_subtype"] == "probate_death_inheritance"
-        assert rows[0]["filed_date"] == ""  # tax winner → bill_year present → blanked
+        assert rows[0]["filed_date"] == ""  # tax winner's synthetic 01/01 date blanked
 
 
 class TestNoSilentTruncation:

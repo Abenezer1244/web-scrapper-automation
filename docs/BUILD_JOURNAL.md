@@ -19,6 +19,33 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-07-04 — Verify #148 grantor fix + fix two residual name-cleaner gaps
+**Context:** Cross-check the shipped #148 grantor label-bleed fix and clean up anything found. Own worktree `bridgeleads-worktrees/verify-auction-grantor` off `origin/main` (branch `chore/verify-auction-grantor`). Codex consulted before coding + reviewed the diff.
+
+**Verified (two independent ways):**
+- **Read-only prod data check:** ran the *deployed* `strip_vesting_clause` against all **31 active WA `nts_notices`** (Pierce 17, King 8, Snohomish 6) via a self-contained `railway run --service api` script reading `DATABASE_URL_MIGRATE` (the app role has no direct SELECT on the RLS system table). #148 confirmed clean on every row, incl. a 4th bled Pierce grantor (`JOHN A. JENSEN…`) not in the fixtures.
+- **Live headed-Chromium UI e2e** (the handoff's primary next step): drove `bridgeleads.io` (NOT `app.` — see below) WA→Pierce→Auction Leads→fresh run→Results. Party Name renders clean (`DEONDRE E. JAMES AND SHAUNIE J. WHEELER-JAMES`), Auction Date + Default Owed populated. Run showed "0 records" = correct cross-job dedup vs an earlier delivered Pierce run (the 17 still display with the fresh #148-cleaned names, tagged OLD).
+
+**Built / Shipped (PR #150):** `src/scrapers/preforeclosure.py` — (1) `_VESTING_CLAUSE` article now OPTIONAL (folds the old redundant `A SINGLE …` line in) with the leading comma still optional, + comma-anchored `_BARE_STATUS_CLAUSE` for a leftover bare status word; (2) `_COLLAPSED_DEHYPHEN` read-time net for stale collapsed soft-hyphen wraps. 8 new real-prod test cases + regression guards. 106 targeted tests pass, ruff clean.
+
+**Tried / Decided:** Codex proposed making the leading comma REQUIRED (`\s*,\s*`). **Rejected** — it regresses the comma-less real prod `TORYIAN M CARTER AN UNMARRIED MAN` (verified against `tests/fixtures/nts_tacoma_quality_loan.txt`). Kept optional comma on the article+noun form; applied Codex's comma-anchoring only to the *risky* bare-status form. Proved the full case matrix in a standalone harness BEFORE editing source.
+
+**Root cause (Snohomish hyphenation):** NOT a live crawler bug. The two `LUD -WIG`/`TEN -ANTS` rows were crawled 2026-06-13 17:57Z, ~1h before the #37 de-hyphenation shipped (18:56Z), and never re-parsed (weekly legals PDF rotates; `_upsert_notice` only rewrites on re-discovery). Current `nts_pdf.normalize_pdf_text` handles the newline form correctly. Fix = read-time net (mirrors #148), not a crawler change; backfill deemed optional (Codex agreed).
+
+**Failed / Blocked:**
+- Headed Playwright screenshots hung until `Page.bringToFront` — Chrome throttles frames on an occluded/backgrounded window. Also `wait_for_load_state("networkidle")` never fires on the SPA (hangs) — use raw CDP `Page.captureScreenshot` + `bringToFront`, no networkidle. Raw CDP WebSocket needs `websocket-client` with `suppress_origin=True` (Chrome 403s an Origin header). Anaconda Python has playwright + chromium; the repo venvs don't.
+- **App host moved to `bridgeleads.io` (root); `app.bridgeleads.io` now 302→`bridgeleads.io/login`** and the session cookie lives on the root host. Navigating to the `app.` host mid-e2e logged the tab out. Use `bridgeleads.io` for the app.
+- Transient `ERR_INTERNET_DISCONNECTED` mid-run (machine network blip) — recovered on reload.
+- Codex `--service` needed for `railway run` var injection (multiple services); the app role hit `permission denied for nts_notices` (RLS system table) → used `DATABASE_URL_MIGRATE` read-only.
+
+**Review:** `codex review --base origin/main` → **PASS** ("No discrete correctness issues"). Security: regex-only, no auth/billing/SSRF/CSV/DB surface; `party_name` still flows through `sanitize_for_csv()`; no ReDoS.
+
+**Pending / Handoff:** PR #150 open (needs merge + Railway api+worker redeploy). 👤 A test scraper "Pierce Auction Leads #148 verify" (job `61794c14…`, 0 records) was created in the admin account during the e2e — safe to delete.
+
+**Facts learned:** headed e2e rig quirks above (bringToFront / no-networkidle / raw-CDP / suppress_origin / anaconda-python / `bridgeleads.io` host). `strip_vesting_clause` is shared by `trustee_sale.py:75` (cache reads) + `snohomish_wa_pre_foreclosure.py:79` (fresh parses) — one fix cleans both. `nts_notices` needs `DATABASE_URL_MIGRATE` for read-only diagnostics.
+
+---
+
 ## 2026-07-03 — Auction Leads: new record type `trustee_sale`
 **Context:** Turn the shared `nts_notices` auction-data cache into a deliverable lead list, reusing the scrape→results→delivery pipeline. Counties Pierce/Snohomish/King only (the only three with an NTS crawler feeding the cache). Plans Pro/Business/Agency. Worktrees off `origin/main` (`auction-leads`, branch `feat/trustee-sale-record-type`) and `origin/master` (`fe-auction-leads`, branch `feat/auction-leads-record-type`). No local Postgres — pure-Python tests run locally; DB-level SQL verified in CI. Codex consulted before coding + reviewed every phase.
 

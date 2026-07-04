@@ -22,7 +22,13 @@ def test_beat_task_registered():
 
 def test_match_counties_cover_every_crawler():
     # the matcher must be wired for every county that has a crawler populating notices
-    assert set(NTS_MATCH_COUNTIES) >= {"pierce", "snohomish", "king"}
+    assert set(NTS_MATCH_COUNTIES) >= {"pierce", "snohomish", "king", "clark"}
+
+
+def test_clark_columbian_crawler_registered():
+    import src.workers.nts_crawler  # noqa: F401 — import registers the @app.task crawlers
+    from src.workers import app
+    assert "src.workers.nts_crawler.crawl_nts_columbian_clark" in app.tasks
 
 
 def test_pdf_crawler_tasks_registered():

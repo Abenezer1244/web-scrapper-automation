@@ -16,6 +16,7 @@ from src.db.models import NtsNotice
 from src.scrapers.registry import _ALLOWED_SCRAPER_MODULES
 from src.scrapers.trustee_sale import (
     RECORD_TYPE,
+    ClarkWATrusteeSaleScraper,
     KingWATrusteeSaleScraper,
     PierceWATrusteeSaleScraper,
     SnohomishWATrusteeSaleScraper,
@@ -73,14 +74,16 @@ class TestRegistryAllowlist:
 
 
 class TestCountySubclasses:
-    def test_three_counties_wired(self):
+    def test_counties_wired(self):
         assert PierceWATrusteeSaleScraper.COUNTY == "pierce"
         assert SnohomishWATrusteeSaleScraper.COUNTY == "snohomish"
         assert KingWATrusteeSaleScraper.COUNTY == "king"
+        assert ClarkWATrusteeSaleScraper.COUNTY == "clark"
         for cls in (
             PierceWATrusteeSaleScraper,
             SnohomishWATrusteeSaleScraper,
             KingWATrusteeSaleScraper,
+            ClarkWATrusteeSaleScraper,
         ):
             assert issubclass(cls, _TrusteeSaleScraper)
 

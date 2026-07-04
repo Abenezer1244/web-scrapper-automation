@@ -209,8 +209,17 @@ def crawl_nts_columbian_clark() -> dict:
         _alert_if_crawl_barren(col.SOURCE, discovered=0, upserted=0)
         return summary
 
-    ad_urls = col.extract_ad_detail_urls(resp.text)[:_CLARK_MAX_ADS]
+    all_ad_urls = col.extract_ad_detail_urls(resp.text)
+    ad_urls = all_ad_urls[:_CLARK_MAX_ADS]
     summary["discovered"] = len(ad_urls)
+    if len(all_ad_urls) > _CLARK_MAX_ADS:
+        # Never truncate silently (Codex P3): if the listing grows past the cap, a
+        # trustee sale later in the page would be dropped unseen — log it loudly so the
+        # cap can be raised. The listing is normally ~32, so this should never fire.
+        _logger.warning(
+            "Clark NTS listing has %d ads > cap %d — %d NOT crawled this run",
+            len(all_ad_urls), _CLARK_MAX_ADS, len(all_ad_urls) - _CLARK_MAX_ADS,
+        )
     _logger.info("Clark NTS crawl: %d ad permalinks", len(ad_urls))
 
     with system_sync_session() as db:
@@ -255,11 +264,13 @@ def crawl_nts_columbian_clark() -> dict:
 
     _logger.info("Clark NTS crawl done: %s", summary)
     # Clark legitimately has 0 trustee sales on many days (the listing is mostly court
-    # summons / probate / bids), so upserted==0 is NORMAL. Alert ONLY when the listing
-    # yielded 0 ad permalinks (discovery/extraction broke), never on 0 upserts (Codex).
+    # summons / probate / bids), so upserted==0 is NORMAL — do NOT alert on it. But DO
+    # alert when the listing yielded 0 ads (discovery/extraction broke) OR when every ad
+    # detail fetch failed (source down / blocked) — that 0-upsert is a real failure, not
+    # a no-sale day (Codex P2). errored>=discovered means no ad was successfully read.
     _alert_if_crawl_barren(
         col.SOURCE, discovered=len(ad_urls), upserted=summary["upserted"],
-        alert_on_zero_upserts=False,
+        errored=summary["errored"], alert_on_zero_upserts=False,
     )
     return summary
 
@@ -427,7 +438,7 @@ def _upsert_notice(db, model, row: dict) -> None:
 
 
 def _barren_alert_reason(
-    discovered: int, upserted: int, alert_on_zero_upserts: bool = True
+    discovered: int, upserted: int, alert_on_zero_upserts: bool = True, errored: int = 0
 ) -> str | None:
     """Pure decision: the reason string to alert on a barren crawl, or None if healthy.
 
@@ -436,18 +447,25 @@ def _barren_alert_reason(
 
     ``alert_on_zero_upserts=False`` (Clark/Columbian) suppresses the "0 upserted" branch:
     that crawler counts EVERY legal-notice ad as "discovered" (not just trustee sales),
-    so 0 upserts is the NORMAL no-sale-today case, not a parser break — only a listing
-    that yields 0 ads (discovered == 0) signals a real failure there (Codex).
+    so 0 upserts is the NORMAL no-sale-today case, not a parser break. BUT if every ad
+    fetch failed (``errored >= discovered``) then 0 upserts IS a real failure — the source
+    is down/blocked, not sale-free — so we still alert (Codex P2).
     """
     if discovered == 0:
         return "0 notices discovered — listing/PDF discovery may have broken"
     if alert_on_zero_upserts and upserted == 0:
         return f"{discovered} notices discovered but 0 upserted — parser may have broken"
+    if not alert_on_zero_upserts and upserted == 0 and errored >= discovered:
+        return (
+            f"{discovered} ads discovered but all {errored} detail fetches failed — "
+            "source may be down or blocking"
+        )
     return None
 
 
 def _alert_if_crawl_barren(
-    source: str, *, discovered: int, upserted: int, alert_on_zero_upserts: bool = True
+    source: str, *, discovered: int, upserted: int, alert_on_zero_upserts: bool = True,
+    errored: int = 0,
 ) -> None:
     """OPS alert when a crawl run produced no usable notices.
 
@@ -461,7 +479,7 @@ def _alert_if_crawl_barren(
     No-op unless OPS_ALERT_EMAIL is configured; send_ops_alert carries its own cooldown
     and never raises. A healthy run (upserted > 0) sends nothing.
     """
-    reason = _barren_alert_reason(discovered, upserted, alert_on_zero_upserts)
+    reason = _barren_alert_reason(discovered, upserted, alert_on_zero_upserts, errored)
     if reason is None:
         return
     from src.workers.ops_alerts import send_ops_alert

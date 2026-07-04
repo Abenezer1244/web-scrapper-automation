@@ -6,10 +6,10 @@ data *matched* on afterward by ``nts_matcher_task``), a ``trustee_sale`` lead IS
 published Notice of Trustee Sale — so its source is a single, known ``nts_notices``
 row. Every lead therefore has a real auction date + amount owing by construction.
 
-Only the three counties with an NTS crawler feeding the cache have data:
-Pierce (Tacoma Daily Index), Snohomish (Snoho Tribune), King (Queen Anne News) —
-mirrors ``nts_matcher_task.NTS_MATCH_COUNTIES``. A county with no notices yields
-zero leads (the SELECT returns nothing), never an error.
+Only counties with an NTS crawler feeding the cache have data: Pierce (Tacoma Daily
+Index), Snohomish (Snoho Tribune), King (Queen Anne News), Clark (The Columbian
+classifieds) — mirrors ``nts_matcher_task.NTS_MATCH_COUNTIES``. A county with no
+notices yields zero leads (the SELECT returns nothing), never an error.
 
 DB-backed, not a portal: like ``snohomish_wa_pre_foreclosure`` / ``snohomish_wa_
 tax_delinquent`` it overrides the Playwright lifecycle to no-ops and reads the DB
@@ -213,3 +213,9 @@ class KingWATrusteeSaleScraper(_TrusteeSaleScraper):
     """King County (WA) auction leads — Queen Anne & Magnolia News NTS cache."""
 
     COUNTY = "king"
+
+
+class ClarkWATrusteeSaleScraper(_TrusteeSaleScraper):
+    """Clark County (WA) auction leads — The Columbian classifieds NTS cache."""
+
+    COUNTY = "clark"

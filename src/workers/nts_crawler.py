@@ -62,6 +62,16 @@ _KING_PAGE = "https://queenannenews.com/Content/Default/Default/Classified/Legal
 _KING_PDF_PREFIX = "/static-4/queenannenews/images/legals/"
 _KING_SOURCE = "queen_anne_news"
 
+# ── The Columbian classifieds (Clark County) ──
+# Clark County trustee sales publish free/open (robots.txt 404) on The Columbian's
+# classifieds site — a single rolling HTML listing (no pagination) mixing every current
+# legal notice. Ingestion adapter: src/scrapers/sources/nts_columbian.py. Unlike Tacoma
+# (one NTS-slug page per notice) we fetch EVERY ad permalink and let is_valid_nts
+# backstop — the listing preview is truncated, so pre-filtering could silently drop a
+# lead (Codex Q1). Browser UA (some classifieds gate non-browser UAs); these are public
+# statutory RCW 61.24.040 notices.
+_CLARK_MAX_ADS = 60  # hard cap on ad-detail fetches per run (the listing is ~32)
+
 
 @app.task(name="src.workers.nts_crawler.crawl_nts_tacoma_index")
 def crawl_nts_tacoma_index() -> dict:
@@ -164,6 +174,105 @@ def crawl_nts_king_queenanne() -> dict:
         county="king",
         parse_fn=parse_king_notice,
     )
+
+
+@app.task(name="src.workers.nts_crawler.crawl_nts_columbian_clark")
+def crawl_nts_columbian_clark() -> dict:
+    """Crawl + upsert current Clark County NTS notices from The Columbian classifieds.
+
+    Fetches the single legal-notices listing, then EVERY /ad-details permalink on it (no
+    NTS pre-filter — is_valid_nts is the backstop), parses each via the shared parser,
+    and upserts the trustee sales into nts_notices. Non-NTS ads (court summons, probate,
+    RFP/bids) parse to is_valid_nts False and are skipped. Returns a summary.
+    """
+    from src.db.models import NtsNotice
+    from src.db.session import system_sync_session
+    from src.scrapers.sources import nts_columbian as col
+    from src.scrapers.sources import nts_tacoma_index as nts
+    from src.utils.safe_http import safe_get
+
+    today = datetime.now(UTC).date()
+    listing_url = col.BASE_URL + col.LISTING_PATH
+    summary = {"source": col.SOURCE, "discovered": 0, "upserted": 0,
+               "skipped": 0, "errored": 0, "expired": 0}
+
+    try:
+        # same_origin_as pins the fetch to The Columbian classifieds origin (Codex P2).
+        resp = safe_get(listing_url, timeout=25, same_origin_as=col.BASE_URL,
+                        headers={"User-Agent": _PDF_BROWSER_UA})
+    except Exception as exc:  # noqa: BLE001 — a bad listing fetch must not crash the beat
+        _logger.warning("Clark NTS listing fetch failed: %s", str(exc)[:140])
+        _alert_if_crawl_barren(col.SOURCE, discovered=0, upserted=0)
+        return summary
+    if resp.status_code != 200:
+        _logger.warning("Clark NTS listing HTTP %d", resp.status_code)
+        _alert_if_crawl_barren(col.SOURCE, discovered=0, upserted=0)
+        return summary
+
+    all_ad_urls = col.extract_ad_detail_urls(resp.text)
+    ad_urls = all_ad_urls[:_CLARK_MAX_ADS]
+    summary["discovered"] = len(ad_urls)
+    if len(all_ad_urls) > _CLARK_MAX_ADS:
+        # Never truncate silently (Codex P3): if the listing grows past the cap, a
+        # trustee sale later in the page would be dropped unseen — log it loudly so the
+        # cap can be raised. The listing is normally ~32, so this should never fire.
+        _logger.warning(
+            "Clark NTS listing has %d ads > cap %d — %d NOT crawled this run",
+            len(all_ad_urls), _CLARK_MAX_ADS, len(all_ad_urls) - _CLARK_MAX_ADS,
+        )
+    _logger.info("Clark NTS crawl: %d ad permalinks", len(ad_urls))
+
+    with system_sync_session() as db:
+        for u in ad_urls:
+            try:
+                r = safe_get(u, timeout=20, same_origin_as=col.BASE_URL,
+                             headers={"User-Agent": _PDF_BROWSER_UA})
+                if r.status_code != 200:
+                    summary["errored"] += 1
+                    continue
+                parsed = nts.parse_tacoma_notice(col.extract_ad_body(r.text))
+                row = nts.notice_to_row(parsed, source_url=u, today=today,
+                                        source=col.SOURCE, county=col.COUNTY)
+                if row is None:
+                    summary["skipped"] += 1  # not an NTS (summons/probate/RFP/bid)
+                    continue
+                row["fetched_at"] = datetime.now(UTC)
+                # Per-row SAVEPOINT: one bad notice rolls back alone, not the whole run.
+                with db.begin_nested():
+                    _upsert_notice(db, NtsNotice, row)
+                summary["upserted"] += 1
+            except Exception as exc:  # noqa: BLE001
+                summary["errored"] += 1
+                _logger.warning("Clark NTS ad %s failed: %s", u, str(exc)[:120])
+            time.sleep(_FETCH_DELAY_S)
+        db.commit()
+
+        # SOURCE-SCOPED expiry (Codex): a Clark run must NEVER expire another source's
+        # rows (do NOT copy Tacoma's global expiry). Past-auction + stale-fetch only.
+        summary["expired"] = db.execute(
+            _sa_text(
+                """
+                UPDATE nts_notices SET is_active = false
+                WHERE source = :source AND is_active
+                  AND (auction_date < :today OR fetched_at < :cutoff)
+                """
+            ),
+            {"source": col.SOURCE, "today": today,
+             "cutoff": datetime.now(UTC) - _td_days(_CACHE_DAYS)},
+        ).rowcount or 0
+        db.commit()
+
+    _logger.info("Clark NTS crawl done: %s", summary)
+    # Clark legitimately has 0 trustee sales on many days (the listing is mostly court
+    # summons / probate / bids), so upserted==0 is NORMAL — do NOT alert on it. But DO
+    # alert when the listing yielded 0 ads (discovery/extraction broke) OR when every ad
+    # detail fetch failed (source down / blocked) — that 0-upsert is a real failure, not
+    # a no-sale day (Codex P2). errored>=discovered means no ad was successfully read.
+    _alert_if_crawl_barren(
+        col.SOURCE, discovered=len(ad_urls), upserted=summary["upserted"],
+        errored=summary["errored"], alert_on_zero_upserts=False,
+    )
+    return summary
 
 
 def _discover_latest_legals_pdf(page_url: str, pdf_path_prefix: str) -> str | None:
@@ -328,20 +437,36 @@ def _upsert_notice(db, model, row: dict) -> None:
     db.execute(stmt)
 
 
-def _barren_alert_reason(discovered: int, upserted: int) -> str | None:
+def _barren_alert_reason(
+    discovered: int, upserted: int, alert_on_zero_upserts: bool = True, errored: int = 0
+) -> str | None:
     """Pure decision: the reason string to alert on a barren crawl, or None if healthy.
 
     discovered == 0 -> discovery broke; discovered > 0 but upserted == 0 -> parse broke;
     any upsert -> healthy (no alert).
+
+    ``alert_on_zero_upserts=False`` (Clark/Columbian) suppresses the "0 upserted" branch:
+    that crawler counts EVERY legal-notice ad as "discovered" (not just trustee sales),
+    so 0 upserts is the NORMAL no-sale-today case, not a parser break. BUT if every ad
+    fetch failed (``errored >= discovered``) then 0 upserts IS a real failure — the source
+    is down/blocked, not sale-free — so we still alert (Codex P2).
     """
     if discovered == 0:
         return "0 notices discovered — listing/PDF discovery may have broken"
-    if upserted == 0:
+    if alert_on_zero_upserts and upserted == 0:
         return f"{discovered} notices discovered but 0 upserted — parser may have broken"
+    if not alert_on_zero_upserts and upserted == 0 and errored >= discovered:
+        return (
+            f"{discovered} ads discovered but all {errored} detail fetches failed — "
+            "source may be down or blocking"
+        )
     return None
 
 
-def _alert_if_crawl_barren(source: str, *, discovered: int, upserted: int) -> None:
+def _alert_if_crawl_barren(
+    source: str, *, discovered: int, upserted: int, alert_on_zero_upserts: bool = True,
+    errored: int = 0,
+) -> None:
     """OPS alert when a crawl run produced no usable notices.
 
     This is the silent-failure mode that let the Pierce NTS cache go stale for a week
@@ -354,7 +479,7 @@ def _alert_if_crawl_barren(source: str, *, discovered: int, upserted: int) -> No
     No-op unless OPS_ALERT_EMAIL is configured; send_ops_alert carries its own cooldown
     and never raises. A healthy run (upserted > 0) sends nothing.
     """
-    reason = _barren_alert_reason(discovered, upserted)
+    reason = _barren_alert_reason(discovered, upserted, alert_on_zero_upserts, errored)
     if reason is None:
         return
     from src.workers.ops_alerts import send_ops_alert

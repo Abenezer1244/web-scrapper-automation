@@ -181,6 +181,13 @@ app.conf.beat_schedule = {
         "task": "src.workers.nts_crawler.crawl_nts_king_queenanne",
         "schedule": crontab(hour=10, minute=50, day_of_week=4),  # Thu 10:50 UTC
     },
+    "crawl-nts-columbian-clark": {
+        # NTS Tier 1 (Clark): The Columbian classifieds publishes Clark County trustee
+        # sales as a single rolling HTML listing. Daily like Tacoma (the listing updates
+        # continuously, not weekly); runs after the AM scrape + the matcher picks it up.
+        "task": "src.workers.nts_crawler.crawl_nts_columbian_clark",
+        "schedule": crontab(hour=10, minute=35, day_of_week="*"),  # 10:35 UTC daily
+    },
     "batch-completion-sweep": {
         # Piece 2: finalize batch_runs whose child jobs are ALL terminal — build
         # the one combined CSV + deliver. Claims each run via a reclaimable lease;

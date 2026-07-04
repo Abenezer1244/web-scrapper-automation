@@ -71,7 +71,12 @@ _STOP = (
     # past the owner into the trustee/beneficiary text. Colon-anchored so an odd
     # entity/trust name containing the word can't truncate a real grantor (Codex).
     r"Grantee\(?s?\)?\s*:|Original\s+beneficiary(?:\s+of\s+the\s+deed\s+of\s+trust)?\s*:|"
-    r"Current\s+Beneficiary|Current\s+Trustee|Current\s+(?:Loan\s+)?Mortgage|"
+    # The Clark / MTC dual-label layout prints "Current Beneficiary … of the Deed of
+    # Trust: <lender> Original Trustee of the Deed of Trust: <original>" — without an
+    # "Original Trustee" stop the beneficiary value bled straight into the original-
+    # trustee text (live 2026-07-04). Added alongside the existing "Original beneficiary"
+    # stop; a value stopping EARLIER at a real label is always safe (Codex).
+    r"Current\s+Beneficiary|Current\s+Trustee|Original\s+Trustee|Current\s+(?:Loan\s+)?Mortgage|"
     r"which\s+is\s+subject|Subject\s+to\b|I\.\s*NOTICE|II\.)|\n|\Z)"
 )
 
@@ -87,13 +92,25 @@ _TITLE_ORDER = re.compile(r"Title\s*Order\s*(?:#|No\.?)\s*:\s*([\w\-]+)", re.I)
 # Grantor / Grantor(s) [optional "for Recording Purposes …"] : value
 _GRANTOR = re.compile(r"Grantor\(?s?\)?[^:\n]*:\s*(.+?)" + _STOP, re.I | re.S)
 _BENEFICIARY = re.compile(r"(?:Current\s+)?Beneficiary[^:\n]*:\s*(.+?)" + _STOP, re.I | re.S)
-# Require the precise "Trustee of the Deed of Trust:" label (both layouts use it),
-# so neither "Trustee Sale No.:" nor a prose "the undersigned Trustee," is read as
-# the trustee NAME (Codex P2 + the one-line-layout 09:00-time-colon trap).
-_TRUSTEE = re.compile(
-    r"(?:Current\s+)?Trustee\s+of\s+the\s+Deed\s+of\s+Trust\s*:\s*(.+?)" + _STOP,
+# The ACTING trustee is the CURRENT trustee, not the original. Some layouts (Clark /
+# MTC) print BOTH "Original Trustee of the Deed of Trust: <x>" and "Current Trustee of
+# the Deed of Trust: <y>"; a single "(?:Current\s+)?Trustee…" regex matches the FIRST
+# occurrence = the ORIGINAL trustee (live 2026-07-04: captured the original title
+# company instead of the acting trustee conducting the sale). So prefer an explicit
+# Current label; else the first bare "Trustee of the Deed of Trust:" NOT preceded by
+# "Original" (see _extract_trustee). Require the precise "Trustee of the Deed of Trust:"
+# label so neither "Trustee Sale No.:" nor a prose "the undersigned Trustee," is read as
+# the trustee NAME (Codex P2 + the one-line-layout 09:00-time-colon trap). Single-label
+# Pierce/Snohomish notices resolve via the bare path, unchanged from the prior regex.
+_TRUSTEE_CURRENT = re.compile(
+    r"Current\s+Trustee\s+of\s+the\s+Deed\s+of\s+Trust\s*:\s*(.+?)" + _STOP,
     re.I | re.S,
 )
+_TRUSTEE_ANY = re.compile(
+    r"Trustee\s+of\s+the\s+Deed\s+of\s+Trust\s*:\s*(.+?)" + _STOP,
+    re.I | re.S,
+)
+_ORIGINAL_BEFORE = re.compile(r"Original\s*$", re.I)
 _SERVICER = re.compile(r"(?:Current\s+)?(?:Loan\s+)?Mortgage\s+Servicer[^:\n]*:\s*(.+?)" + _STOP, re.I | re.S)
 _DEED_REF = re.compile(
     r"Reference\s+Number\s+(?:of\s+(?:the\s+)?)?Deed\s+of\s+Trust\s*:\s*(?:Instrument\s+No\.?\s*)?([\w\-]+)",
@@ -213,6 +230,32 @@ def _first(pattern: re.Pattern, text: str) -> str | None:
     return val or None
 
 
+def _clean_value(raw: str) -> str | None:
+    """Collapse whitespace + strip trailing punctuation (matches _first's cleaning)."""
+    val = " ".join(raw.split()).strip().rstrip(".,")
+    return val or None
+
+
+def _extract_trustee(text: str) -> str | None:
+    """The CURRENT (acting) trustee of the deed of trust.
+
+    Prefer an explicit "Current Trustee of the Deed of Trust:" label; else the first
+    bare "Trustee of the Deed of Trust:" that is NOT the "Original Trustee…" (the
+    dual-label Clark/MTC layout carries both). Single-label Pierce/Snohomish notices
+    resolve via the bare path — byte-identical to the prior single-regex behavior.
+    Returns None when only an original trustee is named (an original title company is
+    not the acting trustee; None is more honest than a misleading name — Codex).
+    """
+    m = _TRUSTEE_CURRENT.search(text)
+    if m:
+        return _clean_value(m.group(1))
+    for m in _TRUSTEE_ANY.finditer(text):
+        if _ORIGINAL_BEFORE.search(text[max(0, m.start() - 12):m.start()]):
+            continue  # this is the "Original Trustee…" label — skip to the acting one
+        return _clean_value(m.group(1))
+    return None
+
+
 def _money(pattern: re.Pattern, text: str) -> Decimal | None:
     m = pattern.search(text)
     if not m:
@@ -312,7 +355,7 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
         "title_order": _first(_TITLE_ORDER, text),
         "grantor": _first(_GRANTOR, text),
         "beneficiary": _first(_BENEFICIARY, text),
-        "trustee": _first(_TRUSTEE, text),
+        "trustee": _extract_trustee(text),
         "servicer": _first(_SERVICER, text),
         "deed_reference": _first(_DEED_REF, text),
         "parcel": _first(_PARCEL, text),

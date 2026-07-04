@@ -19,6 +19,35 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-07-04 — Auction Leads county #4: Clark County (The Columbian)
+**Context:** Expand `trustee_sale` ("Auction Leads") beyond the original 3 counties (Pierce/Snohomish/King). Own worktree `bridgeleads-worktrees/trustee-sale-expansion` off `origin/main` (branch `feat/trustee-sale-county-expansion`). Codex consulted before code + reviewed the diff.
+
+**Key architecture fact (re-confirmed):** `trustee_sale` is a DB reader over the shared `nts_notices` cache. Coverage is bounded by which counties have an NTS **crawler** feeding the cache — NOT by scraper wiring. So "add a county" = build an NTS crawler for that county's legal newspaper (WA RCW 61.24.040 requires NTS publication in a county legal paper). The per-notice field parser is shared and already multi-layout; new counties mostly need a new *ingestion adapter*, not a new parser.
+
+**Research (subagent, verified by live fetch):** ranked 8 WA counties by crawlable-source feasibility. Winner = **Clark via `classifieds.columbian.com`** (free HTML, robots 404, verified real full-text NTS, one-notice-per-permalink = closest to the Tacoma pattern). Whatcom (Lynden Tribune) a close 2nd. Skagit/Yakima MEDIUM (Lee Enterprises robots block `?`-query pagination). Spokane/Thurston 403'd (need headed browser). Kitsap/Tri-Cities = no free standalone source (McClatchy bot-block). `wapublicnotices.com` = statewide aggregator but ASP.NET postback (one-crawler-many-counties spike, deferred).
+
+**Built / Shipped (7 commits):**
+- `src/scrapers/sources/nts_columbian.py` — ingestion adapter: `extract_ad_detail_urls` (listing → host-pinned `/ad-details/<id>` permalinks, no preview pre-filter) + `extract_ad_body` (`p.ad-content-container` via BeautifulSoup). Reuses shared `parse_tacoma_notice` + `notice_to_row(source="columbian_classifieds", county="clark")`.
+- `src/scrapers/sources/nts_tacoma_index.py` — **shared-parser fix**: dual-label MTC layouts print both "Original Trustee of the Deed of Trust:" and "Current Trustee…"; the old single `(?:Current\s+)?Trustee…` regex grabbed the ORIGINAL (title company), and the beneficiary value bled into the Original-Trustee text. Now `_extract_trustee` prefers Current, never Original; `_STOP` stops beneficiary before "Original Trustee". Latently fixes King MTC too.
+- `src/workers/nts_crawler.py` `crawl_nts_columbian_clark` + daily beat (10:35 UTC); `NTS_MATCH_COUNTIES += clark`; `ClarkWATrusteeSaleScraper`; alembic **082** (Clark `trustee_sale` connector, coexists with the Clark recorder connector, keyed on scraper_class).
+
+**Tried / Decided (Codex consult changed 2 decisions):**
+- **Q1 fetch-all vs preview-filter:** I leaned toward pre-filtering listing previews for "trustee". Codex: **fetch every ad** (listing preview is truncated; a real NTS can start with a TS#/trustee-company header, so pre-filter could silently drop a lead; 32 daily fetches is trivial vs a silent missed lead). Adopted — `is_valid_nts` is the backstop.
+- **Q2 shared parser vs Clark override:** I leaned toward a Clark-only override (lowest regression risk). Codex: **fix the shared parser** (it's a general WA/MTC bug that latently affects King; regression risk is manageable with fixture gates). Adopted; proved byte-identical on all 5 Pierce fixtures + King parser tests.
+
+**Caught & fixed (Codex diff review — no P1/Critical):**
+- **[P2]** Clark's barren-alert suppression (0 upserts = normal no-sale day) also hid the case where the listing works but *every* ad fetch fails. `_barren_alert_reason` now takes `errored`; Clark alerts when `errored >= discovered`.
+- **[P3]** `_CLARK_MAX_ADS=60` truncated silently → now logs a warning with the dropped count.
+
+**Proven:** live crawl of Clark right now — 32 ad permalinks discovered → **1 real trustee sale** parsed (TS `WA07000393-24-1`, auction 2026-07-17, owner KENNY D OLSON + MICHELLE A HAAG, acting trustee **MTC Financial** [the fix], default $440,867, parcel 110170068, active) → 31 non-NTS (court summons/probate/RFP/bids) correctly skipped, 0 errors. Full suite **1618 passed / 0 failed**; ruff clean.
+
+**Facts learned:**
+- The Columbian classifieds DOM: single rolling listing at `/subcategories/view/55` (NO pagination), ads split by `<hr class="ad_boundary">`, each = `Posted:` date + truncated `div.ad_details` preview + `/ad-details/<id>` `a.view_post` permalink; full body on the permalink in `<p class="ad-content-container">`. robots.txt → HTTP 404 (no restriction). Browser UA works; bot UA untested (used browser UA to be safe).
+- Clark notices are MTC-Financial month-name layout — the shared `_AUCTION_KING` path already handled the date; only the dual-label trustee/beneficiary needed the parser fix.
+- Barren-alert semantics differ by source: Tacoma/PDF crawlers count NTS *candidates* as "discovered" (0 upserts = parser broke); the Clark crawler counts EVERY legal-notice ad (0 upserts = usually just no-sale-today) — hence the `alert_on_zero_upserts` + `errored` distinction.
+
+**Pending / Handoff:** 👤 deploy (Railway api+worker redeploy + run migration 082 via `scripts/migrate.py`); the connector seeds `health_status='healthy'` so Auction Leads shows in the Clark picker immediately post-migration. Next county on the same pattern = **Whatcom** (Lynden Tribune weekly HTML legals digest — multi-notice-per-page, split on `NOTICE OF TRUSTEE'S SALE` like the PDF path).
+
 ## 2026-07-04 — Verify #148 grantor fix + fix two residual name-cleaner gaps
 **Context:** Cross-check the shipped #148 grantor label-bleed fix and clean up anything found. Own worktree `bridgeleads-worktrees/verify-auction-grantor` off `origin/main` (branch `chore/verify-auction-grantor`). Codex consulted before coding + reviewed the diff.
 

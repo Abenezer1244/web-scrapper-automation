@@ -548,3 +548,53 @@ class TestQualityLoanFormat:
 
     def test_is_valid(self):
         assert is_valid_nts(self.p)
+
+
+class TestDualLabelTrustee:
+    """Live 2026-07-04 (Clark/MTC): a layout that prints BOTH 'Original Trustee of the
+    Deed of Trust:' and 'Current Trustee of the Deed of Trust:'. The single
+    '(?:Current\\s+)?Trustee…' regex matched the FIRST (Original) label, so the trustee
+    field carried the original title company and the beneficiary value bled into the
+    Original-Trustee text. The fix: prefer the Current label, never capture Original, and
+    stop the beneficiary at 'Original Trustee'."""
+
+    def test_prefers_current_trustee_over_original(self):
+        text = (
+            "Current Beneficiary of the Deed of Trust: Idaho Housing and Finance Association "
+            "Original Trustee of the Deed of Trust: FIDELITY NATIONAL TITLE COMPANY OF WASHINGTON INC "
+            "Current Trustee of the Deed of Trust: MTC Financial Inc. dba Trustee Corps "
+            "Current Mortgage Servicer of the Deed of Trust: Idaho Housing "
+            "I. NOTICE IS HEREBY GIVEN that on July 17, 2026, 09:00 AM, X will sell at public auction"
+        )
+        p = parse_nts_notice(text)
+        assert p["trustee"] == "MTC Financial Inc. dba Trustee Corps"
+
+    def test_beneficiary_stops_before_original_trustee(self):
+        text = (
+            "Current Beneficiary of the Deed of Trust: Idaho Housing and Finance Association "
+            "Original Trustee of the Deed of Trust: FIDELITY NATIONAL TITLE COMPANY OF WASHINGTON INC "
+            "Current Trustee of the Deed of Trust: MTC Financial Inc. dba Trustee Corps "
+            "will on 7/1/2026, at 9:00 AM at X sell at public auction"
+        )
+        p = parse_nts_notice(text)
+        assert p["beneficiary"] == "Idaho Housing and Finance Association"
+        assert "Original Trustee" not in p["beneficiary"]
+
+    def test_bare_single_trustee_label_unchanged(self):
+        # A single-label Pierce/Snoho notice still resolves via the bare path. Real
+        # notices follow the trustee with another labeled field (here the servicer),
+        # which is what stops the value — mirror that so the test reflects real structure.
+        text = (
+            "Trustee of the Deed of Trust: North Star Trustee, LLC "
+            "Current Mortgage Servicer of the Deed of Trust: Freedom Mortgage "
+            "will on 7/1/2026, at 9:00 AM at X sell at public auction"
+        )
+        assert parse_nts_notice(text)["trustee"] == "North Star Trustee, LLC"
+
+    def test_only_original_trustee_yields_none(self):
+        # An original title company is not the acting trustee; None beats a wrong name.
+        text = (
+            "Original Trustee of the Deed of Trust: FIDELITY NATIONAL TITLE "
+            "will on 7/1/2026, at 9:00 AM at X sell at public auction"
+        )
+        assert parse_nts_notice(text)["trustee"] is None

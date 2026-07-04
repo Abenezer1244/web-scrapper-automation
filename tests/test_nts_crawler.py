@@ -21,3 +21,21 @@ class TestBarrenAlertReason:
     def test_healthy_run_does_not_alert(self):
         assert _barren_alert_reason(12, 7) is None
         assert _barren_alert_reason(1, 1) is None
+
+    def test_clark_zero_upserts_no_errors_is_not_an_alert(self):
+        # The Columbian crawler counts EVERY legal-notice ad as discovered (not just
+        # trustee sales), so 0 upserts with the ads read fine is the normal no-sale day.
+        assert _barren_alert_reason(32, 0, alert_on_zero_upserts=False, errored=0) is None
+        # a few transient fetch failures among mostly-read ads is still not an alert
+        assert _barren_alert_reason(32, 0, alert_on_zero_upserts=False, errored=3) is None
+
+    def test_clark_zero_discovered_still_alerts(self):
+        # A listing that yields 0 ads means discovery/extraction broke — always alert.
+        assert _barren_alert_reason(0, 0, alert_on_zero_upserts=False) is not None
+
+    def test_clark_all_fetches_failed_alerts(self):
+        # Codex P2: listing works (32 ads) but EVERY detail fetch fails -> source down,
+        # a real failure the suppression must NOT hide.
+        reason = _barren_alert_reason(32, 0, alert_on_zero_upserts=False, errored=32)
+        assert reason is not None
+        assert "detail fetches failed" in reason

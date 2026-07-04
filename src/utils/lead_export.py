@@ -72,6 +72,12 @@ LEAD_CSV_COLUMNS: list[str] = [
     # backward-compat convention. Blank parts mean "couldn't parse confidently" —
     # the full mailing_address column above remains authoritative.
     "mailing_street", "mailing_city", "mailing_state", "mailing_zip",
+    # Probate current-owner reconciliation (2026-07-04, user request): the King
+    # Assessor's CURRENT owner/taxpayer vs the deceased party_name. Display-only —
+    # current_owner is who holds title NOW (often an heir/trust); title_status is a
+    # humble scan aid ("Different owner on title" / "Held by trust or entity" / blank).
+    # King probate/death only; blank elsewhere. Appended at END (back-compat).
+    "current_owner", "title_status",
 ]
 
 
@@ -105,8 +111,8 @@ LEAD_CSV_COLUMNS: list[str] = [
 #   NTS/auction block-> pre_foreclosure (auction_date/default_amount stored,
 #                       trustee/ts_number from enrichment_data["nts"], days_to_auction derived)
 _TYPE_EXTRA_COLUMNS: dict[str, tuple[str, ...]] = {
-    "probate": ("lead_subtype",),
-    "death_certificate": (),
+    "probate": ("lead_subtype", "current_owner", "title_status"),
+    "death_certificate": ("current_owner", "title_status"),
     "divorce": (),
     "eviction": (),
     "tax_delinquent": (
@@ -331,6 +337,15 @@ def _is_synthetic_tax_date(raw_date: Any, bill_year: Any, record_type: Any = Non
     return str(raw_date).strip() == f"01/01/{bill_year}"
 
 
+# Human labels for the probate title_status enum (classify_probate_title_status).
+# Factual, NOT "transferred" — a name/entity difference is a signal to check, not deed
+# proof (Codex). Unknown/empty enum -> blank cell.
+_TITLE_STATUS_LABELS: dict[str, str] = {
+    "current_owner_name_differs": "Different owner on title",
+    "current_owner_entity_or_trust": "Held by trust or entity",
+}
+
+
 def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, str]:
     """Build one canonical CSV row dict from an ORM Result or a plain dict.
 
@@ -433,6 +448,10 @@ def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, s
         "mailing_city": sanitize_for_csv(mail["city"]),
         "mailing_state": sanitize_for_csv(mail["state"]),
         "mailing_zip": sanitize_for_csv(mail["zip"]),
+        # Probate current-owner reconciliation (King probate/death, display-only).
+        # current_owner is the Assessor's owner NOW; title_status is a factual scan aid.
+        "current_owner": _enrich_str(enr, "assessor_current_owner"),
+        "title_status": _TITLE_STATUS_LABELS.get(enr.get("title_status"), ""),
     }
 
 

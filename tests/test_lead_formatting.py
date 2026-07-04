@@ -1,9 +1,66 @@
 """Tests for dialer-CSV display formatting (src/utils/lead_formatting.py)."""
 from src.utils.lead_formatting import (
+    classify_probate_title_status,
     normalize_phone_for_dialer,
     parse_property_for_display,
     split_owner_for_display,
 )
+
+
+class TestClassifyProbateTitleStatus:
+    """Conservative probate current-owner vs deceased party_name classifier. Real
+    cases from the King "king pro tax" audit (2026-07-03)."""
+
+    def test_same_person_abbreviated_first_name_not_flagged(self):
+        # BOUCHER CHARLES DENNIS vs Assessor "BOUCHER CHARLES D" — same person.
+        assert classify_probate_title_status("BOUCHER CHARLES DENNIS", "BOUCHER CHARLES D") == ""
+
+    def test_same_owner_unchanged_not_flagged(self):
+        assert classify_probate_title_status("HOBI MICHAEL E", "HOBI MICHAEL E") == ""
+
+    def test_different_surname_flags_name_differs(self):
+        # HOWTON JAMES W -> Assessor now "LEAPAI MICHELLE".
+        assert (
+            classify_probate_title_status("HOWTON JAMES W", "LEAPAI MICHELLE")
+            == "current_owner_name_differs"
+        )
+
+    def test_hyphenated_new_surname_flags_differs(self):
+        # JONES JAMES EDWARD JR -> "JONES-MITCHELL NESHELLA": a NEW party, must flag.
+        assert (
+            classify_probate_title_status("JONES JAMES EDWARD JR", "JONES-MITCHELL NESHELLA")
+            == "current_owner_name_differs"
+        )
+
+    def test_trust_owner_flags_entity_even_with_matching_surname(self):
+        # PRYOR JOYCE JOANNE -> "PRYOR TRUST MARK A": entity wins over surname match.
+        assert (
+            classify_probate_title_status("PRYOR JOYCE JOANNE", "PRYOR TRUST MARK A")
+            == "current_owner_entity_or_trust"
+        )
+
+    def test_co_owner_survivor_shared_surname_not_flagged(self):
+        # King '+'-joined co-owners sharing a surname: the deceased's surname is still
+        # present -> not a transfer.
+        assert classify_probate_title_status("JANNETTO RUSSELL D", "JANNETTO RUSSELL D+GINA L") == ""
+
+    def test_deceased_surname_present_among_multi_owners_not_flagged(self):
+        assert classify_probate_title_status("SMITH JOHN", "DOE BOB / SMITH JANE") == ""
+
+    def test_estate_of_owner_keeps_surname_not_flagged(self):
+        assert classify_probate_title_status("HOWTON JAMES W", "ESTATE OF JAMES HOWTON") == ""
+
+    def test_blank_owner_returns_blank(self):
+        assert classify_probate_title_status("HOWTON JAMES W", "") == ""
+        assert classify_probate_title_status("HOWTON JAMES W", None) == ""
+
+    def test_unparseable_deceased_returns_blank(self):
+        # No surname to compare (and owner isn't an entity) -> no flag.
+        assert classify_probate_title_status("", "LEAPAI MICHELLE") == ""
+
+    def test_surrounding_whitespace_owner_not_misparsed(self):
+        # Padded owner must still parse surname HOWTON (not "W") -> same owner, no flag.
+        assert classify_probate_title_status("HOWTON JAMES W", "  HOWTON JAMES W  ") == ""
 
 
 class TestNormalizePhoneForDialer:

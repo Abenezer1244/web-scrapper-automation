@@ -456,7 +456,12 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             # (suspenders, so probate/death-cert King rows sharing this enrichment
             # path are never touched).
             from src.scrapers.king_wa_tax_delinquent import is_tax_placeholder_party
+            from src.utils.lead_formatting import classify_probate_title_status
             is_tax_delinquent = config.record_type == "tax_delinquent"
+            # Probate + death-cert: party_name is the DECEASED. The Assessor's owner
+            # is who holds title NOW — often an heir/trust. Surface it + a conservative
+            # flag so the user isn't mailing a decedent.
+            is_probate_family = config.record_type in ("probate", "death_certificate")
             for pid, data in enriched.items():
                 prop = data.get("property_address")
                 mail = data.get("mailing_address")
@@ -472,6 +477,14 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                         and (not res.party_name or is_tax_placeholder_party(res.party_name))
                     ):
                         res.party_name = owner
+                    # Display-only: record the Assessor's current owner + a humble
+                    # "differs/entity" flag. NEVER overwrite party_name, NEVER drop the
+                    # lead (Assessor lag; heirs are valid motivated sellers).
+                    if is_probate_family and owner:
+                        ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+                        ed["assessor_current_owner"] = owner
+                        ed["title_status"] = classify_probate_title_status(res.party_name, owner)
+                        res.enrichment_data = ed
             try:
                 db.commit()
             except Exception as exc:

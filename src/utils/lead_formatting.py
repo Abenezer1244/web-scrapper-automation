@@ -201,6 +201,61 @@ def split_owner_for_display(party_name: str | None) -> tuple[str | None, str | N
     return None, None
 
 
+# King assessor "Name" cell joins co-owners with '+' ("JANNETTO RUSSELL D+GINA L")
+# and occasionally '/', '&', ';', ' AND '. Split so each owner is classified on its own.
+_OWNER_SEP_RE = re.compile(r"\s*\+\s*|\s*/\s*|\s+&\s+|\s*;\s*|\s+AND\s+", re.IGNORECASE)
+
+
+def _surname_key(surname: str | None) -> str:
+    """Alpha-only uppercase surname key. Strips hyphens/punctuation so a REMARRIED or
+    new owner reads as different: 'JONES-MITCHELL' -> 'JONESMITCHELL' != 'JONES' (a real
+    title move), while 'BOUCHER' == 'BOUCHER' (same person, abbreviated first name)."""
+    return re.sub(r"[^A-Z]", "", (surname or "").upper())
+
+
+def classify_probate_title_status(
+    party_name: str | None, current_owner: str | None
+) -> str:
+    """Conservative, NON-authoritative signal comparing a probate lead's party_name
+    (the deceased on the death certificate) to the Assessor's CURRENT owner/taxpayer.
+
+    Returns one of:
+      - "current_owner_entity_or_trust" : title is held by a trust/LLC/estate entity
+        (any owner segment is an entity) — a common estate-planning / post-death signal.
+      - "current_owner_name_differs"    : the deceased's surname matches NONE of the
+        current owner's surnames — the person on title is (probably) a different party.
+      - ""                              : same surname on title (deceased or a same-name
+        heir/spouse still holds it), or nothing parseable to compare.
+
+    Deliberately humble: it is a scan aid, not proof of a transfer (that needs the deed
+    chain). The raw current_owner is the authoritative value the user reads. Entity wins
+    over surname; a surname match anywhere suppresses the "differs" flag so a surviving
+    co-owner or the deceased's own estate never false-flags (Codex).
+    """
+    if not current_owner or not current_owner.strip():
+        return ""
+    # Strip each segment up front: a leading/trailing space would make
+    # `stripped == seg` below false and flip recorder_order, mis-reading the surname
+    # (" HOWTON JAMES W " -> surname "W", a false name_differs) (Codex).
+    segments = [s.strip() for s in _OWNER_SEP_RE.split(current_owner) if s.strip()]
+    if any(_is_entity(seg) for seg in segments):
+        return "current_owner_entity_or_trust"
+    _, dec_last = split_owner_for_display(party_name)
+    dec_key = _surname_key(dec_last)
+    if not dec_key:
+        return ""  # deceased name is an entity/unparseable — nothing to compare
+    owner_keys: set[str] = set()
+    for seg in segments:
+        stripped = _ESTATE_PREFIX_RE.sub("", seg).strip()
+        _, last = _person_first_last(stripped, recorder_order=(stripped == seg))
+        key = _surname_key(last)
+        if key:
+            owner_keys.add(key)
+    if owner_keys and dec_key not in owner_keys:
+        return "current_owner_name_differs"
+    return ""
+
+
 def parse_property_for_display(addr: str | None) -> dict:
     """Split a property address into {street, city, state, zip} for a CSV.
 

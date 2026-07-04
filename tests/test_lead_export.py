@@ -421,9 +421,11 @@ class TestMailingAddressSplit:
     def test_columns_appended_to_csv(self):
         for col in ("mailing_street", "mailing_city", "mailing_state", "mailing_zip"):
             assert col in LEAD_CSV_COLUMNS, col
-        # Appended at END (back-compat convention: existing importers by position
-        # keep working, new columns are extra).
-        assert LEAD_CSV_COLUMNS[-4:] == [
+        # Contiguous block near the END (back-compat convention: existing importers by
+        # position keep working; later columns like current_owner/title_status append
+        # after this block, so pin the block itself, not the absolute tail).
+        i = LEAD_CSV_COLUMNS.index("mailing_street")
+        assert LEAD_CSV_COLUMNS[i:i + 4] == [
             "mailing_street", "mailing_city", "mailing_state", "mailing_zip",
         ]
 
@@ -501,3 +503,40 @@ class TestMailingAddressSplit:
         assert row["mailing_street"] == "PO BOX 9"
         assert row["mailing_city"] == "TACOMA"
         assert row["mailing_zip"] == "98401"
+
+
+class TestProbateCurrentOwnerColumns:
+    """current_owner + title_status surfaced from enrichment_data (King probate/death)."""
+
+    def test_current_owner_and_differs_label(self):
+        rec = {
+            "party_name": "HOWTON JAMES W",
+            "enrichment_data": {
+                "assessor_current_owner": "LEAPAI MICHELLE",
+                "title_status": "current_owner_name_differs",
+            },
+        }
+        row = build_lead_export_row(rec)
+        assert row["current_owner"] == "LEAPAI MICHELLE"
+        assert row["title_status"] == "Different owner on title"
+
+    def test_trust_label(self):
+        rec = {
+            "party_name": "PRYOR JOYCE JOANNE",
+            "enrichment_data": {
+                "assessor_current_owner": "PRYOR TRUST MARK A",
+                "title_status": "current_owner_entity_or_trust",
+            },
+        }
+        row = build_lead_export_row(rec)
+        assert row["current_owner"] == "PRYOR TRUST MARK A"
+        assert row["title_status"] == "Held by trust or entity"
+
+    def test_blank_when_no_enrichment(self):
+        row = build_lead_export_row({"party_name": "SMITH JOHN", "doc_type": "probate"})
+        assert row["current_owner"] == ""
+        assert row["title_status"] == ""
+
+    def test_columns_registered(self):
+        assert "current_owner" in LEAD_CSV_COLUMNS
+        assert "title_status" in LEAD_CSV_COLUMNS

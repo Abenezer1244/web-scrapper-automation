@@ -35,6 +35,31 @@ _KNOWN_GIS_ENDPOINTS: dict[str, dict] = {
             "Land_Value,Taxable_Value,Longitude,Latitude"
         ),
     },
+    # King County — Assessor parcel layer (KingCo_PropertyInfo/2). PIN is a
+    # 10-char string with leading zeros PRESERVED (never strip to int). ADDR_FULL
+    # is the situs street; POSTALCTYNAME/STATE_ABBR/ZIP5 complete the mailable
+    # address (address_suffix_fields). King withholds the taxpayer/mailing fields
+    # (KCTP_*) from public GIS, so there is NO bulk mailing here: mailing_fields=[]
+    # AND echo_property_to_mailing=False — mailing stays NULL unless the per-parcel
+    # eRealProperty pass (king_county_assessor.py) finds a REAL taxpayer mailing.
+    # Echoing property into mailing would (a) misrepresent absentee owners and (b)
+    # block that upgrade pass (which only runs for rows with no mailing). ~1/3 of
+    # delinquent parcels are vacant/raw land with ADDR_FULL=null — those are
+    # returned matched (vacant_no_situs) so they DON'T fall through to the WA
+    # statewide service and pick up a wrong address.
+    "king_WA": {
+        "endpoint": (
+            "https://gismaps.kingcounty.gov/arcgis/rest/services"
+            "/Property/KingCo_PropertyInfo/MapServer/2/query"
+        ),
+        "parcel_field": "PIN",
+        "address_field": "ADDR_FULL",
+        "address_suffix_fields": ["POSTALCTYNAME", "STATE_ABBR", "ZIP5"],
+        "mailing_fields": [],
+        "echo_property_to_mailing": False,
+        "skip_statewide_fallback": True,
+        "out_fields": "PIN,ADDR_FULL,POSTALCTYNAME,STATE_ABBR,ZIP5",
+    },
 }
 
 # ─── Statewide GIS endpoints (covers ALL counties in a state) ────────────────
@@ -116,6 +141,12 @@ def enrich_parcel_gis(
     if gis_config and parcel_id:
         result = _query_gis(parcel_id, gis_config, county_key)
         if result.get("property_address"):
+            return result
+        # A parcel that MATCHED an authoritative county layer but has no street
+        # (vacant/raw land) must not fall through to the statewide service, which
+        # could return a wrong situs — mirror batch_enrich_parcels_gis
+        # (skip_statewide_fallback). Return the matched-vacant result as-is.
+        if result.get("matched") and gis_config.get("skip_statewide_fallback"):
             return result
 
     # Fallback: search by owner name if parcel ID didn't match or is None
@@ -309,22 +340,61 @@ def _query_wa_statewide_by_name(owner_name: str, county: str) -> dict[str, str |
 
 
 def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
-    """Parse ArcGIS REST API response into enrichment fields."""
+    """Parse ArcGIS REST API response into enrichment fields.
+
+    Return keys: property_address, mailing_address, parcel_id, matched,
+    vacant_no_situs, situs_city, situs_state, situs_zip. ``matched`` is True when
+    the layer returned a feature for the parcel; ``vacant_no_situs`` is True when
+    it matched but has NO street address (raw/vacant land). The caller keeps
+    property_address NULL for a vacant parcel (skip-trace bills off it) but can
+    surface the situs city/zip for display. A no-feature response is ``matched``
+    False so the caller can still try a fallback source.
+    """
+    _NOMATCH = {
+        "property_address": None, "mailing_address": None, "parcel_id": None,
+        "matched": False, "vacant_no_situs": False,
+        "situs_city": None, "situs_state": None, "situs_zip": None,
+    }
     features = data.get("features") or []
     if not features:
-        return _empty()
+        return _NOMATCH
 
     attrs = features[0].get("attributes") or {}
 
-    # Property/situs address
-    address_field = gis_config.get("address_field", "Site_Address")
-    property_address = attrs.get(address_field) or None
-    if property_address:
-        property_address = property_address.replace("&nbsp;", "").strip()
-        if not property_address:
-            property_address = None
+    # Situs city/state/zip from the ORDERED suffix fields [city, state, zip], when
+    # configured. Completes a full mailable street address and, for a vacant/
+    # unaddressed parcel, records WHERE it is for display.
+    suffix = gis_config.get("address_suffix_fields") or []
 
-    # Mailing address (may be multiple fields joined)
+    def _suffix(i: int) -> str | None:
+        if i < len(suffix):
+            v = attrs.get(suffix[i])
+            return str(v).strip() if v and str(v).strip() else None
+        return None
+
+    situs_city, situs_state, situs_zip = _suffix(0), _suffix(1), _suffix(2)
+
+    # Property/situs STREET address
+    address_field = gis_config.get("address_field", "Site_Address")
+    street = attrs.get(address_field) or None
+    if street:
+        street = str(street).replace("&nbsp;", "").strip() or None
+
+    # Build the full "STREET, CITY, STATE ZIP" when suffix fields are configured
+    # (better for export + skip-trace city/zip parsing than street-only).
+    property_address = street
+    if street and suffix:
+        loc_parts = [p for p in (situs_city, situs_state) if p]
+        city_state = ", ".join(loc_parts)
+        if situs_zip:
+            city_state = f"{city_state} {situs_zip}".strip()
+        if city_state:
+            property_address = f"{street}, {city_state}"
+
+    # Mailing address. `mailing_fields` builds a real mailing; otherwise
+    # echo_property_to_mailing (default True, back-compat) copies the property
+    # address. King sets it False — no bulk taxpayer mailing exists, so mailing
+    # stays NULL rather than a misleading property echo (Codex).
     mailing_fields = gis_config.get("mailing_fields", [])
     if mailing_fields:
         parts = []
@@ -333,8 +403,10 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
             if val and str(val).strip():
                 parts.append(str(val).strip())
         mailing_address = ", ".join(parts) if parts else None
+    elif gis_config.get("echo_property_to_mailing", True):
+        mailing_address = property_address
     else:
-        mailing_address = property_address  # Fallback to property address
+        mailing_address = None
 
     # Owner name (logged for enrichment_data, not in primary return)
     owner_field = gis_config.get("owner_field")
@@ -345,6 +417,11 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
         "property_address": property_address,
         "mailing_address": mailing_address,
         "parcel_id": attrs.get(parcel_field) or None,
+        "matched": True,
+        "vacant_no_situs": not street,
+        "situs_city": situs_city,
+        "situs_state": situs_state,
+        "situs_zip": situs_zip,
     }
 
     if property_address:
@@ -401,11 +478,19 @@ def batch_enrich_parcels_gis(
     if gis_config:
         results = _batch_query_county(parcel_ids, gis_config)
 
-    # Step 2: WA statewide fallback for parcels not found in county endpoint
-    missing = [pid for pid in parcel_ids if pid not in results and pid and len(pid.strip()) >= 6]
-    if missing:
-        statewide = _batch_query_wa_statewide(missing, county)
-        results.update(statewide)
+    # Step 2: WA statewide fallback ONLY for parcels the county endpoint did not
+    # MATCH at all. A parcel that matched but has no street (vacant/raw land) is
+    # already in `results` (matched=True, property_address=None) — it must NOT
+    # fall through to statewide, which could return a wrong situs (Codex High).
+    # `skip_statewide_fallback` disables the fallback for a county whose own layer
+    # is authoritative (King): a dead PIN won't match statewide either, so the
+    # fallback only risks false positives there.
+    skip_statewide = bool(gis_config and gis_config.get("skip_statewide_fallback"))
+    if not skip_statewide:
+        missing = [pid for pid in parcel_ids if pid not in results and pid and len(pid.strip()) >= 6]
+        if missing:
+            statewide = _batch_query_wa_statewide(missing, county)
+            results.update(statewide)
 
     return results
 
@@ -450,11 +535,19 @@ def _batch_query_county(
                     continue
 
                 parsed = _parse_gis_response({"features": [feature]}, gis_config)
-                if parsed.get("property_address"):
-                    parsed["parcel_id"] = pid
-                    results[pid] = parsed
+                # Keep EVERY matched parcel — including a vacant/raw-land parcel
+                # whose ADDR_FULL is null (property_address=None, matched=True) —
+                # so batch_enrich_parcels_gis does NOT send it to the statewide
+                # fallback and pick up a wrong situs address (Codex High). The
+                # consumer surfaces the situs city/zip for these from enrichment_data.
+                parsed["parcel_id"] = pid
+                results[pid] = parsed
 
-            _logger.info("County GIS batch: %d/%d parcels enriched", len([p for p in clean if p in results]), len(clean))
+            _addr = len([p for p in clean if results.get(p, {}).get("property_address")])
+            _logger.info(
+                "County GIS batch: %d/%d matched, %d with street address",
+                len([p for p in clean if p in results]), len(clean), _addr,
+            )
 
         except Exception as exc:
             _logger.warning("County GIS batch error: %s", str(exc)[:80])

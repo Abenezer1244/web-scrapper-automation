@@ -44,7 +44,7 @@ pandas==2.2.3
 openpyxl==3.1.5
 
 # Storage (Cloudflare R2 / S3-compatible)
-boto3==1.43.29
+boto3==1.43.40
 
 # Email
 resend==2.7.0

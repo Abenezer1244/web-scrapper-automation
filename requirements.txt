@@ -1,6 +1,6 @@
 # API
-fastapi==0.137.2            # M3: bumped from 0.115.6 to pull a fixed starlette (CVE-2025-54121/62727, PYSEC-2026-161)
-uvicorn[standard]==0.49.0
+fastapi==0.139.0            # M3: bumped from 0.115.6 to pull a fixed starlette (CVE-2025-54121/62727, PYSEC-2026-161)
+uvicorn[standard]==0.50.2
 python-multipart==0.0.31    # M3 + 2026-06-15: CVE-2026-53538/53539/53540 (form-parse DoS/HPP)
 
 # Async DB

@@ -6398,10 +6398,24 @@
           "200": {
             "content": {
               "application/json": {
+                "example": {
+                  "status": "ready"
+                },
                 "schema": {}
               }
             },
-            "description": "Successful Response"
+            "description": "Database reachable; this instance can serve traffic."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "ref": "0d39ea7a3c47",
+                  "status": "degraded"
+                }
+              }
+            },
+            "description": "A required dependency is unreachable. The failing dependency is named only in the server logs, correlated by `ref`."
           }
         },
         "summary": "Ready",

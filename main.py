@@ -148,7 +148,32 @@ async def health() -> dict:
     return {"status": "ok", "service": "bridgeleads-api"}
 
 
-@app.get("/ready", tags=["system"])
+@app.get(
+    "/ready",
+    tags=["system"],
+    # 503 is a NORMAL outcome here, not an exception path, so it belongs in the
+    # published contract — schema/openapi.json generates the frontend types and
+    # is what a monitor would be built against. Codex review [P3].
+    responses={
+        200: {
+            "description": "Database reachable; this instance can serve traffic.",
+            "content": {
+                "application/json": {"example": {"status": "ready"}}
+            },
+        },
+        503: {
+            "description": (
+                "A required dependency is unreachable. The failing dependency is "
+                "named only in the server logs, correlated by `ref`."
+            ),
+            "content": {
+                "application/json": {
+                    "example": {"status": "degraded", "ref": "0d39ea7a3c47"}
+                }
+            },
+        },
+    },
+)
 async def ready() -> JSONResponse:
     """503 when the database is unreachable, 200 otherwise.
 

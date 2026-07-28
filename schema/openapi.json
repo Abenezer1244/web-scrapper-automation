@@ -6390,6 +6390,26 @@
         ]
       }
     },
+    "/ready": {
+      "get": {
+        "description": "503 when the database is unreachable, 200 otherwise.\n\nThe body stays coarse on purpose. This endpoint is unauthenticated, and\nnaming which dependency is down hands an attacker a free map of internal\ntopology for no operational gain — the ref ties the response to the full\ntraceback in the logs, which is where responders actually look.",
+        "operationId": "ready_ready_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Ready",
+        "tags": [
+          "system"
+        ]
+      }
+    },
     "/scrapers": {
       "get": {
         "operationId": "list_scrapers_scrapers_get",

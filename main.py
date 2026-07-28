@@ -18,6 +18,7 @@ from src.api import (
     webhooks_router,
 )
 from src.api.middleware import SecurityHeadersMiddleware
+from src.api.readiness import database_ready
 from src.config import settings
 
 
@@ -132,8 +133,33 @@ from src.utils.logger import install_global_redaction
 install_global_redaction()
 
 
-# ─── Health check ─────────────────────────────────────────────────────────────
+# ─── Health / readiness ───────────────────────────────────────────────────────
+# Two endpoints answering two different questions — see src/api/readiness.py.
+#
+#   /health  LIVENESS  — the process is up. Touches nothing downstream, so a
+#                        platform health gate wired here is never held down by a
+#                        dependency outage and you can still deploy mid-incident.
+#   /ready   READINESS — a real database round-trip. This is the one to alert on;
+#                        /health returning 200 during a total DB outage is what
+#                        let the 2026-07-28 Supabase incident go unnoticed.
 
 @app.get("/health", tags=["system"])
 async def health() -> dict:
     return {"status": "ok", "service": "bridgeleads-api"}
+
+
+@app.get("/ready", tags=["system"])
+async def ready() -> JSONResponse:
+    """503 when the database is unreachable, 200 otherwise.
+
+    The body stays coarse on purpose. This endpoint is unauthenticated, and
+    naming which dependency is down hands an attacker a free map of internal
+    topology for no operational gain — the ref ties the response to the full
+    traceback in the logs, which is where responders actually look.
+    """
+    is_ready, ref = await database_ready()
+    if is_ready:
+        return JSONResponse(status_code=200, content={"status": "ready"})
+    return JSONResponse(
+        status_code=503, content={"status": "degraded", "ref": ref}
+    )

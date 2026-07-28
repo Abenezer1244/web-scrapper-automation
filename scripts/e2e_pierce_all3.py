@@ -4,7 +4,6 @@ Creates configs if missing, clicks View > then Run, monitors each job.
 """
 
 import asyncio
-import re
 import time
 import sys
 import os
@@ -63,8 +62,6 @@ async def run_job_and_wait(token: str, config_id: str, label: str) -> dict:
             )
             d = resp.json()
             status = d["status"]
-            records = d["record_count"]
-            elapsed = d.get("elapsed_time", "?")
 
             if status in ("done", "failed"):
                 return d

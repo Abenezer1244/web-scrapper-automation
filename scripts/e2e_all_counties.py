@@ -10,7 +10,6 @@ Usage:
     python scripts/e2e_all_counties.py
 """
 
-import json
 import sys
 import time
 import uuid

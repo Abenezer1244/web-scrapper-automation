@@ -19,6 +19,95 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-07-28 — Prod outage: Supabase project vanished, and `/health` reported 200 through all of it
+**Context:** User reported "trying to login, not working — Something went wrong." Investigated read-only
+first (no branch), then worked in two isolated worktrees off `origin/main`
+(`bridgeleads-worktrees/health-readiness`, `.../pypdf-cve`) because other terminals were active.
+Codex consulted before writing code and reviewed both diffs.
+
+**Built / Shipped:**
+- **`/ready` readiness probe — PR #155, squash `4f1e1aa`** (`src/api/readiness.py` new, `main.py`,
+  `tests/test_readiness.py` new, `schema/openapi.json`). No migration. `/health` stays LIVENESS
+  (static, dependency-free); `/ready` does a real `SELECT 1` → 200, or 503
+  `{"status":"degraded","ref":...}`. Result cached 10s behind an `asyncio.Lock` (single-flight).
+  Live-verified in prod after deploy: `/ready` → 200 `{"status":"ready"}`, `/health` unchanged,
+  control route still 404 (so the 200 is the real route, not a catch-all).
+- **pypdf 6.13.3 → 6.14.2 — PR #156, squash `707940e`** (`requirements.txt`, one line). Four CVEs:
+  CVE-2026-59935/59936 (infinite loop on unterminated inline image, *during text extraction*),
+  59937 (malformed xref long runtime), 59938 (image memory-DoS).
+- **Dead-code sweep — `0011c27`**, committed separately per the CLAUDE.md Step 0 rule. 19 findings
+  (15 unused imports, 4 unused locals) — **all in `scripts/`; `main.py` and `src/` were already clean.**
+
+**Tried / Decided:**
+- **Root cause was NOT a login bug.** `POST /auth/login` → 500 `{"detail":"Internal error","ref":...}`;
+  `railway logs --service api` showed
+  `asyncpg...InternalServerError: (ENOTFOUND) tenant/user bridgeleads_app.xqbrqvodxbursjjjlmjn not found`.
+  Supavisor was rejecting BOTH roles (`bridgeleads_app` api, `bridgeleads_system` worker) and
+  `<ref>.supabase.co` was NXDOMAIN → the Supabase **project** was paused/deleted. Dashboard-only fix,
+  no deploy; user restored it (confirmed by `/auth/login` returning 401 instead of 500).
+- **Split liveness from readiness rather than making `/health` check the DB.** A DB-dependent health
+  gate can block deploying the fix during the very outage you need to fix.
+- **Deliberately did NOT set Railway `healthcheckPath` to `/ready`** (Codex agreed): Railway has one
+  deploy health gate, not k8s-style separate probes.
+- **Cache + single-flight are load-bearing, not an optimisation.** The async engine is `NullPool`, so
+  every probe is a fresh TCP+TLS+auth connection to Supabase (hard conn cap) — an uncached
+  unauthenticated `/ready` is a connection-exhaustion amplifier, and a naive TTL still stampedes on expiry.
+- **Redis excluded from readiness** (Codex corrected the original design, which included it):
+  `rate_limit()` fails open to a per-process limiter (`rate_limit.py:154`), so Redis down ≠ login down.
+  Gating on it would be a false red on the main customer path, and false reds train people to ignore alerts.
+- **503 body kept coarse** (Codex P3): endpoint is unauthenticated, so naming the failing dependency is a
+  free internal-topology map. The `ref` correlates to the logged traceback.
+- **Overrode Codex once, on evidence:** it wanted `/ready` wired into the in-repo Prometheus stack. That
+  stack **cannot scrape this API at all** — there is no `/metrics` endpoint and `prometheus_client` is not
+  in `requirements.txt`, so `monitoring/prometheus.yml`'s `fastapi` job is aspirational config. Its
+  conclusion (nothing polls `/ready`) was right; its mechanism was not. Flagged instead of building theater.
+
+**Failed / Blocked:**
+- **Could not get a clean local full-suite run for the pypdf branch.** Two runs came back with 137 and 54
+  failures — all connection-shaped, `pypdf` in zero of them, wall clock 11min then 61min vs a normal 4m34s.
+  Root cause: **I started portable Postgres as a child of a background job; when the harness reaped that
+  job, Postgres died with it** (`pg.log`: `terminating any other active server processes`, timestamps
+  matching the reaps). Self-inflicted, not machine instability and not a regression. Stopped chasing it
+  after the second run — GitHub CI ran the identical suite on the identical commits in a clean env and
+  passed both. The `/ready` local full suite (1627 passed) *was* valid; Postgres was alive for it.
+- First prod verification of `/ready` printed `C:/Program Files/Git/ready -> 200/n` — Git Bash
+  path-converted the leading `/ready` in the curl `-w` format string. That reading was meaningless and
+  was redone properly.
+
+**Caught & fixed (Codex review, before merge):**
+- **[P1] `schema/openapi.json` was stale.** Adding the route changed the FastAPI schema but the contract
+  was not regenerated; CI runs `export_openapi.py --check`, so the drift gate would have failed the PR and
+  the generated frontend types would not have included the route. Fixed in `cec8c30`.
+- **[P3] the 503 shape was absent from the contract** — 503 is a normal readiness outcome, not an
+  exception path, and the contract advertised only 200. Fixed in `de1aec0`.
+
+**Pending / Handoff:**
+- 👤 **Nothing polls `/ready`.** This makes an outage *observable*, not *alerting*. Needs an external
+  uptime monitor on `https://api.bridgeleads.io/ready` alerting on 503 for 1–2 min. Requires an account →
+  ops action. Until it exists, the next outage surfaces exactly the way this one did: a human hitting a
+  login form.
+- **`start.sh:61` gates API boot on migrations** (`python scripts/migrate.py || exit 1` before uvicorn), so
+  during a DB outage a new deploy cannot boot at all — precisely when you would want to ship. Worth deciding
+  whether migrations belong in a release/manual step. Deliberately not folded into #155.
+
+**Facts learned:**
+- `(ENOTFOUND) tenant/user <role>.<project_ref> not found` from Supavisor means the **Supabase project is
+  paused/deleted**, not a credential problem. Confirm in seconds: `nslookup <ref>.supabase.co` → NXDOMAIN
+  while `aws-0-us-west-2.pooler.supabase.com` still resolves.
+- `/health` returning 200 proves only that the process is up. It proved nothing about the product working.
+- The frontend cannot distinguish a 500 from a bad password: `login/page.tsx:136` special-cases only 401,
+  so every other status falls through to "Something went wrong. Please try again."
+- pypdf's DoS CVEs are **reachable here**: `src/scrapers/sources/nts_pdf.py:88` calls `extract_text()` on
+  externally-fetched county PDFs, which is the exact trigger path. The 25 MB download cap and `max_pages`
+  islice bound memory and page count but **cannot interrupt an infinite loop inside a single page**.
+- `import src.db.session as _db_session` (module, not `from ... import async_engine`) — `tests/conftest.py`
+  swaps the engine at session setup, so binding the object at import time probes the wrong database.
+- Git Bash mangles a leading `/path` inside a curl `-w` format string into `C:/Program Files/Git/...`.
+  Use `export MSYS_NO_PATHCONV=1` when probing endpoints.
+- Do not start the portable test Postgres from inside a background job — it dies when the job is reaped.
+
+---
+
 ## 2026-07-04 — Auction Leads county #4: Clark County (The Columbian)
 **Context:** Expand `trustee_sale` ("Auction Leads") beyond the original 3 counties (Pierce/Snohomish/King). Own worktree `bridgeleads-worktrees/trustee-sale-expansion` off `origin/main` (branch `feat/trustee-sale-county-expansion`). Codex consulted before code + reviewed the diff.
 

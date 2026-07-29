@@ -8,8 +8,8 @@ os.environ.setdefault("PLAYWRIGHT_HEADLESS", "true")
 
 
 async def main() -> int:
-    from src.scrapers.whatcom_wa import WhatcomWAScraper
     from src.scrapers.enrichment.county_gis import batch_enrich_parcels_gis
+    from src.scrapers.whatcom_wa import WhatcomWAScraper
 
     date_from = "03/01/2026"
     date_to = "04/01/2026"

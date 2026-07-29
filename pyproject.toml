@@ -33,6 +33,12 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S", "N", "E402"]   # Relax security + naming; E402 = path/env setup before imports
 "alembic/*" = ["E501"]   # Long lines acceptable in migrations
+# I001: applied migrations are append-only historical records. Re-sorting imports in
+# a revision that already ran in production is pure churn — it buys nothing, muddies
+# `git blame` on the schema history, and widens the merge-conflict surface against
+# concurrent branches. New migrations should still be written import-clean by hand.
+# NOTE: scoped to versions/ only — alembic/env.py is LIVE config and stays linted.
+"alembic/versions/*" = ["I001"]
 # S608: these two build dynamic SQL by interpolating only generated ":param"
 # PLACEHOLDER strings (values are always bound via params dicts — verified); the
 # heuristic can't see the binding. Scoped per-file so the rule stays active elsewhere.

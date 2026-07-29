@@ -24,7 +24,6 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
-
 from _creds import admin_creds
 
 API = "https://api.bridgeleads.io"

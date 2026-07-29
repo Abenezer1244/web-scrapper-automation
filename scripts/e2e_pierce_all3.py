@@ -4,9 +4,9 @@ Creates configs if missing, clicks View > then Run, monitors each job.
 """
 
 import asyncio
-import time
-import sys
 import os
+import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -70,8 +70,8 @@ async def run_job_and_wait(token: str, config_id: str, label: str) -> dict:
 
 
 async def main():
-    from playwright.async_api import async_playwright
     import httpx
+    from playwright.async_api import async_playwright
 
     # Get API token
     async with httpx.AsyncClient() as client:

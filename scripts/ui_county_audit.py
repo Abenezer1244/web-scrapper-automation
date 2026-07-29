@@ -28,9 +28,8 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
-from playwright.async_api import async_playwright
-
 from _creds import admin_creds
+from playwright.async_api import async_playwright
 
 WEB = "https://bridgeleads.io"
 API = "https://api.bridgeleads.io"

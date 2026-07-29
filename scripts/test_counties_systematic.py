@@ -16,7 +16,6 @@ import time
 from datetime import datetime
 
 import requests
-
 from _creds import admin_creds
 
 API = "https://api.bridgeleads.io"

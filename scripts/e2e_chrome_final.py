@@ -5,9 +5,8 @@ import time
 import uuid
 
 import requests as req
-from playwright.async_api import async_playwright
-
 from _creds import test_password
+from playwright.async_api import async_playwright
 
 API = "https://api.bridgeleads.io"
 

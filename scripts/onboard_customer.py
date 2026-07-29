@@ -14,8 +14,8 @@ import argparse
 import json
 import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 
 
 def _post(url: str, payload: dict, token: str | None = None) -> dict:

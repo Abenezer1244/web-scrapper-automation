@@ -13,7 +13,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import Page, async_playwright
 
 FRONTEND = "https://app.bridgeleads.io"
 EMAIL = os.environ.get("BL_EMAIL", "admin@bridgeleads.io")

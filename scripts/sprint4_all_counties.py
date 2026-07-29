@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 from dotenv import load_dotenv
+
 load_dotenv(".env")
 
 import requests
@@ -249,7 +250,8 @@ def main() -> int:
 
     import csv
     import io
-    from src.scrapers.enrichment.skip_trace import pick_best_phone, pick_best_email
+
+    from src.scrapers.enrichment.skip_trace import pick_best_email, pick_best_phone
 
     # One queue list fetch then lookup per queue_id
     r = requests.get(

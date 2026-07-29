@@ -5,9 +5,8 @@ import re
 import time
 
 import requests as req
-from playwright.async_api import async_playwright
-
 from _creds import admin_creds
+from playwright.async_api import async_playwright
 
 API = "https://api.bridgeleads.io"
 FRONTEND = "https://bridgeleads.io"

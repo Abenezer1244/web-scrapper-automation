@@ -14,11 +14,11 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
-from playwright.async_api import async_playwright, Page, TimeoutError as PWTimeout
-
+from playwright.async_api import Page, async_playwright
+from playwright.async_api import TimeoutError as PWTimeout
 
 FRONTEND = "https://app.bridgeleads.io"
 EMAIL = os.environ.get("BL_EMAIL", "admin@bridgeleads.io")

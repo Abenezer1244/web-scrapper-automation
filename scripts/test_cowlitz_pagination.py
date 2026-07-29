@@ -19,6 +19,7 @@ os.environ.setdefault("REDIS_URL", "redis://localhost:6379")
 
 # Stub the security middleware to skip pulling the FastAPI/DB stack.
 import types as _types
+
 _stub = _types.ModuleType("src.api.middleware.security")
 _stub.add_scrape_domain = lambda *_a, **_k: None
 _stub.validate_scraping_target = lambda *_a, **_k: None

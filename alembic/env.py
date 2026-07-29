@@ -1,12 +1,12 @@
 import os
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
-
 from alembic import context
 
 # Pull DATABASE_URL_SYNC from environment (or .env)
 from dotenv import load_dotenv
+from sqlalchemy import engine_from_config, pool
+
 load_dotenv()
 
 config = context.config
@@ -28,6 +28,7 @@ if config.config_file_name is not None:
 
 # Import all models so Alembic autogenerate can detect them
 from src.db.models import Base  # noqa: E402
+
 target_metadata = Base.metadata
 
 

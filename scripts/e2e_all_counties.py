@@ -15,7 +15,6 @@ import time
 import uuid
 
 import requests
-
 from _creds import test_password
 
 API_URL = "https://api.bridgeleads.io"

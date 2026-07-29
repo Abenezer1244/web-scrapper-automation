@@ -23,8 +23,6 @@ from src.config import settings
 from src.scrapers.enrichment.skip_trace import (
     TracerfyError,
     _parse_full_address,
-    classify_grantor_as_entity,
-    split_name,
     submit_batch,
 )
 

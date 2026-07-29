@@ -3,7 +3,6 @@ and dump what comes back so we can see why parcel extraction returns 0.
 """
 import asyncio
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

@@ -65,7 +65,6 @@ async def main():
             await page.screenshot(path="e2e_02_new_scrape.png")
 
         # 6. Select King County
-        king_option = page.locator('text=King, [value="king"], option:has-text("King")')
         county_select = page.locator('select[name*="county"], [data-testid*="county"]')
 
         if await county_select.count() > 0:
@@ -74,7 +73,6 @@ async def main():
             await page.wait_for_timeout(1000)
 
         # 7. Select Pre-Foreclosure record type
-        preforeclosure = page.locator('text=Pre-Foreclosure, text=pre_foreclosure, [value="pre_foreclosure"]')
         record_select = page.locator('select[name*="record"], [data-testid*="record"]')
 
         if await record_select.count() > 0:

@@ -22,14 +22,6 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from src.config import settings
-from src.db.models import (
-    Job,
-    PendingSkipTraceRow,
-    Result,
-    ScraperConfig,
-    SkipTraceCache,
-    User,
-)
 from src.scrapers.enrichment.skip_trace import (
     address_cache_key,
     build_pending_row_payload,

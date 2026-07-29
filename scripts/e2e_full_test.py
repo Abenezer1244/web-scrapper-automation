@@ -2,7 +2,6 @@
 results, download CSV, and test all frontend pages with Chromium."""
 
 import asyncio
-import json
 import time
 import uuid
 

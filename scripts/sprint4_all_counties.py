@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 from dotenv import load_dotenv
+
 load_dotenv(".env")
 
 import requests
@@ -247,8 +248,10 @@ def main() -> int:
     print(f"{'County':<12} {'Uploaded':>9} {'Accepted':>9} {'Phone%':>8} {'Email%':>8}  Verdict")
     print(f"{'-'*12} {'-'*9} {'-'*9} {'-'*8} {'-'*8} {'-'*30}")
 
-    import csv, io
-    from src.scrapers.enrichment.skip_trace import pick_best_phone, pick_best_email
+    import csv
+    import io
+
+    from src.scrapers.enrichment.skip_trace import pick_best_email, pick_best_phone
 
     # One queue list fetch then lookup per queue_id
     r = requests.get(

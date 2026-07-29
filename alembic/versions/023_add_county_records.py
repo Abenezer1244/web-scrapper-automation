@@ -1,7 +1,7 @@
 """Add county_records and user_record_views tables."""
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 from sqlalchemy import inspect
 from sqlalchemy.dialects.postgresql import UUID
 

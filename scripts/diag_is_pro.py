@@ -7,9 +7,8 @@ import asyncio
 import json
 from pathlib import Path
 
-from playwright.async_api import async_playwright
-
 from _creds import admin_creds
+from playwright.async_api import async_playwright
 
 BASE = "https://app.bridgeleads.io"
 EMAIL, PASSWORD = admin_creds()

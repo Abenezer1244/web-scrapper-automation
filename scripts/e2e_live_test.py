@@ -1,9 +1,9 @@
 """Full E2E test on live BridgeLeads SaaS — visible Chrome browser."""
 import asyncio
 import uuid
-from playwright.async_api import async_playwright
 
 from _creds import admin_creds, test_password
+from playwright.async_api import async_playwright
 
 
 async def full_e2e():

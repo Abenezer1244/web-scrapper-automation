@@ -1,17 +1,16 @@
 """Full E2E test: every page on app.bridgeleads.io with timing and error capture."""
 
 import asyncio
+import os
 import re
+import sys
 import time
 
-import sys
-import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("PLAYWRIGHT_HEADLESS", "false")
 
-from playwright.async_api import async_playwright
-
 from _creds import fixture_creds
+from playwright.async_api import async_playwright
 
 
 async def main():

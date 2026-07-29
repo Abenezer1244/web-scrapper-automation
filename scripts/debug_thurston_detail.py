@@ -11,6 +11,7 @@ os.environ.setdefault("PLAYWRIGHT_HEADLESS", "true")
 
 async def main() -> int:
     import requests
+
     from src.scrapers.templates.eagleweb import EagleWebScraper
 
     async with EagleWebScraper(

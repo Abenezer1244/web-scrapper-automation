@@ -64,7 +64,7 @@ async def main() -> int:
                 print(f"  {snippet[:280]}", flush=True)
 
         # Also fetch via browser page.goto (bypasses cookie issue) to compare
-        print(f"\n--- Fetching same URL via Playwright page.goto ---", flush=True)
+        print("\n--- Fetching same URL via Playwright page.goto ---", flush=True)
         await scraper.page.goto(url, wait_until="domcontentloaded", timeout=15_000)
         pw_html = await scraper.page.content()
         print(f"Playwright HTML length: {len(pw_html)}", flush=True)

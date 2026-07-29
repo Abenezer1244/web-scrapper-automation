@@ -109,7 +109,7 @@ async def main() -> int:
             try:
                 await page.locator("span:has-text('Legal Description'), a:has-text('Legal Description'), li:has-text('Legal Description')").first.click(timeout=5_000)
                 await page.wait_for_timeout(1000)
-                print(f"    Clicked Legal Description tab", flush=True)
+                print("    Clicked Legal Description tab", flush=True)
             except Exception as exc:
                 print(f"    Click failed: {exc}", flush=True)
 
@@ -134,9 +134,9 @@ async def main() -> int:
                 all_parcel_text: [...new Set(out.all_parcel_text)].slice(0, 10),
             };
         }""")
-        print(f"\n[6] Parcel search results:", flush=True)
+        print("\n[6] Parcel search results:", flush=True)
         print(f"    exact 'Parcel Id:' cells: {parcel_search['parcel_id_cells']}", flush=True)
-        print(f"    any 'Parcel...' text:", flush=True)
+        print("    any 'Parcel...' text:", flush=True)
         for t in parcel_search["all_parcel_text"]:
             print(f"      {t!r}", flush=True)
 

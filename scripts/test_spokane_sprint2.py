@@ -28,7 +28,7 @@ async def main() -> int:
         records = await scraper.scrape(date_from, date_to)
 
     with_pid = sum(1 for r in records if r.parcel_id)
-    print(f"\n=== RESULTS ===", flush=True)
+    print("\n=== RESULTS ===", flush=True)
     print(f"Total records: {len(records)}", flush=True)
     if records:
         print(f"With parcel_id: {with_pid}/{len(records)} ({100*with_pid/len(records):.0f}%)", flush=True)

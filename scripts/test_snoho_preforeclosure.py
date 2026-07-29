@@ -10,6 +10,7 @@ Run in prod env for parity with the worker:
 """
 import asyncio
 import sys
+from datetime import UTC
 
 sys.path.insert(0, ".")  # railway-run executes from repo root; make `src` importable
 
@@ -24,9 +25,9 @@ async def _main() -> int:
 
     print(f"\n=== Snohomish pre_foreclosure: {len(records)} lead(s) ===")
     future = 0
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     for i, r in enumerate(records, 1):
         ed = r.enrichment_data or {}
         ad = ed.get("auction_date")

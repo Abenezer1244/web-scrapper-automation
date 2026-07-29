@@ -37,7 +37,7 @@ async def full_e2e():
     print(f"  OK: {me['email']} (plan: {me['plan']})")
 
     # 2. Create scraper config
-    print(f"\n[2/8] Creating Pierce County scraper config...")
+    print("\n[2/8] Creating Pierce County scraper config...")
     r = api(
         "POST",
         "/scrapers",
@@ -71,13 +71,13 @@ async def full_e2e():
     print(f"  OK: config_id={config_id}")
 
     # 3. List scrapers
-    print(f"\n[3/8] Listing scrapers...")
+    print("\n[3/8] Listing scrapers...")
     r = api("GET", "/scrapers", token=token)
     scrapers = r.json()
     print(f"  OK: {len(scrapers)} scraper(s)")
 
     # 4. Trigger job
-    print(f"\n[4/8] Triggering scrape job...")
+    print("\n[4/8] Triggering scrape job...")
     r = api(
         "POST",
         "/jobs",
@@ -89,7 +89,7 @@ async def full_e2e():
     print(f"  OK: job_id={job_id}")
 
     # 5. Poll job
-    print(f"\n[5/8] Polling job progress...")
+    print("\n[5/8] Polling job progress...")
     start = time.time()
     status = "pending"
     rc = 0
@@ -110,7 +110,7 @@ async def full_e2e():
     print(f"  SCRAPE PASSED: {rc} records")
 
     # 6. Get results
-    print(f"\n[6/8] Fetching results...")
+    print("\n[6/8] Fetching results...")
     r = api("GET", f"/jobs/{job_id}/results?page=1&page_size=5", token=token)
     assert r.status_code == 200, f"Results failed: {r.status_code}"
     data = r.json()
@@ -127,7 +127,7 @@ async def full_e2e():
         print(f"         Mail: {mail}")
 
     # 7. Download CSV
-    print(f"\n[7/8] Testing CSV download...")
+    print("\n[7/8] Testing CSV download...")
     download_ok = False
     r = api("GET", f"/jobs/{job_id}/export-url", token=token)
     if r.status_code == 200:
@@ -153,14 +153,14 @@ async def full_e2e():
             if len(lines) > 1:
                 print(f"  Row 1:  {lines[1][:100]}")
             download_ok = True
-            print(f"  DOWNLOAD PASSED")
+            print("  DOWNLOAD PASSED")
         else:
             print(f"  DOWNLOAD FAILED: {dl.text[:200]}")
     else:
         print(f"  Export URL failed: {r.status_code} {r.text[:100]}")
 
     # 8. Frontend pages
-    print(f"\n[8/8] Testing frontend pages with Chromium...")
+    print("\n[8/8] Testing frontend pages with Chromium...")
     pages_ok = 0
     pages_fail = 0
 
@@ -213,8 +213,8 @@ async def full_e2e():
 
     # Summary
     print(f"\n{'=' * 70}")
-    print(f"E2E TEST COMPLETE")
-    print(f"  Register:  PASS")
+    print("E2E TEST COMPLETE")
+    print("  Register:  PASS")
     print(f"  Config:    PASS (config_id={config_id[:8]})")
     print(f"  Scrape:    PASS ({rc} records)")
     print(f"  Results:   PASS ({enriched} enriched)")

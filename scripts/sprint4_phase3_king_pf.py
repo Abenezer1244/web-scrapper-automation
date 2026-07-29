@@ -105,7 +105,7 @@ def main() -> int:
             "mailing_zip": "",
         })
 
-    print(f"\nEnriched payload:")
+    print("\nEnriched payload:")
     for i, p in enumerate(payload_rows):
         print(f"  {i+1}. {p['address'][:35]!r} city={p['city']!r} zip={p['zip']!r} last={p['last_name']!r}")
 
@@ -157,7 +157,7 @@ def main() -> int:
     start = time.time()
     timeout = 120
     completed = False
-    print(f"\nPolling...")
+    print("\nPolling...")
     while time.time() - start < timeout:
         time.sleep(10)
         elapsed = int(time.time() - start)

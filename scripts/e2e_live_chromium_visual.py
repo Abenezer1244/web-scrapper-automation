@@ -25,7 +25,7 @@ async def live_scrape():
     r = req.post(f"{API}/auth/register", json={"email": email, "password": password}, timeout=10)
     assert r.status_code == 201, f"Register failed: {r.text[:100]}"
     api_token = r.json()["access_token"]
-    print(f"  API token obtained")
+    print("  API token obtained")
 
     # Pre-create scraper config via API
     r = req.post(f"{API}/scrapers", headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}, json={
@@ -50,7 +50,7 @@ async def live_scrape():
         page = await ctx.new_page()
 
         # 1. Login via the UI
-        print(f"\n[1/8] Logging in via Chrome...")
+        print("\n[1/8] Logging in via Chrome...")
         await page.goto("https://bridgeleads.io/login")
         await page.wait_for_load_state("networkidle")
         await page.wait_for_timeout(1500)
@@ -64,7 +64,7 @@ async def live_scrape():
         print(f"  Logged in. URL: {page.url}")
 
         # 2. Dashboard
-        print(f"[2/8] Dashboard...")
+        print("[2/8] Dashboard...")
         await page.goto("https://bridgeleads.io/dashboard")
         await page.wait_for_timeout(3000)
         await page.screenshot(path="live_03_dashboard_loaded.png")
@@ -77,7 +77,7 @@ async def live_scrape():
         await page.screenshot(path="live_04_scraping_start.png")
 
         # 4. Poll and watch
-        print(f"[4/8] Monitoring progress...")
+        print("[4/8] Monitoring progress...")
         start = time.time()
         last_log = ""
         screenshot_num = 5
@@ -116,14 +116,14 @@ async def live_scrape():
                 await page.screenshot(path=f"live_{screenshot_num:02d}_progress.png")
 
         # 5. View scrapers
-        print(f"[5/8] Checking scrapers page...")
+        print("[5/8] Checking scrapers page...")
         await page.goto("https://bridgeleads.io/scrapers")
         await page.wait_for_timeout(2500)
         await page.screenshot(path="live_20_scrapers.png")
         print("  Scrapers loaded")
 
         # 6. View results list
-        print(f"[6/8] Checking results list...")
+        print("[6/8] Checking results list...")
         await page.goto("https://bridgeleads.io/results")
         await page.wait_for_timeout(2500)
         await page.screenshot(path="live_21_results_list.png")
@@ -140,7 +140,7 @@ async def live_scrape():
         print("  Results detail loaded")
 
         # 7. Download
-        print(f"[7/8] Downloading CSV...")
+        print("[7/8] Downloading CSV...")
         dl_btn = page.locator("button:has-text('Download'), a:has-text('Download')")
         if await dl_btn.count() > 0:
             try:
@@ -152,7 +152,7 @@ async def live_scrape():
                 print(f"  Downloaded: {fname}")
 
                 # Show first few lines
-                with open(f"scripts/live_download_{fname}", "r", errors="replace") as f:
+                with open(f"scripts/live_download_{fname}", errors="replace") as f:
                     lines = f.readlines()
                 print(f"  Rows: {len(lines) - 1}")
                 print(f"  Header: {lines[0].strip()[:80]}")
@@ -166,7 +166,7 @@ async def live_scrape():
         await page.screenshot(path="live_23_after_download.png")
 
         # 8. Settings + deliver
-        print(f"[8/8] Checking remaining pages...")
+        print("[8/8] Checking remaining pages...")
         for name, path in [("deliver", "/deliver"), ("settings", "/settings")]:
             await page.goto(f"https://bridgeleads.io{path}")
             await page.wait_for_timeout(2000)
@@ -177,7 +177,7 @@ async def live_scrape():
         print("LIVE CHROME E2E TEST COMPLETE")
         print(f"  Email:    {email}")
         print(f"  Job ID:   {job_id}")
-        print(f"  Screenshots: live_*.png")
+        print("  Screenshots: live_*.png")
         print("=" * 60)
 
         await page.wait_for_timeout(3000)

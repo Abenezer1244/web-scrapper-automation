@@ -24,7 +24,7 @@ async def run():
     assert r.status_code == 200, f"Login failed: {r.status_code} {r.text[:200]}"
     token = r.json()["access_token"]
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    print(f"  Token obtained")
+    print("  Token obtained")
 
     # 2. Find existing Chelan probate config or create one
     print("[2] Looking for existing Chelan probate config...")
@@ -87,7 +87,7 @@ async def run():
         print(f"  Logged in. URL: {page.url}")
 
         # Watch live scrape
-        print(f"[5] Watching live scrape...")
+        print("[5] Watching live scrape...")
         await page.goto(f"{FRONTEND}/live/{job_id}")
         await page.wait_for_timeout(3000)
         await page.screenshot(path="scripts/e2e_screenshots/chelan_02_scraping.png")
@@ -124,10 +124,10 @@ async def run():
                 shot += 1
                 await page.screenshot(path=f"scripts/e2e_screenshots/chelan_{shot:02d}_progress.png")
         else:
-            print(f"  TIMEOUT after 600s")
+            print("  TIMEOUT after 600s")
 
         # View results
-        print(f"[6] Viewing results...")
+        print("[6] Viewing results...")
         await page.goto(f"{FRONTEND}/results/{job_id}")
         await page.wait_for_timeout(3000)
         await page.screenshot(path=f"scripts/e2e_screenshots/chelan_{shot+1:02d}_results.png")
@@ -141,7 +141,7 @@ async def run():
             print("  Expanded row detail")
 
         # Download
-        print(f"[7] Downloading CSV...")
+        print("[7] Downloading CSV...")
         dl_btn = page.locator("button:has-text('Download'), a:has-text('Download')")
         if await dl_btn.count() > 0:
             try:
@@ -151,7 +151,7 @@ async def run():
                 fname = download.suggested_filename
                 await download.save_as(f"scripts/{fname}")
                 print(f"  Downloaded: {fname}")
-                with open(f"scripts/{fname}", "r", errors="replace") as f:
+                with open(f"scripts/{fname}", errors="replace") as f:
                     lines = f.readlines()
                 print(f"  Rows: {len(lines) - 1}")
                 if lines:
@@ -166,7 +166,7 @@ async def run():
         print("\n" + "=" * 60)
         print("CHELAN PROBATE E2E COMPLETE")
         print(f"  Job: {job_id}")
-        print(f"  Screenshots: scripts/e2e_screenshots/chelan_*.png")
+        print("  Screenshots: scripts/e2e_screenshots/chelan_*.png")
         print("=" * 60)
 
         await page.wait_for_timeout(5000)

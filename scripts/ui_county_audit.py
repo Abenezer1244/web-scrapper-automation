@@ -69,14 +69,17 @@ def api_token() -> str:
 
 def _auth_get(url, **kw):
     """GET with the polling token; transparently re-login once on 401."""
+    # Default the timeout here — this helper polls in a loop, and a hung request
+    # with no timeout stalls the audit forever. An explicit timeout= still wins.
+    kw.setdefault("timeout", 30)
     if _TOKEN["v"] is None:
         _TOKEN["v"] = api_token()
     headers = {"Authorization": f"Bearer {_TOKEN['v']}"}
-    r = requests.get(url, headers=headers, **kw)
+    r = requests.get(url, headers=headers, **kw)       # noqa: S113 — timeout set above
     if r.status_code == 401:
         _TOKEN["v"] = api_token()
         headers = {"Authorization": f"Bearer {_TOKEN['v']}"}
-        r = requests.get(url, headers=headers, **kw)
+        r = requests.get(url, headers=headers, **kw)   # noqa: S113 — timeout set above
     return r
 
 

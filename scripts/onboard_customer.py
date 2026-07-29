@@ -18,6 +18,21 @@ import urllib.error
 import urllib.request
 
 
+_TIMEOUT = 30
+
+
+def _urlopen(req: urllib.request.Request):
+    """urlopen with a timeout and an http(s)-only guard.
+
+    --api-url is operator-supplied, so a typo'd or pasted `file:`/`ftp:` URL would
+    otherwise be opened as-is. Pinning the scheme keeps this to the one thing it is
+    meant to do, and the timeout stops a hung API from hanging onboarding forever.
+    """
+    if req.type not in ("http", "https"):
+        raise SystemExit(f"Refusing non-HTTP(S) URL: {req.full_url}")
+    return urllib.request.urlopen(req, timeout=_TIMEOUT)  # noqa: S310 — scheme checked above
+
+
 def _post(url: str, payload: dict, token: str | None = None) -> dict:
     data = json.dumps(payload).encode()
     headers = {"Content-Type": "application/json"}
@@ -25,7 +40,7 @@ def _post(url: str, payload: dict, token: str | None = None) -> dict:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req) as resp:
+        with _urlopen(req) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode()
@@ -35,7 +50,7 @@ def _post(url: str, payload: dict, token: str | None = None) -> dict:
 
 def _get(url: str, token: str) -> dict:
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    with urllib.request.urlopen(req) as resp:
+    with _urlopen(req) as resp:
         return json.loads(resp.read())
 
 
@@ -56,7 +71,7 @@ def main():
     delivery_email = args.delivery_email or args.email
 
     print(f"\n{'='*60}")
-    print(f"  BridgeLeads Customer Onboarding")
+    print("  BridgeLeads Customer Onboarding")
     print(f"{'='*60}")
     print(f"  API:    {base}")
     print(f"  Email:  {args.email}")
@@ -80,12 +95,12 @@ def main():
         "password": args.password,
     })
     token = login["access_token"]
-    print(f"   ✓ Authenticated (token acquired)")
+    print("   ✓ Authenticated (token acquired)")
 
     # ── Step 3: Verify connector exists ───────────────────────────────────────
     print(f"3. Verifying connector: {args.county}/{args.state}/{args.record_type}...")
     req = urllib.request.Request(f"{base}/scrapers/connectors")
-    with urllib.request.urlopen(req) as resp:
+    with _urlopen(req) as resp:
         connectors = json.loads(resp.read())
 
     match = next(
@@ -97,7 +112,7 @@ def main():
     )
     if not match:
         print(f"   ERROR: No active connector for {args.county}/{args.state}/{args.record_type}")
-        print(f"   Available connectors:")
+        print("   Available connectors:")
         for c in connectors:
             print(f"     - {c['county']}/{c['state']}: {c['record_types']}")
         sys.exit(1)
@@ -126,7 +141,7 @@ def main():
         "deliver": deliver_config,
     }, token=token)
     print(f"   ✓ Scraper config created: {config['name']} (id: {config['id'][:8]}...)")
-    print(f"   ✓ Daily schedule set: 6:00 AM UTC")
+    print("   ✓ Daily schedule set: 6:00 AM UTC")
     print(f"   ✓ Delivery email: {delivery_email}")
 
     # ── Step 5: Optional manual run ───────────────────────────────────────────
@@ -160,15 +175,15 @@ def main():
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
-    print(f"  Onboarding complete!")
+    print("  Onboarding complete!")
     print(f"{'='*60}")
     print(f"  Account:   {args.email}")
     print(f"  Plan:      {args.plan}")
     print(f"  Scraper:   {config['name']}")
-    print(f"  Schedule:  Daily at 6:00 AM UTC")
+    print("  Schedule:  Daily at 6:00 AM UTC")
     print(f"  Delivery:  {delivery_email}")
     if args.plan in ("pro", "business", "agency"):
-        print(f"\n  Next: Collect payment via Stripe checkout")
+        print("\n  Next: Collect payment via Stripe checkout")
         print(f"  POST {base}/billing/checkout  {{price_id: STRIPE_PRICE_{args.plan.upper()}}}")
     print(f"{'='*60}\n")
 

@@ -89,7 +89,7 @@ def find_price_by_metadata(product_id: str, tier: str) -> stripe.Price | None:
 def write_env_vars(values: dict) -> None:
     """Upsert keys into .env without printing any secrets."""
     env_path = ".env"
-    with open(env_path, "r", encoding="utf-8") as f:
+    with open(env_path, encoding="utf-8") as f:
         content = f.read()
     for key, value in values.items():
         pattern = re.compile(rf"^{re.escape(key)}=.*$", re.MULTILINE)
@@ -113,7 +113,7 @@ def main() -> int:
     if product:
         print(f"[product] EXISTING: {product.id} name={product.name}")
     else:
-        print(f"[product] creating new...")
+        print("[product] creating new...")
         product = stripe.Product.create(
             name=PRODUCT_NAME,
             description="Per-lookup phone + email append via Tracerfy. Billed monthly on top of base subscription.",
@@ -130,7 +130,7 @@ def main() -> int:
     if meter:
         print(f"[meter] EXISTING: {meter.id} event={meter.event_name}")
     else:
-        print(f"[meter] creating new...")
+        print("[meter] creating new...")
         meter = stripe.billing.Meter.create(
             display_name=METER_DISPLAY_NAME,
             event_name=METER_EVENT_NAME,

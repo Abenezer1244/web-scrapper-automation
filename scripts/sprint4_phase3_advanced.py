@@ -145,7 +145,7 @@ def main() -> int:
     # The ingest code writes by address_hash upsert, so rows from the
     # normal-trace run earlier may be updated rather than duplicated.
     # Count cache rows from the last 5 minutes.
-    print(f"\n=== Measuring advanced hit rate ===")
+    print("\n=== Measuring advanced hit rate ===")
     with engine.connect() as conn:
         cache_rows = conn.execute(text("""
             SELECT phone, phone_type, email
@@ -165,8 +165,8 @@ def main() -> int:
             print(f"  Phone: {phones}/{n} ({phone_pct:.0f}%)")
             print(f"  Email: {emails}/{n} ({email_pct:.0f}%)")
             print()
-            print(f"  Normal vs Advanced comparison:")
-            print(f"    Normal:   phone 7/10 (70%)  email 0/10 (0%)")
+            print("  Normal vs Advanced comparison:")
+            print("    Normal:   phone 7/10 (70%)  email 0/10 (0%)")
             print(f"    Advanced: phone {phones}/{n} ({phone_pct:.0f}%)  email {emails}/{n} ({email_pct:.0f}%)")
 
     r = requests.get(

@@ -244,7 +244,7 @@ def main() -> int:
         print(f"TIMEOUT — {len(pending)} queues still pending: {list(pending.keys())}")
 
     # Fetch per-queue CSVs and compute per-county stats directly
-    print(f"\n=== Per-county scorecard ===")
+    print("\n=== Per-county scorecard ===")
     print(f"{'County':<12} {'Uploaded':>9} {'Accepted':>9} {'Phone%':>8} {'Email%':>8}  Verdict")
     print(f"{'-'*12} {'-'*9} {'-'*9} {'-'*8} {'-'*8} {'-'*30}")
 

@@ -104,6 +104,55 @@ def _resolve_batch_child_schedule(
     return {}
 
 
+# ScraperConfig.name is String(255). The derived child name can outgrow that even
+# though BatchCreateRequest.name is capped at 120, because county is String(128).
+_SCRAPER_NAME_MAX = 255
+
+
+def _clean_display_name(raw: str | None) -> str:
+    """Collapse whitespace and neutralize control characters in a user-typed name.
+
+    Non-printables become spaces (never vanish) so "King\\nProbate" reads
+    "King Probate" instead of "KingProbate". This matters beyond cosmetics:
+    config.name reaches the lead-delivery email SUBJECT unescaped
+    (src/workers/delivery.py — html.escape() guards only the HTML body), plus job
+    log lines, in-app notifications and dialer/webhook metadata. Sanitizing at the
+    point the name is minted fixes every one of those consumers at once.
+    """
+    if not raw:
+        return ""
+    return " ".join("".join(c if c.isprintable() else " " for c in raw).split())
+
+
+def derive_batch_child_name(batch_name: str | None, county: str, record_type: str) -> str:
+    """Display name for one batch child ScraperConfig.
+
+    Children used to be named "{County} {record_type} (batch)", which threw away
+    the batch name the user typed on the parent. Every batch covering the same
+    county+record_type therefore minted identically named scrapers — 41% of
+    production configs collided, leaving the dashboard's Scrapers table unable to
+    tell rows apart even once it shows the name.
+
+    A whitespace-only batch name counts as absent (BatchCreateRequest.name stays
+    Optional for direct-API callers), which keeps the legacy "(batch)" shape for
+    them. This is identifier UX, not a uniqueness guarantee — two batches may share
+    a name, so the UI still routes by id and disambiguates equal names itself.
+    """
+    suffix = f"{county.title()} {record_type.replace('_', ' ').title()}"
+    clean = _clean_display_name(batch_name)
+    if not clean:
+        return f"{suffix} (batch)"[:_SCRAPER_NAME_MAX]
+    name = f"{clean} - {suffix}"
+    if len(name) <= _SCRAPER_NAME_MAX:
+        return name
+    # Trim the batch-name prefix, never the suffix: the suffix is what says WHAT
+    # this child scrapes, so it has to survive truncation intact.
+    keep = _SCRAPER_NAME_MAX - len(suffix) - 3  # 3 = the " - " joiner
+    if keep <= 0:
+        return suffix[:_SCRAPER_NAME_MAX]
+    return f"{clean[:keep].rstrip()} - {suffix}"
+
+
 @router.post("", response_model=BatchCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_batch(
     body: BatchCreateRequest,
@@ -253,7 +302,7 @@ async def create_batch(
                     id=str(uuid.uuid4()),
                     user_id=current_user.id,
                     batch_id=batch.id,
-                    name=f"{county.title()} {rt} (batch)",
+                    name=derive_batch_child_name(body.name, county, rt),
                     county=county,
                     state=body.state.upper(),
                     record_type=rt,

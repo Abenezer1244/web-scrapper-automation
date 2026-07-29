@@ -22,7 +22,6 @@ Reverse: DROP ROLE bridgeleads_app, bridgeleads_system;  (if unused)
 
 from __future__ import annotations
 
-import io
 import os
 import secrets
 import sys
@@ -34,7 +33,7 @@ _SECRETS = ".rls-cutover-secrets"
 
 
 def _raw_sync_url() -> str:
-    with io.open(".env", "r", encoding="utf-8") as f:
+    with open(".env", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line.startswith("DATABASE_URL_SYNC="):
@@ -45,7 +44,7 @@ def _raw_sync_url() -> str:
 def _load_secrets() -> dict[str, str]:
     out: dict[str, str] = {}
     if os.path.exists(_SECRETS):
-        with io.open(_SECRETS, "r", encoding="utf-8") as f:
+        with open(_SECRETS, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if "=" in line and not line.startswith("#"):
@@ -58,7 +57,7 @@ def _write_secrets(d: dict[str, str]) -> None:
     # Atomic + durable: write a temp file, fsync, os.replace (Codex review) so a
     # crash mid-write can't corrupt/lose the prod role passwords.
     tmp = _SECRETS + ".tmp"
-    with io.open(tmp, "w", encoding="utf-8") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         for k, v in d.items():
             f.write(f"{k}={v}\n")
         f.flush()

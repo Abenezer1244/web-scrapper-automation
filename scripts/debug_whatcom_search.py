@@ -67,7 +67,7 @@ async def main() -> int:
         # Click the first Search button
         search_btn = page.locator("button:has-text('Search'), input[type='submit'][value*='Search' i]")
         if await search_btn.count() > 0:
-            print(f"\nClicking Search...", flush=True)
+            print("\nClicking Search...", flush=True)
             try:
                 async with page.expect_navigation(timeout=20_000):
                     await search_btn.first.click()
@@ -110,7 +110,7 @@ async def main() -> int:
         print(f"\nTables: {len(containers['tables'])}", flush=True)
         for t in containers["tables"][:5]:
             print(f"  rows={t['rows']} headers={t['headers']}", flush=True)
-        print(f"\nResult-like containers:", flush=True)
+        print("\nResult-like containers:", flush=True)
         for c in containers["candidates"][:10]:
             print(f"  {c}", flush=True)
         print(f"\nnoResults flag: {containers['noResults']}", flush=True)

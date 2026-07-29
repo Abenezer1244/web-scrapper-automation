@@ -240,7 +240,7 @@ def main():
         batch_results = wait_for_jobs(token, batch_jobs)
 
         # Validate results
-        print(f"\n[VALIDATE] Checking results for batch...")
+        print("\n[VALIDATE] Checking results for batch...")
         for county, job in batch_results.items():
             if job["status"] == "done" and job.get("record_count", 0) > 0:
                 v = validate_results(token, county, job["id"])

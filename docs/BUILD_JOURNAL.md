@@ -59,9 +59,13 @@ Codex consulted before writing code and reviewed every diff.
 - 94 vestigial `f` prefixes on strings with nothing to interpolate (`scripts/`, auto-fixed).
 
 **Failed / Blocked:**
-- Nothing blocked. One self-inflicted miss worth recording: I read `ruff --statistics` with `tail`
-  and the **top** entry (94 × F541) scrolled off, so I initially reported "no dead code". Read
-  statistics from the head.
+- One self-inflicted miss: I read `ruff --statistics` with `tail` and the **top** entry
+  (94 × F541) scrolled off, so I initially reported "no dead code". Read statistics from the head.
+- **Could not get a clean full-suite run at the end** — another terminal was driving the same local
+  rig. See Facts learned; the first (uncontended) run was 1642 passed / 0 failed.
+- PR #158 ("dead-code removal + import-order sweep") merged to `main` mid-session and overlapped
+  this session's lint work. Merged and reconciled one conflict in `scripts/sprint4_all_counties.py`.
+  The f-string and timeout fixes remain unique to this branch; the import-order sweep was #158's.
 
 **Pending / Handoff:**
 - BE #159 + FE #89 open, both green. 👤 merge + deploy api & worker.
@@ -77,6 +81,13 @@ Codex consulted before writing code and reviewed every diff.
   fixtures, not assertions on generated names. Full suite confirmed.
 - A system-session UPDATE bypasses the API's audit path — ops scripts that change user-visible data
   should write `audit_events` themselves.
+- 🔑 **`bl-testenv/run-full-pytest.sh` is NOT safe to run twice concurrently.** Every instance
+  shares one `bridgeleads_test` DB and one Redis, and conftest `FLUSHDB`s Redis at setup and
+  DELETEs rows at teardown — so a second run yanks state from under the first. Symptom: ~9 failures
+  that **move between runs** (`test_break_glass_login`, `test_register_email_verification`,
+  `*_tax_cap`) while the same tests pass in isolation. Two `proxy6543.py` processes = two rigs.
+  Before blaming your own diff, run the same `-k` subset against a detached `origin/main` worktree:
+  here `main` failed 7F+7E where this branch failed 2, which proved the failures environmental.
 
 ---
 

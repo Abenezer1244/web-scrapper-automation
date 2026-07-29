@@ -60,7 +60,7 @@ async def main() -> int:
 
         # Page link text (navigation)
         links = await page.locator("a").all()
-        print(f"\nNav links (first 15):", flush=True)
+        print("\nNav links (first 15):", flush=True)
         for a in links[:15]:
             text = (await a.text_content() or "").strip()
             href = (await a.get_attribute("href") or "")[:80]

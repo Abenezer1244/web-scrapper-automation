@@ -25,7 +25,7 @@ async def main() -> int:
     with_pid = sum(1 for r in records if r.parcel_id)
     with_party = sum(1 for r in records if r.party_name)
 
-    print(f"\n=== RESULTS ===", flush=True)
+    print("\n=== RESULTS ===", flush=True)
     print(f"Total records: {len(records)}", flush=True)
     print(f"With parcel_id: {with_pid} ({100*with_pid/len(records):.0f}%)" if records else "With parcel_id: 0", flush=True)
     print(f"With party_name: {with_party}", flush=True)

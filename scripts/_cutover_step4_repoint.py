@@ -17,7 +17,6 @@ Redeploy + RLS_ENFORCE + FORCE are deliberately NOT done here.
 
 from __future__ import annotations
 
-import io
 import re
 import sys
 
@@ -25,7 +24,7 @@ _SECRETS = ".rls-cutover-secrets"
 
 
 def _env(key: str) -> str:
-    with io.open(".env", "r", encoding="utf-8") as f:
+    with open(".env", encoding="utf-8") as f:
         for line in f:
             if line.strip().startswith(key + "="):
                 return line.strip().split("=", 1)[1]
@@ -34,7 +33,7 @@ def _env(key: str) -> str:
 
 def _secrets() -> dict[str, str]:
     out: dict[str, str] = {}
-    with io.open(_SECRETS, "r", encoding="utf-8") as f:
+    with open(_SECRETS, encoding="utf-8") as f:
         for line in f:
             if "=" in line and not line.startswith("#"):
                 k, v = line.strip().split("=", 1)
@@ -85,7 +84,7 @@ def main() -> None:
     # Persist rollback BEFORE changing anything.
     s["ROLLBACK_DATABASE_URL"] = cur_async
     s["ROLLBACK_DATABASE_URL_SYNC"] = cur_sync
-    with io.open(_SECRETS, "w", encoding="utf-8") as f:
+    with open(_SECRETS, "w", encoding="utf-8") as f:
         for k, v in s.items():
             f.write(f"{k}={v}\n")
     print("\nrollback (postgres URLs) saved to .rls-cutover-secrets")
@@ -95,7 +94,7 @@ def main() -> None:
     # subprocess of the npm `railway` shim is unreliable on Windows, and we avoid
     # shell=True (no injection surface).
     out = ".rls-cutover-repoint.sh"
-    with io.open(out, "w", encoding="utf-8", newline="\n") as f:
+    with open(out, "w", encoding="utf-8", newline="\n") as f:
         f.write("#!/usr/bin/env bash\nset -euo pipefail\n")
         for svc, vars_ in plan.items():
             for k, v in vars_.items():

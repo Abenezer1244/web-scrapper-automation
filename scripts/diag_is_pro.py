@@ -23,7 +23,7 @@ async def main():
         ctx = await browser.new_context(viewport={"width": 1400, "height": 900})
         page = await ctx.new_page()
 
-        print(f"[1] login")
+        print("[1] login")
         await page.goto(f"{BASE}/login", wait_until="domcontentloaded")
         await page.fill('input[type="email"]', EMAIL)
         await page.fill('input[type="password"]', PASSWORD)

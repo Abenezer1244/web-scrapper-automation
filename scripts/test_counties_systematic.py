@@ -75,20 +75,27 @@ def _refresh(hdrs: dict) -> None:
     hdrs.update(new)
 
 
+# Default the timeout in the helpers, not at every call site: without one a hung
+# API blocks the whole sweep indefinitely. An explicit timeout= still wins.
+_TIMEOUT = 30
+
+
 def _api_get(hdrs: dict, url: str, **kwargs) -> requests.Response:
-    r = requests.get(url, headers=hdrs, **kwargs)
+    kwargs.setdefault("timeout", _TIMEOUT)
+    r = requests.get(url, headers=hdrs, **kwargs)      # noqa: S113 — timeout set above
     if r.status_code == 401:
         _refresh(hdrs)
-        r = requests.get(url, headers=hdrs, **kwargs)
+        r = requests.get(url, headers=hdrs, **kwargs)  # noqa: S113 — timeout set above
     r.raise_for_status()
     return r
 
 
 def _api_post(hdrs: dict, url: str, **kwargs) -> requests.Response:
-    r = requests.post(url, headers=hdrs, **kwargs)
+    kwargs.setdefault("timeout", _TIMEOUT)
+    r = requests.post(url, headers=hdrs, **kwargs)     # noqa: S113 — timeout set above
     if r.status_code == 401:
         _refresh(hdrs)
-        r = requests.post(url, headers=hdrs, **kwargs)
+        r = requests.post(url, headers=hdrs, **kwargs)  # noqa: S113 — timeout set above
     r.raise_for_status()
     return r
 
@@ -290,7 +297,7 @@ def main():
     if not matrix:
         sys.exit("No matching combinations found.")
 
-    print(f"\nBridgeLeads Systematic County Test")
+    print("\nBridgeLeads Systematic County Test")
     print(f"Date range : {DATE_FROM} to {DATE_TO}")
     print(f"Combos     : {len(matrix)}")
     print(f"Job timeout: {JOB_TIMEOUT}s")

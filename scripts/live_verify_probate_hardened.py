@@ -129,7 +129,7 @@ async def run_county(county: str, df: str, dt: str, sem: asyncio.Semaphore, time
                 flush=True,
             )
             return res
-        except asyncio.TimeoutError:
+        except TimeoutError:
             print(f"[{county}] TIMEOUT after {timeout}s", flush=True)
             return {"county": county, "ok": False, "error": f"timeout_{timeout}s"}
         except Exception as exc:

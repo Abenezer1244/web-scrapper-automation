@@ -190,7 +190,7 @@ def validate_results(token, job_id, total):
     print(f"    heirs:            {has_heirs}/{n} ({pct(has_heirs)})")
 
     # Show 3 sample records
-    print(f"\n  Sample records:")
+    print("\n  Sample records:")
     for i, rec in enumerate(items[:3]):
         print(f"    [{i+1}] {rec.get('party_name','?')} | "
               f"{rec.get('date_recorded','?')} | "
@@ -202,10 +202,10 @@ def validate_results(token, job_id, total):
 
 def download_csv(token, job_id):
     """Download the CSV export via presigned URL."""
-    print(f"\n  Requesting download URL...")
+    print("\n  Requesting download URL...")
     r = api("GET", f"/jobs/{job_id}/export-url", token=token)
     if r.status_code == 404:
-        print(f"  No export available (job may not have generated CSV)")
+        print("  No export available (job may not have generated CSV)")
         return None
     if r.status_code != 200:
         print(f"  Export URL failed: {r.status_code} {r.text[:100]}")
@@ -213,11 +213,11 @@ def download_csv(token, job_id):
 
     url = r.json().get("url")
     if not url:
-        print(f"  No URL in response")
+        print("  No URL in response")
         return None
 
     # Download the file
-    print(f"  Downloading CSV...")
+    print("  Downloading CSV...")
     dl = requests.get(url, timeout=60, stream=True)
     if dl.status_code != 200:
         print(f"  Download failed: {dl.status_code}")
@@ -232,7 +232,7 @@ def download_csv(token, job_id):
             total_bytes += len(chunk)
 
     # Count rows
-    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+    with open(filepath, encoding="utf-8", errors="replace") as f:
         lines = f.readlines()
     row_count = len(lines) - 1  # minus header
 
@@ -242,7 +242,7 @@ def download_csv(token, job_id):
 
     # Show header + first 3 rows
     if lines:
-        print(f"\n  CSV preview:")
+        print("\n  CSV preview:")
         print(f"    Header: {lines[0].strip()[:120]}")
         for i, line in enumerate(lines[1:4]):
             print(f"    [{i+1}] {line.strip()[:120]}")
@@ -284,12 +284,12 @@ def main():
         token, user_id, email = register()
 
     # Step 2: Config
-    print(f"\n[2/5] Creating scraper config...")
+    print("\n[2/5] Creating scraper config...")
     config_id = create_config(token, county)
     print(f"  Config ID: {config_id}")
 
     # Step 3: Trigger
-    print(f"\n[3/5] Triggering scrape job...")
+    print("\n[3/5] Triggering scrape job...")
     job_id = trigger_job(token, config_id)
     print(f"  Job ID: {job_id}")
 
@@ -301,7 +301,7 @@ def main():
         }, f, indent=2)
 
     # Step 4: Poll with live progress
-    print(f"\n[4/5] Scraping in progress...")
+    print("\n[4/5] Scraping in progress...")
     job = poll_with_progress(token, job_id)
 
     if not job or job["status"] != "done":
@@ -322,7 +322,7 @@ def main():
 
     # Final summary
     print(f"\n{'=' * 70}")
-    print(f"  PASSED")
+    print("  PASSED")
     print(f"  County:  {county}")
     print(f"  Records: {rc}")
     if filepath:

@@ -30,14 +30,14 @@ async def main() -> int:
 
     n = len(records)
     with_pid = sum(1 for r in records if r.parcel_id)
-    print(f"\n=== SCRAPE RESULTS ===", flush=True)
+    print("\n=== SCRAPE RESULTS ===", flush=True)
     print(f"Total records: {n}", flush=True)
     if n:
         print(f"With parcel_id: {with_pid}/{n} ({100*with_pid/n:.0f}%)", flush=True)
 
     if with_pid:
         unique = list(dict.fromkeys(r.parcel_id for r in records if r.parcel_id))
-        print(f"\n=== ENRICHMENT ===", flush=True)
+        print("\n=== ENRICHMENT ===", flush=True)
         print(f"Unique parcels: {len(unique)}", flush=True)
         enriched = batch_enrich_parcels_gis(unique, "thurston", "WA")
 

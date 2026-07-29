@@ -54,11 +54,35 @@ the parent at line 228). Every batch over the same county+record_type yields ide
 
 ## Phase 3 — Dead code sweep
 
-- [x] `ruff` (incl. F401/F841/ARG/ERA) clean on all touched backend files — one real hit fixed
-      (unused loop var in the new diag script)
+- [x] `ruff` (incl. F401/F841/ARG/ERA) clean on all touched backend files
 - [x] `eslint` clean on all touched frontend files
-- [ ] NOT done repo-wide: ~277 outstanding `I001` import-order findings would collide with the
-      other sessions' in-flight branches. Left for a quiet moment on a dedicated branch.
+
+## Phase 4 — the three deferred items (done 2026-07-29)
+
+**1. Prod rename of the 12 legacy duplicates — APPLIED.**
+- [x] Verified every colliding config has a NAMED parent batch (0 without) and that rebuilding via
+      `derive_batch_child_name()` yields 12 unique names, 0 residual collisions
+- [x] `scripts/backfill_batch_child_names.py` — dry-run default; validates before writing;
+      compare-and-swap on `(id, name, batch_id)`; `SET LOCAL lock_timeout=1s/statement_timeout=5s`
+      so it can never block a concurrent `alembic upgrade head`; rowcount mismatch ⇒ full rollback;
+      writes an `audit_events` row per rename (a system session bypasses the API audit path)
+- [x] Applied: **12 renamed, 12 audit rows**. Re-verified **collisions 12 → 0**. Re-run = no-op.
+
+**2. Dead code / lint — 274 → 95; `src/`, `tests/`, `main.py` all 0.**
+- [x] **Zero** unused imports (F401) or unused variables (F841) repo-wide — there was no dead code
+- [x] 94 vestigial `f` prefixes (F541, all in `scripts/`) auto-fixed — the one true dead syntax
+- [x] **10 real bugs**: `requests` calls with no timeout in 3 operator scripts (a hung API stalled
+      the sweep forever) + `onboard_customer.py` `urlopen` with no timeout and no scheme guard
+- [x] `pyproject.toml` per-file-ignores `scripts/* = ["E402","I001"]` — structural, not sloppiness
+      (every script must `sys.path.insert` before importing `src.*`). **S113 deliberately NOT
+      ignored.**
+- [x] NOT touched: `alembic/` (42) — applied migration history, reformatting = risk, zero benefit.
+      `scripts/` keeps 35 residual nits (S108 temp paths, E702 semicolons); churn, no value.
+
+**3. `docs/BUILD_JOURNAL.md`** — entry appended.
+
+🔑 Process note: I first reported "no dead code" after reading `ruff --statistics` through `tail`,
+which cut the **top** line (94 × F541). Read statistics from the head.
 
 ## Review
 

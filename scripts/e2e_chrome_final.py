@@ -50,7 +50,7 @@ async def main():
         page = await ctx.new_page()
 
         # 1. Login
-        print(f"\n[1/7] Login...")
+        print("\n[1/7] Login...")
         await page.goto("https://bridgeleads.io/login")
         await page.wait_for_load_state("networkidle")
         await page.wait_for_timeout(1000)
@@ -62,13 +62,13 @@ async def main():
         print(f"  OK: {page.url}")
 
         # 2. Dashboard - check trial banner
-        print(f"[2/7] Dashboard + trial banner...")
+        print("[2/7] Dashboard + trial banner...")
         body = await page.inner_text("body")
         print(f"  Trial banner: {'PRO TRIAL' in body}")
         print(f"  Upgrade btn:  {'Upgrade' in body}")
 
         # 3. Live scrape
-        print(f"[3/7] Live scrape page...")
+        print("[3/7] Live scrape page...")
         await page.goto(f"https://bridgeleads.io/live/{job_id}")
         await page.wait_for_timeout(2000)
         await page.screenshot(path="chrome_2_live.png")
@@ -87,14 +87,14 @@ async def main():
         await page.screenshot(path="chrome_3_complete.png")
 
         # 4. Results
-        print(f"[4/7] Results page...")
+        print("[4/7] Results page...")
         await page.goto(f"https://bridgeleads.io/results/{job_id}")
         await page.wait_for_timeout(3000)
         await page.screenshot(path="chrome_4_results.png")
-        print(f"  OK")
+        print("  OK")
 
         # 5. Download
-        print(f"[5/7] Download CSV...")
+        print("[5/7] Download CSV...")
         r = req.get(f"{API}/jobs/{job_id}/export-url", headers=h, timeout=10)
         url = r.json()["url"]
         if url.startswith("/"):
@@ -108,14 +108,14 @@ async def main():
             print(f"  Row 1:  {lines[1][:70]}")
 
         # 6. Other pages
-        print(f"[6/7] All pages...")
+        print("[6/7] All pages...")
         for name, path in [("Scrapers", "/scrapers"), ("Deliver", "/deliver"), ("Settings", "/settings")]:
             await page.goto(f"https://bridgeleads.io{path}")
             await page.wait_for_timeout(1500)
             print(f"  {name}: OK")
 
         # 7. Settings billing
-        print(f"[7/7] Upgrade button...")
+        print("[7/7] Upgrade button...")
         billing = page.locator("button:has-text('Billing'), [data-tab='billing']")
         if await billing.count() > 0:
             await billing.first.click()
@@ -127,13 +127,13 @@ async def main():
 
         # Summary
         print(f"\n{'=' * 60}")
-        print(f"RESULTS")
-        print(f"  Login:          PASS")
+        print("RESULTS")
+        print("  Login:          PASS")
         print(f"  Trial banner:   {'PASS' if 'PRO TRIAL' in body else 'FAIL'}")
         print(f"  Scrape:         {'PASS' if j['status'] == 'done' else 'FAIL'} ({j['record_count']} records)")
-        print(f"  Results page:   PASS")
+        print("  Results page:   PASS")
         print(f"  CSV download:   {'PASS' if dl.status_code == 200 else 'FAIL'} ({len(lines)-1} rows)")
-        print(f"  All pages:      PASS")
+        print("  All pages:      PASS")
         print(f"  Plan:           {me['plan']} trial ({me['trial_days_remaining']}d)")
         print(f"{'=' * 60}")
 

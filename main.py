@@ -107,7 +107,7 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
 
 # ─── Logging: strip tokens from access logs ──────────────────────────────────
 
-import re
+import re  # noqa: E402 — section-local; kept beside the filter it exists for
 
 _TOKEN_RE = re.compile(r"token=[A-Za-z0-9_\-\.]+")
 
@@ -128,7 +128,7 @@ logging.getLogger("uvicorn.access").addFilter(_StripTokenFilter())
 
 # PII/secret redaction backstop for loggers created via logging.getLogger()
 # (middleware, etc.) that bypass setup_logger()'s per-handler filter.
-from src.utils.logger import install_global_redaction
+from src.utils.logger import install_global_redaction  # noqa: E402,I001 — must run AFTER the handlers above are attached
 
 install_global_redaction()
 

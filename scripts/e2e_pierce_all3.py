@@ -137,14 +137,14 @@ async def main():
 
         # Summary
         print(f"\n{'='*50}")
-        print(f"  PIERCE COUNTY SUMMARY")
+        print("  PIERCE COUNTY SUMMARY")
         print(f"{'='*50}")
         for rt, data in results_summary.items():
             label = rt.replace("_", " ").title()
             print(f"  {label:20s}: {data['status']:8s} | {data['records']:4d} records | {data['elapsed']}s")
 
         # Check enrichment quality from API
-        print(f"\n  Enrichment quality:")
+        print("\n  Enrichment quality:")
         async with httpx.AsyncClient(timeout=30) as client:
             for rt, data in results_summary.items():
                 if data["records"] == 0:
@@ -165,7 +165,7 @@ async def main():
                 label = rt.replace("_", " ").title()
                 print(f"  {label:20s}: prop={wp}/{total} ({100*wp//total}%) | mail={wm}/{total} ({100*wm//total}%)")
 
-        print(f"\nBrowser open for 60s...")
+        print("\nBrowser open for 60s...")
         await page.wait_for_timeout(60000)
         await browser.close()
 

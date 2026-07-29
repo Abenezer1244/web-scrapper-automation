@@ -104,17 +104,17 @@ def main() -> int:
             "mailing_zip": "",
         })
 
-    print(f"\nClassification:")
+    print("\nClassification:")
     print(f"  entities (grantor is LLC/Trust/etc): {entity_count}")
     print(f"  individuals: {len(payload_rows) - entity_count}")
 
-    print(f"\nSample payload rows:")
+    print("\nSample payload rows:")
     for i, pr in enumerate(payload_rows[:3]):
         print(f"  {i+1}. addr={pr['address'][:40]!r} city={pr['city']!r} state={pr['state']!r}")
         print(f"     first={pr['first_name']!r} last={pr['last_name']!r}")
 
     # Pre-flight balance check
-    print(f"\nPre-flight: Tracerfy balance check...")
+    print("\nPre-flight: Tracerfy balance check...")
     r = requests.get(
         "https://tracerfy.com/v1/api/analytics/",
         headers={"Authorization": f"Bearer {settings.TRACERFY_API_TOKEN}"},
@@ -143,7 +143,7 @@ def main() -> int:
 
     queue_id = response["queue_id"]
     estimated_wait = response.get("estimated_wait_seconds", 60)
-    print(f"\nSUBMITTED.")
+    print("\nSUBMITTED.")
     print(f"  queue_id={queue_id}")
     print(f"  rows_uploaded={response.get('rows_uploaded')}")
     print(f"  estimated_wait={estimated_wait}s")
@@ -176,7 +176,7 @@ def main() -> int:
             },
         )
         conn.commit()
-    print(f"  Inserted skip_trace_queues row")
+    print("  Inserted skip_trace_queues row")
 
     # 5) Poll for completion
     print(f"\nPolling for webhook completion (up to {max(estimated_wait + 180, 300)}s)...")
@@ -215,7 +215,7 @@ def main() -> int:
         return 1
 
     # 6) Measure hit rate from cache (what the webhook just wrote)
-    print(f"\n=== Measuring hit rate ===")
+    print("\n=== Measuring hit rate ===")
     today_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     with engine.connect() as conn:
         cache_rows = conn.execute(text("""
@@ -236,7 +236,7 @@ def main() -> int:
             print(f"  Phone hits: {phones}/{n} ({phone_pct:.0f}%)")
             print(f"  Email hits: {emails}/{n} ({email_pct:.0f}%)")
             print()
-            print(f"  PRD gate: phone >= 60%, email >= 25%")
+            print("  PRD gate: phone >= 60%, email >= 25%")
             print(f"  Phone:  {'PASS' if phone_pct >= 60 else 'FAIL'}")
             print(f"  Email:  {'PASS' if email_pct >= 25 else 'FAIL'}")
 

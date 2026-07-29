@@ -19,6 +19,67 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-07-29 — Dashboard Scrapers table: the missing name column was a symptom, not the bug
+**Context:** User reported the dashboard Scrapers widget as "vague" — no name column, so you can't
+tell which row to click View on. Worked in isolated worktrees off `origin/main` /`origin/master`
+(`bridgeleads-worktrees/xcheck-0729`, `.../fe-scraper-names`) because ~15 other branches were live.
+Codex consulted before writing code and reviewed every diff.
+
+**Built / Shipped:**
+- **BE PR #159** — `derive_batch_child_name()` in `src/api/routes/batches.py`; children are now
+  `"{Batch} - {County} {Type}"` instead of `"{County} {record_type} (batch)"`. 15 new tests
+  (`tests/test_batch_child_name.py`). No migration.
+- **FE #80 + #81 merged**; **FE PR #89** — created-at line on rows whose name repeats, plus a copy
+  fix (the batch-name field still read "(optional)" while #81 made it required).
+- **Prod backfill APPLIED** — `scripts/backfill_batch_child_names.py --apply`: 12 configs renamed,
+  12 `audit_events` rows written, collisions verified **12 → 0**. Script is idempotent (re-run =
+  no-op) and dry-run by default.
+- **Lint**: 274 → 95 findings. `src/`, `tests/`, `main.py` now **0**.
+
+**Tried / Decided:**
+- Merging PR #80 alone was rejected once prod data came back: showing `config.name` would have
+  rendered the *same duplicate twice*. Fixed the naming source first.
+- Rename scoped to the **colliding subset only** (Codex): renaming every batch child would churn
+  more user-visible labels, webhook/dialer metadata and email subjects for no extra clarity.
+- **No mass reformat.** `alembic/` (42 findings) is applied migration history — reformatting is
+  risk with zero benefit. `E402`/`I001` in `scripts/` are STRUCTURAL (every script must
+  `sys.path.insert` before importing `src.*`), so they got per-file-ignores in `pyproject.toml`
+  rather than edits — which turns `ruff check scripts/` into real signal.
+
+**Caught & fixed:**
+- Codex P2 on the merged #80+#81 stack: `DeliveryStep.tsx` labelled the batch name "(optional)"
+  while the schema rejected blanks — a user who believed the label got bounced with no explanation.
+- `config.name` reaches the lead-delivery email **SUBJECT unescaped** (`src/workers/delivery.py:74`
+  — `html.escape()` guards only the HTML body). Sanitized at the mint point instead of per consumer.
+- Derived name could overflow `ScraperConfig.name` `String(255)`: county is `String(128)` + batch
+  name 120. Truncation trims the prefix and keeps the county/type suffix.
+- **10 no-timeout `requests` calls** in operator scripts (`saas_county_audit`,
+  `test_counties_systematic`, `ui_county_audit`) — a hung API stalled the sweep forever. Plus
+  `onboard_customer.py` `urlopen` with no timeout and no scheme guard.
+- 94 vestigial `f` prefixes on strings with nothing to interpolate (`scripts/`, auto-fixed).
+
+**Failed / Blocked:**
+- Nothing blocked. One self-inflicted miss worth recording: I read `ruff --statistics` with `tail`
+  and the **top** entry (94 × F541) scrolled off, so I initially reported "no dead code". Read
+  statistics from the head.
+
+**Pending / Handoff:**
+- BE #159 + FE #89 open, both green. 👤 merge + deploy api & worker.
+- `scripts/` has 35 residual nits (S108 temp paths, E702 semicolons) and `alembic/` 42 — both
+  deliberately left.
+
+**Facts learned:**
+- **`batches.py` is the ONLY site that names child configs.** `batch_tasks.py` and
+  `scheduler_helpers/dispatch.py` create `BatchRun`, not `ScraperConfig`.
+- `scraper_configs.name` is **display-only** — dedup, overlap, R2 keys, export filenames and
+  download names are all id-based, so a rename re-keys nothing (Codex-verified across the repo).
+- Codex was **wrong** that the literal `"(batch)"` would break tests: those strings are hand-built
+  fixtures, not assertions on generated names. Full suite confirmed.
+- A system-session UPDATE bypasses the API's audit path — ops scripts that change user-visible data
+  should write `audit_events` themselves.
+
+---
+
 ## 2026-07-28 — Prod outage: Supabase project vanished, and `/health` reported 200 through all of it
 **Context:** User reported "trying to login, not working — Something went wrong." Investigated read-only
 first (no branch), then worked in two isolated worktrees off `origin/main`

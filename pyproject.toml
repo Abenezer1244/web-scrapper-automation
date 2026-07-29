@@ -33,6 +33,12 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S", "N", "E402"]   # Relax security + naming; E402 = path/env setup before imports
 "alembic/*" = ["E501"]   # Long lines acceptable in migrations
+# One-off operator diagnostics. E402/I001 are STRUCTURAL here, not sloppiness:
+# every script must sys.path.insert the repo root before it can import src.*, so
+# the imports genuinely cannot sit at the top or be sorted with the stdlib block.
+# Silencing exactly those two turns `ruff check scripts/` from 232 findings into
+# real ones only — S113 (no-timeout HTTP) stays ON, and it caught 10 live hangs.
+"scripts/*" = ["E402", "I001"]
 # S608: these two build dynamic SQL by interpolating only generated ":param"
 # PLACEHOLDER strings (values are always bound via params dicts — verified); the
 # heuristic can't see the binding. Scoped per-file so the rule stays active elsewhere.

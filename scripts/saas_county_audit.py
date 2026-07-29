@@ -55,19 +55,27 @@ def _refresh(hdrs: dict) -> None:
     hdrs.update(_login())
 
 
+# Every call goes through these helpers, so default the timeout here rather than
+# at ~20 call sites. Without it a hung API leaves the audit blocked forever with
+# no output. An explicit timeout= from a caller still wins.
+_TIMEOUT = 30
+
+
 def _get(hdrs, url, **kw):
-    r = requests.get(url, headers=hdrs, **kw)
+    kw.setdefault("timeout", _TIMEOUT)
+    r = requests.get(url, headers=hdrs, **kw)          # noqa: S113 — timeout set above
     if r.status_code == 401:
         _refresh(hdrs)
-        r = requests.get(url, headers=hdrs, **kw)
+        r = requests.get(url, headers=hdrs, **kw)      # noqa: S113 — timeout set above
     return r
 
 
 def _post(hdrs, url, **kw):
-    r = requests.post(url, headers=hdrs, **kw)
+    kw.setdefault("timeout", _TIMEOUT)
+    r = requests.post(url, headers=hdrs, **kw)         # noqa: S113 — timeout set above
     if r.status_code == 401:
         _refresh(hdrs)
-        r = requests.post(url, headers=hdrs, **kw)
+        r = requests.post(url, headers=hdrs, **kw)     # noqa: S113 — timeout set above
     return r
 
 
@@ -106,9 +114,7 @@ def get_or_create_config(hdrs, county, state, record_type) -> str:
     payload = {
         "name": name,
         "county": county, "state": state, "record_type": record_type,
-        "fields": {f: True for f in
-                   ("party_name", "parcel_id", "property_address", "mailing_address",
-                    "heirs", "legal_description", "date_recorded")},
+        "fields": dict.fromkeys(("party_name", "parcel_id", "property_address", "mailing_address", "heirs", "legal_description", "date_recorded"), True),
         "enrichment": {"property_lookup": True, "skip_tracing": False},
         "schedule": {"frequency": "manual", "date_range_mode": "custom",
                      "date_from": DATE_FROM, "date_to": DATE_TO},

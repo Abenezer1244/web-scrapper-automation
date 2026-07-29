@@ -15,7 +15,6 @@ Run:  PYTHONPATH=. python scripts/_cutover_step3_rehearse.py
 
 from __future__ import annotations
 
-import io
 import sys
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -25,7 +24,7 @@ _SECRETS = ".rls-cutover-secrets"
 
 
 def _admin_dsn() -> str:
-    with io.open(".env", "r", encoding="utf-8") as f:
+    with open(".env", encoding="utf-8") as f:
         for line in f:
             if line.strip().startswith("DATABASE_URL_SYNC="):
                 return line.strip().split("=", 1)[1].replace("postgresql+psycopg2://", "postgresql://")
@@ -34,7 +33,7 @@ def _admin_dsn() -> str:
 
 def _secrets() -> dict[str, str]:
     out: dict[str, str] = {}
-    with io.open(_SECRETS, "r", encoding="utf-8") as f:
+    with open(_SECRETS, encoding="utf-8") as f:
         for line in f:
             if "=" in line and not line.startswith("#"):
                 k, v = line.strip().split("=", 1)

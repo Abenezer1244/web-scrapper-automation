@@ -118,13 +118,13 @@ async def main():
 
         # Summary
         print(f"\n{'='*50}")
-        print(f"E2E TIMING SUMMARY")
+        print("E2E TIMING SUMMARY")
         print(f"{'='*50}")
         for name, t in timings.items():
             flag = " ** SLOW" if t > 5 else ""
             print(f"  {name:15s}: {t}s{flag}")
 
-        print(f"\nBrowser open for 60s...")
+        print("\nBrowser open for 60s...")
         await page.wait_for_timeout(60000)
         await browser.close()
 

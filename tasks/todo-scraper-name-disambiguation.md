@@ -33,26 +33,46 @@ the parent at line 228). Every batch over the same county+record_type yields ide
 4. UI disambiguator must render time, not just date.
 5. Naming is identifier UX, not a uniqueness guarantee — keep routing by id.
 
-## Phase 1 — Backend (this branch)
+## Phase 1 — Backend (this branch) — DONE, **PR #159**
 
 - [x] Verify root cause against prod data
 - [x] Consult Codex on design
-- [ ] Add `derive_batch_child_name()` helper: normalize whitespace, strip control chars, cap 255
-- [ ] Use it in `create_batch`; keep legacy `(batch)` fallback for nameless direct-API calls
-- [ ] Tests: named batch, blank/whitespace name, control chars, over-length truncation
-- [ ] `pytest` + Codex review of the diff
+- [x] Add `derive_batch_child_name()` helper: normalize whitespace, strip control chars, cap 255
+- [x] Use it in `create_batch`; keep legacy `(batch)` fallback for nameless direct-API calls
+- [x] Tests: named batch, blank/whitespace name, control chars, NBSP, over-length truncation (15)
+- [x] Full suite 1642 passed / 2 skipped / 0 failed + Codex review PASS, no findings
 
-## Phase 2 — Frontend (`bridgeleads-web`, off `origin/master`)
+## Phase 2 — Frontend (`bridgeleads-web`) — DONE, **PR #89**
 
-- [ ] Verify + merge PR #80 (name column) and #81 (name required)
-- [ ] Duplicate-only disambiguator: show `created_at` time under the name ONLY when another row in
-      the list shares the name. No DB rename (user rejected a backfill).
-- [ ] `tsc --noEmit` + `eslint`, verify via `next build` (repo has no test runner)
+- [x] Verified + merged PR #80 (name column) and #81 (name required)
+- [x] Duplicate-only disambiguator: `created_at` timestamp under the name, only when another row
+      in the account shares the name. No DB rename.
+- [x] Fixed a contradiction #81 shipped (Codex P2): the field still read "Name this batch
+      (optional)" while the schema rejected blanks
+- [x] `tsc` 0 / `eslint` 0 / `next build` clean; strings confirmed in the emitted bundle
+- [x] Codex re-review PASS, no findings
 
 ## Phase 3 — Dead code sweep
 
-- [ ] Remove dead imports/unused locals across touched files
+- [x] `ruff` (incl. F401/F841/ARG/ERA) clean on all touched backend files — one real hit fixed
+      (unused loop var in the new diag script)
+- [x] `eslint` clean on all touched frontend files
+- [ ] NOT done repo-wide: ~277 outstanding `I001` import-order findings would collide with the
+      other sessions' in-flight branches. Left for a quiet moment on a dedicated branch.
 
 ## Review
 
-_(filled in at the end)_
+**What changed.** The reported symptom was a missing name column. The column already existed as
+unmerged PR #80 — but merging it alone would have rendered duplicate names twice, because the
+real defect was upstream: `batches.py:256` threw away the batch name when naming children. 41% of
+production configs collided as a result. Backend now derives distinct child names; the dashboard
+disambiguates the 12 rows that already collided.
+
+**Notes / residual risk.**
+- Existing duplicate names are untouched by design (no backfill). They remain ambiguous in
+  surfaces the dashboard hint doesn't reach — job logs, in-app notifications, per-job email
+  subjects, dialer/webhook metadata. Codex flagged this; it needs a rename to fully close.
+- Two batches may still share a name, so the new formula can still collide. That is acceptable:
+  routing is by id and the UI disambiguates equal names.
+- Codex predicted the `"(batch)"` literal would break tests. It did not — those strings are
+  hand-built fixtures, not assertions on generated names. Verified by the full suite.

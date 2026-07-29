@@ -49,7 +49,7 @@ def main() -> None:
             continue
         users_affected += 1
         print(f"--- user {email or uid} : {len(cfgs)} scrapers, {len(dupes)} colliding name(s) ---")
-        for name, cs in dupes.items():
+        for cs in dupes.values():
             total_colliding += len(cs)
             print(f'  name="{cs[0].name}" x{len(cs)}')
             for c in cs:

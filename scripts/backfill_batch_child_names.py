@@ -43,8 +43,13 @@ from src.api.routes.batches import derive_batch_child_name  # noqa: E402
 from src.db.session import system_sync_session  # noqa: E402
 
 
-def build_plan() -> list[dict]:
-    """Read-only: return [{id, user_id, old, new, batch_id}] for colliding children."""
+def build_plan() -> tuple[list[dict], list[dict]]:
+    """Read-only. Returns (plan, current):
+
+    plan    — [{id, user_id, old, new, batch_id}] for the colliding children
+    current — [{id, user_id, name}] for EVERY config, so validate() can check the
+              plan against the rows it isn't touching
+    """
     with system_sync_session() as db:
         rows = db.execute(
             text(
@@ -82,26 +87,38 @@ def build_plan() -> list[dict]:
 
     for s in skipped:
         print(f"  SKIP {s}")
-    return plan
+    # Snapshot of every config, so validate() can check the plan against the rows
+    # it is NOT touching (Codex).
+    current = [{"id": r.id, "user_id": r.user_id, "name": r.name or ""} for r in rows]
+    return plan, current
 
 
-def validate(plan: list[dict]) -> None:
-    """Refuse to write anything unless the whole plan is coherent."""
+def validate(plan: list[dict], current: list[dict]) -> None:
+    """Refuse to write anything unless the POST-APPLY state is collision-free.
+
+    Checking the plan against itself is not enough: a rebuilt name can equal the
+    name of a config the plan never touches, which would swap one collision for a
+    brand-new one (Codex). So model the state as it will exist after the write —
+    renamed rows take their new name, everything else keeps its current one — and
+    look for duplicates in that.
+    """
     if not plan:
         return
-    # Every rebuilt name must be unique within its user, or we'd just be swapping
-    # one collision for another.
-    per_user = defaultdict(list)
-    for p in plan:
-        per_user[p["user_id"]].append(p["new"].strip().lower())
-    for uid, names in per_user.items():
-        dupes = {n for n in names if names.count(n) > 1}
-        if dupes:
-            raise SystemExit(
-                f"ABORT: rebuilt names still collide for user {uid}: {sorted(dupes)}"
-            )
     if len({p["id"] for p in plan}) != len(plan):
         raise SystemExit("ABORT: the same config appears twice in the plan")
+
+    new_by_id = {p["id"]: p["new"] for p in plan}
+    after = defaultdict(list)
+    for c in current:
+        name = new_by_id.get(c["id"], c["name"])
+        after[c["user_id"]].append(name.strip().lower())
+
+    for uid, names in after.items():
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes:
+            raise SystemExit(
+                f"ABORT: post-apply names would still collide for user {uid}: {dupes}"
+            )
 
 
 def apply(plan: list[dict]) -> None:
@@ -154,7 +171,7 @@ def main() -> None:
     ap.add_argument("--apply", action="store_true", help="commit (default: dry run)")
     args = ap.parse_args()
 
-    plan = build_plan()
+    plan, current = build_plan()
     if not plan:
         print("Nothing to do — no colliding batch-child names.")
         return
@@ -163,7 +180,7 @@ def main() -> None:
     for p in sorted(plan, key=lambda x: x["old"]):
         print(f"  {p['id'][:8]}  {p['old']!r}\n            -> {p['new']!r}")
 
-    validate(plan)
+    validate(plan, current)
 
     if not args.apply:
         print("\nDRY RUN — nothing written. Re-run with --apply to commit.")

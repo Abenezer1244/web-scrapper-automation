@@ -8,8 +8,8 @@ Revises: 002
 Create Date: 2026-03-20
 """
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 
 # revision identifiers
 revision = "003"

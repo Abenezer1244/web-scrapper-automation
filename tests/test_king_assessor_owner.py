@@ -6,6 +6,7 @@ page so King tax-delinquent leads get a real name instead of the
 the REAL shape served by blue.kingcounty.com (captured live), not invented.
 """
 from src.scrapers.enrichment.king_county_assessor import (
+    KingOwnerLookupBlockedError,
     _extract_owner_name,
     batch_extract_king_owners,
 )
@@ -88,3 +89,68 @@ async def test_batch_extract_king_owners_filters_non_numeric_parcels():
     # A long but digit-less value is rejected by the numeric guard before any HTTP,
     # so no external request is generated for a malformed parcel.
     assert await batch_extract_king_owners(["abcdef", "no-digits-here"]) == {}
+
+
+async def test_batch_extract_king_owners_trips_on_transient_window(monkeypatch):
+    async def blocked(_pid, *, max_attempts=1):
+        return None, True
+
+    monkeypatch.setattr(
+        "src.scrapers.enrichment.king_county_assessor._fetch_king_owner",
+        blocked,
+    )
+
+    parcels = [f"12345678{i:02d}" for i in range(20)]
+    try:
+        await batch_extract_king_owners(
+            parcels,
+            delay=0,
+            circuit_window=10,
+            max_transient_rate=0.10,
+        )
+    except KingOwnerLookupBlockedError as exc:
+        assert "circuit breaker tripped" in str(exc)
+    else:
+        raise AssertionError("expected KingOwnerLookupBlockedError")
+
+
+async def test_batch_extract_king_owners_trips_on_miss_window(monkeypatch):
+    async def missing(_pid, *, max_attempts=1):
+        return None, False
+
+    monkeypatch.setattr(
+        "src.scrapers.enrichment.king_county_assessor._fetch_king_owner",
+        missing,
+    )
+
+    parcels = [f"12345678{i:02d}" for i in range(20)]
+    try:
+        await batch_extract_king_owners(
+            parcels,
+            delay=0,
+            circuit_window=10,
+            max_transient_rate=1.0,
+            max_unresolved_rate=0.50,
+        )
+    except KingOwnerLookupBlockedError as exc:
+        assert "unresolved_rate" in str(exc)
+    else:
+        raise AssertionError("expected KingOwnerLookupBlockedError")
+
+
+async def test_batch_extract_king_owners_allows_sparse_real_misses(monkeypatch):
+    async def mostly_found(pid, *, max_attempts=1):
+        if pid.endswith("00") or pid.endswith("37"):
+            return None, False
+        return f"OWNER {pid}", False
+
+    monkeypatch.setattr(
+        "src.scrapers.enrichment.king_county_assessor._fetch_king_owner",
+        mostly_found,
+    )
+
+    parcels = [f"12345678{i:02d}" for i in range(100)]
+    owners = await batch_extract_king_owners(parcels, delay=0, circuit_window=50)
+
+    assert len(owners) == 98
+    assert "1234567800" not in owners

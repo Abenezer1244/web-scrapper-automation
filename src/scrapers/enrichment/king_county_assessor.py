@@ -16,6 +16,8 @@ for the subset that need mailing addresses.
 import asyncio
 import html
 import re
+from collections import deque
+from dataclasses import dataclass
 
 from src.api.middleware.security import add_scrape_domain
 from src.config import settings
@@ -46,6 +48,20 @@ _OWNER_RE = re.compile(
 _OWNER_JUNK = frozenset({"NA", "NONE", "NULL", "UNKNOWN"})
 
 
+class KingOwnerLookupBlockedError(RuntimeError):
+    """Raised when eRealProperty appears to be throttling/blocking lookups."""
+
+
+@dataclass(frozen=True)
+class _OwnerLookupOutcome:
+    resolved: bool
+    transient: bool
+
+    @property
+    def unresolved(self) -> bool:
+        return not self.resolved
+
+
 def _extract_owner_name(page_html: str) -> str | None:
     """Owner/taxpayer name from an eRealProperty Dashboard page, or None."""
     m = _OWNER_RE.search(page_html)
@@ -59,15 +75,16 @@ def _extract_owner_name(page_html: str) -> str | None:
     return name
 
 
-async def _fetch_king_owner(pid: str) -> tuple[str | None, bool]:
+async def _fetch_king_owner(pid: str, *, max_attempts: int = 1) -> tuple[str | None, bool]:
     """Resolve one parcel's owner with bounded retry.
 
     Returns (owner_name_or_None, had_transient_error). A 200 response whose page
     has no owner cell is a GENUINE miss -> (None, False). A persistent non-200
-    (429/5xx/4xx) or exception after Settings.MAX_RETRIES attempts is a TRANSIENT
+    (429/5xx/4xx) or exception after max_attempts attempts is a TRANSIENT
     failure -> (None, True), so a caller can avoid treating it as "no such owner".
     """
-    for attempt in range(settings.MAX_RETRIES):
+    attempts = max(1, max_attempts)
+    for attempt in range(attempts):
         try:
             # S4: safe_get re-validates the (fixed HTTPS) target for SSRF defense
             # in depth — same call the full enricher uses.
@@ -78,13 +95,19 @@ async def _fetch_king_owner(pid: str) -> tuple[str | None, bool]:
             _logger.debug(
                 "Owner fetch error parcel=%s attempt=%d: %s", pid, attempt + 1, str(exc)[:160]
             )
-        if attempt < settings.MAX_RETRIES - 1:
-            await asyncio.sleep(0.5 * (attempt + 1))  # linear backoff
+        if attempt < attempts - 1:
+            await asyncio.sleep(0.5 * (2 ** attempt))  # exponential backoff
     return None, True
 
 
 async def batch_extract_king_owners(
-    parcel_ids: list[str], delay: float = 0.1
+    parcel_ids: list[str],
+    delay: float = 0.1,
+    *,
+    circuit_window: int = 50,
+    max_transient_rate: float = 0.10,
+    max_unresolved_rate: float = 0.50,
+    fetch_attempts: int = 1,
 ) -> dict[str, str]:
     """Owner/taxpayer name per parcel from eRealProperty — HTTP only, no Playwright.
 
@@ -120,14 +143,32 @@ async def batch_extract_king_owners(
 
     _logger.info("Owner-only lookup for %d parcels...", len(clean))
     failures = 0
+    misses = 0
+    window: deque[_OwnerLookupOutcome] = deque(maxlen=max(1, circuit_window))
     for i, pid in enumerate(clean):
         if i % 100 == 0 and i > 0:
             _logger.info("  owner HTTP: %d / %d ...", i, len(clean))
-        owner, errored = await _fetch_king_owner(pid)
+        owner, errored = await _fetch_king_owner(pid, max_attempts=fetch_attempts)
         if owner:
             owners[pid] = owner
         elif errored:
             failures += 1
+        else:
+            misses += 1
+        window.append(_OwnerLookupOutcome(resolved=bool(owner), transient=errored))
+        if len(window) == window.maxlen:
+            transient_rate = sum(o.transient for o in window) / len(window)
+            unresolved_rate = sum(o.unresolved for o in window) / len(window)
+            if transient_rate > max_transient_rate or unresolved_rate > max_unresolved_rate:
+                msg = (
+                    "King owner lookup circuit breaker tripped: "
+                    f"window={len(window)} transient_rate={transient_rate:.0%} "
+                    f"unresolved_rate={unresolved_rate:.0%} resolved={len(owners)}/{i + 1} "
+                    f"transient_failures={failures} genuine_misses={misses}. "
+                    "Aborting to avoid treating a throttle/block as no-owner."
+                )
+                _logger.warning(msg)
+                raise KingOwnerLookupBlockedError(msg)
         await asyncio.sleep(delay)
 
     if failures:

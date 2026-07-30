@@ -519,16 +519,18 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                     f"Resolving owner names for {len(owner_needs)} tax-delinquent leads...",
                     db=db,
                 )
-                from src.scrapers.enrichment.king_county_assessor import batch_extract_king_owners
+                from src.scrapers.enrichment.king_county_assessor import (
+                    KingOwnerLookupBlockedError,
+                    batch_extract_king_owners,
+                )
                 o_pid_map: dict[str, list] = {}
                 for res in owner_needs:
                     o_pid_map.setdefault(res.parcel_id.strip(), []).append(res)
                 o_pids_all = list(o_pid_map.keys())
-                # Owner-only HTTP is fast (~0.2s/parcel), so a higher cap than the
-                # Playwright mailing path is safe; still bounded to protect the
-                # enrichment time budget. Overflow is left for the (re-runnable)
+                # Keep inline eRealProperty owner repair tiny. Bulk owner fill is
+                # operationally sensitive and belongs in a monitored/offline flow
                 # backfill script — logged here so the cap is never silent.
-                _MAX_KING_OWNER_PARCELS = 500
+                _MAX_KING_OWNER_PARCELS = 25
                 overflow = max(0, len(o_pids_all) - _MAX_KING_OWNER_PARCELS)
                 o_pids = o_pids_all[:_MAX_KING_OWNER_PARCELS]
                 if overflow:
@@ -536,7 +538,32 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                         "King owner lookup capped at %d/%d parcels this job; %d deferred to backfill",
                         _MAX_KING_OWNER_PARCELS, len(o_pids_all), overflow,
                     )
-                owners = asyncio.run(asyncio.wait_for(batch_extract_king_owners(o_pids), timeout=180))
+                try:
+                    owners = asyncio.run(asyncio.wait_for(
+                        batch_extract_king_owners(
+                            o_pids,
+                            delay=1.0,
+                            circuit_window=20,
+                            max_transient_rate=0.10,
+                            max_unresolved_rate=0.50,
+                            fetch_attempts=1,
+                        ),
+                        timeout=180,
+                    ))
+                except KingOwnerLookupBlockedError as exc:
+                    _logger.warning(
+                        "Job %s: King owner-only lookup aborted: %s",
+                        job_id, str(exc)[:180],
+                    )
+                    try:
+                        _publish_log(
+                            r, job_id, "warning",
+                            "Owner-name resolution paused because King County appears to be throttling lookups.",
+                            db=db,
+                        )
+                    except Exception:
+                        db.rollback()
+                    owners = {}
                 swapped = 0
                 for pid, owner in owners.items():
                     for res in o_pid_map.get(pid, []):

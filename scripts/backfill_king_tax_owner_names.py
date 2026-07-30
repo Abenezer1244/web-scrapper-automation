@@ -44,7 +44,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sqlalchemy import text
 
 from src.db.session import SyncSessionLocal
-from src.scrapers.enrichment.king_county_assessor import batch_extract_king_owners
+from src.scrapers.enrichment.king_county_assessor import (
+    KingOwnerLookupBlockedError,
+    batch_extract_king_owners,
+)
 from src.scrapers.king_wa_tax_delinquent import is_tax_placeholder_party
 
 logging.basicConfig(level=logging.INFO)
@@ -82,7 +85,16 @@ def _resolve_owners(parcels: list[str], cache: dict[str, str | None], delay: flo
     todo = sorted({p for p in parcels if p not in cache})
     if not todo:
         return
-    found = asyncio.run(batch_extract_king_owners(todo, delay=delay))
+    found = asyncio.run(
+        batch_extract_king_owners(
+            todo,
+            delay=delay,
+            circuit_window=50,
+            max_transient_rate=0.10,
+            max_unresolved_rate=0.50,
+            fetch_attempts=1,
+        )
+    )
     for pid in todo:
         cache[pid] = found.get(pid)  # real owner or None (looked-up, absent)
 
@@ -125,9 +137,14 @@ def run(batch: int, limit: int | None, dry_run: bool, delay: float) -> None:
                     skipped_not_placeholder += 1
 
             if candidates:
-                _resolve_owners(
-                    [c.parcel_id.strip() for c in candidates], owner_cache, delay
-                )
+                try:
+                    _resolve_owners(
+                        [c.parcel_id.strip() for c in candidates], owner_cache, delay
+                    )
+                except KingOwnerLookupBlockedError as exc:
+                    db.rollback()
+                    _log.error("ABORTED: %s", exc)
+                    raise SystemExit(2) from exc
                 # (id, owner, old_placeholder) for rows whose parcel resolved to a
                 # real owner. old_placeholder re-asserts the still-placeholder guard
                 # at write time (idempotent; a concurrent change can't be clobbered).

@@ -5,7 +5,7 @@ no test Postgres, so DB-level row behaviour is verified in CI. Here we lock the
 Python window-resolution logic, the request validation, and the SQL text that the
 windowed queries assemble.
 """
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -26,7 +26,11 @@ class TestResolveFilingWindow:
     def test_lookback_sets_from_and_requires_date(self):
         ff, ft, require = _resolve_filing_window(90, None, None)
         assert ft is None and require is True
-        assert ff == date.today() - timedelta(days=90)  # noqa: DTZ011 (UTC date)
+        # Must match the production clock: _resolve_filing_window uses
+        # datetime.now(UTC).date(). Asserting against local date.today() made this
+        # fail for every run where the local date and the UTC date differ — i.e.
+        # any evening west of UTC.
+        assert ff == datetime.now(UTC).date() - timedelta(days=90)
 
     def test_explicit_range_requires_date(self):
         ff, ft, require = _resolve_filing_window(None, date(2026, 1, 1), date(2026, 6, 1))

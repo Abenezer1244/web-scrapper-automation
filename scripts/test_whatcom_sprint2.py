@@ -56,7 +56,7 @@ async def main() -> int:
                 print(f"    parcel={r.parcel_id} | {prop}", flush=True)
                 shown += 1
 
-        unmatched = sorted(set(r.parcel_id for r in records if not r.enrichment_data.get("property_address")))
+        unmatched = sorted({r.parcel_id for r in records if not r.enrichment_data.get("property_address")})
         if unmatched:
             print(f"\nUnmatched parcels ({len(unmatched)}):", flush=True)
             for p in unmatched:

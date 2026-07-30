@@ -52,7 +52,7 @@ async def main() -> int:
         print(f"property_address: {wp}/{n} ({100*wp/n:.0f}%)", flush=True)
         print(f"mailing_address:  {wm}/{n} ({100*wm/n:.0f}%)", flush=True)
 
-        unmatched = sorted(set(r.parcel_id for r in records if not r.enrichment_data.get("property_address")))
+        unmatched = sorted({r.parcel_id for r in records if not r.enrichment_data.get("property_address")})
         if unmatched:
             print(f"\nUnmatched parcels ({len(unmatched)}):", flush=True)
             for p in unmatched:

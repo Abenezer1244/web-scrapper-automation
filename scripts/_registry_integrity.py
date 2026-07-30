@@ -12,9 +12,9 @@ routes = sorted(
     f"{','.join(sorted(getattr(r, 'methods', []) or []))} {getattr(r, 'path', '')}"
     for r in fastapi_app.routes
 )
-print("=== CELERY TASKS (%d) ===" % len(tasks))
+print(f"=== CELERY TASKS ({len(tasks)}) ===")
 for t in tasks:
     print(t)
-print("=== API ROUTES (%d) ===" % len(routes))
+print(f"=== API ROUTES ({len(routes)}) ===")
 for r in routes:
     print(r)

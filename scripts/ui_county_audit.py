@@ -169,11 +169,14 @@ def write_report(results: list[dict]) -> None:
     for r in results:
         st = r["status"]
         if st == "done" and r.get("record_count", 0) > 0:
-            v = "PASS"; npass += 1
+            v = "PASS"
+            npass += 1
         elif st == "done":
-            v = "EMPTY"; nempty += 1
+            v = "EMPTY"
+            nempty += 1
         else:
-            v = st.upper(); nfail += 1
+            v = st.upper()
+            nfail += 1
         lines.append(
             f"| {r['county']} | {r['record_type']} | {v} | {str(r.get('job_id') or '')[:8]} | "
             f"{r.get('record_count', 0)} | {r.get('new_count', 0)} | {cov(r,'party_name')} | {cov(r,'parcel_id')} | "
@@ -329,7 +332,7 @@ async def main_async(args):
         sys.exit("Nothing to run — all combos already completed cleanly.")
 
     print(f"\n{'#'*60}\n# UI-DRIVEN LIVE AUDIT — {len(matrix)} combos (healthy counties)\n{'#'*60}")
-    for c, s, rt in matrix:
+    for c, _s, rt in matrix:
         print(f"  - {c}/{rt}")
 
     async with async_playwright() as p:

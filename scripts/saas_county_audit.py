@@ -190,11 +190,14 @@ def write_report(results: list[dict]) -> None:
     for r in results:
         st = r["status"]
         if st == "done" and r.get("record_count", 0) > 0:
-            verdict = "PASS"; npass += 1
+            verdict = "PASS"
+            npass += 1
         elif st == "done":
-            verdict = "EMPTY"; nempty += 1
+            verdict = "EMPTY"
+            nempty += 1
         else:
-            verdict = st.upper(); nfail += 1
+            verdict = st.upper()
+            nfail += 1
         lines.append(
             f"| {r['county']} | {r['record_type']} | {verdict} | {str(r.get('job_id',''))[:8]} | "
             f"{r.get('record_count',0)} | {cov(r,'party_name')} | {cov(r,'parcel_id')} | "

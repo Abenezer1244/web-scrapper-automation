@@ -212,7 +212,11 @@ def main() -> int:
 
     if not completed:
         print(f"\nTIMEOUT after {timeout}s. Webhook did not arrive.")
-        print(f"Debug: SELECT * FROM skip_trace_queues WHERE tracerfy_queue_id = {queue_id}")
+        # noqa placed on the f-string line below: this SQL is PRINTED for the
+        # operator to copy/paste, never executed — nothing here to inject into.
+        print(
+            f"Debug: SELECT * FROM skip_trace_queues WHERE tracerfy_queue_id = {queue_id}"  # noqa: S608
+        )
         return 1
 
     # 6) Measure hit rate from cache (what the webhook just wrote)

@@ -193,8 +193,8 @@ def run_test(county, state, record_type, template, hdrs, dry_run) -> dict:
     print(f"  {label.upper()}  [{template}]  {DATE_FROM} to {DATE_TO}")
     print(SEP)
 
-    result = dict(county=county, record_type=record_type, template=template,
-                  status="skip", new=0, old=0, total=0, job_status="", error="")
+    result = {"county": county, "record_type": record_type, "template": template,
+                  "status": "skip", "new": 0, "old": 0, "total": 0, "job_status": "", "error": ""}
 
     if dry_run:
         print("  [DRY RUN] skipped")

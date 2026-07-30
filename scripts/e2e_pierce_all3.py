@@ -77,7 +77,7 @@ async def main():
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://api.bridgeleads.io/auth/login",
-            json=dict(zip(("email", "password"), fixture_creds())),
+            json=dict(zip(("email", "password"), fixture_creds(), strict=False)),
         )
         token = resp.json()["access_token"]
 

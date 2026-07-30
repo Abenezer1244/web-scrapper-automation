@@ -97,7 +97,7 @@ async def main():
                 await page.screenshot(path="e2e_full_09_live_run.png")
 
                 # Monitor
-                for tick in range(36):  # 6 minutes max
+                for _tick in range(36):  # 6 minutes max
                     await page.wait_for_timeout(10000)
                     body = (await page.inner_text("body")).encode("ascii", "replace").decode()
                     m = re.search(r"(\d+)\s*record", body, re.IGNORECASE)

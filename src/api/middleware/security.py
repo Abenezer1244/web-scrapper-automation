@@ -36,7 +36,6 @@ _ALLOWED_SCRAPE_DOMAINS: frozenset[str] = frozenset(
 # EagleWeb), and POST /scrapers/connectors calls it when an admin
 # seeds a connector with an http:// base_url.
 _HTTP_ALLOWED_DOMAINS: frozenset[str] = frozenset()
-_DOMAIN_REGISTRATION_LOCKED = False  # Set True after app startup to prevent runtime additions
 
 
 def _host_matches_set(hostname: str, domain_set: frozenset[str]) -> bool:
@@ -276,21 +275,25 @@ def validate_outbound_webhook(url: str) -> None:
 def add_scrape_domain(domain: str) -> None:
     """Register a county portal domain as an approved scraping target.
 
-    Only allowed during module initialization (scraper constructors).
-    After app startup, runtime additions are logged as warnings.
+    The allowlist is DELIBERATELY DYNAMIC — do not add a startup "lock". Source of
+    truth is the admin-managed ``county_connectors`` table, and
+    ``register_connector_domains_from_db()`` re-registers from it at runtime: in the
+    FastAPI ``lifespan`` hook, on Celery ``worker_ready``, and again at the start of
+    every scrape job (``src/workers/tasks.py``). A connector an admin adds through
+    ``POST /scrapers/connectors`` after a worker booted is only reachable because of
+    those refreshes; freezing the set after startup would silently reject it with
+    "Scraping target not in approved domain list".
+
+    The SSRF guarantee does not come from immutability. It comes from the entries
+    being admin-managed and validated before registration, and from every outbound
+    target passing ``validate_scraping_target()`` (allowlist + DNS/private/metadata
+    checks) at fetch time.
     """
     global _ALLOWED_SCRAPE_DOMAINS
     domain = domain.lower().strip()
 
     if domain in _ALLOWED_SCRAPE_DOMAINS:
         return  # Already registered
-
-    if _DOMAIN_REGISTRATION_LOCKED:
-        import logging
-        logging.getLogger("security").warning(
-            "Attempted to add scrape domain after lock: %s — ignoring", domain
-        )
-        return
 
     _ALLOWED_SCRAPE_DOMAINS = _ALLOWED_SCRAPE_DOMAINS | {domain}
 
@@ -314,12 +317,6 @@ def add_http_allowed_host(domain: str) -> None:
     if domain in _HTTP_ALLOWED_DOMAINS:
         return
     _HTTP_ALLOWED_DOMAINS = _HTTP_ALLOWED_DOMAINS | {domain}
-
-
-def lock_scrape_domains() -> None:
-    """Lock the domain allowlist — no more runtime additions. Call after app startup."""
-    global _DOMAIN_REGISTRATION_LOCKED
-    _DOMAIN_REGISTRATION_LOCKED = True
 
 
 def register_connector_domains_from_db() -> int:

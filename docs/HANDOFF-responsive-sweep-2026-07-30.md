@@ -24,7 +24,12 @@ explicitly desktop-acceptable.
 
 ## 2. Where we are RIGHT NOW
 
-**Phases 1–5b are merged and live in production.** Nothing is in flight. Nothing is broken.
+**Phases 1–5b are merged and live in production. Phase 5c is built and open as FE PR #93**
+(branch `feat/responsive-phase-5c`), not yet merged. Nothing is broken.
+
+> Updated 2026-07-29: phase 5c shipped to review, and §5/§8 below carry a **retraction** of the
+> phase 1 "Tailwind drops nested `min(…, calc(…))`" finding — it was a measurement error, and
+> three live sites depend on that construct working. Read §5 before doing another phase.
 
 ### Frontend — `bridgeleads-web`, default branch `master`
 ```
@@ -127,25 +132,66 @@ npm run build             # must be clean
 ```
 …plus **grepping the compiled CSS in `.next`** to prove each Tailwind class actually emitted.
 
-🛑 **That last step is not optional and it earned its keep.** In phase 1 the first attempt used
-`max-h-[min(85dvh,calc(100dvh-2rem))]`, which **Tailwind silently dropped** — zero rules emitted.
-It would have shipped looking correct and doing nothing. Flattened to `max-h-[85dvh]`.
+🛑 **That last step is not optional.** But read the correction below before trusting the
+conclusion phase 1 drew from it.
 
-Use Python, not grep, to check emitted CSS — the `\:` escaping in Tailwind's output defeats shell
-quoting and I got false zeros three times:
+Use Python **run from a `.py` file**, not grep and not `python -c` through the shell, to check
+emitted CSS:
 ```python
 import pathlib
 css="".join(p.read_text(errors="ignore") for p in pathlib.Path(".next").rglob("*.css"))
 print(css.count("max-height:85dvh"), css.count("pointer-coarse\\:h-11"))
 ```
 
+### 🛑 The real hazard is FALSE ZEROS, and they have already produced one wrong conclusion
+
+Checking compiled CSS is easy to get wrong in three distinct ways. Every one of these reports
+`0` for a class that is present and working:
+
+1. **Searching for source syntax Tailwind normalised away.** Tailwind rewrites values on the way
+   out. `w-[min(18rem,calc(100vw-2rem))]` is emitted as `width:min(18rem,100vw - 2rem)` — the
+   inner `calc()` is gone (legal CSS: `calc` is implicit inside `min()`/`max()`/`clamp()`), and
+   so is the closed-up spacing. Searching the output for `calc(` finds nothing.
+2. **Running Python inline via `bash -c "…"`.** Bash consumes the backslashes before Python sees
+   them, so a pattern for `.sm\:hidden` arrives as `.sm:hidden` and never matches. This is the
+   one that bit three times in phase 1 and twice more in phase 5c. **Run the checker from a
+   file.**
+3. **Assuming `rem` output.** Tailwind v4 emits spacing utilities as `calc(var(--spacing)*N)`.
+   Searching for `min-height:2.75rem` finds nothing for `min-h-11`; search the selector
+   (`.pointer-coarse\:min-h-11`) instead.
+
+**Correction to the phase 1 finding (verified 2026-07-29 with a throwaway probe build):
+`max-h-[min(85dvh,calc(100dvh-2rem))]` is NOT dropped.** It emits
+`max-height:min(85dvh,100dvh - 2rem)`. So does the `100vh` variant, and so does plain
+`calc(100dvh-2rem)`. There is no Tailwind bug here — the original zero was cause (1) or (2)
+above, not a parser limitation.
+
+This matters because three shipped, live sites use exactly that construct and depend on it:
+`components/ui/popover.tsx:24`, `app/(dashboard)/batches/[id]/page.tsx:361`, and
+`app/(dashboard)/scrapers/new/_components/Chip.tsx:82` — where `!w-auto` makes the
+`!max-w-[min(18rem,calc(100vw-2rem))]` the *only* thing bounding the phase 5b locked-chip
+tooltip. All three verified emitting. Flattening `dialog.tsx` to `max-h-[85dvh]` was harmless,
+but it was not necessary, and the rule it implied ("use flat values only") would have wrongly
+constrained later phases.
+
+**Method note:** when a compiled-CSS check reports zero, include a class you *know* is present
+as a control before concluding anything. If the control also reads zero, the checker is broken,
+not the CSS.
+
 ### ⚠️ THE GAP — tell the user about this
-**Nothing in this sweep has been looked at on a real device or in a browser.** Six phases passed
+**Nothing in this sweep has been looked at on a real device or in a browser.** Seven phases passed
 type-check, lint, build and compiled-CSS checks, and every Vercel preview was green — but that
-proves the CSS *rules exist*, not that the screens *read well*. The user was asked three times to
-spot-check a preview and has not yet done so. The highest-value single check is: **tap a locked
-record-type chip in the wizard on a phone** — that explanation was previously impossible to see
-and is now the whole point of phase 5b.
+proves the CSS *rules exist*, not that the screens *read well*. The user has been asked several
+times to spot-check a preview and has not yet done so. The highest-value single check is: **tap a
+locked record-type chip in the wizard on a phone** — that explanation was previously impossible to
+see and is now the whole point of phase 5b.
+
+🛑 **Resizing a desktop browser is NOT a substitute, and this is easy to get wrong.** Every touch
+target in this sweep is sized with the `pointer-coarse:` variant, which keys off the pointer
+*type*, not the viewport width. A desktop Chrome window narrowed to 320px still reports a fine
+pointer, so it silently skips **every** `pointer-coarse:` rule while looking perfectly plausible.
+A narrow desktop window verifies layout only. Touch sizing needs a real phone, or DevTools device
+emulation with touch turned on.
 
 ---
 
@@ -227,14 +273,27 @@ and is now the whole point of phase 5b.
 
 ## 7. NEXT STEPS — in order
 
-### 7a. Phase 5c — `segments/page.tsx` mobile cards  ← START HERE
-`app/(dashboard)/segments/page.tsx` (550 lines). Codex verified its table at **lines 480–521**
-separates identity (**502–506**) from contact fields (**511–514**). By the rule from phases 2 and 4
-that means it needs the **mobile-card treatment**, not horizontal scroll. Model it on
-`LeadCards.tsx`. Also: raw date inputs at **348–358** and **363–373** are below touch size.
-Estimated 1 new component + 1 file edit.
+### 7a. Phase 5c — `segments/page.tsx` mobile cards — ✅ DONE (FE PR #93, awaiting merge)
+New `segments/_components/SegmentCards.tsx` + `segments/_lib.ts`, swapped at `sm` like
+`ResultsTable`. Phone and email were **plain text** and are now `tel:` / `mailto:` — the same
+money-path defect phase 2 fixed, on another screen that lists leads. The date inputs were
+hand-rolled ~28px controls bypassing `.input-base` (third phase running where that was the real
+defect); their labels are now flex columns so `.input-base`'s `width:100%` has something to fill.
+`ResultSkeleton` drew 776px of fixed-width bars inside an `overflow-hidden` box and clipped at
+320px with no scroll; it now mirrors the cards below `sm`.
 
-### 7b. Phase 6 — auth, marketing, error pages
+Two rulings worth keeping:
+- **Do not generalise `PhoneCell` / `EmailCell`.** They are typed to `ResultRow` and branch on
+  `skip_trace_status` plus the `phones[]` / `emails[]` arrays; `SegmentLeadRow` has only scalar
+  `phone` / `phone_type` / `email`. Generalising would risk the leads screen's no-phone semantics
+  to save a few lines. Local link components instead. The pure `formatPhone` helper *is* shared.
+- **Field parity is strict in BOTH directions.** The card renders the table's seven columns, no
+  more and no fewer. `SegmentLeadRow` also carries `county`, `state`, `mailing_address` and
+  `parcel_id` that the desktop table never renders; surfacing them only on mobile inverts the
+  phase 2 defect. The mechanical parity diff caught exactly that mid-development (`phone_type`
+  had crept into the card). **Re-run it whenever either view changes.**
+
+### 7b. Phase 6 — auth, marketing, error pages  ← START HERE
 `app/(auth)/*` + `_components/AuthShell.tsx`, `app/(marketing)/*`, `error.tsx`,
 `global-error.tsx`, `not-found`. ⚠️ **Check the open Darkmatter Phase 6 PRs (#34–#38) and #69
 first** — they touch marketing and settings files and would collide.
@@ -267,7 +326,7 @@ settings) is open against these.
 
 | What | Outcome |
 |---|---|
-| `max-h-[min(85dvh,calc(100dvh-2rem))]` | **Tailwind silently emitted nothing.** Nested `min(…, calc(…))` with a comma isn't parsed. Use flat values. |
+| ~~`max-h-[min(85dvh,calc(100dvh-2rem))]` emits nothing~~ | 🛑 **RETRACTED 2026-07-29 — this was never true.** A probe build shows it emits `max-height:min(85dvh,100dvh - 2rem)`. Nested `min(…, calc(…))` is fine and three live sites rely on it. The original zero was a false-zero measurement error; see §5. Do **not** avoid this construct. |
 | Pseudo-element hit-area expansion for touch targets | Rejected by Codex with codebase-specific reasoning: no reserved layout space → neighbouring controls steal/clip taps in `button-group`s and `overflow-hidden` cells. Use `pointer-coarse:`. |
 | Including **Redis** in `/ready` | Wrong. `rate_limit()` fails open, so Redis down ≠ login down. Would be a false red on the main customer path. |
 | Wiring `/ready` into the in-repo Prometheus stack | Codex's suggestion; **factually impossible** — no `/metrics` endpoint, `prometheus_client` absent. |
@@ -275,7 +334,7 @@ settings) is open against these.
 | Claiming `settings/page.tsx` was "already responsive" | False. Layout was fine; touch targets and conventions were not. |
 | Two local **full pytest** runs (backend) | Both invalid — **self-inflicted**: I started portable Postgres as a child of a background job, so the harness reaping the job killed Postgres mid-run (`pg.log`: `terminating any other active server processes`). 137 then 54 failures, all connection-shaped. **Don't start the test Postgres from inside a background job.** |
 | `curl -w '/path …'` in Git Bash | Path-converted to `C:/Program Files/Git/...`, producing a meaningless reading. Use `export MSYS_NO_PATHCONV=1`. |
-| `grep -c 'sm\\:hidden'` on compiled CSS | False zeros from backslash escaping (3×). Use Python (§5). |
+| `grep -c 'sm\\:hidden'` on compiled CSS | False zeros from backslash escaping (3× in phase 1, 2× more in phase 5c — including via `python -c` through bash, which strips the backslashes just as effectively). Run the checker from a `.py` **file**, with a known-present control class. See §5. |
 | `git worktree remove` on Windows | `Permission denied` while a handle is held; git deregisters but leaves the directory. `rm -rf` then `rmdir`. |
 
 ---

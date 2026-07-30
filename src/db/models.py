@@ -1269,3 +1269,45 @@ class NtsNotice(Base):
     is_active = Column(Boolean, nullable=False, server_default=text("true"))
     fetched_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ExternalSourceHealth(Base):
+    """Health of an EXTERNAL enrichment source (migration 083).
+
+    Distinct from `county_connectors.health_status`, which tracks county SCRAPER
+    TARGETS. This tracks third-party services we call *during* enrichment —
+    eRealProperty, King ArcGIS, Tracerfy — so that a source which starts
+    throttling us is skipped by EVERY worker and backfill until a canary clears
+    it, not just by the run that noticed.
+
+    Why durable (Postgres) rather than a Redis TTL: the cooldown after a block is
+    measured in DAYS, a Redis flush must not silently un-block a source, and ops
+    needs to see WHY and SINCE WHEN. Redis stays the transport for other things;
+    this is a slow-moving operational fact, not hot-path state.
+
+    SYSTEM-written (Celery workers / the canary via system_sync_session), never
+    user-scoped — there is exactly one row per source across all tenants, because
+    the block is on our egress IP, not on a tenant.
+    """
+
+    __tablename__ = "external_source_health"
+
+    # Stable slug, e.g. "king_erealproperty". PK so a source can never be duplicated.
+    source_key = Column(String(64), primary_key=True)
+    # healthy | throttled | blocked. 'throttled' = backing off; 'blocked' =
+    # confirmed refusing us. Both mean "do not call", they differ in severity.
+    status = Column(String(16), nullable=False, default="healthy")
+    # Why it was marked. Operator-facing, never PII.
+    reason = Column(String(512), nullable=True)
+    # When this unhealthy episode STARTED (not updated by repeated probes), so the
+    # true outage length stays visible.
+    first_seen_at = Column(DateTime(timezone=True), nullable=True)
+    # No calls — including canary probes — before this. THE enforcement field.
+    cooldown_until = Column(DateTime(timezone=True), nullable=True)
+    last_probe_at = Column(DateTime(timezone=True), nullable=True)
+    last_success_at = Column(DateTime(timezone=True), nullable=True)
+    # Drives the escalating cooldown (24h -> 48h -> 72h cap).
+    consecutive_probe_failures = Column(Integer, nullable=False, default=0)
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )

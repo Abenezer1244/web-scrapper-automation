@@ -22,6 +22,11 @@ from dataclasses import dataclass
 from src.api.middleware.security import add_scrape_domain
 from src.config import settings
 from src.scrapers.base_scraper import BridgeScraper
+from src.scrapers.enrichment.source_health import (
+    KING_EREALPROPERTY,
+    check_source_or_raise,
+    record_source_blocked,
+)
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
 
@@ -141,6 +146,11 @@ async def batch_extract_king_owners(
     if not clean:
         return owners
 
+    # Shared cross-process gate. The per-run breaker below only stops THIS run;
+    # this stops every worker/backfill while King is still refusing us. Raises
+    # SourceUnavailableError, which callers degrade on (they must not retry).
+    check_source_or_raise(KING_EREALPROPERTY)
+
     _logger.info("Owner-only lookup for %d parcels...", len(clean))
     failures = 0
     misses = 0
@@ -168,6 +178,9 @@ async def batch_extract_king_owners(
                     "Aborting to avoid treating a throttle/block as no-owner."
                 )
                 _logger.warning(msg)
+                # Persist it: the breaker alone would let the next process start
+                # hammering the same blocked source seconds later.
+                record_source_blocked(KING_EREALPROPERTY, msg)
                 raise KingOwnerLookupBlockedError(msg)
         await asyncio.sleep(delay)
 
@@ -191,6 +204,9 @@ async def batch_enrich_king_county(
         return results
 
     # ── Phase 1: HTTP requests for property address + tax URLs (fast) ─────
+    # Same shared gate as the owner-only path — this one also hits eRealProperty.
+    check_source_or_raise(KING_EREALPROPERTY)
+
     _logger.info("Phase 1: HTTP lookup for %d parcels...", len(clean))
     tax_urls: dict[str, str] = {}  # pid → payment.kingcounty.gov URL
 

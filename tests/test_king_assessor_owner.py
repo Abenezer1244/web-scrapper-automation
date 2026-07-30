@@ -5,11 +5,40 @@ page so King tax-delinquent leads get a real name instead of the
 "Tax Delinquent — $X owed (Parcel …)" placeholder. The markup samples below are
 the REAL shape served by blue.kingcounty.com (captured live), not invented.
 """
+import pytest
+from sqlalchemy import text
+
 from src.scrapers.enrichment.king_county_assessor import (
     KingOwnerLookupBlockedError,
     _extract_owner_name,
     batch_extract_king_owners,
 )
+from src.scrapers.enrichment.source_health import KING_EREALPROPERTY
+
+
+@pytest.fixture(autouse=True)
+def _reset_source_health():
+    """Clear the shared eRealProperty health row around every test.
+
+    batch_extract_king_owners now consults durable source health, and the breaker
+    tests below deliberately trip it — which PERSISTS. Without this reset the
+    first tripping test would block every later test in the file (and any other
+    file touching King enrichment) with SourceUnavailableError. That is the
+    feature working; the tests just need to not leak state into each other.
+    """
+    from src.db.session import SyncSessionLocal
+
+    def _wipe():
+        with SyncSessionLocal() as db:
+            db.execute(
+                text("DELETE FROM external_source_health WHERE source_key = :k"),
+                {"k": KING_EREALPROPERTY},
+            )
+            db.commit()
+
+    _wipe()
+    yield
+    _wipe()
 
 # Exact markup captured from a live Dashboard page (parcel 1954600115). King
 # joins co-owners with "+" and bolds the label cell.

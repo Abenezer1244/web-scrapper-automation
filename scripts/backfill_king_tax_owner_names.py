@@ -48,6 +48,7 @@ from src.scrapers.enrichment.king_county_assessor import (
     KingOwnerLookupBlockedError,
     batch_extract_king_owners,
 )
+from src.scrapers.enrichment.source_health import SourceUnavailableError
 from src.scrapers.king_wa_tax_delinquent import is_tax_placeholder_party
 
 logging.basicConfig(level=logging.INFO)
@@ -141,7 +142,7 @@ def run(batch: int, limit: int | None, dry_run: bool, delay: float) -> None:
                     _resolve_owners(
                         [c.parcel_id.strip() for c in candidates], owner_cache, delay
                     )
-                except KingOwnerLookupBlockedError as exc:
+                except (KingOwnerLookupBlockedError, SourceUnavailableError) as exc:
                     db.rollback()
                     _log.error("ABORTED: %s", exc)
                     raise SystemExit(2) from exc

@@ -45,6 +45,7 @@ from src.scrapers.enrichment.king_county_assessor import (
     KingOwnerLookupBlockedError,
     batch_extract_king_owners,
 )
+from src.scrapers.enrichment.source_health import SourceUnavailableError
 from src.utils.lead_formatting import classify_probate_title_status
 
 logging.basicConfig(level=logging.INFO)
@@ -130,7 +131,7 @@ def run(batch: int, limit: int | None, dry_run: bool, delay: float) -> None:
 
             try:
                 _resolve_owners([r.parcel_id.strip() for r in rows], owner_cache, delay)
-            except KingOwnerLookupBlockedError as exc:
+            except (KingOwnerLookupBlockedError, SourceUnavailableError) as exc:
                 # Abort cleanly rather than crashing with a traceback — and never
                 # commit a page whose owners are actually throttle failures.
                 db.rollback()

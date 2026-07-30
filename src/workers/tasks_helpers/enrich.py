@@ -523,6 +523,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                     KingOwnerLookupBlockedError,
                     batch_extract_king_owners,
                 )
+                from src.scrapers.enrichment.source_health import SourceUnavailableError
                 o_pid_map: dict[str, list] = {}
                 for res in owner_needs:
                     o_pid_map.setdefault(res.parcel_id.strip(), []).append(res)
@@ -550,7 +551,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                         ),
                         timeout=180,
                     ))
-                except KingOwnerLookupBlockedError as exc:
+                except (KingOwnerLookupBlockedError, SourceUnavailableError) as exc:
                     _logger.warning(
                         "Job %s: King owner-only lookup aborted: %s",
                         job_id, str(exc)[:180],

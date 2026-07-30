@@ -69,8 +69,10 @@ def main() -> None:
                 key = "jids" if col == "job_id" else "ids"
                 arr = jp if col == "job_id" else p
                 n = db.execute(
-                    text(  # noqa: S608 — table/col come from the literal tuple above, never input
-                        f"SELECT count(*) AS n FROM {table} "
+                    text(
+                        # noqa must sit on the line ruff reports (the f-string), not on
+                        # text(...) — table/col come from the literal tuple above, never input.
+                        f"SELECT count(*) AS n FROM {table} "  # noqa: S608
                         f"WHERE {col} = ANY(CAST(:{key} AS uuid[]))"
                     ),
                     arr,

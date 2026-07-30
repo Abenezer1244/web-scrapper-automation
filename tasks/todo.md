@@ -66,15 +66,15 @@ Consensus on all findings. Codex positions adopted:
 - **Q4** `as_of` is structural — if it cannot be parsed, **fail**, never fall back.
 - **Q5** encode the invariant as a *checked contract with diagnostics*, not a belief.
 
-## Plan — Phase 1 (this branch, parser correctness only)
-- [ ] 1. Replace `_EXPECTED_FIELDS = 17` with explicit layout maps for 15- and 17-field files
-- [ ] 2. Index all column reads through the selected layout; owed = layout's owed column
-- [ ] 3. `_as_of_year()` parses `YYYYMMDD` and `mm/dd/yyyy`; unparseable ⇒ raise, no fallback
-- [ ] 4. `mailing_address = None` when the layout has no mailing street; locality →
-       `enrichment_data.mailing_locality` (+ `full_year_levy`, `layout` for audit)
-- [ ] 5. Reject mixed/unknown field counts loudly; record chosen layout in `stats`
-- [ ] 6. Update/extend `tests/test_snohomish_tax.py` for both layouts + the year-boundary case
-- [ ] 7. `ruff` + targeted pytest; then Codex reviews the diff
+## Plan — Phase 1 (this branch, parser correctness only) — DONE, commit `0a97149`
+- [x] 1. Replace `_EXPECTED_FIELDS = 17` with explicit layout maps for 15- and 17-field files
+- [x] 2. Index all column reads through the selected layout; owed = layout's owed column
+- [x] 3. `_as_of_year()` parses `YYYYMMDD` and `mm/dd/yyyy`; unparseable ⇒ raise, no fallback
+- [x] 4. `mailing_address = None` when the row has no mailing street; locality →
+       `enrichment_data.mailing_locality` (+ `full_year_levy`, `source_layout` for audit)
+- [x] 5. Reject mixed/unknown field counts loudly; record chosen layout in `stats`
+- [x] 6. Update/extend `tests/test_snohomish_tax.py` for both layouts + the year-boundary case
+- [x] 7. `ruff` + targeted pytest; then Codex reviews the diff
 
 ## Deferred (NOT this branch)
 - Codex Q4's bulk-source **contract smoke check** (sample first N rows, alert independently
@@ -89,4 +89,45 @@ Consensus on all findings. Codex positions adopted:
   Verified all 24 active+healthy connectors resolve at runtime (0 broken).
 
 ## Review
-_pending_
+
+**Changed** (commit `0a97149`, branch `chore/xcheck-2026-07-30`, no migration):
+- `src/scrapers/snohomish_wa_tax_delinquent.py` — `_Layout` dataclass + `_LAYOUT_V15` /
+  `_LAYOUT_V17` maps selected by field width and locked per file; all column reads indexed
+  through the layout; `_as_of_year()` accepts `YYYYMMDD` and `mm/dd/yyyy` with month/day
+  validation so a 14-digit parcel or an amount can't be read as a date; `scrape()` raises
+  when the as-of year is unparseable instead of falling back to the wall clock;
+  `mailing_address` gated on an actual street line in the data; `full_year_levy`,
+  `mailing_locality`, `source_layout` added to `enrichment_data`; `layout` added to `stats`.
+- `tests/test_snohomish_tax.py` — 13 → 29 tests.
+- `scripts/diag_snoho_amount_invariant.py`, `scripts/diag_snoho_tax_canary_repro.py` — kept
+  as the reproducible evidence for the column mapping and a per-connector canary repro.
+
+**Proof (live production source, not a fixture):** 327,721 rows, 1 malformed (the file's own
+leading empty record), 8,900 delinquent rows → **1,954 parcels**, `as_of_year=2026`,
+`layout=v15_2026_07`, real owner names + situs addresses. "canary would set healthy."
+
+**Tests:** 29/29 in `test_snohomish_tax.py`; **244 passed** across `-k "tax or dedup or
+snohomish or lead_export or address_intel"`. `ruff` clean on all touched files.
+Local rig is not isolated (handoff §7) — **CI is the authoritative gate.**
+
+**Codex:** consulted on the design before any code (agreed on all four decisions; its
+"support both layouts" and "never fall back on as_of" positions are what shipped), then
+reviewed the diff — **pass, no findings, no regressions identified.**
+
+**Deliberate behaviour change to flag:** the mailing rule also applies to the old layout.
+Verified 0 of 328,069 rows in the v17 file ever populated the mailing street, so the
+**2,253 existing Snohomish rows in prod carry a city-only `mailing_address`** and their
+`absentee_owner` / `out_of_state_owner` flags were derived from it. New rows will have
+`mailing_address = NULL` + `enrichment_data.mailing_locality`. Existing rows are NOT
+backfilled by this change — a separate decision.
+
+**Not done / open:**
+1. `scraper_configs` for snohomish/tax_delinquent will not recover until the connector's
+   `health_status` flips off `down`. The hourly canary samples 5 random connectors of 30,
+   so it should clear on its own within a few hours of deploy — but nothing forces it.
+2. The canary probes only `record_types[0]` per connector row while writing ONE
+   `health_status` for the whole row (`scheduler_helpers/health.py:287`). Harmless for
+   Snohomish (single-type rows) but wrong for multi-type connectors like
+   king `["probate","pre_foreclosure","death_certificate"]`. Untouched here.
+3. Codex Q4's bulk-source contract smoke check — the reason this sat broken 5 weeks.
+   Deferred (see above); overlaps the §8-gated canary work.

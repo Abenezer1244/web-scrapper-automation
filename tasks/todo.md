@@ -1,62 +1,92 @@
-# Trustee Sale ("Auction Leads") — County Expansion
+# Snohomish tax_delinquent — source layout change (2026-07-30)
 
-Branch: `feat/trustee-sale-county-expansion` (worktree off origin/main).
+Branch: `chore/xcheck-2026-07-30` · worktree `bridgeleads-worktrees/xcheck-0730s2` off `origin/main` (`d56b11c`)
 
-## Goal
-Extend `trustee_sale` coverage beyond the current 3 counties (Pierce, Snohomish,
-King-partial). Build ONE new county end-to-end first, prove it, then repeat.
+## Cross-check result
 
-## Architecture (verified against origin/main, not assumed)
-`trustee_sale` is a DB reader over the shared `nts_notices` cache. Coverage is
-bounded by which counties have an NTS crawler feeding that cache. Per new county:
+Swept production (`scripts/diag_build_health_sweep.py`). Jobs healthy (0 stuck, 0 failures
+in 14d, 0 stranded batch runs). One genuine user-facing break found.
 
-1. **Crawler** → `nts_notices` (source-specific; the hard part).
-   - HTML source: listing crawl → `extract_notice_urls` → `extract_article_text`
-     → `parse_nts_notice`/surrogate → `notice_to_row(source=…, county=…)`.
-   - PDF source: `safe_download_to_file` → `nts_pdf.extract/normalize/split`
-     → `parse_nts_notice` → `notice_to_row`.
-   - Parser `parse_nts_notice` is SHARED + already multi-layout — reuse, don't fork.
-2. **Beat schedule** entry in `src/workers/scheduler.py`.
-3. **`NTS_MATCH_COUNTIES`** (`nts_matcher_task.py`) += county — so the county's
-   `pre_foreclosure` leads also get auction enrichment.
-4. **`{County}WATrusteeSaleScraper`** subclass in `src/scrapers/trustee_sale.py`.
-5. **`county_connectors`** seed migration (mirror 081) — one `trustee_sale` row.
-6. **Tests** — parser fixture (real saved notice, no mocks) + wiring.
+**snohomish/tax_delinquent connector `health_status='down'`, 1 active user config, broken ~5 weeks.**
 
-## Steps
-- [x] Research: most-feasible next county = **Clark** (The Columbian classifieds — free
-      HTML, robots 404, verified real full-text NTS). Whatcom (Lynden Tribune) is 2nd.
-- [x] Consult Codex on the plan BEFORE code — changed 2 decisions (fetch-all not
-      pre-filter; fix the SHARED parser not a Clark override).
-- [x] Build ingestion adapter (nts_columbian.py) + shared-parser fix, real fixtures.
-- [x] Wire crawler + beat + NTS_MATCH_COUNTIES + subclass + migration 082.
-- [x] Tests green (108 parser + 32 wiring locally; full suite 1618 pass); ruff clean.
-- [x] Codex reviewed the diff: no P1/Critical. 1 P2 + 1 P3 fixed (barren-alert on total
-      fetch failure; log cap truncation).
-- [x] Prove: live crawl found 32 ads → 1 real Clark trustee sale parsed (TS
-      WA07000393-24-1, MTC acting trustee), 31 non-NTS skipped, 0 errors.
-- [x] Dead-code sweep: no stale `_TRUSTEE`; ruff F-rules clean.
+Reproduced the exact production exception:
+
+```
+RuntimeError: Snohomish tax list format unexpected: 327721/327721 rows malformed (>20%)
+  — possible source change            (snohomish_wa_tax_delinquent.py:367)
+```
+
+### Root cause
+The county changed the bulk-file layout **17 → 15 pipe-delimited fields**.
+`_EXPECTED_FIELDS = 17`, so 100% of rows fail the length check and the
+`_MAX_MALFORMED_RATIO = 0.2` structural guard aborts. **The guard behaved correctly** —
+only the layout constant and column indices are stale.
+
+### Measured over the ENTIRE live file (327,721 rows streamed — not a sample)
+- field count uniformly **15** on 327,721/327,721 rows
+- parcels: 14-digit real property 307,308 · 7-digit personal 20,412 · 1 blank
+- tax years 1996–2026 (2026: 310,058 · 2025: 6,287 · 2024: 3,400 · 2023: 1,868 …)
+- `as_of` uniformly `20260701` (format changed from `mm/dd/yyyy` → `YYYYMMDD`)
+- **8,900** 14-digit prior-year rows with owed > 0 → a corrected parser yields real leads
+
+### Column semantics — derived, then validated at scale
+Invariant `c11 == c12 + c13` holds on **327,720/327,720 rows (100.0000%, 0 failures)**
+⇒ `c11` = billed-to-date, `c12` = paid, `c13` = **still owed**.
+`c14` vs `c11`: equal 27,407 / ~2× 251,031 / other 9,241 ⇒ `c14` = full-year levy.
+Old code took the **last** column as owed (`f[16]`); in the new layout the last column is
+the levy, so a naive reindex would silently overstate every amount.
+
+| | old (17) | new (15) |
+|---|---|---|
+| situs | `f2` street, `f3` line2, `f4` city, `f5` st, `f6` zip | `f2` street, `f3` city, `f4` st, `f5` zip |
+| owner | `f7` | `f6` |
+| mailing | `f8` line1, `f9` line2, `f10` city, `f11` st, `f12` zip | `f7` city, `f8` st, `f9` zip — **no street** |
+| as_of | `f13` `mm/dd/yyyy` | `f10` `YYYYMMDD` |
+| amounts | `f14` billed, `f15`, `f16` owed | `f11` billed, `f12` paid, `f13` owed, `f14` levy |
+
+### Two further landmines found
+- **(a) silent year-boundary bug.** `_as_of_year()` parses only `mm/dd/yyyy`; `20260701`
+  returns `None` → silently falls back to `datetime.now(UTC).year`. Correct by luck in
+  2026; a file published Dec-2026 read in Jan-2027 would use 2027 and classify the whole
+  current year as delinquent. No error raised.
+- **(b) city-only mailing address.** New layout has mailing city/state/zip and no street.
+  `_join_address` would emit `"MONROE, WA 98272-2204"`. Verified that
+  `address_intel.compute_owner_flags(property_address, mailing_address)` derives
+  `owner_state` / `absentee_owner` / `out_of_state_owner` **from the mailing address** —
+  a city-only value manufactures false absentee signals. Also the standing skip-trace rule:
+  never stuff a city-only value into an address field.
+
+## Codex consult (design, before any code)
+Consensus on all findings. Codex positions adopted:
+- **Q1** support BOTH 15 and 17 via explicit named layout maps (both URLs are live and the
+  county rotates: `..._36.txt` vs `..._39.txt`); unknown/mixed field counts fail loudly.
+- **Q2** `mailing_address = None`; keep city/state/zip in `enrichment_data` for audit.
+- **Q3** `total_billed` stays **billed-to-date** (`c11`) so the meaning of the field on the
+  2,253 existing Snohomish rows does not silently change; levy gets a new key.
+- **Q4** `as_of` is structural — if it cannot be parsed, **fail**, never fall back.
+- **Q5** encode the invariant as a *checked contract with diagnostics*, not a belief.
+
+## Plan — Phase 1 (this branch, parser correctness only)
+- [ ] 1. Replace `_EXPECTED_FIELDS = 17` with explicit layout maps for 15- and 17-field files
+- [ ] 2. Index all column reads through the selected layout; owed = layout's owed column
+- [ ] 3. `_as_of_year()` parses `YYYYMMDD` and `mm/dd/yyyy`; unparseable ⇒ raise, no fallback
+- [ ] 4. `mailing_address = None` when the layout has no mailing street; locality →
+       `enrichment_data.mailing_locality` (+ `full_year_levy`, `layout` for audit)
+- [ ] 5. Reject mixed/unknown field counts loudly; record chosen layout in `stats`
+- [ ] 6. Update/extend `tests/test_snohomish_tax.py` for both layouts + the year-boundary case
+- [ ] 7. `ruff` + targeted pytest; then Codex reviews the diff
+
+## Deferred (NOT this branch)
+- Codex Q4's bulk-source **contract smoke check** (sample first N rows, alert independently
+  of user jobs). New subsystem touching the scheduler; overlaps the §8-gated
+  external-source canary work in `HANDOFF-king-owner-names-2026-07-30.md` §9.3. Separate PR.
+- `county_connectors.state` case split (`'WA'` 14 rows vs `'wa'`): **not a correctness bug** —
+  every lookup is case-normalised (`registry.py:76`, `scrapers.py:113,750`, `jobs.py:133`,
+  `batches.py:230`). It does break the picker's `order_by(state, county)` (non-alphabetical,
+  clark listed twice) and defeats `ix_county_connectors_picker`. Cosmetic + perf, separate PR.
+- **Retracted, not a bug:** 12 active+healthy connectors with empty `scraper_class` are
+  `scraper_mode='ai'` and resolve via `_detect_template(base_url)` → `EagleWebScraper`.
+  Verified all 24 active+healthy connectors resolve at runtime (0 broken).
 
 ## Review
-
-Built Clark County ("Auction Leads" / `trustee_sale`) end to end, the 4th NTS county
-after Pierce/Snohomish/King. The record type is downstream of the shared `nts_notices`
-cache, so the work was: a new **ingestion adapter** for The Columbian classifieds +
-wiring, reusing the shared field parser.
-
-**Changes (7 commits, isolated worktree off origin/main):**
-1. `fix(nts)` — shared parser: prefer Current over Original trustee, stop beneficiary
-   before "Original Trustee" (dual-label MTC layout; latently fixes King too). Proven
-   byte-identical on all 5 Pierce fixtures.
-2. `feat(nts)` — `nts_columbian.py` ingestion adapter (listing → /ad-details permalinks
-   → `p.ad-content-container` body via BeautifulSoup), real HTML fixtures + tests.
-3. `feat(nts)` — crawler task, daily beat, `NTS_MATCH_COUNTIES += clark`,
-   `ClarkWATrusteeSaleScraper`, migration 082 (coexists w/ Clark recorder connector).
-4. `fix(nts)` — Codex P2/P3: alert on total fetch failure; log cap truncation.
-
-**Codex:** consulted before code (2 decisions changed) + reviewed the diff (no
-Critical/High; P2/P3 fixed). Live-proven. No migration risk (data INSERT only, idempotent).
-
-**Follow-ups:** Whatcom (Lynden Tribune) is the ready 2nd county on the same pattern.
-Spokane/Thurston need a headed-browser recheck (403'd). wapublicnotices.com statewide
-aggregator is a possible one-crawler-many-counties spike (ASP.NET postback).
+_pending_

@@ -43,6 +43,7 @@ rows are intentionally EXCLUDED (conservative — they may not be overdue yet).
 import os
 import re
 import tempfile
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urljoin
@@ -73,7 +74,69 @@ _DOC_LINK_RE = re.compile(
     r'href="(/DocumentCenter/View/\d+/snohomish_tax_data_totals[^"]*)"', re.IGNORECASE
 )
 
-_EXPECTED_FIELDS = 17
+@dataclass(frozen=True)
+class _Layout:
+    """Column map for one published revision of the Current Tax List.
+
+    The county rotates the bulk file (filenames ``..._36.txt`` / ``..._39.txt``)
+    and on 2026-07-01 it also CHANGED THE LAYOUT: 17 fields → 15, dropping both
+    address "line 2" columns and the mailing STREET line, and adding an amount
+    column. Both revisions are still served from the landing page, so the parser
+    selects a layout by field count instead of assuming one.
+    """
+
+    name: str
+    n_fields: int
+    situs_street: int
+    situs_line2: int | None
+    situs_city: int
+    situs_state: int
+    situs_zip: int
+    owner: int
+    # None = this revision does not publish a mailing street line at all.
+    mail_street: int | None
+    mail_line2: int | None
+    mail_city: int
+    mail_state: int
+    mail_zip: int
+    as_of: int
+    # Amount billed to date for the tax year (what `total_billed` has always meant).
+    billed: int
+    # Amount STILL OWED. Note this is NOT the last column in either revision --
+    # in v15 the last column is the full-year levy, so taking "the last amount"
+    # would silently overstate every delinquent balance.
+    owed: int
+    # Full-year levy; only published by v15.
+    levy: int | None
+
+
+# Layout as served until 2026-07-01. Kept verbatim: the old file is still live at
+# a second URL and its amount columns are (billed, <half>, owed) -- owed is f16.
+_LAYOUT_V17 = _Layout(
+    name="v17_pre_2026_07",
+    n_fields=17,
+    situs_street=2, situs_line2=3, situs_city=4, situs_state=5, situs_zip=6,
+    owner=7,
+    mail_street=8, mail_line2=9, mail_city=10, mail_state=11, mail_zip=12,
+    as_of=13,
+    billed=14, owed=16, levy=None,
+)
+
+# Layout live since 2026-07-01. Amount columns verified against the full 327,721-row
+# file: the invariant billed == paid + owed holds on 327,720/327,720 rows (100.0000%),
+# which is what identifies col 13 as "still owed" and col 14 as the full-year levy.
+_LAYOUT_V15 = _Layout(
+    name="v15_2026_07",
+    n_fields=15,
+    situs_street=2, situs_line2=None, situs_city=3, situs_state=4, situs_zip=5,
+    owner=6,
+    mail_street=None, mail_line2=None, mail_city=7, mail_state=8, mail_zip=9,
+    as_of=10,
+    billed=11, owed=13, levy=14,
+)
+
+_LAYOUTS: dict[int, _Layout] = {lay.n_fields: lay for lay in (_LAYOUT_V15, _LAYOUT_V17)}
+
 # A real-property parcel id is 14 digits; personal-property accounts are 7.
 _REAL_PROPERTY_PARCEL_LEN = 14
 # Abort if more than this fraction of rows don't match the expected shape — the
@@ -139,22 +202,72 @@ def _to_decimal(raw: str) -> Decimal | None:
 
 
 def _as_of_year(raw: str) -> int | None:
-    """Year from a Snohomish 'mm/dd/yyyy' as-of date cell, else None."""
+    """Year from a Snohomish as-of date cell, else None.
+
+    Two published formats: 'mm/dd/yyyy' (v17) and 'YYYYMMDD' (v15, live since
+    2026-07-01). Returning None here is NOT benign -- the as-of year is what
+    separates "delinquent" from "current", so the scraper treats an unparseable
+    as-of as a hard failure rather than falling back to the wall clock (which
+    would misclassify an entire tax year across a year boundary).
+    """
     s = (raw or "").strip()
     parts = s.split("/")
     if len(parts) == 3 and parts[2].isdigit() and len(parts[2]) == 4:
         return int(parts[2])
+    # YYYYMMDD -- validate the month/day so a 14-digit parcel or an amount can
+    # never be mistaken for a date.
+    if len(s) == 8 and s.isdigit():
+        year, month, day = int(s[:4]), int(s[4:6]), int(s[6:8])
+        if 1900 <= year <= 2200 and 1 <= month <= 12 and 1 <= day <= 31:
+            return year
     return None
 
 
-def _join_address(street: str, line2: str, city: str, state: str, zip_code: str) -> str | None:
-    """Build a readable single-line address from Snohomish address parts."""
-    street_full = " ".join(p for p in (street.strip(), line2.strip()) if p)
-    locality = " ".join(p for p in (city.strip(), state.strip()) if p)
+def _join_address(*parts: str | None) -> str | None:
+    """Build a readable single-line address from Snohomish address parts.
+
+    Accepts ``(street[, line2], city, state, zip)`` with ``None`` for columns a
+    given layout does not publish. The last part is treated as the ZIP (appended
+    without a comma); the two before it as city/state.
+    """
+    vals = [(p or "").strip() for p in parts]
+    zip_code = vals.pop() if vals else ""
+    state = vals.pop() if vals else ""
+    city = vals.pop() if vals else ""
+    street_full = " ".join(p for p in vals if p)
+    locality = " ".join(p for p in (city, state) if p)
     head = ", ".join(p for p in (street_full, locality) if p)
-    if zip_code.strip():
-        head = (head + " " + zip_code.strip()).strip(", ").strip()
+    if zip_code:
+        head = (head + " " + zip_code).strip(", ").strip()
     return BridgeScraper.clean(head)
+
+
+def _address_from(f: list[str], street: int | None, line2: int | None,
+                  city: int, state: int, zip_code: int) -> str | None:
+    """Join one address block, honouring columns this layout does not publish."""
+    parts: list[str | None] = []
+    if street is not None:
+        parts.append(f[street])
+    if line2 is not None:
+        parts.append(f[line2])
+    parts += [f[city], f[state], f[zip_code]]
+    return _join_address(*parts)
+
+
+def _has_street(f: list[str], street: int | None, line2: int | None) -> bool:
+    """True when the row actually carries a street line for this address block.
+
+    Deliberately data-driven, not layout-driven: v15 drops the mailing street
+    column outright, but v17 rows very often carry it BLANK. Both cases must be
+    treated the same, because a "mailing address" of "EVERETT, WA 98201" is not
+    an address -- compute_owner_flags() reads the mailing address to derive
+    owner_state / absentee_owner / out_of_state_owner, and skip-trace bills per
+    lookup, so a city-only value manufactures confident-looking wrong signals.
+    """
+    for idx in (street, line2):
+        if idx is not None and f[idx].strip():
+            return True
+    return False
 
 
 def parse_tax_list(
@@ -182,6 +295,7 @@ def parse_tax_list(
     malformed = 0
     delinquent_rows = 0
     current_year: int | None = None
+    layout: _Layout | None = None
 
     for line in lines:
         line = line.rstrip("\r\n")
@@ -189,7 +303,13 @@ def parse_tax_list(
             continue
         total += 1
         f = line.split("|")
-        if len(f) != _EXPECTED_FIELDS:
+        # Lock the layout to the first row whose width we recognise, then hold it
+        # for the whole file: a file that mixes widths is a wrong/half-swapped
+        # download, and every off-width row counting as malformed lets the
+        # caller's malformed-ratio guard abort loudly instead of parsing junk.
+        if layout is None:
+            layout = _LAYOUTS.get(len(f))
+        if layout is None or len(f) != layout.n_fields:
             malformed += 1
             continue
         parcel = f[0].strip()
@@ -200,13 +320,13 @@ def parse_tax_list(
         year = int(year_s)
 
         if current_year is None:
-            current_year = _as_of_year(f[13])
+            current_year = _as_of_year(f[layout.as_of])
         ref_year = current_year or fallback_year
 
         # Real property only; skip 7-digit personal-property (business) accounts.
         if len(parcel) != _REAL_PROPERTY_PARCEL_LEN:
             continue
-        owed = _to_decimal(f[16])
+        owed = _to_decimal(f[layout.owed])
         if owed is None or owed <= 0:
             continue
         # Exclude current-year and future rows — only prior years still owed are
@@ -217,21 +337,40 @@ def parse_tax_list(
         delinquent_rows += 1
         entry = agg.get(parcel)
         if entry is None:
+            has_mail_street = _has_street(f, layout.mail_street, layout.mail_line2)
             entry = {
-                "owner": f[7],
-                "situs": _join_address(f[2], f[3], f[4], f[5], f[6]),
-                "mailing": _join_address(f[8], f[9], f[10], f[11], f[12]),
-                "as_of": f[13].strip(),
+                "owner": f[layout.owner],
+                "situs": _address_from(
+                    f, layout.situs_street, layout.situs_line2,
+                    layout.situs_city, layout.situs_state, layout.situs_zip,
+                ),
+                # Only a real street-bearing address goes in mailing_address.
+                "mailing": _address_from(
+                    f, layout.mail_street, layout.mail_line2,
+                    layout.mail_city, layout.mail_state, layout.mail_zip,
+                ) if has_mail_street else None,
+                # City/state/zip kept for audit even when it can't be a mailing
+                # address, so the owner's locality isn't simply lost.
+                "mail_locality": _address_from(
+                    f, None, None,
+                    layout.mail_city, layout.mail_state, layout.mail_zip,
+                ),
+                "as_of": f[layout.as_of].strip(),
                 "years": set(),
                 "amount": Decimal("0"),
                 "total_billed": Decimal("0"),
+                "full_year_levy": Decimal("0"),
             }
             agg[parcel] = entry
         entry["years"].add(year)
         entry["amount"] += owed
-        billed = _to_decimal(f[14])
+        billed = _to_decimal(f[layout.billed])
         if billed is not None:
             entry["total_billed"] += billed
+        if layout.levy is not None:
+            levy = _to_decimal(f[layout.levy])
+            if levy is not None:
+                entry["full_year_levy"] += levy
 
     records: list[ScrapedRecord] = []
     capped_out = 0
@@ -273,7 +412,18 @@ def parse_tax_list(
             "account_number": parcel,
             "county": "snohomish",
             "state": "WA",
+            # Which published revision this row was parsed from — so a future
+            # layout change is attributable per row rather than guessed at.
+            "source_layout": layout.name if layout else None,
         }
+        # Owner locality when there is no deliverable mailing address (see
+        # _has_street): recorded for audit, deliberately NOT mailing_address.
+        if rec.mailing_address is None and entry["mail_locality"]:
+            rec.enrichment_data["mailing_locality"] = entry["mail_locality"]
+        if entry["full_year_levy"] > 0:
+            rec.enrichment_data["full_year_levy"] = str(
+                entry["full_year_levy"].quantize(Decimal("0.01"))
+            )
         records.append(rec)
 
     stats = {
@@ -282,6 +432,7 @@ def parse_tax_list(
         "delinquent_rows": delinquent_rows,
         "capped_out": capped_out,
         "as_of_year": current_year,
+        "layout": layout.name if layout else None,
     }
     return records, stats
 
@@ -366,7 +517,19 @@ class SnohomishWATaxDelinquentScraper(BridgeScraper):
         if malformed / total > _MAX_MALFORMED_RATIO:
             raise RuntimeError(
                 f"Snohomish tax list format unexpected: {malformed}/{total} rows "
-                f"malformed (>{int(_MAX_MALFORMED_RATIO * 100)}%) — possible source change"
+                f"malformed (>{int(_MAX_MALFORMED_RATIO * 100)}%) — possible source "
+                f"change (layout={stats['layout']!r}; known widths "
+                f"{sorted(_LAYOUTS)})"
+            )
+        # The as-of year is what separates "delinquent" from "current". If it did
+        # not parse, parse_tax_list fell back to the wall-clock year — harmless in
+        # mid-year, but across a year boundary it would classify the entire current
+        # tax year as delinquent. Structural, so fail rather than ship bad leads.
+        if stats["as_of_year"] is None:
+            raise RuntimeError(
+                "Snohomish tax list as-of date unparseable (layout="
+                f"{stats['layout']!r}) — refusing to classify delinquency from the "
+                "wall clock; the source date format likely changed"
             )
         if not records:
             raise RuntimeError(
@@ -377,9 +540,10 @@ class SnohomishWATaxDelinquentScraper(BridgeScraper):
         _logger.info(
             "Snohomish tax delinquent complete — %d bytes, %d rows (%d malformed), "
             "%d delinquent rows → %d parcels (%d capped out >18mo, "
-            "cap_min_year=%d, as_of_year=%s)",
+            "cap_min_year=%d, as_of_year=%s, layout=%s)",
             n_bytes, total, malformed, stats["delinquent_rows"],
             len(records), stats["capped_out"], cap_min_year, stats["as_of_year"],
+            stats["layout"],
         )
         if self.on_progress:
             self.on_progress(1, 1, len(records))

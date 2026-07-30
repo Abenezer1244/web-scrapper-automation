@@ -32,10 +32,10 @@ import sys
 
 sys.path.insert(0, ".")
 
-from cryptography.fernet import Fernet, InvalidToken, MultiFernet  # noqa: E402
-from sqlalchemy import create_engine, text  # noqa: E402
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
+from sqlalchemy import create_engine, text
 
-from src.utils.crypto import _ENC_PREFIX, _derive_key_from_secret, encrypt_field  # noqa: E402
+from src.utils.crypto import _ENC_PREFIX, _derive_key_from_secret, encrypt_field
 
 _BATCH = 200
 

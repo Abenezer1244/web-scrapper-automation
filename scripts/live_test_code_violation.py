@@ -22,9 +22,9 @@ os.environ.setdefault("DATABASE_URL_SYNC", "postgresql+psycopg2://u:p@localhost/
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 os.environ.setdefault("SECRET_KEY", "x" * 48)
 
-from src.scrapers.base_scraper import ScrapedRecord  # noqa: E402
-from src.scrapers.king_wa_code_violation import KingWACodeViolationScraper  # noqa: E402
-from src.scrapers.pierce_wa_code_violation import PierceWACodeViolationScraper  # noqa: E402
+from src.scrapers.base_scraper import ScrapedRecord
+from src.scrapers.king_wa_code_violation import KingWACodeViolationScraper
+from src.scrapers.pierce_wa_code_violation import PierceWACodeViolationScraper
 
 
 def _red_flags(records: list[ScrapedRecord]) -> dict:

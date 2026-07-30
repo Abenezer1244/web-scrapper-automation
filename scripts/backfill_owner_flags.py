@@ -31,11 +31,11 @@ sys.path.insert(0, ".")  # railway-run cwd shim (see other scripts)
 # the per-row UPDATE loop. We only want our own progress lines.
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
-from sqlalchemy import text  # noqa: E402
-from sqlalchemy.exc import OperationalError  # noqa: E402
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
-from src.db.session import system_sync_session  # noqa: E402
-from src.utils.address_intel import compute_owner_flags  # noqa: E402
+from src.db.session import system_sync_session
+from src.utils.address_intel import compute_owner_flags
 
 _SELECT = text(
     """

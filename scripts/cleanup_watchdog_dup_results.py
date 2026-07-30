@@ -55,10 +55,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sqlalchemy import create_engine, text  # noqa: E402
-from sqlalchemy.orm import sessionmaker  # noqa: E402
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 
-from src.db.session import system_sync_session  # noqa: E402
+from src.db.session import system_sync_session
 
 BATCH_SIZE = 500
 TERMINAL_JOB_STATUSES = ("done", "failed", "cancelled")

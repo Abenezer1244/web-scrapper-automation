@@ -7,9 +7,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sqlalchemy import text  # noqa: E402
+from sqlalchemy import text
 
-from src.db.session import system_sync_session  # noqa: E402
+from src.db.session import system_sync_session
 
 _CFG = "40333eb4-e991-499b-ae2c-563da463920a"
 

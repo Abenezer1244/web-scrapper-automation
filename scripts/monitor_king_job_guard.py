@@ -14,9 +14,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sqlalchemy import text  # noqa: E402
+from sqlalchemy import text
 
-from src.db.session import system_sync_session  # noqa: E402
+from src.db.session import system_sync_session
 
 _TERMINAL = ("done", "failed", "cancelled")
 CANCEL_AT_MIN = 63.0

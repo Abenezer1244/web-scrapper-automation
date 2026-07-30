@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from main import app  # noqa: E402
+from main import app
 
 _OUT = Path(__file__).resolve().parents[1] / "schema" / "openapi.json"
 

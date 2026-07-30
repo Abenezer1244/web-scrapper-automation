@@ -81,6 +81,12 @@ Codex consulted before writing code and reviewed every diff.
   fixtures, not assertions on generated names. Full suite confirmed.
 - A system-session UPDATE bypasses the API's audit path — ops scripts that change user-visible data
   should write `audit_events` themselves.
+- 🔑 **`bridgeleads_system` (the `system_sync_session` role) has SELECT/INSERT/UPDATE but
+  `DELETE=False` on EVERY app table** — verified 2026-07-29 via `has_table_privilege`, and it is
+  neither superuser nor `bypassrls`. So **no ops script run through `railway run` can hard-delete
+  anything**; the app's soft-delete (`active=False`) is not just a product choice, it is the only
+  thing the database role permits. A hard delete needs the Supabase owner/`postgres` role. This is
+  a deliberate least-privilege guard — do not route around it without an explicit decision.
 - 🔑 **`bl-testenv/run-full-pytest.sh` is NOT safe to run twice concurrently.** Every instance
   shares one `bridgeleads_test` DB and one Redis, and conftest `FLUSHDB`s Redis at setup and
   DELETEs rows at teardown — so a second run yanks state from under the first. Symptom: ~9 failures

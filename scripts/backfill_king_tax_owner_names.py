@@ -12,7 +12,8 @@ re-runnable: only rows that are STILL a placeholder are touched, so a re-run
 never clobbers a real owner already written.
 
 SCOPE (belt + suspenders, per Codex): a candidate row must satisfy BOTH
-  1. party_name is the exact King tax placeholder shape (is_tax_placeholder_party), AND
+  1. party_name is BLANK (NULL/empty — what the scraper writes today) or the exact
+     legacy King tax placeholder shape (is_tax_placeholder_party), AND
   2. it belongs to a King / WA / tax_delinquent scraper_config (jobs -> scraper_configs join),
 and have a non-NULL parcel_id. The config join — not the placeholder string — is
 the authoritative population boundary; the placeholder shape alone is a weak id.
@@ -43,7 +44,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sqlalchemy import text
 
 from src.db.session import SyncSessionLocal
-from src.scrapers.enrichment.king_county_assessor import batch_extract_king_owners
+from src.scrapers.enrichment.king_county_assessor import (
+    KingOwnerLookupBlockedError,
+    batch_extract_king_owners,
+)
+from src.scrapers.enrichment.source_health import SourceUnavailableError
 from src.scrapers.king_wa_tax_delinquent import is_tax_placeholder_party
 
 logging.basicConfig(level=logging.INFO)
@@ -60,7 +65,12 @@ _SELECT_SQL = text(
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
     WHERE r.id > CAST(:last_id AS uuid)
       AND r.parcel_id IS NOT NULL
-      AND r.party_name LIKE 'Tax Delinquent%'
+      -- BLANK as well as the legacy placeholder. The scraper now writes
+      -- party_name = NULL (king_wa_tax_delinquent.py:336) instead of the old
+      -- "Tax Delinquent — $X owed (Parcel …)" string, so a placeholder-only
+      -- filter matched ZERO of the 15,954 nameless King tax rows in production
+      -- and this backfill silently repaired nothing.
+      AND (r.party_name IS NULL OR r.party_name = '' OR r.party_name LIKE 'Tax Delinquent%')
       AND lower(sc.county) = 'king'
       AND upper(sc.state) = 'WA'
       AND sc.record_type = 'tax_delinquent'
@@ -76,7 +86,16 @@ def _resolve_owners(parcels: list[str], cache: dict[str, str | None], delay: flo
     todo = sorted({p for p in parcels if p not in cache})
     if not todo:
         return
-    found = asyncio.run(batch_extract_king_owners(todo, delay=delay))
+    found = asyncio.run(
+        batch_extract_king_owners(
+            todo,
+            delay=delay,
+            circuit_window=50,
+            max_transient_rate=0.10,
+            max_unresolved_rate=0.50,
+            fetch_attempts=1,
+        )
+    )
     for pid in todo:
         cache[pid] = found.get(pid)  # real owner or None (looked-up, absent)
 
@@ -104,25 +123,33 @@ def run(batch: int, limit: int | None, dry_run: bool, delay: float) -> None:
                 break
             last_id = str(rows[-1].id)
 
-            # Confirm the EXACT placeholder shape in Python (the SQL LIKE only
-            # narrows on the prefix; is_tax_placeholder_party requires the full
-            # "$amount owed (Parcel …)" form).
+            # A row is repairable when its name is BLANK (the current scraper
+            # output) or the EXACT legacy placeholder shape — the SQL LIKE only
+            # narrows on the prefix, so is_tax_placeholder_party re-checks the full
+            # "$amount owed (Parcel …)" form here. Anything else is a real owner
+            # name and must never be touched.
             candidates = []
             for row in rows:
                 scanned += 1
-                if is_tax_placeholder_party(row.party_name):
+                blank = not (row.party_name or "").strip()
+                if blank or is_tax_placeholder_party(row.party_name):
                     candidates.append(row)
                 else:
                     skipped_not_placeholder += 1
 
             if candidates:
-                _resolve_owners(
-                    [c.parcel_id.strip() for c in candidates], owner_cache, delay
-                )
+                try:
+                    _resolve_owners(
+                        [c.parcel_id.strip() for c in candidates], owner_cache, delay
+                    )
+                except (KingOwnerLookupBlockedError, SourceUnavailableError) as exc:
+                    db.rollback()
+                    _log.error("ABORTED: %s", exc)
+                    raise SystemExit(2) from exc
                 # (id, owner, old_placeholder) for rows whose parcel resolved to a
                 # real owner. old_placeholder re-asserts the still-placeholder guard
                 # at write time (idempotent; a concurrent change can't be clobbered).
-                triples: list[tuple[str, str, str]] = []
+                triples: list[tuple[str, str, str | None]] = []
                 for c in candidates:
                     owner = owner_cache.get(c.parcel_id.strip())
                     if owner:
@@ -131,8 +158,12 @@ def run(batch: int, limit: int | None, dry_run: bool, delay: float) -> None:
                         skipped_no_owner += 1
 
                 if triples and not dry_run:
+                    # old_name is CAST to text because it is NULL for every blank
+                    # row, and an untyped NULL in a VALUES list has no type for
+                    # Postgres to compare against.
                     values_sql = ",".join(
-                        f"(:id_{i}, :owner_{i}, :old_{i})" for i in range(len(triples))
+                        f"(:id_{i}, :owner_{i}, CAST(:old_{i} AS text))"
+                        for i in range(len(triples))
                     )
                     params: dict = {}
                     for i, (rid, owner, old) in enumerate(triples):
@@ -146,7 +177,11 @@ def run(batch: int, limit: int | None, dry_run: bool, delay: float) -> None:
                             SET party_name = data.owner
                             FROM (VALUES {values_sql}) AS data(id, owner, old_name)
                             WHERE results.id = data.id::uuid
-                              AND results.party_name = data.old_name
+                              -- IS NOT DISTINCT FROM, not `=`: old_name is NULL for
+                              -- every blank row, and `NULL = NULL` is NULL (never
+                              -- true), so `=` would match nothing and the backfill
+                              -- would report success while writing zero rows.
+                              AND results.party_name IS NOT DISTINCT FROM data.old_name
                             """
                         ),
                         params,

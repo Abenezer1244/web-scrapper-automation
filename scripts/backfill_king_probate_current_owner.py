@@ -41,7 +41,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sqlalchemy import text
 
 from src.db.session import SyncSessionLocal
-from src.scrapers.enrichment.king_county_assessor import batch_extract_king_owners
+from src.scrapers.enrichment.king_county_assessor import (
+    KingOwnerLookupBlockedError,
+    batch_extract_king_owners,
+)
+from src.scrapers.enrichment.source_health import SourceUnavailableError
 from src.utils.lead_formatting import classify_probate_title_status
 
 logging.basicConfig(level=logging.INFO)
@@ -85,7 +89,19 @@ def _resolve_owners(parcels: list[str], cache: dict[str, str | None], delay: flo
     todo = sorted({p for p in parcels if p not in cache})
     if not todo:
         return
-    found = asyncio.run(batch_extract_king_owners(todo, delay=delay))
+    # Same circuit-breaker settings as the tax backfill: a throttled lookup is
+    # indistinguishable from "no such owner" at this layer, so without the breaker
+    # a blocked run silently caches thousands of real owners as None.
+    found = asyncio.run(
+        batch_extract_king_owners(
+            todo,
+            delay=delay,
+            circuit_window=50,
+            max_transient_rate=0.10,
+            max_unresolved_rate=0.50,
+            fetch_attempts=1,
+        )
+    )
     for pid in todo:
         cache[pid] = found.get(pid)
 
@@ -113,7 +129,14 @@ def run(batch: int, limit: int | None, dry_run: bool, delay: float) -> None:
             last_id = str(rows[-1].id)
             scanned += len(rows)
 
-            _resolve_owners([r.parcel_id.strip() for r in rows], owner_cache, delay)
+            try:
+                _resolve_owners([r.parcel_id.strip() for r in rows], owner_cache, delay)
+            except (KingOwnerLookupBlockedError, SourceUnavailableError) as exc:
+                # Abort cleanly rather than crashing with a traceback — and never
+                # commit a page whose owners are actually throttle failures.
+                db.rollback()
+                _log.error("ABORTED: %s", exc)
+                raise SystemExit(2) from exc
             # (id, owner, title_status) for rows whose parcel resolved to a real owner.
             triples: list[tuple[str, str, str]] = []
             for row in rows:

@@ -27,8 +27,9 @@ fresh session should probably start by asking for them.
 
 ## 2. Where we are RIGHT NOW
 
-`origin/main` = **`d3bb02a`**. Both Railway services (`api`, `worker`) deployed at `d3bb02a`,
-status SUCCESS. `/health` 200, `/ready` 200 `{"status":"ready"}`.
+`origin/main` = **`032d059`** (this handoff). The last *code* commit is **`d3bb02a`**, which is what
+both Railway services (`api`, `worker`) were verified deployed at, status SUCCESS — `/health` 200,
+`/ready` 200 `{"status":"ready"}`. Commits after `d3bb02a` are docs-only and change no behaviour.
 
 Everything this session produced is **merged and deployed**. No open PRs of mine. No uncommitted work.
 
@@ -40,6 +41,7 @@ Everything this session produced is **merged and deployed**. No open PRs of mine
 | BE #161 | purge tooling + DELETE-privilege finding | merged `e681372` |
 | BE #165 | circuit breaker + source-health gate (**mig 083**) | merged `931e6c4` |
 | BE #169 | grants fix for mig 083 (**mig 084**) | merged `d3bb02a` |
+| BE #170 | this handoff (docs only) | merged `032d059` |
 
 **Prod alembic version: 084.** Full suite at time of merge: **1666 passed, 2 skipped, 0 failed.**
 
@@ -285,3 +287,27 @@ blank — Codex's recommendation, and not built.
 Do **not** reintroduce a synthetic placeholder name. Blank is honest; a fake lead name is worse.
 The old `tax_placeholder_party` helpers are retained ONLY so the backfill can recognise historical
 rows — they are still referenced in `enrich.py` and are not dead code.
+
+---
+
+## 11. Suggested opening prompt for the fresh session
+
+Paste this verbatim:
+
+> Read `docs/HANDOFF-king-owner-names-2026-07-30.md` in full before doing anything — it is the
+> complete context from the previous session and everything in it is verified against production,
+> not remembered. Pay particular attention to §5 (failed attempts — do not repeat them), §6
+> (environment landmines), §7 (the local pytest rig is not isolated) and §8 (a blocking legal
+> question).
+>
+> Then, before writing any code: I have more questions from the previous session that were never
+> asked. Ask me for them first.
+>
+> Standing rules for this session, same as the last one: consult Codex on every design decision and
+> every diff (`.claude/rules/codex-collaboration.md`); never guess or assume — verify against the
+> repo or production and say which; fix root causes, not symptoms; research anything uncertain; work
+> in your own worktree/branch because other terminals are active on this repo; and do not resume any
+> King County owner-name work until §8 is resolved by me.
+
+**Do NOT let a fresh session start by building the canary (§9 item 3).** It is the most obviously
+"next" task and it is gated on §8. Ask first.

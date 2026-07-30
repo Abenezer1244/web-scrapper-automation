@@ -63,15 +63,18 @@ def main() -> None:
     ref = s["PROJECT_REF"]
 
     # Pick a real user with results (read-only, as admin/postgres).
-    admin = psycopg2.connect(admin_dsn, connect_timeout=20); admin.autocommit = True
+    admin = psycopg2.connect(admin_dsn, connect_timeout=20)
+    admin.autocommit = True
     with admin.cursor() as cur:
         cur.execute("SELECT user_id, COUNT(*) FROM results GROUP BY user_id ORDER BY 2 DESC LIMIT 1")
         row = cur.fetchone()
         if not row:
             print("No results rows in prod — cannot rehearse tenant isolation meaningfully.")
-            admin.close(); sys.exit(1)
+            admin.close()
+            sys.exit(1)
         user_a, n_a = str(row[0]), row[1]
-        cur.execute("SELECT COUNT(*) FROM results"); total = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM results")
+        total = cur.fetchone()[0]
     admin.close()
     print(f"sample user_a={user_a} has {n_a} results; total results={total}\n")
 

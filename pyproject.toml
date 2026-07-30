@@ -50,6 +50,19 @@ ignore = [
 "src/workers/batch_export.py" = ["S608"]  # combined-export SQL interpolates only the tax_cap_sql placeholder; values bound via params
 "scripts/backfill_king_tax_owner_names.py" = ["S608"]  # bulk UPDATE interpolates only generated :id_N/:owner_N/:old_N placeholders; values bound via params
 "scripts/backfill_king_bulk_legal_mailing.py" = ["S608"]  # bulk UPDATE interpolates only generated :id_N/:new_N/:m_N placeholders; values bound via params
+# Same verified pattern as the two above — checked each call site individually: the
+# f-string splices in ONLY a comma-joined run of generated ":name_N" placeholders,
+# and every value travels in the bound `params` dict. No value reaches the SQL text.
+"scripts/backfill_property_membership.py" = ["S608"]
+"scripts/backfill_result_property_key.py" = ["S608"]
+"scripts/backfill_result_tax_fields.py" = ["S608"]
+# S608 in migrations is structural, not sloppiness: a migration takes NO input.
+# Alembic runs these with no parameters, so nothing in them can be user- or
+# attacker-controlled. Enumerated all 20 interpolations across 17 revisions — every
+# one is a generated uuid4() or a literal defined in that same file (_SCRAPER_CLASS,
+# _COUNTY, county/state/scraper_class seed values). Rewriting applied migrations to
+# bound params would carry far more risk than the zero risk it would remove.
+"alembic/versions/*" = ["S608"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["src"]

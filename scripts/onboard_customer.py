@@ -38,7 +38,7 @@ def _post(url: str, payload: dict, token: str | None = None) -> dict:
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")  # noqa: S310 — inert construction; _urlopen() enforces http(s)
     try:
         with _urlopen(req) as resp:
             return json.loads(resp.read())
@@ -49,7 +49,7 @@ def _post(url: str, payload: dict, token: str | None = None) -> dict:
 
 
 def _get(url: str, token: str) -> dict:
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})  # noqa: S310 — inert construction; _urlopen() enforces http(s)
     with _urlopen(req) as resp:
         return json.loads(resp.read())
 
@@ -99,7 +99,7 @@ def main():
 
     # ── Step 3: Verify connector exists ───────────────────────────────────────
     print(f"3. Verifying connector: {args.county}/{args.state}/{args.record_type}...")
-    req = urllib.request.Request(f"{base}/scrapers/connectors")
+    req = urllib.request.Request(f"{base}/scrapers/connectors")  # noqa: S310 — inert construction; _urlopen() enforces http(s)
     with _urlopen(req) as resp:
         connectors = json.loads(resp.read())
 

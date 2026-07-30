@@ -225,7 +225,11 @@ async def batch_enrich_king_county(
 
             try:
                 url = tax_urls[pid]
-                await scraper.page.goto(url, wait_until="domcontentloaded", timeout=8_000)
+                # safe_goto (not raw page.goto): fail-CLOSED pre-flight SSRF
+                # validation + landing-URL re-check after redirects.
+                await scraper.safe_goto(
+                    url, wait_until="domcontentloaded", timeout_ms=8_000
+                )
 
                 try:
                     await scraper.page.wait_for_function(

@@ -518,7 +518,11 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         url = f"{self._base_url}/search/index?theme=.blue&section=searchCriteriaDocuments"
         if "/search/" in self._base_url:
             url = f"{self._base_url}?theme=.blue&section=searchCriteriaDocuments"
-        await self.page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        # safe_goto (not raw page.goto): fail-CLOSED pre-flight SSRF validation.
+        # The context route guard is the structural per-hop control, but it is
+        # deliberately fail-OPEN on internal error, so validating here first is
+        # real defense-in-depth rather than a duplicate check.
+        await self.safe_goto(url, wait_until="domcontentloaded", timeout_ms=30_000)
         await self.page.wait_for_timeout(2000)
         await self._accept_disclaimer()
         try:

@@ -40,8 +40,8 @@ import sys
 
 sys.path.insert(0, ".")
 
-from dotenv import load_dotenv  # noqa: E402
-from sqlalchemy import create_engine, text  # noqa: E402
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
 
 load_dotenv()
 

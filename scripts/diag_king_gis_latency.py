@@ -13,11 +13,11 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sqlalchemy import text  # noqa: E402
+from sqlalchemy import text
 
-from src.db.session import system_sync_session  # noqa: E402
-from src.scrapers.enrichment.county_gis import _WA_STATEWIDE_ENDPOINT  # noqa: E402
-from src.utils.safe_http import safe_get  # noqa: E402
+from src.db.session import system_sync_session
+from src.scrapers.enrichment.county_gis import _WA_STATEWIDE_ENDPOINT
+from src.utils.safe_http import safe_get
 
 
 def main() -> None:

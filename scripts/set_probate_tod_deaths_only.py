@@ -25,8 +25,8 @@ from datetime import UTC, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.db.models import AuditEvent, ScraperConfig  # noqa: E402
-from src.db.session import system_sync_session  # noqa: E402
+from src.db.models import AuditEvent, ScraperConfig
+from src.db.session import system_sync_session
 
 _TOD_RECORD_TYPE = "probate"
 

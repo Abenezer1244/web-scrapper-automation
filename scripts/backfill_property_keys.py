@@ -28,12 +28,12 @@ import sys
 
 sys.path.insert(0, ".")
 
-from sqlalchemy import text  # noqa: E402
+from sqlalchemy import text
 
 # SYSTEM session (Codex P1): this is a cross-tenant maintenance re-key; a
 # plain session would scan zero rows / fail writes once RLS_ENFORCE is on.
-from src.db.session import system_sync_session  # noqa: E402
-from src.workers.property_identity import compute_property_key  # noqa: E402
+from src.db.session import system_sync_session
+from src.workers.property_identity import compute_property_key
 
 _NIL = "00000000-0000-0000-0000-000000000000"
 

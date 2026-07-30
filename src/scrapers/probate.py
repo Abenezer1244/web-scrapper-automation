@@ -398,17 +398,6 @@ def classify_probate_signal(doc_type: str | None) -> ProbateSignal:
     return ProbateSignal.UNKNOWN
 
 
-def is_living_owner_tod(doc_type: str | None) -> bool:
-    """True if ``doc_type`` is a LIVING-owner Transfer-on-Death planning doc.
-
-    Convenience predicate over :func:`classify_probate_signal` for the connector
-    filter: these are the rows excluded from probate unless the customer opts into
-    the estate-planning signal. Death-triggered TOD effectuations return False
-    (they are real ``DEATH_INHERITANCE`` leads).
-    """
-    return classify_probate_signal(doc_type) is ProbateSignal.TOD_LIVING_OWNER
-
-
 # Signal strength for merging a doc_type result with a recorder-comment result —
 # lower = stronger. A row keeps the STRONGEST signal across its two fields.
 _SIGNAL_PRIORITY: dict[ProbateSignal, int] = {

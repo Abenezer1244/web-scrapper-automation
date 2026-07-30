@@ -218,13 +218,13 @@ class TestEmptyStateFinalize:
 # fields AND (missing delinquent_bill_year) shipped a fabricated 01/01/{year}
 # tax date. The fix selects the full lead column set.
 
-import csv as _csv  # noqa: E402
-import io as _io  # noqa: E402
-from datetime import UTC, datetime  # noqa: E402
-from decimal import Decimal  # noqa: E402
+import csv as _csv
+import io as _io
+from datetime import UTC, datetime
+from decimal import Decimal
 
-from src.api.tax_filters import tax_cap_min_year  # noqa: E402
-from src.utils.lead_export import write_lead_csv_with_overlap  # noqa: E402
+from src.api.tax_filters import tax_cap_min_year
+from src.utils.lead_export import write_lead_csv_with_overlap
 
 
 def _tax_year_in_window() -> int:

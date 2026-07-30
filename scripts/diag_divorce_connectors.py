@@ -7,10 +7,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from sqlalchemy import select  # noqa: E402
+from sqlalchemy import select
 
-from src.db.models import CountyConnector  # noqa: E402
-from src.db.session import SyncSessionLocal  # noqa: E402
+from src.db.models import CountyConnector
+from src.db.session import SyncSessionLocal
 
 
 def main() -> int:

@@ -15,9 +15,9 @@ import sys
 
 sys.path.insert(0, ".")
 
-import requests  # noqa: E402
+import requests
 
-from src.api.auth import create_secure_token  # noqa: E402
+from src.api.auth import create_secure_token
 
 API = "https://api.bridgeleads.io"
 ADMIN_USER = "b6d2095d-d33c-4d46-841f-4f835032f563"

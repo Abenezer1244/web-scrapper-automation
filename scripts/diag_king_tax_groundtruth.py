@@ -14,10 +14,10 @@ from datetime import UTC, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sqlalchemy import text  # noqa: E402
+from sqlalchemy import text
 
-from src.api.tax_filters import bill_year_bounds_for_months, tax_cap_min_year  # noqa: E402
-from src.db.session import system_sync_session  # noqa: E402
+from src.api.tax_filters import bill_year_bounds_for_months, tax_cap_min_year
+from src.db.session import system_sync_session
 
 # Same combo shapes as the Snohomish UI test (label, filters).
 COMBOS = [

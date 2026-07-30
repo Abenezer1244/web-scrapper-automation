@@ -541,3 +541,48 @@ def test_system_role_performs_worker_critical_drift_writes(cutover_ready: bool) 
 
         conn.execute(text("RESET ROLE"))
         conn.rollback()
+
+
+def test_system_role_can_use_external_source_health(cutover_ready: bool) -> None:
+    """bridgeleads_system has GRANTS **and** a policy on external_source_health.
+
+    Regression for a real production defect: migration 083 created the table but
+    granted nothing, so the worker got "permission denied for table
+    external_source_health". The source-health gate is written to fall through to
+    "allowed" when it cannot READ health — health infrastructure must never block
+    real work — so the failure was SAFE but SILENT: the gate was inert in prod and
+    nothing surfaced it. Migration 084 adds the grants + `_system` policy.
+
+    A GRANT alone is insufficient here because RLS is enabled on the table: with
+    no policy the role is permitted but every row is filtered out. This asserts
+    the full round trip, which is the only thing that proves both.
+    """
+    if not cutover_ready:
+        pytest.skip("RLS cutover roles not provisioned")
+    key = f"test_src_{uuid.uuid4().hex[:12]}"
+    with sync_engine.begin() as conn:
+        conn.execute(text("SET LOCAL ROLE bridgeleads_system"))
+        conn.execute(
+            text(
+                "INSERT INTO external_source_health (source_key, status, reason) "
+                "VALUES (:k, 'throttled', 'rls grant regression test')"
+            ),
+            {"k": key},
+        )
+        # SELECT must return the row: proves the GRANT *and* that the policy does
+        # not filter it away.
+        got = conn.execute(
+            text("SELECT status FROM external_source_health WHERE source_key = :k"),
+            {"k": key},
+        ).scalar()
+        assert got == "throttled"
+        # UPDATE is how recovery clears a source.
+        conn.execute(
+            text("UPDATE external_source_health SET status = 'healthy' WHERE source_key = :k"),
+            {"k": key},
+        )
+        assert conn.execute(
+            text("SELECT status FROM external_source_health WHERE source_key = :k"),
+            {"k": key},
+        ).scalar() == "healthy"
+        conn.rollback()

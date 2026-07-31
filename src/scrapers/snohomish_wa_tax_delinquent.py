@@ -139,6 +139,13 @@ _LAYOUTS: dict[int, _Layout] = {lay.n_fields: lay for lay in (_LAYOUT_V15, _LAYO
 
 # A real-property parcel id is 14 digits; personal-property accounts are 7.
 _REAL_PROPERTY_PARCEL_LEN = 14
+
+# Bounds for values read out of the untrusted remote file.
+# _MAX_AMOUNT matches the Result.delinquent_amount contract (Numeric(12, 2)) and
+# the ceiling _extract_tax_fields already enforces downstream.
+_MAX_AMOUNT = Decimal("99999999.99")
+_MIN_AS_OF_YEAR = 1900
+_MAX_AS_OF_YEAR = 2200
 # Abort if more than this fraction of rows don't match the expected shape — the
 # county swapped the file/layout and we'd otherwise parse the WRONG file silently.
 _MAX_MALFORMED_RATIO = 0.2
@@ -198,6 +205,14 @@ def _to_decimal(raw: str) -> Decimal | None:
         return None
     if not d.is_finite() or d < 0:
         return None
+    # Bound at parse time. Every amount here comes from an untrusted remote file
+    # and is summed across a parcel's years before being quantized and written to
+    # enrichment_data. _extract_tax_fields bounds delinquent_amount downstream,
+    # but total_billed / full_year_levy would otherwise reach the JSON unbounded,
+    # so a corrupt cell could mean huge Decimal work or an oversized payload.
+    # Same ceiling as the Result.delinquent_amount contract (Numeric(12, 2)).
+    if d > _MAX_AMOUNT or -d.as_tuple().exponent > 2:
+        return None
     return d
 
 
@@ -211,15 +226,16 @@ def _as_of_year(raw: str) -> int | None:
     would misclassify an entire tax year across a year boundary).
     """
     s = (raw or "").strip()
-    parts = s.split("/")
-    if len(parts) == 3 and parts[2].isdigit() and len(parts[2]) == 4:
-        return int(parts[2])
-    # YYYYMMDD -- validate the month/day so a 14-digit parcel or an amount can
-    # never be mistaken for a date.
-    if len(s) == 8 and s.isdigit():
-        year, month, day = int(s[:4]), int(s[4:6]), int(s[6:8])
-        if 1900 <= year <= 2200 and 1 <= month <= 12 and 1 <= day <= 31:
-            return year
+    # Real calendar validation, not a shape check: this cell comes from an
+    # untrusted remote file and decides delinquency, so a corrupt '99/99/2027'
+    # must fail closed rather than yield 2027. strptime also means a 14-digit
+    # parcel or an amount can never be mistaken for a date.
+    for fmt in ("%m/%d/%Y", "%Y%m%d"):
+        try:
+            parsed = datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+        return parsed.year if _MIN_AS_OF_YEAR <= parsed.year <= _MAX_AS_OF_YEAR else None
     return None
 
 

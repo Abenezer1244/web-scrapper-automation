@@ -12,6 +12,7 @@ import pytest
 from src.scrapers.snohomish_wa_tax_delinquent import (
     _as_of_year,
     _select_current_tax_list_url,
+    _to_decimal,
     parse_tax_list,
 )
 
@@ -29,10 +30,43 @@ from src.scrapers.snohomish_wa_tax_delinquent import (
         ("20261301", None),        # month 13
         ("20260732", None),        # day 32
         ("2201.34", None),         # an amount must never read as a date
+        # Real calendar validation, not a shape check — a corrupt cell must fail
+        # closed rather than yield a year that reclassifies delinquency.
+        ("99/99/2027", None),      # impossible month/day, valid-looking year
+        ("13/01/2026", None),      # month 13 in the slash format
+        ("02/30/2026", None),      # Feb 30 never exists
+        ("20260229", None),        # 2026 is not a leap year
+        ("01/01/1800", None),      # below the accepted year range
+        ("01/01/2300", None),      # above the accepted year range
     ],
 )
 def test_as_of_year_accepts_both_published_formats(raw, expected):
     assert _as_of_year(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("507.83", Decimal("507.83")),
+        ("271", Decimal("271")),
+        ("$1,234.56", Decimal("1234.56")),
+        ("0", Decimal("0")),
+        ("", None),
+        ("-5", None),                  # negative
+        ("abc", None),
+        ("99999999.99", Decimal("99999999.99")),   # at the ceiling
+        ("100000000.00", None),        # over the Numeric(12,2) contract
+        ("1e30", None),                # exponent form must not slip past the bound
+        ("1.234", None),               # more precision than cents
+    ],
+)
+def test_to_decimal_is_bounded(raw, expected):
+    """Amounts come from an untrusted remote file and are summed per parcel.
+
+    Unbounded values would reach enrichment_data (total_billed / full_year_levy)
+    even though _extract_tax_fields bounds delinquent_amount downstream.
+    """
+    assert _to_decimal(raw) == expected
 
 # Real rows from the live file (public records). Mix of: 7-digit personal
 # property (excluded), 14-digit current-year (excluded), 14-digit $0-owed

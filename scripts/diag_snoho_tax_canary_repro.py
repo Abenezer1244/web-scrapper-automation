@@ -52,8 +52,14 @@ for c in target:
         )
         print(f"RESULT: {len(recs)} records  -> canary would set "
               f"{'healthy' if recs else 'degraded//historical-probe'}")
+        # Non-PII sample only. These records carry owner names and home addresses;
+        # this runs under `railway run` against PRODUCTION, so printing the record
+        # would put more PII into Railway logs than the real canary ever does
+        # (it logs counts and an exception class, never sample rows).
         for r in recs[:3]:
-            print("   ", str(r)[:200])
+            ed = r.enrichment_data or {}
+            print(f"    parcel={r.parcel_id} bill_year={ed.get('bill_year')} "
+                  f"amount={ed.get('delinquent_amount')} layout={ed.get('source_layout')}")
     except Exception:
         print("CANARY EXCEPTION -> health_status='down'. Full traceback:")
         traceback.print_exc()

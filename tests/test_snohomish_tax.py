@@ -10,9 +10,29 @@ from decimal import Decimal
 import pytest
 
 from src.scrapers.snohomish_wa_tax_delinquent import (
+    _as_of_year,
     _select_current_tax_list_url,
     parse_tax_list,
 )
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("06/01/2026", 2026),      # v17 format
+        ("20260701", 2026),        # v15 format, live since 2026-07-01
+        ("19960101", 1996),
+        ("", None),
+        ("   ", None),
+        ("2026", None),            # bare year is not a date
+        ("27060100400800", None),  # a 14-digit parcel must never read as a date
+        ("20261301", None),        # month 13
+        ("20260732", None),        # day 32
+        ("2201.34", None),         # an amount must never read as a date
+    ],
+)
+def test_as_of_year_accepts_both_published_formats(raw, expected):
+    assert _as_of_year(raw) == expected
 
 # Real rows from the live file (public records). Mix of: 7-digit personal
 # property (excluded), 14-digit current-year (excluded), 14-digit $0-owed
@@ -100,6 +120,121 @@ def test_parse_blank_lines_ignored():
     records, stats = parse_tax_list(rows, fallback_year=2099)
     assert stats["total"] == 8  # blanks not counted
     assert len(records) == 3
+
+
+def test_v17_layout_is_detected():
+    _, stats = parse_tax_list(FIXTURE_ROWS, fallback_year=2099)
+    assert stats["layout"] == "v17_pre_2026_07"
+
+
+# ─── v15 layout, live since 2026-07-01 (17 fields → 15) ───────────────────────
+#
+# Real rows from the live file. The county dropped both address "line 2" columns
+# and the mailing STREET line, and added an amount column, so every column after
+# the situs street shifted. Amounts are (billed, paid, owed, full-year levy) —
+# owed is col 13, NOT the last column.
+#
+# Real rows from the live file (public records), including the leading all-empty
+# record the file actually starts with.
+FIXTURE_ROWS_V15 = """\
+||||||||||||||
+27060100400800|2026|315 S BLAKELEY ST|MONROE|WA|98272-2204|STEWART HEIDI L|MONROE|WA|98272-2204|20260701|2201.34|0|2201.34|4402.67
+27060100417000|2026|518 S LEWIS ST|MONROE|WA|98272-2325|HOLZERLAND K|MONROE|WA|98272-2325|20260701|3850.52|1967.63|1882.89|3850.52
+27060100417000|2025|518 S LEWIS ST|MONROE|WA|98272-2325|HOLZERLAND K|MONROE|WA|98272-2325|20260701|2207.33|1148.31|1059.02|2207.33
+27060100401900|2026|207 S MADISON ST|MONROE|WA|98272-2216|PRICE DEANNA A|MONROE|WA|98272-2216|20260701|0|0|0|481.20
+0006064|2023|21220 87TH AVE SE|WOODINVILLE|WA|98072-8002|T E O TECHNOLOGIES INC|MUKILTEO|WA| 98275|20260701|27.81|27.81|0|27.81
+""".splitlines()
+
+
+def test_v15_layout_detected_and_parsed():
+    records, stats = parse_tax_list(FIXTURE_ROWS_V15, fallback_year=2099)
+    assert stats["layout"] == "v15_2026_07"
+    # as-of read from col 10 in 'YYYYMMDD' form, not the wall clock. fallback_year
+    # 2099 proves the cutoff comes from the file, not the parameter.
+    assert stats["as_of_year"] == 2026
+    by = _by_parcel(records)
+    # Only the prior-year (2025) real-property row with a balance is delinquent.
+    assert set(by) == {"27060100417000"}
+    assert "27060100400800" not in by   # 14-digit but current year (2026)
+    assert "27060100401900" not in by   # 14-digit but $0 owed
+    assert "0006064" not in by          # 7-digit personal property
+    assert stats["total"] == 6
+    assert stats["malformed"] == 1      # the leading all-empty record
+    assert stats["delinquent_rows"] == 1
+
+
+def test_v15_owed_is_not_the_last_column():
+    """Regression: col 14 is the full-year levy, col 13 is what is still owed.
+
+    Reading "the last amount" (as the v17 map did) would report 2207.33 instead
+    of 1059.02 and overstate every delinquent balance.
+    """
+    records, _ = parse_tax_list(FIXTURE_ROWS_V15, fallback_year=2099)
+    ed = _by_parcel(records)["27060100417000"].enrichment_data
+    assert ed["delinquent_amount"] == "1059.02"
+    assert ed["total_billed"] == "2207.33"      # billed-to-date, unchanged meaning
+    assert ed["full_year_levy"] == "2207.33"
+    assert ed["bill_year"] == 2025
+    assert ed["source_layout"] == "v15_2026_07"
+
+
+def test_v15_has_no_mailing_address_only_a_locality():
+    """v15 publishes no mailing street, so mailing_address must stay None.
+
+    compute_owner_flags() derives owner_state / absentee_owner /
+    out_of_state_owner from the mailing address, so a city-only value would
+    manufacture confident wrong signals. The locality is kept for audit only.
+    """
+    records, _ = parse_tax_list(FIXTURE_ROWS_V15, fallback_year=2099)
+    rec = _by_parcel(records)["27060100417000"]
+    assert rec.mailing_address is None
+    assert rec.enrichment_data["mailing_locality"] == "MONROE WA 98272-2325"
+    # the situs street IS published and must still be populated
+    assert rec.property_address == "518 S LEWIS ST, MONROE WA 98272-2325"
+
+
+def test_v17_blank_mailing_street_also_yields_no_mailing_address():
+    """Same rule applied to v17: those rows carry the street columns BLANK."""
+    records, _ = parse_tax_list(FIXTURE_ROWS, fallback_year=2099)
+    rec = _by_parcel(records)["00370600000800"]
+    assert rec.mailing_address is None
+    assert rec.enrichment_data["mailing_locality"] == "SNOHOMISH WA 98290-7300"
+
+
+def test_populated_mailing_street_would_be_kept():
+    """CONSTRUCTED boundary case — no live row currently exercises this.
+
+    Verified against the live v17 file: 0 of 328,069 rows populate the mailing
+    street columns, and v15 drops them entirely, so Snohomish has never published
+    a mailing street. This row is hand-built (like _CAP_ROWS below) purely to pin
+    down the intended behaviour if the county ever restores the column: a real
+    street-bearing address must flow through to mailing_address rather than being
+    suppressed by the city-only rule.
+    """
+    row = (
+        "00400000000004|2025|4 SITUS ST||EVERETT|WA|98201|MAIL OWNER|"
+        "PO BOX 7|STE 2|SEATTLE|WA|98101|06/01/2026|100|100|100"
+    ).splitlines()
+    records, _ = parse_tax_list(row, fallback_year=2099)
+    rec = _by_parcel(records)["00400000000004"]
+    assert rec.mailing_address == "PO BOX 7 STE 2, SEATTLE WA 98101"
+    assert "mailing_locality" not in rec.enrichment_data
+
+
+def test_mixed_field_widths_count_as_malformed():
+    """A half-swapped download must not be parsed as if it were consistent."""
+    rows = [*FIXTURE_ROWS, *FIXTURE_ROWS_V15[1:]]
+    _, stats = parse_tax_list(rows, fallback_year=2099)
+    assert stats["layout"] == "v17_pre_2026_07"   # locked by the first rows
+    assert stats["malformed"] == 5                # every 15-field row rejected
+
+
+def test_unknown_field_width_is_all_malformed():
+    rows = ["a|b|c", "d|e|f"]
+    records, stats = parse_tax_list(rows, fallback_year=2099)
+    assert records == []
+    assert stats["malformed"] == 2
+    assert stats["layout"] is None
 
 
 # ─── landing-page link resolution (real page structure) ───────────────────────

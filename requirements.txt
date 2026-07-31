@@ -41,7 +41,7 @@ requests==2.34.2             # M3: CVE-2024-47081, CVE-2026-25645. 2.34: inline 
 pypdf==6.14.2                # NTS Tier 1: extract text from Pacific Publishing legals PDFs (pure-python, no native deps). 6.14.2: CVE-2026-59935/59936 (extract_text infinite loop), CVE-2026-59937 (xref long runtime), CVE-2026-59938 (image memory-DoS); prior 6.13.3: GHSA-jm82-fx9c-mx94
 
 # AI extraction (Claude API)
-anthropic==0.52.0
+anthropic==0.120.0
 
 # CAPTCHA solving (2Captcha)
 2captcha-python==1.5.0

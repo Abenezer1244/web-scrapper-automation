@@ -19,6 +19,94 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-07-30 — Snohomish tax list changed shape under us: 17→15 fields, connector down 5 weeks
+
+**Built / Shipped:** `fix(snohomish)` — PR #172, squash **`3303dc4`**, no migration. Verified
+deployed on api + worker (`RAILWAY_GIT_COMMIT_SHA` = `3303dc4` on both), `/health` 200,
+`/ready` 200. `src/scrapers/snohomish_wa_tax_delinquent.py`: frozen `_Layout` maps
+(`_LAYOUT_V15`, `_LAYOUT_V17`) selected by field width and **locked for the file**; all column
+reads indexed through the layout; `_as_of_year()` parses both published date formats;
+`scrape()` raises when the as-of year is unparseable; `mailing_address` gated on a real street
+line; new `enrichment_data` keys `mailing_locality` / `full_year_levy` / `source_layout`.
+Tests 13 → 46. Follow-up hardening in this same session (see *Caught & fixed*).
+
+**Tried / Decided:**
+- Started from a production sweep (`scripts/diag_build_health_sweep.py`), not from PR titles.
+  Jobs were healthy — 0 stuck, 0 failures in 14d, 0 stranded batch runs — so the connector
+  health section was the only real signal.
+- **Rejected: hard-coding 15 fields.** Both files are still served (`..._36.txt` v17,
+  `..._39.txt` v15) and the county clearly rotates them. Codex argued for named layout maps
+  supporting both, with unknown/mixed widths failing loudly. Adopted.
+- **Rejected: emitting the city/state/zip as `mailing_address`.** Verified
+  `address_intel.compute_owner_flags()` derives `owner_state` / `absentee_owner` /
+  `out_of_state_owner` **from the mailing address**, so a city-only value manufactures
+  confident wrong signals, and skip-trace bills per lookup. Chose `None` + a `mailing_locality`
+  audit key. Keyed on the **data**, not the layout — see *Facts learned*.
+- **Rejected: keeping the wall-clock fallback for the as-of year.** Codex: as-of is structural
+  for this source. Falling back is harmless mid-year and silently catastrophic across a year
+  boundary. Now a hard failure.
+- `total_billed` deliberately keeps meaning *billed-to-date* so the field doesn't silently
+  change definition on the 2,253 Snohomish rows already in `results`.
+
+**Failed / Blocked:**
+- **Two of my own hypotheses were wrong and were retracted, not reported.** (1) "12
+  active+healthy connectors have an empty `scraper_class`, so the picker advertises counties
+  that can't run" — false: they are `scraper_mode='ai'` and resolve via
+  `_detect_template(base_url)` → `EagleWebScraper`. Ran all 24 active+healthy connectors
+  through `get_scraper_class()` for every record type they advertise: **0 failed.** (2) The
+  previous handoff's "exact-match joins on `state` will silently miss" — false: every lookup
+  is case-normalised (`registry.py:76`, `scrapers.py:113,750`, `jobs.py:133`,
+  `batches.py:230`).
+- **Codex hit its usage quota** partway through the closing work (resets Aug 4). The §14
+  security review got a full first pass; the **second pass is still owed**. The PR #97
+  assessment never ran.
+- Guessed two column names writing the first diagnostic (`health` → `health_status`,
+  `record_type` → `record_types`, which is a JSON array). Caught before running, but it is the
+  same trap logged on 2026-07-29 — read `src/db/models.py` first, every time.
+
+**Caught & fixed:** Master Security Review (§14) pass 1 via Codex on the merged diff came back
+**0 Critical / 0 High — GO**, with 3 findings, all fixed here rather than deferred:
+- *Medium* — `_as_of_year()` validated the new `YYYYMMDD` path but left the pre-existing
+  `mm/dd/yyyy` path accepting `99/99/2027`. Both now go through `datetime.strptime` (real
+  calendar validation) plus a year range.
+- *Medium* — `_to_decimal()` was unbounded. `_extract_tax_fields` bounds `delinquent_amount`
+  downstream, but `total_billed` / `full_year_levy` reached `enrichment_data` unbounded from an
+  untrusted file. Now capped at the `Numeric(12,2)` contract with a cents-precision check.
+- *Low* — `scripts/diag_snoho_tax_canary_repro.py` printed sample records (owner names, home
+  addresses) into Railway logs under `railway run`. Now prints parcel/year/amount/layout only.
+
+**Pending / Handoff:**
+- **§14 pass 2 is owed** — the rule is two consecutive clean passes. Blocked on Codex quota.
+- **PR #97** (Clark tax_delinquent quarantine) — evidence gathered, decision not made. Its
+  1,968 mislabeled rows are **gone** (clark/tax_delinquent = 0 rows) and no Clark connector
+  offers that record type, so it looks obsolete. ⚠️ **`#97` also exists in the frontend repo**
+  as a live responsive-sweep PR — check the repo before acting on that number.
+- 2,253 existing Snohomish rows keep their city-only `mailing_address`; **not backfilled**.
+- No bulk-source **contract check** exists — the reason this sat broken 5 weeks. Design agreed
+  with Codex, recorded in `tasks/BACKLOG.md` §9. Scope it by **source, not county**: Snohomish
+  bulk file and King's Socrata tax feed qualify (neither carries an owner field); King's
+  per-parcel eRealProperty owner lookup does **not** and stays frozen under the §8 legal gate.
+- Canary probes only `record_types[0]` while writing one `health_status` per connector row.
+
+**Facts learned:**
+- **A county can change a bulk file's shape without changing its filename or URL pattern.** The
+  landing-page link text was unchanged; only the column count moved. Any parser pinned to a
+  literal field count is a time bomb.
+- **The last amount column is not "the amount owed".** v17 ended with owed; v15 ends with the
+  full-year levy. A reindex by eye would have overstated every balance by up to 2× — silently,
+  with green tests. What settled it was an invariant checked across **all** 327,720 rows
+  (`billed == paid + owed`, 100.0000%, 0 failures), not a handful of sample rows. Same lesson
+  as the King rate-block: small samples do not characterise a source.
+- **Snohomish has never published a mailing street** — 0 of 328,069 rows in the v17 file, and
+  v15 drops the column entirely. So the city-only mailing problem predates the layout change
+  and is already baked into existing rows.
+- Post-merge, a fixed connector **stays `down` until the canary randomly re-samples it**
+  (5 of ~30 hourly ⇒ ~6h). Don't hand-flip the flag — re-run the real probe path and let a
+  genuine result write the status. Did that: 1,954 records → `healthy`.
+- `railway run` needs a **per-directory** link; the Railway CLI stores them in
+  `~/.railway/config.json` keyed by absolute path. Copy the entry and repoint `projectPath` —
+  `railway link` is interactive and useless in an agent shell.
+
 ## 2026-07-29 — Dashboard Scrapers table: the missing name column was a symptom, not the bug
 **Context:** User reported the dashboard Scrapers widget as "vague" — no name column, so you can't
 tell which row to click View on. Worked in isolated worktrees off `origin/main` /`origin/master`

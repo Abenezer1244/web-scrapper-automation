@@ -39,7 +39,7 @@ redis==5.2.1
 # set (29, same resource_type breakdown) and navigator.webdriver masking.
 # 1.57 repackaged Chromium to Chrome for Testing — headless now resolves to
 # chrome-headless-shell — hence the install-deps step added in the Dockerfile.
-playwright==1.60.0
+playwright==1.61.0
 beautifulsoup4==4.12.3
 lxml==6.1.0                  # M3: PYSEC-2026-87
 requests==2.34.2             # M3: CVE-2024-47081, CVE-2026-25645. 2.34: inline typing + less-greedy no_proxy matching

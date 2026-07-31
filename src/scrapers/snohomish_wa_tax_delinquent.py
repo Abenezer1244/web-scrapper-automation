@@ -144,8 +144,13 @@ _REAL_PROPERTY_PARCEL_LEN = 14
 # _MAX_AMOUNT matches the Result.delinquent_amount contract (Numeric(12, 2)) and
 # the ceiling _extract_tax_fields already enforces downstream.
 _MAX_AMOUNT = Decimal("99999999.99")
+_CENT = Decimal("0.01")
 _MIN_AS_OF_YEAR = 1900
 _MAX_AS_OF_YEAR = 2200
+# Exact published as-of widths. strptime's directives are variable-width, so these
+# gate the shape before strptime validates the calendar.
+_SLASH_DATE_RE = re.compile(r"\d{1,2}/\d{1,2}/\d{4}")
+_COMPACT_DATE_RE = re.compile(r"\d{8}")
 # Abort if more than this fraction of rows don't match the expected shape — the
 # county swapped the file/layout and we'd otherwise parse the WRONG file silently.
 _MAX_MALFORMED_RATIO = 0.2
@@ -211,9 +216,16 @@ def _to_decimal(raw: str) -> Decimal | None:
     # but total_billed / full_year_levy would otherwise reach the JSON unbounded,
     # so a corrupt cell could mean huge Decimal work or an oversized payload.
     # Same ceiling as the Result.delinquent_amount contract (Numeric(12, 2)).
-    if d > _MAX_AMOUNT or -d.as_tuple().exponent > 2:
+    if d > _MAX_AMOUNT:
         return None
-    return d
+    # Normalise to cents. Compare NUMERICALLY so a cent-equivalent value like
+    # '1.230' is accepted (Decimal('1.23') == Decimal('1.230')) while genuine
+    # sub-cent precision like '1.234' is rejected. The earlier raw-exponent test
+    # threw away the harmless case too, which would silently drop valid rows on a
+    # cosmetic source formatting change (Codex §14 pass 2). Checked after the
+    # _MAX_AMOUNT bound so quantize() can't raise on an enormous value.
+    cents = d.quantize(_CENT)
+    return cents if cents == d else None
 
 
 def _as_of_year(raw: str) -> int | None:
@@ -230,13 +242,22 @@ def _as_of_year(raw: str) -> int | None:
     # untrusted remote file and decides delinquency, so a corrupt '99/99/2027'
     # must fail closed rather than yield 2027. strptime also means a 14-digit
     # parcel or an amount can never be mistaken for a date.
-    for fmt in ("%m/%d/%Y", "%Y%m%d"):
-        try:
-            parsed = datetime.strptime(s, fmt)
-        except ValueError:
-            continue
-        return parsed.year if _MIN_AS_OF_YEAR <= parsed.year <= _MAX_AS_OF_YEAR else None
-    return None
+    # Shape-gate BEFORE strptime. strptime's numeric directives are variable-width,
+    # so '%Y%m%d' happily parses '202671' and '2026071' as 2026-07-01 — a truncated
+    # or shifted cell would be silently accepted as a valid year (verified, Codex
+    # §14 pass 2). The regex pins the exact published widths; strptime then does the
+    # real calendar validation (rejects Feb 30, non-leap 02/29).
+    if _SLASH_DATE_RE.fullmatch(s):
+        fmt = "%m/%d/%Y"
+    elif _COMPACT_DATE_RE.fullmatch(s):
+        fmt = "%Y%m%d"
+    else:
+        return None
+    try:
+        parsed = datetime.strptime(s, fmt)
+    except ValueError:
+        return None
+    return parsed.year if _MIN_AS_OF_YEAR <= parsed.year <= _MAX_AS_OF_YEAR else None
 
 
 def _join_address(*parts: str | None) -> str | None:
@@ -342,12 +363,19 @@ def parse_tax_list(
         # Real property only; skip 7-digit personal-property (business) accounts.
         if len(parcel) != _REAL_PROPERTY_PARCEL_LEN:
             continue
-        owed = _to_decimal(f[layout.owed])
-        if owed is None or owed <= 0:
-            continue
         # Exclude current-year and future rows — only prior years still owed are
-        # genuinely delinquent.
+        # genuinely delinquent. Checked BEFORE the amount so the malformed count
+        # below reflects only rows we actually care about.
         if year >= ref_year:
+            continue
+        owed = _to_decimal(f[layout.owed])
+        if owed is None:
+            # An in-scope delinquent row whose amount cell won't parse is a
+            # SOURCE-SHAPE problem, not a row to quietly drop — count it so the
+            # caller's malformed-ratio guard can still abort (Codex §14 pass 2).
+            malformed += 1
+            continue
+        if owed <= 0:
             continue
 
         delinquent_rows += 1

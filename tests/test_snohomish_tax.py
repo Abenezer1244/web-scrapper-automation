@@ -38,6 +38,12 @@ from src.scrapers.snohomish_wa_tax_delinquent import (
         ("20260229", None),        # 2026 is not a leap year
         ("01/01/1800", None),      # below the accepted year range
         ("01/01/2300", None),      # above the accepted year range
+        # strptime's numeric directives are VARIABLE-WIDTH: '%Y%m%d' parses these
+        # as 2026-07-01 unless the shape is gated first. A truncated or shifted
+        # cell must not be read as a valid as-of year.
+        ("202671", None),          # 6 digits
+        ("2026071", None),         # 7 digits
+        ("202607011", None),       # 9 digits
     ],
 )
 def test_as_of_year_accepts_both_published_formats(raw, expected):
@@ -57,7 +63,11 @@ def test_as_of_year_accepts_both_published_formats(raw, expected):
         ("99999999.99", Decimal("99999999.99")),   # at the ceiling
         ("100000000.00", None),        # over the Numeric(12,2) contract
         ("1e30", None),                # exponent form must not slip past the bound
-        ("1.234", None),               # more precision than cents
+        ("1.234", None),               # genuine sub-cent precision is rejected
+        # ...but a cent-EQUIVALENT trailing zero is harmless and must be kept:
+        # rejecting it would silently drop valid rows on a cosmetic source change.
+        ("1.230", Decimal("1.23")),
+        ("507.8300", Decimal("507.83")),
     ],
 )
 def test_to_decimal_is_bounded(raw, expected):
@@ -261,6 +271,38 @@ def test_mixed_field_widths_count_as_malformed():
     _, stats = parse_tax_list(rows, fallback_year=2099)
     assert stats["layout"] == "v17_pre_2026_07"   # locked by the first rows
     assert stats["malformed"] == 5                # every 15-field row rejected
+
+
+def test_unparseable_amount_on_an_in_scope_row_counts_malformed():
+    """A delinquent row whose amount cell won't parse is a source-shape problem.
+
+    Silently skipping it would hide a column shift from the malformed-ratio guard
+    — the exact failure mode that let the 17->15 layout change sit for 5 weeks.
+    Row is 14-digit + prior-year (in scope) with a junk owed cell.
+    """
+    rows = [
+        "27060100400800|2026|315 S BLAKELEY ST|MONROE|WA|98272|OWNER A|MONROE|WA|98272"
+        "|20260701|2201.34|0|2201.34|4402.67",
+        "27060100499999|2025|1 BROKEN ST|MONROE|WA|98272|OWNER B|MONROE|WA|98272"
+        "|20260701|100.00|0|NOT_A_NUMBER|100.00",
+    ]
+    records, stats = parse_tax_list(rows, fallback_year=2099)
+    assert records == []
+    assert stats["malformed"] == 1
+
+
+def test_out_of_scope_rows_with_bad_amounts_do_not_inflate_malformed():
+    """Only IN-SCOPE rows count. A current-year or personal-property row with an
+    unparseable amount must not push the malformed ratio toward a false abort."""
+    rows = [
+        "27060100400800|2026|315 S BLAKELEY ST|MONROE|WA|98272|OWNER A|MONROE|WA|98272"
+        "|20260701|2201.34|0|JUNK|4402.67",          # current year -> out of scope
+        "0006064|2023|21220 87TH AVE SE|WOODINVILLE|WA|98072|BIZ|MUKILTEO|WA|98275"
+        "|20260701|27.81|27.81|JUNK|27.81",          # 7-digit personal property
+    ]
+    records, stats = parse_tax_list(rows, fallback_year=2099)
+    assert records == []
+    assert stats["malformed"] == 0
 
 
 def test_unknown_field_width_is_all_malformed():

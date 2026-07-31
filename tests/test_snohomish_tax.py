@@ -358,6 +358,51 @@ def test_text_canary_flags_an_owner_address_permutation():
     assert stats["text_violations"] == 1        # ...but the text columns moved
 
 
+def test_text_canary_catches_a_parcel_number_in_the_owner_column():
+    """A 14-digit account number in the owner column must count as numeric.
+
+    _to_decimal() would NOT catch it — it rejects anything above _MAX_AMOUNT, so a
+    14-digit value reads as "not a number" and would defeat the canary in exactly
+    the case it exists for (owner column replaced by an account column).
+    """
+    from src.scrapers.snohomish_wa_tax_delinquent import _is_number_like, _to_decimal
+
+    assert _to_decimal("27060100417000") is None      # the trap
+    assert _is_number_like("27060100417000") is True  # the fix
+    assert _is_number_like("HOLZERLAND K") is False
+
+    row = [
+        "27060100417000|2025|518 S LEWIS ST|MONROE|WA|98272-2325|27060100417000"
+        "|MONROE|WA|98272-2325|20260701|2207.33|1148.31|1059.02|2207.33"
+    ]
+    _, stats = parse_tax_list(row, fallback_year=2099)
+    assert stats["invariant_violations"] == 0   # amounts still balance
+    assert stats["text_violations"] == 1        # ...but the owner is an account no.
+
+
+def test_as_of_mismatch_is_tallied_across_the_whole_file():
+    """A splice PAST the sampled head must still be visible.
+
+    Head sampling only picks the year; without a whole-file tally, a file whose
+    first rows agree could classify its entire tail against the wrong cutoff.
+    """
+    good = (
+        "2706010041700{i}|2025|1 A ST|MONROE|WA|98272|OWNER {i}"
+        "|MONROE|WA|98272|20260701|100.00|40.00|60.00|100.00"
+    )
+    spliced = (
+        "2706010041800{i}|2025|1 B ST|MONROE|WA|98272|OWNER B{i}"
+        "|MONROE|WA|98272|20190101|100.00|40.00|60.00|100.00"
+    )
+    rows = [good.format(i=i % 10) for i in range(10)] + [
+        spliced.format(i=i % 10) for i in range(10)
+    ]
+    _, stats = parse_tax_list(rows, fallback_year=2099)
+    assert stats["as_of_year"] == 2026
+    assert stats["as_of_rows"] == 20
+    assert stats["as_of_mismatch"] == 10   # the spliced tail is counted
+
+
 def test_text_canary_tolerates_empty_zip_and_state():
     """Measured on the live file: 14.79% of in-scope rows have an EMPTY situs zip
     and one has an empty state. Treating those as violations would abort every run."""

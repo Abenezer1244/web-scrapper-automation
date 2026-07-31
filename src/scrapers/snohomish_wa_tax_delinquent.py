@@ -283,6 +283,24 @@ def _to_decimal(raw: str) -> Decimal | None:
     return cents if cents == d else None
 
 
+def _is_number_like(raw: str) -> bool:
+    """True when a text cell is really just a number. No amount semantics.
+
+    Deliberately NOT _to_decimal(): that one is amount-specific and rejects
+    anything above _MAX_AMOUNT or with sub-cent precision, so a 14-digit parcel
+    number — precisely what would appear if the owner column were replaced by an
+    account column — would come back as "not a number" and defeat the text canary.
+    """
+    s = (raw or "").strip().lstrip("$").replace(",", "")
+    if not s:
+        return False
+    try:
+        Decimal(s)
+    except (InvalidOperation, ValueError):
+        return False
+    return True
+
+
 def _as_of_year(raw: str) -> int | None:
     """Year from a Snohomish as-of date cell, else None.
 
@@ -392,6 +410,8 @@ def parse_tax_list(
     invariant_violations = 0
     text_checked = 0
     text_violations = 0
+    as_of_rows = 0
+    as_of_mismatch = 0
 
     # ---- head sample: decide the layout and the as-of year by CONSENSUS --------
     # Single streaming pass, so buffer only the first _AS_OF_SAMPLE_ROWS width-valid
@@ -457,6 +477,14 @@ def parse_tax_list(
             continue
         year = int(year_s)
 
+        # WHOLE-FILE as-of agreement. The head sample only chooses the year; a
+        # spliced file whose first rows agree would otherwise classify the entire
+        # remainder against the wrong cutoff without any signal. Counted over every
+        # structurally valid row, not just the in-scope slice.
+        as_of_rows += 1
+        if _as_of_year(f[layout.as_of]) != current_year:
+            as_of_mismatch += 1
+
         ref_year = current_year or fallback_year
 
         # Real property only; skip 7-digit personal-property (business) accounts.
@@ -500,7 +528,7 @@ def parse_tax_list(
         situs_zip_s = f[layout.situs_zip].strip()
         if (
             not owner_s
-            or _to_decimal(owner_s) is not None
+            or _is_number_like(owner_s)
             or (situs_state_s and situs_state_s != _EXPECTED_SITUS_STATE)
             or (situs_zip_s and not _ZIP_RE.fullmatch(situs_zip_s))
         ):
@@ -618,6 +646,9 @@ def parse_tax_list(
         "text_violations": text_violations,
         # Total as-of votes cast over the sampled head (denominator for disagreement).
         "as_of_votes": sum(as_of_votes.values()),
+        # Whole-file as-of agreement, so a splice past the sampled head still shows.
+        "as_of_rows": as_of_rows,
+        "as_of_mismatch": as_of_mismatch,
         # >0 means the sampled head disagreed about the as-of year.
         "as_of_disagreement": as_of_disagreement,
         # Lines held in memory by the as-of sampler; bounded by _MAX_HEAD_SCAN_LINES
@@ -748,6 +779,16 @@ class SnohomishWATaxDelinquentScraper(BridgeScraper):
             )
         # A head that cannot agree on the as-of year means two files were spliced or
         # the source is mid-rotation. Majority-vote alone would paper over that.
+        # Whole-file check first: the head sample can agree while the tail is spliced.
+        as_of_rows = stats["as_of_rows"]
+        as_of_mismatch = stats["as_of_mismatch"]
+        if as_of_rows and as_of_mismatch / as_of_rows > _MAX_AS_OF_DISAGREEMENT_RATIO:
+            raise RuntimeError(
+                f"Snohomish tax list as-of year is not consistent across the file: "
+                f"{as_of_mismatch} of {as_of_rows} rows disagree with "
+                f"{stats['as_of_year']} — refusing to classify delinquency from a "
+                "mixed source"
+            )
         votes = stats["as_of_votes"]
         disagreement = stats["as_of_disagreement"]
         if votes and disagreement / votes > _MAX_AS_OF_DISAGREEMENT_RATIO:
@@ -757,7 +798,7 @@ class SnohomishWATaxDelinquentScraper(BridgeScraper):
                 f"({stats['as_of_year']}) — refusing to classify delinquency from a "
                 "mixed source"
             )
-        elif disagreement:
+        elif disagreement or as_of_mismatch:
             _logger.warning(
                 "Snohomish tax list: %d of %d sampled rows disagreed on the as-of "
                 "year (using majority %s) — worth checking the source",

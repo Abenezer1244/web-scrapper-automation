@@ -38,6 +38,12 @@ from src.scrapers.snohomish_wa_tax_delinquent import (
         ("20260229", None),        # 2026 is not a leap year
         ("01/01/1800", None),      # below the accepted year range
         ("01/01/2300", None),      # above the accepted year range
+        # strptime's numeric directives are VARIABLE-WIDTH: '%Y%m%d' parses these
+        # as 2026-07-01 unless the shape is gated first. A truncated or shifted
+        # cell must not be read as a valid as-of year.
+        ("202671", None),          # 6 digits
+        ("2026071", None),         # 7 digits
+        ("202607011", None),       # 9 digits
     ],
 )
 def test_as_of_year_accepts_both_published_formats(raw, expected):
@@ -57,7 +63,11 @@ def test_as_of_year_accepts_both_published_formats(raw, expected):
         ("99999999.99", Decimal("99999999.99")),   # at the ceiling
         ("100000000.00", None),        # over the Numeric(12,2) contract
         ("1e30", None),                # exponent form must not slip past the bound
-        ("1.234", None),               # more precision than cents
+        ("1.234", None),               # genuine sub-cent precision is rejected
+        # ...but a cent-EQUIVALENT trailing zero is harmless and must be kept:
+        # rejecting it would silently drop valid rows on a cosmetic source change.
+        ("1.230", Decimal("1.23")),
+        ("507.8300", Decimal("507.83")),
     ],
 )
 def test_to_decimal_is_bounded(raw, expected):
@@ -261,6 +271,200 @@ def test_mixed_field_widths_count_as_malformed():
     _, stats = parse_tax_list(rows, fallback_year=2099)
     assert stats["layout"] == "v17_pre_2026_07"   # locked by the first rows
     assert stats["malformed"] == 5                # every 15-field row rejected
+
+
+def test_unparseable_amount_on_an_in_scope_row_counts_malformed():
+    """A delinquent row whose amount cell won't parse is a source-shape problem.
+
+    Silently skipping it would hide a column shift from the malformed-ratio guard
+    — the exact failure mode that let the 17->15 layout change sit for 5 weeks.
+    Row is 14-digit + prior-year (in scope) with a junk owed cell.
+    """
+    rows = [
+        "27060100400800|2026|315 S BLAKELEY ST|MONROE|WA|98272|OWNER A|MONROE|WA|98272"
+        "|20260701|2201.34|0|2201.34|4402.67",
+        "27060100499999|2025|1 BROKEN ST|MONROE|WA|98272|OWNER B|MONROE|WA|98272"
+        "|20260701|100.00|0|NOT_A_NUMBER|100.00",
+    ]
+    records, stats = parse_tax_list(rows, fallback_year=2099)
+    assert records == []
+    assert stats["malformed"] == 1
+
+
+def test_out_of_scope_rows_with_bad_amounts_do_not_inflate_malformed():
+    """Only IN-SCOPE rows count. A current-year or personal-property row with an
+    unparseable amount must not push the malformed ratio toward a false abort."""
+    rows = [
+        "27060100400800|2026|315 S BLAKELEY ST|MONROE|WA|98272|OWNER A|MONROE|WA|98272"
+        "|20260701|2201.34|0|JUNK|4402.67",          # current year -> out of scope
+        "0006064|2023|21220 87TH AVE SE|WOODINVILLE|WA|98072|BIZ|MUKILTEO|WA|98275"
+        "|20260701|27.81|27.81|JUNK|27.81",          # 7-digit personal property
+    ]
+    records, stats = parse_tax_list(rows, fallback_year=2099)
+    assert records == []
+    assert stats["malformed"] == 0
+
+
+# ─── semantic canary: same-width column PERMUTATION (Codex §14 pass 4) ────────
+
+def test_column_permutation_is_caught_by_the_amount_invariant():
+    """A reordered file keeps the width, so every shape check passes.
+
+    This is the same failure class as the 17→15 change that went unnoticed for 5
+    weeks, except worse: it would emit leads with WRONG balances rather than
+    failing. `billed == paid + owed` is a property of the data (100.0000% of the
+    live file), so a permutation breaks it immediately.
+
+    Row below is the real 2025 delinquent row with cols 13/14 (owed ↔ levy)
+    swapped: billed 2207.33 vs paid 1148.31 + owed 2207.33 = 3355.64.
+    """
+    permuted = [
+        "27060100417000|2025|518 S LEWIS ST|MONROE|WA|98272-2325|HOLZERLAND K"
+        "|MONROE|WA|98272-2325|20260701|2207.33|1148.31|2207.33|1059.02"
+    ]
+    _, stats = parse_tax_list(permuted, fallback_year=2099)
+    assert stats["invariant_checked"] == 1
+    assert stats["invariant_violations"] == 1
+
+
+def test_real_rows_satisfy_the_amount_invariant():
+    """The genuine v15 rows must NOT trip the canary (no false aborts)."""
+    _, stats = parse_tax_list(FIXTURE_ROWS_V15, fallback_year=2099)
+    assert stats["invariant_checked"] >= 1
+    assert stats["invariant_violations"] == 0
+
+
+def test_invariant_is_not_applied_to_v17():
+    """v17's middle amount column is not `paid` — its own rows disprove the
+    balance (117.03 != 60.01 + 60.01), so the canary must stay disabled there."""
+    _, stats = parse_tax_list(FIXTURE_ROWS, fallback_year=2099)
+    assert stats["invariant_checked"] == 0
+    assert stats["invariant_violations"] == 0
+
+
+def test_text_canary_flags_an_owner_address_permutation():
+    """An amount-preserving reorder that moved the TEXT columns must still be caught.
+
+    Here the amounts are untouched (so the invariant passes) but owner and situs
+    state/zip are shifted — the row carries a numeric 'owner' and a non-WA state.
+    """
+    permuted = [
+        "27060100417000|2025|518 S LEWIS ST|WA|98272-2325|MONROE|1148.31"
+        "|MONROE|WA|98272-2325|20260701|2207.33|1148.31|1059.02|2207.33"
+    ]
+    _, stats = parse_tax_list(permuted, fallback_year=2099)
+    assert stats["invariant_violations"] == 0   # amounts still balance
+    assert stats["text_checked"] == 1
+    assert stats["text_violations"] == 1        # ...but the text columns moved
+
+
+def test_text_canary_catches_a_parcel_number_in_the_owner_column():
+    """A 14-digit account number in the owner column must count as numeric.
+
+    _to_decimal() would NOT catch it — it rejects anything above _MAX_AMOUNT, so a
+    14-digit value reads as "not a number" and would defeat the canary in exactly
+    the case it exists for (owner column replaced by an account column).
+    """
+    from src.scrapers.snohomish_wa_tax_delinquent import _is_number_like, _to_decimal
+
+    assert _to_decimal("27060100417000") is None      # the trap
+    assert _is_number_like("27060100417000") is True  # the fix
+    assert _is_number_like("HOLZERLAND K") is False
+
+    row = [
+        "27060100417000|2025|518 S LEWIS ST|MONROE|WA|98272-2325|27060100417000"
+        "|MONROE|WA|98272-2325|20260701|2207.33|1148.31|1059.02|2207.33"
+    ]
+    _, stats = parse_tax_list(row, fallback_year=2099)
+    assert stats["invariant_violations"] == 0   # amounts still balance
+    assert stats["text_violations"] == 1        # ...but the owner is an account no.
+
+
+def test_as_of_mismatch_is_tallied_across_the_whole_file():
+    """A splice PAST the sampled head must still be visible.
+
+    Head sampling only picks the year; without a whole-file tally, a file whose
+    first rows agree could classify its entire tail against the wrong cutoff.
+    """
+    good = (
+        "2706010041700{i}|2025|1 A ST|MONROE|WA|98272|OWNER {i}"
+        "|MONROE|WA|98272|20260701|100.00|40.00|60.00|100.00"
+    )
+    spliced = (
+        "2706010041800{i}|2025|1 B ST|MONROE|WA|98272|OWNER B{i}"
+        "|MONROE|WA|98272|20190101|100.00|40.00|60.00|100.00"
+    )
+    rows = [good.format(i=i % 10) for i in range(10)] + [
+        spliced.format(i=i % 10) for i in range(10)
+    ]
+    _, stats = parse_tax_list(rows, fallback_year=2099)
+    assert stats["as_of_year"] == 2026
+    assert stats["as_of_rows"] == 20
+    assert stats["as_of_mismatch"] == 10   # the spliced tail is counted
+
+
+def test_text_canary_tolerates_empty_zip_and_state():
+    """Measured on the live file: 14.79% of in-scope rows have an EMPTY situs zip
+    and one has an empty state. Treating those as violations would abort every run."""
+    rows = [
+        # empty situs zip
+        "27060100417001|2025|717 STATE ROUTE 9 NE|LAKE STEVENS|WA||OWNER A"
+        "|LAKE STEVENS|WA|98258|20260701|100.00|40.00|60.00|100.00",
+        # empty situs state
+        "27060100417002|2025|1 SOME RD|EVERETT||98201|OWNER B"
+        "|EVERETT|WA|98201|20260701|100.00|40.00|60.00|100.00",
+        # legitimately out-of-state MAILING address (the absentee-owner signal)
+        "27060100417003|2025|2 SOME RD|EVERETT|WA|98201|OWNER C"
+        "|PHOENIX|AZ|85001|20260701|100.00|40.00|60.00|100.00",
+    ]
+    records, stats = parse_tax_list(rows, fallback_year=2099)
+    assert len(records) == 3
+    assert stats["text_checked"] == 3
+    assert stats["text_violations"] == 0
+
+
+def test_as_of_year_is_a_consensus_not_the_first_row():
+    """One stray leading row must not redefine delinquency for the whole file.
+
+    First row carries a bogus as-of year; the majority say 2026. With first-row-wins
+    the 2025 row would be treated as current-year and dropped.
+    """
+    rows = [
+        # stray leading row with a wrong as-of year
+        "27060100400800|2026|315 S BLAKELEY ST|MONROE|WA|98272|OWNER A|MONROE|WA|98272"
+        "|20190101|2201.34|0|2201.34|4402.67",
+        *FIXTURE_ROWS_V15[1:],
+    ]
+    records, stats = parse_tax_list(rows, fallback_year=2099)
+    assert stats["as_of_year"] == 2026          # majority, not the stray 2019
+    assert stats["as_of_disagreement"] == 1
+    assert set(_by_parcel(records)) == {"27060100417000"}
+
+
+def test_as_of_sampler_does_not_buffer_a_whole_junk_file():
+    """The head sampler must be bounded by LINES READ, not only by valid rows.
+
+    A large file with no width-valid rows would otherwise be pulled entirely into
+    memory before the main loop's _MAX_SOURCE_ROWS check ever runs — the sampler
+    becoming the very exhaustion path the caps exist to prevent.
+    """
+    from src.scrapers.snohomish_wa_tax_delinquent import _MAX_HEAD_SCAN_LINES
+
+    n = _MAX_HEAD_SCAN_LINES * 4
+
+    def junk():
+        for _ in range(n):
+            yield "no|pipes|that|match|any|layout"
+
+    records, stats = parse_tax_list(junk(), fallback_year=2099)
+    assert records == []
+    # The sampler held at most its ceiling in memory, NOT the whole file. (The main
+    # loop still streams the remainder — that is correct, constant-memory behaviour.)
+    assert stats["head_buffered"] <= _MAX_HEAD_SCAN_LINES
+    # Every line was still seen and counted malformed — nothing dropped at the
+    # head/stream boundary, nothing double-counted.
+    assert stats["total"] == n
+    assert stats["malformed"] == n
 
 
 def test_unknown_field_width_is_all_malformed():

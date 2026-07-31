@@ -20,6 +20,10 @@ from playwright.async_api import (
 
 from src.api.middleware.security import validate_scraping_target
 from src.config import settings
+from src.scrapers.browser_identity import (
+    LEGACY_BROWSER_UA,
+    resolve_playwright_user_agent,
+)
 from src.scrapers.doc_scope import CollectionScope
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
@@ -185,12 +189,28 @@ class BridgeScraper:
                 "--js-flags=--max-old-space-size=512",
             ],
         )
+        # Resolve the identity we present to portals. Derived from the browser
+        # we are ACTUALLY running rather than a hardcoded string, which had
+        # drifted to Chrome/120 while running Chromium 131 and then 148.
+        # Defaults to `legacy` (byte-identical to the old hardcoded value) —
+        # see src/scrapers/browser_identity.py for the rollout reasoning.
+        # Never let an identity problem take scraping down: fall back to the
+        # legacy string rather than raising out of browser startup.
+        try:
+            resolved_ua = resolve_playwright_user_agent(
+                self._browser.version,
+                mode=settings.SCRAPER_BROWSER_UA_MODE,
+                override=settings.SCRAPER_BROWSER_UA_OVERRIDE or None,
+            )
+        except ValueError as exc:
+            _logger.error(
+                "UA resolution failed (mode=%s, browser.version=%r): %s — using legacy UA",
+                settings.SCRAPER_BROWSER_UA_MODE, self._browser.version, exc,
+            )
+            resolved_ua = LEGACY_BROWSER_UA
+
         self._context = await self._browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
+            user_agent=resolved_ua,
             viewport={"width": 1280, "height": 800},
             locale="en-US",
         )
@@ -212,7 +232,17 @@ class BridgeScraper:
             window.chrome = {runtime: {}};
         """)
 
-        _logger.info("Browser context started (headless=%s, DISPLAY=%s)", use_headless, os.environ.get("DISPLAY", "unset"))
+        # Log the resolved identity every startup: this is the evidence trail
+        # when Playwright changes browser packaging again (1.57 moved Chromium
+        # to Chrome for Testing) or when a portal starts behaving differently.
+        _logger.info(
+            "Browser context started (headless=%s, DISPLAY=%s, chromium=%s, ua_mode=%s, ua=%r)",
+            use_headless,
+            os.environ.get("DISPLAY", "unset"),
+            self._browser.version,
+            settings.SCRAPER_BROWSER_UA_MODE,
+            resolved_ua,
+        )
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:

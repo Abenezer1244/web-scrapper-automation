@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -217,6 +217,24 @@ class Settings(BaseSettings):
 
     # ─── Playwright ───────────────────────────────────────────────────────────
     PLAYWRIGHT_HEADLESS: bool = True
+
+    # Which identity the browser presents to portals. See
+    # src/scrapers/browser_identity.py for why this is flagged rather than
+    # simply corrected: changing the UA can change how a portal responds
+    # (content negotiation, bot rules, redirects, cookie gates), and scraper
+    # navigation has no unit coverage. Default reproduces the previous
+    # hardcoded string byte-for-byte, so shipping this is a no-op.
+    #   legacy          — previous hardcoded Windows/Chrome-120 string
+    #   linux_dynamic   — real Chromium major + Linux (coherent with the
+    #                     container and navigator.platform; the intended target)
+    #   windows_dynamic — real major but keeps the Windows claim; for canary
+    #                     comparison only
+    # Literal, not str: a typo like "linux-dynamic" would otherwise fall through
+    # to the legacy UA at the call site and silently turn a canary into a no-op,
+    # invalidating the rollout data. pydantic-settings rejects it at boot instead.
+    SCRAPER_BROWSER_UA_MODE: Literal["legacy", "linux_dynamic", "windows_dynamic"] = "legacy"
+    # Operator escape hatch — wins over the mode. Empty = unused.
+    SCRAPER_BROWSER_UA_OVERRIDE: str = ""
 
     # ─── Scraping ─────────────────────────────────────────────────────────────
     DEFAULT_TIMEOUT: int = 30

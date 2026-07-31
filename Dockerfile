@@ -34,6 +34,16 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Playwright's own system-dependency set for the PINNED version, installed as
+# root (it shells out to apt). The hand-curated apt list above was assembled for
+# the Chromium that shipped with playwright 1.49 (131); 1.57 repackaged Chromium
+# to Chrome for Testing and headless now resolves to chrome-headless-shell, so a
+# hand-maintained list can silently miss a newly-required lib. This tracks
+# whatever the pinned version actually needs. Must run BEFORE `USER bridge` —
+# `playwright install --with-deps` cannot be used below because that step runs
+# unprivileged and apt requires root.
+RUN playwright install-deps chromium
+
 # Create non-root user BEFORE installing Playwright
 # so browsers are installed in the correct home directory
 RUN useradd -m -u 1000 bridge && chown -R bridge:bridge /app

@@ -9,6 +9,16 @@ updates:
       time: "09:00"
       timezone: America/Los_Angeles
     open-pull-requests-limit: 5
+    # redis>=6.5 is INCOMPATIBLE with our task queue and must not be proposed.
+    # celery[redis]==5.6.3 pulls kombu, and kombu (5.6.2, latest) declares:
+    #   redis!=4.5.5,!=5.0.2,<6.5,>=4.5.2 ; extra == "redis"
+    # Dependabot opened #103 (redis 5.2.1 -> 8.0.1) anyway; merging it would have
+    # broken the broker/result backend. Verified against kombu's published
+    # metadata 2026-07-31 — remove this ignore only once a celery/kombu release
+    # actually raises that ceiling. See the pin comment in requirements.txt.
+    ignore:
+      - dependency-name: "redis"
+        versions: [">=6.5"]
     groups:
       fastapi-stack:
         patterns:

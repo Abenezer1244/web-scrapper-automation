@@ -1,6 +1,8 @@
 # API
-fastapi==0.137.2            # M3: bumped from 0.115.6 to pull a fixed starlette (CVE-2025-54121/62727, PYSEC-2026-161)
-uvicorn[standard]==0.49.0
+fastapi==0.141.1            # M3: bumped from 0.115.6 to pull a fixed starlette (CVE-2025-54121/62727, PYSEC-2026-161)
+# NOTE: do NOT pin starlette directly — fastapi resolves a compatible version
+# (0.141.1 floors it at >=0.46.0). A separate pin is how the CVE-2025-54121 drift happened.
+uvicorn[standard]==0.52.0   # 0.51 dropped colorama from [standard] — Windows-only console colour, irrelevant on Linux containers
 python-multipart==0.0.31    # M3 + 2026-06-15: CVE-2026-53538/53539/53540 (form-parse DoS/HPP)
 
 # Async DB
@@ -24,13 +26,18 @@ cryptography==49.0.0         # Fernet field encryption (MFA secret; H3 PII). 202
 
 # Task queue
 celery[redis]==5.6.3
-redis==5.2.1         # pinned <6.5: celery 5.6's kombu[redis] requires redis<6.5 (redis 8.x is incompatible)
+# LOAD-BEARING PIN — do not bump past 6.5. kombu (5.6.2, latest) declares
+# `redis!=4.5.5,!=5.0.2,<6.5,>=4.5.2 ; extra == "redis"`, so redis 8.x breaks the
+# broker/result backend. Re-verified against kombu's PyPI metadata 2026-07-31 after
+# dependabot proposed redis 8.0.1 (#103, closed). A matching ignore rule now lives
+# in .github/dependabot.yml so it stops being re-proposed.
+redis==5.2.1
 
 # Scraping
 playwright==1.49.1
 beautifulsoup4==4.12.3
 lxml==6.1.0                  # M3: PYSEC-2026-87
-requests==2.33.0             # M3: CVE-2024-47081, CVE-2026-25645
+requests==2.34.2             # M3: CVE-2024-47081, CVE-2026-25645. 2.34: inline typing + less-greedy no_proxy matching
 pypdf==6.14.2                # NTS Tier 1: extract text from Pacific Publishing legals PDFs (pure-python, no native deps). 6.14.2: CVE-2026-59935/59936 (extract_text infinite loop), CVE-2026-59937 (xref long runtime), CVE-2026-59938 (image memory-DoS); prior 6.13.3: GHSA-jm82-fx9c-mx94
 
 # AI extraction (Claude API)
@@ -44,7 +51,7 @@ pandas==2.2.3
 openpyxl==3.1.5
 
 # Storage (Cloudflare R2 / S3-compatible)
-boto3==1.43.29
+boto3==1.43.60               # service-model churn only for our S3-compatible R2 use (upload + presigned GET)
 
 # Email
 resend==2.7.0

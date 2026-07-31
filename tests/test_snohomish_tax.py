@@ -305,6 +305,61 @@ def test_out_of_scope_rows_with_bad_amounts_do_not_inflate_malformed():
     assert stats["malformed"] == 0
 
 
+# ─── semantic canary: same-width column PERMUTATION (Codex §14 pass 4) ────────
+
+def test_column_permutation_is_caught_by_the_amount_invariant():
+    """A reordered file keeps the width, so every shape check passes.
+
+    This is the same failure class as the 17→15 change that went unnoticed for 5
+    weeks, except worse: it would emit leads with WRONG balances rather than
+    failing. `billed == paid + owed` is a property of the data (100.0000% of the
+    live file), so a permutation breaks it immediately.
+
+    Row below is the real 2025 delinquent row with cols 13/14 (owed ↔ levy)
+    swapped: billed 2207.33 vs paid 1148.31 + owed 2207.33 = 3355.64.
+    """
+    permuted = [
+        "27060100417000|2025|518 S LEWIS ST|MONROE|WA|98272-2325|HOLZERLAND K"
+        "|MONROE|WA|98272-2325|20260701|2207.33|1148.31|2207.33|1059.02"
+    ]
+    _, stats = parse_tax_list(permuted, fallback_year=2099)
+    assert stats["invariant_checked"] == 1
+    assert stats["invariant_violations"] == 1
+
+
+def test_real_rows_satisfy_the_amount_invariant():
+    """The genuine v15 rows must NOT trip the canary (no false aborts)."""
+    _, stats = parse_tax_list(FIXTURE_ROWS_V15, fallback_year=2099)
+    assert stats["invariant_checked"] >= 1
+    assert stats["invariant_violations"] == 0
+
+
+def test_invariant_is_not_applied_to_v17():
+    """v17's middle amount column is not `paid` — its own rows disprove the
+    balance (117.03 != 60.01 + 60.01), so the canary must stay disabled there."""
+    _, stats = parse_tax_list(FIXTURE_ROWS, fallback_year=2099)
+    assert stats["invariant_checked"] == 0
+    assert stats["invariant_violations"] == 0
+
+
+def test_as_of_year_is_a_consensus_not_the_first_row():
+    """One stray leading row must not redefine delinquency for the whole file.
+
+    First row carries a bogus as-of year; the majority say 2026. With first-row-wins
+    the 2025 row would be treated as current-year and dropped.
+    """
+    rows = [
+        # stray leading row with a wrong as-of year
+        "27060100400800|2026|315 S BLAKELEY ST|MONROE|WA|98272|OWNER A|MONROE|WA|98272"
+        "|20190101|2201.34|0|2201.34|4402.67",
+        *FIXTURE_ROWS_V15[1:],
+    ]
+    records, stats = parse_tax_list(rows, fallback_year=2099)
+    assert stats["as_of_year"] == 2026          # majority, not the stray 2019
+    assert stats["as_of_disagreement"] == 1
+    assert set(_by_parcel(records)) == {"27060100417000"}
+
+
 def test_unknown_field_width_is_all_malformed():
     rows = ["a|b|c", "d|e|f"]
     records, stats = parse_tax_list(rows, fallback_year=2099)

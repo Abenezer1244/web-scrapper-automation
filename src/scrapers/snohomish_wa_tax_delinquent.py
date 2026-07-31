@@ -43,9 +43,11 @@ rows are intentionally EXCLUDED (conservative — they may not be overdue yet).
 import os
 import re
 import tempfile
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from itertools import chain
 from urllib.parse import urljoin
 
 from src.api.middleware.security import add_scrape_domain
@@ -102,6 +104,10 @@ class _Layout:
     as_of: int
     # Amount billed to date for the tax year (what `total_billed` has always meant).
     billed: int
+    # Amount already PAID. Only set where `billed == paid + owed` is a verified
+    # property of the revision — it is the semantic canary (see _INVARIANT_TOLERANCE).
+    # None disables the check for that layout.
+    paid: int | None
     # Amount STILL OWED. Note this is NOT the last column in either revision --
     # in v15 the last column is the full-year levy, so taking "the last amount"
     # would silently overstate every delinquent balance.
@@ -119,7 +125,10 @@ _LAYOUT_V17 = _Layout(
     owner=7,
     mail_street=8, mail_line2=9, mail_city=10, mail_state=11, mail_zip=12,
     as_of=13,
-    billed=14, owed=16, levy=None,
+    # paid=None: v17's middle amount column is NOT "paid" — its own rows disprove
+    # the balance (e.g. 117.03|60.01|60.01, where 60.01+60.01 != 117.03), so the
+    # semantic canary cannot be applied to this revision.
+    billed=14, paid=None, owed=16, levy=None,
 )
 
 # Layout live since 2026-07-01. Amount columns verified against the full 327,721-row
@@ -132,7 +141,7 @@ _LAYOUT_V15 = _Layout(
     owner=6,
     mail_street=None, mail_line2=None, mail_city=7, mail_state=8, mail_zip=9,
     as_of=10,
-    billed=11, owed=13, levy=14,
+    billed=11, paid=12, owed=13, levy=14,
 )
 
 _LAYOUTS: dict[int, _Layout] = {lay.n_fields: lay for lay in (_LAYOUT_V15, _LAYOUT_V17)}
@@ -147,6 +156,29 @@ _MAX_AMOUNT = Decimal("99999999.99")
 _CENT = Decimal("0.01")
 _MIN_AS_OF_YEAR = 1900
 _MAX_AS_OF_YEAR = 2200
+
+# SEMANTIC canary. The width check and _MAX_MALFORMED_RATIO only catch a change in
+# SHAPE. A revision with the SAME width but PERMUTED columns would parse silently and
+# emit wrong owner/address/amount — the same class of failure as the 17->15 change
+# that went unnoticed for 5 weeks. For layouts that publish `paid`, billed == paid +
+# owed is a property of the data (verified: 327,720/327,720 rows, 100.0000%, on the
+# live v15 file), so a column permutation breaks it immediately.
+_INVARIANT_TOLERANCE = Decimal("0.01")
+# Fraction of checked rows allowed to violate before the scrape fails. The real file
+# violates on 0 rows, so anything above a rounding-noise floor means the columns moved.
+_MAX_INVARIANT_VIOLATION_RATIO = 0.01
+
+# As-of consensus: sample this many width-valid rows and take the majority as-of year
+# rather than trusting whichever row happens to come first (a stray or stale leading
+# row would otherwise redefine "delinquent" for the entire file).
+_AS_OF_SAMPLE_ROWS = 200
+
+# Parser-local ceilings. MAX_DOWNLOAD_BYTES bounds the file, not the parse: a minimal
+# valid row is ~41 bytes, so a size-capped file could still encode millions of parcels
+# and blow the worker's memory through `agg`. Generous headroom over the real feed
+# (327,721 rows / ~3,900 delinquent parcels) — these exist to fail loudly, not to trim.
+_MAX_SOURCE_ROWS = 2_000_000
+_MAX_DISTINCT_PARCELS = 500_000
 # Exact published as-of widths. strptime's directives are variable-width, so these
 # gate the shape before strptime validates the calendar.
 _SLASH_DATE_RE = re.compile(r"\d{1,2}/\d{1,2}/\d{4}")
@@ -333,12 +365,49 @@ def parse_tax_list(
     delinquent_rows = 0
     current_year: int | None = None
     layout: _Layout | None = None
+    invariant_checked = 0
+    invariant_violations = 0
 
-    for line in lines:
+    # ---- head sample: decide the layout and the as-of year by CONSENSUS --------
+    # Single streaming pass, so buffer only the first _AS_OF_SAMPLE_ROWS width-valid
+    # rows. Taking whichever row comes first would let one stray or stale leading row
+    # redefine the delinquency cutoff for the whole file (Codex §14 pass 4).
+    stream = iter(lines)
+    head: list[str] = []
+    as_of_votes: Counter[int] = Counter()
+    sampled = 0
+    for line in stream:
+        head.append(line)
+        stripped = line.rstrip("\r\n")
+        if not stripped.strip():
+            continue
+        f = stripped.split("|")
+        if layout is None:
+            layout = _LAYOUTS.get(len(f))
+        if layout is None or len(f) != layout.n_fields:
+            continue
+        if not (f[0].strip().isdigit() and len(f[1].strip()) == 4 and f[1].strip().isdigit()):
+            continue
+        year_seen = _as_of_year(f[layout.as_of])
+        if year_seen is not None:
+            as_of_votes[year_seen] += 1
+        sampled += 1
+        if sampled >= _AS_OF_SAMPLE_ROWS:
+            break
+    if as_of_votes:
+        current_year = as_of_votes.most_common(1)[0][0]
+    as_of_disagreement = sum(as_of_votes.values()) - max(as_of_votes.values(), default=0)
+
+    for line in chain(head, stream):
         line = line.rstrip("\r\n")
         if not line.strip():
             continue
         total += 1
+        if total > _MAX_SOURCE_ROWS:
+            raise RuntimeError(
+                f"Snohomish tax list exceeded {_MAX_SOURCE_ROWS} rows — refusing to "
+                "parse further (source size is implausible; bounding worker memory)"
+            )
         f = line.split("|")
         # Lock the layout to the first row whose width we recognise, then hold it
         # for the whole file: a file that mixes widths is a wrong/half-swapped
@@ -356,8 +425,6 @@ def parse_tax_list(
             continue
         year = int(year_s)
 
-        if current_year is None:
-            current_year = _as_of_year(f[layout.as_of])
         ref_year = current_year or fallback_year
 
         # Real property only; skip 7-digit personal-property (business) accounts.
@@ -378,8 +445,27 @@ def parse_tax_list(
         if owed <= 0:
             continue
 
+        # SEMANTIC canary: a same-width column permutation passes every shape check
+        # above but breaks the arithmetic relationship between the amount columns.
+        if layout.paid is not None:
+            billed_v = _to_decimal(f[layout.billed])
+            paid_v = _to_decimal(f[layout.paid])
+            invariant_checked += 1
+            if (
+                billed_v is None
+                or paid_v is None
+                or abs(billed_v - (paid_v + owed)) > _INVARIANT_TOLERANCE
+            ):
+                invariant_violations += 1
+
         delinquent_rows += 1
         entry = agg.get(parcel)
+        if entry is None and len(agg) >= _MAX_DISTINCT_PARCELS:
+            raise RuntimeError(
+                f"Snohomish tax list exceeded {_MAX_DISTINCT_PARCELS} distinct "
+                "delinquent parcels — refusing to accumulate further (bounding "
+                "worker memory; the real feed yields ~4k)"
+            )
         if entry is None:
             has_mail_street = _has_street(f, layout.mail_street, layout.mail_line2)
             entry = {
@@ -477,6 +563,11 @@ def parse_tax_list(
         "capped_out": capped_out,
         "as_of_year": current_year,
         "layout": layout.name if layout else None,
+        # Semantic-canary telemetry for the caller's structural validation.
+        "invariant_checked": invariant_checked,
+        "invariant_violations": invariant_violations,
+        # >0 means the sampled head disagreed about the as-of year.
+        "as_of_disagreement": as_of_disagreement,
     }
     return records, stats
 
@@ -574,6 +665,26 @@ class SnohomishWATaxDelinquentScraper(BridgeScraper):
                 "Snohomish tax list as-of date unparseable (layout="
                 f"{stats['layout']!r}) — refusing to classify delinquency from the "
                 "wall clock; the source date format likely changed"
+            )
+        # SEMANTIC validation. The checks above only prove the file has the right
+        # SHAPE. If the county republished the same width with the columns in a
+        # different order, every check so far would pass and we would emit wrong
+        # owners and wrong amounts silently. The billed == paid + owed relationship
+        # is a property of the data, so a permutation breaks it immediately.
+        checked = stats["invariant_checked"]
+        violations = stats["invariant_violations"]
+        if checked and violations / checked > _MAX_INVARIANT_VIOLATION_RATIO:
+            raise RuntimeError(
+                f"Snohomish tax list failed its amount invariant: {violations} of "
+                f"{checked} checked rows have billed != paid + owed "
+                f"(layout={stats['layout']!r}) — the amount columns have almost "
+                "certainly moved; refusing to emit leads with wrong balances"
+            )
+        if stats["as_of_disagreement"]:
+            _logger.warning(
+                "Snohomish tax list: %d of the sampled head rows disagreed on the "
+                "as-of year (using majority %s) — worth checking the source",
+                stats["as_of_disagreement"], stats["as_of_year"],
             )
         if not records:
             raise RuntimeError(

@@ -342,6 +342,42 @@ def test_invariant_is_not_applied_to_v17():
     assert stats["invariant_violations"] == 0
 
 
+def test_text_canary_flags_an_owner_address_permutation():
+    """An amount-preserving reorder that moved the TEXT columns must still be caught.
+
+    Here the amounts are untouched (so the invariant passes) but owner and situs
+    state/zip are shifted — the row carries a numeric 'owner' and a non-WA state.
+    """
+    permuted = [
+        "27060100417000|2025|518 S LEWIS ST|WA|98272-2325|MONROE|1148.31"
+        "|MONROE|WA|98272-2325|20260701|2207.33|1148.31|1059.02|2207.33"
+    ]
+    _, stats = parse_tax_list(permuted, fallback_year=2099)
+    assert stats["invariant_violations"] == 0   # amounts still balance
+    assert stats["text_checked"] == 1
+    assert stats["text_violations"] == 1        # ...but the text columns moved
+
+
+def test_text_canary_tolerates_empty_zip_and_state():
+    """Measured on the live file: 14.79% of in-scope rows have an EMPTY situs zip
+    and one has an empty state. Treating those as violations would abort every run."""
+    rows = [
+        # empty situs zip
+        "27060100417001|2025|717 STATE ROUTE 9 NE|LAKE STEVENS|WA||OWNER A"
+        "|LAKE STEVENS|WA|98258|20260701|100.00|40.00|60.00|100.00",
+        # empty situs state
+        "27060100417002|2025|1 SOME RD|EVERETT||98201|OWNER B"
+        "|EVERETT|WA|98201|20260701|100.00|40.00|60.00|100.00",
+        # legitimately out-of-state MAILING address (the absentee-owner signal)
+        "27060100417003|2025|2 SOME RD|EVERETT|WA|98201|OWNER C"
+        "|PHOENIX|AZ|85001|20260701|100.00|40.00|60.00|100.00",
+    ]
+    records, stats = parse_tax_list(rows, fallback_year=2099)
+    assert len(records) == 3
+    assert stats["text_checked"] == 3
+    assert stats["text_violations"] == 0
+
+
 def test_as_of_year_is_a_consensus_not_the_first_row():
     """One stray leading row must not redefine delinquency for the whole file.
 

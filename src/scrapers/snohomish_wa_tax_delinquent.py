@@ -177,6 +177,24 @@ _AS_OF_SAMPLE_ROWS = 200
 # buffered whole). ~5k lines is well under 1 MB and far beyond the real file's
 # need: it reaches 200 valid rows within the first ~201 lines.
 _MAX_HEAD_SCAN_LINES = 5_000
+# A sampled head that disagrees about the as-of year means two files were spliced
+# or the source is mid-rotation. Ratio-gated rather than zero-tolerance so one
+# stray row can't take the connector down (measured: 0 disagreement on the live file).
+_MAX_AS_OF_DISAGREEMENT_RATIO = 0.10
+
+# TEXT-shape canary. The amount invariant only protects the amount block; a
+# permutation could preserve billed == paid + owed and still swap owner/address
+# columns, which is half of what the same-width-reorder risk actually is.
+# Thresholds are MEASURED against the live file's 8,900 in-scope rows, not guessed:
+#   owner empty 0.0000% · owner numeric-like 0 · situs state 'WA' 8,899 + '' 1
+#   situs zip EMPTY 14.7865% (!) · situs zip present-but-malformed 0.0112%
+# So an empty zip and an empty state are NORMAL and must not count as violations —
+# requiring a well-formed zip would fail ~1 row in 7 and abort every run. Mailing
+# state is deliberately NOT checked: out-of-state owners are legitimate and are
+# precisely the absentee-owner signal (measured CA/AZ/TX/NV/ID/OR/FL...).
+_EXPECTED_SITUS_STATE = "WA"
+_ZIP_RE = re.compile(r"\d{5}(?:-\d{4})?")
+_MAX_TEXT_VIOLATION_RATIO = 0.01
 
 # Parser-local ceilings. MAX_DOWNLOAD_BYTES bounds the file, not the parse: a minimal
 # valid row is ~41 bytes, so a size-capped file could still encode millions of parcels
@@ -372,6 +390,8 @@ def parse_tax_list(
     layout: _Layout | None = None
     invariant_checked = 0
     invariant_violations = 0
+    text_checked = 0
+    text_violations = 0
 
     # ---- head sample: decide the layout and the as-of year by CONSENSUS --------
     # Single streaming pass, so buffer only the first _AS_OF_SAMPLE_ROWS width-valid
@@ -469,6 +489,22 @@ def parse_tax_list(
                 or abs(billed_v - (paid_v + owed)) > _INVARIANT_TOLERANCE
             ):
                 invariant_violations += 1
+
+        # TEXT-shape canary — the other half of the permutation risk: a reorder that
+        # kept the amounts consistent but moved owner/address would still ship wrong
+        # leads. Empty zip/state are normal here (measured), so only PRESENT values
+        # are shape-checked.
+        text_checked += 1
+        owner_s = f[layout.owner].strip()
+        situs_state_s = f[layout.situs_state].strip().upper()
+        situs_zip_s = f[layout.situs_zip].strip()
+        if (
+            not owner_s
+            or _to_decimal(owner_s) is not None
+            or (situs_state_s and situs_state_s != _EXPECTED_SITUS_STATE)
+            or (situs_zip_s and not _ZIP_RE.fullmatch(situs_zip_s))
+        ):
+            text_violations += 1
 
         delinquent_rows += 1
         entry = agg.get(parcel)
@@ -578,6 +614,10 @@ def parse_tax_list(
         # Semantic-canary telemetry for the caller's structural validation.
         "invariant_checked": invariant_checked,
         "invariant_violations": invariant_violations,
+        "text_checked": text_checked,
+        "text_violations": text_violations,
+        # Total as-of votes cast over the sampled head (denominator for disagreement).
+        "as_of_votes": sum(as_of_votes.values()),
         # >0 means the sampled head disagreed about the as-of year.
         "as_of_disagreement": as_of_disagreement,
         # Lines held in memory by the as-of sampler; bounded by _MAX_HEAD_SCAN_LINES
@@ -695,11 +735,33 @@ class SnohomishWATaxDelinquentScraper(BridgeScraper):
                 f"(layout={stats['layout']!r}) — the amount columns have almost "
                 "certainly moved; refusing to emit leads with wrong balances"
             )
-        if stats["as_of_disagreement"]:
+        # Same treatment for the non-amount columns: an amount-preserving reorder
+        # that moved owner/address would otherwise ship wrong leads silently.
+        text_checked = stats["text_checked"]
+        text_violations = stats["text_violations"]
+        if text_checked and text_violations / text_checked > _MAX_TEXT_VIOLATION_RATIO:
+            raise RuntimeError(
+                f"Snohomish tax list failed its text-shape checks: {text_violations} "
+                f"of {text_checked} rows have an empty/numeric owner or a malformed "
+                f"situs state/zip (layout={stats['layout']!r}) — the text columns have "
+                "likely moved; refusing to emit leads with wrong owner or address"
+            )
+        # A head that cannot agree on the as-of year means two files were spliced or
+        # the source is mid-rotation. Majority-vote alone would paper over that.
+        votes = stats["as_of_votes"]
+        disagreement = stats["as_of_disagreement"]
+        if votes and disagreement / votes > _MAX_AS_OF_DISAGREEMENT_RATIO:
+            raise RuntimeError(
+                f"Snohomish tax list as-of year is not consistent: {disagreement} of "
+                f"{votes} sampled rows disagree with the majority "
+                f"({stats['as_of_year']}) — refusing to classify delinquency from a "
+                "mixed source"
+            )
+        elif disagreement:
             _logger.warning(
-                "Snohomish tax list: %d of the sampled head rows disagreed on the "
-                "as-of year (using majority %s) — worth checking the source",
-                stats["as_of_disagreement"], stats["as_of_year"],
+                "Snohomish tax list: %d of %d sampled rows disagreed on the as-of "
+                "year (using majority %s) — worth checking the source",
+                disagreement, votes, stats["as_of_year"],
             )
         if not records:
             raise RuntimeError(

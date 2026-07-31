@@ -24,12 +24,28 @@ explicitly desktop-acceptable.
 
 ## 2. Where we are RIGHT NOW
 
-**Phases 1–5b are merged and live in production. Phase 5c is built and open as FE PR #93**
-(branch `feat/responsive-phase-5c`), not yet merged. Nothing is broken.
+**Phases 1–5c are merged and live in production. The sweep is otherwise COMPLETE and sitting in
+eight open PRs**, all CI-green and all Codex-reviewed clean:
 
-> Updated 2026-07-29: phase 5c shipped to review, and §5/§8 below carry a **retraction** of the
-> phase 1 "Tailwind drops nested `min(…, calc(…))`" finding — it was a measurement error, and
-> three live sites depend on that construct working. Read §5 before doing another phase.
+| PR | What |
+|---|---|
+| #95 | phase 1b — `input` + `checkbox` primitives (phase 1 scope gap) |
+| #97 | phase 6a — auth screens (+ `CompleteProfile`) |
+| #98 | phase 6b — pricing + coverage |
+| #99 | phase 6c — error and not-found pages |
+| #101 | phase 3b — shell viewport height + the mobile hamburger |
+| #102 | dead `(marketing)/_components/` removed |
+| #103 | phase 7 — admin |
+| #104 | marketing nav CTA unreachable on a phone |
+
+Independent branches off `master`, no stacking, no conflicts. Merge in any order.
+
+> **Updated 2026-07-31.** Three things in this document were WRONG and are corrected in place —
+> read §5 and §8 before doing anything:
+> 1. §8's "Tailwind drops nested `min(…, calc(…))`" — a measurement error; three live sites
+>    depend on that construct working.
+> 2. §5's "only a real phone can verify this" — false. Device emulation works; see §5.
+> 3. Phases 1 and 3 were reported complete and were not. See §7f.
 
 ### Frontend — `bridgeleads-web`, default branch `master`
 ```
@@ -178,20 +194,46 @@ constrained later phases.
 as a control before concluding anything. If the control also reads zero, the checker is broken,
 not the CSS.
 
-### ⚠️ THE GAP — tell the user about this
-**Nothing in this sweep has been looked at on a real device or in a browser.** Seven phases passed
-type-check, lint, build and compiled-CSS checks, and every Vercel preview was green — but that
-proves the CSS *rules exist*, not that the screens *read well*. The user has been asked several
-times to spot-check a preview and has not yet done so. The highest-value single check is: **tap a
-locked record-type chip in the wizard on a phone** — that explanation was previously impossible to
-see and is now the whole point of phase 5b.
+### ⚠️ THE GAP — mostly CLOSED as of 2026-07-31, and the earlier framing here was wrong
 
-🛑 **Resizing a desktop browser is NOT a substitute, and this is easy to get wrong.** Every touch
-target in this sweep is sized with the `pointer-coarse:` variant, which keys off the pointer
-*type*, not the viewport width. A desktop Chrome window narrowed to 320px still reports a fine
-pointer, so it silently skips **every** `pointer-coarse:` rule while looking perfectly plausible.
-A narrow desktop window verifies layout only. Touch sizing needs a real phone, or DevTools device
-emulation with touch turned on.
+The original claim was that only a real phone could verify this work. **That is false, and it cost
+the sweep several real defects that shipped.** Device emulation works, and it must be *device*
+emulation, not a resized window:
+
+🛑 **Resizing a desktop browser verifies layout ONLY.** Every touch target in this sweep is sized
+with `pointer-coarse:`, which keys off pointer *type*, not viewport width. A desktop Chrome window
+narrowed to 320px still reports `pointer: fine` and silently skips **every** `pointer-coarse:` rule
+while looking perfectly plausible. (The Claude-in-Chrome MCP browser is exactly this: it reports
+`pointerCoarse:false, maxTouchPoints:0`.)
+
+✅ **Playwright device descriptors DO work.** `devices["iPhone 13"]` sets `hasTouch` + `isMobile`,
+which makes `(pointer: coarse)` genuinely match. Always assert that as a **control** at the top of
+every run — without it a "clean" result is meaningless:
+
+```js
+import { chromium, webkit, devices } from "playwright";
+const ctx = await browser.newContext({ ...devices["iPhone 13"], viewport: { width: 320, height: 568 } });
+const ok = await page.evaluate(() => matchMedia("(pointer: coarse)").matches);  // MUST be true
+```
+
+Run it against **both** engines. WebKit ≈ iOS Safari and catches things Chromium hides.
+
+🛑 **Do not use `documentElement.scrollWidth` to detect horizontal overflow.** It counts
+`position:fixed` elements, so it reports page scroll that does not exist — this produced a false
+production alarm during phase 6d. Use `document.body.scrollWidth` **and** an actual
+`window.scrollTo(9999,0)` delta. Note WebKit permits programmatic scrolling past
+`overflow:hidden`, so a non-zero delta there still is not proof a user can swipe to it.
+
+🔑 Git Bash mangles a leading-slash argument (`/pricing` → `C:/Program Files/Git/pricing`). Prefix
+the command with `MSYS_NO_PATHCONV=1`.
+
+**What is now verified under real touch emulation, in Chromium and WebKit:** the whole public
+surface — login, register, forgot-password, pricing, coverage, landing, 404.
+
+**What is still NOT verified:** everything behind auth — the leads cards, the wizard's locked
+record-type chips (still the single highest-value check), the mobile drawer, job and batch views.
+Those need a session; the cleanest route is a throwaway test account to drive the harness with.
+Nothing has been looked at by a human on physical hardware either.
 
 ---
 
@@ -293,13 +335,68 @@ Two rulings worth keeping:
   phase 2 defect. The mechanical parity diff caught exactly that mid-development (`phone_type`
   had crept into the card). **Re-run it whenever either view changes.**
 
-### 7b. Phase 6 — auth, marketing, error pages  ← START HERE
-`app/(auth)/*` + `_components/AuthShell.tsx`, `app/(marketing)/*`, `error.tsx`,
-`global-error.tsx`, `not-found`. ⚠️ **Check the open Darkmatter Phase 6 PRs (#34–#38) and #69
-first** — they touch marketing and settings files and would collide.
+### 7b. Phase 6 — auth, marketing, error pages — ✅ DONE (FE #97, #98, #99, #104)
+Split as Codex advised, because the surface is ~2,100 lines across 22 files.
+- **6a auth (#97)** — the real find was not a touch target. The 2FA code row **overflowed its
+  card at 320px**: AuthShell's `px-4` leaves 288px, the login card's flat `p-6` took 48 more, and
+  six OTP slots plus separator came to 256px inside 240px of content, so the row pushed out of the
+  card. Card is `p-4` below `sm` and slots are `size-9` there: 232 in 256. The slots stay under
+  44px **deliberately** — six slots plus separator at 44px is 280px and a 320px viewport has 288px
+  before any padding, so the floor is arithmetically unreachable for that control.
+  Also `min-h-screen`→`min-h-dvh`, name grids stacked, password-reveal buttons (whose tap target
+  was the 16px glyph) given a real box, plus `CompleteProfile`.
+- **6b marketing (#98)** — pricing's comparison matrix scrolled horizontally with **no sticky
+  identifying column**, which the definition of done forbids; the Feature column is now sticky.
+  Its separating edge is a box-shadow, because collapsed borders do not paint on a pinned cell.
+  Coverage's `grid-cols-3` stats strip → two-up with the third spanning.
+- **6c error pages (#99)** — all five last-resort screens were `100vh`. `global-error.tsx` is
+  inline-styled by design (it replaces the root layout) so it gets `100dvh` and an unconditional
+  44px button; inline styles cannot carry a `pointer-coarse:` variant.
+- **6d marketing nav/footer (#104)** — see §7f. Found only by device emulation.
 
-### 7c. Phase 7 — admin
-`admin/connectors`, `admin/funnel`. Lowest priority; desktop-acceptable by the brief.
+⚠️ Collision check came back narrower than this document implied: the Darkmatter PRs #34–#38
+touch scrapers/settings/detail/admin/list pages and do **not** collide. The two that do are
+**#69** (`_monopo/Pipeline.tsx`) and **#43** (`(marketing)/layout.tsx`). Both avoided.
+
+### 7c. Phase 7 — admin — ✅ DONE (FE #103), and it really was one line
+The brief's "desktop-acceptable, say so rather than burning effort" was right. Both pages already
+use the sweep's container, carry no fixed widths, no `vh`, no tables, and no raw controls — every
+control goes through the shared components, so phases 1 and 1b cover them with no page-level
+change. The single fix was `connectors/page.tsx:160`, `grid-cols-2` → `grid-cols-1 sm:grid-cols-2`
+(~114px per field at 320px).
+
+🔑 A false lead worth not re-investigating: the connector list row at `:294` looks like the phase-3
+TopBar overflow (a `justify-between` flex row with no `min-w-0`/`shrink-0`). **It does not
+overflow.** Neither span sets `whitespace-nowrap`, so text wraps and each flex item's
+`min-width:auto` floor is its longest *word*. Min-content comes to ~271px against 288px available.
+
+### 7f. Two gaps in EARLIER phases, found while finishing — ✅ DONE (FE #95, #101, #104)
+Each was a phase that had been reported complete but wasn't.
+
+- **Phase 1 never finished (#95).** The brief scoped it as `dialog, table, card, dropdown-menu,
+  popover, input, button`; commit `93cca8e` touched four. `input.tsx` (`h-8`, 32px) and
+  `checkbox.tsx` (`size-4`, 16px) had **not been modified since the initial commit**, so every
+  text input in the app — dashboard included — was under the floor, and twelve call sites papering
+  over it with `h-10` only reached 40px. Worse, `checkbox.tsx` expanded its hit area with
+  `after:-inset-x-3 after:-inset-y-2` — **the negative-inset pseudo-element pattern this very
+  sweep rejected in phase 1** — so the primitive violated the convention in production.
+  🔑 Fixed in the primitive with `pointer-coarse:min-h-11`, which fixes all twelve call sites
+  **without editing any of them**. Verified both halves rather than assuming:
+  `twMerge("h-8 … pointer-coarse:min-h-11", "h-10")` keeps both (different variant = different
+  merge group), and Tailwind emits `@media (pointer:coarse)` after the base utilities, so the
+  coarse rule wins at equal specificity.
+- **Phase 3 missed the drawer's own trigger (#101).** `TopBar.tsx`'s mobile hamburger was a flat
+  40px with **no `pointer-coarse:` anywhere in the file** — the only way to open the nav on a
+  phone. Phase 3 raised `CommandTrigger`, `NotificationsBell`, `UserMenu`, `MobileDrawer`'s close
+  and the `NavItem` rows, but not the button that opens the drawer. Sidebar's settings link and
+  collapse toggle likewise.
+  Also the `dvh` sweep finished here: `app/layout.tsx` root `<body>` and the four full-height
+  blocks in `DashboardShellClient`. `ShellMain`'s was **removed rather than converted** — it is a
+  `flex-1` child of a `flex` parent that already stretches it.
+
+🛑 **`min-h-screen` compiles to `min-height:100vh`.** Fourteen instances survived five phases
+because everyone grepped for `vh` in arbitrary values and the `screen` alias never contains that
+string. If you add a viewport-height rule, grep for `screen` too.
 
 ### 7d. Not yet audited at all
 `components/settings/*` — **1917 lines across 7 files** (`BillingTab` 516, `security-tab` 463,

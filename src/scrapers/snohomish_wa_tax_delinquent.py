@@ -172,6 +172,11 @@ _MAX_INVARIANT_VIOLATION_RATIO = 0.01
 # rather than trusting whichever row happens to come first (a stray or stale leading
 # row would otherwise redefine "delinquent" for the entire file).
 _AS_OF_SAMPLE_ROWS = 200
+# Hard ceiling on lines buffered while sampling, so the sampler itself can never
+# become the memory-exhaustion path (a file with no valid rows would otherwise be
+# buffered whole). ~5k lines is well under 1 MB and far beyond the real file's
+# need: it reaches 200 valid rows within the first ~201 lines.
+_MAX_HEAD_SCAN_LINES = 5_000
 
 # Parser-local ceilings. MAX_DOWNLOAD_BYTES bounds the file, not the parse: a minimal
 # valid row is ~41 bytes, so a size-capped file could still encode millions of parcels
@@ -378,6 +383,13 @@ def parse_tax_list(
     sampled = 0
     for line in stream:
         head.append(line)
+        # Bound the buffer by LINES READ, not just by valid rows found. Without
+        # this, a large file containing few or no width-valid rows would be pulled
+        # into memory in its entirety before the main loop (and its
+        # _MAX_SOURCE_ROWS check) ever runs — reintroducing, in the sampler, the
+        # exhaustion the caps were added to prevent.
+        if len(head) >= _MAX_HEAD_SCAN_LINES:
+            break
         stripped = line.rstrip("\r\n")
         if not stripped.strip():
             continue
@@ -568,6 +580,9 @@ def parse_tax_list(
         "invariant_violations": invariant_violations,
         # >0 means the sampled head disagreed about the as-of year.
         "as_of_disagreement": as_of_disagreement,
+        # Lines held in memory by the as-of sampler; bounded by _MAX_HEAD_SCAN_LINES
+        # so the sampler can never become an exhaustion path of its own.
+        "head_buffered": len(head),
     }
     return records, stats
 

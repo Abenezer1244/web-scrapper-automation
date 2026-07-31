@@ -360,6 +360,32 @@ def test_as_of_year_is_a_consensus_not_the_first_row():
     assert set(_by_parcel(records)) == {"27060100417000"}
 
 
+def test_as_of_sampler_does_not_buffer_a_whole_junk_file():
+    """The head sampler must be bounded by LINES READ, not only by valid rows.
+
+    A large file with no width-valid rows would otherwise be pulled entirely into
+    memory before the main loop's _MAX_SOURCE_ROWS check ever runs — the sampler
+    becoming the very exhaustion path the caps exist to prevent.
+    """
+    from src.scrapers.snohomish_wa_tax_delinquent import _MAX_HEAD_SCAN_LINES
+
+    n = _MAX_HEAD_SCAN_LINES * 4
+
+    def junk():
+        for _ in range(n):
+            yield "no|pipes|that|match|any|layout"
+
+    records, stats = parse_tax_list(junk(), fallback_year=2099)
+    assert records == []
+    # The sampler held at most its ceiling in memory, NOT the whole file. (The main
+    # loop still streams the remainder — that is correct, constant-memory behaviour.)
+    assert stats["head_buffered"] <= _MAX_HEAD_SCAN_LINES
+    # Every line was still seen and counted malformed — nothing dropped at the
+    # head/stream boundary, nothing double-counted.
+    assert stats["total"] == n
+    assert stats["malformed"] == n
+
+
 def test_unknown_field_width_is_all_malformed():
     rows = ["a|b|c", "d|e|f"]
     records, stats = parse_tax_list(rows, fallback_year=2099)

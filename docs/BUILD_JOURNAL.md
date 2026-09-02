@@ -19,6 +19,75 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-02 — Pierce auction leads ("Test 3"): the blank Default Owed was a parser gap, and it wasn't the only one
+
+**Built / Shipped:** branch `fix/nts-matured-obligation-amount` (worktree
+`bridgeleads-worktrees/test3-nts-amount`, off `origin/main` `5106fe0`), 4 commits, NOT merged.
+- `src/scrapers/sources/nts_tacoma_index.py`: section-IV amount parser rebuilt as a bounded
+  search (anchor "sum owing on the [qualifier] obligation(s)", cut at the "V." marker, prefer
+  the principal-labelled figure, else the first figure within 120 chars). The `_STOP` label
+  regex no longer fires on "Subject to" that opens a parenthetical.
+- `src/scrapers/preforeclosure.py` `strip_vesting_clause`: drops a "( SUBJECT TO SCH. B … )"
+  title note, an orphaned trailing "(", and "AS (THE) SURVIVING SPOUSE" vesting.
+- `src/scrapers/enrichment/county_gis.py`: county-GIS batch results keyed by the CALLER's raw
+  parcel id (fan-out to every spelling); WA statewide fallback emits no mailing line when the
+  situs row has neither city nor ZIP; ArcGIS `where` literals quote-escaped at all 4 sites.
+- `src/api/schemas.py` `JobResponse`: elapsed time stops at `finished_at` for terminal jobs.
+- `scripts/repair_trustee_sale_from_notices.py`: idempotent dry-run-first repair of
+  `default_amount` / truncated `party_name` from the lead's own `nts_notices` row, scoped to
+  `trustee_sale`.
+- Tests: 2 REAL notices saved as fixtures (`nts_tacoma_matured_obligation.txt`,
+  `nts_tacoma_paren_grantor.txt`) + `test_nts_matured_amount_and_paren_grantor.py`,
+  `test_county_gis_batch_mapping.py` (real Pierce ArcGIS feature), `test_job_response_elapsed.py`.
+
+**Tried / Decided:**
+- Traced the one blank Default Owed end-to-end with the live API, the stored notice row, and
+  the source page: TS# WA-26-1050840-BB (CN Foods LLC, commercial loan) says *"The sum owing on
+  the **matured** obligation secured by the Deed of Trust is: $575,150.38"* — no "principal"
+  wording, and the old regex needed both the literal "on the obligation" and "principal".
+  **Case A: the source has it, we lost it.** Stored the matured total as `principal_owing`
+  (it IS the statutory section-IV sum owing; Codex agreed, no separate column).
+- Measured before generalising: crawled 33 live valid notices — 27 "The principal sum of",
+  5 "Principal $", 1 matured; 1 unbalanced-paren grantor; **11 dashed parcels** (that last one
+  turned out to be the bigger bug, see below). Replayed 39 real notices old-vs-new: 37 identical,
+  0 changed, the matured one gained.
+- **Rejected: canonicalising dashed parcels to digits at the row layer.** Built it, then found
+  `tests/test_nts_king_pdf.py` pins dashed King parcels at row level; dedup/matcher/GIS all
+  normalise already, and the raw source spelling is the safer policy. Reverted (Codex P3 agreed).
+- **Rejected: fixing the truncated party_name at the parser only.** The read-time cleaner also
+  has to handle the already-cached "… SURVIVING SPOUSE (" rows, same defensive-net pattern as
+  `_TRAILING_LABEL`.
+- Kept the statewide "situs = mailing" fallback policy (38 counties) and only stopped the
+  city-and-ZIP-less half-address; flagged the broader owner-occupied assumption.
+
+**Failed / Blocked:** `railway run` (read-only prod stats on `nts_notices`) was blocked by the
+auto-mode classifier, so blast radius was measured against the live source instead of the DB.
+Playwright MCP failed to connect; verified the live UI with a Python-Playwright headless Chromium
+instead (login → Results → Test 3: 6 rows, UI == API, no console/network errors). Codex 0.152
+`codex exec "<34KB prompt>"` dies with "Argument list too long" — feed big prompts via stdin.
+
+**Caught & fixed (Codex, 3 rounds):** first-wins mapping silently dropped a second raw spelling
+of the same APN in one batch (fan-out); repair script unscoped + `CAST` on a native UUID; amount
+anchor too strict vs the old regex ("… as evidenced by the Note and secured by …"); ArcGIS
+`where` string interpolation (pre-existing, now escaped); batch log ratio counted fanned-out ids;
+`V.` section cut too narrow. Final round: GATE PASS.
+
+**Pending / Handoff:** (1) merge + deploy the branch; (2) the daily 10:30 UTC
+`crawl-nts-tacoma-index` re-parses the notices, THEN run
+`scripts/repair_trustee_sale_from_notices.py` (dry-run, then `--apply --party-names`) — the
+existing Test 3 rows stay wrong until then; the Vicedo mailing address is only fixed by a fresh
+scrape. (3) 👤 The audited branch `feat/fields-output-visibility` was already squash-merged as
+PR #107 (+ #111, later reshaped by #128 which removed the preview path); the local branch is
+obsolete and conflicts on 13 files — do not re-merge it.
+
+**Facts learned:** `_batch_query_county` strips dashes for the query but the worker maps rows by
+`res.parcel_id` verbatim — any key mismatch silently downgrades to the statewide situs service.
+The WA statewide service has NO mailing data; its "mailing" is the situs address. `JobResponse`
+computed fields run in `model_post_init` on every read. Trustees print the same Pierce APN as
+`602543-087-0` and `6025430870`; ~1/3 of live notices use the dashed form.
+
+---
+
 ## 2026-07-30 — Snohomish tax list changed shape under us: 17→15 fields, connector down 5 weeks
 
 **Built / Shipped:** `fix(snohomish)` — PR #172, squash **`3303dc4`**, no migration. Verified

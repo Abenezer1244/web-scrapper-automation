@@ -1049,10 +1049,15 @@ class JobResponse(BaseModel):
     def model_post_init(self, __context: Any) -> None:
         now = datetime.now(UTC)
 
-        # Elapsed time
+        # Elapsed time. For a finished job the clock STOPS at finished_at — measuring
+        # to "now" kept growing forever (an 8-second job read "357m 9s" six hours
+        # later, live 2026-09-02) and fed the per-page estimate below.
         if self.started_at:
             started = self.started_at if self.started_at.tzinfo else self.started_at.replace(tzinfo=UTC)
-            self.elapsed_seconds = max(0, int((now - started).total_seconds()))
+            end = now
+            if self.finished_at and self.status in (JobStatus.DONE, JobStatus.FAILED, JobStatus.CANCELLED):
+                end = self.finished_at if self.finished_at.tzinfo else self.finished_at.replace(tzinfo=UTC)
+            self.elapsed_seconds = max(0, int((end - started).total_seconds()))
             self.elapsed_time = self._fmt_time(self.elapsed_seconds)
 
         # Terminal states: 100% done, no estimate needed

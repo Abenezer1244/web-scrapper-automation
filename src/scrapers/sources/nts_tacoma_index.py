@@ -77,7 +77,15 @@ _STOP = (
     # trustee text (live 2026-07-04). Added alongside the existing "Original beneficiary"
     # stop; a value stopping EARLIER at a real label is always safe (Codex).
     r"Current\s+Beneficiary|Current\s+Trustee|Original\s+Trustee|Current\s+(?:Loan\s+)?Mortgage|"
-    r"which\s+is\s+subject|Subject\s+to\b|I\.\s*NOTICE|II\.)|\n|\Z)"
+    # "Subject to" is a stop for the address-style values, but NOT when it opens a
+    # parenthetical title note inside a NAME: "BARBARA J. HILL, AS SURVIVING SPOUSE
+    # ( SUBJECT TO SCH. B, 4 A ) Current Beneficiary …" (live 2026-09-02) was cut to
+    # "… SURVIVING SPOUSE (" and shipped as the lead's party_name. The fixed-width
+    # lookbehinds skip a "Subject to" preceded by "(" and up to three whitespace
+    # chars (space / newline / tab) so the value runs on to the next real label;
+    # strip_vesting_clause drops the note at read time.
+    r"which\s+is\s+subject|(?<!\()(?<!\(\s)(?<!\(\s\s)(?<!\(\s\s\s)Subject\s+to\b|"
+    r"I\.\s*NOTICE|II\.)|\n|\Z)"
 )
 
 # TS#: label variants (TS #, T.S. No., Trustee Sale No./Number) + value formats that
@@ -161,16 +169,51 @@ _COMMONLY_KNOWN = re.compile(
     r"|\s+II\.\s|\n\n|\Z)",
     re.I | re.S,
 )
-# ── Section IV "sum owing on the obligation": two real phrasings —
-#   North Star : "...is: Principal $185,895.06"
-#   Quality Loan: "...is: The principal sum of $423,798.66"
-# So after "principal" we lazily skip non-$ chars ("sum of ") to the first dollar
-# figure. [^$] can't cross a '$', so the capture is pinned to the amount that
-# immediately follows "principal" — never a later figure (interest, fees).
-_PRINCIPAL_OWING = re.compile(
-    r"sum\s+owing\s+on\s+the\s+obligation[^$]*?principal[^$]*?\$([\d,]+\.\d{2})",
-    re.I | re.S,
-)
+# ── Section IV "sum owing on the obligation" — real phrasings:
+#   North Star   : "...secured by the Deed of Trust is: Principal $185,895.06, together…"
+#   Quality Loan : "...secured by the Deed of Trust is: The principal sum of $423,798.66,…"
+#   Quality Loan, matured/commercial loan (live 2026-09-02, TS# WA-26-1050840-BB):
+#                  "...sum owing on the MATURED obligation secured by the Deed of Trust
+#                   is: $575,150.38. V. …" — no "principal" word at all.
+# The old single regex required the literal "on the obligation" AND a following
+# "principal", so a matured/balloon notice silently lost its amount and a real lead
+# shipped with a blank Default Owed. Now: anchor on "sum owing on the [qualifier]
+# obligation(s)" only — as tolerant of the connecting legal text ("… as evidenced by
+# the Note and secured by the Deed of Trust is:") as the old regex was (Codex) —
+# bound the search to section IV (up to the next "V." roman marker or a hard char
+# cap), PREFER the figure labelled "principal", and only when section IV carries no
+# principal label take the FIRST dollar figure within a short window of the anchor.
+# The bound + the window keep the capture pinned inside section IV, so a section-V/VI
+# figure can never be mistaken for the sum owing.
+# Qualifiers are any 1-3 non-space tokens ("matured", "matured/commercial",
+# "matured-loan") so punctuation in a trustee's wording can't defeat the anchor.
+_SUM_OWING_ANCHOR = re.compile(r"sum\s+owing\s+on\s+the\s+(?:\S+\s+){0,3}obligations?\b", re.I)
+_SECTION_IV_SPAN_CHARS = 600
+# Section V marker: "V." followed by whitespace or the next word ("V. The", "V.The",
+# "V .\nThe"); \b keeps "IV." from matching.
+_SECTION_IV_END = re.compile(r"\bV\s?\.(?=\s|[A-Z])")
+_PRINCIPAL_LABELED = re.compile(r"principal[^$]{0,40}?\$([\d,]+\.\d{2})", re.I | re.S)
+# "… secured by the Deed of Trust is: $575,150.38" sits ~45 chars past the anchor.
+_FIRST_DOLLAR_NEAR_ANCHOR = re.compile(r"^[^$]{0,120}?\$([\d,]+\.\d{2})", re.S)
+
+
+def _principal_owing(text: str) -> Decimal | None:
+    """Section IV amount owing on the obligation (see the phrasings above); None if
+    the statutory sentence is absent or carries no dollar figure inside section IV."""
+    m = _SUM_OWING_ANCHOR.search(text)
+    if not m:
+        return None
+    span = text[m.end(): m.end() + _SECTION_IV_SPAN_CHARS]
+    end = _SECTION_IV_END.search(span)
+    if end:
+        span = span[: end.start()]
+    hit = _PRINCIPAL_LABELED.search(span) or _FIRST_DOLLAR_NEAR_ANCHOR.search(span)
+    if not hit:
+        return None
+    try:
+        return Decimal(hit.group(1).replace(",", ""))
+    except (InvalidOperation, ValueError):
+        return None
 # ── "Note Amount: $234,533.00" (original loan size)
 _NOTE_AMOUNT = re.compile(r"Note\s+Amount\s*:?\s*\$?([\d,]+\.\d{2})", re.I)
 # ── NOD transmittal date ("by both first class and certified mail on 1/20/2026")
@@ -364,7 +407,7 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
         "auction_location": auction_location,
         "property_address": _clean_address(_first(_COMMONLY_KNOWN, text)),
         # Section IV "sum owing ... Principal" is the headline default/payoff figure.
-        "principal_owing": _money(_PRINCIPAL_OWING, text),
+        "principal_owing": _principal_owing(text),
         "note_amount": _money(_NOTE_AMOUNT, text),
         "nod_date": _first(_NOD_DATE, text),
     }

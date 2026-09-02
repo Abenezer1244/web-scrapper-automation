@@ -66,5 +66,6 @@ Subject: scraper config "Test 2" (fde53328, pierce/WA/pre_foreclosure), job e72b
 - [x] `enrich.pierce_address_recovery()` extracted; `scripts/rerun_pierce_address_recovery.py` (dry-run verified on Test 2).
 - [x] Codex design consult (PASS) + two diff reviews; all code P2/P3 adopted.
 - [x] Deleted two exploratory scripts with a hardcoded 2Captcha key. 👤 REVOKE that key (NO-GO until done).
-- [ ] 👤 Run the recovery on Test 2 (blocked for the agent by the permission classifier) and re-check the Results page.
+- [x] Recovery run on Test 2 (user authorised): 11/12 filled (2 legal repair + 9 ATIP); `9009002080` not on
+      file anywhere. Results page re-verified: only the 3 name-only rows blank; API enriched_count 202 → 213.
 - [ ] 👤 Push + PR; deploy worker + api.

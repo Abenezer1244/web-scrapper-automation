@@ -97,7 +97,12 @@ new `_grid_doc_type` (caught by the fixture tests before review).
   agent permission classifier → 👤 run it: `railway run --service worker python
   scripts/rerun_pierce_address_recovery.py e72bd6bf-6bf4-4562-abe9-9de3375d5380`
   (expected: 2 via legal repair + 9 via ATIP; `9009002080` stays unresolved — not on file
-  anywhere, no legal to repair from).
+  anywhere, no legal to repair from). **User authorised; RAN 2026-09-02 13:31 UTC: 11/12
+  filled** (2 legal repair + 9 ATIP, one captcha solve), `parcel_no_addr` 12 → 1, API
+  `enriched_count` 202 → 213, job_logs carry the two assessor lines, Results page shows only
+  the 3 name-only rows blank. First attempt died on `redis.railway.internal` (pub/sub is
+  private-network only) AFTER the legal-repair commit → script now wraps Redis in a
+  best-effort publisher and recomputes owner flags like the worker's post-enrichment pass.
 - **🛑 SECURITY (Codex P1, ops):** `tests/test_atip_enrichment.py` + `tests/test_atip_detail.py`
   (exploratory scripts, not pytest tests, no importers) hardcoded a 2Captcha API key
   `af6f…f829` in git since commit `5483840`. It is NOT the prod key (prod ends `…1b05`) but

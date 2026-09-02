@@ -18,6 +18,26 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+class _BestEffortPublisher:
+    """Redis client wrapper whose publish() degrades to a no-op after the first
+    connection failure (e.g. redis.railway.internal from a developer machine)."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self._dead = False
+
+    def publish(self, channel: str, message: str) -> int:
+        if self._dead:
+            return 0
+        try:
+            return self._inner.publish(channel, message)
+        except Exception as exc:  # noqa: BLE001 — best-effort live stream only
+            self._dead = True
+            print(f"(redis pub/sub unreachable from this host — {str(exc)[:80]}; "
+                  "job-log lines are still persisted to the DB)")
+            return 0
+
+
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     dry_run = "--dry-run" in sys.argv
@@ -58,13 +78,35 @@ def main() -> int:
         if dry_run or not targets:
             return 0
 
-        r = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+        # Job-log lines go to Redis pub/sub (live SSE) AND the job_logs table. From
+        # outside Railway's private network the Redis host may not resolve; the
+        # live stream is irrelevant for a re-run, but the DB rows must still land,
+        # so publishing is best-effort here (the worker path is unchanged).
+        r = _BestEffortPublisher(sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs()))
         pierce_address_recovery(db, r, job_id, config, all_results)
 
         db.expire_all()
         after = db.execute(
             select(Result).where(Result.job_id == job_id, Result.user_id == job.user_id)
         ).scalars().all()
+        # Same authoritative owner-location recompute the worker runs after inline
+        # enrichment (tasks.py) — a freshly filled mailing address changes
+        # absentee / out-of-state for that row.
+        from src.utils.address_intel import compute_owner_flags
+        flags_changed = 0
+        for res in after:
+            flags = compute_owner_flags(res.property_address, res.mailing_address)
+            if (res.property_state, res.owner_state, res.absentee_owner, res.out_of_state_owner) != (
+                flags["property_state"], flags["owner_state"], flags["absentee_owner"], flags["out_of_state_owner"]
+            ):
+                res.property_state = flags["property_state"]
+                res.owner_state = flags["owner_state"]
+                res.absentee_owner = flags["absentee_owner"]
+                res.out_of_state_owner = flags["out_of_state_owner"]
+                flags_changed += 1
+        if flags_changed:
+            db.commit()
+        print(f"owner flags recomputed for {flags_changed} rows")
         filled = [res for res in after if res.id in {t.id for t in targets} and res.property_address]
         print(f"filled {len(filled)}/{len(targets)}:")
         for res in filled:

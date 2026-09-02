@@ -118,3 +118,53 @@ class TestAbsentee:
             "property_state": None, "owner_state": None,
             "absentee_owner": None, "out_of_state_owner": None,
         }
+
+
+class TestSuffixlessSitus:
+    """Pierce County GIS Site_Address drops the suffix / post-directional that the
+    same parcel's Delivery_Address keeps. That is the same base street — NOT proof
+    the owner lives elsewhere. Pinned from prod rows (Test 1, 2026-09-02)."""
+
+    def test_missing_post_directional_is_unknown_not_absentee(self):
+        # parcel 8996011270: Site_Address vs Delivery_Address, both Lake Tapps
+        f = compute_owner_flags(
+            "20508 ISLAND PKWY", "20508 ISLAND PKWY E, LAKE TAPPS, WA, 98391-9081"
+        )
+        assert f["absentee_owner"] is None
+
+    def test_missing_suffix_is_unknown_not_absentee(self):
+        # parcel 5275000700: "1006 S 34TH" vs "1006 S 34TH ST"
+        f = compute_owner_flags("1006 S 34TH", "1006 S 34TH ST, TACOMA, WA, 98418-4003")
+        assert f["absentee_owner"] is None
+
+    def test_missing_suffix_with_matching_zip_is_same(self):
+        f = compute_owner_flags(
+            "1006 S 34TH, TACOMA, WA 98418", "1006 S 34TH ST, TACOMA, WA 98418"
+        )
+        assert f["absentee_owner"] is False
+
+    def test_missing_suffix_with_different_zip_is_absentee(self):
+        f = compute_owner_flags(
+            "1006 S 34TH, TACOMA, WA 98418", "1006 S 34TH ST, SEATTLE, WA 98101"
+        )
+        assert f["absentee_owner"] is True
+
+    def test_dropped_leading_directional_is_still_different(self):
+        # Only TRAILING tokens are tolerated — "E MAIN" vs "MAIN" are different streets.
+        f = compute_owner_flags("123 E MAIN ST", "123 MAIN ST, TACOMA, WA 98401")
+        assert f["absentee_owner"] is True
+
+    def test_extra_non_suffix_token_is_still_different(self):
+        f = compute_owner_flags("100 S", "100 S MAIN ST, TACOMA, WA 98401")
+        assert f["absentee_owner"] is True
+
+    def test_different_house_number_is_still_different(self):
+        f = compute_owner_flags("1008 S 34TH", "1006 S 34TH ST, TACOMA, WA, 98418")
+        assert f["absentee_owner"] is True
+
+    def test_genuinely_different_street_is_absentee(self):
+        # parcel 7002180980: property in Bonney Lake, owner mails to Lake Tapps
+        f = compute_owner_flags(
+            "2715 67TH CT SE", "20508 ISLAND PKWY E, LAKE TAPPS, WA, 98391-9081"
+        )
+        assert f["absentee_owner"] is True

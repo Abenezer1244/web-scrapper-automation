@@ -91,7 +91,9 @@ def _dialer_push_sweep_impl() -> None:
         .where(
             PendingSkipTraceRow.job_id == Job.id,
             or_(
-                PendingSkipTraceRow.status == "queued",
+                # 'submitting' = claimed by a dispatcher tick, Tracerfy POST in
+                # flight or outcome unknown (crash window) — still unsettled.
+                PendingSkipTraceRow.status.in_(("queued", "submitting")),
                 and_(
                     PendingSkipTraceRow.status == "submitted",
                     _submitted_age >= _stale_cutoff,

@@ -277,26 +277,29 @@ def looks_like_non_personal_party_name(name: str | None) -> bool:
     should be excluded from skip-trace eligibility entirely, not
     just routed to advanced. This function is the eligibility gate.
 
-    Heuristics:
-      - Contains a street-address suffix word (AVE/ST/RD/BLVD/DR/LN
-        etc.) — entity/personal names effectively never contain those
-      - Contains common non-name punctuation separators (' ? ',
-        ' - ') followed by digits (address patterns)
+    This gate SUPPRESSES skip trace entirely (build_pending_row_payload
+    returns None), so it must only fire on shapes that are provably not a
+    party. It is NOT the entity router — an LLC/trust named after its
+    street ("1423 1ST AVE LLC") still owns a real property, and the advanced
+    (address-only) trace ignores the name, so those must pass through.
+
+    Heuristics (any one → True):
       - Starts with a case-category keyword (LandLord, Weeds,
         Construction, Tenant, Land Use, Tree, Non-licensed, etc.)
+      - A separator (' ? ', ' - ') followed by a house number — the
+        "<category> ? <address>" case-description shape
+      - The whole name IS a street address: leading house number + a
+        street-suffix WORD, with no entity token (LLC/INC/TRUST/…)
+
+    History: the first version substring-matched " ave"/" way"/… against
+    the padded name, which classified real people — AVELINO, AVERY,
+    WAYNE, WAYLAND — as "not a person" and silently dropped them from
+    skip trace (43 rows / 12 jobs in 90 days of prod, 2026-09-02).
+    Street suffixes are now matched as whole words only.
     """
     if not name:
         return False
-    lower = name.lower()
-    # Street-suffix words — a person's legal name does not contain
-    # these in practice. Word-boundary match to avoid false-positives
-    # on things like 'AVERY' (contains 'ave').
-    street_suffixes = (
-        " ave", " ave ", " st ", " rd ", " blvd", " dr ", " ln ",
-        " way", " pl ", " ct ", " ter ", " pkwy", " cir ",
-    )
-    if any(s in f" {lower} " for s in street_suffixes):
-        return True
+    lower = name.lower().strip()
     # Case-category prefixes that appear in code_violation party_name
     if any(lower.startswith(p) for p in (
         "landlord", "tenant", "weeds", "construction", "land use",
@@ -304,7 +307,27 @@ def looks_like_non_personal_party_name(name: str | None) -> bool:
         "nuisance", "derelict",
     )):
         return True
+    # "<category> ? 419 21ST AVE" / "<category> - 1819 HARVARD AVE"
+    if _CASE_SEPARATOR_RE.search(name):
+        return True
+    # The party name is itself a street address (house number … suffix word)
+    # and carries no entity token that would make it a nameable owner.
+    if _ADDRESS_SHAPED_NAME_RE.match(name) and not classify_grantor_as_entity(name):
+        return True
     return False
+
+
+# "<category> ? <house number>" — the code-violation case-description shape.
+_CASE_SEPARATOR_RE = re.compile(r"\s[?\-]\s*\d")
+# Leading house number … whole-word street suffix (optionally followed by a
+# post-directional / unit). Whole-word so "WAYNE"/"AVERY"/"AVELINO" never match.
+_ADDRESS_SHAPED_NAME_RE = re.compile(
+    r"^\s*\d{1,6}[A-Z]?\s+\S.*?\b("
+    r"AVE|AVENUE|ST|STREET|RD|ROAD|DR|DRIVE|BLVD|BOULEVARD|WAY|LN|LANE|CT|COURT|"
+    r"PL|PLACE|HWY|HIGHWAY|TER|TERRACE|CIR|CIRCLE|LOOP|PKWY|PARKWAY|SQ|SQUARE|TRL|TRAIL"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 # ─── Tracerfy batch submit ────────────────────────────────────────────────────
@@ -418,7 +441,13 @@ def submit_batch(
         resp = _sess.post(
             url, headers=headers, data=form_fields, timeout=30, allow_redirects=False
         )
+    except requests.ConnectionError as exc:
+        # Never delivered (refused / DNS / reset before a response) — the
+        # dispatcher may safely release the batch and retry next tick.
+        raise TracerfyError(f"Connection error submitting batch: {exc}") from exc
     except requests.RequestException as exc:
+        # Read timeout etc.: Tracerfy MAY have accepted the batch. The dispatcher
+        # treats this as unknown outcome and never auto-resubmits (double-pay).
         raise TracerfyError(f"Network error submitting batch: {exc}") from exc
 
     if resp.status_code == 429:
@@ -700,12 +729,14 @@ def build_pending_row_payload(result) -> dict | None:
     # Pierce County GIS returns property_address as street-only and
     # mailing_address as the full format — without this fallback, every
     # skip trace row gets city=None/state=None and errors in Tracerfy.
-    if not parsed["city"] and result.mailing_address:
-        mail_parsed = _parse_full_address(result.mailing_address)
-        if mail_parsed["city"]:
-            parsed["city"] = mail_parsed["city"]
-            parsed["state"] = mail_parsed["state"]
-            parsed["zip"] = mail_parsed["zip"]
+    # The owner's mailing address is a separate Tracerfy input (mail_* columns)
+    # that improves normal-trace matching when the owner does not live at the
+    # property. Parse it once; reuse it for the locality fallback below.
+    mail_parsed = _parse_full_address(result.mailing_address) if result.mailing_address else None
+    if not parsed["city"] and mail_parsed and mail_parsed["city"]:
+        parsed["city"] = mail_parsed["city"]
+        parsed["state"] = mail_parsed["state"]
+        parsed["zip"] = mail_parsed["zip"]
 
     return {
         "job_id": result.job_id,
@@ -718,10 +749,13 @@ def build_pending_row_payload(result) -> dict | None:
         # Already None unless select_traceable_owner found a confident person.
         "first_name": first_name,
         "last_name": last_name,
-        "mail_address": None,  # populated below if mailing_address differs
-        "mail_city": None,
-        "mail_state": None,
-        "mail_zip": None,
+        # Previously hard-coded to None with a comment promising they were
+        # "populated below" — nothing ever did, so Tracerfy never received the
+        # mailing address we already hold (Codex, 2026-09-02).
+        "mail_address": (mail_parsed["street"] if mail_parsed else None),
+        "mail_city": (mail_parsed["city"] if mail_parsed else None),
+        "mail_state": (mail_parsed["state"] if mail_parsed else None),
+        "mail_zip": (mail_parsed["zip"] if mail_parsed else None),
         "trace_type": trace_type,
         "status": "queued",
     }

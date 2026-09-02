@@ -265,21 +265,9 @@ def _query_wa_statewide(parcel_id: str, county: str) -> dict[str, str | None]:
             if zipcode:
                 zipcode = str(zipcode).strip()
 
-            # Build full mailing address
-            parts = [address]
-            if city:
-                parts.append(city)
-            if zipcode:
-                parts.append(f"WA {zipcode}")
-            mailing = ", ".join(parts)
-
             parcel_found = attrs.get("ORIG_PARCEL_ID") or apn_clean
             _logger.info("WA statewide GIS enriched parcel %s: %s", parcel_found, address)
-            return {
-                "property_address": address,
-                "mailing_address": mailing,
-                "parcel_id": parcel_found,
-            }
+            return _statewide_result(address, city, zipcode, parcel_found)
 
         return _empty()
 
@@ -334,7 +322,11 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
                 parts.append(str(val).strip())
         mailing_address = ", ".join(parts) if parts else None
     else:
-        mailing_address = property_address  # Fallback to property address
+        # No mailing fields on this layer → the owner's mailing address is
+        # UNKNOWN. Never copy the situs into it: downstream that reads as
+        # "owner-occupied" (absentee_owner=False) and lands in the CSV
+        # Mailing column as if it came from the county.
+        mailing_address = None
 
     # Owner name (logged for enrichment_data, not in primary return)
     owner_field = gis_config.get("owner_field")
@@ -377,6 +369,36 @@ def _make_generic_config(endpoint: str) -> dict:
 
 def _empty() -> dict[str, str | None]:
     return {"property_address": None, "mailing_address": None}
+
+
+def _statewide_result(
+    address: str, city: str, zipcode: str, parcel_id: str
+) -> dict[str, str | None]:
+    """Shape a WA statewide Current_Parcels hit into the enrichment dict.
+
+    The statewide layer carries the SITUS (property) address only — it has no
+    owner/mailing fields. The old code copied the situs into `mailing_address`,
+    which downstream read as a real county mailing address: absentee_owner
+    became False ("owner-occupied") and the CSV Mailing column showed an address
+    the county never supplied. The owner's mailing address is UNKNOWN here → None.
+
+    The situs locality (city / WA / zip) is kept ON the property address instead
+    of being dropped: build_pending_row_payload() parses city/state/zip from
+    property_address first, and Tracerfy rejects rows without them. Format
+    matches what other scrapers already store ("STREET, CITY, WA 98101").
+    """
+    # Only the 3-part "STREET, CITY, WA ZIP" shape parses back into city/state/
+    # zip (skip_trace._parse_full_address); a state or zip without a city would
+    # be mis-read as the city, so without a city the street stands alone.
+    if city:
+        prop = f"{address}, {city}, WA {zipcode}" if zipcode else f"{address}, {city}, WA"
+    else:
+        prop = address
+    return {
+        "property_address": prop,
+        "mailing_address": None,
+        "parcel_id": parcel_id,
+    }
 
 
 def batch_enrich_parcels_gis(
@@ -536,20 +558,10 @@ def _batch_query_wa_statewide(
                 caller_pid = query_to_original.get(pid, pid)
 
                 address = " ".join(address.strip().split())
-                city = (attrs.get("SITUS_CITY_NM") or "").strip()
-                zipcode = (attrs.get("SITUS_ZIP_NR") or "").strip()
-                # Build mailing from situs address + city + state + zip
-                mailing = address
-                if city:
-                    mailing += f", {city}"
-                mailing += ", WA"
-                if zipcode:
-                    mailing += f" {zipcode}"
-                results[caller_pid] = {
-                    "property_address": address,
-                    "mailing_address": mailing,
-                    "parcel_id": pid,  # canonical format from server
-                }
+                city = " ".join((attrs.get("SITUS_CITY_NM") or "").split())
+                zipcode = str(attrs.get("SITUS_ZIP_NR") or "").strip()
+                # parcel_id: canonical format from server
+                results[caller_pid] = _statewide_result(address, city, zipcode, pid)
 
             _logger.info(
                 "Statewide GIS batch: %d/%d parcels enriched",

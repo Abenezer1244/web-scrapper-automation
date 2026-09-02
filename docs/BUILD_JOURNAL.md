@@ -19,6 +19,80 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-02 — "Test 1" (Pierce probate) lead data-quality audit: source vs application, end to end
+
+**Built / Shipped:** branch `fix/test1-lead-data-quality` (worktree `test1-data-quality`, off
+`origin/main`), no migration. Backend: `skip_trace.looks_like_non_personal_party_name` rewritten
+(code-violation shapes only, whole-word suffixes); `build_pending_row_payload` now fills the
+Tracerfy `mail_*` columns; `address_intel._addresses_differ` tolerates a TRAILING suffix /
+post-directional the county situs omits (→ unknown, not absentee); `county_gis` statewide fallback
+returns `mailing_address=None` with the situs locality kept on `property_address`, and the generic
+parser no longer copies situs→mailing; `skip_trace_dispatcher` claims rows `FOR UPDATE SKIP LOCKED`,
+pages ops on 402 (`send_ops_alert`, 6h cooldown) and submits the affordable FIFO head parsed from
+Tracerfy's "need N more credits"; `get_cached_records` drops the `doc_type IS NULL` escape hatch,
+mirrors the scraper's word-boundary/exclude matcher in SQL, and maps the literal
+"(enrichment unavailable)" to null; `scripts/backfill_owner_flags.py --recompute-suffixless`.
+5 new/extended test modules (91 focused tests). Frontend: `fix/scraper-view-latest-results`
+(`e7c6352`) — the command palette opens a scraper's latest completed results, not the county cache.
+Prod data: the 5 false `absentee_owner=TRUE` rows recomputed to NULL via the script (dry-run, then
+`--commit`).
+
+**Tried / Decided:**
+- Verified every "missing" field at the SOURCE before touching code: the 4 parcel-less rows have no
+  Parcel Id on the ARMS Legal Description tab (positive controls on the same pages return parcels);
+  BAKKE's parcel is absent from Pierce GIS *and* WA statewide. Those nulls are correct — nothing to fix.
+- **Rejected: hiding incomplete rows or filling them.** Every field either came from the recorder /
+  GIS / Tracerfy or is null. No placeholder values exist in the job's 110 rows.
+- Codex consult before coding agreed on all six findings and added two: the `mail_*` payload gap
+  and the backfill script's inability to revisit already-flagged rows. Both adopted.
+- Codex round-1 review: FAIL (High: unlocked dispatcher read-before-submit could double-pay a batch
+  across overlapping ticks — pre-existing, adopted; Medium: cache ILIKE bleed `SUCC`→`SUCCESSOR`,
+  adopted; Low: 402-then-429 misclassified, adopted). **Rejected** its `rows_uploaded` finding:
+  prod queue 158749 shows 25 rows sent → 24 uploaded → all 25 reconciled — Tracerfy de-duplicates
+  identical addresses, so a count mismatch is normal, not a lost tail. Codex agreed in round 2.
+- Codex round-2 review: FAIL (High: a row lock is not durable — a worker dying between the Tracerfy
+  POST and the bookkeeping commit rolled the rows back to `queued` and the next tick paid for them
+  again). **Adopted without a schema change:** rows move to a committed `status='submitting'`
+  (submitted_at = claim time) BEFORE the POST; `classify_submit_failure()` releases the claim to
+  `queued` on 429/402/5xx/connection-refused, marks `errored` on definite 4xx/config, and LEAVES
+  `submitting` on timeout / non-JSON / missing queue_id (never auto-resubmitted — double-pay);
+  `_alert_stale_claims()` pages ops after 30 min. `submit_batch` now distinguishes
+  `requests.ConnectionError` (never delivered) from other request errors. The dialer sweep treats
+  `submitting` as unsettled. DB-backed tests cover claim → definite rejection → `errored`, and
+  that a row another tick claimed is never picked up.
+- Codex round-3 review: **PASS** on the blocker; two Mediums. Adopted: a definite rejection now
+  also flips the lead's `skip_trace_status` to `errored` (it used to sit at "Processing" forever).
+  Deferred with rationale: a completed webhook arriving before the dispatcher's own commit is
+  discarded as `unknown_queue` — the ingest already re-checks under a lock and the window is the
+  milliseconds between POST return and commit; a bounded Celery retry on `unknown_queue` is the
+  follow-up.
+
+**Failed / Blocked:**
+- **Tracerfy is out of credits (ops).** Every dispatcher tick since 04:25 UTC fails 402 on a 344-row
+  batch; 565 rows / 7 jobs sit `queued`, the UI says "Processing 10–15 min" indefinitely. The code
+  now alerts and drains partially, but only a top-up at tracerfy.com unblocks it (👤).
+- `county_records` (3,305 rows, March, column-shifted, doc_type NULL) cannot be purged by the app
+  role (no DELETE) — needs `DATABASE_URL_MIGRATE` (👤). The endpoint now filters it out for typed
+  configs and all three "View" entry points prefer real job results.
+- SAARENAS AVELINO G (wrongly gated) stays `not_attempted` on the historical job; re-tracing costs
+  credits and there are none — documented, not forced.
+
+**Caught & fixed:** the first `_statewide_result` emitted "STREET, WA" / "STREET, WA 98501" when the
+city was missing, which `_parse_full_address` would read as city="WA …" — now bare street without a
+city. A raw-string docstring was needed for the PostgreSQL `\m…\M` regex (SyntaxWarning).
+
+**Pending / Handoff:** PRs for both branches; Tracerfy credits; county_records purge; optional
+"Delayed" state on the results page when skip-trace rows are queued > 1h (needs `enqueued_at` on
+the results payload — Codex: separate PR).
+
+**Facts learned:** Pierce GIS `Site_Address` routinely drops the suffix/post-directional that
+`Delivery_Address` keeps; Tracerfy 402 bodies state the exact shortfall ("You need N more credits");
+`jobs/{id}/results` skeleton rows render first — wait for a non-`animate-pulse` row in e2e;
+`/scrapers/{id}/records` is the shared county cache, `/results/{job}` is the tenant's data;
+`ENABLE_DAILY_SCRAPE` defaults False so that cache has been frozen since 2026-03-23.
+
+---
+
 ## 2026-07-30 — Snohomish tax list changed shape under us: 17→15 fields, connector down 5 weeks
 
 **Built / Shipped:** `fix(snohomish)` — PR #172, squash **`3303dc4`**, no migration. Verified

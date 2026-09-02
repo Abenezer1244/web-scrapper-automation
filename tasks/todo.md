@@ -57,3 +57,14 @@ Subject: scraper config "Test 2" (fde53328, pierce/WA/pre_foreclosure), job e72b
   mobile-home rows and 3 name-only rows stay as they are (honest nulls). Existing rows keep the
   legacy `PRE-FORECLOSURE` doc_type — only new scrapes carry the real label.
 - Unverified: prod effect of the window fix (needs deploy + beat run + newspaper publication).
+
+## Round 2 — captcha passer + typo parcels (user follow-up)
+
+- [x] Verified ATIP API + 2Captcha Enterprise token live (9/12 mobile-home parcels resolved, 1 solve).
+- [x] `pierce_atip.py` + `captcha.solve_recaptcha(enterprise=)` + cache key `(sitekey, url, enterprise)`.
+- [x] Legal repair: trailing BLK, edit-distance-1 guard gated on single survivor + plat adjacency; enabled for pre_foreclosure.
+- [x] `enrich.pierce_address_recovery()` extracted; `scripts/rerun_pierce_address_recovery.py` (dry-run verified on Test 2).
+- [x] Codex design consult (PASS) + two diff reviews; all code P2/P3 adopted.
+- [x] Deleted two exploratory scripts with a hardcoded 2Captcha key. 👤 REVOKE that key (NO-GO until done).
+- [ ] 👤 Run the recovery on Test 2 (blocked for the agent by the permission classifier) and re-check the Results page.
+- [ ] 👤 Push + PR; deploy worker + api.

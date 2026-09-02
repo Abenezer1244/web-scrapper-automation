@@ -76,6 +76,39 @@ new `_grid_doc_type` (caught by the fixture tests before review).
 - Live ARMS shows **235** records for Test 2's window vs 217 scraped 9/2 — late indexing of
   9/1 filings + the intentional no-person drop; not audited row-by-row.
 
+**Round 2 (same day, user: "we have a recaptcha passer so use that" / "is 3b fixed?"):**
+- **Built:** `src/scrapers/enrichment/pierce_atip.py` — assessor (ATIP) address fallback for
+  parcels the GIS layers cannot resolve (mobile-home accounts). ATIP's JSON API is reCAPTCHA
+  **Enterprise**-gated via a `recaptcha-response` header; a 2Captcha Enterprise token (~12s,
+  ~$0.003) unlocks it over plain HTTP and is REUSED (server verification cached ~10 min).
+  Response classes verified live: rejected token → 200 + EMPTY body; unknown parcel → `[]`.
+  Solve once, reuse until rejected, re-solve once, circuit on 3 consecutive hard failures,
+  cap 100/call. Takes ONLY situs + mailing (never the taxpayer `name`; RCW 42.56.070(8)
+  boundary documented in the module). `captcha.solve_recaptcha` gained `enterprise=`; its
+  cache is now keyed `(sitekey, site_url, enterprise)`.
+- **Built:** `pierce_legal_repair` extended (probate + pre_foreclosure): trailing `LT n BLK m`
+  parsed with bounded block tokens; parcel guard = lot-suffix OR digit edit-distance 1, the
+  latter ONLY for a single exact-legal survivor whose GIS legal names the plat IMMEDIATELY
+  before the lot (`legal_plat_adjacent`, Codex P2). Both live typo rows resolve
+  (`9066600050→9066000050` 5505 201ST STREET CT E; `718500090→7185000190` 6117 119TH ST SW).
+- **Built:** `enrich.pierce_address_recovery()` (extracted; inline after GIS) +
+  `scripts/rerun_pierce_address_recovery.py <job_id> [--dry-run]` to re-run the SAME path on
+  an existing job. Dry run on Test 2 lists the 12 rows; the live write was BLOCKED by the
+  agent permission classifier → 👤 run it: `railway run --service worker python
+  scripts/rerun_pierce_address_recovery.py e72bd6bf-6bf4-4562-abe9-9de3375d5380`
+  (expected: 2 via legal repair + 9 via ATIP; `9009002080` stays unresolved — not on file
+  anywhere, no legal to repair from).
+- **🛑 SECURITY (Codex P1, ops):** `tests/test_atip_enrichment.py` + `tests/test_atip_detail.py`
+  (exploratory scripts, not pytest tests, no importers) hardcoded a 2Captcha API key
+  `af6f…f829` in git since commit `5483840`. It is NOT the prod key (prod ends `…1b05`) but
+  must be **revoked at 2Captcha**; files deleted here. NO-GO for merge until revoked.
+- **Answered:** "parcel but no name" rows are `test 10 - King Tax Delinquent` (384 rows, 0
+  names) — King Socrata has no owner column and owner lookup is BLOCKED by the standing
+  RCW 42.56.070(9) decision; its 172 missing addresses = King enrichment failed on that job
+  ("Address enrichment failed" in the job log; King rate-block incident). Not Test 2.
+- Tests: 81 passing across the touched files (+`test_pierce_atip.py`, `test_captcha_token_cache.py`,
+  legal-repair block/edit-1/adjacency cases).
+
 **Facts learned:**
 - Pierce ARMS `SearchEntry.aspx` has instrument-number search fields
   (`cphNoMargin_f_txtInstrumentNoFrom/To`) — fastest way to verify one recorded doc.

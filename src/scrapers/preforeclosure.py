@@ -134,9 +134,25 @@ _VESTING_CLAUSE = re.compile(
     r"|(?:AS\s+)?(?:HUSBAND\s+AND\s+WIFE|WIFE\s+AND\s+HUSBAND)\b"
     r"|AS\s+JOINT\s+TENANTS(?:\s+WITH\s+(?:THE\s+)?RIGHTS?\s+OF\s+SURVIVORSHIP)?\b"
     r"|AS\s+TENANTS\s+IN\s+COMMON\b"
+    # "BARBARA J. HILL, AS SURVIVING SPOUSE" (live Pierce NTS 2026-09-02): how title
+    # is now held after a co-owner's death — vesting language of the same class as
+    # "A MARRIED MAN"; the owner's name is the part before it.
+    r"|AS\s+(?:THE\s+)?SURVIVING\s+SPOUSE\b"
     r")",
     re.I,
 )
+
+
+# A title-company exception note in parentheses after the vesting ("BARBARA J. HILL,
+# AS SURVIVING SPOUSE ( SUBJECT TO SCH. B, 4 A )", live 2026-09-02) is a Schedule-B
+# reference, not part of anyone's name. Anchored on "SUBJECT TO" so a legitimate
+# parenthetical ("(AKA JOHN R DOE)", "(DECEASED)") is left alone. The optional close
+# paren tolerates an already-cached value the old parser cut short.
+_TITLE_NOTE_PAREN = re.compile(r"\s*\(\s*SUBJECT\s+TO\b[^)]*\)?", re.I)
+# The pre-2026-09-02 parser stopped the grantor value at "Subject to" INSIDE that
+# parenthetical, caching "… SURVIVING SPOUSE (" — drop the orphaned "(" so the stale
+# rows also clean up at read time (same defensive-net pattern as _TRAILING_LABEL).
+_DANGLING_OPEN_PAREN = re.compile(r"\s*\(\s*$")
 
 
 # A bare vesting status adjective left after the noun-phrase clause is removed
@@ -195,6 +211,8 @@ def strip_vesting_clause(name: str | None) -> str | None:
     if not name:
         return name
     name = _COLLAPSED_DEHYPHEN.sub("", name)  # repair stale collapsed soft-hyphen wraps first
+    name = _TITLE_NOTE_PAREN.sub("", name)    # "( SUBJECT TO SCH. B, 4 A )" title note
+    name = _DANGLING_OPEN_PAREN.sub("", name)  # "(" orphaned by the old parser truncation
     s = _VESTING_CLAUSE.sub("", name)
     s = _BARE_STATUS_CLAUSE.sub("", s)      # strip any leftover bare status adjective
     s = re.sub(r",\s*,", ",", s)            # collapse the comma left where a clause was

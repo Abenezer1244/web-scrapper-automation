@@ -77,7 +77,13 @@ _STOP = (
     # trustee text (live 2026-07-04). Added alongside the existing "Original beneficiary"
     # stop; a value stopping EARLIER at a real label is always safe (Codex).
     r"Current\s+Beneficiary|Current\s+Trustee|Original\s+Trustee|Current\s+(?:Loan\s+)?Mortgage|"
-    r"which\s+is\s+subject|Subject\s+to\b|I\.\s*NOTICE|II\.)|\n|\Z)"
+    # "Subject to" is a stop for the address-style values, but NOT when it opens a
+    # parenthetical title note inside a NAME: "BARBARA J. HILL, AS SURVIVING SPOUSE
+    # ( SUBJECT TO SCH. B, 4 A ) Current Beneficiary …" (live 2026-09-02) was cut to
+    # "… SURVIVING SPOUSE (" and shipped as the lead's party_name. The fixed-width
+    # lookbehinds skip a "Subject to" preceded by "(" / "( " / "(  " so the value runs
+    # on to the next real label; strip_vesting_clause drops the note at read time.
+    r"which\s+is\s+subject|(?<!\()(?<!\(\s)(?<!\(\s\s)Subject\s+to\b|I\.\s*NOTICE|II\.)|\n|\Z)"
 )
 
 # TS#: label variants (TS #, T.S. No., Trustee Sale No./Number) + value formats that
@@ -161,16 +167,49 @@ _COMMONLY_KNOWN = re.compile(
     r"|\s+II\.\s|\n\n|\Z)",
     re.I | re.S,
 )
-# ── Section IV "sum owing on the obligation": two real phrasings —
-#   North Star : "...is: Principal $185,895.06"
-#   Quality Loan: "...is: The principal sum of $423,798.66"
-# So after "principal" we lazily skip non-$ chars ("sum of ") to the first dollar
-# figure. [^$] can't cross a '$', so the capture is pinned to the amount that
-# immediately follows "principal" — never a later figure (interest, fees).
-_PRINCIPAL_OWING = re.compile(
-    r"sum\s+owing\s+on\s+the\s+obligation[^$]*?principal[^$]*?\$([\d,]+\.\d{2})",
-    re.I | re.S,
+# ── Section IV "sum owing on the obligation" — real phrasings:
+#   North Star   : "...secured by the Deed of Trust is: Principal $185,895.06, together…"
+#   Quality Loan : "...secured by the Deed of Trust is: The principal sum of $423,798.66,…"
+#   Quality Loan, matured/commercial loan (live 2026-09-02, TS# WA-26-1050840-BB):
+#                  "...sum owing on the MATURED obligation secured by the Deed of Trust
+#                   is: $575,150.38. V. …" — no "principal" word at all.
+# The old single regex required the literal "on the obligation" AND a following
+# "principal", so a matured/balloon notice silently lost its amount and a real lead
+# shipped with a blank Default Owed. Now: anchor on the statutory sentence (optional
+# qualifier words before "obligation", singular/plural "Deed(s) of Trust"), bound the
+# search to section IV (up to the next "V." roman marker or a hard char cap), PREFER
+# the figure labelled "principal", and only when section IV carries no principal
+# label take the FIRST dollar figure right after "is:". The bound + the first-figure
+# cap keep the capture pinned inside section IV, so a section-V/VI figure can never
+# be mistaken for the sum owing (Codex).
+_SUM_OWING_ANCHOR = re.compile(
+    r"sum\s+owing\s+on\s+the\s+(?:\w+\s+){0,3}obligations?\s+secured\s+by\s+the\s+"
+    r"deeds?\s+of\s+trust\s+is\s*:?",
+    re.I,
 )
+_SECTION_IV_SPAN_CHARS = 600
+_SECTION_IV_END = re.compile(r"\bV\.\s")
+_PRINCIPAL_LABELED = re.compile(r"principal[^$]{0,40}?\$([\d,]+\.\d{2})", re.I | re.S)
+_FIRST_DOLLAR_AFTER_IS = re.compile(r"^[^$]{0,80}?\$([\d,]+\.\d{2})", re.S)
+
+
+def _principal_owing(text: str) -> Decimal | None:
+    """Section IV amount owing on the obligation (see the phrasings above); None if
+    the statutory sentence is absent or carries no dollar figure inside section IV."""
+    m = _SUM_OWING_ANCHOR.search(text)
+    if not m:
+        return None
+    span = text[m.end(): m.end() + _SECTION_IV_SPAN_CHARS]
+    end = _SECTION_IV_END.search(span)
+    if end:
+        span = span[: end.start()]
+    hit = _PRINCIPAL_LABELED.search(span) or _FIRST_DOLLAR_AFTER_IS.search(span)
+    if not hit:
+        return None
+    try:
+        return Decimal(hit.group(1).replace(",", ""))
+    except (InvalidOperation, ValueError):
+        return None
 # ── "Note Amount: $234,533.00" (original loan size)
 _NOTE_AMOUNT = re.compile(r"Note\s+Amount\s*:?\s*\$?([\d,]+\.\d{2})", re.I)
 # ── NOD transmittal date ("by both first class and certified mail on 1/20/2026")
@@ -364,7 +403,7 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
         "auction_location": auction_location,
         "property_address": _clean_address(_first(_COMMONLY_KNOWN, text)),
         # Section IV "sum owing ... Principal" is the headline default/payoff figure.
-        "principal_owing": _money(_PRINCIPAL_OWING, text),
+        "principal_owing": _principal_owing(text),
         "note_amount": _money(_NOTE_AMOUNT, text),
         "nod_date": _first(_NOD_DATE, text),
     }
@@ -501,6 +540,28 @@ def _to_date(mdy: str | None) -> date | None:
     return None
 
 
+_SEPARATED_DIGITS = re.compile(r"^\d[\d\-\s]*$")
+
+
+def _canonical_parcel(parcel: str | None) -> str | None:
+    """Store a purely numeric APN in the county's plain-digit form.
+
+    Trustees print the same Pierce APN as "602543-087-0" or "6025430870", and
+    Snohomish as "008337-000-009-00" or "00833700000900" — 11 of 33 live Pierce
+    notices carried separators (2026-09-02). Every consumer already normalizes
+    (dedup normalize_parcel, the NTS matcher, both GIS query paths), but the RAW
+    string is what the lead displays/exports and what the worker keys enrichment
+    on, so the dashed spelling leaked into delivered parcel_ids. Only a value made
+    of digits + separators is rewritten (leading zeros kept, nothing invented);
+    an alphanumeric APN is returned untouched. Applied at the row layer, NOT in
+    parse_nts_notice, so the APN-<parcel> surrogate ts_number (a stored natural
+    key) keeps its historical spelling.
+    """
+    if not parcel or not _SEPARATED_DIGITS.match(parcel):
+        return parcel
+    return re.sub(r"[\-\s]", "", parcel)
+
+
 def notice_to_row(
     parsed: dict[str, Any],
     source_url: str,
@@ -558,7 +619,7 @@ def notice_to_row(
     # false-match a real lead, so an overlong one becomes None instead.
     addr = _truncate(parsed.get("property_address"), 512)
     norm = _truncate(address_match_key(addr), 512)
-    parcel = parsed.get("parcel")
+    parcel = _canonical_parcel(parsed.get("parcel"))
     if parcel and len(parcel) > 64:
         parcel = None
     trustee = _truncate(parsed.get("trustee"), 255)

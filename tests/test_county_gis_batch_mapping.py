@@ -9,9 +9,18 @@ and shipped a fabricated "STREET, WA" mailing address.
 """
 from src.scrapers.enrichment.county_gis import (
     _KNOWN_GIS_ENDPOINTS,
+    _arcgis_literal,
     _map_county_features,
     _statewide_mailing,
 )
+
+
+class TestArcgisLiteral:
+    def test_plain(self):
+        assert _arcgis_literal("6025430870") == "'6025430870'"
+
+    def test_quote_is_doubled_not_injected(self):
+        assert _arcgis_literal("60254' OR 1=1 --") == "'60254'' OR 1=1 --'"
 
 _PIERCE_CFG = _KNOWN_GIS_ENDPOINTS["pierce_WA"]
 

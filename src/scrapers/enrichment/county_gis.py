@@ -152,7 +152,7 @@ def _query_gis(parcel_id: str, gis_config: dict, county_key: str) -> dict[str, s
     apn_clean = parcel_id.replace("-", "").strip()
 
     params = {
-        "where": f"{parcel_field}='{apn_clean}'",
+        "where": f"{parcel_field}={_arcgis_literal(apn_clean)}",
         "outFields": out_fields,
         "returnGeometry": "false",
         "f": "json",
@@ -225,7 +225,7 @@ def _query_wa_statewide(parcel_id: str, county: str) -> dict[str, str | None]:
     apn_clean = parcel_id.replace("-", "").strip()
     fips = _WA_COUNTY_FIPS.get(county.lower())
 
-    where_clause = f"ORIG_PARCEL_ID='{apn_clean}'"
+    where_clause = f"ORIG_PARCEL_ID={_arcgis_literal(apn_clean)}"
     if fips:
         where_clause += f" AND FIPS_NR='{fips}'"
 
@@ -406,6 +406,15 @@ def batch_enrich_parcels_gis(
     return results
 
 
+def _arcgis_literal(value: str) -> str:
+    """Quote a value for an ArcGIS ``where`` clause (SQL-92 style: '' escapes ').
+
+    Parcel ids come from scraper regexes, but this is app-wide enrichment — a
+    stray quote in a parsed value must not break or reshape the predicate (Codex).
+    """
+    return "'" + value.replace("'", "''") + "'"
+
+
 def _map_county_features(
     features: list[dict], gis_config: dict, clean_to_originals: dict[str, list[str]]
 ) -> dict[str, dict[str, str | None]]:
@@ -484,7 +493,7 @@ def _batch_query_county(
         if not clean_to_originals:
             continue
 
-        in_clause = ",".join(f"'{p}'" for p in clean_to_originals)
+        in_clause = ",".join(_arcgis_literal(p) for p in clean_to_originals)
         params = {
             "where": f"{parcel_field} IN ({in_clause})",
             "outFields": out_fields,
@@ -506,8 +515,10 @@ def _batch_query_county(
             )
             results.update(found)
 
+            # Count distinct APNs, not fanned-out caller ids, so the ratio is honest.
+            found_apns = {row["parcel_id"] for row in found.values()}
             _logger.info(
-                "County GIS batch: %d/%d parcels enriched", len(found), len(clean_to_originals)
+                "County GIS batch: %d/%d parcels enriched", len(found_apns), len(clean_to_originals)
             )
 
         except Exception as exc:
@@ -559,7 +570,7 @@ def _batch_query_wa_statewide(
         query_to_original = dict(query_pairs)
         in_values = list(query_to_original.keys())
 
-        in_clause = ",".join(f"'{p}'" for p in in_values)
+        in_clause = ",".join(_arcgis_literal(p) for p in in_values)
         where = f"ORIG_PARCEL_ID IN ({in_clause})"
         if fips:
             where += f" AND FIPS_NR='{fips}'"

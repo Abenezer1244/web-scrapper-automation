@@ -105,6 +105,16 @@ class TestSectionIvAmountPinning:
     def test_absent_sentence(self):
         assert _principal_owing("NOTICE OF TRUSTEE'S SALE with no section IV at all") is None
 
+    def test_punctuated_qualifier_and_tight_section_marker(self):
+        # "matured/commercial" qualifier + "V.The" (no space) still cuts section IV,
+        # so the principal-labelled figure in section V is NOT picked (Codex).
+        text = (
+            "IV. The sum owing on the matured/commercial obligation secured by the Deed "
+            "of Trust is: $575,150.38.V.The above-described real property will be sold; "
+            "the principal balance of $1.00 stated here belongs to section V."
+        )
+        assert _principal_owing(text) == Decimal("575150.38")
+
     def test_connecting_legal_text_tolerated(self):
         # The old regex accepted anything between "obligation" and "principal"; the
         # anchor must stay that tolerant (Codex).

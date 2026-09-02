@@ -185,9 +185,13 @@ _COMMONLY_KNOWN = re.compile(
 # principal label take the FIRST dollar figure within a short window of the anchor.
 # The bound + the window keep the capture pinned inside section IV, so a section-V/VI
 # figure can never be mistaken for the sum owing.
-_SUM_OWING_ANCHOR = re.compile(r"sum\s+owing\s+on\s+the\s+(?:\w+\s+){0,3}obligations?\b", re.I)
+# Qualifiers are any 1-3 non-space tokens ("matured", "matured/commercial",
+# "matured-loan") so punctuation in a trustee's wording can't defeat the anchor.
+_SUM_OWING_ANCHOR = re.compile(r"sum\s+owing\s+on\s+the\s+(?:\S+\s+){0,3}obligations?\b", re.I)
 _SECTION_IV_SPAN_CHARS = 600
-_SECTION_IV_END = re.compile(r"\bV\.\s")
+# Section V marker: "V." followed by whitespace or the next word ("V. The", "V.The",
+# "V .\nThe"); \b keeps "IV." from matching.
+_SECTION_IV_END = re.compile(r"\bV\s?\.(?=\s|[A-Z])")
 _PRINCIPAL_LABELED = re.compile(r"principal[^$]{0,40}?\$([\d,]+\.\d{2})", re.I | re.S)
 # "… secured by the Deed of Trust is: $575,150.38" sits ~45 chars past the anchor.
 _FIRST_DOLLAR_NEAR_ANCHOR = re.compile(r"^[^$]{0,120}?\$([\d,]+\.\d{2})", re.S)

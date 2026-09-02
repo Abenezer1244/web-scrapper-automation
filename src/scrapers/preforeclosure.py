@@ -146,9 +146,10 @@ _VESTING_CLAUSE = re.compile(
 # A title-company exception note in parentheses after the vesting ("BARBARA J. HILL,
 # AS SURVIVING SPOUSE ( SUBJECT TO SCH. B, 4 A )", live 2026-09-02) is a Schedule-B
 # reference, not part of anyone's name. Anchored on "SUBJECT TO" so a legitimate
-# parenthetical ("(AKA JOHN R DOE)", "(DECEASED)") is left alone. The optional close
-# paren tolerates an already-cached value the old parser cut short.
-_TITLE_NOTE_PAREN = re.compile(r"\s*\(\s*SUBJECT\s+TO\b[^)]*\)?", re.I)
+# parenthetical ("(AKA JOHN R DOE)", "(DECEASED)") is left alone, and the note must
+# close with ")" or end the string within 80 chars so an unclosed one can never eat
+# real trailing text (Codex).
+_TITLE_NOTE_PAREN = re.compile(r"\s*\(\s*SUBJECT\s+TO\b[^)]{0,80}(?:\)|$)", re.I)
 # The pre-2026-09-02 parser stopped the grantor value at "Subject to" INSIDE that
 # parenthetical, caching "… SURVIVING SPOUSE (" — drop the orphaned "(" so the stale
 # rows also clean up at read time (same defensive-net pattern as _TRAILING_LABEL).

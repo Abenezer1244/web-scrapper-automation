@@ -407,7 +407,7 @@ def batch_enrich_parcels_gis(
 
 
 def _map_county_features(
-    features: list[dict], gis_config: dict, clean_to_original: dict[str, str]
+    features: list[dict], gis_config: dict, clean_to_originals: dict[str, list[str]]
 ) -> dict[str, dict[str, str | None]]:
     """Map county-GIS features onto the CALLER's parcel ids.
 
@@ -417,9 +417,11 @@ def _map_county_features(
     the dict by the server value meant every dashed parcel — 11 of 33 live Pierce
     NTS notices print them that way (2026-09-02) — got NO county data and fell
     through to the situs-only statewide service, losing the real mailing address.
-    Mirror the statewide path: key by the original id. ``parcel_id`` in each value
-    stays the server's canonical form. Pure (no I/O) so the mapping is unit-tested
-    against a real ArcGIS feature.
+    Mirror the statewide path: key by the original id(s). One APN can arrive under
+    several raw spellings in a batch ("602543-087-0" and "6025430870"), so the
+    feature fans out to EVERY caller id that collapsed to it (Codex). ``parcel_id``
+    in each value stays the server's canonical form. Pure (no I/O) so the mapping
+    is unit-tested against a real ArcGIS feature.
     """
     parcel_field = gis_config["parcel_field"]
     results: dict[str, dict] = {}
@@ -429,9 +431,11 @@ def _map_county_features(
         if not pid:
             continue
         parsed = _parse_gis_response({"features": [feature]}, gis_config)
-        if parsed.get("property_address"):
-            parsed["parcel_id"] = pid
-            results[clean_to_original.get(str(pid), str(pid))] = parsed
+        if not parsed.get("property_address"):
+            continue
+        parsed["parcel_id"] = pid
+        for caller_pid in clean_to_originals.get(str(pid)) or [str(pid)]:
+            results[caller_pid] = dict(parsed)
     return results
 
 
@@ -472,16 +476,15 @@ def _batch_query_county(
 
     for i in range(0, len(parcel_ids), chunk_size):
         chunk = parcel_ids[i:i + chunk_size]
-        # clean (query/server form) -> the caller's original id; first caller wins
-        # when two raw spellings collapse to one APN.
-        clean_to_original: dict[str, str] = {}
+        # clean (query/server form) -> every caller id that spells it that way.
+        clean_to_originals: dict[str, list[str]] = {}
         for pid in chunk:
             if pid and len(pid.strip()) >= 6:
-                clean_to_original.setdefault(pid.replace("-", "").strip(), pid)
-        if not clean_to_original:
+                clean_to_originals.setdefault(pid.replace("-", "").strip(), []).append(pid)
+        if not clean_to_originals:
             continue
 
-        in_clause = ",".join(f"'{p}'" for p in clean_to_original)
+        in_clause = ",".join(f"'{p}'" for p in clean_to_originals)
         params = {
             "where": f"{parcel_field} IN ({in_clause})",
             "outFields": out_fields,
@@ -499,12 +502,12 @@ def _batch_query_county(
 
             data = resp.json()
             found = _map_county_features(
-                data.get("features") or [], gis_config, clean_to_original
+                data.get("features") or [], gis_config, clean_to_originals
             )
             results.update(found)
 
             _logger.info(
-                "County GIS batch: %d/%d parcels enriched", len(found), len(clean_to_original)
+                "County GIS batch: %d/%d parcels enriched", len(found), len(clean_to_originals)
             )
 
         except Exception as exc:

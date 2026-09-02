@@ -81,9 +81,11 @@ _STOP = (
     # parenthetical title note inside a NAME: "BARBARA J. HILL, AS SURVIVING SPOUSE
     # ( SUBJECT TO SCH. B, 4 A ) Current Beneficiary …" (live 2026-09-02) was cut to
     # "… SURVIVING SPOUSE (" and shipped as the lead's party_name. The fixed-width
-    # lookbehinds skip a "Subject to" preceded by "(" / "( " / "(  " so the value runs
-    # on to the next real label; strip_vesting_clause drops the note at read time.
-    r"which\s+is\s+subject|(?<!\()(?<!\(\s)(?<!\(\s\s)Subject\s+to\b|I\.\s*NOTICE|II\.)|\n|\Z)"
+    # lookbehinds skip a "Subject to" preceded by "(" and up to three whitespace
+    # chars (space / newline / tab) so the value runs on to the next real label;
+    # strip_vesting_clause drops the note at read time.
+    r"which\s+is\s+subject|(?<!\()(?<!\(\s)(?<!\(\s\s)(?<!\(\s\s\s)Subject\s+to\b|"
+    r"I\.\s*NOTICE|II\.)|\n|\Z)"
 )
 
 # TS#: label variants (TS #, T.S. No., Trustee Sale No./Number) + value formats that
@@ -175,22 +177,20 @@ _COMMONLY_KNOWN = re.compile(
 #                   is: $575,150.38. V. …" — no "principal" word at all.
 # The old single regex required the literal "on the obligation" AND a following
 # "principal", so a matured/balloon notice silently lost its amount and a real lead
-# shipped with a blank Default Owed. Now: anchor on the statutory sentence (optional
-# qualifier words before "obligation", singular/plural "Deed(s) of Trust"), bound the
-# search to section IV (up to the next "V." roman marker or a hard char cap), PREFER
-# the figure labelled "principal", and only when section IV carries no principal
-# label take the FIRST dollar figure right after "is:". The bound + the first-figure
-# cap keep the capture pinned inside section IV, so a section-V/VI figure can never
-# be mistaken for the sum owing (Codex).
-_SUM_OWING_ANCHOR = re.compile(
-    r"sum\s+owing\s+on\s+the\s+(?:\w+\s+){0,3}obligations?\s+secured\s+by\s+the\s+"
-    r"deeds?\s+of\s+trust\s+is\s*:?",
-    re.I,
-)
+# shipped with a blank Default Owed. Now: anchor on "sum owing on the [qualifier]
+# obligation(s)" only — as tolerant of the connecting legal text ("… as evidenced by
+# the Note and secured by the Deed of Trust is:") as the old regex was (Codex) —
+# bound the search to section IV (up to the next "V." roman marker or a hard char
+# cap), PREFER the figure labelled "principal", and only when section IV carries no
+# principal label take the FIRST dollar figure within a short window of the anchor.
+# The bound + the window keep the capture pinned inside section IV, so a section-V/VI
+# figure can never be mistaken for the sum owing.
+_SUM_OWING_ANCHOR = re.compile(r"sum\s+owing\s+on\s+the\s+(?:\w+\s+){0,3}obligations?\b", re.I)
 _SECTION_IV_SPAN_CHARS = 600
 _SECTION_IV_END = re.compile(r"\bV\.\s")
 _PRINCIPAL_LABELED = re.compile(r"principal[^$]{0,40}?\$([\d,]+\.\d{2})", re.I | re.S)
-_FIRST_DOLLAR_AFTER_IS = re.compile(r"^[^$]{0,80}?\$([\d,]+\.\d{2})", re.S)
+# "… secured by the Deed of Trust is: $575,150.38" sits ~45 chars past the anchor.
+_FIRST_DOLLAR_NEAR_ANCHOR = re.compile(r"^[^$]{0,120}?\$([\d,]+\.\d{2})", re.S)
 
 
 def _principal_owing(text: str) -> Decimal | None:
@@ -203,7 +203,7 @@ def _principal_owing(text: str) -> Decimal | None:
     end = _SECTION_IV_END.search(span)
     if end:
         span = span[: end.start()]
-    hit = _PRINCIPAL_LABELED.search(span) or _FIRST_DOLLAR_AFTER_IS.search(span)
+    hit = _PRINCIPAL_LABELED.search(span) or _FIRST_DOLLAR_NEAR_ANCHOR.search(span)
     if not hit:
         return None
     try:
@@ -540,28 +540,6 @@ def _to_date(mdy: str | None) -> date | None:
     return None
 
 
-_SEPARATED_DIGITS = re.compile(r"^\d[\d\-\s]*$")
-
-
-def _canonical_parcel(parcel: str | None) -> str | None:
-    """Store a purely numeric APN in the county's plain-digit form.
-
-    Trustees print the same Pierce APN as "602543-087-0" or "6025430870", and
-    Snohomish as "008337-000-009-00" or "00833700000900" — 11 of 33 live Pierce
-    notices carried separators (2026-09-02). Every consumer already normalizes
-    (dedup normalize_parcel, the NTS matcher, both GIS query paths), but the RAW
-    string is what the lead displays/exports and what the worker keys enrichment
-    on, so the dashed spelling leaked into delivered parcel_ids. Only a value made
-    of digits + separators is rewritten (leading zeros kept, nothing invented);
-    an alphanumeric APN is returned untouched. Applied at the row layer, NOT in
-    parse_nts_notice, so the APN-<parcel> surrogate ts_number (a stored natural
-    key) keeps its historical spelling.
-    """
-    if not parcel or not _SEPARATED_DIGITS.match(parcel):
-        return parcel
-    return re.sub(r"[\-\s]", "", parcel)
-
-
 def notice_to_row(
     parsed: dict[str, Any],
     source_url: str,
@@ -619,7 +597,7 @@ def notice_to_row(
     # false-match a real lead, so an overlong one becomes None instead.
     addr = _truncate(parsed.get("property_address"), 512)
     norm = _truncate(address_match_key(addr), 512)
-    parcel = _canonical_parcel(parsed.get("parcel"))
+    parcel = parsed.get("parcel")
     if parcel and len(parcel) > 64:
         parcel = None
     trustee = _truncate(parsed.get("trustee"), 255)

@@ -13,8 +13,10 @@ fixtures (no mocks):
   ( SUBJECT TO SCH. B, 4 A )". The shared label stop fired on "SUBJECT TO" inside
   the parenthetical and the lead's party_name shipped as "… SURVIVING SPOUSE (".
 
-Also pins the parcel canonicalisation (trustees print "602543-087-0" for Pierce APN
-6025430870; 11 of 33 live notices carried separators that day).
+Parcels stay exactly as the trustee printed them ("602543-087-0" is a real Pierce
+spelling of 6025430870): every consumer normalises for matching, and the county-GIS
+mapping fix (tests/test_county_gis_batch_mapping.py) is what makes the dashed
+spelling enrich correctly.
 """
 import re
 from datetime import date
@@ -23,7 +25,6 @@ from pathlib import Path
 
 from src.scrapers.preforeclosure import strip_vesting_clause
 from src.scrapers.sources.nts_tacoma_index import (
-    _canonical_parcel,
     _principal_owing,
     notice_to_row,
     parse_nts_notice,
@@ -104,6 +105,22 @@ class TestSectionIvAmountPinning:
     def test_absent_sentence(self):
         assert _principal_owing("NOTICE OF TRUSTEE'S SALE with no section IV at all") is None
 
+    def test_connecting_legal_text_tolerated(self):
+        # The old regex accepted anything between "obligation" and "principal"; the
+        # anchor must stay that tolerant (Codex).
+        text = (
+            "IV. The sum owing on the obligation, as evidenced by the Note and secured by "
+            "the Deed of Trust, is: Principal $185,895.06, together with interest"
+        )
+        assert _principal_owing(text) == Decimal("185895.06")
+
+    def test_unclosed_paren_note_bounded(self):
+        # A malformed cached value: the note never closes, so only a SHORT tail may
+        # be treated as the note — a long one is left alone rather than eaten.
+        assert strip_vesting_clause("JANE ROE ( SUBJECT TO SCH. B, 4 A") == "JANE ROE"
+        long_tail = "JANE ROE ( SUBJECT TO " + "X" * 100
+        assert strip_vesting_clause(long_tail) == long_tail
+
     def test_every_existing_fixture_parses_exactly_as_before(self):
         # The pre-fix regex, verbatim. Wherever it found an amount, the new parser
         # must return the same one — no silent re-interpretation of the historical
@@ -166,28 +183,3 @@ class TestStripVestingClauseParenAndSurvivingSpouse:
 
     def test_clean_name_untouched(self):
         assert strip_vesting_clause("MICHAEL A. BRANDT") == "MICHAEL A. BRANDT"
-
-
-class TestCanonicalParcel:
-    def test_pierce_dashed_to_plain(self):
-        assert _canonical_parcel("602543-087-0") == "6025430870"
-
-    def test_snohomish_dashed_to_plain(self):
-        assert _canonical_parcel("008337-000-009-00") == "00833700000900"
-
-    def test_plain_with_leading_zero_untouched(self):
-        assert _canonical_parcel("0220104064") == "0220104064"
-
-    def test_alphanumeric_untouched(self):
-        assert _canonical_parcel("R12345-67") == "R12345-67"
-
-    def test_empty(self):
-        assert _canonical_parcel(None) is None
-        assert _canonical_parcel("") == ""
-
-    def test_row_layer_applies_it_but_parse_layer_does_not(self):
-        p = parse_nts_notice(_load("nts_tacoma_matured_obligation.txt"))
-        p["parcel"] = "022-010-4064"  # the same APN as a trustee might print it
-        row = notice_to_row(p, "https://example.test/x", date(2026, 9, 2))
-        assert row["parcel"] == "0220104064"
-        assert p["parcel"] == "022-010-4064"  # parse output (and APN- surrogates) untouched

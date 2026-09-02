@@ -35,7 +35,7 @@ _PIERCE_FEATURE = {
 
 class TestMapCountyFeatures:
     def test_dashed_caller_id_receives_the_county_row(self):
-        res = _map_county_features([_PIERCE_FEATURE], _PIERCE_CFG, {"6025430870": "602543-087-0"})
+        res = _map_county_features([_PIERCE_FEATURE], _PIERCE_CFG, {"6025430870": ["602543-087-0"]})
         assert list(res) == ["602543-087-0"]
         row = res["602543-087-0"]
         assert row["property_address"] == "9226 175TH STREET CT E"
@@ -43,8 +43,18 @@ class TestMapCountyFeatures:
         assert row["parcel_id"] == "6025430870"  # canonical form from the server
 
     def test_plain_caller_id_keyed_as_is(self):
-        res = _map_county_features([_PIERCE_FEATURE], _PIERCE_CFG, {"6025430870": "6025430870"})
+        res = _map_county_features([_PIERCE_FEATURE], _PIERCE_CFG, {"6025430870": ["6025430870"]})
         assert list(res) == ["6025430870"]
+
+    def test_two_spellings_of_one_apn_both_enriched(self):
+        # Two leads in one job can carry the same APN as "602543-087-0" and
+        # "6025430870"; both must receive the county row (Codex).
+        res = _map_county_features(
+            [_PIERCE_FEATURE], _PIERCE_CFG, {"6025430870": ["602543-087-0", "6025430870"]}
+        )
+        assert set(res) == {"602543-087-0", "6025430870"}
+        assert res["602543-087-0"] is not res["6025430870"]  # independent copies
+        assert res["602543-087-0"] == res["6025430870"]
 
     def test_unknown_server_id_falls_back_to_server_key(self):
         res = _map_county_features([_PIERCE_FEATURE], _PIERCE_CFG, {})
@@ -52,7 +62,7 @@ class TestMapCountyFeatures:
 
     def test_feature_without_address_is_skipped(self):
         feature = {"attributes": {**_PIERCE_FEATURE["attributes"], "Site_Address": None}}
-        assert _map_county_features([feature], _PIERCE_CFG, {"6025430870": "602543-087-0"}) == {}
+        assert _map_county_features([feature], _PIERCE_CFG, {"6025430870": ["602543-087-0"]}) == {}
 
 
 class TestStatewideMailing:

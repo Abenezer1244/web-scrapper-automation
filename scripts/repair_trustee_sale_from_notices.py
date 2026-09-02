@@ -38,33 +38,40 @@ from src.db.session import system_sync_session  # noqa: E402
 from src.scrapers.base_scraper import BridgeScraper  # noqa: E402
 from src.scrapers.preforeclosure import strip_vesting_clause  # noqa: E402
 
+# Scope: ONLY trustee_sale leads (an Auction Lead IS its notice row, written by the
+# finalizer keyed on nts_notice_id). pre_foreclosure rows also carry nts_notice_id
+# (fuzzy-matched by nts_matcher_task) and are deliberately excluded — repairing
+# them is a separate decision (Codex). results.nts_notice_id and nts_notices.id are
+# both native UUID columns (migration 059), so they compare directly.
+_TRUSTEE_SALE_JOIN = """
+    FROM results r
+    JOIN jobs j ON j.id = r.job_id
+    JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+    JOIN nts_notices n ON n.id = r.nts_notice_id
+    WHERE sc.record_type = 'trustee_sale'
+"""
 # Amount: copy the re-parsed notice amount onto leads that shipped without one.
 _AMOUNT_CANDIDATES = text(
-    """
-    SELECT r.id, r.job_id, n.ts_number, n.principal_owing
-    FROM results r
-    JOIN nts_notices n ON n.id = CAST(r.nts_notice_id AS uuid)
-    WHERE r.default_amount IS NULL AND n.principal_owing IS NOT NULL
-    ORDER BY r.created_at
-    """
+    "SELECT r.id, r.job_id, n.ts_number, n.principal_owing "
+    + _TRUSTEE_SALE_JOIN
+    + " AND r.default_amount IS NULL AND n.principal_owing IS NOT NULL ORDER BY r.created_at"
 )
 _AMOUNT_REPAIR = text(
     """
-    UPDATE results r SET default_amount = n.principal_owing
-    FROM nts_notices n
-    WHERE n.id = CAST(r.nts_notice_id AS uuid)
-      AND r.default_amount IS NULL AND n.principal_owing IS NOT NULL
+    UPDATE results SET default_amount = n.principal_owing
+    FROM jobs j, scraper_configs sc, nts_notices n
+    WHERE j.id = results.job_id
+      AND sc.id = j.scraper_config_id
+      AND sc.record_type = 'trustee_sale'
+      AND n.id = results.nts_notice_id
+      AND results.default_amount IS NULL AND n.principal_owing IS NOT NULL
     """
 )
 # Party name: only the truncation signature the old parser produced.
 _NAME_CANDIDATES = text(
-    """
-    SELECT r.id, r.job_id, r.party_name, n.grantor
-    FROM results r
-    JOIN nts_notices n ON n.id = CAST(r.nts_notice_id AS uuid)
-    WHERE r.party_name ~ '\\(\\s*$' AND n.grantor IS NOT NULL
-    ORDER BY r.created_at
-    """
+    "SELECT r.id, r.job_id, r.party_name, n.grantor "
+    + _TRUSTEE_SALE_JOIN
+    + " AND r.party_name ~ '\\(\\s*$' AND n.grantor IS NOT NULL ORDER BY r.created_at"
 )
 _NAME_REPAIR = text(
     "UPDATE results SET party_name = :name WHERE id = :rid AND party_name = :old"

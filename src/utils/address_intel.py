@@ -134,8 +134,36 @@ def address_match_key(address: str | None) -> str | None:
     return f"{street}|{zip5}" if zip5 else street
 
 
+def compose_situs(
+    property_address: str | None,
+    property_city: str | None = None,
+    property_state: str | None = None,
+    property_zip: str | None = None,
+) -> str | None:
+    """The street-only situs plus its structured parts as one comparable line.
+
+    Migration 085 stores city/state/zip BESIDE the frozen street-only
+    property_address; the comparator works on address strings, so rebuild the
+    full line here. Parts are appended only when present — nothing is guessed.
+    """
+    if not property_address:
+        return property_address
+    line = property_address.strip()
+    if property_city:
+        line += f", {property_city.strip()}"
+    tail = " ".join(x.strip() for x in (property_state, property_zip) if x)
+    if tail:
+        line += f", {tail}"
+    return line
+
+
 def compute_owner_flags(
-    property_address: str | None, mailing_address: str | None
+    property_address: str | None,
+    mailing_address: str | None,
+    *,
+    property_city: str | None = None,
+    property_state: str | None = None,
+    property_zip: str | None = None,
 ) -> dict[str, object]:
     """Derive the four owner-location fields from the two addresses.
 
@@ -145,7 +173,16 @@ def compute_owner_flags(
     NULL (None) when the inputs can't answer them, so downstream filters must use
     `IS TRUE` / `IS NOT TRUE`, never Python truthiness (Codex): False = known
     not-absentee, None = unknown.
+
+    The keyword parts are the structured situs (migration 085). When given they
+    are composed onto the street-only property_address so a same-street mailing
+    can be CONFIRMED same-place (real False) by city/zip; without them behaviour
+    is exactly as before (strictly opt-in, Codex).
     """
+    if property_city or property_state or property_zip:
+        property_address = compose_situs(
+            property_address, property_city, property_state, property_zip
+        )
     property_state = parse_property_for_display(property_address)["state"] if property_address else None
     owner_state = parse_property_for_display(mailing_address)["state"] if mailing_address else None
 

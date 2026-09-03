@@ -695,7 +695,16 @@ class Result(Base):
     # mailing addresses by src/utils/address_intel.compute_owner_flags. Tri-state
     # booleans — True/False/NULL(unknown); filter with IS TRUE, never truthiness.
     # property_state/owner_state = 2-letter states parsed from the two addresses.
+    # Migration 085 (2026-09-02, "real data everywhere"): the SITUS location as
+    # structured parts from a real source (the notice's "commonly known as" line,
+    # the statewide parcel layer, a county row asserting mail goes to the property).
+    # property_address stays the street-only, FROZEN dedup/billing key; these sit
+    # beside it and are what compute_owner_flags reads, so absentee_owner can be a
+    # real False and out_of_state_owner can be computed at all. property_state is
+    # REPURPOSED from "parsed from the address" (always NULL) to this.
+    property_city = Column(String(128), nullable=True)
     property_state = Column(String(2), nullable=True)
+    property_zip = Column(String(10), nullable=True)
     owner_state = Column(String(2), nullable=True)
     absentee_owner = Column(Boolean, nullable=True)
     out_of_state_owner = Column(Boolean, nullable=True)

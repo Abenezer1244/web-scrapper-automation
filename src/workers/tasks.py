@@ -759,6 +759,12 @@ def run_scrape_job(self, job_id: str) -> None:
                 # NULL here); the end-of-job recompute after _run_inline_enrichment
                 # is the authoritative pass once mailing is filled.
                 _owner = compute_owner_flags(rec.property_address, rec.mailing_address)
+                # Migration 085: keep the situs city/zip the SOURCE gave us (a notice's
+                # "commonly known as" line carries them) — enrichment later replaces
+                # property_address with the assessor's street-only line, which would
+                # otherwise throw them away. Parsed, never guessed: blank when absent.
+                from src.utils.lead_formatting import parse_property_for_display as _ppd
+                _situs = _ppd(rec.property_address) if rec.property_address else {}
                 # Honesty label (probate only): tag every probate row with its signal
                 # subtype so a LIVING-owner Transfer-on-Death deed is never delivered
                 # disguised as a death/inheritance lead. New dict (never mutate the
@@ -797,6 +803,8 @@ def run_scrape_job(self, job_id: str) -> None:
                     "delinquent_bill_year": _tax_bill_year,
                     # Tier 0 (057): owner-location flags (mostly recomputed post-enrich).
                     "property_state": _owner["property_state"],
+                    "property_city": _trunc(_situs.get("city"), 128),
+                    "property_zip": _trunc(_situs.get("zip"), 10),
                     "owner_state": _owner["owner_state"],
                     "absentee_owner": _owner["absentee_owner"],
                     "out_of_state_owner": _owner["out_of_state_owner"],
@@ -1287,7 +1295,11 @@ def run_scrape_job(self, job_id: str) -> None:
             try:
                 _owner_changed = 0
                 for res in refreshed:
-                    flags = compute_owner_flags(res.property_address, res.mailing_address)
+                    flags = compute_owner_flags(
+                        res.property_address, res.mailing_address,
+                        property_city=res.property_city, property_state=res.property_state,
+                        property_zip=res.property_zip,
+                    )
                     if (
                         res.property_state != flags["property_state"]
                         or res.owner_state != flags["owner_state"]

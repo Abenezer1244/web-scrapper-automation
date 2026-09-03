@@ -1,19 +1,26 @@
-# Pierce auction leads "Test 3" data-quality audit (2026-09-02)
+# Real owner-location data (audit items 3 + 4) — 2026-09-02
 
-Branch: `fix/nts-matured-obligation-amount` · worktree `bridgeleads-worktrees/test3-nts-amount` off `origin/main` (`5106fe0`)
+Branch: `feat/real-owner-location` · worktree `bridgeleads-worktrees/real-owner-location` off `origin/main` (`0bb74bc`)
 
-- [x] Trace the blank Default Owed end-to-end (UI → API → DB row → notice row → source page) — Case A (source has it)
-- [x] Fix the section-IV amount parser + real-notice fixture + pinning tests
-- [x] Fix the "Subject to"-in-parenthetical grantor truncation (parser) + read-time cleaner (cached rows)
-- [x] Fix county-GIS batch keying (dashed parcels lost the county mailing address) + statewide half-address
-- [x] Audit all 6 records vs source (names, parcels, addresses, auction dates, amounts) — see BUILD_JOURNAL 2026-09-02
-- [x] Codex consult before code + 3 review rounds (final GATE PASS); every finding re-verified against code
-- [x] Browser verification of the live page (Playwright Chromium; 6 rows, UI == API, 0 console errors)
-- [x] Idempotent repair script for the historical rows (dry-run first)
-- [ ] 👤 merge + deploy; wait for the 10:30 UTC NTS crawl; run the repair script dry-run → `--apply --party-names`
-- [ ] 👤 `feat/fields-output-visibility` is already merged (#107/#111, reshaped by #128) — obsolete, do not re-merge
+User decision: "it should not assume the owner lives [at the property]… real data everywhere."
+Option B on both items (Codex-recommended).
+
+## Phase 1 — item 3: stop writing assumed mailing addresses (≤5 files)
+- [ ] `county_gis.py`: statewide (single + batch) returns `mailing_address=None`; drop `_statewide_mailing`; generic-config `_parse_gis_response` fallback → None
+- [ ] `ai_assessor.py`, `national.py`, `parcel.py` (ATIP): no situs-as-mailing fallback
+- [ ] tests updated/added; Codex review
+## Phase 2 — item 3 backfill (prod)
+- [ ] NULL provably-assumed mailing rows (no real mailing source for that county/record_type) + recompute flags; evidence file; Codex review; run
+## Phase 3 — item 4 schema
+- [ ] migration 085: `results.property_city`, `results.property_zip`; model; `compute_owner_flags` accepts structured situs parts
+## Phase 4 — item 4 fill at scrape/enrich time
+- [ ] capture the scraper's full situs (notice "commonly known as") before GIS overwrites the street; statewide/Pierce/King situs city+zip where the SOURCE has them; insert + end-of-job flags use the parts
+## Phase 5 — item 4 backfill (prod)
+- [ ] fill city/zip for existing leads from real sources; recompute flags; Codex review; run
 
 ## Review
+(pending)
+
 Root causes were three independent defects, none in the UI: a parser regex that required
 "principal" wording, a label-stop firing inside a parenthetical, and a batch-GIS dict keyed by
 the server's parcel spelling while the worker keys by the lead's. Nothing was hard-coded to

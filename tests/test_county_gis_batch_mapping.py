@@ -11,7 +11,8 @@ from src.scrapers.enrichment.county_gis import (
     _KNOWN_GIS_ENDPOINTS,
     _arcgis_literal,
     _map_county_features,
-    _statewide_mailing,
+    _parse_gis_response,
+    _situs_parts,
 )
 
 
@@ -74,22 +75,34 @@ class TestMapCountyFeatures:
         assert _map_county_features([feature], _PIERCE_CFG, {"6025430870": ["602543-087-0"]}) == {}
 
 
-class TestStatewideMailing:
-    _ADDR = "9226 175TH STREET CT E"
-
-    def test_no_city_no_zip_emits_nothing(self):
-        # The live statewide row for APN 6025430870 has SITUS_CITY_NM/ZIP = null; the
-        # old code fabricated "9226 175TH STREET CT E, WA".
-        assert _statewide_mailing(self._ADDR, "", "") is None
-
-    def test_city_only(self):
-        assert _statewide_mailing(self._ADDR, "PUYALLUP", "") == "9226 175TH STREET CT E, PUYALLUP, WA"
-
-    def test_zip_only(self):
-        assert _statewide_mailing(self._ADDR, "", "98375") == "9226 175TH STREET CT E, WA 98375"
+class TestStatewideSitusParts:
+    """The statewide layer is situs-only: it yields the PROPERTY's city/state/zip and
+    never a mailing address (2026-09-02 policy: no assumed owner-occupancy)."""
 
     def test_city_and_zip(self):
-        assert (
-            _statewide_mailing(self._ADDR, "PUYALLUP", "98375")
-            == "9226 175TH STREET CT E, PUYALLUP, WA 98375"
+        assert _situs_parts("PUYALLUP", "98375") == {
+            "property_city": "PUYALLUP", "property_state": "WA", "property_zip": "98375",
+        }
+
+    def test_missing_parts_are_none_not_guessed(self):
+        # The live statewide row for APN 6025430870 has SITUS_CITY_NM/ZIP = null.
+        assert _situs_parts("", "") == {
+            "property_city": None, "property_state": "WA", "property_zip": None,
+        }
+
+    def test_whitespace_normalised(self):
+        assert _situs_parts("  UNIVERSITY   PLACE ", " 98467 ")["property_city"] == "UNIVERSITY PLACE"
+
+
+class TestNoSitusAsMailing:
+    def test_generic_gis_config_without_mailing_fields_leaves_mailing_unknown(self):
+        cfg = {"parcel_field": "APN", "address_field": "SITUS"}
+        parsed = _parse_gis_response(
+            {"features": [{"attributes": {"APN": "1", "SITUS": "1 MAIN ST"}}]}, cfg
         )
+        assert parsed["property_address"] == "1 MAIN ST"
+        assert parsed["mailing_address"] is None
+
+    def test_pierce_config_still_builds_real_mailing(self):
+        parsed = _parse_gis_response({"features": [_PIERCE_FEATURE]}, _PIERCE_CFG)
+        assert parsed["mailing_address"] == "9226 175TH STREET CT E, PUYALLUP, WA, 98375-4018"

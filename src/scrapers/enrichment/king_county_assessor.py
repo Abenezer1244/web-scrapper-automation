@@ -198,6 +198,7 @@ async def batch_enrich_king_county(
     *,
     time_budget_s: float | None = None,
     stats: dict | None = None,
+    pace_s: float = 0.2,
 ) -> dict[str, dict[str, str | None]]:
     """Two-phase enrichment: HTTP for property, Playwright for mailing.
 
@@ -210,6 +211,8 @@ async def batch_enrich_king_county(
     jobs with <= 42 parcels succeeded. ``stats`` (optional dict) is filled with
     requested / property_found / mailing_candidates / mailing_attempted /
     mailing_found / deferred (parcel ids never attempted) / budget_exhausted.
+    ``pace_s`` is the delay between Playwright page loads (0.2 s for a job; a
+    one-off backfill passes several seconds — King has IP-rate-blocked us).
     """
     import time as _time
 
@@ -283,7 +286,7 @@ async def batch_enrich_king_county(
                 pid, str(exc)[:200],
             )
 
-        await asyncio.sleep(0.1)  # minimal delay for HTTP
+        await asyncio.sleep(0.1 if pace_s <= 0.2 else pace_s)  # job: 0.1 s; backfill: slow
 
     st["property_found"] = sum(1 for r in results.values() if r.get("property_address"))
     _logger.info("Phase 1 done: %d/%d property addresses, %d tax URLs",
@@ -302,6 +305,12 @@ async def batch_enrich_king_county(
         pids_to_lookup = pids_to_lookup[:_MAX_MAILING_LOOKUPS]
 
     _logger.info("Phase 2: Playwright lookup for %d mailing addresses...", len(pids_to_lookup))
+    # Provenance for the mailing lookup (2026-09-02): callers must be able to tell
+    # "the tax-bill page was read and shows no mailing address" (a real source
+    # outcome) from "the lookup never happened / failed" (unknown). An earlier
+    # situs-copy fallback masked exactly this gap for every King lead.
+    for _pid in results:
+        results[_pid]["mailing_lookup"] = "not_attempted"
 
     # Never even launch the browser once the budget is gone (Codex): phase 1 may
     # have used it all, and a Playwright start-up would eat the caller's kill-switch.
@@ -325,6 +334,7 @@ async def batch_enrich_king_county(
                 if i % 25 == 0:
                     _logger.info("  Mailing: %d / %d ...", i, len(pids_to_lookup))
                 st["mailing_attempted"] += 1
+                results[pid]["mailing_lookup"] = "error"
 
                 try:
                     url = tax_urls[pid]
@@ -343,6 +353,12 @@ async def batch_enrich_king_county(
                         pass
 
                     body = await scraper.page.inner_text("body")
+                    # "none" ONLY when the rendered page is provably this parcel's
+                    # tax-bill page (its number is on the page, or the explicit
+                    # "No accounts" answer) and the Mailing Address block is absent —
+                    # partial renders / wrong pages stay "error" (Codex P1).
+                    if "No accounts" in body or pid.replace("-", "") in body.replace("-", ""):
+                        results[pid]["mailing_lookup"] = "none"
                     if "Mailing Address" in body:
                         idx = body.index("Mailing Address") + len("Mailing Address")
                         after = body[idx:idx + 200]
@@ -358,11 +374,12 @@ async def batch_enrich_king_county(
                         if addr_lines:
                             mailing = " ".join(", ".join(addr_lines).strip().split())
                             results[pid]["mailing_address"] = mailing
+                            results[pid]["mailing_lookup"] = "found"
 
                 except Exception:
                     pass
 
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(pace_s)
 
 
     found_mail = sum(1 for r in results.values() if r.get("mailing_address"))

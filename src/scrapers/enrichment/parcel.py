@@ -115,9 +115,12 @@ async def enrich_parcel(
                         """, [parcel_id, token])
 
                         if api_result and api_result.get("address"):
+                            # ATIP's parcelSearch line1 is the SITUS; the owner's
+                            # mailing address is not in this response — leave it
+                            # unknown rather than assume owner-occupancy.
                             return {
                                 "property_address": api_result["address"],
-                                "mailing_address": api_result["address"],
+                                "mailing_address": None,
                             }
             except Exception as exc:
                 _logger.warning("ATIP fallback failed: %s", str(exc)[:60])

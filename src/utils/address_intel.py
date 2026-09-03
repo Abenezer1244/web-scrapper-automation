@@ -73,6 +73,42 @@ def _zip5(z: str | None) -> str:
     return (z or "")[:5]
 
 
+# County bulk files encode "no data" as a WORD, not as blank: the Snohomish tax
+# feed ships a situs street of literal UNKNOWN tokens ("UNKNOWN UNKNOWN, GRANITE
+# FALLS WA 98252"). Measured in production 2026-09-03: 408 such rows, every one of
+# them with the ENTIRE street segment made of UNKNOWN tokens, and 0 rows where
+# UNKNOWN appears inside an otherwise real street — so anchoring on the whole
+# segment cannot swallow a genuine address like "123 UNKNOWN RD".
+# ONLY the token that was actually measured. UNAVAILABLE / NONE / N/A were
+# considered and REJECTED: 0 occurrences in production, and inventing an
+# unmeasured guard on this connector is precisely the mistake that once
+# false-aborted 14.79% of real Snohomish rows. Add one only after measuring it.
+_PLACEHOLDER_STREET_RE = re.compile(r"UNKNOWN", re.IGNORECASE)
+
+
+def street_is_placeholder(addr: str | None) -> bool:
+    """True when an address's STREET segment is nothing but placeholder tokens.
+
+    Only the street is judged: in "UNKNOWN UNKNOWN, GRANITE FALLS WA 98252" the
+    locality is REAL and still supports property_state / out_of_state_owner. It is
+    absentee_owner alone that cannot be known, because that one compares streets.
+    """
+    if not addr:
+        return False
+    street = addr.split(",")[0].strip()
+    if not street:
+        return False
+    # Tokenise on WORD characters, not whitespace: splitting on spaces alone left
+    # punctuated debris ("UNKNOWN.", "UNKNOWN-UNKNOWN", "UNKNOWN/UNKNOWN") failing
+    # fullmatch, so a fabricated street walked through and kept a confident
+    # absentee_owner (Codex). Measured 0 such rows in prod today, so this changes
+    # nothing now — it is a cheap guard against the next shape the county emits.
+    # Still `all(...)`, so a REAL street merely containing the word ("123 UNKNOWN
+    # RD") is never suppressed.
+    tokens = re.findall(r"[A-Za-z0-9]+", street)
+    return bool(tokens) and all(_PLACEHOLDER_STREET_RE.fullmatch(t) for t in tokens)
+
+
 def _addresses_differ(property_address: str, mailing_address: str) -> bool | None:
     """Tri-state: True=clearly different, False=confirmed same, None=underdetermined.
 
@@ -84,6 +120,13 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
     not proof of owner-occupancy. Falls back to a normalized full-string compare
     only when neither side parses a usable street.
     """
+    # A placeholder street is NOT a street. "UNKNOWN UNKNOWN" can never equal a
+    # real mailing street, so without this the comparator returns a CONFIDENT
+    # absentee=True for a property whose address we simply do not have — exactly
+    # the fabricated signal the house rule forbids. Unknown means None.
+    if street_is_placeholder(property_address) or street_is_placeholder(mailing_address):
+        return None
+
     # Byte-identical (post-normalize) is unambiguous same-place → confirmed False,
     # even with no parsed ZIP/city/state to discriminate.
     if _normalize_full(property_address) == _normalize_full(mailing_address):
@@ -145,16 +188,58 @@ def compose_situs(
     Migration 085 stores city/state/zip BESIDE the frozen street-only
     property_address; the comparator works on address strings, so rebuild the
     full line here. Parts are appended only when present — nothing is guessed.
+
+    CANONICAL, NOT APPEND-ONLY: `property_address` is street-only on the GIS path
+    but a FULL situs line on others — the King assessor's Site Address carries its
+    own trailing ZIP ("2019 SW 318TH PL 4C 98023"), and
+    scripts/backfill_property_situs_parts.py parses its parts straight out of the
+    line and hands that same line back here. Blind appending gave those a second
+    copy of their own tail ("… 4C 98023, 98023"), which pushed the ZIP into the
+    parsed STREET, so the street no longer matched the mailing street and
+    `absentee_owner` flipped False -> True on owner-occupied leads.
+
+    So: parse the line first, and let whatever it ALREADY carries win; the
+    structured parts only fill what is genuinely absent. Rebuilding from the
+    parsed street also fixes ordering (a supplied city can never land after a ZIP
+    the line already had) and makes a line/part CONFLICT resolve to the line's own
+    value rather than to an invented "…, WA 99999, TACOMA, WA 98402" — a conflict
+    is therefore NOT surfaced here; if that ever needs to read as "unknown" it
+    belongs in compute_owner_flags, not in a string builder (Codex).
+
+    Idempotent for migration-085-shaped input (a situs line + scalar city/state/zip);
+    that is the only way the one production caller uses it, and it is not a promise
+    about arbitrary strings — a part containing its own commas can still re-parse
+    differently on a second pass (Codex).
+
+    KNOWN PARSER EDGE (not introduced here, and not present in live data): a street
+    whose suffix is itself a 2-letter state code — "1407 KAYE WY 82901", WY as an
+    abbreviation of WAY — parses as state=WY and loses the suffix from `street`.
+    Same family as the NE directional collision already handled in
+    parse_property_for_display. Measured 2026-09-03: 0 of 23,284 production rows
+    parse to a non-WA state, and absentee is True both before and after this change,
+    so it is documented rather than guessed at.
     """
     if not property_address:
         return property_address
     line = property_address.strip()
-    if property_city:
-        line += f", {property_city.strip()}"
-    tail = " ".join(x.strip() for x in (property_state, property_zip) if x)
+    if not (property_city or property_state or property_zip):
+        return line
+    # parse_property_for_display only emits a VALIDATED state (real 2-letter code)
+    # and zip, so "98023 MAIN ST" yields no zip and "123 LAKE ST" no city — a bare
+    # substring test would have mistaken both.
+    have = parse_property_for_display(line)
+    street = (have["street"] or line).strip()
+    city = have["city"] or (property_city.strip() if property_city else None)
+    state = have["state"] or (property_state.strip() if property_state else None)
+    zipc = have["zip"] or (property_zip.strip() if property_zip else None)
+
+    out = street
+    if city:
+        out += f", {city}"
+    tail = " ".join(x for x in (state, zipc) if x)
     if tail:
-        line += f", {tail}"
-    return line
+        out += f", {tail}"
+    return out
 
 
 def compute_owner_flags(

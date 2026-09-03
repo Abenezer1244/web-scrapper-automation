@@ -54,8 +54,11 @@ LEAD_CSV_COLUMNS: list[str] = [
     "months_delinquent", "wa_foreclosure_eligible",
     "freshness_days", "contactability_score",
     # Owner-location flags (Tier 0, migration 057): tri-state Yes/No/blank(unknown).
-    # No property_state here — it already exists above as the dialer-split column
-    # (same value: parse(property_address).state == the stored property_state).
+    # No property_state here — it already exists above as the dialer-split column.
+    # (Those were the same value until migration 085: the split column now reads
+    # the STORED property_state first and only falls back to parsing, so for a
+    # street-only property_address they agree where it matters and the stored
+    # value wins where the parse has nothing.)
     "absentee_owner", "out_of_state_owner", "owner_state",
     # NTS Tier 1 (migration 059): matched trustee-sale auction data (pre_foreclosure).
     # auction_date + default_amount are stored columns; trustee/ts# from
@@ -407,9 +410,16 @@ def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, s
         "first_name": sanitize_for_csv(first),
         "last_name": sanitize_for_csv(last),
         "property_street": sanitize_for_csv(prop["street"]),
-        "property_city": sanitize_for_csv(prop["city"]),
-        "property_state": sanitize_for_csv(prop["state"]),
-        "property_zip": sanitize_for_csv(prop["zip"]),
+        # Stored STRUCTURED situs first (migration 085), parsed second. These
+        # columns hold what the source actually said the property's city/zip
+        # are; parsing property_address is only an inference, and since #188
+        # froze property_address to a street-only line for statewide- and
+        # assessor-enriched rows, the parse now yields blanks for exactly the
+        # rows the structured columns were added to describe. Falling back to
+        # the parse keeps every pre-085 row exporting as it always did.
+        "property_city": sanitize_for_csv(_get(record, "property_city") or prop["city"]),
+        "property_state": sanitize_for_csv(_get(record, "property_state") or prop["state"]),
+        "property_zip": sanitize_for_csv(_get(record, "property_zip") or prop["zip"]),
         # Enrichment passthrough (Tier 0): see _enrichment() for why these read
         # the JSON keys directly. Numeric fields rendered plainly; rest sanitized.
         "assessed_value": _enrich_num(enr, "assessed_value"),

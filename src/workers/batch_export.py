@@ -71,6 +71,7 @@ WITH candidates AS (
     -- EncryptedJSON), mirroring segments._decrypt_pii_rows.
     SELECT r.id, r.date_recorded, r.date_recorded_parsed, r.party_name, r.heirs,
            r.parcel_id, r.property_address, r.mailing_address,
+           r.property_city, r.property_state, r.property_zip,
            r.legal_description, r.doc_type,
            r.delinquent_amount, r.delinquent_bill_year,
            r.phone, r.phone_type, r.email, r.phones, r.emails,
@@ -131,6 +132,7 @@ ranked AS (
 )
 SELECT rk.id, rk.date_recorded, rk.date_recorded_parsed, rk.party_name, rk.heirs,
        rk.parcel_id, rk.property_address, rk.mailing_address,
+       rk.property_city, rk.property_state, rk.property_zip,
        rk.legal_description, rk.doc_type,
        -- Bucket-coalesced (agg), NOT the representative row's own — see agg CTE.
        a.delinquent_amount, a.delinquent_bill_year,

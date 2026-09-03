@@ -141,7 +141,8 @@ EXPORT_CAP = 50_000
 _INTERSECTION_SQL = f"""
 WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
-           r.mailing_address, r.phone, r.phone_type, r.email,
+           r.mailing_address, r.property_city, r.property_state, r.property_zip,
+           r.phone, r.phone_type, r.email,
            r.phones, r.emails, r.property_key,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at
@@ -183,7 +184,8 @@ ranked AS (
     FROM candidates c
 )
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
-       rk.mailing_address, rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
+       rk.mailing_address, rk.property_city, rk.property_state, rk.property_zip,
+       rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
        rk.phones, rk.emails,
        a.matched_record_types, a.overlap_count, a.lead_subtype
 FROM ranked rk
@@ -215,7 +217,8 @@ LIMIT :limit
 _UNION_SQL = f"""
 WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
-           r.mailing_address, r.phone, r.phone_type, r.email,
+           r.mailing_address, r.property_city, r.property_state, r.property_zip,
+           r.phone, r.phone_type, r.email,
            r.phones, r.emails,
            r.property_key, r.is_duplicate,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
@@ -266,7 +269,8 @@ ranked AS (
     FROM candidates c
 )
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
-       rk.mailing_address, rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
+       rk.mailing_address, rk.property_city, rk.property_state, rk.property_zip,
+       rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
        rk.phones, rk.emails,
        a.matched_record_types, a.overlap_count, a.identity_strength, a.lead_subtype
 FROM ranked rk
@@ -285,7 +289,8 @@ LIMIT :limit
 _INTERSECTION_DATED_SQL = f"""
 WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
-           r.mailing_address, r.phone, r.phone_type, r.email,
+           r.mailing_address, r.property_city, r.property_state, r.property_zip,
+           r.phone, r.phone_type, r.email,
            r.phones, r.emails, r.property_key,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at
@@ -323,7 +328,8 @@ ranked AS (
     FROM candidates c
 )
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
-       rk.mailing_address, rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
+       rk.mailing_address, rk.property_city, rk.property_state, rk.property_zip,
+       rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
        rk.phones, rk.emails,
        a.matched_record_types, a.overlap_count, a.lead_subtype
 FROM ranked rk

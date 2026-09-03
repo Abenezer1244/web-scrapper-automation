@@ -540,3 +540,37 @@ class TestProbateCurrentOwnerColumns:
     def test_columns_registered(self):
         assert "current_owner" in LEAD_CSV_COLUMNS
         assert "title_status" in LEAD_CSV_COLUMNS
+
+
+class TestStructuredSitusColumns:
+    """Migration 085 stores the property's real city/zip. The CSV must prefer
+    them over parsing property_address, which is street-only for enriched rows."""
+
+    def test_stored_situs_wins_over_street_only_address(self):
+        row = build_lead_export_row({
+            "property_address": "9226 175TH STREET CT E",
+            "property_city": "PUYALLUP",
+            "property_state": "WA",
+            "property_zip": "98375",
+        })
+        assert row["property_street"] == "9226 175TH STREET CT E"
+        assert row["property_city"] == "PUYALLUP"
+        assert row["property_state"] == "WA"
+        assert row["property_zip"] == "98375"
+
+    def test_falls_back_to_parsing_when_columns_are_empty(self):
+        # Every pre-085 row exports exactly as it always did.
+        row = build_lead_export_row({
+            "property_address": "123 MAIN ST, TACOMA, WA 98401",
+        })
+        assert row["property_city"] == "TACOMA"
+        assert row["property_state"] == "WA"
+        assert row["property_zip"] == "98401"
+
+    def test_works_over_orm_style_records_too(self):
+        row = build_lead_export_row(_Obj(
+            property_address="9226 175TH STREET CT E",
+            property_city="PUYALLUP", property_zip="98375",
+        ))
+        assert row["property_city"] == "PUYALLUP"
+        assert row["property_zip"] == "98375"

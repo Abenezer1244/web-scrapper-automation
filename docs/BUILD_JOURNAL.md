@@ -224,17 +224,41 @@ commit `f6e29fb`) + FE `fix/auction-date-relative-label` (`a90d477`). Not pushed
 - Everything else in Test 4 verified CORRECT against the source PDF: all 6 party names, parcel IDs,
   property addresses, auction dates, default-owed amounts.
 
+**Repair (added after the PRs went up):** `scripts/repair_nts_ts_number.py`. Truth comes from
+RE-PARSING the source PDFs with the fixed parser, joined on `parcel` — nothing hand-typed.
+- 🔑 The dry run found the blast radius was **bigger than Test 4**: **5 rows across 3 jobs**, not 2.
+  The extra one (KRISSTOPHER D SCHULTZ, job `bdbf92a9`, `WA05000087-25-1` → `26-77688`) was
+  verified against the 6-24-26 issue, where `WA05000087-25-1` belongs to the NEXT notice (LABONTE).
+- 🛑 **Ordering was mandatory.** Cate's CORRECTED fingerprint is exactly the one Weintraub still
+  holds, in the SAME job, and `uq_results_job_fingerprint` is UNIQUE on (job_id, source_fingerprint).
+  Applying in query order would have thrown. Free-before-claim, both phases.
+- 🛑 `_fingerprint = rec.raw_html_hash or _source_fingerprint(rec)` — so `raw_html_hash` IS the
+  ON CONFLICT key for trustee_sale rows and had to move WITH the ts_number, but ONLY where the
+  stored hash really was the ts-derived one (pre_foreclosure rows key off parcel/party instead).
+- 🛑 The `--notices` phase is written and dry-run-verified but **deliberately NOT run**: nts_notices
+  is upserted ON CONFLICT (source, ts_number), so renaming rows while the OLD parser is still
+  deployed means the next beat crawl re-upserts the wrong number ONTO the renamed row — strictly
+  worse than today. Gated behind an explicit flag.
+- 🔑 The dry run also exposed a **duplicate**: the bug gave Cate's notice two different wrong
+  numbers in two issues, so one real sale became TWO active rows (`WA08000007-26-1` w/ 2 results,
+  `25-10595` w/ 0). Kept the referenced one, retire the orphan — retire not delete (results FK +
+  no DELETE on the app role).
+- 🔑 Two bugs caught in my own repair script by dry-running it: the guard bound used the LIVE
+  `pending` length, which shrinks as renames land, so it abandoned the last rename; and CI failed
+  on **ruff import order** (not tests) from threading `auction_reference_date` into data_exporter.
+
 **Pending / Handoff:**
 - 👤 Codex diff review still owed (usage limit).
-- ⏭️ Neither branch is pushed; no PR opened.
+- ⏭️ **After #195 deploys:** `railway run --service worker python scripts/repair_nts_ts_number.py
+  --notices --i-confirm-fixed-parser-is-deployed --apply` (1 retire + 4 renames, dry-run verified).
+- ⏭️ **PR #195 (BE) + #106 (FE) OPEN, both CI-green and CLEAN.** BE merges first.
 - ⏭️ **Not fixed, same bug class, deliberately out of scope:** `trustee_sale.scrape()` uses
   `date.today()` and `nts_crawler` expiry uses UTC — both gate on a WA-local auction date, so a
   same-day sale can be excluded or expired a day early. Codex flagged these; they need their own
   change with their own blast-radius check.
-- ⏭️ **Historic rows not repaired.** The parser fix is forward-only: the 2 Test 4 leads (CASEY
-  CATE, SHAWN M WEINTRAUB) still carry the wrong `ts_number` in prod, and the KHADEMI notice
-  (`WA09000110-25-1`, parcel 006855-001-004-00, auction 2026-05-22 — already past) was never
-  ingested. A re-crawl of that issue plus a repair script would settle it.
+- ⏭️ The KHADEMI notice (`WA09000110-25-1`, parcel 006855-001-004-00, auction **2026-05-22 —
+  already past**) was never ingested. Not force-inserted: a stale past sale is not a lead, and a
+  re-crawl with the fixed parser picks it up naturally if it is still in the crawl window.
 - Dev artifact left behind: local database `bridgeleads_t4_test`.
 
 

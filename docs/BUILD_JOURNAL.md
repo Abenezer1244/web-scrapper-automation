@@ -114,6 +114,33 @@ new `_grid_doc_type` (caught by the fixture tests before review).
 - Tests: 81 passing across the touched files (+`test_pierce_atip.py`, `test_captcha_token_cache.py`,
   legal-repair block/edit-1/adjacency cases).
 
+**Round 3 (user: "work on all 1 by 1, verify with Codex"):**
+- #1 leaked 2Captcha key: `res.php?action=getbalance` → `ERROR_KEY_DOES_NOT_EXIST` — already dead.
+- #5 King tax "Address enrichment failed" ROOT CAUSE: every King job with a large mailing pass
+  (172 / 7,542 / 8,626 parcels) died in the caller's `asyncio.wait_for(240)` around the Playwright
+  mailing lookup (~5–10 s/parcel); jobs ≤ 42 succeeded. The exception aborted the rest of
+  enrichment incl. SKIP-TRACE ENQUEUE (384/384 rows `not_attempted`). `external_source_health`
+  was empty (not the throttle gate). Fix: `batch_enrich_king_county(time_budget_s=, stats=)`
+  checks a monotonic deadline before every HTTP fetch / navigation and before launching the
+  browser, returns PARTIAL results; caller passes 200 s inside the 240 s kill-switch, wraps in
+  try/except, marks un-attempted parcels `enrichment_data.mailing_lookup_deferred=true`, and
+  logs a 4-number warning. Skip trace + unactionable summary now always run.
+- #6 crawler completeness: walked 40 listing pages (56 NTS) vs cache → 6 missing. 4 were PARSER
+  rejects (real layouts, fixtures saved): "at the hour of" between date/time, weekday prefix
+  ("will, on Friday, August 28, 2026"), "10 o'clock" without minutes, prose "defaul**ts no**w"
+  read as a TS#, "Assessor's Parcel No." label, and "Instrument Number N (Deed of Trust)" deed
+  ref. 2 were simply beyond the beat's 10-page walk on their day. One-off 40-page crawl
+  ingested all 6 (cache 55 → 61, 16 active). Matcher run with the 180-day window: **32 leads
+  enriched** (the 21 aged-out + new).
+- #9 235 vs 217: walked all ARMS pages — 0 rows lost by parsing; 12 intentional no-person drops
+  (commercial LLC borrowers + 6 "[R] [E]" blank-index rows), 6 filings indexed after the scrape.
+- #11 recovery re-run on the other 5 Pierce jobs: 26/28 filled (2 parcels not on file anywhere).
+- Full suite on the rig: 17 auth/API failures were rig PHANTOMS (concurrent `railway run`);
+  all pass in isolation (292 + 80 + 48).
+- Deferred with reasoning: #7 (address key without ZIP — every Pierce notice carries a parcel;
+  a street-only match risks cross-city false attaches), #10 (legacy `PRE-FORECLOSURE` rows —
+  new scrapes carry the real label), #12 (do not switch the shared checkout under other agents).
+
 **Facts learned:**
 - Pierce ARMS `SearchEntry.aspx` has instrument-number search fields
   (`cphNoMargin_f_txtInstrumentNoFrom/To`) — fastest way to verify one recorded doc.

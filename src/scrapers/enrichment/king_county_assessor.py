@@ -195,10 +195,33 @@ async def batch_extract_king_owners(
 
 async def batch_enrich_king_county(
     parcel_ids: list[str],
+    *,
+    time_budget_s: float | None = None,
+    stats: dict | None = None,
 ) -> dict[str, dict[str, str | None]]:
-    """Two-phase enrichment: HTTP for property, Playwright for mailing."""
+    """Two-phase enrichment: HTTP for property, Playwright for mailing.
+
+    ``time_budget_s`` (2026-09-02): a monotonic deadline checked BEFORE every
+    lookup (each HTTP fetch and each Playwright navigation). On exhaustion the
+    remaining parcels are skipped and the PARTIAL results are returned — never
+    cancelled from outside and lost. Evidence: every King tax_delinquent job with
+    a large mailing pass (172 / 7,542 / 8,626 parcels) died in the caller's
+    ``asyncio.wait_for(240)`` and lost everything incl. skip-trace enqueue, while
+    jobs with <= 42 parcels succeeded. ``stats`` (optional dict) is filled with
+    requested / property_found / mailing_candidates / mailing_attempted /
+    mailing_found / deferred (parcel ids never attempted) / budget_exhausted.
+    """
+    import time as _time
+
     results: dict[str, dict[str, str | None]] = {}
     clean = list(dict.fromkeys(pid.strip() for pid in parcel_ids if pid and len(pid.strip()) >= 6))
+    st = stats if stats is not None else {}
+    st.update({"requested": len(clean), "property_found": 0, "mailing_candidates": 0,
+               "mailing_attempted": 0, "mailing_found": 0, "deferred": [], "budget_exhausted": False})
+    deadline = (_time.monotonic() + time_budget_s) if time_budget_s is not None else None
+
+    def _over_budget() -> bool:
+        return deadline is not None and _time.monotonic() >= deadline
 
     if not clean:
         return results
@@ -211,6 +234,11 @@ async def batch_enrich_king_county(
     tax_urls: dict[str, str] = {}  # pid → payment.kingcounty.gov URL
 
     for i, pid in enumerate(clean):
+        if _over_budget():
+            _logger.warning("King phase 1: time budget exhausted after %d/%d parcels", i, len(clean))
+            st["budget_exhausted"] = True
+            st["deferred"].extend(clean[i:])
+            break
         if i % 100 == 0 and i > 0:
             _logger.info("  HTTP: %d / %d ...", i, len(clean))
 
@@ -257,11 +285,12 @@ async def batch_enrich_king_county(
 
         await asyncio.sleep(0.1)  # minimal delay for HTTP
 
+    st["property_found"] = sum(1 for r in results.values() if r.get("property_address"))
     _logger.info("Phase 1 done: %d/%d property addresses, %d tax URLs",
-                 sum(1 for r in results.values() if r.get("property_address")),
-                 len(clean), len(tax_urls))
+                 st["property_found"], len(clean), len(tax_urls))
 
     # ── Phase 2: Playwright for mailing addresses ──────────────────────────
+    st["mailing_candidates"] = len(tax_urls)
     if not tax_urls:
         return results
 
@@ -274,52 +303,73 @@ async def batch_enrich_king_county(
 
     _logger.info("Phase 2: Playwright lookup for %d mailing addresses...", len(pids_to_lookup))
 
-    async with BridgeScraper() as scraper:
+    # Never even launch the browser once the budget is gone (Codex): phase 1 may
+    # have used it all, and a Playwright start-up would eat the caller's kill-switch.
+    if _over_budget():
+        _logger.warning("King phase 2: budget exhausted before mailing lookups; %d deferred", len(pids_to_lookup))
+        st["budget_exhausted"] = True
+        st["deferred"].extend(pids_to_lookup)
+        pids_to_lookup = []
+    if pids_to_lookup:
+        async with BridgeScraper() as scraper:
 
-        for i, pid in enumerate(pids_to_lookup):
-            if i % 25 == 0:
-                _logger.info("  Mailing: %d / %d ...", i, len(pids_to_lookup))
-
-            try:
-                url = tax_urls[pid]
-                # safe_goto (not raw page.goto): fail-CLOSED pre-flight SSRF
-                # validation + landing-URL re-check after redirects.
-                await scraper.safe_goto(
-                    url, wait_until="domcontentloaded", timeout_ms=8_000
-                )
+            for i, pid in enumerate(pids_to_lookup):
+                if _over_budget():
+                    # Checked before EVERY navigation so one slow page can't burn the
+                    # caller's outer kill-switch timeout (Codex).
+                    _logger.warning("King phase 2: time budget exhausted after %d/%d mailing lookups",
+                                    i, len(pids_to_lookup))
+                    st["budget_exhausted"] = True
+                    st["deferred"].extend(pids_to_lookup[i:])
+                    break
+                if i % 25 == 0:
+                    _logger.info("  Mailing: %d / %d ...", i, len(pids_to_lookup))
+                st["mailing_attempted"] += 1
 
                 try:
-                    await scraper.page.wait_for_function(
-                        "() => document.body.innerText.includes('Mailing Address') || document.body.innerText.includes('No accounts')",
-                        timeout=4_000,
+                    url = tax_urls[pid]
+                    # safe_goto (not raw page.goto): fail-CLOSED pre-flight SSRF
+                    # validation + landing-URL re-check after redirects.
+                    await scraper.safe_goto(
+                        url, wait_until="domcontentloaded", timeout_ms=8_000
                     )
+
+                    try:
+                        await scraper.page.wait_for_function(
+                            "() => document.body.innerText.includes('Mailing Address') || document.body.innerText.includes('No accounts')",
+                            timeout=4_000,
+                        )
+                    except Exception:
+                        pass
+
+                    body = await scraper.page.inner_text("body")
+                    if "Mailing Address" in body:
+                        idx = body.index("Mailing Address") + len("Mailing Address")
+                        after = body[idx:idx + 200]
+                        lines = [ln.strip() for ln in after.split("\n") if ln.strip()]
+                        addr_lines = []
+                        for line in lines:
+                            if line.startswith("Pay by") or line.startswith("Annual") or line.startswith("Billing"):
+                                break
+                            if len(line) > 3:
+                                addr_lines.append(line)
+                            if len(addr_lines) >= 2:
+                                break
+                        if addr_lines:
+                            mailing = " ".join(", ".join(addr_lines).strip().split())
+                            results[pid]["mailing_address"] = mailing
+
                 except Exception:
                     pass
 
-                body = await scraper.page.inner_text("body")
-                if "Mailing Address" in body:
-                    idx = body.index("Mailing Address") + len("Mailing Address")
-                    after = body[idx:idx + 200]
-                    lines = [ln.strip() for ln in after.split("\n") if ln.strip()]
-                    addr_lines = []
-                    for line in lines:
-                        if line.startswith("Pay by") or line.startswith("Annual") or line.startswith("Billing"):
-                            break
-                        if len(line) > 3:
-                            addr_lines.append(line)
-                        if len(addr_lines) >= 2:
-                            break
-                    if addr_lines:
-                        mailing = " ".join(", ".join(addr_lines).strip().split())
-                        results[pid]["mailing_address"] = mailing
+                await asyncio.sleep(0.2)
 
-            except Exception:
-                pass
-
-            await asyncio.sleep(0.2)
 
     found_mail = sum(1 for r in results.values() if r.get("mailing_address"))
     found_prop = sum(1 for r in results.values() if r.get("property_address"))
+    st["mailing_found"] = found_mail
+    # Parcels beyond the per-call mailing cap were never attempted either.
+    st["deferred"].extend(p for p in tax_urls if p not in pids_to_lookup)
     _logger.info("Enrichment done: %d/%d property, %d/%d mailing",
                  found_prop, len(clean), found_mail, len(clean))
     return results

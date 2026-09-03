@@ -84,7 +84,11 @@ _STOP = (
 # vary by trustee (North Star YY-NNNNN, Quality Loan WA-25-…-RM). Stop before a
 # trailing "-NOTICE…" (title-line concat) and at whitespace/EOL (Codex P1).
 _TS_NUMBER = re.compile(
-    r"(?:T\.?S\.?\s*#|T\.?S\.?\s*No\.?|Trustee\s+Sale\s+(?:No\.?|Number))\s*:?\s*"
+    # Label boundaries (live 2026-09-02): "defaul[ts no]w in arrears" produced
+    # ts_number "w". The label may not be glued to a preceding letter, and "No"
+    # may not run straight into another letter ("now"). "No." / "No:" / "No 123" /
+    # "T.S.#" all still match.
+    r"(?<![A-Za-z])(?:T\.?S\.?\s*#|T\.?S\.?\s*No\.?(?![A-Za-z])|Trustee\s+Sale\s+(?:No\.?|Number))\s*:?\s*"
     r"([A-Za-z0-9][A-Za-z0-9\-]*?)(?=\s|$|-?NOTICE\b)",
     re.I,
 )
@@ -116,13 +120,21 @@ _DEED_REF = re.compile(
     r"Reference\s+Number\s+(?:of\s+(?:the\s+)?)?Deed\s+of\s+Trust\s*:\s*(?:Instrument\s+No\.?\s*)?([\w\-]+)",
     re.I,
 )
+# Second live layout (private/law-firm trustee, 2026-09-02): "Reference Numbers of
+# Documents Referenced: Instrument Number 202212290190 (Deed of Trust) 202605120147
+# (Appointment of Successor Trustee)". Capture ONLY the instrument explicitly tagged
+# "(Deed of Trust)" — never an adjacent appointment/assignment number (Codex).
+_DEED_REF_TAGGED = re.compile(r"(\d{8,14})\s*\(\s*Deed\s+of\s+Trust\s*\)", re.I)
 # Parcel label variants: "Parcel Number(s):" (North Star / Quality Loan / Affinia),
 # plus "[Assessor's] Tax Parcel No(s).:" (Clear Recon / older law-firm notices — live
 # 2026-06-26). A multi-parcel notice lists several after the colon; we capture the
 # FIRST (a valid match key — the matcher keys on any one exact parcel).
 _PARCEL = re.compile(
-    r"(?:Parcel\s+Number\(?s?\)?|(?:Assessor'?s\s+)?Tax\s+Parcel\s+(?:No|Number)s?\.?)"
-    r"\s*:\s*([\w\-]+)",
+    r"(?:Parcel\s+Number\(?s?\)?|(?:Assessor'?s\s+)?Tax\s+Parcel\s+(?:No|Number)s?\.?"
+    # "Assessor's Parcel No. 766500-0020" (law-firm layout, live 2026-09-02) — no
+    # colon, no "Tax". Bounded to the label so prose can't feed it.
+    r"|Assessor'?s\s+Parcel\s+(?:No|Number)s?\.?)"
+    r"\s*:?\s*([\w\-]+)",
     re.I,
 )
 
@@ -134,8 +146,15 @@ _PARCEL = re.compile(
 # we capture everything up to "sell at public auction" and strip a leading "at " connector
 # in parse_nts_notice. The lazy (.+?) is safe because callers parse ONE notice block at a
 # time (PDF crawler splits first) — it can't drift across a notice boundary (Codex consult).
+# Live 2026-09-02 variants folded in (each still anchored to "sell at public auction"):
+# an explicit weekday ("will, on Friday, August 28, 2026"), "at the hour of 10:00 AM"
+# between date and time, and a comma after the time. Weekdays are spelled out — never
+# a bare \w+day — so unrelated text can't be swallowed (Codex).
+_WEEKDAY = r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+"
+_HOUR_OF = r"(?:the\s+hour\s+of\s+)?"
 _AUCTION = re.compile(
-    r"will\s+on\s+(\d{1,2}/\d{1,2}/\d{4})\s*,?\s*at\s+(\d{1,2}:\d{2}\s*[AP]\.?M\.?)\s+"
+    rf"will\s*,?\s*on\s+(?:{_WEEKDAY})?(\d{{1,2}}/\d{{1,2}}/\d{{4}})\s*,?\s*at\s+{_HOUR_OF}"
+    r"(\d{1,2}:\d{2}\s*[AP]\.?M\.?)\s*,?\s*"
     r"(.+?)\s+sell\s+at\s+public\s+auction",
     re.I | re.S,
 )
@@ -157,7 +176,7 @@ _COMMONLY_KNOWN = re.compile(
     # known as: <addr> Tax Parcel Nos.: <apn> which is subject to…" — without this the
     # parcel text leaks INTO property_address and poisons the normalized match key, so
     # a lead at that address won't attach by address.
-    r"|\s+(?:Assessor'?s\s+)?Tax\s+Parcel\b|\s+Parcel\s+Number\b"
+    r"|\s+(?:Assessor'?s\s+)?Tax\s+Parcel\b|\s+Assessor'?s\s+Parcel\b|\s+Parcel\s+Number\b"
     r"|\s+II\.\s|\n\n|\Z)",
     re.I | re.S,
 )
@@ -196,7 +215,7 @@ _TIME = r"\d{1,2}:\d{2}\s*[AP]\.?M\.?"
 # stray dated timestamp elsewhere in the notice can't be read as the auction (Codex).
 # group(1)=date, group(2)=time. The matched span (group 0) also carries the location.
 _AUCTION_KING = re.compile(
-    rf"\bon\s+({_MONTH_DATE})\s*,?\s*(?:at\s+)?({_TIME})"
+    rf"\bon\s+(?:{_WEEKDAY})?({_MONTH_DATE})\s*,?\s*(?:at\s+)?{_HOUR_OF}({_TIME})"
     r"[\s\S]{0,600}?sell\s+at\s+public\s+auction", re.I)
 # Best-effort location within the matched span: Affinia "…located <loc> to the highest";
 # MTC "<time>, <loc>…". Not required for validity/matching.
@@ -216,7 +235,8 @@ _AUCTION_KING_LOC_B = re.compile(
 # so it reuses the existing _to_date month-name path.
 _AUCTION_WORDED = re.compile(
     rf"will\s+on\s+the\s+(\d{{1,2}})(?:st|nd|rd|th)\s+day\s+of\s+({_MONTHS})\.?,?\s+(\d{{4}})"
-    r"\s*,?\s*at\s+(?:the\s+hour\s+of\s+)?(\d{1,2}:\d{2})\s*o'?clock\s*([AP])\.?\s*M\.?"
+    # "10 o'clock A.M." (no minutes) is a real layout (live 2026-09-02) -> minutes optional.
+    r"\s*,?\s*at\s+(?:the\s+hour\s+of\s+)?(\d{1,2}(?::\d{2})?)\s*o'?clock\s*([AP])\.?\s*M\.?"
     r"[\s\S]{0,600}?sell\s+at\s+public\s+auction",
     re.I,
 )
@@ -348,6 +368,8 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
             if wm:
                 day, month, year, hhmm, ampm = wm.groups()
                 auction_date = f"{month.title()} {int(day)}, {year}"
+                if ":" not in hhmm:
+                    hhmm = f"{hhmm}:00"
                 auction_time = f"{hhmm} {ampm.upper()}M"
 
     return {
@@ -357,7 +379,7 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
         "beneficiary": _first(_BENEFICIARY, text),
         "trustee": _extract_trustee(text),
         "servicer": _first(_SERVICER, text),
-        "deed_reference": _first(_DEED_REF, text),
+        "deed_reference": _first(_DEED_REF, text) or _first(_DEED_REF_TAGGED, text),
         "parcel": _first(_PARCEL, text),
         "auction_date": auction_date,
         "auction_time": auction_time,

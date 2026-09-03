@@ -68,4 +68,11 @@ Subject: scraper config "Test 2" (fde53328, pierce/WA/pre_foreclosure), job e72b
 - [x] Deleted two exploratory scripts with a hardcoded 2Captcha key. 👤 REVOKE that key (NO-GO until done).
 - [x] Recovery run on Test 2 (user authorised): 11/12 filled (2 legal repair + 9 ATIP); `9009002080` not on
       file anywhere. Results page re-verified: only the 3 name-only rows blank; API enriched_count 202 → 213.
-- [ ] 👤 Push + PR; deploy worker + api.
+- [x] Push + PR; deploy worker + api (round 3).
+
+## Round 3 — the 12-item list
+
+- [x] 1 leaked key: already dead at 2Captcha (verified). 2 PR/merge/deploy: this session.
+- [x] 5 King mailing time budget + deferred marker (Codex PASS). 6 parser layouts + 40-page ingest (Codex PASS).
+- [x] 9 ARMS diff (0 parser losses). 11 other Pierce jobs recovered (26/28).
+- [ ] 3/4 legal stances (user), 7/10/12 deferred with reasoning (journal).

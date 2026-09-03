@@ -386,7 +386,23 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             if len(pids) > _MAX_KING_PARCELS:
                 _logger.info("Capping King County mailing lookup to %d/%d parcels", _MAX_KING_PARCELS, len(pids))
                 pids = pids[:_MAX_KING_PARCELS]
-            enriched = asyncio.run(asyncio.wait_for(batch_enrich_king_county(pids), timeout=240))
+            # Internal time budget (200s) returns PARTIAL results; the outer
+            # wait_for(240) is only a last-resort kill switch. Either way the
+            # rest of enrichment (owner repair, unactionable summary, SKIP-TRACE
+            # ENQUEUE) must still run — before 2026-09-02 a TimeoutError here
+            # aborted all of it on every large King tax job (172+ parcels).
+            king_stats: dict = {}
+            king_error: str | None = None
+            try:
+                enriched = asyncio.run(asyncio.wait_for(
+                    batch_enrich_king_county(pids, time_budget_s=200, stats=king_stats),
+                    timeout=240,
+                ))
+            except Exception as exc:  # noqa: BLE001 — best-effort county lookup
+                king_error = f"{type(exc).__name__}: {str(exc)[:120]}"
+                _logger.warning("Job %s: King mailing lookup failed: %s", job_id, king_error)
+                enriched = {}
+                king_stats.setdefault("deferred", list(pids))
             # King tax-delinquent rows ship with a placeholder party_name because
             # the Socrata source has no owner column. The eRealProperty lookup
             # above now also yields the owner name; swap it in here. Dual gate:
@@ -432,7 +448,33 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 db.rollback()
                 db.commit()
             found = sum(1 for d in enriched.values() if d.get("mailing_address"))
-            _publish_log(r, job_id, "info", f"Found {found}/{len(pids)} mailing addresses", db=db)
+            # Durable marker for parcels the budget/cap/failure never reached, so a
+            # later sweep can find them (never a silent gap — Codex).
+            deferred = [p for p in dict.fromkeys(king_stats.get("deferred", [])) if p in pid_map]
+            for pid in deferred:
+                for res in pid_map.get(pid, []):
+                    if res.mailing_address:
+                        continue
+                    ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+                    ed["mailing_lookup_deferred"] = True
+                    res.enrichment_data = ed
+            if deferred:
+                try:
+                    db.commit()
+                except Exception as exc:
+                    _logger.warning("Job %s: deferred-marker commit failed: %s", job_id, str(exc)[:120])
+                    db.rollback()
+            if king_error or deferred:
+                _publish_log(
+                    r, job_id, "warning",
+                    f"King County mailing lookup stopped early: {len(pids)} parcels requested, "
+                    f"{king_stats.get('mailing_attempted', 0)} looked up, {found} mailing addresses found; "
+                    f"{len(deferred)} deferred (property address kept)"
+                    + (f" — {king_error}" if king_error else ""),
+                    db=db,
+                )
+            else:
+                _publish_log(r, job_id, "info", f"Found {found}/{len(pids)} mailing addresses", db=db)
 
         # Owner-only repair for King tax-delinquent rows that ALREADY have a
         # mailing address (so the missing-mailing pass above skipped them — e.g.

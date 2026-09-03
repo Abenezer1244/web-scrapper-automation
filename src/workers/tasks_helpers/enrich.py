@@ -357,72 +357,10 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 db=db,
             )
 
-    # Pierce probate: repair a typo'd parcel_id from the legal description.
-    # ARMS occasionally indexes a non-existent parcel (wrong plat prefix), so the
-    # GIS-by-parcel pass above yields no address. Recover the property from the
-    # legal and replace the CONFIRMED-nonexistent parcel with the assessor's own,
-    # under strict single-match + shared-lot-suffix guards
-    # (src/scrapers/enrichment/pierce_legal_repair.py). Pierce/WA/probate only.
-    if (config.county.lower() == "pierce" and config.state.upper() == "WA"
-            and config.record_type == "probate"):
-        from src.scrapers.enrichment.pierce_legal_repair import (
-            find_pierce_parcels_by_legal,
-            parcel_hard_negative,
-            same_lot_suffix,
-        )
-        repair_targets = [
-            res for res in all_results
-            if res.legal_description and not res.property_address
-            and res.parcel_id and len(res.parcel_id.strip()) >= 6
-        ]
-        repaired = 0
-        for res in repair_targets:
-            # Only touch a parcel Pierce GIS PROVABLY lacks (hard negative) —
-            # never a transient lookup failure (Codex P1).
-            if not parcel_hard_negative(res.parcel_id):
-                continue
-            # A bare plat+lot legal can match several subdivisions; disambiguate
-            # by the scraped parcel's lot suffix and require EXACTLY ONE assessor
-            # parcel that shares it (differs only in the plat prefix — the
-            # confirmed typo class). 0 or >1 -> leave the row untouched.
-            legal_matches = find_pierce_parcels_by_legal(res.legal_description)
-            candidates = [
-                m for m in legal_matches
-                if m.get("property_address") and same_lot_suffix(res.parcel_id, m["parcel_id"])
-            ]
-            if len(candidates) != 1:
-                continue
-            match = candidates[0]
-            old_parcel = res.parcel_id
-            res.property_address = match["property_address"]
-            if match.get("mailing_address"):
-                res.mailing_address = match["mailing_address"]
-            res.parcel_id = match["parcel_id"]
-            ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
-            ed.update({
-                "parcel_source": "gis_legal_match",
-                "raw_scraped_parcel": old_parcel,
-                "gis_match_parcel": match["parcel_id"],
-                "gis_match_method": "plat_lot_unique_suffix",
-                "gis_legal_description": match.get("gis_legal_description"),
-                "gis_legal_survivors": len(legal_matches),  # audit: exact-lot survivors
-                "gis_suffix_matches": len(candidates),       # audit: after suffix disambiguation
-                "gis_parcel_hard_negative": True,            # scraped parcel confirmed absent
-            })
-            res.enrichment_data = ed  # reassign so SQLAlchemy flags the JSON dirty
-            repaired += 1
-        if repair_targets:
-            try:
-                db.commit()
-            except Exception as exc:
-                _logger.warning("Job %s: Pierce legal-repair commit failed: %s", job_id, str(exc)[:120])
-                db.rollback()
-            _publish_log(
-                r, job_id, "info",
-                f"Pierce legal repair: recovered {repaired}/{len(repair_targets)} "
-                "addresses + corrected parcel typos from legal description",
-                db=db,
-            )
+    # Pierce (WA): legal-description parcel repair + assessor (ATIP) address
+    # fallback. Extracted so scripts/rerun_pierce_address_recovery.py can re-run
+    # the SAME production path for an already-delivered job.
+    pierce_address_recovery(db, r, job_id, config, all_results)
 
     # King County: eRealProperty + Tax Bill for property + mailing
     if config.county.lower() == "king" and config.state.upper() == "WA":
@@ -448,7 +386,23 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             if len(pids) > _MAX_KING_PARCELS:
                 _logger.info("Capping King County mailing lookup to %d/%d parcels", _MAX_KING_PARCELS, len(pids))
                 pids = pids[:_MAX_KING_PARCELS]
-            enriched = asyncio.run(asyncio.wait_for(batch_enrich_king_county(pids), timeout=240))
+            # Internal time budget (200s) returns PARTIAL results; the outer
+            # wait_for(240) is only a last-resort kill switch. Either way the
+            # rest of enrichment (owner repair, unactionable summary, SKIP-TRACE
+            # ENQUEUE) must still run — before 2026-09-02 a TimeoutError here
+            # aborted all of it on every large King tax job (172+ parcels).
+            king_stats: dict = {}
+            king_error: str | None = None
+            try:
+                enriched = asyncio.run(asyncio.wait_for(
+                    batch_enrich_king_county(pids, time_budget_s=200, stats=king_stats),
+                    timeout=240,
+                ))
+            except Exception as exc:  # noqa: BLE001 — best-effort county lookup
+                king_error = f"{type(exc).__name__}: {str(exc)[:120]}"
+                _logger.warning("Job %s: King mailing lookup failed: %s", job_id, king_error)
+                enriched = {}
+                king_stats.setdefault("deferred", list(pids))
             # King tax-delinquent rows ship with a placeholder party_name because
             # the Socrata source has no owner column. The eRealProperty lookup
             # above now also yields the owner name; swap it in here. Dual gate:
@@ -494,7 +448,33 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 db.rollback()
                 db.commit()
             found = sum(1 for d in enriched.values() if d.get("mailing_address"))
-            _publish_log(r, job_id, "info", f"Found {found}/{len(pids)} mailing addresses", db=db)
+            # Durable marker for parcels the budget/cap/failure never reached, so a
+            # later sweep can find them (never a silent gap — Codex).
+            deferred = [p for p in dict.fromkeys(king_stats.get("deferred", [])) if p in pid_map]
+            for pid in deferred:
+                for res in pid_map.get(pid, []):
+                    if res.mailing_address:
+                        continue
+                    ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+                    ed["mailing_lookup_deferred"] = True
+                    res.enrichment_data = ed
+            if deferred:
+                try:
+                    db.commit()
+                except Exception as exc:
+                    _logger.warning("Job %s: deferred-marker commit failed: %s", job_id, str(exc)[:120])
+                    db.rollback()
+            if king_error or deferred:
+                _publish_log(
+                    r, job_id, "warning",
+                    f"King County mailing lookup stopped early: {len(pids)} parcels requested, "
+                    f"{king_stats.get('mailing_attempted', 0)} looked up, {found} mailing addresses found; "
+                    f"{len(deferred)} deferred (property address kept)"
+                    + (f" — {king_error}" if king_error else ""),
+                    db=db,
+                )
+            else:
+                _publish_log(r, job_id, "info", f"Found {found}/{len(pids)} mailing addresses", db=db)
 
         # Owner-only repair for King tax-delinquent rows that ALREADY have a
         # mailing address (so the missing-mailing pass above skipped them — e.g.
@@ -661,6 +641,168 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
     # submit in a batch. Actual Tracerfy calls happen in the dispatcher;
     # this step is instant and never blocks scrape completion.
     _enqueue_skip_trace_rows(db, job, r, job_id, config)
+
+
+def pierce_address_recovery(db, r, job_id: str, config, all_results) -> None:
+    """Pierce/WA only: (1) repair a recorder-typo parcel from the legal description
+    (free GIS, strict guards), then (2) fill still-missing addresses from the
+    assessor portal (ATIP, captcha-gated, address only). Both steps are fill-missing,
+    commit their own work and publish job-log lines; a source failure never raises.
+    Called inline at the end of every job's enrichment and by
+    scripts/rerun_pierce_address_recovery.py for an existing job.
+    """
+    # Pierce probate + pre_foreclosure: repair a typo'd parcel_id from the legal
+    # description. ARMS occasionally indexes a non-existent parcel (wrong plat
+    # prefix, one substituted digit, or a dropped digit), so the GIS-by-parcel
+    # pass above yields no address. Recover the property from the legal and
+    # replace the CONFIRMED-nonexistent parcel with the assessor's own, under
+    # strict guards (src/scrapers/enrichment/pierce_legal_repair.py): hard GIS
+    # negative -> exact plat/lot(/block) legal filters -> then the parcel guard.
+    _is_pierce = config.county.lower() == "pierce" and config.state.upper() == "WA"
+    if _is_pierce and config.record_type in ("probate", "pre_foreclosure"):
+        from src.scrapers.enrichment.pierce_legal_repair import (
+            find_pierce_parcels_by_legal,
+            legal_plat_adjacent,
+            parcel_hard_negative,
+            parcel_repair_method,
+            parse_pierce_legal,
+            same_lot_suffix,
+        )
+        repair_targets = [
+            res for res in all_results
+            if res.legal_description and not res.property_address
+            and res.parcel_id and len(res.parcel_id.strip()) >= 6
+        ]
+        repaired = 0
+        for res in repair_targets:
+            # Only touch a parcel Pierce GIS PROVABLY lacks (hard negative) —
+            # never a transient lookup failure (Codex P1).
+            if not parcel_hard_negative(res.parcel_id):
+                continue
+            legal_matches = [
+                m for m in find_pierce_parcels_by_legal(res.legal_description)
+                if m.get("property_address")
+            ]
+            if not legal_matches:
+                continue
+            parsed_legal = parse_pierce_legal(res.legal_description) or (None, None, None)
+            if len(legal_matches) == 1:
+                # ONE exact-legal survivor: accept the shared-suffix class OR a
+                # single-digit recorder typo (edit distance 1). The parcel guard
+                # runs AFTER the legal filters and never chooses between
+                # neighbours (Codex). The edit-1 class has no lot-suffix anchor,
+                # so it additionally requires the GIS legal to name the plat
+                # IMMEDIATELY before the lot (no "DIV 2"-style qualifier between).
+                only = legal_matches[0]
+                method = parcel_repair_method(res.parcel_id, only["parcel_id"])
+                if method == "plat_lot_unique_edit1" and not (
+                    parsed_legal[0]
+                    and legal_plat_adjacent(
+                        only.get("gis_legal_description"), parsed_legal[0], parsed_legal[1], parsed_legal[2]
+                    )
+                ):
+                    method = None
+                candidates = [only] if method else []
+            else:
+                # Several subdivisions share the plat+lot: ONLY the 6-digit lot
+                # suffix may disambiguate, and it must leave exactly one.
+                candidates = [
+                    m for m in legal_matches if same_lot_suffix(res.parcel_id, m["parcel_id"])
+                ]
+                method = "plat_lot_unique_suffix"
+            if len(candidates) != 1:
+                continue
+            match = candidates[0]
+            old_parcel = res.parcel_id
+            res.property_address = match["property_address"]
+            if match.get("mailing_address"):
+                res.mailing_address = match["mailing_address"]
+            res.parcel_id = match["parcel_id"]
+            ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+            ed.update({
+                "parcel_source": "gis_legal_match",
+                "raw_scraped_parcel": old_parcel,
+                "gis_match_parcel": match["parcel_id"],
+                "gis_match_method": method,
+                "gis_legal_description": match.get("gis_legal_description"),
+                "gis_legal_parsed": {"plat": parsed_legal[0], "lot": parsed_legal[1], "block": parsed_legal[2]},
+                "gis_legal_survivors": len(legal_matches),  # audit: exact-lot survivors
+                "gis_suffix_matches": len(candidates),       # audit: after the parcel guard
+                "gis_parcel_hard_negative": True,            # scraped parcel confirmed absent
+            })
+            res.enrichment_data = ed  # reassign so SQLAlchemy flags the JSON dirty
+            repaired += 1
+        if repair_targets:
+            try:
+                db.commit()
+            except Exception as exc:
+                _logger.warning("Job %s: Pierce legal-repair commit failed: %s", job_id, str(exc)[:120])
+                db.rollback()
+            _publish_log(
+                r, job_id, "info",
+                f"Pierce legal repair: recovered {repaired}/{len(repair_targets)} "
+                "addresses + corrected parcel typos from legal description",
+                db=db,
+            )
+
+    # Pierce assessor (ATIP) fallback for parcels the GIS layers cannot resolve —
+    # in practice personal-property MOBILE HOME accounts (a Notice of Foreclosure
+    # by a mobile-home park). Paid (captcha solve, ~$0.003/batch) so it runs LAST,
+    # only for rows still without a property address after the free GIS + legal
+    # passes, and only takes the ADDRESS (never the taxpayer name — see the
+    # module docstring for the RCW 42.56.070(8) boundary). Fill-missing only.
+    if _is_pierce:
+        atip_targets = [
+            res for res in all_results
+            if not res.property_address and res.parcel_id and len(res.parcel_id.strip()) >= 6
+        ]
+        if atip_targets:
+            from src.scrapers.enrichment.pierce_atip import lookup_atip_addresses
+            _publish_log(
+                r, job_id, "info",
+                f"Looking up {len(atip_targets)} addresses via the Pierce assessor...",
+                db=db,
+            )
+            atip_map: dict[str, list] = {}
+            for res in atip_targets:
+                atip_map.setdefault(res.parcel_id.strip(), []).append(res)
+            atip_results, atip_stats = lookup_atip_addresses(list(atip_map.keys()))
+            atip_filled = 0
+            for pid, data in atip_results.items():
+                for res in atip_map.get(pid, []):
+                    filled_fields: list[str] = []
+                    if not res.property_address and data.get("property_address"):
+                        res.property_address = data["property_address"]
+                        filled_fields.append("property_address")
+                    if not res.mailing_address and data.get("mailing_address"):
+                        res.mailing_address = data["mailing_address"]
+                        filled_fields.append("mailing_address")
+                    if not filled_fields:
+                        continue
+                    # Provenance (audit boundary — ADDRESS only, never the taxpayer
+                    # name): which parcel/account was queried and which fields it filled.
+                    ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+                    ed.update({
+                        "address_source": "pierce_atip",
+                        "atip_parcel": pid,
+                        "atip_filled_fields": filled_fields,
+                        "atip_account_type": data.get("atip_account_type"),
+                        "atip_use_code": data.get("atip_use_code"),
+                    })
+                    res.enrichment_data = ed
+                    if "property_address" in filled_fields:
+                        atip_filled += 1
+            try:
+                db.commit()
+            except Exception as exc:
+                _logger.warning("Job %s: ATIP enrichment commit failed: %s", job_id, str(exc)[:120])
+                db.rollback()
+            _publish_log(
+                r, job_id, "info",
+                f"Assessor lookup: {atip_filled}/{len(atip_targets)} addresses found "
+                f"({atip_stats['not_found']} not on file, {atip_stats['hard_failure']} errors)",
+                db=db,
+            )
 
 
 def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:

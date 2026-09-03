@@ -126,6 +126,140 @@ computed fields run in `model_post_init` on every read. Trustees print the same 
 
 ---
 
+## 2026-09-02 — "Test 2" (Pierce pre_foreclosure) data-quality audit: NTS re-match window + real ARMS doc types
+
+**Built / Shipped:** branch `fix/test2-data-quality` (worktree `bridgeleads-worktrees/test2-dq`, off
+main `5106fe0`; NOT pushed/merged this session). Two root-cause fixes, no migration:
+- `src/workers/nts_matcher_task.py` — beat re-match window `_RECENT_DAYS` 45 → **180**. RCW
+  61.24.040(1)/(5): the notice of sale is recorded ≥ 90/120 days before the sale and published
+  35–28 / 14–7 days before it, so the newspaper cache sees a lead's notice **55–150 days AFTER
+  recording**. The 45-day window aged leads out first — prod proof: 21 Pierce leads (created
+  6/23–7/1, recorded 5/11–5/22) with an EXACT parcel match to an ACTIVE notice fetched 9/2 were
+  never enriched. Candidate volume 45d=1,122 vs 180d=1,755 rows (trivial).
+- `src/scrapers/pierce_wa_probate.py` — pre_foreclosure rows now store the REAL ARMS grid
+  document type (`NOTICE OF DEFAULT` / `NOTICE OF FORECLOSURE` / `LIS PENDENS` / `TRUSTEE SALE`,
+  exact closed-set match against the searched checkbox labels, fallback unchanged) instead of
+  the flat `PRE-FORECLOSURE`. Only a TRUSTEE SALE can ever carry auction fields.
+- Tests: `tests/test_pierce_arms_doc_type.py` (7, fixture = live grid layout captured 9/2),
+  `tests/test_nts_matcher_task.py` +2 (tripwire ≥150d + real-DB beat re-match of a 120-day-old
+  lead). Patched parser also run against 2 LIVE ARMS result pages: 48 rows, doc types captured,
+  0 party/legal mismatches vs the stored Test 2 rows.
+
+**Tried / Decided:**
+- Traced every blank field to its layer with prod SQL + live sources (ARMS instrument search,
+  ATIP, Pierce GIS, WA statewide GIS, Tacoma Daily Index cache) before touching code.
+- Auction Date / Default Owed blank on all 217 Test 2 rows = **correct today**: NOD / Lis Pendens
+  / Notice of Foreclosure have no sale date at source; the ~90 TRUSTEE SALE rows (recorded
+  6/3–9/1) had not been published yet as of 9/2. The window bug would have made ~half of them
+  permanently blank; fixed.
+- **Not fixed, escalated:** 12 parcel-but-no-address rows are Pierce **Mobile Home** personal-
+  property accounts (counterparty = MHP/HOA; ATIP `acct_type: Mobile Home`). The GIS Tax_Parcels
+  layer + WA statewide layer return 0 features for them (verified). ATIP HAS the site/mailing
+  address but `/api/pcAtipSummary` is reCAPTCHA-Enterprise gated (plain HTTP → `[]`) and the
+  portal cites RCW 42.56.070(8). Product/legal call, not a scraper fix.
+- **Not fixed by design:** 3 name-only rows — verified on ARMS detail pages the Legal
+  Description tab has **no Parcel Id** (2 TRUSTEE SALE, 1 LIS PENDENS). GIS legal lookup is
+  ambiguous (PALMER LAKE L 28 B 5 exists in two subdivisions). Kept as real source records.
+- **Not fixed:** 2 recorder-typo parcels (`9066600050` → real `9066000050`; `718500090` →
+  real `7185000190`). The probate legal-repair guards (same lot suffix, no BLK) reject both.
+- Codex consult (GATE: PASS): ship the window fix with a real-DB behavior test and document
+  the re-notice caveat; ship the doc-type capture only after checking consumers (none key on
+  `"PRE-FORECLOSURE"`) and the hash effect (see *Facts learned*).
+
+**Failed / Blocked:**
+- Local rig: `pg_ctl -w start` and `nohup … &` inside the Bash tool hang/kill the process; two
+  competing `proxy6543.py` instances made 6543 close every connection. Fix: kill all proxies,
+  start ONE via PowerShell `Start-Process -WindowStyle Hidden`; restart PG the same way.
+- ATIP cannot be scripted without a browser + captcha token — no enrichment path for mobile homes.
+
+**Caught & fixed:** `self.clean()` returns `None` for an empty cell → `.upper()` crash in the
+new `_grid_doc_type` (caught by the fixture tests before review).
+
+**Pending / Handoff:**
+- 👤 Push + PR `fix/test2-data-quality`; deploy **worker** (beat) + api. First beat after deploy
+  enriches the 21 aged-out Pierce leads; Test 2's trustee sales fill in as the paper publishes
+  them (≈ 9/8 → late Nov). Nothing to backfill by hand; **do not** patch rows.
+- 👤 Decide mobile-home address enrichment (ATIP captcha + RCW 42.56.070(8)).
+- Live ARMS shows **235** records for Test 2's window vs 217 scraped 9/2 — late indexing of
+  9/1 filings + the intentional no-person drop; not audited row-by-row.
+
+**Round 2 (same day, user: "we have a recaptcha passer so use that" / "is 3b fixed?"):**
+- **Built:** `src/scrapers/enrichment/pierce_atip.py` — assessor (ATIP) address fallback for
+  parcels the GIS layers cannot resolve (mobile-home accounts). ATIP's JSON API is reCAPTCHA
+  **Enterprise**-gated via a `recaptcha-response` header; a 2Captcha Enterprise token (~12s,
+  ~$0.003) unlocks it over plain HTTP and is REUSED (server verification cached ~10 min).
+  Response classes verified live: rejected token → 200 + EMPTY body; unknown parcel → `[]`.
+  Solve once, reuse until rejected, re-solve once, circuit on 3 consecutive hard failures,
+  cap 100/call. Takes ONLY situs + mailing (never the taxpayer `name`; RCW 42.56.070(8)
+  boundary documented in the module). `captcha.solve_recaptcha` gained `enterprise=`; its
+  cache is now keyed `(sitekey, site_url, enterprise)`.
+- **Built:** `pierce_legal_repair` extended (probate + pre_foreclosure): trailing `LT n BLK m`
+  parsed with bounded block tokens; parcel guard = lot-suffix OR digit edit-distance 1, the
+  latter ONLY for a single exact-legal survivor whose GIS legal names the plat IMMEDIATELY
+  before the lot (`legal_plat_adjacent`, Codex P2). Both live typo rows resolve
+  (`9066600050→9066000050` 5505 201ST STREET CT E; `718500090→7185000190` 6117 119TH ST SW).
+- **Built:** `enrich.pierce_address_recovery()` (extracted; inline after GIS) +
+  `scripts/rerun_pierce_address_recovery.py <job_id> [--dry-run]` to re-run the SAME path on
+  an existing job. Dry run on Test 2 lists the 12 rows; the live write was BLOCKED by the
+  agent permission classifier → 👤 run it: `railway run --service worker python
+  scripts/rerun_pierce_address_recovery.py e72bd6bf-6bf4-4562-abe9-9de3375d5380`
+  (expected: 2 via legal repair + 9 via ATIP; `9009002080` stays unresolved — not on file
+  anywhere, no legal to repair from). **User authorised; RAN 2026-09-02 13:31 UTC: 11/12
+  filled** (2 legal repair + 9 ATIP, one captcha solve), `parcel_no_addr` 12 → 1, API
+  `enriched_count` 202 → 213, job_logs carry the two assessor lines, Results page shows only
+  the 3 name-only rows blank. First attempt died on `redis.railway.internal` (pub/sub is
+  private-network only) AFTER the legal-repair commit → script now wraps Redis in a
+  best-effort publisher and recomputes owner flags like the worker's post-enrichment pass.
+- **🛑 SECURITY (Codex P1, ops):** `tests/test_atip_enrichment.py` + `tests/test_atip_detail.py`
+  (exploratory scripts, not pytest tests, no importers) hardcoded a 2Captcha API key
+  `af6f…f829` in git since commit `5483840`. It is NOT the prod key (prod ends `…1b05`) but
+  must be **revoked at 2Captcha**; files deleted here. NO-GO for merge until revoked.
+- **Answered:** "parcel but no name" rows are `test 10 - King Tax Delinquent` (384 rows, 0
+  names) — King Socrata has no owner column and owner lookup is BLOCKED by the standing
+  RCW 42.56.070(9) decision; its 172 missing addresses = King enrichment failed on that job
+  ("Address enrichment failed" in the job log; King rate-block incident). Not Test 2.
+- Tests: 81 passing across the touched files (+`test_pierce_atip.py`, `test_captcha_token_cache.py`,
+  legal-repair block/edit-1/adjacency cases).
+
+**Round 3 (user: "work on all 1 by 1, verify with Codex"):**
+- #1 leaked 2Captcha key: `res.php?action=getbalance` → `ERROR_KEY_DOES_NOT_EXIST` — already dead.
+- #5 King tax "Address enrichment failed" ROOT CAUSE: every King job with a large mailing pass
+  (172 / 7,542 / 8,626 parcels) died in the caller's `asyncio.wait_for(240)` around the Playwright
+  mailing lookup (~5–10 s/parcel); jobs ≤ 42 succeeded. The exception aborted the rest of
+  enrichment incl. SKIP-TRACE ENQUEUE (384/384 rows `not_attempted`). `external_source_health`
+  was empty (not the throttle gate). Fix: `batch_enrich_king_county(time_budget_s=, stats=)`
+  checks a monotonic deadline before every HTTP fetch / navigation and before launching the
+  browser, returns PARTIAL results; caller passes 200 s inside the 240 s kill-switch, wraps in
+  try/except, marks un-attempted parcels `enrichment_data.mailing_lookup_deferred=true`, and
+  logs a 4-number warning. Skip trace + unactionable summary now always run.
+- #6 crawler completeness: walked 40 listing pages (56 NTS) vs cache → 6 missing. 4 were PARSER
+  rejects (real layouts, fixtures saved): "at the hour of" between date/time, weekday prefix
+  ("will, on Friday, August 28, 2026"), "10 o'clock" without minutes, prose "defaul**ts no**w"
+  read as a TS#, "Assessor's Parcel No." label, and "Instrument Number N (Deed of Trust)" deed
+  ref. 2 were simply beyond the beat's 10-page walk on their day. One-off 40-page crawl
+  ingested all 6 (cache 55 → 61, 16 active). Matcher run with the 180-day window: **32 leads
+  enriched** (the 21 aged-out + new).
+- #9 235 vs 217: walked all ARMS pages — 0 rows lost by parsing; 12 intentional no-person drops
+  (commercial LLC borrowers + 6 "[R] [E]" blank-index rows), 6 filings indexed after the scrape.
+- #11 recovery re-run on the other 5 Pierce jobs: 26/28 filled (2 parcels not on file anywhere).
+- Full suite on the rig: 17 auth/API failures were rig PHANTOMS (concurrent `railway run`);
+  all pass in isolation (292 + 80 + 48).
+- Deferred with reasoning: #7 (address key without ZIP — every Pierce notice carries a parcel;
+  a street-only match risks cross-city false attaches), #10 (legacy `PRE-FORECLOSURE` rows —
+  new scrapes carry the real label), #12 (do not switch the shared checkout under other agents).
+
+**Facts learned:**
+- Pierce ARMS `SearchEntry.aspx` has instrument-number search fields
+  (`cphNoMargin_f_txtInstrumentNoFrom/To`) — fastest way to verify one recorded doc.
+- The ARMS results grid DOES print the document type per row (twice); the old "no reliable
+  doc-type column" comment was wrong.
+- `raw_html_hash = make_hash(record.to_dict())` includes `doc_type`, so a same-job watchdog
+  re-run straddling this deploy would append rows (then flagged `is_duplicate` by the
+  parcel|address billing dedup). One-time, accepted.
+- Pierce mobile-home accounts look like 10-digit parcels (`5000050810`, `4243091386`, …) but are
+  absent from every parcel GIS layer; `heirs` = `… MHP LLC / MHC LLC / HOMEOWNERS COOPERATIVE`
+  is the tell.
+
 ## 2026-07-30 — Snohomish tax list changed shape under us: 17→15 fields, connector down 5 weeks
 
 **Built / Shipped:** `fix(snohomish)` — PR #172, squash **`3303dc4`**, no migration. Verified

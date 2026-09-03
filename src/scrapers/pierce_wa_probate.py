@@ -116,6 +116,22 @@ class PierceWAARMSScraper(BridgeScraper):
         },
     }
 
+    # ARMS document-type checkbox id → the exact label ARMS prints in the results
+    # grid's document-type cell (verified live 2026-09-02 on SearchEntry.aspx).
+    # Used to store the REAL recorded document type on pre_foreclosure rows instead
+    # of collapsing four distinct filings into one "PRE-FORECLOSURE" label: only a
+    # TRUSTEE SALE can ever carry an auction date / default amount (NTS cache
+    # match), so the user must be able to tell a Notice of Default or Lis Pendens
+    # (no sale scheduled — auction fields are legitimately blank) from a Notice of
+    # Trustee Sale. Matched NON-positionally by exact cell text against this closed
+    # set, so a grid column shuffle can only fall back, never mislabel.
+    ARMS_DOC_TYPE_LABELS: dict[str, str] = {
+        "187": "NOTICE OF DEFAULT",
+        "188": "NOTICE OF FORECLOSURE",
+        "146": "LIS PENDENS",
+        "324": "TRUSTEE SALE",
+    }
+
     @classmethod
     def collection_scope(cls, record_type: str):
         """SHOW descriptor — Pierce selects exact ARMS document-type checkboxes."""
@@ -738,12 +754,37 @@ class PierceWAARMSScraper(BridgeScraper):
         if any(kw in record.party_name for kw in junk):
             return None
 
-        # ARMS results rows carry no reliable per-row doc-type column we can map
-        # non-positionally; the search was filtered to this connector's
-        # document-type checkboxes, so the configured label IS the doc type.
-        record.doc_type = self.DOC_TYPE_LABEL
+        # The search was filtered to this connector's document-type checkboxes, so
+        # the configured label is always a CORRECT doc type. For pre_foreclosure
+        # (four distinct filings behind one label) prefer the exact ARMS document
+        # type the grid prints for the row, matched non-positionally against the
+        # closed set of labels for the checked boxes; anything else keeps the
+        # category label (never a guess from an unrecognised cell).
+        record.doc_type = self._grid_doc_type(cells) or self.DOC_TYPE_LABEL
 
         return record
+
+    def _grid_doc_type(self, cells: list[Tag]) -> str | None:
+        """The row's exact ARMS document-type label, or None.
+
+        pre_foreclosure only: returns the first cell whose cleaned text is exactly
+        one of ARMS_DOC_TYPE_LABELS for the checkbox ids this run searched
+        (self.DOC_TYPE_IDS — honours an explicit doc_types narrowing). A row can
+        only ever be one of the searched types, so an exact hit is authoritative;
+        a partial/unknown cell never matches.
+        """
+        if self._record_type != "pre_foreclosure":
+            return None
+        wanted = {
+            self.ARMS_DOC_TYPE_LABELS[i] for i in self.DOC_TYPE_IDS if i in self.ARMS_DOC_TYPE_LABELS
+        }
+        if not wanted:
+            return None
+        for c in cells:
+            text = (self.clean(c.get_text(separator=" ", strip=True)) or "").upper()
+            if text in wanted:
+                return text
+        return None
 
     @staticmethod
     def _parse_name_cell(cell: Tag) -> tuple[str | None, str | None]:

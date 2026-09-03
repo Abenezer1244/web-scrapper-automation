@@ -50,10 +50,13 @@ def _keep_situs_parts(res, gis_data: dict) -> None:
             res.property_state = parsed["state"][:2]
         if parsed.get("zip") and not res.property_zip:
             res.property_zip = parsed["zip"][:10]
-    for col in ("property_city", "property_state", "property_zip"):
+    for col, width in (("property_city", 128), ("property_state", 2), ("property_zip", 10)):
         val = gis_data.get(col)
         if val and not getattr(res, col):
-            setattr(res, col, str(val)[: 128 if col == "property_city" else 10])
+            val = str(val).strip()
+            if col == "property_state" and not re.fullmatch(r"[A-Za-z]{2}", val):
+                continue  # only a clean 2-letter abbreviation is a state (Codex P2)
+            setattr(res, col, val[:width])
 
 
 async def _run_scraper(

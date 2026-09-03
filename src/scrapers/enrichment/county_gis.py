@@ -454,6 +454,8 @@ def _map_county_features(
 
 
 _CITY_STATE_RE = re.compile(r"^\s*(.+?)\s*,\s*([A-Z]{2})\s*$")
+# "PO BOX", "P.O. BOX", "P O BOX", "P.O BOX", "POB" — any post-office box spelling.
+_PO_BOX_RE = re.compile(r"^\s*P\.?\s*O\.?\s*B(?:OX)?\b", re.I)
 
 
 def _situs_parts_from_confirmed_mailing(
@@ -469,7 +471,7 @@ def _situs_parts_from_confirmed_mailing(
         return {}
     delivery = " ".join(str(attrs.get(fields[0]) or "").split()).upper()
     site = " ".join(property_address.split()).upper()
-    if not delivery or delivery != site or delivery.startswith("PO BOX") or delivery.startswith("P.O."):
+    if not delivery or delivery != site or _PO_BOX_RE.match(delivery):
         return {}
     m = _CITY_STATE_RE.match(str(attrs.get(fields[1]) or ""))
     zipcode = str(attrs.get(fields[2]) or "").strip()

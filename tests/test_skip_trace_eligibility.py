@@ -113,7 +113,8 @@ class TestPendingRowPayload:
         assert payload["mail_zip"] is None
 
     def test_statewide_shaped_property_address_carries_locality(self):
-        # county_gis._statewide_result stores "STREET, CITY, WA ZIP" and no mailing
+        # Any source that stores a full "STREET, CITY, WA ZIP" property_address
+        # (recorder notices, King assessor) must still yield locality with no mailing.
         payload = build_pending_row_payload(_result(
             property_address="123 MAIN ST, OLYMPIA, WA 98501", mailing_address=None,
         ))

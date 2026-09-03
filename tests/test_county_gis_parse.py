@@ -1,39 +1,74 @@
 """GIS response shaping (src/scrapers/enrichment/county_gis.py) — pure, no network.
 
-Pins the 2026-09-02 fix: a parcel layer that has NO owner/mailing fields (the WA
-statewide Current_Parcels fallback, or a generic config without mailing_fields)
-must NOT copy the situs into `mailing_address`. That copy read downstream as a
+Pins the 2026-09-02 policy: a parcel layer that has NO owner/mailing fields (the WA
+statewide Current_Parcels fallback, or a generic config without mailing_fields) must
+NOT copy the situs into `mailing_address`. That copy read downstream as a
 county-supplied mailing address: absentee_owner=False ("owner-occupied") and a
-Mailing column the county never provided. The situs locality is kept on
-property_address so skip trace still gets city/state/zip.
+Mailing column the county never provided.
+
+The situs locality it DOES know travels in the structured `property_city` /
+`property_state` / `property_zip` parts (migration 085) beside a FROZEN street-only
+`property_address` — not folded into the address string, which is an identity/cache
+key elsewhere.
 """
 from src.scrapers.enrichment.county_gis import (
     _KNOWN_GIS_ENDPOINTS,
     _make_generic_config,
     _parse_gis_response,
-    _statewide_result,
+    _situs_parts,
+    _situs_parts_from_confirmed_mailing,
 )
 
 
-class TestStatewideResult:
-    def test_mailing_is_never_fabricated(self):
-        r = _statewide_result("123 MAIN ST", "OLYMPIA", "98501", "12345678")
-        assert r["mailing_address"] is None
-        assert r["parcel_id"] == "12345678"
+class TestSitusParts:
+    """WA statewide rows: structured situs parts, never a fabricated mailing line."""
 
-    def test_locality_kept_on_property_address(self):
-        r = _statewide_result("123 MAIN ST", "OLYMPIA", "98501", "1")
-        assert r["property_address"] == "123 MAIN ST, OLYMPIA, WA 98501"
+    def test_city_and_zip_are_kept_as_parts(self):
+        assert _situs_parts("OLYMPIA", "98501") == {
+            "property_city": "OLYMPIA", "property_state": "WA", "property_zip": "98501",
+        }
 
-    def test_city_without_zip(self):
-        r = _statewide_result("123 MAIN ST", "OLYMPIA", "", "1")
-        assert r["property_address"] == "123 MAIN ST, OLYMPIA, WA"
+    def test_state_is_wa_by_construction(self):
+        # The layer IS the WA parcel service, queried with the county FIPS.
+        assert _situs_parts("", "")["property_state"] == "WA"
 
-    def test_no_city_keeps_bare_street(self):
-        # "STREET, WA 98501" would be mis-parsed as city="WA 98501" downstream
-        r = _statewide_result("123 MAIN ST", "", "98501", "1")
-        assert r["property_address"] == "123 MAIN ST"
-        assert r["mailing_address"] is None
+    def test_missing_city_or_zip_is_none_not_empty_string(self):
+        r = _situs_parts("", "98501")
+        assert r["property_city"] is None and r["property_zip"] == "98501"
+        r = _situs_parts("OLYMPIA", "")
+        assert r["property_city"] == "OLYMPIA" and r["property_zip"] is None
+
+    def test_internal_whitespace_is_collapsed(self):
+        assert _situs_parts("  GIG   HARBOR ", " 98335 ")["property_city"] == "GIG HARBOR"
+
+
+class TestSitusPartsFromConfirmedMailing:
+    """County rows only yield situs parts when the county itself says the owner's
+    mail goes to the property (Delivery_Address == Site_Address, not a PO box)."""
+
+    def _cfg(self):
+        return {"mailing_fields": ["Delivery_Address", "City_State", "Zipcode"]}
+
+    def test_confirmed_owner_occupied_yields_parts(self):
+        r = _situs_parts_from_confirmed_mailing(
+            {"Delivery_Address": "20508 ISLAND PKWY E", "City_State": "LAKE TAPPS, WA",
+             "Zipcode": "98391"},
+            "20508 ISLAND PKWY E", self._cfg(),
+        )
+        assert r == {"property_city": "LAKE TAPPS", "property_state": "WA",
+                     "property_zip": "98391"}
+
+    def test_mailing_elsewhere_yields_nothing(self):
+        assert _situs_parts_from_confirmed_mailing(
+            {"Delivery_Address": "1 OTHER ST", "City_State": "TACOMA, WA", "Zipcode": "98401"},
+            "20508 ISLAND PKWY E", self._cfg(),
+        ) == {}
+
+    def test_po_box_yields_nothing(self):
+        assert _situs_parts_from_confirmed_mailing(
+            {"Delivery_Address": "PO BOX 5", "City_State": "TACOMA, WA", "Zipcode": "98401"},
+            "PO BOX 5", self._cfg(),
+        ) == {}
 
 
 class TestParseGisResponse:

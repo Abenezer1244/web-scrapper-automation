@@ -22,7 +22,23 @@ from src.workers import app
 
 _logger = setup_logger("workers.nts_matcher")
 
-_RECENT_DAYS = 45  # beat re-match window for un-enriched pre_foreclosure leads
+# Beat re-match window for un-enriched pre_foreclosure leads, anchored on the
+# Result's created_at. It must cover the STATUTORY lag between a lead being
+# recorded and its trustee-sale notice reaching the newspaper cache:
+# RCW 61.24.040(1) records the notice of sale >= 90 days (120 with a 61.24.031
+# letter) before the sale, and 61.24.040(5) publishes it between the 35th–28th and
+# 14th–7th day before the sale — so publication lands ~55–150 days AFTER recording
+# (prod-observed recording→auction gap on matched leads: mostly 114–179 days). The
+# previous 45-day window aged leads out before their notice was ever published:
+# 2026-09-02 audit found 21 Pierce leads (created 6/23–7/1) with an EXACT parcel
+# match to an ACTIVE notice fetched 9/2 that were never enriched. 180 days from
+# creation covers the horizon (a lead is created no later than its scrape, which
+# is itself after recording); candidate volume is small (~1.8k rows total).
+# Caveat (Codex): an exact-parcel active notice attached to an older unmatched lead
+# CAN be a later re-notice of the same property after a cured default — still the
+# same property in active distress (the product's "urgency clock"), but not
+# necessarily the same recorded instrument as that lead's row.
+_RECENT_DAYS = 180
 
 # Counties with an NTS cache source wired up (Pierce=Tacoma Daily Index, Snohomish=
 # Snohomish County Tribune, King=Queen Anne & Magnolia News, Clark=The Columbian

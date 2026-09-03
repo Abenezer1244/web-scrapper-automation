@@ -25,7 +25,18 @@ neighbouring property:
      the scraped parcel (differ only in the plat prefix — the confirmed defect
      class). Full provenance is stored in enrichment_data for audit.
 
-Scope: Pierce/WA/probate only. HTTP calls go through safe_get (SSRF defense).
+Extended 2026-09-02 (Test 2 audit, Codex-reviewed) for two more live typo classes
+seen on pre_foreclosure rows, under the SAME hard-negative + exact-legal guards:
+  * "THORSON RIDGE LT 5" scraped 9066600050, real 9066000050 (one substituted
+    digit); "RHODODENDRON LANES LT 6 BLK 3" scraped 718500090 (9 digits), real
+    7185000190 (one dropped digit). So: a trailing "BLK m" is parsed and the
+    candidate legal must carry the same bounded block token; and the parcel guard
+    accepts a digit-string edit distance of exactly 1 — but ONLY when the legal
+    filters already left EXACTLY ONE survivor (edit distance never chooses
+    between neighbours; the 6-digit lot-suffix rule remains the only guard
+    allowed to disambiguate several survivors).
+
+Scope: Pierce/WA, probate + pre_foreclosure. HTTP calls go through safe_get (SSRF defense).
 """
 from __future__ import annotations
 
@@ -60,13 +71,20 @@ _LOT_IN_SCRAPE = re.compile(r"\bL(?:OT|T)?\s*#?\s*0*(\d{1,4})\b", re.IGNORECASE)
 # LIKE metacharacters that would widen an ArcGIS where-clause if unescaped.
 _LIKE_META = re.compile(r"[%_]")
 
+# A single trailing block qualifier right after the lot ("... LT 6 BLK 3"). Only
+# this exact position is modelled; a block anywhere else is still rejected by
+# _UNMODELED. Bounded so "BLK 30" can never parse as block 3.
+_TRAILING_BLOCK = re.compile(r"\s+B(?:LK|LOCK)?\s*#?\s*0*(\d{1,4})\s*$", re.IGNORECASE)
 
-def parse_pierce_legal(legal: str | None) -> tuple[str, str] | None:
-    """Parse "PARKWOOD LT 11 (+)" -> ("PARKWOOD", "11").
 
-    Returns (plat, lot) for a SIMPLE single-lot platted legal, or None when the
-    legal is empty, has no lot, carries an unmodeled qualifier, or the plat name
-    is unusable (too short / contains a LIKE metacharacter).
+def parse_pierce_legal(legal: str | None) -> tuple[str, str, str | None] | None:
+    """Parse "PARKWOOD LT 11 (+)" -> ("PARKWOOD", "11", None);
+    "RHODODENDRON LANES LT 6 BLK 3 (+)" -> ("RHODODENDRON LANES", "6", "3").
+
+    Returns (plat, lot, block) for a SIMPLE single-lot platted legal (block is
+    None when absent), or None when the legal is empty, has no lot, carries an
+    unmodeled qualifier, or the plat name is unusable (too short / contains a
+    LIKE metacharacter).
     """
     if not legal:
         return None
@@ -74,6 +92,12 @@ def parse_pierce_legal(legal: str | None) -> tuple[str, str] | None:
     text = re.sub(r"\s+", " ", text)
     if not text:
         return None
+
+    block: str | None = None
+    bm = _TRAILING_BLOCK.search(text)
+    if bm:
+        block = bm.group(1).lstrip("0") or "0"
+        text = text[: bm.start()].strip()
 
     m = _LOT_IN_SCRAPE.search(text)
     if not m:
@@ -83,11 +107,13 @@ def parse_pierce_legal(legal: str | None) -> tuple[str, str] | None:
 
     # Reject anything we do not model on EITHER side of the lot token, so a
     # "PARKWOOD DIV 3 LT 11" or "PARKWOOD LTS 11-12" never reduces to (PARKWOOD, 11).
+    # (The one trailing block clause was already split off above; any OTHER block
+    # placement is still caught here.)
     if _UNMODELED.search(text):
         return None
     if len(plat) < 3 or _LIKE_META.search(plat) or not any(c.isalpha() for c in plat):
         return None
-    return plat, lot
+    return plat, lot, block
 
 
 def _lot_token_re(lot: str) -> re.Pattern:
@@ -99,14 +125,27 @@ def _lot_token_re(lot: str) -> re.Pattern:
     )
 
 
-def collect_legal_matches(features: list[dict], plat: str, lot: str) -> list[dict]:
+def _block_token_re(block: str) -> re.Pattern:
+    """Exact bounded block matcher for a candidate GIS legal: "B 3" / "BLK 3" /
+    "BLOCK 03" but NOT "B 30" nor "B 3-4" (Codex: bounded tokens, never substrings)."""
+    return re.compile(
+        rf"\bB(?:LK|LOCK)?\s*#?\s*0*{re.escape(block)}\b(?!\s*[-&/,]\s*\d)",
+        re.IGNORECASE,
+    )
+
+
+def collect_legal_matches(
+    features: list[dict], plat: str, lot: str, block: str | None = None
+) -> list[dict]:
     """From raw ArcGIS features, keep every candidate whose Legal_Description
-    contains the plat AND the exact singular lot token AND a non-empty situs
-    address. Returns a list (a bare plat+lot can hit multiple subdivisions —
-    e.g. PARKWOOD / PARKWOOD DIV 2 / DIV 3 each have a lot 11); the caller
+    contains the plat AND the exact singular lot token AND (when the scraped
+    legal names one) the exact block token AND a non-empty situs address.
+    Returns a list (a bare plat+lot can hit multiple subdivisions — e.g.
+    PARKWOOD / PARKWOOD DIV 2 / DIV 3 each have a lot 11); the caller
     disambiguates by the scraped parcel's lot suffix.
     """
     tok = _lot_token_re(lot)
+    btok = _block_token_re(block) if block else None
     plat_up = plat.upper()
     out: list[dict] = []
     for f in features or []:
@@ -114,6 +153,8 @@ def collect_legal_matches(features: list[dict], plat: str, lot: str) -> list[dic
         legal = (attrs.get("Legal_Description") or "").upper()
         site = (attrs.get("Site_Address") or "").replace("&nbsp;", "").strip()
         if not site or plat_up not in legal or not tok.search(legal):
+            continue
+        if btok is not None and not btok.search(legal):
             continue
         # NB: do NOT apply _UNMODELED here — every Pierce GIS legal begins with
         # "Section .. Township .. Range .. Quarter ..", so it would reject all
@@ -139,6 +180,53 @@ def same_lot_suffix(scraped: str | None, matched: str | None) -> bool:
     if len(a) != 10 or len(b) != 10:
         return False
     return a[4:] == b[4:] and a[:4] != b[:4]
+
+
+def _digit_edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance between two digit strings (small inputs, O(n*m))."""
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def legal_plat_adjacent(gis_legal: str | None, plat: str, lot: str, block: str | None = None) -> bool:
+    """True when the GIS legal names the plat IMMEDIATELY followed by the lot token
+    (and the block token, when given): "… RHODODENDRON LANES L 6 B 3 …",
+    "THORSON RIDGE: THORSON RIDGE L 5 …". A subdivision qualifier between plat and
+    lot ("PARKWOOD DIV 2 L 11") fails — so the edit-distance path, which has no
+    lot-suffix anchor, can never adopt a neighbouring division's lot (Codex)."""
+    if not gis_legal:
+        return False
+    legal = re.sub(r"\s+", " ", gis_legal.upper())
+    pat = rf"\b{re.escape(plat.upper())}\s*:?\s+L(?:OT|T)?\s*#?\s*0*{re.escape(lot)}\b(?!\s*[-&/,]\s*\d)"
+    if block:
+        pat += rf"\s+B(?:LK|LOCK)?\s*#?\s*0*{re.escape(block)}\b(?!\s*[-&/,]\s*\d)"
+    return re.search(pat, legal) is not None
+
+
+def parcel_repair_method(scraped: str | None, matched: str | None) -> str | None:
+    """Which guard (if any) lets ``matched`` replace ``scraped``.
+
+    "plat_lot_unique_suffix" — same 6-digit lot suffix, different 4-digit plat
+    prefix (the original confirmed class; also the ONLY rule allowed to pick one
+    of several legal survivors). "plat_lot_unique_edit1" — the digit strings
+    differ by exactly one substitution / insertion / deletion (recorder typo or
+    dropped digit); the caller must only use this when the legal filters left a
+    SINGLE survivor. None otherwise (never replace).
+    """
+    if same_lot_suffix(scraped, matched):
+        return "plat_lot_unique_suffix"
+    a = re.sub(r"\D", "", scraped or "")
+    b = re.sub(r"\D", "", matched or "")
+    if len(b) != 10 or not (6 <= len(a) <= 10) or a == b:
+        return None
+    if _digit_edit_distance(a, b) == 1:
+        return "plat_lot_unique_edit1"
+    return None
 
 
 def parcel_hard_negative(parcel_id: str | None) -> bool:
@@ -179,7 +267,7 @@ def find_pierce_parcels_by_legal(legal: str | None) -> list[dict]:
     parsed = parse_pierce_legal(legal)
     if not parsed:
         return []
-    plat, lot = parsed
+    plat, lot, block = parsed
     like_plat = plat.replace("'", "''")  # metachars already rejected in parse
     # Pull the whole plat in one request: the Pierce FeatureServer maxRecordCount
     # is 2000, so a plat under that returns complete (exceededTransferLimit=false)
@@ -207,9 +295,9 @@ def find_pierce_parcels_by_legal(legal: str | None) -> list[dict]:
         if data.get("exceededTransferLimit") or len(feats) >= cap:
             _logger.info("Pierce legal %r/%s ambiguous: server capped (%d rows)", plat, lot, len(feats))
             return []
-        matches = collect_legal_matches(feats, plat, lot)
-        _logger.info("Pierce legal %r LT %s: %d plat rows, %d exact-lot survivors",
-                     plat, lot, len(feats), len(matches))
+        matches = collect_legal_matches(feats, plat, lot, block)
+        _logger.info("Pierce legal %r LT %s BLK %s: %d plat rows, %d exact-lot survivors",
+                     plat, lot, block, len(feats), len(matches))
         return matches
     except Exception as exc:
         _logger.warning("Pierce legal lookup failed for %r: %s", plat, str(exc)[:80])

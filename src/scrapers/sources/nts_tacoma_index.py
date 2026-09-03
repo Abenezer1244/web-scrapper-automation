@@ -77,14 +77,26 @@ _STOP = (
     # trustee text (live 2026-07-04). Added alongside the existing "Original beneficiary"
     # stop; a value stopping EARLIER at a real label is always safe (Codex).
     r"Current\s+Beneficiary|Current\s+Trustee|Original\s+Trustee|Current\s+(?:Loan\s+)?Mortgage|"
-    r"which\s+is\s+subject|Subject\s+to\b|I\.\s*NOTICE|II\.)|\n|\Z)"
+    # "Subject to" is a stop for the address-style values, but NOT when it opens a
+    # parenthetical title note inside a NAME: "BARBARA J. HILL, AS SURVIVING SPOUSE
+    # ( SUBJECT TO SCH. B, 4 A ) Current Beneficiary …" (live 2026-09-02) was cut to
+    # "… SURVIVING SPOUSE (" and shipped as the lead's party_name. The fixed-width
+    # lookbehinds skip a "Subject to" preceded by "(" and up to three whitespace
+    # chars (space / newline / tab) so the value runs on to the next real label;
+    # strip_vesting_clause drops the note at read time.
+    r"which\s+is\s+subject|(?<!\()(?<!\(\s)(?<!\(\s\s)(?<!\(\s\s\s)Subject\s+to\b|"
+    r"I\.\s*NOTICE|II\.)|\n|\Z)"
 )
 
 # TS#: label variants (TS #, T.S. No., Trustee Sale No./Number) + value formats that
 # vary by trustee (North Star YY-NNNNN, Quality Loan WA-25-…-RM). Stop before a
 # trailing "-NOTICE…" (title-line concat) and at whitespace/EOL (Codex P1).
 _TS_NUMBER = re.compile(
-    r"(?:T\.?S\.?\s*#|T\.?S\.?\s*No\.?|Trustee\s+Sale\s+(?:No\.?|Number))\s*:?\s*"
+    # Label boundaries (live 2026-09-02): "defaul[ts no]w in arrears" produced
+    # ts_number "w". The label may not be glued to a preceding letter, and "No"
+    # may not run straight into another letter ("now"). "No." / "No:" / "No 123" /
+    # "T.S.#" all still match.
+    r"(?<![A-Za-z])(?:T\.?S\.?\s*#|T\.?S\.?\s*No\.?(?![A-Za-z])|Trustee\s+Sale\s+(?:No\.?|Number))\s*:?\s*"
     r"([A-Za-z0-9][A-Za-z0-9\-]*?)(?=\s|$|-?NOTICE\b)",
     re.I,
 )
@@ -116,13 +128,21 @@ _DEED_REF = re.compile(
     r"Reference\s+Number\s+(?:of\s+(?:the\s+)?)?Deed\s+of\s+Trust\s*:\s*(?:Instrument\s+No\.?\s*)?([\w\-]+)",
     re.I,
 )
+# Second live layout (private/law-firm trustee, 2026-09-02): "Reference Numbers of
+# Documents Referenced: Instrument Number 202212290190 (Deed of Trust) 202605120147
+# (Appointment of Successor Trustee)". Capture ONLY the instrument explicitly tagged
+# "(Deed of Trust)" — never an adjacent appointment/assignment number (Codex).
+_DEED_REF_TAGGED = re.compile(r"(\d{8,14})\s*\(\s*Deed\s+of\s+Trust\s*\)", re.I)
 # Parcel label variants: "Parcel Number(s):" (North Star / Quality Loan / Affinia),
 # plus "[Assessor's] Tax Parcel No(s).:" (Clear Recon / older law-firm notices — live
 # 2026-06-26). A multi-parcel notice lists several after the colon; we capture the
 # FIRST (a valid match key — the matcher keys on any one exact parcel).
 _PARCEL = re.compile(
-    r"(?:Parcel\s+Number\(?s?\)?|(?:Assessor'?s\s+)?Tax\s+Parcel\s+(?:No|Number)s?\.?)"
-    r"\s*:\s*([\w\-]+)",
+    r"(?:Parcel\s+Number\(?s?\)?|(?:Assessor'?s\s+)?Tax\s+Parcel\s+(?:No|Number)s?\.?"
+    # "Assessor's Parcel No. 766500-0020" (law-firm layout, live 2026-09-02) — no
+    # colon, no "Tax". Bounded to the label so prose can't feed it.
+    r"|Assessor'?s\s+Parcel\s+(?:No|Number)s?\.?)"
+    r"\s*:?\s*([\w\-]+)",
     re.I,
 )
 
@@ -134,8 +154,15 @@ _PARCEL = re.compile(
 # we capture everything up to "sell at public auction" and strip a leading "at " connector
 # in parse_nts_notice. The lazy (.+?) is safe because callers parse ONE notice block at a
 # time (PDF crawler splits first) — it can't drift across a notice boundary (Codex consult).
+# Live 2026-09-02 variants folded in (each still anchored to "sell at public auction"):
+# an explicit weekday ("will, on Friday, August 28, 2026"), "at the hour of 10:00 AM"
+# between date and time, and a comma after the time. Weekdays are spelled out — never
+# a bare \w+day — so unrelated text can't be swallowed (Codex).
+_WEEKDAY = r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+"
+_HOUR_OF = r"(?:the\s+hour\s+of\s+)?"
 _AUCTION = re.compile(
-    r"will\s+on\s+(\d{1,2}/\d{1,2}/\d{4})\s*,?\s*at\s+(\d{1,2}:\d{2}\s*[AP]\.?M\.?)\s+"
+    rf"will\s*,?\s*on\s+(?:{_WEEKDAY})?(\d{{1,2}}/\d{{1,2}}/\d{{4}})\s*,?\s*at\s+{_HOUR_OF}"
+    r"(\d{1,2}:\d{2}\s*[AP]\.?M\.?)\s*,?\s*"
     r"(.+?)\s+sell\s+at\s+public\s+auction",
     re.I | re.S,
 )
@@ -157,20 +184,55 @@ _COMMONLY_KNOWN = re.compile(
     # known as: <addr> Tax Parcel Nos.: <apn> which is subject to…" — without this the
     # parcel text leaks INTO property_address and poisons the normalized match key, so
     # a lead at that address won't attach by address.
-    r"|\s+(?:Assessor'?s\s+)?Tax\s+Parcel\b|\s+Parcel\s+Number\b"
+    r"|\s+(?:Assessor'?s\s+)?Tax\s+Parcel\b|\s+Assessor'?s\s+Parcel\b|\s+Parcel\s+Number\b"
     r"|\s+II\.\s|\n\n|\Z)",
     re.I | re.S,
 )
-# ── Section IV "sum owing on the obligation": two real phrasings —
-#   North Star : "...is: Principal $185,895.06"
-#   Quality Loan: "...is: The principal sum of $423,798.66"
-# So after "principal" we lazily skip non-$ chars ("sum of ") to the first dollar
-# figure. [^$] can't cross a '$', so the capture is pinned to the amount that
-# immediately follows "principal" — never a later figure (interest, fees).
-_PRINCIPAL_OWING = re.compile(
-    r"sum\s+owing\s+on\s+the\s+obligation[^$]*?principal[^$]*?\$([\d,]+\.\d{2})",
-    re.I | re.S,
-)
+# ── Section IV "sum owing on the obligation" — real phrasings:
+#   North Star   : "...secured by the Deed of Trust is: Principal $185,895.06, together…"
+#   Quality Loan : "...secured by the Deed of Trust is: The principal sum of $423,798.66,…"
+#   Quality Loan, matured/commercial loan (live 2026-09-02, TS# WA-26-1050840-BB):
+#                  "...sum owing on the MATURED obligation secured by the Deed of Trust
+#                   is: $575,150.38. V. …" — no "principal" word at all.
+# The old single regex required the literal "on the obligation" AND a following
+# "principal", so a matured/balloon notice silently lost its amount and a real lead
+# shipped with a blank Default Owed. Now: anchor on "sum owing on the [qualifier]
+# obligation(s)" only — as tolerant of the connecting legal text ("… as evidenced by
+# the Note and secured by the Deed of Trust is:") as the old regex was (Codex) —
+# bound the search to section IV (up to the next "V." roman marker or a hard char
+# cap), PREFER the figure labelled "principal", and only when section IV carries no
+# principal label take the FIRST dollar figure within a short window of the anchor.
+# The bound + the window keep the capture pinned inside section IV, so a section-V/VI
+# figure can never be mistaken for the sum owing.
+# Qualifiers are any 1-3 non-space tokens ("matured", "matured/commercial",
+# "matured-loan") so punctuation in a trustee's wording can't defeat the anchor.
+_SUM_OWING_ANCHOR = re.compile(r"sum\s+owing\s+on\s+the\s+(?:\S+\s+){0,3}obligations?\b", re.I)
+_SECTION_IV_SPAN_CHARS = 600
+# Section V marker: "V." followed by whitespace or the next word ("V. The", "V.The",
+# "V .\nThe"); \b keeps "IV." from matching.
+_SECTION_IV_END = re.compile(r"\bV\s?\.(?=\s|[A-Z])")
+_PRINCIPAL_LABELED = re.compile(r"principal[^$]{0,40}?\$([\d,]+\.\d{2})", re.I | re.S)
+# "… secured by the Deed of Trust is: $575,150.38" sits ~45 chars past the anchor.
+_FIRST_DOLLAR_NEAR_ANCHOR = re.compile(r"^[^$]{0,120}?\$([\d,]+\.\d{2})", re.S)
+
+
+def _principal_owing(text: str) -> Decimal | None:
+    """Section IV amount owing on the obligation (see the phrasings above); None if
+    the statutory sentence is absent or carries no dollar figure inside section IV."""
+    m = _SUM_OWING_ANCHOR.search(text)
+    if not m:
+        return None
+    span = text[m.end(): m.end() + _SECTION_IV_SPAN_CHARS]
+    end = _SECTION_IV_END.search(span)
+    if end:
+        span = span[: end.start()]
+    hit = _PRINCIPAL_LABELED.search(span) or _FIRST_DOLLAR_NEAR_ANCHOR.search(span)
+    if not hit:
+        return None
+    try:
+        return Decimal(hit.group(1).replace(",", ""))
+    except (InvalidOperation, ValueError):
+        return None
 # ── "Note Amount: $234,533.00" (original loan size)
 _NOTE_AMOUNT = re.compile(r"Note\s+Amount\s*:?\s*\$?([\d,]+\.\d{2})", re.I)
 # ── NOD transmittal date ("by both first class and certified mail on 1/20/2026")
@@ -196,7 +258,7 @@ _TIME = r"\d{1,2}:\d{2}\s*[AP]\.?M\.?"
 # stray dated timestamp elsewhere in the notice can't be read as the auction (Codex).
 # group(1)=date, group(2)=time. The matched span (group 0) also carries the location.
 _AUCTION_KING = re.compile(
-    rf"\bon\s+({_MONTH_DATE})\s*,?\s*(?:at\s+)?({_TIME})"
+    rf"\bon\s+(?:{_WEEKDAY})?({_MONTH_DATE})\s*,?\s*(?:at\s+)?{_HOUR_OF}({_TIME})"
     r"[\s\S]{0,600}?sell\s+at\s+public\s+auction", re.I)
 # Best-effort location within the matched span: Affinia "…located <loc> to the highest";
 # MTC "<time>, <loc>…". Not required for validity/matching.
@@ -216,7 +278,8 @@ _AUCTION_KING_LOC_B = re.compile(
 # so it reuses the existing _to_date month-name path.
 _AUCTION_WORDED = re.compile(
     rf"will\s+on\s+the\s+(\d{{1,2}})(?:st|nd|rd|th)\s+day\s+of\s+({_MONTHS})\.?,?\s+(\d{{4}})"
-    r"\s*,?\s*at\s+(?:the\s+hour\s+of\s+)?(\d{1,2}:\d{2})\s*o'?clock\s*([AP])\.?\s*M\.?"
+    # "10 o'clock A.M." (no minutes) is a real layout (live 2026-09-02) -> minutes optional.
+    r"\s*,?\s*at\s+(?:the\s+hour\s+of\s+)?(\d{1,2}(?::\d{2})?)\s*o'?clock\s*([AP])\.?\s*M\.?"
     r"[\s\S]{0,600}?sell\s+at\s+public\s+auction",
     re.I,
 )
@@ -348,23 +411,28 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
             if wm:
                 day, month, year, hhmm, ampm = wm.groups()
                 auction_date = f"{month.title()} {int(day)}, {year}"
+                if ":" not in hhmm:
+                    hhmm = f"{hhmm}:00"
                 auction_time = f"{hhmm} {ampm.upper()}M"
 
     return {
-        "ts_number": _first(_TS_NUMBER, text),
+        # A trustee's page TITLE can carry a trailing dash ("TS# WA-26-1035144-SW-
+        # NOTICE OF…", live 2026-09-02) while the body says "WA-26-1035144-SW"; the
+        # title matches first. Trim trailing hyphens only — the TS# is the natural key.
+        "ts_number": (_first(_TS_NUMBER, text) or "").rstrip("-") or None,
         "title_order": _first(_TITLE_ORDER, text),
         "grantor": _first(_GRANTOR, text),
         "beneficiary": _first(_BENEFICIARY, text),
         "trustee": _extract_trustee(text),
         "servicer": _first(_SERVICER, text),
-        "deed_reference": _first(_DEED_REF, text),
+        "deed_reference": _first(_DEED_REF, text) or _first(_DEED_REF_TAGGED, text),
         "parcel": _first(_PARCEL, text),
         "auction_date": auction_date,
         "auction_time": auction_time,
         "auction_location": auction_location,
         "property_address": _clean_address(_first(_COMMONLY_KNOWN, text)),
         # Section IV "sum owing ... Principal" is the headline default/payoff figure.
-        "principal_owing": _money(_PRINCIPAL_OWING, text),
+        "principal_owing": _principal_owing(text),
         "note_amount": _money(_NOTE_AMOUNT, text),
         "nod_date": _first(_NOD_DATE, text),
     }

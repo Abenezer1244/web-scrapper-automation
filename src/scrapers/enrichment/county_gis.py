@@ -9,6 +9,8 @@ Each county's GIS endpoint URL is stored in county_connectors.gis_endpoint.
 The ArcGIS REST query format is standardized across all counties.
 """
 
+import re
+
 import requests
 
 from src.config import settings
@@ -152,7 +154,7 @@ def _query_gis(parcel_id: str, gis_config: dict, county_key: str) -> dict[str, s
     apn_clean = parcel_id.replace("-", "").strip()
 
     params = {
-        "where": f"{parcel_field}='{apn_clean}'",
+        "where": f"{parcel_field}={_arcgis_literal(apn_clean)}",
         "outFields": out_fields,
         "returnGeometry": "false",
         "f": "json",
@@ -225,7 +227,7 @@ def _query_wa_statewide(parcel_id: str, county: str) -> dict[str, str | None]:
     apn_clean = parcel_id.replace("-", "").strip()
     fips = _WA_COUNTY_FIPS.get(county.lower())
 
-    where_clause = f"ORIG_PARCEL_ID='{apn_clean}'"
+    where_clause = f"ORIG_PARCEL_ID={_arcgis_literal(apn_clean)}"
     if fips:
         where_clause += f" AND FIPS_NR='{fips}'"
 
@@ -267,7 +269,15 @@ def _query_wa_statewide(parcel_id: str, county: str) -> dict[str, str | None]:
 
             parcel_found = attrs.get("ORIG_PARCEL_ID") or apn_clean
             _logger.info("WA statewide GIS enriched parcel %s: %s", parcel_found, address)
-            return _statewide_result(address, city, zipcode, parcel_found)
+            return {
+                "property_address": address,
+                # The statewide layer is SITUS-only: it never knows where the owner
+                # gets mail, so it never sets one (2026-09-02 policy: no assumed
+                # owner-occupancy — "real data everywhere").
+                "mailing_address": None,
+                "parcel_id": parcel_found,
+                **_situs_parts(city, zipcode),
+            }
 
         return _empty()
 
@@ -322,10 +332,8 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
                 parts.append(str(val).strip())
         mailing_address = ", ".join(parts) if parts else None
     else:
-        # No mailing fields on this layer → the owner's mailing address is
-        # UNKNOWN. Never copy the situs into it: downstream that reads as
-        # "owner-occupied" (absentee_owner=False) and lands in the CSV
-        # Mailing column as if it came from the county.
+        # A GIS config with no mailing fields knows nothing about the owner's
+        # mail — never copy the situs in as if it did (2026-09-02 policy).
         mailing_address = None
 
     # Owner name (logged for enrichment_data, not in primary return)
@@ -337,6 +345,7 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
         "property_address": property_address,
         "mailing_address": mailing_address,
         "parcel_id": attrs.get(parcel_field) or None,
+        **_situs_parts_from_confirmed_mailing(attrs, property_address, gis_config),
     }
 
     if property_address:
@@ -371,36 +380,6 @@ def _empty() -> dict[str, str | None]:
     return {"property_address": None, "mailing_address": None}
 
 
-def _statewide_result(
-    address: str, city: str, zipcode: str, parcel_id: str
-) -> dict[str, str | None]:
-    """Shape a WA statewide Current_Parcels hit into the enrichment dict.
-
-    The statewide layer carries the SITUS (property) address only — it has no
-    owner/mailing fields. The old code copied the situs into `mailing_address`,
-    which downstream read as a real county mailing address: absentee_owner
-    became False ("owner-occupied") and the CSV Mailing column showed an address
-    the county never supplied. The owner's mailing address is UNKNOWN here → None.
-
-    The situs locality (city / WA / zip) is kept ON the property address instead
-    of being dropped: build_pending_row_payload() parses city/state/zip from
-    property_address first, and Tracerfy rejects rows without them. Format
-    matches what other scrapers already store ("STREET, CITY, WA 98101").
-    """
-    # Only the 3-part "STREET, CITY, WA ZIP" shape parses back into city/state/
-    # zip (skip_trace._parse_full_address); a state or zip without a city would
-    # be mis-read as the city, so without a city the street stands alone.
-    if city:
-        prop = f"{address}, {city}, WA {zipcode}" if zipcode else f"{address}, {city}, WA"
-    else:
-        prop = address
-    return {
-        "property_address": prop,
-        "mailing_address": None,
-        "parcel_id": parcel_id,
-    }
-
-
 def batch_enrich_parcels_gis(
     parcel_ids: list[str], county: str, state: str
 ) -> dict[str, dict[str, str | None]]:
@@ -432,10 +411,99 @@ def batch_enrich_parcels_gis(
     return results
 
 
+def _arcgis_literal(value: str) -> str:
+    """Quote a value for an ArcGIS ``where`` clause (SQL-92 style: '' escapes ').
+
+    Parcel ids come from scraper regexes, but this is app-wide enrichment — a
+    stray quote in a parsed value must not break or reshape the predicate (Codex).
+    """
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _map_county_features(
+    features: list[dict], gis_config: dict, clean_to_originals: dict[str, list[str]]
+) -> dict[str, dict[str, str | None]]:
+    """Map county-GIS features onto the CALLER's parcel ids.
+
+    The query strips dashes ("602543-087-0" -> "6025430870") and the server echoes
+    the canonical form back, but the worker applies results by the lead's RAW
+    parcel_id (tasks_helpers/enrich.py keys its rows on ``res.parcel_id``). Keying
+    the dict by the server value meant every dashed parcel — 11 of 33 live Pierce
+    NTS notices print them that way (2026-09-02) — got NO county data and fell
+    through to the situs-only statewide service, losing the real mailing address.
+    Mirror the statewide path: key by the original id(s). One APN can arrive under
+    several raw spellings in a batch ("602543-087-0" and "6025430870"), so the
+    feature fans out to EVERY caller id that collapsed to it (Codex). ``parcel_id``
+    in each value stays the server's canonical form. Pure (no I/O) so the mapping
+    is unit-tested against a real ArcGIS feature.
+    """
+    parcel_field = gis_config["parcel_field"]
+    results: dict[str, dict] = {}
+    for feature in features:
+        attrs = feature.get("attributes") or {}
+        pid = attrs.get(parcel_field)
+        if not pid:
+            continue
+        parsed = _parse_gis_response({"features": [feature]}, gis_config)
+        if not parsed.get("property_address"):
+            continue
+        parsed["parcel_id"] = pid
+        for caller_pid in clean_to_originals.get(str(pid)) or [str(pid)]:
+            results[caller_pid] = dict(parsed)
+    return results
+
+
+_CITY_STATE_RE = re.compile(r"^\s*(.+?)\s*,\s*([A-Z]{2})\s*$")
+# "PO BOX", "P.O. BOX", "P O BOX", "P.O BOX", "POB" — any post-office box spelling.
+_PO_BOX_RE = re.compile(r"^\s*P\.?\s*O\.?\s*B(?:OX)?\b", re.I)
+
+
+def _situs_parts_from_confirmed_mailing(
+    attrs: dict, property_address: str | None, gis_config: dict
+) -> dict[str, str | None]:
+    """Pierce-style county row (Delivery_Address / City_State / Zipcode = the OWNER's
+    mailing): those fields describe the property ONLY when the county itself says
+    the mail goes there — Delivery_Address equal to Site_Address after whitespace
+    normalization, and not a PO box. Then City_State/Zipcode are evidence-based
+    situs parts (Codex-approved derivation); otherwise nothing is emitted."""
+    fields = gis_config.get("mailing_fields") or []
+    if not property_address or len(fields) < 3:
+        return {}
+    delivery = " ".join(str(attrs.get(fields[0]) or "").split()).upper()
+    site = " ".join(property_address.split()).upper()
+    if not delivery or delivery != site or _PO_BOX_RE.match(delivery):
+        return {}
+    m = _CITY_STATE_RE.match(str(attrs.get(fields[1]) or ""))
+    zipcode = str(attrs.get(fields[2]) or "").strip()
+    if not m:
+        return {}
+    return {
+        "property_city": m.group(1).strip(),
+        "property_state": m.group(2),
+        "property_zip": zipcode[:10] or None,
+    }
+
+
+def _situs_parts(city: str, zipcode: str) -> dict[str, str | None]:
+    """Structured SITUS location from a WA statewide row (SITUS_CITY_NM /
+    SITUS_ZIP_NR). The state is WA by construction (the service is the WA parcel
+    layer, queried with the county FIPS), city/zip only when the row carries them.
+    These describe the PROPERTY's location — never the owner's mail."""
+    city = " ".join((city or "").split())
+    zipcode = (zipcode or "").strip()
+    return {
+        "property_city": city or None,
+        "property_state": "WA",
+        "property_zip": zipcode or None,
+    }
+
+
 def _batch_query_county(
     parcel_ids: list[str], gis_config: dict
 ) -> dict[str, dict[str, str | None]]:
-    """Batch query a county-specific ArcGIS endpoint (has mailing address)."""
+    """Batch query a county-specific ArcGIS endpoint (has mailing address).
+
+    Results are keyed by the CALLER's parcel id (see _map_county_features)."""
     endpoint = gis_config["endpoint"]
     parcel_field = gis_config["parcel_field"]
     out_fields = gis_config.get("out_fields", "*")
@@ -444,11 +512,15 @@ def _batch_query_county(
 
     for i in range(0, len(parcel_ids), chunk_size):
         chunk = parcel_ids[i:i + chunk_size]
-        clean = [pid.replace("-", "").strip() for pid in chunk if pid and len(pid.strip()) >= 6]
-        if not clean:
+        # clean (query/server form) -> every caller id that spells it that way.
+        clean_to_originals: dict[str, list[str]] = {}
+        for pid in chunk:
+            if pid and len(pid.strip()) >= 6:
+                clean_to_originals.setdefault(pid.replace("-", "").strip(), []).append(pid)
+        if not clean_to_originals:
             continue
 
-        in_clause = ",".join(f"'{p}'" for p in clean)
+        in_clause = ",".join(_arcgis_literal(p) for p in clean_to_originals)
         params = {
             "where": f"{parcel_field} IN ({in_clause})",
             "outFields": out_fields,
@@ -465,18 +537,16 @@ def _batch_query_county(
                 continue
 
             data = resp.json()
-            for feature in data.get("features") or []:
-                attrs = feature.get("attributes") or {}
-                pid = attrs.get(parcel_field)
-                if not pid:
-                    continue
+            found = _map_county_features(
+                data.get("features") or [], gis_config, clean_to_originals
+            )
+            results.update(found)
 
-                parsed = _parse_gis_response({"features": [feature]}, gis_config)
-                if parsed.get("property_address"):
-                    parsed["parcel_id"] = pid
-                    results[pid] = parsed
-
-            _logger.info("County GIS batch: %d/%d parcels enriched", len([p for p in clean if p in results]), len(clean))
+            # Count distinct APNs, not fanned-out caller ids, so the ratio is honest.
+            found_apns = {row["parcel_id"] for row in found.values()}
+            _logger.info(
+                "County GIS batch: %d/%d parcels enriched", len(found_apns), len(clean_to_originals)
+            )
 
         except Exception as exc:
             _logger.warning("County GIS batch error: %s", str(exc)[:80])
@@ -527,7 +597,7 @@ def _batch_query_wa_statewide(
         query_to_original = dict(query_pairs)
         in_values = list(query_to_original.keys())
 
-        in_clause = ",".join(f"'{p}'" for p in in_values)
+        in_clause = ",".join(_arcgis_literal(p) for p in in_values)
         where = f"ORIG_PARCEL_ID IN ({in_clause})"
         if fips:
             where += f" AND FIPS_NR='{fips}'"
@@ -558,10 +628,14 @@ def _batch_query_wa_statewide(
                 caller_pid = query_to_original.get(pid, pid)
 
                 address = " ".join(address.strip().split())
-                city = " ".join((attrs.get("SITUS_CITY_NM") or "").split())
-                zipcode = str(attrs.get("SITUS_ZIP_NR") or "").strip()
-                # parcel_id: canonical format from server
-                results[caller_pid] = _statewide_result(address, city, zipcode, pid)
+                city = (attrs.get("SITUS_CITY_NM") or "").strip()
+                zipcode = (attrs.get("SITUS_ZIP_NR") or "").strip()
+                results[caller_pid] = {
+                    "property_address": address,
+                    "mailing_address": None,  # situs-only layer: owner's mail unknown
+                    "parcel_id": pid,  # canonical format from server
+                    **_situs_parts(city, zipcode),
+                }
 
             _logger.info(
                 "Statewide GIS batch: %d/%d parcels enriched",

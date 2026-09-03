@@ -99,12 +99,11 @@ def _parse_regrid_response(data: dict) -> dict[str, str | None]:
         property_address = property_address.strip()
 
     # Mailing address
+    # Only a real `mailadd` counts; a missing one is UNKNOWN, never the situs
+    # (2026-09-02 policy: no assumed owner-occupancy).
     mailing_address = props.get("mailadd") or None
     if mailing_address:
-        mailing_address = mailing_address.strip()
-    elif property_address:
-        # Fallback: use property address if no separate mailing
-        mailing_address = property_address
+        mailing_address = mailing_address.strip() or None
 
     # Owner name
     owner_name = props.get("owner") or None

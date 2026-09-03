@@ -173,8 +173,8 @@ async def enrich_parcel_ai(
                 if mailing_address.lower() in ("null", "none", ""):
                     mailing_address = None
 
-            if not mailing_address and property_address:
-                mailing_address = property_address
+            # No mailing address extracted means UNKNOWN — never substitute the
+            # situs (2026-09-02 policy: no assumed owner-occupancy).
 
             if property_address:
                 _logger.info(

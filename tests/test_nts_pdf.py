@@ -93,11 +93,12 @@ class TestParseRealBlocks:
         self.parsed = [parse_nts_notice(b) for b in self.blocks]
 
     def test_majority_parse_valid(self):
-        # 5 of the 7 are the dominant residential formats (Quality Loan / North Star);
-        # the other 2 (a commercial-loan notice + an MTC reverse-mortgage layout) are
-        # safely SKIPPED by is_valid_nts — never emitted with wrong data.
+        # 6 of the 7 now parse: the 5 dominant residential formats (Quality Loan /
+        # North Star) plus the MTC notice recovered by the pre-header TS fix. The
+        # remaining commercial-loan notice is safely SKIPPED by is_valid_nts — never
+        # emitted with wrong data.
         valid = [p for p in self.parsed if is_valid_nts(p)]
-        assert len(valid) >= 5
+        assert len(valid) >= 6
 
     def test_known_quality_loan_notice(self):
         by_ts = {p["ts_number"]: p for p in self.parsed}
@@ -110,8 +111,27 @@ class TestParseRealBlocks:
     def test_auction_on_the_steps_variant_parses(self):
         # this issue's Quality Loan notices use "at <time> On the Steps in Front of …"
         # (no "at" before the location) — the broadened _AUCTION must capture it.
-        valid = [p for p in self.parsed if is_valid_nts(p)]
-        assert all(p["auction_date"] == "12/26/2025" for p in valid)
+        #
+        # This used to assert EVERY valid notice was dated 12/26/2025, which only held
+        # because the seventh (MTC, "TS No WA07000249-25-1" printed BEFORE its header)
+        # was being dropped for want of a TS number. It is recovered now, and the source
+        # really does say "NOTICE IS HEREBY GIVEN that on January 16, 2026" for it — so
+        # the date is asserted per notice instead of as a blanket property of the issue.
+        by_ts = {p["ts_number"]: p for p in self.parsed if is_valid_nts(p)}
+        assert by_ts, "no valid notices parsed"
+        for ts, p in by_ts.items():
+            assert p["auction_date"], ts  # every valid notice carries a date
+        for ts in ("WA-25-1012820-SW", "WA-25-1018388-RM", "WA-25-1018467-SW"):
+            assert by_ts[ts]["auction_date"] == "12/26/2025", ts
+
+    def test_pre_header_ts_notice_is_recovered_from_this_issue_too(self):
+        """The pre-header TS bug was not specific to the Test 4 issue — this fixture,
+        already in the repo, was silently losing a notice to it as well."""
+        by_ts = {p["ts_number"]: p for p in self.parsed}
+        petersons = by_ts["WA07000249-25-1"]
+        assert is_valid_nts(petersons)
+        assert "LIJA PETERSONS" in petersons["grantor"]
+        assert petersons["auction_date"] == "January 16, 2026"
 
     def test_notice_to_row_for_snoho(self):
         p = next(p for p in self.parsed if p["ts_number"] == "WA-25-1012820-SW")
@@ -219,11 +239,53 @@ class TestTrailingIdentityHelpers:
         assert carry == "TS #: 26-78299 Title Order #: DEF-687559"
         assert "26-78299" not in body
 
-    def test_keeps_a_trailing_run_when_the_body_has_no_ts_of_its_own(self):
-        """Ambiguous: we cannot prove the run belongs to the NEXT notice, so behave
-        exactly as before rather than guess."""
+    def test_detaches_unconditionally_because_the_receiver_decides(self):
+        """Detaching is not where the safety lives — split_notice_blocks decides whether
+        to USE the run, and only gives it to a notice that states no TS number itself.
+        That test is strictly stronger than inspecting the block being detached from."""
         block = "NOTICE OF TRUSTEE'S SALE Grantor: SOMEONE TS #: 26-78299"
-        assert nts_pdf._detach_trailing_identity(block) == (block, "")
+        body, carry = nts_pdf._detach_trailing_identity(block)
+        assert carry == "TS #: 26-78299"
+        assert body == "NOTICE OF TRUSTEE'S SALE Grantor: SOMEONE"
+
+
+class TestCarriedRunNeverOverridesAStatedNumber:
+    """A pre-header run SUPPLIES an identity to a notice that prints one before its
+    header; it must never OVERRIDE one printed after it. Both cases below were the
+    original bug in mirror image, found by Codex on the first implementation."""
+
+    def test_a_notices_own_trailer_is_not_pushed_onto_the_next_notice(self):
+        text = (
+            "NOTICE OF TRUSTEE'S SALE Trustee Sale No.: CUR-1 Grantor(s): CURR ONE "
+            "will on 1/2/2027, at 10:00 AM Steps sell at public auction "
+            "TS No CUR-1 Title Order No ABC "
+            "NOTICE OF TRUSTEE'S SALE Trustee Sale No.: NEXT-2 Grantor(s): NEXT TWO "
+            "will on 1/3/2027, at 10:00 AM Steps sell at public auction"
+        )
+        got = [parse_nts_notice(b)["ts_number"] for b in nts_pdf.split_notice_blocks(text)]
+        assert got == ["CUR-1", "NEXT-2"]
+
+    def test_chrome_before_the_first_header_cannot_hijack_the_first_notice(self):
+        text = (
+            "Weekly index / non-notice chrome TS No INDEX-1 "
+            "NOTICE OF TRUSTEE'S SALE Trustee Sale No.: REAL-1 Grantor(s): REAL ONE "
+            "will on 1/2/2027, at 10:00 AM Steps sell at public auction"
+        )
+        blocks = nts_pdf.split_notice_blocks(text)
+        assert len(blocks) == 1
+        assert parse_nts_notice(blocks[0])["ts_number"] == "REAL-1"
+
+    def test_a_notice_with_no_stated_number_still_receives_the_carried_one(self):
+        """The case the whole repair exists for — must keep working."""
+        text = (
+            "TS No FIRST-1 TO No AAA "
+            "NOTICE OF TRUSTEE'S SALE Grantor: ONE will on 1/2/2027, at 10:00 AM Steps "
+            "sell at public auction TS #: SECOND-2 Title Order #: BBB "
+            "NOTICE OF TRUSTEE'S SALE Grantor: TWO will on 1/3/2027, at 10:00 AM Steps "
+            "sell at public auction"
+        )
+        got = [parse_nts_notice(b)["ts_number"] for b in nts_pdf.split_notice_blocks(text)]
+        assert got == ["FIRST-1", "SECOND-2"]
 
     def test_pathological_identity_run_does_not_hang(self):
         """A run of identity-looking tokens followed by one non-matching word used to

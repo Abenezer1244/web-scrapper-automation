@@ -65,8 +65,10 @@ def _canonical_dataframe(
     `LEAD_CSV_COLUMNS`. Selecting a subset of the full-width rows can't drift from
     the CSV because both project the SAME built rows.
     """
-    today = datetime.now(UTC).date()
-    auction_today = auction_reference_date()
+    # Both clocks from a SINGLE instant (see write_lead_csv).
+    _now = datetime.now(UTC)
+    today = _now.date()
+    auction_today = auction_reference_date(_now)
     rows = [
         _apply_visibility(
             build_lead_export_row(r, today, auction_today=auction_today), hidden_fields
@@ -160,10 +162,12 @@ class DataExporter:
         """
         filepath = self._timestamped_path(filename, "json")
         keys = columns or LEAD_CSV_COLUMNS
-        # One consistent pair of "today"s for the whole file: UTC for the tax signals,
-        # county-local for the auction countdown (lead_signals.AUCTION_TZ).
-        today = datetime.now(UTC).date()
-        auction_today = auction_reference_date()
+        # One consistent pair of "today"s for the whole file, from a SINGLE instant:
+        # UTC for the tax signals, county-local for the auction countdown
+        # (lead_signals.AUCTION_TZ).
+        _now = datetime.now(UTC)
+        today = _now.date()
+        auction_today = auction_reference_date(_now)
         rows = []
         for rec in records:
             row = _apply_visibility(

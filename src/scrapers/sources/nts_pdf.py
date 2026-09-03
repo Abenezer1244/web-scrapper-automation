@@ -139,17 +139,35 @@ _PREHEADER_ONE = re.compile(rf"(?:(?<=\s)|^)({_PREHEADER_ITEM})\s*$", re.I)
 # largest real block in the Test 4 issue is ~43k chars of swallowed newspaper chrome.
 _PREHEADER_WINDOW = 400
 
+# One layout prints "AMENDED NOTICE OF TRUSTEE'S SALE", so the split leaves the run as
+# "TS No: <x> AMENDED" and it no longer ends on an identity item. MEASURED before being
+# allowed: across the six Snohomish Tribune issues plus the King and 2025-12-17 fixtures,
+# 13 of the 14 distinct pre-header runs end exactly on the identity items and this is the
+# only qualifier that appears. Kept to what was observed — widen it only against real
+# text, since a loose grammar here is what puts one notice's number on another.
+_PREHEADER_QUALIFIER = re.compile(r"(?:(?<=\s)|^)(AMENDED)\s*$", re.I)
+
 
 def _identity_run_start(text: str) -> int:
-    """Index where the trailing run of identity labels begins (``len(text)`` if none)."""
+    """Index where the trailing run of identity labels begins (``len(text)`` if none).
+
+    Any trailing qualifier is skipped first but stays INSIDE the returned run, so the
+    carried text reassembles the notice's real opening ("TS No: <x> AMENDED" + header).
+    """
     end = len(text)
     floor = max(0, len(text) - _PREHEADER_WINDOW)
+    qualifier = _PREHEADER_QUALIFIER.search(text, floor, end)
+    if qualifier:
+        end = qualifier.start(1)
+    peeled = False
     while end > floor:
         m = _PREHEADER_ONE.search(text, floor, end)
         if not m:
             break
         end = m.start(1)
-    return end
+        peeled = True
+    # A bare qualifier with no identity items in front of it is just a word — not a run.
+    return end if peeled or not qualifier else len(text)
 
 
 def _trailing_identity(text: str) -> str:
@@ -158,18 +176,15 @@ def _trailing_identity(text: str) -> str:
 
 
 def _detach_trailing_identity(block: str) -> tuple[str, str]:
-    """Split ``block`` into (body, next notice's identity preamble).
+    """Split ``block`` into (body, the trailing identity run).
 
-    Only detaches when the body left behind still carries a TS number of its own, so a
-    notice whose ONLY TS number happens to sit at the very end of its block keeps it.
+    Detaching is unconditional; whether the run is actually USED is decided at the
+    receiving end by ``split_notice_blocks``, which is the stronger test — see there.
     """
     start = _identity_run_start(block)
     if start >= len(block):
         return block, ""
-    body = block[:start].rstrip()
-    if not _ANY_TS_LABEL.search(body):
-        return block, ""  # can't prove the run isn't this notice's own — leave it
-    return body, block[start:].strip()
+    return block[:start].rstrip(), block[start:].strip()
 
 
 # Deliberately looser than the parser's `_TS_NUMBER`: this only answers "does the body
@@ -191,21 +206,33 @@ def split_notice_blocks(normalized: str) -> list[str]:
     (Codex). The caller validates each block with ``is_valid_nts``.
 
     The identity preamble is carried forward rather than left where a header-only split
-    puts it — see ``_PREHEADER_ONE`` for why that matters and why the move is narrow.
+    puts it — see ``_PREHEADER_ONE`` for why that matters.
+
+    A carried run is applied ONLY to a notice that does not already state a TS number of
+    its own. That is the whole point of the run: it SUPPLIES an identity to a notice that
+    prints one before its header, and must never OVERRIDE one printed after it. Without
+    that test the repair reintroduced the original bug in mirror image (Codex, verified):
+    a notice whose trailer happened to end on its own "TS No <x>" pushed that number onto
+    the next notice, and chrome before the first header ending in a TS-looking token
+    hijacked the first notice.
     """
     parts = _NOTICE_SPLIT.split(normalized)
     blocks: list[str] = []
-    carry = ""  # identity preamble that belongs to the NEXT block's notice
+    carry = ""  # identity run that may belong to the NEXT block's notice
     for i, part in enumerate(parts):
         if not _HAS_HEADER.search(part):
             # Text before the first header: newspaper chrome, dropped — except a
-            # trailing identity run, which by construction introduces the notice
-            # whose header follows it.
+            # trailing identity run, which may introduce the notice whose header
+            # follows it (only used if that notice states no TS number itself).
             carry = _trailing_identity(part)
             continue
-        block = f"{carry} {part.strip()}".strip() if carry else part.strip()
-        carry = ""
-        if i < len(parts) - 1:
-            block, carry = _detach_trailing_identity(block)
-        blocks.append(block)
+        body, next_carry = (
+            _detach_trailing_identity(part.strip())
+            if i < len(parts) - 1
+            else (part.strip(), "")  # nothing follows the last notice to carry into
+        )
+        if carry and not _ANY_TS_LABEL.search(body):
+            body = f"{carry} {body}"
+        blocks.append(body.strip())
+        carry = next_carry
     return blocks

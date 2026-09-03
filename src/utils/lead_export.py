@@ -491,9 +491,12 @@ def write_lead_csv(
     common (no separate builder, no drift).
     """
     # One consistent pair of "today"s for the whole file: UTC for the tax signals,
-    # county-local for the auction countdown (lead_signals.AUCTION_TZ).
-    today = datetime.now(UTC).date()
-    auction_today = auction_reference_date()
+    # county-local for the auction countdown (lead_signals.AUCTION_TZ). Derived from a
+    # SINGLE instant — two separate now() calls can straddle a date boundary and pair a
+    # UTC date from one moment with a local date from another (Codex).
+    _now = datetime.now(UTC)
+    today = _now.date()
+    auction_today = auction_reference_date(_now)
     writer = csv.DictWriter(
         filelike, fieldnames=columns or LEAD_CSV_COLUMNS, extrasaction="ignore"
     )
@@ -593,11 +596,13 @@ def write_lead_csv_with_overlap(
     `hidden_fields` (from the batch's shared `fields`) blanks the user-deselected
     hideable columns, keeping the combined CSV consistent with each per-job export.
     """
-    # Freeze both clocks once per file, exactly like write_lead_csv — this path used
-    # to fall through to a per-ROW now(), so a long combined export could straddle a
-    # date boundary and emit two different countdowns for the same auction (Codex).
-    today = datetime.now(UTC).date()
-    auction_today = auction_reference_date()
+    # Freeze both clocks once per file from a SINGLE instant, exactly like
+    # write_lead_csv — this path used to fall through to a per-ROW now(), so a long
+    # combined export could straddle a date boundary and emit two different countdowns
+    # for the same auction (Codex).
+    _now = datetime.now(UTC)
+    today = _now.date()
+    auction_today = auction_reference_date(_now)
     writer = csv.DictWriter(filelike, fieldnames=OVERLAP_LEAD_COLUMNS)
     writer.writeheader()
     for record, overlap in rows:

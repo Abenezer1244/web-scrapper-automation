@@ -38,11 +38,14 @@ from src.db.session import system_sync_session  # noqa: E402
 from src.scrapers.base_scraper import BridgeScraper  # noqa: E402
 from src.scrapers.preforeclosure import strip_vesting_clause  # noqa: E402
 
-# Scope: ONLY trustee_sale leads (an Auction Lead IS its notice row, written by the
-# finalizer keyed on nts_notice_id). pre_foreclosure rows also carry nts_notice_id
-# (fuzzy-matched by nts_matcher_task) and are deliberately excluded — repairing
-# them is a separate decision (Codex). results.nts_notice_id and nts_notices.id are
-# both native UUID columns (migration 059), so they compare directly.
+# Scope: trustee_sale leads by default (an Auction Lead IS its notice row, written by
+# the finalizer keyed on nts_notice_id). pre_foreclosure rows also carry nts_notice_id
+# (fuzzy-matched by nts_matcher_task, which writes default_amount once and never
+# re-syncs) — opt in with --include-pre-foreclosure; the amount is the same public
+# auction figure for the same linked notice (Codex). results.nts_notice_id and
+# nts_notices.id are both native UUID columns (migration 059), so they compare directly.
+_AMOUNT_TYPES_DEFAULT = ["trustee_sale"]
+_AMOUNT_TYPES_WIDE = ["trustee_sale", "pre_foreclosure"]
 _TRUSTEE_SALE_JOIN = """
     FROM results r
     JOIN jobs j ON j.id = r.job_id
@@ -52,9 +55,16 @@ _TRUSTEE_SALE_JOIN = """
 """
 # Amount: copy the re-parsed notice amount onto leads that shipped without one.
 _AMOUNT_CANDIDATES = text(
-    "SELECT r.id, r.job_id, n.ts_number, n.principal_owing "
-    + _TRUSTEE_SALE_JOIN
-    + " AND r.default_amount IS NULL AND n.principal_owing IS NOT NULL ORDER BY r.created_at"
+    """
+    SELECT r.id, r.job_id, sc.record_type, r.nts_match_confidence, n.ts_number, n.principal_owing
+    FROM results r
+    JOIN jobs j ON j.id = r.job_id
+    JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+    JOIN nts_notices n ON n.id = r.nts_notice_id
+    WHERE sc.record_type = ANY(:types)
+      AND r.default_amount IS NULL AND n.principal_owing IS NOT NULL
+    ORDER BY r.created_at
+    """
 )
 _AMOUNT_REPAIR = text(
     """
@@ -62,11 +72,23 @@ _AMOUNT_REPAIR = text(
     FROM jobs j, scraper_configs sc, nts_notices n
     WHERE j.id = results.job_id
       AND sc.id = j.scraper_config_id
-      AND sc.record_type = 'trustee_sale'
+      AND sc.record_type = ANY(:types)
       AND n.id = results.nts_notice_id
       AND results.default_amount IS NULL AND n.principal_owing IS NOT NULL
     """
 )
+
+
+def amount_breakdown(rows) -> dict[str, int]:
+    """Count candidates by record_type and match-confidence bucket (exact = 1.0,
+    fuzzy = below) so a dry-run shows what a wide repair would touch (Codex)."""
+    out: dict[str, int] = {}
+    for row in rows:
+        conf = row.nts_match_confidence
+        bucket = "exact" if conf is None or float(conf) >= 1.0 else "fuzzy"
+        key = f"{row.record_type}/{bucket}"
+        out[key] = out.get(key, 0) + 1
+    return out
 # Party name: only the truncation signature the old parser produced.
 _NAME_CANDIDATES = text(
     "SELECT r.id, r.job_id, r.party_name, n.grantor "
@@ -85,13 +107,20 @@ def main() -> int:
         "--party-names", action="store_true",
         help="also repair party_name on rows still carrying the '(' truncation",
     )
+    ap.add_argument(
+        "--include-pre-foreclosure", action="store_true",
+        help="widen the default_amount pass to pre_foreclosure leads linked to a notice",
+    )
     args = ap.parse_args()
+    types = _AMOUNT_TYPES_WIDE if args.include_pre_foreclosure else _AMOUNT_TYPES_DEFAULT
 
     with system_sync_session() as db:
-        amount_rows = db.execute(_AMOUNT_CANDIDATES).fetchall()
-        print(f"default_amount: {len(amount_rows)} lead(s) whose notice now carries an amount")
+        amount_rows = db.execute(_AMOUNT_CANDIDATES, {"types": types}).fetchall()
+        print(f"default_amount: {len(amount_rows)} lead(s) whose notice now carries an amount "
+              f"(scope {types}; breakdown {amount_breakdown(amount_rows)})")
         for row in amount_rows:
-            print(f"  result={row.id} job={row.job_id} ts={row.ts_number} -> {row.principal_owing}")
+            print(f"  result={row.id} job={row.job_id} {row.record_type} conf={row.nts_match_confidence} "
+                  f"ts={row.ts_number} -> {row.principal_owing}")
 
         name_plan: list[tuple] = []
         if args.party_names:
@@ -108,7 +137,7 @@ def main() -> int:
             db.rollback()
             return 0
 
-        amount_written = db.execute(_AMOUNT_REPAIR).rowcount or 0
+        amount_written = db.execute(_AMOUNT_REPAIR, {"types": types}).rowcount or 0
         name_written = 0
         for rid, old, new in name_plan:
             name_written += db.execute(_NAME_REPAIR, {"rid": rid, "old": old, "name": new}).rowcount or 0

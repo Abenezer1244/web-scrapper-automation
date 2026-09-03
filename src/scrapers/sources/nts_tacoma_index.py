@@ -394,7 +394,10 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
                 auction_time = f"{hhmm} {ampm.upper()}M"
 
     return {
-        "ts_number": _first(_TS_NUMBER, text),
+        # A trustee's page TITLE can carry a trailing dash ("TS# WA-26-1035144-SW-
+        # NOTICE OF…", live 2026-09-02) while the body says "WA-26-1035144-SW"; the
+        # title matches first. Trim trailing hyphens only — the TS# is the natural key.
+        "ts_number": (_first(_TS_NUMBER, text) or "").rstrip("-") or None,
         "title_order": _first(_TITLE_ORDER, text),
         "grantor": _first(_GRANTOR, text),
         "beneficiary": _first(_BENEFICIARY, text),

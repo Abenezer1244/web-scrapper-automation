@@ -61,6 +61,21 @@ _MARK_SQL_TMPL = (
     "RETURNING r.id"
 )
 
+# A capped row is never delivered, so paying Tracerfy for it is pure waste — and
+# `_enqueue_skip_trace_rows` runs INSIDE inline enrichment, i.e. BEFORE this cap
+# exists, so by the time we mark a row its skip trace may already be queued.
+#
+# Only 'queued' rows are withdrawn. A 'submitting' row has already been POSTed
+# and may have been charged; the dispatcher's standing rule is that such a row is
+# NEVER auto-resolved, because releasing it is how you pay twice. Ops reconciles
+# those against Tracerfy's queue list.
+_CANCEL_PENDING_SQL = (
+    "DELETE FROM pending_skip_trace_rows "
+    "WHERE status = 'queued' "
+    "  AND user_id = CAST(:uid AS uuid) "
+    "  AND result_id = ANY(CAST(:ids AS uuid[]))"
+)
+
 # Scoped to THIS job's claims. Matching on (user_id, dedup_hash) alone had no
 # ownership guard, so a stale is_duplicate, a manual repair or a hash anomaly
 # could delete a DIFFERENT job's durable claim for the same user — letting an
@@ -119,6 +134,11 @@ def apply_plan_cap(db, job_id: str, user_id: str, remaining: int) -> list[str]:
         # (or next month's quota) can still deliver them. Keeping the claim would
         # make the lead permanently unreachable rather than merely deferred.
         db.execute(_release_stmt(), {"uid": str(user_id), "jid": job_id, "ids": capped_ids})
+        # Withdraw any skip trace queued for them before this cap existed.
+        db.execute(
+            sa_text(_CANCEL_PENDING_SQL),
+            {"uid": str(user_id), "ids": capped_ids},
+        )
 
     db.commit()
     return capped_ids

@@ -304,3 +304,84 @@ class TestTenantIsolation:
         # Guards against the marker and the rule drifting apart.
         assert DELIVERY_EXCLUDED_KEY in actionable_sql("r")
         assert OVER_QUOTA in actionable_sql("r")
+
+
+class TestCostGuardWithdrawsSkipTrace:
+    """`_enqueue_skip_trace_rows` runs INSIDE inline enrichment, i.e. BEFORE the
+    cap exists, so a finite-quota user's over-quota rows can already be queued
+    for a PAID Tracerfy lookup by the time we mark them."""
+
+    async def _queue_for(self, jid, uid, result_ids, status="queued"):
+        from src.db.models import PendingSkipTraceRow
+        async with _db_session.AsyncSessionLocal() as s:
+            for rid in result_ids:
+                s.add(PendingSkipTraceRow(
+                    job_id=jid, result_id=rid, user_id=uid,
+                    property_address="1 MAIN ST", trace_type="advanced",
+                    status=status,
+                ))
+            await s.commit()
+
+    async def _pending_count(self, db, uid, status=None):
+        q = ("SELECT count(*) FROM pending_skip_trace_rows "
+             "WHERE user_id = CAST(:uid AS uuid)")
+        p = {"uid": uid}
+        if status:
+            q += " AND status = :st"
+            p["st"] = status
+        return db.execute(text(q), p).scalar()
+
+    async def test_queued_rows_for_capped_leads_are_withdrawn(self):
+        ids, jid, uid = await _seed(6)
+        await self._queue_for(jid, uid, ids["actionable"])
+        with _sync() as db:
+            assert await self._pending_count(db, uid) == 6
+            capped = apply_plan_cap(db, jid, uid, remaining=2)
+            assert len(capped) == 4
+            # Only the two we will actually deliver keep their paid lookup.
+            assert await self._pending_count(db, uid) == 2
+
+    async def test_submitting_rows_are_never_withdrawn(self):
+        """A 'submitting' row has already been POSTed and may have been charged.
+        The dispatcher's standing rule is that such a row is never auto-resolved
+        — releasing it is exactly how you pay twice."""
+        ids, jid, uid = await _seed(4)
+        await self._queue_for(jid, uid, ids["actionable"], status="submitting")
+        with _sync() as db:
+            apply_plan_cap(db, jid, uid, remaining=0)
+            assert await self._pending_count(db, uid, "submitting") == 4
+
+    async def test_another_tenants_queued_rows_are_untouched(self):
+        ids_a, jid_a, uid_a = await _seed(3)
+        ids_b, jid_b, uid_b = await _seed(3)
+        await self._queue_for(jid_a, uid_a, ids_a["actionable"])
+        await self._queue_for(jid_b, uid_b, ids_b["actionable"])
+        with _sync() as db:
+            apply_plan_cap(db, jid_a, uid_a, remaining=0)
+            assert await self._pending_count(db, uid_a) == 0
+            assert await self._pending_count(db, uid_b) == 3
+
+
+class TestCostBoundArithmetic:
+    """The raw bound is a SPEND guard, not the quota. It must never be tight
+    enough to discard leads the user is entitled to — that is the bug the whole
+    after-enrichment design exists to prevent."""
+
+    async def test_bound_clears_the_quota_at_the_worst_measured_rate(self):
+        from src.config import settings
+        # Worst actionable rate observed in production (king/tax_delinquent).
+        WORST_RATE = 0.436
+        for remaining in (1, 10, 100, 1000, 10_000):
+            bound = max(
+                remaining * settings.PLAN_CAP_RAW_MULTIPLIER,
+                settings.PLAN_CAP_RAW_FLOOR,
+            )
+            assert int(bound * WORST_RATE) >= remaining, (
+                f"raw bound {bound} yields fewer than {remaining} actionable rows "
+                "at the worst measured rate — it would discard entitled leads"
+            )
+
+    async def test_bound_is_generous_not_the_quota(self):
+        from src.config import settings
+        assert settings.PLAN_CAP_RAW_MULTIPLIER >= 2
+        assert settings.PLAN_CAP_RAW_FLOOR >= 100

@@ -45,7 +45,9 @@ def dispatch_pending_skip_trace() -> dict:
         return {"skipped": "no_token"}
 
     from sqlalchemy import and_, select, update
+    from sqlalchemy import exists as sa_exists
 
+    from src.api.lead_actionability import actionable_condition
     from src.db.models import PendingSkipTraceRow, Result, SkipTraceQueue
     from src.db.session import system_sync_session
     from src.scrapers.enrichment.skip_trace import TracerfyError, submit_batch
@@ -75,6 +77,23 @@ def dispatch_pending_skip_trace() -> dict:
                             and_(
                                 PendingSkipTraceRow.status == "queued",
                                 PendingSkipTraceRow.trace_type == trace_type,
+                                # Never spend on a row that is no longer a
+                                # deliverable lead. Rows are enqueued during
+                                # inline enrichment, BEFORE the plan cap marks
+                                # anything, so a finite-quota user's over-quota
+                                # rows can already be sitting here. The cap
+                                # withdraws its own queued rows, but this is the
+                                # guard at the moment money is actually spent, so
+                                # it also covers rows queued by any other path
+                                # and any race between the two (Codex).
+                                sa_exists()
+                                .where(
+                                    and_(
+                                        Result.id == PendingSkipTraceRow.result_id,
+                                        actionable_condition(),
+                                    )
+                                )
+                                .correlate(PendingSkipTraceRow),
                             )
                         )
                         .order_by(PendingSkipTraceRow.enqueued_at)

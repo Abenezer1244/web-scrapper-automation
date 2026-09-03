@@ -655,15 +655,37 @@ def run_scrape_job(self, job_id: str) -> None:
                     db=db,
                 )
 
-        # ── Plan quota ────────────────────────────────────────────────────────
-        # NOT capped here. A row's actionability is unknowable at this point: the
-        # counties whose addresses arrive during inline enrichment (King probate,
-        # the generic GIS sweep) look addressless until then. Slicing the RAW list
-        # to the quota could therefore save a fully-quarantined prefix, bill ~0,
-        # and silently discard real leads the user still had quota for. The cap is
-        # applied after enrichment instead, against the same actionable set that
-        # display, export and billing use — see "APPLY THE PLAN CAP" below
-        # (Codex ruling, 2026-09-03).
+        # ── Plan quota: a COST bound here, the real cap after enrichment ──────
+        # The quota itself is NOT applied here. A row's actionability is
+        # unknowable at this point: the counties whose addresses arrive during
+        # inline enrichment (King probate, the generic GIS sweep) look
+        # addressless until then. Slicing the RAW list to the quota saved a
+        # possibly-quarantined prefix, billed ~0, and silently discarded real
+        # leads the user still had quota for — measured actionable rates on
+        # king/tax_delinquent are ~0.55, worst observed job 0.436, so roughly
+        # half the entitled leads were being thrown away. The real cap runs
+        # against the actionable set after enrichment: see "APPLY THE PLAN CAP".
+        #
+        # What IS applied here is a spend bound. Enrichment costs money per row
+        # (county GIS, assessor, Regrid) and skip trace costs real credits, so
+        # persisting and enriching 5,000 rows to deliver 10 is waste. Keep a
+        # generous multiple of the quota — enough headroom that the actionable
+        # yield still clears `remaining` on the worst county measured — and cap
+        # only the pathological tail.
+        if user.records_limit != -1:
+            from src.config import settings as _settings
+
+            _remaining_now = max(0, user.records_limit - (user.records_used or 0))
+            _raw_bound = max(
+                _remaining_now * _settings.PLAN_CAP_RAW_MULTIPLIER,
+                _settings.PLAN_CAP_RAW_FLOOR,
+            )
+            if _raw_bound < len(records):
+                _logger.info(
+                    "Job %s: cost bound kept %d of %d raw rows (remaining=%d)",
+                    job_id, _raw_bound, len(records), _remaining_now,
+                )
+                records = records[:_raw_bound]
 
         # ── ENRICHING ─────────────────────────────────────────────────────────
         # CAS no-op here means a batch force-finalize cancelled this child while

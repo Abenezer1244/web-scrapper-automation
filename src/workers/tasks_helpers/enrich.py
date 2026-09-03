@@ -868,6 +868,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
         build_pending_row_payload,
         legacy_cache_locality,
     )
+    from src.utils.address_intel import street_is_placeholder
 
     if not settings.SKIP_TRACE_ENABLED:
         return
@@ -911,6 +912,25 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
             Result.is_duplicate.is_(False),
         )
     ).scalars().all()
+
+    # A PLACEHOLDER street is not an address, and skip trace bills per lookup.
+    # Worse than the money: address_cache_key() hashes the ADDRESS, so every row
+    # sharing one placeholder string collapses to ONE cache key — measured in
+    # production 2026-09-03, 'UNKNOWN UNKNOWN, UNKNOWN WA' is shared by 328
+    # DISTINCT parcels. A single Tracerfy result would then be copied onto all 328
+    # unrelated leads, stamping one person's phone/email across properties they have
+    # nothing to do with. Nothing has been traced yet (all 408 rows are
+    # 'not_attempted'), so this gate is preventative, not a cleanup (Codex).
+    placeholder_rows = [rec for rec in eligible if street_is_placeholder(rec.property_address)]
+    if placeholder_rows:
+        eligible = [rec for rec in eligible if not street_is_placeholder(rec.property_address)]
+        _publish_log(
+            r, job_id, "warning",
+            f"Skip trace skipped for {len(placeholder_rows)} lead(s): the county supplied a "
+            "placeholder property address, so a lookup would be billed against an address "
+            "we do not have",
+            db=db,
+        )
 
     if not eligible:
         return

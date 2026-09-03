@@ -195,8 +195,13 @@ async def batch_extract_king_owners(
 
 async def batch_enrich_king_county(
     parcel_ids: list[str],
+    pace_s: float = 0.2,
 ) -> dict[str, dict[str, str | None]]:
-    """Two-phase enrichment: HTTP for property, Playwright for mailing."""
+    """Two-phase enrichment: HTTP for property, Playwright for mailing.
+
+    ``pace_s`` is the delay between requests in BOTH phases (0.2 s for a normal
+    job; one-off backfills pass several seconds — King has IP-rate-blocked us).
+    """
     results: dict[str, dict[str, str | None]] = {}
     clean = list(dict.fromkeys(pid.strip() for pid in parcel_ids if pid and len(pid.strip()) >= 6))
 
@@ -255,7 +260,7 @@ async def batch_enrich_king_county(
                 pid, str(exc)[:200],
             )
 
-        await asyncio.sleep(0.1)  # minimal delay for HTTP
+        await asyncio.sleep(0.1 if pace_s <= 0.2 else pace_s)  # job: 0.1 s; backfill: slow
 
     _logger.info("Phase 1 done: %d/%d property addresses, %d tax URLs",
                  sum(1 for r in results.values() if r.get("property_address")),
@@ -274,12 +279,21 @@ async def batch_enrich_king_county(
 
     _logger.info("Phase 2: Playwright lookup for %d mailing addresses...", len(pids_to_lookup))
 
+    # Provenance for the mailing lookup (2026-09-02): callers must be able to tell
+    # "the tax-bill page was read and shows no mailing address" (a real source
+    # outcome) from "the lookup never happened / failed" (unknown). Without this
+    # the two were indistinguishable and an earlier situs-copy fallback masked
+    # the gap for every King lead.
+    for pid in results:
+        results[pid]["mailing_lookup"] = "not_attempted"
+
     async with BridgeScraper() as scraper:
 
         for i, pid in enumerate(pids_to_lookup):
             if i % 25 == 0:
                 _logger.info("  Mailing: %d / %d ...", i, len(pids_to_lookup))
 
+            results[pid]["mailing_lookup"] = "error"
             try:
                 url = tax_urls[pid]
                 # safe_goto (not raw page.goto): fail-CLOSED pre-flight SSRF
@@ -297,6 +311,12 @@ async def batch_enrich_king_county(
                     pass
 
                 body = await scraper.page.inner_text("body")
+                # "none" ONLY when the rendered page is provably the tax-bill account
+                # page for THIS parcel (its number is on the page, or the site's
+                # explicit "No accounts" answer) and the Mailing Address block is
+                # absent — partial renders / wrong pages stay "error" (Codex P1).
+                if "No accounts" in body or pid.replace("-", "") in body.replace("-", ""):
+                    results[pid]["mailing_lookup"] = "none"
                 if "Mailing Address" in body:
                     idx = body.index("Mailing Address") + len("Mailing Address")
                     after = body[idx:idx + 200]
@@ -312,11 +332,12 @@ async def batch_enrich_king_county(
                     if addr_lines:
                         mailing = " ".join(", ".join(addr_lines).strip().split())
                         results[pid]["mailing_address"] = mailing
+                        results[pid]["mailing_lookup"] = "found"
 
             except Exception:
                 pass
 
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(pace_s)
 
     found_mail = sum(1 for r in results.values() if r.get("mailing_address"))
     found_prop = sum(1 for r in results.values() if r.get("property_address"))

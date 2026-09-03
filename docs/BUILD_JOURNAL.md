@@ -19,6 +19,72 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-03 (end of session) — Three of my own "fixes" contained P1s. Review caught every one.
+
+**Built / Shipped:** PR #191 merged AND DEPLOYED (`77d5ef3`, 12:05Z). Follow-up **PR #196**
+(`fix/test1-followups`, off main) open, CI green, 2066 tests. FE #105 unchanged.
+
+**#196 contents:** five rule-drift fixes (the enrichment health log, `public_cache.py`'s public
+numbers, the skip-trace backfill re-paying Tracerfy, job search missing city/ZIP, a non-uniform
+captcha kill switch); structured situs wired into `ResultRow`/`BatchLeadRow`/`SegmentLeadRow` + the
+dialer + PhoneBurner (OpenAPI regenerated, additive); the plan cap extracted to
+`tasks_helpers/plan_cap.py` with 22 real-DB tests; and skip-trace spend guards.
+
+**Caught & fixed — and the pattern is the point.** Of the changes I was confident in, THREE
+contained P1s that only review found:
+
+1. The ArcGIS quote fix (previous entry) would have caused **wrong-property enrichment** — the
+   broken predicate was accidentally protecting a bad fallback order.
+2. The plan cap shipped three defects, the worst being that `expire_on_commit=False` made its
+   markers **invisible to the export** while billing saw them.
+3. **The cost guard I built while Codex was rate-limited reintroduced the very bug it complemented.**
+   The raw bound sliced BEFORE dedup while the cap and billing count only `is_duplicate = false`, so
+   a duplicate-heavy prefix — exactly what a re-run over the same county produces — consumed the
+   whole bound and delivered **ZERO leads on a full quota**, with the net-new rows past the bound
+   never persisted. Reverted. 🔑 **Under-delivering a paying customer beats saving enrichment spend
+   every time.** I had explicitly flagged this case to the reviewer as "the one I'm most worried
+   about and my tests do not cover it" — asking the question was what surfaced it.
+
+Also fixed from that review: the cap now takes `FOR UPDATE SKIP LOCKED` on its queued skip-trace
+rows BEFORE marking (the dispatcher reads `results` through an un-locked EXISTS, so under READ
+COMMITTED it could see the pre-cap row and POST it — money gone); withdrawn lookups no longer strand
+the lead as permanently "Processing…"; the dispatcher resolves dead queued rows instead of filtering
+them (the dispatch index is `(status, trace_type, enqueued_at)`, so the 5000 limit bounds the batch,
+not the scan); and the public "leads delivered" count now requires `Job.status='done'` and
+`is_duplicate=false`.
+
+**Tried / Decided:**
+- Two reviewers had ruled differently on the cap — option (ii) vs (iii). 🔑 **They were never in
+  conflict: (iii) is (ii) PLUS a spend bound.** Recognising that is what unblocked progress. The
+  bound itself then turned out to be wrong in its placement, not its principle.
+- The correct shape for a spend guard is to bound **enrichment** (after dedup, gating only the
+  enrichment step, releasing the dedup claims of whatever it skips). Deliberately NOT attempted a
+  second time under time pressure.
+
+**Failed / Blocked:** Codex exhausted its ChatGPT quota three times (one review alone ≈8M tokens);
+`codex exec` intermittently dies with "Reading additional input from stdin…" even with `< /dev/null`
+— verdicts are still recoverable from the streamed reasoning traces. Two full-suite runs were killed
+mid-flight and left orphan pytest processes holding DB locks, producing 45 phantom errors; a
+competing session's suite produced another round (`ForeignKeyViolationError` on users +
+`waits for ShareLock` = unmistakable contention, not logic).
+
+**Facts learned:**
+- 🔑 **A green suite proves nothing about code it cannot reach.** The cap was inline in
+  `run_scrape_job`, so 2000 passing tests said nothing about it. Extracting it was what made the
+  three defects findable.
+- 🔑 **A test that mirrors its implementation proves nothing either** — the actionability helper and
+  its test encoded the identical one-sided placeholder bug.
+- 🔑 **Run the command CI runs.** CI does `ruff check src/ tests/`; I had been checking `src/` only.
+- 🔑 **After any raw-SQL UPDATE, ORM objects already in the session are stale** under
+  `expire_on_commit=False` — expire or `populate_existing`.
+- 🔑 A CONFLICTING PR runs **zero** CI and reads as untested, not blocked; `behind N` goes stale in
+  minutes when parallel sessions are merging.
+
+**Pending / Handoff:** concurrent `records_used` race (pre-existing on main, own PR); the enrichment
+cost bound; 👤 Tracerfy top-up, `county_records` purge, 2Captcha key on the Railway **worker**.
+
+---
+
 ## 2026-09-03 (later) — The Codex gate came back NO-GO, and it was right about all four
 
 **Built / Shipped:** three P1 fixes on `fix/test1-lead-data-quality` (`a5ffbfd`, `65c7557`, `4965b1e`)

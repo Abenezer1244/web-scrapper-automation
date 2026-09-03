@@ -866,6 +866,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     from src.scrapers.enrichment.skip_trace import (
         address_cache_key,
         build_pending_row_payload,
+        legacy_cache_locality,
     )
 
     if not settings.SKIP_TRACE_ENABLED:
@@ -932,6 +933,22 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
             payload["state"],
         )
         cached = db.get(SkipTraceCache, cache_key)
+        if cached is None:
+            # Miss under the current key: this row may already be PAID FOR under
+            # the pre-2026-09-03 key, when the locality came from the owner's
+            # mailing address instead of the property's own situs. Those differ
+            # for every absentee owner, so without this second look we would buy
+            # the same address twice. Read-only convergence — no alias row is
+            # written, so no duplicate PII is stored (Codex: the dual-read
+            # belongs at enqueue, not in tracerfy_ingest).
+            _legacy_city, _legacy_state = legacy_cache_locality(rec)
+            if (_legacy_city, _legacy_state) != (payload["city"], payload["state"]):
+                cached = db.get(SkipTraceCache, address_cache_key(
+                    job.user_id,
+                    payload["property_address"],
+                    _legacy_city,
+                    _legacy_state,
+                ))
         cache_valid = False
         if cached:
             # 90-day TTL check

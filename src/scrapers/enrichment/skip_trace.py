@@ -685,6 +685,33 @@ def download_tracerfy_csv(download_url: str) -> str:
     return resp.text
 
 
+def legacy_cache_locality(result) -> tuple[str | None, str | None]:
+    """The (city, state) `build_pending_row_payload` produced BEFORE the
+    structured-situs fallback was added (2026-09-03).
+
+    `address_cache_key` hashes (user_id, street, city, state), so changing where
+    the locality comes from CHANGES THE KEY — and a missed key means re-paying
+    Tracerfy for an address already bought. The change is real for absentee
+    owners: the property sits in PUYALLUP while the owner's mail goes to
+    SEATTLE, so the old precedence keyed the row under the OWNER's city and the
+    new one keys it under the PROPERTY's. (The new precedence is the correct
+    one — Tracerfy traces by property address, so a Puyallup street under a
+    Seattle city was simply a wrong address — but the old rows are already paid
+    for.) This reproduces the OLD precedence so the enqueue path can look under
+    the old key before spending money. Deliberately ignores the structured
+    situs columns: that is exactly what made it "legacy".
+
+    Kept beside build_pending_row_payload, and using the same parser, so the two
+    spellings of the rule cannot drift apart.
+    """
+    parsed = _parse_full_address(result.property_address)
+    if not parsed["city"] and result.mailing_address:
+        mail = _parse_full_address(result.mailing_address)
+        if mail["city"]:
+            return mail["city"], mail["state"]
+    return parsed["city"], parsed["state"]
+
+
 # ─── Helper: build a PendingSkipTraceRow payload from a Result ─────────────
 
 def build_pending_row_payload(result) -> dict | None:

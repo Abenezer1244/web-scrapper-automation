@@ -14,6 +14,7 @@ import pytest
 
 from src.scrapers.enrichment.skip_trace import (
     build_pending_row_payload,
+    legacy_cache_locality,
     looks_like_non_personal_party_name,
 )
 
@@ -195,3 +196,47 @@ class TestStructuredSitusLocality:
         ))
         assert (payload["city"], payload["state"], payload["zip"]) == (
             "PUYALLUP", "WA", "98375")
+
+
+class TestLegacyCacheLocality:
+    """address_cache_key hashes (user, street, city, state), so moving the
+    locality source changes the key — and a missed key means re-paying Tracerfy
+    for an address already bought. legacy_cache_locality() reproduces the OLD
+    precedence so the enqueue path can look under the old key first."""
+
+    def test_absentee_owner_is_where_the_key_actually_moves(self):
+        # Property in PUYALLUP, owner's mail goes to SEATTLE. Old precedence
+        # keyed under the OWNER's city; the new one keys under the PROPERTY's.
+        rec = _result(
+            property_address="9226 175TH STREET CT E",
+            mailing_address="1 OTHER ST, SEATTLE, WA 98101",
+            property_city="PUYALLUP", property_state="WA", property_zip="98375",
+        )
+        assert legacy_cache_locality(rec) == ("SEATTLE", "WA")
+        payload = build_pending_row_payload(rec)
+        assert (payload["city"], payload["state"]) == ("PUYALLUP", "WA")
+
+    def test_owner_occupied_key_is_unchanged(self):
+        # Same city both sides → no key movement → the dual-read is a no-op.
+        rec = _result(
+            property_address="9226 175TH STREET CT E",
+            mailing_address="9226 175TH STREET CT E, PUYALLUP, WA 98375",
+            property_city="PUYALLUP", property_state="WA", property_zip="98375",
+        )
+        payload = build_pending_row_payload(rec)
+        assert legacy_cache_locality(rec) == (payload["city"], payload["state"])
+
+    def test_legacy_ignores_the_structured_situs(self):
+        # That is precisely what makes it "legacy" — no mailing, no parsed city.
+        rec = _result(
+            property_address="9226 175TH STREET CT E", mailing_address=None,
+            property_city="PUYALLUP", property_state="WA", property_zip="98375",
+        )
+        assert legacy_cache_locality(rec) == (None, None)
+
+    def test_full_property_address_needs_no_legacy_lookup(self):
+        rec = _result(
+            property_address="123 MAIN ST, OLYMPIA, WA 98501", mailing_address=None,
+        )
+        payload = build_pending_row_payload(rec)
+        assert legacy_cache_locality(rec) == (payload["city"], payload["state"])

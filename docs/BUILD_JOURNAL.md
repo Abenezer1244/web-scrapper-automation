@@ -19,6 +19,44 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-02 (later) — Audit follow-ups: the 30 fabricated mailing lines, a re-sweep, and an alert for the silent field
+
+**Built / Shipped:** #184 + #185 merged and deployed (`cf6e6fd`); the six Test 3 rows repaired
+from their re-parsed notices (1 amount, 1 name) after a by-URL re-parse — the beat crawl's
+10-page window never reaches a 07/31 notice. Then branch `fix/nts-audit-followups`
+(worktree `bridgeleads-worktrees/followups`):
+- `scripts/backfill_pierce_statewide_mailing.py` — **run in prod: 30/30 rows updated.** Every
+  fabricated "situs, WA" mailing line was Pierce (9 trustee_sale dashed parcels + 21
+  pre_foreclosure whose county call had failed at scrape time). 25 got the county's real
+  mailing address (3 differ materially: a PO BOX, "4122 320TH ST E" vs "4120 TO 4122…", an
+  owner in Salem MA); 5 rows on one parcel the county layer lacks went to NULL. Owner flags
+  recomputed in the same guarded UPDATE; per-row JSONL evidence kept.
+- `nts_crawler.py` — bounded re-sweep of active, future-dated notices with NULL amount
+  (Tacoma + Clark, URL-based only); `_upsert_notice` retires a trailing-dash TS# twin.
+- `trustee_sale_finalize.py` — WARNING + per-county ops alert on any null default_amount.
+- `repair_trustee_sale_from_notices.py` — `--include-pre-foreclosure` (prod dry-run: 0 rows).
+- `nts_tacoma_index.py` — TS# trailing hyphens trimmed (real title-dash notice as fixture).
+
+**Tried / Decided:** Codex consulted per item (design + implementation, all GATE PASS).
+Sweep predicate = NULL amount only (no grantor heuristics); alert on ANY null, not a ratio;
+404 during the sweep refreshes fetched_at but never deactivates. Items 3 (statewide
+situs-as-mailing for 38 counties) and 4 (street-only property_address → dead
+property_state, absentee never False) are POLICY: Codex recommends option B for both —
+statewide writes mailing=None going forward; add property_city/state/zip columns fed from
+GIS/notice and compute flags from them, never touching the frozen dedup key. Not
+implemented — user decision. Dependabot #174 (redis 6.x) closed per the #173 rule;
+#175–#178 left for a decision (alembic, anthropic 0.52→0.120, stripe 11→15, playwright 1.61).
+
+**Failed / Blocked:** none new. `railway run` worked this session once explicitly authorized.
+
+**Facts learned:** 21 of the 30 fabricated lines had PLAIN parcels — the county GIS batch
+call must have failed at scrape time and the code `continue`s past that; the statewide
+fallback then filled in silently. King has 4,765 situs-prefixed mailing rows (tax bulk is a
+real mailing source, so most are legitimate owner-occupied); Snohomish's 18 are all statewide
+copies. property_address contains a city on 1 of ~5,500 leads app-wide.
+
+---
+
 ## 2026-09-02 — Pierce auction leads ("Test 3"): the blank Default Owed was a parser gap, and it wasn't the only one
 
 **Built / Shipped:** branch `fix/nts-matured-obligation-amount` (worktree

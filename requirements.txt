@@ -22,7 +22,7 @@ python-dotenv==1.2.2         # M3: CVE-2026-28684
 PyJWT[crypto]==2.13.0        # M3: clears PYSEC-2026-120/175/176/177/178/179 (audits clean at 2.13.0; no ignore needed)
 bcrypt==5.0.0                # direct pyca/bcrypt (passlib dropped 2026-06-18 — its 1.7.4 pin blocked bcrypt>=5)
 pyotp==2.9.0                 # TOTP (MFA, H2)
-cryptography==49.0.0         # Fernet field encryption (MFA secret; H3 PII). 2026-06-15: GHSA-537c-gmf6-5ccf (bundled OpenSSL secadv 2026-06-09)
+cryptography==50.0.0         # Fernet field encryption (MFA secret; H3 PII). 2026-09-02: PYSEC-2026-3552 (pkcs7_decrypt_* outcome oracle; fixed 50.0.0). 2026-06-15: GHSA-537c-gmf6-5ccf (bundled OpenSSL secadv 2026-06-09)
 
 # Task queue
 celery[redis]==5.6.3
@@ -43,7 +43,7 @@ playwright==1.60.0
 beautifulsoup4==4.12.3
 lxml==6.1.0                  # M3: PYSEC-2026-87
 requests==2.34.2             # M3: CVE-2024-47081, CVE-2026-25645. 2.34: inline typing + less-greedy no_proxy matching
-pypdf==6.14.2                # NTS Tier 1: extract text from Pacific Publishing legals PDFs (pure-python, no native deps). 6.14.2: CVE-2026-59935/59936 (extract_text infinite loop), CVE-2026-59937 (xref long runtime), CVE-2026-59938 (image memory-DoS); prior 6.13.3: GHSA-jm82-fx9c-mx94
+pypdf==6.16.1                # NTS Tier 1: extract text from Pacific Publishing legals PDFs (pure-python, no native deps). 6.16.1: PYSEC-2026-3655/3656 + CVE-2026-84309/84310/84311 (crafted-PDF memory/runtime DoS, infinite loop; fixed 6.15.0-6.16.1). 6.14.2: CVE-2026-59935/59936 (extract_text infinite loop), CVE-2026-59937 (xref long runtime), CVE-2026-59938 (image memory-DoS); prior 6.13.3: GHSA-jm82-fx9c-mx94
 
 # AI extraction (Claude API)
 anthropic==0.52.0

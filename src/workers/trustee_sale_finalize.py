@@ -185,8 +185,66 @@ def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
             f"after finalize (job {job_id}) — refusing to deliver blank Auction Leads"
         )
 
+    # Observability for the OPTIONAL field (2026-09-02): a NULL default_amount is a
+    # valid source outcome, but an amount-PARSER regression looks exactly the same and
+    # shipped silently for weeks. Warn + ops-alert (per-county cooldown in
+    # send_ops_alert) on ANY null amount in the job — never raise (Codex).
+    null_amounts = db.execute(
+        _sa_text(
+            "SELECT id, nts_notice_id FROM results "
+            "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
+            "AND is_duplicate = false AND default_amount IS NULL "
+            "ORDER BY created_at LIMIT 5"
+        ),
+        {"jid": job_id, "uid": str(user_id)},
+    ).fetchall()
+    if null_amounts:
+        total_null = db.execute(
+            _sa_text(
+                "SELECT count(*) FROM results WHERE job_id = :jid "
+                "AND user_id = CAST(:uid AS uuid) AND is_duplicate = false "
+                "AND default_amount IS NULL"
+            ),
+            {"jid": job_id, "uid": str(user_id)},
+        ).scalar() or 0
+        scope = db.execute(
+            _sa_text(
+                "SELECT sc.county, sc.state FROM jobs j "
+                "JOIN scraper_configs sc ON sc.id = j.scraper_config_id WHERE j.id = :jid"
+            ),
+            {"jid": job_id},
+        ).fetchone()
+        county = f"{scope.county}/{scope.state}" if scope else "?"
+        subject, body = null_amount_alert(
+            job_id, county, total_null, len(rows),
+            [str(r.nts_notice_id) for r in null_amounts],
+        )
+        _logger.warning("%s — %s", subject, body)
+        from src.workers.ops_alerts import send_ops_alert
+        send_ops_alert("trustee_sale_null_amount", county, subject, body)
+
     _logger.info(
         "Job %s: trustee_sale finalize populated %d leads, collapsed %d same-parcel siblings",
         job_id, populated, collapsed,
     )
     return collapsed
+
+
+def null_amount_alert(
+    job_id: str, county: str, null_count: int, total: int, notice_ids: list[str],
+) -> tuple[str, str]:
+    """(subject, body) for the null-amount warning. Pure so the wording is testable.
+
+    Carries what an operator needs to tell a legitimate source omission from a
+    parser gap: county, job, counts, and the source notice ids to re-check.
+    """
+    subject = f"Auction leads without Default Owed: {null_count}/{total} ({county})"
+    body = (
+        f"Job {job_id} ({county}) delivered {null_count} of {total} trustee_sale lead(s) "
+        f"with no default_amount. This is allowed (the notice may state no sum owing) "
+        f"but it is also the signature of a section-IV parser gap — check the source "
+        f"notices for these nts_notices ids: {', '.join(notice_ids) or 'n/a'}. "
+        f"If the source states an amount, fix the parser and run "
+        f"scripts/repair_trustee_sale_from_notices.py."
+    )
+    return subject, body

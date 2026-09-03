@@ -14,7 +14,7 @@ Decoupling the slow crawl from user scrape jobs is deliberate (Codex).
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import text as _sa_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -32,6 +32,13 @@ _FETCH_DELAY_S = 1.0      # polite delay between notice fetches
 _LISTING_DELAY_S = 0.5    # polite delay between listing-page fetches (we now always
                           # walk multiple pages per run — Bug A fix)
 _CACHE_DAYS = 90          # expire notices not seen in this window
+# Re-sweep (2026-09-02): the listing pass only reaches the newest _MAX_PAGES pages, so a
+# parser fix never revisited an older notice — a 07/31 notice sat with a NULL amount
+# for a month. Each URL-based crawl (Tacoma, Clark) now re-fetches a bounded batch of
+# still-active, future-dated notices that carry NO amount and were last fetched over
+# _RESWEEP_MIN_AGE_HOURS ago, so a genuinely amount-less notice costs one fetch/day.
+_RESWEEP_LIMIT = 25
+_RESWEEP_MIN_AGE_HOURS = 20
 
 # ── Pacific Publishing weekly-PDF crawlers (Snohomish Tribune, Queen Anne News) ──
 # These papers publish one weekly "Legals" PDF carrying MANY notices (vs Tacoma's
@@ -131,6 +138,20 @@ def crawl_nts_tacoma_index() -> dict:
             time.sleep(_FETCH_DELAY_S)
         db.commit()
 
+        # Re-sweep older active notices the listing pass can no longer reach.
+        def _fetch_notice(u: str):
+            resp = safe_get(u, timeout=20, same_origin_as=nts.BASE_URL,
+                            headers={"User-Agent": "BridgeLeadsBot/1.0"})
+            return resp.status_code, resp.text
+
+        resweep = _resweep_null_amount_notices(
+            db, NtsNotice, source=nts.SOURCE, county=nts.COUNTY, today=today,
+            fetch=_fetch_notice,
+            parse=lambda html: nts.parse_tacoma_notice(nts.extract_article_text(html)),
+            notice_to_row=nts.notice_to_row,
+        )
+        db.commit()
+
         # Expire: past-auction + anything not refreshed within the cache window.
         expired = db.execute(
             _sa_text(
@@ -146,7 +167,8 @@ def crawl_nts_tacoma_index() -> dict:
         db.commit()
 
     summary = {"candidates": len(notice_urls), "upserted": upserted,
-               "skipped": skipped, "errored": errored, "expired": expired or 0}
+               "skipped": skipped, "errored": errored, "expired": expired or 0,
+               "resweep": resweep}
     _logger.info("NTS crawl done: %s", summary)
     _alert_if_crawl_barren("tacoma_daily_index", discovered=len(notice_urls), upserted=upserted)
     return summary
@@ -245,6 +267,21 @@ def crawl_nts_columbian_clark() -> dict:
                 summary["errored"] += 1
                 _logger.warning("Clark NTS ad %s failed: %s", u, str(exc)[:120])
             time.sleep(_FETCH_DELAY_S)
+        db.commit()
+
+        # Re-sweep older active Clark notices that still carry no amount (URL-based
+        # source, so an old permalink can be re-fetched — unlike the weekly PDFs).
+        def _fetch_ad(u: str):
+            r = safe_get(u, timeout=20, same_origin_as=col.BASE_URL,
+                         headers={"User-Agent": _PDF_BROWSER_UA})
+            return r.status_code, r.text
+
+        summary["resweep"] = _resweep_null_amount_notices(
+            db, NtsNotice, source=col.SOURCE, county=col.COUNTY, today=today,
+            fetch=_fetch_ad,
+            parse=lambda html: nts.parse_tacoma_notice(col.extract_ad_body(html)),
+            notice_to_row=nts.notice_to_row,
+        )
         db.commit()
 
         # SOURCE-SCOPED expiry (Codex): a Clark run must NEVER expire another source's
@@ -435,6 +472,77 @@ def _upsert_notice(db, model, row: dict) -> None:
         constraint="uq_nts_notices_source_ts", set_=update_cols
     )
     db.execute(stmt)
+    # Retire a trailing-dash twin: before 2026-09-02 the parser stored the trustee's
+    # page-title spelling "WA-26-1035144-SW-" (dash and all); it now normalizes to
+    # "WA-26-1035144-SW", which is a DIFFERENT natural key. Without this, both rows
+    # stay active through the auction window and the same sale would surface twice
+    # (Codex). Exact match on the dashed spelling only.
+    db.execute(
+        _sa_text(
+            "UPDATE nts_notices SET is_active = false "
+            "WHERE source = :source AND ts_number = :dashed AND is_active"
+        ),
+        {"source": row["source"], "dashed": row["ts_number"] + "-"},
+    )
+
+
+_RESWEEP_SELECT = _sa_text(
+    """
+    SELECT id, ts_number, source_url FROM nts_notices
+    WHERE source = :source AND is_active AND auction_date >= :today
+      AND principal_owing IS NULL AND source_url IS NOT NULL
+      AND (fetched_at IS NULL OR fetched_at < :stale_before)
+    ORDER BY auction_date ASC
+    LIMIT :lim
+    """
+)
+_TOUCH_FETCHED = _sa_text("UPDATE nts_notices SET fetched_at = :now WHERE id = :id")
+
+
+def _resweep_null_amount_notices(
+    db, model, *, source: str, county: str, today, fetch, parse, notice_to_row,
+) -> dict:
+    """Re-fetch a bounded batch of active, future-dated notices with NO amount.
+
+    ``fetch(url) -> (status_code, html)``; ``parse(html) -> parsed dict``;
+    ``notice_to_row`` is the source's row builder. A re-parse that now yields an
+    amount is upserted (updated); one that still has none only refreshes fetched_at
+    (unchanged_null) so it is retried at most once per _RESWEEP_MIN_AGE_HOURS; a
+    non-200 page also just refreshes fetched_at and is counted (not_found) — the
+    notice is NEVER deactivated from one bad fetch, auction-date expiry handles a
+    page the source really removed (Codex). Errors never abort the crawl.
+    """
+    counts = {"attempted": 0, "updated": 0, "unchanged_null": 0, "not_found": 0, "errors": 0}
+    stale_before = datetime.now(UTC) - timedelta(hours=_RESWEEP_MIN_AGE_HOURS)
+    rows = db.execute(
+        _RESWEEP_SELECT,
+        {"source": source, "today": today, "stale_before": stale_before, "lim": _RESWEEP_LIMIT},
+    ).fetchall()
+    for r in rows:
+        counts["attempted"] += 1
+        now = datetime.now(UTC)
+        try:
+            status, html = fetch(r.source_url)
+            if status != 200:
+                counts["not_found"] += 1
+                db.execute(_TOUCH_FETCHED, {"now": now, "id": r.id})
+                continue
+            row = notice_to_row(parse(html), source_url=r.source_url, today=today,
+                                source=source, county=county)
+            if row is None or row.get("principal_owing") is None:
+                counts["unchanged_null"] += 1
+                db.execute(_TOUCH_FETCHED, {"now": now, "id": r.id})
+                continue
+            row["fetched_at"] = now
+            _upsert_notice(db, model, row)
+            counts["updated"] += 1
+        except Exception as exc:  # noqa: BLE001 — one bad notice must not stop the sweep
+            counts["errors"] += 1
+            _logger.warning("NTS resweep %s failed: %s", r.source_url, str(exc)[:120])
+        time.sleep(_FETCH_DELAY_S)
+    if counts["attempted"]:
+        _logger.info("NTS resweep (%s): %s", source, counts)
+    return counts
 
 
 def _barren_alert_reason(

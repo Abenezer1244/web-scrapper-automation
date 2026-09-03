@@ -131,9 +131,16 @@ def _set_status(
     status: str,
     *,
     expected_started_at: datetime | None = None,
+    commit: bool = True,
     **kwargs: Unpack[JobUpdateFields],
 ) -> bool:
     """Update job status and any extra fields, then commit.
+
+    ``commit=False`` leaves the CAS UPDATE pending in the caller's transaction
+    so it can be committed atomically with other writes (the done-CAS is
+    committed together with billing — a crash can no longer leave a job billed
+    but not done, or done but not billed). The caller MUST then commit on True
+    and roll back on False; ``job`` is not refreshed in that mode.
 
     Terminal-write guard (Track A, Codex P2): the write is a CAS that only
     touches a row still in a NON-terminal status. If the row was terminalized
@@ -164,6 +171,8 @@ def _set_status(
     rowcount = db.execute(
         _sa_update(Job).where(*where).values(status=status, **kwargs)
     ).rowcount
+    if not commit:
+        return rowcount == 1
     db.commit()
     db.refresh(job)
     return rowcount == 1

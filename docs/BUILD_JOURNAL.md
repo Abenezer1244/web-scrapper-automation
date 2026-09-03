@@ -19,6 +19,255 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-03 (later) — The Codex gate came back NO-GO, and it was right about all four
+
+**Built / Shipped:** three P1 fixes on `fix/test1-lead-data-quality` (`a5ffbfd`, `65c7557`, `4965b1e`)
+after the Codex adversarial review of PR #191 returned **4 P1 + 2 P2 + 1 P3**. Every finding was
+re-verified in the code before being believed; all four P1s were real.
+
+**Caught & fixed:**
+
+1. **The quarantine had a hole in its own rule.** `enrichment/parcel.py`'s failure return writes
+   `"(enrichment unavailable)"` into **both** address columns, but `lead_actionability` excluded it
+   only on the property branch. A row whose enrichment failed completely passed through the mailing
+   side and was listed, exported, counted **and billed** with no address anywhere — the precise
+   outcome the quarantine exists to prevent. 🔑 **The test helper had baked in the same bug**: its
+   `_sql_eval` twin omitted the placeholder check on the mailing side and `CASES` never contained
+   `(None, PLACEHOLDER)`, so a fully green suite proved nothing about that path. A rule with three
+   spellings needs a test matrix that crosses BOTH inputs, not one that mirrors the implementation.
+
+2. **The previous session's quote fix would have caused wrong-property enrichment.**
+   `enrich_parcel_gis` ran the fuzzy owner-name search (first token, `resultRecordCount=1`) BEFORE
+   the exact WA statewide parcel lookup. That ordering was harmless only *because* the predicate was
+   broken: an apostrophe surname produced malformed SQL, ArcGIS errored, the bare `except` swallowed
+   it, and control fell through to the correct exact lookup. 🛑 **Escaping the predicate without
+   fixing the order would have converted "no enrichment" into "confidently wrong address on a
+   lead"** — a net downgrade shipped as a fix. Exact identifier now beats fuzzy name, and the name
+   search only runs when there is no parcel id at all.
+
+3. **The situs-first locality change silently re-bills Tracerfy.** `address_cache_key` hashes
+   (user_id, street, city, state), so moving where the locality comes from moves the KEY, and a
+   missed key is not a cache miss — it is buying the same address twice. 🛑 **I had argued the
+   opposite to the user**: that the fix restored the pre-#188 key. True for statewide rows (the
+   fabricated mailing city WAS the situs city), false for **absentee owners**, where the old key used
+   the owner's city (SEATTLE) and the new one uses the property's (PUYALLUP). Codex was right.
+   Resolution: keep the new precedence (Tracerfy traces by property address, so the old pairing was
+   simply a wrong address) and add a read-only legacy-key lookup at enqueue.
+   `legacy_cache_locality()` sits beside `build_pending_row_payload` and uses the same parser so the
+   two spellings cannot drift.
+
+**Tried / Decided — what was deliberately NOT fixed:**
+
+- **Plan cap vs actionable billing (P1).** `records = records[:remaining]` slices RAW rows before
+  enrichment while billing counts persisted ACTIONABLE non-duplicates, so a user near quota whose
+  first rows are addressless saves a quarantined prefix, is billed ~0, and loses real leads past the
+  slice. Real, and this branch's quarantine created the divergence. **Not fixed here**: the
+  root-cause fix moves a cap inside a billing path, Codex exhausted its quota before ruling on the
+  four options put to it, and shipping an unreviewed heuristic into billing is how incidents happen.
+  Flagged rather than guessed.
+- **Concurrent `records_used` overrun (P1).** Verified byte-identical on `origin/main` — the
+  unlocked `remaining` read and the predicate-less UPDATE both predate this branch. Pre-existing,
+  own PR.
+- **Structured situs missing from `ResultRow`/`BatchLeadRow`/`SegmentLeadRow` and from the
+  dialer/PhoneBurner payload (P2)**, and **job search not covering property_city/zip (P3)** —
+  pre-existing #188 gaps; this branch fixed only the CSV.
+
+**Failed / Blocked:** Codex hit its ChatGPT usage limit twice (the deep review alone burned ~8M
+tokens), and `codex exec` dies with "Reading additional input from stdin..." on long runs even with
+`< /dev/null`. Its verdicts on A/B/C were recovered from the streamed reasoning traces before the
+process exited; the D/E verdicts were never obtained.
+
+**Facts learned:**
+- 🔑 **A green suite is not evidence when the test mirrors the implementation.** Both the
+  actionability hole and its test helper encoded the same asymmetry. Cross the inputs.
+- 🔑 **A security/correctness fix can activate a dormant bug behind it.** The quote escaping was
+  correct in isolation and harmful in situ. Ask what the broken thing was accidentally protecting.
+- 🔑 **Changing where a value comes from changes every hash it feeds.** Grep for the field in key
+  builders before changing its provenance.
+
+**Pending / Handoff:** PR #191 is NO-GO until Codex clears the plan-cap item (quota resets 06:49).
+👤 Tracerfy top-up and the `county_records` purge remain the owner's.
+
+---
+
+## 2026-09-03 — Merging Test 1 into a moved main: #188 landed mid-session and took three regressions with it
+
+**Built / Shipped:** merged `origin/main` into `fix/test1-lead-data-quality` (merge commit `40f0e3b`)
+and then fixed three real defects the merge exposed. The branch was reported as "behind 4"; by the
+time the merge ran it was **behind 6** — PR #188 (`feat/real-owner-location`, merge commit
+`1b964d9`) and #189 landed *during* the session, at 2026-09-03 05:31Z.
+
+**Tried / Decided:** the only real conflict was `src/scrapers/enrichment/county_gis.py`, and it was
+SEMANTIC, not textual. This branch and #188 independently implemented the SAME 2026-09-02
+"no assumed situs-as-mailing" policy, two different ways:
+
+- this branch: `_statewide_result()` — `mailing_address=None`, situs locality FOLDED INTO the
+  `property_address` string as `"STREET, CITY, WA ZIP"`;
+- #188: `mailing_address=None`, `property_address` left street-only and FROZEN, locality moved to
+  structured `Result.property_city` / `property_zip` columns (migration 085).
+
+**#188's design wins and this branch's `_statewide_result` was dropped as superseded.** The
+deciding argument (Codex, verified in the code): `property_address` is an identity/cache/export key
+— `property_identity`, `skip_trace.address_cache_key()` — so stuffing city/state/zip into it drifts
+those keys. Folding locality into the string is not merely duplicate after 085, it is corrupting.
+`_arcgis_literal()` + `_map_county_features()` from #184/#186 were kept intact.
+
+`tasks.py` and `tasks_helpers/enrich.py` auto-merged; both were verified SEMANTICALLY rather than
+trusted. `tasks.py` kept both of #188's hunks (situs parse at row build; `compute_owner_flags(...)`
+kwargs in the post-enrich recompute) alongside this branch's restructure (billing moved after inline
+enrichment, folded into the same transaction as the done-CAS), with the ordering intact:
+enrichment → owner flags → billing → done-CAS. `enrich.py` kept both `_keep_situs_parts()` and
+`actionable_condition()`.
+
+**Caught & fixed — three regressions in code ALREADY ON MAIN, all found by cross-checking the merge,
+all confirmed in the code before being believed:**
+
+1. **(High) #188 broke Tracerfy locality.** `build_pending_row_payload()` sourced city/state/zip from
+   `property_address`, falling back to `mailing_address`. #188 correctly stopped fabricating that
+   mailing line for statewide/mailing-less GIS rows, and stored the truth in the new 085 columns —
+   but nothing read them. Statewide-enriched rows therefore reached Tracerfy with city/state/zip all
+   `None`, which the function's own comment says "errors in Tracerfy". #188 removed the locality
+   source without wiring its replacement. Fixed by reading the structured parts as the FIRST
+   fallback (property parts describe the property; the owner's mail is only a proxy).
+2. **(Medium) the structured situs never reached the CSV.** `lead_export.build_lead_export_row()`
+   derived `property_city/state/zip` purely by parsing `property_address` — blank for exactly the
+   street-only rows 085 was added to describe. Fixed stored-first, parse-as-fallback. The raw-SQL
+   projections in `batch_export.py` and `segments.py` never SELECTed the new columns either, so the
+   row builder could not have exported them for combined/segment exports; added to all 8 projections.
+3. **(Medium, correctness not just injection) unescaped ArcGIS owner-name predicate.**
+   `_query_gis_by_name()` still built `LIKE '{name_clean}%'` by raw interpolation. `name_clean` keeps
+   apostrophes, so an ordinary WA surname — O'BRIEN, O'CONNOR, D'ANGELO — produced a malformed
+   predicate; ArcGIS errored, the bare `except` swallowed it, and those owners silently got NO
+   enrichment. #184/#186 had added `_arcgis_literal()` and applied it to every parcel predicate but
+   missed this one. Fixed with `_arcgis_literal()`, plus a `_LIKE_META` reject for `%`/`_` matching
+   the existing `pierce_legal_repair` precedent.
+
+**Failed / corrected mid-flight:** Codex advised filling the locality fields "independently, not
+only inside `if not parsed[city]`". That is right for the structured situs parts (same property, one
+source) but WRONG against the mailing address: pairing a situs city with an absentee owner's mailing
+ZIP invents a locality that exists nowhere ("OLYMPIA WA 98101" for a Seattle-mailed Olympia
+property) — the very fabricate-an-address class of bug #188 was fixing. The situs fill is per-field;
+the mailing fallback stays ATOMIC. Pinned by a regression test.
+
+**Facts learned:**
+- A branch's "behind N" is a snapshot with a short shelf life when parallel sessions are merging.
+  Re-read `origin/main` immediately before resolving, not once at the start.
+- `git merge-tree --write-tree` predicts the conflict SET without touching the worktree, but a clean
+  auto-merge is only a TEXTUAL result. Every auto-merged file that both sides edited still needs a
+  semantic read — here `tasks.py` and `enrich.py` both merged clean and both needed checking.
+- Two branches can implement the same policy decision and still conflict destructively. The tiebreak
+  is which representation the rest of the system already treats as canonical.
+
+**Pending / Handoff:** 👤 Tracerfy credit top-up and the `county_records` purge (needs
+`DATABASE_URL_MIGRATE`) remain the user's. Not addressed here: `ResultRow` still does not expose
+`property_city`/`property_zip` to the API results page (only `property_state`), so the structured
+situs is exported but not displayed.
+
+---
+
+## 2026-09-02 — "Test 1" (Pierce probate) lead data-quality audit: source vs application, end to end
+
+**Built / Shipped:** branch `fix/test1-lead-data-quality` (worktree `test1-data-quality`, off
+`origin/main`), no migration. Backend: `skip_trace.looks_like_non_personal_party_name` rewritten
+(code-violation shapes only, whole-word suffixes); `build_pending_row_payload` now fills the
+Tracerfy `mail_*` columns; `address_intel._addresses_differ` tolerates a TRAILING suffix /
+post-directional the county situs omits (→ unknown, not absentee); `county_gis` statewide fallback
+returns `mailing_address=None` with the situs locality kept on `property_address`, and the generic
+parser no longer copies situs→mailing; `skip_trace_dispatcher` claims rows `FOR UPDATE SKIP LOCKED`,
+pages ops on 402 (`send_ops_alert`, 6h cooldown) and submits the affordable FIFO head parsed from
+Tracerfy's "need N more credits"; `get_cached_records` drops the `doc_type IS NULL` escape hatch,
+mirrors the scraper's word-boundary/exclude matcher in SQL, and maps the literal
+"(enrichment unavailable)" to null; `scripts/backfill_owner_flags.py --recompute-suffixless`.
+5 new/extended test modules (91 focused tests). Frontend: `fix/scraper-view-latest-results`
+(`e7c6352`) — the command palette opens a scraper's latest completed results, not the county cache.
+Prod data: the 5 false `absentee_owner=TRUE` rows recomputed to NULL via the script (dry-run, then
+`--commit`).
+
+**Tried / Decided:**
+- Verified every "missing" field at the SOURCE before touching code: the 4 parcel-less rows have no
+  Parcel Id on the ARMS Legal Description tab (positive controls on the same pages return parcels);
+  BAKKE's parcel is absent from Pierce GIS *and* WA statewide. Those nulls are correct — nothing to fix.
+- **Rejected: hiding incomplete rows or filling them.** Every field either came from the recorder /
+  GIS / Tracerfy or is null. No placeholder values exist in the job's 110 rows.
+- Codex consult before coding agreed on all six findings and added two: the `mail_*` payload gap
+  and the backfill script's inability to revisit already-flagged rows. Both adopted.
+- Codex round-1 review: FAIL (High: unlocked dispatcher read-before-submit could double-pay a batch
+  across overlapping ticks — pre-existing, adopted; Medium: cache ILIKE bleed `SUCC`→`SUCCESSOR`,
+  adopted; Low: 402-then-429 misclassified, adopted). **Rejected** its `rows_uploaded` finding:
+  prod queue 158749 shows 25 rows sent → 24 uploaded → all 25 reconciled — Tracerfy de-duplicates
+  identical addresses, so a count mismatch is normal, not a lost tail. Codex agreed in round 2.
+- Codex round-2 review: FAIL (High: a row lock is not durable — a worker dying between the Tracerfy
+  POST and the bookkeeping commit rolled the rows back to `queued` and the next tick paid for them
+  again). **Adopted without a schema change:** rows move to a committed `status='submitting'`
+  (submitted_at = claim time) BEFORE the POST; `classify_submit_failure()` releases the claim to
+  `queued` on 429/402/5xx/connection-refused, marks `errored` on definite 4xx/config, and LEAVES
+  `submitting` on timeout / non-JSON / missing queue_id (never auto-resubmitted — double-pay);
+  `_alert_stale_claims()` pages ops after 30 min. `submit_batch` now distinguishes
+  `requests.ConnectionError` (never delivered) from other request errors. The dialer sweep treats
+  `submitting` as unsettled. DB-backed tests cover claim → definite rejection → `errored`, and
+  that a row another tick claimed is never picked up.
+- Codex round-3 review: **PASS** on the blocker; two Mediums. Adopted: a definite rejection now
+  also flips the lead's `skip_trace_status` to `errored` (it used to sit at "Processing" forever).
+  Deferred with rationale: a completed webhook arriving before the dispatcher's own commit is
+  discarded as `unknown_queue` — the ingest already re-checks under a lock and the window is the
+  milliseconds between POST return and commit; a bounded Celery retry on `unknown_queue` is the
+  follow-up.
+
+**Follow-up in the same session — quarantine unactionable leads (owner decision):** a row with no
+property address AND no mailing address is not a lead: not listed, not exported, not counted, not
+billed; kept in `results` for dedup + scraper health. One rule, three spellings in
+`src/api/lead_actionability.py` (`actionable_condition` / `actionable_sql` / `is_actionable`), wired
+as a standing filter like the tax cap into `jobs.py` (results, download, total_scraped/duplicate_count),
+`batch_export.py`, `segments.py` (4 queries), `analytics.py`, the dialer sweep + outbox, and both job
+exports. The billing block (force-finalize guard + `billable_count` + CAS + overage warning) moved
+from BEFORE inline enrichment to right before the done-CAS, because actionability is unknowable until
+enrichment fills addresses; `billable_count` now = non-duplicate actionable rows and `display_count`
+(headline, email, webhook, notification) is that same number. Codex consult agreed and added the
+webhook count (was `len(records)`), the dialer paths, and scoping `total_scraped` so the duplicate
+banner cannot be driven by non-leads. Test fixtures that built "leads" with a property_key but no
+address were given one. Already-billed historical usage is NOT credited back; Test 1 now reads 105.
+Codex adversarial review of this diff: FAIL → adopted (High) on an already-billed re-run the
+headline/email/webhook now report the persisted `billed_count`, not a recomputed count that
+enrichment may have changed; (Medium) `previous_job_id` and the download's "has rows" check apply
+both standing predicates; (Medium) all three predicate spellings trim whitespace (`btrim`); (Medium)
+five test modules seeded address-less "leads" — given addresses. Round 2 still FAILed on the
+billing/done split (a crash between them lets the watchdog re-scrape and re-export against a stale
+bill) — **adopted**: `_set_status(commit=False)` lets the done-CAS commit in the SAME transaction as
+the billing CAS + `records_used` increment; a failed CAS rolls both back (a cancelled job is never
+charged). Also adopted: the skip-trace enqueue applies the rule (never pay Tracerfy for a
+quarantined row; blank / placeholder property addresses rejected in `build_pending_row_payload`), and
+the analytics fixture carries an address. Round 3 FAILed on a consequence of filtering the FIRST
+(pre-enrichment) export: if the post-enrichment re-upload failed, the emailed R2 file could omit rows
+that enrichment made actionable while the bill counted them — **adopted**: the re-export now uses
+`_upload_export_with_retry` and any failure is fatal BEFORE billing (claims released, job failed with
+an honest reason, `job_failed` notification), mirroring the first-upload rule. Round 4: **PASS**.
+
+**Failed / Blocked:**
+- **Tracerfy is out of credits (ops).** Every dispatcher tick since 04:25 UTC fails 402 on a 344-row
+  batch; 565 rows / 7 jobs sit `queued`, the UI says "Processing 10–15 min" indefinitely. The code
+  now alerts and drains partially, but only a top-up at tracerfy.com unblocks it (👤).
+- `county_records` (3,305 rows, March, column-shifted, doc_type NULL) cannot be purged by the app
+  role (no DELETE) — needs `DATABASE_URL_MIGRATE` (👤). The endpoint now filters it out for typed
+  configs and all three "View" entry points prefer real job results.
+- SAARENAS AVELINO G (wrongly gated) stays `not_attempted` on the historical job; re-tracing costs
+  credits and there are none — documented, not forced.
+
+**Caught & fixed:** the first `_statewide_result` emitted "STREET, WA" / "STREET, WA 98501" when the
+city was missing, which `_parse_full_address` would read as city="WA …" — now bare street without a
+city. A raw-string docstring was needed for the PostgreSQL `\m…\M` regex (SyntaxWarning).
+
+**Pending / Handoff:** PRs for both branches; Tracerfy credits; county_records purge; optional
+"Delayed" state on the results page when skip-trace rows are queued > 1h (needs `enqueued_at` on
+the results payload — Codex: separate PR).
+
+**Facts learned:** Pierce GIS `Site_Address` routinely drops the suffix/post-directional that
+`Delivery_Address` keeps; Tracerfy 402 bodies state the exact shortfall ("You need N more credits");
+`jobs/{id}/results` skeleton rows render first — wait for a non-`animate-pulse` row in e2e;
+`/scrapers/{id}/records` is the shared county cache, `/results/{job}` is the tenant's data;
+`ENABLE_DAILY_SCRAPE` defaults False so that cache has been frozen since 2026-03-23.
+
+---
+
 ## 2026-09-02 (later) — Audit follow-ups: the 30 fabricated mailing lines, a re-sweep, and an alert for the silent field
 
 **Built / Shipped:** #184 + #185 merged and deployed (`cf6e6fd`); the six Test 3 rows repaired

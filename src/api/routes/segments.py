@@ -33,6 +33,7 @@ from starlette.responses import Response
 
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
+from src.api.lead_actionability import actionable_sql
 from src.api.middleware import rate_limit
 from src.api.schemas import (
     SegmentIntersectionRequest,
@@ -140,7 +141,8 @@ EXPORT_CAP = 50_000
 _INTERSECTION_SQL = f"""
 WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
-           r.mailing_address, r.phone, r.phone_type, r.email,
+           r.mailing_address, r.property_city, r.property_state, r.property_zip,
+           r.phone, r.phone_type, r.email,
            r.phones, r.emails, r.property_key,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at
@@ -151,7 +153,7 @@ WITH candidates AS (
       AND r.property_key IS NOT NULL
       AND sc.record_type = ANY(:types)
       -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass).
-      AND {tax_cap_sql('r')}
+      AND {tax_cap_sql('r')} AND {actionable_sql('r')}
       AND r.property_key IN (
           SELECT property_key
           FROM property_list_membership
@@ -182,7 +184,8 @@ ranked AS (
     FROM candidates c
 )
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
-       rk.mailing_address, rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
+       rk.mailing_address, rk.property_city, rk.property_state, rk.property_zip,
+       rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
        rk.phones, rk.emails,
        a.matched_record_types, a.overlap_count, a.lead_subtype
 FROM ranked rk
@@ -214,7 +217,8 @@ LIMIT :limit
 _UNION_SQL = f"""
 WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
-           r.mailing_address, r.phone, r.phone_type, r.email,
+           r.mailing_address, r.property_city, r.property_state, r.property_zip,
+           r.phone, r.phone_type, r.email,
            r.phones, r.emails,
            r.property_key, r.is_duplicate,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
@@ -226,7 +230,7 @@ WITH candidates AS (
     WHERE r.user_id = :uid
       AND sc.record_type = ANY(:types)
       -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass).
-      AND {tax_cap_sql('r')}
+      AND {tax_cap_sql('r')} AND {actionable_sql('r')}
       -- Optional filing-date window (migration 049 date_recorded_parsed). When no
       -- window is requested :require_date is FALSE and from/to are NULL, so all
       -- three predicates pass and behavior is identical to the all-time query.
@@ -265,7 +269,8 @@ ranked AS (
     FROM candidates c
 )
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
-       rk.mailing_address, rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
+       rk.mailing_address, rk.property_city, rk.property_state, rk.property_zip,
+       rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
        rk.phones, rk.emails,
        a.matched_record_types, a.overlap_count, a.identity_strength, a.lead_subtype
 FROM ranked rk
@@ -284,7 +289,8 @@ LIMIT :limit
 _INTERSECTION_DATED_SQL = f"""
 WITH candidates AS (
     SELECT r.id, r.date_recorded, r.party_name, r.parcel_id, r.property_address,
-           r.mailing_address, r.phone, r.phone_type, r.email,
+           r.mailing_address, r.property_city, r.property_state, r.property_zip,
+           r.phone, r.phone_type, r.email,
            r.phones, r.emails, r.property_key,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at
@@ -296,7 +302,7 @@ WITH candidates AS (
       AND r.date_recorded_parsed IS NOT NULL
       AND sc.record_type = ANY(:types)
       -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass).
-      AND {tax_cap_sql('r')}
+      AND {tax_cap_sql('r')} AND {actionable_sql('r')}
       AND (CAST(:filing_from AS date) IS NULL OR r.date_recorded_parsed >= CAST(:filing_from AS date))
       AND (CAST(:filing_to AS date) IS NULL OR r.date_recorded_parsed <= CAST(:filing_to AS date))
       {{county_clause}}
@@ -322,7 +328,8 @@ ranked AS (
     FROM candidates c
 )
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
-       rk.mailing_address, rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
+       rk.mailing_address, rk.property_city, rk.property_state, rk.property_zip,
+       rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
        rk.phones, rk.emails,
        a.matched_record_types, a.overlap_count, a.lead_subtype
 FROM ranked rk
@@ -362,7 +369,7 @@ WHERE r.user_id = :uid
   AND r.date_recorded_parsed IS NULL
   -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass), so
   -- this "skipped (no filing date)" count matches the capped candidate scope.
-  AND {tax_cap_sql('r')}
+  AND {tax_cap_sql('r')} AND {actionable_sql('r')}
   {{pk_clause}}
   {{county_clause}}
 """

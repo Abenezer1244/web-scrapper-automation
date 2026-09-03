@@ -48,6 +48,10 @@ async def overlap_batch(db, starter_user):
         db.add(Result(
             id=str(uuid.uuid4()), user_id=starter_user.id, job_id=job.id,
             date_recorded="06/01/2026", party_name=party, property_key=pk,
+            # Leads carry an address (lead_actionability, 2026-09-02): rows with
+            # neither property nor mailing address are quarantined from the
+            # batch leads view, so every fixture row has one.
+            property_address=f"1 {party} ST",
         ))
     run = BatchRun(
         id=str(uuid.uuid4()), batch_id=batch.id, user_id=starter_user.id,

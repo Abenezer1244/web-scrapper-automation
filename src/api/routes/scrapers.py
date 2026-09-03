@@ -1,5 +1,6 @@
 """Scraper config routes: CRUD for user's scraper configurations."""
 
+import re
 import uuid
 from datetime import UTC, datetime
 
@@ -868,6 +869,62 @@ async def create_connector(
 
 # ─── Cached records endpoint ─────────────────────────────────────────────────
 
+# Older cache writers stored this literal when a parcel lookup came back empty.
+# It is a placeholder, not an address — the API must return null for it so the
+# UI renders "—" rather than a fake value (the same rule the results page has).
+_CACHE_ADDRESS_PLACEHOLDER = "(enrichment unavailable)"
+
+
+def _cache_address_or_none(value: str | None) -> str | None:
+    if not value or value.strip() == _CACHE_ADDRESS_PLACEHOLDER:
+        return None
+    return value
+
+
+def _cached_doc_type_filter(record_type: str) -> tuple[str | None, dict]:
+    r"""SQL fragment + bind params restricting county_records to one record type.
+
+    A typed config gets ONLY rows whose doc_type matches its keywords. The former
+    `doc_type IS NULL OR …` escape hatch let every untyped row through to every
+    record type: on 2026-09-02 the entire cache (3,305 rows, all doc_type NULL,
+    scraped in March by a since-replaced parser) was served under a probate
+    config as if it were probate — column-shifted rows, NULL party names and the
+    literal "(enrichment unavailable)" included. Keywords are hardcoded values
+    (never user input) bound as parameters; the fragment is never f-string
+    interpolated with them. (None, {}) for a record type with no keyword list.
+
+    Mirrors the scraper's own matcher (eagleweb._doc_type_matches +
+    _DOC_TYPE_EXCLUDE, Codex review): multi-word / long keywords are substring
+    matches (ILIKE), short single-token codes (<=5 chars: SUCC, NTS, TOD, …) are
+    WORD-BOUNDARY matches (PostgreSQL ARE `\m…\M`) so "SUCC" cannot bleed into
+    "SUCCESSOR TRUSTEE", and the record type's exclude phrases drop the row.
+    """
+    from src.scrapers.templates.eagleweb import _DOC_TYPE_EXCLUDE, _DOC_TYPE_MAP
+
+    keywords = _DOC_TYPE_MAP.get(record_type, [])
+    if not keywords:
+        return None, {}
+    conditions = []
+    params: dict = {}
+    for i, kw in enumerate(keywords):
+        name = f"kw_{i}"
+        if " " in kw or len(kw) > 5:
+            conditions.append(f"doc_type ILIKE :{name}")
+            params[name] = f"%{kw}%"
+        else:
+            conditions.append(f"doc_type ~* :{name}")
+            params[name] = rf"\m{re.escape(kw)}\M"
+    clause = "(" + " OR ".join(conditions) + ")"
+    excludes = _DOC_TYPE_EXCLUDE.get(record_type, [])
+    if excludes:
+        ex_conditions = []
+        for i, ex in enumerate(excludes):
+            name = f"ex_{i}"
+            ex_conditions.append(f"doc_type ILIKE :{name}")
+            params[name] = f"%{ex}%"
+        clause += " AND NOT (" + " OR ".join(ex_conditions) + ")"
+    return clause, params
+
 
 @router.get("/{config_id}/records", response_model=CachedResultsPage)
 async def get_cached_records(
@@ -920,17 +977,12 @@ async def get_cached_records(
     )
 
     # 3. Build doc_type filter from record_type keywords (safe: hardcoded values only)
-    from src.scrapers.templates.eagleweb import _DOC_TYPE_MAP
-    keywords = _DOC_TYPE_MAP.get(config.record_type, [])
     type_clauses = []
     query_params: dict = {}
-    if keywords:
-        kw_conditions = []
-        for i, kw in enumerate(keywords):
-            param_name = f"kw_{i}"
-            kw_conditions.append(f"doc_type ILIKE :{param_name}")
-            query_params[param_name] = f"%{kw}%"
-        type_clauses.append("(doc_type IS NULL OR " + " OR ".join(kw_conditions) + ")")
+    doc_type_clause, doc_type_params = _cached_doc_type_filter(config.record_type)
+    if doc_type_clause:
+        type_clauses.append(doc_type_clause)
+        query_params.update(doc_type_params)
 
     # 4. Search filter (parameterized — :q is never interpolated into SQL)
     if q and len(q) <= 100:
@@ -1013,8 +1065,8 @@ async def get_cached_records(
                 doc_type=r.doc_type,
                 legal_description=r.legal_description,
                 parcel_id=r.parcel_id,
-                property_address=r.property_address,
-                mailing_address=r.mailing_address,
+                property_address=_cache_address_or_none(r.property_address),
+                mailing_address=_cache_address_or_none(r.mailing_address),
                 is_new=r.is_new,
                 scraped_at=r.scraped_at,
             )

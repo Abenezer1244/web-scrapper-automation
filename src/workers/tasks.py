@@ -13,6 +13,13 @@ from datetime import datetime
 from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
 
+from src.api.lead_actionability import (
+    DELIVERY_EXCLUDED_KEY,
+    OVER_QUOTA,
+    actionable_sql,
+    address_actionable_sql,
+    is_actionable,
+)
 from src.config.constants import (
     PRIORITY_QUEUE_PLANS,
     SCRAPE_TRANSIENT_BACKOFF_SECONDS,
@@ -650,15 +657,15 @@ def run_scrape_job(self, job_id: str) -> None:
                     db=db,
                 )
 
-        # ── Cap records to user's remaining plan quota ────────────────────────
-        if user.records_limit != -1:
-            remaining = max(0, user.records_limit - (user.records_used or 0))
-            if remaining < len(records):
-                _publish_log(
-                    r, job_id, "warning",
-                    f"Plan limit: saving {remaining} of {len(records)} records. Upgrade for more.",
-                    db=db)
-                records = records[:remaining]
+        # ── Plan quota ────────────────────────────────────────────────────────
+        # NOT capped here. A row's actionability is unknowable at this point: the
+        # counties whose addresses arrive during inline enrichment (King probate,
+        # the generic GIS sweep) look addressless until then. Slicing the RAW list
+        # to the quota could therefore save a fully-quarantined prefix, bill ~0,
+        # and silently discard real leads the user still had quota for. The cap is
+        # applied after enrichment instead, against the same actionable set that
+        # display, export and billing use — see "APPLY THE PLAN CAP" below
+        # (Codex ruling, 2026-09-03).
 
         # ── ENRICHING ─────────────────────────────────────────────────────────
         # CAS no-op here means a batch force-finalize cancelled this child while
@@ -1057,6 +1064,10 @@ def run_scrape_job(self, job_id: str) -> None:
             record_dicts = _result_rows_to_export_dicts(_ts_rows)
         else:
             record_dicts = [r_obj.to_dict() for r_obj in records]
+        # Standing rule (owner, 2026-09-02): rows with no property AND no mailing
+        # address are not leads — never in the deliverable. They stay in `results`
+        # (dedup/health). Addresses filled by enrichment surface in the re-export.
+        record_dicts = [d for d in record_dicts if is_actionable(d)]
         # Honor the user's output-field visibility (blank deselected hideable
         # columns; identity/derived columns always present). Legacy/empty => all.
         hidden_fields = resolve_hidden_output_fields(config.fields)
@@ -1139,85 +1150,6 @@ def run_scrape_job(self, job_id: str) -> None:
                     },
                 )
             return
-
-        # Force-finalize guard (Codex P2): a batch force-finalize may have
-        # cancelled this child while it was exporting. Re-check the live DB
-        # status before charging quota — never bill a job that is no longer
-        # ours to complete. (A cancel landing between this check and the final
-        # done-CAS still can't resurrect the job; at worst that sliver of a
-        # window bills records that were genuinely scraped.)
-        db.refresh(job)
-        if job.status in _TERMINAL_STATUSES:
-            _logger.info(
-                "Job %s externally terminalized (%s) after export — skipping billing/delivery",
-                job_id, job.status,
-            )
-            return
-
-        # Atomic update of monthly record usage.
-        # Sprint 6.4: duplicates delivered to this user in a prior scrape
-        # do NOT count against the monthly quota. Records without a
-        # dedup_hash (no parcel AND no address) still count, because
-        # they are genuinely new data even though we can't dedupe them.
-        #
-        # Bill the PERSISTED billable set, not len(records): with conflict-skipping
-        # inserts the in-memory scrape count can diverge from what actually landed
-        # (intra-run fingerprint collisions, a re-run over a changed source set), so
-        # the authoritative billable count is this job's non-duplicate result rows
-        # (no-dedup_hash rows have is_duplicate=false, so they're included). (Codex)
-        billable_count = db.execute(
-            sa_text(
-                "SELECT count(*) FROM results "
-                "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) AND is_duplicate = false"
-            ),
-            {"jid": job_id, "uid": str(job.user_id)},
-        ).scalar() or 0
-        from sqlalchemy import update as sa_update
-        # Idempotent billing (migration 063): claim billing for THIS job via a CAS
-        # on billing_applied_at. Only the attempt that flips it from NULL bills the
-        # user, so a watchdog re-run (which re-reaches this point) never
-        # double-charges records_used. billed_count records the charged amount. The
-        # Job CAS + the User increment commit together (a crash between the two
-        # execute()s rolls both back — neither is committed until db.commit()).
-        billed_now = db.execute(
-            sa_update(Job)
-            .where(Job.id == job_id, Job.billing_applied_at.is_(None))
-            .values(billed_count=billable_count, billing_applied_at=_now())
-        ).rowcount
-        if billed_now:
-            user_billed = db.execute(
-                sa_update(User)
-                .where(User.id == user.id)
-                .values(records_used=User.records_used + billable_count)
-            ).rowcount
-            if user_billed != 1:
-                # The job was CAS-marked billed but the user counter did NOT move
-                # (deleted user / bad id / RLS scope). Don't leave the job marked
-                # billed-without-charge — roll back and fail loudly (Codex).
-                db.rollback()
-                reason = "Billing failed: user record-usage counter could not be updated."
-                if _fail_job(db, job, r, job_id, reason):
-                    from src.workers.notification_emit import create_notification
-                    create_notification(
-                        user_id=job.user_id, type="job_failed", job_id=job_id,
-                        detail={
-                            "scraper_name": getattr(config, "name", None),
-                            "county": getattr(config, "county", None),
-                            "error_summary": reason[:200],
-                        },
-                    )
-                return
-        else:
-            _logger.info(
-                "Job %s already billed (billing_applied_at set) — skipping "
-                "records_used increment on this re-run", job_id,
-            )
-        db.commit()
-        db.refresh(user)
-
-        if user.records_limit != -1 and user.records_used > user.records_limit:
-            overage = user.records_used - user.records_limit
-            _publish_log(r, job_id, "warning", f"Plan limit exceeded by {overage} records. Upgrade to keep scraping.", db=db)
 
         # ── INLINE ENRICHMENT (BEFORE marking done) ──────────────────────────
         # Runs on this Celery task's thread, sharing the same DB session.
@@ -1318,24 +1250,201 @@ def run_scrape_job(self, job_id: str) -> None:
                 db.rollback()
                 _logger.warning("Job %s: owner-flag recompute failed: %s", job_id, str(exc)[:120])
 
+        # ── APPLY THE PLAN CAP (after enrichment, before delivery) ───────────
+        # Every scraped row was persisted and enriched, so actionability is now
+        # known. Mark everything past the user's remaining quota as excluded:
+        # lead_actionability then hides those rows from display, export, counting
+        # AND billing at once, so the four can never disagree.
+        #
+        # A finite-quota user whose refetch FAILED cannot be capped safely (we
+        # cannot tell which rows are actionable), and delivering an uncapped
+        # export would over-deliver. Fail before billing rather than guess —
+        # same rule as the enriched re-export below.
+        _capped_ids: list[str] = []
+        if user.records_limit != -1:
+            _cap_error: Exception | None = None
+            if refreshed is None:
+                _cap_error = RuntimeError("post-enrichment refetch failed")
+            else:
+                try:
+                    db.refresh(user)  # a concurrent job may have consumed quota
+                    _remaining = max(0, user.records_limit - (user.records_used or 0))
+                    # Clear this job's previous marks first: on a watchdog re-run
+                    # the ranking must start from the FULL actionable set, or each
+                    # pass would renumber the survivors and mark a second batch,
+                    # shrinking the delivered set every time.
+                    db.execute(
+                        sa_text("UPDATE results SET enrichment_data = (CASE WHEN jsonb_typeof(COALESCE(enrichment_data, '{}')::jsonb) = 'object' THEN COALESCE(enrichment_data, '{}')::jsonb ELSE '{}'::jsonb END - :key)::json WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) AND enrichment_data->>:key = :reason"),
+                        {"jid": job_id, "uid": str(job.user_id),
+                         "key": DELIVERY_EXCLUDED_KEY, "reason": OVER_QUOTA},
+                    )
+                    _capped_ids = [
+                        str(_row[0]) for _row in db.execute(
+                            sa_text(
+                                "WITH ranked AS (  SELECT id, row_number() OVER (    ORDER BY party_name, date_recorded, id  ) AS rn  FROM results  WHERE job_id = :jid AND user_id = CAST(:uid AS uuid)    AND is_duplicate = false    AND {addr_rule}) UPDATE results r SET enrichment_data =   (CASE WHEN jsonb_typeof(COALESCE(r.enrichment_data, '{{}}')::jsonb) = 'object' THEN COALESCE(r.enrichment_data, '{{}}')::jsonb ELSE '{{}}'::jsonb END    || jsonb_build_object(:key, :reason))::json FROM ranked WHERE r.id = ranked.id AND ranked.rn > :remaining RETURNING r.id".format(
+                                    addr_rule=address_actionable_sql("results")
+                                )
+                            ),
+                            {"jid": job_id, "uid": str(job.user_id),
+                             "key": DELIVERY_EXCLUDED_KEY, "reason": OVER_QUOTA,
+                             "remaining": _remaining},
+                        ).fetchall()
+                    ]
+                    if _capped_ids:
+                        # Release the dedup claims of rows we are NOT delivering,
+                        # so a later run (or next month's quota) can still deliver
+                        # them. Keeping the claim would make the lead permanently
+                        # unreachable — the same invariant the re-export failure
+                        # path protects.
+                        db.execute(
+                            sa_text('DELETE FROM delivered_records dr USING results r WHERE dr.user_id = CAST(:uid AS uuid)   AND dr.first_job_id = :jid   AND dr.dedup_hash = r.dedup_hash   AND r.id = ANY(CAST(:ids AS uuid[]))   AND r.user_id = CAST(:uid AS uuid)   AND r.dedup_hash IS NOT NULL'),
+                            {"uid": str(job.user_id), "jid": job_id, "ids": _capped_ids},
+                        )
+                    db.commit()
+                except Exception as exc:
+                    db.rollback()
+                    _cap_error = exc
+
+            if _cap_error is not None:
+                _logger.error(
+                    "Job %s: plan cap failed — failing job before billing: %s",
+                    job_id, str(_cap_error)[:200],
+                )
+                try:
+                    db.rollback()
+                    db.execute(
+                        sa_text(
+                            "DELETE FROM delivered_records "
+                            "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
+                        ),
+                        {"jid": job_id, "uid": str(job.user_id)},
+                    )
+                    db.commit()
+                except Exception as cleanup_exc:
+                    db.rollback()
+                    _logger.error(
+                        "Job %s: failed to release dedup claims after cap failure: %s",
+                        job_id, str(cleanup_exc)[:200],
+                    )
+                reason = (
+                    'The lead list could not be re-read after enrichment, so your plan quota could not be applied — no file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.' if refreshed is None else 'Your plan quota could not be applied to this run — no file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.'
+                )
+                if _fail_job(db, job, r, job_id, reason):
+                    from src.workers.notification_emit import create_notification
+                    create_notification(
+                        user_id=job.user_id, type="job_failed", job_id=job_id,
+                        detail={
+                            "scraper_name": getattr(config, "name", None),
+                            "county": getattr(config, "county", None),
+                            "error_summary": reason[:200],
+                        },
+                    )
+                return
+
+            if _capped_ids:
+                _publish_log(
+                    r, job_id, "warning",
+                    f"Plan limit: delivering {_remaining} of "
+                    f"{_remaining + len(_capped_ids)} leads. Upgrade for more.",
+                    db=db,
+                )
+                _logger.info(
+                    "Job %s: plan cap excluded %d actionable rows (remaining=%d)",
+                    job_id, len(_capped_ids), _remaining,
+                )
+            # Reload whenever the cap RAN — after the mark AND after the clear.
+            #
+            # populate_existing is load-bearing, not defensive: the sessions are
+            # built with expire_on_commit=False (src/db/session.py), and these
+            # Result identities were already loaded by the post-enrichment refetch
+            # above. A plain re-SELECT returns those SAME objects with their STALE
+            # enrichment_data, so `is_actionable(res)` at export time would miss
+            # the marker the raw SQL just wrote — the export would ship over-quota
+            # rows while billing (which reads the DB) charged for fewer. That is
+            # exactly the file/bill disagreement this cap exists to prevent, and
+            # no test caught it because nothing exercises the worker cap
+            # end-to-end (Codex, 2026-09-03).
+            #
+            # The clear path needs it too: with no rows newly marked, stale
+            # objects could still carry a PREVIOUS run's marker and under-export.
+            refreshed = db.execute(
+                select(Result)
+                .where(Result.job_id == job_id, Result.user_id == job.user_id)
+                .order_by(Result.party_name, Result.date_recorded, Result.id)
+                .execution_options(populate_existing=True)
+            ).scalars().all()
+
         # Re-export CSV with enriched data — only if the refetch succeeded.
         if refreshed is not None:
             enriched_file = None
+            reexport_error: Exception | None = None
             try:
-                record_dicts = _result_rows_to_export_dicts(refreshed)
+                # Deliverable = actionable rows only (see the first export above);
+                # `refreshed` itself stays complete for the membership upsert.
+                record_dicts = _result_rows_to_export_dicts(
+                    [res for res in refreshed if is_actionable(res)]
+                )
                 enriched_file = exporter.export(
                     record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt,
                     hidden_fields=resolve_hidden_output_fields(config.fields),
                     columns=export_columns,
                 )
                 if object_key:
-                    exporter.upload_to_r2(enriched_file, object_key)
-                    _logger.info("Re-exported CSV with enriched data")
+                    upload_ok, upload_exc = _upload_export_with_retry(
+                        exporter, enriched_file, object_key
+                    )
+                    if upload_ok:
+                        _logger.info("Re-exported CSV with enriched data")
+                    else:
+                        reexport_error = upload_exc
             except Exception as exc:
-                _logger.warning("CSV re-export failed: %s", str(exc)[:60])
+                reexport_error = exc
             finally:
                 if enriched_file:
                     enriched_file.unlink(missing_ok=True)
+            if reexport_error is not None:
+                # The R2 object is the PRE-enrichment deliverable, which (by the
+                # actionability rule) omits rows that enrichment has since made
+                # actionable — and those rows are about to be billed. A bill that
+                # does not match the delivered file is never acceptable, so this is
+                # fatal exactly like the first upload: release the dedup claims,
+                # fail before billing, and let the user re-run (Codex).
+                _logger.error(
+                    "Job %s: enriched re-export failed — failing job before billing: %s",
+                    job_id, str(reexport_error)[:200],
+                )
+                try:
+                    db.rollback()
+                    db.execute(
+                        sa_text(
+                            "DELETE FROM delivered_records "
+                            "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
+                        ),
+                        {"jid": job_id, "uid": str(job.user_id)},
+                    )
+                    db.commit()
+                except Exception as cleanup_exc:
+                    db.rollback()
+                    _logger.error(
+                        "Job %s: failed to release dedup claims after re-export failure: %s",
+                        job_id, str(cleanup_exc)[:200],
+                    )
+                reason = (
+                    "The lead file could not be refreshed with enriched addresses — "
+                    "no file was delivered and you were not charged. Please run the "
+                    "scraper again; contact support if it keeps failing."
+                )
+                if _fail_job(db, job, r, job_id, reason):
+                    from src.workers.notification_emit import create_notification
+                    create_notification(
+                        user_id=job.user_id, type="job_failed", job_id=job_id,
+                        detail={
+                            "scraper_name": getattr(config, "name", None),
+                            "county": getattr(config, "county", None),
+                            "error_summary": reason[:200],
+                        },
+                    )
+                return
 
         # ── PHASE 3: RESULT.property_key (combine/overlap join key) ──────────
         # Stamp the strong-identity key on this job's rows BEFORE the membership
@@ -1391,24 +1500,124 @@ def run_scrape_job(self, job_id: str) -> None:
                     job_id, str(exc)[:200],
                 )
 
-        # ── NOW mark done (after enrichment + re-export) ────────────────────
+        # Force-finalize guard (Codex P2): a batch force-finalize may have
+        # cancelled this child while it was exporting. Re-check the live DB
+        # status before charging quota — never bill a job that is no longer
+        # ours to complete. (A cancel landing between this check and the final
+        # done-CAS still can't resurrect the job; at worst that sliver of a
+        # window bills records that were genuinely scraped.)
+        db.refresh(job)
+        if job.status in _TERMINAL_STATUSES:
+            _logger.info(
+                "Job %s externally terminalized (%s) after export — skipping billing/delivery",
+                job_id, job.status,
+            )
+            return
+
+        # Atomic update of monthly record usage.
+        # Sprint 6.4: duplicates delivered to this user in a prior scrape
+        # do NOT count against the monthly quota.
+        # 2026-09-02 (owner decision): rows with no property AND no mailing
+        # address are not leads and are NOT billed either — which is why this
+        # whole block now runs AFTER inline enrichment (addresses for many
+        # counties only exist post-enrichment) and right before the done-CAS.
+        # The force-finalize guard above moved with it (Codex).
+        #
+        # Bill the PERSISTED billable set, not len(records): with conflict-skipping
+        # inserts the in-memory scrape count can diverge from what actually landed
+        # (intra-run fingerprint collisions, a re-run over a changed source set), so
+        # the authoritative billable count is this job's non-duplicate result rows
+        # (no-dedup_hash rows have is_duplicate=false, so they're included). (Codex)
+        billable_count = db.execute(
+            sa_text(
+                "SELECT count(*) FROM results "
+                "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) AND is_duplicate = false "
+                f"AND {actionable_sql('results')}"
+            ),
+            {"jid": job_id, "uid": str(job.user_id)},
+        ).scalar() or 0
+        from sqlalchemy import update as sa_update
+        # Idempotent billing (migration 063): claim billing for THIS job via a CAS
+        # on billing_applied_at. Only the attempt that flips it from NULL bills the
+        # user, so a watchdog re-run (which re-reaches this point) never
+        # double-charges records_used. billed_count records the charged amount. The
+        # Job CAS + the User increment commit together (a crash between the two
+        # execute()s rolls both back — neither is committed until db.commit()).
+        billed_now = db.execute(
+            sa_update(Job)
+            .where(Job.id == job_id, Job.billing_applied_at.is_(None))
+            .values(billed_count=billable_count, billing_applied_at=_now())
+        ).rowcount
+        if billed_now:
+            user_billed = db.execute(
+                sa_update(User)
+                .where(User.id == user.id)
+                .values(records_used=User.records_used + billable_count)
+            ).rowcount
+            if user_billed != 1:
+                # The job was CAS-marked billed but the user counter did NOT move
+                # (deleted user / bad id / RLS scope). Don't leave the job marked
+                # billed-without-charge — roll back and fail loudly (Codex).
+                db.rollback()
+                reason = "Billing failed: user record-usage counter could not be updated."
+                if _fail_job(db, job, r, job_id, reason):
+                    from src.workers.notification_emit import create_notification
+                    create_notification(
+                        user_id=job.user_id, type="job_failed", job_id=job_id,
+                        detail={
+                            "scraper_name": getattr(config, "name", None),
+                            "county": getattr(config, "county", None),
+                            "error_summary": reason[:200],
+                        },
+                    )
+                return
+        else:
+            _logger.info(
+                "Job %s already billed (billing_applied_at set) — skipping "
+                "records_used increment on this re-run", job_id,
+            )
+            # Re-run after a crash between the billing commit and the done-CAS:
+            # the headline/email/webhook must report what was actually CHARGED,
+            # not a fresh count that enrichment may have changed since (Codex).
+            db.refresh(job)
+            if job.billed_count is not None:
+                billable_count = int(job.billed_count)
+
+        # ── NOW mark done — in the SAME transaction as the billing writes ──────
         # record_count reflects unique (non-duplicate) leads — what the user
         # actually sees on the results page. The raw scrape total is in the
         # log: "{N} records saved ({unique} new leads, {dup} duplicates)".
-        display_count = max(0, len(records) - dup_count)
+        # Persisted non-duplicate ACTIONABLE rows — the same number that was just
+        # billed, so the headline, email, webhook and bill can never disagree.
+        # The billing CAS + records_used increment above are still UNCOMMITTED:
+        # they commit together with this done-CAS, so a crash can never leave a
+        # job billed-but-not-done (which a watchdog re-run would re-scrape and
+        # re-export against a stale bill) or done-but-not-billed (Codex).
+        display_count = int(billable_count)
         if not _set_status(
             db, job, "done",
             finished_at=_now(),
             record_count=display_count,
             export_key=object_key,
+            commit=False,
         ):
             # Cancelled (force-finalize) while enriching: the CAS kept the row
-            # terminal — suppress the success log, email, and webhook.
+            # terminal — roll the pending billing back (a cancelled job is never
+            # charged) and suppress the success log, email, and webhook.
+            db.rollback()
+            db.refresh(job)
             _logger.info(
                 "Job %s externally terminalized (%s) — suppressing completion delivery",
                 job_id, job.status,
             )
             return
+        db.commit()
+        db.refresh(job)
+        db.refresh(user)
+
+        if user.records_limit != -1 and user.records_used > user.records_limit:
+            overage = user.records_used - user.records_limit
+            _publish_log(r, job_id, "warning", f"Plan limit exceeded by {overage} records. Upgrade to keep scraping.", db=db)
         _publish_log(r, job_id, "success", f"Job complete — {display_count} new leads ({dup_count} duplicates filtered)", db=db)
         r.publish(f"job_logs:{job_id}", json.dumps({"type": "done", "record_count": display_count}))
 
@@ -1483,7 +1692,10 @@ def run_scrape_job(self, job_id: str) -> None:
                     state=config.state,
                     record_type=config.record_type,
                     status="done",
-                    record_count=len(records),
+                    # Same deliverable count as the job/email/UI (non-duplicate,
+                    # actionable) — len(records) included duplicates and
+                    # unactionable rows (Codex).
+                    record_count=display_count,
                     started_at=job.started_at,
                     finished_at=_now(),
                     export_key=object_key,

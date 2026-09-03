@@ -866,6 +866,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     from src.scrapers.enrichment.skip_trace import (
         address_cache_key,
         build_pending_row_payload,
+        legacy_cache_locality,
     )
     from src.utils.address_intel import street_is_placeholder
 
@@ -896,11 +897,17 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     # SETTLED prior trace onto cross-job dupes that have one; the remainder — including
     # the same-job siblings the trustee_sale collapse marks, which have no prior row to
     # copy from — must NOT be enqueued for a fresh paid lookup (Codex).
+    from src.api.lead_actionability import actionable_condition
+
     eligible = db.execute(
         sa_select(Result).where(
             Result.job_id == job_id,
             Result.user_id == job.user_id,
             Result.property_address.isnot(None),
+            # Standing rule: a quarantined row (no real property AND no mailing
+            # address, incl. "(enrichment unavailable)" / blanks) is not a lead —
+            # never pay Tracerfy for it (Codex).
+            actionable_condition(),
             Result.skip_trace_status == "not_attempted",
             Result.is_duplicate.is_(False),
         )
@@ -946,6 +953,22 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
             payload["state"],
         )
         cached = db.get(SkipTraceCache, cache_key)
+        if cached is None:
+            # Miss under the current key: this row may already be PAID FOR under
+            # the pre-2026-09-03 key, when the locality came from the owner's
+            # mailing address instead of the property's own situs. Those differ
+            # for every absentee owner, so without this second look we would buy
+            # the same address twice. Read-only convergence — no alias row is
+            # written, so no duplicate PII is stored (Codex: the dual-read
+            # belongs at enqueue, not in tracerfy_ingest).
+            _legacy_city, _legacy_state = legacy_cache_locality(rec)
+            if (_legacy_city, _legacy_state) != (payload["city"], payload["state"]):
+                cached = db.get(SkipTraceCache, address_cache_key(
+                    job.user_id,
+                    payload["property_address"],
+                    _legacy_city,
+                    _legacy_state,
+                ))
         cache_valid = False
         if cached:
             # 90-day TTL check

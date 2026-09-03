@@ -93,16 +93,21 @@ async def _seed_three(db: AsyncSession, job_id: str, user_id: str) -> dict[str, 
     db.add(Result(
         id=ids["in_window"], job_id=job_id, user_id=user_id,
         party_name="IN WINDOW OWNER", property_key=f"pk-in-{job_id}",
+        # Leads carry an address (lead_actionability, 2026-09-02): address-less
+        # rows are quarantined from every segment/export, so fixtures have one.
+        property_address="1 IN WINDOW ST",
         delinquent_amount=5000, delinquent_bill_year=_IN_WINDOW_YEAR,
     ))
     db.add(Result(
         id=ids["out_of_window"], job_id=job_id, user_id=user_id,
         party_name="STALE DEBT OWNER", property_key=f"pk-out-{job_id}",
+        property_address="2 STALE DEBT ST",
         delinquent_amount=5000, delinquent_bill_year=_OUT_OF_WINDOW_YEAR,
     ))
     db.add(Result(
         id=ids["non_tax"], job_id=job_id, user_id=user_id,
         party_name="PROBATE OWNER", property_key=f"pk-nontax-{job_id}",
+        property_address="3 PROBATE LN",
         delinquent_amount=None, delinquent_bill_year=None,
     ))
     await db.commit()
@@ -171,6 +176,7 @@ async def test_intersection_sql_excludes_out_of_window(
         db.add(Result(
             id=str(uuid.uuid4()), job_id=probate_job, user_id=starter_user.id,
             party_name=f"PROBATE {key}", property_key=pk,
+            property_address=f"9 {key.upper()} WAY",
             delinquent_amount=None, delinquent_bill_year=None,
         ))
     # property_list_membership rollup the all-time intersection reads.

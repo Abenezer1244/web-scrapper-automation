@@ -90,6 +90,10 @@ def _result(db, user_id: str, job_id: str, *, party="JANE DOE",
         job_id=job_id,
         date_recorded="06/01/2026",
         party_name=party,
+        # A lead must carry a deliverable address (lead_actionability, 2026-09-02):
+        # rows with neither property nor mailing address are quarantined from
+        # every export/count, so the fixture rows carry one like real leads do.
+        property_address="100 MAIN ST",
         property_key=property_key,
         dedup_hash=dedup_hash,
     )
@@ -255,6 +259,7 @@ class TestCombinedExportColumns:
                 id=str(uuid.uuid4()), user_id=user.id, job_id=j2.id,
                 date_recorded=f"01/01/{by}",  # synthetic — county tax has no event date
                 party_name="TAX OWNER", property_key="WA|pierce|000000A2",
+                property_address="200 TAX AVE",
                 delinquent_bill_year=by, delinquent_amount=Decimal("1234.56"),
                 heirs="ESTATE OF X", legal_description="LOT 1 BLK 2", doc_type="TAXLIEN",
             ))
@@ -285,7 +290,7 @@ class TestCombinedExportColumns:
             db.add(Result(
                 id=str(uuid.uuid4()), user_id=user.id, job_id=j1.id,
                 date_recorded="06/01/2026", party_name="OWNER", property_key=pk,
-                is_duplicate=True,
+                property_address="300 OWNER RD", is_duplicate=True,
                 enrichment_data={"lead_subtype": "probate_death_inheritance"},
             ))
             # tax row: no subtype → the representative winner. Cap-safe bill_year so
@@ -297,7 +302,7 @@ class TestCombinedExportColumns:
             db.add(Result(
                 id=str(uuid.uuid4()), user_id=user.id, job_id=j2.id,
                 date_recorded=f"01/01/{tax_year}", party_name="OWNER", property_key=pk,
-                is_duplicate=False,
+                property_address="300 OWNER RD", is_duplicate=False,
                 delinquent_bill_year=tax_year,
             ))
             db.flush()

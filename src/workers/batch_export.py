@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 from sqlalchemy import select, text, update
 
+from src.api.lead_actionability import actionable_sql
 from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
 from src.db.models import BatchRun, Job, ScraperBatch
 from src.utils.crypto import decrypt_field
@@ -70,6 +71,7 @@ WITH candidates AS (
     -- EncryptedJSON), mirroring segments._decrypt_pii_rows.
     SELECT r.id, r.date_recorded, r.date_recorded_parsed, r.party_name, r.heirs,
            r.parcel_id, r.property_address, r.mailing_address,
+           r.property_city, r.property_state, r.property_zip,
            r.legal_description, r.doc_type,
            r.delinquent_amount, r.delinquent_bill_year,
            r.phone, r.phone_type, r.email, r.phones, r.emails,
@@ -91,6 +93,9 @@ WITH candidates AS (
       AND r.job_id = ANY(CAST(:job_ids AS uuid[]))
       -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass).
       AND {tax_cap_sql('r')}
+      -- Standing rule: no property AND no mailing address = not a lead (kept in
+      -- results for dedup/health, never delivered or counted). lead_actionability.
+      AND {actionable_sql('r')}
 ),
 agg AS (
     SELECT bucket,
@@ -127,6 +132,7 @@ ranked AS (
 )
 SELECT rk.id, rk.date_recorded, rk.date_recorded_parsed, rk.party_name, rk.heirs,
        rk.parcel_id, rk.property_address, rk.mailing_address,
+       rk.property_city, rk.property_state, rk.property_zip,
        rk.legal_description, rk.doc_type,
        -- Bucket-coalesced (agg), NOT the representative row's own — see agg CTE.
        a.delinquent_amount, a.delinquent_bill_year,

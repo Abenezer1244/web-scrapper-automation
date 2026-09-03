@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
+from src.api.lead_actionability import actionable_condition
 from src.api.middleware import rate_limit
 from src.api.schemas import (
     AnalyticsSummary,
@@ -91,6 +92,9 @@ async def analytics_summary(
     base = (
         Result.user_id == uid,
         Result.is_duplicate.is_(False),
+        # Standing product rule: a row with no property AND no mailing address is
+        # not a lead anywhere the customer looks (see lead_actionability).
+        actionable_condition(),
         Result.created_at >= start_dt,
         local_day >= start,
         # Upper bound at today's local day so a future-dated created_at (clock

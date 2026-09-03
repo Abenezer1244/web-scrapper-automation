@@ -120,18 +120,42 @@ def enrich_parcel_gis(
         if result.get("property_address"):
             return result
 
-    # Fallback: search by owner name if parcel ID didn't match or is None
-    # (e.g. Tyler SelfService records that have names but no parcel)
-    if gis_config and owner_name and gis_config.get("owner_field"):
-        result = _query_gis_by_name(owner_name, gis_config, county_key)
-        if result.get("property_address"):
-            _logger.info("GIS name-based fallback succeeded for %s", owner_name)
-            return result
-
-    # Fallback: WA statewide parcel service (covers all 39 WA counties)
+    # Fallback: WA statewide parcel service (covers all 39 WA counties).
+    #
+    # ORDER MATTERS: this EXACT parcel lookup must run before either name-based
+    # fallback. A name search reduces the owner to its first token and asks for
+    # ONE row, so it can only ever return "some parcel owned by someone whose
+    # surname starts like this" — for a common surname that is a DIFFERENT
+    # property. Letting it pre-empt an exact APN match means silently attaching
+    # the wrong address to a lead. Exact identifier always beats fuzzy name
+    # (Codex, 2026-09-03).
     if state.upper() == "WA" and parcel_id:
         result = _query_wa_statewide(parcel_id, county)
         if result.get("property_address"):
+            return result
+
+    # Fallback: search by owner name. Skipped when a parcel id is in hand AND an
+    # exact statewide lookup already had its chance at it — today that means WA,
+    # whose Current_Parcels layer covers all 39 counties. There, a surname guess
+    # is never an acceptable substitute for the exact APN paths above.
+    #
+    # Deliberately NOT a blanket `not parcel_id`: outside WA there is no
+    # statewide exact service, so a county parcel miss leaves this as the ONLY
+    # remaining fallback, and banning it globally would silently kill enrichment
+    # for every non-WA gis_endpoint config whose parcel id is merely stale or
+    # mis-parsed. Narrowing the ban to the states that HAVE an exact fallback
+    # removes the wrong-property hazard without creating a dead path (Codex).
+    _has_exact_statewide_fallback = state.upper() == "WA"
+    _name_search_preempts_exact = bool(parcel_id) and _has_exact_statewide_fallback
+    if (
+        gis_config
+        and owner_name
+        and not _name_search_preempts_exact
+        and gis_config.get("owner_field")
+    ):
+        result = _query_gis_by_name(owner_name, gis_config, county_key)
+        if result.get("property_address"):
+            _logger.info("GIS name-based fallback succeeded for %s", owner_name)
             return result
 
     # WA statewide name-based fallback when parcel_id is None
@@ -193,9 +217,23 @@ def _query_gis_by_name(owner_name: str, gis_config: dict, county_key: str) -> di
     name_clean = owner_name.strip().upper().split(",")[0].split(" ")[0]
     if len(name_clean) < 3:
         return _empty()
+    # A LIKE metacharacter in the name would silently widen the match to a
+    # different owner's parcel. Not a legitimate character in a surname, so
+    # reject rather than rewrite the name — same rule, same reason, as
+    # pierce_legal_repair._LIKE_META (Codex, 2026-09-03).
+    if _LIKE_META.search(name_clean):
+        _logger.warning(
+            "GIS owner-name lookup skipped: LIKE metacharacter in %r", name_clean[:40]
+        )
+        return _empty()
 
     params = {
-        "where": f"{owner_field} LIKE '{name_clean}%'",
+        # Quote-escaped: an apostrophe is ORDINARY in a surname (O'BRIEN,
+        # O'CONNOR, D'ANGELO) and raw interpolation made the predicate
+        # malformed — ArcGIS errored, the except below swallowed it, and those
+        # owners silently got NO enrichment at all. The trailing % is appended
+        # INSIDE the literal so it stays a wildcard after escaping.
+        "where": f"{owner_field} LIKE {_arcgis_literal(name_clean + '%')}",
         "outFields": out_fields,
         "returnGeometry": "false",
         "resultRecordCount": 1,
@@ -453,6 +491,9 @@ def _map_county_features(
     return results
 
 
+# A LIKE metacharacter (% or _) in an interpolated value silently widens the
+# predicate to unrelated rows. Values carrying one are rejected, not rewritten.
+_LIKE_META = re.compile(r"[%_]")
 _CITY_STATE_RE = re.compile(r"^\s*(.+?)\s*,\s*([A-Z]{2})\s*$")
 # "PO BOX", "P.O. BOX", "P O BOX", "P.O BOX", "POB" — any post-office box spelling.
 _PO_BOX_RE = re.compile(r"^\s*P\.?\s*O\.?\s*B(?:OX)?\b", re.I)

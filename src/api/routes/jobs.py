@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.auth import CurrentUser
 from src.api.deps import get_db, get_rls_db
 from src.api.dialer_filters import dialer_ready_conditions
+from src.api.lead_actionability import actionable_condition
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.owner_filters import build_owner_conditions
 from src.api.schemas import JobCreate, JobResponse, LogLine, ResultRow, ResultsPage
@@ -385,6 +386,10 @@ async def get_results(
     # gates the empty-scrape "previous job" hint below — the cap is a standing
     # rule, not a user-set view filter, so it must not change that branch.
     base_query = base_query.where(tax_cap_condition(today))
+    # Standing product rule (owner, 2026-09-02): a row with no property AND no
+    # mailing address is not a lead — not listed, exported, counted or billed.
+    # Kept in `results` for dedup/health only. See src/api/lead_actionability.py.
+    base_query = base_query.where(actionable_condition())
 
     # Tier 0 (057): owner-location filters (absentee / out-of-state). Same view
     # semantics as the tax filters — narrows total + items, leaves scrape stats.
@@ -456,11 +461,14 @@ async def get_results(
 
     enriching = parcel_count > 0 and not enrichment_task_finished
 
-    # Total scraped (including duplicates) and duplicate count
+    # Total scraped (including duplicates) and duplicate count — both scoped to
+    # ACTIONABLE rows so the "all N records were duplicates" banner can never be
+    # driven by rows that are not leads (Codex).
     total_scraped_result = await db.execute(
         select(func.count()).where(
             Result.job_id == job_id,
             Result.user_id == current_user.id,
+            actionable_condition(),
         )
     )
     total_scraped = total_scraped_result.scalar_one()
@@ -470,6 +478,7 @@ async def get_results(
             Result.job_id == job_id,
             Result.user_id == current_user.id,
             Result.is_duplicate.is_(True),
+            actionable_condition(),
         )
     )
     duplicate_count = dup_count_result.scalar_one()
@@ -510,7 +519,12 @@ async def get_results(
                     exists(
                         select(Result.id).where(
                             Result.job_id == Job.id,
+                            Result.user_id == current_user.id,
                             Result.is_duplicate.is_(False),
+                            # Only a prior job with VISIBLE leads is worth linking
+                            # to — same standing rules as the list (Codex).
+                            tax_cap_condition(today),
+                            actionable_condition(),
                         )
                     ),
                 )
@@ -964,6 +978,8 @@ async def download_export(
         # view-filter, so it must not flip a genuinely empty/unmatched job from a
         # 404 into a header-only CSV — that decision stays driven by USER filters.
         dl_query = dl_query.where(tax_cap_condition(today))
+        # Standing rule (matches get_results): unactionable rows are never exported.
+        dl_query = dl_query.where(actionable_condition())
         # Phase 5: dialer-ready filter (not known-DNC; matches get_results +
         # the push — strict IS-FALSE would hide skip-traced phones whose DNC is
         # NULL; the dialer scrubs DNC).
@@ -996,7 +1012,15 @@ async def download_export(
             if any_filter_active:
                 exists_row = await db.execute(
                     select(Result.id)
-                    .where(Result.job_id == job_id, Result.user_id == user.id)
+                    .where(
+                        Result.job_id == job_id,
+                        Result.user_id == user.id,
+                        # "Has rows" means has EXPORTABLE rows under the standing
+                        # rules; a job whose only rows are quarantined is empty
+                        # for every filter combination (Codex).
+                        tax_cap_condition(today),
+                        actionable_condition(),
+                    )
                     .limit(1)
                 )
                 job_has_any = exists_row.scalar_one_or_none() is not None

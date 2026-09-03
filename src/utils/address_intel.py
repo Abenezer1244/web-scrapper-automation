@@ -64,6 +64,34 @@ def _normalize_street(street: str | None) -> str:
     return " ".join(tokens).strip()
 
 
+# Tokens a county situs may legitimately OMIT at the end of a street while the
+# owner's mailing address carries them: the canonical suffixes and directionals
+# produced by _normalize_street (values of _SUFFIX / _DIRECTIONAL).
+_TRAILING_OPTIONAL_TOKENS = frozenset(_SUFFIX.values()) | frozenset(_DIRECTIONAL.values())
+
+
+def _same_street_modulo_trailing_tokens(a: str, b: str) -> bool:
+    """True when the two normalized streets differ ONLY by trailing suffix /
+    post-directional tokens present on one side and absent on the other.
+
+    Pierce County GIS `Site_Address` routinely drops the suffix or the
+    post-directional that the same parcel's `Delivery_Address` keeps
+    ("20508 ISLAND PKWY" vs "20508 ISLAND PKWY E", "1006 S 34TH" vs
+    "1006 S 34TH ST"). Those are the same base street, so the caller must fall
+    through to the ZIP/city discriminators (→ None when the situs has none)
+    instead of calling the owner absentee. Deliberately TRAILING-only: a
+    differing house number, a dropped LEADING directional ("E MAIN" vs "MAIN"),
+    or any non-suffix extra token still reads as a different street.
+    """
+    ta, tb = a.split(" "), b.split(" ")
+    if len(ta) == len(tb):
+        return False
+    short, long = (ta, tb) if len(ta) < len(tb) else (tb, ta)
+    if long[: len(short)] != short:
+        return False
+    return all(tok in _TRAILING_OPTIONAL_TOKENS for tok in long[len(short):])
+
+
 def _normalize_full(addr: str) -> str:
     s = _PUNCT_RE.sub(" ", addr).upper()
     return _WS_RE.sub(" ", s).strip()
@@ -141,7 +169,7 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
         # No parsed street on a side — fall back to a whole-string compare. Equal
         # strings are confirmed-same (False); different strings are different (True).
         return _normalize_full(property_address) != _normalize_full(mailing_address)
-    if p_street != m_street:
+    if p_street != m_street and not _same_street_modulo_trailing_tokens(p_street, m_street):
         return True
 
     # Base street matches — need a positive discriminator to call it same vs diff.

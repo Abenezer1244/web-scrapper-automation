@@ -63,11 +63,57 @@ _UPDATE = text(
 )
 
 
+# Targeted recompute (2026-09-02): rows already flagged absentee_owner=TRUE whose
+# mailing street merely EXTENDS the property street (county situs dropped the
+# suffix / post-directional: "20508 ISLAND PKWY" vs "20508 ISLAND PKWY E …").
+# compute_owner_flags now reads those as unknown (NULL), not absentee. The NULL
+# window above never revisits them, so this mode re-evaluates exactly that set.
+_SELECT_SUFFIXLESS = text(
+    """
+    SELECT id, property_address, mailing_address
+    FROM results
+    WHERE absentee_owner IS TRUE
+      AND property_address IS NOT NULL
+      AND mailing_address IS NOT NULL
+      AND UPPER(mailing_address) LIKE UPPER(property_address) || ' %'
+    ORDER BY id
+    """
+)
+
+
+def recompute_suffixless(commit: bool) -> None:
+    changed = 0
+    scanned = 0
+    with system_sync_session() as db:
+        rows = db.execute(_SELECT_SUFFIXLESS).fetchall()
+        for rid, prop, mail in rows:
+            scanned += 1
+            flags = compute_owner_flags(prop, mail)
+            if flags["absentee_owner"] is True:
+                continue  # still a different place (e.g. different ZIP) — keep
+            print(f"  {rid}: absentee True -> {flags['absentee_owner']}  [{prop!r} vs {mail!r}]", flush=True)
+            changed += 1
+            if commit:
+                db.execute(_UPDATE, {"id": rid, **flags})
+        if commit:
+            db.commit()
+    print("\n=== suffixless absentee recompute ===")
+    print(f"scanned:   {scanned}")
+    print(f"corrected: {changed}" + ("" if commit else "  (DRY RUN — re-run with --commit)"))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--commit", action="store_true", help="apply updates (default: dry run)")
     ap.add_argument("--batch", type=int, default=1000, help="rows per chunk (Codex: 1k-5k)")
+    ap.add_argument(
+        "--recompute-suffixless", action="store_true",
+        help="only re-evaluate absentee=TRUE rows whose mailing street extends the property street",
+    )
     args = ap.parse_args()
+    if args.recompute_suffixless:
+        recompute_suffixless(args.commit)
+        return
     batch = max(100, min(args.batch, 5000))
 
     scanned = 0

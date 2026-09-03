@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from src.api.lead_actionability import actionable_condition
 from src.api.middleware.security import validate_outbound_webhook
 from src.utils.logger import setup_logger
 from src.workers import app
@@ -136,6 +137,10 @@ def process_dialer_outbox(job_id: str) -> None:
                     Result.id == row.result_id,
                     Result.user_id == job.user_id,
                     tax_cap_condition(today),
+                    # Standing rule (lead_actionability): no property AND no
+                    # mailing address = not a lead — treated like the tax cap
+                    # below (terminal skip, never dialed).
+                    actionable_condition(),
                 )
             ).scalar_one_or_none()
             if result is None:

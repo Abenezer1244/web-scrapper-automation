@@ -80,10 +80,10 @@ def _seed_result(
             text("""
                 INSERT INTO results
                     (id, job_id, user_id, is_duplicate,
-                     skip_trace_status, phone, email, created_at)
+                     skip_trace_status, phone, email, property_address, created_at)
                 VALUES
                     (:result_id, :job_id, :user_id, :is_duplicate,
-                     :skip_trace_status, :phone, :email, now())
+                     :skip_trace_status, :phone, :email, '100 MAIN ST', now())
             """),
             {
                 "result_id": result_id,

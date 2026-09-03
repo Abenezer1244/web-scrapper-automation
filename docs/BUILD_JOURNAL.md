@@ -19,6 +19,81 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-03 — Merging Test 1 into a moved main: #188 landed mid-session and took three regressions with it
+
+**Built / Shipped:** merged `origin/main` into `fix/test1-lead-data-quality` (merge commit `40f0e3b`)
+and then fixed three real defects the merge exposed. The branch was reported as "behind 4"; by the
+time the merge ran it was **behind 6** — PR #188 (`feat/real-owner-location`, merge commit
+`1b964d9`) and #189 landed *during* the session, at 2026-09-03 05:31Z.
+
+**Tried / Decided:** the only real conflict was `src/scrapers/enrichment/county_gis.py`, and it was
+SEMANTIC, not textual. This branch and #188 independently implemented the SAME 2026-09-02
+"no assumed situs-as-mailing" policy, two different ways:
+
+- this branch: `_statewide_result()` — `mailing_address=None`, situs locality FOLDED INTO the
+  `property_address` string as `"STREET, CITY, WA ZIP"`;
+- #188: `mailing_address=None`, `property_address` left street-only and FROZEN, locality moved to
+  structured `Result.property_city` / `property_zip` columns (migration 085).
+
+**#188's design wins and this branch's `_statewide_result` was dropped as superseded.** The
+deciding argument (Codex, verified in the code): `property_address` is an identity/cache/export key
+— `property_identity`, `skip_trace.address_cache_key()` — so stuffing city/state/zip into it drifts
+those keys. Folding locality into the string is not merely duplicate after 085, it is corrupting.
+`_arcgis_literal()` + `_map_county_features()` from #184/#186 were kept intact.
+
+`tasks.py` and `tasks_helpers/enrich.py` auto-merged; both were verified SEMANTICALLY rather than
+trusted. `tasks.py` kept both of #188's hunks (situs parse at row build; `compute_owner_flags(...)`
+kwargs in the post-enrich recompute) alongside this branch's restructure (billing moved after inline
+enrichment, folded into the same transaction as the done-CAS), with the ordering intact:
+enrichment → owner flags → billing → done-CAS. `enrich.py` kept both `_keep_situs_parts()` and
+`actionable_condition()`.
+
+**Caught & fixed — three regressions in code ALREADY ON MAIN, all found by cross-checking the merge,
+all confirmed in the code before being believed:**
+
+1. **(High) #188 broke Tracerfy locality.** `build_pending_row_payload()` sourced city/state/zip from
+   `property_address`, falling back to `mailing_address`. #188 correctly stopped fabricating that
+   mailing line for statewide/mailing-less GIS rows, and stored the truth in the new 085 columns —
+   but nothing read them. Statewide-enriched rows therefore reached Tracerfy with city/state/zip all
+   `None`, which the function's own comment says "errors in Tracerfy". #188 removed the locality
+   source without wiring its replacement. Fixed by reading the structured parts as the FIRST
+   fallback (property parts describe the property; the owner's mail is only a proxy).
+2. **(Medium) the structured situs never reached the CSV.** `lead_export.build_lead_export_row()`
+   derived `property_city/state/zip` purely by parsing `property_address` — blank for exactly the
+   street-only rows 085 was added to describe. Fixed stored-first, parse-as-fallback. The raw-SQL
+   projections in `batch_export.py` and `segments.py` never SELECTed the new columns either, so the
+   row builder could not have exported them for combined/segment exports; added to all 8 projections.
+3. **(Medium, correctness not just injection) unescaped ArcGIS owner-name predicate.**
+   `_query_gis_by_name()` still built `LIKE '{name_clean}%'` by raw interpolation. `name_clean` keeps
+   apostrophes, so an ordinary WA surname — O'BRIEN, O'CONNOR, D'ANGELO — produced a malformed
+   predicate; ArcGIS errored, the bare `except` swallowed it, and those owners silently got NO
+   enrichment. #184/#186 had added `_arcgis_literal()` and applied it to every parcel predicate but
+   missed this one. Fixed with `_arcgis_literal()`, plus a `_LIKE_META` reject for `%`/`_` matching
+   the existing `pierce_legal_repair` precedent.
+
+**Failed / corrected mid-flight:** Codex advised filling the locality fields "independently, not
+only inside `if not parsed[city]`". That is right for the structured situs parts (same property, one
+source) but WRONG against the mailing address: pairing a situs city with an absentee owner's mailing
+ZIP invents a locality that exists nowhere ("OLYMPIA WA 98101" for a Seattle-mailed Olympia
+property) — the very fabricate-an-address class of bug #188 was fixing. The situs fill is per-field;
+the mailing fallback stays ATOMIC. Pinned by a regression test.
+
+**Facts learned:**
+- A branch's "behind N" is a snapshot with a short shelf life when parallel sessions are merging.
+  Re-read `origin/main` immediately before resolving, not once at the start.
+- `git merge-tree --write-tree` predicts the conflict SET without touching the worktree, but a clean
+  auto-merge is only a TEXTUAL result. Every auto-merged file that both sides edited still needs a
+  semantic read — here `tasks.py` and `enrich.py` both merged clean and both needed checking.
+- Two branches can implement the same policy decision and still conflict destructively. The tiebreak
+  is which representation the rest of the system already treats as canonical.
+
+**Pending / Handoff:** 👤 Tracerfy credit top-up and the `county_records` purge (needs
+`DATABASE_URL_MIGRATE`) remain the user's. Not addressed here: `ResultRow` still does not expose
+`property_city`/`property_zip` to the API results page (only `property_state`), so the structured
+situs is exported but not displayed.
+
+---
+
 ## 2026-09-02 — "Test 1" (Pierce probate) lead data-quality audit: source vs application, end to end
 
 **Built / Shipped:** branch `fix/test1-lead-data-quality` (worktree `test1-data-quality`, off

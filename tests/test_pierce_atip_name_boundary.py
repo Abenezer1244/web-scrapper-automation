@@ -154,3 +154,54 @@ def test_the_name_is_still_stripped_when_it_shares_the_street_line():
     out = parse_summary(row)
     assert "BOICOURT" not in (out["mailing_address"] or "").upper()
     assert "10608 63RD ST E" in out["mailing_address"]
+
+
+# ── Second review round: two MORE breaks Codex found in the fixes above ───────
+# Same lesson a third time — a guard must never remove text it cannot prove is a
+# name. Both were reproduced before being fixed.
+
+
+def test_an_addressee_prefixed_ADDRESS_key_is_not_a_person():
+    # The addressee/attn exception was UNCONDITIONAL, so "addressee_address" was
+    # read as a person and its STREET was harvested into the exclusion list —
+    # mailing collapsed to "PUYALLUP, WA, 98372", the same street-eating failure
+    # as owner_address. The veto now runs on the key's RESIDUE.
+    assert _is_person_key("addressee") is True
+    assert _is_person_key("attn") is True
+    assert _is_person_key("addressee_address") is False
+    assert _is_person_key("attn_address") is False
+    assert _is_person_key("situs_name") is False
+
+
+def test_an_addressee_address_key_does_not_eat_the_street():
+    row = {"situs": "1 A ST", "mail": "10608 63RD STREET CT E", "city": "PUYALLUP",
+           "state": "WA", "zip": "98372", "addressee_address": "10608 63RD STREET CT E"}
+    out = parse_summary(row)
+    assert out["mailing_address"] == "10608 63RD STREET CT E, PUYALLUP, WA, 98372"
+
+
+def test_a_one_token_surname_is_not_cut_out_of_a_street_that_shares_it():
+    # "LEE" is both a surname and a real street name. Word-boundary matching alone
+    # still excised it from "123 LEE ST", yielding "123  ST" — fabricated. A single
+    # token may now only remove a segment it matches ENTIRELY.
+    row = {"situs": "123 LEE ST", "mail": "123 LEE ST", "city": "TACOMA",
+           "state": "WA", "zip": "98402", "taxpayer_last_name": "LEE"}
+    out = parse_summary(row)
+    assert out["mailing_address"] == "123 LEE ST, TACOMA, WA, 98402"
+
+
+def test_a_one_token_name_on_its_own_line_is_still_dropped():
+    # The narrowing must not make the guard useless: a lone name segment still goes.
+    row = {"situs": "x", "mail": "LEE", "mail2": "10608 63RD ST E",
+           "city": "PUYALLUP", "state": "WA", "zip": "98372", "name": "LEE"}
+    out = parse_summary(row)
+    assert out["mailing_address"] == "10608 63RD ST E, PUYALLUP, WA, 98372"
+
+
+def test_a_multi_token_name_sharing_the_street_line_is_still_excised():
+    row = {"situs": "x", "mail": "BOICOURT JACQUELINE L 10608 63RD ST E",
+           "city": "PUYALLUP", "state": "WA", "zip": "98372",
+           "name": "BOICOURT JACQUELINE L"}
+    out = parse_summary(row)
+    assert "BOICOURT" not in (out["mailing_address"] or "").upper()
+    assert "10608 63RD ST E" in out["mailing_address"]

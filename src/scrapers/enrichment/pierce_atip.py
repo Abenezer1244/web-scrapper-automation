@@ -109,7 +109,7 @@ _ALLOWED_OUT_KEYS = frozenset(
 # closed against field names we have not seen.
 # A key naming a person outright — always a person, whatever else it contains
 # ("addressee" also contains "addr", so these must be tested FIRST).
-_STRONG_PERSON_KEY_TOKENS = ("taxpayer", "owner", "addressee", "attn")
+_PERSON_KEY_TOKENS = ("taxpayer", "owner", "addressee", "attn", "name")
 # "name" on its own is ambiguous: "mail_name" is the addressee, but "street_name"
 # and "city_name" are ADDRESS data. Excising one of those would delete a real
 # street from mailing_address — the over-broad-guard mistake that once
@@ -121,19 +121,23 @@ _ADDRESS_COMPONENT_KEY_TOKENS = ("street", "addr", "situs", "city", "state", "zi
 def _is_person_key(key: object) -> bool:
     """Is this row key a PERSON field (so its value must be excluded)?
 
-    The address-component veto applies to EVERY person token, not just a bare
-    "name". An `owner_address` / `owner_city` / `taxpayer_addr` key is ADDRESS
-    data that merely mentions the owner; treating it as a person harvested a
-    STREET into the exclusion list and then deleted that street from
-    mailing_address (measured: mail became "PUYALLUP, WA, 98372"). Only
-    "addressee"/"attn" outrank the veto, since "addressee" itself contains "addr".
+    Strip every person token from the key FIRST, then veto on what is left. A
+    plain "does it contain 'addressee'?" test let `addressee_address` through and
+    the street was harvested into the exclusion list, exactly the same
+    street-eating failure as `owner_address` (measured: mailing collapsed to
+    "PUYALLUP, WA, 98372"). Removing the person token first is what lets
+    "addressee" itself stay a person while "addressee_address" is address data —
+    the residue "_address" still carries an address noun.
     """
     low = str(key).lower()
-    if "addressee" in low or "attn" in low:
-        return True
-    if any(tok in low for tok in _ADDRESS_COMPONENT_KEY_TOKENS):
+    if not any(tok in low for tok in _PERSON_KEY_TOKENS):
         return False
-    return any(tok in low for tok in _STRONG_PERSON_KEY_TOKENS) or "name" in low
+    residue = low
+    for tok in _PERSON_KEY_TOKENS:
+        residue = residue.replace(tok, " ")
+    return not any(tok in residue for tok in _ADDRESS_COMPONENT_KEY_TOKENS)
+
+
 # Prefixes an assessor puts before an addressee; stripped before comparing so
 # "C/O JANE DOE" is recognised as the same person as "JANE DOE".
 _ADDRESSEE_PREFIX_RE = re.compile(r"^\s*(?:C\s*/\s*O|C/O|ATTN\.?:?|ATTENTION:?)\s+", re.IGNORECASE)
@@ -183,6 +187,14 @@ def _drop_person_line(mailing: str | None, row: dict) -> str | None:
             # excised the name "LEE" out of the street "LEELAND ST" and produced
             # "123 LAND ST" — a FABRICATED address, which is worse than the leak
             # this guard exists to prevent.
+            # A ONE-TOKEN person value is not enough to cut text out of a line
+            # that also carries an address: the surname "LEE" is also the street
+            # "123 LEE ST", and excising it produced "123  ST" — a FABRICATED
+            # address, the very thing this guard exists to prevent. A single token
+            # can only remove a segment it matches ENTIRELY (handled above); only a
+            # multi-token full name is unambiguous enough to excise in place.
+            if len(person.split()) < 2:
+                continue
             m = re.search(
                 r"(?<![A-Z0-9])" + re.escape(person) + r"(?![A-Z0-9])", upper
             )

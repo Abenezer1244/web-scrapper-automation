@@ -19,6 +19,117 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-03 — The #187/#188 seam, and a backlog sweep where every gate found something
+
+Started as one question: PRs #187 (King mailing time budget) and #188 (owner-location / migration 085)
+merged cleanly and were **never tested together**. They coexist in code but not in behaviour.
+
+**Built / Shipped** — five PRs merged, all CI-green, api + worker healthy after each deploy:
+- **#193 `057d695`** — `compose_situs()` assumed `property_address` is street-only. True on the GIS path
+  (parts parsed, then the address *replaced* by the street-only assessor line); false on the two paths
+  #188 added: King's Site Address carries its own trailing ZIP which #188 copies into `property_zip`
+  **without stripping it**, and `backfill_property_situs_parts.py:131` parses parts *out of*
+  `property_address` then hands that same line back. Append-only compose produced `… 4C 98023, 98023`;
+  the doubled tail pushed the ZIP into the parsed STREET, so streets stopped matching and
+  **`absentee_owner` flipped False → True on owner-occupied leads**. Compose is now canonical. Latent in
+  prod (26 rows in the shape, 0 changed value) — it would have fired on the next King job or the
+  phase-5 backfill.
+- **#193 also** — a placeholder street must not manufacture a confident flag. Snohomish encodes "no
+  situs" as the literal word UNKNOWN, walking straight through the emptiness-based `_has_street` guard →
+  **408 rows with a fabricated `absentee_owner = TRUE`** — plus the skip-trace gate below.
+- **#194 `6629833`** — the Pierce ATIP taxpayer-name boundary enforced in code rather than holding only
+  because nothing happened to read `row["name"]`.
+- **#191 `77d5ef3`** (another session's; reviewed and merged), **#153 `890062d`** (King bulk GIS,
+  CONFLICTING since 2026-07-04, merged forward), **#197 `f7433b6`** (alembic 1.19.1, anthropic 1.3.0,
+  playwright 1.62.0).
+- **Production repair applied**: 408 rows, `updated: 408, stale: 0`. Re-queried independently — 0 still
+  TRUE, 408 NULL, `owner_state` kept on 407, `out_of_state_owner` on 30, `property_address` untouched,
+  and the 2,432 non-placeholder TRUE rows unmoved.
+
+**Tried / Decided:**
+- **Fixed at `compose_situs`, not at the King call site or the backfill.** Those are symptoms; the broken
+  invariant ("property_address is sometimes street-only, sometimes a full situs line") lives in the
+  string builder. Codex concurred on the layer.
+- **`property_address` left alone throughout** — the frozen billing/matching key skip trace bills off.
+  The Snohomish ingestion change that would blank the fake situs is drafted but deliberately NOT made.
+- **Only the MEASURED placeholder token.** `UNAVAILABLE`/`NONE`/`N/A` and 16 more Codex proposed were
+  measured at **0 occurrences across 23,284 rows** and rejected — inventing an unmeasured guard on this
+  exact connector is what once false-aborted 14.79% of real Snohomish rows.
+- **Split ATIP into its own PR** (#194) on Codex's advice. **Held `stripe` at 11.4.0** and split it out
+  of the deps PR; #177 left open, #175/#176/#178 closed.
+- **#153 merged FORWARD, not rebased**, pushed as a **fast-forward** to its own branch, so the PR updated
+  in place with history intact and no branch was force-moved.
+
+**Failed / Blocked — the honest half:**
+- 🛑 **`codex exec` EDITED THIS WORKTREE during a "review"** — 334 lines across 3 files. It is a full
+  coding agent with file-write and shell access, invoked without a sandbox flag. A pytest run overlapping
+  those writes produced 2 phantom failures (they passed in isolation). Every later call used
+  `-s read-only -C <worktree>`, which also fixed its habit of probing the **stale shared checkout** and
+  reasoning from wrong output (its `parse_property_for_display` probe returned `zip: None` where the real
+  code returns `'98023'`).
+- 🛑 **The local rig degraded mid-session and its verdict was worthless**: merged main gave **9, then 2,
+  then 16** failures across three runs of the *same commit* (auth / break-glass / jobs,
+  `sqlalchemy.exc.InvalidRequestError`), none in a touched file. Flushing PG+Redis was not enough; only
+  killing and restarting both processes restored it (then 1899 passed). Clean CI was the trustworthy
+  signal throughout, and it was green.
+- 🛑 **My own reconciliation was futile.** I wrote the vacant-parcel situs into 085's columns claiming it
+  would let `out_of_state_owner` be answered. `compose_situs()` early-returns on a falsy
+  `property_address`, so the parts were discarded and the post-enrichment recompute wrote `None` back
+  over the `WA` just stored. Codex caught it as High.
+- 🛑 **My Stripe verification was insufficient and Codex said so correctly.** I probed whether the methods
+  still exist — they all do — and never checked what they **return**.
+- Codex hit its usage limit **twice**, blocking gates for hours each time.
+
+**Caught & fixed (before shipping):**
+- **Two defects in Codex's own ATIP hardening**, both the over-broad-guard mistake its comments warned
+  about: an address-component veto applied only to a bare `"name"`, so `owner_address` counted as a
+  PERSON and its STREET was deleted from the mailing address (mail became `"PUYALLUP, WA, 98372"`); and a
+  bare-substring excision that cut `LEE` out of `LEELAND ST` → `"123 LAND ST"`, a **fabricated address**.
+  A second gate then found **two more**: an unconditional `addressee`/`attn` exception let
+  `addressee_address` through (same street-eating class — the hole had merely *moved*), and a one-token
+  surname still excised the street from `123 LEE ST` → `"123  ST"`.
+- **`_map_county_features` drops any feature with no street** — silently deleting exactly what #153
+  exists to keep (matched vacant/raw land, ~1/3 of King's delinquent parcels), sending them to the
+  statewide service that answers with a WRONG situs. A verbatim merge would have compiled, passed every
+  test, and quietly killed the feature. Guard now scoped to counties with their own authoritative layer.
+- **#153's `echo_property_to_mailing` defaulted TRUE**, predating #188's removal of the echo entirely.
+  Merging it back would have restored situs-as-mailing for every county EXCEPT King — the inverse of the
+  intent. Two of main's policy tests caught it.
+- **Stripe v15 breaks billing**: `StripeObject` no longer inherits from `dict` (`__mro__` is
+  `(StripeObject, object)`), so `.get()` raises. ~17 call sites — the webhook handler, the subscription
+  sync, the skip-trace usage meter — would have broken at runtime.
+- A quarantine gap found, then **self-corrected**: the rule does not recognise county `UNKNOWN`
+  placeholder streets, but all 408 affected rows are `is_duplicate = true` and never delivered or billed.
+  Latent, **zero live impact**. Nearly reported a billing bug that was not one.
+
+**Pending / Handoff:**
+- ⏭️ **The Playwright 1.62 live-portal canary has not fired.** Deploy 20:21 UTC, newest connector check
+  20:10; beat's interval restarts on redeploy so it is due ~21:21, not 21:10. Confirm with
+  `county_connectors.last_checked` > deploy time and the mix still **25 healthy / 5 down**.
+- 👤 **Snohomish fake situs at ingestion** and 👤 **the ATIP access method** (it solves a reCAPTCHA the
+  county put on its own portal — a terms-of-use judgement, not a code one).
+- ⏭️ **stripe** needs the `.get()` call sites converted plus tests on real v15-shaped `StripeObject`s.
+- 👤 **King owner names**: the gate was lifted, but the real scale is **32,648 nameless of 34,552 rows**,
+  not the 384 the prior handoff states, and there is **no code gate** — `_extract_owner_name` and the
+  `party_name` swap already exist. What was gated was the BACKFILL, against the source that
+  IP-rate-blocked at 877/15,954. Skipped this session at the user's instruction.
+
+**Facts learned (durable):**
+- 🔑 **A method-EXISTENCE probe is not a compatibility check.** Assert on what a call RETURNS. That is the
+  whole Stripe finding.
+- 🔑 **`address_cache_key()` hashes the ADDRESS**, so one placeholder string is shared by **328 distinct
+  parcels** in production. A single Tracerfy result would have been copied onto all 328 unrelated leads —
+  one person's phone and email across properties they have nothing to do with.
+- 🔑 **A guard that DELETES text needs the inverse rule: never remove what you cannot prove.** The ATIP
+  name-stripper sprang a hole three times; two successive "fixed it" rounds were both wrong. Demand a
+  concrete breaking input before believing such a fix — mine or Codex's.
+- 🔑 **Clean merge ≠ works together.** Both #187/#188 and #153 merged without conflict markers where it
+  mattered and were still semantically broken. Run the combination.
+- 🔑 `results` has **no `county` column** — join `jobs` → `scraper_configs`.
+- 🔑 Neither **stripe** nor **anthropic** has any test coverage, so a green suite says nothing about them.
+
+---
+
 ## 2026-09-03 (later) — The Codex gate came back NO-GO, and it was right about all four
 
 **Built / Shipped:** three P1 fixes on `fix/test1-lead-data-quality` (`a5ffbfd`, `65c7557`, `4965b1e`)

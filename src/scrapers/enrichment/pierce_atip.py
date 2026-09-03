@@ -96,6 +96,115 @@ def _clean(value: Any) -> str | None:
     return text or None
 
 
+# The ONLY fields this module is permitted to emit. RCW 42.56.070(8) forbids the
+# commercial use of LISTS OF INDIVIDUALS, so ATIP contributes addresses and nothing
+# else; the lead's party_name comes from the RECORDER (ARMS), never from here.
+_ALLOWED_OUT_KEYS = frozenset(
+    {"property_address", "mailing_address", "atip_account_type", "atip_use_code"}
+)
+# Row keys that carry a person. Read ONLY so their value can be excluded.
+# Matched as a SUBSTRING of the key, not an exact list, so an unseen spelling
+# (taxpayerName, owner1, mail_name, TaxPayer_NM …) cannot silently bypass the
+# boundary just because we never met it (Codex). A statutory guard must fail
+# closed against field names we have not seen.
+# A key naming a person outright — always a person, whatever else it contains
+# ("addressee" also contains "addr", so these must be tested FIRST).
+_STRONG_PERSON_KEY_TOKENS = ("taxpayer", "owner", "addressee", "attn")
+# "name" on its own is ambiguous: "mail_name" is the addressee, but "street_name"
+# and "city_name" are ADDRESS data. Excising one of those would delete a real
+# street from mailing_address — the over-broad-guard mistake that once
+# false-aborted 14.79% of real rows. An address COMPONENT noun vetoes a bare
+# "name"; "mail" deliberately does not, because a mail block's name IS a person.
+_ADDRESS_COMPONENT_KEY_TOKENS = ("street", "addr", "situs", "city", "state", "zip", "line")
+
+
+def _is_person_key(key: object) -> bool:
+    """Is this row key a PERSON field (so its value must be excluded)?
+
+    The address-component veto applies to EVERY person token, not just a bare
+    "name". An `owner_address` / `owner_city` / `taxpayer_addr` key is ADDRESS
+    data that merely mentions the owner; treating it as a person harvested a
+    STREET into the exclusion list and then deleted that street from
+    mailing_address (measured: mail became "PUYALLUP, WA, 98372"). Only
+    "addressee"/"attn" outrank the veto, since "addressee" itself contains "addr".
+    """
+    low = str(key).lower()
+    if "addressee" in low or "attn" in low:
+        return True
+    if any(tok in low for tok in _ADDRESS_COMPONENT_KEY_TOKENS):
+        return False
+    return any(tok in low for tok in _STRONG_PERSON_KEY_TOKENS) or "name" in low
+# Prefixes an assessor puts before an addressee; stripped before comparing so
+# "C/O JANE DOE" is recognised as the same person as "JANE DOE".
+_ADDRESSEE_PREFIX_RE = re.compile(r"^\s*(?:C\s*/\s*O|C/O|ATTN\.?:?|ATTENTION:?)\s+", re.IGNORECASE)
+
+
+def _person_values(row: dict) -> list[str]:
+    out = []
+    for key, value in row.items():
+        if not _is_person_key(key):
+            continue
+        val = _clean(value)
+        if val:
+            out.append(_ADDRESSEE_PREFIX_RE.sub("", val).upper())
+    return out
+
+
+def _drop_person_line(mailing: str | None, row: dict) -> str | None:
+    """Remove an addressee NAME that the assessor put in the mail block.
+
+    Verified against production 2026-09-03: all 31 ATIP-enriched rows carry a real
+    street in mail/mail2/mail3 and no name, so this strips nothing today. It exists
+    because an assessor mailing block conventionally MAY lead with the addressee,
+    and that would put a person's name into mailing_address without anyone ever
+    reading row["name"].
+    """
+    if not mailing:
+        return mailing
+    people = _person_values(row)
+    if not people:
+        return mailing
+    kept = []
+    for seg in mailing.split(", "):
+        # Strip an addressee prefix for COMPARISON only. Whole-segment equality
+        # alone missed "C/O JANE DOE" and, worse, "JANE DOE 10608 63RD STREET CT E",
+        # where the assessor puts the name and the street on ONE line (Codex).
+        bare = _ADDRESSEE_PREFIX_RE.sub("", seg).strip()
+        if bare.upper() in people:
+            continue
+        # A segment that is NOT a person passes through byte-for-byte: rebuilding
+        # it from the prefix-stripped form would silently rewrite a legitimate
+        # "C/O ..." mailing line.
+        cleaned, upper = seg, bare.upper()
+        for person in people:
+            if not person:
+                continue
+            # WORD-BOUNDARY match, never a bare substring: a plain `in` test
+            # excised the name "LEE" out of the street "LEELAND ST" and produced
+            # "123 LAND ST" — a FABRICATED address, which is worse than the leak
+            # this guard exists to prevent.
+            m = re.search(
+                r"(?<![A-Z0-9])" + re.escape(person) + r"(?![A-Z0-9])", upper
+            )
+            if m:
+                # Name shares the line with the street: excise only the name.
+                cleaned = (bare[:m.start()] + bare[m.end():]).strip(" ,")
+                bare, upper = cleaned, cleaned.upper()
+        if cleaned:
+            kept.append(cleaned)
+    return ", ".join(kept) if kept else None
+
+
+def _assert_address_only(out: dict) -> None:
+    """Fail loudly if this module ever emits anything but address data."""
+    extra = set(out) - _ALLOWED_OUT_KEYS
+    if extra:
+        raise AssertionError(
+            f"pierce_atip may only emit address fields; refusing to return {sorted(extra)} "
+            "(RCW 42.56.070(8) boundary — see module docstring)"
+        )
+
+
 def parse_summary(row: dict) -> dict[str, str | None] | None:
     """Map one ATIP summary row to the app's address fields.
 
@@ -120,12 +229,18 @@ def parse_summary(row: dict) -> dict[str, str | None] | None:
         if zipcode:
             parts.append(zipcode)
         mailing = ", ".join(parts)
-    return {
+    mailing = _drop_person_line(mailing, row)
+    out = {
         "property_address": situs,
         "mailing_address": mailing,
         "atip_account_type": _clean(row.get("acct_type")),
         "atip_use_code": _clean(row.get("use_cd")),
     }
+    # HARD GUARD, not a comment: the RCW 42.56.070(8) boundary is enforced here so
+    # a later edit cannot quietly widen it. Previously the boundary held only
+    # because nothing happened to read row["name"].
+    _assert_address_only(out)
+    return out
 
 
 def _solve_token() -> str | None:

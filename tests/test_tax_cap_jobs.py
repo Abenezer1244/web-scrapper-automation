@@ -54,6 +54,9 @@ async def _seed_results(job_id: str, user_id: str) -> dict[str, str]:
             job_id=job_id,
             user_id=user_id,
             party_name="IN WINDOW OWNER",
+            # Leads carry an address (lead_actionability, 2026-09-02): address-less
+            # rows are quarantined from list/export, so the fixtures have one.
+            property_address="1 IN WINDOW ST",
             delinquent_amount=5000,
             delinquent_bill_year=_IN_WINDOW_YEAR,
         ))
@@ -62,6 +65,7 @@ async def _seed_results(job_id: str, user_id: str) -> dict[str, str]:
             job_id=job_id,
             user_id=user_id,
             party_name="STALE DEBT OWNER",
+            property_address="2 STALE DEBT ST",
             delinquent_amount=5000,
             delinquent_bill_year=_OUT_OF_WINDOW_YEAR,
         ))
@@ -70,6 +74,7 @@ async def _seed_results(job_id: str, user_id: str) -> dict[str, str]:
             job_id=job_id,
             user_id=user_id,
             party_name="PROBATE OWNER",
+            property_address="3 PROBATE LN",
             delinquent_amount=None,
             delinquent_bill_year=None,
         ))

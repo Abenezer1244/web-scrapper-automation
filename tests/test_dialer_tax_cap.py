@@ -25,6 +25,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.dialer_filters import dialer_ready_conditions
+from src.api.lead_actionability import actionable_condition
 from src.api.tax_filters import tax_cap_condition, tax_cap_min_year
 from src.db.models import Job, Result, ScraperConfig, User
 
@@ -52,6 +53,9 @@ async def _seed_three(db: AsyncSession, job_id: str, user_id: str) -> dict[str, 
         "user_id": user_id,
         "phone": "2065550100",
         "is_duplicate": False,
+        # Leads carry an address (lead_actionability, 2026-09-02): the sweep and
+        # the outbox never dial an address-less row, so the fixtures have one.
+        "property_address": "100 MAIN ST",
     }
     db.add(Result(
         id=ids["in_window"], party_name="IN WINDOW OWNER",
@@ -102,6 +106,7 @@ async def test_outbox_result_reread_excludes_out_of_window(
                 Result.id == result_id,
                 Result.user_id == starter_user.id,
                 tax_cap_condition(_TODAY),
+                actionable_condition(),
             )
         )).scalar_one_or_none()
 
@@ -118,6 +123,8 @@ def test_outbox_query_wires_in_tax_cap():
     src = inspect.getsource(dialer_outbox.process_dialer_outbox)
     assert "tax_cap_condition(today)" in src
     assert "from src.api.tax_filters import tax_cap_condition" in src
+    # Standing actionability rule (lead_actionability) must stay wired too.
+    assert "actionable_condition()" in src
 
 
 # ─── Push sweep: the conds the sweep selects on ─────────────────────────────────
@@ -152,6 +159,7 @@ async def test_push_sweep_count_and_fetch_exclude_out_of_window(
     conds = dialer_ready_conditions(include_unknown_dnc=True)
     conds = [*conds, Result.is_duplicate.is_(False)]
     conds = [*conds, tax_cap_condition(_TODAY)]
+    conds = [*conds, actionable_condition()]
 
     total = (await db.execute(
         select(func.count()).select_from(Result).where(

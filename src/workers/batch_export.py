@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 from sqlalchemy import select, text, update
 
+from src.api.lead_actionability import actionable_sql
 from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
 from src.db.models import BatchRun, Job, ScraperBatch
 from src.utils.crypto import decrypt_field
@@ -91,6 +92,9 @@ WITH candidates AS (
       AND r.job_id = ANY(CAST(:job_ids AS uuid[]))
       -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass).
       AND {tax_cap_sql('r')}
+      -- Standing rule: no property AND no mailing address = not a lead (kept in
+      -- results for dedup/health, never delivered or counted). lead_actionability.
+      AND {actionable_sql('r')}
 ),
 agg AS (
     SELECT bucket,

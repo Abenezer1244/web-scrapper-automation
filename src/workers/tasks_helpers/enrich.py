@@ -707,11 +707,17 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     # SETTLED prior trace onto cross-job dupes that have one; the remainder — including
     # the same-job siblings the trustee_sale collapse marks, which have no prior row to
     # copy from — must NOT be enqueued for a fresh paid lookup (Codex).
+    from src.api.lead_actionability import actionable_condition
+
     eligible = db.execute(
         sa_select(Result).where(
             Result.job_id == job_id,
             Result.user_id == job.user_id,
             Result.property_address.isnot(None),
+            # Standing rule: a quarantined row (no real property AND no mailing
+            # address, incl. "(enrichment unavailable)" / blanks) is not a lead —
+            # never pay Tracerfy for it (Codex).
+            actionable_condition(),
             Result.skip_trace_status == "not_attempted",
             Result.is_duplicate.is_(False),
         )

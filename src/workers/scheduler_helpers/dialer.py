@@ -56,6 +56,7 @@ def _dialer_push_sweep_impl() -> None:
     from sqlalchemy import and_, func, or_, select, update
 
     from src.api.dialer_filters import dialer_ready_conditions
+    from src.api.lead_actionability import actionable_condition
     from src.api.tax_filters import tax_cap_condition
     from src.config.constants import BUSINESS_FEATURES_PLANS
     from src.db.models import Job, PendingSkipTraceRow, Result, ScraperConfig, User
@@ -188,6 +189,9 @@ def _dialer_push_sweep_impl() -> None:
                 # to BOTH the count and the fetch below so they can never disagree.
                 # An out-of-window tax lead is never swept into dialing.
                 conds = [*conds, tax_cap_condition(_today)]
+                # Standing rule: a row with no property AND no mailing address is
+                # not a lead anywhere (lead_actionability) — never pushed either.
+                conds = [*conds, actionable_condition()]
                 total = db.execute(
                     select(func.count()).select_from(Result).where(
                         Result.job_id == job.id, Result.user_id == job.user_id, *conds

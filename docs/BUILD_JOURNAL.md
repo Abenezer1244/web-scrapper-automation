@@ -67,6 +67,35 @@ Prod data: the 5 false `absentee_owner=TRUE` rows recomputed to NULL via the scr
   milliseconds between POST return and commit; a bounded Celery retry on `unknown_queue` is the
   follow-up.
 
+**Follow-up in the same session — quarantine unactionable leads (owner decision):** a row with no
+property address AND no mailing address is not a lead: not listed, not exported, not counted, not
+billed; kept in `results` for dedup + scraper health. One rule, three spellings in
+`src/api/lead_actionability.py` (`actionable_condition` / `actionable_sql` / `is_actionable`), wired
+as a standing filter like the tax cap into `jobs.py` (results, download, total_scraped/duplicate_count),
+`batch_export.py`, `segments.py` (4 queries), `analytics.py`, the dialer sweep + outbox, and both job
+exports. The billing block (force-finalize guard + `billable_count` + CAS + overage warning) moved
+from BEFORE inline enrichment to right before the done-CAS, because actionability is unknowable until
+enrichment fills addresses; `billable_count` now = non-duplicate actionable rows and `display_count`
+(headline, email, webhook, notification) is that same number. Codex consult agreed and added the
+webhook count (was `len(records)`), the dialer paths, and scoping `total_scraped` so the duplicate
+banner cannot be driven by non-leads. Test fixtures that built "leads" with a property_key but no
+address were given one. Already-billed historical usage is NOT credited back; Test 1 now reads 105.
+Codex adversarial review of this diff: FAIL → adopted (High) on an already-billed re-run the
+headline/email/webhook now report the persisted `billed_count`, not a recomputed count that
+enrichment may have changed; (Medium) `previous_job_id` and the download's "has rows" check apply
+both standing predicates; (Medium) all three predicate spellings trim whitespace (`btrim`); (Medium)
+five test modules seeded address-less "leads" — given addresses. Round 2 still FAILed on the
+billing/done split (a crash between them lets the watchdog re-scrape and re-export against a stale
+bill) — **adopted**: `_set_status(commit=False)` lets the done-CAS commit in the SAME transaction as
+the billing CAS + `records_used` increment; a failed CAS rolls both back (a cancelled job is never
+charged). Also adopted: the skip-trace enqueue applies the rule (never pay Tracerfy for a
+quarantined row; blank / placeholder property addresses rejected in `build_pending_row_payload`), and
+the analytics fixture carries an address. Round 3 FAILed on a consequence of filtering the FIRST
+(pre-enrichment) export: if the post-enrichment re-upload failed, the emailed R2 file could omit rows
+that enrichment made actionable while the bill counted them — **adopted**: the re-export now uses
+`_upload_export_with_retry` and any failure is fatal BEFORE billing (claims released, job failed with
+an honest reason, `job_failed` notification), mirroring the first-upload rule. Round 4: **PASS**.
+
 **Failed / Blocked:**
 - **Tracerfy is out of credits (ops).** Every dispatcher tick since 04:25 UTC fails 402 on a 344-row
   batch; 565 rows / 7 jobs sit `queued`, the UI says "Processing 10–15 min" indefinitely. The code

@@ -700,7 +700,10 @@ def build_pending_row_payload(result) -> dict | None:
     The caller is responsible for the actual insert and for the
     cache lookup before enqueueing.
     """
-    if not result.property_address:
+    # Tracerfy traces by PROPERTY address; a blank or the legacy
+    # "(enrichment unavailable)" placeholder is not one (lead_actionability).
+    prop = (result.property_address or "").strip()
+    if not prop or prop == "(enrichment unavailable)":
         return None
 
     # Post-M9 audit gate: reject records whose party_name is a

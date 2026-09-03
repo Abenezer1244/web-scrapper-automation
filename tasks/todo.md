@@ -33,6 +33,11 @@ Subject: scraper config "Test 1" (pierce/WA/probate), job `1e358ca8`, 110 rows.
 - [x] scripts/backfill_owner_flags.py: `--recompute-suffixless` targeted mode for the known false positives
 ### Phase 3 — frontend (separate FE worktree/branch)
 - [x] Scrapers page + dashboard row already prefer `/results/{latest done job}` on master; command palette fixed to match (FE `e7c6352`)
+### Phase 4 — quarantine unactionable leads (owner decision, same session)
+- [x] `src/api/lead_actionability.py`: one rule, three spellings (ORM / raw SQL / Python) + tests
+- [x] standing filter in jobs.py results + download + total_scraped/duplicate_count, batch_export, segments ×4, analytics, dialer sweep + outbox
+- [x] tasks.py: both exports filtered; billing block moved after enrichment; billable_count = non-dup actionable; display_count = billable_count; webhook count fixed
+- [x] fixtures that built address-less "leads" given an address; Codex consult + adversarial review
 ### Verification
 - [x] ruff clean; 91 focused tests + 263 across every module touching the changed code; full rig run (see Review)
 - [x] Codex consult + round-1 review (FAIL → 3 adopted, 1 rejected with prod evidence) + round-2 review

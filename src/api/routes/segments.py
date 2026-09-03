@@ -33,6 +33,7 @@ from starlette.responses import Response
 
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
+from src.api.lead_actionability import actionable_sql
 from src.api.middleware import rate_limit
 from src.api.schemas import (
     SegmentIntersectionRequest,
@@ -151,7 +152,7 @@ WITH candidates AS (
       AND r.property_key IS NOT NULL
       AND sc.record_type = ANY(:types)
       -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass).
-      AND {tax_cap_sql('r')}
+      AND {tax_cap_sql('r')} AND {actionable_sql('r')}
       AND r.property_key IN (
           SELECT property_key
           FROM property_list_membership
@@ -226,7 +227,7 @@ WITH candidates AS (
     WHERE r.user_id = :uid
       AND sc.record_type = ANY(:types)
       -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass).
-      AND {tax_cap_sql('r')}
+      AND {tax_cap_sql('r')} AND {actionable_sql('r')}
       -- Optional filing-date window (migration 049 date_recorded_parsed). When no
       -- window is requested :require_date is FALSE and from/to are NULL, so all
       -- three predicates pass and behavior is identical to the all-time query.
@@ -296,7 +297,7 @@ WITH candidates AS (
       AND r.date_recorded_parsed IS NOT NULL
       AND sc.record_type = ANY(:types)
       -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass).
-      AND {tax_cap_sql('r')}
+      AND {tax_cap_sql('r')} AND {actionable_sql('r')}
       AND (CAST(:filing_from AS date) IS NULL OR r.date_recorded_parsed >= CAST(:filing_from AS date))
       AND (CAST(:filing_to AS date) IS NULL OR r.date_recorded_parsed <= CAST(:filing_to AS date))
       {{county_clause}}
@@ -362,7 +363,7 @@ WHERE r.user_id = :uid
   AND r.date_recorded_parsed IS NULL
   -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass), so
   -- this "skipped (no filing date)" count matches the capped candidate scope.
-  AND {tax_cap_sql('r')}
+  AND {tax_cap_sql('r')} AND {actionable_sql('r')}
   {{pk_clause}}
   {{county_clause}}
 """

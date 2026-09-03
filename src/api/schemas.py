@@ -963,6 +963,10 @@ class BatchLeadRow(BaseModel):
     parcel_id: str | None = None
     property_address: str | None = None
     mailing_address: str | None = None
+    # Migration 085: street-only property_address needs its structured parts.
+    property_city: str | None = None
+    property_state: str | None = None
+    property_zip: str | None = None
     phone: str | None = None
     phone_type: str | None = None
     email: str | None = None
@@ -1136,6 +1140,11 @@ class ResultRow(BaseModel):
     # Tier 0 (migration 057): owner-location flags, straight passthrough from the
     # stored columns (tri-state True/False/None=unknown).
     property_state: str | None = None
+    # Migration 085: the property's own city/ZIP. property_address is street-only
+    # for GIS/assessor-enriched rows, so without these the results view cannot
+    # show where the property actually is.
+    property_city: str | None = None
+    property_zip: str | None = None
     owner_state: str | None = None
     absentee_owner: bool | None = None
     out_of_state_owner: bool | None = None
@@ -1407,6 +1416,10 @@ class SegmentLeadRow(BaseModel):
     parcel_id: str | None = None
     property_address: str | None = None
     mailing_address: str | None = None
+    # Migration 085: street-only property_address needs its structured parts.
+    property_city: str | None = None
+    property_state: str | None = None
+    property_zip: str | None = None
     county: str | None = None
     state: str | None = None
     phone: str | None = None

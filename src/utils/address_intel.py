@@ -73,6 +73,35 @@ def _zip5(z: str | None) -> str:
     return (z or "")[:5]
 
 
+# County bulk files encode "no data" as a WORD, not as blank: the Snohomish tax
+# feed ships a situs street of literal UNKNOWN tokens ("UNKNOWN UNKNOWN, GRANITE
+# FALLS WA 98252"). Measured in production 2026-09-03: 408 such rows, every one of
+# them with the ENTIRE street segment made of UNKNOWN tokens, and 0 rows where
+# UNKNOWN appears inside an otherwise real street — so anchoring on the whole
+# segment cannot swallow a genuine address like "123 UNKNOWN RD".
+# ONLY the token that was actually measured. UNAVAILABLE / NONE / N/A were
+# considered and REJECTED: 0 occurrences in production, and inventing an
+# unmeasured guard on this connector is precisely the mistake that once
+# false-aborted 14.79% of real Snohomish rows. Add one only after measuring it.
+_PLACEHOLDER_STREET_RE = re.compile(r"UNKNOWN", re.IGNORECASE)
+
+
+def _street_is_placeholder(addr: str | None) -> bool:
+    """True when an address's STREET segment is nothing but placeholder tokens.
+
+    Only the street is judged: in "UNKNOWN UNKNOWN, GRANITE FALLS WA 98252" the
+    locality is REAL and still supports property_state / out_of_state_owner. It is
+    absentee_owner alone that cannot be known, because that one compares streets.
+    """
+    if not addr:
+        return False
+    street = addr.split(",")[0].strip()
+    if not street:
+        return False
+    tokens = [t for t in _WS_RE.sub(" ", street).split(" ") if t]
+    return bool(tokens) and all(_PLACEHOLDER_STREET_RE.fullmatch(t) for t in tokens)
+
+
 def _addresses_differ(property_address: str, mailing_address: str) -> bool | None:
     """Tri-state: True=clearly different, False=confirmed same, None=underdetermined.
 
@@ -84,6 +113,13 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
     not proof of owner-occupancy. Falls back to a normalized full-string compare
     only when neither side parses a usable street.
     """
+    # A placeholder street is NOT a street. "UNKNOWN UNKNOWN" can never equal a
+    # real mailing street, so without this the comparator returns a CONFIDENT
+    # absentee=True for a property whose address we simply do not have — exactly
+    # the fabricated signal the house rule forbids. Unknown means None.
+    if _street_is_placeholder(property_address) or _street_is_placeholder(mailing_address):
+        return None
+
     # Byte-identical (post-normalize) is unambiguous same-place → confirmed False,
     # even with no parsed ZIP/city/state to discriminate.
     if _normalize_full(property_address) == _normalize_full(mailing_address):

@@ -278,6 +278,23 @@ class Settings(BaseSettings):
     # the constraint is burst count, not total rows.
     SKIP_TRACE_MAX_BATCHES_PER_TICK: int = 2
 
+    # ─── Plan-quota cost guard ────────────────────────────────────────────────
+    # The plan cap is applied AFTER enrichment (a row's actionability is
+    # unknowable before it), so without a bound a user with 10 remaining quota
+    # who scrapes 5,000 rows would have all 5,000 persisted and enriched — GIS,
+    # assessor, Regrid — to deliver 10.
+    #
+    # This multiplier bounds the RAW rows kept before enrichment, as a multiple
+    # of the user's remaining quota. It is NOT the quota: measured actionable
+    # rates on king/tax_delinquent are ~0.55 (worst observed job 0.436), so a
+    # bound of remaining/0.436 ≈ 2.3x would only just suffice. 5x leaves ample
+    # headroom for a worse county while still capping a pathological scrape, and
+    # the floor keeps small quotas from producing a uselessly tiny sample.
+    # Raising it costs enrichment spend; lowering it risks discarding leads the
+    # user is entitled to, which is the bug this whole design exists to prevent.
+    PLAN_CAP_RAW_MULTIPLIER: int = 5
+    PLAN_CAP_RAW_FLOOR: int = 500
+
     @field_validator("TRACERFY_WEBHOOK_SECRET")
     @classmethod
     def webhook_secret_must_be_strong_if_set(cls, v: str) -> str:

@@ -21,6 +21,7 @@ def _refresh_public_sample_cache_impl() -> None:
     from sqlalchemy import func as sa_func
     from sqlalchemy import select, text
 
+    from src.api.lead_actionability import ADDRESS_PLACEHOLDER, actionable_condition
     from src.db.models import Job, Result, ScraperConfig
     from src.db.session import system_sync_session
 
@@ -46,10 +47,17 @@ def _refresh_public_sample_cache_impl() -> None:
             .join(ScraperConfig, Job.scraper_config_id == ScraperConfig.id)
             .where(
                 Job.status == "done",
+                # A sample row renders BOTH columns, so it still needs both —
+                # but the "(enrichment unavailable)" placeholder is not an
+                # address and must never be shown to the public as one, and a
+                # quota-excluded row was never delivered to anyone.
+                actionable_condition(),
                 Result.property_address.isnot(None),
                 Result.property_address != "",
+                Result.property_address != ADDRESS_PLACEHOLDER,
                 Result.mailing_address.isnot(None),
                 Result.mailing_address != "",
+                Result.mailing_address != ADDRESS_PLACEHOLDER,
             )
             .order_by(Job.created_at.desc())
             .limit(5)
@@ -75,10 +83,24 @@ def _refresh_public_sample_cache_impl() -> None:
                 "has_parcel": bool(r.parcel_id),
             })
 
+        # The public "leads delivered" number must mean the SAME thing the app
+        # means by a lead. This counted any row with a non-empty
+        # property_address — including the "(enrichment unavailable)"
+        # placeholder, and (after the plan cap) rows that were never delivered
+        # to anyone — while the sample rows above used a stricter rule. One
+        # marketing number, one definition (Codex, 2026-09-03).
+        # "Delivered" has to mean delivered: a row only counts if its job
+        # actually finished and it was not a duplicate. actionable_condition()
+        # alone still let through rows from failed/in-flight jobs and dedup
+        # duplicates, which billing never counted either (Codex, 2026-09-03).
         delivered_count = db.execute(
-            select(sa_func.count(Result.id)).where(
-                Result.property_address.isnot(None),
-                Result.property_address != "",
+            select(sa_func.count(Result.id))
+            .select_from(Result)
+            .join(Job, Result.job_id == Job.id)
+            .where(
+                Job.status == "done",
+                Result.is_duplicate.is_(False),
+                actionable_condition(),
             )
         ).scalar() or 0
 

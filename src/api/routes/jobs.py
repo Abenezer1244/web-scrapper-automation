@@ -365,6 +365,12 @@ async def get_results(
             Result.party_name.ilike(pattern, escape="\\")
             | Result.parcel_id.ilike(pattern, escape="\\")
             | Result.property_address.ilike(pattern, escape="\\")
+            # Migration 085 froze property_address to a street-only line for
+            # statewide- and assessor-enriched rows and moved the locality into
+            # these columns. Without them, searching a visible lead by its own
+            # city or ZIP returns nothing (Codex, 2026-09-03).
+            | Result.property_city.ilike(pattern, escape="\\")
+            | Result.property_zip.ilike(pattern, escape="\\")
         )
 
     # Phase 4: tax filters (amount owed / months delinquent). Applied to the

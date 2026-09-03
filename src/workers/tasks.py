@@ -14,10 +14,7 @@ from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
 
 from src.api.lead_actionability import (
-    DELIVERY_EXCLUDED_KEY,
-    OVER_QUOTA,
     actionable_sql,
-    address_actionable_sql,
     is_actionable,
 )
 from src.config.constants import (
@@ -60,6 +57,7 @@ from src.workers.tasks_helpers.enrich import (  # noqa: F401  (re-export)
     _run_inline_enrichment,
     _run_scraper,
 )
+from src.workers.tasks_helpers.plan_cap import apply_plan_cap
 from src.workers.tasks_helpers.status import (
     _DELIVERY_TOKEN_TTL,  # noqa: F401  (re-export)
     _TERMINAL_STATUSES,
@@ -657,15 +655,24 @@ def run_scrape_job(self, job_id: str) -> None:
                     db=db,
                 )
 
-        # ── Plan quota ────────────────────────────────────────────────────────
-        # NOT capped here. A row's actionability is unknowable at this point: the
-        # counties whose addresses arrive during inline enrichment (King probate,
-        # the generic GIS sweep) look addressless until then. Slicing the RAW list
-        # to the quota could therefore save a fully-quarantined prefix, bill ~0,
-        # and silently discard real leads the user still had quota for. The cap is
-        # applied after enrichment instead, against the same actionable set that
-        # display, export and billing use — see "APPLY THE PLAN CAP" below
-        # (Codex ruling, 2026-09-03).
+        # ── Plan quota: NOT bounded here, deliberately ────────────────────────
+        # The quota cap runs after enrichment, against the actionable set (see
+        # "APPLY THE PLAN CAP"). A pre-enrichment RAW bound was tried here as a
+        # spend guard and REVERTED: this point is BEFORE dedup, while the cap and
+        # billing both count only `is_duplicate = false`. A duplicate-heavy
+        # prefix — exactly what a re-run over the same county produces — would
+        # therefore consume the whole bound, leave the user with ZERO delivered
+        # leads on a full quota, and never even persist the net-new rows past the
+        # bound. That is the same silent-discard bug the after-enrichment cap
+        # exists to fix, in a subtler form, and it is strictly worse than the
+        # enrichment spend it was meant to save (Codex, 2026-09-03).
+        #
+        # The real per-row money is skip trace, and that IS bounded: the cap
+        # withdraws capped rows' queued lookups and the dispatcher re-checks
+        # actionability before it spends. A bound on ENRICHMENT specifically
+        # (applied after dedup, gating only the enrichment step, releasing the
+        # dedup claims of anything it skips) is the correct shape and is left as
+        # a separate, designed change rather than guessed at here.
 
         # ── ENRICHING ─────────────────────────────────────────────────────────
         # CAS no-op here means a batch force-finalize cancelled this child while
@@ -1269,38 +1276,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 try:
                     db.refresh(user)  # a concurrent job may have consumed quota
                     _remaining = max(0, user.records_limit - (user.records_used or 0))
-                    # Clear this job's previous marks first: on a watchdog re-run
-                    # the ranking must start from the FULL actionable set, or each
-                    # pass would renumber the survivors and mark a second batch,
-                    # shrinking the delivered set every time.
-                    db.execute(
-                        sa_text("UPDATE results SET enrichment_data = (CASE WHEN jsonb_typeof(COALESCE(enrichment_data, '{}')::jsonb) = 'object' THEN COALESCE(enrichment_data, '{}')::jsonb ELSE '{}'::jsonb END - :key)::json WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) AND enrichment_data->>:key = :reason"),
-                        {"jid": job_id, "uid": str(job.user_id),
-                         "key": DELIVERY_EXCLUDED_KEY, "reason": OVER_QUOTA},
-                    )
-                    _capped_ids = [
-                        str(_row[0]) for _row in db.execute(
-                            sa_text(
-                                "WITH ranked AS (  SELECT id, row_number() OVER (    ORDER BY party_name, date_recorded, id  ) AS rn  FROM results  WHERE job_id = :jid AND user_id = CAST(:uid AS uuid)    AND is_duplicate = false    AND {addr_rule}) UPDATE results r SET enrichment_data =   (CASE WHEN jsonb_typeof(COALESCE(r.enrichment_data, '{{}}')::jsonb) = 'object' THEN COALESCE(r.enrichment_data, '{{}}')::jsonb ELSE '{{}}'::jsonb END    || jsonb_build_object(:key, :reason))::json FROM ranked WHERE r.id = ranked.id AND ranked.rn > :remaining RETURNING r.id".format(
-                                    addr_rule=address_actionable_sql("results")
-                                )
-                            ),
-                            {"jid": job_id, "uid": str(job.user_id),
-                             "key": DELIVERY_EXCLUDED_KEY, "reason": OVER_QUOTA,
-                             "remaining": _remaining},
-                        ).fetchall()
-                    ]
-                    if _capped_ids:
-                        # Release the dedup claims of rows we are NOT delivering,
-                        # so a later run (or next month's quota) can still deliver
-                        # them. Keeping the claim would make the lead permanently
-                        # unreachable — the same invariant the re-export failure
-                        # path protects.
-                        db.execute(
-                            sa_text('DELETE FROM delivered_records dr USING results r WHERE dr.user_id = CAST(:uid AS uuid)   AND dr.first_job_id = :jid   AND dr.dedup_hash = r.dedup_hash   AND r.id = ANY(CAST(:ids AS uuid[]))   AND r.user_id = CAST(:uid AS uuid)   AND r.dedup_hash IS NOT NULL'),
-                            {"uid": str(job.user_id), "jid": job_id, "ids": _capped_ids},
-                        )
-                    db.commit()
+                    _capped_ids = apply_plan_cap(db, job_id, job.user_id, _remaining)
                 except Exception as exc:
                     db.rollback()
                     _cap_error = exc

@@ -305,7 +305,12 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
 
         # Method 1: Auto-solve via 2Captcha if API key is available
         from src.config import settings
-        has_captcha_key = bool(settings.CAPTCHA_API_KEY)
+        # Both, not just the key: solve_recaptcha() itself refuses when
+        # CAPTCHA_ENABLED is false, so checking the key alone only bought a
+        # misleading "Solving reCAPTCHA..." log line and a wasted call before
+        # the inner guard returned None. Match every other call site
+        # (parcel.py, pierce_atip.py) so the kill switch reads uniformly.
+        has_captcha_key = bool(settings.CAPTCHA_API_KEY) and settings.CAPTCHA_ENABLED
         if has_captcha_key and sitekey:
             _logger.info("Solving reCAPTCHA via 2Captcha service...")
             try:
@@ -615,8 +620,8 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         Must be called RIGHT BEFORE submit so the token is fresh.
         """
         from src.config import settings
-        if not settings.CAPTCHA_API_KEY:
-            return  # No auto-solve available
+        if not settings.CAPTCHA_API_KEY or not settings.CAPTCHA_ENABLED:
+            return  # No auto-solve available (missing key, or kill switch off)
 
         # Check if captcha is on this page
         has_captcha = await self.page.evaluate("""

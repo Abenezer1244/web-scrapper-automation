@@ -24,6 +24,7 @@ confirmed against the live API during the first smoke (the research flagged the
 spec as not fully verifiable without an account). The outbox/security architecture
 is independent of the exact body shape.
 """
+from src.utils.address_intel import compose_situs
 from src.workers.dialer_connectors.base import DialerConnector
 
 _CONTACTS_URL = "https://www.phoneburner.com/rest/1/contacts"
@@ -84,7 +85,18 @@ class PhoneBurnerConnector(DialerConnector):
                 "last_name": last_name,
                 "phone_number": ld.get("phone"),
                 "email_address": ld.get("email"),
-                "address": ld.get("property_address"),
+                # Rebuild the full situs line rather than pushing the
+                # street-only value: migration 085 froze property_address to the
+                # street and moved city/ZIP into their own columns, so a bare
+                # "9226 175TH STREET CT E" reached the dialer with no town.
+                # compose_situs is canonical-not-append-only, so a source that
+                # already carries its own tail is not given a second copy.
+                "address": compose_situs(
+                    ld.get("property_address"),
+                    ld.get("property_city"),
+                    ld.get("property_state"),
+                    ld.get("property_zip"),
+                ),
                 # PhoneBurner-side dedup backstop (NOT our replay model). Confirm
                 # exact param names against the live API on first smoke.
                 "duplicate_checks": "phone",

@@ -45,7 +45,10 @@ def dispatch_pending_skip_trace() -> dict:
         return {"skipped": "no_token"}
 
     from sqlalchemy import and_, select, update
+    from sqlalchemy import exists as sa_exists
+    from sqlalchemy import text as sa_text
 
+    from src.api.lead_actionability import actionable_condition, actionable_sql
     from src.db.models import PendingSkipTraceRow, Result, SkipTraceQueue
     from src.db.session import system_sync_session
     from src.scrapers.enrichment.skip_trace import TracerfyError, submit_batch
@@ -62,6 +65,39 @@ def dispatch_pending_skip_trace() -> dict:
     with system_sync_session() as db:
         _alert_stale_claims(db)
 
+        # Resolve queued rows whose lead is no longer deliverable, instead of
+        # merely filtering them below. Filtering alone leaves them 'queued'
+        # forever, and since the dispatch index is (status, trace_type,
+        # enqueued_at) the FIFO head fills with dead rows that every tick walks
+        # and re-probes — the 5000 limit bounds the batch, not the scan. Rows can
+        # arrive here from the deployed pre-cap code, from a race, or from any
+        # other enqueue path (Codex, 2026-09-03).
+        _dead = db.execute(
+            sa_text(
+                "UPDATE pending_skip_trace_rows p SET status = 'cancelled' "
+                "WHERE p.status = 'queued' AND NOT EXISTS ("
+                "  SELECT 1 FROM results r WHERE r.id = p.result_id "
+                f"   AND {actionable_sql('r')}"
+                ") RETURNING p.result_id"
+            )
+        ).fetchall()
+        if _dead:
+            # Put the leads' own status back so they are not stranded as
+            # "Processing…" with nothing left to process them.
+            db.execute(
+                sa_text(
+                    "UPDATE results SET skip_trace_status = 'not_attempted' "
+                    "WHERE id = ANY(CAST(:ids AS uuid[])) "
+                    "AND skip_trace_status = 'queued'"
+                ),
+                {"ids": [str(row[0]) for row in _dead]},
+            )
+            db.commit()
+            _logger.info(
+                "Skip-trace dispatcher: cancelled %d queued row(s) whose lead is "
+                "no longer deliverable", len(_dead),
+            )
+
         for _ in range(max_batches):
             # Pick a trace_type to drain this pass. Prefer 'normal' first
             # (cheaper per row), then 'advanced'. Within a pass we batch
@@ -75,6 +111,23 @@ def dispatch_pending_skip_trace() -> dict:
                             and_(
                                 PendingSkipTraceRow.status == "queued",
                                 PendingSkipTraceRow.trace_type == trace_type,
+                                # Never spend on a row that is no longer a
+                                # deliverable lead. Rows are enqueued during
+                                # inline enrichment, BEFORE the plan cap marks
+                                # anything, so a finite-quota user's over-quota
+                                # rows can already be sitting here. The cap
+                                # withdraws its own queued rows, but this is the
+                                # guard at the moment money is actually spent, so
+                                # it also covers rows queued by any other path
+                                # and any race between the two (Codex).
+                                sa_exists()
+                                .where(
+                                    and_(
+                                        Result.id == PendingSkipTraceRow.result_id,
+                                        actionable_condition(),
+                                    )
+                                )
+                                .correlate(PendingSkipTraceRow),
                             )
                         )
                         .order_by(PendingSkipTraceRow.enqueued_at)

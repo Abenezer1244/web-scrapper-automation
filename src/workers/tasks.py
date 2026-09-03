@@ -655,37 +655,24 @@ def run_scrape_job(self, job_id: str) -> None:
                     db=db,
                 )
 
-        # ── Plan quota: a COST bound here, the real cap after enrichment ──────
-        # The quota itself is NOT applied here. A row's actionability is
-        # unknowable at this point: the counties whose addresses arrive during
-        # inline enrichment (King probate, the generic GIS sweep) look
-        # addressless until then. Slicing the RAW list to the quota saved a
-        # possibly-quarantined prefix, billed ~0, and silently discarded real
-        # leads the user still had quota for — measured actionable rates on
-        # king/tax_delinquent are ~0.55, worst observed job 0.436, so roughly
-        # half the entitled leads were being thrown away. The real cap runs
-        # against the actionable set after enrichment: see "APPLY THE PLAN CAP".
+        # ── Plan quota: NOT bounded here, deliberately ────────────────────────
+        # The quota cap runs after enrichment, against the actionable set (see
+        # "APPLY THE PLAN CAP"). A pre-enrichment RAW bound was tried here as a
+        # spend guard and REVERTED: this point is BEFORE dedup, while the cap and
+        # billing both count only `is_duplicate = false`. A duplicate-heavy
+        # prefix — exactly what a re-run over the same county produces — would
+        # therefore consume the whole bound, leave the user with ZERO delivered
+        # leads on a full quota, and never even persist the net-new rows past the
+        # bound. That is the same silent-discard bug the after-enrichment cap
+        # exists to fix, in a subtler form, and it is strictly worse than the
+        # enrichment spend it was meant to save (Codex, 2026-09-03).
         #
-        # What IS applied here is a spend bound. Enrichment costs money per row
-        # (county GIS, assessor, Regrid) and skip trace costs real credits, so
-        # persisting and enriching 5,000 rows to deliver 10 is waste. Keep a
-        # generous multiple of the quota — enough headroom that the actionable
-        # yield still clears `remaining` on the worst county measured — and cap
-        # only the pathological tail.
-        if user.records_limit != -1:
-            from src.config import settings as _settings
-
-            _remaining_now = max(0, user.records_limit - (user.records_used or 0))
-            _raw_bound = max(
-                _remaining_now * _settings.PLAN_CAP_RAW_MULTIPLIER,
-                _settings.PLAN_CAP_RAW_FLOOR,
-            )
-            if _raw_bound < len(records):
-                _logger.info(
-                    "Job %s: cost bound kept %d of %d raw rows (remaining=%d)",
-                    job_id, _raw_bound, len(records), _remaining_now,
-                )
-                records = records[:_raw_bound]
+        # The real per-row money is skip trace, and that IS bounded: the cap
+        # withdraws capped rows' queued lookups and the dispatcher re-checks
+        # actionability before it spends. A bound on ENRICHMENT specifically
+        # (applied after dedup, gating only the enrichment step, releasing the
+        # dedup claims of anything it skips) is the correct shape and is left as
+        # a separate, designed change rather than guessed at here.
 
         # ── ENRICHING ─────────────────────────────────────────────────────────
         # CAS no-op here means a batch force-finalize cancelled this child while

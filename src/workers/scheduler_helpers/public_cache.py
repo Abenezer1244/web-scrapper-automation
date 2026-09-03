@@ -89,8 +89,19 @@ def _refresh_public_sample_cache_impl() -> None:
         # placeholder, and (after the plan cap) rows that were never delivered
         # to anyone — while the sample rows above used a stricter rule. One
         # marketing number, one definition (Codex, 2026-09-03).
+        # "Delivered" has to mean delivered: a row only counts if its job
+        # actually finished and it was not a duplicate. actionable_condition()
+        # alone still let through rows from failed/in-flight jobs and dedup
+        # duplicates, which billing never counted either (Codex, 2026-09-03).
         delivered_count = db.execute(
-            select(sa_func.count(Result.id)).where(actionable_condition())
+            select(sa_func.count(Result.id))
+            .select_from(Result)
+            .join(Job, Result.job_id == Job.id)
+            .where(
+                Job.status == "done",
+                Result.is_duplicate.is_(False),
+                actionable_condition(),
+            )
         ).scalar() or 0
 
         counties_active = db.execute(

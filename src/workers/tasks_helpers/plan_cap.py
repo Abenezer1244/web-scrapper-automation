@@ -61,6 +61,23 @@ _MARK_SQL_TMPL = (
     "RETURNING r.id"
 )
 
+# Lock this job's queued skip-trace rows BEFORE marking anything.
+#
+# The dispatcher's claim query reads `results` through an un-locked EXISTS, so
+# under READ COMMITTED it can still see the PRE-cap version of a row while this
+# transaction is uncommitted, claim the pending row and POST it — money gone,
+# for a lead that will never be delivered. Taking the lock first means the
+# dispatcher's own FOR UPDATE SKIP LOCKED skips these rows for the duration,
+# closing the window instead of narrowing it (Codex, 2026-09-03).
+#
+# Scoped to this job and to 'queued' only: a 'submitting' row is already POSTed
+# and must never be touched.
+_LOCK_PENDING_SQL = (
+    "SELECT id FROM pending_skip_trace_rows "
+    "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) AND status = 'queued' "
+    "FOR UPDATE SKIP LOCKED"
+)
+
 # A capped row is never delivered, so paying Tracerfy for it is pure waste — and
 # `_enqueue_skip_trace_rows` runs INSIDE inline enrichment, i.e. BEFORE this cap
 # exists, so by the time we mark a row its skip trace may already be queued.
@@ -73,7 +90,20 @@ _CANCEL_PENDING_SQL = (
     "DELETE FROM pending_skip_trace_rows "
     "WHERE status = 'queued' "
     "  AND user_id = CAST(:uid AS uuid) "
-    "  AND result_id = ANY(CAST(:ids AS uuid[]))"
+    "  AND result_id = ANY(CAST(:ids AS uuid[])) "
+    "RETURNING result_id"
+)
+
+# Withdrawing the work row without resetting the lead's own status stranded it:
+# `results.skip_trace_status` stayed 'queued' with nothing left to process it, so
+# if the cap later cleared (upgrade, new month, re-run) the lead came back visible
+# and permanently "Processing…". Put it back to not_attempted so the next run can
+# legitimately enqueue it again (Codex, 2026-09-03).
+_RESET_STATUS_SQL = (
+    "UPDATE results SET skip_trace_status = 'not_attempted' "
+    "WHERE user_id = CAST(:uid AS uuid) "
+    "  AND id = ANY(CAST(:ids AS uuid[])) "
+    "  AND skip_trace_status = 'queued'"
 )
 
 # Scoped to THIS job's claims. Matching on (user_id, dedup_hash) alone had no
@@ -110,6 +140,9 @@ def apply_plan_cap(db, job_id: str, user_id: str, remaining: int) -> list[str]:
         "reason": OVER_QUOTA,
     }
 
+    # Take the skip-trace lock before any marking (see _LOCK_PENDING_SQL).
+    db.execute(sa_text(_LOCK_PENDING_SQL), {"jid": job_id, "uid": str(user_id)})
+
     # Clear this job's previous marks FIRST. On a watchdog re-run the ranking has
     # to start from the full actionable set; ranking over the already-capped set
     # would renumber the survivors and mark a second batch, shrinking what is
@@ -134,11 +167,20 @@ def apply_plan_cap(db, job_id: str, user_id: str, remaining: int) -> list[str]:
         # (or next month's quota) can still deliver them. Keeping the claim would
         # make the lead permanently unreachable rather than merely deferred.
         db.execute(_release_stmt(), {"uid": str(user_id), "jid": job_id, "ids": capped_ids})
-        # Withdraw any skip trace queued for them before this cap existed.
-        db.execute(
-            sa_text(_CANCEL_PENDING_SQL),
-            {"uid": str(user_id), "ids": capped_ids},
-        )
+        # Withdraw any skip trace queued for them before this cap existed, and
+        # put the lead's own status back so it is not stranded as "Processing…".
+        withdrawn = [
+            str(row[0])
+            for row in db.execute(
+                sa_text(_CANCEL_PENDING_SQL),
+                {"uid": str(user_id), "ids": capped_ids},
+            ).fetchall()
+        ]
+        if withdrawn:
+            db.execute(
+                sa_text(_RESET_STATUS_SQL),
+                {"uid": str(user_id), "ids": withdrawn},
+            )
 
     db.commit()
     return capped_ids

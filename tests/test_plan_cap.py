@@ -362,26 +362,34 @@ class TestCostGuardWithdrawsSkipTrace:
             assert await self._pending_count(db, uid_b) == 3
 
 
-class TestCostBoundArithmetic:
-    """The raw bound is a SPEND guard, not the quota. It must never be tight
-    enough to discard leads the user is entitled to — that is the bug the whole
-    after-enrichment design exists to prevent."""
+class TestWithdrawnRowsAreNotStranded:
+    """Deleting the work row without resetting the lead's own status left it
+    'queued' with nothing left to process it, so a later cap-clear (upgrade, new
+    month, re-run) brought it back visible and permanently "Processing…"."""
 
-    async def test_bound_clears_the_quota_at_the_worst_measured_rate(self):
-        from src.config import settings
-        # Worst actionable rate observed in production (king/tax_delinquent).
-        WORST_RATE = 0.436
-        for remaining in (1, 10, 100, 1000, 10_000):
-            bound = max(
-                remaining * settings.PLAN_CAP_RAW_MULTIPLIER,
-                settings.PLAN_CAP_RAW_FLOOR,
-            )
-            assert int(bound * WORST_RATE) >= remaining, (
-                f"raw bound {bound} yields fewer than {remaining} actionable rows "
-                "at the worst measured rate — it would discard entitled leads"
-            )
+    async def test_status_is_reset_when_the_pending_row_is_withdrawn(self):
+        from src.db.models import PendingSkipTraceRow
+        ids, jid, uid = await _seed(4)
+        async with _db_session.AsyncSessionLocal() as s:
+            for rid in ids["actionable"]:
+                s.add(PendingSkipTraceRow(
+                    job_id=jid, result_id=rid, user_id=uid,
+                    property_address="1 MAIN ST", trace_type="advanced",
+                    status="queued",
+                ))
+            await s.commit()
+        async with _db_session.AsyncSessionLocal() as s:
+            await s.execute(text(
+                "UPDATE results SET skip_trace_status = 'queued' "
+                "WHERE id = ANY(CAST(:ids AS uuid[]))"), {"ids": ids["actionable"]})
+            await s.commit()
 
-    async def test_bound_is_generous_not_the_quota(self):
-        from src.config import settings
-        assert settings.PLAN_CAP_RAW_MULTIPLIER >= 2
-        assert settings.PLAN_CAP_RAW_FLOOR >= 100
+        with _sync() as db:
+            apply_plan_cap(db, jid, uid, remaining=1)
+            stranded = db.execute(text(
+                "SELECT count(*) FROM results WHERE job_id = :jid "
+                "AND skip_trace_status = 'queued' AND NOT EXISTS ("
+                "  SELECT 1 FROM pending_skip_trace_rows p "
+                "  WHERE p.result_id = results.id)"),
+                {"jid": jid}).scalar()
+            assert stranded == 0, "a withdrawn lookup must not leave the lead queued"

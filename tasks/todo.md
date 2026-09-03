@@ -146,3 +146,49 @@ still `json_typeof=object`, stale provenance dropped, `_REPAIR` in scope — the
 **Not done / handed back:** the King run itself (847 undecided rows ≈ 29 paced runs) is a
 resource decision for the user — see todo 8. Pierce (1,218) and --repair-flags (1,286) are cheap
 and ready to run.
+
+
+---
+
+# Test 4 — auction-date label + lead data-quality audit
+
+Job: `90e5eb41-07ff-46ae-8d06-63bca40f67cc` (config `Test 4`, snohomish/trustee_sale, 6 leads)
+Source: Snohomish Tribune legals PDF `Legals - 8-5-26.pdf`
+
+## Findings (all verified against the real source PDF + prod DB)
+
+- [x] "2D" = `days_to_auction` (int) + a literal "d", CSS-uppercased. Means **2 days until the auction**.
+- [x] **P1 TS-number off-by-one / cross-record contamination** — `split_notice_blocks` orphans a
+      pre-header `TS No <x>` into the PREVIOUS block. 2 of 6 Test 4 leads carry the next notice's
+      TS number; the last notice in every such PDF is DROPPED (`is_valid_nts` needs a ts_number).
+- [x] **P2 past auctions clamp to 0** — indistinguishable from "auction is today".
+- [x] **P2 UTC clock for a Washington-local event** — Pacific-evening off-by-one.
+- [x] property_city/property_zip NULL = STALE pre-fix data (fixed by 1b964d9, landed 21h AFTER the run).
+- [x] mailing_address NULL = Case B — Snohomish publishes no mailing source.
+
+## Tasks
+- [x] Fix `split_notice_blocks` to bind a notice's pre-header identity preamble to its OWN block
+- [x] Make `days_to_auction` signed; add a county-local auction clock (keep UTC for tax parity)
+- [x] Frontend: replace `{n}d` with plain language, keep the date visible
+- [x] Regression tests: tomorrow / in 2 days / today / yesterday / several days ago + splitter
+- [~] Codex review — design review DONE (it rejected my first splitter draft, correctly).
+      Post-implementation DIFF review NOT done: Codex hit its usage limit mid-run.
+
+## Review
+
+**Changed:** `nts_pdf.py` (pre-header identity binding, linear peeling), `lead_signals.py`
+(signed `days_to_auction` + `auction_reference_date`), `lead_export.py` / `data_exporter.py` /
+`schemas.py` (two frozen clocks through every export surface), FE `AuctionCountdown` +
+`lib/utils.ts`, tests + a second real-PDF fixture.
+
+**Verified:** all 8 notices in the source PDF now parse with their own TS number (was 3 wrong +
+1 dropped); backend 1884 passed / 2 skipped; FE tsc + eslint + build clean; the label rendered in
+real Chromium (light + dark) across in-5/in-2/tomorrow/today/yesterday/5-days-ago/45-days, no
+console or network errors; the live API path returns `days_to_auction=1` for all 6 Test 4 rows.
+
+**Deliberately NOT changed:** party names, parcel IDs, property addresses, auction dates and
+default-owed values — all 6 verified correct against the source. Blank mailing addresses are a
+real Snohomish source limitation.
+
+**Left open:** historic prod rows not repaired (forward-only fix); `trustee_sale.scrape()` /
+`nts_crawler` expiry still gate on a UTC date for a WA-local event; neither branch pushed.

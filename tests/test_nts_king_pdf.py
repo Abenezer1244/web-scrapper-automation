@@ -132,8 +132,23 @@ class TestKing20260701Pdf:
     def test_mtc_colonless_commonly_known_as(self):
         # MTC layout: "More commonly known as 1814 FRANKLIN AVE E…" (no colon)
         # used to yield property_address=None.
-        row = _rows_0701()["REF-20200710001874"]
+        #
+        # This notice was keyed "REF-20200710001874" — the deed-reference SURROGATE
+        # parse_king_notice invents when it finds no TS number. It has one: the source
+        # prints "TS No WA06000049-25-2 TO No … NOTICE OF TRUSTEE'S SALE … Grantor: CORY
+        # P SIMMONSEN", i.e. BEFORE the header, so the pre-header TS bug orphaned it onto
+        # the previous notice and this one fell back to a synthetic key. Same notice,
+        # same address — it just carries its real trustee number now.
+        row = _rows_0701()["WA06000049-25-2"]
         assert row["property_address"] == "1814 FRANKLIN AVE E, SEATTLE, WA 98102"
+
+    def test_real_ts_number_beats_the_deed_ref_surrogate(self):
+        """A surrogate key is a last resort. Where the source prints a real TS number —
+        even before the header — it must win, or the notice's identity in nts_notices
+        (keyed on source+ts_number) is synthetic and cannot be cross-referenced."""
+        keys = set(_rows_0701())
+        assert "WA06000049-25-2" in keys
+        assert "REF-20200710001874" not in keys
 
     def test_all_fields_fit_their_columns(self):
         limits = {"ts_number": 64, "parcel": 64, "property_address": 512,

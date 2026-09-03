@@ -165,6 +165,105 @@ situs is exported but not displayed.
 
 ---
 
+## 2026-09-03 — "Test 4": the 2D badge, and the TS numbers that belonged to the next notice
+
+**Built / Shipped:** branch `fix/test4-lead-data-quality` (worktree `bridgeleads-worktrees/test4-dq`,
+commit `f6e29fb`) + FE `fix/auction-date-relative-label` (`a90d477`). Not pushed — local review pending.
+
+- `split_notice_blocks` now binds each notice's **own** pre-header identity run to its block.
+- `days_to_auction` is **signed** (past auctions read negative) and runs on a **county-local**
+  clock (`AUCTION_TZ = America/Los_Angeles`) threaded separately from the UTC `today`.
+- FE: `{n}d` chip → plain language ("In 2 days" / "Today" / "1 day ago") in a shared
+  `AuctionCountdown`; the auction date stays visible.
+
+**Tried / Decided:**
+- First splitter draft was "move the last TS label in the block tail to the next block."
+  **Codex rejected it and was right** — Quality Loan repeats its OWN TS number in its trailer,
+  so that rule recreates the same bug in reverse. Replaced with: move a run only when it is
+  immediately adjacent to the next header AND the body left behind still identifies itself.
+  Anything ambiguous keeps the old behaviour rather than guessing.
+- Considered switching `derive_signals`' single `today` to Pacific. **Rejected**:
+  `src/api/tax_filters.py:32` requires UTC for `months_delinquent` parity with the filter SQL.
+  Two clocks, passed explicitly.
+- Considered leaving `days_to_auction` clamped and adding a second signed field. Rejected —
+  only two consumers (CSV column, FE badge), no filters or sorts, so signing it is clean.
+
+**Failed / Blocked:**
+- Codex hit its usage limit part-way through the post-implementation diff review (resets 08:36).
+  Its design review landed in full; the diff review did **not**. I worked its checklist myself
+  (backtracking, callers, block-count regression, text loss) — the diff review is still owed.
+- Couldn't use the shared `bl-testenv` pytest rig: another session was actively running against
+  `bridgeleads_test` (pg.log live). Created a separate `bridgeleads_t4_test` database on the same
+  server instead — isolated tables, no interference. 1884 passed, 2 skipped.
+
+**Caught & fixed (before shipping):**
+- My own first cut made `build_lead_export_row(rec, today=X)` silently ignore `X` for the auction
+  clock (defaulted to a live `now()`), breaking determinism — caught by an existing export test.
+  `auction_today` now defaults to `today`; the writers inject the county-local date.
+- **Catastrophic backtracking** in the first regex: `(?:ITEM)(?:\s+ITEM)*$` against 200 repeated
+  "TS No X " tokens followed by one non-matching word ran **>120s** (real PDF: 7.7ms). A malformed
+  legals PDF could have stalled the crawler worker. Rewrote as linear one-item-at-a-time peeling
+  with a bounded window: **>120s → 1.2ms**. Regression test added.
+- `build_overlap_export_row` was calling `build_lead_export_row(record)` with no frozen date at
+  all — a per-ROW `now()`. A long combined export could straddle midnight and print two different
+  countdowns for the same auction. Now frozen once per file, like `write_lead_csv`.
+
+**Facts learned:**
+- **"2D" meant "2 days until the auction"** — `days_to_auction` + a literal "d", CSS-uppercased.
+- Snohomish Tribune issues mix two trustee layouts: Quality Loan prints the TS number AFTER the
+  statutory header, North Star and MTC/Trustee Corps print it BEFORE. Only the second kind was
+  ever affected — which is why this stayed invisible in the existing 2025-12-17 fixture.
+- The shifted TS number was **not cosmetic**: `nts_notices` is keyed on `(source, ts_number)` and
+  `trustee_sale` derives `raw_html_hash` from it, so it corrupts cache identity and the per-job
+  idempotency key.
+- Test 4's NULL `property_city`/`property_zip` are **stale data, not a live bug** — the situs
+  capture landed in `1b964d9` at 2026-09-03 05:31 UTC, ~21h AFTER the job ran at 09-02 07:58 UTC.
+  Always check commit time against job time before chasing a fixed bug.
+- Snohomish publishes **no** mailing-address source (`mailing_source: "none_no_source"`), so blank
+  mailing on these leads is a real source limitation, not pipeline loss.
+- Everything else in Test 4 verified CORRECT against the source PDF: all 6 party names, parcel IDs,
+  property addresses, auction dates, default-owed amounts.
+
+**Repair (added after the PRs went up):** `scripts/repair_nts_ts_number.py`. Truth comes from
+RE-PARSING the source PDFs with the fixed parser, joined on `parcel` — nothing hand-typed.
+- 🔑 The dry run found the blast radius was **bigger than Test 4**: **5 rows across 3 jobs**, not 2.
+  The extra one (KRISSTOPHER D SCHULTZ, job `bdbf92a9`, `WA05000087-25-1` → `26-77688`) was
+  verified against the 6-24-26 issue, where `WA05000087-25-1` belongs to the NEXT notice (LABONTE).
+- 🛑 **Ordering was mandatory.** Cate's CORRECTED fingerprint is exactly the one Weintraub still
+  holds, in the SAME job, and `uq_results_job_fingerprint` is UNIQUE on (job_id, source_fingerprint).
+  Applying in query order would have thrown. Free-before-claim, both phases.
+- 🛑 `_fingerprint = rec.raw_html_hash or _source_fingerprint(rec)` — so `raw_html_hash` IS the
+  ON CONFLICT key for trustee_sale rows and had to move WITH the ts_number, but ONLY where the
+  stored hash really was the ts-derived one (pre_foreclosure rows key off parcel/party instead).
+- 🛑 The `--notices` phase is written and dry-run-verified but **deliberately NOT run**: nts_notices
+  is upserted ON CONFLICT (source, ts_number), so renaming rows while the OLD parser is still
+  deployed means the next beat crawl re-upserts the wrong number ONTO the renamed row — strictly
+  worse than today. Gated behind an explicit flag.
+- 🔑 The dry run also exposed a **duplicate**: the bug gave Cate's notice two different wrong
+  numbers in two issues, so one real sale became TWO active rows (`WA08000007-26-1` w/ 2 results,
+  `25-10595` w/ 0). Kept the referenced one, retire the orphan — retire not delete (results FK +
+  no DELETE on the app role).
+- 🔑 Two bugs caught in my own repair script by dry-running it: the guard bound used the LIVE
+  `pending` length, which shrinks as renames land, so it abandoned the last rename; and CI failed
+  on **ruff import order** (not tests) from threading `auction_reference_date` into data_exporter.
+
+**Pending / Handoff:**
+- 👤 Codex diff review still owed (usage limit).
+- ⏭️ **After #195 deploys:** `railway run --service worker python scripts/repair_nts_ts_number.py
+  --notices --i-confirm-fixed-parser-is-deployed --apply` (1 retire + 4 renames, dry-run verified).
+- ⏭️ **PR #195 (BE) + #106 (FE) OPEN, both CI-green and CLEAN.** BE merges first.
+- ⏭️ **Not fixed, same bug class, deliberately out of scope:** `trustee_sale.scrape()` uses
+  `date.today()` and `nts_crawler` expiry uses UTC — both gate on a WA-local auction date, so a
+  same-day sale can be excluded or expired a day early. Codex flagged these; they need their own
+  change with their own blast-radius check.
+- ⏭️ The KHADEMI notice (`WA09000110-25-1`, parcel 006855-001-004-00, auction **2026-05-22 —
+  already past**) was never ingested. Not force-inserted: a stale past sale is not a lead, and a
+  re-crawl with the fixed parser picks it up naturally if it is still in the crawl window.
+- Dev artifact left behind: local database `bridgeleads_t4_test`.
+
+
+---
+
 ## 2026-09-02 — "Test 1" (Pierce probate) lead data-quality audit: source vs application, end to end
 
 **Built / Shipped:** branch `fix/test1-lead-data-quality` (worktree `test1-data-quality`, off
@@ -267,7 +366,6 @@ the results payload — Codex: separate PR).
 `ENABLE_DAILY_SCRAPE` defaults False so that cache has been frozen since 2026-03-23.
 
 ---
-
 ## 2026-09-02 (later) — Audit follow-ups: the 30 fabricated mailing lines, a re-sweep, and an alert for the silent field
 
 **Built / Shipped:** #184 + #185 merged and deployed (`cf6e6fd`); the six Test 3 rows repaired

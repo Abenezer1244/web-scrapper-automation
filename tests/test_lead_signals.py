@@ -148,8 +148,97 @@ class TestDaysToAuction:
         from src.utils.lead_signals import days_to_auction
         assert days_to_auction(None, TODAY) is None
 
-    def test_past_auction_clamped(self):
+    def test_auction_tomorrow(self):
         from datetime import date
 
         from src.utils.lead_signals import days_to_auction
-        assert days_to_auction(date(2026, 1, 1), date(2026, 6, 12)) == 0
+        assert days_to_auction(date(2026, 6, 13), date(2026, 6, 12)) == 1
+
+    def test_auction_in_two_days(self):
+        from datetime import date
+
+        from src.utils.lead_signals import days_to_auction
+        assert days_to_auction(date(2026, 6, 14), date(2026, 6, 12)) == 2
+
+    def test_auction_today_is_zero(self):
+        from datetime import date
+
+        from src.utils.lead_signals import days_to_auction
+        assert days_to_auction(date(2026, 6, 12), date(2026, 6, 12)) == 0
+
+    def test_auction_yesterday_is_negative_one(self):
+        """Signed, NOT clamped: a delivered list outlives its sale date, and the old
+        clamp made every past auction read as 0 == "today" (the Test 4 defect)."""
+        from datetime import date
+
+        from src.utils.lead_signals import days_to_auction
+        assert days_to_auction(date(2026, 6, 11), date(2026, 6, 12)) == -1
+
+    def test_auction_several_days_ago_is_negative(self):
+        from datetime import date
+
+        from src.utils.lead_signals import days_to_auction
+        assert days_to_auction(date(2026, 6, 5), date(2026, 6, 12)) == -7
+
+    def test_month_and_year_boundaries_are_calendar_days(self):
+        from datetime import date
+
+        from src.utils.lead_signals import days_to_auction
+        assert days_to_auction(date(2026, 1, 1), date(2025, 12, 31)) == 1
+        assert days_to_auction(date(2026, 3, 1), date(2026, 2, 28)) == 1  # 2026 not a leap year
+
+
+class TestAuctionReferenceDate:
+    """The auction clock runs on the COUNTY's calendar day, not UTC's — a WA trustee
+    sale happens on the WA date. Pacific evenings are where the two disagree."""
+
+    def test_pacific_evening_is_still_the_previous_utc_day(self):
+        from datetime import UTC, date, datetime
+
+        from src.utils.lead_signals import auction_reference_date
+        # 2026-06-13 05:00 UTC == 2026-06-12 22:00 America/Los_Angeles (PDT).
+        now = datetime(2026, 6, 13, 5, 0, tzinfo=UTC)
+        assert now.date() == date(2026, 6, 13)
+        assert auction_reference_date(now) == date(2026, 6, 12)
+
+    def test_pacific_midday_matches_utc_day(self):
+        from datetime import UTC, date, datetime
+
+        from src.utils.lead_signals import auction_reference_date
+        assert auction_reference_date(datetime(2026, 6, 12, 19, 0, tzinfo=UTC)) == date(2026, 6, 12)
+
+    def test_evening_auction_is_not_reported_as_already_past(self):
+        """The bug the timezone split exists to prevent: at 10pm Pacific on the day
+        BEFORE the sale, a UTC clock says the auction is today; a signed UTC clock
+        would say it is already past on the morning of the sale itself."""
+        from datetime import UTC, date, datetime
+
+        from src.utils.lead_signals import auction_reference_date, days_to_auction
+        now = datetime(2026, 6, 13, 5, 0, tzinfo=UTC)  # 10pm PDT on the 12th
+        auction = date(2026, 6, 13)
+        assert days_to_auction(auction, now.date()) == 0          # UTC: "today" (wrong)
+        assert days_to_auction(auction, auction_reference_date(now)) == 1  # local: "in 1 day"
+
+
+class TestDeriveSignalsAuctionClock:
+    def test_auction_today_defaults_to_today(self):
+        from datetime import date
+
+        from src.utils.lead_signals import derive_signals
+        rec = {"auction_date": date(2026, 6, 14)}
+        assert derive_signals(rec, date(2026, 6, 12))["days_to_auction"] == 2
+
+    def test_auction_today_is_used_only_for_the_auction_clock(self):
+        """months_delinquent must keep using the UTC `today` for tax-filter parity
+        even when the auction clock is a day behind it."""
+        from datetime import date
+
+        from src.utils.lead_signals import derive_signals, months_delinquent
+        utc_today, local_today = date(2026, 6, 13), date(2026, 6, 12)
+        sig = derive_signals(
+            {"auction_date": date(2026, 6, 13), "delinquent_bill_year": 2023},
+            utc_today,
+            auction_today=local_today,
+        )
+        assert sig["days_to_auction"] == 1
+        assert sig["months_delinquent"] == months_delinquent(2023, utc_today)

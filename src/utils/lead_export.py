@@ -28,7 +28,7 @@ from src.utils.lead_formatting import (
     parse_property_for_display,
     split_owner_for_display,
 )
-from src.utils.lead_signals import derive_signals
+from src.utils.lead_signals import auction_reference_date, derive_signals
 
 # Canonical column order. Existing reference/legacy columns first, dialer-import
 # split columns + enrichment passthrough appended at END (backward-compatible for
@@ -349,7 +349,9 @@ _TITLE_STATUS_LABELS: dict[str, str] = {
 }
 
 
-def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, str]:
+def build_lead_export_row(
+    record: Any, today: date | None = None, *, auction_today: date | None = None
+) -> dict[str, str]:
     """Build one canonical CSV row dict from an ORM Result or a plain dict.
 
     Parses raw name/address, THEN sanitizes each emitted value (never before
@@ -361,6 +363,11 @@ def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, s
     """
     if today is None:
         today = datetime.now(UTC).date()
+    # Defaults to `today` so a caller that freezes ONE date still gets a deterministic
+    # auction clock. The county-local date is injected by the CSV writers below, which
+    # are the real entry points — this module never reads a hidden clock of its own.
+    if auction_today is None:
+        auction_today = today
     first, last = split_owner_for_display(_get(record, "party_name"))
     prop = parse_property_for_display(_get(record, "property_address"))
     # Same parser for the mailing address — it is address-generic (validated
@@ -371,7 +378,7 @@ def build_lead_export_row(record: Any, today: date | None = None) -> dict[str, s
     amt = _get(record, "delinquent_amount")
     year = _get(record, "delinquent_bill_year")
     enr = _enrichment(record)
-    sig = derive_signals(record, today)
+    sig = derive_signals(record, today, auction_today=auction_today)
 
     return {
         # Tax-delinquent rows carry a SYNTHETIC date_recorded ("01/01/{bill_year}")
@@ -483,13 +490,18 @@ def write_lead_csv(
     lean file and the full file share identical values for the columns they have in
     common (no separate builder, no drift).
     """
-    today = datetime.now(UTC).date()  # one consistent "today" for the whole file
+    # One consistent pair of "today"s for the whole file: UTC for the tax signals,
+    # county-local for the auction countdown (lead_signals.AUCTION_TZ).
+    today = datetime.now(UTC).date()
+    auction_today = auction_reference_date()
     writer = csv.DictWriter(
         filelike, fieldnames=columns or LEAD_CSV_COLUMNS, extrasaction="ignore"
     )
     writer.writeheader()
     for rec in records:
-        writer.writerow(_apply_visibility(build_lead_export_row(rec, today), hidden_fields))
+        writer.writerow(_apply_visibility(
+            build_lead_export_row(rec, today, auction_today=auction_today), hidden_fields
+        ))
 
 
 # Overlap/combine CSV (Lists page + batch scrape). Same dialer-ready semantics as
@@ -533,7 +545,12 @@ OVERLAP_LEAD_COLUMNS: list[str] = [
 
 
 def build_overlap_export_row(
-    record: Any, overlap: dict[str, Any], hidden_fields: set[str] | None = None
+    record: Any,
+    overlap: dict[str, Any],
+    hidden_fields: set[str] | None = None,
+    *,
+    today: date | None = None,
+    auction_today: date | None = None,
 ) -> dict[str, str]:
     """One overlap-CSV row from a lead record + its overlap metadata.
 
@@ -546,7 +563,9 @@ def build_overlap_export_row(
     `hidden_fields` (from the batch's `fields`) blanks the user-deselected hideable
     columns; the header set is unchanged, matching the per-job CSV's behavior.
     """
-    base = _apply_visibility(build_lead_export_row(record), hidden_fields)
+    base = _apply_visibility(
+        build_lead_export_row(record, today, auction_today=auction_today), hidden_fields
+    )
     try:
         count = int(overlap.get("lists_count") or 0)
     except (TypeError, ValueError):
@@ -574,7 +593,14 @@ def write_lead_csv_with_overlap(
     `hidden_fields` (from the batch's shared `fields`) blanks the user-deselected
     hideable columns, keeping the combined CSV consistent with each per-job export.
     """
+    # Freeze both clocks once per file, exactly like write_lead_csv — this path used
+    # to fall through to a per-ROW now(), so a long combined export could straddle a
+    # date boundary and emit two different countdowns for the same auction (Codex).
+    today = datetime.now(UTC).date()
+    auction_today = auction_reference_date()
     writer = csv.DictWriter(filelike, fieldnames=OVERLAP_LEAD_COLUMNS)
     writer.writeheader()
     for record, overlap in rows:
-        writer.writerow(build_overlap_export_row(record, overlap, hidden_fields))
+        writer.writerow(build_overlap_export_row(
+            record, overlap, hidden_fields, today=today, auction_today=auction_today
+        ))

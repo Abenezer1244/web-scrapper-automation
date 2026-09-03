@@ -146,3 +146,29 @@ still `json_typeof=object`, stale provenance dropped, `_REPAIR` in scope — the
 **Not done / handed back:** the King run itself (847 undecided rows ≈ 29 paced runs) is a
 resource decision for the user — see todo 8. Pierce (1,218) and --repair-flags (1,286) are cheap
 and ready to run.
+
+
+---
+
+# Test 4 — auction-date label + lead data-quality audit
+
+Job: `90e5eb41-07ff-46ae-8d06-63bca40f67cc` (config `Test 4`, snohomish/trustee_sale, 6 leads)
+Source: Snohomish Tribune legals PDF `Legals - 8-5-26.pdf`
+
+## Findings (all verified against the real source PDF + prod DB)
+
+- [x] "2D" = `days_to_auction` (int) + a literal "d", CSS-uppercased. Means **2 days until the auction**.
+- [x] **P1 TS-number off-by-one / cross-record contamination** — `split_notice_blocks` orphans a
+      pre-header `TS No <x>` into the PREVIOUS block. 2 of 6 Test 4 leads carry the next notice's
+      TS number; the last notice in every such PDF is DROPPED (`is_valid_nts` needs a ts_number).
+- [x] **P2 past auctions clamp to 0** — indistinguishable from "auction is today".
+- [x] **P2 UTC clock for a Washington-local event** — Pacific-evening off-by-one.
+- [x] property_city/property_zip NULL = STALE pre-fix data (fixed by 1b964d9, landed 21h AFTER the run).
+- [x] mailing_address NULL = Case B — Snohomish publishes no mailing source.
+
+## Tasks
+- [ ] Fix `split_notice_blocks` to bind a notice's pre-header identity preamble to its OWN block
+- [ ] Make `days_to_auction` signed; add a county-local auction clock (keep UTC for tax parity)
+- [ ] Frontend: replace `{n}d` with plain language, keep the date visible
+- [ ] Regression tests: tomorrow / in 2 days / today / yesterday / several days ago + splitter
+- [ ] Codex review of the diff

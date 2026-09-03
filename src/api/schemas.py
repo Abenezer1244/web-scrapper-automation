@@ -1198,8 +1198,14 @@ class ResultRow(BaseModel):
         # parsing the date_recorded string (handled inside derive_signals).
         from datetime import UTC, datetime
 
-        from src.utils.lead_signals import derive_signals
-        sig = derive_signals(self, datetime.now(UTC).date())
+        from src.utils.lead_signals import auction_reference_date, derive_signals
+        _now = datetime.now(UTC)
+        # Two clocks on purpose: UTC for the tax signals (parity with the tax-filter
+        # SQL), county-local for the auction countdown (a WA sale happens on the WA
+        # calendar day). See lead_signals.AUCTION_TZ.
+        sig = derive_signals(
+            self, _now.date(), auction_today=auction_reference_date(_now)
+        )
         object.__setattr__(self, "months_delinquent", sig["months_delinquent"])
         object.__setattr__(self, "wa_foreclosure_eligible", sig["wa_foreclosure_eligible"])
         object.__setattr__(self, "freshness_days", sig["freshness_days"])

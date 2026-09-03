@@ -129,3 +129,124 @@ class TestParseRealBlocks:
         assert row["auction_date"] == date(2025, 12, 26)
         assert row["is_active"] is True
         assert row["property_address_normalized"]
+
+
+# ── Pre-header TS number binding ──────────────────────────────────────────────
+# A second REAL Snohomish Tribune PDF, saved because it mixes the two trustee
+# layouts in one issue: Quality Loan prints "Trustee Sale No.: <x>" AFTER the
+# statutory header, while North Star ("TS #: <x> Title Order #: <y>") and MTC /
+# Trustee Corps ("TS No <x> TO No <y>") print it BEFORE. A header-only split gave
+# every pre-header notice the FOLLOWING notice's TS number and dropped the last one
+# outright. This is the source behind the "Test 4" list (job 90e5eb41), where 2 of 6
+# delivered leads carried the wrong TS number.
+_PDF_MIXED_LAYOUT = Path(__file__).parent / "fixtures" / "nts_snoho_tribune_2026-08-05.pdf"
+
+# grantor fragment -> the TS number THIS notice prints, read off the source PDF by hand.
+_EXPECTED_TS = {
+    "Jhan R. Smith": "WA-22-945105-SW",        # Quality Loan  (TS after header)
+    "Diane Boggio": "WA-25-1018467-SW",        # Quality Loan
+    "DONALD GREEN": "WA-26-1036613-BB",        # Quality Loan
+    "MACARIO G. TORRES": "WA-26-1048154-BB",   # Quality Loan
+    "SHAWN M WEINTRAUB": "25-75913",           # North Star    (TS BEFORE header)
+    "CASEY CATE": "26-78299",                  # North Star
+    "KERRY VERNON PHELPS": "WA08000007-26-1",  # MTC           (TS BEFORE header)
+    "NAYER KHADEMI": "WA09000110-25-1",        # MTC — was dropped entirely before the fix
+}
+
+
+def _mixed_layout_notices() -> dict[str, dict]:
+    data = _PDF_MIXED_LAYOUT.read_bytes()
+    blocks = nts_pdf.split_notice_blocks(nts_pdf.normalize_pdf_text(nts_pdf.extract_pdf_text(data)))
+    out: dict[str, dict] = {}
+    for block in blocks:
+        parsed = parse_nts_notice(block)
+        grantor = parsed.get("grantor") or ""
+        for key in _EXPECTED_TS:
+            if key.lower() in grantor.lower():
+                out[key] = parsed
+    return out
+
+
+class TestPreHeaderTsNumberBinding:
+    def test_every_notice_is_found(self):
+        assert set(_mixed_layout_notices()) == set(_EXPECTED_TS)
+
+    def test_each_notice_carries_its_own_ts_number(self):
+        """The regression: a notice must never inherit the NEXT notice's TS number."""
+        notices = _mixed_layout_notices()
+        actual = {k: v.get("ts_number") for k, v in notices.items()}
+        assert actual == _EXPECTED_TS
+
+    def test_ts_numbers_are_all_distinct(self):
+        notices = _mixed_layout_notices()
+        numbers = [v.get("ts_number") for v in notices.values()]
+        assert len(set(numbers)) == len(numbers)
+
+    def test_last_notice_is_not_dropped(self):
+        """MTC's KHADEMI notice is last in the issue; its only TS number sits before
+        its header, so pre-fix it parsed to ts_number=None and is_valid_nts rejected
+        it — a real upcoming sale silently lost."""
+        khademi = _mixed_layout_notices()["NAYER KHADEMI"]
+        assert khademi.get("ts_number") == "WA09000110-25-1"
+        assert is_valid_nts(khademi)
+
+    def test_quality_loan_trailer_ts_is_not_stolen_by_the_next_notice(self):
+        """Quality Loan repeats its OWN TS number in its trailer. The pre-header fix
+        must not move that onto the following notice (the same bug in reverse)."""
+        notices = _mixed_layout_notices()
+        assert notices["Jhan R. Smith"]["ts_number"] == "WA-22-945105-SW"
+        assert notices["Diane Boggio"]["ts_number"] == "WA-25-1018467-SW"
+
+    def test_identity_stays_attached_to_the_right_property(self):
+        """TS number, grantor and parcel must all come from the SAME notice."""
+        notices = _mixed_layout_notices()
+        assert notices["CASEY CATE"]["parcel"] == "008337-000-009-00"
+        assert notices["SHAWN M WEINTRAUB"]["parcel"] == "010347-00-0086-00"
+        assert notices["NAYER KHADEMI"]["parcel"] == "006855-001-004-00"
+
+
+class TestTrailingIdentityHelpers:
+    def test_leaves_a_block_that_ends_in_its_own_trailer_alone(self):
+        block = (
+            "NOTICE OF TRUSTEE'S SALE Trustee Sale No.: WA-22-945105-SW "
+            "Sale Line: 916-939-0772 IDSPub #0314650 8/5/2026"
+        )
+        assert nts_pdf._detach_trailing_identity(block) == (block, "")
+
+    def test_detaches_an_adjacent_pre_header_run(self):
+        block = "NOTICE OF TRUSTEE'S SALE Trustee Sale No.: WA-1 body TS #: 26-78299 Title Order #: DEF-687559"
+        body, carry = nts_pdf._detach_trailing_identity(block)
+        assert carry == "TS #: 26-78299 Title Order #: DEF-687559"
+        assert "26-78299" not in body
+
+    def test_keeps_a_trailing_run_when_the_body_has_no_ts_of_its_own(self):
+        """Ambiguous: we cannot prove the run belongs to the NEXT notice, so behave
+        exactly as before rather than guess."""
+        block = "NOTICE OF TRUSTEE'S SALE Grantor: SOMEONE TS #: 26-78299"
+        assert nts_pdf._detach_trailing_identity(block) == (block, "")
+
+    def test_pathological_identity_run_does_not_hang(self):
+        """A run of identity-looking tokens followed by one non-matching word used to
+        backtrack catastrophically (200 tokens hung for >2 minutes) — a malformed or
+        hostile legals PDF could have stalled the crawler worker. Peeling one item at
+        a time is linear; 2,000 tokens must finish effectively instantly."""
+        import time
+
+        blob = (
+            "NOTICE OF TRUSTEE'S SALE Trustee Sale No.: WA-1 body "
+            + "TS No X " * 2000
+            + "junk"
+        )
+        started = time.perf_counter()
+        body, carry = nts_pdf._detach_trailing_identity(blob)
+        assert time.perf_counter() - started < 5.0
+        assert (body, carry) == (blob, "")  # trailing "junk" means there is no run
+
+    def test_identity_run_scan_is_bounded(self):
+        """The scan window is bounded, so cost does not grow with block size."""
+        import time
+
+        blob = "NOTICE OF TRUSTEE'S SALE Trustee Sale No.: WA-1 " + ("filler " * 50000)
+        started = time.perf_counter()
+        assert nts_pdf._identity_run_start(blob) == len(blob)
+        assert time.perf_counter() - started < 5.0

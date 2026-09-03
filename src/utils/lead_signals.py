@@ -14,8 +14,9 @@ adapter the export + API layers call.
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 # WA RCW 84.64: a parcel becomes tax-foreclosure eligible once a tax year is a
 # full 3 years delinquent. Used by wa_foreclosure_eligible().
@@ -89,17 +90,34 @@ def freshness_days(
     return delta if delta >= 0 else 0
 
 
+# Trustee sales are county-local events: a Washington auction happens on the WA
+# calendar day, not the UTC one. Between 5pm Pacific and midnight, UTC has already
+# rolled over, so a UTC-based clock reported an auction as one day nearer than it is
+# (and, once signed, as already past on its own morning). Presentation/export only —
+# `months_delinquent` MUST stay on UTC to keep exact parity with the tax-filter SQL
+# (src/api/tax_filters.py), so the two clocks are passed separately, never merged.
+AUCTION_TZ = ZoneInfo("America/Los_Angeles")
+
+
+def auction_reference_date(now: datetime | None = None) -> date:
+    """Today's date in the county's own timezone — the reference for the auction clock."""
+    return (now or datetime.now(UTC)).astimezone(AUCTION_TZ).date()
+
+
 def days_to_auction(auction_date: Any, today: date) -> int | None:
     """Days until the trustee-sale auction — the pre-foreclosure urgency clock.
 
     From the matched NTS auction_date (a real date). None when no auction is matched.
-    Clamped at 0 (a past auction shouldn't reach here — the matcher only attaches
-    future sales — but a stale row must read as 0-days, not negative).
+    SIGNED: positive = days until, 0 = auction is today, negative = days since. It was
+    previously clamped at 0 on the assumption that a past auction "shouldn't reach
+    here" — but a lead keeps its auction date after delivery, so any list outlives its
+    sale date and every stale row read as 0 == "today". A user cannot act on a sale
+    that already happened, so the sign is the whole point (verified on the "Test 4"
+    Snohomish list, 2026-09-03).
     """
     if not isinstance(auction_date, date):
         return None
-    delta = (auction_date - today).days
-    return delta if delta >= 0 else 0
+    return (auction_date - today).days
 
 
 def contactability_score(
@@ -162,12 +180,20 @@ def _get(record: Any, name: str) -> Any:
     return getattr(record, name, None)
 
 
-def derive_signals(record: Any, today: date) -> dict[str, Any]:
+def derive_signals(
+    record: Any, today: date, *, auction_today: date | None = None
+) -> dict[str, Any]:
     """Compute all derived signals for one record (ORM Result or export dict).
 
-    Returns a dict with the four signal keys. The export and API layers each
+    Returns a dict with the five signal keys. The export and API layers each
     render these in their own shape; this is the single source of the math.
+
+    `today` is the UTC date (tax-filter parity — see AUCTION_TZ). `auction_today` is
+    the county-local date used ONLY for the auction clock; it defaults to `today` so
+    existing callers and tests are unchanged.
     """
+    if auction_today is None:
+        auction_today = today
     bill_year = _get(record, "delinquent_bill_year")
     return {
         "months_delinquent": months_delinquent(bill_year, today),
@@ -182,5 +208,5 @@ def derive_signals(record: Any, today: date) -> dict[str, Any]:
             _get(record, "emails"),
         ),
         # NTS Tier 1: days until the matched trustee-sale auction (pre_foreclosure).
-        "days_to_auction": days_to_auction(_get(record, "auction_date"), today),
+        "days_to_auction": days_to_auction(_get(record, "auction_date"), auction_today),
     }

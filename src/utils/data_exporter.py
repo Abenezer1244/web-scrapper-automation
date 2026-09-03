@@ -18,6 +18,7 @@ import pandas as pd
 import requests as _requests
 
 from src.config import settings
+from src.utils.lead_signals import auction_reference_date
 from src.utils.lead_export import (
     LEAD_CSV_COLUMNS,
     _apply_visibility,
@@ -65,7 +66,13 @@ def _canonical_dataframe(
     the CSV because both project the SAME built rows.
     """
     today = datetime.now(UTC).date()
-    rows = [_apply_visibility(build_lead_export_row(r, today), hidden_fields) for r in records]
+    auction_today = auction_reference_date()
+    rows = [
+        _apply_visibility(
+            build_lead_export_row(r, today, auction_today=auction_today), hidden_fields
+        )
+        for r in records
+    ]
     return pd.DataFrame(rows, columns=columns or LEAD_CSV_COLUMNS)
 
 
@@ -153,10 +160,15 @@ class DataExporter:
         """
         filepath = self._timestamped_path(filename, "json")
         keys = columns or LEAD_CSV_COLUMNS
-        today = datetime.now(UTC).date()  # one consistent "today" for the whole file
+        # One consistent pair of "today"s for the whole file: UTC for the tax signals,
+        # county-local for the auction countdown (lead_signals.AUCTION_TZ).
+        today = datetime.now(UTC).date()
+        auction_today = auction_reference_date()
         rows = []
         for rec in records:
-            row = _apply_visibility(build_lead_export_row(rec, today), hidden_fields)
+            row = _apply_visibility(
+                build_lead_export_row(rec, today, auction_today=auction_today), hidden_fields
+            )
             # Project to the (possibly lean) column set, preserving canonical order.
             rows.append({k: row[k] for k in keys if k in row})
         with open(filepath, "w", encoding="utf-8") as f:

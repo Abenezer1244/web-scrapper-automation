@@ -191,7 +191,7 @@ def split_notice_blocks(normalized: str) -> list[str]:
     (Codex). The caller validates each block with ``is_valid_nts``.
 
     The identity preamble is carried forward rather than left where a header-only split
-    puts it — see ``_PREHEADER_RUN`` for why that matters and why the move is narrow.
+    puts it — see ``_PREHEADER_ONE`` for why that matters and why the move is narrow.
     """
     parts = _NOTICE_SPLIT.split(normalized)
     blocks: list[str] = []

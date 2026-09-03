@@ -167,8 +167,28 @@ Source: Snohomish Tribune legals PDF `Legals - 8-5-26.pdf`
 - [x] mailing_address NULL = Case B — Snohomish publishes no mailing source.
 
 ## Tasks
-- [ ] Fix `split_notice_blocks` to bind a notice's pre-header identity preamble to its OWN block
-- [ ] Make `days_to_auction` signed; add a county-local auction clock (keep UTC for tax parity)
-- [ ] Frontend: replace `{n}d` with plain language, keep the date visible
-- [ ] Regression tests: tomorrow / in 2 days / today / yesterday / several days ago + splitter
-- [ ] Codex review of the diff
+- [x] Fix `split_notice_blocks` to bind a notice's pre-header identity preamble to its OWN block
+- [x] Make `days_to_auction` signed; add a county-local auction clock (keep UTC for tax parity)
+- [x] Frontend: replace `{n}d` with plain language, keep the date visible
+- [x] Regression tests: tomorrow / in 2 days / today / yesterday / several days ago + splitter
+- [~] Codex review — design review DONE (it rejected my first splitter draft, correctly).
+      Post-implementation DIFF review NOT done: Codex hit its usage limit mid-run.
+
+## Review
+
+**Changed:** `nts_pdf.py` (pre-header identity binding, linear peeling), `lead_signals.py`
+(signed `days_to_auction` + `auction_reference_date`), `lead_export.py` / `data_exporter.py` /
+`schemas.py` (two frozen clocks through every export surface), FE `AuctionCountdown` +
+`lib/utils.ts`, tests + a second real-PDF fixture.
+
+**Verified:** all 8 notices in the source PDF now parse with their own TS number (was 3 wrong +
+1 dropped); backend 1884 passed / 2 skipped; FE tsc + eslint + build clean; the label rendered in
+real Chromium (light + dark) across in-5/in-2/tomorrow/today/yesterday/5-days-ago/45-days, no
+console or network errors; the live API path returns `days_to_auction=1` for all 6 Test 4 rows.
+
+**Deliberately NOT changed:** party names, parcel IDs, property addresses, auction dates and
+default-owed values — all 6 verified correct against the source. Blank mailing addresses are a
+real Snohomish source limitation.
+
+**Left open:** historic prod rows not repaired (forward-only fix); `trustee_sale.scrape()` /
+`nts_crawler` expiry still gate on a UTC date for a WA-local event; neither branch pushed.

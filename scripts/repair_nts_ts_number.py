@@ -73,11 +73,19 @@ def truth_from_pdfs(urls: list[str]) -> dict[str, str]:
     """parcel -> the TS number that notice actually prints, per the FIXED parser."""
     truth: dict[str, str] = {}
     for url in urls:
+        # FAIL CLOSED on a fetch failure. Skipping used to be a warning, which made the
+        # whole run quietly under-repair while still printing "APPLIED — N rows" (Codex).
+        # Worse, an incomplete truth map disarms the cross-issue disagreement check
+        # below: if a parcel legitimately carries two different TS numbers in two issues
+        # and only one issue fetched, the map looks unanimous and the notices phase would
+        # retire a live sale as a duplicate. A partial map is not safe to write from.
         try:
             data = _fetch(url)
         except Exception as exc:
-            _logger.warning("skip %s: %s", url, str(exc)[:120])
-            continue
+            raise SystemExit(
+                f"ABORT: could not fetch {url} ({str(exc)[:120]}). Refusing to repair "
+                "from an incomplete source set — re-run when every issue is reachable."
+            ) from exc
         blocks = nts_pdf.split_notice_blocks(nts_pdf.normalize_pdf_text(nts_pdf.extract_pdf_text(data)))
         hits = 0
         for block in blocks:
@@ -95,6 +103,17 @@ def truth_from_pdfs(urls: list[str]) -> dict[str, str]:
             hits += 1
         print(f"  parsed {hits}/{len(blocks)} notices from {url.rsplit('/', 1)[-1]}")
     return truth
+
+
+def _require_one(result, table: str, row_id: str) -> None:
+    """Every UPDATE here targets one row by primary key, so anything else means the row
+    moved under us (the crawler also writes nts_notices). Abort so the whole transaction
+    rolls back rather than report a repair that did not land (Codex)."""
+    if result.rowcount != 1:
+        raise SystemExit(
+            f"ABORT: UPDATE {table} id={row_id} touched {result.rowcount} rows, expected 1 "
+            "— the row changed underneath this run; nothing has been committed."
+        )
 
 
 def _ts_hash(ts_number: str) -> str:
@@ -135,17 +154,22 @@ def repair_results(db, truth: dict[str, str], apply: bool) -> int:
         # the two must move together — and ONLY when the stored hash really is the
         # ts-derived one. pre_foreclosure rows carry raw_html_hash NULL and a fingerprint
         # built from parcel/party instead; those must not be touched.
-        old_hash, new_hash = m["raw_html_hash"], _ts_hash(correct)
-        if old_hash and old_hash == _ts_hash(stored or ""):
+        # Each column is tested on its OWN value rather than assuming the two agree:
+        # a row whose source_fingerprint had drifted from raw_html_hash used to get only
+        # the hash rewritten, leaving the real ON CONFLICT key stale (Codex). Measured
+        # 0 such rows in production, but the coupling was an assumption, not a fact.
+        stale, new_hash = _ts_hash(stored or ""), _ts_hash(correct)
+        if m["raw_html_hash"] == stale:
             sets.append("raw_html_hash = :h")
             params["h"] = new_hash
-            if m["source_fingerprint"] == old_hash:
-                sets.append("source_fingerprint = :h")
+        if m["source_fingerprint"] == stale:
+            sets.append("source_fingerprint = :h")
+            params["h"] = new_hash
 
         plan.append({
             "m": m, "stored": stored, "correct": correct, "sets": sets, "params": params,
             "old_fp": m["source_fingerprint"],
-            "new_fp": params["h"] if "h" in params and m["source_fingerprint"] == old_hash else m["source_fingerprint"],
+            "new_fp": new_hash if m["source_fingerprint"] == stale else m["source_fingerprint"],
         })
 
     if not plan:
@@ -157,11 +181,17 @@ def repair_results(db, truth: dict[str, str], apply: bool) -> int:
     # Weintraub's row is squatting on Cate's TS number. Updating in query order therefore
     # trips the constraint. Free a fingerprint before claiming it, same as the notices
     # phase. (Unique INDEXES cannot be DEFERRABLE, so ordering is the only option.)
+    # Model EVERY fingerprint in the affected jobs, not only the rows being changed: the
+    # unique index spans the whole job, so a row this script never selected can hold the
+    # key a rename wants and the pre-check would miss it (Codex).
     held: dict[tuple[str, str], str] = {}
-    for row in rows:
+    for row in db.execute(sa_text("""
+        SELECT id::text AS id, job_id::text AS job_id, source_fingerprint
+          FROM results
+         WHERE job_id = ANY(CAST(:jobs AS uuid[])) AND source_fingerprint IS NOT NULL
+    """), {"jobs": sorted({item["m"]["job_id"] for item in plan})}).all():
         m = dict(row._mapping)
-        if m["source_fingerprint"]:
-            held[(m["job_id"], m["source_fingerprint"])] = m["id"]
+        held[(m["job_id"], m["source_fingerprint"])] = m["id"]
 
     changed, queue, guard = 0, list(plan), 0
     while queue and guard <= len(plan) * len(plan) + 1:
@@ -182,10 +212,11 @@ def repair_results(db, truth: dict[str, str], apply: bool) -> int:
             # text — every value is a bound parameter. Which fragments apply varies per
             # row, which is why the statement is composed rather than written out.
             columns = ", ".join(item["sets"])
-            db.execute(
+            res = db.execute(
                 sa_text(f"UPDATE results SET {columns} WHERE id = CAST(:id AS uuid)"),  # noqa: S608
                 item["params"],
             )
+            _require_one(res, "results", m["id"])
         if item["old_fp"]:
             held.pop((m["job_id"], item["old_fp"]), None)
         if item["new_fp"]:
@@ -226,10 +257,22 @@ def repair_notices(db, truth: dict[str, str], apply: bool) -> int:
 
     retire: list[dict] = []
     keep_rows: list[dict] = []
-    for group in by_parcel.values():
+    for parcel, group in by_parcel.items():
         if len(group) == 1:
             keep_rows.append(group[0])
             continue
+        # "Same parcel" is NOT the same thing as "same sale" (Codex): a parcel can carry
+        # two genuinely distinct trustee sales. Same parcel AND same auction date is the
+        # duplicate this bug manufactures — one real notice split across two rows because
+        # two issues gave it two different wrong numbers. Anything else is refused rather
+        # than guessed at, because retiring a live sale hides it from every lead list.
+        dates = {m["auction_date"] for m in group}
+        if len(dates) != 1:
+            raise SystemExit(
+                f"ABORT: parcel {parcel} has {len(group)} notices across "
+                f"{len(dates)} auction dates ({sorted(str(d) for d in dates)}) — these may "
+                "be DISTINCT sales, not duplicates. Resolve by hand; nothing written."
+            )
         group.sort(key=lambda g: (-int(g["results"]), g["created_at"]))
         keep_rows.append(group[0])
         retire.extend(group[1:])
@@ -238,10 +281,11 @@ def repair_notices(db, truth: dict[str, str], apply: bool) -> int:
         print(f"  RETIRE duplicate {(m['grantor'] or '')[:30]!r:32} parcel={m['parcel']:20} "
               f"ts={m['ts_number']!r} results={m['results']} active={m['is_active']}")
         if apply and m["is_active"]:
-            db.execute(
+            res = db.execute(
                 sa_text("UPDATE nts_notices SET is_active = false WHERE id = CAST(:id AS uuid)"),
                 {"id": m["id"]},
             )
+            _require_one(res, "nts_notices", m["id"])
 
     pending = []
     for m in keep_rows:
@@ -263,7 +307,16 @@ def repair_notices(db, truth: dict[str, str], apply: bool) -> int:
                 "moving a retired row out of the way is unimplemented — inspect manually"
             )
 
-    held = {m["ts_number"]: m["id"] for m in keep_rows}
+    # Model EVERY ts_number in this source, not just the rows being changed: the unique
+    # key spans the source, so a notice whose parcel is absent from `truth` can still be
+    # holding the number a rename wants and the pre-check would miss it (Codex).
+    held = {
+        r[0]: r[1]
+        for r in db.execute(
+            sa_text("SELECT ts_number, id::text FROM nts_notices WHERE source = :src"),
+            {"src": SOURCE},
+        ).all()
+    }
     # Bound on the INITIAL size: `pending` shrinks as renames land, so recomputing the
     # limit from the live list made it fall below `guard` and abandon the last rename.
     done, guard, budget = 0, 0, len(pending) ** 2 + 1
@@ -276,10 +329,11 @@ def repair_notices(db, truth: dict[str, str], apply: bool) -> int:
         print(f"  {(m['grantor'] or '')[:34]:36} parcel={m['parcel']:20} "
               f"{m['ts_number']!r} -> {correct!r}")
         if apply:
-            db.execute(
+            res = db.execute(
                 sa_text("UPDATE nts_notices SET ts_number = :new WHERE id = CAST(:id AS uuid)"),
                 {"new": correct, "id": m["id"]},
             )
+            _require_one(res, "nts_notices", m["id"])
         held.pop(m["ts_number"], None)
         held[correct] = m["id"]
         done += 1

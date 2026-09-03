@@ -247,11 +247,49 @@ RE-PARSING the source PDFs with the fixed parser, joined on `parcel` — nothing
   `pending` length, which shrinks as renames land, so it abandoned the last rename; and CI failed
   on **ruff import order** (not tests) from threading `auction_reference_date` into data_exporter.
 
+**Codex diff review (ran after the limit reset) — it found real bugs in BOTH halves:**
+- 🛑 **My fix had reintroduced the bug in MIRROR IMAGE.** The guard was in the wrong place: testing
+  at the DETACHING end cannot tell whose run it is. Now tested at the RECEIVING end — a carried run
+  is applied only to a notice that states no TS number of its own. Both cases reproduced before
+  being accepted.
+- 🛑 **TWO EXISTING TESTS WERE ASSERTING THE BUG.** The repo's OWN `nts_snoho_tribune_2025-12-17`
+  fixture was losing a notice (5 valid → 6; source really says "January 16, 2026"), and the King
+  test looked a notice up by its `REF-` SURROGATE — **so the bug reached King too**, not just
+  Snohomish. Both verified against source text, not adjusted to match new output.
+- 🔑 One layout prints "AMENDED NOTICE OF TRUSTEE'S SALE". MEASURED before widening the grammar:
+  13 of 14 distinct pre-header runs across all issues + fixtures end exactly on the identity items,
+  AMENDED is the only qualifier. Allowed only that.
+- Repair-script review: 2 P1 + 2 P2 + 1 P3, all LATENT (none had touched the applied rows, verified
+  in prod) but all real holes for the notices phase — fetch failure was a warning (silently
+  under-repairing while printing "APPLIED"), retirement grouped by parcel ALONE ("same parcel" ≠
+  "same sale"), both ordering pre-checks modeled only changed rows, the fingerprint update assumed
+  `source_fingerprint == raw_html_hash` (measured 0 divergent rows in 201), no rowcount check.
+- 🔑 Codex ran READ-ONLY this time; verified by snapshotting HEAD + `git status` before and after.
+
+**Shipped — both PRs merged, both repair phases applied:**
+- **#195 merged `ec5a3d6`**, **FE #106 merged `5e769a6`**. Railway api + worker both deployed off
+  the merge (build image 20:39:55Z, containers restarted).
+- `--results`: **8 rows across 4 jobs** (grew 5 → 8 because the corrected parser recovers MORE
+  identities than the version the first pass ran against — job `863532b3` ARMSTRONG/TWENTER/DOOLEY,
+  another chain, each verified in the 7-22-26 issue).
+- `--notices`: **7 renames + 1 retirement**, run only after the deploy. All 6 active Snohomish
+  notices now carry their own TS number; **0 active parcels with >1 notice**.
+- Final state: all 6 Test 4 leads correct on TS number, auction date and default owed; fingerprints
+  6/6 distinct; both phases re-run to 0.
+- ⏭️ **PR #199** open: the retirement list counted already-inactive rows, so a fully repaired DB
+  dry-ran as "1 row would change" instead of 0.
+
 **Pending / Handoff:**
-- 👤 Codex diff review still owed (usage limit).
-- ⏭️ **After #195 deploys:** `railway run --service worker python scripts/repair_nts_ts_number.py
-  --notices --i-confirm-fixed-parser-is-deployed --apply` (1 retire + 4 renames, dry-run verified).
-- ⏭️ **PR #195 (BE) + #106 (FE) OPEN, both CI-green and CLEAN.** BE merges first.
+- 👤 **The one thing NOT verified: convergence.** The deployed worker's parser could not be
+  exercised from here — the Celery broker is on Railway's private network, so a crawl cannot be
+  enqueued locally. The Snohomish crawl runs **Thu 10:45 UTC**; after it, re-run
+  `railway run --service worker python scripts/repair_nts_ts_number.py --results --notices` and
+  confirm it still reports **0 rows**. If the deployed parser were somehow stale the crawl would
+  re-corrupt the renamed rows — recoverable, since the script is idempotent and re-runnable.
+- ⏭️ **King is NOT covered by the repair.** A King notice moving from a `REF-`/`APN-` surrogate to
+  its real TS number will be re-inserted under a new `(source, ts_number)` key on the next crawl,
+  leaving the surrogate row behind — the same duplicate shape fixed here for snohomish_tribune.
+  The script scopes to `snohomish_tribune` only.
 - ⏭️ **Not fixed, same bug class, deliberately out of scope:** `trustee_sale.scrape()` uses
   `date.today()` and `nts_crawler` expiry uses UTC — both gate on a WA-local auction date, so a
   same-day sale can be excluded or expired a day early. Codex flagged these; they need their own

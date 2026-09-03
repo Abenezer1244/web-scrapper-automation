@@ -74,14 +74,25 @@ boto3==1.43.60               # service-model churn only for our S3-compatible R2
 resend==2.7.0
 
 # Billing
-# 11.4.0 -> 15.6.1 crosses FOUR majors and the suite does not exercise a single Stripe
-# call, so CI cannot vouch for this one either. Verified 2026-09-03 in an isolated venv
-# against every call site in src/: the legacy global namespace still works
-# (`stripe.api_key = ...`) and Coupon.retrieve, Customer.create, Customer.list,
-# Subscription.list, Subscription.retrieve and Webhook.construct_event all still exist.
-# Stripe's library default API VERSION moves with a major, so response SHAPES can shift
-# even when the methods survive — watch the first live webhook + subscription sync.
-stripe==15.6.1
+# HELD AT 11.x ON PURPOSE — do NOT let dependabot walk this to 15.x without the code
+# change first. Verified 2026-09-03 against stripe 15.6.1 in an isolated venv:
+# `StripeObject` NO LONGER INHERITS FROM dict. Its __mro__ is (StripeObject, object),
+# `issubclass(StripeObject, dict)` is False, and `.get()` raises
+#   AttributeError: 'get' is a dict method, but a StripeObject is not a dict.
+# Attribute and bracket access still work; only the dict methods are gone.
+#
+# This repo calls `.get()` on Stripe-RETURNED objects in ~17 places, including the
+# webhook handler (`event.get("id")`, `data.get("customer")`, `data.get("subscription")`),
+# the subscription sync in workers/scheduler_helpers/billing.py (`subs.get("data")`,
+# `s.get("status")`) and the skip-trace usage meter
+# (`event.get("identifier") or event.get("id")`). Every one of those raises under 15.x,
+# so bumping this alone silently breaks billing, webhooks and usage metering.
+#
+# A method-EXISTENCE probe does not catch this — the methods all still exist; it is the
+# RETURNED object that changed. Bump only together with converting those call sites to
+# attribute / bracket access, plus tests built on real v15-shaped StripeObjects, since
+# nothing in tests/ currently exercises a Stripe call at all (Codex High, 2026-09-03).
+stripe==11.4.0
 
 # Logging
 colorlog==6.9.0

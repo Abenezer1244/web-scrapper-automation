@@ -8,7 +8,7 @@ python-multipart==0.0.31    # M3 + 2026-06-15: CVE-2026-53538/53539/53540 (form-
 # Async DB
 sqlalchemy[asyncio]==2.0.36
 asyncpg==0.30.0
-alembic==1.14.0
+alembic==1.19.1
 
 # Sync DB (Celery workers)
 psycopg2-binary==2.9.10
@@ -39,14 +39,26 @@ redis==5.2.1
 # set (29, same resource_type breakdown) and navigator.webdriver masking.
 # 1.57 repackaged Chromium to Chrome for Testing — headless now resolves to
 # chrome-headless-shell — hence the install-deps step added in the Dockerfile.
-playwright==1.60.0
+# 1.60 -> 1.62 (2026-09-03): our entire surface is core and stable — locator, click,
+# evaluate, fill, goto, wait_for_selector/load_state, route/continue_/abort,
+# add_init_script, new_context/new_page, launch, screenshot, select_option, content.
+# ZERO uses of anything these releases removed (page.accessibility, expose_binding,
+# is_editable). The live-portal canary above has NOT been re-run for 1.62.
+playwright==1.62.0
 beautifulsoup4==4.12.3
 lxml==6.1.0                  # M3: PYSEC-2026-87
 requests==2.34.2             # M3: CVE-2024-47081, CVE-2026-25645. 2.34: inline typing + less-greedy no_proxy matching
 pypdf==6.16.1                # NTS Tier 1: extract text from Pacific Publishing legals PDFs (pure-python, no native deps). 6.16.1: PYSEC-2026-3655/3656 + CVE-2026-84309/84310/84311 (crafted-PDF memory/runtime DoS, infinite loop; fixed 6.15.0-6.16.1). 6.14.2: CVE-2026-59935/59936 (extract_text infinite loop), CVE-2026-59937 (xref long runtime), CVE-2026-59938 (image memory-DoS); prior 6.13.3: GHSA-jm82-fx9c-mx94
 
 # AI extraction (Claude API)
-anthropic==0.52.0
+# 0.52.0 -> 1.3.0 is a MAJOR jump and NOTHING in tests/ exercises this client, so a
+# green CI proves nothing here. Verified 2026-09-03 by importing 1.3.0 in an isolated
+# venv and probing the exact surface src/scrapers/ai/client.py uses: AsyncAnthropic,
+# RateLimitError, APIStatusError, messages.create(model/max_tokens/system/messages),
+# and the response shape it reads back (Message.content/.usage, Usage.input_tokens /
+# .output_tokens, TextBlock.text). All present. NOTE: 1.x dropped `temperature` from
+# the create() signature (no **kwargs) — we never passed it, but adding it will fail.
+anthropic==1.3.0
 
 # CAPTCHA solving (2Captcha)
 2captcha-python==1.5.0
@@ -62,7 +74,14 @@ boto3==1.43.60               # service-model churn only for our S3-compatible R2
 resend==2.7.0
 
 # Billing
-stripe==11.4.0
+# 11.4.0 -> 15.6.1 crosses FOUR majors and the suite does not exercise a single Stripe
+# call, so CI cannot vouch for this one either. Verified 2026-09-03 in an isolated venv
+# against every call site in src/: the legacy global namespace still works
+# (`stripe.api_key = ...`) and Coupon.retrieve, Customer.create, Customer.list,
+# Subscription.list, Subscription.retrieve and Webhook.construct_event all still exist.
+# Stripe's library default API VERSION moves with a major, so response SHAPES can shift
+# even when the methods survive — watch the first live webhook + subscription sync.
+stripe==15.6.1
 
 # Logging
 colorlog==6.9.0

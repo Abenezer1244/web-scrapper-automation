@@ -23,134 +23,81 @@ Test 3; every fix is pinned by a real-source fixture or a real ArcGIS feature.
 
 # Snohomish tax_delinquent — source layout change (2026-07-30)
 
-Branch: `chore/xcheck-2026-07-30` · worktree `bridgeleads-worktrees/xcheck-0730s2` off `origin/main` (`d56b11c`)
+# Test 2 data-quality audit — Pierce WA pre_foreclosure (2026-09-02)
 
-## Cross-check result
+Branch `fix/test2-data-quality`, worktree `C:/Users/Windows/bridgeleads-worktrees/test2-dq` (off origin/main 5106fe0).
+Subject: scraper config "Test 2" (fde53328, pierce/WA/pre_foreclosure), job e72bd6bf, 217 results.
 
-Swept production (`scripts/diag_build_health_sweep.py`). Jobs healthy (0 stuck, 0 failures
-in 14d, 0 stranded batch runs). One genuine user-facing break found.
+## Findings (all verified against prod DB + live sources)
 
-**snohomish/tax_delinquent connector `health_status='down'`, 1 active user config, broken ~5 weeks.**
+- [x] Auction Date / Default Owed blank on every row. Source facts: the ARMS recorder grid never carries
+      them (they are inside the document image); the product attaches them from the Tacoma Daily Index
+      newspaper cache (`nts_notices`) by parcel/address. RCW 61.24.040 puts publication 28–35 days before a
+      sale that is itself >= 90/120 days after recording, so publication is 55–150 days AFTER recording.
+      None of Test 2's trustee sales (recorded 6/3–9/1) had been published as of 9/2 -> genuinely null today.
+- [x] **BUG (app loses data):** the daily re-match beat only considers Results created in the last 45 days
+      (`nts_matcher_task._RECENT_DAYS`). 21 Pierce pre_foreclosure Results (created 6/23–7/1) have an EXACT
+      parcel match to an ACTIVE notice fetched 9/2 and were never matched — they aged out. Test 2 rows
+      recorded after ~mid-July would go permanently blank the same way.
+- [x] 12 rows parcel-but-no-address: all are Pierce personal-property (mobile-home) accounts (counterparty
+      = MHP/HOA; ATIP shows "Account Type: Mobile Home"). The county GIS Tax_Parcels layer + WA statewide
+      layer return 0 features for them (verified live). ATIP has the site/mailing address but its API is
+      reCAPTCHA-gated and the portal cites RCW 42.56.070(8). -> product/legal decision, no code.
+- [x] 3 rows name-only: verified on ARMS detail pages that the Legal Description tab has NO Parcel Id
+      (2 TRUSTEE SALE, 1 LIS PENDENS). GIS legal lookup ambiguous. Real source records; keep, no fabrication.
+- [x] 2 recorder-typo parcels (9066600050 vs real 9066000050; 718500090 vs real 7185000190): existing
+      probate-only legal-repair guards would reject both classes. Leave; report.
+- [x] Scraper discards the real ARMS document type (grid carries NOTICE OF DEFAULT / NOTICE OF FORECLOSURE /
+      LIS PENDENS / TRUSTEE SALE) and stamps "PRE-FORECLOSURE" on every row -> users cannot tell which rows
+      can ever carry an auction date.
+- [x] Placeholder / dummy / fake scan: none. 217 real instruments, no company-token party names, no
+      repeated instrument, 4 parcels with 2 filings each (legit distinct documents).
 
-Reproduced the exact production exception:
+## Plan
 
-```
-RuntimeError: Snohomish tax list format unexpected: 327721/327721 rows malformed (>20%)
-  — possible source change            (snohomish_wa_tax_delinquent.py:367)
-```
-
-### Root cause
-The county changed the bulk-file layout **17 → 15 pipe-delimited fields**.
-`_EXPECTED_FIELDS = 17`, so 100% of rows fail the length check and the
-`_MAX_MALFORMED_RATIO = 0.2` structural guard aborts. **The guard behaved correctly** —
-only the layout constant and column indices are stale.
-
-### Measured over the ENTIRE live file (327,721 rows streamed — not a sample)
-- field count uniformly **15** on 327,721/327,721 rows
-- parcels: 14-digit real property 307,308 · 7-digit personal 20,412 · 1 blank
-- tax years 1996–2026 (2026: 310,058 · 2025: 6,287 · 2024: 3,400 · 2023: 1,868 …)
-- `as_of` uniformly `20260701` (format changed from `mm/dd/yyyy` → `YYYYMMDD`)
-- **8,900** 14-digit prior-year rows with owed > 0 → a corrected parser yields real leads
-
-### Column semantics — derived, then validated at scale
-Invariant `c11 == c12 + c13` holds on **327,720/327,720 rows (100.0000%, 0 failures)**
-⇒ `c11` = billed-to-date, `c12` = paid, `c13` = **still owed**.
-`c14` vs `c11`: equal 27,407 / ~2× 251,031 / other 9,241 ⇒ `c14` = full-year levy.
-Old code took the **last** column as owed (`f[16]`); in the new layout the last column is
-the levy, so a naive reindex would silently overstate every amount.
-
-| | old (17) | new (15) |
-|---|---|---|
-| situs | `f2` street, `f3` line2, `f4` city, `f5` st, `f6` zip | `f2` street, `f3` city, `f4` st, `f5` zip |
-| owner | `f7` | `f6` |
-| mailing | `f8` line1, `f9` line2, `f10` city, `f11` st, `f12` zip | `f7` city, `f8` st, `f9` zip — **no street** |
-| as_of | `f13` `mm/dd/yyyy` | `f10` `YYYYMMDD` |
-| amounts | `f14` billed, `f15`, `f16` owed | `f11` billed, `f12` paid, `f13` owed, `f14` levy |
-
-### Two further landmines found
-- **(a) silent year-boundary bug.** `_as_of_year()` parses only `mm/dd/yyyy`; `20260701`
-  returns `None` → silently falls back to `datetime.now(UTC).year`. Correct by luck in
-  2026; a file published Dec-2026 read in Jan-2027 would use 2027 and classify the whole
-  current year as delinquent. No error raised.
-- **(b) city-only mailing address.** New layout has mailing city/state/zip and no street.
-  `_join_address` would emit `"MONROE, WA 98272-2204"`. Verified that
-  `address_intel.compute_owner_flags(property_address, mailing_address)` derives
-  `owner_state` / `absentee_owner` / `out_of_state_owner` **from the mailing address** —
-  a city-only value manufactures false absentee signals. Also the standing skip-trace rule:
-  never stuff a city-only value into an address field.
-
-## Codex consult (design, before any code)
-Consensus on all findings. Codex positions adopted:
-- **Q1** support BOTH 15 and 17 via explicit named layout maps (both URLs are live and the
-  county rotates: `..._36.txt` vs `..._39.txt`); unknown/mixed field counts fail loudly.
-- **Q2** `mailing_address = None`; keep city/state/zip in `enrichment_data` for audit.
-- **Q3** `total_billed` stays **billed-to-date** (`c11`) so the meaning of the field on the
-  2,253 existing Snohomish rows does not silently change; levy gets a new key.
-- **Q4** `as_of` is structural — if it cannot be parsed, **fail**, never fall back.
-- **Q5** encode the invariant as a *checked contract with diagnostics*, not a belief.
-
-## Plan — Phase 1 (this branch, parser correctness only) — DONE, commit `0a97149`
-- [x] 1. Replace `_EXPECTED_FIELDS = 17` with explicit layout maps for 15- and 17-field files
-- [x] 2. Index all column reads through the selected layout; owed = layout's owed column
-- [x] 3. `_as_of_year()` parses `YYYYMMDD` and `mm/dd/yyyy`; unparseable ⇒ raise, no fallback
-- [x] 4. `mailing_address = None` when the row has no mailing street; locality →
-       `enrichment_data.mailing_locality` (+ `full_year_levy`, `source_layout` for audit)
-- [x] 5. Reject mixed/unknown field counts loudly; record chosen layout in `stats`
-- [x] 6. Update/extend `tests/test_snohomish_tax.py` for both layouts + the year-boundary case
-- [x] 7. `ruff` + targeted pytest; then Codex reviews the diff
-
-## Deferred (NOT this branch)
-- Codex Q4's bulk-source **contract smoke check** (sample first N rows, alert independently
-  of user jobs). New subsystem touching the scheduler; overlaps the §8-gated
-  external-source canary work in `HANDOFF-king-owner-names-2026-07-30.md` §9.3. Separate PR.
-- `county_connectors.state` case split (`'WA'` 14 rows vs `'wa'`): **not a correctness bug** —
-  every lookup is case-normalised (`registry.py:76`, `scrapers.py:113,750`, `jobs.py:133`,
-  `batches.py:230`). It does break the picker's `order_by(state, county)` (non-alphabetical,
-  clark listed twice) and defeats `ix_county_connectors_picker`. Cosmetic + perf, separate PR.
-- **Retracted, not a bug:** 12 active+healthy connectors with empty `scraper_class` are
-  `scraper_mode='ai'` and resolve via `_detect_template(base_url)` → `EagleWebScraper`.
-  Verified all 24 active+healthy connectors resolve at runtime (0 broken).
+- [x] Consult Codex on fixes (GATE: PASS; ship A with behavior test + re-notice caveat; B only after
+      consumer + hash check — done: no consumer keys on the value; hash caveat documented).
+- [x] Fix A: widen `_RECENT_DAYS` to the statutory horizon (180d) with rationale; behavior test on a real
+      test DB (lead created 120d ago + active exact-parcel notice -> enriched) + tripwire test.
+- [x] Fix B: Pierce `_map_row` stores the real ARMS document type (closed-set exact match against the
+      configured checkbox labels; pre_foreclosure only; fallback unchanged). Fixture-based unit tests.
+- [x] Run related tests on the local rig (49 passed); ruff clean.
+- [x] Codex diff review (GATE: PASS, no P1); P2 already covered by the DB test; §14: no new inputs,
+      endpoints or SQL shapes — doc_type is a closed-set match, the window is a bound parameter.
+- [x] Browser/E2E: logged in as the user, opened Test 2 — headers include AUCTION DATE / DEFAULT OWED,
+      API `has_auction_data=true`, 0/50 items with auction data, 7 null addresses + 3 null parcels on
+      page 1, no console errors. Patched parser validated on 2 LIVE ARMS grid pages (48 rows, 0 mismatches).
+- [x] Journal entry + review section below.
 
 ## Review
 
-**Changed** (commit `0a97149`, branch `chore/xcheck-2026-07-30`, no migration):
-- `src/scrapers/snohomish_wa_tax_delinquent.py` — `_Layout` dataclass + `_LAYOUT_V15` /
-  `_LAYOUT_V17` maps selected by field width and locked per file; all column reads indexed
-  through the layout; `_as_of_year()` accepts `YYYYMMDD` and `mm/dd/yyyy` with month/day
-  validation so a 14-digit parcel or an amount can't be read as a date; `scrape()` raises
-  when the as-of year is unparseable instead of falling back to the wall clock;
-  `mailing_address` gated on an actual street line in the data; `full_year_levy`,
-  `mailing_locality`, `source_layout` added to `enrichment_data`; `layout` added to `stats`.
-- `tests/test_snohomish_tax.py` — 13 → 29 tests.
-- `scripts/diag_snoho_amount_invariant.py`, `scripts/diag_snoho_tax_canary_repro.py` — kept
-  as the reproducible evidence for the column mapping and a per-connector canary repro.
+- Root causes: (1) NTS re-match window shorter than the statutory publication lag (app lost data);
+  (2) Pierce scraper discarded the per-row document type the source prints (app lost data);
+  (3) mobile-home accounts absent from every parcel GIS layer (source-layer gap; assessor portal is
+  captcha-gated + RCW 42.56.070(8) — escalated); (4) name-only rows: recorder index has no parcel
+  (source gap; kept); (5) two recorder typos outside the repair guards (source gap; left).
+- Changed: `src/workers/nts_matcher_task.py` (window 45→180 + rationale), `src/scrapers/pierce_wa_probate.py`
+  (`ARMS_DOC_TYPE_LABELS`, `_grid_doc_type`, stale comment removed), tests (+9), journal, this file.
+- Historical Test 2 rows: no manual patching. The beat will enrich them as notices publish; the 12
+  mobile-home rows and 3 name-only rows stay as they are (honest nulls). Existing rows keep the
+  legacy `PRE-FORECLOSURE` doc_type — only new scrapes carry the real label.
+- Unverified: prod effect of the window fix (needs deploy + beat run + newspaper publication).
 
-**Proof (live production source, not a fixture):** 327,721 rows, 1 malformed (the file's own
-leading empty record), 8,900 delinquent rows → **1,954 parcels**, `as_of_year=2026`,
-`layout=v15_2026_07`, real owner names + situs addresses. "canary would set healthy."
+## Round 2 — captcha passer + typo parcels (user follow-up)
 
-**Tests:** 29/29 in `test_snohomish_tax.py`; **244 passed** across `-k "tax or dedup or
-snohomish or lead_export or address_intel"`. `ruff` clean on all touched files.
-Local rig is not isolated (handoff §7) — **CI is the authoritative gate.**
+- [x] Verified ATIP API + 2Captcha Enterprise token live (9/12 mobile-home parcels resolved, 1 solve).
+- [x] `pierce_atip.py` + `captcha.solve_recaptcha(enterprise=)` + cache key `(sitekey, url, enterprise)`.
+- [x] Legal repair: trailing BLK, edit-distance-1 guard gated on single survivor + plat adjacency; enabled for pre_foreclosure.
+- [x] `enrich.pierce_address_recovery()` extracted; `scripts/rerun_pierce_address_recovery.py` (dry-run verified on Test 2).
+- [x] Codex design consult (PASS) + two diff reviews; all code P2/P3 adopted.
+- [x] Deleted two exploratory scripts with a hardcoded 2Captcha key. 👤 REVOKE that key (NO-GO until done).
+- [x] Recovery run on Test 2 (user authorised): 11/12 filled (2 legal repair + 9 ATIP); `9009002080` not on
+      file anywhere. Results page re-verified: only the 3 name-only rows blank; API enriched_count 202 → 213.
+- [x] Push + PR; deploy worker + api (round 3).
 
-**Codex:** consulted on the design before any code (agreed on all four decisions; its
-"support both layouts" and "never fall back on as_of" positions are what shipped), then
-reviewed the diff — **pass, no findings, no regressions identified.**
+## Round 3 — the 12-item list
 
-**Deliberate behaviour change to flag:** the mailing rule also applies to the old layout.
-Verified 0 of 328,069 rows in the v17 file ever populated the mailing street, so the
-**2,253 existing Snohomish rows in prod carry a city-only `mailing_address`** and their
-`absentee_owner` / `out_of_state_owner` flags were derived from it. New rows will have
-`mailing_address = NULL` + `enrichment_data.mailing_locality`. Existing rows are NOT
-backfilled by this change — a separate decision.
-
-**Not done / open:**
-1. `scraper_configs` for snohomish/tax_delinquent will not recover until the connector's
-   `health_status` flips off `down`. The hourly canary samples 5 random connectors of 30,
-   so it should clear on its own within a few hours of deploy — but nothing forces it.
-2. The canary probes only `record_types[0]` per connector row while writing ONE
-   `health_status` for the whole row (`scheduler_helpers/health.py:287`). Harmless for
-   Snohomish (single-type rows) but wrong for multi-type connectors like
-   king `["probate","pre_foreclosure","death_certificate"]`. Untouched here.
-3. Codex Q4's bulk-source contract smoke check — the reason this sat broken 5 weeks.
-   Deferred (see above); overlaps the §8-gated canary work.
+- [x] 1 leaked key: already dead at 2Captcha (verified). 2 PR/merge/deploy: this session.
+- [x] 5 King mailing time budget + deferred marker (Codex PASS). 6 parser layouts + 40-page ingest (Codex PASS).
+- [x] 9 ARMS diff (0 parser losses). 11 other Pierce jobs recovered (26/28).
+- [ ] 3/4 legal stances (user), 7/10/12 deferred with reasoning (journal).

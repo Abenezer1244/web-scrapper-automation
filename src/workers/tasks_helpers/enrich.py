@@ -282,18 +282,53 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             gis_results = batch_enrich_parcels_gis(batch_pids, config.county, config.state)
             batch_updated = 0
             for pid, gis_data in gis_results.items():
-                if not gis_data.get("property_address"):
-                    continue
+                prop = gis_data.get("property_address")
+                mail = gis_data.get("mailing_address")
                 for res in parcel_map.get(pid, []):
-                    # Migration 085: the assessor line is street-only; keep whatever
-                    # REAL situs parts we have — from the scraper's full line (parsed
-                    # before it is replaced) or from the GIS row when it carries them
-                    # (statewide SITUS_*; Pierce when the county says mail goes to the
-                    # property). Fill only when empty; never invent.
+                    # Migration 085 (#188) — capture the REAL situs parts BEFORE the
+                    # assessor's street-only line replaces the scraper's fuller one.
+                    # Runs for every branch below, including vacant land, so a parcel
+                    # with no street still records WHERE it is.
                     _keep_situs_parts(res, gis_data)
-                    res.property_address = gis_data["property_address"]
-                    res.mailing_address = gis_data.get("mailing_address") or res.mailing_address
-                    batch_updated += 1
+                    if prop:
+                        res.property_address = prop
+                        # Only a REAL mailing overwrites (King never echoes the
+                        # property into mailing — Codex): never clobber an existing
+                        # value with None.
+                        if mail:
+                            res.mailing_address = mail
+                        batch_updated += 1
+                    elif mail:
+                        # No street, but a real mailing (e.g. a Pierce parcel with a
+                        # Delivery_Address but null Site_Address) — keep it rather
+                        # than drop it into the vacant branch (Codex P2).
+                        res.mailing_address = mail
+                        batch_updated += 1
+                    elif gis_data.get("vacant_no_situs"):
+                        # Matched but no street (vacant/raw land, ~1/3 of King
+                        # delinquent parcels). Keep property_address NULL — skip
+                        # trace BILLS off it, so a city-only pseudo-address would
+                        # buy a lookup for an address we do not have — but record
+                        # WHERE the parcel is for display (Codex).
+                        ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+                        ed["gis_matched"] = True
+                        ed["vacant_no_situs"] = True
+                        for k in ("situs_city", "situs_state", "situs_zip"):
+                            if gis_data.get(k):
+                                ed[k] = gis_data[k]
+                        res.enrichment_data = ed
+                        # #153 predates migration 085 and could only stash the situs
+                        # in enrichment_data. The real columns exist now, and this is
+                        # exactly what they are for: a vacant parcel with a known city
+                        # and ZIP can still answer out_of_state_owner. Fill-only —
+                        # never overwrite a value a real source already set.
+                        for _col, _src, _w in (("property_city", "situs_city", 128),
+                                               ("property_state", "situs_state", 2),
+                                               ("property_zip", "situs_zip", 10)):
+                            _v = gis_data.get(_src)
+                            if _v and not getattr(res, _col, None):
+                                setattr(res, _col, str(_v).strip()[:_w])
+                        batch_updated += 1
             try:
                 db.commit()
             except Exception as exc:

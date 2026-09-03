@@ -115,9 +115,17 @@ class TestParseGisResponse:
         assert r["mailing_address"] == "PO BOX 5, TACOMA, WA, 98401"
 
     def test_empty_features(self):
-        assert _parse_gis_response({"features": []}, _KNOWN_GIS_ENDPOINTS["pierce_WA"]) == {
-            "property_address": None, "mailing_address": None,
-        }
+        # #153 widened this return: it now also reports `matched` / `vacant_no_situs`
+        # and the situs parts, so batch_enrich_parcels_gis can tell "the county has
+        # no such parcel" apart from "matched, but it is vacant land". Assert the
+        # INVARIANTS rather than an exact dict, so adding a field is not a failure
+        # but inventing an address is.
+        r = _parse_gis_response({"features": []}, _KNOWN_GIS_ENDPOINTS["pierce_WA"])
+        assert r["property_address"] is None
+        assert r["mailing_address"] is None
+        assert r["matched"] is False
+        assert r["vacant_no_situs"] is False  # no feature at all is NOT vacant land
+        assert r.get("parcel_id") is None
 
 
 class TestArcgisPredicateQuoting:

@@ -296,7 +296,19 @@ def compute_owner_flags(
         property_address = compose_situs(
             property_address, property_city, property_state, property_zip
         )
+    # Keep the caller's structured state before the name is rebound below.
+    _given_state = (property_state or "").strip().upper()
     property_state = parse_property_for_display(property_address)["state"] if property_address else None
+    if not property_state and re.fullmatch(r"[A-Z]{2}", _given_state):
+        # No STREET, so compose_situs returned the (empty) address unchanged and the
+        # structured parts were discarded — which silently threw away a state we were
+        # handed. That is the vacant / raw-land case: King's GIS matches the parcel and
+        # gives city+state+ZIP but no ADDR_FULL (~1/3 of its delinquent parcels), so
+        # `property_address` stays NULL on purpose (skip trace bills off it). The state
+        # is still a REAL source value, and out_of_state_owner only needs the two
+        # states — so honour it. absentee_owner stays None below, because comparing
+        # streets is still impossible and that is the honest answer (Codex).
+        property_state = _given_state
     owner_state = parse_property_for_display(mailing_address)["state"] if mailing_address else None
 
     if owner_state and property_state:

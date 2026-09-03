@@ -95,16 +95,27 @@ def actionable_sql(alias: str) -> str:
     return f"({address_actionable_sql(alias)} AND {_not_quota_excluded_sql(alias)})"
 
 
-def is_actionable(row: Any) -> bool:
-    """Python twin for ORM rows / ScrapedRecords / dicts (attribute or key access)."""
-    enr = _field(row, "enrichment_data")
-    if isinstance(enr, dict) and enr.get(DELIVERY_EXCLUDED_KEY) == OVER_QUOTA:
-        return False
+def has_deliverable_address(row: Any) -> bool:
+    """Python twin of address_actionable_sql: the ADDRESS half of the rule only.
+
+    Use this when the question is genuinely "could we mail/call/visit this?" —
+    e.g. the post-enrichment health log, which counts rows enrichment could not
+    rescue. Using the full rule there would later fold in quota-excluded rows,
+    which DO have addresses and are not an enrichment failure.
+    """
     prop = _field(row, "property_address")
     mail = _field(row, "mailing_address")
     if prop and prop.strip() and prop.strip() != ADDRESS_PLACEHOLDER:
         return True
     return bool(mail and mail.strip() and mail.strip() != ADDRESS_PLACEHOLDER)
+
+
+def is_actionable(row: Any) -> bool:
+    """Python twin for ORM rows / ScrapedRecords / dicts (attribute or key access)."""
+    enr = _field(row, "enrichment_data")
+    if isinstance(enr, dict) and enr.get(DELIVERY_EXCLUDED_KEY) == OVER_QUOTA:
+        return False
+    return has_deliverable_address(row)
 
 
 def _field(row: Any, name: str) -> str | None:

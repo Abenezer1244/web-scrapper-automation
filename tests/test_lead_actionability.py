@@ -26,6 +26,13 @@ CASES = [
     ("   ", None, False),
     (ADDRESS_PLACEHOLDER, None, False),               # placeholder is not an address
     (ADDRESS_PLACEHOLDER, "5311 108TH AVENUE CT E, PUYALLUP, WA", True),
+    # enrichment/parcel.py's failure return writes the placeholder into BOTH
+    # columns. Rejecting it on only the property side let the row pass through
+    # the mailing side and be listed, exported, counted AND BILLED with no
+    # address anywhere (Codex, 2026-09-03).
+    (None, ADDRESS_PLACEHOLDER, False),
+    (ADDRESS_PLACEHOLDER, ADDRESS_PLACEHOLDER, False),
+    (ADDRESS_PLACEHOLDER, f"  {ADDRESS_PLACEHOLDER}  ", False),   # btrim'd both sides
 ]
 
 
@@ -47,10 +54,13 @@ def _sql_eval(sql: str, prop, mail) -> bool:
     def nn(v):  # IS NOT NULL
         return v is not None
     prop_ok = nn(prop) and prop.strip() != "" and prop.strip() != ADDRESS_PLACEHOLDER
-    mail_ok = nn(mail) and mail.strip() != ""
+    mail_ok = nn(mail) and mail.strip() != "" and mail.strip() != ADDRESS_PLACEHOLDER
     # Structural check that the SQL really encodes those comparisons, trimmed.
-    assert sql.count("property_address") == 3 and sql.count("mailing_address") == 2
-    assert sql.count("btrim(") == 3  # property <> '', property <> placeholder, mailing <> ''
+    # The placeholder is rejected on BOTH columns, so each side contributes
+    # three mentions and two btrim()s.
+    assert sql.count("property_address") == 3 and sql.count("mailing_address") == 3
+    assert sql.count("btrim(") == 4
+    assert sql.count(ADDRESS_PLACEHOLDER) == 2
     return prop_ok or mail_ok
 
 

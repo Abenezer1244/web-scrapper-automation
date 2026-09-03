@@ -25,6 +25,12 @@ from src.db.models import Result
 
 # Older enrichment writers stored this literal instead of NULL when a parcel
 # lookup came back empty. It is a placeholder, never an address.
+#
+# It lands in BOTH columns, not just property_address: enrichment/parcel.py's
+# failure return sets property_address AND mailing_address to it. Excluding it
+# on only one side let a fully-failed row pass the rule through the other
+# (Codex, 2026-09-03) — the row was listed, exported, counted and BILLED with
+# no address anywhere. Every branch below rejects it on BOTH columns.
 ADDRESS_PLACEHOLDER = "(enrichment unavailable)"
 
 
@@ -35,7 +41,7 @@ def actionable_condition():
     mail = func.btrim(Result.mailing_address)
     return or_(
         and_(Result.property_address.isnot(None), prop != "", prop != ADDRESS_PLACEHOLDER),
-        and_(Result.mailing_address.isnot(None), mail != ""),
+        and_(Result.mailing_address.isnot(None), mail != "", mail != ADDRESS_PLACEHOLDER),
     )
 
 
@@ -45,7 +51,8 @@ def actionable_sql(alias: str) -> str:
     return (
         f"(({alias}.property_address IS NOT NULL AND btrim({alias}.property_address) <> '' "
         f"AND btrim({alias}.property_address) <> '{ADDRESS_PLACEHOLDER}') "
-        f"OR ({alias}.mailing_address IS NOT NULL AND btrim({alias}.mailing_address) <> ''))"
+        f"OR ({alias}.mailing_address IS NOT NULL AND btrim({alias}.mailing_address) <> '' "
+        f"AND btrim({alias}.mailing_address) <> '{ADDRESS_PLACEHOLDER}'))"
     )
 
 
@@ -55,7 +62,7 @@ def is_actionable(row: Any) -> bool:
     mail = _field(row, "mailing_address")
     if prop and prop.strip() and prop.strip() != ADDRESS_PLACEHOLDER:
         return True
-    return bool(mail and mail.strip())
+    return bool(mail and mail.strip() and mail.strip() != ADDRESS_PLACEHOLDER)
 
 
 def _field(row: Any, name: str) -> str | None:

@@ -120,18 +120,28 @@ def enrich_parcel_gis(
         if result.get("property_address"):
             return result
 
-    # Fallback: search by owner name if parcel ID didn't match or is None
-    # (e.g. Tyler SelfService records that have names but no parcel)
-    if gis_config and owner_name and gis_config.get("owner_field"):
-        result = _query_gis_by_name(owner_name, gis_config, county_key)
-        if result.get("property_address"):
-            _logger.info("GIS name-based fallback succeeded for %s", owner_name)
-            return result
-
-    # Fallback: WA statewide parcel service (covers all 39 WA counties)
+    # Fallback: WA statewide parcel service (covers all 39 WA counties).
+    #
+    # ORDER MATTERS: this EXACT parcel lookup must run before either name-based
+    # fallback. A name search reduces the owner to its first token and asks for
+    # ONE row, so it can only ever return "some parcel owned by someone whose
+    # surname starts like this" — for a common surname that is a DIFFERENT
+    # property. Letting it pre-empt an exact APN match means silently attaching
+    # the wrong address to a lead. Exact identifier always beats fuzzy name
+    # (Codex, 2026-09-03).
     if state.upper() == "WA" and parcel_id:
         result = _query_wa_statewide(parcel_id, county)
         if result.get("property_address"):
+            return result
+
+    # Fallback: search by owner name — ONLY when there is no parcel id to match
+    # on (e.g. Tyler SelfService records that carry names but no parcel). With a
+    # parcel_id in hand, every exact lookup above has already been tried and a
+    # surname guess is not an acceptable substitute for them.
+    if gis_config and owner_name and not parcel_id and gis_config.get("owner_field"):
+        result = _query_gis_by_name(owner_name, gis_config, county_key)
+        if result.get("property_address"):
+            _logger.info("GIS name-based fallback succeeded for %s", owner_name)
             return result
 
     # WA statewide name-based fallback when parcel_id is None

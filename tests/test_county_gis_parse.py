@@ -145,3 +145,58 @@ class TestArcgisPredicateQuoting:
         assert _LIKE_META.search("SMITH%") is not None
         assert _LIKE_META.search("SMITH_JR") is not None
         assert _LIKE_META.search("OBRIEN") is None
+
+
+class TestFallbackOrder:
+    """An EXACT parcel lookup must always beat a fuzzy owner-name lookup.
+
+    The name search reduces the owner to its first token and asks ArcGIS for ONE
+    row, so for a common surname it returns *some* parcel owned by *someone*
+    similarly named. Before 2026-09-03 it ran BEFORE the exact WA statewide
+    parcel lookup, so a name hit could pre-empt the real APN match and attach
+    the wrong address to a lead. Escaping the predicate (so O'BRIEN stopped
+    erroring out) is exactly what would have made that misfire reachable.
+    """
+
+    def _patch(self, monkeypatch, calls):
+        from src.scrapers.enrichment import county_gis as cg
+
+        def rec(name, ret):
+            def _f(*a, **kw):
+                calls.append(name)
+                return ret
+            return _f
+
+        monkeypatch.setattr(cg.settings, "GIS_ENRICHMENT_ENABLED", True, raising=False)
+        # county parcel lookup misses (this is the trigger for any fallback)
+        monkeypatch.setattr(cg, "_query_gis", rec("county_parcel", cg._empty()))
+        monkeypatch.setattr(cg, "_query_gis_by_name",
+                            rec("name", {"property_address": "999 WRONG ST",
+                                         "mailing_address": None}))
+        monkeypatch.setattr(cg, "_query_wa_statewide",
+                            rec("statewide_parcel", {"property_address": "1 RIGHT ST",
+                                                     "mailing_address": None}))
+        monkeypatch.setattr(cg, "_query_wa_statewide_by_name",
+                            rec("statewide_name", cg._empty()))
+        return cg
+
+    def test_exact_parcel_wins_over_owner_name(self, monkeypatch):
+        calls = []
+        cg = self._patch(monkeypatch, calls)
+        out = cg.enrich_parcel_gis(
+            parcel_id="0121228036", county="pierce", state="WA", owner_name="O'BRIEN JOHN",
+        )
+        assert out["property_address"] == "1 RIGHT ST"
+        # The name search must not even be consulted while a parcel id exists.
+        assert "name" not in calls
+        assert calls == ["county_parcel", "statewide_parcel"]
+
+    def test_name_search_still_runs_when_there_is_no_parcel(self, monkeypatch):
+        calls = []
+        cg = self._patch(monkeypatch, calls)
+        out = cg.enrich_parcel_gis(
+            parcel_id=None, county="pierce", state="WA", owner_name="O'BRIEN JOHN",
+        )
+        # No parcel to match on, so a name search is the only option left.
+        assert out["property_address"] == "999 WRONG ST"
+        assert "name" in calls

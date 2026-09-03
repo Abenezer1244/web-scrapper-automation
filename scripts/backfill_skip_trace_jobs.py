@@ -114,6 +114,7 @@ def main() -> int:
     from src.scrapers.enrichment.skip_trace import (
         address_cache_key,
         build_pending_row_payload,
+    legacy_cache_locality,
     )
 
     mode = "COMMIT (writes + enables Tracerfy spend via dispatcher)" if args.commit \
@@ -183,6 +184,18 @@ def main() -> int:
                     payload["city"], payload["state"],
                 )
                 cached = db.get(SkipTraceCache, key)
+                if cached is None:
+                    # Same dual-read as the worker enqueue path: a row cached
+                    # before 2026-09-03 was keyed with the locality taken from
+                    # the OWNER's mailing address, which differs from the
+                    # property's own situs for every absentee owner. Without
+                    # this second look a manual backfill re-buys addresses the
+                    # worker would have recovered for free (Codex).
+                    _lc, _ls = legacy_cache_locality(rec)
+                    if (_lc, _ls) != (payload["city"], payload["state"]):
+                        cached = db.get(SkipTraceCache, address_cache_key(
+                            job.user_id, payload["property_address"], _lc, _ls,
+                        ))
                 cache_valid = bool(
                     cached and (datetime.now(UTC) - cached.fetched_at).days
                     < settings.SKIP_TRACE_CACHE_DAYS

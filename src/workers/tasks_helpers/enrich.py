@@ -641,11 +641,16 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
     fresh = db.execute(
         sa_select(Result).where(Result.job_id == job_id, Result.user_id == job.user_id)
     ).scalars().all()
-    unactionable = [
-        res for res in fresh
-        if not (res.property_address and res.property_address != "(enrichment unavailable)")
-        and not res.mailing_address
-    ]
+    from src.api.lead_actionability import has_deliverable_address
+
+    # One rule, one spelling: hand-rolling the address test here had already
+    # drifted — it missed the "(enrichment unavailable)" placeholder on the
+    # MAILING side, so a row whose enrichment failed completely (parcel.py writes
+    # the placeholder into BOTH columns) was not counted as unactionable and the
+    # health signal under-reported it. Deliberately the ADDRESS-only twin, not
+    # is_actionable: a quota-excluded row HAS an address and is not an
+    # enrichment failure (Codex, 2026-09-03).
+    unactionable = [res for res in fresh if not has_deliverable_address(res)]
     if unactionable:
         # Break down WHY so a genuinely-unrecoverable row (no parcel AND no legal
         # — e.g. a probate court filing with no property recorded) is

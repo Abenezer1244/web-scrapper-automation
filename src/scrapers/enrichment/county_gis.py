@@ -9,6 +9,8 @@ Each county's GIS endpoint URL is stored in county_connectors.gis_endpoint.
 The ArcGIS REST query format is standardized across all counties.
 """
 
+import re
+
 import requests
 
 from src.config import settings
@@ -343,6 +345,7 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
         "property_address": property_address,
         "mailing_address": mailing_address,
         "parcel_id": attrs.get(parcel_field) or None,
+        **_situs_parts_from_confirmed_mailing(attrs, property_address, gis_config),
     }
 
     if property_address:
@@ -448,6 +451,35 @@ def _map_county_features(
         for caller_pid in clean_to_originals.get(str(pid)) or [str(pid)]:
             results[caller_pid] = dict(parsed)
     return results
+
+
+_CITY_STATE_RE = re.compile(r"^\s*(.+?)\s*,\s*([A-Z]{2})\s*$")
+
+
+def _situs_parts_from_confirmed_mailing(
+    attrs: dict, property_address: str | None, gis_config: dict
+) -> dict[str, str | None]:
+    """Pierce-style county row (Delivery_Address / City_State / Zipcode = the OWNER's
+    mailing): those fields describe the property ONLY when the county itself says
+    the mail goes there — Delivery_Address equal to Site_Address after whitespace
+    normalization, and not a PO box. Then City_State/Zipcode are evidence-based
+    situs parts (Codex-approved derivation); otherwise nothing is emitted."""
+    fields = gis_config.get("mailing_fields") or []
+    if not property_address or len(fields) < 3:
+        return {}
+    delivery = " ".join(str(attrs.get(fields[0]) or "").split()).upper()
+    site = " ".join(property_address.split()).upper()
+    if not delivery or delivery != site or delivery.startswith("PO BOX") or delivery.startswith("P.O."):
+        return {}
+    m = _CITY_STATE_RE.match(str(attrs.get(fields[1]) or ""))
+    zipcode = str(attrs.get(fields[2]) or "").strip()
+    if not m:
+        return {}
+    return {
+        "property_city": m.group(1).strip(),
+        "property_state": m.group(2),
+        "property_zip": zipcode[:10] or None,
+    }
 
 
 def _situs_parts(city: str, zipcode: str) -> dict[str, str | None]:

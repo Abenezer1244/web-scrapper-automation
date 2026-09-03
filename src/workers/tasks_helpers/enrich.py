@@ -6,6 +6,7 @@ behavior is byte-identical to the originals in tasks.py.
 """
 
 import asyncio
+import re
 from typing import TYPE_CHECKING
 
 import redis as sync_redis
@@ -24,6 +25,35 @@ _logger = setup_logger("worker.task")
 # that a hard-kill loses at most one batch of work; large enough to keep the
 # commit overhead negligible against the per-chunk (50-parcel) HTTP cost.
 _GIS_COMMIT_BATCH = 500
+
+# Anchored trailing ZIP only ("… PL 4C 98023" / "… 98023-1234"): never a 5-digit
+# token inside the street (house numbers, road numbers).
+_TRAILING_ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\s*$")
+
+
+def _keep_situs_parts(res, gis_data: dict) -> None:
+    """Fill results.property_city / property_state / property_zip (migration 085)
+    from REAL sources only, without touching property_address itself.
+
+    Order: the scraper's own full situs line (a notice's "commonly known as"),
+    parsed BEFORE the GIS street-only line replaces it; then the GIS row's
+    structured situs parts (statewide SITUS_*, or Pierce when Delivery ==
+    Site). Each part is filled only when still empty. Nothing is inferred.
+    """
+    from src.utils.lead_formatting import parse_property_for_display
+
+    if res.property_address and not (res.property_city and res.property_zip):
+        parsed = parse_property_for_display(res.property_address)
+        if parsed.get("city") and not res.property_city:
+            res.property_city = parsed["city"][:128]
+        if parsed.get("state") and not res.property_state:
+            res.property_state = parsed["state"][:2]
+        if parsed.get("zip") and not res.property_zip:
+            res.property_zip = parsed["zip"][:10]
+    for col in ("property_city", "property_state", "property_zip"):
+        val = gis_data.get(col)
+        if val and not getattr(res, col):
+            setattr(res, col, str(val)[: 128 if col == "property_city" else 10])
 
 
 async def _run_scraper(
@@ -252,6 +282,12 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 if not gis_data.get("property_address"):
                     continue
                 for res in parcel_map.get(pid, []):
+                    # Migration 085: the assessor line is street-only; keep whatever
+                    # REAL situs parts we have — from the scraper's full line (parsed
+                    # before it is replaced) or from the GIS row when it carries them
+                    # (statewide SITUS_*; Pierce when the county says mail goes to the
+                    # property). Fill only when empty; never invent.
+                    _keep_situs_parts(res, gis_data)
                     res.property_address = gis_data["property_address"]
                     res.mailing_address = gis_data.get("mailing_address") or res.mailing_address
                     batch_updated += 1
@@ -423,6 +459,13 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 for res in pid_map.get(pid, []):
                     if prop and not res.property_address:
                         res.property_address = prop
+                    if prop and not res.property_zip:
+                        # eRealProperty's Site Address sometimes ends in the ZIP
+                        # ("2019 SW 318TH PL 4C 98023"): anchored trailing token only,
+                        # no city inferred from it (Codex).
+                        _z = _TRAILING_ZIP_RE.search(prop)
+                        if _z:
+                            res.property_zip = _z.group(1)
                     if mail:
                         res.mailing_address = mail
                     if (

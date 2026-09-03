@@ -13,6 +13,8 @@ key elsewhere.
 """
 from src.scrapers.enrichment.county_gis import (
     _KNOWN_GIS_ENDPOINTS,
+    _LIKE_META,
+    _arcgis_literal,
     _make_generic_config,
     _parse_gis_response,
     _situs_parts,
@@ -116,3 +118,30 @@ class TestParseGisResponse:
         assert _parse_gis_response({"features": []}, _KNOWN_GIS_ENDPOINTS["pierce_WA"]) == {
             "property_address": None, "mailing_address": None,
         }
+
+
+class TestArcgisPredicateQuoting:
+    """A raw-interpolated ArcGIS `where` value breaks the predicate the moment a
+    real value contains a quote. Parcel predicates were fixed in #184/#186; the
+    owner-name LIKE was missed (2026-09-03)."""
+
+    def test_apostrophe_surname_is_escaped_not_broken(self):
+        # O'BRIEN, O'CONNOR, D'ANGELO are ordinary WA surnames. Raw
+        # interpolation produced LIKE 'O'BRIEN%' — malformed; ArcGIS errored and
+        # the caller's except swallowed it, so those owners silently got no
+        # enrichment at all.
+        assert _arcgis_literal("O'BRIEN%") == "'O''BRIEN%'"
+
+    def test_wildcard_stays_a_wildcard_after_escaping(self):
+        # The % must sit INSIDE the literal, still acting as the LIKE wildcard.
+        lit = _arcgis_literal("SMITH" + "%")
+        assert lit.startswith("'") and lit.endswith("%'")
+
+    def test_plain_surname_is_unchanged_apart_from_quoting(self):
+        assert _arcgis_literal("SMITH%") == "'SMITH%'"
+
+    def test_like_metacharacters_are_detected(self):
+        # Rejected, not rewritten — same rule as pierce_legal_repair._LIKE_META.
+        assert _LIKE_META.search("SMITH%") is not None
+        assert _LIKE_META.search("SMITH_JR") is not None
+        assert _LIKE_META.search("OBRIEN") is None

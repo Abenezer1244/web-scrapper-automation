@@ -193,9 +193,23 @@ def _query_gis_by_name(owner_name: str, gis_config: dict, county_key: str) -> di
     name_clean = owner_name.strip().upper().split(",")[0].split(" ")[0]
     if len(name_clean) < 3:
         return _empty()
+    # A LIKE metacharacter in the name would silently widen the match to a
+    # different owner's parcel. Not a legitimate character in a surname, so
+    # reject rather than rewrite the name — same rule, same reason, as
+    # pierce_legal_repair._LIKE_META (Codex, 2026-09-03).
+    if _LIKE_META.search(name_clean):
+        _logger.warning(
+            "GIS owner-name lookup skipped: LIKE metacharacter in %r", name_clean[:40]
+        )
+        return _empty()
 
     params = {
-        "where": f"{owner_field} LIKE '{name_clean}%'",
+        # Quote-escaped: an apostrophe is ORDINARY in a surname (O'BRIEN,
+        # O'CONNOR, D'ANGELO) and raw interpolation made the predicate
+        # malformed — ArcGIS errored, the except below swallowed it, and those
+        # owners silently got NO enrichment at all. The trailing % is appended
+        # INSIDE the literal so it stays a wildcard after escaping.
+        "where": f"{owner_field} LIKE {_arcgis_literal(name_clean + '%')}",
         "outFields": out_fields,
         "returnGeometry": "false",
         "resultRecordCount": 1,
@@ -453,6 +467,9 @@ def _map_county_features(
     return results
 
 
+# A LIKE metacharacter (% or _) in an interpolated value silently widens the
+# predicate to unrelated rows. Values carrying one are rejected, not rewritten.
+_LIKE_META = re.compile(r"[%_]")
 _CITY_STATE_RE = re.compile(r"^\s*(.+?)\s*,\s*([A-Z]{2})\s*$")
 # "PO BOX", "P.O. BOX", "P O BOX", "P.O BOX", "POB" — any post-office box spelling.
 _PO_BOX_RE = re.compile(r"^\s*P\.?\s*O\.?\s*B(?:OX)?\b", re.I)

@@ -265,16 +265,16 @@ def _query_wa_statewide(parcel_id: str, county: str) -> dict[str, str | None]:
             if zipcode:
                 zipcode = str(zipcode).strip()
 
-            # situs-as-mailing fallback; None when the row has no city/zip (same
-            # rule as the batch path — never emit a half-address).
-            mailing = _statewide_mailing(address, city, zipcode)
-
             parcel_found = attrs.get("ORIG_PARCEL_ID") or apn_clean
             _logger.info("WA statewide GIS enriched parcel %s: %s", parcel_found, address)
             return {
                 "property_address": address,
-                "mailing_address": mailing,
+                # The statewide layer is SITUS-only: it never knows where the owner
+                # gets mail, so it never sets one (2026-09-02 policy: no assumed
+                # owner-occupancy — "real data everywhere").
+                "mailing_address": None,
                 "parcel_id": parcel_found,
+                **_situs_parts(city, zipcode),
             }
 
         return _empty()
@@ -330,7 +330,9 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
                 parts.append(str(val).strip())
         mailing_address = ", ".join(parts) if parts else None
     else:
-        mailing_address = property_address  # Fallback to property address
+        # A GIS config with no mailing fields knows nothing about the owner's
+        # mail — never copy the situs in as if it did (2026-09-02 policy).
+        mailing_address = None
 
     # Owner name (logged for enrichment_data, not in primary return)
     owner_field = gis_config.get("owner_field")
@@ -448,27 +450,18 @@ def _map_county_features(
     return results
 
 
-def _statewide_mailing(address: str, city: str, zipcode: str) -> str | None:
-    """Mailing line from a WA statewide SITUS row, or None when the row has neither
-    city nor ZIP.
-
-    The statewide service carries no owner/mailing data at all; the app's long-
-    standing fallback treats the situs as the mailing address (owner-occupied
-    assumption). With city AND zip both absent that produced half-addresses like
-    "9226 175TH STREET CT E, WA" (live 2026-09-02) — a fabricated, undeliverable
-    mailing line that also poisons the absentee/out-of-state flags. Emit nothing in
-    that case: downstream keeps whatever mailing address it already has, and the
-    UI/CSV show blank rather than an invented value.
-    """
-    if not city and not zipcode:
-        return None
-    mailing = address
-    if city:
-        mailing += f", {city}"
-    mailing += ", WA"
-    if zipcode:
-        mailing += f" {zipcode}"
-    return mailing
+def _situs_parts(city: str, zipcode: str) -> dict[str, str | None]:
+    """Structured SITUS location from a WA statewide row (SITUS_CITY_NM /
+    SITUS_ZIP_NR). The state is WA by construction (the service is the WA parcel
+    layer, queried with the county FIPS), city/zip only when the row carries them.
+    These describe the PROPERTY's location — never the owner's mail."""
+    city = " ".join((city or "").split())
+    zipcode = (zipcode or "").strip()
+    return {
+        "property_city": city or None,
+        "property_state": "WA",
+        "property_zip": zipcode or None,
+    }
 
 
 def _batch_query_county(
@@ -605,9 +598,9 @@ def _batch_query_wa_statewide(
                 zipcode = (attrs.get("SITUS_ZIP_NR") or "").strip()
                 results[caller_pid] = {
                     "property_address": address,
-                    # situs-as-mailing fallback; None when the row has no city/zip
-                    "mailing_address": _statewide_mailing(address, city, zipcode),
+                    "mailing_address": None,  # situs-only layer: owner's mail unknown
                     "parcel_id": pid,  # canonical format from server
+                    **_situs_parts(city, zipcode),
                 }
 
             _logger.info(

@@ -7,7 +7,7 @@ returned a CONFIDENT absentee_owner = TRUE for a property whose address we do no
 have. Measured in production 2026-09-03: 408 such rows, every one
 snohomish / tax_delinquent, all absentee_owner = TRUE.
 
-The code fix (address_intel._street_is_placeholder) makes NEW rows honest; this
+The code fix (address_intel.street_is_placeholder) makes NEW rows honest; this
 repairs the ones already written. User approved the repair 2026-09-03.
 
 Deliberately narrow: only absentee_owner changes. In 'UNKNOWN UNKNOWN, GRANITE
@@ -34,7 +34,7 @@ from sqlalchemy import text  # noqa: E402
 
 from src.db.session import system_sync_session  # noqa: E402
 from src.utils.address_intel import (  # noqa: E402
-    _street_is_placeholder,
+    street_is_placeholder,
     compute_owner_flags,
 )
 
@@ -53,13 +53,19 @@ _CANDIDATES = text(
     """
 )
 
-# Guarded: only clears the row still holding the value this run read, so a
-# concurrent correction is never clobbered (rowcount 0 -> counted as stale).
+# Guarded on the SAME fields the decision was made from. `absentee_owner IS TRUE`
+# alone was not enough (Codex): the verdict rests on property_address, so if
+# enrichment replaced the placeholder situs with a REAL street between this run's
+# read and its write, the flag could have become legitimately True and we would
+# have cleared it. Re-checking both addresses makes that a rowcount-0 conflict.
 _UPDATE = text(
     """
     UPDATE results
     SET absentee_owner = NULL
-    WHERE id = :id AND absentee_owner IS TRUE
+    WHERE id = :id
+      AND absentee_owner IS TRUE
+      AND property_address = :property_address
+      AND mailing_address IS NOT DISTINCT FROM :mailing_address
     """
 )
 
@@ -82,7 +88,7 @@ def main() -> int:
         for r in rows:
             # The SQL LIKE is only a cheap prefilter; the REAL decision uses the
             # same helper the worker uses, so script and worker can never diverge.
-            if not _street_is_placeholder(r.property_address):
+            if not street_is_placeholder(r.property_address):
                 totals["left_alone"] += 1
                 continue
             totals["placeholder"] += 1
@@ -108,9 +114,15 @@ def main() -> int:
 
         if args.apply:
             for r in plans:
-                rc = db.execute(_UPDATE, {"id": r.id}).rowcount or 0
+                rc = db.execute(_UPDATE, {
+                    "id": r.id,
+                    "property_address": r.property_address,
+                    "mailing_address": r.mailing_address,
+                }).rowcount or 0
                 totals["updated"] += rc
                 totals["stale"] += 1 - rc
+                if rc != 1:
+                    print(f"  CONFLICT id={r.id} rowcount={rc} — row changed since read, not cleared")
             db.commit()
         else:
             db.rollback()

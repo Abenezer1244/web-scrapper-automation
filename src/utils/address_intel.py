@@ -86,7 +86,7 @@ def _zip5(z: str | None) -> str:
 _PLACEHOLDER_STREET_RE = re.compile(r"UNKNOWN", re.IGNORECASE)
 
 
-def _street_is_placeholder(addr: str | None) -> bool:
+def street_is_placeholder(addr: str | None) -> bool:
     """True when an address's STREET segment is nothing but placeholder tokens.
 
     Only the street is judged: in "UNKNOWN UNKNOWN, GRANITE FALLS WA 98252" the
@@ -98,7 +98,14 @@ def _street_is_placeholder(addr: str | None) -> bool:
     street = addr.split(",")[0].strip()
     if not street:
         return False
-    tokens = [t for t in _WS_RE.sub(" ", street).split(" ") if t]
+    # Tokenise on WORD characters, not whitespace: splitting on spaces alone left
+    # punctuated debris ("UNKNOWN.", "UNKNOWN-UNKNOWN", "UNKNOWN/UNKNOWN") failing
+    # fullmatch, so a fabricated street walked through and kept a confident
+    # absentee_owner (Codex). Measured 0 such rows in prod today, so this changes
+    # nothing now — it is a cheap guard against the next shape the county emits.
+    # Still `all(...)`, so a REAL street merely containing the word ("123 UNKNOWN
+    # RD") is never suppressed.
+    tokens = re.findall(r"[A-Za-z0-9]+", street)
     return bool(tokens) and all(_PLACEHOLDER_STREET_RE.fullmatch(t) for t in tokens)
 
 
@@ -117,7 +124,7 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
     # real mailing street, so without this the comparator returns a CONFIDENT
     # absentee=True for a property whose address we simply do not have — exactly
     # the fabricated signal the house rule forbids. Unknown means None.
-    if _street_is_placeholder(property_address) or _street_is_placeholder(mailing_address):
+    if street_is_placeholder(property_address) or street_is_placeholder(mailing_address):
         return None
 
     # Byte-identical (post-normalize) is unambiguous same-place → confirmed False,

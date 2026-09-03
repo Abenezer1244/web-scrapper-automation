@@ -19,6 +19,90 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-03 — Cross-checking our own merged work: the backfill that could never finish
+
+**Built / Shipped:** #188 merged (`1b964d9`, migration 085 live) and then, from a cross-check of
+#188 against its OWN production evidence, **#190** (`d166e806`) fixing two real defects in
+`scripts/backfill_assumed_mailing.py`.
+
+**Tried / Decided — the two defects.**
+1. **The backfill could not converge.** The handoff said "King 180/217 done, ~37 left; repeat until
+   `candidates: 0`". Reading the six evidence JSONL files instead of trusting that: 180 written
+   rows, **39 distinct ids**, 23 of them re-written in all six runs. Root cause: when the assessor
+   says the owner IS at the property, the row is rewritten to a mailing that *still begins with the
+   situs*, so it re-matches the situs-copy predicate `mailing LIKE property || '%'` and the
+   `ORDER BY created_at,id` + `[:30]` head never advances. The instruction could never terminate,
+   and every loop re-hit a source that has IP-rate-blocked this app. The real remaining work was
+   **847 King rows**, not 37. Fix: every row now leaves a durable
+   `enrichment_data.mailing_backfill_status`; terminal states are excluded from the candidate
+   query; retries are bounded (`--max-attempts`), sort *after* untried rows, and go
+   `failed_terminal` when exhausted.
+2. **It wrote `property_state = NULL` on every row it touched.** `compute_owner_flags` was called
+   without the structured situs, so the state was parsed from the FROZEN street-only
+   `property_address` — which never yields one, forcing `out_of_state_owner` NULL too. **1,286 prod
+   rows**, i.e. the script was quietly defeating the goal of audit item 4. The state is a *fact* of
+   the config being scraped (the query is `sc.state='WA'`-scoped), so it is now passed explicitly,
+   and `--repair-flags` re-derives the flags for rows already stamped — needed because rules S and
+   King-cleared set `mailing_address` NULL, so those rows can never be re-selected as candidates.
+
+**Caught & fixed (Codex review, 5 findings — 4 adopted, 1 rejected):** stale `mailing_source`
+surviving a re-decision (jsonb `||` merges, it does not delete — the merge now drops the old
+provenance keys first); the K abort being a result-*shape* heuristic that could stall an all-absent
+batch for ever (now only an all-transport-failure batch aborts, and it exits **2** so it cannot
+stall silently); `--repair-flags` comparing 2 of 4 flags before skipping. Codex also independently
+flagged the `retry_later` head-pinning we had found in parallel — consensus, so it shipped.
+
+**Failed / Blocked — things that were NOT true.**
+- Codex raised a **[Critical]** that `compute_owner_flags` does not accept the structured-situs
+  kwargs. **False** — it does (#188 added them); Codex had only been given the script diff. Verified
+  in the file and by executing it against prod before rejecting.
+- Codex's stricter situs predicate (require `=` or a `,` delimiter) was **rejected on measurement**:
+  it drops **9 real candidates** whose stored situs is truncated (`'20508 ISLAND PKWY'` vs
+  `'20508 ISLAND PKWY E, LAKE TAPPS'`) — exactly the shape the audit exists to fix. Only the
+  provably equivalent `left()` form shipped (LIKE 20,277 / `left()` 20,277, 0 lost / 0 gained).
+  The `LIKE`-metacharacter risk it named is real but has **zero** live impact: 0 of 23,284
+  `property_address` values contain `%` or `_`.
+- **A false alarm we did not raise.** `alembic_version` reads back **0 rows** to the app role, which
+  looks like "migrations lost". It is not: RLS is ENABLED on that table with **zero policies** and
+  `bridgeleads_system` has no `BYPASSRLS`, so Postgres denies every row to it; the migration owner
+  (`postgres`) bypasses RLS and the row is there. Verified before saying anything.
+
+**Verified.** 67 tests, ruff clean. The unit tests only assert on SQL *strings*, which cannot catch
+a runtime SQL error — so every new statement was additionally executed **against the live
+production database inside a transaction that always rolls back**: `_CANDIDATES` (1,218 Pierce
+candidates), `_UPDATE`/`_STAMP` rowcount 1, the stale-address guard rowcount 0, `enrichment_data`
+still `json_typeof=object`, stale provenance dropped — then ROLLBACK, 0 stamps left behind,
+re-checked from a fresh session.
+
+**Production data applied.** `--repair-flags` on all **1,286** stamped rows: `property_state IS
+NULL` → **0**, 1,261 gained a real `out_of_state_owner=False`, and **7 genuinely out-of-state
+owners** became visible (Fort Mill SC, Greenville SC) — the very evidence that the owner-occupied
+assumption had been materially wrong. Dry-run first: **0 rows lost a known value.** Rule P re-run
+to terminal (1,184 confirmed + 34 `not_found`). **Rules S and P now return `candidates: 0`** —
+convergence proven on the live data, where before the fix Pierce would have returned 1,218 for ever.
+
+**Pending / Handoff.**
+- **King: 847 undecided rows** (≈29 paced runs ≈ 2h against a rate-limiting source) — deliberately
+  deferred by the user to a dedicated session. Do NOT raise the 3 s pace.
+- Phase 5 `scripts/backfill_property_situs_parts.py` still NOT run; 085 is deployed so it now can
+  be. Until then `property_city`/`property_zip` are 0-filled and `absentee_owner` stays None on
+  same-street rows.
+- 34 Pierce rows keep an unverifiable situs-copy mailing (parcel absent from the county layer).
+  That is the original approved design ("leave untouched"), not a new bug — but it is 34 rows still
+  carrying an assumption, so it is worth a policy look.
+
+**Facts learned.**
+- **Trust a handoff's narrative, verify its numbers.** "180/217 done" was 39 ids and 847 remaining.
+  The evidence files were sitting there the whole time.
+- **An idempotent-looking write is not progress.** A write that leaves the selection predicate still
+  true is an infinite loop with a commit in it.
+- **Assert on behaviour, not on SQL text.** String assertions pass on SQL that Postgres would reject.
+  Executing inside a rolled-back transaction is cheap and catches what tests cannot.
+- **Measure before adopting a guard — including a reviewer's.** The same discipline that saved 14.79%
+  of Snohomish rows saved 9 truncated-situs candidates here.
+
+---
+
 ## 2026-09-02 (later) — Audit follow-ups: the 30 fabricated mailing lines, a re-sweep, and an alert for the silent field
 
 **Built / Shipped:** #184 + #185 merged and deployed (`cf6e6fd`); the six Test 3 rows repaired

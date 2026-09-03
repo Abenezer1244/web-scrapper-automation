@@ -16,8 +16,8 @@ Nullable ADD COLUMN only (no rewrite, no lock beyond the catalog change).
 Revision ID: 085
 Revises: 084
 """
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 
 revision = "085"
 down_revision = "084"

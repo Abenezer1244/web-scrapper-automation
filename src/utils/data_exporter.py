@@ -18,13 +18,13 @@ import pandas as pd
 import requests as _requests
 
 from src.config import settings
-from src.utils.lead_signals import auction_reference_date
 from src.utils.lead_export import (
     LEAD_CSV_COLUMNS,
     _apply_visibility,
     build_lead_export_row,
     write_lead_csv,
 )
+from src.utils.lead_signals import auction_reference_date
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("exporter")

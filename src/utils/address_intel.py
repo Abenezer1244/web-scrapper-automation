@@ -145,16 +145,58 @@ def compose_situs(
     Migration 085 stores city/state/zip BESIDE the frozen street-only
     property_address; the comparator works on address strings, so rebuild the
     full line here. Parts are appended only when present — nothing is guessed.
+
+    CANONICAL, NOT APPEND-ONLY: `property_address` is street-only on the GIS path
+    but a FULL situs line on others — the King assessor's Site Address carries its
+    own trailing ZIP ("2019 SW 318TH PL 4C 98023"), and
+    scripts/backfill_property_situs_parts.py parses its parts straight out of the
+    line and hands that same line back here. Blind appending gave those a second
+    copy of their own tail ("… 4C 98023, 98023"), which pushed the ZIP into the
+    parsed STREET, so the street no longer matched the mailing street and
+    `absentee_owner` flipped False -> True on owner-occupied leads.
+
+    So: parse the line first, and let whatever it ALREADY carries win; the
+    structured parts only fill what is genuinely absent. Rebuilding from the
+    parsed street also fixes ordering (a supplied city can never land after a ZIP
+    the line already had) and makes a line/part CONFLICT resolve to the line's own
+    value rather than to an invented "…, WA 99999, TACOMA, WA 98402" — a conflict
+    is therefore NOT surfaced here; if that ever needs to read as "unknown" it
+    belongs in compute_owner_flags, not in a string builder (Codex).
+
+    Idempotent for migration-085-shaped input (a situs line + scalar city/state/zip);
+    that is the only way the one production caller uses it, and it is not a promise
+    about arbitrary strings — a part containing its own commas can still re-parse
+    differently on a second pass (Codex).
+
+    KNOWN PARSER EDGE (not introduced here, and not present in live data): a street
+    whose suffix is itself a 2-letter state code — "1407 KAYE WY 82901", WY as an
+    abbreviation of WAY — parses as state=WY and loses the suffix from `street`.
+    Same family as the NE directional collision already handled in
+    parse_property_for_display. Measured 2026-09-03: 0 of 23,284 production rows
+    parse to a non-WA state, and absentee is True both before and after this change,
+    so it is documented rather than guessed at.
     """
     if not property_address:
         return property_address
     line = property_address.strip()
-    if property_city:
-        line += f", {property_city.strip()}"
-    tail = " ".join(x.strip() for x in (property_state, property_zip) if x)
+    if not (property_city or property_state or property_zip):
+        return line
+    # parse_property_for_display only emits a VALIDATED state (real 2-letter code)
+    # and zip, so "98023 MAIN ST" yields no zip and "123 LAKE ST" no city — a bare
+    # substring test would have mistaken both.
+    have = parse_property_for_display(line)
+    street = (have["street"] or line).strip()
+    city = have["city"] or (property_city.strip() if property_city else None)
+    state = have["state"] or (property_state.strip() if property_state else None)
+    zipc = have["zip"] or (property_zip.strip() if property_zip else None)
+
+    out = street
+    if city:
+        out += f", {city}"
+    tail = " ".join(x for x in (state, zipc) if x)
     if tail:
-        line += f", {tail}"
-    return line
+        out += f", {tail}"
+    return out
 
 
 def compute_owner_flags(

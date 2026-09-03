@@ -126,3 +126,72 @@ class TestPendingRowPayload:
 
     def test_case_description_is_ineligible(self):
         assert build_pending_row_payload(_result(party_name="Weeds ? 1819 HARVARD AVE")) is None
+
+
+class TestStructuredSitusLocality:
+    """#188 stopped fabricating a mailing line out of the situs but nothing read
+    the structured columns it stores instead, so statewide-enriched rows reached
+    Tracerfy with city/state/zip all None and errored out (2026-09-03)."""
+
+    def test_situs_parts_supply_locality_when_address_is_street_only(self):
+        payload = build_pending_row_payload(_result(
+            property_address="9226 175TH STREET CT E",
+            mailing_address=None,
+            property_city="PUYALLUP", property_state="WA", property_zip="98375",
+        ))
+        assert payload is not None
+        assert payload["property_address"] == "9226 175TH STREET CT E"
+        assert (payload["city"], payload["state"], payload["zip"]) == (
+            "PUYALLUP", "WA", "98375")
+
+    def test_situs_parts_fill_independently(self):
+        # A parsed city with no state/zip must still gain the stored parts.
+        payload = build_pending_row_payload(_result(
+            property_address="123 MAIN ST, OLYMPIA",
+            mailing_address=None,
+            property_city=None, property_state="WA", property_zip="98501",
+        ))
+        assert payload["city"] == "OLYMPIA"
+        assert (payload["state"], payload["zip"]) == ("WA", "98501")
+
+    def test_parsed_address_wins_over_stored_parts(self):
+        # property_address is the authoritative line when it carries locality.
+        payload = build_pending_row_payload(_result(
+            property_address="123 MAIN ST, OLYMPIA, WA 98501",
+            mailing_address=None,
+            property_city="WRONGTOWN", property_state="OR", property_zip="99999",
+        ))
+        assert (payload["city"], payload["state"], payload["zip"]) == (
+            "OLYMPIA", "WA", "98501")
+
+    def test_blank_stored_parts_are_ignored(self):
+        payload = build_pending_row_payload(_result(
+            property_address="9226 175TH STREET CT E", mailing_address=None,
+            property_city="   ", property_state="", property_zip=None,
+        ))
+        assert payload["city"] is None and payload["state"] is None
+
+    def test_mailing_fallback_is_atomic_never_blended_with_situs(self):
+        """An absentee owner's mailing ZIP must never be pinned onto the
+        property's own city — that invents a locality that exists nowhere."""
+        payload = build_pending_row_payload(_result(
+            property_address="9226 175TH STREET CT E",
+            mailing_address="1 OTHER ST, SEATTLE, WA 98101",
+            property_city="PUYALLUP", property_state=None, property_zip=None,
+        ))
+        # City came from the situs, so the Seattle mailing line contributes
+        # NOTHING to the property locality.
+        assert payload["city"] == "PUYALLUP"
+        assert payload["zip"] is None
+        # ...but it is still sent as the owner's mailing address.
+        assert payload["mail_city"] == "SEATTLE"
+        assert payload["mail_zip"] == "98101"
+
+    def test_mailing_still_used_when_there_is_no_situs_at_all(self):
+        payload = build_pending_row_payload(_result(
+            property_address="9226 175TH STREET CT E",
+            mailing_address="9226 175TH STREET CT E, PUYALLUP, WA 98375",
+            property_city=None, property_state=None, property_zip=None,
+        ))
+        assert (payload["city"], payload["state"], payload["zip"]) == (
+            "PUYALLUP", "WA", "98375")

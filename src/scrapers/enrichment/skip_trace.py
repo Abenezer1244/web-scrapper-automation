@@ -727,14 +727,47 @@ def build_pending_row_payload(result) -> dict | None:
     # Many of our scrapers concatenate "STREET, CITY, ST ZIP" in one field.
     parsed = _parse_full_address(result.property_address)
 
-    # If property_address only has the street (no city/state), fall back
-    # to mailing_address which often has the full "STREET, CITY, ST ZIP".
-    # Pierce County GIS returns property_address as street-only and
-    # mailing_address as the full format — without this fallback, every
-    # skip trace row gets city=None/state=None and errors in Tracerfy.
-    # The owner's mailing address is a separate Tracerfy input (mail_* columns)
-    # that improves normal-trace matching when the owner does not live at the
-    # property. Parse it once; reuse it for the locality fallback below.
+    # property_address is street-only from several sources (Pierce county GIS,
+    # the WA statewide layer, the King assessor), so the locality has to come
+    # from somewhere else or Tracerfy errors the row out. Two fallbacks, in
+    # descending order of truth:
+    #
+    #   1. The STRUCTURED SITUS parts (migration 085): property_city /
+    #      property_state / property_zip describe the PROPERTY itself, which is
+    #      exactly what Tracerfy keys on. Before #188 the statewide layer faked
+    #      a mailing address out of the situs and this fell out of fallback 2 by
+    #      accident; #188 correctly stopped fabricating that mailing line but
+    #      nothing read the new columns, so statewide-enriched rows reached
+    #      Tracerfy with city/state/zip all None (Codex, 2026-09-03).
+    #   2. The owner's mailing_address — only a proxy for where the property is
+    #      (it is right for owner-occupied, wrong for absentee), so it is the
+    #      last resort, not the first.
+    #
+    # Each field is filled INDEPENDENTLY: a row can carry a parsed city but no
+    # state/zip, and gating the whole block on a missing city would strand them
+    # (Codex). No default state — "WA" is real source context that _situs_parts
+    # stores for the WA layer, not an assumption skip trace may invent.
+    for _field, _stored in (
+        ("city", getattr(result, "property_city", None)),
+        ("state", getattr(result, "property_state", None)),
+        ("zip", getattr(result, "property_zip", None)),
+    ):
+        if not parsed[_field] and _stored:
+            parsed[_field] = str(_stored).strip() or None
+
+    # The owner's mailing address is also a separate Tracerfy input (mail_*
+    # columns) that improves normal-trace matching when the owner does not live
+    # at the property. Parse it once; reuse it for the locality fallback.
+    #
+    # This fallback stays ATOMIC — all three fields from the mailing parse, or
+    # none — unlike the situs fill above. The situs parts describe the same
+    # property as property_address, so blending them per-field is coherent; the
+    # mailing address is a DIFFERENT place whenever the owner is absentee.
+    # Taking a city from the situs and a ZIP from the mailing line would invent
+    # a locality that exists nowhere ("OLYMPIA WA 98101" for a Seattle-mailed
+    # Olympia property) — the same fabricate-an-address class of bug #188 was
+    # fixing. Only when we still have NO city at all is the owner's mail worth
+    # guessing from, and then it is used whole.
     mail_parsed = _parse_full_address(result.mailing_address) if result.mailing_address else None
     if not parsed["city"] and mail_parsed and mail_parsed["city"]:
         parsed["city"] = mail_parsed["city"]

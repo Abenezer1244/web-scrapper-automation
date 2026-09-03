@@ -1274,14 +1274,14 @@ def run_scrape_job(self, job_id: str) -> None:
                     # pass would renumber the survivors and mark a second batch,
                     # shrinking the delivered set every time.
                     db.execute(
-                        sa_text("UPDATE results SET enrichment_data = (COALESCE(enrichment_data, '{}')::jsonb - :key)::json WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) AND enrichment_data->>:key = :reason"),
+                        sa_text("UPDATE results SET enrichment_data = (CASE WHEN jsonb_typeof(COALESCE(enrichment_data, '{}')::jsonb) = 'object' THEN COALESCE(enrichment_data, '{}')::jsonb ELSE '{}'::jsonb END - :key)::json WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) AND enrichment_data->>:key = :reason"),
                         {"jid": job_id, "uid": str(job.user_id),
                          "key": DELIVERY_EXCLUDED_KEY, "reason": OVER_QUOTA},
                     )
                     _capped_ids = [
                         str(_row[0]) for _row in db.execute(
                             sa_text(
-                                "WITH ranked AS (  SELECT id, row_number() OVER (    ORDER BY party_name, date_recorded, id  ) AS rn  FROM results  WHERE job_id = :jid AND user_id = CAST(:uid AS uuid)    AND is_duplicate = false    AND {addr_rule}) UPDATE results r SET enrichment_data =   (COALESCE(r.enrichment_data, '{{}}')::jsonb    || jsonb_build_object(:key, :reason))::json FROM ranked WHERE r.id = ranked.id AND ranked.rn > :remaining RETURNING r.id".format(
+                                "WITH ranked AS (  SELECT id, row_number() OVER (    ORDER BY party_name, date_recorded, id  ) AS rn  FROM results  WHERE job_id = :jid AND user_id = CAST(:uid AS uuid)    AND is_duplicate = false    AND {addr_rule}) UPDATE results r SET enrichment_data =   (CASE WHEN jsonb_typeof(COALESCE(r.enrichment_data, '{{}}')::jsonb) = 'object' THEN COALESCE(r.enrichment_data, '{{}}')::jsonb ELSE '{{}}'::jsonb END    || jsonb_build_object(:key, :reason))::json FROM ranked WHERE r.id = ranked.id AND ranked.rn > :remaining RETURNING r.id".format(
                                     addr_rule=address_actionable_sql("results")
                                 )
                             ),
@@ -1297,8 +1297,8 @@ def run_scrape_job(self, job_id: str) -> None:
                         # unreachable — the same invariant the re-export failure
                         # path protects.
                         db.execute(
-                            sa_text('DELETE FROM delivered_records WHERE user_id = CAST(:uid AS uuid) AND dedup_hash IN (  SELECT dedup_hash FROM results   WHERE id = ANY(CAST(:ids AS uuid[]))     AND user_id = CAST(:uid AS uuid)     AND dedup_hash IS NOT NULL)'),
-                            {"uid": str(job.user_id), "ids": _capped_ids},
+                            sa_text('DELETE FROM delivered_records dr USING results r WHERE dr.user_id = CAST(:uid AS uuid)   AND dr.first_job_id = :jid   AND dr.dedup_hash = r.dedup_hash   AND r.id = ANY(CAST(:ids AS uuid[]))   AND r.user_id = CAST(:uid AS uuid)   AND r.dedup_hash IS NOT NULL'),
+                            {"uid": str(job.user_id), "jid": job_id, "ids": _capped_ids},
                         )
                     db.commit()
                 except Exception as exc:
@@ -1352,13 +1352,27 @@ def run_scrape_job(self, job_id: str) -> None:
                     "Job %s: plan cap excluded %d actionable rows (remaining=%d)",
                     job_id, len(_capped_ids), _remaining,
                 )
-                # The marks changed what is deliverable — reload so the re-export
-                # and the membership upsert below see the capped set.
-                refreshed = db.execute(
-                    select(Result)
-                    .where(Result.job_id == job_id, Result.user_id == job.user_id)
-                    .order_by(Result.party_name, Result.date_recorded, Result.id)
-                ).scalars().all()
+            # Reload whenever the cap RAN — after the mark AND after the clear.
+            #
+            # populate_existing is load-bearing, not defensive: the sessions are
+            # built with expire_on_commit=False (src/db/session.py), and these
+            # Result identities were already loaded by the post-enrichment refetch
+            # above. A plain re-SELECT returns those SAME objects with their STALE
+            # enrichment_data, so `is_actionable(res)` at export time would miss
+            # the marker the raw SQL just wrote — the export would ship over-quota
+            # rows while billing (which reads the DB) charged for fewer. That is
+            # exactly the file/bill disagreement this cap exists to prevent, and
+            # no test caught it because nothing exercises the worker cap
+            # end-to-end (Codex, 2026-09-03).
+            #
+            # The clear path needs it too: with no rows newly marked, stale
+            # objects could still carry a PREVIOUS run's marker and under-export.
+            refreshed = db.execute(
+                select(Result)
+                .where(Result.job_id == job_id, Result.user_id == job.user_id)
+                .order_by(Result.party_name, Result.date_recorded, Result.id)
+                .execution_options(populate_existing=True)
+            ).scalars().all()
 
         # Re-export CSV with enriched data — only if the refetch succeeded.
         if refreshed is not None:

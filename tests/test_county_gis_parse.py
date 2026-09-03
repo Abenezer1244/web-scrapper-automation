@@ -191,6 +191,24 @@ class TestFallbackOrder:
         assert "name" not in calls
         assert calls == ["county_parcel", "statewide_parcel"]
 
+    def test_non_wa_keeps_its_only_fallback_even_with_a_parcel(self, monkeypatch):
+        """Outside WA there is NO statewide exact service, so the county parcel
+        miss leaves the name search as the last resort. Banning it globally
+        would silently kill enrichment for every non-WA gis_endpoint config
+        whose parcel id is merely stale or mis-parsed (Codex)."""
+        calls = []
+        cg = self._patch(monkeypatch, calls)
+        # Non-WA counties get their config from county_connectors.gis_endpoint,
+        # which _make_generic_config turns into a config WITH an owner_field.
+        out = cg.enrich_parcel_gis(
+            parcel_id="R123456", county="ada", state="ID", owner_name="O'BRIEN JOHN",
+            gis_endpoint="https://example.invalid/arcgis/rest/services/x/FeatureServer/0/query",
+        )
+        assert out["property_address"] == "999 WRONG ST"
+        assert "name" in calls
+        # No WA statewide service exists for Idaho, so it is never consulted.
+        assert "statewide_parcel" not in calls
+
     def test_name_search_still_runs_when_there_is_no_parcel(self, monkeypatch):
         calls = []
         cg = self._patch(monkeypatch, calls)

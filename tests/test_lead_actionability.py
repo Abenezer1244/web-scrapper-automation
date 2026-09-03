@@ -11,8 +11,11 @@ import pytest
 
 from src.api.lead_actionability import (
     ADDRESS_PLACEHOLDER,
+    DELIVERY_EXCLUDED_KEY,
+    OVER_QUOTA,
     actionable_condition,
     actionable_sql,
+    address_actionable_sql,
     is_actionable,
 )
 
@@ -83,3 +86,51 @@ def test_orm_condition_compiles_to_the_same_rule():
     assert "results.mailing_address IS NOT NULL" in compiled
     assert ADDRESS_PLACEHOLDER in compiled
     assert " OR " in compiled
+
+
+class TestQuotaExclusion:
+    """The plan cap marks rows past the quota in enrichment_data. The standing
+    rule must then hide them from display, export, counting AND billing at once,
+    so those four can never disagree (Codex ruling, 2026-09-03)."""
+
+    def _row(self, **kw):
+        base = {"property_address": "123 MAIN ST, TACOMA, WA 98401",
+                "mailing_address": None, "enrichment_data": None}
+        base.update(kw)
+        return base
+
+    def test_marked_row_is_not_actionable_despite_a_real_address(self):
+        row = self._row(enrichment_data={DELIVERY_EXCLUDED_KEY: OVER_QUOTA})
+        assert is_actionable(row) is False
+        assert is_actionable(SimpleNamespace(**row)) is False
+
+    def test_unmarked_row_with_other_enrichment_keys_is_unaffected(self):
+        row = self._row(enrichment_data={"assessed_value": 400000,
+                                         "lead_subtype": "probate"})
+        assert is_actionable(row) is True
+
+    def test_a_different_exclusion_reason_does_not_quarantine(self):
+        # Only the quota reason is a delivery exclusion today; an unknown value
+        # must not silently start hiding rows.
+        row = self._row(enrichment_data={DELIVERY_EXCLUDED_KEY: "something_else"})
+        assert is_actionable(row) is True
+
+    def test_null_enrichment_data_is_actionable(self):
+        assert is_actionable(self._row(enrichment_data=None)) is True
+
+    def test_marked_row_with_no_address_stays_unactionable(self):
+        row = self._row(property_address=None,
+                        enrichment_data={DELIVERY_EXCLUDED_KEY: OVER_QUOTA})
+        assert is_actionable(row) is False
+
+    def test_sql_twin_carries_the_exclusion_clause(self):
+        sql = actionable_sql("r")
+        assert DELIVERY_EXCLUDED_KEY in sql and OVER_QUOTA in sql
+        assert "enrichment_data" in sql
+
+    def test_address_only_rule_deliberately_ignores_the_marker(self):
+        # The cap RANKS with this one; using the full rule would drop rows this
+        # job already marked, so a re-run would renumber and mark a second batch.
+        addr = address_actionable_sql("results")
+        assert DELIVERY_EXCLUDED_KEY not in addr
+        assert "property_address" in addr and "mailing_address" in addr

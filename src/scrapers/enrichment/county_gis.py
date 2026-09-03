@@ -134,11 +134,25 @@ def enrich_parcel_gis(
         if result.get("property_address"):
             return result
 
-    # Fallback: search by owner name — ONLY when there is no parcel id to match
-    # on (e.g. Tyler SelfService records that carry names but no parcel). With a
-    # parcel_id in hand, every exact lookup above has already been tried and a
-    # surname guess is not an acceptable substitute for them.
-    if gis_config and owner_name and not parcel_id and gis_config.get("owner_field"):
+    # Fallback: search by owner name. Skipped when a parcel id is in hand AND an
+    # exact statewide lookup already had its chance at it — today that means WA,
+    # whose Current_Parcels layer covers all 39 counties. There, a surname guess
+    # is never an acceptable substitute for the exact APN paths above.
+    #
+    # Deliberately NOT a blanket `not parcel_id`: outside WA there is no
+    # statewide exact service, so a county parcel miss leaves this as the ONLY
+    # remaining fallback, and banning it globally would silently kill enrichment
+    # for every non-WA gis_endpoint config whose parcel id is merely stale or
+    # mis-parsed. Narrowing the ban to the states that HAVE an exact fallback
+    # removes the wrong-property hazard without creating a dead path (Codex).
+    _has_exact_statewide_fallback = state.upper() == "WA"
+    _name_search_preempts_exact = bool(parcel_id) and _has_exact_statewide_fallback
+    if (
+        gis_config
+        and owner_name
+        and not _name_search_preempts_exact
+        and gis_config.get("owner_field")
+    ):
         result = _query_gis_by_name(owner_name, gis_config, county_key)
         if result.get("property_address"):
             _logger.info("GIS name-based fallback succeeded for %s", owner_name)

@@ -13,7 +13,13 @@ from datetime import datetime
 from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
 
-from src.api.lead_actionability import actionable_sql, is_actionable
+from src.api.lead_actionability import (
+    DELIVERY_EXCLUDED_KEY,
+    OVER_QUOTA,
+    actionable_sql,
+    address_actionable_sql,
+    is_actionable,
+)
 from src.config.constants import (
     PRIORITY_QUEUE_PLANS,
     SCRAPE_TRANSIENT_BACKOFF_SECONDS,
@@ -651,15 +657,15 @@ def run_scrape_job(self, job_id: str) -> None:
                     db=db,
                 )
 
-        # ── Cap records to user's remaining plan quota ────────────────────────
-        if user.records_limit != -1:
-            remaining = max(0, user.records_limit - (user.records_used or 0))
-            if remaining < len(records):
-                _publish_log(
-                    r, job_id, "warning",
-                    f"Plan limit: saving {remaining} of {len(records)} records. Upgrade for more.",
-                    db=db)
-                records = records[:remaining]
+        # ── Plan quota ────────────────────────────────────────────────────────
+        # NOT capped here. A row's actionability is unknowable at this point: the
+        # counties whose addresses arrive during inline enrichment (King probate,
+        # the generic GIS sweep) look addressless until then. Slicing the RAW list
+        # to the quota could therefore save a fully-quarantined prefix, bill ~0,
+        # and silently discard real leads the user still had quota for. The cap is
+        # applied after enrichment instead, against the same actionable set that
+        # display, export and billing use — see "APPLY THE PLAN CAP" below
+        # (Codex ruling, 2026-09-03).
 
         # ── ENRICHING ─────────────────────────────────────────────────────────
         # CAS no-op here means a batch force-finalize cancelled this child while
@@ -1243,6 +1249,116 @@ def run_scrape_job(self, job_id: str) -> None:
             except Exception as exc:
                 db.rollback()
                 _logger.warning("Job %s: owner-flag recompute failed: %s", job_id, str(exc)[:120])
+
+        # ── APPLY THE PLAN CAP (after enrichment, before delivery) ───────────
+        # Every scraped row was persisted and enriched, so actionability is now
+        # known. Mark everything past the user's remaining quota as excluded:
+        # lead_actionability then hides those rows from display, export, counting
+        # AND billing at once, so the four can never disagree.
+        #
+        # A finite-quota user whose refetch FAILED cannot be capped safely (we
+        # cannot tell which rows are actionable), and delivering an uncapped
+        # export would over-deliver. Fail before billing rather than guess —
+        # same rule as the enriched re-export below.
+        _capped_ids: list[str] = []
+        if user.records_limit != -1:
+            _cap_error: Exception | None = None
+            if refreshed is None:
+                _cap_error = RuntimeError("post-enrichment refetch failed")
+            else:
+                try:
+                    db.refresh(user)  # a concurrent job may have consumed quota
+                    _remaining = max(0, user.records_limit - (user.records_used or 0))
+                    # Clear this job's previous marks first: on a watchdog re-run
+                    # the ranking must start from the FULL actionable set, or each
+                    # pass would renumber the survivors and mark a second batch,
+                    # shrinking the delivered set every time.
+                    db.execute(
+                        sa_text("UPDATE results SET enrichment_data = (COALESCE(enrichment_data, '{}')::jsonb - :key)::json WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) AND enrichment_data->>:key = :reason"),
+                        {"jid": job_id, "uid": str(job.user_id),
+                         "key": DELIVERY_EXCLUDED_KEY, "reason": OVER_QUOTA},
+                    )
+                    _capped_ids = [
+                        str(_row[0]) for _row in db.execute(
+                            sa_text(
+                                "WITH ranked AS (  SELECT id, row_number() OVER (    ORDER BY party_name, date_recorded, id  ) AS rn  FROM results  WHERE job_id = :jid AND user_id = CAST(:uid AS uuid)    AND is_duplicate = false    AND {addr_rule}) UPDATE results r SET enrichment_data =   (COALESCE(r.enrichment_data, '{{}}')::jsonb    || jsonb_build_object(:key, :reason))::json FROM ranked WHERE r.id = ranked.id AND ranked.rn > :remaining RETURNING r.id".format(
+                                    addr_rule=address_actionable_sql("results")
+                                )
+                            ),
+                            {"jid": job_id, "uid": str(job.user_id),
+                             "key": DELIVERY_EXCLUDED_KEY, "reason": OVER_QUOTA,
+                             "remaining": _remaining},
+                        ).fetchall()
+                    ]
+                    if _capped_ids:
+                        # Release the dedup claims of rows we are NOT delivering,
+                        # so a later run (or next month's quota) can still deliver
+                        # them. Keeping the claim would make the lead permanently
+                        # unreachable — the same invariant the re-export failure
+                        # path protects.
+                        db.execute(
+                            sa_text('DELETE FROM delivered_records WHERE user_id = CAST(:uid AS uuid) AND dedup_hash IN (  SELECT dedup_hash FROM results   WHERE id = ANY(CAST(:ids AS uuid[]))     AND user_id = CAST(:uid AS uuid)     AND dedup_hash IS NOT NULL)'),
+                            {"uid": str(job.user_id), "ids": _capped_ids},
+                        )
+                    db.commit()
+                except Exception as exc:
+                    db.rollback()
+                    _cap_error = exc
+
+            if _cap_error is not None:
+                _logger.error(
+                    "Job %s: plan cap failed — failing job before billing: %s",
+                    job_id, str(_cap_error)[:200],
+                )
+                try:
+                    db.rollback()
+                    db.execute(
+                        sa_text(
+                            "DELETE FROM delivered_records "
+                            "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
+                        ),
+                        {"jid": job_id, "uid": str(job.user_id)},
+                    )
+                    db.commit()
+                except Exception as cleanup_exc:
+                    db.rollback()
+                    _logger.error(
+                        "Job %s: failed to release dedup claims after cap failure: %s",
+                        job_id, str(cleanup_exc)[:200],
+                    )
+                reason = (
+                    'The lead list could not be re-read after enrichment, so your plan quota could not be applied — no file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.' if refreshed is None else 'Your plan quota could not be applied to this run — no file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.'
+                )
+                if _fail_job(db, job, r, job_id, reason):
+                    from src.workers.notification_emit import create_notification
+                    create_notification(
+                        user_id=job.user_id, type="job_failed", job_id=job_id,
+                        detail={
+                            "scraper_name": getattr(config, "name", None),
+                            "county": getattr(config, "county", None),
+                            "error_summary": reason[:200],
+                        },
+                    )
+                return
+
+            if _capped_ids:
+                _publish_log(
+                    r, job_id, "warning",
+                    f"Plan limit: delivering {_remaining} of "
+                    f"{_remaining + len(_capped_ids)} leads. Upgrade for more.",
+                    db=db,
+                )
+                _logger.info(
+                    "Job %s: plan cap excluded %d actionable rows (remaining=%d)",
+                    job_id, len(_capped_ids), _remaining,
+                )
+                # The marks changed what is deliverable — reload so the re-export
+                # and the membership upsert below see the capped set.
+                refreshed = db.execute(
+                    select(Result)
+                    .where(Result.job_id == job_id, Result.user_id == job.user_id)
+                    .order_by(Result.party_name, Result.date_recorded, Result.id)
+                ).scalars().all()
 
         # Re-export CSV with enriched data — only if the refetch succeeded.
         if refreshed is not None:

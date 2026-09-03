@@ -499,6 +499,39 @@
             ],
             "title": "Property Address"
           },
+          "property_city": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Property City"
+          },
+          "property_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Property State"
+          },
+          "property_zip": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Property Zip"
+          },
           "source_counties": {
             "items": {
               "type": "string"
@@ -2597,6 +2630,17 @@
             ],
             "title": "Property Address"
           },
+          "property_city": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Property City"
+          },
           "property_state": {
             "anyOf": [
               {
@@ -2607,6 +2651,17 @@
               }
             ],
             "title": "Property State"
+          },
+          "property_zip": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Property Zip"
           },
           "skip_trace_attempted_at": {
             "anyOf": [
@@ -3425,6 +3480,39 @@
               }
             ],
             "title": "Property Address"
+          },
+          "property_city": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Property City"
+          },
+          "property_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Property State"
+          },
+          "property_zip": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Property Zip"
           },
           "state": {
             "anyOf": [

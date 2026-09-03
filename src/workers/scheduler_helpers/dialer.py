@@ -214,6 +214,13 @@ def _dialer_push_sweep_impl() -> None:
                             "email": row.email,
                             "property_address": row.property_address,
                             "mailing_address": row.mailing_address,
+                            # Migration 085: connectors need the property's own
+                            # city/ZIP — property_address is street-only for
+                            # GIS/assessor-enriched rows, and a dialer pushing a
+                            # bare street has no idea which town it is in.
+                            "property_city": row.property_city,
+                            "property_state": row.property_state,
+                            "property_zip": row.property_zip,
                         }
                         for row in rows
                     ]

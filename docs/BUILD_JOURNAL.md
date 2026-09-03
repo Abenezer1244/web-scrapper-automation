@@ -19,6 +19,77 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-03 (later) — The Codex gate came back NO-GO, and it was right about all four
+
+**Built / Shipped:** three P1 fixes on `fix/test1-lead-data-quality` (`a5ffbfd`, `65c7557`, `4965b1e`)
+after the Codex adversarial review of PR #191 returned **4 P1 + 2 P2 + 1 P3**. Every finding was
+re-verified in the code before being believed; all four P1s were real.
+
+**Caught & fixed:**
+
+1. **The quarantine had a hole in its own rule.** `enrichment/parcel.py`'s failure return writes
+   `"(enrichment unavailable)"` into **both** address columns, but `lead_actionability` excluded it
+   only on the property branch. A row whose enrichment failed completely passed through the mailing
+   side and was listed, exported, counted **and billed** with no address anywhere — the precise
+   outcome the quarantine exists to prevent. 🔑 **The test helper had baked in the same bug**: its
+   `_sql_eval` twin omitted the placeholder check on the mailing side and `CASES` never contained
+   `(None, PLACEHOLDER)`, so a fully green suite proved nothing about that path. A rule with three
+   spellings needs a test matrix that crosses BOTH inputs, not one that mirrors the implementation.
+
+2. **The previous session's quote fix would have caused wrong-property enrichment.**
+   `enrich_parcel_gis` ran the fuzzy owner-name search (first token, `resultRecordCount=1`) BEFORE
+   the exact WA statewide parcel lookup. That ordering was harmless only *because* the predicate was
+   broken: an apostrophe surname produced malformed SQL, ArcGIS errored, the bare `except` swallowed
+   it, and control fell through to the correct exact lookup. 🛑 **Escaping the predicate without
+   fixing the order would have converted "no enrichment" into "confidently wrong address on a
+   lead"** — a net downgrade shipped as a fix. Exact identifier now beats fuzzy name, and the name
+   search only runs when there is no parcel id at all.
+
+3. **The situs-first locality change silently re-bills Tracerfy.** `address_cache_key` hashes
+   (user_id, street, city, state), so moving where the locality comes from moves the KEY, and a
+   missed key is not a cache miss — it is buying the same address twice. 🛑 **I had argued the
+   opposite to the user**: that the fix restored the pre-#188 key. True for statewide rows (the
+   fabricated mailing city WAS the situs city), false for **absentee owners**, where the old key used
+   the owner's city (SEATTLE) and the new one uses the property's (PUYALLUP). Codex was right.
+   Resolution: keep the new precedence (Tracerfy traces by property address, so the old pairing was
+   simply a wrong address) and add a read-only legacy-key lookup at enqueue.
+   `legacy_cache_locality()` sits beside `build_pending_row_payload` and uses the same parser so the
+   two spellings cannot drift.
+
+**Tried / Decided — what was deliberately NOT fixed:**
+
+- **Plan cap vs actionable billing (P1).** `records = records[:remaining]` slices RAW rows before
+  enrichment while billing counts persisted ACTIONABLE non-duplicates, so a user near quota whose
+  first rows are addressless saves a quarantined prefix, is billed ~0, and loses real leads past the
+  slice. Real, and this branch's quarantine created the divergence. **Not fixed here**: the
+  root-cause fix moves a cap inside a billing path, Codex exhausted its quota before ruling on the
+  four options put to it, and shipping an unreviewed heuristic into billing is how incidents happen.
+  Flagged rather than guessed.
+- **Concurrent `records_used` overrun (P1).** Verified byte-identical on `origin/main` — the
+  unlocked `remaining` read and the predicate-less UPDATE both predate this branch. Pre-existing,
+  own PR.
+- **Structured situs missing from `ResultRow`/`BatchLeadRow`/`SegmentLeadRow` and from the
+  dialer/PhoneBurner payload (P2)**, and **job search not covering property_city/zip (P3)** —
+  pre-existing #188 gaps; this branch fixed only the CSV.
+
+**Failed / Blocked:** Codex hit its ChatGPT usage limit twice (the deep review alone burned ~8M
+tokens), and `codex exec` dies with "Reading additional input from stdin..." on long runs even with
+`< /dev/null`. Its verdicts on A/B/C were recovered from the streamed reasoning traces before the
+process exited; the D/E verdicts were never obtained.
+
+**Facts learned:**
+- 🔑 **A green suite is not evidence when the test mirrors the implementation.** Both the
+  actionability hole and its test helper encoded the same asymmetry. Cross the inputs.
+- 🔑 **A security/correctness fix can activate a dormant bug behind it.** The quote escaping was
+  correct in isolation and harmful in situ. Ask what the broken thing was accidentally protecting.
+- 🔑 **Changing where a value comes from changes every hash it feeds.** Grep for the field in key
+  builders before changing its provenance.
+
+**Pending / Handoff:** PR #191 is NO-GO until Codex clears the plan-cap item (quota resets 06:49).
+👤 Tracerfy top-up and the `county_records` purge remain the owner's.
+
+---
+
 ## 2026-09-03 — Merging Test 1 into a moved main: #188 landed mid-session and took three regressions with it
 
 **Built / Shipped:** merged `origin/main` into `fix/test1-lead-data-quality` (merge commit `40f0e3b`)

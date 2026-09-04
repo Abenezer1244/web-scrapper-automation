@@ -51,34 +51,105 @@ Pierce + Snohomish but never King.
 - **RC3 (bug).** The crawler reads only the single "current issue" PDF; a missed or
   failed week is lost permanently. 4 weeks lost since 2026-08-06; 22 of 36 archive
   notices were never cached. The archive *is* reachable by constructed URL for King
-  (18/18) — but **not** for Snohomish (3 of 4 probes 404).
+  (18/18). *(Snohomish too — my initial 3-of-4 404s were a wrong filename guess; the
+  paper uses "Legals - M-D-YY.pdf" for the back catalogue and "Legals M-D-YY.pdf" from
+  September, and the shipped backfill script already knew the first.)*
 - **RC4 (bug, highest severity).** 12/14 cached King rows have a wrong `ts_number` and
   2 have a wrong `auction_date`, suppressing a live 2026-09-18 King auction.
 - **RC5 (bug, separate path).** Batch/segment/overlap CSVs silently drop both fields.
 
 ## Plan
 
-- [ ] 1. `nts_crawler`: bounded weekly-archive sweep for papers with a deterministic
-      issue-URL template (King only — Snohomish's naming is not derivable), tolerating
-      404s, idempotent via the existing `(source, ts_number)` upsert. Recovers lost
-      weeks and self-heals future misses.
-- [ ] 2. `repair_nts_ts_number.py`: also correct `auction_date` / `principal_owing`
+- [x] 1. `nts_crawler`: bounded weekly-archive sweep, tolerating 404s, idempotent via
+      the existing `(source, ts_number)` upsert. Recovers lost weeks and self-heals
+      future misses. *(Revised during implementation: PR #200 already shipped
+      `scripts/backfill_nts_pdf_archive.py` with filename builders for BOTH papers — it
+      was simply never run. So the sweep reuses that map rather than a King-only template
+      of my own, and covers Snohomish too. My earlier "Snohomish's naming is not
+      derivable" was wrong: my probe guessed the wrong spelling, and the paper uses two.)*
+- [x] 2. `repair_nts_ts_number.py`: also correct `auction_date` / `principal_owing`
       from the re-parsed truth (today it only rewrites `ts_number`), so RC4's wrong
       dates are fixed, not just the keys.
-- [ ] 3. `lead_export.py`: include `auction_date` / `default_amount` in the
+- [x] 3. `lead_export.py`: include `auction_date` / `default_amount` in the
       overlap/batch/segment column set (RC5).
-- [ ] 4. Regression tests keyed on source structure, not on Test 8 values.
-- [ ] 5. Full pytest + lint; Codex diff review; browser re-verify.
+- [x] 4. Regression tests keyed on source structure, not on Test 8 values.
+- [x] 5. Full pytest + lint; Codex diff review; browser re-verify.
 
 ## Explicitly NOT doing
 
 - No fabricated or inferred auction dates. No mapping of `date_recorded` (a recording
   date) onto Auction Date.
 - No Test 8-specific hardcoding.
-- Not building recorded-document ingestion: LandmarkWeb is reCAPTCHA-gated, the
-  2Captcha key is dead, King has IP-rate-blocked us before, and document images are
-  likely paid. Reported as a product decision, not attempted here.
+- Not building recorded-document ingestion. *(Scoped 2026-09-04 — see the addendum in
+  `docs/scoping-king-nts-coverage-2026-09-03.md`. The reason is NOT cost: unofficial
+  images are free, and only certified copies are paid. King County LandmarkWeb's terms
+  prohibit "high-volume, automated" access and "Data Mining (mass downloading) of
+  images" outright, and King has already IP-rate-blocked this project once. The
+  reCAPTCHA/dead-2Captcha-key issues compound it but are not the decisive blocker.)*
 
 ## Review
 
-_(filled in at the end)_
+**PR #209** (`fix/test8-data-quality`), CI green, **merge blocked by the auto-mode
+classifier — awaiting the user**. FE needed no change: `origin/master` already renders a
+past sale as a muted "N days ago" (my first read was of a stale working tree).
+
+### Verdict on Test 8
+
+Test 8 **passes** the data-quality audit. Party names, parcel IDs, property addresses and
+mailing addresses are real, correctly associated, and match the recorder's index (153/155
+carry a property address; 155/155 a mailing address). Phone/email are empty because
+skip-trace was still queued, not because of a defect. Auction Date and Default Owed are
+legitimately NULL on 154 rows and were recoverable on exactly 1.
+
+### Auction Date and Default Owed: ONE defect, not two
+
+Both are written by a single `UPDATE` in `_write_match` from a single matched notice
+(prod-wide: auction-only 1, owed-only 0, both 200). No match ever occurred on Test 8, so
+both were NULL together. Not two independent bugs, and not an API, serialization,
+timezone, or frontend problem — all of those were checked and cleared.
+
+### Source vs BridgeLeads
+
+- **A — source had it, we lost it: 1/155.** `KIM MYONG HEE`, parcel `1112630120`; notice
+  `WA09000059-24-1`, auction 2026-08-07, $397,621.29, cached since 2026-07-30.
+- **B — source genuinely lacks it: 154/155.** Left NULL. Nothing inferred from
+  `date_recorded`.
+- The recorded document *does* contain both by RCW 61.24.040(1)(f), but King's own terms
+  prohibit the bulk automated access that would take (see the 2026-09-04 addendum in
+  `docs/scoping-king-nts-coverage-2026-09-03.md`).
+
+### Fixed
+
+1. Weekly-archive self-heal in the beat (both Pacific Publishing papers), with the URL
+   map extracted to `src/scrapers/sources/nts_pdf_archive.py` and shared with the
+   operator backfill — which had drifted and could no longer reach Snohomish's September
+   filenames.
+2. `repair_nts_ts_number.py --fields` and `--retire-wrong-key`; `--results` parcel join
+   normalized (it had been skipping King's rows outright).
+3. `auction_date` / `days_to_auction` / `default_amount` restored to the batch/segment CSV.
+4. Historical-sale matching pass, live-wins, newer-past-wins.
+
+### Codex
+
+Five findings, all reproduced against the code and fixed: a cross-county rewrite risk I
+introduced by normalizing the parcel join; a fresher past sale unable to correct an older
+one across a capped catch-up; archive recoveries masking the barren alert; `--fields` not
+deploy-gated; and the sweep missing Snohomish's slipped-day issues.
+
+### Still to do (needs the user)
+
+- Merge + deploy #209.
+- Then run, in this order:
+  `backfill_nts_pdf_archive.py --source queen_anne_news --apply`, then
+  `repair_nts_ts_number.py --source queen_anne_news --retire-wrong-key --fields --results
+  --i-confirm-fixed-parser-is-deployed --apply` (dry run: 8 rows).
+- Snohomish `--fields` also has 1 legitimate correction pending (a NULL `principal_owing`
+  the current parser now reads as 350,661.98).
+
+### Unverified
+
+- Why the King crawl stopped ingesting after 2026-08-06 was never pinned to a specific
+  failure — log retention did not reach back, and the code path works when run today. The
+  archive sweep makes the cause moot rather than answering it.
+- Whether LandmarkWeb serves text-layer or image-only PDFs.
+- 7+ of King's 22 approved legal newspapers were never checked for robots.txt/ToS.

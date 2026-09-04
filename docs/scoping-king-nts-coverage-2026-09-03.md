@@ -177,7 +177,7 @@ stays sparse by design, and the product should say so rather than imply missing 
 
 ---
 
-# Addendum 2026-09-04 (2): the newspaper list is CLOSED — no clean route exists
+# Addendum 2026-09-04 (2): the newspaper list is exhausted — no usable route found
 
 **Status:** all 22 court-approved King County legal newspapers now examined. **Result: none
 is usable** — 20 verified closed or legals-less, 2 (PSBJ, Voice of the Valley) UNVERIFIED but

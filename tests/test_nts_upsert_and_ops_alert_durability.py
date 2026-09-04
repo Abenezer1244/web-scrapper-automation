@@ -109,13 +109,6 @@ def _fake_session(sink):
     return lambda: _S()
 
 
-def _drain_persist_pool():
-    """Block until the background persistence worker has finished its queue."""
-    from src.workers import ops_alerts
-
-    ops_alerts._persist_pool.submit(lambda: None).result(timeout=10)
-
-
 def test_an_undelivered_alert_still_writes_a_row(monkeypatch):
     """Production's exact configuration — OPS_ALERT_EMAIL blank — used to return False
     and leave no trace anywhere. It must now leave a row."""
@@ -127,7 +120,6 @@ def test_an_undelivered_alert_still_writes_a_row(monkeypatch):
     monkeypatch.setattr(ops_alerts, "_session_for_persist", _fake_session(added))
 
     assert ops_alerts.send_ops_alert("canary", "king/WA", "crawler barren", "body") is False
-    _drain_persist_pool()
 
     assert len(added) == 1
     row = added[0]
@@ -159,7 +151,6 @@ def test_a_delivered_alert_is_recorded_as_sent(monkeypatch):
     monkeypatch.setitem(sys.modules, "resend", fake)
 
     assert ops_alerts.send_ops_alert("nts_crawl_barren", "queen_anne_news", "subj", "b") is True
-    _drain_persist_pool()
     assert added[0].detail == "[sent] subj"
 
 
@@ -176,15 +167,20 @@ def test_a_cooldown_suppressed_alert_is_still_recorded(monkeypatch):
     monkeypatch.setattr(ops_alerts, "_session_for_persist", _fake_session(added))
 
     assert ops_alerts.send_ops_alert("canary", "pierce/WA", "s", "b") is False
-    _drain_persist_pool()
     assert len(added) == 1 and added[0].detail.startswith("[undelivered]")
 
 
-def test_recording_never_runs_on_the_callers_thread(monkeypatch):
-    """The point of the hand-off. In production OPS_ALERT_EMAIL is blank, so the e-mail
-    send is never reached — inline persistence would have ADDED database work to a path
-    that previously returned instantly, including a Stripe webhook handler, with the sync
-    engine allowing pool_timeout=30s / connect_timeout=10s / statement_timeout=120s."""
+def test_an_event_loop_is_never_blocked_by_the_durable_write():
+    """The one caller that runs on an event loop is the Stripe webhook handler
+    (src/api/routes/billing.py). In production OPS_ALERT_EMAIL is blank, so the e-mail
+    send is never reached — an inline write would have put the database in front of a
+    path that previously returned instantly, with the sync engine allowing
+    pool_timeout=30s / connect_timeout=10s / statement_timeout=120s.
+
+    Fourteen of the fifteen call sites are ordinary sync Celery workers, where an inline
+    INSERT is unremarkable; only the loop case needs the hand-off.
+    """
+    import asyncio
     import threading
 
     from src.config import settings
@@ -206,24 +202,38 @@ def test_recording_never_runs_on_the_callers_thread(monkeypatch):
         def commit(self):
             pass
 
-    monkeypatch.setattr(settings, "OPS_ALERT_EMAIL", "")
-    monkeypatch.setattr(ops_alerts, "_session_for_persist", lambda: _S())
-    caller = threading.current_thread().name
+    original = ops_alerts._session_for_persist
+    original_email = settings.OPS_ALERT_EMAIL
+    ops_alerts._session_for_persist = lambda: _S()
+    settings.OPS_ALERT_EMAIL = ""
+    try:
+        async def _drive():
+            loop_thread = threading.current_thread().name
+            ops_alerts.send_ops_alert("billing", "gap/x", "s", "b")
+            # yield until the executor task has run
+            for _ in range(200):
+                if "thread" in seen:
+                    break
+                await asyncio.sleep(0.01)
+            return loop_thread
 
-    ops_alerts.send_ops_alert("k", "v", "s", "b")
-    _drain_persist_pool()
+        loop_thread = asyncio.run(_drive())
+        assert "thread" in seen, "the write never ran"
+        assert seen["thread"] != loop_thread, "the event loop thread did the DB work"
+    finally:
+        ops_alerts._session_for_persist = original
+        settings.OPS_ALERT_EMAIL = original_email
 
-    assert seen["thread"] != caller
-    assert seen["thread"].startswith("ops-alert-persist")
 
-
-def test_a_wedged_database_cannot_grow_the_queue_without_limit():
-    """A stalled database must not let alerts pile up unbounded — the incident being
-    reported may BE the database."""
+def test_a_sync_caller_records_inline_without_a_private_thread_pool():
+    """Deliberately NOT a background pool: a private executor is joined at interpreter
+    exit, so a wedged database became shutdown latency for Celery workers and one-shot
+    scripts, and a bounded queue dropped the NEWEST alert — the one carrying a novel
+    failure mode during a storm (Codex)."""
     from src.workers import ops_alerts
 
-    assert 0 < ops_alerts._PERSIST_MAX_BACKLOG <= 500
-    assert ops_alerts._persist_pool._max_workers == 1, "one writer, not a thread per alert"
+    assert not hasattr(ops_alerts, "_persist_pool")
+    assert not hasattr(ops_alerts, "_PERSIST_MAX_BACKLOG")
 
 
 def test_persistence_failure_never_reaches_the_caller(monkeypatch):
@@ -239,7 +249,6 @@ def test_persistence_failure_never_reaches_the_caller(monkeypatch):
     monkeypatch.setattr(ops_alerts, "_session_for_persist", _explode)
 
     assert ops_alerts.send_ops_alert("k", "v", "s", "b") is False
-    _drain_persist_pool()  # the worker swallowed it and the pool is still usable
 
 
 def test_unconfigured_alerting_warns_instead_of_returning_silently(caplog):
@@ -253,7 +262,6 @@ def test_unconfigured_alerting_warns_instead_of_returning_silently(caplog):
     assert settings.OPS_ALERT_EMAIL == "", "CI default: alerting unconfigured"
     with caplog.at_level(logging.WARNING, logger="worker.ops_alerts"):
         ops_alerts.send_ops_alert("canary", "king/WA", "a barren crawl", "body")
-    _drain_persist_pool()
 
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("OPS_ALERT_EMAIL not configured" in m for m in warnings), warnings

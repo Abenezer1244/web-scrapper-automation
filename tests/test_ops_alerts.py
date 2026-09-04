@@ -11,8 +11,32 @@ return meant a four-week crawl outage left no trace anywhere. These tests do not
 assert on that; see tests/test_nts_upsert_and_ops_alert_durability.py, which
 injects a fake session via ops_alerts._session_for_persist.
 """
+import pytest
+
 from src.config import settings
+from src.workers import ops_alerts
 from src.workers.ops_alerts import send_ops_alert
+
+
+@pytest.fixture(autouse=True)
+def _no_real_audit_write(monkeypatch):
+    """Every send now also records a durable audit row. These tests are about the
+    CONFIG GATES, so stub the persistence seam — otherwise each one would attempt a
+    real INSERT against whatever database the suite is pointed at (Codex)."""
+    class _S:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def add(self, _obj):
+            pass
+
+        def commit(self):
+            pass
+
+    monkeypatch.setattr(ops_alerts, "_session_for_persist", lambda: _S())
 
 
 def test_disabled_by_default_is_silent_noop():

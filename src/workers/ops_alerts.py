@@ -14,9 +14,8 @@ Design rules:
 - **Disabled by default**: empty OPS_ALERT_EMAIL = no-op (dev/CI safe).
 - No PII in alert bodies: job/connector identifiers only, never lead data.
 """
+import asyncio
 import html
-import threading
-from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 
 from src.config import settings
 from src.utils.logger import setup_logger
@@ -60,53 +59,48 @@ def _session_for_persist():
     return system_sync_session()
 
 
-# Persistence runs OFF the caller's thread. Neither `finally` nor "the e-mail send is
-# already synchronous" is a real bound (Codex): in production OPS_ALERT_EMAIL is blank, so
-# send_ops_alert returns before Resend is ever reached — persisting inline would have ADDED
-# database work to a path that previously returned instantly, on every alert, including the
-# Stripe webhook handler in src/api/routes/billing.py. And the sync engine's own limits are
-# generous by design (pool_timeout=30s, connect_timeout=10s, statement_timeout=120s), so a
-# stalled database could hold a caller for tens of seconds — while the incident being
-# reported may BE the database.
+# How the durable write is scheduled.
 #
-# One worker thread, so a burst cannot spawn threads without limit, and a bounded backlog
-# so a wedged database cannot grow the queue without limit either. ThreadPoolExecutor
-# threads are joined at interpreter exit, so a queued write still lands on a clean shutdown.
-_PERSIST_MAX_BACKLOG = 50
-_persist_lock = threading.Lock()
-_persist_inflight = 0
-_persist_pool = _ThreadPoolExecutor(max_workers=1, thread_name_prefix="ops-alert-persist")
-
-
+# Round 1 wrote it inline. That was wrong (Codex): Resend is only reached AFTER the config
+# and cooldown gates, and production has OPS_ALERT_EMAIL blank, so inline persistence ADDED
+# database work to a path that previously returned instantly — including the Stripe webhook
+# handler in src/api/routes/billing.py.
+#
+# Round 2 put it on a private single-worker ThreadPoolExecutor with a bounded backlog. That
+# fixed the latency but was over-built (Codex again), and it bought two new problems: the
+# executor is joined at interpreter exit, so a wedged database turned into SHUTDOWN latency
+# for Celery workers and one-shot `railway run` scripts, and a full queue dropped the NEWEST
+# alert — exactly the one carrying a novel failure mode during a storm.
+#
+# What is actually needed is narrower than either. Fourteen of the fifteen call sites are
+# Celery workers, where a short synchronous INSERT is unremarkable — those do DB work
+# constantly. Only ONE caller runs on an event loop (the billing webhook), and only there
+# does a blocking write actually cost anything. So: write inline when there is no loop, and
+# hand off to asyncio's own default executor when there is. No private pool, no backlog
+# counter, no drop policy, no shutdown hook — and no event loop ever blocked.
+#
+# This is best-effort by contract. A hard kill (SIGKILL, container eviction) can still lose
+# the row; the alternative that survives that is a Celery task, which cannot be trusted for
+# an alert that may BE about the broker.
 def _submit_persist(kind: str, key: str, subject: str, delivered: bool) -> None:
-    """Hand the durable write to the background worker. Never blocks, never raises."""
-    global _persist_inflight
+    """Record the alert without ever blocking an event loop. Never raises."""
     try:
-        with _persist_lock:
-            if _persist_inflight >= _PERSIST_MAX_BACKLOG:
-                _logger.warning(
-                    "ops alert persistence backlog full (%d) — not recording [%s:%s]",
-                    _persist_inflight, kind, key,
-                )
-                return
-            _persist_inflight += 1
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None  # ordinary sync caller (every Celery worker call site)
 
-        def _run():
-            global _persist_inflight
-            try:
-                _persist_ops_alert(kind, key, subject, delivered)
-            finally:
-                with _persist_lock:
-                    _persist_inflight -= 1
-
-        _persist_pool.submit(_run)
+        if loop is None:
+            _persist_ops_alert(kind, key, subject, delivered)
+        else:
+            # Fire-and-forget on the default executor so the request handler continues.
+            loop.run_in_executor(None, _persist_ops_alert, kind, key, subject, delivered)
     except Exception as exc:  # noqa: BLE001 — recording must never affect the caller
-        _logger.warning("could not queue ops alert record: %s", str(exc)[:200])
+        _logger.warning("could not record ops alert: %s", str(exc)[:200])
 
 
 def _persist_ops_alert(kind: str, key: str, subject: str, delivered: bool) -> None:
-    """Best-effort durable record of an ops alert. NEVER raises. Runs on the persistence
-    worker thread, never on the caller's.
+    """Best-effort durable record of an ops alert. NEVER raises.
 
     Written to audit_events (event='ops_alert', user_id NULL) rather than to a new
     table: system-written rows with a NULL user_id are already an established pattern
@@ -159,10 +153,8 @@ def send_ops_alert(kind: str, key: str, subject: str, body: str) -> bool:
     # noticed, Railway's stdout retention no longer reached back and the outage could not
     # be explained. An alert nobody can reconstruct afterwards is not an alert.
     #
-    # Recorded from a `finally`, so every gate below and the except branch all record —
-    # and HANDED OFF to a background worker (see _submit_persist), so the database is never
-    # on the caller's critical path. Both matter: the recording must be unconditional, and
-    # it must not be able to delay the very message reporting that something is wrong.
+    # Recorded from a `finally`, so every gate below and the except branch all record.
+    # _submit_persist keeps it off an event loop when there is one; see the note there.
     delivered = False
     try:
         if not settings.OPS_ALERT_EMAIL:

@@ -315,6 +315,55 @@ class TestSurrogateTsNumberAndWordedDate:
         assert p["ts_number"] == "APN-031713-2-024"
         assert is_valid_nts(p) is True
 
+    def test_commercial_notice_without_the_day_of_or_oclock(self):
+        """Live Snohomish AMENDED COMMERCIAL notice (Law Offices of Jason C. Tatman,
+        "Legals - 8-27-26.pdf"): "will on 25th of September, 2026, at 10:00 AM".
+
+        It drops THREE things the worded pattern used to require at once — the "the",
+        the "day", and "o'clock" — so a real $1,980,932.61 Snohomish commercial
+        trustee sale parsed to auction_date=None and is_valid_nts dropped it whole.
+        Measured across all 10 known source PDFs (66 notices): this recovers 1 and
+        changes 0.
+        """
+        block = (
+            "TS No: 25-10595 AMENDED NOTICE OF TRUSTEE'S SALE OF COMMERCIAL LOAN(S) "
+            "PURSUANT TO THE REVISED CODE OF WASHINGTON CHAPTER 61.24 ET. SEQ. "
+            "Grantor: Lee, Sang Ki and Lee, Hye Kyung "
+            "Current trustee of the deed of trust: Law Offices of Jason C. Tatman, PC "
+            "Parcel number(s): 011004-000-009-00 "
+            "I. NOTICE IS HEREBY GIVEN that the undersigned Trustee will on 25th of "
+            "September, 2026, at 10:00 AM at Outside The North Plaza Entrance to the "
+            "Snohomish County Courthouse, 3000 Rockefeller Ave, Everett, WA 98201 "
+            "sell at public auction to the highest and best bidder, payable, in the "
+            "form of cash, at the time of sale the following described real property. "
+            "Commonly known as:12093 Arbors Lane, Mukilteo, WA 98275 "
+            "IV. The sum owing on the obligation secured by the Deed of Trust is: "
+            "The principal sum of $1,980,932.61, together with interest."
+        )
+        p = parse_nts_notice(block)
+        assert p["auction_date"] == "September 25, 2026"
+        assert _to_date(p["auction_date"]) == date(2026, 9, 25)
+        assert p["ts_number"] == "25-10595"
+        assert p["parcel"] == "011004-000-009-00"
+        assert p["principal_owing"] == Decimal("1980932.61")
+        assert is_valid_nts(p) is True
+
+    def test_the_day_of_and_oclock_phrasings_still_parse(self):
+        """The two phrasings that already worked must be untouched by the relaxation."""
+        head = "Trustee Sale No.: X-1 Grantor: SOMEONE "
+        tail = " at the Courthouse sell at public auction to the highest bidder."
+        with_day_of = head + "The Trustee will on the 17th day of July, 2026, at the "                              "hour of 10:00 o'clock AM" + tail
+        no_minutes = head + "The Trustee will on the 3rd day of April, 2026, at 10 "                             "o'clock A.M." + tail
+        assert parse_nts_notice(with_day_of)["auction_date"] == "July 17, 2026"
+        assert parse_nts_notice(no_minutes)["auction_date"] == "April 3, 2026"
+
+    def test_a_bare_number_without_an_ordinal_is_not_a_date(self):
+        """The ordinal suffix stays REQUIRED — relaxing it too would let an
+        unanchored number be read as the sale day."""
+        block = ("Trustee Sale No.: X-2 Grantor: SOMEONE The Trustee will on 25 of "
+                 "September, 2026, at 10:00 AM at the Courthouse sell at public auction.")
+        assert parse_nts_notice(block)["auction_date"] is None
+
     def test_tax_parcel_line_not_leaked_into_address(self):
         # Codex P2: "Commonly known as: <addr> Tax Parcel Nos.: <apn> which is subject…"
         # must NOT leak the parcel line into property_address / the normalized match key,

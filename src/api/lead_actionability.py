@@ -89,6 +89,24 @@ def actionable_condition():
     return and_(has_address, not_excluded)
 
 
+def has_address_condition():
+    """ORM predicate for the ADDRESS half of `actionable_condition` alone.
+
+    `actionable_condition` is address + "not excluded from delivery", and the
+    exclusion reasons (over-quota today, duplicates at the query layer) are why a row
+    is not DELIVERABLE — not evidence that the job scraped nothing. The download
+    endpoint needs that distinction: a job whose rows all hit the plan cap, or are all
+    duplicates, still produced rows and its completion email still links to the
+    download, so it must get a header-only CSV rather than a 404 (Codex).
+    """
+    prop = func.btrim(Result.property_address)
+    mail = func.btrim(Result.mailing_address)
+    return or_(
+        and_(Result.property_address.isnot(None), prop != "", prop != ADDRESS_PLACEHOLDER),
+        and_(Result.mailing_address.isnot(None), mail != "", mail != ADDRESS_PLACEHOLDER),
+    )
+
+
 def actionable_sql(alias: str) -> str:
     """Raw-SQL twin of actionable_condition for hand-written queries. No binds:
     the only literal is the fixed placeholder constant, never user input."""

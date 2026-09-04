@@ -1050,24 +1050,38 @@ def run_scrape_job(self, job_id: str) -> None:
 
         _publish_log(r, job_id, "info", f"Building {fmt.upper()} export...", db=db)
 
-        if config.record_type == "trustee_sale":
-            # Auction data lives ONLY on the finalized DB rows (the in-memory
-            # ScrapedRecords carry nts_source, not the typed auction columns), so
-            # build the FIRST deliverable from the DB rows too — otherwise a skipped
-            # non-fatal re-export could ship blank auction columns (Codex). Mailing is
-            # NULL pre-enrichment; the later re-export refreshes it.
-            _ts_rows = db.execute(
-                select(Result)
-                .where(Result.job_id == job_id, Result.user_id == job.user_id)
-                .order_by(Result.party_name, Result.date_recorded, Result.id)
-            ).scalars().all()
-            record_dicts = _result_rows_to_export_dicts(_ts_rows)
-        else:
-            record_dicts = [r_obj.to_dict() for r_obj in records]
+        # Build the FIRST deliverable from the PERSISTED rows for every record type.
+        # trustee_sale always needed this (auction data lives only on the typed DB
+        # columns — the in-memory ScrapedRecords carry nts_source instead), and the
+        # standing "never deliver a duplicate" rule below needs it for the rest: the
+        # in-memory records carry no `is_duplicate`, because that flag is written by
+        # the dedup pass a few hundred lines above, against the DB. Reading the DB
+        # here also makes this export and the post-enrichment re-export agree by
+        # construction instead of by coincidence. Mailing is NULL pre-enrichment; the
+        # later re-export refreshes it.
+        _export_rows = db.execute(
+            select(Result)
+            .where(Result.job_id == job_id, Result.user_id == job.user_id)
+            .order_by(Result.party_name, Result.date_recorded, Result.id)
+        ).scalars().all()
         # Standing rule (owner, 2026-09-02): rows with no property AND no mailing
         # address are not leads — never in the deliverable. They stay in `results`
         # (dedup/health). Addresses filled by enrichment surface in the re-export.
-        record_dicts = [d for d in record_dicts if is_actionable(d)]
+        #
+        # Standing rule (owner, 2026-09-04): a DUPLICATE is never delivered either.
+        # It was already delivered — and paid for — on an earlier run, so shipping it
+        # again put rows in the CSV that the completion email, the webhook and the
+        # bill all reported as zero. The row stays in `results` as dedup bookkeeping;
+        # it just never reaches a deliverable. Lists/segments and the batch combined
+        # export deliberately KEEP duplicates (a lead whose only contactable row is a
+        # duplicate must not vanish there) — this rule is per-job delivery only.
+        #
+        # Both filters run on the ORM rows, BEFORE projection: is_duplicate is not one
+        # of _RESULT_EXPORT_COLUMNS, so filtering the projected dicts would silently
+        # never match. Mirrors the re-export below.
+        record_dicts = _result_rows_to_export_dicts(
+            [res for res in _export_rows if is_actionable(res) and not res.is_duplicate]
+        )
         # Honor the user's output-field visibility (blank deselected hideable
         # columns; identity/derived columns always present). Legacy/empty => all.
         hidden_fields = resolve_hidden_output_fields(config.fields)
@@ -1379,10 +1393,13 @@ def run_scrape_job(self, job_id: str) -> None:
             enriched_file = None
             reexport_error: Exception | None = None
             try:
-                # Deliverable = actionable rows only (see the first export above);
-                # `refreshed` itself stays complete for the membership upsert.
+                # Deliverable = actionable, NON-DUPLICATE rows (see the first export
+                # above for both rules); `refreshed` itself stays complete for the
+                # property_list_membership upsert, which is cross-job overlap evidence
+                # and must still see duplicates.
                 record_dicts = _result_rows_to_export_dicts(
-                    [res for res in refreshed if is_actionable(res)]
+                    [res for res in refreshed
+                     if is_actionable(res) and not res.is_duplicate]
                 )
                 enriched_file = exporter.export(
                     record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt,

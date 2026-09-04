@@ -1,0 +1,203 @@
+"""Recover NTS notices from weekly legals PDFs the crawler never fetched.
+
+WHY THIS EXISTS
+    The Pacific Publishing papers (Snohomish Tribune, Queen Anne & Magnolia News) expose
+    only the CURRENT issue on their legal-notices page — there is no archive link — and
+    until 2026-09-03 both crawls ran THURSDAYS ONLY. One missed or failed Thursday lost
+    that week's notices permanently, because nothing ever revisited them. Measured for
+    King on 2026-09-03: only 4 of 14 published issues were ever ingested, the cache held
+    14 notices where the back issues carry 31, and 8 of the missing ones were still-live
+    auctions the product could not show.
+
+    The back issues are unlinked but PUBLIC and fetchable by constructed URL (verified
+    14/14 HTTP 200). These are statutory RCW 61.24.040 notices, robots.txt allows "*",
+    and they live on the same CDN path the crawler already downloads — this script just
+    asks for the issues the discovery page stopped linking. It fetches politely, caps
+    what it will pull, and is dry-run by default.
+
+    Going forward the beat runs DAILY (src/workers/scheduler.py), so this should be a
+    one-time recovery per source rather than a recurring chore.
+
+ORDER MATTERS — OLDEST ISSUE FIRST
+    `_upsert_notice` refreshes every mutable field ON CONFLICT (source, ts_number). A
+    notice republished across several issues can legitimately CHANGE between them (an
+    inline "SALE POSTPONED TO <later date>" is the common case). Ingesting newest-first
+    would let a stale older issue overwrite the current truth, so this walks strictly
+    oldest -> newest and the most recent issue always writes last.
+
+RELATIONSHIP TO scripts/repair_nts_ts_number.py
+    They are complementary and this one runs FIRST. Backfill CREATES the correctly-keyed
+    rows (with the fixed parser); the repair script RETIRES the mis-bound rows earlier
+    crawls wrote under the wrong TS number. Run backfill --apply, then the repair's dry
+    run, then the repair --apply.
+
+Usage:
+    railway run --service worker python scripts/backfill_nts_pdf_archive.py --source queen_anne_news
+    railway run --service worker python scripts/backfill_nts_pdf_archive.py --source queen_anne_news --apply
+    # widen/narrow the window (default: 90 days back from today)
+    ... --source snohomish_tribune --days 120 --apply
+
+Dry-run by default: prints every issue found and every notice it would upsert, writes nothing.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+import urllib.parse
+from datetime import UTC, date, datetime, timedelta
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.db.session import system_sync_session  # noqa: E402
+from src.scrapers.sources import nts_pdf  # noqa: E402
+from src.scrapers.sources import nts_tacoma_index as nts  # noqa: E402
+from src.utils.logger import setup_logger  # noqa: E402
+from src.utils.safe_http import safe_get  # noqa: E402
+from src.workers.nts_crawler import (  # noqa: E402
+    _MAX_PDF_BYTES,
+    _PDF_BROWSER_UA,
+    _PDF_HOST,
+    _upsert_notice,
+)
+
+_logger = setup_logger("scripts.backfill_nts_pdf_archive")
+
+_CDN = f"https://{_PDF_HOST}"
+_FETCH_DELAY_S = 0.4      # polite gap between probes
+_MAX_ISSUES = 40          # hard cap on PDFs downloaded in one run
+
+
+def _king_names(d: date) -> list[str]:
+    """King: "QA Legals MM-DD-YY.pdf" — zero-padded (verified across 14 issues)."""
+    return [f"QA Legals {d.month:02d}-{d.day:02d}-{d.year % 100:02d}.pdf"]
+
+
+def _snoho_names(d: date) -> list[str]:
+    """Snohomish: "Legals - M-D-YY.pdf" — NOT zero-padded. Both variants are probed
+    because the paper has been inconsistent and a padded issue costs one extra HEAD."""
+    return [
+        f"Legals - {d.month}-{d.day}-{d.year % 100:02d}.pdf",
+        f"Legals - {d.month:02d}-{d.day:02d}-{d.year % 100:02d}.pdf",
+    ]
+
+
+# Each source: CDN path prefix, county, filename builder, and the parser its crawler
+# uses. King MUST use parse_king_notice — its no-colon Affinia fields and surrogate
+# REF-/APN- keys come out as garbage under the shared colon parser.
+def _sources() -> dict:
+    from src.scrapers.sources.nts_king_pdf import parse_king_notice
+
+    return {
+        "queen_anne_news": {
+            "prefix": "/static-4/queenannenews/images/legals/",
+            "county": "king",
+            "names": _king_names,
+            "parse": parse_king_notice,
+        },
+        "snohomish_tribune": {
+            "prefix": "/static-4/snoho/images/",
+            "county": "snohomish",
+            "names": _snoho_names,
+            "parse": nts.parse_nts_notice,
+        },
+    }
+
+
+def _try_fetch(url: str) -> bytes | None:
+    """GET one candidate issue. A 404 is the NORMAL answer for a day with no issue and
+    must never abort the run — unlike repair_nts_ts_number, an unreachable URL here is
+    an absence of data, not an incomplete truth map."""
+    try:
+        resp = safe_get(url, timeout=45, headers={"User-Agent": _PDF_BROWSER_UA})
+    except Exception as exc:  # noqa: BLE001
+        _logger.info("probe failed %s: %s", url.rsplit("/", 1)[-1], str(exc)[:100])
+        return None
+    if resp.status_code != 200:
+        return None
+    data = resp.content
+    if len(data) > _MAX_PDF_BYTES:
+        _logger.warning("skipping oversized PDF (%d bytes): %s", len(data), url)
+        return None
+    return data
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--source", required=True, choices=sorted(_sources()))
+    ap.add_argument("--days", type=int, default=90, help="lookback window (default 90)")
+    ap.add_argument("--apply", action="store_true", help="write; otherwise dry-run")
+    args = ap.parse_args()
+
+    cfg = _sources()[args.source]
+    today = datetime.now(UTC).date()
+    start = today - timedelta(days=args.days)
+
+    # OLDEST FIRST — see the module docstring. The newest issue must write last.
+    print(f"Probing {args.source} issues from {start} to {today} (oldest first)…")
+    issues: list[tuple[date, str, bytes]] = []
+    d = start
+    while d <= today and len(issues) < _MAX_ISSUES:
+        for name in cfg["names"](d):
+            url = _CDN + cfg["prefix"] + urllib.parse.quote(name)
+            data = _try_fetch(url)
+            time.sleep(_FETCH_DELAY_S)
+            if data:
+                issues.append((d, url, data))
+                print(f"  found {name} ({len(data)} bytes)")
+                break
+        d += timedelta(days=1)
+
+    print(f"\n{len(issues)} issue PDF(s) found.\n")
+    if not issues:
+        print("Nothing to do.")
+        return
+
+    upserted = skipped = errored = 0
+    with system_sync_session() as db:
+        from src.db.models import NtsNotice
+
+        for issue_date, url, data in issues:
+            try:
+                blocks = nts_pdf.split_notice_blocks(
+                    nts_pdf.normalize_pdf_text(nts_pdf.extract_pdf_text(data))
+                )
+            except Exception as exc:  # noqa: BLE001
+                errored += 1
+                print(f"  {issue_date} PARSE FAILED: {str(exc)[:100]}")
+                continue
+            kept = 0
+            for block in blocks:
+                parsed = cfg["parse"](block)
+                row = nts.notice_to_row(
+                    parsed, source_url=url, today=today,
+                    source=args.source, county=cfg["county"],
+                )
+                if row is None:
+                    skipped += 1
+                    continue
+                row["fetched_at"] = datetime.now(UTC)
+                kept += 1
+                upserted += 1
+                print(f"    {row['ts_number']:22} parcel={str(row['parcel']):16} "
+                      f"auction={row['auction_date']} active={row['is_active']} "
+                      f"owing={row['principal_owing']}")
+                if args.apply:
+                    # Per-row SAVEPOINT so one bad notice rolls back alone.
+                    with db.begin_nested():
+                        _upsert_notice(db, NtsNotice, row)
+            print(f"  {issue_date}: {kept}/{len(blocks)} notices\n")
+
+        if args.apply:
+            db.commit()
+            print(f"APPLIED — {upserted} notice(s) upserted, {skipped} non-NTS block(s) "
+                  f"skipped, {errored} issue(s) unreadable.")
+        else:
+            db.rollback()
+            print(f"DRY RUN — {upserted} notice(s) would be upserted, {skipped} non-NTS "
+                  f"block(s) skipped, {errored} issue(s) unreadable. Re-run with --apply.")
+
+
+if __name__ == "__main__":
+    main()

@@ -275,11 +275,59 @@ async def batch_extract_king_owners(
     return owners
 
 
+def _read_parcel_page(page_html: str) -> tuple[str | None, str | None, str | None]:
+    """(site address, tax-bill URL, owner) from one eRealProperty page.
+
+    Shared by the ordinary path and the malformed-PID recovery path so a page is
+    read exactly one way regardless of which PIN fetched it.
+    """
+    m = re.search(r"Site Address</td>\s*<td[^>]*>([^<]+)", page_html)
+    prop = m.group(1).replace("&nbsp;", "").strip() if m else None
+    m2 = re.search(r'href="(https://payment\.kingcounty\.gov[^"]+)"', page_html)
+    tax_url = m2.group(1).replace("&amp;", "&") if m2 else None
+    return (prop or None), tax_url, _extract_owner_name(page_html)
+
+
+def _gis_exists(candidates: list[str]) -> set[str]:
+    """Which candidate PINs King's strict parcel layer actually carries."""
+    from src.scrapers.enrichment.county_gis import batch_enrich_parcels_gis
+
+    return set(batch_enrich_parcels_gis(candidates, "king", "WA"))
+
+
+def _owner_of(pin: str) -> str | None:
+    """Assessor owner for one candidate, echo-verified (a page that names another
+    parcel yields None, so a truncating answer can never break the tie)."""
+    try:
+        r = safe_get(f"{_ERP_URL}{pin}", headers=_HEADERS, timeout=10)
+    except Exception:  # noqa: BLE001 — a lookup failure must only cost a repair
+        return None
+    if r.status_code != 200 or not parcel_page_is_for(r.text, pin):
+        return None
+    return _extract_owner_name(r.text)
+
+
+def resolve_malformed_parcel(source_pid: str, party_name: str | None,
+                             stats: dict | None = None):
+    """Recover the real PIN behind a malformed recorder PID, or None.
+
+    Thin binding of king_parcel_repair to the live county sources. The caller
+    keeps ``parcel_id`` as the county printed it and uses the result only for
+    lookups + provenance — see that module's docstring for why.
+    """
+    from src.scrapers.enrichment.king_parcel_repair import resolve_king_parcel
+
+    return resolve_king_parcel(
+        source_pid, party_name, gis_exists=_gis_exists, owner_of=_owner_of, stats=stats,
+    )
+
+
 async def batch_enrich_king_county(
     parcel_ids: list[str],
     *,
     time_budget_s: float | None = None,
     stats: dict | None = None,
+    party_names: dict[str, str | None] | None = None,
     pace_s: float = 0.2,
 ) -> dict[str, dict[str, str | None]]:
     """Two-phase enrichment: HTTP for property, Playwright for mailing.
@@ -303,7 +351,7 @@ async def batch_enrich_king_county(
     st = stats if stats is not None else {}
     st.update({"requested": len(clean), "property_found": 0, "mailing_candidates": 0,
                "mailing_attempted": 0, "mailing_found": 0, "deferred": [],
-               "budget_exhausted": False, "parcel_mismatch": 0})
+               "budget_exhausted": False, "parcel_mismatch": 0, "parcel_recovered": 0})
     deadline = (_time.monotonic() + time_budget_s) if time_budget_s is not None else None
 
     def _over_budget() -> bool:
@@ -351,6 +399,34 @@ async def batch_enrich_king_county(
                     "requested=%s (echoed=%s) — discarding page",
                     pid, _extract_parcel_echo(r.text),
                 )
+                # The county's own PID is malformed. Try to recover the REAL
+                # parcel under strict guards (king_parcel_repair) and, if it
+                # resolves, redo THIS lookup against the recovered PIN. The
+                # stored parcel_id still stays exactly as the county printed it —
+                # only the lookup target and the provenance change.
+                resolved = resolve_malformed_parcel(pid, (party_names or {}).get(pid), st)
+                if resolved is not None:
+                    rr = safe_get(f"{_ERP_URL}{resolved.parcel_id}", headers=_HEADERS, timeout=10)
+                    if rr.status_code == 200 and parcel_page_is_for(rr.text, resolved.parcel_id):
+                        _logger.info(
+                            "King enrichment: recovered %s -> %s via %s",
+                            pid, resolved.parcel_id, resolved.method,
+                        )
+                        prop, tax_url, owner = _read_parcel_page(rr.text)
+                        results[pid] = {
+                            "property_address": prop,
+                            "mailing_address": None,
+                            "owner_name": owner,
+                            "parcel_lookup": "recovered",
+                            **resolved.provenance(pid),
+                        }
+                        if tax_url:
+                            # Keyed by the SOURCE pid so phase 2 still writes the
+                            # mailing address back onto the right lead.
+                            tax_urls[pid] = tax_url
+                        st["parcel_recovered"] += 1
+                        await asyncio.sleep(0.1 if pace_s <= 0.2 else pace_s)
+                        continue
                 results[pid] = {
                     "property_address": None,
                     "mailing_address": None,
@@ -359,21 +435,10 @@ async def batch_enrich_king_county(
                 }
                 continue
 
-            # Extract Site Address
-            m = re.search(r"Site Address</td>\s*<td[^>]*>([^<]+)", r.text)
-            prop = m.group(1).replace("&nbsp;", "").strip() if m else None
-            if not prop:
-                prop = None
-
-            # Extract Tax Bill URL (has correct tax account number)
-            m2 = re.search(
-                r'href="(https://payment\.kingcounty\.gov[^"]+)"', r.text
-            )
-            tax_url = m2.group(1).replace("&amp;", "&") if m2 else None
-
-            # Owner/taxpayer name — same page, no extra request. Fills the
+            # Site address + tax-bill URL + owner/taxpayer name, all from the
+            # page already fetched (no extra request). The owner fills the
             # placeholder party_name on King tax-delinquent leads downstream.
-            owner = _extract_owner_name(r.text)
+            prop, tax_url, owner = _read_parcel_page(r.text)
 
             if prop or tax_url or owner:
                 results[pid] = {
@@ -400,8 +465,9 @@ async def batch_enrich_king_county(
         await asyncio.sleep(0.1 if pace_s <= 0.2 else pace_s)  # job: 0.1 s; backfill: slow
 
     st["property_found"] = sum(1 for r in results.values() if r.get("property_address"))
-    _logger.info("Phase 1 done: %d/%d property addresses, %d tax URLs, %d parcel mismatches",
-                 st["property_found"], len(clean), len(tax_urls), st["parcel_mismatch"])
+    _logger.info("Phase 1 done: %d/%d property addresses, %d tax URLs, %d parcel mismatches "
+                 "(%d recovered)", st["property_found"], len(clean), len(tax_urls),
+                 st["parcel_mismatch"], st["parcel_recovered"])
 
     # ── Phase 2: Playwright for mailing addresses ──────────────────────────
     st["mailing_candidates"] = len(tax_urls)
@@ -468,7 +534,11 @@ async def batch_enrich_king_county(
                     # tax-bill page (its number is on the page, or the explicit
                     # "No accounts" answer) and the Mailing Address block is absent —
                     # partial renders / wrong pages stay "error" (Codex P1).
-                    if "No accounts" in body or pid.replace("-", "") in body.replace("-", ""):
+                    # Validate against the pid whose tax URL this is: for a
+                    # RECOVERED parcel the page names the resolved PIN, not the
+                    # malformed one we key results by (Codex P2).
+                    _probe = (results.get(pid, {}).get("resolved_parcel_id") or pid)
+                    if "No accounts" in body or _probe.replace("-", "") in body.replace("-", ""):
                         results[pid]["mailing_lookup"] = "none"
                     if "Mailing Address" in body:
                         idx = body.index("Mailing Address") + len("Mailing Address")

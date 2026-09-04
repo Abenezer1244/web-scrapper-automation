@@ -587,9 +587,17 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             def _king_left() -> float:
                 return _king_deadline - _time.monotonic()
 
-            def _run_chunk(_chunk: list, **kw) -> dict:
-                """One chunked lookup: enrich, write, commit. Returns its stats."""
+            def _run_chunk(_chunk: list, _owned: list | None = None,
+                           _meta_out: dict | None = None, **kw) -> dict:
+                """One chunked lookup: enrich, write, commit. Returns its stats.
+
+                `_owned` names the parcels this chunk is RESPONSIBLE for. It is
+                not always `_chunk`: the mailing pass drives phase 2 by URL and
+                passes an empty parcel list, so deriving deferral from `_chunk`
+                there would record an empty list and lose the chunk silently.
+                """
                 nonlocal king_error, found
+                _own = list(_owned if _owned is not None else _chunk)
                 _cs: dict = {}
                 _left = _king_left()
                 try:
@@ -608,11 +616,16 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                     # ASSIGN, never setdefault: batch_enrich_king_county seeds
                     # stats["deferred"] = [] as its FIRST action, so setdefault is a
                     # no-op here and the chunk would silently get no marker.
-                    _cs["deferred"] = list(_chunk)
+                    _cs["deferred"] = list(_own)
                 _apply_king(_enriched)
-                found += sum(1 for d in _enriched.values() if d.get("mailing_address"))
+                _n_mail = sum(1 for d in _enriched.values() if d.get("mailing_address"))
                 try:
                     db.commit()
+                    # Count only what actually persisted — a rollback below would
+                    # otherwise leave `found` overreporting in the summary log.
+                    found += _n_mail
+                    if _meta_out is not None:
+                        _meta_out.update(_enriched)
                 except Exception as exc:
                     _logger.warning(
                         "Job %s: King enrichment commit failed: %s", job_id, str(exc)[:120]
@@ -621,7 +634,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                     # The rollback discarded this chunk's writes and the chunk is
                     # already off the pending list, so without this it would vanish
                     # with neither data nor a deferred marker (Codex P2).
-                    _cs["deferred"] = list(dict.fromkeys(list(_cs.get("deferred", [])) + list(_chunk)))
+                    _cs["deferred"] = list(dict.fromkeys(list(_cs.get("deferred", [])) + _own))
                 for _k, _v in _cs.items():
                     if isinstance(_v, list):
                         king_stats.setdefault(_k, []).extend(_v)
@@ -641,6 +654,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             # names matter most. Phase 1 runs to completion across all parcels
             # first; mailing then gets whatever is left (Codex P1).
             _tax_urls: dict[str, str] = {}
+            _p1_meta: dict[str, dict] = {}
             _pending = list(pids)
             while _pending:
                 if _king_left() <= 5:
@@ -654,10 +668,17 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 _chunk, _pending = _pending[:_KING_CHUNK], _pending[_KING_CHUNK:]
                 _cs = _run_chunk(
                     _chunk,
+                    _meta_out=_p1_meta,
                     party_names={k: party_names[k] for k in _chunk if k in party_names},
                     do_mailing=False,
                     tax_urls_out=_tax_urls,
                 )
+                # Keep phase-1 rows ONLY for parcels that produced a tax-bill URL —
+                # those are the only ones pass 2 will revisit, and phase 2 needs
+                # their resolved_parcel_id to validate the rendered page.
+                for _k in list(_p1_meta):
+                    if _k not in _tax_urls:
+                        _p1_meta.pop(_k, None)
                 if _cs.get("budget_exhausted"):
                     king_stats.setdefault("deferred", []).extend(_pending)
                     _pending = []
@@ -675,7 +696,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                     _mail_pending[:_KING_CHUNK], _mail_pending[_KING_CHUNK:]
                 )
                 _cs = _run_chunk(
-                    [], tax_urls_in={k: _tax_urls[k] for k in _chunk}
+                    [], _owned=_chunk,
+                    tax_urls_in={k: _tax_urls[k] for k in _chunk},
+                    results_seed={k: _p1_meta[k] for k in _chunk if k in _p1_meta},
                 )
                 if _cs.get("budget_exhausted"):
                     king_stats.setdefault("deferred", []).extend(_mail_pending)

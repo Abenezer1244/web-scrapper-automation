@@ -356,6 +356,7 @@ async def batch_enrich_king_county(
     do_mailing: bool = True,
     tax_urls_out: dict[str, str] | None = None,
     tax_urls_in: dict[str, str] | None = None,
+    results_seed: dict[str, dict] | None = None,
 ) -> dict[str, dict[str, str | None]]:
     """Two-phase enrichment: HTTP for property, Playwright for mailing.
 
@@ -390,7 +391,14 @@ async def batch_enrich_king_county(
     if tax_urls_in is not None:
         st["requested"] = len(tax_urls_in)
         check_source_or_raise(KING_EREALPROPERTY)
-        return await _king_mailing_phase({}, dict(tax_urls_in), st, _over_budget, pace_s)
+        # Seeded with phase 1's own rows for these parcels. Phase 2 is not
+        # standalone-pure: it validates the rendered tax page against
+        # `resolved_parcel_id` (a RECOVERED parcel's page names the resolved PIN,
+        # not the malformed one we key by), so starting from an empty dict would
+        # make every recovered parcel fail that check and silently drop its
+        # mailing address. Copied per pid so the caller's dict is never mutated.
+        _seeded = {pid: dict((results_seed or {}).get(pid) or {}) for pid in tax_urls_in}
+        return await _king_mailing_phase(_seeded, dict(tax_urls_in), st, _over_budget, pace_s)
 
     if not clean:
         return results
@@ -619,7 +627,10 @@ async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
                 if i % 25 == 0:
                     _logger.info("  Mailing: %d / %d ...", i, len(pids_to_lookup))
                 st["mailing_attempted"] += 1
-                results[pid]["mailing_lookup"] = "error"
+                # setdefault, not results[pid]: in mailing-only mode a pid may have
+                # no phase-1 row at all, and a KeyError here is swallowed upstream
+                # as a whole-chunk failure (so phase 2 would appear to do nothing).
+                results.setdefault(pid, {})["mailing_lookup"] = "error"
 
                 try:
                     url = tax_urls[pid]

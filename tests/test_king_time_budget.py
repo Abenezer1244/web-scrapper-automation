@@ -99,7 +99,10 @@ def test_mailing_only_pass_does_not_refetch_phase_one():
         [], time_budget_s=0, stats=stats,
         tax_urls_in={"1234567890": "https://payment.kingcounty.gov/x"},
     ))
-    assert out == {}
+    # A row exists and says NOT ATTEMPTED — the honest answer. Returning nothing
+    # would be indistinguishable from "this parcel's page has no mailing address".
+    assert out["1234567890"]["mailing_lookup"] == "not_attempted"
+    assert "mailing_address" not in out["1234567890"]
     assert stats["requested"] == 1
     assert stats["budget_exhausted"] is True
     assert "1234567890" in stats["deferred"]
@@ -114,3 +117,39 @@ def test_default_call_still_runs_both_phases_in_order():
     asyncio.run(batch_enrich_king_county(["1234567890"], time_budget_s=0, stats=stats))
     assert stats["budget_exhausted"] is True
     assert stats["deferred"] == ["1234567890"]
+
+
+def test_mailing_only_mode_seeds_a_row_for_every_parcel():
+    """Phase 2 writes results[pid][...] unconditionally, so every driven pid must
+    already have a row. Starting from an empty dict raised KeyError on the first
+    parcel, which the worker swallowed as a whole-chunk failure — phase 2 looked
+    like it simply found nothing. A zero-budget test cannot catch that (it defers
+    before the browser starts), so assert the seeding contract directly."""
+    from src.scrapers.enrichment import king_county_assessor as K
+
+    seeded = {}
+    captured = {}
+
+    async def _fake_phase(results, tax_urls, st, over, pace):
+        captured.update({"results": results, "tax_urls": tax_urls})
+        return results
+
+    orig = K._king_mailing_phase
+    K._king_mailing_phase = _fake_phase
+    try:
+        caller_seed = {"1234567890": {"resolved_parcel_id": "9999999999"}}
+        asyncio.run(K.batch_enrich_king_county(
+            [], time_budget_s=5, stats=seeded,
+            tax_urls_in={"1234567890": "u1", "2345678901": "u2"},
+            results_seed=caller_seed,
+        ))
+    finally:
+        K._king_mailing_phase = orig
+
+    # Every driven parcel has a row, seeded or empty — never missing.
+    assert set(captured["results"]) == {"1234567890", "2345678901"}
+    # Phase-1 metadata survives (phase 2 validates the page against it).
+    assert captured["results"]["1234567890"]["resolved_parcel_id"] == "9999999999"
+    assert captured["results"]["2345678901"] == {}
+    # The caller's dict is never mutated.
+    assert caller_seed == {"1234567890": {"resolved_parcel_id": "9999999999"}}

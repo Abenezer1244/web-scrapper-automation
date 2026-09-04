@@ -40,7 +40,7 @@ from src.config.constants import (
     SKIP_TRACE_ADDON_PLANS,
 )
 from src.db import CountyConnector
-from src.db.models import BatchRun, Job, ScraperBatch, ScraperConfig
+from src.db.models import BatchRun, Job, Result, ScraperBatch, ScraperConfig
 from src.scrapers.probate import new_probate_config_tod_default
 from src.utils.crypto import decrypt_field
 from src.utils.lead_export import resolve_hidden_output_fields
@@ -369,6 +369,19 @@ async def create_batch(
 # (scraper_configs, jobs). A run is at-most-one per batch in on-demand 2A.
 
 
+def _child_lead_count(
+    job: tuple[str, str, int], persisted: dict[str, int]
+) -> int:
+    """Leads to report for one batch child, given ``(job_id, status, record_count)``.
+
+    See the call site for why a non-done child is capped by its persisted rows.
+    """
+    job_id, status, record_count = job
+    if status == "done":
+        return record_count
+    return min(record_count, persisted.get(job_id, 0))
+
+
 def _combined_record_count(batch: ScraperBatch, run: BatchRun | None) -> int | None:
     """Rows in the combined export as-delivered, mode-aware, from the run's
     finalized delivery_counts snapshot. NULL until finalize writes it — the
@@ -501,6 +514,7 @@ async def get_batch(
     # Map child config -> its dispatched job (scoped to THIS run's child_job_ids so
     # an unrelated job on the same config — should not happen in 2A — can't leak in).
     job_by_config: dict[str, tuple[str, str, int]] = {}
+    persisted: dict[str, int] = {}
     if run and run.child_job_ids:
         job_rows = (
             await db.execute(
@@ -510,6 +524,22 @@ async def get_batch(
             )
         ).all()
         job_by_config = {scid: (jid, st, rc) for (jid, scid, st, rc) in job_rows}
+        # How many rows each child ACTUALLY persisted. jobs.record_count is also
+        # written mid-scrape by the progress callback, so a child that died before
+        # the save step still carries the in-flight counter and would otherwise
+        # report leads that do not exist (Test 11: 210 reported, 0 rows).
+        persisted = dict(
+            (
+                await db.execute(
+                    select(Result.job_id, func.count(Result.id))
+                    .where(
+                        Result.user_id == current_user.id,
+                        Result.job_id.in_(run.child_job_ids),
+                    )
+                    .group_by(Result.job_id)
+                )
+            ).all()
+        )
 
     config_rows = (
         await db.execute(
@@ -542,14 +572,22 @@ async def get_batch(
                 record_type=record_type,
                 job_id=job[0] if job else None,
                 status=child_status,
-                # Only a DONE child has a lead count. jobs.record_count is also
-                # written mid-scrape by the progress callback, so a failed /
-                # running child still carries the in-flight raw counter — Test 11's
-                # failed child reported 210 while it persisted, exported and billed
-                # ZERO, and the UI rendered that as "210 leads" and summed it into
-                # the batch total. Report 0 for any non-done child so the client
-                # renders "—" instead of inventing leads that were never delivered.
-                record_count=job[2] if (job and child_status == "done") else 0,
+                # A DONE child's record_count is final and authoritative (it is
+                # what billing charged), so it is reported as-is — including when
+                # retention has since removed the rows behind it.
+                #
+                # For any OTHER child the same field may still hold the counter the
+                # progress callback wrote mid-scrape, which can run ahead of what
+                # was actually saved: Test 11's failed child said 210 with ZERO
+                # rows, and the UI rendered "210 leads" and summed it into the
+                # batch total. Cap those by the rows that really exist.
+                #
+                # Capped, NOT zeroed (Codex P1): a failed or cancelled child can
+                # still have persisted rows that reach the delivered combined CSV —
+                # batch_export selects every child_job_id with no status filter,
+                # and force-finalize CANCELS still-active children after they may
+                # have saved rows. Zeroing would hide leads the user is holding.
+                record_count=_child_lead_count(job, persisted) if job else 0,
             )
         )
 

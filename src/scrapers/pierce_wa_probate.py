@@ -50,6 +50,11 @@ _PAGE_ADVANCE_POLL_MS = 1_500
 # is what used to break small result pages.
 _ARMS_MIN_ROW_CELLS = 9
 
+# An ARMS instrument number as printed in the results grid (modern rows are 12
+# digits, older ones 10+). _map_row reads the same shape off the row, so requiring
+# it in the grid signature can never reject a row the parser would have accepted.
+_ARMS_INSTRUMENT = re.compile(r"\b\d{10,12}\b")
+
 # ─── Patterns ─────────────────────────────────────────────────────────────────
 
 _ARMS_HOME = "https://armsweb.co.pierce.wa.us/"
@@ -613,13 +618,25 @@ class PierceWAARMSScraper(BridgeScraper):
 
     @classmethod
     def _is_grid_signature_row(cls, row: Tag) -> bool:
-        """``_is_grid_row`` plus a recorded date — the signature used to PICK the
-        grid. Every ARMS result row carries filed/recorded dates; the pager,
-        criteria and filter tables that share the page do not carry all three of
-        width, a leading row number and a date."""
+        """``_is_grid_row`` plus a recorded date AND an instrument number — the
+        signature used to PICK the grid.
+
+        Width and a leading row number alone are not enough. If a chrome/status
+        table on a blocked page happened to match, the grid would be "found",
+        every row would fail to map, and ``_extract_records`` would return ``[]``
+        — scoring a blocked page as a healthy zero, which is exactly the failure
+        the raise below exists to prevent (Codex P1). Requiring what ``_map_row``
+        itself keys off — a recorded date and a 10-12 digit instrument number
+        outside the row-number cell — makes a chrome false positive implausible.
+        """
         if not cls._is_grid_row(row):
             return False
-        return bool(_DATE_PATTERN.search(row.get_text(" ", strip=True)))
+        # Skip cells[0]: that is the row number, which can itself be 10-12 digits
+        # on a very large result set.
+        body = " ".join(c.get_text(" ", strip=True) for c in row.find_all("td")[1:])
+        if not _DATE_PATTERN.search(body):
+            return False
+        return bool(_ARMS_INSTRUMENT.search(body))
 
     def _extract_records(self, soup: BeautifulSoup) -> list[ScrapedRecord]:
         """Extract records from the ARMS results table."""

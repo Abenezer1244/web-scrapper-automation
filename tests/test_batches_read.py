@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest_asyncio
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.schemas import (
@@ -19,7 +20,7 @@ from src.api.schemas import (
     BatchDetailResponse,
     BatchSummaryResponse,
 )
-from src.db.models import BatchRun, Job, ScraperBatch, ScraperConfig, User
+from src.db.models import BatchRun, Job, Result, ScraperBatch, ScraperConfig, User
 
 
 def _auth(token: str) -> dict:
@@ -452,3 +453,40 @@ async def test_failed_child_reports_zero_not_its_in_flight_scrape_counter(
     assert by_type["probate"]["record_count"] == 0
     # what the batch header sums
     assert sum(c["record_count"] for c in body["children"]) == 0
+
+
+async def test_failed_child_that_did_persist_rows_still_reports_them(
+    db: AsyncSession, client: AsyncClient, starter_user: User, starter_token: str,
+    partial_batch: SimpleNamespace,
+):
+    """Do NOT key the count on status (Codex P1). finalize_batch_run builds the
+    combined CSV from every child_job_id with no status filter, and force-finalize
+    CANCELS still-active children after they may have persisted rows — so a
+    failed/cancelled child's rows can be in the delivered CSV. Those must stay
+    visible; only the count that outran persistence is capped."""
+    job_id = (
+        await db.execute(
+            select(Job.id).join(
+                ScraperConfig, ScraperConfig.id == Job.scraper_config_id
+            ).where(
+                ScraperConfig.batch_id == partial_batch.batch_id,
+                Job.status == "failed",
+            )
+        )
+    ).scalar_one()
+    for _ in range(3):
+        db.add(Result(
+            id=str(uuid.uuid4()), job_id=job_id, user_id=starter_user.id,
+            party_name="SMITH JANE", property_address="1 MAIN ST",
+        ))
+    await db.commit()
+
+    resp = await client.get(
+        f"/batches/{partial_batch.batch_id}", headers=_auth(starter_token)
+    )
+    assert resp.status_code == 200
+    child = {c["record_type"]: c for c in resp.json()["children"]}["pre_foreclosure"]
+    assert child["status"] == "failed"
+    # 3 rows exist, so the mid-scrape 210 is capped to what was actually persisted
+    # — not zeroed away.
+    assert child["record_count"] == 3

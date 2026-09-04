@@ -129,6 +129,34 @@ def test_numeric_wide_chrome_row_without_a_date_is_not_mistaken_for_the_grid():
         _scraper("9")._extract_records(soup)
 
 
+def test_dated_chrome_row_without_an_instrument_still_fails_loud():
+    """The dangerous shape (Codex P1): a blocked page carrying a wide,
+    numerically-led, DATED status row. If it were accepted as the grid, every row
+    would fail to map and _extract_records would return [] — scoring a blocked
+    page as a healthy zero, which is exactly what the raise exists to prevent.
+    The instrument-number requirement keeps it a hard failure."""
+    decoy = (
+        "<table><tr><th>h</th></tr><tr><td>1</td><td>Session expired</td>"
+        "<td>09/04/2026</td>" + "<td>-</td>" * 9 + "</tr></table>"
+    )
+    soup = BeautifulSoup(f"<html><body>{decoy}</body></html>", "html.parser")
+    with pytest.raises(TransientScrapeError):
+        _scraper("9")._extract_records(soup)
+
+
+def test_a_grid_whose_rows_are_all_filtered_still_returns_empty_not_raises():
+    """A real grid whose every row is dropped by a PRODUCT filter (pre_foreclosure
+    drops rows with no natural-person party) is found, parsed, and legitimately
+    yields nothing. That must not be confused with a missing table."""
+    corporate = _grid_row(1, "202608240099").replace(
+        "[R] QUALITY LOAN SERVICE CORP (+) [E] SMITH JANE",
+        "[R] QUALITY LOAN SERVICE CORP (+) [E] 1436 E 31ST ST LLC",
+    )
+    grid = f"<table><tr><th>#</th></tr>{corporate}</table>"
+    soup = BeautifulSoup(f"<html><body>{_CHROME}{grid}</body></html>", "html.parser")
+    assert _scraper("1")._extract_records(soup) == []
+
+
 def test_header_row_is_never_emitted_as_a_record():
     recs = _scraper("3")._extract_records(_page(3))
     assert all(r.enrichment_data.get("instrument_number") for r in recs)

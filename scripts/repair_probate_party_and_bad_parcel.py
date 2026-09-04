@@ -354,6 +354,18 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                 # Fully at the intended end-state. A partial earlier recovery (stale
                 # mailing or situs) must NOT be skipped (Codex P2).
                 stats["already_recovered"] = stats.get("already_recovered", 0) + 1
+                if apply:
+                    # An EARLIER run may have cancelled this lead's trace before the
+                    # re-point existed, leaving it stranded behind an 'errored'
+                    # pending row holding the wrong address. The re-point is
+                    # idempotent (it no-ops once the address already matches), so
+                    # run it here too rather than only on a fresh recovery.
+                    repointed = db.execute(
+                        _REPOINT_PENDING, {"id": row["id"], "property_address": prop}
+                    ).rowcount
+                    if repointed:
+                        db.execute(_REQUEUE_RESULT_TRACE, {"id": row["id"]})
+                    stats["traces_repointed"] = stats.get("traces_repointed", 0) + repointed
                 continue
             new_enrichment = {k: v for k, v in enrichment.items()
                               if k not in _ASSESSOR_DERIVED_KEYS and k != "parcel_echoed_by_county"}

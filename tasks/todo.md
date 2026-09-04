@@ -40,16 +40,36 @@ and the King assessor). The defect is not field quality — it is that **only 1 
   date, so delivered rows legitimately sit OUTSIDE the requested window (the 9/4/2026 row in a
   06/04–09/02 job). Intentional, but nothing tells the user.
 
-## Plan (awaiting approval before any code)
+## Status
 
-- [ ] **P0-1** Add `_AUCTION_LOC_AFTER` as a 4th fallback in `nts_tacoma_index.py`, tried only after
+**P0 SHIPPED — PR #200 open, Codex gate CLEAN after 3 rounds, full suite 2091 passed / 0 failed.**
+Both live King issues now yield 7 of 7 notices kept, 0 dropped, all active.
+A third defect surfaced during the Codex gate and is fixed in the same PR: **inline sale
+postponements were ignored**, so TS `WA05000073-24-2` (sale genuinely 09/18/2026,
+$155,361.99 owing) was stored with its stale 06/26/2026 date, marked inactive, and
+suppressed — another reason Test 6 came back nearly empty.
+
+## Plan
+
+- [x] **P0-1** Add `_AUCTION_LOC_AFTER` as a 4th fallback in `nts_tacoma_index.py`, tried only after
       the existing three miss (byte-identical behavior for every layout that parses today).
       Per Codex: anchor on `Trustee\s+will`, capture location as bounded `[\s\S]{0,300}`.
-- [ ] **P0-2** Tests: 3 Affinia positives; unchanged-output regression for the existing 3 regexes;
+- [x] **P0-2** Tests: 3 Affinia positives; unchanged-output regression for the existing 3 regexes;
       a 45k-char adversarial block asserting no catastrophic backtracking (hard runtime bound).
-- [ ] **P1-1** Add `--source` to `scripts/repair_nts_ts_number.py`; dry-run then apply for
-      `queen_anne_news`. Retire the mis-bound twin, re-key the surrogate row.
-- [ ] **P2-1** Log + `_alert_if_crawl_barren`-style signal when notices are dropped for a missing
+- [x] **P1-1a** `--source` added to `scripts/repair_nts_ts_number.py` (King paired with
+      `parse_king_notice`; snohomish default unchanged). Committed.
+- [ ] **P1-1b** 🔒 BLOCKED ON USER — running the repair (even the dry run) and linking the
+      worktree to Railway were both denied by the auto-mode classifier. The repair must be
+      run by the user AFTER PR #200 deploys:
+      `railway run --service worker python scripts/repair_nts_ts_number.py --results --notices --source queen_anne_news`
+      (dry-run first; add `--apply --i-confirm-fixed-parser-is-deployed` to write).
+      Known King state needing repair:
+        * `WA07000020-26-1` holds GUILER's data — truth says MEKMORAKOTH / parcel 259900081003
+        * `REF-20231006000715` is MEKMORAKOTH under a surrogate key; the Test 6 lead hangs off it
+        * `WA07000014-24-4` GUILER 06/26 — superseded twin
+        * `WA05000073-24-2` (GUILER, 09/18/2026, $155,361.99) is MISSING entirely.
+          Its published run includes 09/09/2026, so the post-deploy crawl should re-ingest it.
+- [x] **P2-1** Log + `_alert_if_crawl_barren`-style signal when notices are dropped for a missing
       auction date (F3) — the silent drop is the real production failure.
 - [ ] **P2-2** Decide: re-sweep / catch-up for PDF sources (F4).
 - [ ] **F5/F6** → user decision, no code.

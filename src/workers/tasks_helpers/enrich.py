@@ -7,6 +7,7 @@ behavior is byte-identical to the originals in tasks.py.
 
 import asyncio
 import re
+import time as _time
 from typing import TYPE_CHECKING
 
 import redis as sync_redis
@@ -477,38 +478,17 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             # aborted all of it on every large King tax job (172+ parcels).
             king_stats: dict = {}
             king_error: str | None = None
-            try:
-                # party_names lets the malformed-PID resolver break a tie between
-                # several REAL candidate parcels by matching the assessor owner to
-                # this lead's own party. Only consulted for a confirmed mismatch.
-                party_names = {
-                    pid: list(dict.fromkeys(
-                        res.party_name for res in pid_map.get(pid, []) if res.party_name
-                    ))
-                    for pid in pids
-                }
-                enriched = asyncio.run(asyncio.wait_for(
-                    # 200s could not even finish phase 1 for a few hundred parcels
-                    # (~0.5s each), so owner + property resolution was being cut off
-                    # by the clock as well as by the old count cap.
-                    # BUDGET ARITHMETIC (these are additive within ONE Celery task):
-                    #   scrape 1800s (_SCRAPE_TIMEOUT) + this 660s + owner-only 300s
-                    #   = 2760s, inside soft_time_limit=3600s with headroom for
-                    #   persistence, export, billing and delivery. Raise either
-                    #   budget only by re-doing that sum — 900+900 here overran it.
-                    # Phase 1 (property + owner, cheap HTTP) always runs to
-                    # completion first, so the expensive Playwright mailing pass can
-                    # only ever spend what is left over: owner names are never the
-                    # thing that gets dropped.
-                    batch_enrich_king_county(pids, time_budget_s=600, stats=king_stats,
-                                             party_names=party_names),
-                    timeout=660,
+            # party_names lets the malformed-PID resolver break a tie between
+            # several REAL candidate parcels by matching the assessor owner to
+            # this lead's own party. Only consulted for a confirmed mismatch.
+            party_names = {
+                pid: list(dict.fromkeys(
+                    res.party_name for res in pid_map.get(pid, []) if res.party_name
                 ))
-            except Exception as exc:  # noqa: BLE001 — best-effort county lookup
-                king_error = f"{type(exc).__name__}: {str(exc)[:120]}"
-                _logger.warning("Job %s: King mailing lookup failed: %s", job_id, king_error)
-                enriched = {}
-                king_stats.setdefault("deferred", list(pids))
+                for pid in pids
+            }
+            enriched_count = 0
+            found = 0
             # King tax-delinquent rows ship with a placeholder party_name because
             # the Socrata source has no owner column. The eRealProperty lookup
             # above now also yields the owner name; swap it in here. Dual gate:
@@ -522,68 +502,140 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             # is who holds title NOW — often an heir/trust. Surface it + a conservative
             # flag so the user isn't mailing a decedent.
             is_probate_family = config.record_type in ("probate", "death_certificate")
-            for pid, data in enriched.items():
-                prop = data.get("property_address")
-                mail = data.get("mailing_address")
-                owner = data.get("owner_name")
-                for res in pid_map.get(pid, []):
-                    if data.get("resolved_by") == "gis_plus_owner_match" and not (
-                        # Compare against the assessor OWNER that actually proved the
-                        # parcel, not against the other lead's party. Party-to-party
-                        # is NON-TRANSITIVE: "SMITH JOHN B" matches "SMITH JOHN" but
-                        # not owner "SMITH JOHN A", so gating on the party would hand
-                        # B the parcel A's evidence chose (Codex P1).
-                        owner_matches_party(res.party_name, data.get("resolved_owner_match"))
-                    ):
-                        # The parcel was resolved by matching ANOTHER lead's party.
-                        # Two leads can share one malformed PID with different
-                        # parties, and that evidence does not transfer (Codex P1).
-                        continue
-                    if prop and not res.property_address:
-                        res.property_address = prop
-                    if prop and not res.property_zip:
-                        # eRealProperty's Site Address sometimes ends in the ZIP
-                        # ("2019 SW 318TH PL 4C 98023"): anchored trailing token only,
-                        # no city inferred from it (Codex).
-                        _z = _TRAILING_ZIP_RE.search(prop)
-                        if _z:
-                            res.property_zip = _z.group(1)
-                    if mail:
-                        res.mailing_address = mail
-                    if (
-                        is_tax_delinquent
-                        and owner
-                        and (not res.party_name or is_tax_placeholder_party(res.party_name))
-                    ):
-                        res.party_name = owner
-                    # Display-only: record the Assessor's current owner + a humble
-                    # "differs/entity" flag. NEVER overwrite party_name, NEVER drop the
-                    # lead (Assessor lag; heirs are valid motivated sellers).
-                    if is_probate_family and owner:
-                        ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
-                        ed["assessor_current_owner"] = owner
-                        ed["title_status"] = classify_probate_title_status(res.party_name, owner)
-                        res.enrichment_data = ed
-                    # The county printed a malformed parcel and we recovered the
-                    # real one. parcel_id STAYS as the county printed it (it feeds
-                    # the frozen dedup_hash); the resolved PIN + the evidence that
-                    # chose it are recorded beside it (Codex).
-                    if data.get("parcel_lookup") in ("recovered", "mismatch"):
-                        ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
-                        ed["parcel_lookup"] = data["parcel_lookup"]
-                        for k, v in data.items():
-                            if k.startswith("resolved_") or k == "source_parcel_id":
-                                ed[k] = v
-                        res.enrichment_data = ed
-            try:
-                db.commit()
-            except Exception as exc:
-                _logger.warning(
-                    "Job %s: King enrichment commit failed: %s", job_id, str(exc)[:120]
-                )
-                db.rollback()
-                db.commit()
-            found = sum(1 for d in enriched.values() if d.get("mailing_address"))
+            def _apply_king(enriched: dict) -> None:
+                """Write ONE chunk's lookups onto their rows (caller commits).
+
+                Extracted so the enrichment can run in chunks: the previous
+                shape accumulated every parcel's result in memory and wrote
+                NOTHING until the whole pass returned, so any interruption threw
+                away every lookup already paid for.
+                """
+                for pid, data in enriched.items():
+                    prop = data.get("property_address")
+                    mail = data.get("mailing_address")
+                    owner = data.get("owner_name")
+                    for res in pid_map.get(pid, []):
+                        if data.get("resolved_by") == "gis_plus_owner_match" and not (
+                            # Compare against the assessor OWNER that actually proved the
+                            # parcel, not against the other lead's party. Party-to-party
+                            # is NON-TRANSITIVE: "SMITH JOHN B" matches "SMITH JOHN" but
+                            # not owner "SMITH JOHN A", so gating on the party would hand
+                            # B the parcel A's evidence chose (Codex P1).
+                            owner_matches_party(res.party_name, data.get("resolved_owner_match"))
+                        ):
+                            # The parcel was resolved by matching ANOTHER lead's party.
+                            # Two leads can share one malformed PID with different
+                            # parties, and that evidence does not transfer (Codex P1).
+                            continue
+                        if prop and not res.property_address:
+                            res.property_address = prop
+                        if prop and not res.property_zip:
+                            # eRealProperty's Site Address sometimes ends in the ZIP
+                            # ("2019 SW 318TH PL 4C 98023"): anchored trailing token only,
+                            # no city inferred from it (Codex).
+                            _z = _TRAILING_ZIP_RE.search(prop)
+                            if _z:
+                                res.property_zip = _z.group(1)
+                        if mail:
+                            res.mailing_address = mail
+                        if (
+                            is_tax_delinquent
+                            and owner
+                            and (not res.party_name or is_tax_placeholder_party(res.party_name))
+                        ):
+                            res.party_name = owner
+                        # Display-only: record the Assessor's current owner + a humble
+                        # "differs/entity" flag. NEVER overwrite party_name, NEVER drop the
+                        # lead (Assessor lag; heirs are valid motivated sellers).
+                        if is_probate_family and owner:
+                            ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+                            ed["assessor_current_owner"] = owner
+                            ed["title_status"] = classify_probate_title_status(res.party_name, owner)
+                            res.enrichment_data = ed
+                        # The county printed a malformed parcel and we recovered the
+                        # real one. parcel_id STAYS as the county printed it (it feeds
+                        # the frozen dedup_hash); the resolved PIN + the evidence that
+                        # chose it are recorded beside it (Codex).
+                        if data.get("parcel_lookup") in ("recovered", "mismatch"):
+                            ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+                            ed["parcel_lookup"] = data["parcel_lookup"]
+                            for k, v in data.items():
+                                if k.startswith("resolved_") or k == "source_parcel_id":
+                                    ed[k] = v
+                            res.enrichment_data = ed
+            # ── Chunked driver ────────────────────────────────────────────
+            # Enrich a slice, WRITE IT, COMMIT IT, then move on. The previous
+            # shape asked for every parcel in one call and persisted nothing
+            # until it returned, so ANY interruption lost the whole pass. That is
+            # not hypothetical: a 17,157-parcel verification run was killed
+            # mid-enrichment by an unrelated worker redeploy 6 minutes in, and
+            # every lookup it had already paid for was discarded, leaving the job
+            # orphaned in 'enriching' with 0 owner names. Deploys restart workers
+            # routinely, so a long enrichment MUST checkpoint. Chunking also
+            # bounds the in-flight set and lets the shared deadline stop the pass
+            # cleanly at a chunk boundary.
+            _KING_CHUNK = 200
+            _KING_TOTAL_BUDGET_S = 600  # see BUDGET ARITHMETIC below
+            _king_deadline = _time.monotonic() + _KING_TOTAL_BUDGET_S
+            _pending = list(pids)
+            while _pending:
+                _left = _king_deadline - _time.monotonic()
+                if _left <= 5:
+                    king_stats.setdefault("deferred", []).extend(_pending)
+                    _logger.info(
+                        "King enrichment: budget spent, %d parcels deferred", len(_pending)
+                    )
+                    break
+                _chunk, _pending = _pending[:_KING_CHUNK], _pending[_KING_CHUNK:]
+                _chunk_stats: dict = {}
+                try:
+                    enriched = asyncio.run(asyncio.wait_for(
+                        # BUDGET ARITHMETIC (additive within ONE Celery task):
+                        #   scrape 1800s (_SCRAPE_TIMEOUT) + this 600s + owner-only
+                        #   300s = 2700s, inside soft_time_limit=3600s with headroom
+                        #   for persistence, export, billing and delivery. Raise a
+                        #   budget only by re-doing that sum.
+                        batch_enrich_king_county(
+                            _chunk, time_budget_s=_left, stats=_chunk_stats,
+                            party_names={k: party_names[k] for k in _chunk if k in party_names},
+                        ),
+                        timeout=_left + 60,
+                    ))
+                except Exception as exc:  # noqa: BLE001 — best-effort county lookup
+                    king_error = f"{type(exc).__name__}: {str(exc)[:120]}"
+                    _logger.warning(
+                        "Job %s: King lookup failed on a chunk: %s", job_id, king_error
+                    )
+                    enriched = {}
+                    # ASSIGN, never setdefault: batch_enrich_king_county seeds
+                    # stats["deferred"] = [] as its FIRST action, so setdefault is
+                    # a no-op here and the chunk's parcels would silently get no
+                    # durable marker. We lost this chunk's return value entirely,
+                    # so every parcel in it is unreached by definition.
+                    _chunk_stats["deferred"] = list(_chunk)
+                # Accumulate this chunk's stats into the job-level totals.
+                for _k, _v in _chunk_stats.items():
+                    if isinstance(_v, list):
+                        king_stats.setdefault(_k, []).extend(_v)
+                    elif isinstance(_v, bool):
+                        king_stats[_k] = king_stats.get(_k, False) or _v
+                    elif isinstance(_v, int):
+                        king_stats[_k] = king_stats.get(_k, 0) + _v
+                _apply_king(enriched)
+                enriched_count += len(enriched)
+                found += sum(1 for d in enriched.values() if d.get("mailing_address"))
+                try:
+                    db.commit()
+                except Exception as exc:
+                    _logger.warning(
+                        "Job %s: King enrichment commit failed: %s", job_id, str(exc)[:120]
+                    )
+                    db.rollback()
+                # Free the chunk's payload before the next one is fetched.
+                enriched = {}
+                if _chunk_stats.get("budget_exhausted"):
+                    king_stats.setdefault("deferred", []).extend(_pending)
+                    _pending = []
             # Durable marker for parcels the budget/cap/failure never reached, so a
             # later sweep can find them (never a silent gap — Codex).
             deferred = [p for p in dict.fromkeys(king_stats.get("deferred", [])) if p in pid_map]

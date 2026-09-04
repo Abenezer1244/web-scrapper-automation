@@ -77,40 +77,26 @@ _FETCH_DELAY_S = 0.4      # polite gap between probes
 _MAX_ISSUES = 40          # abort guard (NOT a truncation) — see the probe loop
 
 
-def _king_names(d: date) -> list[str]:
-    """King: "QA Legals MM-DD-YY.pdf" — zero-padded (verified across 14 issues)."""
-    return [f"QA Legals {d.month:02d}-{d.day:02d}-{d.year % 100:02d}.pdf"]
-
-
-def _snoho_names(d: date) -> list[str]:
-    """Snohomish: "Legals - M-D-YY.pdf" — NOT zero-padded. Both variants are probed
-    because the paper has been inconsistent and a padded issue costs one extra HEAD."""
-    return [
-        f"Legals - {d.month}-{d.day}-{d.year % 100:02d}.pdf",
-        f"Legals - {d.month:02d}-{d.day:02d}-{d.year % 100:02d}.pdf",
-    ]
-
-
 # Each source: CDN path prefix, county, filename builder, and the parser its crawler
 # uses. King MUST use parse_king_notice — its no-colon Affinia fields and surrogate
 # REF-/APN- keys come out as garbage under the shared colon parser.
 def _sources() -> dict:
-    from src.scrapers.sources.nts_king_pdf import parse_king_notice
+    """Per-source config = the shared archive map + the parser this paper needs.
 
-    return {
-        "queen_anne_news": {
-            "prefix": "/static-4/queenannenews/images/legals/",
-            "county": "king",
-            "names": _king_names,
-            "parse": parse_king_notice,
-        },
-        "snohomish_tribune": {
-            "prefix": "/static-4/snoho/images/",
-            "county": "snohomish",
-            "names": _snoho_names,
-            "parse": nts.parse_nts_notice,
-        },
+    The prefix/county/filename rules live in src/scrapers/sources/nts_pdf_archive.py so
+    this one-shot recovery and the crawler's daily self-heal sweep cannot disagree about
+    where a back issue lives (they did: this script's Snohomish builder only knew the
+    "Legals - M-D-YY.pdf" spelling and could not reach the no-separator names the paper
+    switched to by 2026-09-02).
+    """
+    from src.scrapers.sources.nts_king_pdf import parse_king_notice
+    from src.scrapers.sources.nts_pdf_archive import ARCHIVE_SOURCES
+
+    parsers = {
+        "queen_anne_news": parse_king_notice,
+        "snohomish_tribune": nts.parse_nts_notice,
     }
+    return {name: {**cfg, "parse": parsers[name]} for name, cfg in ARCHIVE_SOURCES.items()}
 
 
 def _try_fetch(url: str) -> bytes | None:

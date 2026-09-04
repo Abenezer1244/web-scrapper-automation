@@ -5,8 +5,12 @@ a bypassing role, and the new roles serve no traffic until the repoint). Runs as
 postgres via the SESSION pooler (:5432). Idempotent.
 
 Part A: table GRANT/REVOKE — mirrors scripts/provision_rls_roles.sql (the fixed,
-        Codex-reviewed grant block) exactly: app least-privilege + explicit
-        REVOKEs + a hard-fail verify. (Role creation already done in step 1.)
+        Codex-reviewed grant block): app least-privilege + explicit REVOKEs + TWO
+        hard-fail verifies — a negative one (app holds nothing extra) and a
+        positive one (system still holds every DELETE the worker needs). The
+        second exists because this file silently drifted from
+        provision_rls_roles.sql by one line and prod lost DELETE on
+        delivered_records; "mirrors exactly" is now enforced, not asserted.
 Part B: executes scripts/apply_rls_cutover_policies.sql (role-targeted policies +
         029 binding backfill), stripping psql meta-commands so psycopg2 can run it.
 
@@ -52,6 +56,17 @@ _GRANTS = [
     "GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO bridgeleads_system",
     "GRANT DELETE ON county_records TO bridgeleads_system",
     "GRANT DELETE ON property_list_membership TO bridgeleads_system",
+    # tasks.py releases a job's cross-job dedup claims on FIVE paths (trustee-sale
+    # finalize failure, R2 upload failure, over-quota cap release, plan-cap
+    # failure, enriched re-export failure) so leads that were never delivered and
+    # never billed are not treated as duplicates forever. This line existed in
+    # provision_rls_roles.sql but was MISSING here — and this script is what
+    # actually provisioned prod, right after `REVOKE ALL ON delivered_records`
+    # above. Result in production: bridgeleads_system held INSERT+UPDATE but not
+    # DELETE, every release raised InsufficientPrivilege, and the over-quota
+    # release (which runs INSIDE the plan-cap transaction) turned an ordinary
+    # over-quota run into a FAILED job while stranding 16,761 dedup claims.
+    "GRANT DELETE ON delivered_records TO bridgeleads_system",
     # H1: operator MFA reset (scripts/reset_user_mfa.py) deletes both MFA tables
     "GRANT DELETE ON mfa_backup_codes, mfa_break_glass_codes TO bridgeleads_system",
     # pending_registrations (074): worker dispatch SELECT/UPDATE (ALL TABLES) + purge DELETE
@@ -78,6 +93,36 @@ _VERIFY_APP_GRANTS = """
             AND table_name IN ('scraper_batches','batch_runs','audit_events'))
         OR (privilege_type = 'SELECT' AND table_name = 'audit_events')
       )
+"""
+
+
+# The app verify above is a NEGATIVE check: it fails when the app role holds a
+# privilege it should not. Nothing asserted that the SYSTEM role still HOLDS the
+# privileges the worker depends on, so a grant could go missing here and this
+# script would still print "verified". That is exactly how DELETE on
+# delivered_records was lost. This POSITIVE check closes that hole: every table
+# the worker issues a DELETE against must be listed, and a missing grant is a
+# hard failure rather than a silent runtime InsufficientPrivilege months later.
+#
+# Keep in sync with the worker's actual DELETE statements. Current sources:
+#   delivered_records        tasks.py (dedup-claim release x5)
+#   county_records           scheduler.py retention
+#   property_list_membership overlap rollup prune
+#   mfa_backup_codes         scripts/reset_user_mfa.py
+#   mfa_break_glass_codes    scripts/reset_user_mfa.py
+#   pending_registrations    hourly expired-row purge
+_SYSTEM_DELETE_TABLES = (
+    "delivered_records",
+    "county_records",
+    "property_list_membership",
+    "mfa_backup_codes",
+    "mfa_break_glass_codes",
+    "pending_registrations",
+)
+
+_VERIFY_SYSTEM_GRANTS = """
+    SELECT t.name FROM unnest(%s::text[]) AS t(name)
+    WHERE NOT has_table_privilege('bridgeleads_system', t.name, 'DELETE')
 """
 
 
@@ -118,7 +163,17 @@ def main() -> None:
             bad = cur.fetchone()[0]
             if bad:
                 raise SystemExit(f"app role holds {bad} disallowed privilege(s) — convergence failed")
-            print("  grants applied; app least-privilege verified (0 disallowed)")
+            cur.execute(_VERIFY_SYSTEM_GRANTS, (list(_SYSTEM_DELETE_TABLES),))
+            missing = [r[0] for r in cur.fetchall()]
+            if missing:
+                raise SystemExit(
+                    "system role is MISSING DELETE on: " + ", ".join(missing)
+                    + " — the worker's cleanup paths would fail with InsufficientPrivilege"
+                )
+            print(
+                f"  grants applied; app least-privilege verified (0 disallowed); "
+                f"system DELETE verified on {len(_SYSTEM_DELETE_TABLES)} table(s)"
+            )
 
             print("== Part B: role-targeted policies (apply_rls_cutover_policies.sql) ==")
             cur.execute(_policy_sql_without_psql_meta())

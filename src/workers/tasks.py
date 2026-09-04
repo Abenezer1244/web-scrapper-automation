@@ -83,6 +83,47 @@ _R2_UPLOAD_ATTEMPTS = 3
 _R2_UPLOAD_BACKOFF = 2  # seconds, multiplied by attempt number (2s, 4s)
 
 
+def _alert_dedup_release_failed(job_id: str, user_id, context: str, exc: Exception) -> None:
+    """A dedup-claim release failed — escalate, never just log.
+
+    Releasing `delivered_records` is what keeps a lead that was NEVER delivered
+    and NEVER billed from being treated as an already-seen duplicate forever. If
+    the release fails, those leads become permanently unreachable for that user:
+    excluded from every future run's results and downloads, silently, while the
+    job tells them "no file was delivered and you were not charged".
+
+    That failure mode was invisible for exactly this reason — the call sites
+    caught the exception and logged it. In production the worker role was missing
+    DELETE on delivered_records, so all five release paths raised
+    InsufficientPrivilege, stranding 16,761 claims with nothing but a log line
+    that had already scrolled out of retention by the time anyone looked.
+
+    send_ops_alert persists a durable row even when OPS_ALERT_EMAIL is unset
+    (which it is in prod), so the incident survives log rotation.
+    """
+    _logger.error(
+        "Job %s: dedup-claim release FAILED (%s) — leads may be permanently "
+        "suppressed as duplicates: %s", job_id, context, str(exc)[:200],
+    )
+    try:
+        from src.workers.ops_alerts import send_ops_alert
+
+        send_ops_alert(
+            "dedup_release_failed",
+            f"{context}:{job_id}",
+            "Dedup-claim release failed — leads may be permanently suppressed",
+            f"Job {job_id} (user {user_id}) could not release its delivered_records "
+            f"claims on the '{context}' path: {str(exc)[:400]}. "
+            "Those leads were not delivered and not billed, but they remain claimed, "
+            "so future runs will drop them as duplicates. Check that the worker role "
+            "still holds DELETE on delivered_records "
+            "(scripts/_cutover_step2_grants_policies.py), then release them with: "
+            "DELETE FROM delivered_records WHERE first_job_id = <job> AND user_id = <user>;",
+        )
+    except Exception as alert_exc:  # noqa: BLE001 — alerting must never mask the original
+        _logger.error("Job %s: dedup-release alert failed too: %s", job_id, str(alert_exc)[:160])
+
+
 def _upload_export_with_retry(exporter, local_file, object_key) -> tuple[bool, Exception | None]:
     """Upload an export to R2 with bounded retries. Never raises.
 
@@ -1002,6 +1043,7 @@ def run_scrape_job(self, job_id: str) -> None:
                         "Job %s: failed to release dedup claims after finalize "
                         "failure: %s", job_id, str(cleanup_exc)[:200],
                     )
+                    _alert_dedup_release_failed(job_id, job.user_id, "finalize_failure", cleanup_exc)
                 reason = (
                     "Auction data could not be attached to your Auction Leads, so the "
                     "run was stopped and you were not charged. Please try again; "
@@ -1144,6 +1186,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     "Job %s: failed to release dedup claims after upload failure: %s",
                     job_id, str(cleanup_exc)[:200],
                 )
+                _alert_dedup_release_failed(job_id, job.user_id, "upload_failure", cleanup_exc)
             # Honest message: a FAILED job is terminal — the watchdog does NOT
             # re-queue it (it only requeues stuck active/pending jobs). A
             # scheduled scraper makes a fresh job on its next occurrence; a manual
@@ -1340,6 +1383,7 @@ def run_scrape_job(self, job_id: str) -> None:
                         "Job %s: failed to release dedup claims after cap failure: %s",
                         job_id, str(cleanup_exc)[:200],
                     )
+                    _alert_dedup_release_failed(job_id, job.user_id, "plan_cap_failure", cleanup_exc)
                 reason = (
                     'The lead list could not be re-read after enrichment, so your plan quota could not be applied — no file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.' if refreshed is None else 'Your plan quota could not be applied to this run — no file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.'
                 )
@@ -1446,6 +1490,7 @@ def run_scrape_job(self, job_id: str) -> None:
                         "Job %s: failed to release dedup claims after re-export failure: %s",
                         job_id, str(cleanup_exc)[:200],
                     )
+                    _alert_dedup_release_failed(job_id, job.user_id, "reexport_failure", cleanup_exc)
                 reason = (
                     "The lead file could not be refreshed with enriched addresses — "
                     "no file was delivered and you were not charged. Please run the "

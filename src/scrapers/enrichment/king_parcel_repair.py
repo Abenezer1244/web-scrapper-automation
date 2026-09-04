@@ -151,6 +151,12 @@ def _normalize_token(tok: str) -> str:
     return re.sub(r"[^A-Z]", "", tok.upper())
 
 
+# A hyphen joins a compound surname, and the two sources disagree about it:
+# "SMITH-JONES MARY" vs "SMITH JONES MARY" are the same person, so split on it and
+# let the sequence comparison line them up (Codex P2).
+_SPLIT_TOKEN_RE = re.compile(r"[-\u2010-\u2015/]+")
+
+
 def person_tokens(name: str | None) -> list[tuple[str, ...]]:
     """One normalised token tuple per PERSON named in ``name``.
 
@@ -176,6 +182,7 @@ def person_tokens(name: str | None) -> list[tuple[str, ...]]:
             raw_tokens = [last] + rest.split()
         else:
             raw_tokens = seg.split()
+        raw_tokens = [part for tok in raw_tokens for part in _SPLIT_TOKEN_RE.split(tok)]
         tokens = tuple(
             t for t in (_normalize_token(x) for x in raw_tokens) if t and t not in _SUFFIXES
         )

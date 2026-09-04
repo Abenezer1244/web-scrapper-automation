@@ -351,7 +351,7 @@ async def batch_enrich_king_county(
     *,
     time_budget_s: float | None = None,
     stats: dict | None = None,
-    party_names: dict[str, str | None] | None = None,
+    party_names: dict[str, list[str]] | None = None,
     pace_s: float = 0.2,
 ) -> dict[str, dict[str, str | None]]:
     """Two-phase enrichment: HTTP for property, Playwright for mailing.
@@ -454,7 +454,16 @@ async def batch_enrich_king_county(
                 # resolves, redo THIS lookup against the recovered PIN. The
                 # stored parcel_id still stays exactly as the county printed it —
                 # only the lookup target and the provenance change.
-                resolved = resolve_malformed_parcel(pid, (party_names or {}).get(pid), st)
+                # Try EVERY distinct party on this PID, not just the first: two
+                # leads can share one malformed PID, and picking one party meant a
+                # lead whose party did not resolve silently lost its recovery
+                # (Codex P1). The first party that resolves wins; the write-back
+                # then applies it only to rows naming that same person.
+                resolved = None
+                for _party in ((party_names or {}).get(pid) or [None]):
+                    resolved = resolve_malformed_parcel(pid, _party, st)
+                    if resolved is not None:
+                        break
                 if resolved is not None:
                     rr = safe_get(f"{_ERP_URL}{resolved.parcel_id}", headers=_HEADERS, timeout=10)
                     if rr.status_code == 200 and parcel_page_is_for(rr.text, resolved.parcel_id):

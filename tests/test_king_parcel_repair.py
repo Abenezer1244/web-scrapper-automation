@@ -215,3 +215,12 @@ def test_never_resolves_to_the_parcel_erealproperty_would_have_truncated_to():
         gis_exists=_gis(_REAL), owner_of=_owner(_REAL),
     )
     assert got is not None and got.parcel_id != "6411600002"
+
+
+def test_a_hyphenated_compound_surname_matches_its_spaced_form():
+    # Codex P2: the recorder and the assessor disagree about the hyphen, and both
+    # spellings are the same person.
+    assert owner_matches_party("SMITH-JONES MARY", "SMITH JONES MARY")
+    assert owner_matches_party("SMITH JONES MARY E", "SMITH-JONES MARY ELLEN")
+    # ...but it must not make two different people agree.
+    assert not owner_matches_party("SMITH-JONES MARY", "SMITH JONES JOHN")

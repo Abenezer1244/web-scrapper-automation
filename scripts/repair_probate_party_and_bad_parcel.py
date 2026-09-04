@@ -90,6 +90,46 @@ _PARTY_UPDATE = text(
     """
 )
 
+# The pending skip-trace payload snapshots the lead's NAME at enqueue time. When
+# the party repair rewrites party_name, that snapshot is stale — and for this
+# repair class the OLD party was a placeholder or agency, so the queued trace
+# would be submitted for a person like "State Washington" at a real address, at
+# Tracerfy's expense (Codex). Refresh it with the ENQUEUE'S OWN derivation
+# (select_traceable_owner + the same normal/advanced rule), never a bespoke
+# splitter — two ad-hoc splitters in this session both got compound surnames
+# wrong.
+_PENDING_FOR_RESULT = text(
+    """
+    SELECT id, first_name, last_name, trace_type, status
+    FROM pending_skip_trace_rows
+    WHERE result_id = :id
+    """
+)
+
+_PENDING_NAME_REFRESH = text(
+    """
+    UPDATE pending_skip_trace_rows
+    SET first_name = :new_first, last_name = :new_last, trace_type = :new_trace_type
+    WHERE result_id = :id
+      -- Only a row that has NOT reached the provider. 'submitting', 'submitted'
+      -- and 'completed' may already be paid for or correlated to a Tracerfy
+      -- queue id, and 'errored' cannot be told apart from a genuine provider
+      -- rejection by status alone (Codex).
+      AND status = 'queued'
+      AND tracerfy_queue_id IS NULL
+      AND submitted_at IS NULL
+      AND first_name IS NOT DISTINCT FROM :old_first
+      AND last_name IS NOT DISTINCT FROM :old_last
+      AND trace_type IS NOT DISTINCT FROM :old_trace_type
+      AND (
+           first_name IS DISTINCT FROM :new_first
+        OR last_name IS DISTINCT FROM :new_last
+        OR trace_type IS DISTINCT FROM :new_trace_type
+      )
+    """
+)
+
+
 _PARCEL_CANDIDATES = text(
     """
     SELECT r.id, r.parcel_id, r.party_name, r.property_address, r.mailing_address,
@@ -157,7 +197,62 @@ _PARCEL_RECOVER = text(
     WHERE id = :id
       AND parcel_id = :parcel_id
       AND property_address IS NOT DISTINCT FROM :old_property
+      -- Guard EVERY value this statement overwrites, not just the address
+      -- (Codex P2): it also replaces the mailing address and nulls the situs.
+      AND mailing_address IS NOT DISTINCT FROM :old_mailing
+      AND property_city IS NOT DISTINCT FROM :old_city
+      AND property_state IS NOT DISTINCT FROM :old_state
+      AND property_zip IS NOT DISTINCT FROM :old_zip
       AND CAST(enrichment_data AS text) IS NOT DISTINCT FROM :old_enrichment_text
+    """
+)
+
+# Recovery gives the lead its REAL address, so a trace queued against the wrong
+# one should be RE-POINTED, not cancelled. backfill_skip_trace_jobs excludes any
+# result that already has a pending row REGARDLESS of status, so cancelling would
+# strand the corrected lead permanently (Codex P2).
+_REPOINT_PENDING = text(
+    """
+    UPDATE pending_skip_trace_rows
+    SET property_address = :property_address,
+        -- EVERY payload column, not just the street: the dispatcher submits these
+        -- verbatim, so a stale locality / mailing / name left over from the WRONG
+        -- parcel would ship a corrected street with a stranger's context (Codex
+        -- P1). Anything not verified for the corrected parcel becomes NULL.
+        city = NULL, state = NULL, zip = NULL,
+        mail_address = :mail_address, mail_city = NULL, mail_state = NULL, mail_zip = NULL,
+        -- first_name / last_name are deliberately NOT touched. They describe the
+        -- PERSON, which a parcel correction does not change: the enqueue derived
+        -- them from this lead's own party and they are still right. Blanking them
+        -- would ship a 'normal' trace with no name, and re-deriving them here
+        -- needs a surname splitter this module does not have — person_tokens() is
+        -- explicitly not one, and using it made "VAN DYKE MARY" into
+        -- last='VAN' first='DYKE' (Codex P1). Leaving them alone avoids both.
+        tracerfy_queue_id = NULL,
+        status = 'queued', submitted_at = NULL
+    WHERE result_id = :id
+      -- Reviving 'errored' is limited to the shape this repair created: something
+      -- this statement repairs must still be off-target. A genuine provider
+      -- rejection recorded AFTER the repair matches on every column and is left
+      -- alone (Codex P2). Listing every repaired column (not just the street) also
+      -- completes a row a PREVIOUS, narrower re-point left half-fixed (Codex P1).
+      AND status IN ('queued', 'errored')
+      AND (
+           property_address IS DISTINCT FROM :property_address
+        OR mail_address IS DISTINCT FROM :mail_address
+        OR city IS NOT NULL OR state IS NOT NULL OR zip IS NOT NULL
+        OR mail_city IS NOT NULL OR mail_state IS NOT NULL OR mail_zip IS NOT NULL
+        OR tracerfy_queue_id IS NOT NULL
+      )
+    """
+)
+
+_REQUEUE_RESULT_TRACE = text(
+    """
+    UPDATE results
+    SET skip_trace_status = 'queued'
+    WHERE id = :id
+      AND skip_trace_status IN ('not_attempted', 'errored')
     """
 )
 
@@ -186,6 +281,36 @@ _ASSESSOR_DERIVED_KEYS = ("assessor_current_owner", "title_status")
 def _journal(path: str, payload: dict) -> None:
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, default=str) + "\n")
+
+
+def _refresh_pending_name(db, result_id: str, new_party: str | None, *, journal: str) -> int:
+    """Re-derive a queued trace's name payload from the REPAIRED party. Returns rows written.
+
+    Uses the enqueue's own rule so the repaired row is indistinguishable from one
+    enqueued fresh: select_traceable_owner picks the highest-confidence person and
+    returns (None, None) for an entity/ambiguous name, which is exactly when the
+    enqueue falls back to an address-only ADVANCED trace.
+    """
+    from src.scrapers.enrichment.skip_trace import select_traceable_owner
+
+    first, last = select_traceable_owner(new_party)
+    trace_type = "normal" if (first and last) else "advanced"
+    written = 0
+    for pend in db.execute(_PENDING_FOR_RESULT, {"id": result_id}).mappings().all():
+        if (pend["first_name"], pend["last_name"], pend["trace_type"]) == (first, last, trace_type):
+            continue
+        _journal(journal, {"repair": "pending_name", "id": result_id,
+                           "pending_id": pend["id"], "pending_status": pend["status"],
+                           "new_party": new_party,
+                           "old_first": pend["first_name"], "old_last": pend["last_name"],
+                           "old_trace_type": pend["trace_type"],
+                           "new_first": first, "new_last": last, "new_trace_type": trace_type})
+        written += db.execute(_PENDING_NAME_REFRESH, {
+            "id": result_id, "new_first": first, "new_last": last,
+            "new_trace_type": trace_type, "old_first": pend["first_name"],
+            "old_last": pend["last_name"], "old_trace_type": pend["trace_type"],
+        }).rowcount
+    return written
 
 
 def repair_party(db, *, apply: bool, journal: str) -> dict:
@@ -220,6 +345,10 @@ def repair_party(db, *, apply: bool, journal: str) -> dict:
                 "old_party": row["party_name"], "old_heirs": row["heirs"],
             })
             stats["written"] += res.rowcount
+            if res.rowcount:
+                stats["pending_refreshed"] = stats.get("pending_refreshed", 0) + _refresh_pending_name(
+                    db, row["id"], new_party, journal=journal
+                )
     if apply:
         db.commit()
     return stats
@@ -313,8 +442,30 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
         recovered = recoveries[rec_key]
         if recovered is not None:
             prop, mail, prov = recovered
-            if row["property_address"] == prop and enrichment.get("resolved_parcel_id"):
+            if (
+                row["property_address"] == prop
+                and row["mailing_address"] == mail
+                and row["property_city"] is None
+                and row["property_state"] is None
+                and row["property_zip"] is None
+                and enrichment.get("resolved_parcel_id") == prov.get("resolved_parcel_id")
+            ):
+                # Fully at the intended end-state. A partial earlier recovery (stale
+                # mailing or situs) must NOT be skipped (Codex P2).
                 stats["already_recovered"] = stats.get("already_recovered", 0) + 1
+                if apply:
+                    # An EARLIER run may have cancelled this lead's trace before the
+                    # re-point existed, leaving it stranded behind an 'errored'
+                    # pending row holding the wrong address. The re-point is
+                    # idempotent (it no-ops once the address already matches), so
+                    # run it here too rather than only on a fresh recovery.
+                    repointed = db.execute(
+                        _REPOINT_PENDING,
+                        {"id": row["id"], "property_address": prop, "mail_address": mail}
+                    ).rowcount
+                    if repointed:
+                        db.execute(_REQUEUE_RESULT_TRACE, {"id": row["id"]})
+                    stats["traces_repointed"] = stats.get("traces_repointed", 0) + repointed
                 continue
             new_enrichment = {k: v for k, v in enrichment.items()
                               if k not in _ASSESSOR_DERIVED_KEYS and k != "parcel_echoed_by_county"}
@@ -338,6 +489,10 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                 res = db.execute(_PARCEL_RECOVER, {
                     "id": row["id"], "parcel_id": row["parcel_id"],
                     "old_property": row["property_address"],
+                    "old_mailing": row["mailing_address"],
+                    "old_city": row["property_city"],
+                    "old_state": row["property_state"],
+                    "old_zip": row["property_zip"],
                     "old_enrichment_text": row["enrichment_text"],
                     "property_address": prop, "mailing_address": mail,
                     "new_enrichment": json.dumps(new_enrichment),
@@ -346,13 +501,17 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                 if res.rowcount:
                     # pending_skip_trace_rows stores its OWN address snapshot, so a
                     # trace queued against the wrong parcel would still submit the
-                    # old address after this row is corrected (Codex P1). Cancel it
-                    # and return the lead to not_attempted so a later run can
-                    # enqueue the CORRECT address.
-                    cancelled = db.execute(_CANCEL_PENDING, {"id": row["id"]}).rowcount
-                    if cancelled:
-                        db.execute(_RESET_RESULT_TRACE, {"id": row["id"]})
-                    stats["traces_cancelled"] += cancelled
+                    # old address. RE-POINT it at the corrected one rather than
+                    # cancelling: the backfill excludes any result that already has a
+                    # pending row whatever its status, so a cancel strands the lead
+                    # forever (Codex P2).
+                    repointed = db.execute(
+                        _REPOINT_PENDING,
+                        {"id": row["id"], "property_address": prop, "mail_address": mail}
+                    ).rowcount
+                    if repointed:
+                        db.execute(_REQUEUE_RESULT_TRACE, {"id": row["id"]})
+                    stats["traces_repointed"] = stats.get("traces_repointed", 0) + repointed
             continue
 
         if (

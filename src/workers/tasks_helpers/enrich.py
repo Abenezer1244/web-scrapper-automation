@@ -607,7 +607,12 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                         "Job %s: King lookup failed on a chunk: %s", job_id, king_error
                     )
                     enriched = {}
-                    _chunk_stats.setdefault("deferred", list(_chunk))
+                    # ASSIGN, never setdefault: batch_enrich_king_county seeds
+                    # stats["deferred"] = [] as its FIRST action, so setdefault is
+                    # a no-op here and the chunk's parcels would silently get no
+                    # durable marker. We lost this chunk's return value entirely,
+                    # so every parcel in it is unreached by definition.
+                    _chunk_stats["deferred"] = list(_chunk)
                 # Accumulate this chunk's stats into the job-level totals.
                 for _k, _v in _chunk_stats.items():
                     if isinstance(_v, list):

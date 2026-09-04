@@ -60,14 +60,40 @@ while the same page says "COMBINED LEADS: … 1 single-list". 210 leads that wer
 exported or billed. Non-done children now report 0, so the client renders "—". Backend-only —
 the FE already had the right fallback.
 
+**Codex gate (ran later the same session, after the quota reset):**
+- **r1 — two P1s, both real.** (1) The new picker's signature was width + a leading row
+  number + a date; a chrome/status table matching that would be "found", every row would fail
+  to map, and `_extract_records` would return `[]` — scoring a *blocked* page as a healthy
+  zero, the exact false-success the raise exists to prevent. (2) Zeroing a non-done child's
+  count hides leads: `batch_export` selects every `child_job_id` with **no status filter**,
+  and force-finalize *cancels* still-active children after they may have saved rows.
+- **r2 — one more P1, and it was the better catch.** `min(record_count, rows)` still hid
+  rows, because `_retry_scrape_job` **resets `record_count` to 0** on a re-queue
+  (`tasks_helpers/status.py`). So for a non-done child the counter is unreliable in *both*
+  directions; non-done children are now counted from the rows themselves. Codex also caught
+  that my instrument test was **looser than the parser it claimed to mirror** — `_map_row`'s
+  no-link fallback only accepts `20` + 10 digits, so a bare 10-digit case id could still let a
+  chrome row through. Fixed by extracting `_row_instrument()` as the single source of truth
+  that both the parser and the signature call.
+- **r3 — NOT RUN**, usage limit again (`try again at 10:27 AM`) after 112,157 tokens. Its two
+  open questions were self-verified: `is_duplicate` is `nullable=False`, so `IS NOT TRUE` is
+  exactly `= FALSE`; and `clean()` only strips control characters and collapses whitespace, so
+  it can never *create* digits — the signature can only be more permissive than `_map_row`,
+  never reject a row the parser would have accepted.
+
 **Failed / Blocked:**
-- **Codex's post-implementation diff-review gate did not run** — the CLI hit its usage limit
-  mid-review (`try again at 8:04 AM`) after 51,576 tokens. The pre-implementation consult *did*
-  run and its six findings were each verified independently; the diff gate is still owed.
 - Merge/deploy held pending the user's decision, so the in-product re-run of Test 11 is
   **UNVERIFIED**.
 
 **Facts learned:**
+- 🛑 **A `\b` inside a shell heredoc becomes a literal backspace (0x08).** Writing the
+  regex that way produced a pattern matching a control character instead of a word boundary —
+  it matches nothing, which would have made *every* Pierce scrape raise "results table
+  missing". `ruff` and `ast.parse` both passed it. Only exercising the compiled pattern
+  against real inputs caught it.
+- 🔑 A guard is only as good as the parser it mirrors. Two rounds of Codex went at the
+  same question — "is the signature equivalent to `_map_row`?" — and the answer was no until
+  the two shared one function. Duplicating the rule is what let them drift.
 - 🔑 **Three retries landing within 2 s of each other is a data-shape bug, not a flaky portal.**
   Transient failures scatter; this one was a metronome.
 - 🔑 `_on_progress` fires *after* a page is extracted, so a frozen `page_current=N` means the

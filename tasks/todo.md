@@ -60,3 +60,63 @@ Branch: `fix/test7-data-quality`  ·  Worktree: `C:/Users/Windows/bridgeleads-wo
   `orient_probate_party` or it bypasses the Transfer-on-Death guard.
 - Codex note adopted: parse the `Parcel Number` cell label-specifically, never "first
   10-digit number on the page".
+
+## Progress
+
+- [x] Phase 1 — `src/scrapers/probate.py` placeholder + agency word orders + heirs rule (`6c906c2`)
+- [x] Phase 2 — King assessor parcel-echo verification, both call sites (`5d07415`)
+- [x] Phase 3 — never ship a party-less probate lead (`6c60c3c`, extended to 4 more scrapers in `023daf0`)
+- [x] Phase 4 — repair script + APPLIED to prod (`2898cd6`, `023daf0`, `cc4c843`, `0007fea`, `ecfd2ac`)
+- [x] Phase 5 — Codex diff review (3 rounds), full suite, E2E in the live app
+
+## Review
+
+**Test 7 passes the data-quality audit.** All 121 leads re-verified against King County's own
+systems after the repair.
+
+| Field | Result |
+|---|---|
+| Source fidelity (instrument, date, doc_type, parcel, legal) | **121/121 exact**, 0 mismatches |
+| Party name | 0 null, 0 placeholder/agency, **121/121 trace to a real source party** |
+| Heirs | 0 placeholders; every non-null value traces to the source grantee |
+| Parcel ID | 120 well-formed 10-digit King PINs; 1 preserved verbatim as the county printed it |
+| Property address | 103 agree with King GIS, 16 agree with eRealProperty (condo units absent from the GIS layer), 1 legitimately NULL (vacant parcel), 1 correctly NULL (malformed county parcel). **0 disagreements** |
+| Mailing address | 1 NULL (the malformed-parcel row); 103 owner-occupied, 16 absentee |
+| Auction date / Default owed | 0 — correct: probate records carry neither at the source |
+| Phone / Email | 0 — skip trace still queued (119 queued, 2 not_attempted) |
+
+**Root causes, all three confirmed against the live source:**
+
+1. `PUBLIC` = the King recorder's PLACEHOLDER counterparty on a death certificate (101/204 raw
+   rows carry it in the grantee slot). In 8 rows the parties were indexed REVERSED, so it reached
+   `party_name`. **Category C** — semantic mapping defect, not a row/column shift. Confirmed NOT a
+   shift: all 121 rows match the source exactly on every other field.
+2. Missing Property Address (result `45472c60`, parcel 3751604519) — King's Site Address cell is
+   empty and GIS reports `vacant_no_situs`. **Category B** — the source genuinely lacks it.
+3. July 15 Health Department (result `4eae622c`) — the county's legal carries an 11-digit PID;
+   eRealProperty silently truncated it and served a DIFFERENT parcel. **Category A** — application
+   defect. The lead had a WRONG property address, not merely a missing mailing one.
+
+**Notable:** the wrong address had already enqueued 2 skip-trace rows against a stranger's house.
+
+## Codex review — 3 rounds, 9 findings, all independently verified
+
+Round 1 (design) 4 findings · Round 2 (diff) GATE FAIL, 5 findings · Round 3 GATE **PASS**,
+2 findings. Round 4 (confirmation only) blocked by a Codex usage limit.
+
+Adopted: 8 of 9. One [P2] declined with reasoning — rejecting non-10-digit PIDs at extraction
+would DROP a verified-real death-certificate lead over a county typo, and the echo check already
+removes the harm. 🔑 My own fix for finding #6 introduced finding #7 (the residue guard over-fired
+on retained entity parties) — tightening one guard opened another.
+
+## Not done / limitations
+
+- The correct parcel for the July 15 lead is almost certainly `6411600027` (assessor owner
+  REINKE NORMAN L, 11547 CORLISS AVE N — matching the decedent), but choosing which digit to
+  delete from `64116000027` is a guess and `parcel_id` feeds the FROZEN `dedup_hash`. Left as the
+  county printed it. **Recovering it is a human decision.**
+- 3 non-probate rows (2 King parcels) keep an address obtained through the truncating lookup.
+  Correct today (the assessor owner corroborates the lead's party) but unverifiable in principle.
+- The 2Captcha key is dead (`ERROR_KEY_DOES_NOT_EXIST`). The King search still succeeded without
+  a solved token, but the captcha path is unprotected.
+- **No dead code was removed** — nothing in the touched paths was verified unused.

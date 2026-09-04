@@ -153,9 +153,38 @@ def test_repoint_rebuilds_the_whole_pending_payload():
     sql = " ".join(str(_mod._REPOINT_PENDING).split())
     for col in ("city = NULL", "state = NULL", "zip = NULL",
                 "mail_city = NULL", "mail_state = NULL", "mail_zip = NULL",
-                "first_name = NULL", "last_name = NULL", "tracerfy_queue_id = NULL"):
+                "tracerfy_queue_id = NULL"):
         assert col in sql, col
     assert "mail_address = :mail_address" in sql
+    # Names are recomputed rather than nulled — see the dedicated test below.
     requeue = " ".join(str(_mod._REQUEUE_RESULT_TRACE).split())
     assert "SET skip_trace_status = 'queued'" in requeue
     assert "skip_trace_status IN ('not_attempted', 'errored')" in requeue
+
+
+def test_repoint_recomputes_names_instead_of_blanking_them():
+    # Codex P1: the dispatcher selects by trace_type and submits these verbatim, so
+    # a 'normal' row with blank names becomes a normal trace with no name.
+    sql = " ".join(str(_mod._REPOINT_PENDING).split())
+    assert "first_name = :first_name" in sql
+    assert "last_name = :last_name" in sql
+    assert "first_name = NULL" not in sql and "last_name = NULL" not in sql
+    assert _mod._party_name_parts("REINKE NORMAN LEONARD") == {
+        "last_name": "REINKE", "first_name": "NORMAN"}
+    # An agency / placeholder names no person, so no name is invented.
+    assert _mod._party_name_parts("WASHINGTON STATE DEPARTMENT OF HEALTH") == {
+        "last_name": None, "first_name": None}
+    assert _mod._party_name_parts(None) == {"last_name": None, "first_name": None}
+
+
+def test_repoint_also_completes_a_half_fixed_row():
+    # Codex P1: guarding only on the street meant a row a PREVIOUS narrower
+    # re-point had already street-corrected kept its stale locality/mailing/names.
+    sql = " ".join(str(_mod._REPOINT_PENDING).split())
+    for cond in ("mail_address IS DISTINCT FROM :mail_address",
+                 "first_name IS DISTINCT FROM :first_name",
+                 "last_name IS DISTINCT FROM :last_name",
+                 "city IS NOT NULL", "state IS NOT NULL", "zip IS NOT NULL",
+                 "mail_city IS NOT NULL", "mail_state IS NOT NULL", "mail_zip IS NOT NULL",
+                 "tracerfy_queue_id IS NOT NULL"):
+        assert cond in sql, cond

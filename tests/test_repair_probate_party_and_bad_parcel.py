@@ -120,3 +120,30 @@ def test_candidates_read_the_json_as_text_for_that_guard():
     # the guard value must come from the database as text.
     sql = " ".join(str(_mod._PARCEL_CANDIDATES).split())
     assert "CAST(r.enrichment_data AS text) AS enrichment_text" in sql
+
+
+def test_recover_update_guards_every_value_it_overwrites():
+    # Codex P2: it replaces the mailing address and nulls the situs, so those must
+    # be guarded too — not just the property address.
+    sql = " ".join(str(_mod._PARCEL_RECOVER).split())
+    for guard in ("mailing_address IS NOT DISTINCT FROM :old_mailing",
+                  "property_city IS NOT DISTINCT FROM :old_city",
+                  "property_state IS NOT DISTINCT FROM :old_state",
+                  "property_zip IS NOT DISTINCT FROM :old_zip",
+                  "CAST(enrichment_data AS text) IS NOT DISTINCT FROM :old_enrichment_text"):
+        assert guard in sql
+    assert "SET parcel_id" not in sql
+
+
+def test_recovery_repoints_the_trace_instead_of_cancelling_it():
+    # Codex P2: backfill_skip_trace_jobs excludes any result that already has a
+    # pending row WHATEVER its status, so cancelling strands the corrected lead
+    # forever. Recovery gives it a REAL address, so re-point and re-queue.
+    sql = " ".join(str(_mod._REPOINT_PENDING).split())
+    assert "SET property_address = :property_address" in sql
+    assert "status = 'queued'" in sql
+    assert "status IN ('queued', 'errored')" in sql
+    assert "property_address IS DISTINCT FROM :property_address" in sql   # idempotent
+    requeue = " ".join(str(_mod._REQUEUE_RESULT_TRACE).split())
+    assert "SET skip_trace_status = 'queued'" in requeue
+    assert "skip_trace_status IN ('not_attempted', 'errored')" in requeue

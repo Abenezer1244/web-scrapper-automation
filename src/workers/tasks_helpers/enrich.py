@@ -446,6 +446,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
         if needs:
             _publish_log(r, job_id, "info", f"Looking up {len(needs)} mailing addresses...", db=db)
             from src.scrapers.enrichment.king_county_assessor import batch_enrich_king_county
+            from src.scrapers.enrichment.king_parcel_repair import owner_matches_party
             pids = list({res.parcel_id.strip() for res in needs})
             pid_map: dict[str, list] = {}
             for res in needs:
@@ -472,7 +473,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 # several REAL candidate parcels by matching the assessor owner to
                 # this lead's own party. Only consulted for a confirmed mismatch.
                 party_names = {
-                    pid: next((res.party_name for res in pid_map.get(pid, []) if res.party_name), None)
+                    pid: list(dict.fromkeys(
+                        res.party_name for res in pid_map.get(pid, []) if res.party_name
+                    ))
                     for pid in pids
                 }
                 enriched = asyncio.run(asyncio.wait_for(
@@ -503,9 +506,8 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 mail = data.get("mailing_address")
                 owner = data.get("owner_name")
                 for res in pid_map.get(pid, []):
-                    if (
-                        data.get("resolved_by") == "gis_plus_owner_match"
-                        and (res.party_name or "") != (data.get("resolved_party_match") or "")
+                    if data.get("resolved_by") == "gis_plus_owner_match" and not (
+                        owner_matches_party(res.party_name, data.get("resolved_party_match"))
                     ):
                         # The parcel was resolved by matching ANOTHER lead's party.
                         # Two leads can share one malformed PID with different

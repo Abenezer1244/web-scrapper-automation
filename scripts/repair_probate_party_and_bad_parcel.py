@@ -157,7 +157,37 @@ _PARCEL_RECOVER = text(
     WHERE id = :id
       AND parcel_id = :parcel_id
       AND property_address IS NOT DISTINCT FROM :old_property
+      -- Guard EVERY value this statement overwrites, not just the address
+      -- (Codex P2): it also replaces the mailing address and nulls the situs.
+      AND mailing_address IS NOT DISTINCT FROM :old_mailing
+      AND property_city IS NOT DISTINCT FROM :old_city
+      AND property_state IS NOT DISTINCT FROM :old_state
+      AND property_zip IS NOT DISTINCT FROM :old_zip
       AND CAST(enrichment_data AS text) IS NOT DISTINCT FROM :old_enrichment_text
+    """
+)
+
+# Recovery gives the lead its REAL address, so a trace queued against the wrong
+# one should be RE-POINTED, not cancelled. backfill_skip_trace_jobs excludes any
+# result that already has a pending row REGARDLESS of status, so cancelling would
+# strand the corrected lead permanently (Codex P2).
+_REPOINT_PENDING = text(
+    """
+    UPDATE pending_skip_trace_rows
+    SET property_address = :property_address, city = NULL, zip = NULL,
+        status = 'queued', submitted_at = NULL
+    WHERE result_id = :id
+      AND status IN ('queued', 'errored')
+      AND property_address IS DISTINCT FROM :property_address
+    """
+)
+
+_REQUEUE_RESULT_TRACE = text(
+    """
+    UPDATE results
+    SET skip_trace_status = 'queued'
+    WHERE id = :id
+      AND skip_trace_status IN ('not_attempted', 'errored')
     """
 )
 
@@ -313,7 +343,16 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
         recovered = recoveries[rec_key]
         if recovered is not None:
             prop, mail, prov = recovered
-            if row["property_address"] == prop and enrichment.get("resolved_parcel_id"):
+            if (
+                row["property_address"] == prop
+                and row["mailing_address"] == mail
+                and row["property_city"] is None
+                and row["property_state"] is None
+                and row["property_zip"] is None
+                and enrichment.get("resolved_parcel_id") == prov.get("resolved_parcel_id")
+            ):
+                # Fully at the intended end-state. A partial earlier recovery (stale
+                # mailing or situs) must NOT be skipped (Codex P2).
                 stats["already_recovered"] = stats.get("already_recovered", 0) + 1
                 continue
             new_enrichment = {k: v for k, v in enrichment.items()
@@ -338,6 +377,10 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                 res = db.execute(_PARCEL_RECOVER, {
                     "id": row["id"], "parcel_id": row["parcel_id"],
                     "old_property": row["property_address"],
+                    "old_mailing": row["mailing_address"],
+                    "old_city": row["property_city"],
+                    "old_state": row["property_state"],
+                    "old_zip": row["property_zip"],
                     "old_enrichment_text": row["enrichment_text"],
                     "property_address": prop, "mailing_address": mail,
                     "new_enrichment": json.dumps(new_enrichment),
@@ -346,13 +389,16 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                 if res.rowcount:
                     # pending_skip_trace_rows stores its OWN address snapshot, so a
                     # trace queued against the wrong parcel would still submit the
-                    # old address after this row is corrected (Codex P1). Cancel it
-                    # and return the lead to not_attempted so a later run can
-                    # enqueue the CORRECT address.
-                    cancelled = db.execute(_CANCEL_PENDING, {"id": row["id"]}).rowcount
-                    if cancelled:
-                        db.execute(_RESET_RESULT_TRACE, {"id": row["id"]})
-                    stats["traces_cancelled"] += cancelled
+                    # old address. RE-POINT it at the corrected one rather than
+                    # cancelling: the backfill excludes any result that already has a
+                    # pending row whatever its status, so a cancel strands the lead
+                    # forever (Codex P2).
+                    repointed = db.execute(
+                        _REPOINT_PENDING, {"id": row["id"], "property_address": prop}
+                    ).rowcount
+                    if repointed:
+                        db.execute(_REQUEUE_RESULT_TRACE, {"id": row["id"]})
+                    stats["traces_repointed"] = stats.get("traces_repointed", 0) + repointed
             continue
 
         if (

@@ -48,7 +48,7 @@ def main():
             ORDER BY r.created_at
             """), {"src": src}).fetchall()]
 
-    print(f"leads pointing at a queen_anne_news notice: {len(rows)}\n")
+    print(f"leads pointing at a {src} notice: {len(rows)}\n")
     bad = 0
     for m in rows:
         same = _norm_parcel(m["parcel_id"]) == _norm_parcel(m["notice_parcel"])

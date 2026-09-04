@@ -307,6 +307,13 @@
             ],
             "title": "Completed At"
           },
+          "counties": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Counties",
+            "type": "array"
+          },
           "created_at": {
             "format": "date-time",
             "title": "Created At",
@@ -331,7 +338,6 @@
             "anyOf": [
               {
                 "items": {
-                  "additionalProperties": true,
                   "type": "object"
                 },
                 "type": "array"
@@ -516,8 +522,33 @@
       "BatchLeadsPage": {
         "description": "A page of the combined batch view + live honest counts.",
         "properties": {
+          "available_counties": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Available Counties",
+            "type": "array"
+          },
+          "available_record_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Available Record Types",
+            "type": "array"
+          },
           "counts": {
             "$ref": "#/components/schemas/BatchDeliveryCounts"
+          },
+          "county": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "County"
           },
           "delivery_mode": {
             "title": "Delivery Mode",
@@ -537,6 +568,17 @@
           "page_size": {
             "title": "Page Size",
             "type": "integer"
+          },
+          "record_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Record Type"
           },
           "total": {
             "title": "Total",
@@ -609,7 +651,6 @@
             "anyOf": [
               {
                 "items": {
-                  "additionalProperties": true,
                   "type": "object"
                 },
                 "type": "array"
@@ -685,6 +726,13 @@
               }
             ],
             "title": "Completed At"
+          },
+          "counties": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Counties",
+            "type": "array"
           },
           "created_at": {
             "format": "date-time",
@@ -1044,7 +1092,6 @@
           "collection_scope_by_record_type": {
             "anyOf": [
               {
-                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -1124,7 +1171,6 @@
           "pre_foreclosure_doc_types": {
             "anyOf": [
               {
-                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -2079,7 +2125,6 @@
           "detail": {
             "anyOf": [
               {
-                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -2411,7 +2456,6 @@
           "enrichment_data": {
             "anyOf": [
               {
-                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -2908,6 +2952,17 @@
             "title": "Active",
             "type": "boolean"
           },
+          "batch_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Batch Id"
+          },
           "county": {
             "title": "County",
             "type": "string"
@@ -2920,7 +2975,6 @@
           "deliver": {
             "anyOf": [
               {
-                "additionalProperties": true,
                 "type": "object"
               },
               {}
@@ -2944,7 +2998,6 @@
           "enrichment": {
             "anyOf": [
               {
-                "additionalProperties": true,
                 "type": "object"
               },
               {}
@@ -2954,7 +3007,6 @@
           "fields": {
             "anyOf": [
               {
-                "additionalProperties": true,
                 "type": "object"
               },
               {
@@ -2993,7 +3045,6 @@
           "schedule": {
             "anyOf": [
               {
-                "additionalProperties": true,
                 "type": "object"
               },
               {}
@@ -4057,7 +4108,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Auth Config Auth Config Get",
                   "type": "object"
                 }
@@ -4091,7 +4141,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Forgot Password Auth Forgot Password Post",
                   "type": "object"
                 }
@@ -4502,7 +4551,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Onboarding Status Auth Onboarding Get",
                   "type": "object"
                 }
@@ -4680,7 +4728,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Reset Password Auth Reset Password Post",
                   "type": "object"
                 }
@@ -4952,6 +4999,44 @@
               "title": "Page Size",
               "type": "integer"
             }
+          },
+          {
+            "description": "Narrow the combined list to leads MATCHING this record type. The set is deduped, so an overlapping lead carries several record types and is returned by each of them — per-type subtotals therefore sum to MORE than the unfiltered total. That is the overlap, not double counting.",
+            "in": "query",
+            "name": "record_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow the combined list to leads MATCHING this record type. The set is deduped, so an overlapping lead carries several record types and is returned by each of them — per-type subtotals therefore sum to MORE than the unfiltered total. That is the overlap, not double counting.",
+              "title": "Record Type"
+            }
+          },
+          {
+            "description": "Narrow to leads sourced from this county.",
+            "in": "query",
+            "name": "county",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow to leads sourced from this county.",
+              "title": "County"
+            }
           }
         ],
         "responses": {
@@ -5139,6 +5224,44 @@
               "title": "Page Size",
               "type": "integer"
             }
+          },
+          {
+            "description": "Narrow the combined list to leads MATCHING this record type. The set is deduped, so an overlapping lead carries several record types and is returned by each of them — per-type subtotals therefore sum to MORE than the unfiltered total. That is the overlap, not double counting.",
+            "in": "query",
+            "name": "record_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow the combined list to leads MATCHING this record type. The set is deduped, so an overlapping lead carries several record types and is returned by each of them — per-type subtotals therefore sum to MORE than the unfiltered total. That is the overlap, not double counting.",
+              "title": "Record Type"
+            }
+          },
+          {
+            "description": "Narrow to leads sourced from this county.",
+            "in": "query",
+            "name": "county",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow to leads sourced from this county.",
+              "title": "County"
+            }
           }
         ],
         "responses": {
@@ -5195,7 +5318,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Activation Funnel Billing Activation Funnel Get",
                   "type": "object"
                 }
@@ -5244,7 +5366,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Create Checkout Billing Checkout Post",
                   "type": "object"
                 }
@@ -5283,7 +5404,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response List Plans Billing Plans Get",
                   "type": "object"
                 }
@@ -5307,7 +5427,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Customer Portal Billing Portal Post",
                   "type": "object"
                 }
@@ -5336,7 +5455,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Pricing Page Billing Pricing Get",
                   "type": "object"
                 }
@@ -5360,7 +5478,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Referral Status Billing Referral Get",
                   "type": "object"
                 }
@@ -5389,7 +5506,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Skip Trace Usage Billing Skip Trace Usage Get",
                   "type": "object"
                 }
@@ -5418,7 +5534,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Get Subscription Billing Subscription Get",
                   "type": "object"
                 }
@@ -5447,7 +5562,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Get Usage Billing Usage Get",
                   "type": "object"
                 }
@@ -5487,7 +5601,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Stripe Webhook Billing Webhook Post",
                   "type": "object"
                 }
@@ -5520,7 +5633,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Health Health Get",
                   "type": "object"
                 }
@@ -5749,8 +5861,8 @@
             "schema": {
               "anyOf": [
                 {
-                  "maximum": 100000000,
-                  "minimum": 0,
+                  "maximum": 100000000.0,
+                  "minimum": 0.0,
                   "type": "number"
                 },
                 {
@@ -5767,8 +5879,8 @@
             "schema": {
               "anyOf": [
                 {
-                  "maximum": 100000000,
-                  "minimum": 0,
+                  "maximum": 100000000.0,
+                  "minimum": 0.0,
                   "type": "number"
                 },
                 {
@@ -5905,8 +6017,8 @@
             "schema": {
               "anyOf": [
                 {
-                  "maximum": 100000000,
-                  "minimum": 0,
+                  "maximum": 100000000.0,
+                  "minimum": 0.0,
                   "type": "number"
                 },
                 {
@@ -5923,8 +6035,8 @@
             "schema": {
               "anyOf": [
                 {
-                  "maximum": 100000000,
-                  "minimum": 0,
+                  "maximum": 100000000.0,
+                  "minimum": 0.0,
                   "type": "number"
                 },
                 {
@@ -6018,7 +6130,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Get Export Url Jobs  Job Id  Export Url Get",
                   "type": "object"
                 }
@@ -6155,8 +6266,8 @@
             "schema": {
               "anyOf": [
                 {
-                  "maximum": 100000000,
-                  "minimum": 0,
+                  "maximum": 100000000.0,
+                  "minimum": 0.0,
                   "type": "number"
                 },
                 {
@@ -6173,8 +6284,8 @@
             "schema": {
               "anyOf": [
                 {
-                  "maximum": 100000000,
-                  "minimum": 0,
+                  "maximum": 100000000.0,
+                  "minimum": 0.0,
                   "type": "number"
                 },
                 {
@@ -6432,6 +6543,20 @@
     "/scrapers": {
       "get": {
         "operationId": "list_scrapers_scrapers_get",
+        "parameters": [
+          {
+            "description": "Exclude configs that are children of a batch (batch_id is set). The Scrapers list sets this so one user-initiated batch renders as ONE row instead of one row per county x record_type child. Default False on purpose: other callers legitimately need the children (the grandfathered-probate TOD notice counts EVERY probate config, and /scrapers/{id}/records resolves a child config out of this list) — flipping the default would silently break both.",
+            "in": "query",
+            "name": "exclude_batch_children",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Exclude configs that are children of a batch (batch_id is set). The Scrapers list sets this so one user-initiated batch renders as ONE row instead of one row per county x record_type child. Default False on purpose: other callers legitimately need the children (the grandfathered-probate TOD notice counts EVERY probate config, and /scrapers/{id}/records resolves a child config out of this list) — flipping the default would silently break both.",
+              "title": "Exclude Batch Children",
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -6446,6 +6571,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "security": [
@@ -6606,7 +6741,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Sample Records Scrapers Sample Get",
                   "type": "object"
                 }
@@ -6650,7 +6784,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Replay Dialer Push Scrapers  Config Id  Jobs  Job Id  Dialer Replay Post",
                   "type": "object"
                 }
@@ -7101,7 +7234,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Tracerfy Webhook Webhooks Tracerfy Post",
                   "type": "object"
                 }
@@ -7136,7 +7268,6 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "title": "Response Tracerfy Webhook Legacy Webhooks Tracerfy  Provided Secret  Post",
                   "type": "object"
                 }

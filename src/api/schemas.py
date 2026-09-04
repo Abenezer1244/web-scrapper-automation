@@ -692,6 +692,12 @@ class ScraperConfigResponse(BaseModel):
     # TOD, True = opt-in. Frontend must NOT echo a default False for a None config (a
     # null read means grandfathered — only a real user toggle should write a value).
     include_living_owner_tod: bool | None = None
+    # NULL for an ordinary standalone scrape; set when this config is one child of
+    # a batch (one child per county x record_type). Exposed so the dashboard can
+    # collapse a batch's children into the single top-level scrape the user
+    # actually started, instead of rendering each child as its own scraper.
+    # Mirrors JobResponse.batch_id, which already carries the same signal.
+    batch_id: str | None = None
     active: bool
     created_at: datetime
     updated_at: datetime
@@ -934,6 +940,10 @@ class BatchSummaryResponse(BaseModel):
     # without reconstructing it from child jobs — which it can't, since those are
     # excluded from GET /jobs to keep the newest-100 window for standalone exports.
     record_types: list[str] = Field(default_factory=list)
+    # Distinct counties across the batch's child scrapes (sorted). Mirrors
+    # record_types so a collapsed batch row can say "King" / "Pierce, Snohomish"
+    # without a second round-trip per batch.
+    counties: list[str] = Field(default_factory=list)
     combined_export_ready: bool = False  # status-derived — never expose the R2 key
     delivery_mode: str = "everything"
     # Rows in the combined export as-delivered (mode-aware: overlaps_delivered for
@@ -980,7 +990,19 @@ class BatchLeadsPage(BaseModel):
     delivery_mode: str
     page: int
     page_size: int
-    total: int  # rows in the CURRENT mode (overlaps_only => overlaps_delivered)
+    # Rows in the CURRENT mode (overlaps_only => overlaps_delivered), NARROWED by
+    # the active filters — this is what pagination pages over, so it must track
+    # the filter or the pager would offer pages that render empty.
+    total: int
+    # Echo of the applied filters (null = not filtering on that axis).
+    record_type: str | None = None
+    county: str | None = None
+    # Facet values actually present in the mode-filtered combined set. Computed
+    # WITHOUT the active filters so the option list doesn't collapse to the single
+    # value the user just picked, and so the UI can hide the County control
+    # entirely for a single-county batch.
+    available_record_types: list[str] = Field(default_factory=list)
+    available_counties: list[str] = Field(default_factory=list)
 
 
 # ─── Jobs ─────────────────────────────────────────────────────────────────────

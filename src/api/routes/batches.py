@@ -387,6 +387,7 @@ def _summary(
     run: BatchRun | None,
     child_count: int,
     record_types: list[str] | None = None,
+    counties: list[str] | None = None,
 ) -> BatchSummaryResponse:
     return BatchSummaryResponse(
         id=batch.id,
@@ -395,6 +396,7 @@ def _summary(
         run_status=run.status if run else "pending",
         child_count=child_count,
         record_types=record_types or [],
+        counties=counties or [],
         combined_export_ready=bool(run and run.status in _DOWNLOADABLE_STATUSES),
         delivery_mode=batch.delivery_mode or "everything",
         combined_record_count=_combined_record_count(batch, run),
@@ -470,7 +472,11 @@ async def list_batches(
     # Child config (batch_id, record_type) rows → per-batch count + distinct types.
     cfg_rows = (
         await db.execute(
-            select(ScraperConfig.batch_id, ScraperConfig.record_type).where(
+            select(
+                ScraperConfig.batch_id,
+                ScraperConfig.record_type,
+                ScraperConfig.county,
+            ).where(
                 ScraperConfig.user_id == current_user.id,
                 ScraperConfig.batch_id.in_(batch_ids),
             )
@@ -478,12 +484,21 @@ async def list_batches(
     ).all()
     counts: dict[str, int] = {}
     rtypes: dict[str, set[str]] = {}
-    for bid, rt in cfg_rows:
+    bcounties: dict[str, set[str]] = {}
+    for bid, rt, county in cfg_rows:
         counts[bid] = counts.get(bid, 0) + 1
         if rt:
             rtypes.setdefault(bid, set()).add(rt)
+        if county:
+            bcounties.setdefault(bid, set()).add(county)
     return [
-        _summary(b, run_by_batch.get(b.id), counts.get(b.id, 0), sorted(rtypes.get(b.id, set())))
+        _summary(
+            b,
+            run_by_batch.get(b.id),
+            counts.get(b.id, 0),
+            sorted(rtypes.get(b.id, set())),
+            sorted(bcounties.get(b.id, set())),
+        )
         for b in batches
     ]
 
@@ -547,8 +562,11 @@ async def get_batch(
         )
 
     record_types = sorted({rt for _, _, rt in config_rows if rt})
+    detail_counties = sorted({c for _, c, _ in config_rows if c})
     return BatchDetailResponse(
-        **_summary(batch, run, len(children), record_types).model_dump(),
+        **_summary(
+            batch, run, len(children), record_types, detail_counties
+        ).model_dump(),
         failed_children=run.failed_children if run else None,
         children=children,
         delivery_counts=run.delivery_counts if run else None,
@@ -708,6 +726,8 @@ async def _leads_page(
     page: int,
     page_size: int,
     response: Response,
+    record_type: str | None = None,
+    county: str | None = None,
 ) -> BatchLeadsPage:
     """Shared body for the latest-run and run-scoped leads endpoints. Caller has
     verified batch ownership and (for the run-scoped variant) run membership.
@@ -723,7 +743,12 @@ async def _leads_page(
     # Lazy import (matches create_batch/_stream_run_csv) — keep the Celery app
     # out of the API BOOT import graph; first use constructs it, same as the
     # dispatch path.
-    from src.workers.batch_export import _COMBINED_SQL, _DELIVERY_COUNTS_SQL
+    from src.workers.batch_export import (
+        _COMBINED_SQL,
+        _DELIVERY_COUNTS_SQL,
+        _FACETS_SQL,
+        _FILTERED_TOTAL_SQL,
+    )
 
     if run is None or run.status not in _DOWNLOADABLE_STATUSES:
         raise HTTPException(
@@ -750,6 +775,32 @@ async def _leads_page(
         else counts.leads_total
     )
 
+    # `counts` stay UNFILTERED batch facts (delivery accounting — what the CSV
+    # holds). `total` is what the table paginates over, so under an active filter
+    # it MUST come from the filtered query or pagination would offer pages that
+    # render empty.
+    overlaps_only = delivery_mode == "overlaps_only"
+    filters = {"f_record_type": record_type, "f_county": county}
+    filtered = record_type is not None or county is not None
+
+    facet_record_types: list[str] = []
+    facet_counties: list[str] = []
+    if job_ids:
+        facet_row = (await db.execute(
+            text(_FACETS_SQL),
+            {"uid": run.user_id, "job_ids": job_ids,
+             "overlaps_only": overlaps_only, TAX_CAP_BIND: tax_bind},
+        )).one()
+        facet_record_types = list(facet_row.record_types or [])
+        facet_counties = list(facet_row.counties or [])
+
+        if filtered:
+            total = int((await db.execute(
+                text(_FILTERED_TOTAL_SQL),
+                {"uid": run.user_id, "job_ids": job_ids,
+                 "overlaps_only": overlaps_only, **filters, TAX_CAP_BIND: tax_bind},
+            )).one().total)
+
     rows = []
     if job_ids:
         result = await db.execute(
@@ -759,7 +810,8 @@ async def _leads_page(
                 "job_ids": job_ids,
                 "limit": page_size,
                 "offset": (page - 1) * page_size,
-                "overlaps_only": delivery_mode == "overlaps_only",
+                "overlaps_only": overlaps_only,
+                **filters,
                 TAX_CAP_BIND: tax_bind,
             },
         )
@@ -787,6 +839,10 @@ async def _leads_page(
         page=page,
         page_size=page_size,
         total=total,
+        record_type=record_type,
+        county=county,
+        available_record_types=facet_record_types,
+        available_counties=facet_counties,
     )
 
 
@@ -798,6 +854,19 @@ async def list_batch_leads(
     current_user: CurrentUser,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=100),
+    record_type: str | None = Query(
+        None,
+        max_length=64,
+        description=(
+            "Narrow the combined list to leads MATCHING this record type. The set is "
+            "deduped, so an overlapping lead carries several record types and is "
+            "returned by each of them — per-type subtotals therefore sum to MORE than "
+            "the unfiltered total. That is the overlap, not double counting."
+        ),
+    ),
+    county: str | None = Query(
+        None, max_length=128, description="Narrow to leads sourced from this county."
+    ),
     db: AsyncSession = Depends(get_rls_db),
 ) -> BatchLeadsPage:
     """The combined (deduped, overlap-first, mode-filtered) lead list of the
@@ -806,7 +875,9 @@ async def list_batch_leads(
         await rate_limit(request, zone="general", identifier=current_user.id)
         batch = await _owned_batch(db, batch_id, current_user.id)
         run = await _run_for(db, batch_id, current_user.id)
-        return await _leads_page(db, batch, run, page, page_size, response)
+        return await _leads_page(
+            db, batch, run, page, page_size, response, record_type, county
+        )
     except HTTPException as exc:
         # Codex P2: FastAPI builds exception responses separately from the
         # injected Response, so the no-store must ride the exception itself —
@@ -824,6 +895,19 @@ async def list_batch_run_leads(
     current_user: CurrentUser,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=100),
+    record_type: str | None = Query(
+        None,
+        max_length=64,
+        description=(
+            "Narrow the combined list to leads MATCHING this record type. The set is "
+            "deduped, so an overlapping lead carries several record types and is "
+            "returned by each of them — per-type subtotals therefore sum to MORE than "
+            "the unfiltered total. That is the overlap, not double counting."
+        ),
+    ),
+    county: str | None = Query(
+        None, max_length=128, description="Narrow to leads sourced from this county."
+    ),
     db: AsyncSession = Depends(get_rls_db),
 ) -> BatchLeadsPage:
     """Run-scoped combined lead list (2B history parity with the CSV download)."""
@@ -841,7 +925,9 @@ async def list_batch_run_leads(
         ).scalar_one_or_none()
         if run is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
-        return await _leads_page(db, batch, run, page, page_size, response)
+        return await _leads_page(
+            db, batch, run, page, page_size, response, record_type, county
+        )
     except HTTPException as exc:
         # Codex P2: FastAPI builds exception responses separately from the
         # injected Response, so the no-store must ride the exception itself —

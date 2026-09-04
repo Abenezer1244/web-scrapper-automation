@@ -1,155 +1,78 @@
-# Test 8 (King WA · pre_foreclosure) — data-quality audit
+# UI/UX Cleanup + Scraper Result Architecture
 
-Branch: `fix/test8-data-quality`  ·  Worktree: `C:\Users\Windows\bridgeleads-worktrees\test8-dq`
-Base: `origin/main` @ `88ba03f`  ·  Job: `5178ce6c-db28-4b53-8441-887795c89c52` (155 results)
+Branch: `feat/uiux-cleanup-batch-results` (BE + FE worktrees, isolated).
+BE worktree: `C:/Users/Windows/bridgeleads-worktrees/uiux-be` (off origin/main `ea3f32f`)
+FE worktree: `C:/Users/Windows/bridgeleads-web-worktrees/uiux-fe` (off origin/master `305e7a7`)
 
-## What Test 8 is
+## Verified findings (evidence, not assumption)
 
-King County WA, `record_type=pre_foreclosure`, scraped from the King County Recorder
-LandmarkWeb index (`enrichment_data.source = "king_landmark_json"`), window
-2026-06-04 → 2026-09-01. Every row's `doc_type` is `NOTICE OF TRUSTEE SALE`.
+### Item 4 — batch architecture (ground truth from prod, BYPASSRLS role)
+- Parent/child model ALREADY EXISTS and is DB-enforced:
+  `scraper_batches` -> `scraper_configs.batch_id` (composite tenant FK) -> `jobs` -> `results`;
+  `batch_runs` = one execution.
+- **Test 9 IS one batch**: `scraper_batches` `9fb8f55e-83f1-4fbc-a111-8a7f9da6f906` name "test 9 batch",
+  2 children (`king/pre_foreclosure`, `king/probate`), both `batch_id=9fb8f55e`, identical `created_at`.
+  Grouping uses the FK ONLY — never name/time/user/date.
+- Prod shape: 33 active configs = 25 standalone + 8 batch children across 4 batches.
+  Scrapers page shows 33 rows; correct is 29.
+- ROOT CAUSE: `GET /scrapers` (src/api/routes/scrapers.py:88) selects all active configs with NO
+  batch filter, and `ScraperConfigResponse` (src/api/schemas.py:678) does not expose `batch_id`.
+- `/results` page ALREADY collapses batches correctly (listStandaloneJobs + listBatches).
+- Precedent to copy: `GET /jobs?exclude_batch_children=true` + `JobResponse.batch_id` already exist.
+- Combined leads are DEDUPED across children; `matched_record_types` / `source_counties` are
+  bucket-AGGREGATED arrays -> one lead can belong to 2 record types at once. Filters must use array
+  containment on the deduped set; per-type subtotals legitimately exceed the total.
+- `_COMBINED_SQL` / `_DELIVERY_COUNTS_SQL` (src/workers/batch_export.py) are the SINGLE authoritative
+  count/dedupe rule, shared with the CSV export. Do NOT create a second one.
 
-## Established by measurement (not assumption)
+### Item 1 — record type colors
+- `recordTypeTone()` lib/utils.ts:162 maps record type -> brand color.
+- Call sites: scrapers/page.tsx:250, dashboard/_components/ScrapersTable.tsx:77,
+  dashboard/_components/RecordTypeMix.tsx:43,51.
+- RecordTypeMix is the Lead Mix PIE CHART — per-slice color is legitimate data encoding.
+  => NARROW the helper to chart use; do NOT delete it.
 
-| # | Finding | Evidence |
-|---|---------|----------|
-| F1 | All 155 rows: `auction_date`, `default_amount`, `nts_notice_id`, `nts_match_confidence` all NULL | prod query |
-| F2 | The two fields are written by ONE `UPDATE` in `_write_match` (`src/workers/nts_matcher_task.py:213`) — never independently | code + prod: `auction_only=1, owed_only=0, both=200` |
-| F3 | API + UI are correct. `has_auction_data=true` for pre_foreclosure; columns render; `—` is the null state | Playwright against prod |
-| F4 | King's only wired auction source is the Queen Anne & Magnolia News weekly legals PDF | `src/workers/scheduler.py:187` |
-| F5 | Full 18-issue archive 2026-05-06→2026-09-02 (all 18 fetched OK) = **36 distinct King notices**. Exact-parcel overlap with Test 8's 155 leads = **1** | live re-parse |
-| F6 | `nts_notices` holds 14 King rows; last insert + last `fetched_at` = 2026-08-06. Issues 08-12/08-19/08-26/09-02 hold 3–5 parseable notices each and were never ingested | prod + live fetch |
-| F7 | **12 of 14 cached King rows carry a `ts_number` belonging to a different notice in the same PDF**; **2 also carry a wrong `auction_date`** | re-parsed each row's own `source_url` |
-| F8 | `OVERLAP_LEAD_COLUMNS` omits `auction_date`/`default_amount` although `batch_export.py` SELECTs them | `src/utils/lead_export.py:536` |
+### Item 2 — Lead Mix responsiveness
+- `RecordTypeMix.tsx:38` `<ChartContainer className="h-36 w-36 shrink-0">` = fixed 144x144, cannot
+  shrink or grow. Sibling charts use `h-56 w-full` / `h-48 w-full` -> it is the ONLY chart deviating
+  from the app's own convention.
+- Wrapper `flex items-center gap-4` never wraps; card sits in `lg:col-span-3` of a 12-col grid, so at
+  ~1024px the card is ~230px: 144px chart + gap leaves ~30px for the legend.
+- Stack: Tailwind v4 (native container queries), Next 16.1.7, recharts 3.8.
+  Card width comes from its GRID COLUMN, not the viewport -> container queries are the correct tool.
 
-### F7 detail — wrong stored auction dates
+### Item 3 — em dash placeholders
+- Legit prose em dashes dominate (~340) -> LEAVE ALONE.
+- Placeholder uses: 22 `&mdash;` spans across 8 files + ~15 literal `"—"` + 3 helpers.
+  Densest: ResultsTable.tsx (9), BatchLeadsTable.tsx (5), segments/page.tsx (5).
+- TWO duplicated `dash` consts: LeadCards.tsx:49 (inline style) and SegmentCards.tsx:28 (className)
+  -> consolidation target.
+- lib/utils.ts:11/59/80 (`timeAgo`, `formatDate`, `formatDateTime`) return "—" for null.
 
-| parcel | stored | truth (same PDF, current parser) | effect |
-|---|---|---|---|
-| `6385500350` | 2026-06-26 | **2026-09-18** | live auction stored as expired → `is_active=false` → invisible |
-| `211101002007` | 2026-07-10 | 2026-08-28 | was live for ~1 month, stored as expired |
+## Codex consult (round 1) — adopted / rejected
+- ADOPTED: presentation aggregation (Option A), no data-model change; do not compute batch counts
+  from child jobs; severity-based status aggregation; server-side filtering; preserve deep links.
+- REJECTED (independently verified as wrong for this codebase): Codex said make `GET /scrapers`
+  return standalone-only BY DEFAULT. Verified that would regress two callers:
+  * `components/probate-tod-notice.tsx:52` filters ALL configs for grandfathered probate — a batch
+    child IS a probate config (Test 9), so the compliance notice would silently stop appearing.
+  * `app/(dashboard)/scrapers/[id]/records/page.tsx:61` does `scrapers?.find(s => s.id === id)` —
+    excluding children makes `config` undefined and breaks the page.
+  => use the OPT-IN `exclude_batch_children` param instead (matches the `/jobs` precedent).
+- NOTED, out of scope: `jobs.batch_run_id` would give per-OCCURRENCE membership (today jobs->batch
+  resolves only to the parent). Not needed for this fix; recorded as a follow-up.
 
-Residue of the split/label-bleed bug fixed in #195/#199 whose data repair covered
-Pierce + Snohomish but never King.
-
-## Source vs BridgeLeads classification
-
-- **A (source had it, BridgeLeads lost it): 1 / 155** — `KIM MYONG HEE`, parcel
-  `1112630120`. Notice `WA09000059-24-1`, auction 2026-08-07, owed $397,621.29, cached
-  since 2026-07-30. Not attached: the auction had already passed when the job ran
-  (2026-09-02) and the matcher only considers `is_active AND auction_date >= today`.
-- **B (this source genuinely has no notice): 154 / 155.** The paper carries ~2 King
-  trustee sales/week; King records ~50/month. Coverage ceiling ≈1%. **Leave NULL.**
-- The recorded NTS *document* does contain both values by RCW 61.24.040(1)(f), but
-  BridgeLeads reads only the recorder's *index*, never the document.
-
-## Root causes
-
-- **RC1 (shared).** Auction Date and Default Owed are the same defect, not two — both
-  come from one matched notice in one UPDATE. For Test 8 no match ever occurred.
-- **RC2.** Coverage: the only wired King auction source overlaps 1/155 leads. Not a bug.
-- **RC3 (bug).** The crawler reads only the single "current issue" PDF; a missed or
-  failed week is lost permanently. 4 weeks lost since 2026-08-06; 22 of 36 archive
-  notices were never cached. The archive *is* reachable by constructed URL for King
-  (18/18). *(Snohomish too — my initial 3-of-4 404s were a wrong filename guess; the
-  paper uses "Legals - M-D-YY.pdf" for the back catalogue and "Legals M-D-YY.pdf" from
-  September, and the shipped backfill script already knew the first.)*
-- **RC4 (bug, highest severity).** 12/14 cached King rows have a wrong `ts_number` and
-  2 have a wrong `auction_date`, suppressing a live 2026-09-18 King auction.
-- **RC5 (bug, separate path).** Batch/segment/overlap CSVs silently drop both fields.
-
-## Plan
-
-- [x] 1. `nts_crawler`: bounded weekly-archive sweep, tolerating 404s, idempotent via
-      the existing `(source, ts_number)` upsert. Recovers lost weeks and self-heals
-      future misses. *(Revised during implementation: PR #200 already shipped
-      `scripts/backfill_nts_pdf_archive.py` with filename builders for BOTH papers — it
-      was simply never run. So the sweep reuses that map rather than a King-only template
-      of my own, and covers Snohomish too. My earlier "Snohomish's naming is not
-      derivable" was wrong: my probe guessed the wrong spelling, and the paper uses two.)*
-- [x] 2. `repair_nts_ts_number.py`: also correct `auction_date` / `principal_owing`
-      from the re-parsed truth (today it only rewrites `ts_number`), so RC4's wrong
-      dates are fixed, not just the keys.
-- [x] 3. `lead_export.py`: include `auction_date` / `default_amount` in the
-      overlap/batch/segment column set (RC5).
-- [x] 4. Regression tests keyed on source structure, not on Test 8 values.
-- [x] 5. Full pytest + lint; Codex diff review; browser re-verify.
-
-## Explicitly NOT doing
-
-- No fabricated or inferred auction dates. No mapping of `date_recorded` (a recording
-  date) onto Auction Date.
-- No Test 8-specific hardcoding.
-- Not building recorded-document ingestion. *(Scoped 2026-09-04 — see the addendum in
-  `docs/scoping-king-nts-coverage-2026-09-03.md`. The reason is NOT cost: unofficial
-  images are free, and only certified copies are paid. King County LandmarkWeb's terms
-  prohibit "high-volume, automated" access and "Data Mining (mass downloading) of
-  images" outright, and King has already IP-rate-blocked this project once. The
-  reCAPTCHA/dead-2Captcha-key issues compound it but are not the decisive blocker.)*
-
-## Review
-
-**PR #209** (`fix/test8-data-quality`), CI green, **merge blocked by the auto-mode
-classifier — awaiting the user**. FE needed no change: `origin/master` already renders a
-past sale as a muted "N days ago" (my first read was of a stale working tree).
-
-### Verdict on Test 8
-
-Test 8 **passes** the data-quality audit. Party names, parcel IDs, property addresses and
-mailing addresses are real, correctly associated, and match the recorder's index (153/155
-carry a property address; 155/155 a mailing address). Phone/email are empty because
-skip-trace was still queued, not because of a defect. Auction Date and Default Owed are
-legitimately NULL on 154 rows and were recoverable on exactly 1.
-
-### Auction Date and Default Owed: ONE defect, not two
-
-Both are written by a single `UPDATE` in `_write_match` from a single matched notice
-(prod-wide: auction-only 1, owed-only 0, both 200). No match ever occurred on Test 8, so
-both were NULL together. Not two independent bugs, and not an API, serialization,
-timezone, or frontend problem — all of those were checked and cleared.
-
-### Source vs BridgeLeads
-
-- **A — source had it, we lost it: 1/155.** `KIM MYONG HEE`, parcel `1112630120`; notice
-  `WA09000059-24-1`, auction 2026-08-07, $397,621.29, cached since 2026-07-30.
-- **B — source genuinely lacks it: 154/155.** Left NULL. Nothing inferred from
-  `date_recorded`.
-- The recorded document *does* contain both by RCW 61.24.040(1)(f), but King's own terms
-  prohibit the bulk automated access that would take (see the 2026-09-04 addendum in
-  `docs/scoping-king-nts-coverage-2026-09-03.md`).
-
-### Fixed
-
-1. Weekly-archive self-heal in the beat (both Pacific Publishing papers), with the URL
-   map extracted to `src/scrapers/sources/nts_pdf_archive.py` and shared with the
-   operator backfill — which had drifted and could no longer reach Snohomish's September
-   filenames.
-2. `repair_nts_ts_number.py --fields` and `--retire-wrong-key`; `--results` parcel join
-   normalized (it had been skipping King's rows outright).
-3. `auction_date` / `days_to_auction` / `default_amount` restored to the batch/segment CSV.
-4. Historical-sale matching pass, live-wins, newer-past-wins.
-
-### Codex
-
-Five findings, all reproduced against the code and fixed: a cross-county rewrite risk I
-introduced by normalizing the parcel join; a fresher past sale unable to correct an older
-one across a capped catch-up; archive recoveries masking the barren alert; `--fields` not
-deploy-gated; and the sweep missing Snohomish's slipped-day issues.
-
-### Still to do (needs the user)
-
-- Merge + deploy #209.
-- Then run, in this order:
-  `backfill_nts_pdf_archive.py --source queen_anne_news --apply`, then
-  `repair_nts_ts_number.py --source queen_anne_news --retire-wrong-key --fields --results
-  --i-confirm-fixed-parser-is-deployed --apply` (dry run: 8 rows).
-- Snohomish `--fields` also has 1 legitimate correction pending (a NULL `principal_owing`
-  the current parser now reads as 350,661.98).
-
-### Unverified
-
-- Why the King crawl stopped ingesting after 2026-08-06 was never pinned to a specific
-  failure — log retention did not reach back, and the code path works when run today. The
-  archive sweep makes the cause moot rather than answering it.
-- Whether LandmarkWeb serves text-layer or image-only PDFs.
-- 7+ of King's 22 approved legal newspapers were never checked for robots.txt/ToS.
+## Todo
+- [ ] Confirm plan + missing-value convention with user
+- [ ] BE: expose `batch_id` on ScraperConfigResponse + opt-in `exclude_batch_children` on GET /scrapers
+- [ ] BE: batch summary aggregate (status severity + authoritative count) reused by both pages
+- [ ] BE: server-side `record_type` / `county` filters on batch leads (+ matching filtered total)
+- [ ] FE: Scrapers page renders one row per batch (neutral record-type chips, aggregate count/status)
+- [ ] FE: batch detail — record type + county filters, composing with pagination/search
+- [ ] FE: neutralize record-type color in table contexts, keep it in the pie chart
+- [ ] FE: Lead Mix responsive fix via container queries + w-full convention
+- [ ] FE: shared missing-value component; replace placeholder em dashes only
+- [ ] Tests: BE pytest + FE typecheck/lint/build; regression tests for aggregation/counts/filters
+- [ ] Playwright verification at desktop/laptop/tablet/mobile
+- [ ] Codex review round 2
+- [ ] Dead code removal (verified safe)

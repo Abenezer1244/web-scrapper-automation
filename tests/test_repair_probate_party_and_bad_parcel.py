@@ -15,6 +15,14 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
 
+def _sql_without_comments(stmt):
+    """Statement text with -- comments stripped, so an assertion cannot pass or
+    fail on prose that merely explains the SQL."""
+    import re as _re
+    body = _re.sub("--.*", " ", str(stmt))
+    return " ".join(body.split())
+
+
 def test_party_update_writes_only_the_identity_columns():
     sql = " ".join(str(_mod._PARTY_UPDATE).split())
     assert "SET party_name = :new_party, heirs = :new_heirs" in sql
@@ -184,3 +192,36 @@ def test_repoint_also_completes_a_half_fixed_row():
                  "mail_city IS NOT NULL", "mail_state IS NOT NULL", "mail_zip IS NOT NULL",
                  "tracerfy_queue_id IS NOT NULL"):
         assert cond in sql, cond
+
+
+def test_party_repair_refreshes_the_stale_trace_name():
+    # Codex round 6 [P2]: the pending payload snapshots the lead's NAME at enqueue
+    # time. When the party repair rewrites party_name, that snapshot is stale — and
+    # for this repair class the OLD party was a placeholder or agency, so the
+    # queued trace would be submitted for a person like "State Washington" at a
+    # real address, at Tracerfy's expense.
+    sql = _sql_without_comments(_mod._PENDING_NAME_REFRESH)
+    assert "SET first_name = :new_first, last_name = :new_last, trace_type = :new_trace_type" in sql
+    # Only a row that has NOT reached the provider.
+    assert "AND status = 'queued'" in sql
+    assert "tracerfy_queue_id IS NULL" in sql
+    assert "submitted_at IS NULL" in sql
+    for st in ("submitting", "submitted", "completed", "errored"):
+        assert f"'{st}'" not in sql, st
+    # Guarded on every value it read, and a no-op once already correct.
+    for guard in ("first_name IS NOT DISTINCT FROM :old_first",
+                  "last_name IS NOT DISTINCT FROM :old_last",
+                  "trace_type IS NOT DISTINCT FROM :old_trace_type",
+                  "first_name IS DISTINCT FROM :new_first"):
+        assert guard in sql, guard
+
+
+def test_trace_name_uses_the_enqueues_own_derivation():
+    # Never a bespoke splitter: two ad-hoc ones in this session both got compound
+    # surnames wrong. select_traceable_owner is what the enqueue itself uses.
+    src = _SCRIPT.read_text(encoding="utf-8")
+    assert "select_traceable_owner(new_party)" in src
+    # The bespoke splitters are deliberately NOT used for this decision; they
+    # are named only in comments explaining why.
+    # ...and the same normal/advanced rule the enqueue applies.
+    assert '"normal" if (first and last) else "advanced"' in src

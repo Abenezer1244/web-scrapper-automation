@@ -90,6 +90,46 @@ _PARTY_UPDATE = text(
     """
 )
 
+# The pending skip-trace payload snapshots the lead's NAME at enqueue time. When
+# the party repair rewrites party_name, that snapshot is stale — and for this
+# repair class the OLD party was a placeholder or agency, so the queued trace
+# would be submitted for a person like "State Washington" at a real address, at
+# Tracerfy's expense (Codex). Refresh it with the ENQUEUE'S OWN derivation
+# (select_traceable_owner + the same normal/advanced rule), never a bespoke
+# splitter — two ad-hoc splitters in this session both got compound surnames
+# wrong.
+_PENDING_FOR_RESULT = text(
+    """
+    SELECT id, first_name, last_name, trace_type, status
+    FROM pending_skip_trace_rows
+    WHERE result_id = :id
+    """
+)
+
+_PENDING_NAME_REFRESH = text(
+    """
+    UPDATE pending_skip_trace_rows
+    SET first_name = :new_first, last_name = :new_last, trace_type = :new_trace_type
+    WHERE result_id = :id
+      -- Only a row that has NOT reached the provider. 'submitting', 'submitted'
+      -- and 'completed' may already be paid for or correlated to a Tracerfy
+      -- queue id, and 'errored' cannot be told apart from a genuine provider
+      -- rejection by status alone (Codex).
+      AND status = 'queued'
+      AND tracerfy_queue_id IS NULL
+      AND submitted_at IS NULL
+      AND first_name IS NOT DISTINCT FROM :old_first
+      AND last_name IS NOT DISTINCT FROM :old_last
+      AND trace_type IS NOT DISTINCT FROM :old_trace_type
+      AND (
+           first_name IS DISTINCT FROM :new_first
+        OR last_name IS DISTINCT FROM :new_last
+        OR trace_type IS DISTINCT FROM :new_trace_type
+      )
+    """
+)
+
+
 _PARCEL_CANDIDATES = text(
     """
     SELECT r.id, r.parcel_id, r.party_name, r.property_address, r.mailing_address,
@@ -243,6 +283,36 @@ def _journal(path: str, payload: dict) -> None:
         fh.write(json.dumps(payload, default=str) + "\n")
 
 
+def _refresh_pending_name(db, result_id: str, new_party: str | None, *, journal: str) -> int:
+    """Re-derive a queued trace's name payload from the REPAIRED party. Returns rows written.
+
+    Uses the enqueue's own rule so the repaired row is indistinguishable from one
+    enqueued fresh: select_traceable_owner picks the highest-confidence person and
+    returns (None, None) for an entity/ambiguous name, which is exactly when the
+    enqueue falls back to an address-only ADVANCED trace.
+    """
+    from src.scrapers.enrichment.skip_trace import select_traceable_owner
+
+    first, last = select_traceable_owner(new_party)
+    trace_type = "normal" if (first and last) else "advanced"
+    written = 0
+    for pend in db.execute(_PENDING_FOR_RESULT, {"id": result_id}).mappings().all():
+        if (pend["first_name"], pend["last_name"], pend["trace_type"]) == (first, last, trace_type):
+            continue
+        _journal(journal, {"repair": "pending_name", "id": result_id,
+                           "pending_id": pend["id"], "pending_status": pend["status"],
+                           "new_party": new_party,
+                           "old_first": pend["first_name"], "old_last": pend["last_name"],
+                           "old_trace_type": pend["trace_type"],
+                           "new_first": first, "new_last": last, "new_trace_type": trace_type})
+        written += db.execute(_PENDING_NAME_REFRESH, {
+            "id": result_id, "new_first": first, "new_last": last,
+            "new_trace_type": trace_type, "old_first": pend["first_name"],
+            "old_last": pend["last_name"], "old_trace_type": pend["trace_type"],
+        }).rowcount
+    return written
+
+
 def repair_party(db, *, apply: bool, journal: str) -> dict:
     rows = db.execute(_PARTY_CANDIDATES).mappings().all()
     stats = {"scanned": len(rows), "changed": 0, "party_fixed": 0, "heirs_fixed": 0,
@@ -275,6 +345,10 @@ def repair_party(db, *, apply: bool, journal: str) -> dict:
                 "old_party": row["party_name"], "old_heirs": row["heirs"],
             })
             stats["written"] += res.rowcount
+            if res.rowcount:
+                stats["pending_refreshed"] = stats.get("pending_refreshed", 0) + _refresh_pending_name(
+                    db, row["id"], new_party, journal=journal
+                )
     if apply:
         db.commit()
     return stats

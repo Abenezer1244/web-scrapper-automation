@@ -2,7 +2,6 @@
 
     railway run python scripts/diag_test7_inventory.py
 """
-import json
 import os
 import sys
 

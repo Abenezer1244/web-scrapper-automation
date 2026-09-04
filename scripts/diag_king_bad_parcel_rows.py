@@ -51,10 +51,6 @@ def main():
                                                   DeliveredRecord.dedup_hash == r.dedup_hash)
                 ).scalars().all()
                 print(f"    delivered_records rows: {len(dr)}")
-        # Skip trace cache entries keyed on the wrong address
-        cache = db.execute(select(SkipTraceCache)).scalars().all()
-        hits = [c for c in cache if "11524 MERIDIAN" in (getattr(c, "address_key", "") or "").upper()]
-        print(f"\nskip_trace_cache rows mentioning 11524 MERIDIAN: {len(hits)}")
 
 
 if __name__ == "__main__":

@@ -60,3 +60,96 @@ def test_owner_lookup_without_out_still_returns_a_dict():
     from src.scrapers.enrichment.king_county_assessor import batch_extract_king_owners
 
     assert asyncio.run(batch_extract_king_owners([], time_budget_s=5)) == {}
+
+
+# ── Phase ordering (Codex P1 on the chunking refactor) ───────────────────────
+# batch_enrich_king_county is phase 1 (cheap HTTP: property + OWNER) then phase 2
+# (Playwright mailing, ~10-20x costlier). A caller that chunks its parcel list and
+# calls this per chunk inverts their priority: chunk 1's phase 2 spends the whole
+# shared budget and later chunks never get phase 1 at all. In prod that took a
+# 17,157-parcel job from ~1,200 parcels reached down to 173. The driver now runs
+# phase 1 across every parcel first (do_mailing=False, collecting tax_urls_out)
+# and drives phase 2 afterwards (tax_urls_in) with the budget left over.
+
+def test_phase1_only_pass_skips_mailing_and_exports_tax_urls():
+    from src.scrapers.enrichment.king_county_assessor import batch_enrich_king_county
+
+    stats: dict = {}
+    urls: dict = {}
+    # Zero budget: no network. What matters is that the phase-1-only contract
+    # exists and never enters the Playwright phase.
+    out = asyncio.run(batch_enrich_king_county(
+        ["1234567890"], time_budget_s=0, stats=stats,
+        do_mailing=False, tax_urls_out=urls,
+    ))
+    assert out == {}
+    assert urls == {}
+    # Phase 2 never ran, so it never reported mailing attempts.
+    assert stats["mailing_attempted"] == 0
+    assert stats["mailing_found"] == 0
+
+
+def test_mailing_only_pass_does_not_refetch_phase_one():
+    # tax_urls_in drives phase 2 alone. With no budget it must defer rather than
+    # silently report "no mailing address" for parcels it never looked at.
+    from src.scrapers.enrichment.king_county_assessor import batch_enrich_king_county
+
+    stats: dict = {}
+    out = asyncio.run(batch_enrich_king_county(
+        [], time_budget_s=0, stats=stats,
+        tax_urls_in={"1234567890": "https://payment.kingcounty.gov/x"},
+    ))
+    # A row exists and says NOT ATTEMPTED — the honest answer. Returning nothing
+    # would be indistinguishable from "this parcel's page has no mailing address".
+    assert out["1234567890"]["mailing_lookup"] == "not_attempted"
+    assert "mailing_address" not in out["1234567890"]
+    assert stats["requested"] == 1
+    assert stats["budget_exhausted"] is True
+    assert "1234567890" in stats["deferred"]
+
+
+def test_default_call_still_runs_both_phases_in_order():
+    # Defaults must preserve the original single-call behaviour exactly, so the
+    # backfill scripts and any other caller are unaffected.
+    from src.scrapers.enrichment.king_county_assessor import batch_enrich_king_county
+
+    stats: dict = {}
+    asyncio.run(batch_enrich_king_county(["1234567890"], time_budget_s=0, stats=stats))
+    assert stats["budget_exhausted"] is True
+    assert stats["deferred"] == ["1234567890"]
+
+
+def test_mailing_only_mode_seeds_a_row_for_every_parcel():
+    """Phase 2 writes results[pid][...] unconditionally, so every driven pid must
+    already have a row. Starting from an empty dict raised KeyError on the first
+    parcel, which the worker swallowed as a whole-chunk failure — phase 2 looked
+    like it simply found nothing. A zero-budget test cannot catch that (it defers
+    before the browser starts), so assert the seeding contract directly."""
+    from src.scrapers.enrichment import king_county_assessor as K
+
+    seeded = {}
+    captured = {}
+
+    async def _fake_phase(results, tax_urls, st, over, pace):
+        captured.update({"results": results, "tax_urls": tax_urls})
+        return results
+
+    orig = K._king_mailing_phase
+    K._king_mailing_phase = _fake_phase
+    try:
+        caller_seed = {"1234567890": {"resolved_parcel_id": "9999999999"}}
+        asyncio.run(K.batch_enrich_king_county(
+            [], time_budget_s=5, stats=seeded,
+            tax_urls_in={"1234567890": "u1", "2345678901": "u2"},
+            results_seed=caller_seed,
+        ))
+    finally:
+        K._king_mailing_phase = orig
+
+    # Every driven parcel has a row, seeded or empty — never missing.
+    assert set(captured["results"]) == {"1234567890", "2345678901"}
+    # Phase-1 metadata survives (phase 2 validates the page against it).
+    assert captured["results"]["1234567890"]["resolved_parcel_id"] == "9999999999"
+    assert captured["results"]["2345678901"] == {}
+    # The caller's dict is never mutated.
+    assert caller_seed == {"1234567890": {"resolved_parcel_id": "9999999999"}}

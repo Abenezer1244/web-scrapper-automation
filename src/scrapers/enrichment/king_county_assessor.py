@@ -353,6 +353,10 @@ async def batch_enrich_king_county(
     stats: dict | None = None,
     party_names: dict[str, list[str]] | None = None,
     pace_s: float = 0.2,
+    do_mailing: bool = True,
+    tax_urls_out: dict[str, str] | None = None,
+    tax_urls_in: dict[str, str] | None = None,
+    results_seed: dict[str, dict] | None = None,
 ) -> dict[str, dict[str, str | None]]:
     """Two-phase enrichment: HTTP for property, Playwright for mailing.
 
@@ -381,9 +385,35 @@ async def batch_enrich_king_county(
     def _over_budget() -> bool:
         return deadline is not None and _time.monotonic() >= deadline
 
+    # Mailing-only pass (see PHASE SELECTION below). Must come BEFORE the
+    # empty-`clean` early return: this mode is driven by tax_urls_in and is
+    # legitimately called with an EMPTY parcel_ids list.
+    if tax_urls_in is not None:
+        st["requested"] = len(tax_urls_in)
+        check_source_or_raise(KING_EREALPROPERTY)
+        # Seeded with phase 1's own rows for these parcels. Phase 2 is not
+        # standalone-pure: it validates the rendered tax page against
+        # `resolved_parcel_id` (a RECOVERED parcel's page names the resolved PIN,
+        # not the malformed one we key by), so starting from an empty dict would
+        # make every recovered parcel fail that check and silently drop its
+        # mailing address. Copied per pid so the caller's dict is never mutated.
+        _seeded = {pid: dict((results_seed or {}).get(pid) or {}) for pid in tax_urls_in}
+        return await _king_mailing_phase(_seeded, dict(tax_urls_in), st, _over_budget, pace_s)
+
     if not clean:
         return results
 
+    # PHASE SELECTION (2026-09-04). The two phases have wildly different costs:
+    # phase 1 is one cheap HTTP GET per parcel (~0.5s) and yields property +
+    # OWNER; phase 2 drives Playwright against the tax-bill page (~5-10s) for the
+    # mailing address. A caller that slices its parcel list into chunks and calls
+    # this function per chunk silently INVERTS their priority — chunk 1's phase 2
+    # eats the whole shared budget and later chunks never get phase 1 at all.
+    # (Observed in prod: a 17,157-parcel job reached 173 parcels, not ~1,200.)
+    # `do_mailing=False` + `tax_urls_out` let such a caller run phase 1 across
+    # EVERY parcel first and collect the tax-bill URLs; `tax_urls_in` then drives
+    # phase 2 alone with whatever budget is left. Defaults preserve the original
+    # single-call behaviour exactly.
     # ── Phase 1: HTTP requests for property address + tax URLs (fast) ─────
     # Same shared gate as the owner-only path — this one also hits eRealProperty.
     check_source_or_raise(KING_EREALPROPERTY)
@@ -532,7 +562,24 @@ async def batch_enrich_king_county(
                  "(%d recovered)", st["property_found"], len(clean), len(tax_urls),
                  st["parcel_mismatch"], st["parcel_recovered"])
 
-    # ── Phase 2: Playwright for mailing addresses ──────────────────────────
+    if tax_urls_out is not None:
+        tax_urls_out.update(tax_urls)
+    if not do_mailing:
+        # Phase-1-only pass: the caller drives mailing itself, afterwards, with
+        # the budget that is actually left over.
+        st["mailing_candidates"] = len(tax_urls)
+        return results
+
+    return await _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s)
+
+
+async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
+    """Phase 2 — Playwright mailing lookups for parcels with a tax-bill URL.
+
+    Split out of batch_enrich_king_county so a chunking caller can run it AFTER
+    phase 1 has covered every parcel, instead of once per chunk (see PHASE
+    SELECTION above).
+    """
     st["mailing_candidates"] = len(tax_urls)
     if not tax_urls:
         return results
@@ -580,7 +627,10 @@ async def batch_enrich_king_county(
                 if i % 25 == 0:
                     _logger.info("  Mailing: %d / %d ...", i, len(pids_to_lookup))
                 st["mailing_attempted"] += 1
-                results[pid]["mailing_lookup"] = "error"
+                # setdefault, not results[pid]: in mailing-only mode a pid may have
+                # no phase-1 row at all, and a KeyError here is swallowed upstream
+                # as a whole-chunk failure (so phase 2 would appear to do nothing).
+                results.setdefault(pid, {})["mailing_lookup"] = "error"
 
                 try:
                     url = tax_urls[pid]
@@ -637,6 +687,9 @@ async def batch_enrich_king_county(
     st["mailing_found"] = found_mail
     # Parcels beyond the per-call mailing cap were never attempted either.
     st["deferred"].extend(p for p in tax_urls if p not in pids_to_lookup)
+    # `requested` (not the enclosing scope's parcel list — this phase is also
+    # reachable standalone via tax_urls_in, where no such list exists).
+    _n = st.get("requested") or len(tax_urls)
     _logger.info("Enrichment done: %d/%d property, %d/%d mailing",
-                 found_prop, len(clean), found_mail, len(clean))
+                 found_prop, _n, found_mail, _n)
     return results

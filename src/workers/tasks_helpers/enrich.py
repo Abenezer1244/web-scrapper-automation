@@ -487,7 +487,6 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 ))
                 for pid in pids
             }
-            enriched_count = 0
             found = 0
             # King tax-delinquent rows ship with a placeholder party_name because
             # the Socrata source has no owner column. The eRealProperty lookup
@@ -575,29 +574,36 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             # bounds the in-flight set and lets the shared deadline stop the pass
             # cleanly at a chunk boundary.
             _KING_CHUNK = 200
-            _KING_TOTAL_BUDGET_S = 600  # see BUDGET ARITHMETIC below
+            # BUDGET ARITHMETIC (additive within ONE Celery task):
+            #   scrape 1800s (_SCRAPE_TIMEOUT) + this pass + owner-only 300s.
+            # This pass can run to _KING_TOTAL_BUDGET_S plus one chunk's wait_for
+            # grace (+60s), so 600 + 60 = 660s worst case:
+            #   1800 + 660 + 300 = 2760s, inside soft_time_limit=3600s with ~840s
+            # left for persistence, export, billing and delivery. Raise a budget
+            # only by re-doing that sum.
+            _KING_TOTAL_BUDGET_S = 600
             _king_deadline = _time.monotonic() + _KING_TOTAL_BUDGET_S
-            _pending = list(pids)
-            while _pending:
-                _left = _king_deadline - _time.monotonic()
-                if _left <= 5:
-                    king_stats.setdefault("deferred", []).extend(_pending)
-                    _logger.info(
-                        "King enrichment: budget spent, %d parcels deferred", len(_pending)
-                    )
-                    break
-                _chunk, _pending = _pending[:_KING_CHUNK], _pending[_KING_CHUNK:]
-                _chunk_stats: dict = {}
+
+            def _king_left() -> float:
+                return _king_deadline - _time.monotonic()
+
+            def _run_chunk(_chunk: list, _owned: list | None = None,
+                           _meta_out: dict | None = None, **kw) -> dict:
+                """One chunked lookup: enrich, write, commit. Returns its stats.
+
+                `_owned` names the parcels this chunk is RESPONSIBLE for. It is
+                not always `_chunk`: the mailing pass drives phase 2 by URL and
+                passes an empty parcel list, so deriving deferral from `_chunk`
+                there would record an empty list and lose the chunk silently.
+                """
+                nonlocal king_error, found
+                _own = list(_owned if _owned is not None else _chunk)
+                _cs: dict = {}
+                _left = _king_left()
                 try:
-                    enriched = asyncio.run(asyncio.wait_for(
-                        # BUDGET ARITHMETIC (additive within ONE Celery task):
-                        #   scrape 1800s (_SCRAPE_TIMEOUT) + this 600s + owner-only
-                        #   300s = 2700s, inside soft_time_limit=3600s with headroom
-                        #   for persistence, export, billing and delivery. Raise a
-                        #   budget only by re-doing that sum.
+                    _enriched = asyncio.run(asyncio.wait_for(
                         batch_enrich_king_county(
-                            _chunk, time_budget_s=_left, stats=_chunk_stats,
-                            party_names={k: party_names[k] for k in _chunk if k in party_names},
+                            _chunk, time_budget_s=_left, stats=_cs, **kw
                         ),
                         timeout=_left + 60,
                     ))
@@ -606,36 +612,98 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                     _logger.warning(
                         "Job %s: King lookup failed on a chunk: %s", job_id, king_error
                     )
-                    enriched = {}
+                    _enriched = {}
                     # ASSIGN, never setdefault: batch_enrich_king_county seeds
-                    # stats["deferred"] = [] as its FIRST action, so setdefault is
-                    # a no-op here and the chunk's parcels would silently get no
-                    # durable marker. We lost this chunk's return value entirely,
-                    # so every parcel in it is unreached by definition.
-                    _chunk_stats["deferred"] = list(_chunk)
-                # Accumulate this chunk's stats into the job-level totals.
-                for _k, _v in _chunk_stats.items():
+                    # stats["deferred"] = [] as its FIRST action, so setdefault is a
+                    # no-op here and the chunk would silently get no marker.
+                    _cs["deferred"] = list(_own)
+                _apply_king(_enriched)
+                _n_mail = sum(1 for d in _enriched.values() if d.get("mailing_address"))
+                try:
+                    db.commit()
+                    # Count only what actually persisted — a rollback below would
+                    # otherwise leave `found` overreporting in the summary log.
+                    found += _n_mail
+                    if _meta_out is not None:
+                        _meta_out.update(_enriched)
+                except Exception as exc:
+                    _logger.warning(
+                        "Job %s: King enrichment commit failed: %s", job_id, str(exc)[:120]
+                    )
+                    db.rollback()
+                    # The rollback discarded this chunk's writes and the chunk is
+                    # already off the pending list, so without this it would vanish
+                    # with neither data nor a deferred marker (Codex P2).
+                    _cs["deferred"] = list(dict.fromkeys(list(_cs.get("deferred", [])) + _own))
+                for _k, _v in _cs.items():
                     if isinstance(_v, list):
                         king_stats.setdefault(_k, []).extend(_v)
                     elif isinstance(_v, bool):
                         king_stats[_k] = king_stats.get(_k, False) or _v
                     elif isinstance(_v, int):
                         king_stats[_k] = king_stats.get(_k, 0) + _v
-                _apply_king(enriched)
-                enriched_count += len(enriched)
-                found += sum(1 for d in enriched.values() if d.get("mailing_address"))
-                try:
-                    db.commit()
-                except Exception as exc:
-                    _logger.warning(
-                        "Job %s: King enrichment commit failed: %s", job_id, str(exc)[:120]
+                return _cs
+
+            # ── Pass 1: property + OWNER for EVERY parcel (cheap HTTP) ────────
+            # Phase ordering is load-bearing and must not be per-chunk: phase 2
+            # (Playwright mailing, ~5-10s/parcel) would otherwise consume the whole
+            # shared budget inside the FIRST chunk, starving every later parcel of
+            # the cheap phase-1 lookup that carries the owner name. That is what a
+            # naive chunking did in prod — 173 of 17,157 parcels reached instead of
+            # ~1,200 — and it directly undercut the product decision that owner
+            # names matter most. Phase 1 runs to completion across all parcels
+            # first; mailing then gets whatever is left (Codex P1).
+            _tax_urls: dict[str, str] = {}
+            _p1_meta: dict[str, dict] = {}
+            _pending = list(pids)
+            while _pending:
+                if _king_left() <= 5:
+                    king_stats.setdefault("deferred", []).extend(_pending)
+                    _logger.info(
+                        "King enrichment: budget spent in phase 1, %d parcels deferred",
+                        len(_pending),
                     )
-                    db.rollback()
-                # Free the chunk's payload before the next one is fetched.
-                enriched = {}
-                if _chunk_stats.get("budget_exhausted"):
+                    _pending = []
+                    break
+                _chunk, _pending = _pending[:_KING_CHUNK], _pending[_KING_CHUNK:]
+                _cs = _run_chunk(
+                    _chunk,
+                    _meta_out=_p1_meta,
+                    party_names={k: party_names[k] for k in _chunk if k in party_names},
+                    do_mailing=False,
+                    tax_urls_out=_tax_urls,
+                )
+                # Keep phase-1 rows ONLY for parcels that produced a tax-bill URL —
+                # those are the only ones pass 2 will revisit, and phase 2 needs
+                # their resolved_parcel_id to validate the rendered page.
+                for _k in list(_p1_meta):
+                    if _k not in _tax_urls:
+                        _p1_meta.pop(_k, None)
+                if _cs.get("budget_exhausted"):
                     king_stats.setdefault("deferred", []).extend(_pending)
                     _pending = []
+
+            # ── Pass 2: mailing, with whatever budget phase 1 left over ───────
+            _mail_pending = [
+                p for p in _tax_urls
+                if any(not res.mailing_address for res in pid_map.get(p, []))
+            ]
+            while _mail_pending:
+                if _king_left() <= 5:
+                    king_stats.setdefault("deferred", []).extend(_mail_pending)
+                    break
+                _chunk, _mail_pending = (
+                    _mail_pending[:_KING_CHUNK], _mail_pending[_KING_CHUNK:]
+                )
+                _cs = _run_chunk(
+                    [], _owned=_chunk,
+                    tax_urls_in={k: _tax_urls[k] for k in _chunk},
+                    results_seed={k: _p1_meta[k] for k in _chunk if k in _p1_meta},
+                )
+                if _cs.get("budget_exhausted"):
+                    king_stats.setdefault("deferred", []).extend(_mail_pending)
+                    _mail_pending = []
+
             # Durable marker for parcels the budget/cap/failure never reached, so a
             # later sweep can find them (never a silent gap — Codex).
             deferred = [p for p in dict.fromkeys(king_stats.get("deferred", [])) if p in pid_map]

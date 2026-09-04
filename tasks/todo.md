@@ -62,17 +62,50 @@ FE worktree: `C:/Users/Windows/bridgeleads-web-worktrees/uiux-fe` (off origin/ma
 - NOTED, out of scope: `jobs.batch_run_id` would give per-OCCURRENCE membership (today jobs->batch
   resolves only to the parent). Not needed for this fix; recorded as a follow-up.
 
-## Todo
-- [ ] Confirm plan + missing-value convention with user
-- [ ] BE: expose `batch_id` on ScraperConfigResponse + opt-in `exclude_batch_children` on GET /scrapers
-- [ ] BE: batch summary aggregate (status severity + authoritative count) reused by both pages
-- [ ] BE: server-side `record_type` / `county` filters on batch leads (+ matching filtered total)
-- [ ] FE: Scrapers page renders one row per batch (neutral record-type chips, aggregate count/status)
-- [ ] FE: batch detail — record type + county filters, composing with pagination/search
-- [ ] FE: neutralize record-type color in table contexts, keep it in the pie chart
-- [ ] FE: Lead Mix responsive fix via container queries + w-full convention
-- [ ] FE: shared missing-value component; replace placeholder em dashes only
-- [ ] Tests: BE pytest + FE typecheck/lint/build; regression tests for aggregation/counts/filters
-- [ ] Playwright verification at desktop/laptop/tablet/mobile
-- [ ] Codex review round 2
-- [ ] Dead code removal (verified safe)
+## Todo — all complete
+- [x] Confirm plan + missing-value convention with user
+- [x] BE: expose `batch_id` + opt-in `exclude_batch_children` on GET /scrapers
+- [x] BE: BatchSummary.counties (aggregate reused by both pages)
+- [x] BE: server-side record_type/county filters + filtered total + facets
+- [x] FE: Scrapers page = one expandable row per batch
+- [x] FE: batch detail filters composing with pagination + URL state
+- [x] FE: record type neutral in tables, colour kept in the pie
+- [x] FE: Lead Mix responsive via container queries
+- [x] FE: shared <EmptyValue>; only placeholder em dashes replaced
+- [x] Tests: 2264 passed + 5 new regression tests; FE tsc/lint/build clean
+- [x] Playwright verification at 7 viewports against the real prod dataset
+- [x] Codex review round 2 (4 findings; 2 real and fixed, 2 disproved)
+- [x] Dead code: recordTypeTone narrowed (NOT deleted), 2 duplicate `dash` consts removed
+
+## Review
+
+### What changed
+Presentation aggregation only — no data-model change. The parent/child batch model
+already existed and is DB-enforced; the API simply never exposed it.
+
+### Verified against prod (login account owns Test 9/10/11)
+- GET /scrapers default -> 17 rows (6 batch children) — UNCHANGED, back-compat intact
+- GET /scrapers?exclude_batch_children=true -> 11 rows, 0 children
+- Scrapers page: 17 rows -> 14 (11 standalone + 3 batch)
+- Test 9 = ONE row, expandable, "Batch · 2 scrapes", King, Pre foreclosure + Probate
+- Test 11 (run_status=partial) renders "Completed with errors" + warning icon
+- Filter proof on Test 9's real 267 leads: facets [pre_foreclosure, probate] / [king];
+  155 + 112 = 267; composed filter 155; rows == filtered total; 0 non-matching rows;
+  bogus filter -> 0 (not 267)
+- Record type chips: 19 on screen, 1 distinct colour (was 6)
+
+### Findings I did NOT fix (pre-existing, out of scope — reported, not hidden)
+- The app shell's PRO TRIAL banner ("Upgrade now") and the dashboard KpiStrip do not
+  wrap, so /dashboard and /scrapers overflow horizontally at <=1024px. Measured on
+  origin/master too: /scrapers bodyScroll 703 baseline vs 696 mine; dashboard 881
+  baseline vs 888 mine. Unrelated to the Lead Mix, which never overflows its card.
+- `export_openapi.py --check` is not CI-equivalent in this environment: it reports
+  STALE for main's own committed schema (.venv-schema has fastapi 0.137.2,
+  requirements.txt pins 0.141.1).
+
+### Landmine hit
+`git stash` is SHARED across all worktrees of a repo. A `git stash push -- src/` that
+staged nothing left a later `pop` applying ANOTHER session's stash into this worktree
+(conflict in docs/BUILD_JOURNAL.md). Their 3 stash entries were preserved and the
+conflict was reset to HEAD; my commits contain only my own files. Never `git stash`
+in a shared-worktree repo.

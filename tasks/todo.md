@@ -1,3 +1,86 @@
+# "Test 5" data-quality audit + Records-count inconsistency (2026-09-03)
+
+Worktree `C:/Users/Windows/bridgeleads-worktrees/test5-dq`, branch `fix/test5-data-quality` (off origin/main).
+Subject: scraper config "Test 5" (snohomish/WA/**pre_foreclosure**), job `425d49ce`, 4 rows.
+Frontend worktree `C:/Users/Windows/bridgeleads-worktrees/fe-test5`, branch `fix/test5-records-count` (off origin/master).
+
+## Verified findings (evidence gathered before any code change)
+
+1. **Parcel IDs are legitimate source values — BridgeLeads is NOT altering them.**
+   The Snohomish County Tribune legals PDF prints all four verbatim under
+   `Parcel Number(s):` — `00876100600800`, `01133800000900`, `008337-000-009-00`,
+   `010347-00-0086-00`. Quality Loan Service Corp prints Snohomish PINs bare;
+   North Star Trustee hyphenates (and not even consistently: 6-3-3-2 for one
+   property, 6-2-4-2 for another). Every value is 14 digits with leading zeros
+   intact. `property_identity.normalize_parcel()` strips hyphens before computing
+   `dedup_hash`/`property_key`, so the variation cannot break dedup or billing.
+   **No code change — the variation is the source's, and it must be preserved.**
+
+2. **`Records = 0` vs 4 leads is a PRESENTATION defect, not a counting bug.**
+   `jobs.record_count` = billable (non-duplicate + actionable) = 0, and that is
+   load-bearing: `workers/tasks.py` commits it in the same transaction as billing so
+   the headline, email, webhook and bill can never disagree.
+   `/jobs/{id}/results.total` deliberately INCLUDES duplicates = 4.
+   The detail page rendered `total` while the list rendered `record_count`, so two
+   surfaces labelled two different rules identically, with nothing explaining the gap.
+   All 4 rows are duplicates of **"Test 4"** (snohomish/trustee_sale, run 4 minutes
+   earlier) — both record types are sourced from the SAME NTS legal notices, and
+   `delivered_records` is keyed `(user_id, dedup_hash)` with no record_type scope.
+
+3. **The "all N were duplicates" banner was unreachable.** Gated on
+   `resultsPage.total === 0`, but `total` includes duplicates, so an all-duplicate
+   job always has `total > 0`. It could never fire for the one case it explains.
+
+4. **2 of the 4 leads carried a stale, wrong top-level `enrichment_data.ts_number`**
+   (CASEY CATE `25-10595`, SHAWN WEINTRAUB `26-78299`). Reproduced exactly by
+   re-running the pre-PR#195 header-only split over the real source PDF. The correct
+   values live in `enrichment_data["nts"]` / `nts_notices`. PR #195 fixed the scraper
+   AND repaired the nested copy, but its repair never modelled the top-level key that
+   `snohomish_wa_pre_foreclosure.py` writes from its own parse. 6 rows / 3 jobs.
+
+5. **`SHAWN M WEINTRAUB` was falsely flagged `absentee_owner = True`** while living in
+   the house. The NTS situs line has no comma before the city ("1207 118TH PL SW
+   EVERETT, WASHINGTON 98204-4813"), so the comma-splitting parser glues the city into
+   the STREET. That shape only ever survived by accident — via the whole-string
+   equality shortcut — which breaks the moment one side carries ZIP+4 and the other
+   ZIP5. Measured in prod: 1 row of 2,432 absentee rows.
+
+## Tasks
+
+- [x] BE: add `new_count` to `ResultsPage` (the same predicate `record_count` bills on)
+- [x] BE: regression tests — 0 / 1 / many / all-duplicate / unactionable / view-filtered
+- [x] BE: fix the glued-city false absentee in `address_intel._addresses_differ`
+- [x] BE: absentee regression tests pinned to the real Test 5 rows
+- [x] BE: export test — a stale top-level ts_number never overrides the nested one
+- [x] BE: parcel test — the two Snohomish house formats are dedup-equivalent
+- [x] Repair: extend `repair_nts_ts_number.py --results` to the top-level key; APPLIED (6 rows, converged to 0)
+- [x] FE: detail headline shows the list's rule (`new_count`) + duplicate context
+- [x] FE: fix the unreachable all-duplicate banner guard
+- [x] FE: duplicate rows say "Duplicate", not "Old"
+- [x] Codex review of the diff
+- [x] E2E re-verify against production
+
+## Reported, deliberately NOT changed (owner decision, not mine)
+
+- **CSV export includes duplicate rows.** `/jobs/{id}/download` and the scheduled R2
+  export filter on actionable + tax cap but NOT `is_duplicate`, so Test 5's CSV has
+  4 rows while the email said "0 records". Changing it alters delivered files for
+  every existing customer and every scheduled delivery; adding an `is_duplicate`
+  column changes the dialer-ready CSV contract customers have mapped. Codex agrees
+  this is ambiguous rather than clearly wrong, and wants it pinned by an explicit
+  product decision either way.
+- **Cross-record-type dedup.** Snohomish pre_foreclosure and trustee_sale draw from
+  the same NTS notices and collide on `(user_id, dedup_hash)`. Codex and I both read
+  this as intended ("never bill the same property twice"); scoping the key by
+  record_type would double-bill and weaken skip-trace reuse.
+- **The Lee/Sang Ki commercial notice is dropped** — `auction_date` unparsed from
+  "the 17th day of September, 2026", so `is_valid_nts` rejects it. A pre-existing
+  parser coverage gap, present in both PDFs, unrelated to Test 5's four leads.
+
+---
+
+# (earlier session, kept for reference)
+
 # "Test 1" lead data-quality investigation (2026-09-02)
 
 Worktree `C:/Users/Windows/bridgeleads-worktrees/test1-data-quality`, branch `fix/test1-lead-data-quality` (off origin/main).

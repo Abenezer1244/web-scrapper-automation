@@ -30,6 +30,34 @@ def test_normalize_parcel_keeps_leading_zeros():
     assert normalize_parcel("00371700101700") == "00371700101700"
 
 
+def test_snohomish_house_formats_are_dedup_equivalent():
+    """Snohomish PINs are 14 digits, but each trustee typesets them differently in
+    the legal notice: Quality Loan prints them bare, North Star hyphenates (and not
+    even consistently — 6-3-3-2 for one property, 6-2-4-2 for another). Those
+    strings are stored VERBATIM because they are what the source published; it is
+    normalization's job to make them compare equal, so the same parcel arriving
+    from two trustees (or from the county tax file) is never billed twice.
+
+    The four values below are the real Test 5 parcels, copied from the Snohomish
+    County Tribune legals PDF.
+    """
+    quality_loan = ["00876100600800", "01133800000900"]
+    north_star = ["008337-000-009-00", "010347-00-0086-00"]
+
+    # Hyphens carry no identity — only the digits do.
+    assert normalize_parcel("008337-000-009-00") == "00833700000900"
+    assert normalize_parcel("010347-00-0086-00") == "01034700008600"
+    # ...and every one of them is still 14 digits with its leading zeros intact.
+    for parcel in quality_loan + north_star:
+        assert len(normalize_parcel(parcel)) == 14, parcel
+        assert normalize_parcel(parcel).startswith("0"), parcel
+
+    # The same parcel published in either house style is ONE property.
+    assert normalize_parcel("008337-000-009-00") == normalize_parcel("00833700000900")
+    # ...while genuinely different parcels stay distinct.
+    assert len({normalize_parcel(p) for p in quality_loan + north_star}) == 4
+
+
 def test_normalize_address_collapses_punctuation_and_whitespace():
     assert normalize_address("123 Main St., #4  ") == "123 MAIN ST 4"
     assert normalize_address(None) == ""

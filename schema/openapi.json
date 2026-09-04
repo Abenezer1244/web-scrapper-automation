@@ -2684,6 +2684,11 @@
             "title": "Job Id",
             "type": "string"
           },
+          "new_count": {
+            "default": 0,
+            "title": "New Count",
+            "type": "integer"
+          },
           "page": {
             "title": "Page",
             "type": "integer"

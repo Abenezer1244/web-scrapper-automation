@@ -79,12 +79,28 @@ def _digits(value: str | None) -> str:
 
 
 def _extract_parcel_echo(page_html: str) -> str | None:
-    """Digits of the parcel the eRealProperty page says it resolved, or None."""
-    m = _PARCEL_ECHO_RE.search(page_html)
-    if not m:
-        return None
-    echoed = _digits(BridgeScraper.clean(html.unescape(re.sub(r"<[^>]+>", " ", m.group(1)))))
-    return echoed or None
+    """Digits of the parcel the eRealProperty page says it resolved, or None.
+
+    Scans EVERY parcel-labelled cell and returns the first that yields digits
+    (Codex P3): the page carries both a "Parcel" and a "Parcel Number" label
+    depending on the view, so a blank or "N/A" cell appearing first must not mask
+    a real echo further down and must not be mistaken for "no echo on this page".
+    """
+    for m in _PARCEL_ECHO_RE.finditer(page_html):
+        echoed = _digits(BridgeScraper.clean(html.unescape(re.sub(r"<[^>]+>", " ", m.group(1)))))
+        if echoed:
+            return echoed
+    return None
+
+
+def _page_has_parcel_cell(page_html: str) -> bool:
+    """True if the page carries a parcel-labelled cell at all (even a blank one).
+
+    Distinguishes "this page has no such cell" (a layout change) from "the cell is
+    present but says N/A" — the latter is a page that declined to name its parcel,
+    which is not evidence that it is ours.
+    """
+    return _PARCEL_ECHO_RE.search(page_html) is not None
 
 
 def parcel_page_is_for(page_html: str, requested_pid: str) -> bool:
@@ -92,13 +108,19 @@ def parcel_page_is_for(page_html: str, requested_pid: str) -> bool:
 
     MISMATCH -> False: we asked about parcel X and the county answered about
     parcel Y, so nothing on the page may be attributed to this lead.
-    MISSING ECHO -> trusted only when the requested id is already a well-formed
-    10-digit King PIN (the truncation class cannot apply to it); a malformed id
-    with no echo fails CLOSED.
+    NO PARCEL CELL AT ALL -> trusted only when the requested id is already a
+    well-formed 10-digit King PIN (the truncation class cannot apply to it); a
+    malformed id with no echo fails CLOSED.
+    PARCEL CELL PRESENT BUT UNREADABLE ("N/A", blank) -> always False (Codex P3):
+    the page declined to name its parcel, which is not evidence that it is ours.
     """
     want = _digits(requested_pid)
+    if not want:
+        return False
     echoed = _extract_parcel_echo(page_html)
     if echoed is None:
+        if _page_has_parcel_cell(page_html):
+            return False
         return len(want) == _KING_PIN_DIGITS
     return echoed == want
 

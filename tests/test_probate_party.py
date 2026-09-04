@@ -393,18 +393,28 @@ def test_new_agency_orders_do_not_strip_real_names():
         assert strip_filing_agency(value) == value
 
 
-def test_agency_grantee_is_not_an_heir_when_grantor_is_the_decedent():
-    # The mirror-image of the promotion case: 5 live rows carry the agency in the
-    # GRANTEE slot while the grantor is already the decedent. heirs must be None.
+def test_bare_state_grantee_is_not_an_heir():
+    # A grantee that names NO party at all is dropped from the heirs slot.
+    for non_party in ("WASHINGTON STATE-GOVT", "STATE OF WASHINGTON", "WASHINGTON STATE"):
+        assert orient_probate_party("SERONKO ROBERT LEE", non_party, "DEATH CERTIFICATE") == (
+            "SERONKO ROBERT LEE", None
+        )
+
+
+def test_a_named_agency_counterparty_is_KEPT_in_heirs():
+    # Codex P1: the counterparty rule is deliberately narrower than the grantor
+    # rule. An agency in the GRANTOR slot stands in for the decedent and must be
+    # removed to find the party; an agency in the COUNTERPARTY slot may be a real
+    # claimant on the estate, and erasing it would destroy true information.
     for agency in (
         "WASHINGTON STATE DEPARTMENT OF HEALTH",
-        "WASHINGTON STATE OF DEPARTMENT OF HEALTH",
-        "WASHINGTON STATE DEPT OF HEALTH",
-        "STATE OF WASHINGTON DEPARTMENT OF HEALTH",
-        "WASHINGTON STATE-GOVT",
+        "WASHINGTON STATE DEPARTMENT OF REVENUE",
+        "DEPARTMENT OF SOCIAL AND HEALTH SERVICES",
+        "SEATTLE-KING COUNTY PUBLIC HEALTH DEPARTMENT",
+        "ACME TITLE COMPANY",
     ):
         assert orient_probate_party("SERONKO ROBERT LEE", agency, "DEATH CERTIFICATE") == (
-            "SERONKO ROBERT LEE", None
+            "SERONKO ROBERT LEE", agency
         )
 
 
@@ -427,3 +437,25 @@ def test_ordinary_king_rows_are_unchanged():
     assert orient_probate_party(
         "THOMAS GARY / THOMAS DELORES A", "TUSZYNSKI GARY / THOMAS GARY", "DEATH CERTIFICATE"
     ) == ("THOMAS GARY / THOMAS DELORES A", "TUSZYNSKI GARY / THOMAS GARY")
+
+
+def test_counterparty_cleanup_never_strips_an_agency_phrase_from_a_stacked_heir():
+    # Only whole non-party SEGMENTS are dropped; a segment that names something
+    # keeps its full text.
+    assert orient_probate_party(
+        "DOE JOHN", "DOE JANE / WASHINGTON STATE DEPARTMENT OF REVENUE / PUBLIC",
+        "DEATH CERTIFICATE",
+    ) == ("DOE JOHN", "DOE JANE / WASHINGTON STATE DEPARTMENT OF REVENUE")
+
+
+def test_agency_phrase_with_a_locality_prefix_is_consumed_whole():
+    # Codex: "PUBLIC" is part of the agency NAME here. Stripping only
+    # "HEALTH DEPARTMENT" left the mangled fragment "SEATTLE-KING COUNTY PUBLIC"
+    # as the lead's party.
+    assert strip_filing_agency("SEATTLE-KING COUNTY PUBLIC HEALTH DEPARTMENT") == (
+        "SEATTLE-KING COUNTY"
+    )
+    assert strip_filing_agency("PUBLIC HEALTH DEPARTMENT") == ""
+    # ...and a real entity that merely starts with the same word is untouched.
+    assert strip_filing_agency("PUBLIC UTILITY DISTRICT NO 1") == "PUBLIC UTILITY DISTRICT NO 1"
+    assert strip_filing_agency("PUBLIC STORAGE") == "PUBLIC STORAGE"

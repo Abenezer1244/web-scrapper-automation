@@ -225,10 +225,16 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
         removed = {k: enrichment.pop(k) for k in _ASSESSOR_DERIVED_KEYS if k in enrichment}
         enrichment["parcel_lookup"] = "mismatch"
         enrichment["parcel_echoed_by_county"] = echoed
+        # Journal EVERY value the update nulls, so any row can be restored from
+        # the evidence file alone (Codex P2).
         _journal(journal, {"repair": "parcel", "action": "apply" if apply else "dry_run",
                            "id": row["id"], "parcel_id": pid, "county_echoed": echoed,
                            "cleared_property_address": row["property_address"],
+                           "cleared_property_city": row["property_city"],
+                           "cleared_property_state": row["property_state"],
+                           "cleared_property_zip": row["property_zip"],
                            "cleared_enrichment": removed,
+                           "old_enrichment_data": row["enrichment_data"],
                            "skip_trace_status": row["skip_trace_status"]})
         if apply:
             res = db.execute(_PARCEL_UPDATE, {
@@ -237,10 +243,16 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                 "new_enrichment": json.dumps(enrichment),
             })
             stats["cleared"] += res.rowcount
-            cancelled = db.execute(_CANCEL_PENDING, {"id": row["id"]}).rowcount
-            if cancelled:
-                db.execute(_RESET_RESULT_TRACE, {"id": row["id"]})
-            stats["traces_cancelled"] += cancelled
+            if res.rowcount:
+                # ONLY when the guarded clear actually wrote (Codex P1). If the row
+                # changed under us the clear no-ops, and cancelling its trace would
+                # kill a queued lookup for an address this run did not remove.
+                cancelled = db.execute(_CANCEL_PENDING, {"id": row["id"]}).rowcount
+                if cancelled:
+                    db.execute(_RESET_RESULT_TRACE, {"id": row["id"]})
+                stats["traces_cancelled"] += cancelled
+            else:
+                stats["skipped_row_changed"] = stats.get("skipped_row_changed", 0) + 1
     if apply:
         db.commit()
     return stats

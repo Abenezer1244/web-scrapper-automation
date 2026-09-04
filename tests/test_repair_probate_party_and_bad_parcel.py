@@ -77,3 +77,27 @@ def test_parcel_candidates_are_king_rows_with_a_malformed_pin():
     assert "lower(sc.county) = 'king'" in sql
     assert "length(btrim(r.parcel_id)) <> :pin_len" in sql
     assert _mod._KING_PIN_DIGITS == 10
+
+
+def test_journal_records_every_column_the_parcel_update_nulls():
+    # Codex P2: the evidence file must be enough to restore any row it cleared.
+    src = _SCRIPT.read_text(encoding="utf-8")
+    for key in ("cleared_property_address", "cleared_property_city",
+                "cleared_property_state", "cleared_property_zip",
+                "cleared_enrichment", "old_enrichment_data"):
+        assert f'"{key}"' in src
+    # ...and the party repair must journal both sides of what it rewrites.
+    for key in ("old_party", "new_party", "old_heirs", "new_heirs"):
+        assert f'"{key}"' in src
+
+
+def test_a_trace_is_cancelled_only_after_the_clear_actually_wrote():
+    # Codex P1: if the guarded clear no-ops because the row changed under us,
+    # cancelling its queued trace would kill a lookup for an address this run did
+    # not remove. The cancel must sit behind the rowcount check.
+    src = _SCRIPT.read_text(encoding="utf-8")
+    clear_at = src.index('stats["cleared"] += res.rowcount')
+    guard_at = src.index("if res.rowcount:", clear_at)
+    cancel_at = src.index("_CANCEL_PENDING", guard_at)
+    reset_at = src.index("_RESET_RESULT_TRACE", guard_at)
+    assert clear_at < guard_at < cancel_at < reset_at

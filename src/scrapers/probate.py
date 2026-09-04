@@ -98,9 +98,13 @@ _AGENCY_DEPT_RE = re.compile(
 # vital-records agency subject, so no bare token ("HEALTH", "REVENUE") can strip a
 # real surname; the scrambled order additionally requires the state qualifier,
 # because "DEPARTMENT <word>" without a state is too loose to be evidence.
+# "PUBLIC" is part of the agency's NAME in "<locality> PUBLIC HEALTH DEPARTMENT",
+# so the phrase must be consumed as one unit. Without this the strip removes only
+# "HEALTH DEPARTMENT" and leaves the mangled fragment "SEATTLE-KING COUNTY PUBLIC"
+# as the party (Codex).
 _AGENCY_TRAILING_RE = re.compile(
-    rf"(?:{_STATE_QUALIFIER})?{_AGENCY_SUBJECT}\s+(?:DEPARTMENT|DEPT)\b\.?"
-    rf"|(?:DEPARTMENT|DEPT)\.?\s+{_STATE_QUALIFIER}{_AGENCY_SUBJECT}\b",
+    rf"(?:{_STATE_QUALIFIER})?(?:PUBLIC\s+)?{_AGENCY_SUBJECT}\s+(?:DEPARTMENT|DEPT)\b\.?"
+    rf"|(?:DEPARTMENT|DEPT)\.?\s+{_STATE_QUALIFIER}(?:PUBLIC\s+)?{_AGENCY_SUBJECT}\b",
     re.IGNORECASE,
 )
 
@@ -312,15 +316,26 @@ def strip_estate_caption(name: str | None) -> str | None:
 
 
 def clean_counterparty(value: str | None) -> str | None:
-    """Sanitize the grantee/heir slot: drop agencies + recorder placeholders.
+    """Sanitize the grantee/heir slot: drop values that name NO party at all.
 
-    ``heirs`` is a customer-facing field, so the same doctrine that keeps a filing
-    agency out of ``party_name`` applies to it: "PUBLIC" is not an heir, and
-    neither is "WASHINGTON STATE DEPARTMENT OF HEALTH". A stacked value keeps its
-    real names ("KAUR RAJWANT / PUBLIC" -> "KAUR RAJWANT"); a value that is wholly
-    a placeholder/agency becomes None rather than being shown as a person.
+    ``heirs`` is customer-facing, so the recorder's "PUBLIC" placeholder and a bare
+    filing state must not be shown as people. A stacked value keeps its real names
+    ("KAUR RAJWANT / PUBLIC" -> "KAUR RAJWANT").
+
+    DELIBERATELY NARROWER than the grantor rule (Codex): it drops only non-party
+    segments and does NOT excise agency phrases. An agency in the GRANTOR slot is
+    the filer standing in for the decedent, so it must be removed to find the
+    party; an agency in the COUNTERPARTY slot may be a real claimant on the estate
+    ("WASHINGTON STATE DEPARTMENT OF REVENUE", a DSHS estate-recovery claim), and
+    erasing that would destroy true information about the record.
     """
-    return strip_filing_agency(value) or None
+    if not value or not value.strip():
+        return None
+    segments = [s.strip() for s in value.strip().split(" / ") if s.strip()]
+    kept = [s for s in segments if not _is_non_party_segment(s)]
+    if not kept:
+        return None
+    return " / ".join(kept) if len(kept) != len(segments) else value.strip()
 
 
 def orient_probate_party(

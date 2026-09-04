@@ -422,6 +422,11 @@ class LaserficheWebLinkScraper(BridgeScraper):
                     record.party_name, record.heirs = orient_probate_party(
                         grantor, grantee, doc_type
                     )
+                    if not record.party_name:
+                        # Guard #2: no decedent on either side. The append gate
+                        # below keeps any row with a DATE, so a party-less
+                        # probate lead would ship and still be billed (Codex).
+                        continue
                 elif self.active_record_type == "divorce":
                     # Both spouses are valid leads; only correct the case where the
                     # recorder indexed a court/state/agency as grantor. No-op when

@@ -303,3 +303,28 @@ async def test_enrichment_attaches_nothing_from_a_different_parcels_page(monkeyp
     assert out["64116000027"]["parcel_lookup"] == "mismatch"
     assert stats["parcel_mismatch"] == 1
     assert stats["mailing_candidates"] == 0
+
+
+def test_an_unreadable_parcel_cell_is_not_treated_as_a_missing_one():
+    # Codex P3: a page that CARRIES a parcel cell but declines to name the parcel
+    # ("N/A", blank) is not evidence that the page is ours, even for a well-formed
+    # 10-digit PIN. Only a page with no parcel cell at all falls back to trust.
+    assert not parcel_page_is_for('<tr><td>Parcel Number</td><td>N/A</td></tr>', "3751604519")
+    assert not parcel_page_is_for('<tr><td>Parcel Number</td><td></td></tr>', "3751604519")
+
+
+def test_a_blank_parcel_cell_does_not_mask_a_later_mismatching_one():
+    # Codex P3: eRealProperty labels the cell "Parcel" on one view and
+    # "Parcel Number" on another, so the first match may be empty. Scan them all.
+    markup = (
+        '<tr><td>Parcel</td><td>&nbsp;</td></tr>'
+        '<tr><td>Parcel Number</td><td>641160-0002</td></tr>'
+    )
+    assert _extract_parcel_echo(markup) == "6411600002"
+    assert not parcel_page_is_for(markup, "64116000027")
+    assert parcel_page_is_for(markup, "6411600002")
+
+
+def test_an_empty_requested_pid_is_never_trusted():
+    assert not parcel_page_is_for(_ECHO_MATCH, "")
+    assert not parcel_page_is_for("<tr><td>Name</td><td>SMITH JANE</td></tr>", "")

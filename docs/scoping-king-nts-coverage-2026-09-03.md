@@ -174,3 +174,67 @@ can disagree and the ToS wins. Do not build anything against an outlet until bot
 clean, and measure its actual coverage against the LandmarkWeb NTS index before
 investing in a parser. Until then, King `pre_foreclosure` Auction Date / Default Owed
 stays sparse by design, and the product should say so rather than imply missing data.
+
+---
+
+# Addendum 2026-09-04 (2): the newspaper list is CLOSED — no clean route exists
+
+**Status:** all 22 court-approved King County legal newspapers now checked. **Result: none
+are scrapable.** This closes the question; stop hunting outlets.
+
+## Why the list is a dead end
+
+Nine of the remaining unchecked papers — Auburn, Bellevue, Bothell/Kenmore, Covington/Maple
+Valley, Enumclaw Courier Herald, Kent, Redmond, Renton, Snoqualmie Valley Record, plus the
+Vashon-Maury Beachcomber — are **Sound Publishing / Carpenter Media Group** titles, and none
+of them hosts legal notices at all. Every one carries the same hard-coded sentence:
+
+> "To view legal notices online, please visit http://www.wapublicnotices.com/"
+
+Verified directly on 8 of the 9 domains. Their own robots.txt files are permissive and their
+network ToS has no anti-scraping clause — and it makes no difference, because **there is
+nothing of their own to scrape**. They all funnel to wapublicnotices.com, whose Terms of Use
+ban scraping outright with liquidated damages up to $10,000 per incident.
+
+The rest:
+
+| Outlet | Finding |
+|---|---|
+| Burien Highline Times (`westsideseattle.com`) | No legals section found |
+| North Seattle Herald-Outlook | **Defunct** — Pacific Publishing closed it in 2012; domain repurposed |
+| The Stranger | `/classifieds/` returns "Nothing Found"; no legals function |
+| Seattle Chinese Post | Classifieds page carries ad rates and a job posting; no legal notices |
+| Masonic Tribune | Grand Lodge fraternal publication, not a general-circulation legals venue |
+| The Medium (Seattle Medium) | No legals/public-notices section found |
+| Puget Sound Business Journal | **UNVERIFIED** — bizjournals.com not fetchable; no evidence of a legals section |
+| Voice of the Valley | **UNVERIFIED** — genuinely hosts its own notices, robots.txt fully permissive, but every content page (including `/terms-of-use/`) returns **HTTP 403** to automated requests. A site that 403s robots while publishing a permissive robots.txt is refusing automated access in practice. |
+
+## The conclusion
+
+Combined with the first addendum (DJC, WNPA, Seattle Times, and the recorded document all
+blocked), **every identified route to King trustee-sale auction data is closed by terms of
+use, robots.txt, or a bot block.** The ~1% ceiling from the Queen Anne & Magnolia News is not
+a gap waiting to be filled — it is the whole legally-clean supply.
+
+🔑 The recurring pattern across this entire investigation: **the blocker is never price and
+rarely technical.** DJC sells a $199/yr subscription that does not include crawl permission;
+King's recorder gives away unofficial document images while prohibiting bulk retrieval of
+them; Seattle Times publishes a permissive robots.txt over a ToS that forbids scrapers; Voice
+of the Valley publishes a permissive robots.txt and then 403s every fetch. **Check the terms,
+not the robots.txt.**
+
+## What to do instead — 👤 a product decision, not an engineering one
+
+Do not keep hunting. The honest options are:
+
+1. **Say so in the product.** King `pre_foreclosure` will show Auction Date and Default Owed
+   on roughly 1 lead in 100. Right now that renders as an em-dash, which reads as "we failed
+   to get it" rather than "this is not published anywhere we may read". A short note on the
+   results header for affected counties would be truthful and cheap.
+2. **Scope the offering.** Auction data is genuinely good for Pierce (Tacoma Daily Index, a
+   dedicated legals paper) and Snohomish. It is structurally thin for King and Clark. That is
+   a fact about WA publishing, and pricing/marketing can reflect it.
+3. **Buy it.** A commercial foreclosure-data feed licenses the data WITH the right to use it.
+   That is the only path that actually raises King coverage, and it is a purchasing decision.
+
+Nothing here is worth further engineering effort until one of those is chosen.

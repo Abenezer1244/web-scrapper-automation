@@ -26,6 +26,7 @@ TWO PHASES, because they have different safety conditions:
 
 Usage:
     railway run --service worker python scripts/repair_nts_ts_number.py --results
+    # a different paper (King):  --source queen_anne_news
     railway run --service worker python scripts/repair_nts_ts_number.py --results --apply
     # only after PR #195 is deployed:
     railway run --service worker python scripts/repair_nts_ts_number.py --notices \
@@ -54,7 +55,23 @@ from src.workers.nts_crawler import _PDF_BROWSER_UA  # noqa: E402
 
 _logger = setup_logger("scripts.repair_nts_ts_number")
 
+# Which paper this run repairs. Set from --source in main(); every query, the ts hash
+# and the re-parse all key off these, so a run can never mix two sources' rows.
+# Each source needs the SAME parser its crawler uses — King's layouts (no-colon Affinia
+# fields, surrogate REF-/APN- keys) come out garbage under the shared colon parser, and
+# a garbage truth map is exactly what this script must never write from.
 SOURCE = "snohomish_tribune"
+PARSE_FN = None  # resolved in main() from _SOURCE_PARSERS
+
+
+def _source_parsers() -> dict:
+    """source -> the parse function its crawler passes to the shared PDF pipeline."""
+    from src.scrapers.sources.nts_king_pdf import parse_king_notice
+
+    return {
+        "snohomish_tribune": nts.parse_nts_notice,   # shared colon parser
+        "queen_anne_news": parse_king_notice,        # King: no-colon + surrogate keys
+    }
 
 
 def _fetch(url: str) -> bytes:
@@ -89,7 +106,7 @@ def truth_from_pdfs(urls: list[str]) -> dict[str, str]:
         blocks = nts_pdf.split_notice_blocks(nts_pdf.normalize_pdf_text(nts_pdf.extract_pdf_text(data)))
         hits = 0
         for block in blocks:
-            parsed = nts.parse_nts_notice(block)
+            parsed = PARSE_FN(block)
             parcel, ts = parsed.get("parcel"), parsed.get("ts_number")
             if not parcel or not ts:
                 continue
@@ -356,7 +373,14 @@ def main() -> None:
     ap.add_argument("--notices", action="store_true", help="rename nts_notices (needs the fix deployed)")
     ap.add_argument("--apply", action="store_true", help="write; otherwise dry-run")
     ap.add_argument("--i-confirm-fixed-parser-is-deployed", action="store_true", dest="deployed")
+    ap.add_argument(
+        "--source", default="snohomish_tribune", choices=sorted(_source_parsers()),
+        help="which paper's rows to repair (default: snohomish_tribune, the original run)",
+    )
     args = ap.parse_args()
+    global SOURCE, PARSE_FN
+    SOURCE = args.source
+    PARSE_FN = _source_parsers()[SOURCE]
     if not (args.results or args.notices):
         ap.error("pick --results and/or --notices")
     # The gate is on WRITING, not on planning — a dry run must always be allowed so the

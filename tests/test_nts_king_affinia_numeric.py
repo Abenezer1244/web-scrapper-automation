@@ -282,3 +282,54 @@ def test_unparseable_date_is_also_a_visible_drop():
         summary, {"ts_number": "WA05000073-24-2", "auction_date": "09/0S/2026"}, "queen_anne_news"
     ) is True
     assert summary["dropped_undated"] == 2
+
+
+# ── Postponement override must stay narrow (Codex round 2) ───────────────────────
+
+def test_unrelated_continuance_language_never_overrides_the_sale():
+    """Litigation / mediation / hearing continuances share the verb but not the sale."""
+    for text in (
+        ("the undersigned Trustee will on 07/10/2026, at 10:00 AM at the courthouse sell "
+         "at public auction. Borrower filed a related court action. The motion hearing "
+         "was CONTINUED TO 09/18/2026 at 9:00AM."),
+        ("the undersigned Trustee will on 07/10/2026, at 10:00 AM at the courthouse sell "
+         "at public auction. The foreclosure mediation conference was RESCHEDULED TO "
+         "09/18/2026."),
+    ):
+        p = parse_nts_notice(text)
+        assert p["auction_date"] == "07/10/2026", p["auction_date"]
+
+
+def test_postponement_far_from_the_sale_sentence_is_ignored():
+    """Only the sale sentence's own inline marker counts; the window is bounded."""
+    text = ("the undersigned Trustee will on 07/10/2026, at 10:00 AM at the courthouse "
+            "sell at public auction. " + ("filler text. " * 60) +
+            "The sale was postponed to 09/18/2026.")
+    p = parse_nts_notice(text)
+    assert p["auction_date"] == "07/10/2026"
+
+
+def test_same_day_continuance_does_not_rewrite_the_time():
+    """Strictly later, so a same-day hearing time can't become the auction time."""
+    text = ("the undersigned Trustee will on 09/18/2026, at 10:00 AM at the courthouse "
+            "sell at public auction. The sale was continued to 09/18/2026 at 1:30 PM.")
+    p = parse_nts_notice(text)
+    assert p["auction_date"] == "09/18/2026"
+    assert p["auction_time"] == "10:00 AM"
+
+
+def test_postponement_never_rescues_an_unparseable_original_date():
+    """An original that cannot convert must stay a visible parse failure, not a live row."""
+    from src.scrapers.sources.nts_tacoma_index import _POSTPONED, _to_date
+
+    assert _to_date("13/40/2026") is None
+    m = _POSTPONED.search("The sale was postponed to 09/18/2026 @ 9:00AM")
+    assert m is not None and _to_date(m.group(1)) is not None
+    # The guard requires a convertible original, so the rescue cannot fire.
+    text = ("the undersigned Trustee will on 13/40/2026, at 10:00 AM at the courthouse "
+            "sell at public auction. The sale was postponed to 09/18/2026 @ 9:00AM.")
+    p = parse_nts_notice(text)
+    assert _to_date(p["auction_date"]) is None
+    assert notice_to_row(
+        p, source_url="x", today=date(2026, 9, 3), source="queen_anne_news", county="king"
+    ) is None

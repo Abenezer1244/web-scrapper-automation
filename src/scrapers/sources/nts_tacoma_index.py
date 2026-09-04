@@ -303,7 +303,13 @@ _AUCTION_NUM_LOC_AFTER = re.compile(
 # not county-specific.
 # Only ever moves the date FORWARD: a postponement cannot go backwards, so an unrelated
 # date elsewhere in the notice can never pull a sale earlier than its stated one.
+# Anchored on the word SALE (Codex round 2): a bare "CONTINUED TO"/"RESCHEDULED TO"
+# also appears in litigation, mediation and hearing language inside these mixed legal
+# sections, and would otherwise overwrite a perfectly good sale date. Searched ONLY in a
+# window around the matched sale sentence, never the whole block — the real case is
+# printed INLINE in that sentence.
 _POSTPONED = re.compile(
+    r"(?:TRUSTEE'?S?\s+)?SALE\s+(?:WAS\s+|HAS\s+BEEN\s+|IS\s+)?"
     r"(?:POSTPONED|CONTINUED|RESCHEDULED)\s+TO\s*:?\s*"
     rf"({_MONTH_DATE}|\d{{1,2}}/\d{{1,2}}/\d{{4}})"
     rf"(?:\s*(?:@|at)?\s*({_TIME}))?",
@@ -415,6 +421,7 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
     text = text.replace("’", "'").replace("‘", "'").replace("�", "'")
 
     auction_date = auction_time = auction_location = None
+    auction_match = None   # the sale sentence a postponement may supersede
     am = _AUCTION.search(text)
     if am:
         loc = " ".join(am.group(3).split()).strip().rstrip(".,")
@@ -425,6 +432,7 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
         # runs hundreds of chars. If it does, the match is suspect — discard it whole.
         if "NOTICE OF TRUSTEE" not in loc.upper() and len(loc) <= 300:
             auction_date = am.group(1).strip()
+            auction_match = am
             auction_time = " ".join(am.group(2).split())
             auction_location = loc or None
 
@@ -439,6 +447,7 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
         km = _AUCTION_KING.search(text) or _AUCTION_NUM_LOC_AFTER.search(text)
         if km:
             auction_date = " ".join(km.group(1).split()).strip().rstrip(",")
+            auction_match = km
             auction_time = " ".join(km.group(2).split())
             # Location from a BOUNDED window around the anchored match (no whole-notice
             # drift, Codex P3) — extend ~200 chars past the verb to reach Affinia's
@@ -465,15 +474,23 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
                 if ":" not in hhmm:
                     hhmm = f"{hhmm}:00"
                 auction_time = f"{hhmm} {ampm.upper()}M"
+                auction_match = wm
 
-    # An inline "POSTPONED TO <date>" supersedes whatever the sale sentence says — the
-    # original date is stale the moment it is printed. Forward-only (see _POSTPONED), so
-    # this can never pull a sale earlier or resurrect a genuinely finished auction.
-    if auction_date:
-        pm = _POSTPONED.search(text)
+    # An inline "SALE POSTPONED TO <date>" supersedes the sale sentence — the original
+    # date is stale the moment it is printed. Sale-anchored, window-bounded and
+    # strictly forward, so it cannot pull a sale earlier, fire on unrelated continuance
+    # language, or rescue a notice whose own date never parsed.
+    if auction_date and auction_match is not None:
+        # Bounded to the sale sentence (+300 chars) so unrelated hearing/mediation
+        # language elsewhere in the block can never reach it (Codex round 2).
+        window = text[auction_match.start():auction_match.end() + 300]
+        pm = _POSTPONED.search(window)
         if pm:
             original, moved = _to_date(auction_date), _to_date(pm.group(1))
-            if moved and (original is None or moved >= original):
+            # STRICTLY later, and only when the original itself parsed: an unconvertible
+            # original must stay a visible parse failure, not be rescued into a live row
+            # by some other date (Codex round 2).
+            if moved and original and moved > original:
                 auction_date = " ".join(pm.group(1).split()).strip().rstrip(",")
                 if pm.group(2):
                     auction_time = " ".join(pm.group(2).split())

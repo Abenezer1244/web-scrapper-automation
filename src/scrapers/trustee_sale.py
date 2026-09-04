@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from datetime import date
+from datetime import date, timedelta
 
 from sqlalchemy import func, select
 
@@ -35,6 +35,7 @@ from src.db.models import NtsNotice
 from src.db.session import system_sync_session
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.scrapers.preforeclosure import strip_vesting_clause
+from src.utils.lead_signals import auction_reference_date
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.trustee_sale")
@@ -45,6 +46,10 @@ RECORD_TYPE = "trustee_sale"
 # accepts M/D/YYYY; any other format (incl. ISO) parses to NULL and drops the row from
 # date-windowed Lists/overlap + blanks its freshness signal.
 _MDY_RE = re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$")
+
+# Floor for the forward auction window (see _window_span_days). A same-day or inverted
+# window is a UI artifact, not a request for "only auctions happening today".
+MINIMUM_SPAN_DAYS = 7
 
 
 def _filing_date_mdy(notice: NtsNotice) -> str | None:
@@ -60,6 +65,35 @@ def _filing_date_mdy(notice: NtsNotice) -> str | None:
         return nod
     d = notice.auction_date
     return f"{d.month}/{d.day}/{d.year}" if d else None
+
+
+def _window_span_days(date_from: str | None, date_to: str | None) -> int | None:
+    """The requested window's LENGTH in days, or None when there is no usable window.
+
+    The job stores a resolved M/D/YYYY pair (src/workers/tasks_helpers/dates.py). Only
+    the span is meaningful for trustee_sale — the absolute dates are backward-looking
+    and would match nothing. Returns None (= no horizon, every upcoming auction) rather
+    than guessing when either bound is missing or unparseable, so a malformed window can
+    never silently shrink a user's results to zero.
+
+    A zero/negative span is clamped to a MINIMUM_SPAN_DAYS floor: a same-day window is
+    almost certainly a UI artifact, and honoring it literally would deliver only auctions
+    happening today — an empty list, not a useful answer.
+    """
+    a, b = _parse_mdy(date_from), _parse_mdy(date_to)
+    if a is None or b is None:
+        return None
+    return max((b - a).days, MINIMUM_SPAN_DAYS)
+
+
+def _parse_mdy(value: str | None) -> date | None:
+    if not value or not _MDY_RE.match(value.strip()):
+        return None
+    try:
+        m, d, y = (int(p) for p in value.strip().split("/"))
+        return date(y, m, d)
+    except ValueError:
+        return None
 
 
 def _record_from_notice(notice: NtsNotice) -> ScrapedRecord:
@@ -150,29 +184,46 @@ class _TrusteeSaleScraper(BridgeScraper):
         )
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
-        # date_from/date_to unused: nts_notices is a current snapshot of UPCOMING
-        # sales (a lead's date_recorded is its FUTURE auction date), so a past-looking
-        # window would drop exactly the active sales we want — same rationale as
-        # snohomish_wa_pre_foreclosure. We select active + future-dated notices; the
-        # user-facing window lives at the results/Lists layer.
-        del date_from, date_to
+        # The requested window is applied FORWARD, by LENGTH (2026-09-03).
+        #
+        # nts_notices is a snapshot of UPCOMING sales and a lead's date_recorded is its
+        # FUTURE auction date, so the window's absolute dates are always in the past and
+        # applying them literally would drop every active sale. Previously both bounds
+        # were discarded outright — which meant a job asking for 06/04..09/02 delivered a
+        # row dated 9/4/2026 and the control the user set did nothing.
+        #
+        # So we keep the user's INTENT (how much data) and flip the DIRECTION: a 90-day
+        # window means "auctions in the next 90 days". date_recorded then always falls
+        # inside the window the user asked for, instead of provably outside it. An
+        # unparseable/absent window keeps the old behavior (every upcoming auction).
+        today = auction_reference_date()   # county-local, not UTC — see lead_signals
+        span = _window_span_days(date_from, date_to)
+        horizon = today + timedelta(days=span) if span is not None else None
 
-        today = date.today()
         with system_sync_session() as db:
+            conditions = [
+                func.lower(NtsNotice.county) == self.COUNTY,
+                NtsNotice.is_active.is_(True),
+                NtsNotice.auction_date.isnot(None),
+                NtsNotice.auction_date >= today,
+            ]
+            if horizon is not None:
+                conditions.append(NtsNotice.auction_date <= horizon)
             notices = (
                 db.execute(
                     select(NtsNotice)
-                    .where(
-                        func.lower(NtsNotice.county) == self.COUNTY,
-                        NtsNotice.is_active.is_(True),
-                        NtsNotice.auction_date.isnot(None),
-                        NtsNotice.auction_date >= today,
-                    )
+                    .where(*conditions)
                     .order_by(NtsNotice.auction_date.asc())
                 )
                 .scalars()
                 .all()
             )
+        _logger.info(
+            "trustee_sale %s: auctions %s..%s (%s) -> %d notice(s)",
+            self.COUNTY, today, horizon or "no horizon",
+            f"{span}d forward window" if span is not None else "full upcoming",
+            len(notices),
+        )
 
         records = [_record_from_notice(n) for n in notices]
         if not records:

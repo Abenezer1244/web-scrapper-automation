@@ -100,7 +100,8 @@ _PARTY_UPDATE = text(
 # wrong.
 _PENDING_FOR_RESULT = text(
     """
-    SELECT id, first_name, last_name, trace_type, status
+    SELECT id, first_name, last_name, trace_type, status,
+           tracerfy_queue_id, submitted_at
     FROM pending_skip_trace_rows
     WHERE result_id = :id
     """
@@ -110,7 +111,16 @@ _PENDING_NAME_REFRESH = text(
     """
     UPDATE pending_skip_trace_rows
     SET first_name = :new_first, last_name = :new_last, trace_type = :new_trace_type
-    WHERE result_id = :id
+    -- Keyed by the pending row's OWN id, not just result_id. There is no unique
+    -- constraint on pending_skip_trace_rows.result_id (models.py: a plain FK; the
+    -- only Index is the dispatch one) and the enqueue inserts unconditionally, so
+    -- a result CAN hold more than one pending row. Keying on result_id alone made
+    -- the first loop iteration update every sibling that shared the old name
+    -- tuple, after which the remaining iterations journalled writes that had
+    -- already happened and no-opped (Codex round 7 P2). Latent today — production
+    -- has 758 pending rows across 758 distinct results — but nothing prevents it.
+    WHERE id = :pending_id
+      AND result_id = :id
       -- Only a row that has NOT reached the provider. 'submitting', 'submitted'
       -- and 'completed' may already be paid for or correlated to a Tracerfy
       -- queue id, and 'errored' cannot be told apart from a genuine provider
@@ -126,6 +136,26 @@ _PENDING_NAME_REFRESH = text(
         OR last_name IS DISTINCT FROM :new_last
         OR trace_type IS DISTINCT FROM :new_trace_type
       )
+    """
+)
+
+# The enqueue does not merely choose a trace TYPE for a non-personal party — it
+# returns None and creates no pending row at all (build_pending_row_payload,
+# skip_trace.py). Refreshing such a row to 'advanced' would keep paying for an
+# address-only trace the enqueue itself would have refused, so the repair mirrors
+# the enqueue's own outcome instead: move the row to the established terminal
+# 'errored' state (what the clearing path already uses for "will never be
+# traced") and return the Result to 'not_attempted'. Same not-yet-at-the-provider
+# guard as the refresh — a row that has reached Tracerfy is never touched.
+_PENDING_SUPPRESS = text(
+    """
+    UPDATE pending_skip_trace_rows
+    SET status = 'errored'
+    WHERE id = :pending_id
+      AND result_id = :id
+      AND status = 'queued'
+      AND tracerfy_queue_id IS NULL
+      AND submitted_at IS NULL
     """
 )
 
@@ -283,40 +313,104 @@ def _journal(path: str, payload: dict) -> None:
         fh.write(json.dumps(payload, default=str) + "\n")
 
 
-def _refresh_pending_name(db, result_id: str, new_party: str | None, *, journal: str) -> int:
-    """Re-derive a queued trace's name payload from the REPAIRED party. Returns rows written.
+def _refresh_pending_name(
+    db, result_id: str, new_party: str | None, *, journal: str, apply: bool
+) -> dict:
+    """Re-derive a queued trace's name payload from the REPAIRED party.
 
-    Uses the enqueue's own rule so the repaired row is indistinguishable from one
-    enqueued fresh: select_traceable_owner picks the highest-confidence person and
-    returns (None, None) for an entity/ambiguous name, which is exactly when the
-    enqueue falls back to an address-only ADVANCED trace.
+    Returns {"refreshed": n, "suppressed": n} — rows written under --apply, rows
+    that WOULD be written in a dry run.
+
+    Mirrors the enqueue exactly, because a repaired row must be indistinguishable
+    from one enqueued fresh. That means both halves of the enqueue's decision:
+
+      * looks_like_non_personal_party_name -> build_pending_row_payload returns
+        None and NO pending row is created at all. Refreshing such a row to an
+        address-only ADVANCED trace would keep spending on a trace the enqueue
+        itself refuses, so the row is suppressed instead (Codex round 7 P2).
+      * otherwise select_traceable_owner picks the highest-confidence person and
+        returns (None, None) for an entity/ambiguous name, which is exactly when
+        the enqueue falls back to ADVANCED.
+
+    Runs in dry run too. The trace type decides what we SPEND, so an operator has
+    to be able to see the cost impact before authorising --apply; gating the whole
+    function on `apply` hid it (Codex round 7 P3). Nothing is executed unless
+    `apply` is set.
     """
-    from src.scrapers.enrichment.skip_trace import select_traceable_owner
+    from src.scrapers.enrichment.skip_trace import (
+        looks_like_non_personal_party_name,
+        select_traceable_owner,
+    )
 
-    first, last = select_traceable_owner(new_party)
-    trace_type = "normal" if (first and last) else "advanced"
-    written = 0
+    suppress = looks_like_non_personal_party_name(new_party)
+    if suppress:
+        first, last, trace_type = None, None, None
+    else:
+        first, last = select_traceable_owner(new_party)
+        trace_type = "normal" if (first and last) else "advanced"
+
+    counts = {"refreshed": 0, "suppressed": 0}
     for pend in db.execute(_PENDING_FOR_RESULT, {"id": result_id}).mappings().all():
-        if (pend["first_name"], pend["last_name"], pend["trace_type"]) == (first, last, trace_type):
+        # The "has not reached the provider" test is applied HERE as well as in
+        # each statement's WHERE. The SQL guard alone would make a dry run
+        # over-report: it would count and journal a row that --apply then declines
+        # to touch, so the preview an operator authorises would not match what
+        # runs. Both statements still keep their own guard — this is the
+        # belt-and-suspenders rule the project applies to user_id filtering.
+        if (
+            pend["status"] != "queued"
+            or pend["tracerfy_queue_id"] is not None
+            or pend["submitted_at"] is not None
+        ):
             continue
-        _journal(journal, {"repair": "pending_name", "id": result_id,
+        if not suppress and (
+            (pend["first_name"], pend["last_name"], pend["trace_type"])
+            == (first, last, trace_type)
+        ):
+            continue
+        stmt = _PENDING_SUPPRESS if suppress else _PENDING_NAME_REFRESH
+        params = {"pending_id": pend["id"], "id": result_id}
+        if not suppress:
+            params.update({
+                "new_first": first, "new_last": last, "new_trace_type": trace_type,
+                "old_first": pend["first_name"], "old_last": pend["last_name"],
+                "old_trace_type": pend["trace_type"],
+            })
+        # Journal AFTER the write, carrying the rowcount, so the record says what
+        # actually happened rather than what was intended. Safe because the commit
+        # is at the end of repair_party: a crash before the journal line also rolls
+        # the write back (Codex round 7 P2).
+        rc = db.execute(stmt, params).rowcount if apply else 0
+        key = "suppressed" if suppress else "refreshed"
+        counts[key] += rc if apply else 1
+        _journal(journal, {"repair": "pending_name",
+                           "action": ("suppress" if suppress else "refresh")
+                                     + ("" if apply else "_dry_run"),
+                           "id": result_id,
                            "pending_id": pend["id"], "pending_status": pend["status"],
                            "new_party": new_party,
                            "old_first": pend["first_name"], "old_last": pend["last_name"],
                            "old_trace_type": pend["trace_type"],
-                           "new_first": first, "new_last": last, "new_trace_type": trace_type})
-        written += db.execute(_PENDING_NAME_REFRESH, {
-            "id": result_id, "new_first": first, "new_last": last,
-            "new_trace_type": trace_type, "old_first": pend["first_name"],
-            "old_last": pend["last_name"], "old_trace_type": pend["trace_type"],
-        }).rowcount
-    return written
+                           "new_first": first, "new_last": last,
+                           "new_trace_type": trace_type, "written": rc})
+        if suppress and apply and rc:
+            # Mirror the enqueue's outcome on the Result as well, exactly as the
+            # clearing path does, so the lead does not sit in 'queued' behind a
+            # row that will never be submitted. Guarded on skip_trace_status
+            # 'queued', so running it once per suppressed sibling is idempotent.
+            db.execute(_RESET_RESULT_TRACE, {"id": result_id})
+    return counts
 
 
 def repair_party(db, *, apply: bool, journal: str) -> dict:
     rows = db.execute(_PARTY_CANDIDATES).mappings().all()
+    # pending_* are always present, including at 0 and including in a dry run:
+    # they describe what this repair does to QUEUED SKIP TRACES, which is the part
+    # that costs money, and a key that only appears when non-zero reads as "not
+    # considered" rather than "considered, nothing to do" (Codex round 7 P3).
     stats = {"scanned": len(rows), "changed": 0, "party_fixed": 0, "heirs_fixed": 0,
-             "no_party_left": 0, "written": 0}
+             "no_party_left": 0, "written": 0,
+             "pending_refreshed": 0, "pending_suppressed": 0}
     for row in rows:
         new_party, new_heirs = orient_probate_party(row["party_name"], row["heirs"], row["doc_type"])
         if new_party == row["party_name"] and new_heirs == row["heirs"]:
@@ -339,16 +433,25 @@ def repair_party(db, *, apply: bool, journal: str) -> dict:
                            "id": row["id"], "county": row["county"],
                            "old_party": row["party_name"], "new_party": new_party,
                            "old_heirs": row["heirs"], "new_heirs": new_heirs})
+        # In a dry run there is no UPDATE to gate on, so the trace impact is
+        # reported for every row that WOULD change. Under --apply it stays gated
+        # on the guarded UPDATE actually writing: if the row moved under us the
+        # party was never repaired, so its trace payload must not be rewritten
+        # either.
+        refresh = True
         if apply:
             res = db.execute(_PARTY_UPDATE, {
                 "id": row["id"], "new_party": new_party, "new_heirs": new_heirs,
                 "old_party": row["party_name"], "old_heirs": row["heirs"],
             })
             stats["written"] += res.rowcount
-            if res.rowcount:
-                stats["pending_refreshed"] = stats.get("pending_refreshed", 0) + _refresh_pending_name(
-                    db, row["id"], new_party, journal=journal
-                )
+            refresh = bool(res.rowcount)
+        if refresh:
+            counts = _refresh_pending_name(
+                db, row["id"], new_party, journal=journal, apply=apply
+            )
+            stats["pending_refreshed"] += counts["refreshed"]
+            stats["pending_suppressed"] += counts["suppressed"]
     if apply:
         db.commit()
     return stats

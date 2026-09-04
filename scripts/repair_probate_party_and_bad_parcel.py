@@ -181,11 +181,13 @@ _REPOINT_PENDING = text(
         -- P1). Anything not verified for the corrected parcel becomes NULL.
         city = NULL, state = NULL, zip = NULL,
         mail_address = :mail_address, mail_city = NULL, mail_state = NULL, mail_zip = NULL,
-        -- Names are RECOMPUTED from the corrected lead, never blanked: the
-        -- dispatcher selects by trace_type and submits these verbatim, so a
-        -- 'normal' row with empty names becomes a normal trace with no name
-        -- (Codex P1).
-        first_name = :first_name, last_name = :last_name,
+        -- first_name / last_name are deliberately NOT touched. They describe the
+        -- PERSON, which a parcel correction does not change: the enqueue derived
+        -- them from this lead's own party and they are still right. Blanking them
+        -- would ship a 'normal' trace with no name, and re-deriving them here
+        -- needs a surname splitter this module does not have — person_tokens() is
+        -- explicitly not one, and using it made "VAN DYKE MARY" into
+        -- last='VAN' first='DYKE' (Codex P1). Leaving them alone avoids both.
         tracerfy_queue_id = NULL,
         status = 'queued', submitted_at = NULL
     WHERE result_id = :id
@@ -198,8 +200,6 @@ _REPOINT_PENDING = text(
       AND (
            property_address IS DISTINCT FROM :property_address
         OR mail_address IS DISTINCT FROM :mail_address
-        OR first_name IS DISTINCT FROM :first_name
-        OR last_name IS DISTINCT FROM :last_name
         OR city IS NOT NULL OR state IS NOT NULL OR zip IS NOT NULL
         OR mail_city IS NOT NULL OR mail_state IS NOT NULL OR mail_zip IS NOT NULL
         OR tracerfy_queue_id IS NOT NULL
@@ -278,22 +278,6 @@ def repair_party(db, *, apply: bool, journal: str) -> dict:
     if apply:
         db.commit()
     return stats
-
-
-def _party_name_parts(party_name: str | None) -> dict:
-    """(last_name, first_name) for the pending skip-trace payload.
-
-    Reuses the SAME tokenizer the parcel resolver uses, so a recorder party is
-    split exactly once, in one place. Both are None when the party names no
-    identifiable person (an agency, a placeholder, a single token).
-    """
-    from src.scrapers.enrichment.king_parcel_repair import person_tokens
-
-    people = person_tokens(party_name)
-    if not people:
-        return {"last_name": None, "first_name": None}
-    tokens = people[0]
-    return {"last_name": tokens[0], "first_name": tokens[1]}
 
 
 def _recover(pid: str, party_name: str | None, stats: dict):
@@ -403,8 +387,7 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                     # run it here too rather than only on a fresh recovery.
                     repointed = db.execute(
                         _REPOINT_PENDING,
-                        {"id": row["id"], "property_address": prop, "mail_address": mail,
-                         **_party_name_parts(row["party_name"])}
+                        {"id": row["id"], "property_address": prop, "mail_address": mail}
                     ).rowcount
                     if repointed:
                         db.execute(_REQUEUE_RESULT_TRACE, {"id": row["id"]})
@@ -450,8 +433,7 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                     # forever (Codex P2).
                     repointed = db.execute(
                         _REPOINT_PENDING,
-                        {"id": row["id"], "property_address": prop, "mail_address": mail,
-                         **_party_name_parts(row["party_name"])}
+                        {"id": row["id"], "property_address": prop, "mail_address": mail}
                     ).rowcount
                     if repointed:
                         db.execute(_REQUEUE_RESULT_TRACE, {"id": row["id"]})

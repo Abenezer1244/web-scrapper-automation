@@ -162,19 +162,17 @@ def test_repoint_rebuilds_the_whole_pending_payload():
     assert "skip_trace_status IN ('not_attempted', 'errored')" in requeue
 
 
-def test_repoint_recomputes_names_instead_of_blanking_them():
-    # Codex P1: the dispatcher selects by trace_type and submits these verbatim, so
-    # a 'normal' row with blank names becomes a normal trace with no name.
+def test_repoint_never_touches_the_lead_s_name():
+    # Codex P1 (rounds 4+5): blanking first/last shipped a 'normal' trace with no
+    # name, and re-deriving them via person_tokens() — which is explicitly NOT a
+    # surname splitter — turned "VAN DYKE MARY" into last='VAN' first='DYKE'.
+    # Names describe the PERSON, which a parcel correction does not change, so the
+    # repair leaves them exactly as the enqueue set them.
     sql = " ".join(str(_mod._REPOINT_PENDING).split())
-    assert "first_name = :first_name" in sql
-    assert "last_name = :last_name" in sql
-    assert "first_name = NULL" not in sql and "last_name = NULL" not in sql
-    assert _mod._party_name_parts("REINKE NORMAN LEONARD") == {
-        "last_name": "REINKE", "first_name": "NORMAN"}
-    # An agency / placeholder names no person, so no name is invented.
-    assert _mod._party_name_parts("WASHINGTON STATE DEPARTMENT OF HEALTH") == {
-        "last_name": None, "first_name": None}
-    assert _mod._party_name_parts(None) == {"last_name": None, "first_name": None}
+    for assignment in ("first_name =", "last_name =",
+                       "first_name IS DISTINCT", "last_name IS DISTINCT"):
+        assert assignment not in sql, assignment
+    assert not hasattr(_mod, "_party_name_parts")
 
 
 def test_repoint_also_completes_a_half_fixed_row():
@@ -182,8 +180,6 @@ def test_repoint_also_completes_a_half_fixed_row():
     # re-point had already street-corrected kept its stale locality/mailing/names.
     sql = " ".join(str(_mod._REPOINT_PENDING).split())
     for cond in ("mail_address IS DISTINCT FROM :mail_address",
-                 "first_name IS DISTINCT FROM :first_name",
-                 "last_name IS DISTINCT FROM :last_name",
                  "city IS NOT NULL", "state IS NOT NULL", "zip IS NOT NULL",
                  "mail_city IS NOT NULL", "mail_state IS NOT NULL", "mail_zip IS NOT NULL",
                  "tracerfy_queue_id IS NOT NULL"):

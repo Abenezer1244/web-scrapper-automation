@@ -95,8 +95,13 @@ multi-record-type scraper results.
 - **The app role returns 0 rows for EVERYTHING under RLS** — an "empty" prod query is a role
   problem, not data loss. Use `DATABASE_URL_MIGRATE`.
 - **A clean `openapi.json` regen shows ZERO deletions.** Any deletion = environment drift, not your
-  change. And `export_openapi.py --check` is NOT CI-equivalent locally: it calls `origin/main`'s
-  own committed schema STALE (`.venv-schema` fastapi 0.137.2 vs requirements' 0.141.1).
+  change. `.venv-schema` IS CI-equivalent and `export_openapi.py --check` is trustworthy — but only
+  against `origin/main`. I "confirmed" it was non-equivalent by diffing against my OWN already-
+  polluted commit, concluded main used a float constraint form it does not use, and hand-normalized
+  the file into being genuinely stale. CI caught it (`Check OpenAPI schema is current`, PR #219).
+  The script dumps `sort_keys=True, indent=2, ensure_ascii=False` + trailing newline; main
+  round-trips through that byte-identically, so that IS the canonical form. Never hand-patch this
+  file — regenerate in `.venv-schema` and diff against `origin/main`, not against HEAD.
 - Test 9 has **267 leads but 0 overlaps**, so its `overlaps_only` combined view is legitimately
   empty — the facets correctly return `[]`. An empty combined list is not necessarily a bug.
 - The JWT-revocation check **fails CLOSED (503)** when Redis is unreachable, so nothing

@@ -1,11 +1,43 @@
-"""M6 ops alerts: configuration gates (pure — never sends a real email).
+"""M6 ops alerts: configuration gates. Never sends a real email.
 
 The send path is exercised in prod by construction (best-effort + cooldown);
-these lock the SAFE defaults: alerting is a no-op unless explicitly configured,
-and a missing Resend key can never raise out of a worker task.
+these lock the SAFE defaults: e-mail DELIVERY is a no-op unless explicitly
+configured, and a missing Resend key can never raise out of a worker task.
+
+NOTE (2026-09-04): "no-op" now means *no e-mail*, not *no side effect*. Every
+alert-worthy call also writes a durable audit_events row — inline for a sync
+caller like these tests, handed to an executor only when an event loop is running
+— because OPS_ALERT_EMAIL was blank in production and the old silent return meant
+a four-week crawl outage left no trace anywhere. The autouse fixture below stubs
+that write so these stay pure; the behaviour itself is covered in
+tests/test_nts_upsert_and_ops_alert_durability.py.
 """
+import pytest
+
 from src.config import settings
+from src.workers import ops_alerts
 from src.workers.ops_alerts import send_ops_alert
+
+
+@pytest.fixture(autouse=True)
+def _no_real_audit_write(monkeypatch):
+    """Every send now also records a durable audit row. These tests are about the
+    CONFIG GATES, so stub the persistence seam — otherwise each one would attempt a
+    real INSERT against whatever database the suite is pointed at (Codex)."""
+    class _S:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def add(self, _obj):
+            pass
+
+        def commit(self):
+            pass
+
+    monkeypatch.setattr(ops_alerts, "_session_for_persist", lambda: _S())
 
 
 def test_disabled_by_default_is_silent_noop():

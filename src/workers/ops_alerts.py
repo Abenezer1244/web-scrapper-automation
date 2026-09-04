@@ -14,6 +14,7 @@ Design rules:
 - **Disabled by default**: empty OPS_ALERT_EMAIL = no-op (dev/CI safe).
 - No PII in alert bodies: job/connector identifiers only, never lead data.
 """
+import asyncio
 import html
 
 from src.config import settings
@@ -46,15 +47,130 @@ def _cooldown_acquired(kind: str, key: str) -> bool:
         return True
 
 
+def _session_for_persist():
+    """The session the durable write uses.
+
+    A named seam so the behaviour above can be tested against a fake, rather than only
+    asserted against source text (Codex: most of the first round of tests inspected
+    source strings and would not have caught a wrong value or a blocking write).
+    """
+    from src.db.session import system_sync_session
+
+    return system_sync_session()
+
+
+# How the durable write is scheduled.
+#
+# Round 1 wrote it inline. That was wrong (Codex): Resend is only reached AFTER the config
+# and cooldown gates, and production has OPS_ALERT_EMAIL blank, so inline persistence ADDED
+# database work to a path that previously returned instantly — including the Stripe webhook
+# handler in src/api/routes/billing.py.
+#
+# Round 2 put it on a private single-worker ThreadPoolExecutor with a bounded backlog. That
+# fixed the latency but was over-built (Codex again), and it bought two new problems: the
+# executor is joined at interpreter exit, so a wedged database turned into SHUTDOWN latency
+# for Celery workers and one-shot `railway run` scripts, and a full queue dropped the NEWEST
+# alert — exactly the one carrying a novel failure mode during a storm.
+#
+# What is actually needed is narrower than either. Fourteen of the fifteen call sites are
+# Celery workers, where a short synchronous INSERT is unremarkable — those do DB work
+# constantly. Only ONE caller runs on an event loop (the billing webhook), and only there
+# does a blocking write actually cost anything. So: write inline when there is no loop, and
+# hand off to asyncio's own default executor when there is. No private pool, no backlog
+# counter, no drop policy, no shutdown hook — and no event loop ever blocked.
+#
+# This is best-effort by contract. A hard kill (SIGKILL, container eviction) can still lose
+# the row; the alternative that survives that is a Celery task, which cannot be trusted for
+# an alert that may BE about the broker.
+#
+# Known caveat (Codex, accepted): `run_in_executor(None, ...)` is not fully detached —
+# asyncio drains the default executor when the loop closes, so under `asyncio.run` a wedged
+# database can still delay process exit after the coroutine returns. That is acceptable for
+# the one loop-bound caller here (a long-lived FastAPI request loop, not a short
+# `asyncio.run`), and the alternative — a private pool with its own shutdown hook — is what
+# this replaced.
+def _submit_persist(kind: str, key: str, subject: str, delivered: bool) -> None:
+    """Record the alert without ever blocking an event loop. Never raises."""
+    try:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None  # ordinary sync caller (every Celery worker call site)
+
+        if loop is None:
+            _persist_ops_alert(kind, key, subject, delivered)
+        else:
+            # Fire-and-forget on the default executor so the request handler continues.
+            loop.run_in_executor(None, _persist_ops_alert, kind, key, subject, delivered)
+    except Exception as exc:  # noqa: BLE001 — recording must never affect the caller
+        _logger.warning("could not record ops alert: %s", str(exc)[:200])
+
+
+def _persist_ops_alert(kind: str, key: str, subject: str, delivered: bool) -> None:
+    """Best-effort durable record of an ops alert. NEVER raises.
+
+    Written to audit_events (event='ops_alert', user_id NULL) rather than to a new
+    table: system-written rows with a NULL user_id are already an established pattern
+    there, so this needs no migration. Deliberately records EVERY alert-worthy
+    occurrence, not just the ones that clear the e-mail cooldown — "this fired daily
+    for four weeks" is the shape of the question these rows exist to answer.
+
+    created_at is set client-side so the INSERT emits no RETURNING: under FORCE RLS the
+    app role may INSERT into audit_events but not SELECT, and a server_default would
+    trigger a RETURNING that RLS then denies (same trap as _persist_audit_event in
+    src/api/middleware/security.py).
+    """
+    try:
+        import uuid as _uuid
+        from datetime import UTC, datetime
+
+        from src.db.models import AuditEvent
+
+        with _session_for_persist() as db:
+            db.add(
+                AuditEvent(
+                    id=str(_uuid.uuid4()),
+                    event="ops_alert",
+                    user_id=None,
+                    path=f"{kind}:{key}"[:256],
+                    # The outcome is part of the record: "fired daily for four weeks
+                    # and was never delivered" is a different fact from "fired once and
+                    # was e-mailed", and only the row can tell them apart later.
+                    detail=f"[{'sent' if delivered else 'undelivered'}] {subject}"[:512],
+                    created_at=datetime.now(UTC),
+                )
+            )
+            db.commit()
+    except Exception as exc:  # noqa: BLE001 — durability is additive, never fatal
+        _logger.warning("ops_alert audit insert failed (alert still logged): %s", str(exc)[:200])
+
+
 def send_ops_alert(kind: str, key: str, subject: str, body: str) -> bool:
     """Send an operational alert email. Returns True when an email was sent.
 
     ``kind``/``key`` form the cooldown bucket (e.g. ("canary", "pierce/WA")).
     ``subject``/``body`` are plain text; body is HTML-escaped into the template.
     """
+    # Every alert-worthy condition leaves a durable row, whether or not an email goes
+    # out, because the delivery path is exactly what turned out to be broken:
+    # OPS_ALERT_EMAIL was '' in production, so this function silently returned False for
+    # all 15 call sites (canary, batch, billing, delivery, NTS crawl, registration,
+    # skip-trace, webhook) — and the King NTS crawl then went barren for four consecutive
+    # weeks with no alert, no log line and nothing in the database. By the time anyone
+    # noticed, Railway's stdout retention no longer reached back and the outage could not
+    # be explained. An alert nobody can reconstruct afterwards is not an alert.
+    #
+    # Recorded from a `finally`, so every gate below and the except branch all record.
+    # _submit_persist keeps it off an event loop when there is one; see the note there.
+    delivered = False
     try:
         if not settings.OPS_ALERT_EMAIL:
-            return False  # alerting not configured — silent no-op
+            # WARNING, not a silent return. The RESEND_API_KEY branch below already
+            # warned; the far likelier misconfiguration was the one that said nothing.
+            _logger.warning(
+                "OPS_ALERT_EMAIL not configured — alert dropped [%s:%s]: %s", kind, key, subject
+            )
+            return False
         if not settings.RESEND_API_KEY:
             _logger.warning("OPS_ALERT_EMAIL set but RESEND_API_KEY missing — alert dropped: %s", subject)
             return False
@@ -81,7 +197,10 @@ def send_ops_alert(kind: str, key: str, subject: str, body: str) -> bool:
             }
         )
         _logger.info("ops alert sent [%s:%s] %s", kind, key, subject)
+        delivered = True
         return True
     except Exception as exc:  # noqa: BLE001 — never fail the caller
         _logger.error("ops alert send failed [%s:%s]: %s", kind, key, str(exc)[:200])
         return False
+    finally:
+        _submit_persist(kind, key, subject, delivered)

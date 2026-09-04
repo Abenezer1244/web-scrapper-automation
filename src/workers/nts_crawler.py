@@ -607,6 +607,28 @@ def _crawl_pacific_publishing_pdf(
 
 _NO_UPDATE = frozenset({"id", "source", "ts_number", "created_at"})
 
+# Columns a re-crawl may only ever IMPROVE, never blank out.
+#
+# _upsert_notice refreshes every mutable field ON CONFLICT, so one pass that parses the
+# same notice but fails to extract a field used to overwrite a good value with NULL.
+# Observed in production 2026-09-04: Tacoma notice WA-26-1050840-BB held
+# principal_owing = NULL while the lead matched from it still carried 575,150.38, and
+# re-parsing its own source page with today's parser yields 575150.38 — the page never
+# stopped saying "$575,150.38", we simply stored a NULL over the top of it. That is also
+# why _resweep_null_amount_notices exists: it can add an amount back, but nothing stopped
+# the next crawl from removing it again.
+#
+# A NULL from the parser means "this run could not read it", essentially never "the
+# notice no longer states it" — trustees amend sale dates and amounts, they do not delete
+# them. So a NULL is treated as no-information and the stored value stands.
+# DELIBERATELY EXCLUDED: is_active (must be able to go false), fetched_at (must always
+# advance), source_url and raw_hash (must track the issue actually read last).
+_COALESCE_ON_UPDATE = frozenset({
+    "auction_date", "auction_time", "auction_location", "parcel", "property_address",
+    "property_address_normalized", "grantor", "trustee", "beneficiary",
+    "principal_owing", "note_amount", "nod_date", "county", "state",
+})
+
 
 def _upsert_notice(db, model, row: dict) -> None:
     """Upsert one notice on (source, ts_number); refresh all mutable fields.
@@ -615,12 +637,22 @@ def _upsert_notice(db, model, row: dict) -> None:
     INSERT path and is NEVER in the conflict-update set — refreshing an existing
     notice must not churn its PK or created_at. The natural key (source, ts_number)
     and id are stable across re-crawls.
+
+    Value columns are COALESCEd (see _COALESCE_ON_UPDATE) so a re-crawl can improve a
+    field but never blank one out — a NULL from the parser means "this run could not
+    read it", not "the notice stopped saying it".
     """
     from uuid import uuid4
 
+    from sqlalchemy import func as _func
+
     row = {**row, "id": str(uuid4())}
     stmt = pg_insert(model).values(**row)
-    update_cols = {c: stmt.excluded[c] for c in row if c not in _NO_UPDATE}
+    update_cols = {
+        c: (_func.coalesce(stmt.excluded[c], getattr(model, c))
+            if c in _COALESCE_ON_UPDATE else stmt.excluded[c])
+        for c in row if c not in _NO_UPDATE
+    }
     stmt = stmt.on_conflict_do_update(
         constraint="uq_nts_notices_source_ts", set_=update_cols
     )

@@ -438,10 +438,17 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
 
     # King County: eRealProperty + Tax Bill for property + mailing
     if config.county.lower() == "king" and config.state.upper() == "WA":
+        # A row qualifies if it is missing a mailing address OR (tax-delinquent) is
+        # missing its owner name. The owner comes FREE from the same eRealProperty
+        # page phase 1 already fetches for the property address, so gating this
+        # pass on "missing mailing" alone silently starved owner resolution for any
+        # row whose mailing had already been filled upstream — the shape that left
+        # a real 384-lead King job with 0 owner names.
+        is_tax_delinquent = config.record_type == "tax_delinquent"
         needs = [
             res for res in all_results
             if res.parcel_id and len(res.parcel_id.strip()) >= 6
-            and not res.mailing_address
+            and (not res.mailing_address or (is_tax_delinquent and not res.party_name))
         ]
         if needs:
             _publish_log(r, job_id, "info", f"Looking up {len(needs)} mailing addresses...", db=db)
@@ -453,13 +460,15 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 if pid not in pid_map:
                     pid_map[pid] = []
                 pid_map[pid].append(res)
-            # Cap at 300 parcels to avoid 10+ minute hangs on large batches.
-            # King County assessor is slow (~0.5s per parcel) — 1354 parcels
-            # takes ~11 min which exceeds the enrichment timeout.
-            _MAX_KING_PARCELS = 300
-            if len(pids) > _MAX_KING_PARCELS:
-                _logger.info("Capping King County mailing lookup to %d/%d parcels", _MAX_KING_PARCELS, len(pids))
-                pids = pids[:_MAX_KING_PARCELS]
+            # NO fixed parcel cap. A count cap truncated the parcel list before the
+            # work started, so on a 384-parcel job 84 parcels were dropped without
+            # ever being attempted — and the cheap phase-1 lookup (property + OWNER,
+            # one HTTP GET) was never the reason jobs ran long. The wall-clock
+            # budget below is the real bound: it is checked before every single
+            # lookup, returns PARTIAL results rather than losing them, and marks
+            # whatever it did not reach as deferred. That keeps a pathological
+            # 17k-parcel job inside the Celery soft limit while letting an ordinary
+            # job resolve every parcel it has.
             # Internal time budget (200s) returns PARTIAL results; the outer
             # wait_for(240) is only a last-resort kill switch. Either way the
             # rest of enrichment (owner repair, unactionable summary, SKIP-TRACE
@@ -476,9 +485,17 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                     for pid in pids
                 }
                 enriched = asyncio.run(asyncio.wait_for(
-                    batch_enrich_king_county(pids, time_budget_s=200, stats=king_stats,
+                    # 200s could not even finish phase 1 for a few hundred parcels
+                    # (~0.5s each), so owner + property resolution was being cut off
+                    # by the clock as well as by the old count cap. The Celery task
+                    # allows 3600s for scrape+enrichment; 900s is a small slice of
+                    # that and still bounds a runaway. Phase 1 (property + owner,
+                    # cheap HTTP) always runs to completion first, so the expensive
+                    # Playwright mailing pass can only ever spend what's left over —
+                    # owner names are never the thing that gets dropped.
+                    batch_enrich_king_county(pids, time_budget_s=900, stats=king_stats,
                                              party_names=party_names),
-                    timeout=240,
+                    timeout=960,
                 ))
             except Exception as exc:  # noqa: BLE001 — best-effort county lookup
                 king_error = f"{type(exc).__name__}: {str(exc)[:120]}"
@@ -493,7 +510,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             # path are never touched).
             from src.scrapers.king_wa_tax_delinquent import is_tax_placeholder_party
             from src.utils.lead_formatting import classify_probate_title_status
-            is_tax_delinquent = config.record_type == "tax_delinquent"
+            # (is_tax_delinquent computed above, where it also selects `needs`.)
             # Probate + death-cert: party_name is the DECEASED. The Assessor's owner
             # is who holds title NOW — often an heir/trust. Surface it + a conservative
             # flag so the user isn't mailing a decedent.
@@ -616,19 +633,22 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 for res in owner_needs:
                     o_pid_map.setdefault(res.parcel_id.strip(), []).append(res)
                 o_pids_all = list(o_pid_map.keys())
-                # Keep inline eRealProperty owner repair tiny. Bulk owner fill is
-                # operationally sensitive and belongs in a monitored/offline flow
-                # backfill script — logged here so the cap is never silent.
-                _MAX_KING_OWNER_PARCELS = 25
-                overflow = max(0, len(o_pids_all) - _MAX_KING_OWNER_PARCELS)
-                o_pids = o_pids_all[:_MAX_KING_OWNER_PARCELS]
-                if overflow:
-                    _logger.info(
-                        "King owner lookup capped at %d/%d parcels this job; %d deferred to backfill",
-                        _MAX_KING_OWNER_PARCELS, len(o_pids_all), overflow,
-                    )
+                # No count cap (product decision 2026-09-03): a lead without an
+                # owner name is barely a lead, and a fixed 25 meant at most 6.5% of
+                # a 384-row job could ever be named. Volume is bounded instead by
+                # the wall-clock timeout below plus the SAME protections that
+                # matter operationally — paced requests, the source-health gate,
+                # and the circuit breaker that trips on a throttle/block rather
+                # than recording it as "no owner". Those are safety valves, not
+                # caps, and are deliberately kept: they are what stops a repeat of
+                # the eRealProperty IP rate-block.
+                o_pids = o_pids_all
+                overflow = 0
+                # Caller-owned result dict: names are kept even if the outer
+                # wait_for cancels, and even if the breaker raises mid-run.
+                owners: dict[str, str] = {}
                 try:
-                    owners = asyncio.run(asyncio.wait_for(
+                    asyncio.run(asyncio.wait_for(
                         batch_extract_king_owners(
                             o_pids,
                             delay=1.0,
@@ -636,9 +656,19 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                             max_transient_rate=0.10,
                             max_unresolved_rate=0.50,
                             fetch_attempts=1,
+                            out=owners,
+                            # Stop cooperatively just inside the hard timeout so the
+                            # loop exits on its own terms rather than being killed.
+                            time_budget_s=840,
                         ),
-                        timeout=180,
+                        timeout=900,
                     ))
+                except TimeoutError:
+                    _logger.warning(
+                        "Job %s: King owner-only lookup hit the hard timeout; "
+                        "keeping %d owner names already resolved",
+                        job_id, len(owners),
+                    )
                 except (KingOwnerLookupBlockedError, SourceUnavailableError) as exc:
                     _logger.warning(
                         "Job %s: King owner-only lookup aborted: %s",
@@ -652,7 +682,10 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                         )
                     except Exception:
                         db.rollback()
-                    owners = {}
+                    # Keep what was already resolved. The breaker guards against
+                    # reading a throttle as "this parcel has no owner"; it does not
+                    # make the names fetched BEFORE it tripped any less real, and
+                    # discarding them threw away good data on every trip.
                 swapped = 0
                 for pid, owner in owners.items():
                     for res in o_pid_map.get(pid, []):

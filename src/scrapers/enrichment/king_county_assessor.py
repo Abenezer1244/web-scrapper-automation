@@ -195,6 +195,8 @@ async def batch_extract_king_owners(
     max_transient_rate: float = 0.10,
     max_unresolved_rate: float = 0.50,
     fetch_attempts: int = 1,
+    out: dict[str, str] | None = None,
+    time_budget_s: float | None = None,
 ) -> dict[str, str]:
     """Owner/taxpayer name per parcel from eRealProperty — HTTP only, no Playwright.
 
@@ -218,7 +220,16 @@ async def batch_extract_king_owners(
     failed transiently this run is retried on the next run (it is still a
     placeholder), never permanently abandoned.
     """
-    owners: dict[str, str] = {}
+    # `out`, when the caller supplies it, IS the result dict — names land in it as
+    # they resolve, so a caller that wraps this in asyncio.wait_for still keeps
+    # every owner already found when the timeout cancels the coroutine. Returning
+    # only at the end meant a cancelled run threw away all of its work; that is
+    # exactly how a real King job finished with zero owner names.
+    # `time_budget_s` is the cooperative version of the same idea: stop cleanly
+    # (keeping results) instead of being killed from outside.
+    owners: dict[str, str] = out if out is not None else {}
+    import time as _time
+    _deadline = (_time.monotonic() + time_budget_s) if time_budget_s is not None else None
     # parcel_id comes from our own scraped DB rows (not user input), but require a
     # digit so a malformed value can't generate a noisy external request.
     clean = list(dict.fromkeys(
@@ -238,6 +249,12 @@ async def batch_extract_king_owners(
     misses = 0
     window: deque[_OwnerLookupOutcome] = deque(maxlen=max(1, circuit_window))
     for i, pid in enumerate(clean):
+        if _deadline is not None and _time.monotonic() >= _deadline:
+            _logger.warning(
+                "Owner-only lookup: time budget exhausted after %d/%d parcels "
+                "(%d resolved so far, kept)", i, len(clean), len(owners),
+            )
+            break
         if i % 100 == 0 and i > 0:
             _logger.info("  owner HTTP: %d / %d ...", i, len(clean))
         owner, errored = await _fetch_king_owner(pid, max_attempts=fetch_attempts)
@@ -474,11 +491,17 @@ async def batch_enrich_king_county(
     if not tax_urls:
         return results
 
-    # Cap at 200 parcels to avoid job timeout (~5-10s per lookup)
+    # Cap at 200 parcels to avoid job timeout (~5-10s per lookup). The mailing
+    # pass really is expensive (Playwright), so unlike phase 1 this cap stays.
+    # What must NOT stay is dropping the overflow SILENTLY: the truncated parcels
+    # used to vanish without entering `deferred`, so they got no durable marker
+    # and no later sweep could find them — a gap invisible to both the logs and
+    # the caller. Record them like any other unreached parcel.
     _MAX_MAILING_LOOKUPS = 200
     pids_to_lookup = list(tax_urls.keys())
     if len(pids_to_lookup) > _MAX_MAILING_LOOKUPS:
         _logger.info("Capping mailing lookups: %d → %d (to avoid timeout)", len(pids_to_lookup), _MAX_MAILING_LOOKUPS)
+        st["deferred"].extend(pids_to_lookup[_MAX_MAILING_LOOKUPS:])
         pids_to_lookup = pids_to_lookup[:_MAX_MAILING_LOOKUPS]
 
     _logger.info("Phase 2: Playwright lookup for %d mailing addresses...", len(pids_to_lookup))

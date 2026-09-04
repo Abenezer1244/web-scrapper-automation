@@ -220,15 +220,27 @@ def aggregate_delinquent_rows(
     fully before emitting: a parcel's charge lines span API pages, so NOTHING is
     emitted mid-stream.
 
+    SELECTION vs TOTALS are deliberately independent:
+      * ``start_year``..``effective_end_year`` is the SELECTION window — a parcel
+        is emitted only if it has a delinquent charge line somewhere inside it.
+      * Its ``delinquent_amount`` and ``bill_year`` are computed over ALL of its
+        delinquent years through ``effective_end_year``, window or not.
+    Feeding rows only from inside the window therefore UNDERSTATES the balance and
+    reports a too-recent oldest year; the caller must query with an upper bound
+    only. Years after ``effective_end_year`` are ignored (not yet billed).
+
     ``cap_min_year`` enforces the 18-month product cap: a parcel is DROPPED when
     its oldest delinquent year (``bill_year``) is older than this year. ``None``
     (the default) disables the cap, keeping the function pure for callers/tests
-    that don't want it; the scraper passes ``tax_cap_min_year(today)``.
+    that don't want it; the scraper passes ``tax_cap_min_year(today)``. NOTE this
+    now compares against the parcel's TRUE oldest year rather than a
+    window-clipped one, so a capped caller drops strictly more parcels — correct,
+    and inert for King, which is cap-exempt (TAX_CAP_EXEMPT_SOURCES).
 
     Returns ``(records, stats)``. ``delinquent_amount`` for a parcel =
-    SUM(billed - paid) over included charge types and delinquent years, floored
-    at 0 at the PARCEL total (not per line). ``bill_year`` = oldest delinquent
-    year (matches Snohomish).
+    SUM(billed - paid) over included charge types and ALL delinquent years,
+    floored at 0 at the PARCEL total (not per line). ``bill_year`` = true oldest
+    delinquent year (matches Snohomish).
     """
     agg: dict[str, dict] = {}
     stats = {
@@ -246,6 +258,10 @@ def aggregate_delinquent_rows(
         "net_zero_parcels": 0,  # candidate dropped: net (billed-paid) <= 0
         "overflow": 0,
         "capped_out": 0,
+        # Candidate dropped: delinquent, but only in years OUTSIDE the requested
+        # window. Its rows were still read (they are what makes the totals of an
+        # in-window parcel correct), it simply is not a lead for this job.
+        "out_of_window": 0,
     }
 
     for item in rows:
@@ -262,8 +278,14 @@ def aggregate_delinquent_rows(
             stats["skipped_malformed_acct"] += 1
             continue
         year = int(year_raw)
-        # Range + current-year exclusion (defensive; also enforced in the $where).
-        if year < start_year or year > effective_end_year:
+        # Upper bound only. The requested window SELECTS which parcels are leads;
+        # it must NOT truncate a selected parcel's balance or its oldest year.
+        # Clipping the low side here understated delinquent_amount and reported a
+        # too-recent oldest_tax_year for every parcel whose delinquency predates
+        # the window (King's feed carries bill_year back to 2002; 3,569 of 17,297
+        # accounts have a pre-2025 year). Future years are still excluded so a
+        # not-yet-billed year can never inflate the balance.
+        if year > effective_end_year:
             continue
 
         rtype = (item.get("receivable_type") or "").strip().upper()
@@ -293,10 +315,16 @@ def aggregate_delinquent_rows(
                 "by_type_cents": defaultdict(int),
                 "by_year_cents": defaultdict(int),
                 "accounts": set(),
+                # True once ANY charge line falls inside the requested window.
+                # This — not the year range of the sum — is what makes the parcel
+                # a lead for this job, so selection and totals stay independent.
+                "in_window": False,
             }
             agg[parcel] = entry
         entry["owed_cents"] += owed_cents
         entry["years"].add(year)
+        if year >= start_year:
+            entry["in_window"] = True
         entry["by_type_cents"][rtype] += owed_cents
         entry["by_year_cents"][year] += owed_cents
         entry["accounts"].add(acct)
@@ -305,6 +333,12 @@ def aggregate_delinquent_rows(
 
     records: list[ScrapedRecord] = []
     for parcel, entry in agg.items():
+        # SELECTION: the parcel is a lead for this job only if it is delinquent
+        # somewhere inside the requested window. Its money and its oldest year are
+        # still computed over its FULL history below.
+        if not entry["in_window"]:
+            stats["out_of_window"] += 1
+            continue
         # Floor at the PARCEL total (not per line) — preserves partial-payment /
         # credit math within the parcel before clamping.
         total_cents = entry["owed_cents"]
@@ -335,7 +369,14 @@ def aggregate_delinquent_rows(
         # one-time clear-backfill can still recognize and null out historical rows.
         rec.party_name = None
         rec.legal_description = parcel
-        rec.date_recorded = f"01/01/{bill_year}"
+        # NO DATE. This source is a tax RECEIVABLE ROLL, not a recorder index: it
+        # carries a bill YEAR and no filing/recording/delinquency date. The former
+        # `01/01/<bill_year>` asserted an event on a specific January 1st that
+        # never happened — a fabricated date under a "Date" header, which the
+        # frontend already had to paper over with an em-dash and which still
+        # reached the CSV export. The real signal is the bill year, surfaced
+        # honestly as `oldest_tax_year` / `delinquent_bill_year`.
+        rec.date_recorded = None
         rec.enrichment_data = {
             "source": _SOURCE,
             # Source-gated structured fields read by _extract_tax_fields.
@@ -468,10 +509,17 @@ class KingWATaxDelinquentScraper(BridgeScraper):
             )
             return []
 
-        where = f"bill_year>='{start_year}' AND bill_year<='{effective_end}'"
+        # UPPER BOUND ONLY. A parcel's charge lines from BEFORE the window are part
+        # of what it owes and set its oldest delinquent year, so they must be
+        # fetched and summed even though they do not, on their own, make it a lead.
+        # `aggregate_delinquent_rows` applies the window as a SELECTION filter.
+        # (A lower bound here silently understated the balance and reported a
+        # too-recent oldest year for ~26% of a real King job's leads.)
+        where = f"bill_year<='{effective_end}'"
         _logger.info(
-            "King WA tax delinquent — delinquent bill years %d to %d",
-            start_year, effective_end,
+            "King WA tax delinquent — leads delinquent in %d-%d; balances summed "
+            "across all bill years through %d",
+            start_year, effective_end, effective_end,
         )
 
         # 18-month recency cap. King is EXEMPT (user decision 2026-06-23): its

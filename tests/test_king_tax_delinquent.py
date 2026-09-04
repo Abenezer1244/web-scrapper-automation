@@ -123,7 +123,9 @@ def test_aggregates_all_charge_types_and_years_per_parcel():
     assert a["delinquent_years"] == [2023, 2024]
     assert a["delinquent_year_count"] == 2
     assert a["source"] == "king_county_delinquent_taxes"
-    assert by["0123456789"].date_recorded == "01/01/2023"
+    # NO fabricated date: the tax receivable roll has no filing/recording date, so
+    # date_recorded stays NULL. The bill year is surfaced as oldest_tax_year.
+    assert by["0123456789"].date_recorded is None
     # both 12-digit accounts that share the parcel are recorded
     assert a["account_numbers"] == ["012345678900", "012345678955"]
 
@@ -358,3 +360,89 @@ def test_retryable_classification():
         err.response.status_code = code
         assert not _is_retryable(err), f"{code} must not retry"
     assert not _is_retryable(ValueError("SSRF: refusing internal host"))
+
+
+# ── Window truncation regression (Test 10) ────────────────────────────────────
+# Reproduces the SOURCE SHAPE that caused it: King's feed carries a parcel's
+# delinquent charge lines for years reaching far back (live: 2002..2026), while a
+# job asks for a recent window. The window must decide WHICH PARCELS are leads —
+# never how much a selected lead owes or how far back its delinquency runs.
+# Before the fix, a lower bound in the Socrata $where (mirrored by a lower-bound
+# row drop here) hid the pre-window years: on a real 384-lead King job that made
+# 100 leads (26%) report a too-recent oldest year and understated the delinquent
+# balance by $652,958.57 in aggregate.
+
+# Parcel LONGRUN is delinquent 2021-2026; parcel RECENT only in 2026.
+_WINDOW_ROWS = [
+    _row("111111111100", 2021, "R", 150000, 0),   # $1,500.00  pre-window
+    _row("111111111100", 2022, "R", 160000, 0),   # $1,600.00  pre-window
+    _row("111111111100", 2023, "N", 2500, 0),     # $25.00     pre-window
+    _row("111111111100", 2025, "R", 200000, 0),   # $2,000.00  IN window
+    _row("111111111100", 2026, "R", 210000, 0),   # $2,100.00  IN window
+    _row("222222222200", 2026, "R", 90000, 0),    # $900.00    IN window only
+]
+
+
+def test_balance_and_oldest_year_span_all_years_not_just_the_window():
+    records, stats = aggregate_delinquent_rows(
+        _WINDOW_ROWS, start_year=2025, effective_end_year=2026
+    )
+    by = _by_parcel(records)
+    assert set(by) == {"1111111111", "2222222222"}
+
+    ed = by["1111111111"].enrichment_data
+    # 1500 + 1600 + 25 + 2000 + 2100 — the pre-window years are REAL money owed.
+    assert ed["delinquent_amount"] == "7225.00"
+    assert ed["oldest_tax_year"] == 2021          # not 2025
+    assert ed["bill_year"] == 2021
+    assert ed["delinquent_years"] == [2021, 2022, 2023, 2025, 2026]
+    assert ed["delinquent_year_count"] == 5
+    # Per-year breakdown keeps every year, so the UI can show the full history.
+    assert ed["amount_by_year"]["2021"] == "1500.00"
+    assert ed["amount_by_year"]["2026"] == "2100.00"
+
+    # A parcel with only in-window delinquency is unaffected.
+    assert by["2222222222"].enrichment_data["delinquent_amount"] == "900.00"
+    assert by["2222222222"].enrichment_data["oldest_tax_year"] == 2026
+    assert stats["out_of_window"] == 0
+
+
+def test_parcel_delinquent_only_before_the_window_is_not_a_lead():
+    # Selection still honours the window: pre-window-only delinquency is read (it
+    # would count toward an in-window parcel's total) but never emitted as a lead.
+    rows = [
+        _row("333333333300", 2021, "R", 500000, 0),
+        _row("333333333300", 2022, "R", 500000, 0),
+    ]
+    records, stats = aggregate_delinquent_rows(
+        rows, start_year=2025, effective_end_year=2026
+    )
+    assert records == []
+    assert stats["out_of_window"] == 1
+    # It was a well-formed candidate, so this is a business empty, not a parse break.
+    assert stats["aggregated_parcels"] == 1
+
+
+def test_future_bill_years_never_inflate_the_balance():
+    # Years past the effective end are not yet billed and must be ignored even
+    # though the lower bound is gone.
+    rows = [
+        _row("444444444400", 2026, "R", 100000, 0),
+        _row("444444444400", 2027, "R", 999999, 0),   # future -> excluded
+    ]
+    records, _ = aggregate_delinquent_rows(
+        rows, start_year=2025, effective_end_year=2026
+    )
+    ed = _by_parcel(records)["4444444444"].enrichment_data
+    assert ed["delinquent_amount"] == "1000.00"
+    assert ed["delinquent_years"] == [2026]
+
+
+def test_tax_rows_never_carry_a_fabricated_date():
+    # The Socrata tax roll exposes a bill YEAR and no event date. Every emitted
+    # record must leave date_recorded NULL rather than synthesize a January 1st.
+    records, _ = aggregate_delinquent_rows(
+        _WINDOW_ROWS, start_year=2025, effective_end_year=2026
+    )
+    assert records
+    assert all(r.date_recorded is None for r in records)

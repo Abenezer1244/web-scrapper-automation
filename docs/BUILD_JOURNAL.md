@@ -111,6 +111,88 @@ to understand *why* the code is the way it is and *what's been attempted before*
   lookup. Correct today, unverifiable in principle. `--record-types` clears them on request.
 - ⏭️ 119 Test 7 rows sit at `skip_trace_status=queued` with no phone/email.
 
+## 2026-09-03 (night) — "Test 6": the leads were fine; the parser was deleting them
+
+**Built / Shipped:** PR **#200** on `chore/test6-dq` (`3241de2`, `0ec9139`, `f9e2974`, `25d5ea6`) —
+CI green, `MERGEABLE`/`CLEAN`, **not merged**. Suite **2091 passed / 0 failed**, ruff clean.
+- `_AUCTION_NUM_LOC_AFTER` (`src/scrapers/sources/nts_tacoma_index.py`) — a 4th auction-date
+  fallback, tried only after the existing three miss, for the Affinia layout: numeric date with the
+  location printed *after* "sell at public auction".
+- `_POSTPONED` (same file) — an inline "SALE POSTPONED TO \<date\>" now supersedes the sale sentence.
+- `_note_undated_drop` (`src/workers/nts_crawler.py`) — splits "chrome" from "a real notice we
+  could not date" on all three crawl paths; the latter is logged as a lost lead.
+- `scripts/repair_nts_ts_number.py --source` — was hardcoded to `snohomish_tribune`.
+- Fixtures: verbatim split blocks from two published Queen Anne & Magnolia News legals PDFs.
+
+**Tried / Decided:**
+- Audited the *delivered* row first and it was perfect — party name, parcel, property + mailing
+  address, auction date, default owed, all matching the source PDF and the King assessor. Pivoted
+  to running the **production splitter + parser over the real source PDFs** and counting kept vs
+  dropped. That is what found both bugs; no amount of output inspection would have.
+- Rejected generalizing `_AUCTION` (the hot path) to make its location group optional — Codex
+  agreed. A fallback tried last keeps every existing input byte-identical. Made the new pattern the
+  **tightest** of the four, not the loosest: it runs last, so it only ever sees what nothing else
+  could handle.
+- Did **not** fold numeric dates into `_AUCTION_KING` even though that regex already tolerates a
+  location-after shape: hardening it with the `Trustee will` anchor would have broken the MTC
+  layout, whose "Trustee, will" comes *after* the date.
+
+**Failed / Blocked:**
+- 🛑 `railway run … repair_nts_ts_number.py` (even dry-run) and editing `~/.railway/config.json` to
+  link the worktree were both **denied by the auto-mode classifier**. The King row repair was
+  therefore never executed — it is a user/ops action now.
+- The worktree is not Railway-linked, so prod diagnostics had to run from the main OneDrive
+  checkout, which is on stale code — fine for SELECTs, useless for anything needing the fixed parser.
+
+**Caught & fixed** (Codex gate, 3 rounds to convergence — 4 findings → 3 → CLEAN):
+- **Round 1 Medium → shipped as High:** inline sale postponements. A republished notice keeps its
+  original sale sentence and marks the new date inline
+  (`"on June 26, 2026, 09:00 AM***THE SALE WAS POSTPONED TO 09/18/2026 @ 9:00AM***"`). The parser
+  read June 26 → past → `is_active` False → a **still-upcoming sale disappeared**. Real and live:
+  TS `WA05000073-24-2`, parcel 6385500350, $155,361.99, genuinely selling 09/18/2026.
+- **Round 2, three Highs, all in my own fix:** `_POSTPONED` matched a bare
+  `POSTPONED|CONTINUED|RESCHEDULED TO` **anywhere in the block** — these legals sections mix
+  summons, probate and mediation, so "the motion hearing was CONTINUED TO …" would have clobbered
+  good sale dates on *every* source. And `original is None or moved >= original` let an
+  unconvertible original date be **rescued into a live row** by an unrelated date, turning a visible
+  parse failure into a bogus lead. Narrowed to: anchored on the word SALE, bounded to the matched
+  sale sentence (+300 chars), strictly later, and only when the original itself converts.
+- **Round 1 High I did not accept as-written:** claimed location pollution via
+  `_AUCTION_KING_LOC_B`. Disproved against the corpus — all 7 notices were clean because `LOC_A`
+  anchors past the verb. Kept the one-line guard anyway and added the assertion my test lacked.
+
+**Pending / Handoff:**
+- ⏭️ 👤 **King `nts_notices` repair** after #200 deploys:
+  `railway run --service worker python scripts/repair_nts_ts_number.py --results --notices --source queen_anne_news`
+  (dry-run first). `WA07000020-26-1` holds GUILER's data (truth = MEKMORAKOTH / 259900081003);
+  `REF-20231006000715` is MEKMORAKOTH under a surrogate key and carries the delivered Test 6 lead;
+  `WA07000014-24-4` is a superseded GUILER twin; `WA05000073-24-2` is missing entirely (its
+  publication run includes 09/09, so the post-deploy crawl should re-ingest it).
+- 🛑 **No catch-up for the weekly-PDF sources.** `_discover_latest_legals_pdf` takes only the newest
+  issue, the legals page exposes no archive, and the King task runs **Thursdays only**
+  (`scheduler.py:182`). A missed or failed week is lost permanently; `_resweep_null_amount_notices`
+  is wired for Tacoma + Clark but never for the PDF sources.
+- 👤 King coverage is structurally thin — Queen Anne & Magnolia News is a neighborhood paper; the
+  dominant foreclosure venue is the DJC (paid, deferred).
+- 📋 `trustee_sale` **discards the job's date window** (`trustee_sale.py` `del date_from, date_to`)
+  and `date_recorded` falls through to the auction date, so delivered rows legitimately sit outside
+  the requested window. Intentional; nothing surfaces it to the user.
+
+**Facts learned:**
+- In this pipeline **one unparsed field deletes the whole lead** — `is_valid_nts` needs both
+  `ts_number` and `auction_date`, and the drop is indistinguishable from "this was never a trustee
+  sale". A single unhandled date phrasing removed **100% of one trustee's notices** with no error,
+  no alert and no row. Never let those two outcomes share a counter.
+- Test the date **converts**, not that it exists: captured garbage ("13/40/2026") fails downstream
+  identically and was slipping back into the quiet bucket.
+- An override that supersedes a parsed field needs *several* narrowing constraints, not one:
+  anchored on its subject, bounded to a window around what it replaces, monotonic, and refusing to
+  fire when the replaced value never parsed.
+- Amounts are the Section IV **"sum owing … Principal $X"**, not the larger "total debt now owing"
+  (interest + fees). Both appear in every notice.
+- `queen_anne_news` is King's only NTS source; `_MAX_PDF_BYTES`, the Thursday-only beat entry and
+  the newest-issue-only discovery together cap King coverage independently of any parser bug.
+
 ---
 
 ## 2026-09-03 (later) — The Codex gate came back NO-GO, and it was right about all four

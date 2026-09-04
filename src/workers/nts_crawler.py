@@ -63,8 +63,15 @@ _SNOHO_SOURCE = "snohomish_tribune"
 
 # King County via the Queen Anne & Magnolia News (Pacific Publishing). PARTIAL
 # coverage — it's a neighborhood paper, not King County's dominant foreclosure venue
-# (that's the DJC, $350/yr, deferred). Same weekly-PDF pipeline; its legals live in a
-# /legals/ subdir (vs snoho's flat /images/).
+# (that's the Seattle DJC). Same weekly-PDF pipeline; its legals live in a /legals/
+# subdir (vs snoho's flat /images/).
+# DJC status, scoped 2026-09-03 (docs/scoping-king-nts-coverage-2026-09-03.md): NOT a
+# "just pay for it" item. The old "$350/yr" note here was stale — the relevant tier is
+# $199/yr — but price was never the blocker: djc.com/robots.txt disallows /notices/ for
+# ALL crawlers, and the free WNPA aggregator carrying the same notices
+# (wapublicnotices.com) bans scraping outright in its Terms of Use. A subscription buys
+# reading access, not crawl permission. The cheap path to more King coverage is the
+# OTHER approved King legal newspapers, not the DJC.
 _KING_PAGE = "https://queenannenews.com/Content/Default/Default/Classified/Legal-Notices/-3/-3/498"
 _KING_PDF_PREFIX = "/static-4/queenannenews/images/legals/"
 _KING_SOURCE = "queen_anne_news"
@@ -112,6 +119,7 @@ def crawl_nts_tacoma_index() -> dict:
     _logger.info("NTS crawl: %d candidate notice URLs", len(notice_urls))
 
     upserted = skipped = errored = 0
+    _drops: dict = {}
     with system_sync_session() as db:
         for u in notice_urls:
             try:
@@ -127,6 +135,7 @@ def crawl_nts_tacoma_index() -> dict:
                 parsed = nts.parse_tacoma_notice(nts.extract_article_text(resp.text))
                 row = nts.notice_to_row(parsed, source_url=u, today=today)
                 if row is None:
+                    _note_undated_drop(_drops, parsed, "tacoma_daily_index")
                     skipped += 1  # not a parseable NTS body
                     continue
                 row["fetched_at"] = datetime.now(UTC)
@@ -168,7 +177,8 @@ def crawl_nts_tacoma_index() -> dict:
 
     summary = {"candidates": len(notice_urls), "upserted": upserted,
                "skipped": skipped, "errored": errored, "expired": expired or 0,
-               "resweep": resweep}
+               "resweep": resweep,
+               "dropped_undated": _drops.get("dropped_undated", 0)}
     _logger.info("NTS crawl done: %s", summary)
     _alert_if_crawl_barren("tacoma_daily_index", discovered=len(notice_urls), upserted=upserted)
     return summary
@@ -256,6 +266,7 @@ def crawl_nts_columbian_clark() -> dict:
                 row = nts.notice_to_row(parsed, source_url=u, today=today,
                                         source=col.SOURCE, county=col.COUNTY)
                 if row is None:
+                    _note_undated_drop(summary, parsed, col.SOURCE)
                     summary["skipped"] += 1  # not an NTS (summons/probate/RFP/bid)
                     continue
                 row["fetched_at"] = datetime.now(UTC)
@@ -421,7 +432,9 @@ def _crawl_pacific_publishing_pdf(
                     parsed, source_url=pdf_url, today=today, source=source, county=county
                 )
                 if row is None:
-                    summary["skipped"] += 1  # not a parseable NTS body (commercial/other format)
+                    # Chrome vs. a real sale we failed to date — never the same counter.
+                    _note_undated_drop(summary, parsed, source)
+                    summary["skipped"] += 1
                     continue
                 row["fetched_at"] = datetime.now(UTC)
                 # Per-row SAVEPOINT: one bad notice (e.g. an over-long field) rolls back
@@ -569,6 +582,37 @@ def _barren_alert_reason(
             "source may be down or blocking"
         )
     return None
+
+
+def _note_undated_drop(summary: dict, parsed: dict, source: str) -> bool:
+    """Record + log a discarded block that still carries a trustee-sale identity.
+
+    ``notice_to_row`` returns None whenever ``is_valid_nts`` is False (it needs BOTH a
+    ts_number and an auction_date). Most of those really are not NTS bodies — summons,
+    probate, RFPs, bids — and must stay quiet, so every drop shared one silent
+    ``skipped`` counter.
+
+    That hid a real outage: a block WITH a ts_number but WITHOUT an auction date is not
+    chrome, it is a published trustee sale whose date shape the parser could not read —
+    a lost lead. King/Affinia numeric auction dates went undetected this way until
+    2026-09-03, by which point the current issue was dropping 100% of its notices.
+    Splitting that case out is what makes the next parser gap visible on day one.
+
+    Returns True when the drop was an undated real notice (caller counts it as such).
+    """
+    from src.scrapers.sources.nts_tacoma_index import _to_date
+
+    # Convertibility, not mere presence (Codex): a captured-but-unparseable date
+    # ("13/40/2026", OCR garbage) also fails is_valid_nts downstream and is the SAME
+    # class of parser failure — it must not slip back into the quiet `skipped` bucket.
+    if not parsed.get("ts_number") or _to_date(parsed.get("auction_date")):
+        return False
+    summary["dropped_undated"] = summary.get("dropped_undated", 0) + 1
+    _logger.warning(
+        "NTS drop (%s): notice %s has no parseable auction date — parser gap, lead lost",
+        source, str(parsed.get("ts_number"))[:64],
+    )
+    return True
 
 
 def _alert_if_crawl_barren(

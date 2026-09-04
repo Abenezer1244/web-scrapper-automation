@@ -168,18 +168,29 @@ app.conf.beat_schedule = {
     },
     "crawl-nts-snoho-tribune": {
         # NTS Tier 1 (Snohomish): the Snohomish County Tribune publishes a weekly
-        # "Legals" PDF (Pacific Publishing). Weekly cadence — the paper prints once a
-        # week (Wednesdays), so a daily crawl would just re-fetch the same PDF. Runs
-        # Thursdays so the new issue is up; the matcher's daily run attaches it.
+        # "Legals" PDF (Pacific Publishing).
+        # DAILY, not weekly (2026-09-03). The old Thursday-only schedule was a
+        # single-point-of-failure: the legals page exposes ONLY the current issue and
+        # there is no archive link, so ONE missed or failed Thursday lost that week's
+        # notices PERMANENTLY — nothing ever revisited them. Measured on King, which
+        # ran the identical schedule: only 4 of 14 published issues were ever ingested.
+        # The current issue stays up all week, so a daily run turns "miss a week" into
+        # "miss a day, recover tomorrow"; a real outage now needs 7 consecutive
+        # failures, which _alert_if_crawl_barren pages on. Re-fetching the same PDF is
+        # cheap (~250 KB) and the (source, ts_number) upsert is idempotent, so extra
+        # runs only refresh fetched_at — which also stops the 90-day _CACHE_DAYS sweep
+        # from expiring a still-live notice. Barren alerts are keyed per source behind
+        # a 6h cooldown, so daily cannot turn one page into seven.
         "task": "src.workers.nts_crawler.crawl_nts_snoho_tribune",
-        "schedule": crontab(hour=10, minute=45, day_of_week=4),  # Thu 10:45 UTC
+        "schedule": crontab(hour=10, minute=45),  # 10:45 UTC daily
     },
     "crawl-nts-king-queenanne": {
         # NTS Tier 1 (King, PARTIAL coverage): the Queen Anne & Magnolia News weekly
-        # "Legals" PDF. Same weekly cadence; runs Thursdays. King's dominant venue is
-        # the DJC (paid, deferred), so this is supplemental King NTS coverage.
+        # "Legals" PDF. Daily for the same reason as Snohomish above — this is the
+        # schedule that demonstrably lost 10 of 14 issues. King's dominant venue is
+        # still the DJC (paid, deferred), so this remains supplemental King coverage.
         "task": "src.workers.nts_crawler.crawl_nts_king_queenanne",
-        "schedule": crontab(hour=10, minute=50, day_of_week=4),  # Thu 10:50 UTC
+        "schedule": crontab(hour=10, minute=50),  # 10:50 UTC daily
     },
     "crawl-nts-columbian-clark": {
         # NTS Tier 1 (Clark): The Columbian classifieds publishes Clark County trustee

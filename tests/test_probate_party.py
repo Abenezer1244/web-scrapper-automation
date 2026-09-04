@@ -297,3 +297,133 @@ def test_is_person_like_still_rejects_institutional_form():
     assert not is_person_like_party("PIERCE COUNTY CORONER")
     assert not is_person_like_party("FIRST NATIONAL BANK")
     assert not is_person_like_party("WASHINGTON, STATE OF")  # comma-inverted state
+
+
+# --- Test 7 audit (2026-09-03): King recorder placeholder + agency word orders --
+#
+# Every input below is a VERBATIM grantor/grantee pair captured from King County's
+# live LandmarkWeb Death Certificate index for 06/04/2026-09/02/2026. These assert
+# the SEMANTIC outcome (the decedent reaches party_name, the placeholder reaches
+# nothing) — not merely that some string is forbidden.
+
+def test_placeholder_grantor_promotes_the_decedent_grantee():
+    # King indexed instrument 20260828001142 with the parties reversed: the
+    # recorder placeholder as grantor, the decedent as grantee. Corroborated at the
+    # King Assessor — parcel 3276080220's owner is "TRUJILLO CHUCK+PATSY".
+    assert orient_probate_party("PUBLIC", "TRUJILLO CHARLES JAMES", "DEATH CERTIFICATE") == (
+        "TRUJILLO CHARLES JAMES", None
+    )
+    # Same defect, instrument 20260710000167 (assessor owner MCINTOSH LEONA LORRAINE).
+    assert orient_probate_party("PUBLIC", "MCINTOSH JOHN HAROLD", "DEATH CERTIFICATE") == (
+        "MCINTOSH JOHN HAROLD", None
+    )
+
+
+def test_placeholder_grantee_is_not_an_heir():
+    # The dominant live shape: real decedent as grantor, placeholder as grantee
+    # (101 of 204 rows). The decedent must survive untouched and heirs must be None
+    # rather than the literal placeholder.
+    for placeholder in ("PUBLIC", "THE PUBLIC", "PUBLIC THE"):
+        assert orient_probate_party(
+            "ELTING EMILY WILLIAMS", placeholder, "DEATH CERTIFICATE"
+        ) == ("ELTING EMILY WILLIAMS", None)
+
+
+def test_placeholder_dropped_from_a_stacked_grantee_keeping_the_real_heir():
+    assert orient_probate_party(
+        "SINGH GURDEV", "KAUR RAJWANT / PUBLIC", "DEATH CERTIFICATE"
+    ) == ("SINGH GURDEV", "KAUR RAJWANT")
+
+
+def test_placeholder_never_promoted_into_party_name():
+    # Both sides non-parties -> no lead party at all (guard #2), never "PUBLIC".
+    assert orient_probate_party(
+        "WASHINGTON STATE DEPT OF HEALTH", "PUBLIC", "DEATH CERTIFICATE"
+    ) == (None, None)
+
+
+def test_placeholder_rule_does_not_touch_real_public_entities_or_people():
+    # Whole-value anchoring: these must all pass through untouched.
+    for value in (
+        "PUBLIC STORAGE",
+        "PUBLIC UTILITY DISTRICT NO 1",
+        "REPUBLIC SERVICES",
+        "PUBLIC, JOHN",
+        "PUBLICOVER MARGARET",
+    ):
+        assert strip_filing_agency(value) == value
+    assert is_person_like_party("PUBLIC, JOHN")
+
+
+def test_agency_trailing_word_order_promotes_the_decedent():
+    # Instrument 20260715000926 — "<STATE> HEALTH DEPARTMENT" slipped past the
+    # "DEPT OF HEALTH"-only regex and shipped as the lead's party_name.
+    assert orient_probate_party(
+        "WASHINGTON STATE HEALTH DEPARTMENT", "REINKE NORMAN LEONARD", "DEATH CERTIFICATE"
+    ) == ("REINKE NORMAN LEONARD", None)
+
+
+def test_agency_scrambled_word_order_promotes_the_decedent():
+    # Instrument 20260626000676 — "DEPARTMENT <STATE> HEALTH".
+    assert orient_probate_party(
+        "DEPARTMENT WASHINGTON STATE HEALTH", "MICHALENKO TANITA C", "DEATH CERTIFICATE"
+    ) == ("MICHALENKO TANITA C", None)
+
+
+def test_bare_state_with_govt_marker_promotes_the_decedent():
+    # Instruments 20260612000387/388 — "WASHINGTON STATE-GOVT" (and the unhyphenated
+    # form seen in the grantee slot).
+    assert orient_probate_party(
+        "WASHINGTON STATE-GOVT", "LAROUX JOHN ALEXANDER", "DEATH CERTIFICATE"
+    ) == ("LAROUX JOHN ALEXANDER", None)
+    assert strip_filing_agency("WASHINGTON STATE GOVT") == ""
+
+
+def test_new_agency_orders_do_not_strip_real_names():
+    # The trailing/scrambled regexes require a DEPARTMENT/DEPT token adjacent to a
+    # vital-records subject, so these real values must survive intact.
+    for value in (
+        "WASHINGTON STATE UNIVERSITY",
+        "HEALTH JOHN ROBERT",
+        "STATE FARM",
+        "WASHINGTON, GEORGE",
+        "GOVT MARIA",
+        "DEPARTMENT, ANNA",
+    ):
+        assert strip_filing_agency(value) == value
+
+
+def test_agency_grantee_is_not_an_heir_when_grantor_is_the_decedent():
+    # The mirror-image of the promotion case: 5 live rows carry the agency in the
+    # GRANTEE slot while the grantor is already the decedent. heirs must be None.
+    for agency in (
+        "WASHINGTON STATE DEPARTMENT OF HEALTH",
+        "WASHINGTON STATE OF DEPARTMENT OF HEALTH",
+        "WASHINGTON STATE DEPT OF HEALTH",
+        "STATE OF WASHINGTON DEPARTMENT OF HEALTH",
+        "WASHINGTON STATE-GOVT",
+    ):
+        assert orient_probate_party("SERONKO ROBERT LEE", agency, "DEATH CERTIFICATE") == (
+            "SERONKO ROBERT LEE", None
+        )
+
+
+def test_counterparty_cleanup_does_not_fire_on_a_transfer_on_death_deed():
+    # Guard #3 still holds: a TOD grantor is a LIVING owner and is never swapped,
+    # but the grantee slot is still sanitized.
+    assert orient_probate_party(
+        "NELSON MYRNA JOAN", "PUBLIC", "TRANSFER ON DEATH DEED"
+    ) == ("NELSON MYRNA JOAN", None)
+    assert orient_probate_party(
+        "NELSON MYRNA JOAN", "NELSON DAVID", "TRANSFER ON DEATH DEED"
+    ) == ("NELSON MYRNA JOAN", "NELSON DAVID")
+
+
+def test_ordinary_king_rows_are_unchanged():
+    # 196 of the 204 live rows must pass through with the grantor as party_name.
+    assert orient_probate_party(
+        "BANEZ MATILDE UMIPIG", "BANEZ JOSELITO U", "DEATH CERTIFICATE"
+    ) == ("BANEZ MATILDE UMIPIG", "BANEZ JOSELITO U")
+    assert orient_probate_party(
+        "THOMAS GARY / THOMAS DELORES A", "TUSZYNSKI GARY / THOMAS GARY", "DEATH CERTIFICATE"
+    ) == ("THOMAS GARY / THOMAS DELORES A", "TUSZYNSKI GARY / THOMAS GARY")

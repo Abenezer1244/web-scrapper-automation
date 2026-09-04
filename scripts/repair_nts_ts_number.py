@@ -275,12 +275,15 @@ def repair_notices(db, truth: dict[str, str], apply: bool) -> int:
             )
         group.sort(key=lambda g: (-int(g["results"]), g["created_at"]))
         keep_rows.append(group[0])
-        retire.extend(group[1:])
+        # Already-inactive losers are ALREADY retired — excluded so a fully repaired
+        # database dry-runs as "0 rows would change" instead of perpetually reporting
+        # a retirement it would not actually perform.
+        retire.extend(m for m in group[1:] if m["is_active"])
 
     for m in retire:
         print(f"  RETIRE duplicate {(m['grantor'] or '')[:30]!r:32} parcel={m['parcel']:20} "
               f"ts={m['ts_number']!r} results={m['results']} active={m['is_active']}")
-        if apply and m["is_active"]:
+        if apply:
             res = db.execute(
                 sa_text("UPDATE nts_notices SET is_active = false WHERE id = CAST(:id AS uuid)"),
                 {"id": m["id"]},

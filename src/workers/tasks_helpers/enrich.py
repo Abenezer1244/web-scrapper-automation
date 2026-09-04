@@ -487,7 +487,6 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 ))
                 for pid in pids
             }
-            enriched_count = 0
             found = 0
             # King tax-delinquent rows ship with a placeholder party_name because
             # the Socrata source has no owner column. The eRealProperty lookup
@@ -622,7 +621,6 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                     elif isinstance(_v, int):
                         king_stats[_k] = king_stats.get(_k, 0) + _v
                 _apply_king(enriched)
-                enriched_count += len(enriched)
                 found += sum(1 for d in enriched.values() if d.get("mailing_address"))
                 try:
                     db.commit()

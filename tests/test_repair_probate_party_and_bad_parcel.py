@@ -15,6 +15,14 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
 
+def _sql_without_comments(stmt):
+    """Statement text with -- comments stripped, so an assertion cannot pass or
+    fail on prose that merely explains the SQL."""
+    import re as _re
+    body = _re.sub("--.*", " ", str(stmt))
+    return " ".join(body.split())
+
+
 def test_party_update_writes_only_the_identity_columns():
     sql = " ".join(str(_mod._PARTY_UPDATE).split())
     assert "SET party_name = :new_party, heirs = :new_heirs" in sql
@@ -120,3 +128,100 @@ def test_candidates_read_the_json_as_text_for_that_guard():
     # the guard value must come from the database as text.
     sql = " ".join(str(_mod._PARCEL_CANDIDATES).split())
     assert "CAST(r.enrichment_data AS text) AS enrichment_text" in sql
+
+
+def test_recover_update_guards_every_value_it_overwrites():
+    # Codex P2: it replaces the mailing address and nulls the situs, so those must
+    # be guarded too — not just the property address.
+    sql = " ".join(str(_mod._PARCEL_RECOVER).split())
+    for guard in ("mailing_address IS NOT DISTINCT FROM :old_mailing",
+                  "property_city IS NOT DISTINCT FROM :old_city",
+                  "property_state IS NOT DISTINCT FROM :old_state",
+                  "property_zip IS NOT DISTINCT FROM :old_zip",
+                  "CAST(enrichment_data AS text) IS NOT DISTINCT FROM :old_enrichment_text"):
+        assert guard in sql
+    assert "SET parcel_id" not in sql
+
+
+def test_recovery_repoints_the_trace_instead_of_cancelling_it():
+    # Codex P2: backfill_skip_trace_jobs excludes any result that already has a
+    # pending row WHATEVER its status, so cancelling strands the corrected lead
+    # forever. Recovery gives it a REAL address, so re-point and re-queue.
+    sql = " ".join(str(_mod._REPOINT_PENDING).split())
+    assert "SET property_address = :property_address" in sql
+    assert "status = 'queued'" in sql
+    assert "status IN ('queued', 'errored')" in sql
+    assert "property_address IS DISTINCT FROM :property_address" in sql   # idempotent
+
+
+def test_repoint_rebuilds_the_whole_pending_payload():
+    # Codex P1: the dispatcher submits these columns verbatim, so a stale locality,
+    # mailing or name from the WRONG parcel would ship a corrected street with a
+    # stranger's context. Everything not verified for the corrected parcel is NULL.
+    sql = " ".join(str(_mod._REPOINT_PENDING).split())
+    for col in ("city = NULL", "state = NULL", "zip = NULL",
+                "mail_city = NULL", "mail_state = NULL", "mail_zip = NULL",
+                "tracerfy_queue_id = NULL"):
+        assert col in sql, col
+    assert "mail_address = :mail_address" in sql
+    # Names are recomputed rather than nulled — see the dedicated test below.
+    requeue = " ".join(str(_mod._REQUEUE_RESULT_TRACE).split())
+    assert "SET skip_trace_status = 'queued'" in requeue
+    assert "skip_trace_status IN ('not_attempted', 'errored')" in requeue
+
+
+def test_repoint_never_touches_the_lead_s_name():
+    # Codex P1 (rounds 4+5): blanking first/last shipped a 'normal' trace with no
+    # name, and re-deriving them via person_tokens() — which is explicitly NOT a
+    # surname splitter — turned "VAN DYKE MARY" into last='VAN' first='DYKE'.
+    # Names describe the PERSON, which a parcel correction does not change, so the
+    # repair leaves them exactly as the enqueue set them.
+    sql = " ".join(str(_mod._REPOINT_PENDING).split())
+    for assignment in ("first_name =", "last_name =",
+                       "first_name IS DISTINCT", "last_name IS DISTINCT"):
+        assert assignment not in sql, assignment
+    assert not hasattr(_mod, "_party_name_parts")
+
+
+def test_repoint_also_completes_a_half_fixed_row():
+    # Codex P1: guarding only on the street meant a row a PREVIOUS narrower
+    # re-point had already street-corrected kept its stale locality/mailing/names.
+    sql = " ".join(str(_mod._REPOINT_PENDING).split())
+    for cond in ("mail_address IS DISTINCT FROM :mail_address",
+                 "city IS NOT NULL", "state IS NOT NULL", "zip IS NOT NULL",
+                 "mail_city IS NOT NULL", "mail_state IS NOT NULL", "mail_zip IS NOT NULL",
+                 "tracerfy_queue_id IS NOT NULL"):
+        assert cond in sql, cond
+
+
+def test_party_repair_refreshes_the_stale_trace_name():
+    # Codex round 6 [P2]: the pending payload snapshots the lead's NAME at enqueue
+    # time. When the party repair rewrites party_name, that snapshot is stale — and
+    # for this repair class the OLD party was a placeholder or agency, so the
+    # queued trace would be submitted for a person like "State Washington" at a
+    # real address, at Tracerfy's expense.
+    sql = _sql_without_comments(_mod._PENDING_NAME_REFRESH)
+    assert "SET first_name = :new_first, last_name = :new_last, trace_type = :new_trace_type" in sql
+    # Only a row that has NOT reached the provider.
+    assert "AND status = 'queued'" in sql
+    assert "tracerfy_queue_id IS NULL" in sql
+    assert "submitted_at IS NULL" in sql
+    for st in ("submitting", "submitted", "completed", "errored"):
+        assert f"'{st}'" not in sql, st
+    # Guarded on every value it read, and a no-op once already correct.
+    for guard in ("first_name IS NOT DISTINCT FROM :old_first",
+                  "last_name IS NOT DISTINCT FROM :old_last",
+                  "trace_type IS NOT DISTINCT FROM :old_trace_type",
+                  "first_name IS DISTINCT FROM :new_first"):
+        assert guard in sql, guard
+
+
+def test_trace_name_uses_the_enqueues_own_derivation():
+    # Never a bespoke splitter: two ad-hoc ones in this session both got compound
+    # surnames wrong. select_traceable_owner is what the enqueue itself uses.
+    src = _SCRIPT.read_text(encoding="utf-8")
+    assert "select_traceable_owner(new_party)" in src
+    # The bespoke splitters are deliberately NOT used for this decision; they
+    # are named only in comments explaining why.
+    # ...and the same normal/advanced rule the enqueue applies.
+    assert '"normal" if (first and last) else "advanced"' in src

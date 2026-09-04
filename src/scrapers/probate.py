@@ -201,11 +201,15 @@ _ESTATE_CAPTION_RE = re.compile(
 # fully consumed (Codex). Anchored ^...$ and checked only AFTER an agency phrase was
 # actually removed, so it can never touch an ordinary value; the comma-form person
 # check runs first, so a decedent indexed "COUNTY, JOHN" is unaffected.
+# A bare trailing CITY is deliberately NOT here: "UNION CITY" / "JANE CITY" read as
+# a company or a person, and no real agency name reduces to that shape (a city files
+# as "CITY OF SEATTLE"). COUNTY / BOROUGH / PARISH are unambiguous jurisdiction
+# suffixes that do not form personal names (Codex P3).
 _BARE_LOCALITY_RE = re.compile(
     r"^\s*(?:"
     r"CITY\s+OF\s+[A-Z .'’-]+"
     r"|COUNTY\s+OF\s+[A-Z .'’-]+"
-    r"|[A-Z .'’-]+\s+(?:COUNTY|CITY|BOROUGH|PARISH)"
+    r"|[A-Z .'’-]+\s+(?:COUNTY|BOROUGH|PARISH)"
     r")\s*$",
     re.IGNORECASE,
 )
@@ -353,6 +357,19 @@ def clean_counterparty(value: str | None) -> str | None:
     return " / ".join(kept) if len(kept) != len(segments) else value.strip()
 
 
+def _agency_phrase_present(name: str) -> bool:
+    """True if ``name`` contains an agency PHRASE (not merely a non-party segment).
+
+    strip_filing_agency changes a value for two different reasons: it EXCISES an
+    agency phrase from within a longer value, or it DROPS whole non-party segments
+    ("ACME LLC / PUBLIC" -> "ACME LLC"). Only the first can leave a meaningless
+    fragment, so only the first may be second-guessed by _residue_is_a_party.
+    Conflating them rejected legitimate retained entity parties — an LLC, a trust,
+    a place-named company — which the product explicitly preserves (Codex P2).
+    """
+    return bool(_AGENCY_DEPT_RE.search(name) or _AGENCY_TRAILING_RE.search(name))
+
+
 def _residue_is_a_party(residue: str) -> bool:
     """True if what survived an agency excision can stand as the decedent.
 
@@ -404,7 +421,9 @@ def orient_probate_party(
     deagencied = strip_filing_agency(g)
     if deagencied != g:
         # An agency phrase / placeholder was present in the grantor.
-        if deagencied and _residue_is_a_party(deagencied):
+        if deagencied and (
+            not _agency_phrase_present(g) or _residue_is_a_party(deagencied)
+        ):
             party, heirs = deagencied, clean_counterparty(e)
         elif is_person_like_party(e):          # guard #1
             party, heirs = e, None

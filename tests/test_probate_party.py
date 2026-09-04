@@ -486,3 +486,36 @@ def test_a_real_name_left_beside_an_agency_is_still_the_decedent():
     assert orient_probate_party(
         "COUNTY, JOHN, WA DEPT OF HEALTH", "COUNTY, JANE", "DEATH CERTIFICATE"
     ) == ("COUNTY, JOHN", "COUNTY, JANE")
+
+
+def test_a_retained_entity_party_is_not_second_guessed_by_the_residue_guard():
+    # Codex P2: dropping a whole non-party SEGMENT is not the same as excising an
+    # agency PHRASE. An LLC, a company, or a place-named party that merely sat
+    # beside a placeholder must survive — the product preserves legal entities.
+    assert orient_probate_party(
+        "ACME LLC / PUBLIC", "DOE JANE", "DEATH CERTIFICATE"
+    ) == ("ACME LLC", "DOE JANE")
+    assert orient_probate_party(
+        "JANE CITY / PUBLIC", "DOE JANE", "DEATH CERTIFICATE"
+    ) == ("JANE CITY", "DOE JANE")
+    assert orient_probate_party(
+        "WASHINGTON STATE / ACME TITLE COMPANY", "DOE JANE", "DEATH CERTIFICATE"
+    ) == ("ACME TITLE COMPANY", "DOE JANE")
+    assert orient_probate_party(
+        "SMITH FAMILY TRUST / STATE OF WASHINGTON", "DOE JANE", "DEATH CERTIFICATE"
+    ) == ("SMITH FAMILY TRUST", "DOE JANE")
+
+
+def test_bare_city_shaped_names_are_not_treated_as_a_locality():
+    # Codex P3: "UNION CITY" / "JANE CITY" read as a company or a person, and no
+    # real agency reduces to that shape (a city files as "CITY OF SEATTLE").
+    assert _mod_bare_locality("KING COUNTY")
+    assert _mod_bare_locality("CITY OF SEATTLE")
+    assert not _mod_bare_locality("UNION CITY")
+    assert not _mod_bare_locality("JANE CITY")
+    assert not _mod_bare_locality("SMITH JOHN")
+
+
+def _mod_bare_locality(value):
+    from src.scrapers.probate import _BARE_LOCALITY_RE
+    return bool(_BARE_LOCALITY_RE.match(value))

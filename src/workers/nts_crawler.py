@@ -76,6 +76,26 @@ _KING_PAGE = "https://queenannenews.com/Content/Default/Default/Classified/Legal
 _KING_PDF_PREFIX = "/static-4/queenannenews/images/legals/"
 _KING_SOURCE = "queen_anne_news"
 
+# ── Weekly-archive sweep ─────────────────────────────────────────────────────
+# The legal-notices page exposes ONLY the current issue and carries no archive link, so
+# every prior design treated a missed/failed week as PERMANENTLY lost — going daily
+# (2026-09-03) narrowed the window but still cannot recover a week already gone, and
+# scripts/backfill_nts_pdf_archive.py can only recover one when an operator remembers to
+# run it (it never was: King sat 4 weeks stale until the 2026-09-04 Test 8 audit).
+#
+# So the beat now heals itself. The back issues are unlinked but public and addressable
+# by derived URL — the filename is the issue date — and src/scrapers/sources/
+# nts_pdf_archive.py owns that mapping for both the operator script and this sweep, so
+# the two cannot drift.
+#
+# Bounded on purpose: only the recent ISSUE WEEKDAYS (not every date, the way the
+# operator backfill probes), only issues we have not read lately, oldest first, capped
+# at _ARCHIVE_MAX_FETCH downloads per run with the same polite delay as every other
+# fetch. Steady state is 0-1 fetches/day.
+_ARCHIVE_WEEKS = 8            # how far back a sweep will reach
+_ARCHIVE_MAX_FETCH = 6        # hard cap on archive downloads per run
+_ARCHIVE_REFRESH_DAYS = 7     # re-read an issue whose newest row is older than this
+
 # ── The Columbian classifieds (Clark County) ──
 # Clark County trustee sales publish free/open (robots.txt 404) on The Columbian's
 # classifieds site — a single rolling HTML listing (no pagination) mixing every current
@@ -192,6 +212,7 @@ def crawl_nts_snoho_tribune() -> dict:
         pdf_path_prefix=_SNOHO_PDF_PREFIX,
         source=_SNOHO_SOURCE,
         county="snohomish",
+        archive=True,
     )
 
 
@@ -205,6 +226,7 @@ def crawl_nts_king_queenanne() -> dict:
         source=_KING_SOURCE,
         county="king",
         parse_fn=parse_king_notice,
+        archive=True,
     )
 
 
@@ -362,8 +384,140 @@ def _discover_latest_legals_pdf(page_url: str, pdf_path_prefix: str) -> str | No
     return None
 
 
+def _fetch_legals_blocks(pdf_url: str) -> list[str]:
+    """Download one legals PDF (SSRF-guarded, byte-capped) and split it into notice
+    blocks. Raises on download/extract failure — callers decide whether that is fatal.
+    """
+    import os
+    import tempfile
+
+    from src.scrapers.sources import nts_pdf
+    from src.utils.safe_http import safe_download_to_file
+
+    fd, path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    try:
+        safe_download_to_file(
+            pdf_url, path, max_bytes=_MAX_PDF_BYTES, require_https=True,
+            headers={"User-Agent": _PDF_BROWSER_UA},
+        )
+        with open(path, "rb") as fh:
+            data = fh.read()
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return nts_pdf.split_notice_blocks(
+        nts_pdf.normalize_pdf_text(nts_pdf.extract_pdf_text(data))
+    )
+
+
+def _ingest_pdf_blocks(
+    db, model, blocks, *, pdf_url: str, source: str, county: str, parse_fn, today,
+    summary: dict,
+) -> int:
+    """Parse + upsert every notice block from one PDF. Returns the number upserted.
+
+    Each row gets its OWN savepoint so one bad notice cannot poison the PDF's batch.
+    Caller commits.
+    """
+    from src.scrapers.sources import nts_tacoma_index as nts
+
+    upserted = 0
+    for block in blocks:
+        try:
+            parsed = parse_fn(block)
+            row = nts.notice_to_row(
+                parsed, source_url=pdf_url, today=today, source=source, county=county
+            )
+            if row is None:
+                # Chrome vs. a real sale we failed to date — never the same counter.
+                _note_undated_drop(summary, parsed, source)
+                summary["skipped"] += 1
+                continue
+            row["fetched_at"] = datetime.now(UTC)
+            with db.begin_nested():
+                _upsert_notice(db, model, row)
+            upserted += 1
+        except Exception as exc:  # noqa: BLE001
+            summary["errored"] += 1
+            _logger.warning("NTS PDF notice upsert failed (%s): %s", source, str(exc)[:140])
+    return upserted
+
+
+def _sweep_pdf_archive(
+    db, model, *, source: str, county: str, parse_fn, today, summary: dict,
+) -> None:
+    """Re-read recent weekly issues we have not read lately, oldest first, on a budget.
+
+    Oldest first is load-bearing: _upsert_notice refreshes every mutable field ON
+    CONFLICT, and a notice republished across issues can legitimately change between
+    them (an inline "SALE POSTPONED TO <later date>"), so the newest issue must write
+    last. A 404 is the normal answer for a week with no issue (or a filename variant
+    that missed) and is never fatal — this sweep is best-effort recovery layered UNDER
+    the discover-current-issue pass, never a replacement for it.
+    """
+    from src.scrapers.sources.nts_pdf_archive import candidate_urls
+
+    per_issue = candidate_urls(source, today, _ARCHIVE_WEEKS)   # oldest first
+    flat = [u for group in per_issue for u in group]
+    last_fetch = {
+        r[0]: r[1] for r in db.execute(
+            _sa_text(
+                "SELECT source_url, max(fetched_at) FROM nts_notices "
+                "WHERE source = :source AND source_url = ANY(:urls) GROUP BY source_url"
+            ),
+            {"source": source, "urls": flat},
+        ).fetchall()
+    }
+    # "Has a row" is NOT the same as "fully ingested": the 2026-08-05 King issue had 2
+    # of its 5 notices cached because the old splitter dropped the rest, and a
+    # skip-if-any-row rule would have left those 3 lost forever. So an issue is due when
+    # its newest row is older than _ARCHIVE_REFRESH_DAYS. Re-reading is idempotent (the
+    # (source, ts_number) upsert refreshes in place), which also makes a future parser
+    # fix self-healing — the same reasoning as _resweep_null_amount_notices.
+    stale_before = datetime.now(UTC) - _td_days(_ARCHIVE_REFRESH_DAYS)
+
+    def _due(group: list[str]) -> bool:
+        seen = [last_fetch[u] for u in group if last_fetch.get(u) is not None]
+        return not seen or max(seen) < stale_before
+
+    due = [g for g in per_issue if _due(g)]      # still oldest first
+    summary["archive_candidates"] = len(due)
+    fetched = 0
+    for group in due:
+        if fetched >= _ARCHIVE_MAX_FETCH:
+            break
+        for url in group:            # filename variants, first hit wins
+            try:
+                blocks = _fetch_legals_blocks(url)
+            except Exception as exc:  # noqa: BLE001
+                # Overwhelmingly a 404: an unpublished week or a spelling that missed.
+                # Info, not warning — alerting here would page on every quiet week.
+                _logger.info("NTS archive sweep (%s): %s unavailable (%s)",
+                             source, url.rsplit("/", 1)[-1], str(exc)[:100])
+                time.sleep(_FETCH_DELAY_S)
+                continue
+            fetched += 1
+            summary["archive_fetched"] += 1
+            n = _ingest_pdf_blocks(
+                db, model, blocks, pdf_url=url, source=source, county=county,
+                parse_fn=parse_fn, today=today, summary=summary,
+            )
+            summary["archive_upserted"] += n
+            # Commit per issue so a later failure cannot discard the weeks already
+            # recovered in this run.
+            db.commit()
+            _logger.info("NTS archive sweep (%s): %s -> %d notices from %d blocks",
+                         source, url.rsplit("/", 1)[-1], n, len(blocks))
+            time.sleep(_FETCH_DELAY_S)
+            break
+
+
 def _crawl_pacific_publishing_pdf(
-    *, page_url: str, pdf_path_prefix: str, source: str, county: str, parse_fn=None
+    *, page_url: str, pdf_path_prefix: str, source: str, county: str, parse_fn=None,
+    archive: bool = False,
 ) -> dict:
     """Discover → download → extract → split → parse → upsert one weekly Legals PDF.
 
@@ -375,14 +529,9 @@ def _crawl_pacific_publishing_pdf(
     scopes by county). Expiry is scoped to this source so one paper's crawl never expires
     another's rows.
     """
-    import os
-    import tempfile
-
     from src.db.models import NtsNotice
     from src.db.session import system_sync_session
-    from src.scrapers.sources import nts_pdf
     from src.scrapers.sources import nts_tacoma_index as nts
-    from src.utils.safe_http import safe_download_to_file
 
     # Parser variance is isolated per paper (Codex): Snohomish uses the shared
     # colon parser; King passes parse_king_notice for its no-colon/surrogate-key
@@ -392,60 +541,47 @@ def _crawl_pacific_publishing_pdf(
 
     today = datetime.now(UTC).date()
     summary = {"source": source, "pdf_url": None, "blocks": 0,
-               "upserted": 0, "skipped": 0, "errored": 0, "expired": 0}
+               "upserted": 0, "skipped": 0, "errored": 0, "expired": 0,
+               "archive_candidates": 0, "archive_fetched": 0, "archive_upserted": 0}
 
     pdf_url = _discover_latest_legals_pdf(page_url, pdf_path_prefix)
     summary["pdf_url"] = pdf_url
-    if not pdf_url:
-        _logger.warning("NTS PDF crawl (%s): no current legals PDF found", source)
-        _alert_if_crawl_barren(source, discovered=0, upserted=0)
-        return summary
 
-    fd, path = tempfile.mkstemp(suffix=".pdf")
-    os.close(fd)
-    try:
+    blocks: list[str] = []
+    current_upserted = 0
+    if pdf_url:
         try:
-            safe_download_to_file(
-                pdf_url, path, max_bytes=_MAX_PDF_BYTES, require_https=True,
-                headers={"User-Agent": _PDF_BROWSER_UA},
-            )
-            with open(path, "rb") as fh:
-                data = fh.read()
-            text = nts_pdf.extract_pdf_text(data)
+            blocks = _fetch_legals_blocks(pdf_url)
         except Exception as exc:  # noqa: BLE001 — a bad download/PDF must not crash the beat
             summary["errored"] += 1
             _logger.warning("NTS PDF download/extract failed (%s): %s", pdf_url, str(exc)[:160])
-            return summary
-        blocks = nts_pdf.split_notice_blocks(nts_pdf.normalize_pdf_text(text))
-    finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
+    else:
+        _logger.warning("NTS PDF crawl (%s): no current legals PDF found", source)
     summary["blocks"] = len(blocks)
+
     with system_sync_session() as db:
-        for block in blocks:
+        if blocks:
+            current_upserted = _ingest_pdf_blocks(
+                db, NtsNotice, blocks, pdf_url=pdf_url, source=source, county=county,
+                parse_fn=parse_fn, today=today, summary=summary,
+            )
+            summary["upserted"] += current_upserted
+            db.commit()
+
+        # Recovery pass. The current-issue fetch above was historically the ONLY writer
+        # of this cache, so any week it missed was lost for good. Deliberately runs even
+        # when that fetch just failed — a broken current issue is exactly the hole this
+        # exists to fill. Best-effort: never let it fail the crawl.
+        if archive:
             try:
-                parsed = parse_fn(block)
-                row = nts.notice_to_row(
-                    parsed, source_url=pdf_url, today=today, source=source, county=county
+                _sweep_pdf_archive(
+                    db, NtsNotice, source=source, county=county,
+                    parse_fn=parse_fn, today=today, summary=summary,
                 )
-                if row is None:
-                    # Chrome vs. a real sale we failed to date — never the same counter.
-                    _note_undated_drop(summary, parsed, source)
-                    summary["skipped"] += 1
-                    continue
-                row["fetched_at"] = datetime.now(UTC)
-                # Per-row SAVEPOINT: one bad notice (e.g. an over-long field) rolls back
-                # alone instead of poisoning the whole PDF's batch (Codex: failure isolation).
-                with db.begin_nested():
-                    _upsert_notice(db, NtsNotice, row)
-                summary["upserted"] += 1
             except Exception as exc:  # noqa: BLE001
-                summary["errored"] += 1
-                _logger.warning("NTS PDF notice upsert failed (%s): %s", source, str(exc)[:140])
-        db.commit()
+                _logger.warning("NTS archive sweep failed (%s): %s", source, str(exc)[:160])
+                db.rollback()
+            summary["upserted"] += summary["archive_upserted"]
 
         summary["expired"] = db.execute(
             _sa_text(
@@ -461,7 +597,11 @@ def _crawl_pacific_publishing_pdf(
         db.commit()
 
     _logger.info("NTS PDF crawl done (%s): %s", source, summary)
-    _alert_if_crawl_barren(source, discovered=summary["blocks"], upserted=summary["upserted"])
+    # Barren alerting deliberately judges the CURRENT ISSUE ONLY (Codex P2). Folding the
+    # archive's recoveries into `upserted` would let a healthy back-catalogue hide the
+    # exact failure this alert exists to catch: today's issue downloaded and split into
+    # blocks, but every block failing to parse — i.e. the paper changed layout.
+    _alert_if_crawl_barren(source, discovered=summary["blocks"], upserted=current_upserted)
     return summary
 
 

@@ -57,19 +57,60 @@ def test_matcher_still_runs_after_the_crawls():
 # ── Recovery-script URL templates (verified against the live CDN) ─────────────────
 
 def test_king_filename_template_matches_published_issues():
-    m = _backfill_module()
-    assert m._king_names(date(2026, 8, 5)) == ["QA Legals 08-05-26.pdf"]
-    assert m._king_names(date(2026, 9, 2)) == ["QA Legals 09-02-26.pdf"]
+    from src.scrapers.sources.nts_pdf_archive import king_names
+
+    assert king_names(date(2026, 8, 5)) == ["QA Legals 08-05-26.pdf"]
+    assert king_names(date(2026, 9, 2)) == ["QA Legals 09-02-26.pdf"]
     # zero-padded month AND day — an unpadded guess 404s on this paper
-    assert m._king_names(date(2026, 6, 3)) == ["QA Legals 06-03-26.pdf"]
+    assert king_names(date(2026, 6, 3)) == ["QA Legals 06-03-26.pdf"]
 
 
-def test_snohomish_filename_template_is_unpadded_and_tries_both():
+def test_snohomish_filename_templates_cover_both_observed_spellings():
+    """The paper renamed its own files mid-catalogue, so both spellings must be probed.
+
+    "Legals - 8-5-26.pdf" is the back catalogue (6-10, 6-17, 6-24, 7-22, 8-5, 8-27 all
+    verified live). By 2026-09-02 it had dropped the separator — "Legals 9-2-26.pdf",
+    confirmed HTTP 200 while the separator form 404s — and that variant was MISSING, so
+    the newest Snohomish issues were unreachable by construction.
+    """
+    from src.scrapers.sources.nts_pdf_archive import snoho_names
+
+    names = snoho_names(date(2026, 8, 5))
+    assert names[0] == "Legals - 8-5-26.pdf"
+    assert "Legals 8-5-26.pdf" in names          # the 2026-09 spelling
+    assert "Legals - 08-05-26.pdf" in names      # cheap padded fallbacks
+    assert "Legals 08-05-26.pdf" in names
+    assert snoho_names(date(2026, 9, 2))[1] == "Legals 9-2-26.pdf"
+
+
+def test_backfill_script_and_beat_sweep_share_one_archive_map():
+    """The one-shot recovery and the daily self-heal must not disagree about where a
+    back issue lives — they did, which is how the Snohomish rename went unnoticed."""
+    from src.scrapers.sources.nts_pdf_archive import ARCHIVE_SOURCES
+
     m = _backfill_module()
-    names = m._snoho_names(date(2026, 8, 5))
-    assert names[0] == "Legals - 8-5-26.pdf"      # the shape the paper actually uses
-    assert names[1] == "Legals - 08-05-26.pdf"    # cheap fallback; the paper is inconsistent
-    assert m._snoho_names(date(2026, 7, 15))[0] == "Legals - 7-15-26.pdf"
+    script = m._sources()
+    assert set(script) == set(ARCHIVE_SOURCES)
+    for name, cfg in ARCHIVE_SOURCES.items():
+        assert script[name]["names"] is cfg["names"]
+        assert script[name]["prefix"] == cfg["prefix"]
+        assert script[name]["county"] == cfg["county"]
+
+
+def test_recent_issue_dates_are_oldest_first_and_weekday_anchored():
+    """Oldest-first is load-bearing: the upsert refreshes every mutable field, so the
+    NEWEST issue must write last or a postponed sale reverts to its old date."""
+    from src.scrapers.sources.nts_pdf_archive import recent_issue_dates
+
+    for anchor in (date(2026, 9, 2), date(2026, 9, 4), date(2026, 9, 8)):
+        got = recent_issue_dates("queen_anne_news", anchor, weeks=3)
+        assert got == sorted(got), "issue dates must be oldest first"
+        assert all(d.weekday() == 2 for d in got), "issues are dated Wednesday"
+        assert got[-1] <= anchor, "never derives an issue from the future"
+    # a Friday anchor still resolves to that week's Wednesday, not the next one
+    assert recent_issue_dates("queen_anne_news", date(2026, 9, 4), weeks=1) == [
+        date(2026, 9, 2)
+    ]
 
 
 def test_every_source_is_paired_with_its_own_parser():

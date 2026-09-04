@@ -544,6 +544,13 @@ OVERLAP_LEAD_COLUMNS: list[str] = [
     # Mailing split — appended at end (same back-compat convention as the
     # canonical CSV); values auto-copied from the canonical row below.
     "mailing_street", "mailing_city", "mailing_state", "mailing_zip",
+    # Auction columns — appended at end, same convention. These were MISSING while
+    # batch_export.py explicitly SELECTed r.auction_date / r.default_amount, so a
+    # pre_foreclosure or trustee_sale lead delivered through a batch or a segment lost
+    # its auction date and amount owed even though the per-job CSV carried both. Same
+    # three the app surfaces; `trustee` / `ts_number` stay out because a combined export
+    # mixes record types and they would be blank on most rows.
+    "auction_date", "days_to_auction", "default_amount",
 ]
 
 

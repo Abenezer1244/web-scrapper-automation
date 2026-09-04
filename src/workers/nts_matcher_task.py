@@ -6,11 +6,19 @@ a high-confidence UNAMBIGUOUS match writes the auction columns + enrichment_data
 ["nts"] onto the Result. The scorer is the false-match firewall; this module is
 just the plumbing.
 
-Two entry points (Codex): a daily beat task that re-matches recent Pierce leads
-against the freshly-crawled cache, and match_results_inline() the scrape pipeline
-calls at the end of a Pierce pre_foreclosure job for that job's rows only. Both
-scope to: county=pierce, record_type=pre_foreclosure, auction_date IS NULL
-(never re-match or clobber an already-matched lead), notices active + future.
+Two entry points (Codex): a daily beat task that re-matches recent leads against the
+freshly-crawled cache, and match_results_inline() the scrape pipeline calls at the end
+of a pre_foreclosure job for that job's rows only. Both scope to
+record_type=pre_foreclosure and a single county.
+
+Notices are considered in TWO ordered passes (2026-09-04). The live pass is the original
+behavior: active, future-dated notices. The historical pass then attaches an
+already-past sale to a lead still carrying nothing — a lead whose notice ran before we
+scraped it used to show a blank Auction Date / Default Owed that was indistinguishable
+from "this county's source has no notice for this property", when we in fact held the
+real sale date and the real amount owed. Live always wins: a live notice may replace an
+attached PAST date (so a postponed or re-noticed sale is not frozen on the stale one),
+while a historical notice only ever claims a lead that is still unset.
 """
 from __future__ import annotations
 
@@ -47,6 +55,15 @@ _RECENT_DAYS = 180
 # address key isn't county-unique).
 NTS_MATCH_COUNTIES = ("pierce", "snohomish", "king", "clark")
 
+# How far back a HISTORICAL (already-held) sale may be attached to a lead. Bounded so a
+# long-past sale is never presented as this lead's event: an auction older than this is
+# no longer describing the lead's current distress. Matches the crawler's cache horizon.
+_PAST_AUCTION_DAYS = 180
+# Mirrors nts_crawler._CACHE_DAYS. is_active cannot filter staleness for past sales (the
+# expiry pass flips it false the day an auction passes, for every notice), so the past
+# pass filters on fetched_at against the same horizon instead.
+_CACHE_DAYS = 90
+
 
 @app.task(name="src.workers.nts_matcher_task.match_nts_notices")
 def match_nts_notices() -> dict:
@@ -67,11 +84,14 @@ def match_nts_notices() -> dict:
                     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
                     WHERE sc.record_type = 'pre_foreclosure'
                       AND lower(sc.county) = :county
-                      AND r.auction_date IS NULL
+                      -- NULL *or already past*: a lead carrying a historical sale must
+                      -- stay a candidate so a later live re-notice can replace it.
+                      AND (r.auction_date IS NULL OR r.auction_date < :today)
                       AND r.created_at >= :cutoff
                     """
                 ),
-                {"county": county, "cutoff": cutoff},
+                {"county": county, "cutoff": cutoff,
+                 "today": datetime.now(UTC).date()},
             ).fetchall()
             matched = _match_and_write(db, [dict(r._mapping) for r in result_rows], county=county)
             total_candidates += len(result_rows)
@@ -121,10 +141,10 @@ def match_job_inline(db, job_id: str) -> int:
             FROM results
             WHERE job_id = :jid
               AND user_id = (SELECT user_id FROM jobs WHERE id = :jid)
-              AND auction_date IS NULL
+              AND (auction_date IS NULL OR auction_date < :today)
             """
         ),
-        {"jid": job_id},
+        {"jid": job_id, "today": datetime.now(UTC).date()},
     ).fetchall()
     return _match_and_write(db, [dict(r._mapping) for r in rows], county=county, commit=True)
 
@@ -158,19 +178,47 @@ def _match_and_write(
             by_parcel.setdefault(np_, []).append(c)
 
     today = datetime.now(UTC).date()
-    notices = db.execute(
-        _sa_text(
-            """
+    _COLS = """
             SELECT id, parcel, property_address, property_address_normalized,
                    grantor, auction_date, auction_time, auction_location, trustee,
                    beneficiary, ts_number, principal_owing, source, source_url
             FROM nts_notices
+    """
+    live = db.execute(
+        _sa_text(
+            _COLS + """
             WHERE is_active AND auction_date IS NOT NULL AND auction_date >= :today
               AND lower(county) = :county
+            ORDER BY auction_date ASC, id
             """
         ),
         {"today": today, "county": county},
     ).fetchall()
+    # Second pass: sales that have ALREADY happened. A lead whose notice was published
+    # before we scraped it (or whose sale ran while the cache was stale) used to render
+    # a blank Auction Date / Default Owed — indistinguishable from "this source has no
+    # notice", when in fact we hold the real sale date and the real amount owed. A past
+    # date is factual and useful (the sale already ran); a blank is just less
+    # information. Bounded lookback so we never attach an ancient sale, and is_active is
+    # NOT usable here — the expiry pass flips it false the day an auction passes — so
+    # staleness is filtered on fetched_at instead, the same _CACHE_DAYS horizon.
+    # Deliberately a SEPARATE, LOWER-priority pass: a live sale must always win over a
+    # past one for the same property (a postponed or re-noticed sale is the value).
+    past = db.execute(
+        _sa_text(
+            _COLS + """
+            WHERE auction_date IS NOT NULL AND auction_date < :today
+              AND auction_date >= :floor AND lower(county) = :county
+              AND fetched_at IS NOT NULL AND fetched_at >= :stale_before
+            ORDER BY auction_date DESC
+            """
+        ),
+        {"today": today, "floor": today - _td_days(_PAST_AUCTION_DAYS),
+         "stale_before": datetime.now(UTC) - _td_days(_CACHE_DAYS),
+         "county": county},
+    ).fetchall()
+    notices = list(live) + list(past)
+    live_ids = {r._mapping["id"] for r in live}
 
     matched = 0
     used_result_ids: set = set()
@@ -201,12 +249,12 @@ def _match_and_write(
         # all get it (best_match's single-winner bail silently dropped that case).
         # best_match_group still returns [] on a different-property tie (ambiguous).
         group = best_match_group(nm, candidates)
+        is_live = nm["id"] in live_ids
         for rid, conf in group:
             used_result_ids.add(rid)
-            # Count only an actual write — the WHERE auction_date IS NULL guard
-            # means a row a concurrent beat/inline pass already claimed updates 0
-            # rows (Codex).
-            if _write_match(db, rid, nm, conf) == 1:
+            # Count only an actual write — the guard in _write_match means a row a
+            # concurrent beat/inline pass already claimed updates 0 rows (Codex).
+            if _write_match(db, rid, nm, conf, live=is_live, today=today) == 1:
                 matched += 1
 
     if commit and matched:
@@ -214,12 +262,30 @@ def _match_and_write(
     return matched
 
 
-def _write_match(db, result_id: Any, notice: dict, confidence: float) -> int:
+def _write_match(
+    db, result_id: Any, notice: dict, confidence: float, *, live: bool = True, today=None
+) -> int:
     """Write the auction columns + enrichment_data['nts'] onto one Result.
 
     enrichment_data is merged (not overwritten) so existing scrape/enrichment keys
-    survive. Only fills auction fields that are still NULL — never clobbers. Returns
-    the rowcount (1 = written, 0 = another pass already claimed it).
+    survive. Returns the rowcount (1 = written, 0 = another pass already claimed it).
+
+    Two claim rules, because attaching PAST sales made the old blanket
+    "only if auction_date IS NULL" guard wrong in one direction:
+
+      live=True   claims a row that is unset OR already carries a PAST auction. Without
+                  this, a sale postponed or re-noticed to a new date could never
+                  replace the stale one we had already attached — the lead would be
+                  frozen on a sale that no longer happens, which is worse than blank.
+      live=False  claims a row that is unset, or one holding a STRICTLY OLDER past
+                  sale. It can never touch a row holding a live (future) sale, and
+                  never moves an attachment backwards in time.
+
+                  The "strictly older" clause is not redundant with the pass ordering
+                  (Codex P1): the archive sweep is capped at _ARCHIVE_MAX_FETCH issues
+                  per run, so during a multi-week catch-up the matcher can attach an old
+                  sale on Monday and only learn about the newer re-notice on Tuesday.
+                  Ordering alone only holds WITHIN one run.
     """
     from sqlalchemy import text as _sa_text
 
@@ -245,7 +311,11 @@ def _write_match(db, result_id: Any, notice: dict, confidence: float) -> int:
                 nts_notice_id = :notice_id,
                 enrichment_data = COALESCE(enrichment_data, '{}'::json)::jsonb
                                   || jsonb_build_object('nts', CAST(:nts AS jsonb))
-            WHERE id = :rid AND auction_date IS NULL
+            WHERE id = :rid
+              AND (auction_date IS NULL
+                   OR (:live AND auction_date < :today)
+                   OR (NOT :live AND auction_date < :today
+                       AND auction_date < :auction_date))
             """
         ),
         {
@@ -255,6 +325,8 @@ def _write_match(db, result_id: Any, notice: dict, confidence: float) -> int:
             "notice_id": notice.get("id"),
             "nts": json.dumps(nts_blob),
             "rid": result_id,
+            "live": bool(live),
+            "today": today or datetime.now(UTC).date(),
         },
     )
     return res.rowcount or 0

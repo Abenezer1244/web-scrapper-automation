@@ -5,11 +5,12 @@ these lock the SAFE defaults: e-mail DELIVERY is a no-op unless explicitly
 configured, and a missing Resend key can never raise out of a worker task.
 
 NOTE (2026-09-04): "no-op" now means *no e-mail*, not *no side effect*. Every
-alert-worthy call also queues a durable audit_events row on a background worker
-thread — because OPS_ALERT_EMAIL was blank in production and the old silent
-return meant a four-week crawl outage left no trace anywhere. These tests do not
-assert on that; see tests/test_nts_upsert_and_ops_alert_durability.py, which
-injects a fake session via ops_alerts._session_for_persist.
+alert-worthy call also writes a durable audit_events row — inline for a sync
+caller like these tests, handed to an executor only when an event loop is running
+— because OPS_ALERT_EMAIL was blank in production and the old silent return meant
+a four-week crawl outage left no trace anywhere. The autouse fixture below stubs
+that write so these stay pure; the behaviour itself is covered in
+tests/test_nts_upsert_and_ops_alert_durability.py.
 """
 import pytest
 

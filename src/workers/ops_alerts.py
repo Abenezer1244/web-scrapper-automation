@@ -82,6 +82,13 @@ def _session_for_persist():
 # This is best-effort by contract. A hard kill (SIGKILL, container eviction) can still lose
 # the row; the alternative that survives that is a Celery task, which cannot be trusted for
 # an alert that may BE about the broker.
+#
+# Known caveat (Codex, accepted): `run_in_executor(None, ...)` is not fully detached —
+# asyncio drains the default executor when the loop closes, so under `asyncio.run` a wedged
+# database can still delay process exit after the coroutine returns. That is acceptable for
+# the one loop-bound caller here (a long-lived FastAPI request loop, not a short
+# `asyncio.run`), and the alternative — a private pool with its own shutdown hook — is what
+# this replaced.
 def _submit_persist(kind: str, key: str, subject: str, delivered: bool) -> None:
     """Record the alert without ever blocking an event loop. Never raises."""
     try:

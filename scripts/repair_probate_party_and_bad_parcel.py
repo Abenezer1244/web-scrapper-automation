@@ -233,6 +233,15 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                                "property_address": row["property_address"]})
             continue
         enrichment = dict(row["enrichment_data"] or {})
+        if (
+            row["property_address"] is None
+            and enrichment.get("parcel_lookup") == "mismatch"
+            and not any(k in enrichment for k in _ASSESSOR_DERIVED_KEYS)
+        ):
+            # Already repaired on an earlier run. Skip rather than re-issue a
+            # no-op UPDATE, so the stats stay honest on a re-run.
+            stats["already_clear"] = stats.get("already_clear", 0) + 1
+            continue
         removed = {k: enrichment.pop(k) for k in _ASSESSOR_DERIVED_KEYS if k in enrichment}
         enrichment["parcel_lookup"] = "mismatch"
         enrichment["parcel_echoed_by_county"] = echoed

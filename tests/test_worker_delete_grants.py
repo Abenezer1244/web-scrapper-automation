@@ -81,3 +81,34 @@ def test_ops_script_required_tables_match_the_cutover_verify():
         _PY.read_text(encoding="utf-8"), re.DOTALL,
     )
     assert ops_tables == set(re.findall(r'"([a-z_]+)"', py_block.group(1)))
+
+
+def test_no_later_statement_revokes_the_system_delete_grant():
+    """Order matters: _GRANTS is executed top-to-bottom, so a REVOKE placed after
+    the GRANT would undo it and every text-level "is the grant present?" check
+    would still pass. This is the ordered-execution invariant (Codex)."""
+    py_text = _PY.read_text(encoding="utf-8")
+    grant_at = py_text.index("GRANT DELETE ON delivered_records TO bridgeleads_system")
+    after = py_text[grant_at:]
+    offenders = [
+        m.group(0)
+        for m in re.finditer(r"REVOKE[^\"']*?FROM\s+" + _ROLE, after, re.IGNORECASE | re.DOTALL)
+        if "delivered_records" in m.group(0) or "ALL TABLES" in m.group(0).upper()
+    ]
+    assert not offenders, (
+        f"a REVOKE after the GRANT would strip it again: {offenders}"
+    )
+
+
+def test_alert_helper_is_not_passed_an_orm_attribute():
+    """Every _alert_dedup_release_failed call runs after db.rollback(), which
+    expires ORM instances — reading job.user_id there would emit a refresh SELECT
+    on the session that just failed, and if it raised it would skip the job's real
+    failure handling. The cached plain value must be used instead."""
+    tasks = (_ROOT / "src" / "workers" / "tasks.py").read_text(encoding="utf-8")
+    calls = re.findall(r"_alert_dedup_release_failed\(([^)]*)\)", tasks)
+    assert calls, "no call sites found — did the helper get renamed?"
+    for call in calls:
+        assert "job.user_id" not in call, (
+            "pass the cached _boot_user_id, not the ORM attribute job.user_id: " + call
+        )

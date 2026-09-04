@@ -122,7 +122,7 @@ _SYSTEM_DELETE_TABLES = (
 
 _VERIFY_SYSTEM_GRANTS = """
     SELECT t.name FROM unnest(%s::text[]) AS t(name)
-    WHERE NOT has_table_privilege('bridgeleads_system', t.name, 'DELETE')
+    WHERE NOT has_table_privilege('bridgeleads_system', 'public.' || t.name, 'DELETE')
 """
 
 

@@ -86,6 +86,12 @@ _R2_UPLOAD_BACKOFF = 2  # seconds, multiplied by attempt number (2s, 4s)
 def _alert_dedup_release_failed(job_id: str, user_id, context: str, exc: Exception) -> None:
     """A dedup-claim release failed — escalate, never just log.
 
+    ``user_id`` MUST be a plain value (the cached ``_boot_user_id``), never an ORM
+    attribute: every call site runs after ``db.rollback()``, which expires ORM
+    instances, so reading ``job.user_id`` there would emit a refresh SELECT on the
+    session that just failed. If that raised, it would escape the except block and
+    skip the job's real failure handling — an alert must never replace it (Codex).
+
     Releasing `delivered_records` is what keeps a lead that was NEVER delivered
     and NEVER billed from being treated as an already-seen duplicate forever. If
     the release fails, those leads become permanently unreachable for that user:
@@ -1043,7 +1049,7 @@ def run_scrape_job(self, job_id: str) -> None:
                         "Job %s: failed to release dedup claims after finalize "
                         "failure: %s", job_id, str(cleanup_exc)[:200],
                     )
-                    _alert_dedup_release_failed(job_id, job.user_id, "finalize_failure", cleanup_exc)
+                    _alert_dedup_release_failed(job_id, _boot_user_id, "finalize_failure", cleanup_exc)
                 reason = (
                     "Auction data could not be attached to your Auction Leads, so the "
                     "run was stopped and you were not charged. Please try again; "
@@ -1186,7 +1192,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     "Job %s: failed to release dedup claims after upload failure: %s",
                     job_id, str(cleanup_exc)[:200],
                 )
-                _alert_dedup_release_failed(job_id, job.user_id, "upload_failure", cleanup_exc)
+                _alert_dedup_release_failed(job_id, _boot_user_id, "upload_failure", cleanup_exc)
             # Honest message: a FAILED job is terminal — the watchdog does NOT
             # re-queue it (it only requeues stuck active/pending jobs). A
             # scheduled scraper makes a fresh job on its next occurrence; a manual
@@ -1383,7 +1389,7 @@ def run_scrape_job(self, job_id: str) -> None:
                         "Job %s: failed to release dedup claims after cap failure: %s",
                         job_id, str(cleanup_exc)[:200],
                     )
-                    _alert_dedup_release_failed(job_id, job.user_id, "plan_cap_failure", cleanup_exc)
+                    _alert_dedup_release_failed(job_id, _boot_user_id, "plan_cap_failure", cleanup_exc)
                 reason = (
                     'The lead list could not be re-read after enrichment, so your plan quota could not be applied — no file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.' if refreshed is None else 'Your plan quota could not be applied to this run — no file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.'
                 )
@@ -1490,7 +1496,7 @@ def run_scrape_job(self, job_id: str) -> None:
                         "Job %s: failed to release dedup claims after re-export failure: %s",
                         job_id, str(cleanup_exc)[:200],
                     )
-                    _alert_dedup_release_failed(job_id, job.user_id, "reexport_failure", cleanup_exc)
+                    _alert_dedup_release_failed(job_id, _boot_user_id, "reexport_failure", cleanup_exc)
                 reason = (
                     "The lead file could not be refreshed with enriched addresses — "
                     "no file was delivered and you were not charged. Please run the "

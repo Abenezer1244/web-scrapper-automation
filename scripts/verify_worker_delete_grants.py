@@ -78,13 +78,18 @@ def main() -> None:
             text("SELECT 1 FROM pg_roles WHERE rolname = :r"), {"r": ROLE}
         ).first()
         if not exists:
-            print(f"role {ROLE} does not exist here — nothing to check")
-            return
+            # NOT a clean bill of health: an operator running this against the
+            # wrong database would otherwise read "nothing to check" as "fine".
+            msg = f"role {ROLE} does not exist in this database"
+            if "--allow-missing-role" in sys.argv:
+                print(f"{msg} — skipping (--allow-missing-role)")
+                return
+            raise SystemExit(f"{msg} — wrong database? pass --allow-missing-role if expected.")
 
         missing = [
             t for t in REQUIRED_DELETE_TABLES
             if not conn.execute(
-                text("SELECT has_table_privilege(:r, :t, 'DELETE')"), {"r": ROLE, "t": t}
+                text("SELECT has_table_privilege(:r, :t, 'DELETE')"), {"r": ROLE, "t": f"public.{t}"}
             ).scalar()
         ]
         for t in REQUIRED_DELETE_TABLES:
@@ -103,12 +108,12 @@ def main() -> None:
 
         # Idempotent; each GRANT is independent so a partial failure is still progress.
         for t in missing:
-            conn.execute(text(f"GRANT DELETE ON {t} TO {ROLE}"))
+            conn.execute(text(f"GRANT DELETE ON public.{t} TO {ROLE}"))
         conn.commit()
         still = [
             t for t in missing
             if not conn.execute(
-                text("SELECT has_table_privilege(:r, :t, 'DELETE')"), {"r": ROLE, "t": t}
+                text("SELECT has_table_privilege(:r, :t, 'DELETE')"), {"r": ROLE, "t": f"public.{t}"}
             ).scalar()
         ]
         if still:

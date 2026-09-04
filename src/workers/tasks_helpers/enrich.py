@@ -468,8 +468,16 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
             king_stats: dict = {}
             king_error: str | None = None
             try:
+                # party_names lets the malformed-PID resolver break a tie between
+                # several REAL candidate parcels by matching the assessor owner to
+                # this lead's own party. Only consulted for a confirmed mismatch.
+                party_names = {
+                    pid: next((res.party_name for res in pid_map.get(pid, []) if res.party_name), None)
+                    for pid in pids
+                }
                 enriched = asyncio.run(asyncio.wait_for(
-                    batch_enrich_king_county(pids, time_budget_s=200, stats=king_stats),
+                    batch_enrich_king_county(pids, time_budget_s=200, stats=king_stats,
+                                             party_names=party_names),
                     timeout=240,
                 ))
             except Exception as exc:  # noqa: BLE001 — best-effort county lookup
@@ -495,6 +503,14 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 mail = data.get("mailing_address")
                 owner = data.get("owner_name")
                 for res in pid_map.get(pid, []):
+                    if (
+                        data.get("resolved_by") == "gis_plus_owner_match"
+                        and (res.party_name or "") != (data.get("resolved_party_match") or "")
+                    ):
+                        # The parcel was resolved by matching ANOTHER lead's party.
+                        # Two leads can share one malformed PID with different
+                        # parties, and that evidence does not transfer (Codex P1).
+                        continue
                     if prop and not res.property_address:
                         res.property_address = prop
                     if prop and not res.property_zip:
@@ -519,6 +535,17 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                         ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
                         ed["assessor_current_owner"] = owner
                         ed["title_status"] = classify_probate_title_status(res.party_name, owner)
+                        res.enrichment_data = ed
+                    # The county printed a malformed parcel and we recovered the
+                    # real one. parcel_id STAYS as the county printed it (it feeds
+                    # the frozen dedup_hash); the resolved PIN + the evidence that
+                    # chose it are recorded beside it (Codex).
+                    if data.get("parcel_lookup") in ("recovered", "mismatch"):
+                        ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+                        ed["parcel_lookup"] = data["parcel_lookup"]
+                        for k, v in data.items():
+                            if k.startswith("resolved_") or k == "source_parcel_id":
+                                ed[k] = v
                         res.enrichment_data = ed
             try:
                 db.commit()

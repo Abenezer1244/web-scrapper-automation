@@ -18,11 +18,20 @@ PARCEL — blue.kingcounty.com silently truncates an over-length ParcelNbr to th
 first 10 digits and serves a DIFFERENT parcel's page with HTTP 200. Rows whose
 parcel_id is not a well-formed 10-digit King PIN may therefore carry another
 property's address and owner. Each candidate is RE-VERIFIED live against the
-assessor before anything is cleared — a row is only touched when the county
-itself echoes a different parcel than the one we asked for. Nothing is invented:
-the wrong values become NULL, never a corrected guess. parcel_id itself is left
-exactly as the county printed it (it feeds the FROZEN dedup_hash billing key,
-and no 10-digit candidate can be derived without guessing).
+assessor before anything is touched — a row is only acted on when the county
+itself echoes a different parcel than the one we asked for.
+
+For such a row the script first tries to RECOVER the real parcel through
+king_parcel_repair (deletion candidates -> must exist in King's strict GIS ->
+exactly one survivor, or exactly one whose assessor owner matches this lead's own
+party), re-verifies the winner, and fills the correct property + mailing address
+plus full provenance. Only when the evidence is inconclusive does it fall back to
+CLEARING the wrong values to NULL. Nothing is ever invented.
+
+parcel_id itself is NEVER rewritten, on either path: it is the SOURCE identity and
+feeds the FROZEN dedup_hash billing key, so changing it would turn a county typo
+repair into a billing/idempotency migration (Codex). The recovered PIN lives beside
+it as enrichment_data.resolved_parcel_id.
 
 Clearing a wrong property_address also cancels the skip trace it bought: a queued
 pending_skip_trace_row for that lead is moved to 'errored' (the established
@@ -83,8 +92,9 @@ _PARTY_UPDATE = text(
 
 _PARCEL_CANDIDATES = text(
     """
-    SELECT r.id, r.parcel_id, r.property_address, r.property_city, r.property_state,
-           r.property_zip, r.enrichment_data, r.skip_trace_status, sc.record_type,
+    SELECT r.id, r.parcel_id, r.party_name, r.property_address, r.mailing_address,
+           r.property_city, r.property_state, r.property_zip, r.enrichment_data,
+           r.skip_trace_status, sc.record_type,
            -- Read the JSON's exact stored text so the update can guard on it
            -- byte-for-byte; re-serializing the parsed dict would not match.
            CAST(r.enrichment_data AS text) AS enrichment_text
@@ -126,6 +136,27 @@ _PARCEL_UPDATE = text(
       -- built from the copy we READ, so a concurrent writer's enrichment would be
       -- clobbered by a stale copy if only the address were guarded. Compared as
       -- text because json has no equality operator in Postgres.
+      AND CAST(enrichment_data AS text) IS NOT DISTINCT FROM :old_enrichment_text
+    """
+)
+
+_PARCEL_RECOVER = text(
+    """
+    UPDATE results
+    SET property_address = :property_address,
+        -- REPLACE, never COALESCE: any mailing_address already on the row came
+        -- from the WRONG (truncated) parcel, so keeping it when the fresh lookup
+        -- returns nothing would preserve a stranger's address (Codex P1).
+        mailing_address = :mailing_address,
+        -- Same for the situs parts — they described the wrong parcel. NULL rather
+        -- than a stale mix (Codex P2).
+        property_city = NULL,
+        property_state = NULL,
+        property_zip = NULL,
+        enrichment_data = CAST(:new_enrichment AS json)
+    WHERE id = :id
+      AND parcel_id = :parcel_id
+      AND property_address IS NOT DISTINCT FROM :old_property
       AND CAST(enrichment_data AS text) IS NOT DISTINCT FROM :old_enrichment_text
     """
 )
@@ -194,6 +225,43 @@ def repair_party(db, *, apply: bool, journal: str) -> dict:
     return stats
 
 
+def _recover(pid: str, party_name: str | None, stats: dict):
+    """(property_address, mailing_address, provenance) for a malformed parcel, or None.
+
+    Uses the SAME resolver + verification the live enrichment path uses, so a
+    backfilled row is indistinguishable from one a fresh scrape would produce.
+    """
+    from src.scrapers.enrichment.king_county_assessor import (
+        _read_parcel_page,
+        resolve_malformed_parcel,
+    )
+
+    resolved = resolve_malformed_parcel(pid, party_name, stats)
+    if resolved is None:
+        return None
+    try:
+        r = safe_get(f"{_ERP_URL}{resolved.parcel_id}", headers=_HEADERS, timeout=15)
+    except Exception:  # noqa: BLE001 — a lookup failure must only cost a repair
+        return None
+    if r.status_code != 200 or not parcel_page_is_for(r.text, resolved.parcel_id):
+        return None
+    prop, _tax_url, _owner = _read_parcel_page(r.text)
+    if not prop:
+        return None
+    # Mailing comes from the tax-bill page (Playwright); the backfill reuses the
+    # production enricher for it rather than reimplementing the parse.
+    mail = None
+    try:
+        import asyncio
+
+        from src.scrapers.enrichment.king_county_assessor import batch_enrich_king_county
+        out = asyncio.run(batch_enrich_king_county([resolved.parcel_id], time_budget_s=120))
+        mail = (out.get(resolved.parcel_id) or {}).get("mailing_address")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  mailing lookup failed for {resolved.parcel_id}: {type(exc).__name__}: {str(exc)[:100]}")
+    return prop, mail, resolved.provenance(pid)
+
+
 def repair_bad_parcel(db, *, apply: bool, journal: str,
                       record_types: tuple[str, ...] = _DEFAULT_RECORD_TYPES) -> dict:
     rows = db.execute(_PARCEL_CANDIDATES, {"pin_len": _KING_PIN_DIGITS}).mappings().all()
@@ -201,6 +269,7 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
              "traces_cancelled": 0, "lookup_failed": 0, "out_of_scope": 0}
     # One live lookup per DISTINCT parcel, not per row.
     verdicts: dict[str, tuple[bool, str | None]] = {}
+    recoveries: dict[tuple, tuple | None] = {}
     for row in rows:
         pid = row["parcel_id"].strip()
         if pid not in verdicts:
@@ -233,6 +302,59 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                                "property_address": row["property_address"]})
             continue
         enrichment = dict(row["enrichment_data"] or {})
+
+        # The county's parcel is malformed. Before clearing, try to RECOVER the
+        # real one under king_parcel_repair's guards. parcel_id itself is never
+        # rewritten (it feeds the FROZEN dedup_hash); only the address and the
+        # provenance change. Resolution is cached per distinct parcel + party.
+        rec_key = (pid, row["party_name"])
+        if rec_key not in recoveries:
+            recoveries[rec_key] = _recover(pid, row["party_name"], stats)
+        recovered = recoveries[rec_key]
+        if recovered is not None:
+            prop, mail, prov = recovered
+            if row["property_address"] == prop and enrichment.get("resolved_parcel_id"):
+                stats["already_recovered"] = stats.get("already_recovered", 0) + 1
+                continue
+            new_enrichment = {k: v for k, v in enrichment.items()
+                              if k not in _ASSESSOR_DERIVED_KEYS and k != "parcel_echoed_by_county"}
+            new_enrichment["parcel_lookup"] = "recovered"
+            new_enrichment.update(prov)
+            _journal(journal, {"repair": "parcel", "action":
+                               ("apply" if apply else "dry_run") + "_recover",
+                               "id": row["id"], "parcel_id": pid,
+                               "resolved_parcel_id": prov.get("resolved_parcel_id"),
+                               "resolved_by": prov.get("resolved_by"),
+                               "old_property_address": row["property_address"],
+                               "old_mailing_address": row.get("mailing_address"),
+                               "cleared_property_city": row["property_city"],
+                               "cleared_property_state": row["property_state"],
+                               "cleared_property_zip": row["property_zip"],
+                               "new_property_address": prop,
+                               "new_mailing_address": mail,
+                               "old_enrichment_data": row["enrichment_data"]})
+            stats["recovered"] = stats.get("recovered", 0) + 1
+            if apply:
+                res = db.execute(_PARCEL_RECOVER, {
+                    "id": row["id"], "parcel_id": row["parcel_id"],
+                    "old_property": row["property_address"],
+                    "old_enrichment_text": row["enrichment_text"],
+                    "property_address": prop, "mailing_address": mail,
+                    "new_enrichment": json.dumps(new_enrichment),
+                })
+                stats["recover_written"] = stats.get("recover_written", 0) + res.rowcount
+                if res.rowcount:
+                    # pending_skip_trace_rows stores its OWN address snapshot, so a
+                    # trace queued against the wrong parcel would still submit the
+                    # old address after this row is corrected (Codex P1). Cancel it
+                    # and return the lead to not_attempted so a later run can
+                    # enqueue the CORRECT address.
+                    cancelled = db.execute(_CANCEL_PENDING, {"id": row["id"]}).rowcount
+                    if cancelled:
+                        db.execute(_RESET_RESULT_TRACE, {"id": row["id"]})
+                    stats["traces_cancelled"] += cancelled
+            continue
+
         if (
             row["property_address"] is None
             and enrichment.get("parcel_lookup") == "mismatch"

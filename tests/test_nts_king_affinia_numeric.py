@@ -95,6 +95,71 @@ def test_location_after_the_verb_is_captured():
     assert len(loc) <= 300
 
 
+def test_location_never_swallows_the_auction_verb():
+    """The location-after match ends AT the verb, so the search window starts before it.
+
+    A capture that begins "sell at public auction located at ..." is the venue plus the
+    sentence that introduced it — rejected outright rather than shown to the user (Codex).
+    """
+    for name in ("nts_king_affinia_numeric_addai.txt",
+                 "nts_king_affinia_numeric_walker.txt",
+                 "nts_king_affinia_numeric_lutes.txt"):
+        loc = _parse_king(name)["auction_location"]
+        if loc:
+            assert "SELL AT PUBLIC AUCTION" not in loc.upper()
+            assert "NOTICE OF TRUSTEE" not in loc.upper()
+
+
+def test_trustee_comma_will_appositive_still_matches():
+    """"the undersigned Trustee, will on ..." is real in these papers (Codex)."""
+    text = ("I. NOTICE IS HEREBY GIVEN that the undersigned Trustee, will on 08/14/2026, "
+            "at 10:00 AM sell at public auction located at the 4th Avenue Entrance")
+    p = parse_nts_notice(text)
+    assert p["auction_date"] == "08/14/2026"
+    assert p["auction_time"] == "10:00 AM"
+
+
+# ── Postponement: the printed sale date is stale the moment it is published ───────
+
+def test_inline_postponement_supersedes_the_original_sale_date():
+    """REAL notice: "on June 26, 2026, 09:00 AM***THE SALE WAS POSTPONED TO 09/18/2026***".
+
+    Reading the original date buried a still-upcoming King sale as "past": is_active
+    flipped False and the lead vanished from the product. This is TS WA05000073-24-2,
+    whose sale is genuinely on 09/18/2026.
+    """
+    p = _parse_king("nts_king_postponed_guiler.txt")
+    assert p["ts_number"] == "WA05000073-24-2"
+    assert p["auction_date"] == "09/18/2026"
+    assert p["auction_time"] == "9:00AM"
+    row = _row(p, date(2026, 9, 3))
+    assert row is not None
+    assert row["auction_date"] == date(2026, 9, 18)
+    assert row["is_active"] is True          # the whole point: still a live lead
+    assert str(row["principal_owing"]) == "155361.99"
+    assert row["parcel"] == "6385500350"
+
+
+def test_postponement_only_ever_moves_the_date_forward():
+    """A postponement cannot go backwards, so a stray earlier date must not win."""
+    backwards = ("the undersigned Trustee will on 09/18/2026, at 9:00 AM sell at public "
+                 "auction. The sale was postponed to 06/26/2026 @ 9:00AM")
+    p = parse_nts_notice(backwards)
+    assert p["auction_date"] == "09/18/2026"
+
+    forwards = ("the undersigned Trustee will on 06/26/2026, at 9:00 AM sell at public "
+                "auction. The sale was postponed to 09/18/2026 @ 9:00AM")
+    p = parse_nts_notice(forwards)
+    assert p["auction_date"] == "09/18/2026"
+
+
+def test_postponement_does_not_fire_without_a_parsed_sale_date():
+    """No sale sentence => nothing to supersede; the notice still fails validation."""
+    p = parse_nts_notice("The sale was postponed to 09/18/2026 @ 9:00AM")
+    assert p["auction_date"] is None
+    assert not is_valid_nts(p)
+
+
 # ── The new pattern must stay strictly additive ───────────────────────────────────
 
 def test_new_pattern_does_not_fire_on_location_before_layout():
@@ -203,3 +268,17 @@ def test_the_three_recovered_notices_would_have_tripped_the_drop_counter():
             summary, {**p, "auction_date": None}, "queen_anne_news"
         ) is True
     assert summary["dropped_undated"] == 3
+
+
+def test_unparseable_date_is_also_a_visible_drop():
+    """A captured-but-unconvertible date fails validation the same way (Codex)."""
+    from src.workers.nts_crawler import _note_undated_drop
+
+    summary: dict = {}
+    assert _note_undated_drop(
+        summary, {"ts_number": "WA05000073-24-2", "auction_date": "13/40/2026"}, "queen_anne_news"
+    ) is True
+    assert _note_undated_drop(
+        summary, {"ts_number": "WA05000073-24-2", "auction_date": "09/0S/2026"}, "queen_anne_news"
+    ) is True
+    assert summary["dropped_undated"] == 2

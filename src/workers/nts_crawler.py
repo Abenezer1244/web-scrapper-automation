@@ -593,7 +593,12 @@ def _note_undated_drop(summary: dict, parsed: dict, source: str) -> bool:
 
     Returns True when the drop was an undated real notice (caller counts it as such).
     """
-    if not parsed.get("ts_number") or parsed.get("auction_date"):
+    from src.scrapers.sources.nts_tacoma_index import _to_date
+
+    # Convertibility, not mere presence (Codex): a captured-but-unparseable date
+    # ("13/40/2026", OCR garbage) also fails is_valid_nts downstream and is the SAME
+    # class of parser failure — it must not slip back into the quiet `skipped` bucket.
+    if not parsed.get("ts_number") or _to_date(parsed.get("auction_date")):
         return False
     summary["dropped_undated"] = summary.get("dropped_undated", 0) + 1
     _logger.warning(

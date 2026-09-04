@@ -285,8 +285,28 @@ _AUCTION_KING_LOC_B = re.compile(
 # so the caller handles both identically. Fully anchored literals, no nested
 # quantifiers, no unbounded '.' -> linear, no backtracking blowup on a 45k block.
 _AUCTION_NUM_LOC_AFTER = re.compile(
-    rf"Trustee\s+will\s*,?\s*on\s+(?:{_WEEKDAY})?(\d{{1,2}}/\d{{1,2}}/\d{{4}})\s*,?\s*"
+    # "the undersigned Trustee, will on …" is a real appositive in these papers (2 of
+    # 5 notices in the 08-05-26 issue), so the comma after Trustee is optional (Codex).
+    rf"Trustee\s*,?\s+will\s*,?\s*on\s+(?:{_WEEKDAY})?(\d{{1,2}}/\d{{1,2}}/\d{{4}})\s*,?\s*"
     rf"at\s+{_HOUR_OF}({_TIME})\s*,?\s*sell\s+at\s+public\s+auction",
+    re.I,
+)
+
+# ── Postponement override (live 2026-09-03, King / MTC). A re-published notice keeps
+# its ORIGINAL sale sentence and marks the new date INLINE:
+#   "…GIVEN that on June 26, 2026, 09:00 AM***THE SALE WAS POSTPONED TO 09/18/2026 @
+#    9:00AM***, Main Entrance, King County Administration Building…"
+# Every auction pattern reads the sentence's own date, so the notice lands with a PAST
+# auction date, is_active flips False, and a sale that is still upcoming vanishes from
+# the product. That is exactly what buried a real King sale (TS WA05000073-24-2, truly
+# 09/18/2026) and left the lead unreachable. Applies to ALL sources — postponements are
+# not county-specific.
+# Only ever moves the date FORWARD: a postponement cannot go backwards, so an unrelated
+# date elsewhere in the notice can never pull a sale earlier than its stated one.
+_POSTPONED = re.compile(
+    r"(?:POSTPONED|CONTINUED|RESCHEDULED)\s+TO\s*:?\s*"
+    rf"({_MONTH_DATE}|\d{{1,2}}/\d{{1,2}}/\d{{4}})"
+    rf"(?:\s*(?:@|at)?\s*({_TIME}))?",
     re.I,
 )
 
@@ -427,7 +447,12 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
             lm = _AUCTION_KING_LOC_A.search(span) or _AUCTION_KING_LOC_B.search(span)
             if lm:
                 loc = " ".join(lm.group(1).split()).strip().rstrip(".,")
-                if "NOTICE OF TRUSTEE" not in loc.upper() and 0 < len(loc) <= 300:
+                # For the location-AFTER layout the match ends at the verb, so the
+                # search window starts before it — reject a capture that swallowed the
+                # verb instead of the venue (Codex). LOC_A normally anchors past it.
+                if ("NOTICE OF TRUSTEE" not in loc.upper()
+                        and "SELL AT PUBLIC AUCTION" not in loc.upper()
+                        and 0 < len(loc) <= 300):
                     auction_location = loc
         else:
             # Ordinal worded date fallback ("17th day of July, 2026" — Clear Recon /
@@ -440,6 +465,18 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
                 if ":" not in hhmm:
                     hhmm = f"{hhmm}:00"
                 auction_time = f"{hhmm} {ampm.upper()}M"
+
+    # An inline "POSTPONED TO <date>" supersedes whatever the sale sentence says — the
+    # original date is stale the moment it is printed. Forward-only (see _POSTPONED), so
+    # this can never pull a sale earlier or resurrect a genuinely finished auction.
+    if auction_date:
+        pm = _POSTPONED.search(text)
+        if pm:
+            original, moved = _to_date(auction_date), _to_date(pm.group(1))
+            if moved and (original is None or moved >= original):
+                auction_date = " ".join(pm.group(1).split()).strip().rstrip(",")
+                if pm.group(2):
+                    auction_time = " ".join(pm.group(2).split())
 
     return {
         # A trustee's page TITLE can carry a trailing dash ("TS# WA-26-1035144-SW-

@@ -52,6 +52,13 @@ _OWNER_RE = re.compile(
 # "N.A.", and "N / A" all collapse to "NA".
 _OWNER_JUNK = frozenset({"NA", "NONE", "NULL", "UNKNOWN"})
 
+# Phase-1 breaker: trip when this many of the last N fetches came back non-200.
+# 30/50 is well clear of the normal miss rate (a genuine 200-with-no-data page is
+# NOT a failure here — only a non-200 counts), so ordinary sparse parcels can
+# never trip it, while a real block trips it within ~50 requests.
+_PHASE1_BREAKER_WINDOW = 50
+_PHASE1_BREAKER_MIN_FAILURES = 30
+
 # eRealProperty SILENTLY TRUNCATES an over-length ParcelNbr to the first 10 digits
 # and serves a DIFFERENT parcel's page with no error (verified live 2026-09-03:
 # ParcelNbr=64116000027 returns parcel 641160-0002, owner SNYDER JACOB, site
@@ -195,6 +202,8 @@ async def batch_extract_king_owners(
     max_transient_rate: float = 0.10,
     max_unresolved_rate: float = 0.50,
     fetch_attempts: int = 1,
+    out: dict[str, str] | None = None,
+    time_budget_s: float | None = None,
 ) -> dict[str, str]:
     """Owner/taxpayer name per parcel from eRealProperty — HTTP only, no Playwright.
 
@@ -218,7 +227,16 @@ async def batch_extract_king_owners(
     failed transiently this run is retried on the next run (it is still a
     placeholder), never permanently abandoned.
     """
-    owners: dict[str, str] = {}
+    # `out`, when the caller supplies it, IS the result dict — names land in it as
+    # they resolve, so a caller that wraps this in asyncio.wait_for still keeps
+    # every owner already found when the timeout cancels the coroutine. Returning
+    # only at the end meant a cancelled run threw away all of its work; that is
+    # exactly how a real King job finished with zero owner names.
+    # `time_budget_s` is the cooperative version of the same idea: stop cleanly
+    # (keeping results) instead of being killed from outside.
+    owners: dict[str, str] = out if out is not None else {}
+    import time as _time
+    _deadline = (_time.monotonic() + time_budget_s) if time_budget_s is not None else None
     # parcel_id comes from our own scraped DB rows (not user input), but require a
     # digit so a malformed value can't generate a noisy external request.
     clean = list(dict.fromkeys(
@@ -238,6 +256,12 @@ async def batch_extract_king_owners(
     misses = 0
     window: deque[_OwnerLookupOutcome] = deque(maxlen=max(1, circuit_window))
     for i, pid in enumerate(clean):
+        if _deadline is not None and _time.monotonic() >= _deadline:
+            _logger.warning(
+                "Owner-only lookup: time budget exhausted after %d/%d parcels "
+                "(%d resolved so far, kept)", i, len(clean), len(owners),
+            )
+            break
         if i % 100 == 0 and i > 0:
             _logger.info("  owner HTTP: %d / %d ...", i, len(clean))
         owner, errored = await _fetch_king_owner(pid, max_attempts=fetch_attempts)
@@ -367,6 +391,17 @@ async def batch_enrich_king_county(
     _logger.info("Phase 1: HTTP lookup for %d parcels...", len(clean))
     tax_urls: dict[str, str] = {}  # pid → payment.kingcounty.gov URL
 
+    # Per-run circuit breaker for phase 1. The one-shot check_source_or_raise gate
+    # above only asks "was King refusing us BEFORE this run started"; it cannot
+    # notice the source starting to refuse us DURING a run. That was tolerable
+    # while the parcel list was hard-capped, but this loop is now bounded by time
+    # rather than count, so an unnoticed block could mean a long run of failed
+    # fetches recorded as "this parcel simply has no data" — the exact shape of the
+    # eRealProperty IP rate-block incident. Mirrors the owner-only path's breaker:
+    # a sustained failure rate aborts the run AND is persisted, so the next worker
+    # does not immediately start hammering a source that is still refusing us.
+    _p1_window: deque[bool] = deque(maxlen=_PHASE1_BREAKER_WINDOW)  # True = failed
+
     for i, pid in enumerate(clean):
         if _over_budget():
             _logger.warning("King phase 1: time budget exhausted after %d/%d parcels", i, len(clean))
@@ -383,6 +418,21 @@ async def batch_enrich_king_county(
             r = safe_get(
                 f"{_ERP_URL}{pid}", headers=_HEADERS, timeout=10
             )
+            _p1_window.append(r.status_code != 200)
+            if (len(_p1_window) == _PHASE1_BREAKER_WINDOW
+                    and _p1_window.count(True) >= _PHASE1_BREAKER_MIN_FAILURES):
+                msg = (
+                    "King phase-1 circuit breaker tripped: "
+                    f"{_p1_window.count(True)}/{len(_p1_window)} recent eRealProperty "
+                    f"fetches failed (last status={r.status_code}) after {i} of "
+                    f"{len(clean)} parcels. Aborting so a block is never recorded as "
+                    "'this parcel has no data'."
+                )
+                _logger.warning(msg)
+                record_source_blocked(KING_EREALPROPERTY, msg)
+                st["budget_exhausted"] = True
+                st["deferred"].extend(clean[i:])
+                break
             if r.status_code != 200:
                 continue
 
@@ -457,6 +507,10 @@ async def batch_enrich_king_county(
                     tax_urls[pid] = tax_url
 
         except Exception as exc:
+            # A hard block / DNS or TLS failure RAISES rather than returning a
+            # non-200, so the breaker must see these too — otherwise a total
+            # outage looks like a run of parcels that merely "had no data".
+            _p1_window.append(True)
             _logger.debug(
                 "Property URL fetch failed for parcel=%s: %s",
                 pid, str(exc)[:200],
@@ -474,11 +528,17 @@ async def batch_enrich_king_county(
     if not tax_urls:
         return results
 
-    # Cap at 200 parcels to avoid job timeout (~5-10s per lookup)
+    # Cap at 200 parcels to avoid job timeout (~5-10s per lookup). The mailing
+    # pass really is expensive (Playwright), so unlike phase 1 this cap stays.
+    # What must NOT stay is dropping the overflow SILENTLY: the truncated parcels
+    # used to vanish without entering `deferred`, so they got no durable marker
+    # and no later sweep could find them — a gap invisible to both the logs and
+    # the caller. Record them like any other unreached parcel.
     _MAX_MAILING_LOOKUPS = 200
     pids_to_lookup = list(tax_urls.keys())
     if len(pids_to_lookup) > _MAX_MAILING_LOOKUPS:
         _logger.info("Capping mailing lookups: %d → %d (to avoid timeout)", len(pids_to_lookup), _MAX_MAILING_LOOKUPS)
+        st["deferred"].extend(pids_to_lookup[_MAX_MAILING_LOOKUPS:])
         pids_to_lookup = pids_to_lookup[:_MAX_MAILING_LOOKUPS]
 
     _logger.info("Phase 2: Playwright lookup for %d mailing addresses...", len(pids_to_lookup))

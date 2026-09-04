@@ -144,6 +144,20 @@ def test_dated_chrome_row_without_an_instrument_still_fails_loud():
         _scraper("9")._extract_records(soup)
 
 
+def test_dated_chrome_row_with_an_unrelated_10_digit_id_still_fails_loud():
+    """Codex round 2: a bare 10-digit id (a case/request number) is NOT an ARMS
+    instrument — _map_row's no-link fallback only accepts "20" + 10 digits. The
+    signature resolves the instrument through that same helper, so such a row
+    cannot pass as the grid and silently return []."""
+    decoy = (
+        "<table><tr><th>h</th></tr><tr><td>1</td><td>Request 4177060700</td>"
+        "<td>09/04/2026</td>" + "<td>-</td>" * 9 + "</tr></table>"
+    )
+    soup = BeautifulSoup(f"<html><body>{decoy}</body></html>", "html.parser")
+    with pytest.raises(TransientScrapeError):
+        _scraper("9")._extract_records(soup)
+
+
 def test_a_grid_whose_rows_are_all_filtered_still_returns_empty_not_raises():
     """A real grid whose every row is dropped by a PRODUCT filter (pre_foreclosure
     drops rows with no natural-person party) is found, parsed, and legitimately

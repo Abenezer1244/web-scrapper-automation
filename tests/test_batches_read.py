@@ -487,6 +487,70 @@ async def test_failed_child_that_did_persist_rows_still_reports_them(
     assert resp.status_code == 200
     child = {c["record_type"]: c for c in resp.json()["children"]}["pre_foreclosure"]
     assert child["status"] == "failed"
-    # 3 rows exist, so the mid-scrape 210 is capped to what was actually persisted
-    # — not zeroed away.
+    # 3 rows exist, so they are reported — not zeroed away, and not the mid-scrape
+    # 210 either.
     assert child["record_count"] == 3
+
+
+async def test_failed_child_rows_survive_a_retry_that_reset_record_count(
+    db: AsyncSession, client: AsyncClient, starter_user: User, starter_token: str,
+    partial_batch: SimpleNamespace,
+):
+    """_retry_scrape_job sets record_count=0 on a re-queue, so the counter also runs
+    BEHIND rows that were already saved. Counting the rows keeps them visible where
+    min(record_count, rows) would have hidden them (Codex round 2)."""
+    job = (
+        await db.execute(
+            select(Job).join(
+                ScraperConfig, ScraperConfig.id == Job.scraper_config_id
+            ).where(
+                ScraperConfig.batch_id == partial_batch.batch_id,
+                Job.status == "failed",
+            )
+        )
+    ).scalar_one()
+    job.record_count = 0  # what a watchdog re-queue leaves behind
+    for _ in range(2):
+        db.add(Result(
+            id=str(uuid.uuid4()), job_id=job.id, user_id=starter_user.id,
+            party_name="DOE JOHN", property_address="2 OAK AVE",
+        ))
+    await db.commit()
+
+    resp = await client.get(
+        f"/batches/{partial_batch.batch_id}", headers=_auth(starter_token)
+    )
+    child = {c["record_type"]: c for c in resp.json()["children"]}["pre_foreclosure"]
+    assert child["record_count"] == 2
+
+
+async def test_duplicate_rows_are_not_counted_as_leads(
+    db: AsyncSession, client: AsyncClient, starter_user: User, starter_token: str,
+    partial_batch: SimpleNamespace,
+):
+    """record_count counts NEW non-duplicate rows, so counting rows must too."""
+    job_id = (
+        await db.execute(
+            select(Job.id).join(
+                ScraperConfig, ScraperConfig.id == Job.scraper_config_id
+            ).where(
+                ScraperConfig.batch_id == partial_batch.batch_id,
+                Job.status == "failed",
+            )
+        )
+    ).scalar_one()
+    db.add(Result(
+        id=str(uuid.uuid4()), job_id=job_id, user_id=starter_user.id,
+        party_name="NEW LEAD", property_address="3 ELM ST",
+    ))
+    db.add(Result(
+        id=str(uuid.uuid4()), job_id=job_id, user_id=starter_user.id,
+        party_name="SEEN BEFORE", property_address="4 ELM ST", is_duplicate=True,
+    ))
+    await db.commit()
+
+    resp = await client.get(
+        f"/batches/{partial_batch.batch_id}", headers=_auth(starter_token)
+    )
+    child = {c["record_type"]: c for c in resp.json()["children"]}["pre_foreclosure"]
+    assert child["record_count"] == 1

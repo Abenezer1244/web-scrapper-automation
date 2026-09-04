@@ -374,12 +374,13 @@ def _child_lead_count(
 ) -> int:
     """Leads to report for one batch child, given ``(job_id, status, record_count)``.
 
-    See the call site for why a non-done child is capped by its persisted rows.
+    See the call site for why a non-done child is counted from its rows instead of
+    from ``jobs.record_count``.
     """
     job_id, status, record_count = job
     if status == "done":
         return record_count
-    return min(record_count, persisted.get(job_id, 0))
+    return persisted.get(job_id, 0)
 
 
 def _combined_record_count(batch: ScraperBatch, run: BatchRun | None) -> int | None:
@@ -524,10 +525,10 @@ async def get_batch(
             )
         ).all()
         job_by_config = {scid: (jid, st, rc) for (jid, scid, st, rc) in job_rows}
-        # How many rows each child ACTUALLY persisted. jobs.record_count is also
-        # written mid-scrape by the progress callback, so a child that died before
-        # the save step still carries the in-flight counter and would otherwise
-        # report leads that do not exist (Test 11: 210 reported, 0 rows).
+        # New, non-duplicate rows each child ACTUALLY saved — the same rule
+        # jobs.record_count follows, but measured from the rows. One grouped query
+        # for the whole batch (children are a handful), tenant-scoped like every
+        # other query here.
         persisted = dict(
             (
                 await db.execute(
@@ -535,6 +536,7 @@ async def get_batch(
                     .where(
                         Result.user_id == current_user.id,
                         Result.job_id.in_(run.child_job_ids),
+                        Result.is_duplicate.is_not(True),
                     )
                     .group_by(Result.job_id)
                 )
@@ -576,17 +578,20 @@ async def get_batch(
                 # what billing charged), so it is reported as-is — including when
                 # retention has since removed the rows behind it.
                 #
-                # For any OTHER child the same field may still hold the counter the
-                # progress callback wrote mid-scrape, which can run ahead of what
-                # was actually saved: Test 11's failed child said 210 with ZERO
-                # rows, and the UI rendered "210 leads" and summed it into the
-                # batch total. Cap those by the rows that really exist.
+                # For any OTHER child that field cannot be trusted in EITHER
+                # direction. The progress callback writes it mid-scrape, so it runs
+                # ahead of what was saved (Test 11's failed child said 210 with ZERO
+                # rows, and the UI printed "210 leads" and summed it into the batch
+                # total); and _retry_scrape_job RESETS it to 0 on a re-queue, so it
+                # also runs behind rows that were already saved. Count the rows
+                # instead — the same non-duplicate rule record_count itself uses,
+                # measured from what exists rather than from a counter.
                 #
-                # Capped, NOT zeroed (Codex P1): a failed or cancelled child can
-                # still have persisted rows that reach the delivered combined CSV —
-                # batch_export selects every child_job_id with no status filter,
-                # and force-finalize CANCELS still-active children after they may
-                # have saved rows. Zeroing would hide leads the user is holding.
+                # Counted, not zeroed (Codex): a failed or cancelled child can still
+                # have persisted rows that reach the delivered combined CSV —
+                # batch_export selects every child_job_id with no status filter, and
+                # force-finalize CANCELS still-active children after they may have
+                # saved rows. Zeroing would hide leads the user is holding.
                 record_count=_child_lead_count(job, persisted) if job else 0,
             )
         )

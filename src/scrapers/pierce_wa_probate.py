@@ -53,7 +53,11 @@ _ARMS_MIN_ROW_CELLS = 9
 # An ARMS instrument number as printed in the results grid (modern rows are 12
 # digits, older ones 10+). _map_row reads the same shape off the row, so requiring
 # it in the grid signature can never reject a row the parser would have accepted.
-_ARMS_INSTRUMENT = re.compile(r"\b\d{10,12}\b")
+_ARMS_INSTRUMENT = re.compile(r"\b(\d{10,12})\b")
+# Fallback when the row has no instrument LINK: a bare ARMS instrument is
+# "20" + 10 digits. Deliberately tighter than _ARMS_INSTRUMENT so an unrelated
+# 10-digit id in a chrome row is not read as an instrument.
+_ARMS_INSTRUMENT_BARE = re.compile(r"\b(20\d{10})\b")
 
 # ─── Patterns ─────────────────────────────────────────────────────────────────
 
@@ -616,27 +620,53 @@ class PierceWAARMSScraper(BridgeScraper):
             return False
         return cells[0].get_text(strip=True).isdigit()
 
+    @staticmethod
+    def _row_instrument(cells: list[Tag], texts: list[str]) -> str | None:
+        """The ARMS instrument number for a results row, or None.
+
+        Preferred source is the clickable link (12 digits on modern rows, 10+ on
+        old ones); the fallback is a bare ``20`` + 10 digits anywhere in the row.
+        SINGLE SOURCE OF TRUTH: ``_is_grid_signature_row`` calls this too, so the
+        signature used to PICK the grid accepts exactly the rows ``_map_row``
+        can parse — no more (a chrome row carrying an unrelated 10-digit id is
+        rejected, so it cannot be mistaken for the grid and silently yield []) and
+        no fewer (a row the parser would have accepted can never fail the
+        signature and lose the whole grid) — Codex.
+        """
+        for c in cells:
+            for link in c.find_all("a"):
+                link_text = link.get_text(strip=True)
+                m = _ARMS_INSTRUMENT.match(link_text)
+                if m and len(link_text) >= 10:
+                    return m.group(1)
+        for text in texts:
+            m = _ARMS_INSTRUMENT_BARE.search(text)
+            if m:
+                return m.group(1)
+        return None
+
     @classmethod
     def _is_grid_signature_row(cls, row: Tag) -> bool:
         """``_is_grid_row`` plus a recorded date AND an instrument number — the
         signature used to PICK the grid.
 
         Width and a leading row number alone are not enough. If a chrome/status
-        table on a blocked page happened to match, the grid would be "found",
-        every row would fail to map, and ``_extract_records`` would return ``[]``
-        — scoring a blocked page as a healthy zero, which is exactly the failure
-        the raise below exists to prevent (Codex P1). Requiring what ``_map_row``
-        itself keys off — a recorded date and a 10-12 digit instrument number
-        outside the row-number cell — makes a chrome false positive implausible.
+        table on a blocked page matched, the grid would be "found", every row
+        would fail to map, and ``_extract_records`` would return ``[]`` — scoring
+        a blocked page as a healthy zero, which is exactly the failure the raise
+        below exists to prevent (Codex P1). The instrument number is resolved
+        through ``_row_instrument``, the SAME function ``_map_row`` uses, so this
+        accepts precisely the rows the parser can read.
         """
         if not cls._is_grid_row(row):
             return False
-        # Skip cells[0]: that is the row number, which can itself be 10-12 digits
-        # on a very large result set.
-        body = " ".join(c.get_text(" ", strip=True) for c in row.find_all("td")[1:])
-        if not _DATE_PATTERN.search(body):
+        # Skip cells[0]: that is the row number, and on a very large result set it
+        # could itself be 10+ digits and satisfy the instrument test on its own.
+        cells = row.find_all("td")[1:]
+        texts = [c.get_text(" ", strip=True) for c in cells]
+        if not _DATE_PATTERN.search(" ".join(texts)):
             return False
-        return bool(_ARMS_INSTRUMENT.search(body))
+        return cls._row_instrument(cells, texts) is not None
 
     def _extract_records(self, soup: BeautifulSoup) -> list[ScrapedRecord]:
         """Extract records from the ARMS results table."""
@@ -691,23 +721,9 @@ class PierceWAARMSScraper(BridgeScraper):
 
         record = ScrapedRecord()
 
-        # Instrument number — clickable link (12 digits for modern, 10+ for old)
-        inst_re = re.compile(r"\b(\d{10,12})\b")
-        for c in cells:
-            for link in c.find_all("a"):
-                link_text = link.get_text(strip=True)
-                m = inst_re.match(link_text)
-                if m and len(link_text) >= 10:
-                    record.enrichment_data = {"instrument_number": m.group(1)}
-                    break
-            if record.enrichment_data:
-                break
-        if not record.enrichment_data:
-            for text in all_texts:
-                m = re.search(r"\b(20\d{10})\b", text)
-                if m:
-                    record.enrichment_data = {"instrument_number": m.group(1)}
-                    break
+        inst = self._row_instrument(cells, all_texts)
+        if inst:
+            record.enrichment_data = {"instrument_number": inst}
 
         # Date — must be valid MM/DD/YYYY
         for text in all_texts:

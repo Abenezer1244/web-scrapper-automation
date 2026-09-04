@@ -102,7 +102,8 @@ systems after the repair.
 ## Codex review — 3 rounds, 9 findings, all independently verified
 
 Round 1 (design) 4 findings · Round 2 (diff) GATE FAIL, 5 findings · Round 3 GATE **PASS**,
-2 findings. Round 4 (confirmation only) blocked by a Codex usage limit.
+2 findings · Round 4 GATE **PASS**, **0 findings** — confirmed both round-3 fixes and that the
+repair script is safe against live customer data.
 
 Adopted: 8 of 9. One [P2] declined with reasoning — rejecting non-10-digit PIDs at extraction
 would DROP a verified-real death-certificate lead over a county typo, and the echo check already

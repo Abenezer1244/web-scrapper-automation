@@ -100,9 +100,9 @@ to understand *why* the code is the way it is and *what's been attempted before*
 - The **2Captcha key is DEAD** — `ERROR_KEY_DOES_NOT_EXIST` on every attempt. The King search
   still succeeded without a solved token, so the scrape is not currently blocked, but the captcha
   path is unprotected if King re-enforces it. 👤 needs a key rotation.
-- Codex hit its **usage limit** on the 4th (confirmation-only) review pass. Rounds 1–3 completed;
-  round 3 returned **GATE: PASS**. The two round-3 findings were fixed and verified by me with
-  tests, but carry no Codex re-confirmation.
+- Codex hit its usage limit on the 4th review pass and it had to wait for the quota reset.
+  It then ran clean: **round 4 returned ZERO findings, GATE: PASS**, confirming both round-3
+  fixes and answering explicitly that the repair script is safe against live customer data.
 
 **Pending / Handoff:**
 

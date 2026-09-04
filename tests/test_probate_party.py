@@ -297,3 +297,225 @@ def test_is_person_like_still_rejects_institutional_form():
     assert not is_person_like_party("PIERCE COUNTY CORONER")
     assert not is_person_like_party("FIRST NATIONAL BANK")
     assert not is_person_like_party("WASHINGTON, STATE OF")  # comma-inverted state
+
+
+# --- Test 7 audit (2026-09-03): King recorder placeholder + agency word orders --
+#
+# Every input below is a VERBATIM grantor/grantee pair captured from King County's
+# live LandmarkWeb Death Certificate index for 06/04/2026-09/02/2026. These assert
+# the SEMANTIC outcome (the decedent reaches party_name, the placeholder reaches
+# nothing) — not merely that some string is forbidden.
+
+def test_placeholder_grantor_promotes_the_decedent_grantee():
+    # King indexed instrument 20260828001142 with the parties reversed: the
+    # recorder placeholder as grantor, the decedent as grantee. Corroborated at the
+    # King Assessor — parcel 3276080220's owner is "TRUJILLO CHUCK+PATSY".
+    assert orient_probate_party("PUBLIC", "TRUJILLO CHARLES JAMES", "DEATH CERTIFICATE") == (
+        "TRUJILLO CHARLES JAMES", None
+    )
+    # Same defect, instrument 20260710000167 (assessor owner MCINTOSH LEONA LORRAINE).
+    assert orient_probate_party("PUBLIC", "MCINTOSH JOHN HAROLD", "DEATH CERTIFICATE") == (
+        "MCINTOSH JOHN HAROLD", None
+    )
+
+
+def test_placeholder_grantee_is_not_an_heir():
+    # The dominant live shape: real decedent as grantor, placeholder as grantee
+    # (101 of 204 rows). The decedent must survive untouched and heirs must be None
+    # rather than the literal placeholder.
+    for placeholder in ("PUBLIC", "THE PUBLIC", "PUBLIC THE"):
+        assert orient_probate_party(
+            "ELTING EMILY WILLIAMS", placeholder, "DEATH CERTIFICATE"
+        ) == ("ELTING EMILY WILLIAMS", None)
+
+
+def test_placeholder_dropped_from_a_stacked_grantee_keeping_the_real_heir():
+    assert orient_probate_party(
+        "SINGH GURDEV", "KAUR RAJWANT / PUBLIC", "DEATH CERTIFICATE"
+    ) == ("SINGH GURDEV", "KAUR RAJWANT")
+
+
+def test_placeholder_never_promoted_into_party_name():
+    # Both sides non-parties -> no lead party at all (guard #2), never "PUBLIC".
+    assert orient_probate_party(
+        "WASHINGTON STATE DEPT OF HEALTH", "PUBLIC", "DEATH CERTIFICATE"
+    ) == (None, None)
+
+
+def test_placeholder_rule_does_not_touch_real_public_entities_or_people():
+    # Whole-value anchoring: these must all pass through untouched.
+    for value in (
+        "PUBLIC STORAGE",
+        "PUBLIC UTILITY DISTRICT NO 1",
+        "REPUBLIC SERVICES",
+        "PUBLIC, JOHN",
+        "PUBLICOVER MARGARET",
+    ):
+        assert strip_filing_agency(value) == value
+    assert is_person_like_party("PUBLIC, JOHN")
+
+
+def test_agency_trailing_word_order_promotes_the_decedent():
+    # Instrument 20260715000926 — "<STATE> HEALTH DEPARTMENT" slipped past the
+    # "DEPT OF HEALTH"-only regex and shipped as the lead's party_name.
+    assert orient_probate_party(
+        "WASHINGTON STATE HEALTH DEPARTMENT", "REINKE NORMAN LEONARD", "DEATH CERTIFICATE"
+    ) == ("REINKE NORMAN LEONARD", None)
+
+
+def test_agency_scrambled_word_order_promotes_the_decedent():
+    # Instrument 20260626000676 — "DEPARTMENT <STATE> HEALTH".
+    assert orient_probate_party(
+        "DEPARTMENT WASHINGTON STATE HEALTH", "MICHALENKO TANITA C", "DEATH CERTIFICATE"
+    ) == ("MICHALENKO TANITA C", None)
+
+
+def test_bare_state_with_govt_marker_promotes_the_decedent():
+    # Instruments 20260612000387/388 — "WASHINGTON STATE-GOVT" (and the unhyphenated
+    # form seen in the grantee slot).
+    assert orient_probate_party(
+        "WASHINGTON STATE-GOVT", "LAROUX JOHN ALEXANDER", "DEATH CERTIFICATE"
+    ) == ("LAROUX JOHN ALEXANDER", None)
+    assert strip_filing_agency("WASHINGTON STATE GOVT") == ""
+
+
+def test_new_agency_orders_do_not_strip_real_names():
+    # The trailing/scrambled regexes require a DEPARTMENT/DEPT token adjacent to a
+    # vital-records subject, so these real values must survive intact.
+    for value in (
+        "WASHINGTON STATE UNIVERSITY",
+        "HEALTH JOHN ROBERT",
+        "STATE FARM",
+        "WASHINGTON, GEORGE",
+        "GOVT MARIA",
+        "DEPARTMENT, ANNA",
+    ):
+        assert strip_filing_agency(value) == value
+
+
+def test_bare_state_grantee_is_not_an_heir():
+    # A grantee that names NO party at all is dropped from the heirs slot.
+    for non_party in ("WASHINGTON STATE-GOVT", "STATE OF WASHINGTON", "WASHINGTON STATE"):
+        assert orient_probate_party("SERONKO ROBERT LEE", non_party, "DEATH CERTIFICATE") == (
+            "SERONKO ROBERT LEE", None
+        )
+
+
+def test_a_named_agency_counterparty_is_KEPT_in_heirs():
+    # Codex P1: the counterparty rule is deliberately narrower than the grantor
+    # rule. An agency in the GRANTOR slot stands in for the decedent and must be
+    # removed to find the party; an agency in the COUNTERPARTY slot may be a real
+    # claimant on the estate, and erasing it would destroy true information.
+    for agency in (
+        "WASHINGTON STATE DEPARTMENT OF HEALTH",
+        "WASHINGTON STATE DEPARTMENT OF REVENUE",
+        "DEPARTMENT OF SOCIAL AND HEALTH SERVICES",
+        "SEATTLE-KING COUNTY PUBLIC HEALTH DEPARTMENT",
+        "ACME TITLE COMPANY",
+    ):
+        assert orient_probate_party("SERONKO ROBERT LEE", agency, "DEATH CERTIFICATE") == (
+            "SERONKO ROBERT LEE", agency
+        )
+
+
+def test_counterparty_cleanup_does_not_fire_on_a_transfer_on_death_deed():
+    # Guard #3 still holds: a TOD grantor is a LIVING owner and is never swapped,
+    # but the grantee slot is still sanitized.
+    assert orient_probate_party(
+        "NELSON MYRNA JOAN", "PUBLIC", "TRANSFER ON DEATH DEED"
+    ) == ("NELSON MYRNA JOAN", None)
+    assert orient_probate_party(
+        "NELSON MYRNA JOAN", "NELSON DAVID", "TRANSFER ON DEATH DEED"
+    ) == ("NELSON MYRNA JOAN", "NELSON DAVID")
+
+
+def test_ordinary_king_rows_are_unchanged():
+    # 196 of the 204 live rows must pass through with the grantor as party_name.
+    assert orient_probate_party(
+        "BANEZ MATILDE UMIPIG", "BANEZ JOSELITO U", "DEATH CERTIFICATE"
+    ) == ("BANEZ MATILDE UMIPIG", "BANEZ JOSELITO U")
+    assert orient_probate_party(
+        "THOMAS GARY / THOMAS DELORES A", "TUSZYNSKI GARY / THOMAS GARY", "DEATH CERTIFICATE"
+    ) == ("THOMAS GARY / THOMAS DELORES A", "TUSZYNSKI GARY / THOMAS GARY")
+
+
+def test_counterparty_cleanup_never_strips_an_agency_phrase_from_a_stacked_heir():
+    # Only whole non-party SEGMENTS are dropped; a segment that names something
+    # keeps its full text.
+    assert orient_probate_party(
+        "DOE JOHN", "DOE JANE / WASHINGTON STATE DEPARTMENT OF REVENUE / PUBLIC",
+        "DEATH CERTIFICATE",
+    ) == ("DOE JOHN", "DOE JANE / WASHINGTON STATE DEPARTMENT OF REVENUE")
+
+
+def test_agency_phrase_with_a_locality_prefix_is_consumed_whole():
+    # Codex: "PUBLIC" is part of the agency NAME here. Stripping only
+    # "HEALTH DEPARTMENT" left the mangled fragment "SEATTLE-KING COUNTY PUBLIC"
+    # as the lead's party.
+    assert strip_filing_agency("SEATTLE-KING COUNTY PUBLIC HEALTH DEPARTMENT") == (
+        "SEATTLE-KING COUNTY"
+    )
+    assert strip_filing_agency("PUBLIC HEALTH DEPARTMENT") == ""
+    # ...and a real entity that merely starts with the same word is untouched.
+    assert strip_filing_agency("PUBLIC UTILITY DISTRICT NO 1") == "PUBLIC UTILITY DISTRICT NO 1"
+    assert strip_filing_agency("PUBLIC STORAGE") == "PUBLIC STORAGE"
+
+
+def test_an_agency_residue_that_is_only_a_place_is_not_the_decedent():
+    # Codex P1: excising "PUBLIC HEALTH DEPARTMENT" leaves the agency's own
+    # locality. Trusting any non-empty remainder surfaced that fragment as the
+    # lead's party; the grantee must be promoted instead.
+    assert orient_probate_party(
+        "SEATTLE-KING COUNTY PUBLIC HEALTH DEPARTMENT", "DOE JANE", "DEATH CERTIFICATE"
+    ) == ("DOE JANE", None)
+    assert orient_probate_party(
+        "CITY OF SEATTLE HEALTH DEPARTMENT", "DOE JANE", "DEATH CERTIFICATE"
+    ) == ("DOE JANE", None)
+
+
+def test_a_real_name_left_beside_an_agency_is_still_the_decedent():
+    # The residue guard must not undo the case the agency strip exists for.
+    assert orient_probate_party(
+        "PERRIN, RONALD, STATE OF WA, DEPT OF HEALTH", "PERRIN, SUSAN", "DEATH CERTIFICATE"
+    ) == ("PERRIN, RONALD", "PERRIN, SUSAN")
+    assert orient_probate_party(
+        "SMITH JOHN / STATE OF WASHINGTON", "SMITH JANE", "DEATH CERTIFICATE"
+    ) == ("SMITH JOHN", "SMITH JANE")
+    # A decedent whose surname collides with the locality rule survives via the
+    # comma-form rescue.
+    assert orient_probate_party(
+        "COUNTY, JOHN, WA DEPT OF HEALTH", "COUNTY, JANE", "DEATH CERTIFICATE"
+    ) == ("COUNTY, JOHN", "COUNTY, JANE")
+
+
+def test_a_retained_entity_party_is_not_second_guessed_by_the_residue_guard():
+    # Codex P2: dropping a whole non-party SEGMENT is not the same as excising an
+    # agency PHRASE. An LLC, a company, or a place-named party that merely sat
+    # beside a placeholder must survive — the product preserves legal entities.
+    assert orient_probate_party(
+        "ACME LLC / PUBLIC", "DOE JANE", "DEATH CERTIFICATE"
+    ) == ("ACME LLC", "DOE JANE")
+    assert orient_probate_party(
+        "JANE CITY / PUBLIC", "DOE JANE", "DEATH CERTIFICATE"
+    ) == ("JANE CITY", "DOE JANE")
+    assert orient_probate_party(
+        "WASHINGTON STATE / ACME TITLE COMPANY", "DOE JANE", "DEATH CERTIFICATE"
+    ) == ("ACME TITLE COMPANY", "DOE JANE")
+    assert orient_probate_party(
+        "SMITH FAMILY TRUST / STATE OF WASHINGTON", "DOE JANE", "DEATH CERTIFICATE"
+    ) == ("SMITH FAMILY TRUST", "DOE JANE")
+
+
+def test_bare_city_shaped_names_are_not_treated_as_a_locality():
+    # Codex P3: "UNION CITY" / "JANE CITY" read as a company or a person, and no
+    # real agency reduces to that shape (a city files as "CITY OF SEATTLE").
+    assert _mod_bare_locality("KING COUNTY")
+    assert _mod_bare_locality("CITY OF SEATTLE")
+    assert not _mod_bare_locality("UNION CITY")
+    assert not _mod_bare_locality("JANE CITY")
+    assert not _mod_bare_locality("SMITH JOHN")
+
+
+def _mod_bare_locality(value):
+    from src.scrapers.probate import _BARE_LOCALITY_RE
+    return bool(_BARE_LOCALITY_RE.match(value))

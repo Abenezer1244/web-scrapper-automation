@@ -168,3 +168,81 @@ class TestSuffixlessSitus:
             "2715 67TH CT SE", "20508 ISLAND PKWY E, LAKE TAPPS, WA, 98391-9081"
         )
         assert f["absentee_owner"] is True
+
+
+class TestCommalessSitusCity:
+    """An NTS notice prints the situs with NO comma before the city ("Commonly known
+    as: 1207 118TH PL SW EVERETT, WASHINGTON 98204-4813"), so the comma-splitting
+    display parser reads the city as part of the STREET while the owner's mailing
+    address parses it out. Same place, two different street strings.
+
+    Pinned from the prod "Test 5" rows (Snohomish trustee-sale leads, 2026-09-02).
+    """
+
+    def test_glued_city_with_zip4_vs_zip5_is_not_absentee(self):
+        """The bug: identical addresses, but the situs carries ZIP+4 and the mailing
+        ZIP5, so the whole-string shortcut missed and the glued city read as a
+        different street — a confident absentee=True for an owner living in the house.
+        """
+        f = compute_owner_flags(
+            "1207 118TH PL SW EVERETT, WA 98204-4813",
+            "1207 118TH PL SW, EVERETT, WA 98204",
+        )
+        assert f["absentee_owner"] is False
+
+    def test_glued_city_with_identical_zips_still_not_absentee(self):
+        """The sibling row that happened to work before (both sides ZIP+4) — it must
+        keep working, and now for the right reason rather than by string luck."""
+        f = compute_owner_flags(
+            "712 143RD PL SW LYNNWOOD, WA 98087-6429",
+            "712 143RD PL SW, LYNNWOOD, WA 98087-6429",
+        )
+        assert f["absentee_owner"] is False
+
+    def test_glued_city_with_a_different_zip_is_still_absentee(self):
+        """The tolerance only DEFERS to the ZIP/city discriminator — it never asserts
+        same-place on its own. A real absentee owner must still be flagged."""
+        f = compute_owner_flags(
+            "1207 118TH PL SW EVERETT, WA 98204-4813",
+            "1207 118TH PL SW, SEATTLE, WA 98101",
+        )
+        assert f["absentee_owner"] is True
+
+    def test_trailing_token_must_match_the_other_sides_own_city(self):
+        """Matched on the OTHER side's parsed city, not on any city-looking token:
+        a genuine extra street word is still a different street."""
+        f = compute_owner_flags(
+            "1207 118TH PL SW BOTHELL, WA 98204",
+            "1207 118TH PL SW, EVERETT, WA 98204",
+        )
+        assert f["absentee_owner"] is True
+
+    def test_glued_city_without_a_discriminator_stays_unknown(self):
+        """No ZIP on the situs side: same street modulo the city is not proof of
+        owner-occupancy, so the honest answer is unknown, not False."""
+        f = compute_owner_flags(
+            "1207 118TH PL SW EVERETT",
+            "1207 118TH PL SW, EVERETT, WA 98204",
+        )
+        assert f["absentee_owner"] is None
+
+    def test_a_property_that_parsed_its_own_city_is_left_alone(self):
+        """The tolerance is keyed to the comma-less situs shape, where the parser
+        finds NO city because the city is glued to the street. When the property
+        address DID parse a city of its own, a trailing word is part of the street
+        name and must not be dropped — behaviour here is unchanged from before the
+        fix (Codex review)."""
+        f = compute_owner_flags(
+            "1207 118TH PL SW EVERETT, EVERETT, WA 98204",
+            "1207 118TH PL SW, EVERETT, WA 98204",
+        )
+        assert f["absentee_owner"] is True
+
+    def test_a_bare_house_number_is_not_a_street_to_absorb_into(self):
+        """"123, EVERETT, WA 98204" parses to street "123" + city "EVERETT". Without
+        a letter in it that is not a street, and absorbing it would let any
+        "123 <CITY>" in the same ZIP match it (Codex review). These two normalize to
+        the same full string, so the answer comes from the pre-existing whole-string
+        shortcut — this test pins that the new helper does not widen it."""
+        f = compute_owner_flags("123 EVERETT, WA 98204", "456 MAPLE ST, EVERETT, WA 98204")
+        assert f["absentee_owner"] is True

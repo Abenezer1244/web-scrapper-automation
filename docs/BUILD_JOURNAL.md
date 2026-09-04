@@ -19,6 +19,98 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-03 (Test 7) — "PUBLIC" was the recorder's word for *nobody*, and a truncating search box gave a lead someone else's house
+
+**Built / Shipped:** `fix/test7-data-quality` (7 commits). Test 7 = King WA **probate**, job
+`f19f9cc5`, 121 leads over 06/04–09/02/2026.
+
+1. `src/scrapers/probate.py` (SHARED by 8 county scrapers) — a recorder-**placeholder** rule for
+   `PUBLIC` / `THE PUBLIC` / `PUBLIC THE`, two missing filing-agency word orders, a `GOVT` suffix
+   on the bare-state rule, and `clean_counterparty()` for the heirs slot.
+2. `src/scrapers/enrichment/king_county_assessor.py` — `parcel_page_is_for()`: read back the
+   parcel the assessor page says it resolved and discard the page on mismatch. Gated at BOTH
+   call sites.
+3. King/Clark/AcclaimWeb/Laserfiche/Skagit — never ship a probate lead whose orientation left no
+   party (they appended on `date_recorded` alone).
+4. `scripts/repair_probate_party_and_bad_parcel.py` — applied to prod: **235 rows** re-oriented
+   (25 party corrections), **5** wrong-parcel rows cleared, **2 queued skip-traces cancelled**.
+
+**Facts learned:**
+
+- **`PUBLIC` is the King recorder's placeholder counterparty on a death certificate** — the
+  instrument is recorded "to the public". It appears in the GRANTEE slot on **101 of 204** raw
+  rows in a single 90-day window. In 8 rows the recorder indexed the parties **reversed**, so the
+  placeholder sat in the GRANTOR slot and the DECEDENT in the grantee slot. It is never a legal
+  party. Corroborated at the assessor: parcel 3276080220's owner is TRUJILLO CHUCK+PATSY for the
+  row whose grantor read `PUBLIC` and grantee read TRUJILLO CHARLES JAMES.
+- **One agency, three word orders, one window.** `WASHINGTON STATE DEPT OF HEALTH` (handled),
+  `WASHINGTON STATE HEALTH DEPARTMENT` and `DEPARTMENT WASHINGTON STATE HEALTH` (both missed),
+  plus `WASHINGTON STATE-GOVT`. A phrase-anchored regex written from one live sample is not
+  enough; recorders permute the same name.
+- 🛑 **blue.kingcounty.com eRealProperty SILENTLY TRUNCATES an over-length `ParcelNbr` to the
+  first 10 digits and serves a DIFFERENT parcel with HTTP 200 and no error.** King's own recorder
+  printed `PID: 64116000027` (11 digits) on a REINKE death certificate; the lookup resolved
+  641160-0002 and the lead was given SNYDER JACOB's address. King's **ArcGIS layer is strict**
+  (clean hard-negative) — the disagreement between the two services is the tell.
+- 🛑 A wrong `property_address` is not a cosmetic defect: it **buys a skip trace**. Two
+  `pending_skip_trace_rows` were sitting in `status=queued` against the stranger's house, ready
+  to bill Tracerfy and attach that stranger's phone/email to the lead.
+- **Truncation cannot be judged from the legal description.** It never changes the 6-digit plat
+  prefix, so SUB / SEC / TWP / RGE match the WRONG parcel just as well as the right one. Only the
+  echoed parcel number discriminates.
+- The API's `actionable_condition()` (property OR mailing address) is why Test 7 now shows **120**
+  of 121 rows: the REINKE lead has neither, so it drops out of the customer-facing list instead of
+  being shown with someone else's address.
+
+**Tried / Decided:**
+
+- **Rejected** rejecting non-10-digit PIDs at extraction (Codex [P2]). `if parcel_id:` gates the
+  append, so that discards a verified-real death certificate over a county typo. The echo check
+  already removes the harm, and no address means no skip-trace enqueue.
+- **Rejected** deriving the correct parcel. `6411600027` (owner REINKE NORMAN L, 11547 CORLISS
+  AVE N) is almost certainly right, but choosing which digit to delete is a guess, and `parcel_id`
+  feeds the FROZEN `dedup_hash`. Left exactly as the county printed it; provenance stamped.
+- **Scoped the parcel repair** to probate. Two non-probate rows truncate to the *correct* parcel
+  (assessor owner corroborates the lead's party) — clearing them would destroy correct data on a
+  delivered lead. Reported, not cleared; `--record-types` widens it.
+
+**Caught & fixed (Codex, 3 review rounds — the gate said FAIL twice):**
+
+1. [P1] Echo verification only covered `batch_enrich_king_county`; `_fetch_king_owner` hits the
+   same lenient endpoint and is used by the owner repair + 2 backfills. **Confirmed by reading
+   the code.**
+2. [P1] Agency/placeholder values in the GRANTEE slot were left untouched when the grantor was
+   person-like — 205 prod rows carried `heirs='PUBLIC'`. **Confirmed.**
+3. [P1] Repair scope too narrow re: skip-trace residue. **Confirmed, and LARGER than Codex
+   stated** — it found the queued rows.
+4. [P1] `clean_counterparty` erased legitimate government counterparties
+   (`DEPARTMENT OF REVENUE` as an heir is a real estate claimant). Narrowed to non-party segments
+   only.
+5. [P1] The repair cancelled a queued trace even when its guarded clear updated **zero** rows.
+6. [P1] The agency strip left the agency's own locality as the party
+   (`SEATTLE-KING COUNTY PUBLIC HEALTH DEPARTMENT` → `SEATTLE-KING COUNTY`).
+7. [P2] The residue guard then over-fired: it ran when only a whole non-party SEGMENT was dropped,
+   rejecting retained entity parties (`ACME LLC / PUBLIC` → party became the grantee). 🔑 **My own
+   fix for #6 caused #7** — tightening one guard opened another.
+8. [P2] `_PARCEL_UPDATE` overwrote `enrichment_data` while guarding only the address.
+9. [P3] `_BARE_LOCALITY_RE` matched `UNION CITY` / `JANE CITY`; bare trailing CITY removed.
+
+**Failed / Blocked:**
+
+- The **2Captcha key is DEAD** — `ERROR_KEY_DOES_NOT_EXIST` on every attempt. The King search
+  still succeeded without a solved token, so the scrape is not currently blocked, but the captcha
+  path is unprotected if King re-enforces it. 👤 needs a key rotation.
+- Codex hit its usage limit on the 4th review pass and it had to wait for the quota reset.
+  It then ran clean: **round 4 returned ZERO findings, GATE: PASS**, confirming both round-3
+  fixes and answering explicitly that the repair script is safe against live customer data.
+
+**Pending / Handoff:**
+
+- PR open, not merged/deployed. The repair is already applied to prod data.
+- ⏭️ 3 non-probate rows (2 King parcels) still carry an address obtained through the truncating
+  lookup. Correct today, unverifiable in principle. `--record-types` clears them on request.
+- ⏭️ 119 Test 7 rows sit at `skip_trace_status=queued` with no phone/email.
+
 ## 2026-09-03 (night) — "Test 6": the leads were fine; the parser was deleting them
 
 **Built / Shipped:** PR **#200** on `chore/test6-dq` (`3241de2`, `0ec9139`, `f9e2974`, `25d5ea6`) —

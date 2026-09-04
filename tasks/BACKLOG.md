@@ -154,3 +154,54 @@ NOT cover. Detail: `tasks/todo.md` "Review" + the PR body.
 **Do NOT re-investigate these two — both were checked against production on 2026-07-30 and are NOT bugs:**
 - 12 active+healthy connectors have an EMPTY `scraper_class` (benton, chelan, clallam, cowlitz, douglas, grant, island, jefferson, kitsap, okanogan, thurston, whitman). That is **by design**: they are `scraper_mode='ai'` and resolve via `_detect_template(base_url)` → `EagleWebScraper`. All 24 active+healthy connectors were run through `get_scraper_class()` for every record type they advertise — **0 failed**.
 - "Exact-match joins on `state` will silently miss" (an earlier handoff's §9.5 concern) — **does not hold**; every comparison is wrapped in `func.lower`/`func.upper` on both sides.
+
+## 10. Test 6 / King auction-lead follow-ups (registered 2026-09-04, from PR #200)
+
+PR #200 (`88ba03f`, merged + deployed) fixed why King `trustee_sale` returned ONE lead: the
+Affinia auction-date layout was discarded whole, inline sale postponements were ignored, only
+4 of 14 weekly issues were ever fetched, and the date window was thrown away. These are the
+items that fix deliberately did NOT cover. Detail: `docs/BUILD_JOURNAL.md` (2026-09-03 night)
+and `docs/scoping-king-nts-coverage-2026-09-03.md`.
+
+- [ ] 👤🔴 **Run `scripts/backfill_nts_pdf_archive.py --source queen_anne_news`** (dry-run, then
+  `--apply`). This is what actually recovers the missing leads: measured 2026-09-03, the King
+  back issues carry **31 distinct notices where the cache held 14**, and **9 have a future
+  auction date against the 1 the product was showing**. The parser fix alone does not backfill —
+  it only makes future crawls correct. Ideally pause the two PDF beat tasks while applying (the
+  script walks oldest→newest; the daily crawl re-ingests the current issue anyway, so any
+  interleaving self-heals within 24h). Never executed in-session: the agent's auto-mode
+  classifier denies `railway run`.
+- [ ] 👤🔴 **Then run `scripts/repair_nts_ts_number.py --results --notices --source queen_anne_news`**
+  (dry-run first; `--apply --i-confirm-fixed-parser-is-deployed` to write — the parser IS now
+  deployed). ORDER MATTERS: backfill first (creates correctly-keyed rows), repair second (retires
+  the mis-bound rows earlier crawls wrote). Known King damage, all from the pre-`ec5a3d6` split
+  bug: `WA07000020-26-1` holds GUILER's data when the notice is actually MEKMORAKOTH's
+  (parcel 259900081003); `REF-20231006000715` is that MEKMORAKOTH notice under a surrogate key,
+  and the delivered Test 6 lead hangs off it; `WA07000014-24-4` is a superseded GUILER twin;
+  `WA05000073-24-2` (GUILER, really selling 09/18/2026, $155,361.99) was missing entirely. The
+  repair script was `snohomish_tribune`-only until #200 added `--source`.
+- [ ] 🟠 **(FRONTEND REPO)** The scrape-window control must say it filters by **auction date** for
+  `trustee_sale`. #200 changed the semantics — a 90-day window now means "auctions in the next 90
+  days" instead of being discarded — so the number finally means something, but nothing in the UI
+  says which direction it runs. Lives in `bridgeleads-web`, not this repo.
+- [ ] 🧭🟠 **Audit the OTHER approved King legal newspapers** — this, not the DJC, is the cheap path
+  to more King coverage. 🛑 Do **not** buy the DJC: the blocker is not price (the "$350/yr" note in
+  `nts_crawler.py` was stale — it is $199) but that **`djc.com/robots.txt` disallows `/notices/`
+  for all crawlers**, and the free WNPA aggregator carrying the same notices
+  (wapublicnotices.com) bans scraping in its Terms of Use with liquidated damages. Get the
+  authoritative approved-newspaper list from the King County Clerk (King County's page links a
+  PDF rather than listing it inline — NOT verified), then check each candidate's robots.txt and
+  legals section. Same weekly-PDF/HTML shape we already handle, so a new source is a config +
+  parser variant, not new architecture.
+- [ ] 🔵 **Verify the daily King crawl actually lands.** #200 moved both PDF crawls from
+  Thursday-only to daily (10:45 / 10:50 UTC). Confirm `nts_notices.fetched_at` for
+  `queen_anne_news` advances on consecutive days and that `dropped_undated` stays 0 in the crawl
+  summary — that counter is the new early-warning for the next parser gap.
+
+**Do NOT re-investigate this — checked 2026-09-03 and it is NOT a shortcut:**
+- "Use the King County Recorder feed for auction leads instead of the newspaper." The recorder
+  connector (`src/scrapers/templates/landmarkweb.py`) scrapes the search-RESULTS GRID only —
+  record date, doc type, grantor/grantee, parcel — and never opens the document image or body, so
+  it structurally cannot supply sale date, time, location or principal owing. That is exactly why
+  the architecture is recorder → `pre_foreclosure` lead, newspaper → `nts_notices`, matcher →
+  join. A postponed sale is also re-PUBLISHED, not re-recorded.

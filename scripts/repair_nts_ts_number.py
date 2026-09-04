@@ -26,6 +26,26 @@ TWO PHASES, because they have different safety conditions:
               That is strictly worse than the current state, so this phase refuses to
               run without --i-confirm-fixed-parser-is-deployed.
 
+  --retire-wrong-key
+              The alternative to --notices when the corrections do NOT form an orderable
+              rename chain. On King they do not: an already-inactive twin still occupies
+              a number a live row needs, and --notices refuses (correctly) to invent a
+              rename-parking scheme. This retires the wrongly-keyed rows instead and
+              lets the crawler's archive sweep insert the correctly-keyed ones. Same
+              deploy gate as --notices. Mutually exclusive with it.
+
+  --fields    Corrects nts_notices auction_date / principal_owing, which the two phases
+              above never touched. The same split bug also captured a NEIGHBOURING
+              notice's auction date onto a row, and a wrong date is worse than a wrong
+              key: it is the product's urgency clock, and a live sale mis-stored as a
+              past one is flipped is_active=false by the crawler's expiry pass and
+              vanishes from matching. Measured on King 2026-09-04: 12 of 14 cached rows
+              had a wrong ts_number and 2 also had a wrong auction_date, one of them
+              hiding a live 2026-09-18 sale. Corrects each row against a re-parse of ITS
+              OWN source PDF (not a cross-issue map — a postponed sale legitimately
+              prints two dates), and re-activates a row whose corrected auction is still
+              ahead, since nothing else ever sets is_active back to true.
+
 Usage:
     railway run --service worker python scripts/repair_nts_ts_number.py --results
     # a different paper (King):  --source queen_anne_news
@@ -43,6 +63,7 @@ import hashlib
 import json
 import os
 import sys
+from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -64,6 +85,10 @@ _logger = setup_logger("scripts.repair_nts_ts_number")
 # a garbage truth map is exactly what this script must never write from.
 SOURCE = "snohomish_tribune"
 PARSE_FN = None  # resolved in main() from _SOURCE_PARSERS
+
+# notice_to_row stamps the county onto every row it builds, and the matcher scopes by
+# county — so the re-parse must use the SAME county its crawler task passes.
+_SOURCE_COUNTY = {"snohomish_tribune": "snohomish", "queen_anne_news": "king"}
 
 
 def _source_parsers() -> dict:
@@ -124,6 +149,176 @@ def truth_from_pdfs(urls: list[str]) -> dict[str, str]:
     return truth
 
 
+def truth_by_issue(urls: list[str]) -> dict[str, dict[str, dict]]:
+    """source_url -> parcel -> the auction fields that issue actually prints.
+
+    Deliberately NOT keyed on parcel alone, unlike `truth_from_pdfs`. A TS number is a
+    stable property of the sale, so one map across every issue is right for it — but an
+    auction DATE is not: a postponed sale legitimately prints two different dates in two
+    issues, and folding those together would either abort or pick one at random. Each
+    stored row is therefore corrected against a re-parse of ITS OWN source PDF, which is
+    the only text that row was ever supposed to represent.
+    """
+    from datetime import date as _date
+
+    today = _date.today()
+    county = _SOURCE_COUNTY[SOURCE]
+    out: dict[str, dict[str, dict]] = {}
+    for url in urls:
+        try:
+            data = _fetch(url)
+        except Exception as exc:
+            raise SystemExit(
+                f"ABORT: could not fetch {url} ({str(exc)[:120]}). Refusing to repair "
+                "from an incomplete source set — re-run when every issue is reachable."
+            ) from exc
+        blocks = nts_pdf.split_notice_blocks(
+            nts_pdf.normalize_pdf_text(nts_pdf.extract_pdf_text(data)))
+        per: dict[str, dict] = {}
+        for block in blocks:
+            # Go through notice_to_row, not the raw parser: it is what the crawler
+            # writes through, so the dates/decimals compared here are normalized the
+            # same way as the stored values (the raw parser returns strings). It
+            # returns None for a notice it could not date — nothing to correct from.
+            row = nts.notice_to_row(PARSE_FN(block), source_url=url, today=today,
+                                    source=SOURCE, county=county)
+            if row is None or not row.get("parcel"):
+                continue
+            parcel = row["parcel"]
+            if parcel in per:
+                # One issue printing a parcel twice with conflicting fields means the
+                # re-parse is not authoritative for it; refuse rather than choose.
+                raise SystemExit(
+                    f"ABORT: parcel {parcel} appears twice in {url.rsplit('/', 1)[-1]}")
+            per[parcel] = {
+                "ts_number": row.get("ts_number"),
+                "auction_date": row.get("auction_date"),
+                "principal_owing": row.get("principal_owing"),
+            }
+        out[url] = per
+        print(f"  re-read {len(per)} notices from {url.rsplit('/', 1)[-1]}")
+    return out
+
+
+def repair_notice_fields(db, by_issue: dict[str, dict[str, dict]], apply: bool) -> int:
+    """Correct auction_date / principal_owing on nts_notices from each row's own PDF.
+
+    The TS repair (--notices) only ever rewrote the natural key, so rows whose auction
+    DATE was captured from a neighbouring notice by the same split bug kept the wrong
+    date indefinitely — and a wrong date is the more damaging of the two: it is the
+    product's urgency clock, and a live sale mis-stored as a past one is flipped
+    is_active=false by the crawler's expiry pass and disappears from matching entirely.
+
+    Reactivates a row whose corrected auction is still in the future, because nothing
+    else ever sets is_active back to true.
+    """
+    from datetime import date as _date
+
+    today = _date.today()
+    rows = [dict(r._mapping) for r in db.execute(sa_text("""
+        SELECT id::text AS id, ts_number, parcel, source_url, auction_date,
+               principal_owing, is_active
+          FROM nts_notices
+         WHERE source = :src AND source_url IS NOT NULL AND source_url <> ''
+         ORDER BY source_url, parcel
+    """), {"src": SOURCE}).all()]
+
+    changed = 0
+    for row in rows:
+        per = by_issue.get(row["source_url"]) or {}
+        tr = per.get(row["parcel"])
+        if tr is None:
+            # Never guess. A parcel absent from its own issue means the row's provenance
+            # is not reproducible; leave it alone and say so.
+            print(f"  SKIP  parcel={row['parcel']!r} not found in "
+                  f"{row['source_url'].rsplit('/', 1)[-1]} — left untouched")
+            continue
+        sets, notes = {}, []
+        if tr["auction_date"] is not None and tr["auction_date"] != row["auction_date"]:
+            sets["auction_date"] = tr["auction_date"]
+            notes.append(f"auction_date {row['auction_date']} -> {tr['auction_date']}")
+        if tr["principal_owing"] is not None and (
+            row["principal_owing"] is None
+            or Decimal(str(tr["principal_owing"])) != Decimal(str(row["principal_owing"]))
+        ):
+            sets["principal_owing"] = tr["principal_owing"]
+            notes.append(f"principal_owing {row['principal_owing']} -> {tr['principal_owing']}")
+        if not sets:
+            continue
+        new_auction = sets.get("auction_date", row["auction_date"])
+        # Reactivation is the one destructive thing this phase can do, so it is gated on
+        # the row ALREADY carrying the correct TS number — i.e. --notices has run and
+        # this row is the survivor, not a twin it deliberately retired. Un-retiring a
+        # twin would surface one sale twice, which is the bug --notices exists to kill.
+        # Run order is therefore --notices, then --fields; run alone, --fields corrects
+        # the stored values and reactivates nothing (fail closed).
+        if (
+            new_auction and new_auction >= today and not row["is_active"]
+            and tr["ts_number"] and row["ts_number"] == tr["ts_number"]
+        ):
+            sets["is_active"] = True
+            notes.append("is_active false -> true (auction is still ahead)")
+        changed += 1
+        print(f"  parcel={row['parcel']!r} ts={row['ts_number']!r}: {'; '.join(notes)}")
+        if apply:
+            assign = ", ".join(f"{k} = :{k}" for k in sets)
+            res = db.execute(
+                sa_text(f"UPDATE nts_notices SET {assign} WHERE id = CAST(:id AS uuid)"),  # noqa: S608
+                {**sets, "id": row["id"]},
+            )
+            _require_one(res, "nts_notices", row["id"])
+    return changed
+
+
+def retire_wrong_key(db, by_issue: dict[str, dict[str, dict]], apply: bool) -> int:
+    """Retire rows whose stored ts_number is not the one their own issue prints.
+
+    An alternative to --notices for a source whose back issues are all re-fetchable.
+    --notices RENAMES rows onto the right natural key, which needs the corrections to
+    form an orderable chain; on King they do not — an already-inactive twin still
+    occupies a number a live row needs, and freeing it would need a rename-parking
+    scheme the script deliberately refuses to invent. Retiring instead is strictly
+    simpler and loses nothing here: the crawler's archive sweep re-reads those issues
+    and INSERTS the correctly-keyed rows itself.
+
+    Retire, never delete: results.nts_notice_id points at these rows (and the app role
+    has no DELETE). A retired row keeps serving as the audit target of the lead it
+    matched; is_active=false only removes it from future matching, so the correct row
+    the sweep inserts cannot end up competing with a stale twin for the same sale.
+    """
+    rows = [dict(r._mapping) for r in db.execute(sa_text("""
+        SELECT n.id::text AS id, n.ts_number, n.parcel, n.source_url, n.is_active,
+               n.auction_date, count(r.id) AS results
+          FROM nts_notices n
+          LEFT JOIN results r ON r.nts_notice_id = n.id
+         WHERE n.source = :src AND n.source_url IS NOT NULL AND n.source_url <> ''
+         GROUP BY n.id, n.ts_number, n.parcel, n.source_url, n.is_active, n.auction_date
+         ORDER BY n.source_url, n.parcel
+    """), {"src": SOURCE}).all()]
+
+    n = 0
+    for row in rows:
+        tr = (by_issue.get(row["source_url"]) or {}).get(row["parcel"])
+        if tr is None or not tr["ts_number"]:
+            continue
+        if row["ts_number"] == tr["ts_number"]:
+            continue
+        if not row["is_active"]:
+            # Already out of the matching set; nothing to do. Reported so a repaired
+            # database dry-runs as "0 rows would change".
+            continue
+        n += 1
+        print(f"  RETIRE parcel={row['parcel']!r} ts={row['ts_number']!r} "
+              f"(issue prints {tr['ts_number']!r}) results={row['results']}")
+        if apply:
+            res = db.execute(
+                sa_text("UPDATE nts_notices SET is_active = false WHERE id = CAST(:id AS uuid)"),
+                {"id": row["id"]},
+            )
+            _require_one(res, "nts_notices", row["id"])
+    return n
+
+
 def _require_one(result, table: str, row_id: str) -> None:
     """Every UPDATE here targets one row by primary key, so anything else means the row
     moved under us (the crawler also writes nts_notices). Abort so the whole transaction
@@ -140,22 +335,57 @@ def _ts_hash(ts_number: str) -> str:
     return hashlib.sha256(f"nts|{SOURCE}|{ts_number}".encode()).hexdigest()[:32]
 
 
+def _normalized_truth(truth: dict[str, str]) -> dict[str, str]:
+    """truth re-keyed the way the MATCHER compares parcels (alphanumerics, uppercased).
+
+    A lead's parcel_id is the recorder's verbatim spelling and the notice's is the
+    newspaper's; King prints "111263-0120" for a lead stored as "1112630120", so an
+    exact-string join silently skips exactly the rows the matcher had no trouble
+    pairing. Reuses the matcher's own _norm_parcel so the repair joins on the same key
+    the match was made on. Aborts on a genuine collision rather than pick a side.
+    """
+    from src.scrapers.sources.nts_matcher import _norm_parcel
+
+    out: dict[str, str] = {}
+    for parcel, ts in truth.items():
+        k = _norm_parcel(parcel)
+        if not k:
+            continue
+        if k in out and out[k] != ts:
+            raise SystemExit(
+                f"ABORT: parcels normalizing to {k!r} carry two TS numbers "
+                f"({out[k]!r}, {ts!r}) — resolve by hand; nothing written."
+            )
+        out[k] = ts
+    return out
+
+
 def repair_results(db, truth: dict[str, str], apply: bool) -> int:
     """Fix the stored TS number on already-delivered lead rows."""
+    norm_truth = _normalized_truth(truth)
+    # JOIN through to the notice so only rows matched from THIS paper are touched.
+    # Parcel numbers are not globally unique across counties and normalizing widens the
+    # collision surface, so parcel alone must never decide which row gets rewritten
+    # (Codex P1). The pre-existing exact-string join had the same hole; it was simply
+    # harder to hit.
     rows = db.execute(sa_text("""
         SELECT r.id::text AS id, r.job_id::text AS job_id, r.party_name, r.parcel_id,
                r.raw_html_hash, r.source_fingerprint, r.enrichment_data
           FROM results r
-         WHERE r.nts_notice_id IS NOT NULL
+          JOIN nts_notices n ON n.id = r.nts_notice_id
+         WHERE n.source = :src
            AND r.enrichment_data -> 'nts' ->> 'ts_number' IS NOT NULL
-           AND r.parcel_id = ANY(:parcels)
-    """), {"parcels": list(truth)}).all()
+           AND upper(regexp_replace(coalesce(r.parcel_id, ''), '[^A-Za-z0-9]', '', 'g'))
+               = ANY(:parcels)
+    """), {"parcels": list(norm_truth), "src": SOURCE}).all()
+
+    from src.scrapers.sources.nts_matcher import _norm_parcel
 
     # Plan every change first, then order them — see the loop below.
     plan = []
     for row in rows:
         m = dict(row._mapping)
-        correct = truth[m["parcel_id"]]
+        correct = norm_truth[_norm_parcel(m["parcel_id"])]
         enr = m["enrichment_data"] or {}
         stored = (enr.get("nts") or {}).get("ts_number")
         # The TOP-LEVEL ts_number is a SECOND, independent copy: the pre_foreclosure
@@ -404,6 +634,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--results", action="store_true", help="repair delivered lead rows (safe now)")
     ap.add_argument("--notices", action="store_true", help="rename nts_notices (needs the fix deployed)")
+    ap.add_argument("--retire-wrong-key", action="store_true", dest="retire_wrong_key",
+                    help="retire nts_notices whose ts_number is not the one their own "
+                         "issue prints (alternative to --notices; needs the fix deployed)")
+    ap.add_argument("--fields", action="store_true",
+                    help="correct nts_notices auction_date/principal_owing from each row's own PDF")
     ap.add_argument("--apply", action="store_true", help="write; otherwise dry-run")
     ap.add_argument("--i-confirm-fixed-parser-is-deployed", action="store_true", dest="deployed")
     ap.add_argument(
@@ -414,13 +649,21 @@ def main() -> None:
     global SOURCE, PARSE_FN
     SOURCE = args.source
     PARSE_FN = _source_parsers()[SOURCE]
-    if not (args.results or args.notices):
-        ap.error("pick --results and/or --notices")
+    if not (args.results or args.notices or args.fields or args.retire_wrong_key):
+        ap.error("pick --results, --notices, --retire-wrong-key and/or --fields")
+    if args.notices and args.retire_wrong_key:
+        ap.error("--notices and --retire-wrong-key are two ways to resolve the SAME wrong "
+                 "keys; pick one")
     # The gate is on WRITING, not on planning — a dry run must always be allowed so the
     # rename plan can be reviewed before the deploy that makes it safe.
-    if args.notices and args.apply and not args.deployed:
+    # --fields is gated for the same reason (Codex P2): it rewrites product-facing
+    # auction_date / principal_owing from a LOCAL re-parse. If the deployed crawler runs
+    # a different parser, the next beat overwrites what this just wrote — or worse, a
+    # locally-stale parser writes values the deployed one would never produce.
+    if (args.notices or args.retire_wrong_key or args.fields) and args.apply             and not args.deployed:
         ap.error(
-            "--notices --apply needs --i-confirm-fixed-parser-is-deployed: with the OLD "
+            "--apply on --notices/--retire-wrong-key/--fields needs "
+            "--i-confirm-fixed-parser-is-deployed: with the OLD "
             "parser live, the next beat crawl re-upserts the wrong number onto the row you "
             "just renamed, overwriting one notice's data with another's"
         )
@@ -431,8 +674,12 @@ def main() -> None:
             "WHERE source = :src AND source_url IS NOT NULL AND source_url <> ''"
         ), {"src": SOURCE}).all()]
         print(f"Re-parsing {len(urls)} {SOURCE} source PDFs with the FIXED parser…")
-        truth = truth_from_pdfs(urls)
-        print(f"  authoritative parcel -> ts_number for {len(truth)} notices\n")
+        truth: dict[str, str] = {}
+        if args.results or args.notices:
+            truth = truth_from_pdfs(urls)
+            print(f"  authoritative parcel -> ts_number for {len(truth)} notices\n")
+        by_issue = (truth_by_issue(urls)
+                    if (args.fields or args.retire_wrong_key) else {})
 
         total = 0
         if args.results:
@@ -441,6 +688,12 @@ def main() -> None:
         if args.notices:
             print("nts_notices:")
             total += repair_notices(db, truth, args.apply)
+        if args.retire_wrong_key:
+            print("nts_notices wrong-key retirement:")
+            total += retire_wrong_key(db, by_issue, args.apply)
+        if args.fields:
+            print("nts_notices auction fields:")
+            total += repair_notice_fields(db, by_issue, args.apply)
 
         if args.apply:
             db.commit()

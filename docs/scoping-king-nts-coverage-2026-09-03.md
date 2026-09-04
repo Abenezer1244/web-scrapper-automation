@@ -95,3 +95,82 @@ source we are not permitted to crawl.
 - WA Public Notices (WNPA) — https://www.wapublicnotices.com/
 - WA Public Notices Terms of Use — https://www.wapublicnotices.com/Terms-of-Use.aspx
 - King County Recorder LandmarkWeb — https://recordsearch.kingcounty.gov/LandmarkWeb
+
+---
+
+# Addendum 2026-09-04: the recorded-document route, and the rest of the newspaper list
+
+**Prompted by:** the "Test 8" audit (King, `pre_foreclosure`, 155 leads, job `5178ce6c`).
+**Status:** scoping only, nothing built. **Verdict: the recorded-document route is NOT feasible.**
+
+## What the audit measured
+
+Re-parsing **every** Queen Anne & Magnolia News issue from 2026-05-06 to 2026-09-02
+(18/18 fetched, HTTP 200) yields **36 distinct King notices**. Test 8 recorded **155**
+King Notices of Trustee Sale over an overlapping window. Exact-parcel overlap: **1**.
+
+So the ceiling on King auction-data coverage from the currently wired source is
+**~1%**, and 154 of Test 8's 155 leads correctly carry a NULL Auction Date and
+Default Owed. That is a coverage limit, not a bug, and must never be papered over by
+inferring a date from `date_recorded` or any other field.
+
+## Why not read the recorded document itself?
+
+Every recorded NTS *does* contain both values — RCW 61.24.040(1)(f) requires the notice
+to state the sale date/time/place and the amount in arrears — and we already store each
+document's instrument number. The blocker is not technical and not price:
+
+> "You agree not to use high-volume, automated, electronic processes to access or query
+> the database contained on the website of the King County Recorder's Office."
+>
+> "You agree not to engage in Data Mining (mass downloading) of images and index
+> information... Any users detected mining information via this website will be denied
+> access immediately."
+>
+> — King County LandmarkWeb terms, surfaced on `recordsearch.kingcounty.gov/LandmarkWeb/search/index`
+
+That describes the proposed activity almost literally. Copies are not the obstacle
+(unofficial watermarked images are free; only *certified* copies cost $3 + $1/page) —
+permission is. `recordsearch.kingcounty.gov/robots.txt` is a 404, so there is no
+technical exclusion to rely on either way; the in-page terms govern.
+
+Compounding factors, each independently sufficient to defer:
+
+- King County has **already IP-rate-blocked this project** once, on eRealProperty — a
+  system with *less* explicit restrictions than this one.
+- The 2Captcha key the King scraper depends on is currently dead, so the index scrape
+  itself is fragile before adding a per-document fetch on top.
+- **Unverified:** whether LandmarkWeb serves text-layer PDFs or image-only scans. If
+  scanned, extracting free-form "amount in arrears" language needs a whole OCR layer —
+  and this project's parsing history on the *already text-bearing* legals PDFs
+  (header-splitting, missed "SALE POSTPONED TO", a >120s regex backtrack) is not an
+  argument for optimism.
+
+No King County **recorder** bulk-data or API product was found. RANS (Recording Activity
+Notification System) is a free name-watch email alert, not a data feed.
+
+## The other approved legal newspapers
+
+King County Superior Court's current list (22 papers, per the Serve-By-Publication
+packet, "as of 02/23/2026") was obtained. Status of the ones checked:
+
+| Outlet | Status |
+|---|---|
+| Seattle DJC | **Blocked** — `robots.txt` disallows `/notices/` (verified 2026-09-03) |
+| wapublicnotices.com (WNPA aggregator) | **Blocked** — ToU bans scraping, liquidated damages to $10k/incident |
+| **Seattle Times** classifieds | **Blocked by ToS**, despite a permissive robots.txt: "you agree not to use any robot, spider, scraper or other automated means to access the Sites." Notice pages also expire quickly. |
+| Queen Anne & Magnolia News | Wired today; ~1% coverage |
+| Puget Sound Business Journal | **Unverified** — robots.txt/ToS not reachable this pass; publishes legals as scanned classifieds PDFs (same OCR burden) |
+| Sound Publishing "Reporter" chain (Auburn, Bellevue, Bothell/Kenmore, Covington/Maple Valley, Kent, Redmond, Renton) + 7 smaller papers | **Unverified** — not individually checked |
+
+`wa.mypublicnotices.com` did not resolve from the research environment — unverified,
+not "gone".
+
+## Recommendation
+
+The cheap next step is a **verification-only** pass over the unverified outlets above —
+each one's own robots.txt *and* its Terms of Service, since Seattle Times proves the two
+can disagree and the ToS wins. Do not build anything against an outlet until both are
+clean, and measure its actual coverage against the LandmarkWeb NTS index before
+investing in a parser. Until then, King `pre_foreclosure` Auction Date / Default Owed
+stays sparse by design, and the product should say so rather than imply missing data.

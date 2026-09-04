@@ -325,10 +325,23 @@ _POSTPONED = re.compile(
 # when _AUCTION missed (am is None), so numeric-format parsing is byte-identical.
 # group(1)=day, (2)=month, (3)=year, (4)=HH:MM, (5)=A|P. Normalized to "Month D, YYYY"
 # so it reuses the existing _to_date month-name path.
+# Three real phrasings share this shape, so three parts are OPTIONAL — each was
+# measured on live text before being relaxed, never widened speculatively:
+#   "will on the 17th day of July, 2026, at the hour of 10:00 o'clock AM"  (Clear Recon)
+#   "will on the 3rd day of April, 2026, at 10 o'clock A.M."               (no minutes)
+#   "will on 25th of September, 2026, at 10:00 AM"                          (Tatman, commercial)
+# The last one drops "the", drops "day", and states a plain clock time with no
+# "o'clock" — it is the AMENDED COMMERCIAL notice shape, and missing all three at once
+# is why a live $1.98M Snohomish commercial trustee sale parsed to auction_date=None
+# and was dropped by is_valid_nts (verified against "Legals - 8-27-26.pdf", 2026-09-04).
+# The ORDINAL SUFFIX stays REQUIRED: every observed variant prints one, and making it
+# optional would let a bare "will on 25 of ..." style number through with nothing else
+# anchoring it to a real date.
 _AUCTION_WORDED = re.compile(
-    rf"will\s+on\s+the\s+(\d{{1,2}})(?:st|nd|rd|th)\s+day\s+of\s+({_MONTHS})\.?,?\s+(\d{{4}})"
-    # "10 o'clock A.M." (no minutes) is a real layout (live 2026-09-02) -> minutes optional.
-    r"\s*,?\s*at\s+(?:the\s+hour\s+of\s+)?(\d{1,2}(?::\d{2})?)\s*o'?clock\s*([AP])\.?\s*M\.?"
+    rf"will\s+on\s+(?:the\s+)?(\d{{1,2}})(?:st|nd|rd|th)\s+(?:day\s+)?of\s+({_MONTHS})\.?,?\s+(\d{{4}})"
+    # "10 o'clock A.M." (no minutes) is a real layout (live 2026-09-02) -> minutes optional;
+    # "at 10:00 AM" (no "o'clock" at all) is another (live 2026-09-04).
+    r"\s*,?\s*at\s+(?:the\s+hour\s+of\s+)?(\d{1,2}(?::\d{2})?)\s*(?:o'?clock\s*)?([AP])\.?\s*M\.?"
     r"[\s\S]{0,600}?sell\s+at\s+public\s+auction",
     re.I,
 )

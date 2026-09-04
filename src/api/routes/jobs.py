@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.auth import CurrentUser
 from src.api.deps import get_db, get_rls_db
 from src.api.dialer_filters import dialer_ready_conditions
-from src.api.lead_actionability import actionable_condition
+from src.api.lead_actionability import actionable_condition, has_address_condition
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.owner_filters import build_owner_conditions
 from src.api.schemas import JobCreate, JobResponse, LogLine, ResultRow, ResultsPage
@@ -352,12 +352,21 @@ async def get_results(
 
     safe_q = sanitize_search(q)
 
-    # Show ALL results (new + duplicates). New leads appear first,
-    # duplicates appear after — grayed out in the frontend so users
-    # can see what was scraped while focusing on fresh leads.
+    # Standing rule (owner, 2026-09-04): a duplicate is NEVER shown. It was already
+    # delivered — and paid for — on an earlier run, so listing it again produced a
+    # page of rows for a job the list, the email, the webhook and the bill all
+    # reported as zero. The rows stay in `results` as dedup bookkeeping and are still
+    # counted in `duplicate_count`/`total_scraped`, which is what the "all N were
+    # duplicates" banner is built from — so the run is explained without shipping the
+    # rows. Previously they were listed after the new leads and greyed.
+    #
+    # Per-job delivery ONLY. Lists/segments (src/api/routes/segments.py) and the batch
+    # combined export deliberately KEEP duplicates: there, a lead whose only
+    # contactable row happens to be a duplicate must not disappear.
     base_query = select(Result).where(
         Result.job_id == job_id,
         Result.user_id == current_user.id,
+        Result.is_duplicate.is_(False),
     )
     if safe_q:
         pattern = f"%{safe_q}%"
@@ -410,7 +419,8 @@ async def get_results(
     total = count_result.scalar_one()
 
     rows_result = await db.execute(
-        base_query.order_by(Result.is_duplicate.asc(), Result.created_at.asc())
+        # is_duplicate is no longer a sort key — the query excludes them entirely.
+        base_query.order_by(Result.created_at.asc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
@@ -510,7 +520,17 @@ async def get_results(
     # active: total==0 then means "no rows matched the filter", NOT "the job
     # scraped nothing", and the prior job wasn't checked against the same filter
     # so suggesting it would be misleading (Codex).
-    if total == 0 and config and not tax_conditions and not dialer_ready:
+    if (
+        total == 0
+        and config
+        and not tax_conditions
+        and not dialer_ready
+        # owner-location filters were missed here (Codex): with one active, total==0
+        # means "nothing matched the filter", so pointing at a previous job — which
+        # was never checked against that filter — is just as misleading as it is for
+        # the tax/dialer filters this already guards.
+        and not build_owner_conditions(absentee, out_of_state)
+    ):
         # Find all config IDs for same county/state/record_type
         sibling_configs = await db.execute(
             select(ScraperConfig.id).where(
@@ -991,13 +1011,14 @@ async def download_export(
         for cond in tax_conditions:
             dl_query = dl_query.where(cond)
         # Hard product cap: never EXPORT tax rows whose oldest unpaid year is >18
-        # months old, regardless of user filters. Matches get_results. Kept OUT
-        # of `any_filter_active` below: the cap is a standing rule, not a user
-        # view-filter, so it must not flip a genuinely empty/unmatched job from a
-        # 404 into a header-only CSV — that decision stays driven by USER filters.
+        # months old, regardless of user filters. Matches get_results.
         dl_query = dl_query.where(tax_cap_condition(today))
-        # Standing rule (matches get_results): unactionable rows are never exported.
+        # Standing rules (match get_results + the worker exports): unactionable rows
+        # and duplicates are never exported. None of these three is a user "filter" —
+        # they are product rules, which is why the empty-result branch below probes
+        # for rows using only the quarantine rules and asks nothing about them.
         dl_query = dl_query.where(actionable_condition())
+        dl_query = dl_query.where(Result.is_duplicate.is_(False))
         # Phase 5: dialer-ready filter (not known-DNC; matches get_results +
         # the push — strict IS-FALSE would hide skip-traced phones whose DNC is
         # NULL; the dialer scrubs DNC).
@@ -1008,8 +1029,6 @@ async def download_export(
         owner_conditions = build_owner_conditions(absentee, out_of_state)
         for cond in owner_conditions:
             dl_query = dl_query.where(cond)
-        # Any active filter -> an empty result is "no matches", not an empty job.
-        any_filter_active = bool(tax_conditions) or dialer_ready or bool(owner_conditions)
 
         # Deterministic order (groups an estate's records together) — the SAME
         # order the scheduled/R2 export uses, so the two exports are byte-identical,
@@ -1022,26 +1041,36 @@ async def download_export(
         records = results_query.scalars().all()
 
         if not records:
-            # A genuinely empty job still 404s (existing contract). With a filter
-            # active the filtered query can't tell "no matches" from "empty job",
-            # so check unfiltered existence: rows exist but none matched -> a
-            # valid header-only CSV; no rows at all -> 404 (Codex).
-            job_has_any = False
-            if any_filter_active:
-                exists_row = await db.execute(
-                    select(Result.id)
-                    .where(
-                        Result.job_id == job_id,
-                        Result.user_id == user.id,
-                        # "Has rows" means has EXPORTABLE rows under the standing
-                        # rules; a job whose only rows are quarantined is empty
-                        # for every filter combination (Codex).
-                        tax_cap_condition(today),
-                        actionable_condition(),
-                    )
-                    .limit(1)
+            # A genuinely empty job still 404s (existing contract). Everything else
+            # gets a valid header-only CSV.
+            #
+            # Two ways to arrive here with rows in the DB:
+            #  1. a USER filter matched nothing — "no matches", not an empty job;
+            #  2. every deliverable row is a DUPLICATE. That is the whole shape of an
+            #     all-duplicate run, and the completion email for such a job still
+            #     links here — so 404ing it would hand the user a dead download for a
+            #     job the product legitimately reports as "0 records" (Codex).
+            # The probe therefore runs unconditionally and asks "did this job persist
+            # any actionable, in-cap row at all", INDEPENDENT of the duplicate rule.
+            exists_row = await db.execute(
+                select(Result.id)
+                .where(
+                    Result.job_id == job_id,
+                    Result.user_id == user.id,
+                    # "Has rows" means the job persisted a row with a usable
+                    # ADDRESS. Deliberately the address half only: every other rule
+                    # here (duplicate, over-plan-quota, tax cap) says a row is not
+                    # DELIVERABLE, which is precisely the header-only case — the job
+                    # produced rows, none of them ship, and its completion email
+                    # still links here. Using the full actionable_condition() would
+                    # 404 an all-over-quota job the same way it used to 404 an
+                    # all-duplicate one (Codex). Only a job with no addressable row
+                    # at all is genuinely empty.
+                    has_address_condition(),
                 )
-                job_has_any = exists_row.scalar_one_or_none() is not None
+                .limit(1)
+            )
+            job_has_any = exists_row.scalar_one_or_none() is not None
             if not job_has_any:
                 raise HTTPException(status_code=404, detail="No records found for this job")
 

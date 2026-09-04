@@ -19,6 +19,182 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-03 (Test 7) — "PUBLIC" was the recorder's word for *nobody*, and a truncating search box gave a lead someone else's house
+
+**Built / Shipped:** `fix/test7-data-quality` (7 commits). Test 7 = King WA **probate**, job
+`f19f9cc5`, 121 leads over 06/04–09/02/2026.
+
+1. `src/scrapers/probate.py` (SHARED by 8 county scrapers) — a recorder-**placeholder** rule for
+   `PUBLIC` / `THE PUBLIC` / `PUBLIC THE`, two missing filing-agency word orders, a `GOVT` suffix
+   on the bare-state rule, and `clean_counterparty()` for the heirs slot.
+2. `src/scrapers/enrichment/king_county_assessor.py` — `parcel_page_is_for()`: read back the
+   parcel the assessor page says it resolved and discard the page on mismatch. Gated at BOTH
+   call sites.
+3. King/Clark/AcclaimWeb/Laserfiche/Skagit — never ship a probate lead whose orientation left no
+   party (they appended on `date_recorded` alone).
+4. `scripts/repair_probate_party_and_bad_parcel.py` — applied to prod: **235 rows** re-oriented
+   (25 party corrections), **5** wrong-parcel rows cleared, **2 queued skip-traces cancelled**.
+
+**Facts learned:**
+
+- **`PUBLIC` is the King recorder's placeholder counterparty on a death certificate** — the
+  instrument is recorded "to the public". It appears in the GRANTEE slot on **101 of 204** raw
+  rows in a single 90-day window. In 8 rows the recorder indexed the parties **reversed**, so the
+  placeholder sat in the GRANTOR slot and the DECEDENT in the grantee slot. It is never a legal
+  party. Corroborated at the assessor: parcel 3276080220's owner is TRUJILLO CHUCK+PATSY for the
+  row whose grantor read `PUBLIC` and grantee read TRUJILLO CHARLES JAMES.
+- **One agency, three word orders, one window.** `WASHINGTON STATE DEPT OF HEALTH` (handled),
+  `WASHINGTON STATE HEALTH DEPARTMENT` and `DEPARTMENT WASHINGTON STATE HEALTH` (both missed),
+  plus `WASHINGTON STATE-GOVT`. A phrase-anchored regex written from one live sample is not
+  enough; recorders permute the same name.
+- 🛑 **blue.kingcounty.com eRealProperty SILENTLY TRUNCATES an over-length `ParcelNbr` to the
+  first 10 digits and serves a DIFFERENT parcel with HTTP 200 and no error.** King's own recorder
+  printed `PID: 64116000027` (11 digits) on a REINKE death certificate; the lookup resolved
+  641160-0002 and the lead was given SNYDER JACOB's address. King's **ArcGIS layer is strict**
+  (clean hard-negative) — the disagreement between the two services is the tell.
+- 🛑 A wrong `property_address` is not a cosmetic defect: it **buys a skip trace**. Two
+  `pending_skip_trace_rows` were sitting in `status=queued` against the stranger's house, ready
+  to bill Tracerfy and attach that stranger's phone/email to the lead.
+- **Truncation cannot be judged from the legal description.** It never changes the 6-digit plat
+  prefix, so SUB / SEC / TWP / RGE match the WRONG parcel just as well as the right one. Only the
+  echoed parcel number discriminates.
+- The API's `actionable_condition()` (property OR mailing address) is why Test 7 now shows **120**
+  of 121 rows: the REINKE lead has neither, so it drops out of the customer-facing list instead of
+  being shown with someone else's address.
+
+**Tried / Decided:**
+
+- **Rejected** rejecting non-10-digit PIDs at extraction (Codex [P2]). `if parcel_id:` gates the
+  append, so that discards a verified-real death certificate over a county typo. The echo check
+  already removes the harm, and no address means no skip-trace enqueue.
+- **Rejected** deriving the correct parcel. `6411600027` (owner REINKE NORMAN L, 11547 CORLISS
+  AVE N) is almost certainly right, but choosing which digit to delete is a guess, and `parcel_id`
+  feeds the FROZEN `dedup_hash`. Left exactly as the county printed it; provenance stamped.
+- **Scoped the parcel repair** to probate. Two non-probate rows truncate to the *correct* parcel
+  (assessor owner corroborates the lead's party) — clearing them would destroy correct data on a
+  delivered lead. Reported, not cleared; `--record-types` widens it.
+
+**Caught & fixed (Codex, 3 review rounds — the gate said FAIL twice):**
+
+1. [P1] Echo verification only covered `batch_enrich_king_county`; `_fetch_king_owner` hits the
+   same lenient endpoint and is used by the owner repair + 2 backfills. **Confirmed by reading
+   the code.**
+2. [P1] Agency/placeholder values in the GRANTEE slot were left untouched when the grantor was
+   person-like — 205 prod rows carried `heirs='PUBLIC'`. **Confirmed.**
+3. [P1] Repair scope too narrow re: skip-trace residue. **Confirmed, and LARGER than Codex
+   stated** — it found the queued rows.
+4. [P1] `clean_counterparty` erased legitimate government counterparties
+   (`DEPARTMENT OF REVENUE` as an heir is a real estate claimant). Narrowed to non-party segments
+   only.
+5. [P1] The repair cancelled a queued trace even when its guarded clear updated **zero** rows.
+6. [P1] The agency strip left the agency's own locality as the party
+   (`SEATTLE-KING COUNTY PUBLIC HEALTH DEPARTMENT` → `SEATTLE-KING COUNTY`).
+7. [P2] The residue guard then over-fired: it ran when only a whole non-party SEGMENT was dropped,
+   rejecting retained entity parties (`ACME LLC / PUBLIC` → party became the grantee). 🔑 **My own
+   fix for #6 caused #7** — tightening one guard opened another.
+8. [P2] `_PARCEL_UPDATE` overwrote `enrichment_data` while guarding only the address.
+9. [P3] `_BARE_LOCALITY_RE` matched `UNION CITY` / `JANE CITY`; bare trailing CITY removed.
+
+**Failed / Blocked:**
+
+- The **2Captcha key is DEAD** — `ERROR_KEY_DOES_NOT_EXIST` on every attempt. The King search
+  still succeeded without a solved token, so the scrape is not currently blocked, but the captcha
+  path is unprotected if King re-enforces it. 👤 needs a key rotation.
+- Codex hit its usage limit on the 4th review pass and it had to wait for the quota reset.
+  It then ran clean: **round 4 returned ZERO findings, GATE: PASS**, confirming both round-3
+  fixes and answering explicitly that the repair script is safe against live customer data.
+
+**Pending / Handoff:**
+
+- PR open, not merged/deployed. The repair is already applied to prod data.
+- ⏭️ 3 non-probate rows (2 King parcels) still carry an address obtained through the truncating
+  lookup. Correct today, unverifiable in principle. `--record-types` clears them on request.
+- ⏭️ 119 Test 7 rows sit at `skip_trace_status=queued` with no phone/email.
+
+## 2026-09-03 (night) — "Test 6": the leads were fine; the parser was deleting them
+
+**Built / Shipped:** PR **#200** on `chore/test6-dq` (`3241de2`, `0ec9139`, `f9e2974`, `25d5ea6`) —
+CI green, `MERGEABLE`/`CLEAN`, **not merged**. Suite **2091 passed / 0 failed**, ruff clean.
+- `_AUCTION_NUM_LOC_AFTER` (`src/scrapers/sources/nts_tacoma_index.py`) — a 4th auction-date
+  fallback, tried only after the existing three miss, for the Affinia layout: numeric date with the
+  location printed *after* "sell at public auction".
+- `_POSTPONED` (same file) — an inline "SALE POSTPONED TO \<date\>" now supersedes the sale sentence.
+- `_note_undated_drop` (`src/workers/nts_crawler.py`) — splits "chrome" from "a real notice we
+  could not date" on all three crawl paths; the latter is logged as a lost lead.
+- `scripts/repair_nts_ts_number.py --source` — was hardcoded to `snohomish_tribune`.
+- Fixtures: verbatim split blocks from two published Queen Anne & Magnolia News legals PDFs.
+
+**Tried / Decided:**
+- Audited the *delivered* row first and it was perfect — party name, parcel, property + mailing
+  address, auction date, default owed, all matching the source PDF and the King assessor. Pivoted
+  to running the **production splitter + parser over the real source PDFs** and counting kept vs
+  dropped. That is what found both bugs; no amount of output inspection would have.
+- Rejected generalizing `_AUCTION` (the hot path) to make its location group optional — Codex
+  agreed. A fallback tried last keeps every existing input byte-identical. Made the new pattern the
+  **tightest** of the four, not the loosest: it runs last, so it only ever sees what nothing else
+  could handle.
+- Did **not** fold numeric dates into `_AUCTION_KING` even though that regex already tolerates a
+  location-after shape: hardening it with the `Trustee will` anchor would have broken the MTC
+  layout, whose "Trustee, will" comes *after* the date.
+
+**Failed / Blocked:**
+- 🛑 `railway run … repair_nts_ts_number.py` (even dry-run) and editing `~/.railway/config.json` to
+  link the worktree were both **denied by the auto-mode classifier**. The King row repair was
+  therefore never executed — it is a user/ops action now.
+- The worktree is not Railway-linked, so prod diagnostics had to run from the main OneDrive
+  checkout, which is on stale code — fine for SELECTs, useless for anything needing the fixed parser.
+
+**Caught & fixed** (Codex gate, 3 rounds to convergence — 4 findings → 3 → CLEAN):
+- **Round 1 Medium → shipped as High:** inline sale postponements. A republished notice keeps its
+  original sale sentence and marks the new date inline
+  (`"on June 26, 2026, 09:00 AM***THE SALE WAS POSTPONED TO 09/18/2026 @ 9:00AM***"`). The parser
+  read June 26 → past → `is_active` False → a **still-upcoming sale disappeared**. Real and live:
+  TS `WA05000073-24-2`, parcel 6385500350, $155,361.99, genuinely selling 09/18/2026.
+- **Round 2, three Highs, all in my own fix:** `_POSTPONED` matched a bare
+  `POSTPONED|CONTINUED|RESCHEDULED TO` **anywhere in the block** — these legals sections mix
+  summons, probate and mediation, so "the motion hearing was CONTINUED TO …" would have clobbered
+  good sale dates on *every* source. And `original is None or moved >= original` let an
+  unconvertible original date be **rescued into a live row** by an unrelated date, turning a visible
+  parse failure into a bogus lead. Narrowed to: anchored on the word SALE, bounded to the matched
+  sale sentence (+300 chars), strictly later, and only when the original itself converts.
+- **Round 1 High I did not accept as-written:** claimed location pollution via
+  `_AUCTION_KING_LOC_B`. Disproved against the corpus — all 7 notices were clean because `LOC_A`
+  anchors past the verb. Kept the one-line guard anyway and added the assertion my test lacked.
+
+**Pending / Handoff:**
+- ⏭️ 👤 **King `nts_notices` repair** after #200 deploys:
+  `railway run --service worker python scripts/repair_nts_ts_number.py --results --notices --source queen_anne_news`
+  (dry-run first). `WA07000020-26-1` holds GUILER's data (truth = MEKMORAKOTH / 259900081003);
+  `REF-20231006000715` is MEKMORAKOTH under a surrogate key and carries the delivered Test 6 lead;
+  `WA07000014-24-4` is a superseded GUILER twin; `WA05000073-24-2` is missing entirely (its
+  publication run includes 09/09, so the post-deploy crawl should re-ingest it).
+- 🛑 **No catch-up for the weekly-PDF sources.** `_discover_latest_legals_pdf` takes only the newest
+  issue, the legals page exposes no archive, and the King task runs **Thursdays only**
+  (`scheduler.py:182`). A missed or failed week is lost permanently; `_resweep_null_amount_notices`
+  is wired for Tacoma + Clark but never for the PDF sources.
+- 👤 King coverage is structurally thin — Queen Anne & Magnolia News is a neighborhood paper; the
+  dominant foreclosure venue is the DJC (paid, deferred).
+- 📋 `trustee_sale` **discards the job's date window** (`trustee_sale.py` `del date_from, date_to`)
+  and `date_recorded` falls through to the auction date, so delivered rows legitimately sit outside
+  the requested window. Intentional; nothing surfaces it to the user.
+
+**Facts learned:**
+- In this pipeline **one unparsed field deletes the whole lead** — `is_valid_nts` needs both
+  `ts_number` and `auction_date`, and the drop is indistinguishable from "this was never a trustee
+  sale". A single unhandled date phrasing removed **100% of one trustee's notices** with no error,
+  no alert and no row. Never let those two outcomes share a counter.
+- Test the date **converts**, not that it exists: captured garbage ("13/40/2026") fails downstream
+  identically and was slipping back into the quiet bucket.
+- An override that supersedes a parsed field needs *several* narrowing constraints, not one:
+  anchored on its subject, bounded to a window around what it replaces, monotonic, and refusing to
+  fire when the replaced value never parsed.
+- Amounts are the Section IV **"sum owing … Principal $X"**, not the larger "total debt now owing"
+  (interest + fees). Both appear in every notice.
+- `queen_anne_news` is King's only NTS source; `_MAX_PDF_BYTES`, the Thursday-only beat entry and
+  the newest-issue-only discovery together cap King coverage independently of any parser bug.
+
+---
+
 ## 2026-09-03 (later) — The Codex gate came back NO-GO, and it was right about all four
 
 **Built / Shipped:** three P1 fixes on `fix/test1-lead-data-quality` (`a5ffbfd`, `65c7557`, `4965b1e`)

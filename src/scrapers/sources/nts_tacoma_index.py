@@ -267,6 +267,55 @@ _AUCTION_KING_LOC_B = re.compile(
     rf"{_TIME}\s*,\s*(.+?)(?=,\s*to\s+the\s+highest|the\s+undersigned|will\s+sell|$)",
     re.I | re.S)
 
+# ── Affinia with a NUMERIC date (live 2026-09-03, Queen Anne & Magnolia News / King).
+# Affinia puts the location AFTER the verb ("…will on 08/14/2026, at 10:00 AM sell at
+# public auction located at the 4th Avenue Entrance…"). _AUCTION requires a NON-EMPTY
+# location BETWEEN the time and the verb, so it cannot match this; _AUCTION_KING allows
+# the location after but only accepts a MONTH-NAME date; _AUCTION_WORDED needs "Nth day
+# of <Month> … o'clock". So all three missed and the notice was DISCARDED whole
+# (is_valid_nts needs auction_date) — 3 of 5 notices on the 08-05-26 issue and 2 of 2
+# on the 09-02-26 issue, i.e. every Affinia sale in King.
+#
+# Deliberately the TIGHTEST of the four: the verb must follow the time IMMEDIATELY
+# (only optional whitespace/comma), and the whole thing must hang off "Trustee will"
+# (Codex). A numeric date is common inside these notices (deed recording, "Interest
+# Paid To", publication dates), so — unlike the month-name _AUCTION_KING — this one
+# gets NO 600-char window to reach the verb: a recording date is never immediately
+# followed by "sell at public auction". Groups (1)=date, (2)=time match _AUCTION_KING's
+# so the caller handles both identically. Fully anchored literals, no nested
+# quantifiers, no unbounded '.' -> linear, no backtracking blowup on a 45k block.
+_AUCTION_NUM_LOC_AFTER = re.compile(
+    # "the undersigned Trustee, will on …" is a real appositive in these papers (2 of
+    # 5 notices in the 08-05-26 issue), so the comma after Trustee is optional (Codex).
+    rf"Trustee\s*,?\s+will\s*,?\s*on\s+(?:{_WEEKDAY})?(\d{{1,2}}/\d{{1,2}}/\d{{4}})\s*,?\s*"
+    rf"at\s+{_HOUR_OF}({_TIME})\s*,?\s*sell\s+at\s+public\s+auction",
+    re.I,
+)
+
+# ── Postponement override (live 2026-09-03, King / MTC). A re-published notice keeps
+# its ORIGINAL sale sentence and marks the new date INLINE:
+#   "…GIVEN that on June 26, 2026, 09:00 AM***THE SALE WAS POSTPONED TO 09/18/2026 @
+#    9:00AM***, Main Entrance, King County Administration Building…"
+# Every auction pattern reads the sentence's own date, so the notice lands with a PAST
+# auction date, is_active flips False, and a sale that is still upcoming vanishes from
+# the product. That is exactly what buried a real King sale (TS WA05000073-24-2, truly
+# 09/18/2026) and left the lead unreachable. Applies to ALL sources — postponements are
+# not county-specific.
+# Only ever moves the date FORWARD: a postponement cannot go backwards, so an unrelated
+# date elsewhere in the notice can never pull a sale earlier than its stated one.
+# Anchored on the word SALE (Codex round 2): a bare "CONTINUED TO"/"RESCHEDULED TO"
+# also appears in litigation, mediation and hearing language inside these mixed legal
+# sections, and would otherwise overwrite a perfectly good sale date. Searched ONLY in a
+# window around the matched sale sentence, never the whole block — the real case is
+# printed INLINE in that sentence.
+_POSTPONED = re.compile(
+    r"(?:TRUSTEE'?S?\s+)?SALE\s+(?:WAS\s+|HAS\s+BEEN\s+|IS\s+)?"
+    r"(?:POSTPONED|CONTINUED|RESCHEDULED)\s+TO\s*:?\s*"
+    rf"({_MONTH_DATE}|\d{{1,2}}/\d{{1,2}}/\d{{4}})"
+    rf"(?:\s*(?:@|at)?\s*({_TIME}))?",
+    re.I,
+)
+
 # ── Ordinal worded auction date (Clear Recon / older law-firm Tacoma notices, live
 # 2026-06-26): "...Trustee will on the 17th day of July, 2026, at the hour of 10:00
 # o'clock AM <loc> ... sell at public auction". Neither the numeric _AUCTION nor the
@@ -385,6 +434,7 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
     text = text.replace("’", "'").replace("‘", "'").replace("�", "'")
 
     auction_date = auction_time = auction_location = None
+    auction_match = None   # the sale sentence a postponement may supersede
     am = _AUCTION.search(text)
     if am:
         loc = " ".join(am.group(3).split()).strip().rstrip(".,")
@@ -395,6 +445,7 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
         # runs hundreds of chars. If it does, the match is suspect — discard it whole.
         if "NOTICE OF TRUSTEE" not in loc.upper() and len(loc) <= 300:
             auction_date = am.group(1).strip()
+            auction_match = am
             auction_time = " ".join(am.group(2).split())
             auction_location = loc or None
 
@@ -403,9 +454,13 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
     # numeric notice whose location drift-guard rejected it (Codex). Date+time are
     # load-bearing; location (same anchored match) is best-effort.
     if am is None:
-        km = _AUCTION_KING.search(text)
+        # Month-name layouts first, then the numeric location-after layout (Affinia).
+        # Both expose group(1)=date, group(2)=time, so one branch serves both; _to_date
+        # already accepts M/D/YYYY and "Month D, YYYY".
+        km = _AUCTION_KING.search(text) or _AUCTION_NUM_LOC_AFTER.search(text)
         if km:
             auction_date = " ".join(km.group(1).split()).strip().rstrip(",")
+            auction_match = km
             auction_time = " ".join(km.group(2).split())
             # Location from a BOUNDED window around the anchored match (no whole-notice
             # drift, Codex P3) — extend ~200 chars past the verb to reach Affinia's
@@ -414,7 +469,12 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
             lm = _AUCTION_KING_LOC_A.search(span) or _AUCTION_KING_LOC_B.search(span)
             if lm:
                 loc = " ".join(lm.group(1).split()).strip().rstrip(".,")
-                if "NOTICE OF TRUSTEE" not in loc.upper() and 0 < len(loc) <= 300:
+                # For the location-AFTER layout the match ends at the verb, so the
+                # search window starts before it — reject a capture that swallowed the
+                # verb instead of the venue (Codex). LOC_A normally anchors past it.
+                if ("NOTICE OF TRUSTEE" not in loc.upper()
+                        and "SELL AT PUBLIC AUCTION" not in loc.upper()
+                        and 0 < len(loc) <= 300):
                     auction_location = loc
         else:
             # Ordinal worded date fallback ("17th day of July, 2026" — Clear Recon /
@@ -427,6 +487,26 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
                 if ":" not in hhmm:
                     hhmm = f"{hhmm}:00"
                 auction_time = f"{hhmm} {ampm.upper()}M"
+                auction_match = wm
+
+    # An inline "SALE POSTPONED TO <date>" supersedes the sale sentence — the original
+    # date is stale the moment it is printed. Sale-anchored, window-bounded and
+    # strictly forward, so it cannot pull a sale earlier, fire on unrelated continuance
+    # language, or rescue a notice whose own date never parsed.
+    if auction_date and auction_match is not None:
+        # Bounded to the sale sentence (+300 chars) so unrelated hearing/mediation
+        # language elsewhere in the block can never reach it (Codex round 2).
+        window = text[auction_match.start():auction_match.end() + 300]
+        pm = _POSTPONED.search(window)
+        if pm:
+            original, moved = _to_date(auction_date), _to_date(pm.group(1))
+            # STRICTLY later, and only when the original itself parsed: an unconvertible
+            # original must stay a visible parse failure, not be rescued into a live row
+            # by some other date (Codex round 2).
+            if moved and original and moved > original:
+                auction_date = " ".join(pm.group(1).split()).strip().rstrip(",")
+                if pm.group(2):
+                    auction_time = " ".join(pm.group(2).split())
 
     return {
         # A trustee's page TITLE can carry a trailing dash ("TS# WA-26-1035144-SW-

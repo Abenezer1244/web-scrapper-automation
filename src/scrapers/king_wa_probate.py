@@ -937,6 +937,15 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                 # decedent and strip "Estate of" captions. No-op when the grantor
                 # is already the decedent.
                 grantor, grantee = orient_probate_party(grantor, grantee, doc_type)
+                if not grantor:
+                    # Guard #2 fired: BOTH sides were a filing agency / recorder
+                    # placeholder, so there is no decedent to sell. A probate lead
+                    # with no party is unusable and would still be billed, so drop
+                    # it rather than ship a nameless row (Codex).
+                    _logger.debug(
+                        "probate: dropping row %s — no party after orientation", rec_num
+                    )
+                    continue
 
             record = ScrapedRecord()
             record.date_recorded = date_str
@@ -1097,6 +1106,11 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                     # Promote the decedent over the issuing agency/filing state;
                     # strip "Estate of" captions. No-op when grantor is the decedent.
                     grantor, grantee = orient_probate_party(grantor, grantee, doc_type)
+                    if not grantor:
+                        # Guard #2: no decedent on either side — see the JSON path.
+                        # This branch matters more here, because the DOM append
+                        # below accepts a row on date_recorded ALONE.
+                        continue
 
                 record = ScrapedRecord()
                 record.parcel_id = parcel_id

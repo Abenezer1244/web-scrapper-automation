@@ -1,7 +1,8 @@
 """Shared PROBATE party-orientation helpers.
 
 SINGLE SOURCE OF TRUTH for putting the DECEDENT (not a filing agency, issuing
-state, court, or "Estate of" caption) into ``party_name`` on probate records.
+state, recorder placeholder, court, or "Estate of" caption) into ``party_name``
+on probate records — and for keeping those same non-parties out of ``heirs``.
 
 Why this exists: on a Certificate of Death the county recorder routinely indexes
 the *issuing authority* — "STATE OF WASHINGTON", "WASHINGTON STATE DEPARTMENT OF
@@ -25,6 +26,24 @@ Design guards (pressure-tested with Codex):
      LIVING owner/transferor, so swapping to the grantee would corrupt a correct
      party. (Also structurally safe — a living owner never matches the agency
      regexes — but the doc_type guard makes the intent explicit.)
+  4. Apply the SAME non-party rule to the grantee/heir slot. ``heirs`` is shown to
+     the customer, so a placeholder or agency there is the identical defect in a
+     different column.
+
+Extended 2026-09-03 (Test 7 audit, Codex-reviewed) from the King recorder's live
+Death Certificate index — 204 raw rows over one 90-day window:
+  * ``PUBLIC`` / ``THE PUBLIC`` / ``PUBLIC THE`` is the recorder's PLACEHOLDER
+    counterparty (the certificate is recorded "to the public"): 101/204 rows carry
+    it in the grantee slot, and in 2 rows the parties are indexed REVERSED so it
+    lands in the grantor slot and the DECEDENT in the grantee slot. It is never a
+    legal party. Corroborated at the King Assessor: parcel 3276080220's owner is
+    TRUJILLO CHUCK+PATSY for the row whose grantor read ``PUBLIC`` and whose
+    grantee read TRUJILLO CHARLES JAMES.
+  * The SAME agency appears under three word orders in one window — ``WASHINGTON
+    STATE DEPT OF HEALTH`` (already handled), ``WASHINGTON STATE HEALTH
+    DEPARTMENT`` and ``DEPARTMENT WASHINGTON STATE HEALTH`` — plus the bare filing
+    state with a government marker, ``WASHINGTON STATE-GOVT``. Only the first was
+    caught before, so the other three reached ``party_name`` on live leads.
 """
 from __future__ import annotations
 
@@ -59,13 +78,48 @@ _US_STATE = (
 # "STATE OF WA, DEPT OF HEALTH" (benton) and "WASHINGTON STATE DEPARTMENT OF HEALTH"
 # (king). Every agency suffix is PHRASE-anchored ("(DEPT|BUREAU|OFFICE) OF <agency>")
 # so no bare ambiguous token (REVENUE, LICENSING, BUREAU) can strip a real surname.
-_AGENCY_DEPT_RE = re.compile(
-    rf"(?:(?:STATE\s+OF\s+)?{_US_STATE}\.?\s*(?:STATE\b\s*)?,?\s*)?"
-    r"(?:DEPARTMENT|DEPT|BUREAU|OFFICE)\.?\s+OF\s+"
+_STATE_QUALIFIER = rf"(?:STATE\s+OF\s+)?{_US_STATE}\.?\s*(?:STATE\b\.?\s*)?,?\s*"
+_AGENCY_SUBJECT = (
     r"(?:HEALTH|LICENSING|REVENUE"
     r"|VITAL\s+(?:RECORDS|STATISTICS)"
-    r"|SOCIAL\s+(?:AND|&)\s+HEALTH(?:\s+SERVICES)?)\b",
+    r"|SOCIAL\s+(?:AND|&)\s+HEALTH(?:\s+SERVICES)?)"
+)
+_AGENCY_DEPT_RE = re.compile(
+    rf"(?:{_STATE_QUALIFIER})?"
+    rf"(?:DEPARTMENT|DEPT|BUREAU|OFFICE)\.?\s+OF\s+{_AGENCY_SUBJECT}\b",
     re.IGNORECASE,
+)
+
+# The same agencies with the "OF" dropped and the words re-ordered. King's recorder
+# emits all three orders for one agency across a single 90-day window (verified live
+# 2026-09-03): "WASHINGTON STATE DEPT OF HEALTH" (caught above), "WASHINGTON STATE
+# HEALTH DEPARTMENT" (trailing) and "DEPARTMENT WASHINGTON STATE HEALTH" (scrambled).
+# Both alternatives below require the DEPARTMENT/DEPT token ADJACENT to a
+# vital-records agency subject, so no bare token ("HEALTH", "REVENUE") can strip a
+# real surname; the scrambled order additionally requires the state qualifier,
+# because "DEPARTMENT <word>" without a state is too loose to be evidence.
+# "PUBLIC" is part of the agency's NAME in "<locality> PUBLIC HEALTH DEPARTMENT",
+# so the phrase must be consumed as one unit. Without this the strip removes only
+# "HEALTH DEPARTMENT" and leaves the mangled fragment "SEATTLE-KING COUNTY PUBLIC"
+# as the party (Codex).
+_AGENCY_TRAILING_RE = re.compile(
+    rf"(?:{_STATE_QUALIFIER})?(?:PUBLIC\s+)?{_AGENCY_SUBJECT}\s+(?:DEPARTMENT|DEPT)\b\.?"
+    rf"|(?:DEPARTMENT|DEPT)\.?\s+{_STATE_QUALIFIER}(?:PUBLIC\s+)?{_AGENCY_SUBJECT}\b",
+    re.IGNORECASE,
+)
+
+# The recorder's PLACEHOLDER counterparty on a certificate of death. King indexes
+# the "other side" of a death certificate as the literal string PUBLIC — the
+# instrument is recorded *to the public* — in 101 of 204 raw rows over a 90-day
+# window (verified live 2026-09-03), and in a minority of rows the parties are
+# indexed REVERSED so the placeholder lands in the grantor slot and the DECEDENT in
+# the grantee slot. It is a recording convention, never a legal party.
+#
+# Matched on the WHOLE value (per " / " segment), the same anchoring discipline as
+# _BARE_STATE_RE, so it can never touch "PUBLIC STORAGE", "PUBLIC UTILITY DISTRICT",
+# "REPUBLIC", or a comma-form person "PUBLIC, JOHN".
+_PLACEHOLDER_PARTY_RE = re.compile(
+    r"^\s*(?:THE\s+)?PUBLIC(?:\s*,?\s*THE)?\.?\s*$", re.IGNORECASE
 )
 
 # A lone state name/abbreviation left as residue after the agency phrase is
@@ -79,11 +133,15 @@ _LONE_STATE_RE = re.compile(r"^\s*(?:WA|WASH|WN|WASHINGTON)\.?\s*$", re.IGNORECA
 # names (_US_STATE) so it never fires on "WASHINGTON STATE UNIVERSITY" (trailing
 # UNIVERSITY breaks the anchor) or a co-decedent like "MCKINLEY STATE". State-
 # agnostic across all 50 so an out-of-state death certificate is corrected too.
+# A trailing government marker the recorder appends to the bare filing state:
+# "WASHINGTON STATE-GOVT" / "WASHINGTON STATE GOVT" (10 prod rows). Optional, so
+# the plain "WASHINGTON STATE" form still matches.
+_GOVT_SUFFIX = r"(?:\s*[-\s]\s*GOV(?:T|ERNMENT)?\.?)?"
 _BARE_STATE_RE = re.compile(
     rf"^\s*(?:"
     rf"STATE\s+OF\s+{_US_STATE}"              # STATE OF <state>
     rf"|{_US_STATE}\.?\s+STATE(?:\s+OF)?"      # <state> STATE [OF]
-    r")\s*$",
+    rf"){_GOVT_SUFFIX}\s*$",
     re.IGNORECASE,
 )
 
@@ -137,24 +195,62 @@ _ESTATE_CAPTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A residue that is wholly a place — what is left of "SEATTLE-KING COUNTY PUBLIC
+# HEALTH DEPARTMENT" once the agency phrase is excised. A locality is the agency's
+# own qualifier, never the decedent, so a residue reduced to one must be treated as
+# fully consumed (Codex). Anchored ^...$ and checked only AFTER an agency phrase was
+# actually removed, so it can never touch an ordinary value; the comma-form person
+# check runs first, so a decedent indexed "COUNTY, JOHN" is unaffected.
+# A bare trailing CITY is deliberately NOT here: "UNION CITY" / "JANE CITY" read as
+# a company or a person, and no real agency name reduces to that shape (a city files
+# as "CITY OF SEATTLE"). COUNTY / BOROUGH / PARISH are unambiguous jurisdiction
+# suffixes that do not form personal names (Codex P3).
+_BARE_LOCALITY_RE = re.compile(
+    r"^\s*(?:"
+    r"CITY\s+OF\s+[A-Z .'’-]+"
+    r"|COUNTY\s+OF\s+[A-Z .'’-]+"
+    r"|[A-Z .'’-]+\s+(?:COUNTY|BOROUGH|PARISH)"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
 # Doc types whose grantor is a LIVING owner — the agency swap must NOT fire.
 _LIVING_OWNER_DOC_RE = re.compile(r"TRANSFER\s+ON\s+DEATH|\bTOD\b", re.IGNORECASE)
 
 
+def _is_non_party_segment(segment: str) -> bool:
+    """True if one " / "-segment is a filing state or a recorder placeholder.
+
+    These are the values that carry no party identity at all and are dropped
+    wholesale, as opposed to an agency PHRASE which is merely excised from a
+    longer value that may still contain a real name.
+    """
+    return bool(
+        _BARE_STATE_RE.match(segment)
+        or _LONE_STATE_RE.match(segment)
+        or _PLACEHOLDER_PARTY_RE.match(segment)
+    )
+
+
 def strip_filing_agency(name: str | None) -> str:
-    """Remove the Certificate-of-Death filing agency from a grantor name.
+    """Remove the Certificate-of-Death filing agency / recorder placeholder.
 
     "PERRIN, RONALD, STATE OF WA, DEPT OF HEALTH" -> "PERRIN, RONALD".
     "STATE OF WASHINGTON DEPARTMENT OF HEALTH"    -> "" (agency only).
+    "WASHINGTON STATE HEALTH DEPARTMENT"          -> "" (trailing word order).
     "STATE OF WASHINGTON"                          -> "" (bare state only).
+    "WASHINGTON STATE-GOVT"                        -> "" (bare state + govt marker).
+    "PUBLIC" / "THE PUBLIC"                        -> "" (recorder placeholder).
+    "KAUR RAJWANT / PUBLIC"                        -> "KAUR RAJWANT".
     "WASHINGTON STATE UNIVERSITY"                  -> unchanged (not the filer).
 
-    Returns the cleaned name, or "" when the value was wholly the agency/state
-    (the caller then falls back to the grantee).
+    Returns the cleaned name, or "" when the value carried no party identity at
+    all (the caller then falls back to the counterparty).
     """
     if not name:
         return name or ""
     cleaned = _AGENCY_DEPT_RE.sub("", name)
+    cleaned = _AGENCY_TRAILING_RE.sub("", cleaned)
     cleaned = re.sub(r"(?:\s*/\s*){2,}", " / ", cleaned)   # collapse left-behind separators
     cleaned = re.sub(r"(?:,\s*){2,}", ", ", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
@@ -164,16 +260,18 @@ def strip_filing_agency(name: str | None) -> str:
     # A lone state name/abbrev left behind ("WA DEPT OF HEALTH" -> "WA").
     if _LONE_STATE_RE.match(cleaned):
         return ""
-    # Every " / "-split segment is a bare filing state -> nothing real remains.
+    # Every " / "-split segment is a bare filing state / recorder placeholder ->
+    # nothing real remains.
     parts = [p for p in cleaned.split(" / ") if p.strip()]
-    if parts and all(_BARE_STATE_RE.match(p) for p in parts):
+    if parts and all(_is_non_party_segment(p) for p in parts):
         return ""
     # A stacked grantor where SOME (not all) " / "-segments are a bare filing state
-    # ("DOE, JOHN / STATE OF WASHINGTON"): drop only the exact bare-state/lone-state
-    # segments, keep the decedent. Limited to exact filing-state segments (Codex) so
-    # a genuine co-decedent ("SMITH JOHN / SMITH JANE") is never dropped.
+    # or placeholder ("DOE, JOHN / STATE OF WASHINGTON", "KAUR RAJWANT / PUBLIC"):
+    # drop only those exact segments, keep the decedent. Limited to exact
+    # filing-state/placeholder segments (Codex) so a genuine co-decedent
+    # ("SMITH JOHN / SMITH JANE") is never dropped.
     if len(parts) > 1:
-        kept = [p for p in parts if not _BARE_STATE_RE.match(p) and not _LONE_STATE_RE.match(p)]
+        kept = [p for p in parts if not _is_non_party_segment(p)]
         if kept and len(kept) != len(parts):
             cleaned = " / ".join(kept)
             parts = kept
@@ -236,6 +334,65 @@ def strip_estate_caption(name: str | None) -> str | None:
     return name
 
 
+def clean_counterparty(value: str | None) -> str | None:
+    """Sanitize the grantee/heir slot: drop values that name NO party at all.
+
+    ``heirs`` is customer-facing, so the recorder's "PUBLIC" placeholder and a bare
+    filing state must not be shown as people. A stacked value keeps its real names
+    ("KAUR RAJWANT / PUBLIC" -> "KAUR RAJWANT").
+
+    DELIBERATELY NARROWER than the grantor rule (Codex): it drops only non-party
+    segments and does NOT excise agency phrases. An agency in the GRANTOR slot is
+    the filer standing in for the decedent, so it must be removed to find the
+    party; an agency in the COUNTERPARTY slot may be a real claimant on the estate
+    ("WASHINGTON STATE DEPARTMENT OF REVENUE", a DSHS estate-recovery claim), and
+    erasing that would destroy true information about the record.
+    """
+    if not value or not value.strip():
+        return None
+    segments = [s.strip() for s in value.strip().split(" / ") if s.strip()]
+    kept = [s for s in segments if not _is_non_party_segment(s)]
+    if not kept:
+        return None
+    return " / ".join(kept) if len(kept) != len(segments) else value.strip()
+
+
+def _agency_phrase_present(name: str) -> bool:
+    """True if ``name`` contains an agency PHRASE (not merely a non-party segment).
+
+    strip_filing_agency changes a value for two different reasons: it EXCISES an
+    agency phrase from within a longer value, or it DROPS whole non-party segments
+    ("ACME LLC / PUBLIC" -> "ACME LLC"). Only the first can leave a meaningless
+    fragment, so only the first may be second-guessed by _residue_is_a_party.
+    Conflating them rejected legitimate retained entity parties — an LLC, a trust,
+    a place-named company — which the product explicitly preserves (Codex P2).
+    """
+    return bool(_AGENCY_DEPT_RE.search(name) or _AGENCY_TRAILING_RE.search(name))
+
+
+def _residue_is_a_party(residue: str) -> bool:
+    """True if what survived an agency excision can stand as the decedent.
+
+    Excising "PUBLIC HEALTH DEPARTMENT" from "SEATTLE-KING COUNTY PUBLIC HEALTH
+    DEPARTMENT" leaves "SEATTLE-KING COUNTY" — the agency's own locality, not a
+    person. Trusting any non-empty remainder would surface that fragment as the
+    lead's party (Codex). A residue that is wholly a place, or that still reads as
+    an institution, means the value was ENTIRELY the filer, so the caller should
+    fall through to promoting the grantee instead.
+
+    Only consulted when an agency phrase was actually removed.
+    """
+    v = residue.strip()
+    if not v:
+        return False
+    # A comma-form personal name wins outright ("PERRIN, RONALD", "COUNTY, JOHN").
+    if _PERSON_COMMA_RE.match(v) and not _UNAMBIGUOUS_ORG_RE.search(v.upper()):
+        return True
+    if _BARE_LOCALITY_RE.match(v):
+        return False
+    return not _NON_PERSON_RE.search(v.upper())
+
+
 def orient_probate_party(
     grantor: str | None,
     grantee: str | None,
@@ -243,12 +400,14 @@ def orient_probate_party(
 ) -> tuple[str | None, str | None]:
     """Return ``(party_name, heirs)`` with the DECEDENT as ``party_name``.
 
-    - Strips the filing agency/state from the grantor.
-    - If the grantor was wholly an agency, promotes a person-like grantee
-      (guard #1); if both are agency/empty -> (None, None) (guard #2).
+    - Strips the filing agency/state/recorder placeholder from the grantor.
+    - If the grantor carried no party identity, promotes a person-like grantee
+      (guard #1); if both are agency/placeholder/empty -> (None, None) (guard #2).
     - No-ops the agency swap on Transfer-on-Death deeds (guard #3): the grantor
       is a living owner.
     - Strips a leading "Estate of" caption from the resulting party.
+    - Sanitizes the ``heirs`` slot the same way (guard #4) so a placeholder or
+      agency is never surfaced as an heir.
 
     A no-op for the common case where the grantor is already the decedent.
     """
@@ -257,19 +416,21 @@ def orient_probate_party(
 
     # Guard #3 — TOD deed: grantor is a living owner; never swap. Caption-strip only.
     if doc_type and _LIVING_OWNER_DOC_RE.search(doc_type):
-        return (strip_estate_caption(g) or None, e or None)
+        return (strip_estate_caption(g) or None, clean_counterparty(e))
 
     deagencied = strip_filing_agency(g)
     if deagencied != g:
-        # An agency phrase was present in the grantor.
-        if deagencied:
-            party, heirs = deagencied, (e or None)
+        # An agency phrase / placeholder was present in the grantor.
+        if deagencied and (
+            not _agency_phrase_present(g) or _residue_is_a_party(deagencied)
+        ):
+            party, heirs = deagencied, clean_counterparty(e)
         elif is_person_like_party(e):          # guard #1
             party, heirs = e, None
         else:                                   # guard #2 — both agency/empty
             party, heirs = None, None
     else:
-        party, heirs = (g or None), (e or None)
+        party, heirs = (g or None), clean_counterparty(e)
 
     return (strip_estate_caption(party), heirs)
 

@@ -487,15 +487,19 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 enriched = asyncio.run(asyncio.wait_for(
                     # 200s could not even finish phase 1 for a few hundred parcels
                     # (~0.5s each), so owner + property resolution was being cut off
-                    # by the clock as well as by the old count cap. The Celery task
-                    # allows 3600s for scrape+enrichment; 900s is a small slice of
-                    # that and still bounds a runaway. Phase 1 (property + owner,
-                    # cheap HTTP) always runs to completion first, so the expensive
-                    # Playwright mailing pass can only ever spend what's left over —
-                    # owner names are never the thing that gets dropped.
-                    batch_enrich_king_county(pids, time_budget_s=900, stats=king_stats,
+                    # by the clock as well as by the old count cap.
+                    # BUDGET ARITHMETIC (these are additive within ONE Celery task):
+                    #   scrape 1800s (_SCRAPE_TIMEOUT) + this 660s + owner-only 300s
+                    #   = 2760s, inside soft_time_limit=3600s with headroom for
+                    #   persistence, export, billing and delivery. Raise either
+                    #   budget only by re-doing that sum — 900+900 here overran it.
+                    # Phase 1 (property + owner, cheap HTTP) always runs to
+                    # completion first, so the expensive Playwright mailing pass can
+                    # only ever spend what is left over: owner names are never the
+                    # thing that gets dropped.
+                    batch_enrich_king_county(pids, time_budget_s=600, stats=king_stats,
                                              party_names=party_names),
-                    timeout=960,
+                    timeout=660,
                 ))
             except Exception as exc:  # noqa: BLE001 — best-effort county lookup
                 king_error = f"{type(exc).__name__}: {str(exc)[:120]}"
@@ -659,9 +663,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                             out=owners,
                             # Stop cooperatively just inside the hard timeout so the
                             # loop exits on its own terms rather than being killed.
-                            time_budget_s=840,
+                            time_budget_s=240,
                         ),
-                        timeout=900,
+                        timeout=300,
                     ))
                 except TimeoutError:
                     _logger.warning(

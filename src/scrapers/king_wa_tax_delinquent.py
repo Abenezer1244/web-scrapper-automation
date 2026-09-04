@@ -315,36 +315,67 @@ def aggregate_delinquent_rows(
                 "by_type_cents": defaultdict(int),
                 "by_year_cents": defaultdict(int),
                 "accounts": set(),
-                # True once ANY charge line falls inside the requested window.
-                # This — not the year range of the sum — is what makes the parcel
-                # a lead for this job, so selection and totals stay independent.
-                "in_window": False,
+                # Net (billed - paid) from the IN-WINDOW years only. Selection is
+                # "owes money inside the window" — deliberately the same test the
+                # pre-fix code applied to its (window-only) total, so this change
+                # corrects the AMOUNT and the OLDEST YEAR without moving a single
+                # parcel into or out of the lead set. Mere PRESENCE of an in-window
+                # line is not enough: a line that nets to zero is a paid line, and
+                # letting it select the parcel would make old debt resurrect a
+                # parcel the previous behaviour (correctly) dropped.
+                "in_window_cents": 0,
+                # Whether the parcel has ANY included charge line inside the
+                # window. Tracked separately from the net above so "fully paid
+                # inside the window" (net_zero, a real candidate) stays
+                # distinguishable from "no in-window activity at all"
+                # (out_of_window, never a candidate) — they are different facts
+                # and only the first should feed the candidate count.
+                "in_window_lines": False,
             }
             agg[parcel] = entry
         entry["owed_cents"] += owed_cents
         entry["years"].add(year)
         if year >= start_year:
-            entry["in_window"] = True
+            entry["in_window_cents"] += owed_cents
+            entry["in_window_lines"] = True
         entry["by_type_cents"][rtype] += owed_cents
         entry["by_year_cents"][year] += owed_cents
         entry["accounts"].add(acct)
 
-    stats["aggregated_parcels"] = len(agg)
+    # Candidates = parcels that owe money INSIDE the requested window. Parcels that
+    # exist in `agg` only because their pre-window lines were read (they are what
+    # makes an in-window parcel's total correct) are NOT candidates. Counting them
+    # here would blind the structural canary: during schema drift that breaks only
+    # the current window's rows, stale historical rows would keep
+    # `aggregated_parcels > 0` and `is_parse_break` would stay silent while the
+    # whole current lead set silently vanished.
+    stats["aggregated_parcels"] = sum(
+        1 for e in agg.values() if e["in_window_lines"]
+    )
 
     records: list[ScrapedRecord] = []
     for parcel, entry in agg.items():
-        # SELECTION: the parcel is a lead for this job only if it is delinquent
-        # somewhere inside the requested window. Its money and its oldest year are
-        # still computed over its FULL history below.
-        if not entry["in_window"]:
+        # SELECTION, in two steps, so the lead set is EXACTLY what it was before
+        # the full-history change — only the reported balance and oldest year move.
+        # 1. No in-window charge line at all: the parcel was read only so that an
+        #    in-window parcel's total could be correct. Never a lead here.
+        if not entry["in_window_lines"]:
             stats["out_of_window"] += 1
             continue
+        # 2. In-window lines exist but net to nothing (fully paid / credit-offset).
+        #    This is the SAME test the pre-fix code applied to its window-only
+        #    total, so old debt can never resurrect a parcel that is square for the
+        #    window the user asked about.
+        if entry["in_window_cents"] <= 0:
+            stats["net_zero_parcels"] += 1
+            continue
         # Floor at the PARCEL total (not per line) — preserves partial-payment /
-        # credit math within the parcel before clamping.
+        # credit math within the parcel before clamping. Pre-window credits can
+        # still, in principle, cancel an in-window balance.
         total_cents = entry["owed_cents"]
         if total_cents <= 0:
             stats["net_zero_parcels"] += 1
-            continue  # net not-owed (fully paid / credit-offset) = not a lead
+            continue  # net not-owed across all years = not a lead
         amount = (Decimal(total_cents) / 100).quantize(Decimal("0.01"))
         if amount > _AMOUNT_MAX:
             stats["overflow"] += 1

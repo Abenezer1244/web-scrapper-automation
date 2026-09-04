@@ -52,6 +52,13 @@ _OWNER_RE = re.compile(
 # "N.A.", and "N / A" all collapse to "NA".
 _OWNER_JUNK = frozenset({"NA", "NONE", "NULL", "UNKNOWN"})
 
+# Phase-1 breaker: trip when this many of the last N fetches came back non-200.
+# 30/50 is well clear of the normal miss rate (a genuine 200-with-no-data page is
+# NOT a failure here — only a non-200 counts), so ordinary sparse parcels can
+# never trip it, while a real block trips it within ~50 requests.
+_PHASE1_BREAKER_WINDOW = 50
+_PHASE1_BREAKER_MIN_FAILURES = 30
+
 # eRealProperty SILENTLY TRUNCATES an over-length ParcelNbr to the first 10 digits
 # and serves a DIFFERENT parcel's page with no error (verified live 2026-09-03:
 # ParcelNbr=64116000027 returns parcel 641160-0002, owner SNYDER JACOB, site
@@ -384,6 +391,17 @@ async def batch_enrich_king_county(
     _logger.info("Phase 1: HTTP lookup for %d parcels...", len(clean))
     tax_urls: dict[str, str] = {}  # pid → payment.kingcounty.gov URL
 
+    # Per-run circuit breaker for phase 1. The one-shot check_source_or_raise gate
+    # above only asks "was King refusing us BEFORE this run started"; it cannot
+    # notice the source starting to refuse us DURING a run. That was tolerable
+    # while the parcel list was hard-capped, but this loop is now bounded by time
+    # rather than count, so an unnoticed block could mean a long run of failed
+    # fetches recorded as "this parcel simply has no data" — the exact shape of the
+    # eRealProperty IP rate-block incident. Mirrors the owner-only path's breaker:
+    # a sustained failure rate aborts the run AND is persisted, so the next worker
+    # does not immediately start hammering a source that is still refusing us.
+    _p1_window: deque[bool] = deque(maxlen=_PHASE1_BREAKER_WINDOW)  # True = failed
+
     for i, pid in enumerate(clean):
         if _over_budget():
             _logger.warning("King phase 1: time budget exhausted after %d/%d parcels", i, len(clean))
@@ -400,6 +418,21 @@ async def batch_enrich_king_county(
             r = safe_get(
                 f"{_ERP_URL}{pid}", headers=_HEADERS, timeout=10
             )
+            _p1_window.append(r.status_code != 200)
+            if (len(_p1_window) == _PHASE1_BREAKER_WINDOW
+                    and _p1_window.count(True) >= _PHASE1_BREAKER_MIN_FAILURES):
+                msg = (
+                    "King phase-1 circuit breaker tripped: "
+                    f"{_p1_window.count(True)}/{len(_p1_window)} recent eRealProperty "
+                    f"fetches failed (last status={r.status_code}) after {i} of "
+                    f"{len(clean)} parcels. Aborting so a block is never recorded as "
+                    "'this parcel has no data'."
+                )
+                _logger.warning(msg)
+                record_source_blocked(KING_EREALPROPERTY, msg)
+                st["budget_exhausted"] = True
+                st["deferred"].extend(clean[i:])
+                break
             if r.status_code != 200:
                 continue
 
@@ -474,6 +507,10 @@ async def batch_enrich_king_county(
                     tax_urls[pid] = tax_url
 
         except Exception as exc:
+            # A hard block / DNS or TLS failure RAISES rather than returning a
+            # non-200, so the breaker must see these too — otherwise a total
+            # outage looks like a run of parcels that merely "had no data".
+            _p1_window.append(True)
             _logger.debug(
                 "Property URL fetch failed for parcel=%s: %s",
                 pid, str(exc)[:200],

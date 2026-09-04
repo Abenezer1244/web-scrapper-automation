@@ -419,8 +419,11 @@ def test_parcel_delinquent_only_before_the_window_is_not_a_lead():
     )
     assert records == []
     assert stats["out_of_window"] == 1
-    # It was a well-formed candidate, so this is a business empty, not a parse break.
-    assert stats["aggregated_parcels"] == 1
+    # It never had an in-window charge line, so it is not a CANDIDATE either: the
+    # canary must not count history-only parcels, or stale old rows would keep it
+    # quiet while schema drift silently wiped the current window's whole lead set.
+    assert stats["aggregated_parcels"] == 0
+    assert stats["net_zero_parcels"] == 0  # not "fully paid" — simply not in scope
 
 
 def test_future_bill_years_never_inflate_the_balance():
@@ -446,3 +449,40 @@ def test_tax_rows_never_carry_a_fabricated_date():
     )
     assert records
     assert all(r.date_recorded is None for r in records)
+
+
+def test_old_debt_cannot_resurrect_a_parcel_square_for_the_window():
+    # Codex P1 on the full-history change: if mere PRESENCE of an in-window line
+    # selected the parcel, a parcel whose in-window years are fully PAID would be
+    # dragged back into the lead set by its pre-window debt — silently changing
+    # WHICH parcels are leads (and what gets billed), not just their totals.
+    # Selection is net-owed-in-window, exactly the test the pre-fix code applied.
+    rows = [
+        _row("777777777700", 2023, "R", 400000, 0),        # $4,000 pre-window debt
+        _row("777777777700", 2026, "R", 100000, 100000),   # in-window, fully PAID
+    ]
+    records, stats = aggregate_delinquent_rows(
+        rows, start_year=2025, effective_end_year=2026
+    )
+    assert records == []
+    # It IS a candidate (it had an in-window line), just a fully-paid one — so it
+    # is reported as net-zero, not as "no in-window activity".
+    assert stats["aggregated_parcels"] == 1
+    assert stats["net_zero_parcels"] == 1
+    assert stats["out_of_window"] == 0
+
+
+def test_partially_paid_in_window_still_leads_and_carries_old_debt():
+    # The mirror case: a parcel that still owes something in-window IS a lead, and
+    # its balance/oldest year then legitimately include the pre-window years.
+    rows = [
+        _row("888888888800", 2023, "R", 400000, 0),        # $4,000 pre-window
+        _row("888888888800", 2026, "R", 100000, 60000),    # $400 still owed
+    ]
+    records, stats = aggregate_delinquent_rows(
+        rows, start_year=2025, effective_end_year=2026
+    )
+    ed = _by_parcel(records)["8888888888"].enrichment_data
+    assert ed["delinquent_amount"] == "4400.00"
+    assert ed["oldest_tax_year"] == 2023
+    assert stats["net_zero_parcels"] == 0

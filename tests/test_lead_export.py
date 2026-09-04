@@ -333,6 +333,30 @@ class TestNtsAuctionColumns:
         for col in ("auction_date", "days_to_auction", "default_amount", "trustee", "ts_number"):
             assert row[col] == "", col
 
+    def test_nested_nts_ts_number_wins_over_a_stale_top_level_one(self):
+        """Two writers put a ts_number in enrichment_data and they can disagree.
+
+        The Snohomish pre_foreclosure scraper writes a TOP-LEVEL `ts_number` from its
+        own parse of the legals PDF; the NTS matcher writes the nested `nts` blob from
+        the crawler's `nts_notices` cache. Rows scraped before PR #195 carry a
+        top-level value that names the FOLLOWING notice (the pre-header split bug),
+        while the nested one has since been repaired. The export must read the nested,
+        corroborated value — never the stale sibling.
+        """
+        rec = {
+            "enrichment_data": {
+                "ts_number": "25-10595",                      # stale: the NEXT notice
+                "nts": {"ts_number": "26-78299"},             # repaired + corroborated
+            },
+        }
+        assert build_lead_export_row(rec)["ts_number"] == "26-78299"
+
+    def test_top_level_ts_number_alone_is_not_exported(self):
+        """`ts_number` is sourced ONLY from the nested blob, so a row carrying just the
+        scraper's own copy exports blank rather than an unverified number."""
+        rec = {"enrichment_data": {"ts_number": "25-10595"}}
+        assert build_lead_export_row(rec)["ts_number"] == ""
+
 
 class TestOutputFieldVisibility:
     """Output-boundary field visibility — the wizard's "Fields to collect" checkboxes

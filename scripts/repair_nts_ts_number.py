@@ -11,8 +11,10 @@ nothing is hand-typed. Parcel is the safe join key: it was never affected by the
 
 TWO PHASES, because they have different safety conditions:
 
-  --results   SAFE TO RUN NOW. Rewrites the delivered lead rows' stored TS number
-              (enrichment_data + the ts-derived raw_html_hash/source_fingerprint).
+  --results   SAFE TO RUN NOW. Rewrites the delivered lead rows' stored TS number —
+              BOTH copies in enrichment_data (the crawler's nested `nts` blob and the
+              pre_foreclosure scraper's own top-level `ts_number`) plus the ts-derived
+              raw_html_hash/source_fingerprint.
               Durable: the beat matcher only writes rows WHERE auction_date IS NULL
               (src/workers/nts_matcher_task.py), so it never rewrites a matched row.
 
@@ -139,13 +141,26 @@ def repair_results(db, truth: dict[str, str], apply: bool) -> int:
         correct = truth[m["parcel_id"]]
         enr = m["enrichment_data"] or {}
         stored = (enr.get("nts") or {}).get("ts_number")
-        if stored == correct:
+        # The TOP-LEVEL ts_number is a SECOND, independent copy: the pre_foreclosure
+        # scraper writes it from its own parse of the same PDF
+        # (snohomish_wa_pre_foreclosure._record_from_notice), so it carried the SAME
+        # shift and needs the SAME correction. The first pass of this repair modelled
+        # only the nested `nts` blob — which is why 6 rows across 3 jobs were left with
+        # a corrected nested value sitting next to a top-level one still naming the
+        # FOLLOWING notice. Present-only: never ADD the key to a trustee_sale row that
+        # never had one, or the two writers would start disagreeing in the other
+        # direction.
+        top_stored = enr.get("ts_number")
+        top_wrong = top_stored is not None and top_stored != correct
+        if stored == correct and not top_wrong:
             continue
 
         new_enr = dict(enr)
         new_enr["nts"] = {**(enr.get("nts") or {}), "ts_number": correct}
         if isinstance(enr.get("nts_source"), dict):
             new_enr["nts_source"] = {**enr["nts_source"], "ts_number": correct}
+        if top_stored is not None:
+            new_enr["ts_number"] = correct
 
         params = {"id": m["id"], "enr": json.dumps(new_enr)}
         sets = ["enrichment_data = CAST(:enr AS json)"]
@@ -158,18 +173,29 @@ def repair_results(db, truth: dict[str, str], apply: bool) -> int:
         # a row whose source_fingerprint had drifted from raw_html_hash used to get only
         # the hash rewritten, leaving the real ON CONFLICT key stale (Codex). Measured
         # 0 such rows in production, but the coupling was an assumption, not a fact.
+        # Only the NESTED value feeds these hashes, so a row whose nested number was
+        # already correct (top-level-only repair) must not touch them — otherwise
+        # `stale` equals `new_hash` and the row rewrites its own fingerprint to the
+        # value it already holds, churning the uq_results_job_fingerprint bookkeeping
+        # below for no reason.
         stale, new_hash = _ts_hash(stored or ""), _ts_hash(correct)
-        if m["raw_html_hash"] == stale:
-            sets.append("raw_html_hash = :h")
-            params["h"] = new_hash
-        if m["source_fingerprint"] == stale:
-            sets.append("source_fingerprint = :h")
-            params["h"] = new_hash
+        if stored != correct:
+            if m["raw_html_hash"] == stale:
+                sets.append("raw_html_hash = :h")
+                params["h"] = new_hash
+            if m["source_fingerprint"] == stale:
+                sets.append("source_fingerprint = :h")
+                params["h"] = new_hash
 
         plan.append({
             "m": m, "stored": stored, "correct": correct, "sets": sets, "params": params,
+            "top_stored": top_stored, "top_wrong": top_wrong,
             "old_fp": m["source_fingerprint"],
-            "new_fp": new_hash if m["source_fingerprint"] == stale else m["source_fingerprint"],
+            "new_fp": (
+                new_hash
+                if stored != correct and m["source_fingerprint"] == stale
+                else m["source_fingerprint"]
+            ),
         })
 
     if not plan:
@@ -201,8 +227,15 @@ def repair_results(db, truth: dict[str, str], apply: bool) -> int:
         if item["new_fp"] and held.get(key, m["id"]) != m["id"]:
             queue.append(item)  # another row in this job still holds it
             continue
+        nested_note = (
+            f"nts {item['stored']!r} -> {item['correct']!r}"
+            if item["stored"] != item["correct"] else "nts ok"
+        )
+        top_note = (
+            f"  top {item['top_stored']!r} -> {item['correct']!r}" if item["top_wrong"] else ""
+        )
         print(f"  {m['party_name'][:26]:28} job={m['job_id'][:8]} parcel={m['parcel_id']:20} "
-              f"{item['stored']!r} -> {item['correct']!r}"
+              f"{nested_note}{top_note}"
               + (f"  fp {item['old_fp'][:8]}->{item['new_fp'][:8]}"
                  if item["new_fp"] and item["new_fp"] != item["old_fp"] else ""))
         if apply:

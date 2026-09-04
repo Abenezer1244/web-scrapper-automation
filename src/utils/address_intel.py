@@ -92,6 +92,52 @@ def _same_street_modulo_trailing_tokens(a: str, b: str) -> bool:
     return all(tok in _TRAILING_OPTIONAL_TOKENS for tok in long[len(short):])
 
 
+def _street_absorbed_city(p: dict, m: dict, p_street: str, m_street: str) -> bool:
+    """True when one side's STREET is the other's street with that other side's own
+    CITY glued onto the end.
+
+    An NTS notice prints the situs with no comma before the city — "Commonly known
+    as: 1207 118TH PL SW EVERETT, WASHINGTON 98204-4813" — so the display parser,
+    which splits on commas, reads the street as "1207 118TH PL SW EVERETT" while the
+    owner's mailing address parses cleanly to street "1207 118TH PL SW" + city
+    "EVERETT". Same place, two different street strings.
+
+    Until now that shape only survived by accident: `_addresses_differ` returns False
+    early when the two FULL strings normalize identically, which held whenever both
+    sides carried the same ZIP spelling, and broke the moment one side had ZIP+4 and
+    the other ZIP5 — producing a confident absentee_owner=True for an owner living in
+    the house. Measured in production 2026-09-03: 1 such row out of 2,432 absentee
+    rows (a Snohomish trustee-sale lead), so this is narrow by design, matched on the
+    other side's OWN parsed city rather than on any city-looking token.
+
+    This only defers the verdict — the caller still has to CONFIRM same-place with a
+    matching ZIP (or city+state) before returning False. Different ZIPs still read as
+    absentee, so a genuinely different property cannot be merged by this.
+
+    Two guards keep it to the shape it was written for (Codex review):
+      * the absorbing side must have parsed NO city of its own. A city glued to the
+        street is exactly why the parser found none; if it DID find one, the trailing
+        word is part of the street name and dropping it would compare two real streets
+        as equal.
+      * the other side's street must contain a letter. Otherwise "123, EVERETT, WA"
+        (a bare house number, city, state) reads as street "123" + city "EVERETT" and
+        would absorb into any "123 <CITY>" street in the same ZIP.
+    """
+    for street, other_street, other, own in (
+        (p_street, m_street, m, p), (m_street, p_street, p, m)
+    ):
+        if own.get("city"):
+            continue
+        city = _normalize_street(other.get("city"))
+        if not city or not other_street:
+            continue
+        if not any(c.isalpha() for c in other_street):
+            continue
+        if street == f"{other_street} {city}":
+            return True
+    return False
+
+
 def _normalize_full(addr: str) -> str:
     s = _PUNCT_RE.sub(" ", addr).upper()
     return _WS_RE.sub(" ", s).strip()
@@ -169,7 +215,11 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
         # No parsed street on a side — fall back to a whole-string compare. Equal
         # strings are confirmed-same (False); different strings are different (True).
         return _normalize_full(property_address) != _normalize_full(mailing_address)
-    if p_street != m_street and not _same_street_modulo_trailing_tokens(p_street, m_street):
+    if (
+        p_street != m_street
+        and not _same_street_modulo_trailing_tokens(p_street, m_street)
+        and not _street_absorbed_city(p, m, p_street, m_street)
+    ):
         return True
 
     # Base street matches — need a positive discriminator to call it same vs diff.

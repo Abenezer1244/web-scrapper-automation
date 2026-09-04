@@ -483,6 +483,23 @@ async def get_results(
     )
     duplicate_count = dup_count_result.scalar_one()
 
+    # New (non-duplicate, actionable) leads — the SAME predicate workers/tasks.py
+    # uses for billable_count, which is what it writes to jobs.record_count and
+    # reports in the completion log / email / webhook. Returned explicitly so the
+    # results page can render the number the jobs list renders instead
+    # of falling back to `total` (which includes duplicates) and showing "4" for a
+    # job the list correctly shows as "0". Deliberately NOT tax-capped, matching
+    # billable_count exactly — this must track record_count, not `total`.
+    new_count_result = await db.execute(
+        select(func.count()).where(
+            Result.job_id == job_id,
+            Result.user_id == current_user.id,
+            Result.is_duplicate.is_(False),
+            actionable_condition(),
+        )
+    )
+    new_count = new_count_result.scalar_one()
+
     # When results are empty (all duplicates or no new leads), find
     # the most recent previous job for the same county/record_type
     # that has actual Result rows, so the user can navigate there.
@@ -561,6 +578,7 @@ async def get_results(
         job_id=job_id, total=total, page=page, page_size=page_size,
         items=items, enriched_count=enriched_count, enriching=enriching,
         total_scraped=total_scraped, duplicate_count=duplicate_count,
+        new_count=new_count,
         date_range_mode=date_range_mode,
         previous_job_id=previous_job_id,
         has_auction_data=has_auction_data,

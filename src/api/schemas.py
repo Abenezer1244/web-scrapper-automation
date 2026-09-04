@@ -1223,6 +1223,21 @@ class ResultsPage(BaseModel):
     enriching: bool = False       # True while background enrichment is running
     total_scraped: int = 0       # all records before dedup
     duplicate_count: int = 0     # records flagged as duplicate
+    # The NEW-lead count: non-duplicate + actionable — the SAME PREDICATE
+    # workers/tasks.py bills on and writes to jobs.record_count, so the results
+    # page can show the number the jobs list / email / webhook show.
+    # It is the same RULE, not a guaranteed-equal value: record_count is a
+    # billing-time snapshot while this is a live count, so they legitimately
+    # differ while a watchdog re-run has reset record_count to 0
+    # (scheduler_helpers/health.py) and after any post-finalization repair or
+    # address backfill that makes a stored row actionable. For a normally
+    # finalized, untouched job the two agree (Codex review).
+    # `total` deliberately differs (it INCLUDES duplicates, which stay visible so
+    # a user can see what was scraped) — surfacing both is what stops a caller
+    # from inferring one rule from the other and rendering "4" next to a list
+    # that says "0". Unfiltered like total_scraped/duplicate_count: it describes
+    # the scrape, not the current view filter.
+    new_count: int = 0
     date_range_mode: str = ""    # rolling_90 | since_last_run | custom etc.
     previous_job_id: str | None = None  # most recent job with results (for "view previous" link)
     # NTS Tier 1: True if the JOB has ANY auction-matched lead (independent of the

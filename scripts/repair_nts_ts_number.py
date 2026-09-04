@@ -370,7 +370,8 @@ def repair_results(db, truth: dict[str, str], apply: bool) -> int:
     # harder to hit.
     rows = db.execute(sa_text("""
         SELECT r.id::text AS id, r.job_id::text AS job_id, r.party_name, r.parcel_id,
-               r.raw_html_hash, r.source_fingerprint, r.enrichment_data
+               r.raw_html_hash, r.source_fingerprint, r.enrichment_data,
+               r.nts_notice_id::text AS notice_id, n.parcel AS notice_parcel
           FROM results r
           JOIN nts_notices n ON n.id = r.nts_notice_id
          WHERE n.source = :src
@@ -380,6 +381,13 @@ def repair_results(db, truth: dict[str, str], apply: bool) -> int:
     """), {"parcels": list(norm_truth), "src": SOURCE}).all()
 
     from src.scrapers.sources.nts_matcher import _norm_parcel
+
+    # ts_number -> notice id for THIS source, used to repoint nts_notice_id below.
+    notice_by_ts = {
+        r[0]: r[1] for r in db.execute(sa_text(
+            "SELECT ts_number, id::text FROM nts_notices WHERE source = :src"
+        ), {"src": SOURCE}).all()
+    }
 
     # Plan every change first, then order them — see the loop below.
     plan = []
@@ -399,7 +407,15 @@ def repair_results(db, truth: dict[str, str], apply: bool) -> int:
         # direction.
         top_stored = enr.get("ts_number")
         top_wrong = top_stored is not None and top_stored != correct
-        if stored == correct and not top_wrong:
+        # Computed BEFORE the skip: a row can hold the RIGHT ts_number and still have a
+        # pointer aimed at another parcel (the backfill rewrote the row it pointed at),
+        # and skipping on the ts alone would leave that unrepaired.
+        want_id = notice_by_ts.get(correct)
+        repoint = (
+            _norm_parcel(m["parcel_id"]) != _norm_parcel(m["notice_parcel"])
+            and want_id is not None and want_id != m["notice_id"]
+        )
+        if stored == correct and not top_wrong and not repoint:
             continue
 
         new_enr = dict(enr)
@@ -411,6 +427,20 @@ def repair_results(db, truth: dict[str, str], apply: bool) -> int:
 
         params = {"id": m["id"], "enr": json.dumps(new_enr)}
         sets = ["enrichment_data = CAST(:enr AS json)"]
+
+        # REPOINT nts_notice_id when it now resolves to a DIFFERENT property.
+        # nts_notices is upserted ON CONFLICT (source, ts_number), so as soon as the
+        # archive backfill inserts the real notice for a key a mis-bound row had been
+        # squatting on, that row's CONTENT is replaced wholesale — and any lead pointing
+        # at it is left aimed at a stranger's parcel. The lead's own auction_date /
+        # default_amount are unaffected (copied at match time, and correct), but an audit
+        # pointer must not claim a different property. Measured on King 2026-09-04:
+        # 1 of 4 matched leads, immediately after the backfill.
+        # Only ever repoints to the notice whose ts_number is the one THIS parcel's own
+        # issue prints, and only when that notice actually exists. Never guessed.
+        if repoint:
+            sets.append("nts_notice_id = CAST(:nid AS uuid)")
+            params["nid"] = want_id
         # raw_html_hash IS the ON CONFLICT source_fingerprint for trustee_sale rows
         # (tasks.py: `_fingerprint = rec.raw_html_hash or _source_fingerprint(rec)`), so
         # the two must move together — and ONLY when the stored hash really is the
@@ -436,6 +466,7 @@ def repair_results(db, truth: dict[str, str], apply: bool) -> int:
 
         plan.append({
             "m": m, "stored": stored, "correct": correct, "sets": sets, "params": params,
+            "repoint": repoint,
             "top_stored": top_stored, "top_wrong": top_wrong,
             "old_fp": m["source_fingerprint"],
             "new_fp": (
@@ -481,6 +512,8 @@ def repair_results(db, truth: dict[str, str], apply: bool) -> int:
         top_note = (
             f"  top {item['top_stored']!r} -> {item['correct']!r}" if item["top_wrong"] else ""
         )
+        if item["repoint"]:
+            top_note += "  REPOINT nts_notice_id (was aimed at another parcel)"
         print(f"  {m['party_name'][:26]:28} job={m['job_id'][:8]} parcel={m['parcel_id']:20} "
               f"{nested_note}{top_note}"
               + (f"  fp {item['old_fp'][:8]}->{item['new_fp'][:8]}"

@@ -52,6 +52,56 @@ _OWNER_RE = re.compile(
 # "N.A.", and "N / A" all collapse to "NA".
 _OWNER_JUNK = frozenset({"NA", "NONE", "NULL", "UNKNOWN"})
 
+# eRealProperty SILENTLY TRUNCATES an over-length ParcelNbr to the first 10 digits
+# and serves a DIFFERENT parcel's page with no error (verified live 2026-09-03:
+# ParcelNbr=64116000027 returns parcel 641160-0002, owner SNYDER JACOB, site
+# 11524 MERIDIAN AVE N — while the lead's decedent was REINKE NORMAN LEONARD,
+# whose parcel 6411600027 is 11547 CORLISS AVE N). King's own recorder emits
+# malformed PIDs in its legal-description index, so this is reachable from real
+# scraped data and it attaches ANOTHER PROPERTY'S address to a lead.
+#
+# The page states which parcel it actually resolved, so read it back and compare.
+# LABEL-ANCHORED on the "Parcel Number" cell (Codex): never "the first 10-digit
+# number on the page" — the page is full of unrelated numbers.
+_PARCEL_ECHO_RE = re.compile(
+    r"<td[^>]*>\s*Parcel\s*(?:Number|Nbr)?\s*</td>\s*<td[^>]*>(.*?)</td>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# King PIN = 6-digit major + 4-digit minor. A requested id of exactly this shape
+# cannot be truncated, so it is the only case where a page that omits the echo
+# (layout change) may still be trusted.
+_KING_PIN_DIGITS = 10
+
+
+def _digits(value: str | None) -> str:
+    return re.sub(r"\D", "", value or "")
+
+
+def _extract_parcel_echo(page_html: str) -> str | None:
+    """Digits of the parcel the eRealProperty page says it resolved, or None."""
+    m = _PARCEL_ECHO_RE.search(page_html)
+    if not m:
+        return None
+    echoed = _digits(BridgeScraper.clean(html.unescape(re.sub(r"<[^>]+>", " ", m.group(1)))))
+    return echoed or None
+
+
+def parcel_page_is_for(page_html: str, requested_pid: str) -> bool:
+    """True if this eRealProperty page is really about ``requested_pid``.
+
+    MISMATCH -> False: we asked about parcel X and the county answered about
+    parcel Y, so nothing on the page may be attributed to this lead.
+    MISSING ECHO -> trusted only when the requested id is already a well-formed
+    10-digit King PIN (the truncation class cannot apply to it); a malformed id
+    with no echo fails CLOSED.
+    """
+    want = _digits(requested_pid)
+    echoed = _extract_parcel_echo(page_html)
+    if echoed is None:
+        return len(want) == _KING_PIN_DIGITS
+    return echoed == want
+
 
 class KingOwnerLookupBlockedError(RuntimeError):
     """Raised when eRealProperty appears to be throttling/blocking lookups."""
@@ -95,6 +145,16 @@ async def _fetch_king_owner(pid: str, *, max_attempts: int = 1) -> tuple[str | N
             # in depth — same call the full enricher uses.
             r = safe_get(f"{_ERP_URL}{pid}", headers=_HEADERS, timeout=10)
             if r.status_code == 200:
+                # The county may have silently resolved a DIFFERENT parcel (see
+                # parcel_page_is_for). A wrong owner is worse than no owner — this
+                # path repairs placeholder party_name — so treat it as a genuine
+                # miss, not a transient error (retrying would return the same page).
+                if not parcel_page_is_for(r.text, pid):
+                    _logger.warning(
+                        "King owner lookup: eRealProperty resolved a DIFFERENT parcel for "
+                        "requested=%s (echoed=%s) — discarding", pid, _extract_parcel_echo(r.text),
+                    )
+                    return None, False
                 return _extract_owner_name(r.text), False  # genuine result (name or miss)
         except Exception as exc:
             _logger.debug(
@@ -220,7 +280,8 @@ async def batch_enrich_king_county(
     clean = list(dict.fromkeys(pid.strip() for pid in parcel_ids if pid and len(pid.strip()) >= 6))
     st = stats if stats is not None else {}
     st.update({"requested": len(clean), "property_found": 0, "mailing_candidates": 0,
-               "mailing_attempted": 0, "mailing_found": 0, "deferred": [], "budget_exhausted": False})
+               "mailing_attempted": 0, "mailing_found": 0, "deferred": [],
+               "budget_exhausted": False, "parcel_mismatch": 0})
     deadline = (_time.monotonic() + time_budget_s) if time_budget_s is not None else None
 
     def _over_budget() -> bool:
@@ -255,6 +316,27 @@ async def batch_enrich_king_county(
             if r.status_code != 200:
                 continue
 
+            # The county may have silently truncated our id and served ANOTHER
+            # parcel's page (see parcel_page_is_for). Everything below — site
+            # address, tax-bill URL, owner — would then belong to a different
+            # property, so discard the whole page rather than attach any of it.
+            # A lead with no address is honest; a lead with someone else's address
+            # is a wrong mailing AND a paid skip-trace on a stranger's house.
+            if not parcel_page_is_for(r.text, pid):
+                st["parcel_mismatch"] += 1
+                _logger.warning(
+                    "King enrichment: eRealProperty resolved a DIFFERENT parcel for "
+                    "requested=%s (echoed=%s) — discarding page",
+                    pid, _extract_parcel_echo(r.text),
+                )
+                results[pid] = {
+                    "property_address": None,
+                    "mailing_address": None,
+                    "owner_name": None,
+                    "parcel_lookup": "mismatch",
+                }
+                continue
+
             # Extract Site Address
             m = re.search(r"Site Address</td>\s*<td[^>]*>([^<]+)", r.text)
             prop = m.group(1).replace("&nbsp;", "").strip() if m else None
@@ -276,6 +358,13 @@ async def batch_enrich_king_county(
                     "property_address": prop,
                     "mailing_address": None,
                     "owner_name": owner,
+                    # Provenance (Codex): "verified" = the page echoed the parcel we
+                    # asked for; "echo_absent" = the page carried no Parcel Number
+                    # cell but our id was a well-formed 10-digit King PIN, so the
+                    # truncation class could not apply.
+                    "parcel_lookup": (
+                        "verified" if _extract_parcel_echo(r.text) else "echo_absent"
+                    ),
                 }
                 if tax_url:
                     tax_urls[pid] = tax_url
@@ -289,8 +378,8 @@ async def batch_enrich_king_county(
         await asyncio.sleep(0.1 if pace_s <= 0.2 else pace_s)  # job: 0.1 s; backfill: slow
 
     st["property_found"] = sum(1 for r in results.values() if r.get("property_address"))
-    _logger.info("Phase 1 done: %d/%d property addresses, %d tax URLs",
-                 st["property_found"], len(clean), len(tax_urls))
+    _logger.info("Phase 1 done: %d/%d property addresses, %d tax URLs, %d parcel mismatches",
+                 st["property_found"], len(clean), len(tax_urls), st["parcel_mismatch"])
 
     # ── Phase 2: Playwright for mailing addresses ──────────────────────────
     st["mailing_candidates"] = len(tax_urls)

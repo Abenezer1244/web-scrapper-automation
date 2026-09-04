@@ -267,6 +267,29 @@ _AUCTION_KING_LOC_B = re.compile(
     rf"{_TIME}\s*,\s*(.+?)(?=,\s*to\s+the\s+highest|the\s+undersigned|will\s+sell|$)",
     re.I | re.S)
 
+# ── Affinia with a NUMERIC date (live 2026-09-03, Queen Anne & Magnolia News / King).
+# Affinia puts the location AFTER the verb ("…will on 08/14/2026, at 10:00 AM sell at
+# public auction located at the 4th Avenue Entrance…"). _AUCTION requires a NON-EMPTY
+# location BETWEEN the time and the verb, so it cannot match this; _AUCTION_KING allows
+# the location after but only accepts a MONTH-NAME date; _AUCTION_WORDED needs "Nth day
+# of <Month> … o'clock". So all three missed and the notice was DISCARDED whole
+# (is_valid_nts needs auction_date) — 3 of 5 notices on the 08-05-26 issue and 2 of 2
+# on the 09-02-26 issue, i.e. every Affinia sale in King.
+#
+# Deliberately the TIGHTEST of the four: the verb must follow the time IMMEDIATELY
+# (only optional whitespace/comma), and the whole thing must hang off "Trustee will"
+# (Codex). A numeric date is common inside these notices (deed recording, "Interest
+# Paid To", publication dates), so — unlike the month-name _AUCTION_KING — this one
+# gets NO 600-char window to reach the verb: a recording date is never immediately
+# followed by "sell at public auction". Groups (1)=date, (2)=time match _AUCTION_KING's
+# so the caller handles both identically. Fully anchored literals, no nested
+# quantifiers, no unbounded '.' -> linear, no backtracking blowup on a 45k block.
+_AUCTION_NUM_LOC_AFTER = re.compile(
+    rf"Trustee\s+will\s*,?\s*on\s+(?:{_WEEKDAY})?(\d{{1,2}}/\d{{1,2}}/\d{{4}})\s*,?\s*"
+    rf"at\s+{_HOUR_OF}({_TIME})\s*,?\s*sell\s+at\s+public\s+auction",
+    re.I,
+)
+
 # ── Ordinal worded auction date (Clear Recon / older law-firm Tacoma notices, live
 # 2026-06-26): "...Trustee will on the 17th day of July, 2026, at the hour of 10:00
 # o'clock AM <loc> ... sell at public auction". Neither the numeric _AUCTION nor the
@@ -390,7 +413,10 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
     # numeric notice whose location drift-guard rejected it (Codex). Date+time are
     # load-bearing; location (same anchored match) is best-effort.
     if am is None:
-        km = _AUCTION_KING.search(text)
+        # Month-name layouts first, then the numeric location-after layout (Affinia).
+        # Both expose group(1)=date, group(2)=time, so one branch serves both; _to_date
+        # already accepts M/D/YYYY and "Month D, YYYY".
+        km = _AUCTION_KING.search(text) or _AUCTION_NUM_LOC_AFTER.search(text)
         if km:
             auction_date = " ".join(km.group(1).split()).strip().rstrip(",")
             auction_time = " ".join(km.group(2).split())

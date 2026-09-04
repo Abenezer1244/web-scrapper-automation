@@ -1,0 +1,205 @@
+"""REAL King (Queen Anne & Magnolia News) Affinia notices the crawler discarded whole.
+
+Affinia Default Services prints the sale LOCATION *after* the verb with a NUMERIC date:
+
+    "...the undersigned Trustee will on 08/14/2026, at 10:00 AM sell at public
+     auction located at the 4th Avenue Entrance of the King County Administration..."
+
+_AUCTION needs a non-empty location BETWEEN the time and the verb; _AUCTION_KING allows
+the location after but only for a MONTH-NAME date; _AUCTION_WORDED needs "Nth day of
+<Month> ... o'clock". All three missed, so auction_date was None and is_valid_nts
+discarded the notice — silently, counted only as `skipped`. Measured against the live
+PDFs on 2026-09-03: 3 of 5 notices lost on the 08-05-26 issue and 2 of 2 (100%) on the
+then-current 09-02-26 issue, i.e. every Affinia sale in King County.
+
+Fixtures are the verbatim split blocks from those two published PDFs.
+"""
+import time
+from datetime import date
+from pathlib import Path
+
+from src.scrapers.sources.nts_king_pdf import parse_king_notice
+from src.scrapers.sources.nts_tacoma_index import (
+    _AUCTION,
+    _AUCTION_NUM_LOC_AFTER,
+    is_valid_nts,
+    notice_to_row,
+    parse_nts_notice,
+)
+
+_FX = Path(__file__).parent / "fixtures"
+
+
+def _parse_king(name: str) -> dict:
+    return parse_king_notice((_FX / name).read_text(encoding="utf-8"))
+
+
+def _row(parsed: dict, today: date) -> dict | None:
+    return notice_to_row(
+        parsed,
+        source_url="https://pacificpublishingcompany.media.clients.ellingtoncms.com/x.pdf",
+        today=today,
+        source="queen_anne_news",
+        county="king",
+    )
+
+
+# ── The three real notices, end to end ────────────────────────────────────────────
+
+def test_affinia_numeric_addai_recovered():
+    p = _parse_king("nts_king_affinia_numeric_addai.txt")
+    assert p["auction_date"] == "08/14/2026"
+    assert p["auction_time"] == "10:00 AM"
+    assert p["parcel"] == "192105-9193"
+    assert p["ts_number"] == "REF-20240305000737"
+    assert is_valid_nts(p)
+    row = _row(p, date(2026, 8, 6))
+    assert row is not None
+    assert row["auction_date"] == date(2026, 8, 14)
+    # Section IV "sum owing ... Principal $512,000.00" — NOT the larger
+    # "total debt now owing in the amount of $603,776.44" (interest + fees).
+    assert str(row["principal_owing"]) == "512000.00"
+    assert row["county"] == "king"
+
+
+def test_affinia_numeric_walker_recovered():
+    p = _parse_king("nts_king_affinia_numeric_walker.txt")
+    assert p["auction_date"] == "09/04/2026"
+    assert p["auction_time"] == "9:00 AM"
+    assert p["parcel"] == "327692-0130-03"
+    assert is_valid_nts(p)
+    row = _row(p, date(2026, 8, 6))
+    assert row is not None
+    assert row["auction_date"] == date(2026, 9, 4)
+    assert str(row["principal_owing"]) == "679597.29"
+
+
+def test_affinia_numeric_lutes_recovered():
+    p = _parse_king("nts_king_affinia_numeric_lutes.txt")
+    assert p["auction_date"] == "10/02/2026"
+    assert p["auction_time"] == "10:00 AM"
+    assert p["parcel"] == "2898600015"
+    assert is_valid_nts(p)
+    row = _row(p, date(2026, 9, 3))
+    assert row is not None
+    assert row["auction_date"] == date(2026, 10, 2)
+    assert str(row["principal_owing"]) == "414780.74"
+
+
+def test_location_after_the_verb_is_captured():
+    """Location is display-only, but it must not be left empty or swallow the notice."""
+    p = _parse_king("nts_king_affinia_numeric_addai.txt")
+    loc = p["auction_location"]
+    assert loc and "4th Avenue Entrance" in loc
+    assert "NOTICE OF TRUSTEE" not in loc.upper()
+    assert len(loc) <= 300
+
+
+# ── The new pattern must stay strictly additive ───────────────────────────────────
+
+def test_new_pattern_does_not_fire_on_location_before_layout():
+    """A location-BEFORE notice is _AUCTION's job; the new fallback must not match it.
+
+    The fallback requires the verb to follow the time immediately, so a layout with a
+    location in between can never reach it — _AUCTION keeps owning those notices.
+    """
+    text = ("the undersigned Trustee will on 08/14/2026, at 10:00 AM at the 4th Avenue "
+            "Entrance of the King County Administration Building sell at public auction")
+    assert _AUCTION.search(text) is not None
+    assert _AUCTION_NUM_LOC_AFTER.search(text) is None
+
+
+def test_new_pattern_does_not_bind_a_recording_or_publication_date():
+    """Numeric dates are everywhere in these notices; only the sale sentence may match.
+
+    A deed recording / "Interest Paid To" / publication date is never immediately
+    followed by "sell at public auction", and none hangs off "Trustee will".
+    """
+    for text in (
+        "Deed of Trust recorded on 03/05/2024, at 10:00 AM sell at public auction",
+        "Interest Paid To: 04/01/2025, at 10:00 AM. The Trustee will sell at public auction",
+        "Published on 08/05/2026, at 10:00 AM in the Queen Anne & Magnolia News",
+    ):
+        assert _AUCTION_NUM_LOC_AFTER.search(text) is None
+
+
+def test_existing_month_name_and_worded_layouts_unchanged():
+    """The three pre-existing shapes still parse exactly as before (no preemption)."""
+    mtc = ("I. NOTICE IS HEREBY GIVEN that on September 4, 2026, 09:00 AM, Main Entrance, "
+           "King County Administration Building, 500 4th Avenue, Seattle, WA 98104, MTC "
+           "Financial Inc. dba Trustee Corps, the undersigned Trustee, will sell at public "
+           "auction to the highest and best bidder")
+    p = parse_nts_notice(mtc)
+    assert p["auction_date"] == "September 4, 2026"
+    assert p["auction_time"] == "09:00 AM"
+
+    worded = ("the undersigned Trustee will on the 17th day of July, 2026, at the hour of "
+              "10:00 o'clock AM at the county courthouse steps sell at public auction")
+    p = parse_nts_notice(worded)
+    assert p["auction_date"] == "July 17, 2026"
+    assert p["auction_time"] == "10:00 AM"
+
+    numeric_loc_before = ("the undersigned Trustee will on 9/25/2026, at 10:00 AM at the "
+                          "Pierce County Courthouse steps sell at public auction")
+    p = parse_nts_notice(numeric_loc_before)
+    assert p["auction_date"] == "9/25/2026"
+    assert p["auction_time"] == "10:00 AM"
+    assert p["auction_location"] == "the Pierce County Courthouse steps"
+
+
+# ── Backtracking safety (a prior regex change in this file ran >120s) ─────────────
+
+def test_no_catastrophic_backtracking_on_a_large_real_block():
+    """The Walker fixture is a real 44k-char block; parsing must stay far under a second."""
+    text = (_FX / "nts_king_affinia_numeric_walker.txt").read_text(encoding="utf-8")
+    assert len(text) > 40_000
+    start = time.perf_counter()
+    parse_king_notice(text)
+    assert time.perf_counter() - start < 2.0
+
+
+def test_no_catastrophic_backtracking_on_adversarial_non_matching_text():
+    """Many 'Trustee will on <date>, at <time>' near-misses that never reach the verb."""
+    text = ("the undersigned Trustee will on 08/14/2026, at 10:00 AM " + "x " * 400) * 120
+    assert len(text) > 100_000
+    start = time.perf_counter()
+    assert _AUCTION_NUM_LOC_AFTER.search(text) is None
+    assert time.perf_counter() - start < 2.0
+
+
+# ── The drop must never be silent again ───────────────────────────────────────────
+
+def test_undated_real_notice_is_counted_separately_from_chrome():
+    """A block with an identity but no auction date is a lost lead, not chrome."""
+    from src.workers.nts_crawler import _note_undated_drop
+
+    summary: dict = {}
+    # A real trustee sale whose date shape the parser could not read.
+    assert _note_undated_drop(summary, {"ts_number": "REF-20240305000737"}, "queen_anne_news") is True
+    assert summary["dropped_undated"] == 1
+
+    # Chrome / a non-NTS legal notice — no identity, must stay quiet.
+    assert _note_undated_drop(summary, {"ts_number": None, "grantor": None}, "queen_anne_news") is False
+    # A fully parsed notice is not a drop at all.
+    assert _note_undated_drop(
+        summary, {"ts_number": "WA05000073-24-2", "auction_date": "08/14/2026"}, "queen_anne_news"
+    ) is False
+    assert summary["dropped_undated"] == 1
+
+
+def test_the_three_recovered_notices_would_have_tripped_the_drop_counter():
+    """Pins the regression: pre-fix, each of these was an undated real notice."""
+    from src.workers.nts_crawler import _note_undated_drop
+
+    summary: dict = {}
+    for name in ("nts_king_affinia_numeric_addai.txt",
+                 "nts_king_affinia_numeric_walker.txt",
+                 "nts_king_affinia_numeric_lutes.txt"):
+        p = _parse_king(name)
+        # They parse now, so they are NOT drops...
+        assert _note_undated_drop(summary, p, "queen_anne_news") is False
+        # ...but the same notice minus its auction date is exactly what used to be lost.
+        assert _note_undated_drop(
+            summary, {**p, "auction_date": None}, "queen_anne_news"
+        ) is True
+    assert summary["dropped_undated"] == 3

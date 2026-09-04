@@ -455,6 +455,12 @@ class ClarkWAScraper(BridgeScraper):
                 # "Estate of" captions. No-op when grantor is already the decedent
                 # (Clark is mostly TOD deeds, whose grantor is a live owner).
                 grantor, grantee = orient_probate_party(grantor, grantee, doc_type)
+                if not grantor:
+                    # Guard #2: both sides were a filing agency / recorder
+                    # placeholder, so there is no decedent. The append gate below
+                    # keeps any row with a DATE, so a party-less probate lead
+                    # would ship and still be billed (Codex).
+                    continue
 
             record.party_name = grantor
             record.heirs = grantee

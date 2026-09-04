@@ -487,6 +487,11 @@ class SkagitRecordingScraper(BridgeScraper):
                     record.party_name, record.heirs = orient_probate_party(
                         record.party_name, record.heirs, record.doc_type
                     )
+                    if not record.party_name:
+                        # Guard #2: no decedent on either side. The append gate
+                        # below keeps any row with a DATE, so a party-less
+                        # probate lead would ship and still be billed (Codex).
+                        continue
 
                 # Comment — contains probate info like "INHERITANCE LACK OF PROBATE"
                 # Use for doc_type filtering AND store in enrichment_data

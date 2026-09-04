@@ -542,7 +542,14 @@ async def get_batch(
                 record_type=record_type,
                 job_id=job[0] if job else None,
                 status=child_status,
-                record_count=job[2] if job else 0,
+                # Only a DONE child has a lead count. jobs.record_count is also
+                # written mid-scrape by the progress callback, so a failed /
+                # running child still carries the in-flight raw counter — Test 11's
+                # failed child reported 210 while it persisted, exported and billed
+                # ZERO, and the UI rendered that as "210 leads" and summed it into
+                # the batch total. Report 0 for any non-done child so the client
+                # renders "—" instead of inventing leads that were never delivered.
+                record_count=job[2] if (job and child_status == "done") else 0,
             )
         )
 

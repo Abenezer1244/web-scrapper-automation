@@ -389,3 +389,66 @@ class TestCombinedRecordCount:
         bid = await self._mk(db, starter_user, mode="overlaps_only", counts=None)
         body = (await client.get(f"/batches/{bid}", headers=_auth(starter_token))).json()
         assert body["combined_record_count"] is None
+
+
+# ─── a PARTIAL run: a failed child must not report in-flight scrape progress ──
+
+@pytest_asyncio.fixture
+async def partial_batch(db: AsyncSession, starter_user: User) -> SimpleNamespace:
+    """Test 11's shape: one done child (0 leads) + one FAILED child whose
+    jobs.record_count still holds the mid-scrape counter (210) even though it
+    persisted, exported and billed nothing. The run is 'partial'."""
+    batch = ScraperBatch(
+        id=str(uuid.uuid4()), user_id=starter_user.id, name="Test 11", state="WA",
+        fields=["party_name"], enrichment=[], schedule={}, deliver={"emails": []},
+        status="active",
+    )
+    db.add(batch)
+    await db.flush()
+    jobs = {}
+    for record_type, status, record_count in (
+        ("probate", "done", 0),
+        ("pre_foreclosure", "failed", 210),
+    ):
+        cfg = ScraperConfig(
+            id=str(uuid.uuid4()), user_id=starter_user.id, batch_id=batch.id,
+            name=f"Test 11 - {record_type}", county="pierce", state="WA",
+            record_type=record_type, fields=["party_name"], enrichment=[],
+            schedule={}, deliver={},
+        )
+        db.add(cfg)
+        job = Job(
+            id=str(uuid.uuid4()), user_id=starter_user.id, scraper_config_id=cfg.id,
+            status=status, trigger="batch", record_count=record_count,
+        )
+        db.add(job)
+        jobs[record_type] = job
+    await db.flush()
+    db.add(BatchRun(
+        id=str(uuid.uuid4()), batch_id=batch.id, user_id=starter_user.id,
+        status="partial", child_job_ids=[j.id for j in jobs.values()],
+    ))
+    await db.commit()
+    return SimpleNamespace(batch_id=batch.id)
+
+
+async def test_failed_child_reports_zero_not_its_in_flight_scrape_counter(
+    client: AsyncClient, starter_token: str, partial_batch: SimpleNamespace
+):
+    """jobs.record_count is written mid-scrape by the progress callback, so a
+    FAILED child keeps the raw counter from the page it died on. Surfacing it
+    made Test 11's UI print "210 leads" for a job that delivered zero, and
+    summed it into the batch total. A non-done child reports 0."""
+    resp = await client.get(
+        f"/batches/{partial_batch.batch_id}", headers=_auth(starter_token)
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["run_status"] == "partial"
+    by_type = {c["record_type"]: c for c in body["children"]}
+    assert by_type["pre_foreclosure"]["status"] == "failed"
+    assert by_type["pre_foreclosure"]["record_count"] == 0
+    assert by_type["probate"]["status"] == "done"
+    assert by_type["probate"]["record_count"] == 0
+    # what the batch header sums
+    assert sum(c["record_count"] for c in body["children"]) == 0

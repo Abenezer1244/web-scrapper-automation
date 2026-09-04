@@ -44,6 +44,12 @@ _PAGE_RETRY_BACKOFF_MS: tuple[int, ...] = (5_000, 15_000)  # waits between attem
 _PAGE_ADVANCE_POLLS = 5
 _PAGE_ADVANCE_POLL_MS = 1_500
 
+# Minimum <td> count for a row to be an ARMS results row. The live grid renders 39
+# cells per row; 9 is the number _map_row actually needs and is what the row filter
+# has always used. It is a WIDTH test on a single row — never a COUNT of rows, which
+# is what used to break small result pages.
+_ARMS_MIN_ROW_CELLS = 9
+
 # ─── Patterns ─────────────────────────────────────────────────────────────────
 
 _ARMS_HOME = "https://armsweb.co.pierce.wa.us/"
@@ -586,19 +592,48 @@ class PierceWAARMSScraper(BridgeScraper):
 
         _logger.info("  Detail pages: %d parcel IDs found across %d pages", found, page_num)
 
+    @staticmethod
+    def _own_rows(table: Tag) -> list[Tag]:
+        """Rows this table owns directly.
+
+        ``find_all("tr")`` is recursive, so a WRAPPER table reports every row of
+        the grid nested inside it and would be tested — and could be picked —
+        before the grid itself. Scoping to the nearest enclosing table keeps the
+        shape test honest (Codex).
+        """
+        return [r for r in table.find_all("tr") if r.find_parent("table") is table]
+
+    @classmethod
+    def _is_grid_row(cls, row: Tag) -> bool:
+        """A row wide enough to be an ARMS results row, numbered like one."""
+        cells = row.find_all("td")
+        if len(cells) < _ARMS_MIN_ROW_CELLS:
+            return False
+        return cells[0].get_text(strip=True).isdigit()
+
+    @classmethod
+    def _is_grid_signature_row(cls, row: Tag) -> bool:
+        """``_is_grid_row`` plus a recorded date — the signature used to PICK the
+        grid. Every ARMS result row carries filed/recorded dates; the pager,
+        criteria and filter tables that share the page do not carry all three of
+        width, a leading row number and a date."""
+        if not cls._is_grid_row(row):
+            return False
+        return bool(_DATE_PATTERN.search(row.get_text(" ", strip=True)))
+
     def _extract_records(self, soup: BeautifulSoup) -> list[ScrapedRecord]:
         """Extract records from the ARMS results table."""
-        tables = soup.find_all("table")
+        # The grid carries no id or class, so it is identified by ROW SHAPE — never
+        # by a row COUNT. The previous `len(rows) < 5` guard rejected the grid
+        # whenever a page held 1-3 records: a whole search that small, or the LAST
+        # page of a multi-page search when the remainder was 1-3. The grid then
+        # looked "missing", which raised below and failed the entire job even
+        # though 9 of 10 pages had scraped fine (Test 11).
         data_table = None
-        for t in tables:
-            data_rows = t.find_all("tr")
-            if len(data_rows) < 5:
-                continue
-            if len(data_rows) > 1:
-                first_td = data_rows[1].find("td")
-                if first_td and first_td.get_text(strip=True).isdigit():
-                    data_table = t
-                    break
+        for t in soup.find_all("table"):
+            if any(self._is_grid_signature_row(r) for r in self._own_rows(t)):
+                data_table = t
+                break
 
         if data_table is None:
             # Genuine empty day ("0 records found") legitimately has no table →
@@ -616,17 +651,11 @@ class PierceWAARMSScraper(BridgeScraper):
                 record_type=self._record_type,
             )
 
-        rows = data_table.find_all("tr")
         records: list[ScrapedRecord] = []
-
-        for row in rows[1:]:
-            cells = row.find_all("td")
-            if len(cells) < 9:
-                continue
-            first_text = cells[0].get_text(strip=True)
-            if not first_text.isdigit():
-                continue
-            record = self._map_row(cells)
+        for row in self._own_rows(data_table):
+            if not self._is_grid_row(row):
+                continue  # header / spacer / nested chrome
+            record = self._map_row(row.find_all("td"))
             if record:
                 records.append(record)
 

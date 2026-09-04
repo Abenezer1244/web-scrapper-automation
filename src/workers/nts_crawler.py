@@ -63,8 +63,15 @@ _SNOHO_SOURCE = "snohomish_tribune"
 
 # King County via the Queen Anne & Magnolia News (Pacific Publishing). PARTIAL
 # coverage — it's a neighborhood paper, not King County's dominant foreclosure venue
-# (that's the DJC, $350/yr, deferred). Same weekly-PDF pipeline; its legals live in a
-# /legals/ subdir (vs snoho's flat /images/).
+# (that's the Seattle DJC). Same weekly-PDF pipeline; its legals live in a /legals/
+# subdir (vs snoho's flat /images/).
+# DJC status, scoped 2026-09-03 (docs/scoping-king-nts-coverage-2026-09-03.md): NOT a
+# "just pay for it" item. The old "$350/yr" note here was stale — the relevant tier is
+# $199/yr — but price was never the blocker: djc.com/robots.txt disallows /notices/ for
+# ALL crawlers, and the free WNPA aggregator carrying the same notices
+# (wapublicnotices.com) bans scraping outright in its Terms of Use. A subscription buys
+# reading access, not crawl permission. The cheap path to more King coverage is the
+# OTHER approved King legal newspapers, not the DJC.
 _KING_PAGE = "https://queenannenews.com/Content/Default/Default/Classified/Legal-Notices/-3/-3/498"
 _KING_PDF_PREFIX = "/static-4/queenannenews/images/legals/"
 _KING_SOURCE = "queen_anne_news"

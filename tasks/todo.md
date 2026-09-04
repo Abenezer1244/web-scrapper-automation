@@ -57,8 +57,18 @@ Evidence:
 - `ruff check src/ tests/` clean. Full suite **2260 passed, 2 skipped**. CI green on #217.
 - Prod UI captured with Chromium: "Completed with errors", failed child "210 leads".
 
+### Codex gate
+| Round | Result |
+|---|---|
+| Consult (pre-implementation) | 6 findings; all verified independently, 2 became fixes, 1 declined with reasoning |
+| Diff review r1 | **2 × P1** — chrome table could score a blocked page as healthy 0; zeroing a non-done child hides rows that reach the combined CSV. Both fixed. |
+| Diff review r2 | **1 × P1** (`_retry_scrape_job` resets `record_count` to 0, so `min()` still hides rows) + 2 × P2. All fixed. |
+| Diff review r3 | ⏭️ **NOT RUN** — CLI usage limit again (resets 10:27). Its two questions were self-verified: `is_duplicate` is `nullable=False` so `IS NOT TRUE` ≡ `= FALSE`; `clean()` only strips control chars and collapses whitespace, so it can never create digits and the signature can only be more permissive than `_map_row`, never reject a real row. |
+
 ### Open
-- ⏭️ **Codex diff-review gate NOT RUN** — CLI usage limit, resets 08:04. Pre-implementation
-  consult ran; all six findings verified independently.
 - ⏭️ **#217 not merged** — user holding. In-product re-run of Test 11 therefore UNVERIFIED.
 - ⏭️ Same-family row-count guards in 4 other scraper templates: reported, not changed.
+- 📋 A non-done child's count is *non-duplicate saved rows*. The combined CSV additionally
+  applies actionability, the tax cap and dedup buckets, so it can still sit slightly above what
+  downloads — an approximation, never a fabrication. The accurate delivered number is the
+  batch-level `combined_record_count`, which reads the run's `delivery_counts`.

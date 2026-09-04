@@ -179,19 +179,24 @@ stays sparse by design, and the product should say so rather than imply missing 
 
 # Addendum 2026-09-04 (2): the newspaper list is CLOSED — no clean route exists
 
-**Status:** all 22 court-approved King County legal newspapers now checked. **Result: none
-are scrapable.** This closes the question; stop hunting outlets.
+**Status:** all 22 court-approved King County legal newspapers now examined. **Result: none
+is usable** — 20 verified closed or legals-less, 2 (PSBJ, Voice of the Valley) UNVERIFIED but
+unpromising. This closes the question in practice; stop hunting outlets.
 
 ## Why the list is a dead end
 
-Nine of the remaining unchecked papers — Auburn, Bellevue, Bothell/Kenmore, Covington/Maple
-Valley, Enumclaw Courier Herald, Kent, Redmond, Renton, Snoqualmie Valley Record, plus the
-Vashon-Maury Beachcomber — are **Sound Publishing / Carpenter Media Group** titles, and none
-of them hosts legal notices at all. Every one carries the same hard-coded sentence:
+**Ten** of the remaining unchecked papers — Auburn, Bellevue, Bothell/Kenmore,
+Covington/Maple Valley, Enumclaw Courier Herald, Kent, Redmond, Renton, Snoqualmie Valley
+Record and the Vashon-Maury Beachcomber — are **Sound Publishing / Carpenter Media Group**
+titles, and none of them hosts legal notices at all. Every one carries the same hard-coded
+sentence:
 
 > "To view legal notices online, please visit http://www.wapublicnotices.com/"
 
-Verified directly on 8 of the 9 domains. Their own robots.txt files are permissive and their
+Confirmed by direct fetch on **8 of the 10**; Covington/Maple Valley refused the connection
+(`ECONNREFUSED`) and Bothell/Kenmore was read from the shared network template rather than
+its own domain. Both are presumed to follow the pattern their eight verified siblings share,
+which is an inference, not a measurement. Their own robots.txt files are permissive and their
 network ToS has no anti-scraping clause — and it makes no difference, because **there is
 nothing of their own to scrape**. They all funnel to wapublicnotices.com, whose Terms of Use
 ban scraping outright with liquidated damages up to $10,000 per incident.
@@ -212,9 +217,23 @@ The rest:
 ## The conclusion
 
 Combined with the first addendum (DJC, WNPA, Seattle Times, and the recorded document all
-blocked), **every identified route to King trustee-sale auction data is closed by terms of
-use, robots.txt, or a bot block.** The ~1% ceiling from the Queen Anne & Magnolia News is not
-a gap waiting to be filled — it is the whole legally-clean supply.
+blocked), **every route that has been verified is closed** by terms of use, robots.txt, or a
+bot block — and the ~1% ceiling from the Queen Anne & Magnolia News is, as far as anything
+here shows, the whole legally-clean supply.
+
+Two caveats, stated because the point of this doc is to justify stopping and a decision to
+stop should not rest on overstated evidence:
+
+- **Puget Sound Business Journal** could not be fetched at all, so neither its robots.txt nor
+  its ToS was read, and no legals section was found or ruled out.
+- **Voice of the Valley** genuinely publishes its own notices and has a fully permissive
+  robots.txt, but returns **HTTP 403 to automated requests on every content page**, including
+  `/terms-of-use/`. A site that blocks robots while publishing a permissive robots.txt is
+  refusing automated access in practice, so this is treated as closed — but the ToS text
+  itself was never read.
+
+Neither looks promising enough to spend more time on. Both are recorded as UNVERIFIED rather
+than folded into the "closed" count.
 
 🔑 The recurring pattern across this entire investigation: **the blocker is never price and
 rarely technical.** DJC sells a $199/yr subscription that does not include crawl permission;

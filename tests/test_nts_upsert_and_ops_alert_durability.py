@@ -85,95 +85,177 @@ def test_a_reparse_that_loses_an_amount_cannot_erase_it():
 
 
 # ── 2. An alert nobody can reconstruct afterwards is not an alert ────────────────
+#
+# These are BEHAVIOURAL. The first round asserted against source text, which would not
+# have caught a wrong column value, a write on the caller's thread, or the cooldown
+# swallowing an occurrence (Codex).
 
 
-def test_every_ops_alert_is_recorded_whatever_the_delivery_outcome():
-    """Recording must not be conditional on the delivery path working — that path is
-    exactly what was broken. A `finally` makes it unconditional across every early
-    return AND the except branch."""
-    import inspect
+def _fake_session(sink):
+    """Stand-in for the persistence session; records what was added."""
+    class _S:
+        def __enter__(self):
+            return self
 
+        def __exit__(self, *_a):
+            return False
+
+        def add(self, obj):
+            sink.append(obj)
+
+        def commit(self):
+            pass
+
+    return lambda: _S()
+
+
+def _drain_persist_pool():
+    """Block until the background persistence worker has finished its queue."""
     from src.workers import ops_alerts
 
-    src = inspect.getsource(ops_alerts.send_ops_alert)
-    tail = src[src.index("finally:"):]
-    assert "_persist_ops_alert(kind, key, subject, delivered)" in tail
-    # exactly one call site, in the finally — not duplicated on some paths
-    assert src.count("_persist_ops_alert(") == 1
+    ops_alerts._persist_pool.submit(lambda: None).result(timeout=10)
 
 
-def test_recording_does_not_sit_in_front_of_the_alert_email():
-    """Persisting BEFORE delivery would put a database write ahead of every alert, so a
-    slow or unreachable database would delay the very message reporting trouble."""
-    import inspect
-
+def test_an_undelivered_alert_still_writes_a_row(monkeypatch):
+    """Production's exact configuration — OPS_ALERT_EMAIL blank — used to return False
+    and leave no trace anywhere. It must now leave a row."""
+    from src.config import settings
     from src.workers import ops_alerts
 
-    src = inspect.getsource(ops_alerts.send_ops_alert)
-    assert src.index("_persist_ops_alert(") > src.index("resend.Emails.send")
+    added = []
+    monkeypatch.setattr(settings, "OPS_ALERT_EMAIL", "")
+    monkeypatch.setattr(ops_alerts, "_session_for_persist", _fake_session(added))
+
+    assert ops_alerts.send_ops_alert("canary", "king/WA", "crawler barren", "body") is False
+    _drain_persist_pool()
+
+    assert len(added) == 1
+    row = added[0]
+    assert row.event == "ops_alert"
+    assert row.user_id is None, "system-written, not tenant-scoped"
+    assert row.path == "canary:king/WA"
+    assert row.detail == "[undelivered] crawler barren"
+    assert row.created_at is not None, "client-side created_at avoids INSERT..RETURNING"
 
 
-def test_the_recorded_row_says_whether_it_was_delivered():
+def test_a_delivered_alert_is_recorded_as_sent(monkeypatch):
     """"Fired daily for four weeks and never delivered" is a different fact from "fired
-    once and was e-mailed" — only the row can tell them apart afterwards."""
-    import inspect
+    once and was e-mailed"."""
+    import sys
+    import types
 
+    from src.config import settings
     from src.workers import ops_alerts
 
-    send = inspect.getsource(ops_alerts.send_ops_alert)
-    assert "delivered = False" in send and "delivered = True" in send
-    persist = inspect.getsource(ops_alerts._persist_ops_alert)
-    assert "'sent' if delivered else 'undelivered'" in persist
+    added = []
+    monkeypatch.setattr(settings, "OPS_ALERT_EMAIL", "ops@test.invalid")
+    monkeypatch.setattr(settings, "RESEND_API_KEY", "re_test_not_real")
+    monkeypatch.setattr(ops_alerts, "_cooldown_acquired", lambda kind, key: True)
+    monkeypatch.setattr(ops_alerts, "_session_for_persist", _fake_session(added))
+
+    fake = types.ModuleType("resend")
+    fake.api_key = None
+    fake.Emails = type("E", (), {"send": staticmethod(lambda _p: None)})
+    monkeypatch.setitem(sys.modules, "resend", fake)
+
+    assert ops_alerts.send_ops_alert("nts_crawl_barren", "queen_anne_news", "subj", "b") is True
+    _drain_persist_pool()
+    assert added[0].detail == "[sent] subj"
 
 
-def test_unconfigured_alerting_warns_instead_of_returning_silently():
+def test_a_cooldown_suppressed_alert_is_still_recorded(monkeypatch):
+    """Recording every OCCURRENCE, not every e-mail, is what makes "this fired daily for
+    four weeks" answerable — the 6h cooldown must not hide the pattern."""
+    from src.config import settings
+    from src.workers import ops_alerts
+
+    added = []
+    monkeypatch.setattr(settings, "OPS_ALERT_EMAIL", "ops@test.invalid")
+    monkeypatch.setattr(settings, "RESEND_API_KEY", "re_test_not_real")
+    monkeypatch.setattr(ops_alerts, "_cooldown_acquired", lambda kind, key: False)
+    monkeypatch.setattr(ops_alerts, "_session_for_persist", _fake_session(added))
+
+    assert ops_alerts.send_ops_alert("canary", "pierce/WA", "s", "b") is False
+    _drain_persist_pool()
+    assert len(added) == 1 and added[0].detail.startswith("[undelivered]")
+
+
+def test_recording_never_runs_on_the_callers_thread(monkeypatch):
+    """The point of the hand-off. In production OPS_ALERT_EMAIL is blank, so the e-mail
+    send is never reached — inline persistence would have ADDED database work to a path
+    that previously returned instantly, including a Stripe webhook handler, with the sync
+    engine allowing pool_timeout=30s / connect_timeout=10s / statement_timeout=120s."""
+    import threading
+
+    from src.config import settings
+    from src.workers import ops_alerts
+
+    seen = {}
+
+    class _S:
+        def __enter__(self):
+            seen["thread"] = threading.current_thread().name
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def add(self, _obj):
+            pass
+
+        def commit(self):
+            pass
+
+    monkeypatch.setattr(settings, "OPS_ALERT_EMAIL", "")
+    monkeypatch.setattr(ops_alerts, "_session_for_persist", lambda: _S())
+    caller = threading.current_thread().name
+
+    ops_alerts.send_ops_alert("k", "v", "s", "b")
+    _drain_persist_pool()
+
+    assert seen["thread"] != caller
+    assert seen["thread"].startswith("ops-alert-persist")
+
+
+def test_a_wedged_database_cannot_grow_the_queue_without_limit():
+    """A stalled database must not let alerts pile up unbounded — the incident being
+    reported may BE the database."""
+    from src.workers import ops_alerts
+
+    assert 0 < ops_alerts._PERSIST_MAX_BACKLOG <= 500
+    assert ops_alerts._persist_pool._max_workers == 1, "one writer, not a thread per alert"
+
+
+def test_persistence_failure_never_reaches_the_caller(monkeypatch):
+    """send_ops_alert is called from a Stripe webhook handler; durability is additive and
+    must never turn into an exception the caller sees."""
+    from src.config import settings
+    from src.workers import ops_alerts
+
+    def _explode():
+        raise RuntimeError("database is down")
+
+    monkeypatch.setattr(settings, "OPS_ALERT_EMAIL", "")
+    monkeypatch.setattr(ops_alerts, "_session_for_persist", _explode)
+
+    assert ops_alerts.send_ops_alert("k", "v", "s", "b") is False
+    _drain_persist_pool()  # the worker swallowed it and the pool is still usable
+
+
+def test_unconfigured_alerting_warns_instead_of_returning_silently(caplog):
     """The likelier misconfiguration used to be the silent one: a missing RESEND_API_KEY
     warned, a missing OPS_ALERT_EMAIL said nothing at all."""
-    import inspect
+    import logging
 
+    from src.config import settings
     from src.workers import ops_alerts
 
-    src = inspect.getsource(ops_alerts.send_ops_alert)
-    head = src[:src.index("if not settings.RESEND_API_KEY")]
-    assert "OPS_ALERT_EMAIL not configured" in head
-    assert "_logger.warning" in head
-    assert "silent no-op" not in src
+    assert settings.OPS_ALERT_EMAIL == "", "CI default: alerting unconfigured"
+    with caplog.at_level(logging.WARNING, logger="worker.ops_alerts"):
+        ops_alerts.send_ops_alert("canary", "king/WA", "a barren crawl", "body")
+    _drain_persist_pool()
 
-
-def test_persist_records_a_system_row_and_never_raises():
-    """Best-effort by contract: durability is additive and must never fail the caller
-    (send_ops_alert is called from a Stripe webhook handler, among others)."""
-    import inspect
-
-    from src.workers import ops_alerts
-
-    src = inspect.getsource(ops_alerts._persist_ops_alert)
-    assert 'event="ops_alert"' in src
-    assert "user_id=None" in src, "system-written row, not tenant-scoped"
-    assert "except Exception" in src and "_logger.warning" in src
-    # created_at client-side: a server_default triggers INSERT..RETURNING, which FORCE
-    # RLS denies for the app role (same trap as _persist_audit_event).
-    assert "created_at=datetime.now(UTC)" in src
-
-
-def test_persisted_row_carries_the_alert_identity():
-    """kind:key is what makes "this fired daily for four weeks" answerable later."""
-    import inspect
-
-    from src.workers import ops_alerts
-
-    src = inspect.getsource(ops_alerts._persist_ops_alert)
-    assert 'path=f"{kind}:{key}"[:256]' in src
-    assert "{subject}" in src
-
-
-def test_send_ops_alert_still_returns_false_when_undelivered():
-    """The return value means DELIVERED, and callers may rely on that; recording an
-    alert must not start reporting success."""
-    import inspect
-
-    from src.workers import ops_alerts
-
-    src = inspect.getsource(ops_alerts.send_ops_alert)
-    head = src[:src.index("if not _cooldown_acquired")]
-    assert head.count("return False") >= 2
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("OPS_ALERT_EMAIL not configured" in m for m in warnings), warnings
+    # and it names the alert it dropped, so the log line is actionable
+    assert any("canary:king/WA" in m and "a barren crawl" in m for m in warnings), warnings

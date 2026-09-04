@@ -1,8 +1,15 @@
-"""M6 ops alerts: configuration gates (pure — never sends a real email).
+"""M6 ops alerts: configuration gates. Never sends a real email.
 
 The send path is exercised in prod by construction (best-effort + cooldown);
-these lock the SAFE defaults: alerting is a no-op unless explicitly configured,
-and a missing Resend key can never raise out of a worker task.
+these lock the SAFE defaults: e-mail DELIVERY is a no-op unless explicitly
+configured, and a missing Resend key can never raise out of a worker task.
+
+NOTE (2026-09-04): "no-op" now means *no e-mail*, not *no side effect*. Every
+alert-worthy call also queues a durable audit_events row on a background worker
+thread — because OPS_ALERT_EMAIL was blank in production and the old silent
+return meant a four-week crawl outage left no trace anywhere. These tests do not
+assert on that; see tests/test_nts_upsert_and_ops_alert_durability.py, which
+injects a fake session via ops_alerts._session_for_persist.
 """
 from src.config import settings
 from src.workers.ops_alerts import send_ops_alert

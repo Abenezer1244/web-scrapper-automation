@@ -15,6 +15,8 @@ Design rules:
 - No PII in alert bodies: job/connector identifiers only, never lead data.
 """
 import html
+import threading
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 
 from src.config import settings
 from src.utils.logger import setup_logger
@@ -46,8 +48,65 @@ def _cooldown_acquired(kind: str, key: str) -> bool:
         return True
 
 
+def _session_for_persist():
+    """The session the durable write uses.
+
+    A named seam so the behaviour above can be tested against a fake, rather than only
+    asserted against source text (Codex: most of the first round of tests inspected
+    source strings and would not have caught a wrong value or a blocking write).
+    """
+    from src.db.session import system_sync_session
+
+    return system_sync_session()
+
+
+# Persistence runs OFF the caller's thread. Neither `finally` nor "the e-mail send is
+# already synchronous" is a real bound (Codex): in production OPS_ALERT_EMAIL is blank, so
+# send_ops_alert returns before Resend is ever reached — persisting inline would have ADDED
+# database work to a path that previously returned instantly, on every alert, including the
+# Stripe webhook handler in src/api/routes/billing.py. And the sync engine's own limits are
+# generous by design (pool_timeout=30s, connect_timeout=10s, statement_timeout=120s), so a
+# stalled database could hold a caller for tens of seconds — while the incident being
+# reported may BE the database.
+#
+# One worker thread, so a burst cannot spawn threads without limit, and a bounded backlog
+# so a wedged database cannot grow the queue without limit either. ThreadPoolExecutor
+# threads are joined at interpreter exit, so a queued write still lands on a clean shutdown.
+_PERSIST_MAX_BACKLOG = 50
+_persist_lock = threading.Lock()
+_persist_inflight = 0
+_persist_pool = _ThreadPoolExecutor(max_workers=1, thread_name_prefix="ops-alert-persist")
+
+
+def _submit_persist(kind: str, key: str, subject: str, delivered: bool) -> None:
+    """Hand the durable write to the background worker. Never blocks, never raises."""
+    global _persist_inflight
+    try:
+        with _persist_lock:
+            if _persist_inflight >= _PERSIST_MAX_BACKLOG:
+                _logger.warning(
+                    "ops alert persistence backlog full (%d) — not recording [%s:%s]",
+                    _persist_inflight, kind, key,
+                )
+                return
+            _persist_inflight += 1
+
+        def _run():
+            global _persist_inflight
+            try:
+                _persist_ops_alert(kind, key, subject, delivered)
+            finally:
+                with _persist_lock:
+                    _persist_inflight -= 1
+
+        _persist_pool.submit(_run)
+    except Exception as exc:  # noqa: BLE001 — recording must never affect the caller
+        _logger.warning("could not queue ops alert record: %s", str(exc)[:200])
+
+
 def _persist_ops_alert(kind: str, key: str, subject: str, delivered: bool) -> None:
-    """Best-effort durable record of an ops alert. NEVER raises.
+    """Best-effort durable record of an ops alert. NEVER raises. Runs on the persistence
+    worker thread, never on the caller's.
 
     Written to audit_events (event='ops_alert', user_id NULL) rather than to a new
     table: system-written rows with a NULL user_id are already an established pattern
@@ -65,9 +124,8 @@ def _persist_ops_alert(kind: str, key: str, subject: str, delivered: bool) -> No
         from datetime import UTC, datetime
 
         from src.db.models import AuditEvent
-        from src.db.session import system_sync_session
 
-        with system_sync_session() as db:
+        with _session_for_persist() as db:
             db.add(
                 AuditEvent(
                     id=str(_uuid.uuid4()),
@@ -101,11 +159,10 @@ def send_ops_alert(kind: str, key: str, subject: str, body: str) -> bool:
     # noticed, Railway's stdout retention no longer reached back and the outage could not
     # be explained. An alert nobody can reconstruct afterwards is not an alert.
     #
-    # Recorded in a `finally`, AFTER delivery, deliberately. Persisting first would put a
-    # database write in front of every alert e-mail, so a slow or unreachable database
-    # would delay the very message reporting that something is wrong. `finally` keeps the
-    # recording unconditional — every gate below returns through it — without letting the
-    # database sit on the critical path.
+    # Recorded from a `finally`, so every gate below and the except branch all record —
+    # and HANDED OFF to a background worker (see _submit_persist), so the database is never
+    # on the caller's critical path. Both matter: the recording must be unconditional, and
+    # it must not be able to delay the very message reporting that something is wrong.
     delivered = False
     try:
         if not settings.OPS_ALERT_EMAIL:
@@ -147,4 +204,4 @@ def send_ops_alert(kind: str, key: str, subject: str, body: str) -> bool:
         _logger.error("ops alert send failed [%s:%s]: %s", kind, key, str(exc)[:200])
         return False
     finally:
-        _persist_ops_alert(kind, key, subject, delivered)
+        _submit_persist(kind, key, subject, delivered)

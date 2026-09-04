@@ -25,6 +25,13 @@ ORDER MATTERS — OLDEST ISSUE FIRST
     would let a stale older issue overwrite the current truth, so this walks strictly
     oldest -> newest and the most recent issue always writes last.
 
+CONCURRENCY WITH THE DAILY BEAT
+    Oldest -> newest only holds for a single uninterrupted writer (Codex). If the daily
+    crawl lands mid-run, an older issue here can briefly overwrite the fresher row the
+    beat just wrote. It is self-limiting — the beat re-ingests the CURRENT issue every
+    day, so any staleness clears within 24h — but for a clean run, apply this while the
+    two PDF beat tasks are paused, or simply re-run the crawl task afterwards.
+
 RELATIONSHIP TO scripts/repair_nts_ts_number.py
     They are complementary and this one runs FIRST. Backfill CREATES the correctly-keyed
     rows (with the fixed parser); the repair script RETIRES the mis-bound rows earlier
@@ -54,6 +61,7 @@ from src.db.session import system_sync_session  # noqa: E402
 from src.scrapers.sources import nts_pdf  # noqa: E402
 from src.scrapers.sources import nts_tacoma_index as nts  # noqa: E402
 from src.utils.logger import setup_logger  # noqa: E402
+from src.utils.lead_signals import auction_reference_date  # noqa: E402
 from src.utils.safe_http import safe_get  # noqa: E402
 from src.workers.nts_crawler import (  # noqa: E402
     _MAX_PDF_BYTES,
@@ -66,7 +74,7 @@ _logger = setup_logger("scripts.backfill_nts_pdf_archive")
 
 _CDN = f"https://{_PDF_HOST}"
 _FETCH_DELAY_S = 0.4      # polite gap between probes
-_MAX_ISSUES = 40          # hard cap on PDFs downloaded in one run
+_MAX_ISSUES = 40          # abort guard (NOT a truncation) — see the probe loop
 
 
 def _king_names(d: date) -> list[str]:
@@ -131,14 +139,16 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = _sources()[args.source]
-    today = datetime.now(UTC).date()
+    # County-local, matching trustee_sale's own filter (Codex): a UTC clock in the
+    # Pacific evening rolls over early and would mark a same-day WA auction inactive.
+    today = auction_reference_date()
     start = today - timedelta(days=args.days)
 
     # OLDEST FIRST — see the module docstring. The newest issue must write last.
     print(f"Probing {args.source} issues from {start} to {today} (oldest first)…")
     issues: list[tuple[date, str, bytes]] = []
     d = start
-    while d <= today and len(issues) < _MAX_ISSUES:
+    while d <= today:
         for name in cfg["names"](d):
             url = _CDN + cfg["prefix"] + urllib.parse.quote(name)
             data = _try_fetch(url)
@@ -153,6 +163,16 @@ def main() -> None:
     if not issues:
         print("Nothing to do.")
         return
+    # ABORT rather than truncate (Codex High). The cap used to stop the probe loop, which
+    # would have applied the OLDEST prefix and never reached the newest issues — and since
+    # the upsert refreshes every mutable field, a stale older auction date would then be
+    # the final truth. Narrowing --days is the operator's call, not a silent one.
+    if len(issues) > _MAX_ISSUES:
+        raise SystemExit(
+            f"ABORT: {len(issues)} issues exceeds the {_MAX_ISSUES}-issue cap. Applying an "
+            "oldest-first PREFIX would let a stale issue win the upsert. Re-run with a "
+            "smaller --days (or raise _MAX_ISSUES deliberately)."
+        )
 
     upserted = skipped = errored = 0
     with system_sync_session() as db:
@@ -178,21 +198,36 @@ def main() -> None:
                     skipped += 1
                     continue
                 row["fetched_at"] = datetime.now(UTC)
-                kept += 1
-                upserted += 1
                 print(f"    {row['ts_number']:22} parcel={str(row['parcel']):16} "
                       f"auction={row['auction_date']} active={row['is_active']} "
                       f"owing={row['principal_owing']}")
                 if args.apply:
-                    # Per-row SAVEPOINT so one bad notice rolls back alone.
-                    with db.begin_nested():
-                        _upsert_notice(db, NtsNotice, row)
+                    # The SAVEPOINT rolls one bad notice back, but it does NOT stop the
+                    # exception escaping — which would abort the run before the NEWER
+                    # issues write, i.e. exactly the ones that repair stale reposts
+                    # (Codex). Catch, count, keep going.
+                    try:
+                        with db.begin_nested():
+                            _upsert_notice(db, NtsNotice, row)
+                    except Exception as exc:  # noqa: BLE001
+                        errored += 1
+                        print(f"      UPSERT FAILED {row['ts_number']} ({url}): {str(exc)[:110]}")
+                        continue
+                kept += 1
+                upserted += 1
             print(f"  {issue_date}: {kept}/{len(blocks)} notices\n")
 
         if args.apply:
             db.commit()
             print(f"APPLIED — {upserted} notice(s) upserted, {skipped} non-NTS block(s) "
-                  f"skipped, {errored} issue(s) unreadable.")
+                  f"skipped, {errored} failure(s).")
+            if upserted == 0:
+                # Issues downloaded but nothing parsed out of them is the exact
+                # parser-gap failure this whole effort exists to surface (Codex).
+                raise SystemExit(
+                    f"FAILED: {len(issues)} issue(s) downloaded but 0 notices upserted — "
+                    "that is a parser gap, not an empty archive."
+                )
         else:
             db.rollback()
             print(f"DRY RUN — {upserted} notice(s) would be upserted, {skipped} non-NTS "

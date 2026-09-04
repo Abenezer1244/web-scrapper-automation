@@ -47,9 +47,11 @@ RECORD_TYPE = "trustee_sale"
 # date-windowed Lists/overlap + blanks its freshness signal.
 _MDY_RE = re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$")
 
-# Floor for the forward auction window (see _window_span_days). A same-day or inverted
-# window is a UI artifact, not a request for "only auctions happening today".
-MINIMUM_SPAN_DAYS = 7
+# NOTE: there is deliberately NO minimum-span floor. An earlier draft clamped a
+# same-day/inverted window up to 7 days, which Codex correctly called another silent
+# lead-loss mode — a malformed saved range or a date-helper regression would have
+# quietly become "next week only". A non-positive span now falls back to the legacy
+# behavior (every upcoming auction) and says so in the log.
 
 
 def _filing_date_mdy(notice: NtsNotice) -> str | None:
@@ -76,14 +78,22 @@ def _window_span_days(date_from: str | None, date_to: str | None) -> int | None:
     than guessing when either bound is missing or unparseable, so a malformed window can
     never silently shrink a user's results to zero.
 
-    A zero/negative span is clamped to a MINIMUM_SPAN_DAYS floor: a same-day window is
-    almost certainly a UI artifact, and honoring it literally would deliver only auctions
-    happening today — an empty list, not a useful answer.
+    A zero or inverted span also returns None. Honoring it literally would deliver only
+    auctions happening today, and clamping it to some floor would silently become "next
+    week only" — both are lead loss dressed up as a filter. Falling back to the legacy
+    all-upcoming behavior is the only option that cannot lose a lead (Codex).
     """
     a, b = _parse_mdy(date_from), _parse_mdy(date_to)
     if a is None or b is None:
         return None
-    return max((b - a).days, MINIMUM_SPAN_DAYS)
+    span = (b - a).days
+    if span <= 0:
+        _logger.warning(
+            "trustee_sale: window %r..%r has a non-positive span — ignoring it and "
+            "returning every upcoming auction", date_from, date_to,
+        )
+        return None
+    return span
 
 
 def _parse_mdy(value: str | None) -> date | None:
@@ -218,12 +228,30 @@ class _TrusteeSaleScraper(BridgeScraper):
                 .scalars()
                 .all()
             )
+            # The horizon must never cost a lead SILENTLY (Codex High). Measured
+            # 2026-09-03: every trustee_sale config runs rolling_90 and the furthest
+            # auction anywhere is 29 days out, so nothing is excluded today — but a
+            # shorter window on a longer-dated county would, and the operator has to be
+            # able to see that rather than wonder where the leads went.
+            beyond = 0
+            if horizon is not None:
+                beyond = db.execute(
+                    select(func.count()).select_from(NtsNotice).where(
+                        *conditions[:-1], NtsNotice.auction_date > horizon
+                    )
+                ).scalar_one()
         _logger.info(
             "trustee_sale %s: auctions %s..%s (%s) -> %d notice(s)",
             self.COUNTY, today, horizon or "no horizon",
             f"{span}d forward window" if span is not None else "full upcoming",
             len(notices),
         )
+        if beyond:
+            _logger.warning(
+                "trustee_sale %s: %d active auction(s) fall BEYOND the %dd window "
+                "(after %s) and were excluded — widen the scrape window to include them",
+                self.COUNTY, beyond, span, horizon,
+            )
 
         records = [_record_from_notice(n) for n in notices]
         if not records:

@@ -195,6 +195,21 @@ _ESTATE_CAPTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A residue that is wholly a place — what is left of "SEATTLE-KING COUNTY PUBLIC
+# HEALTH DEPARTMENT" once the agency phrase is excised. A locality is the agency's
+# own qualifier, never the decedent, so a residue reduced to one must be treated as
+# fully consumed (Codex). Anchored ^...$ and checked only AFTER an agency phrase was
+# actually removed, so it can never touch an ordinary value; the comma-form person
+# check runs first, so a decedent indexed "COUNTY, JOHN" is unaffected.
+_BARE_LOCALITY_RE = re.compile(
+    r"^\s*(?:"
+    r"CITY\s+OF\s+[A-Z .'’-]+"
+    r"|COUNTY\s+OF\s+[A-Z .'’-]+"
+    r"|[A-Z .'’-]+\s+(?:COUNTY|CITY|BOROUGH|PARISH)"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
 # Doc types whose grantor is a LIVING owner — the agency swap must NOT fire.
 _LIVING_OWNER_DOC_RE = re.compile(r"TRANSFER\s+ON\s+DEATH|\bTOD\b", re.IGNORECASE)
 
@@ -338,6 +353,29 @@ def clean_counterparty(value: str | None) -> str | None:
     return " / ".join(kept) if len(kept) != len(segments) else value.strip()
 
 
+def _residue_is_a_party(residue: str) -> bool:
+    """True if what survived an agency excision can stand as the decedent.
+
+    Excising "PUBLIC HEALTH DEPARTMENT" from "SEATTLE-KING COUNTY PUBLIC HEALTH
+    DEPARTMENT" leaves "SEATTLE-KING COUNTY" — the agency's own locality, not a
+    person. Trusting any non-empty remainder would surface that fragment as the
+    lead's party (Codex). A residue that is wholly a place, or that still reads as
+    an institution, means the value was ENTIRELY the filer, so the caller should
+    fall through to promoting the grantee instead.
+
+    Only consulted when an agency phrase was actually removed.
+    """
+    v = residue.strip()
+    if not v:
+        return False
+    # A comma-form personal name wins outright ("PERRIN, RONALD", "COUNTY, JOHN").
+    if _PERSON_COMMA_RE.match(v) and not _UNAMBIGUOUS_ORG_RE.search(v.upper()):
+        return True
+    if _BARE_LOCALITY_RE.match(v):
+        return False
+    return not _NON_PERSON_RE.search(v.upper())
+
+
 def orient_probate_party(
     grantor: str | None,
     grantee: str | None,
@@ -366,7 +404,7 @@ def orient_probate_party(
     deagencied = strip_filing_agency(g)
     if deagencied != g:
         # An agency phrase / placeholder was present in the grantor.
-        if deagencied:
+        if deagencied and _residue_is_a_party(deagencied):
             party, heirs = deagencied, clean_counterparty(e)
         elif is_person_like_party(e):          # guard #1
             party, heirs = e, None

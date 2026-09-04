@@ -459,3 +459,30 @@ def test_agency_phrase_with_a_locality_prefix_is_consumed_whole():
     # ...and a real entity that merely starts with the same word is untouched.
     assert strip_filing_agency("PUBLIC UTILITY DISTRICT NO 1") == "PUBLIC UTILITY DISTRICT NO 1"
     assert strip_filing_agency("PUBLIC STORAGE") == "PUBLIC STORAGE"
+
+
+def test_an_agency_residue_that_is_only_a_place_is_not_the_decedent():
+    # Codex P1: excising "PUBLIC HEALTH DEPARTMENT" leaves the agency's own
+    # locality. Trusting any non-empty remainder surfaced that fragment as the
+    # lead's party; the grantee must be promoted instead.
+    assert orient_probate_party(
+        "SEATTLE-KING COUNTY PUBLIC HEALTH DEPARTMENT", "DOE JANE", "DEATH CERTIFICATE"
+    ) == ("DOE JANE", None)
+    assert orient_probate_party(
+        "CITY OF SEATTLE HEALTH DEPARTMENT", "DOE JANE", "DEATH CERTIFICATE"
+    ) == ("DOE JANE", None)
+
+
+def test_a_real_name_left_beside_an_agency_is_still_the_decedent():
+    # The residue guard must not undo the case the agency strip exists for.
+    assert orient_probate_party(
+        "PERRIN, RONALD, STATE OF WA, DEPT OF HEALTH", "PERRIN, SUSAN", "DEATH CERTIFICATE"
+    ) == ("PERRIN, RONALD", "PERRIN, SUSAN")
+    assert orient_probate_party(
+        "SMITH JOHN / STATE OF WASHINGTON", "SMITH JANE", "DEATH CERTIFICATE"
+    ) == ("SMITH JOHN", "SMITH JANE")
+    # A decedent whose surname collides with the locality rule survives via the
+    # comma-form rescue.
+    assert orient_probate_party(
+        "COUNTY, JOHN, WA DEPT OF HEALTH", "COUNTY, JANE", "DEATH CERTIFICATE"
+    ) == ("COUNTY, JOHN", "COUNTY, JANE")

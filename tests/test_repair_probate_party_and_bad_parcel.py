@@ -101,3 +101,22 @@ def test_a_trace_is_cancelled_only_after_the_clear_actually_wrote():
     cancel_at = src.index("_CANCEL_PENDING", guard_at)
     reset_at = src.index("_RESET_RESULT_TRACE", guard_at)
     assert clear_at < guard_at < cancel_at < reset_at
+
+
+def test_parcel_update_guards_every_value_it_overwrites():
+    # Codex P2: the new enrichment_data is built from the copy we READ, so a
+    # concurrent writer's JSON would be clobbered by a stale copy unless the JSON
+    # itself is guarded. Same for the situs parts the update nulls.
+    sql = " ".join(str(_mod._PARCEL_UPDATE).split())
+    for guard in ("property_city IS NOT DISTINCT FROM :old_city",
+                  "property_state IS NOT DISTINCT FROM :old_state",
+                  "property_zip IS NOT DISTINCT FROM :old_zip",
+                  "CAST(enrichment_data AS text) IS NOT DISTINCT FROM :old_enrichment_text"):
+        assert guard in sql
+
+
+def test_candidates_read_the_json_as_text_for_that_guard():
+    # Re-serializing the parsed dict would not match Postgres's own rendering, so
+    # the guard value must come from the database as text.
+    sql = " ".join(str(_mod._PARCEL_CANDIDATES).split())
+    assert "CAST(r.enrichment_data AS text) AS enrichment_text" in sql

@@ -84,7 +84,10 @@ _PARTY_UPDATE = text(
 _PARCEL_CANDIDATES = text(
     """
     SELECT r.id, r.parcel_id, r.property_address, r.property_city, r.property_state,
-           r.property_zip, r.enrichment_data, r.skip_trace_status, sc.record_type
+           r.property_zip, r.enrichment_data, r.skip_trace_status, sc.record_type,
+           -- Read the JSON's exact stored text so the update can guard on it
+           -- byte-for-byte; re-serializing the parsed dict would not match.
+           CAST(r.enrichment_data AS text) AS enrichment_text
     FROM results r
     JOIN jobs j ON j.id = r.job_id
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
@@ -116,6 +119,14 @@ _PARCEL_UPDATE = text(
     WHERE id = :id
       AND parcel_id = :parcel_id
       AND property_address IS NOT DISTINCT FROM :old_property
+      AND property_city IS NOT DISTINCT FROM :old_city
+      AND property_state IS NOT DISTINCT FROM :old_state
+      AND property_zip IS NOT DISTINCT FROM :old_zip
+      -- Guard the JSON we are about to replace as well (Codex): the new value is
+      -- built from the copy we READ, so a concurrent writer's enrichment would be
+      -- clobbered by a stale copy if only the address were guarded. Compared as
+      -- text because json has no equality operator in Postgres.
+      AND CAST(enrichment_data AS text) IS NOT DISTINCT FROM :old_enrichment_text
     """
 )
 
@@ -240,6 +251,10 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
             res = db.execute(_PARCEL_UPDATE, {
                 "id": row["id"], "parcel_id": row["parcel_id"],
                 "old_property": row["property_address"],
+                "old_city": row["property_city"],
+                "old_state": row["property_state"],
+                "old_zip": row["property_zip"],
+                "old_enrichment_text": row["enrichment_text"],
                 "new_enrichment": json.dumps(enrichment),
             })
             stats["cleared"] += res.rowcount

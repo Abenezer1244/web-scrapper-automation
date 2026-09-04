@@ -341,3 +341,44 @@ def test_archive_sweep_also_probes_a_slipped_issue_day():
     assert any("8-27-26" in u for u in aug26), "slipped Thursday must also be probed"
     # nominal day is tried FIRST
     assert aug26[0].endswith("8-26-26.pdf") or "8-26-26" in aug26[0]
+
+
+# ── 5. Pointer repair after an archive backfill ──────────────────────────────────
+
+
+def test_repair_repoints_nts_notice_id_when_it_names_another_parcel():
+    """`nts_notices` is upserted ON CONFLICT (source, ts_number). The archive backfill
+    therefore REPLACES the content of a row that was squatting on the wrong TS number
+    with the real notice for that key — leaving any lead pointing at it aimed at a
+    stranger's parcel. Measured on King 2026-09-04: 1 of 4 matched leads, immediately
+    after the backfill. The lead's own auction_date/default_amount are unaffected."""
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[1] / "scripts"
+            / "repair_nts_ts_number.py").read_text(encoding="utf-8")
+    assert "nts_notice_id = CAST(:nid AS uuid)" in text
+    assert "notice_by_ts" in text, "must resolve the correct notice by its ts_number"
+
+
+def test_repoint_is_decided_before_the_ts_only_skip():
+    """A row can hold the RIGHT ts_number and still point at the wrong parcel; skipping
+    on the ts alone would leave that unrepaired forever."""
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[1] / "scripts"
+            / "repair_nts_ts_number.py").read_text(encoding="utf-8")
+    skip = text.index("if stored == correct and not top_wrong")
+    decide = text.index("repoint = (")
+    assert decide < skip, "repoint must be computed BEFORE the skip"
+    assert "not repoint" in text[skip:skip + 120], "the skip must account for repoint"
+
+
+def test_repoint_never_guesses_a_target():
+    """Only ever repoints to the notice whose ts_number is the one this parcel's own
+    issue prints, and only when that notice exists."""
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[1] / "scripts"
+            / "repair_nts_ts_number.py").read_text(encoding="utf-8")
+    assert "want_id = notice_by_ts.get(correct)" in text
+    assert "want_id is not None and want_id != m[\"notice_id\"]" in text

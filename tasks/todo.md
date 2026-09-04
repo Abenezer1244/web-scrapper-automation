@@ -36,3 +36,29 @@ Evidence:
 - `08/24` "5 found / 4 extracted": row 3 dropped by the deliberate *no person party* filter
   (both parties corporate). Logged with a reason.
 - Batch status `partial` is **correctly** assigned — one child succeeded, one failed.
+
+---
+
+## Review (2026-09-04)
+
+### Changes
+| File | Change |
+|---|---|
+| `src/scrapers/pierce_wa_probate.py` | Grid identified by row SHAPE (`_own_rows`, `_is_grid_row`, `_is_grid_signature_row`, `_ARMS_MIN_ROW_CELLS`) instead of `len(rows) < 5`. |
+| `src/api/routes/batches.py` | A batch child that is not `done` reports `record_count=0`. |
+| `tests/test_pierce_arms_small_result_page.py` | New. 14 tests; 7 fail on `origin/main` with the production error. |
+| `tests/test_batches_read.py` | +1 test (`partial_batch` fixture); fails on `origin/main` with `assert 210 == 0`. |
+| `scripts/diag_test11_repro.py`, `scripts/diag_test11_rowthreshold.py` | Reproduction harnesses. |
+
+### Verification
+- Exact failing range `06/04–09/01/2026`: **raised on page 10 before, 222 records after**.
+- A/B `06/04–09/02/2026`: **223 records before and after** — zero regression.
+- Live: 05/26, 12/26/2025, 09/02 now extract; a genuine 0-record day still returns 0.
+- `ruff check src/ tests/` clean. Full suite **2260 passed, 2 skipped**. CI green on #217.
+- Prod UI captured with Chromium: "Completed with errors", failed child "210 leads".
+
+### Open
+- ⏭️ **Codex diff-review gate NOT RUN** — CLI usage limit, resets 08:04. Pre-implementation
+  consult ran; all six findings verified independently.
+- ⏭️ **#217 not merged** — user holding. In-product re-run of Test 11 therefore UNVERIFIED.
+- ⏭️ Same-family row-count guards in 4 other scraper templates: reported, not changed.

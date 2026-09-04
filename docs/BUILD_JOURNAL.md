@@ -19,6 +19,73 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-04 (Test 11) — a page with three rows on it looked like no page at all
+
+**Built / Shipped:** `fix/test11-completed-with-error` → **PR #217** (CI green: Test 5m5s,
+Dependency Audit pass). Test 11 = batch `437a4939`, run `019048aa`, status **`partial`** →
+the UI's **"Completed with errors"**. Two children: `pierce/probate` done, `pierce/pre_foreclosure`
+(`25a8ea53`) **failed** after `retry_count=2`.
+
+**Tried / Decided:**
+- The prod row said `page_current=9, page_total=10, record_count=210, results=0, billed=0,
+  export_key=NULL` and a sanitized `error_message`. `job_logs` stopped at "Connecting to county
+  portal..." on all three attempts, each **~52 s apart to within 2 s** — the tell that this was
+  deterministic, not a flaky portal.
+- Timed a live scrape: ten ARMS pages take ~34 s. So 52 s covers form-fill + nine pages + a
+  failure on page ten. `_on_progress` fires *after* extraction, which is why `page_current`
+  froze at 9 — the exception was in page 10's `_extract_records`, not in pagination.
+- **Root cause:** `_extract_records` picked the results grid with `if len(data_rows) < 5:
+  continue`. The grid is one header `<tr>` plus one `<tr>` per record, so a page holding **1–3
+  records** was skipped, `data_table` came back `None`, the marker was non-zero, and it raised
+  `TransientScrapeError` → 2 retries → the whole job failed.
+- **Reproduced exactly.** Test 11's range was **228 records / 10 pages of 25**, so page 10 held
+  3 rows. Re-running `06/04/2026–09/01/2026` failed at page 9/10 with the production error.
+  Three separate single days with exactly 3 records (05/26, 12/26/2025, 09/02) all raised, and
+  `pierce/divorce 08/24–08/28` = **1 record** raised too. All three record types this class
+  serves were affected; ~12% of multi-page runs land on a 1–3 row remainder.
+- **Fix:** identify the grid by **row shape, never row count** — a row ≥ `_ARMS_MIN_ROW_CELLS`
+  wide, led by a row number, carrying a date. Rows scoped to their nearest enclosing table so a
+  wrapper cannot be picked ahead of the grid (`find_all("tr")` is recursive) — Codex's catch.
+  Row-level filtering untouched.
+- **Kept retry semantics deliberately.** Codex argued "positive marker + no grid" should become
+  permanent. With the grid found correctly that condition now only fires on a genuinely blocked
+  or unrendered page, which *is* transient. Failing a recoverable blip permanently costs a whole
+  run; a bounded retry costs three minutes. The asymmetry favours retry.
+
+**Caught & fixed:** Codex found — and prod + the live UI confirmed — that the batch detail
+surfaces `jobs.record_count` for **any** child. That field is written mid-scrape by the progress
+callback, so Test 11's failed child carried `210`. The live page renders **"Pierce County ·
+Pre foreclosure · 210 leads · Failed"** and the header **"1 of 2 scrapes done · 210 leads"**,
+while the same page says "COMBINED LEADS: … 1 single-list". 210 leads that were never persisted,
+exported or billed. Non-done children now report 0, so the client renders "—". Backend-only —
+the FE already had the right fallback.
+
+**Failed / Blocked:**
+- **Codex's post-implementation diff-review gate did not run** — the CLI hit its usage limit
+  mid-review (`try again at 8:04 AM`) after 51,576 tokens. The pre-implementation consult *did*
+  run and its six findings were each verified independently; the diff gate is still owed.
+- Merge/deploy held pending the user's decision, so the in-product re-run of Test 11 is
+  **UNVERIFIED**.
+
+**Facts learned:**
+- 🔑 **Three retries landing within 2 s of each other is a data-shape bug, not a flaky portal.**
+  Transient failures scatter; this one was a metronome.
+- 🔑 `_on_progress` fires *after* a page is extracted, so a frozen `page_current=N` means the
+  failure was on page **N+1** — the progress counter points one page short of the crime scene.
+- 🛑 A minimum **row count** can never identify a table whose size is the thing that varies. Same
+  family, verified but not fixed (browser-side JS against portals I could not live-test):
+  `laserfiche_weblink.py:343` and `skagit_recording.py:404` (`rows.length < 3`),
+  `landmarkweb.py:444` (`bestRows >= 5`), `acclaimweb.py:775,816` (`bodyRows.length < 2` — this
+  one carries a documented Chelan filter-bar reason and is load-bearing).
+- 🔑 Pierce `NOTICE OF FORECLOSURE` rows put a **number in the legal-description column** and no
+  legal text; the scraper stores it as `parcel_id` and it is absent from the Pierce real-property
+  GIS (9 of the 10 unenrichable rows). Faithful to source, so no address is available.
+- 🔑 The 9-digit parcel `718500090` in this run is **already documented** in
+  `pierce_legal_repair.py` (real: `7185000190`, RHODODENDRON LANES LT 6 BLK 3), as is
+  `9066600050` → `9066000050`. Raw scraper output is pre-repair; the enrichment stage fixes both.
+
+---
+
 ## 2026-09-04 (Test 8) — the answer was "the newspaper never printed it", and looking for the one lead it *did* print found three other bugs
 
 **Built / Shipped:** `fix/test8-data-quality` → **PR #209** (CI green; **merge blocked by the

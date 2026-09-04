@@ -144,6 +144,18 @@ def test_recovery_repoints_the_trace_instead_of_cancelling_it():
     assert "status = 'queued'" in sql
     assert "status IN ('queued', 'errored')" in sql
     assert "property_address IS DISTINCT FROM :property_address" in sql   # idempotent
+
+
+def test_repoint_rebuilds_the_whole_pending_payload():
+    # Codex P1: the dispatcher submits these columns verbatim, so a stale locality,
+    # mailing or name from the WRONG parcel would ship a corrected street with a
+    # stranger's context. Everything not verified for the corrected parcel is NULL.
+    sql = " ".join(str(_mod._REPOINT_PENDING).split())
+    for col in ("city = NULL", "state = NULL", "zip = NULL",
+                "mail_city = NULL", "mail_state = NULL", "mail_zip = NULL",
+                "first_name = NULL", "last_name = NULL", "tracerfy_queue_id = NULL"):
+        assert col in sql, col
+    assert "mail_address = :mail_address" in sql
     requeue = " ".join(str(_mod._REQUEUE_RESULT_TRACE).split())
     assert "SET skip_trace_status = 'queued'" in requeue
     assert "skip_trace_status IN ('not_attempted', 'errored')" in requeue

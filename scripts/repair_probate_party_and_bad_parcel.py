@@ -174,9 +174,21 @@ _PARCEL_RECOVER = text(
 _REPOINT_PENDING = text(
     """
     UPDATE pending_skip_trace_rows
-    SET property_address = :property_address, city = NULL, zip = NULL,
+    SET property_address = :property_address,
+        -- EVERY payload column, not just the street: the dispatcher submits these
+        -- verbatim, so a stale locality / mailing / name left over from the WRONG
+        -- parcel would ship a corrected street with a stranger's context (Codex
+        -- P1). Anything not verified for the corrected parcel becomes NULL.
+        city = NULL, state = NULL, zip = NULL,
+        mail_address = :mail_address, mail_city = NULL, mail_state = NULL, mail_zip = NULL,
+        first_name = NULL, last_name = NULL,
+        tracerfy_queue_id = NULL,
         status = 'queued', submitted_at = NULL
     WHERE result_id = :id
+      -- Reviving 'errored' is limited to the bad-address shape this repair created:
+      -- the stored street must still differ from the corrected one. A genuine
+      -- provider rejection recorded AFTER the repair already carries the corrected
+      -- address and is therefore left alone (Codex P2).
       AND status IN ('queued', 'errored')
       AND property_address IS DISTINCT FROM :property_address
     """
@@ -361,7 +373,8 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                     # idempotent (it no-ops once the address already matches), so
                     # run it here too rather than only on a fresh recovery.
                     repointed = db.execute(
-                        _REPOINT_PENDING, {"id": row["id"], "property_address": prop}
+                        _REPOINT_PENDING,
+                        {"id": row["id"], "property_address": prop, "mail_address": mail}
                     ).rowcount
                     if repointed:
                         db.execute(_REQUEUE_RESULT_TRACE, {"id": row["id"]})
@@ -406,7 +419,8 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                     # pending row whatever its status, so a cancel strands the lead
                     # forever (Codex P2).
                     repointed = db.execute(
-                        _REPOINT_PENDING, {"id": row["id"], "property_address": prop}
+                        _REPOINT_PENDING,
+                        {"id": row["id"], "property_address": prop, "mail_address": mail}
                     ).rowcount
                     if repointed:
                         db.execute(_REQUEUE_RESULT_TRACE, {"id": row["id"]})

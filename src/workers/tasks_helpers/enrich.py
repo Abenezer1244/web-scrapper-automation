@@ -507,7 +507,12 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                 owner = data.get("owner_name")
                 for res in pid_map.get(pid, []):
                     if data.get("resolved_by") == "gis_plus_owner_match" and not (
-                        owner_matches_party(res.party_name, data.get("resolved_party_match"))
+                        # Compare against the assessor OWNER that actually proved the
+                        # parcel, not against the other lead's party. Party-to-party
+                        # is NON-TRANSITIVE: "SMITH JOHN B" matches "SMITH JOHN" but
+                        # not owner "SMITH JOHN A", so gating on the party would hand
+                        # B the parcel A's evidence chose (Codex P1).
+                        owner_matches_party(res.party_name, data.get("resolved_owner_match"))
                     ):
                         # The parcel was resolved by matching ANOTHER lead's party.
                         # Two leads can share one malformed PID with different

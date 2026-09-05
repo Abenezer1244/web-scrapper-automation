@@ -150,6 +150,17 @@ async def _create_real_user(
     """Insert the real users row (Pro 7-day trial) and flush. Raises
     IntegrityError on the email_hmac UNIQUE race — the caller decides how to map
     it (generic error vs 'already registered, please log in')."""
+    # Anchor BOTH billing periods to the start of the current UTC month at
+    # creation. Leaving these NULL is what let the daily quota rollover's
+    # "IS NULL" arm zero a brand-new user's records_used inside their own
+    # signup month (prod: 999 records billed on day 1, counter read 2 the next
+    # morning). The columns also carry a server_default + NOT NULL as of
+    # migration 086; this is the explicit belt to that suspenders, so the value
+    # is right even when the ORM sends the column.
+    _now = datetime.now(UTC)
+    _period_start = _now.replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
     user = User(
         id=str(uuid.uuid4()),
         email=email,
@@ -158,7 +169,9 @@ async def _create_real_user(
         password_hash=password_hash,
         plan="pro",
         records_limit=settings.PLAN_LIMITS["pro"],  # Pro limit during the 7-day trial
-        trial_ends_at=datetime.now(UTC) + timedelta(days=7),
+        trial_ends_at=_now + timedelta(days=7),
+        records_period_start=_period_start,
+        skip_trace_period_start=_period_start,
         referral_code=referral_code,
         referred_by_user_id=referred_by_id,
     )

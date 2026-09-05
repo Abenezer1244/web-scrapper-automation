@@ -111,7 +111,16 @@ class User(Base):
     # month-boundary reset (Celery Beat downtime on the 1st) and
     # catch up on the next run instead of silently carrying last
     # month's records_used forward.
-    records_period_start = Column(DateTime(timezone=True), nullable=True)
+    # Migration 086: NOT NULL with a server_default of the current month start.
+    # This column was nullable with NO default, and _create_real_user never set
+    # it, so every new user was NULL — and the daily rollover's "IS NULL" arm
+    # zeroed their records_used inside their own signup month. A server_default
+    # alone is not enough (it does not stop an explicit NULL), hence NOT NULL.
+    records_period_start = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("date_trunc('month', NOW() AT TIME ZONE 'UTC')"),
+    )
     stripe_customer_id = Column(String(64), nullable=True)
     # Durable Stripe ENTITLEMENT (migration 077). stripe_customer_id only means
     # "has touched Stripe" (created at checkout START, not at payment) — it is NOT
@@ -125,7 +134,14 @@ class User(Base):
     trial_ends_at = Column(DateTime(timezone=True), nullable=True)
     # Sprint 4: skip-trace usage counter for bundled-quota + overage billing
     skip_trace_used_this_month = Column(Integer, nullable=False, default=0)
-    skip_trace_period_start = Column(DateTime(timezone=True), nullable=True)
+    # Migration 086: same treatment as records_period_start. The daily rollover
+    # used to gate the skip-trace reset on records_period_start, so drift between
+    # the two columns could reset metered skip-trace usage early or never.
+    skip_trace_period_start = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("date_trunc('month', NOW() AT TIME ZONE 'UTC')"),
+    )
     # Sprint 7.3: referral program — each user has a unique shareable
     # code; referred_by_user_id is set when they sign up via another
     # user's link; referral_credit_cents accumulates $20 per successful

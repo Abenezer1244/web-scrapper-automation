@@ -492,6 +492,40 @@ async def test_failed_child_that_did_persist_rows_still_reports_them(
     assert child["record_count"] == 3
 
 
+async def test_unactionable_rows_are_not_counted_as_leads(
+    db: AsyncSession, client: AsyncClient, starter_user: User, starter_token: str,
+    partial_batch: SimpleNamespace,
+):
+    """The count must use the same per-row rules the combined export applies:
+    a row with neither a property nor a mailing address is not a lead, so it must
+    not be reported as one (Codex round 3)."""
+    job_id = (
+        await db.execute(
+            select(Job.id).join(
+                ScraperConfig, ScraperConfig.id == Job.scraper_config_id
+            ).where(
+                ScraperConfig.batch_id == partial_batch.batch_id,
+                Job.status == "failed",
+            )
+        )
+    ).scalar_one()
+    db.add(Result(
+        id=str(uuid.uuid4()), job_id=job_id, user_id=starter_user.id,
+        party_name="HAS AN ADDRESS", property_address="5 PINE ST",
+    ))
+    db.add(Result(  # no property AND no mailing address -> not a lead
+        id=str(uuid.uuid4()), job_id=job_id, user_id=starter_user.id,
+        party_name="NO ADDRESS AT ALL",
+    ))
+    await db.commit()
+
+    resp = await client.get(
+        f"/batches/{partial_batch.batch_id}", headers=_auth(starter_token)
+    )
+    child = {c["record_type"]: c for c in resp.json()["children"]}["pre_foreclosure"]
+    assert child["record_count"] == 1
+
+
 async def test_failed_child_rows_survive_a_retry_that_reset_record_count(
     db: AsyncSession, client: AsyncClient, starter_user: User, starter_token: str,
     partial_batch: SimpleNamespace,

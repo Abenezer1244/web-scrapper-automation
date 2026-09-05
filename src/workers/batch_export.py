@@ -147,6 +147,16 @@ FROM ranked rk
 JOIN agg a ON a.bucket = rk.bucket
 WHERE rk.rn = 1
   AND (NOT :overlaps_only OR (rk.bucket LIKE 'pk:%' AND a.overlap_count >= 2))
+  -- Optional in-app view filters. Both default to NULL (a NULL filter bind lets
+  -- every row pass), so the CSV/delivery path binds NULL and this query stays BYTE-
+  -- IDENTICAL in behavior to before the filters existed — one query, not two, so
+  -- the filtered view can never drift from the exported file.
+  -- Containment (= ANY), not equality: the combined set is DEDUPED, so one lead
+  -- legitimately carries several record types / counties (that IS an overlap).
+  AND (CAST(:f_record_type AS text) IS NULL
+       OR CAST(:f_record_type AS text) = ANY(a.matched_record_types))
+  AND (CAST(:f_county AS text) IS NULL
+       OR CAST(:f_county AS text) = ANY(a.source_counties))
 ORDER BY a.overlap_count DESC,
          (CASE WHEN rk.phone IS NOT NULL OR rk.email IS NOT NULL THEN 0 ELSE 1 END),
          rk.job_created_at DESC NULLS LAST,
@@ -163,6 +173,39 @@ SELECT count(*) AS leads_total,
        count(*) FILTER (WHERE bucket LIKE 'pk:%' AND overlap_count < 2) AS singletons_suppressed,
        count(*) FILTER (WHERE bucket NOT LIKE 'pk:%') AS unmatchable_no_parcel
 FROM agg
+"""
+
+
+# Mode-aware total UNDER the active view filters. Deliberately NOT a second
+# counting rule: same _COMBINED_CTES, same dedup buckets, same mode predicate as
+# _COMBINED_SQL / _DELIVERY_COUNTS_SQL — only narrowed. agg has exactly one row
+# per bucket and ranked-rn=1 has exactly one row per bucket, so counting over agg
+# matches the rows the page renders (this is the same equivalence
+# _DELIVERY_COUNTS_SQL already relies on).
+_FILTERED_TOTAL_SQL = _COMBINED_CTES + """
+SELECT count(*) AS total
+FROM agg a
+WHERE (NOT :overlaps_only OR (a.bucket LIKE 'pk:%' AND a.overlap_count >= 2))
+  AND (CAST(:f_record_type AS text) IS NULL
+       OR CAST(:f_record_type AS text) = ANY(a.matched_record_types))
+  AND (CAST(:f_county AS text) IS NULL
+       OR CAST(:f_county AS text) = ANY(a.source_counties))
+"""
+
+# The facet values actually present in the mode-filtered combined set, so the UI
+# offers only filters that can return rows (and can hide the County control
+# entirely for a single-county batch). Deliberately NOT narrowed by the active filters — the option
+# list must not collapse as soon as the user picks one.
+_FACETS_SQL = _COMBINED_CTES + """
+SELECT
+  (SELECT coalesce(array_agg(DISTINCT rt ORDER BY rt), '{}')
+     FROM agg a2, unnest(a2.matched_record_types) AS rt
+    WHERE (NOT :overlaps_only OR (a2.bucket LIKE 'pk:%' AND a2.overlap_count >= 2))
+  ) AS record_types,
+  (SELECT coalesce(array_agg(DISTINCT ct ORDER BY ct), '{}')
+     FROM agg a3, unnest(a3.source_counties) AS ct
+    WHERE (NOT :overlaps_only OR (a3.bucket LIKE 'pk:%' AND a3.overlap_count >= 2))
+  ) AS counties
 """
 
 
@@ -211,6 +254,10 @@ def _combined_pairs(
             "limit": limit,
             "offset": offset,
             "overlaps_only": delivery_mode == "overlaps_only",
+            # Export is never view-filtered — NULL/NULL makes the new predicate a
+            # no-op, so the delivered file is exactly what it was before.
+            "f_record_type": None,
+            "f_county": None,
             TAX_CAP_BIND: tax_cap_min_year(datetime.now(UTC).date()),
         },
     )

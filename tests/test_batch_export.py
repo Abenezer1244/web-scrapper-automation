@@ -61,7 +61,7 @@ class TestRawSqlExecutesOnPostgres:
     time, so no fixture rows are needed; both empty + non-empty job_ids are
     exercised (empty -> ANY(CAST('{}' AS uuid[])) must not error)."""
 
-    def _run(self, sql: str):
+    def _run(self, sql: str, record_type=None, county=None):
         from datetime import UTC, datetime
 
         from sqlalchemy import text
@@ -77,6 +77,9 @@ class TestRawSqlExecutesOnPostgres:
                     params["offset"] = 0
                 if ":overlaps_only" in sql:
                     params["overlaps_only"] = True
+                if ":f_record_type" in sql:
+                    params["f_record_type"] = record_type
+                    params["f_county"] = county
                 if f":{TAX_CAP_BIND}" in sql:
                     params[TAX_CAP_BIND] = tax_cap_min_year(datetime.now(UTC).date())
                 db.execute(text(sql), params).fetchall()
@@ -92,6 +95,23 @@ class TestRawSqlExecutesOnPostgres:
 
     def test_failed_children_sql_executes(self):
         self._run(_FAILED_CHILDREN_SQL)
+
+    def test_combined_sql_executes_with_view_filters(self):
+        """The record_type/county view filters must PLAN on Postgres too — the
+        `= ANY(array)` containment is where a wrong cast would blow up, and a NULL
+        bind must still type-resolve (that is what makes the export path a no-op)."""
+        self._run(_COMBINED_SQL, record_type="probate", county="king")
+
+    def test_filtered_total_sql_executes(self):
+        from src.workers.batch_export import _FILTERED_TOTAL_SQL
+
+        self._run(_FILTERED_TOTAL_SQL)
+        self._run(_FILTERED_TOTAL_SQL, record_type="probate", county="king")
+
+    def test_facets_sql_executes(self):
+        from src.workers.batch_export import _FACETS_SQL
+
+        self._run(_FACETS_SQL)
 
 
 class TestCombinedSqlColumnCompleteness:

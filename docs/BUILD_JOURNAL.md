@@ -109,6 +109,95 @@ the FE already had the right fallback.
 - 🔑 The 9-digit parcel `718500090` in this run is **already documented** in
   `pierce_legal_repair.py` (real: `7185000190`, RHODODENDRON LANES LT 6 BLK 3), as is
   `9066600050` → `9066000050`. Raw scraper output is pre-repair; the enrichment stage fixes both.
+## 2026-09-04 (UI/UX + batch results) — the batch model was already right; the API just never admitted it existed
+
+**Built / Shipped:** `feat/uiux-cleanup-batch-results` in BOTH repos (BE 3 commits `8e976b8`,
+`e659c16`, `c8352f7`; FE 4 commits `0091252`, `3161474`, `e6e0d91`, `6c42bbc`). Four requested
+cleanups: record-type colour, Lead Mix responsiveness, em-dash placeholders, and multi-county /
+multi-record-type scraper results.
+
+**Tried / Decided:**
+- **Option A (presentation aggregation), NOT a data-model change.** Inspected first: a proper
+  parent/child batch model already exists and is DB-enforced — `scraper_batches` →
+  `scraper_configs.batch_id` (tenant-scoped composite FK) → `jobs` → `results`, with
+  `batch_runs` as one execution. The bug was only that `GET /scrapers` had no batch filter and
+  `ScraperConfigResponse` never exposed `batch_id`. `/results` had ALREADY solved this
+  (`listStandaloneJobs` + `listBatches`); the Scrapers page just never got the same treatment.
+  Grouping keys off the FK only — never name/time/user/date.
+- **Verified Test 9 before merging anything.** Prod (BYPASSRLS role): `scraper_batches`
+  `9fb8f55e…` "test 9 batch", 2 children (`king/pre_foreclosure` + `king/probate`), identical
+  `created_at`. It genuinely IS one batch — the prompt's assumption happened to be right, but it
+  was checked, not taken. Prod shape 33 active configs = 25 standalone + 8 children / 4 batches.
+- **Rejected Codex's first recommendation.** It said make `GET /scrapers` standalone-only BY
+  DEFAULT. Generated the consequences instead of accepting the argument: the grandfathered-probate
+  TOD notice counts EVERY probate config (a batch child is one → the compliance notice silently
+  disappears) and `/scrapers/[id]/records` resolves a child via `scrapers.find(s => s.id === id)`
+  → `undefined`. Shipped it as an OPT-IN param instead, matching the existing
+  `GET /jobs?exclude_batch_children` precedent.
+- **Filters as new bind params on the EXISTING `_COMBINED_SQL`**, not a second query: a NULL bind
+  lets every row pass, so the CSV/delivery path is unchanged *by construction* and the in-app view
+  can never drift from the delivered file. `_FILTERED_TOTAL_SQL` reuses the same CTEs/buckets/mode
+  predicate as `_DELIVERY_COUNTS_SQL` rather than inventing a second counting rule.
+- **Kept `recordTypeTone()`.** Colour is decoration on a table label but it IS the encoding in the
+  Lead Mix pie (wedge → legend row). Narrowed to the chart; did not delete.
+- **Container queries, not viewport breakpoints,** for the Lead Mix: the card's width comes from its
+  `lg:col-span-3` grid column, so `md:`/`lg:` cannot express "this card is narrow".
+
+**Failed / Blocked:**
+- **`git stash` is SHARED across all ~50 worktrees.** A `git stash push -- src/` that matched no
+  changes was a silent no-op, so the following `pop` applied ANOTHER session's stash into this
+  worktree (conflict in this file). Their 3 entries survived (a conflicted pop keeps the entry);
+  reset to HEAD and switched to explicit-path commits. Never stash in this repo — use
+  `git checkout <ref> -- <paths>`.
+- **First `schema/openapi.json` regen was polluted by the local venv** (fastapi 0.136 → 6
+  `additionalProperties` vs the committed 36), which flipped generated FE types to
+  `Record<string, never>` and broke `tsc`. Redone in `.venv-schema`.
+- **Codex quota ran out** before reviewing the last two FE commits. Round-2 gate still OWED.
+
+**Caught & fixed:**
+- Codex: a URL filter with no matching control (`?county=bogus`, or any filter on a batch whose
+  facets are `[]`) hid the filter bar entirely, stranding the user on an empty table reading
+  "clear them" with nothing to click. Reproduced its exact counterexample in Chromium, fixed, re-verified.
+- Codex: every non-done child rendered "Pending", so a FAILED child read "Failed … Pending".
+- **Mine, found by measuring after Codex passed on it:** the neutral record-type chip copied
+  `--muted` + `--color-text-secondary` from the adjacent state/skip-trace pills — **4.39:1 light /
+  4.49:1 dark, under AA 4.5:1** for 11px text. The colour-coded chip it replaced had been
+  deliberately tuned to clear AA, so the "cleanup" was quietly a contrast regression. Now
+  `--color-text-primary`: 16.12:1 / 8.84:1, still one distinct foreground across all types.
+- SQLAlchemy `text()` parses binds inside SQL COMMENTS: a `:f_*` in a comment became a phantom
+  bind `f_` and failed every combined-lead query. Only running the tests found it.
+
+**Pending / Handoff:**
+- ⏭️ Codex round-2 gate on `e6e0d91` + `6c42bbc` (quota). Self-reviewed its 6 challenge points in
+  the meantime; all clear. **Merge should wait on this** per the Codex NO-GO rule.
+- ⏭️ 👤 `_monopo/data.ts:188-189` — the pricing table's `"—"` for Starter is marketing copy
+  ("not on this plan"), not a null fallback. Wording is a product decision, deliberately untouched.
+- ⏭️ Pre-existing, measured on `origin/master`, NOT fixed: the shell's PRO TRIAL banner and the
+  dashboard KpiStrip do not wrap, so `/dashboard` and `/scrapers` overflow horizontally ≤1024px
+  (`/scrapers` bodyScroll 703 baseline vs 696 mine). Unrelated to the Lead Mix.
+- ⏭️ Pre-existing: the state pill and skip-trace On/Off pill use the same sub-AA pair (~4.4:1).
+- ⏭️ `trustee_sale` is missing from `recordTypeTone`'s curated map (hash fallback); now only
+  affects the pie.
+- ⏭️ Codex's architecture note: `jobs` has no `batch_run_id`, so job→batch resolves to the PARENT
+  only, not the occurrence. Fine today; will age badly if per-run membership ever matters.
+
+**Facts learned:**
+- **The app role returns 0 rows for EVERYTHING under RLS** — an "empty" prod query is a role
+  problem, not data loss. Use `DATABASE_URL_MIGRATE`.
+- **A clean `openapi.json` regen shows ZERO deletions.** Any deletion = environment drift, not your
+  change. `.venv-schema` IS CI-equivalent and `export_openapi.py --check` is trustworthy — but only
+  against `origin/main`. I "confirmed" it was non-equivalent by diffing against my OWN already-
+  polluted commit, concluded main used a float constraint form it does not use, and hand-normalized
+  the file into being genuinely stale. CI caught it (`Check OpenAPI schema is current`, PR #219).
+  The script dumps `sort_keys=True, indent=2, ensure_ascii=False` + trailing newline; main
+  round-trips through that byte-identically, so that IS the canonical form. Never hand-patch this
+  file — regenerate in `.venv-schema` and diff against `origin/main`, not against HEAD.
+- Test 9 has **267 leads but 0 overlaps**, so its `overlaps_only` combined view is legitimately
+  empty — the facets correctly return `[]`. An empty combined list is not necessarily a bug.
+- The JWT-revocation check **fails CLOSED (503)** when Redis is unreachable, so nothing
+  authenticated is testable locally without pointing `REDIS_URL` at a live instance.
+- `RecordTypeMix` was the ONLY chart in the app pinning both dimensions (`h-36 w-36 shrink-0`);
+  every sibling uses `h-* w-full`. The app's own convention was the diagnosis.
 
 ---
 

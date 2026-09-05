@@ -171,6 +171,24 @@ def test_a_grid_whose_rows_are_all_filtered_still_returns_empty_not_raises():
     assert _scraper("1")._extract_records(soup) == []
 
 
+def test_a_grid_with_no_instrument_anywhere_fails_loud_by_design():
+    """Codex round 3 residual, documented deliberately. _map_row can return a
+    record from date + party alone, but the grid SIGNATURE requires an instrument.
+    If ARMS ever stopped printing instrument numbers, the grid would stop being
+    recognised and the job would FAIL rather than silently under-deliver — the
+    same trade this module makes everywhere else (never a silent partial scrape).
+    Every live ARMS row carries one, and extraction counts were identical before
+    and after the signature was tightened."""
+    rows = "".join(
+        _grid_row(i + 1, "202608240000").replace("202608240000", "n/a")
+        for i in range(3)
+    )
+    grid = f"<table><tr><th>#</th></tr>{rows}</table>"
+    soup = BeautifulSoup(f"<html><body>{_CHROME}{grid}</body></html>", "html.parser")
+    with pytest.raises(TransientScrapeError):
+        _scraper("3")._extract_records(soup)
+
+
 def test_header_row_is_never_emitted_as_a_record():
     recs = _scraper("3")._extract_records(_page(3))
     assert all(r.enrichment_data.get("instrument_number") for r in recs)

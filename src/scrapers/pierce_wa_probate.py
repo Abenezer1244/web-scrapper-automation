@@ -44,6 +44,21 @@ _PAGE_RETRY_BACKOFF_MS: tuple[int, ...] = (5_000, 15_000)  # waits between attem
 _PAGE_ADVANCE_POLLS = 5
 _PAGE_ADVANCE_POLL_MS = 1_500
 
+# Minimum <td> count for a row to be an ARMS results row. The live grid renders 39
+# cells per row; 9 is the number _map_row actually needs and is what the row filter
+# has always used. It is a WIDTH test on a single row — never a COUNT of rows, which
+# is what used to break small result pages.
+_ARMS_MIN_ROW_CELLS = 9
+
+# An ARMS instrument number as printed in the results grid (modern rows are 12
+# digits, older ones 10+). _map_row reads the same shape off the row, so requiring
+# it in the grid signature can never reject a row the parser would have accepted.
+_ARMS_INSTRUMENT = re.compile(r"\b(\d{10,12})\b")
+# Fallback when the row has no instrument LINK: a bare ARMS instrument is
+# "20" + 10 digits. Deliberately tighter than _ARMS_INSTRUMENT so an unrelated
+# 10-digit id in a chrome row is not read as an instrument.
+_ARMS_INSTRUMENT_BARE = re.compile(r"\b(20\d{10})\b")
+
 # ─── Patterns ─────────────────────────────────────────────────────────────────
 
 _ARMS_HOME = "https://armsweb.co.pierce.wa.us/"
@@ -586,19 +601,86 @@ class PierceWAARMSScraper(BridgeScraper):
 
         _logger.info("  Detail pages: %d parcel IDs found across %d pages", found, page_num)
 
+    @staticmethod
+    def _own_rows(table: Tag) -> list[Tag]:
+        """Rows this table owns directly.
+
+        ``find_all("tr")`` is recursive, so a WRAPPER table reports every row of
+        the grid nested inside it and would be tested — and could be picked —
+        before the grid itself. Scoping to the nearest enclosing table keeps the
+        shape test honest (Codex).
+        """
+        return [r for r in table.find_all("tr") if r.find_parent("table") is table]
+
+    @classmethod
+    def _is_grid_row(cls, row: Tag) -> bool:
+        """A row wide enough to be an ARMS results row, numbered like one."""
+        cells = row.find_all("td")
+        if len(cells) < _ARMS_MIN_ROW_CELLS:
+            return False
+        return cells[0].get_text(strip=True).isdigit()
+
+    @staticmethod
+    def _row_instrument(cells: list[Tag], texts: list[str]) -> str | None:
+        """The ARMS instrument number for a results row, or None.
+
+        Preferred source is the clickable link (12 digits on modern rows, 10+ on
+        old ones); the fallback is a bare ``20`` + 10 digits anywhere in the row.
+        SINGLE SOURCE OF TRUTH: ``_is_grid_signature_row`` calls this too, so the
+        signature used to PICK the grid accepts exactly the rows ``_map_row``
+        can parse — no more (a chrome row carrying an unrelated 10-digit id is
+        rejected, so it cannot be mistaken for the grid and silently yield []) and
+        no fewer (a row the parser would have accepted can never fail the
+        signature and lose the whole grid) — Codex.
+        """
+        for c in cells:
+            for link in c.find_all("a"):
+                link_text = link.get_text(strip=True)
+                m = _ARMS_INSTRUMENT.match(link_text)
+                if m and len(link_text) >= 10:
+                    return m.group(1)
+        for text in texts:
+            m = _ARMS_INSTRUMENT_BARE.search(text)
+            if m:
+                return m.group(1)
+        return None
+
+    @classmethod
+    def _is_grid_signature_row(cls, row: Tag) -> bool:
+        """``_is_grid_row`` plus a recorded date AND an instrument number — the
+        signature used to PICK the grid.
+
+        Width and a leading row number alone are not enough. If a chrome/status
+        table on a blocked page matched, the grid would be "found", every row
+        would fail to map, and ``_extract_records`` would return ``[]`` — scoring
+        a blocked page as a healthy zero, which is exactly the failure the raise
+        below exists to prevent (Codex P1). The instrument number is resolved
+        through ``_row_instrument``, the SAME function ``_map_row`` uses, so this
+        accepts precisely the rows the parser can read.
+        """
+        if not cls._is_grid_row(row):
+            return False
+        # Skip cells[0]: that is the row number, and on a very large result set it
+        # could itself be 10+ digits and satisfy the instrument test on its own.
+        cells = row.find_all("td")[1:]
+        texts = [c.get_text(" ", strip=True) for c in cells]
+        if not _DATE_PATTERN.search(" ".join(texts)):
+            return False
+        return cls._row_instrument(cells, texts) is not None
+
     def _extract_records(self, soup: BeautifulSoup) -> list[ScrapedRecord]:
         """Extract records from the ARMS results table."""
-        tables = soup.find_all("table")
+        # The grid carries no id or class, so it is identified by ROW SHAPE — never
+        # by a row COUNT. The previous `len(rows) < 5` guard rejected the grid
+        # whenever a page held 1-3 records: a whole search that small, or the LAST
+        # page of a multi-page search when the remainder was 1-3. The grid then
+        # looked "missing", which raised below and failed the entire job even
+        # though 9 of 10 pages had scraped fine (Test 11).
         data_table = None
-        for t in tables:
-            data_rows = t.find_all("tr")
-            if len(data_rows) < 5:
-                continue
-            if len(data_rows) > 1:
-                first_td = data_rows[1].find("td")
-                if first_td and first_td.get_text(strip=True).isdigit():
-                    data_table = t
-                    break
+        for t in soup.find_all("table"):
+            if any(self._is_grid_signature_row(r) for r in self._own_rows(t)):
+                data_table = t
+                break
 
         if data_table is None:
             # Genuine empty day ("0 records found") legitimately has no table →
@@ -616,17 +698,11 @@ class PierceWAARMSScraper(BridgeScraper):
                 record_type=self._record_type,
             )
 
-        rows = data_table.find_all("tr")
         records: list[ScrapedRecord] = []
-
-        for row in rows[1:]:
-            cells = row.find_all("td")
-            if len(cells) < 9:
-                continue
-            first_text = cells[0].get_text(strip=True)
-            if not first_text.isdigit():
-                continue
-            record = self._map_row(cells)
+        for row in self._own_rows(data_table):
+            if not self._is_grid_row(row):
+                continue  # header / spacer / nested chrome
+            record = self._map_row(row.find_all("td"))
             if record:
                 records.append(record)
 
@@ -645,23 +721,9 @@ class PierceWAARMSScraper(BridgeScraper):
 
         record = ScrapedRecord()
 
-        # Instrument number — clickable link (12 digits for modern, 10+ for old)
-        inst_re = re.compile(r"\b(\d{10,12})\b")
-        for c in cells:
-            for link in c.find_all("a"):
-                link_text = link.get_text(strip=True)
-                m = inst_re.match(link_text)
-                if m and len(link_text) >= 10:
-                    record.enrichment_data = {"instrument_number": m.group(1)}
-                    break
-            if record.enrichment_data:
-                break
-        if not record.enrichment_data:
-            for text in all_texts:
-                m = re.search(r"\b(20\d{10})\b", text)
-                if m:
-                    record.enrichment_data = {"instrument_number": m.group(1)}
-                    break
+        inst = self._row_instrument(cells, all_texts)
+        if inst:
+            record.enrichment_data = {"instrument_number": inst}
 
         # Date — must be valid MM/DD/YYYY
         for text in all_texts:

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest_asyncio
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.schemas import (
@@ -19,7 +20,7 @@ from src.api.schemas import (
     BatchDetailResponse,
     BatchSummaryResponse,
 )
-from src.db.models import BatchRun, Job, ScraperBatch, ScraperConfig, User
+from src.db.models import BatchRun, Job, Result, ScraperBatch, ScraperConfig, User
 
 
 def _auth(token: str) -> dict:
@@ -389,3 +390,201 @@ class TestCombinedRecordCount:
         bid = await self._mk(db, starter_user, mode="overlaps_only", counts=None)
         body = (await client.get(f"/batches/{bid}", headers=_auth(starter_token))).json()
         assert body["combined_record_count"] is None
+
+
+# ─── a PARTIAL run: a failed child must not report in-flight scrape progress ──
+
+@pytest_asyncio.fixture
+async def partial_batch(db: AsyncSession, starter_user: User) -> SimpleNamespace:
+    """Test 11's shape: one done child (0 leads) + one FAILED child whose
+    jobs.record_count still holds the mid-scrape counter (210) even though it
+    persisted, exported and billed nothing. The run is 'partial'."""
+    batch = ScraperBatch(
+        id=str(uuid.uuid4()), user_id=starter_user.id, name="Test 11", state="WA",
+        fields=["party_name"], enrichment=[], schedule={}, deliver={"emails": []},
+        status="active",
+    )
+    db.add(batch)
+    await db.flush()
+    jobs = {}
+    for record_type, status, record_count in (
+        ("probate", "done", 0),
+        ("pre_foreclosure", "failed", 210),
+    ):
+        cfg = ScraperConfig(
+            id=str(uuid.uuid4()), user_id=starter_user.id, batch_id=batch.id,
+            name=f"Test 11 - {record_type}", county="pierce", state="WA",
+            record_type=record_type, fields=["party_name"], enrichment=[],
+            schedule={}, deliver={},
+        )
+        db.add(cfg)
+        job = Job(
+            id=str(uuid.uuid4()), user_id=starter_user.id, scraper_config_id=cfg.id,
+            status=status, trigger="batch", record_count=record_count,
+        )
+        db.add(job)
+        jobs[record_type] = job
+    await db.flush()
+    db.add(BatchRun(
+        id=str(uuid.uuid4()), batch_id=batch.id, user_id=starter_user.id,
+        status="partial", child_job_ids=[j.id for j in jobs.values()],
+    ))
+    await db.commit()
+    return SimpleNamespace(batch_id=batch.id)
+
+
+async def test_failed_child_reports_zero_not_its_in_flight_scrape_counter(
+    client: AsyncClient, starter_token: str, partial_batch: SimpleNamespace
+):
+    """jobs.record_count is written mid-scrape by the progress callback, so a
+    FAILED child keeps the raw counter from the page it died on. Surfacing it
+    made Test 11's UI print "210 leads" for a job that delivered zero, and
+    summed it into the batch total. A non-done child reports 0."""
+    resp = await client.get(
+        f"/batches/{partial_batch.batch_id}", headers=_auth(starter_token)
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["run_status"] == "partial"
+    by_type = {c["record_type"]: c for c in body["children"]}
+    assert by_type["pre_foreclosure"]["status"] == "failed"
+    assert by_type["pre_foreclosure"]["record_count"] == 0
+    assert by_type["probate"]["status"] == "done"
+    assert by_type["probate"]["record_count"] == 0
+    # what the batch header sums
+    assert sum(c["record_count"] for c in body["children"]) == 0
+
+
+async def test_failed_child_that_did_persist_rows_still_reports_them(
+    db: AsyncSession, client: AsyncClient, starter_user: User, starter_token: str,
+    partial_batch: SimpleNamespace,
+):
+    """Do NOT key the count on status (Codex P1). finalize_batch_run builds the
+    combined CSV from every child_job_id with no status filter, and force-finalize
+    CANCELS still-active children after they may have persisted rows — so a
+    failed/cancelled child's rows can be in the delivered CSV. Those must stay
+    visible; only the count that outran persistence is capped."""
+    job_id = (
+        await db.execute(
+            select(Job.id).join(
+                ScraperConfig, ScraperConfig.id == Job.scraper_config_id
+            ).where(
+                ScraperConfig.batch_id == partial_batch.batch_id,
+                Job.status == "failed",
+            )
+        )
+    ).scalar_one()
+    for _ in range(3):
+        db.add(Result(
+            id=str(uuid.uuid4()), job_id=job_id, user_id=starter_user.id,
+            party_name="SMITH JANE", property_address="1 MAIN ST",
+        ))
+    await db.commit()
+
+    resp = await client.get(
+        f"/batches/{partial_batch.batch_id}", headers=_auth(starter_token)
+    )
+    assert resp.status_code == 200
+    child = {c["record_type"]: c for c in resp.json()["children"]}["pre_foreclosure"]
+    assert child["status"] == "failed"
+    # 3 rows exist, so they are reported — not zeroed away, and not the mid-scrape
+    # 210 either.
+    assert child["record_count"] == 3
+
+
+async def test_unactionable_rows_are_not_counted_as_leads(
+    db: AsyncSession, client: AsyncClient, starter_user: User, starter_token: str,
+    partial_batch: SimpleNamespace,
+):
+    """The count must use the same per-row rules the combined export applies:
+    a row with neither a property nor a mailing address is not a lead, so it must
+    not be reported as one (Codex round 3)."""
+    job_id = (
+        await db.execute(
+            select(Job.id).join(
+                ScraperConfig, ScraperConfig.id == Job.scraper_config_id
+            ).where(
+                ScraperConfig.batch_id == partial_batch.batch_id,
+                Job.status == "failed",
+            )
+        )
+    ).scalar_one()
+    db.add(Result(
+        id=str(uuid.uuid4()), job_id=job_id, user_id=starter_user.id,
+        party_name="HAS AN ADDRESS", property_address="5 PINE ST",
+    ))
+    db.add(Result(  # no property AND no mailing address -> not a lead
+        id=str(uuid.uuid4()), job_id=job_id, user_id=starter_user.id,
+        party_name="NO ADDRESS AT ALL",
+    ))
+    await db.commit()
+
+    resp = await client.get(
+        f"/batches/{partial_batch.batch_id}", headers=_auth(starter_token)
+    )
+    child = {c["record_type"]: c for c in resp.json()["children"]}["pre_foreclosure"]
+    assert child["record_count"] == 1
+
+
+async def test_failed_child_rows_survive_a_retry_that_reset_record_count(
+    db: AsyncSession, client: AsyncClient, starter_user: User, starter_token: str,
+    partial_batch: SimpleNamespace,
+):
+    """_retry_scrape_job sets record_count=0 on a re-queue, so the counter also runs
+    BEHIND rows that were already saved. Counting the rows keeps them visible where
+    min(record_count, rows) would have hidden them (Codex round 2)."""
+    job = (
+        await db.execute(
+            select(Job).join(
+                ScraperConfig, ScraperConfig.id == Job.scraper_config_id
+            ).where(
+                ScraperConfig.batch_id == partial_batch.batch_id,
+                Job.status == "failed",
+            )
+        )
+    ).scalar_one()
+    job.record_count = 0  # what a watchdog re-queue leaves behind
+    for _ in range(2):
+        db.add(Result(
+            id=str(uuid.uuid4()), job_id=job.id, user_id=starter_user.id,
+            party_name="DOE JOHN", property_address="2 OAK AVE",
+        ))
+    await db.commit()
+
+    resp = await client.get(
+        f"/batches/{partial_batch.batch_id}", headers=_auth(starter_token)
+    )
+    child = {c["record_type"]: c for c in resp.json()["children"]}["pre_foreclosure"]
+    assert child["record_count"] == 2
+
+
+async def test_duplicate_rows_are_not_counted_as_leads(
+    db: AsyncSession, client: AsyncClient, starter_user: User, starter_token: str,
+    partial_batch: SimpleNamespace,
+):
+    """record_count counts NEW non-duplicate rows, so counting rows must too."""
+    job_id = (
+        await db.execute(
+            select(Job.id).join(
+                ScraperConfig, ScraperConfig.id == Job.scraper_config_id
+            ).where(
+                ScraperConfig.batch_id == partial_batch.batch_id,
+                Job.status == "failed",
+            )
+        )
+    ).scalar_one()
+    db.add(Result(
+        id=str(uuid.uuid4()), job_id=job_id, user_id=starter_user.id,
+        party_name="NEW LEAD", property_address="3 ELM ST",
+    ))
+    db.add(Result(
+        id=str(uuid.uuid4()), job_id=job_id, user_id=starter_user.id,
+        party_name="SEEN BEFORE", property_address="4 ELM ST", is_duplicate=True,
+    ))
+    await db.commit()
+
+    resp = await client.get(
+        f"/batches/{partial_batch.batch_id}", headers=_auth(starter_token)
+    )
+    child = {c["record_type"]: c for c in resp.json()["children"]}["pre_foreclosure"]
+    assert child["record_count"] == 1

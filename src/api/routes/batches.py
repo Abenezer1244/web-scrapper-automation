@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
 from src.api.entitlements import enforce_entitlements
+from src.api.lead_actionability import actionable_condition
 from src.api.middleware.rate_limit import rate_limit
 from src.api.schemas import (
     BatchChildSummary,
@@ -31,7 +32,7 @@ from src.api.schemas import (
     BatchRunResponse,
     BatchSummaryResponse,
 )
-from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year
+from src.api.tax_filters import TAX_CAP_BIND, tax_cap_condition, tax_cap_min_year
 from src.config.constants import (
     BATCH_HARD_CEILING,
     BATCH_MAX_COMBINATIONS,
@@ -40,7 +41,7 @@ from src.config.constants import (
     SKIP_TRACE_ADDON_PLANS,
 )
 from src.db import CountyConnector
-from src.db.models import BatchRun, Job, ScraperBatch, ScraperConfig
+from src.db.models import BatchRun, Job, Result, ScraperBatch, ScraperConfig
 from src.scrapers.probate import new_probate_config_tod_default
 from src.utils.crypto import decrypt_field
 from src.utils.lead_export import resolve_hidden_output_fields
@@ -369,6 +370,20 @@ async def create_batch(
 # (scraper_configs, jobs). A run is at-most-one per batch in on-demand 2A.
 
 
+def _child_lead_count(
+    job: tuple[str, str, int], persisted: dict[str, int]
+) -> int:
+    """Leads to report for one batch child, given ``(job_id, status, record_count)``.
+
+    See the call site for why a non-done child is counted from its rows instead of
+    from ``jobs.record_count``.
+    """
+    job_id, status, record_count = job
+    if status == "done":
+        return record_count
+    return persisted.get(job_id, 0)
+
+
 def _combined_record_count(batch: ScraperBatch, run: BatchRun | None) -> int | None:
     """Rows in the combined export as-delivered, mode-aware, from the run's
     finalized delivery_counts snapshot. NULL until finalize writes it — the
@@ -516,6 +531,7 @@ async def get_batch(
     # Map child config -> its dispatched job (scoped to THIS run's child_job_ids so
     # an unrelated job on the same config — should not happen in 2A — can't leak in).
     job_by_config: dict[str, tuple[str, str, int]] = {}
+    persisted: dict[str, int] = {}
     if run and run.child_job_ids:
         job_rows = (
             await db.execute(
@@ -525,6 +541,33 @@ async def get_batch(
             )
         ).all()
         job_by_config = {scid: (jid, st, rc) for (jid, scid, st, rc) in job_rows}
+        # Deliverable rows each child ACTUALLY saved. Same per-row rules the
+        # combined export applies in _COMBINED_CTES — actionability (no property
+        # AND no mailing address = not a lead) and the tax recency cap — plus the
+        # non-duplicate rule jobs.record_count itself follows, so a done and a
+        # non-done child are counted by the same definition of "lead" (Codex).
+        # One grouped query for the whole batch (children are a handful),
+        # tenant-scoped like every other query here.
+        #
+        # It is a PER-SCRAPE count, not a slice of the combined CSV: that CSV
+        # dedups ACROSS children into property buckets, and a bucket spanning two
+        # children cannot be attributed to either one. The delivered figure is the
+        # batch-level combined_record_count, which reads the run's delivery_counts.
+        persisted = dict(
+            (
+                await db.execute(
+                    select(Result.job_id, func.count(Result.id))
+                    .where(
+                        Result.user_id == current_user.id,
+                        Result.job_id.in_(run.child_job_ids),
+                        Result.is_duplicate.is_not(True),
+                        actionable_condition(),
+                        tax_cap_condition(datetime.now(UTC).date()),
+                    )
+                    .group_by(Result.job_id)
+                )
+            ).all()
+        )
 
     config_rows = (
         await db.execute(
@@ -557,7 +600,25 @@ async def get_batch(
                 record_type=record_type,
                 job_id=job[0] if job else None,
                 status=child_status,
-                record_count=job[2] if job else 0,
+                # A DONE child's record_count is final and authoritative (it is
+                # what billing charged), so it is reported as-is — including when
+                # retention has since removed the rows behind it.
+                #
+                # For any OTHER child that field cannot be trusted in EITHER
+                # direction. The progress callback writes it mid-scrape, so it runs
+                # ahead of what was saved (Test 11's failed child said 210 with ZERO
+                # rows, and the UI printed "210 leads" and summed it into the batch
+                # total); and _retry_scrape_job RESETS it to 0 on a re-queue, so it
+                # also runs behind rows that were already saved. Count the rows
+                # instead — the same non-duplicate rule record_count itself uses,
+                # measured from what exists rather than from a counter.
+                #
+                # Counted, not zeroed (Codex): a failed or cancelled child can still
+                # have persisted rows that reach the delivered combined CSV —
+                # batch_export selects every child_job_id with no status filter, and
+                # force-finalize CANCELS still-active children after they may have
+                # saved rows. Zeroing would hide leads the user is holding.
+                record_count=_child_lead_count(job, persisted) if job else 0,
             )
         )
 

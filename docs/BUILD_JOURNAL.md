@@ -168,8 +168,29 @@ multi-record-type scraper results.
   bind `f_` and failed every combined-lead query. Only running the tests found it.
 
 **Pending / Handoff:**
-- ⏭️ Codex round-2 gate on `e6e0d91` + `6c42bbc` (quota). Self-reviewed its 6 challenge points in
-  the meantime; all clear. **Merge should wait on this** per the Codex NO-GO rule.
+- ✅ **SHIPPED.** BE **#219** `2c24f1fb` → main (Test + Build & Push + Run Migrations all green);
+  FE **#109** `2835621c` → master; Codex follow-ups FE **#110** `614c663e`. Prod-verified live on
+  `api.bridgeleads.io`: `batch_id` exposed, `/scrapers` default 14 rows / 6 children (back-compat
+  intact), `?exclude_batch_children=true` → 8 rows / 0 children, `counties` populated on all three
+  batches, filter params accepted and echoed alongside the facet fields.
+- 🛑 **CI caught a schema mistake my local check had blessed.** `Check OpenAPI schema is current`
+  failed on #219: I had hand-normalized the currency constraint to a float form believing that was
+  main's style. It is not — main uses the int form — and I only concluded otherwise by diffing
+  against my OWN already-polluted commit instead of `origin/main`. `.venv-schema` had been right all
+  along. Fixed in `113b36b`; the diff vs main is now purely additive and `--check` passes locally.
+- 🛑 **Codex's round-2 gate ran late (quota) and found two REAL defects the merge had already
+  shipped**, both fixed in #110:
+  (a) the new "Clear filters" button repeated the EXACT sub-AA pair I had just fixed on the badge —
+      on the one element that is the only way out of a filtered empty state. Fixing a contrast bug
+      and reintroducing it three files later is a pattern worth watching for.
+  (b) "No leads" for a failed/cancelled child could be a LIE: the completion barrier flips any
+      non-terminal child to `cancelled` (`batch_export.py:417-423`) while `Job.record_count` is only
+      written on the normal path (`tasks.py:489`), so a child cancelled mid-run can hold persisted
+      result rows and still read 0. That count is UNKNOWN, not zero.
+  Codex cleared the rest: both clear-filter branches, page-reset vs the clamp, the
+  `useSearchParams`/`router.replace` model, and the badge fix itself.
+- 🔑 **The gate is worth waiting for.** Every substantive defect this session was found by RUNNING
+  something — CI, the tests, a contrast measurement, or Codex — never by re-reading the diff.
 - ⏭️ 👤 `_monopo/data.ts:188-189` — the pricing table's `"—"` for Starter is marketing copy
   ("not on this plan"), not a null fallback. Wording is a product decision, deliberately untouched.
 - ⏭️ Pre-existing, measured on `origin/master`, NOT fixed: the shell's PRO TRIAL banner and the

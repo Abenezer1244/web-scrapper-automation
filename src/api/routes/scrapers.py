@@ -88,13 +88,26 @@ async def sample_records(db: AsyncSession = Depends(get_db)) -> dict:
 @router.get("", response_model=list[ScraperConfigResponse])
 async def list_scrapers(
     current_user: CurrentUser,
+    exclude_batch_children: bool = Query(
+        False,
+        description=(
+            "Exclude configs that are children of a batch (batch_id is set). The "
+            "Scrapers list sets this so one user-initiated batch renders as ONE row "
+            "instead of one row per county x record_type child. "
+            "Default False on purpose: other callers legitimately need the children "
+            "(the grandfathered-probate TOD notice counts EVERY probate config, and "
+            "/scrapers/{id}/records resolves a child config out of this list) — "
+            "flipping the default would silently break both."
+        ),
+    ),
     db: AsyncSession = Depends(get_rls_db),
 ) -> list[ScraperConfigResponse]:
-    result = await db.execute(
-        select(ScraperConfig)
-        .where(ScraperConfig.user_id == current_user.id, ScraperConfig.active)
-        .order_by(ScraperConfig.created_at.desc())
+    stmt = select(ScraperConfig).where(
+        ScraperConfig.user_id == current_user.id, ScraperConfig.active
     )
+    if exclude_batch_children:
+        stmt = stmt.where(ScraperConfig.batch_id.is_(None))
+    result = await db.execute(stmt.order_by(ScraperConfig.created_at.desc()))
     return [ScraperConfigResponse.model_validate(s) for s in result.scalars().all()]
 
 

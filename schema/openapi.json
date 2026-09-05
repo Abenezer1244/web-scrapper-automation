@@ -307,6 +307,13 @@
             ],
             "title": "Completed At"
           },
+          "counties": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Counties",
+            "type": "array"
+          },
           "created_at": {
             "format": "date-time",
             "title": "Created At",
@@ -516,8 +523,33 @@
       "BatchLeadsPage": {
         "description": "A page of the combined batch view + live honest counts.",
         "properties": {
+          "available_counties": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Available Counties",
+            "type": "array"
+          },
+          "available_record_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Available Record Types",
+            "type": "array"
+          },
           "counts": {
             "$ref": "#/components/schemas/BatchDeliveryCounts"
+          },
+          "county": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "County"
           },
           "delivery_mode": {
             "title": "Delivery Mode",
@@ -537,6 +569,17 @@
           "page_size": {
             "title": "Page Size",
             "type": "integer"
+          },
+          "record_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Record Type"
           },
           "total": {
             "title": "Total",
@@ -685,6 +728,13 @@
               }
             ],
             "title": "Completed At"
+          },
+          "counties": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Counties",
+            "type": "array"
           },
           "created_at": {
             "format": "date-time",
@@ -2908,6 +2958,17 @@
             "title": "Active",
             "type": "boolean"
           },
+          "batch_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Batch Id"
+          },
           "county": {
             "title": "County",
             "type": "string"
@@ -4952,6 +5013,44 @@
               "title": "Page Size",
               "type": "integer"
             }
+          },
+          {
+            "description": "Narrow the combined list to leads MATCHING this record type. The set is deduped, so an overlapping lead carries several record types and is returned by each of them — per-type subtotals therefore sum to MORE than the unfiltered total. That is the overlap, not double counting.",
+            "in": "query",
+            "name": "record_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow the combined list to leads MATCHING this record type. The set is deduped, so an overlapping lead carries several record types and is returned by each of them — per-type subtotals therefore sum to MORE than the unfiltered total. That is the overlap, not double counting.",
+              "title": "Record Type"
+            }
+          },
+          {
+            "description": "Narrow to leads sourced from this county.",
+            "in": "query",
+            "name": "county",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow to leads sourced from this county.",
+              "title": "County"
+            }
           }
         ],
         "responses": {
@@ -5138,6 +5237,44 @@
               "minimum": 1,
               "title": "Page Size",
               "type": "integer"
+            }
+          },
+          {
+            "description": "Narrow the combined list to leads MATCHING this record type. The set is deduped, so an overlapping lead carries several record types and is returned by each of them — per-type subtotals therefore sum to MORE than the unfiltered total. That is the overlap, not double counting.",
+            "in": "query",
+            "name": "record_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow the combined list to leads MATCHING this record type. The set is deduped, so an overlapping lead carries several record types and is returned by each of them — per-type subtotals therefore sum to MORE than the unfiltered total. That is the overlap, not double counting.",
+              "title": "Record Type"
+            }
+          },
+          {
+            "description": "Narrow to leads sourced from this county.",
+            "in": "query",
+            "name": "county",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow to leads sourced from this county.",
+              "title": "County"
             }
           }
         ],
@@ -6432,6 +6569,20 @@
     "/scrapers": {
       "get": {
         "operationId": "list_scrapers_scrapers_get",
+        "parameters": [
+          {
+            "description": "Exclude configs that are children of a batch (batch_id is set). The Scrapers list sets this so one user-initiated batch renders as ONE row instead of one row per county x record_type child. Default False on purpose: other callers legitimately need the children (the grandfathered-probate TOD notice counts EVERY probate config, and /scrapers/{id}/records resolves a child config out of this list) — flipping the default would silently break both.",
+            "in": "query",
+            "name": "exclude_batch_children",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Exclude configs that are children of a batch (batch_id is set). The Scrapers list sets this so one user-initiated batch renders as ONE row instead of one row per county x record_type child. Default False on purpose: other callers legitimately need the children (the grandfathered-probate TOD notice counts EVERY probate config, and /scrapers/{id}/records resolves a child config out of this list) — flipping the default would silently break both.",
+              "title": "Exclude Batch Children",
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -6446,6 +6597,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "security": [

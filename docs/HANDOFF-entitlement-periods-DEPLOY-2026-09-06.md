@@ -417,3 +417,68 @@ NO-GO until fixed, per `.claude/rules/codex-collaboration.md`.
 Read `tasks/todo-entitlement-periods.md` for the full design, the nine policies,
 the 5-round Codex table and the §14 security review. Read
 `docs/BUILD_JOURNAL.md` (top entry) for the narrative.
+
+---
+
+## 10. THE 2026-09-06 CODEX PASS — the gap in §6.1, now closed
+
+Codex quota came back the same afternoon. **Both halves are now reviewed and
+both gates end clean.** Every finding was verified against the code before being
+adopted; none was taken on trust, and one was rejected on the evidence.
+
+### Frontend `feat/entitlement-usage-display`
+
+| Round | Target | Findings |
+|---|---|---|
+| review | `ef3ba3d` | none ("no clear functional regression") |
+| **challenge** | `ef3ba3d` | **2 × P1 — both real.** The plain review missed both. |
+| review | `bf578ce` | 1 × P2 — real |
+| review | `ae222a5` | **CLEAN — "I did not find a discrete regression"** |
+
+- **P1 — the THIRD blocked-state gate.** The dashboard passed only
+  plan/used/limit into `QuotaUpgradeBanner`, which returns `null` below 90%
+  usage, so a frozen account at 10/50 got no payment message on the main
+  surface. The page already fetched `usage`; `payment_state` sat there unused.
+  Fixed with a separate `PaymentFrozenBanner` — folding it into the upgrade
+  banner would have re-created the bug behind the same usage gate.
+- **P1 — the reset date was a day early west of UTC.** `toLocaleDateString`
+  with no `timeZone`, so the `2026-10-01T00:00:00Z` boundary rendered "Sep 30"
+  in Pacific (measured, not assumed), and dated the pending downgrade early too.
+  New `formatUtcDate` in `lib/utils`, deliberately a SIBLING of `formatDate` —
+  that one builds date-only strings locally on purpose, and merging them breaks
+  one or the other.
+- **P2 — frozen and over-quota were independent but not exclusive.** A frozen
+  account above 90% got both banners, offering an upgrade that cannot unblock a
+  declined card. Frozen now wins, matching the records page.
+
+### Backend — the commits the original 5 rounds never covered
+
+| Round | Target | Findings |
+|---|---|---|
+| review | `e6c4d55` | 1 × P2 — real, and it broke the verifier's premise |
+| review | `eed9fd2` | 1 × P1 — real, **in my own fix** |
+| review | `7e6a0a3` | 1 × P1 — real, **also in my own fix** |
+| review | `c3c20c9` | **CLEAN — "no discrete, newly introduced correctness issues"** |
+
+The verifier took four rounds to get right, and the arc is the lesson:
+
+1. **P2** — its premise was false. `records_period_start` is written in lockstep
+   with `quota_period_start`, so after any rollover C1 compares a value to
+   itself. Fixed with C7 plus a real `--snapshot` / `--baseline`.
+2. **P1** — the new C8 hard-failed on any counter change, which ordinary traffic
+   causes. It would have blocked a good deploy.
+3. **P1** — the "fix" for that hard-failed on a *decrease*, which settlement
+   (`billable − reserved`) and release also cause. Same bug, narrower.
+
+🔑 **Codex contradicted itself between rounds 2 and 3** (one said do not fail on
+drift, the other said drift must not pass). That was resolved by reasoning, not
+by deferring to the newer round: both were right about different halves. Live
+traffic makes `records_used` **unverifiable in either direction**, so the delta
+is reported and never judged, while the *verdict* refuses to say "moved nobody"
+whenever one exists. `--strict-counter` is the only sound check and only against
+a quiesced production.
+
+🛑 **Two of the three backend findings were defects in fixes I had just written**
+and had already convinced myself were correct. The FE `challenge` mode also
+found two P1s that plain `codex review` reported as clean — **the adversarial
+pass is not optional on this project.**

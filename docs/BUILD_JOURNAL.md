@@ -84,6 +84,68 @@ the handoff disclosed. **2 of 4 closed, 2 provably cannot close yet.**
 **Pending / Handoff:** deploy go/no-go (operator); Wed Codex pass on FE
 `ef3ba3d` + BE `e6c4d55`; FE api-types regen after #231 merges.
 
+*(Superseded within the hour — Codex quota returned the same afternoon. See the
+entry below, which is the same session continued.)*
+
+---
+
+## 2026-09-06 — Codex came back, and found five real defects (two in my own fixes)
+
+Same session, later. The quota block in the entry above lifted, so the frontend
+finally got the review it had never had, and the commits added earlier that day
+got theirs. **Both gates now end clean.** Still not deployed, still no operator
+go. All findings verified against the code before being adopted.
+
+**Built / Shipped:** FE `bf578ce`, `ae222a5`; BE `eed9fd2`, `7e6a0a3`, `c3c20c9`.
+
+**Caught & fixed — frontend (2 × P1, 1 × P2):**
+- 🛑 **The THIRD blocked-state gate.** The dashboard passed only
+  plan/used/limit into `QuotaUpgradeBanner`, which returns `null` below 90%
+  usage, so a frozen account at 10/50 got no payment message at all on the main
+  surface — while the page was already fetching `usage` and ignoring
+  `payment_state`. Two gates of this exact shape had been fixed in `ef3ba3d`;
+  this was a third. Fixed with a separate `PaymentFrozenBanner`, because folding
+  it into the upgrade banner puts it back behind the same usage gate.
+- 🛑 **The reset date was a day early for every user west of UTC.**
+  `toLocaleDateString` with no `timeZone` on a UTC instant: measured local
+  "Sep 30" vs UTC "Oct 1" for the same `2026-10-01T00:00:00Z` boundary. It dated
+  pending downgrades early too. The prior hand-review had guarded "Invalid Date"
+  on that exact line and walked past this.
+- 🛑 A frozen account above 90% got BOTH banners — a payment notice and an
+  upgrade CTA that cannot unblock a declined card.
+
+**Caught & fixed — backend (3 findings, 2 of them in fixes I had just written):**
+- 🛑 The verifier's central premise was **false**: `records_period_start` is
+  written in lockstep with `quota_period_start`, so after any rollover its
+  headline check compared a value against itself.
+- 🛑 The fix for that hard-failed on any counter movement — ordinary traffic —
+  and would have blocked a good deploy.
+- 🛑 The fix for *that* hard-failed on a decrease, which settlement
+  (`billable − reserved`) and release also produce. I had noticed releases could
+  do this while writing it and shipped the heuristic anyway.
+
+**Tried / Decided:**
+- **Codex contradicted itself** between rounds 2 and 3 on the counter check.
+  Resolved by reasoning rather than deferring to the newer round: both were half
+  right. Under live traffic `records_used` is **unverifiable in either
+  direction**, so the delta is reported and never judged — and the *verdict*
+  refuses to print "moved nobody" whenever one exists. `--strict-counter` is the
+  only sound check, and only against a quiesced production.
+- `formatUtcDate` is deliberately a SIBLING of `formatDate`, not a change to it.
+  `formatDate` builds date-only strings LOCALLY on purpose (a bare date has no
+  zone); this takes the opposite input, a timestamptz where the UTC day is the
+  meaning. Merging them breaks one or the other.
+
+**Facts learned:**
+- 🔑 **`codex review` and `codex challenge` are not substitutes.** The plain
+  review called the frontend clean; the adversarial pass on the same commit
+  found two P1s. On this project the challenge pass is not optional.
+- 🛑 **Two of three backend findings were defects in fixes I had just written**
+  and already believed correct. A fix is not evidence of a fix.
+- 🔑 A deploy gate that can pass vacuously is worse than none, and so is one that
+  cries wolf — the third revision had to stop *classifying* and start *reporting
+  honestly*, with the safety carried by a verdict that refuses to overclaim.
+
 ---
 
 ## 2026-09-06 — quota stops resetting on the 1st: entitlement periods

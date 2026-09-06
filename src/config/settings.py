@@ -167,7 +167,22 @@ class Settings(BaseSettings):
 
     # ─── Email ────────────────────────────────────────────────────────────────
     RESEND_API_KEY: str = ""
+    # The VERIFIED Resend sending address. Changing it breaks SPF/DKIM/DMARC
+    # alignment and provider verification — do not edit without re-verifying the
+    # domain in Resend.
     EMAIL_FROM: str = "leads@bridgeleads.io"
+    # Display name recipients see in their inbox. Without it the From header is a
+    # bare address and Gmail falls back to rendering the local part ("leads"),
+    # which is what shipped. Composed into the From header by
+    # src/utils/email_layout.from_header() — the ONLY place that builds it.
+    EMAIL_FROM_NAME: str = "BridgeLeads"
+    # Where a recipient's reply lands. Separate from EMAIL_FROM on purpose: the
+    # From address is the deliverability-verified sender, this is the human
+    # inbox our footers point at. Empty = omit the Reply-To header entirely
+    # (replies then go to EMAIL_FROM).
+    EMAIL_REPLY_TO: str = "support@bridgeleads.io"
+    # Support address printed in email footers / help copy.
+    SUPPORT_EMAIL: str = "support@bridgeleads.io"
 
     # Registration email-verification flow (anti-enumeration). Default FALSE =
     # legacy behavior: /auth/register creates the account immediately and returns

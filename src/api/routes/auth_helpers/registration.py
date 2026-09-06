@@ -28,6 +28,7 @@ from src.api.auth import create_refresh_token, create_secure_token, hash_passwor
 from src.api.middleware import audit_log, once_per, rate_limit, release_once
 from src.api.schemas import RegisterResponse, TokenResponse, UserRegister, VerifyEmailRequest
 from src.config import settings
+from src.config.constants import TRIAL_PERIOD_DAYS
 from src.db import PendingRegistration, User
 from src.utils.crypto import blind_index
 from src.utils.logger import email_fingerprint, setup_logger
@@ -174,7 +175,10 @@ async def _create_real_user(
     #
     # skip_trace_period_start stays on the calendar month — skip-trace is billed
     # on its own Stripe meter and is deliberately out of scope here.
-    _trial_ends = _now + timedelta(days=7)
+    # Trial length from the shared constant, not a literal, so the welcome
+    # email quotes the SAME window this stamps on trial_ends_at (and, since
+    # main derives quota_period_end from it, the quota window too).
+    _trial_ends = _now + timedelta(days=TRIAL_PERIOD_DAYS)
     user = User(
         id=str(uuid.uuid4()),
         email=email,

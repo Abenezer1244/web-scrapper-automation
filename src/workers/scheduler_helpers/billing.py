@@ -16,17 +16,44 @@ def _reset_monthly_usage_impl() -> None:
     redeploy, broker hiccup) the reset was SKIPPED ENTIRELY and every
     user carried last month's records_used forward into the new
     month. A user at 500/500 last month started the new month
-    instantly at cap.
+    instantly at cap. So it now runs DAILY at 00:05 UTC and catches up.
 
-    Now runs daily at 00:05 UTC. On each run, finds users whose
-    records_period_start points at a month strictly earlier than
-    this run's current month and resets their counters +
-    advances records_period_start to the first of the current
-    month. Idempotent: a user who was already reset this month
-    has records_period_start = this month and is skipped.
+    QUOTA-LOSS FIX: that catch-up design used a single blanket
+    ``SET records_used = 0 WHERE records_period_start IS NULL OR
+    records_period_start < this_month``, which destroyed usage TWO ways:
 
-    The same logic applies to skip_trace_used_this_month +
-    skip_trace_period_start for Sprint 4 billing.
+      1. ``records_period_start`` had no server_default and was never set
+         at registration, so EVERY new user was NULL and got zeroed on
+         their first 00:05 run — inside their own signup month, with no
+         billing event. (Prod: a user billed 999 records on day 1 and
+         woke up at 2.)
+      2. Zeroing was unconditional, so when Beat DID miss the 1st — the
+         very case this task exists for — the late run also wiped usage
+         already billed inside the NEW period. (Prod: 67 records billed
+         Sep 2 destroyed by a Sep 3 catch-up run.)
+
+    Both are fixed by splitting the blanket UPDATE into two statements
+    with different semantics, and by making billing itself roll the
+    period forward atomically (see ``_bill_records_used`` in
+    workers/tasks.py). Because billing advances records_period_start in
+    the same statement that increments records_used, a period_start that
+    is STILL stale here PROVES no job billed in the current period — so
+    zeroing those rows is correct by construction, not by hope.
+
+      * NULL period_start  -> ADOPT: stamp the period, keep the counter.
+        Zeroing is the financially destructive direction (it grants free
+        quota and lets a user exceed their cap invisibly), so an
+        unexpected NULL must never cost us the counter. NULL should be
+        unreachable after migration 086 + the registration fix; if one
+        appears anyway it is a bug, so we alert on it.
+      * STALE period_start -> ROLL OVER: zero the counter and advance.
+
+    Skip-trace gets the SAME two-statement treatment, keyed on its OWN
+    ``skip_trace_period_start``. It was previously gated on
+    ``records_period_start``, so a drift between the two columns could
+    reset skip-trace early or never reset it at all — skip-trace is
+    metered to Stripe, so that is a billing-correctness bug in its own
+    right.
     """
     from sqlalchemy import text
 
@@ -34,33 +61,75 @@ def _reset_monthly_usage_impl() -> None:
 
     now = datetime.now(UTC)
 
+    # NOTE: every statement below recomputes the boundary with the same
+    # expression rather than sharing an interpolated constant, so the SQL stays
+    # static (no string-built queries) and Postgres evaluates one consistent
+    # NOW() per statement.
+
     with system_sync_session() as db:
-        # Truncate to first-of-current-month at UTC. Postgres
-        # date_trunc('month', ...) gives us the boundary.
-        result = db.execute(
+        # ── 1. ADOPT rows with no period at all (stamp only, never zero) ──────
+        adopted_records = db.execute(
             text("""
-                WITH period_start AS (
-                    SELECT date_trunc('month', NOW() AT TIME ZONE 'UTC')
-                           AT TIME ZONE 'UTC' AS this_month
-                )
                 UPDATE users
-                SET
-                    records_used = 0,
-                    records_period_start = (SELECT this_month FROM period_start),
-                    skip_trace_used_this_month = 0,
-                    skip_trace_period_start = (SELECT this_month FROM period_start)
-                WHERE
-                    records_period_start IS NULL
-                    OR records_period_start
-                       < (SELECT this_month FROM period_start)
+                SET records_period_start = date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+                WHERE records_period_start IS NULL
             """)
-        )
+        ).rowcount
+        adopted_skip = db.execute(
+            text("""
+                UPDATE users
+                SET skip_trace_period_start = date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+                WHERE skip_trace_period_start IS NULL
+            """)
+        ).rowcount
+
+        # ── 2. ROLL OVER genuinely stale periods (zero + advance) ─────────────
+        rolled_records = db.execute(
+            text("""
+                UPDATE users
+                SET records_used = 0,
+                    records_period_start = date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+                WHERE records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+            """)
+        ).rowcount
+        rolled_skip = db.execute(
+            text("""
+                UPDATE users
+                SET skip_trace_used_this_month = 0,
+                    skip_trace_period_start = date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+                WHERE skip_trace_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+            """)
+        ).rowcount
         db.commit()
-        _logger.info(
-            "Daily usage rollover: reset %d users whose period_start "
-            "was earlier than %s",
-            result.rowcount, now.isoformat(),
-        )
+
+    _logger.info(
+        "Daily usage rollover at %s: rolled %d records / %d skip-trace periods; "
+        "adopted %d records / %d skip-trace NULL periods",
+        now.isoformat(), rolled_records, rolled_skip, adopted_records, adopted_skip,
+    )
+
+    # A NULL period_start is unreachable once migration 086 has run and
+    # registration stamps both columns. If one shows up, an insert path is
+    # bypassing that — surface it instead of silently absorbing it.
+    if adopted_records or adopted_skip:
+        try:
+            from src.workers.ops_alerts import send_ops_alert
+
+            send_ops_alert(
+                kind="billing",
+                key="null_billing_period",
+                subject="Quota rollover adopted NULL billing periods",
+                body=(
+                    f"reset_monthly_usage stamped {adopted_records} NULL "
+                    f"records_period_start and {adopted_skip} NULL "
+                    f"skip_trace_period_start rows. Both columns are NOT NULL "
+                    f"with a server_default as of migration 086, so this means "
+                    f"an insert path is writing an explicit NULL. Counters were "
+                    f"PRESERVED (not zeroed); investigate the insert path."
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — alerting must never break the beat
+            _logger.warning("Could not send NULL-period ops alert: %s", exc)
 
 
 #: Stripe subscription statuses that GRANT entitlement — a user in any of these

@@ -1331,7 +1331,23 @@ def run_scrape_job(self, job_id: str) -> None:
             else:
                 try:
                     db.refresh(user)  # a concurrent job may have consumed quota
-                    _remaining = max(0, user.records_limit - (user.records_used or 0))
+                    # PERIOD-AWARE read, mirroring the billing increment below.
+                    # records_used is only meaningful for the period named by
+                    # records_period_start: if that period is stale (the daily
+                    # rollover has not caught up yet), the stored number belongs
+                    # to LAST month and counting it here would under-deliver a
+                    # user who is actually at 0 for the current period.
+                    _effective_used = db.execute(
+                        sa_text(
+                            "SELECT CASE"
+                            "  WHEN records_period_start IS NULL"
+                            "    OR records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+                            "  THEN 0 ELSE records_used END "
+                            "FROM users WHERE id = CAST(:uid AS uuid)"
+                        ),
+                        {"uid": str(user.id)},
+                    ).scalar() or 0
+                    _remaining = max(0, user.records_limit - _effective_used)
                     # Clear this job's previous marks first: on a watchdog re-run
                     # the ranking must start from the FULL actionable set, or each
                     # pass would renumber the survivors and mark a second batch,
@@ -1611,16 +1627,63 @@ def run_scrape_job(self, job_id: str) -> None:
         # double-charges records_used. billed_count records the charged amount. The
         # Job CAS + the User increment commit together (a crash between the two
         # execute()s rolls both back — neither is committed until db.commit()).
+        # ONE database-clock reading, reused as the billing instant for BOTH the
+        # job anchor and the user's period decision below.
+        #
+        # Postgres NOW() is transaction_timestamp() — fixed when the transaction
+        # OPENED, which here is the billable-count SELECT above, potentially
+        # minutes earlier. A transaction that opens just before a UTC month
+        # boundary and reaches this point just after it would stamp
+        # billing_applied_at in the new month while NOW() still resolved to the
+        # old one, leaving records_period_start stale. The beat task would then
+        # read that user as stale and zero a charge that had just been applied
+        # inside the new period — the exact failure this whole change exists to
+        # prevent. clock_timestamp() reads the wall clock at statement time, and
+        # binding the single value into both statements makes the job anchor and
+        # the user period agree by construction rather than by luck. (Codex)
+        _billed_at = db.execute(sa_text("SELECT clock_timestamp()")).scalar()
         billed_now = db.execute(
             sa_update(Job)
             .where(Job.id == job_id, Job.billing_applied_at.is_(None))
-            .values(billed_count=billable_count, billing_applied_at=_now())
+            .values(billed_count=billable_count, billing_applied_at=_billed_at)
         ).rowcount
         if billed_now:
+            # PERIOD-AWARE increment. The counter is rolled forward in the SAME
+            # statement that charges it, so the month boundary is applied at the
+            # moment of billing rather than whenever the daily beat task next
+            # happens to run.
+            #
+            # This closes a real quota-loss hole: reset_monthly_usage runs daily
+            # at 00:05 UTC to survive Beat downtime on the 1st, but it used to
+            # zero records_used unconditionally — so a late catch-up run wiped
+            # usage that had ALREADY been billed inside the new period. In prod a
+            # user billed 67 records on Sep 2 and a Sep-3 catch-up run destroyed
+            # them.
+            #
+            # It also makes the daily task's zeroing provably safe rather than
+            # merely hopeful: because every bill advances records_period_start,
+            # a period_start that is still stale when the beat runs PROVES no job
+            # billed in the current period, so there is nothing of value to zero.
+            #
+            # One statement, evaluated atomically under the row lock Postgres
+            # already takes for an UPDATE, so a concurrent bill for the same user
+            # cannot interleave a read and a write (no lost update).
             user_billed = db.execute(
-                sa_update(User)
-                .where(User.id == user.id)
-                .values(records_used=User.records_used + billable_count)
+                sa_text(
+                    "UPDATE users SET "
+                    "  records_used = CASE"
+                    "    WHEN records_period_start IS NULL"
+                    "      OR records_period_start < date_trunc('month', CAST(:billed_at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+                    "    THEN 0 ELSE records_used END + :billable, "
+                    "  records_period_start = CASE"
+                    "    WHEN records_period_start IS NULL"
+                    "      OR records_period_start < date_trunc('month', CAST(:billed_at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+                    "    THEN date_trunc('month', CAST(:billed_at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+                    "    ELSE records_period_start END "
+                    "WHERE id = CAST(:uid AS uuid)"
+                ),
+                {"billable": billable_count, "uid": str(user.id),
+                 "billed_at": _billed_at},
             ).rowcount
             if user_billed != 1:
                 # The job was CAS-marked billed but the user counter did NOT move

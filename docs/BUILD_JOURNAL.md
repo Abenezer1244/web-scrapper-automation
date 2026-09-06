@@ -89,6 +89,56 @@ entry below, which is the same session continued.)*
 
 ---
 
+## 2026-09-06 — DEPLOYED: quota now resets on the entitlement anniversary
+
+Operator gave the go. **Both halves are live.** BE #231 `e323678` (Build & Push +
+Run Migrations 088 both green), FE #116 `bfa7a50` (master green, Vercel
+deployed).
+
+**Verified in production, not by test:** 12/12 users pass every hard check,
+`records_used` identical to the pre-deploy snapshot for all 12, window start
+unchanged for all 12, zero rollovers. The watched account is **1007 / 1000,
+still over cap, next reset 2026-10-01** — untouched, exactly as required. The
+deploy was the behavioural no-op it was designed to be.
+
+**Tried / Decided:**
+- **Step 0 (pre-deploy snapshot) earned its place immediately.** Taken before
+  the merge, 12 users. It is now the only record of the pre-088 state, and it is
+  what let step 2 assert "identical" rather than "plausible".
+- **Step 3 was NOT applied — it had nothing to do.** The dry run found **0
+  candidates: production has zero users with a `stripe_subscription_id`** (3
+  have a customer id, 1 has a subscription_status). I checked the raw columns
+  rather than trusting the count, because "0" from a filtered query is exactly
+  the shape of a silent bug. It is real: there are no live Stripe subscriptions,
+  so there is no anniversary to move anyone to. Everyone stays day-1 anchored,
+  which is correct — future conversions anchor at `billing_cycle_anchor` via P1.
+
+**Failed / Blocked:**
+- 🛑 **The verifier failed its FIRST production run**, after four Codex rounds
+  and three local DB exercises had all passed it. `select(User)` maps `email`
+  through the field encryptor, one legacy production row holds an unencrypted
+  value, and strict mode aborted the entire audit with `InvalidToken` — exit 2
+  on a deploy where the quota data was perfect. `take_snapshot()` had survived
+  the same database minutes earlier only because it already used raw SQL. Fixed
+  in `b824cb2`: a quota audit never prints an email, so it no longer loads the
+  column.
+
+**Facts learned:**
+- 🔑 **A tool that only ever ran against a seeded local DB has not been tested.**
+  Four review rounds and three throwaway-Postgres exercises did not surface an
+  encrypted-column landmine that production hit on contact. Local rigs have
+  clean data by construction; that is exactly what makes them miss this class.
+- 🔑 The whole anniversary machinery is live but currently **dormant by data**:
+  with no Stripe subscriptions, every window is still a day-1 month. The first
+  real conversion is what will exercise P1 end to end. Worth watching.
+- 🔑 The 1007/1000 account is a **trial** (`trial_ends_at` 2026-09-09,
+  `first_paid_at` NULL). Under the old calendar policy, converting would have
+  left it at 1007/1000 until Oct 1 — the exact "paid and got nothing" gap this
+  project set out to close. It is now positioned to get a fresh window at
+  conversion instead.
+
+---
+
 ## 2026-09-06 — Codex came back, and found five real defects (two in my own fixes)
 
 Same session, later. The quota block in the entry above lifted, so the frontend

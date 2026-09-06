@@ -397,6 +397,43 @@ Two defects I found that Codex did not: the `release_quota_reservation` /
 `/usage` drift sites, and the `past_due`-via-`subscription.updated` leak (which
 Codex then reported independently in round 1).
 
+## Master Security Review (§14) — 2 passes, both CLEAN
+
+Required by `.claude/rules/security.md` after every meaningful feature; run against
+the whole diff `a009f15..HEAD`, translated to this stack per the rules' table.
+
+| # | Item | Result |
+|---|---|---|
+| 1 | Authorization | `/billing/usage` + the four gates read `current_user` only. The C3 customer-id mismatch guard in checkout is intact, and the `.with_for_update()` added in `ea98ac0` did not displace it. The webhook resolves identity from the SIGNATURE-VERIFIED event payload and only takes plan/status/cancel fields from the Stripe re-read — identity from the signed source, state from the authoritative one. |
+| 2 | Secrets | No hardcoded keys added. `BILLING_PAST_DUE_GRACE_DAYS` is a plain int setting, no secret. |
+| 3 | Input validation | No new request fields. `_stripe_ts` coerces and rejects unparseable Stripe epochs rather than raising; the `attempt_count` clamp is preserved. |
+| 4 | Error handling | New 402 bodies carry only the caller's own numbers and a reset date. No stack traces, DB errors or column names. |
+| 5 | XSS / raw rendering | No new rendering path; no new user-controlled string reaches an export. |
+| 6 | SQL injection | Every interpolation in the new SQL is a module-level BUILDER made of literal column names (`window_cte_sql`, `window_set_sql`, `reservation_is_current_sql`, `_RESERVATION_STILL_HELD`); every value travels in a bound params dict. Verified by grepping the diff for value interpolation — none. The three S608 per-file ignores added are each justified in `pyproject.toml`. |
+| 7 | File uploads | None added. |
+| 8 | Rate limiting | The new `invoice.payment_succeeded` branch sits inside the existing chain: `rate_limit(zone="webhook")` -> `construct_event` signature check -> Redis `SET NX` dedup. |
+| 9 | CSRF / origin | Unchanged; webhook is signature-authenticated. |
+| 10 | PII | The 11 new columns are timestamps, a plan string and an int. No PII. New log lines carry `user.id`, plan, window instants and Stripe `cus_`/`sub_` ids — the same non-PII set `_alert_billing_gap` already logs. The one `user.email` log is pre-existing and the logger fingerprints it (`e***@…`). |
+| 11 | Configuration / RLS | **No new tables.** Columns only, on `users` and `jobs`, both confirmed `relrowsecurity = true`; `users` has no column-level grants, so new columns inherit the table grants. The six `public.quota_*` functions are confirmed **not** SECURITY DEFINER and IMMUTABLE — unlike `grant_referral_credit`, they cross no tenant boundary and need no elevation, and they expose arithmetic rather than rows. |
+| 12 | Dependencies | **Zero** added — `requirements.txt` untouched, so no SBOM check needed. |
+| 13 | Logging | Covered under 10. Every new failure path logs with a reason; the two beat tasks warn when they hit their cap. |
+| 14 | Non-negotiables | Every DB query is `user_id`/`id`-scoped except the two BEAT tasks, which are cross-tenant by design, run under `system_sync_session`/`SyncSessionLocal`, and are **not importable from any API route** (verified). No raw SQL with user input. No secrets in code. No mock/dummy code. No error silenced as a fix. |
+
+**Critical: 0. High: 0. Approval: GO.**
+
+One **Low**, accepted and recorded rather than inherited: `quota_grid_index` searches a
+`generate_series` sized by the months between the anchor and now, so an anchor far in the past
+would make every quota statement scan a longer series. Not attacker-reachable — both arguments
+come from our own NOT NULL columns and a bound clock, and the only writers are the migration
+backfill and a Stripe `billing_cycle_anchor`. Left unbounded deliberately: a cap would return a
+WRONG index for a genuinely old anchor, which is worse than a slow one. Documented in
+`src/api/quota_window.py::grid_index`.
+
+Second pass re-examined what the first moved fastest through — migration DDL lock duration
+(Alembic runs the revision in one transaction, so `ADD COLUMN`'s ACCESS EXCLUSIVE lock already
+covers the backfill; no separate `LOCK TABLE` needed as in 086), function privileges, and RLS
+inheritance. No cascading issues, because the first pass produced no fixes to cascade from.
+
 ## Verification
 
 - Full CI-equivalent suite: **2437 passed, 2 skipped** (baseline 2350/2).

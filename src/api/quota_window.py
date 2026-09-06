@@ -98,6 +98,16 @@ def grid_index(anchor: datetime, at: datetime) -> int:
     off by one in either direction. Both corrections below are loops rather than
     a single step because being exactly right here is cheap and reasoning about
     "can it ever be off by two?" is not.
+
+    COST NOTE (security review, Low, accepted): the SQL twin searches a
+    ``generate_series`` sized by the months between the anchor and ``at``, so a
+    ``quota_anchor_at`` far in the past makes every quota statement scan a
+    proportionally longer series. Not attacker-reachable — both arguments come
+    from our own columns and a bound clock, and the column is NOT NULL with a
+    current-month default — and the only writers are the migration backfill
+    (``records_period_start``, i.e. this year) and a Stripe
+    ``billing_cycle_anchor``. Left unbounded on purpose: a cap would return a
+    WRONG index for a genuinely old anchor, which is worse than a slow one.
     """
     anchor, at = as_utc(anchor), as_utc(at)
     if at <= anchor:

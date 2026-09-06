@@ -1351,17 +1351,12 @@ def run_scrape_job(self, job_id: str) -> None:
                     # preventing it. A lock cannot span the gap either, because
                     # this block commits before the export runs.
                     #
-                    # So the grant is CLAIMED in the same statement that
-                    # computes it. Postgres row-locks the user for the duration
-                    # of the UPDATE, so a second job blocks, then re-reads the
-                    # already-decremented remainder and is granted only what is
-                    # genuinely left.
-                    #
-                    # reserved_at is the CAS gate: a watchdog re-run of this
-                    # same job reuses its existing grant instead of taking a
-                    # second one. The period CASE mirrors the billing statement
-                    # so a stale period reads as 0 used rather than under-
-                    # delivering a user who is actually at 0 for this period.
+                    # LOCK ORDER: jobs, then users — the same order billing and
+                    # release_quota_reservation use. Locking users first (the
+                    # obvious way to write this) inverts against them and lets a
+                    # watchdog re-run deadlock with an attempt already in
+                    # billing: one holds users and wants jobs, the other holds
+                    # jobs and wants users. (Codex)
                     _want = db.execute(
                         sa_text(
                             "SELECT count(*) FROM results "
@@ -1374,39 +1369,56 @@ def run_scrape_job(self, job_id: str) -> None:
                     _reserved_at = db.execute(
                         sa_text("SELECT clock_timestamp()")
                     ).scalar()
+
+                    # 1. CAS-claim on the JOB. Only the attempt that flips
+                    #    reserved_at from NULL reserves, so a watchdog re-run of
+                    #    this same job reuses its grant instead of taking a
+                    #    second one.
                     _claimed = db.execute(
                         sa_text(
-                            "WITH grant_calc AS ("
-                            "  SELECT LEAST(:want, GREATEST(0, u.records_limit - CASE"
-                            "      WHEN u.records_period_start IS NULL"
-                            "        OR u.records_period_start < date_trunc('month', CAST(:at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-                            "      THEN 0 ELSE u.records_used END)) AS granted"
-                            "  FROM users u WHERE u.id = CAST(:uid AS uuid) FOR UPDATE"
-                            "), claim AS ("
-                            "  UPDATE jobs SET reserved_count = (SELECT granted FROM grant_calc),"
-                            "                  reserved_at = CAST(:at AS timestamptz)"
-                            "  WHERE id = :jid AND reserved_at IS NULL"
-                            "  RETURNING reserved_count"
-                            "), charge AS ("
-                            "  UPDATE users SET"
-                            "    records_used = CASE"
-                            "      WHEN records_period_start IS NULL"
-                            "        OR records_period_start < date_trunc('month', CAST(:at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-                            "      THEN 0 ELSE records_used END"
-                            "      + COALESCE((SELECT reserved_count FROM claim), 0),"
-                            "    records_period_start = CASE"
-                            "      WHEN records_period_start IS NULL"
-                            "        OR records_period_start < date_trunc('month', CAST(:at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-                            "      THEN date_trunc('month', CAST(:at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-                            "      ELSE records_period_start END"
-                            "  WHERE id = CAST(:uid AS uuid)"
-                            ") SELECT COALESCE((SELECT reserved_count FROM claim), -1)"
+                            "UPDATE jobs SET reserved_at = CAST(:at AS timestamptz) "
+                            "WHERE id = :jid AND reserved_at IS NULL"
                         ),
-                        {"want": _want, "uid": str(user.id), "jid": job_id,
-                         "at": _reserved_at},
-                    ).scalar()
-                    if _claimed is not None and _claimed >= 0:
-                        _remaining = int(_claimed)
+                        {"jid": job_id, "at": _reserved_at},
+                    ).rowcount
+
+                    if _claimed:
+                        # 2. Compute the grant and consume it in ONE statement.
+                        #    FOR UPDATE serialises concurrent reservations for
+                        #    this user: the loser blocks, then re-reads the
+                        #    already-decremented remainder (READ COMMITTED
+                        #    re-evaluates a locked row against the newer
+                        #    version) and is granted only what is truly left.
+                        #    The period CASE mirrors billing so a stale period
+                        #    reads as 0 used rather than under-delivering a user
+                        #    who is actually at 0 for this period.
+                        _remaining = int(db.execute(
+                            sa_text(
+                                "WITH cur AS ("
+                                "  SELECT u.id, u.records_limit, CASE"
+                                "      WHEN u.records_period_start IS NULL"
+                                "        OR u.records_period_start < date_trunc('month', CAST(:at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+                                "      THEN 0 ELSE u.records_used END AS base"
+                                "  FROM users u WHERE u.id = CAST(:uid AS uuid) FOR UPDATE"
+                                "), g AS ("
+                                "  SELECT id, base,"
+                                "         LEAST(:want, GREATEST(0, records_limit - base)) AS granted"
+                                "  FROM cur"
+                                ") UPDATE users u SET"
+                                "    records_used = g.base + g.granted,"
+                                "    records_period_start = date_trunc('month', CAST(:at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+                                "  FROM g WHERE u.id = g.id"
+                                "  RETURNING g.granted"
+                            ),
+                            {"want": _want, "uid": str(user.id), "at": _reserved_at},
+                        ).scalar() or 0)
+                        # 3. Record what was granted, so a failure can hand back
+                        #    exactly this much. Same job row, already locked by
+                        #    step 1 — no new lock is taken.
+                        db.execute(
+                            sa_text("UPDATE jobs SET reserved_count = :n WHERE id = :jid"),
+                            {"n": _remaining, "jid": job_id},
+                        )
                     else:
                         # Already reserved (watchdog re-run): reuse the grant.
                         db.refresh(job)
@@ -1748,7 +1760,29 @@ def run_scrape_job(self, job_id: str) -> None:
             # full billable_count, so this one expression covers both. In-flight
             # jobs at deploy time also have reserved_count = 0 and bill exactly
             # as they did before.
+            # Which period does this job's reservation belong to? A grant made
+            # in an EARLIER period was charged to that period's counter, and
+            # that counter has since rolled — so the charge is gone and the
+            # delta is meaningless. The leads are being delivered NOW, so the
+            # current period must carry them in full. Netting a stale grant off
+            # instead would deliver records nobody is charged for. (Codex)
             _reserved = int(getattr(job, "reserved_count", 0) or 0)
+            _reservation_is_current = bool(db.execute(
+                sa_text(
+                    "SELECT j.reserved_at IS NOT NULL AND date_trunc('month', j.reserved_at AT TIME ZONE 'UTC')"
+                    "       = date_trunc('month', CAST(:billed_at AS timestamptz) AT TIME ZONE 'UTC') "
+                    "FROM jobs j WHERE j.id = :jid"
+                ),
+                {"jid": job_id, "billed_at": _billed_at},
+            ).scalar())
+            if not _reservation_is_current and _reserved:
+                _logger.warning(
+                    "Job %s: reservation of %d belongs to an earlier billing "
+                    "period — charging the full delivered count to the current "
+                    "one instead of netting a charge that has already rolled",
+                    job_id, _reserved,
+                )
+                _reserved = 0
             _delta = billable_count - _reserved
             user_billed = db.execute(
                 sa_text(

@@ -431,3 +431,150 @@ def test_a_job_that_never_reserved_still_bills_its_full_count():
 
     with SyncSessionLocal() as db:
         assert db.get(User, user_id).records_used == 120
+
+
+def test_TRULY_concurrent_reservations_serialise_on_the_user_row():
+    """The sequential test above proves the arithmetic; this proves the LOCK.
+
+    Two threads race to reserve from a 100-record remainder, each wanting 80.
+    `SELECT ... FOR UPDATE` in the reserve CTE must make the loser block until
+    the winner commits and then re-read the already-decremented remainder
+    (READ COMMITTED re-evaluates a locked row against the newer version). If the
+    lock did not hold, both would compute 80 and the user would be handed 160.
+    """
+    import threading
+
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, used=900, limit=1000)      # 100 remaining
+        config = _mk_config(db, user.id)
+        job_ids = [_mk_job(db, user.id, config.id).id for _ in range(2)]
+        user_id = user.id
+        db.commit()
+
+    start = threading.Barrier(2)
+    grants: dict[str, int] = {}
+    errors: list[Exception] = []
+
+    def worker(job_id: str) -> None:
+        try:
+            with SyncSessionLocal() as db:
+                start.wait(timeout=10)      # maximise overlap
+                grants[job_id] = _reserve(db, job_id, user_id, want=80)
+                db.commit()
+        except Exception as exc:            # noqa: BLE001 - surfaced below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(j,)) for j in job_ids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors, f"reservation raised under concurrency: {errors}"
+    assert sorted(grants.values()) == [20, 80], (
+        f"one job must win 80 and the other get only the remaining 20: {grants}"
+    )
+
+    with SyncSessionLocal() as db:
+        assert db.get(User, user_id).records_used == 1000, (
+            "the two jobs together must never exceed the plan"
+        )
+
+
+# ─── Reconciliation sweep (catches paths no release call covers) ──────────────
+
+def test_sweep_releases_a_reservation_stranded_by_an_external_cancel():
+    """An external cancel writes only jobs.status — no release code runs.
+
+    Enumerating call sites is the fragile fix; the sweep works by STATE, so a
+    grant stranded by ANY path is returned within one beat interval.
+    """
+    from src.workers.tasks_helpers.status import sweep_stranded_quota_reservations
+
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, used=0, limit=1000)
+        config = _mk_config(db, user.id)
+        job = _mk_job(db, user.id, config.id)
+        user_id, job_id = user.id, job.id
+        db.commit()
+        _reserve(db, job_id, user_id, want=75)
+        db.commit()
+        # Something outside the task terminalizes it, touching only status.
+        db.execute(text("UPDATE jobs SET status = 'cancelled' WHERE id = :j"),
+                   {"j": job_id})
+        db.commit()
+
+    assert sweep_stranded_quota_reservations() >= 1
+
+    with SyncSessionLocal() as db:
+        assert db.get(User, user_id).records_used == 0
+        assert db.get(Job, job_id).reserved_count == 0
+
+
+def test_sweep_leaves_a_live_job_alone():
+    """A job still running holds its reservation legitimately."""
+    from src.workers.tasks_helpers.status import sweep_stranded_quota_reservations
+
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, used=0, limit=1000)
+        config = _mk_config(db, user.id)
+        job = _mk_job(db, user.id, config.id)   # status='enriching'
+        user_id, job_id = user.id, job.id
+        db.commit()
+        _reserve(db, job_id, user_id, want=75)
+        db.commit()
+
+    sweep_stranded_quota_reservations()
+
+    with SyncSessionLocal() as db:
+        assert db.get(User, user_id).records_used == 75, "live job keeps its grant"
+
+
+def test_sweep_leaves_a_billed_job_alone():
+    from src.workers.tasks_helpers.status import sweep_stranded_quota_reservations
+
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, used=0, limit=1000)
+        config = _mk_config(db, user.id)
+        job = _mk_job(db, user.id, config.id)
+        user_id, job_id = user.id, job.id
+        db.commit()
+        _reserve(db, job_id, user_id, want=75)
+        db.commit()
+        db.execute(
+            text("UPDATE jobs SET status='done', billing_applied_at=NOW(), "
+                 "billed_count=75 WHERE id = :j"),
+            {"j": job_id},
+        )
+        db.commit()
+
+    sweep_stranded_quota_reservations()
+
+    with SyncSessionLocal() as db:
+        assert db.get(User, user_id).records_used == 75, "a billed job owns its charge"
+
+
+def test_release_is_month_scoped_not_merely_less_than_or_equal():
+    """The guard compares MONTHS. A reservation made mid-month against a period
+    that has since rolled must not be refunded out of the new period."""
+    from src.workers.tasks_helpers.status import release_quota_reservation
+
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, used=200, limit=1000)
+        config = _mk_config(db, user.id)
+        job = _mk_job(db, user.id, config.id)
+        user_id, job_id = user.id, job.id
+        db.commit()
+        # Grant belongs to a PREVIOUS month; the user's period is current.
+        db.execute(
+            text("UPDATE jobs SET reserved_count = 90, "
+                 "reserved_at = TIMESTAMPTZ '2020-06-15 12:00+00' WHERE id = :j"),
+            {"j": job_id},
+        )
+        db.commit()
+
+    with SyncSessionLocal() as db:
+        assert release_quota_reservation(db, job_id) == 0
+
+    with SyncSessionLocal() as db:
+        assert db.get(User, user_id).records_used == 200, "current period untouched"

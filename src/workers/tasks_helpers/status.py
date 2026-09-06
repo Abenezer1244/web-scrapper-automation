@@ -188,54 +188,71 @@ def release_quota_reservation(db, job_id: str) -> int:
     so every terminal-without-billing path has to release, or the reservation
     becomes a silent permanent charge.
 
+    CONCURRENCY: the amount comes from the job UPDATE's own RETURNING, not from
+    a prior SELECT. Two racing releases would both read the same
+    ``reserved_count`` from an unlocked read and both refund it, subtracting the
+    grant twice and eating unrelated current-period usage. Clearing
+    ``reserved_at`` alone first makes the claim exclusive — the loser blocks,
+    re-evaluates ``reserved_at IS NOT NULL`` against the newer row version, and
+    matches nothing. ``RETURNING reserved_count`` is safe there precisely
+    because that column is left untouched by this statement, so it still carries
+    the original grant. (Codex)
+
     Guards, all necessary:
       * ``billing_applied_at IS NULL`` — a job that DID bill settled its own
         delta and owns its charge; releasing would refund a real delivery.
-      * ``reserved_at IS NOT NULL`` — nothing to give back otherwise, and this
-        makes a double-release a no-op.
-      * the user's period must not have rolled since the reservation. After a
-        rollover the stored counter belongs to a NEW period that this grant was
-        never added to, and subtracting from it would destroy current-period
-        usage — the exact class of bug this whole area is recovering from.
+      * the reservation must belong to the user's CURRENT period. After a
+        rollover the counter belongs to a new period this grant was never added
+        to, and subtracting from it would destroy current-period usage — the
+        exact class of bug this whole area is recovering from. Compared by
+        MONTH, not ``<=``: the latter is only accidentally right for tidy
+        month-start values and is far too broad as a correctness guard. (Codex)
       * ``GREATEST(0, ...)`` so a counter can never be driven negative.
 
-    Clearing ``reserved_at`` lets a watchdog re-run of this job reserve afresh
-    rather than reusing a grant that has already been handed back.
+    Clearing ``reserved_at`` also lets a watchdog re-run reserve afresh rather
+    than reusing a grant that has already been handed back.
     """
     try:
-        freed = db.execute(
+        # Exclusive claim. reserved_count is deliberately NOT written here, so
+        # RETURNING still yields the original grant.
+        row = db.execute(
             text(
-                "WITH held AS ("
-                "  SELECT j.reserved_count AS amount, j.user_id AS uid"
-                "  FROM jobs j"
-                "  WHERE j.id = :jid"
-                "    AND j.reserved_at IS NOT NULL"
-                "    AND j.billing_applied_at IS NULL"
-                "    AND j.reserved_count > 0"
-                "    AND EXISTS ("
-                "      SELECT 1 FROM users u"
-                "      WHERE u.id = j.user_id"
-                "        AND u.records_period_start <= j.reserved_at"
-                "    )"
-                "), cleared AS ("
-                "  UPDATE jobs SET reserved_count = 0, reserved_at = NULL"
-                "  WHERE id = :jid AND EXISTS (SELECT 1 FROM held)"
-                "), refunded AS ("
-                "  UPDATE users u"
-                "  SET records_used = GREATEST(0, u.records_used - held.amount)"
-                "  FROM held WHERE u.id = held.uid"
-                "  RETURNING held.amount"
-                ") SELECT COALESCE((SELECT amount FROM refunded), 0)"
+                "UPDATE jobs SET reserved_at = NULL "
+                "WHERE id = :jid "
+                "  AND reserved_at IS NOT NULL "
+                "  AND billing_applied_at IS NULL "
+                "  AND reserved_count > 0 "
+                "  AND EXISTS ("
+                "    SELECT 1 FROM users u "
+                "    WHERE u.id = jobs.user_id "
+                "      AND date_trunc('month', u.records_period_start AT TIME ZONE 'UTC')"
+                "        = date_trunc('month', jobs.reserved_at AT TIME ZONE 'UTC')"
+                "  ) "
+                "RETURNING user_id, reserved_count"
             ),
             {"jid": job_id},
-        ).scalar() or 0
+        ).fetchone()
+        if row is None:
+            db.commit()
+            return 0
+        user_id, amount = str(row[0]), int(row[1])
+        db.execute(
+            text(
+                "UPDATE users SET records_used = GREATEST(0, records_used - :n) "
+                "WHERE id = CAST(:uid AS uuid)"
+            ),
+            {"n": amount, "uid": user_id},
+        )
+        db.execute(
+            text("UPDATE jobs SET reserved_count = 0 WHERE id = :jid"),
+            {"jid": job_id},
+        )
         db.commit()
-        if freed:
-            _logger.info(
-                "Job %s: released %d reserved records back to the user's quota",
-                job_id, freed,
-            )
-        return int(freed)
+        _logger.info(
+            "Job %s: released %d reserved records back to the user's quota",
+            job_id, amount,
+        )
+        return amount
     except Exception as exc:  # noqa: BLE001 — never mask the original failure
         try:
             db.rollback()
@@ -246,6 +263,57 @@ def release_quota_reservation(db, job_id: str) -> int:
             job_id, str(exc)[:200],
         )
         return 0
+
+
+def sweep_stranded_quota_reservations(limit: int = 500) -> int:
+    """Release grants held by jobs that ended without ever billing.
+
+    ``release_quota_reservation`` is called from ``_fail_job``, the post-crash
+    cleanup and the cancel branch, which covers the paths that exist today. It
+    cannot cover the ones that do not: a job terminalized by something that only
+    writes ``jobs.status`` (an external cancel, a batch force-finalize, the
+    watchdog permanently failing a stuck job) never runs any of that code, and
+    its reservation stays charged to the user forever. Enumerating call sites is
+    the fragile fix — the next path added would silently reintroduce it. (Codex)
+
+    So this sweeps by STATE instead of by code path: any job already in a
+    terminal status that still holds a reservation it never billed is, by
+    definition, holding records the user did not receive. Runs on the beat, so
+    a stranded grant is returned within minutes however the job got there.
+
+    Returns the number of reservations released.
+    """
+    from src.db.session import system_sync_session
+
+    with system_sync_session() as db:
+        stranded = [
+            str(row[0])
+            for row in db.execute(
+                text(
+                    "SELECT id FROM jobs "
+                    "WHERE status IN ('done', 'failed', 'cancelled') "
+                    "  AND reserved_at IS NOT NULL "
+                    "  AND billing_applied_at IS NULL "
+                    "  AND reserved_count > 0 "
+                    "ORDER BY reserved_at "
+                    "LIMIT :lim"
+                ),
+                {"lim": limit},
+            ).fetchall()
+        ]
+        released = 0
+        for job_id in stranded:
+            # Each release commits on its own, so one problem row cannot block
+            # the rest, and the guards inside make a concurrent release a no-op.
+            if release_quota_reservation(db, job_id):
+                released += 1
+
+    if released:
+        _logger.warning(
+            "Released %d stranded quota reservation(s) from terminal jobs that "
+            "never billed", released,
+        )
+    return released
 
 
 def _fail_job(db, job, r, job_id: str, reason: str, expected_started_at=None) -> bool:

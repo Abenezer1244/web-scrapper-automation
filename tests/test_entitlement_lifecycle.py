@@ -1242,3 +1242,46 @@ def test_expire_trials_does_not_downgrade_someone_who_paid_mid_lookup():
     assert fresh.plan == "pro", "a customer who just paid must not be downgraded"
     assert fresh.records_limit == 1000
     assert fresh.subscription_status == "active"
+
+
+def test_a_trial_downgrade_clears_the_entitlement_end_it_leaves_behind():
+    """A Starter account has no paid entitlement end.
+
+    Leaving a stale one set is not cosmetic: quota_should_roll refuses to open a
+    window at or beyond it, and quota_block_reason refuses new work outright — so
+    the account would be frozen at Starter forever. Reachable for a trial user
+    who reached a subscription before the trial lapsed.
+    """
+    from src.api.quota import quota_block_reason
+    from src.workers.scheduler_helpers.billing import _expire_trials_impl
+
+    with SyncSessionLocal() as db:
+        user = _mk_user(
+            db, plan="pro", records_limit=1000,
+            trial_ends_at=datetime.now(UTC) - timedelta(days=1),
+            subscription_status="canceled",
+            stripe_customer_id=f"cus_stale_{uuid.uuid4().hex[:8]}",
+            entitlement_ends_at=datetime.now(UTC) - timedelta(days=2),
+            # An ENDED window, so "can it advance again?" is a real question.
+            quota_period_start=datetime.now(UTC) - timedelta(days=40),
+            quota_period_end=datetime.now(UTC) - timedelta(days=10),
+        )
+        user_id = user.id
+        db.commit()
+
+    # Before: the stale end refuses new work, correctly — the paid term is over.
+    with SyncSessionLocal() as db:
+        stale = db.get(User, user_id)
+        assert quota_block_reason(stale, datetime.now(UTC)) is not None
+
+    _expire_trials_impl(subscription_lookup=lambda _c: None)
+
+    with SyncSessionLocal() as db:
+        fresh = db.get(User, user_id)
+
+    assert fresh.plan == "starter"
+    assert fresh.entitlement_ends_at is None
+    assert quota_block_reason(fresh, datetime.now(UTC)) is None, (
+        "a free Starter account has no paid term to have ended, so nothing "
+        "blocks it — leaving the stale date set would have frozen it forever"
+    )

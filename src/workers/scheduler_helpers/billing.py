@@ -431,7 +431,16 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
                 "  trial_consumed_at = COALESCE(trial_consumed_at, trial_ends_at, "
                 "                               CAST(:now AS timestamptz)), "
                 "  subscription_status = CASE WHEN :record_canceled "
-                "    THEN 'canceled' ELSE subscription_status END "
+                "    THEN 'canceled' ELSE subscription_status END, "
+                # A Starter account has no paid entitlement end, and leaving a
+                # stale one set is not cosmetic: it stops the window advancing
+                # (quota_should_roll refuses to open one at or beyond it) AND
+                # refuses new work outright. Cleared here for the same reason
+                # end_subscription clears it. Reachable for a trial user who had
+                # reached a subscription before the trial lapsed.
+                "  entitlement_ends_at = NULL, "
+                "  pending_plan = NULL, "
+                "  pending_records_limit = NULL "
                 "WHERE id = CAST(:uid AS uuid) "
                 "  AND trial_ends_at IS NOT NULL "
                 "  AND trial_ends_at < CAST(:now AS timestamptz) "

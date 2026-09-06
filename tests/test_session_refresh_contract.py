@@ -197,3 +197,48 @@ async def test_expired_refresh_token_is_rejected(client: AsyncClient):
     )
     resp = await client.post("/auth/refresh", json={"refresh_token": dead})
     assert resp.status_code == 401
+
+
+async def test_concurrent_refresh_all_succeed_with_one_pair(client: AsyncClient):
+    """Fire several /auth/refresh calls with the SAME token at once.
+
+    This is the shape a browser actually produces — a page load whose parallel
+    requests all 401 and all try to rotate. Every caller must get 200, and they
+    must all receive the SAME pair: the grace window is there to stop a racer
+    being logged out, not to mint extra sessions.
+
+    Covers the gap Codex flagged: the winner claims the jti BEFORE minting, so a
+    racer landing between the claim and the publish would otherwise read an empty
+    cache and 401.
+    """
+    import asyncio
+
+    reg, _ = await _register(client, "refresh_contract_concurrent")
+    refresh = reg["refresh_token"]
+
+    responses = await asyncio.gather(
+        *(client.post("/auth/refresh", json={"refresh_token": refresh}) for _ in range(5))
+    )
+
+    assert [r.status_code for r in responses] == [200] * 5, [
+        (r.status_code, r.text) for r in responses
+    ]
+    pairs = {(r.json()["access_token"], r.json()["refresh_token"]) for r in responses}
+    assert len(pairs) == 1, "concurrent refreshes must not mint multiple sessions"
+
+
+async def test_publish_wait_gives_up_and_rejects_a_true_replay(client: AsyncClient):
+    """The wait is bounded: a replay with no winner to wait for still 401s.
+
+    Without this the helper could turn every stale token into a slow 200.
+    """
+    reg, _ = await _register(client, "refresh_contract_nowinner")
+    refresh = reg["refresh_token"]
+
+    first = await client.post("/auth/refresh", json={"refresh_token": refresh})
+    assert first.status_code == 200, first.text
+
+    await _lapse_grace(refresh)  # nothing left to wait for
+    replay = await client.post("/auth/refresh", json={"refresh_token": refresh})
+    assert replay.status_code == 401
+    assert "already used" in replay.json()["detail"].lower()

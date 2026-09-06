@@ -187,7 +187,16 @@ async def _create_real_user(
         quota_anchor_at=_now,
         quota_period_start=_now,
         quota_period_end=_trial_ends,
-        records_period_start=_now,
+        # The MIRROR column stays on the calendar month at signup, deliberately.
+        # During a deploy the API can be new while a worker still runs the
+        # retired calendar reset; that task zeroes rows whose
+        # records_period_start is in an earlier month, so a signup-dated mirror
+        # would let it wipe a brand-new trial user's counter and hand them a
+        # second 1,000 records. A month-start mirror never matches it. The value
+        # is harmless until they are first charged — the ledger scoped by it is
+        # empty — and the first charging statement rewrites it to the true
+        # window start in lockstep. (Codex)
+        records_period_start=_period_start,
         skip_trace_period_start=_period_start,
         referral_code=referral_code,
         referred_by_user_id=referred_by_id,

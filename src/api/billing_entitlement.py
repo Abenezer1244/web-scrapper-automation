@@ -101,6 +101,32 @@ def _clear_dunning(user: User) -> None:
     user.entitlement_grace_ends_at = None
 
 
+def mark_payment_failed(user: User, *, now: datetime | None = None) -> datetime:
+    """P7 — start (but never extend) the dunning grace. Returns its end.
+
+    Stripe retries a failed invoice over several days. Freezing on the first
+    failure would cut off a customer whose card succeeds on retry 3; serving
+    forever would hand a non-paying subscription a fresh bucket every month. So
+    the account is served normally until the grace expires, after which
+    ``quota_window.is_frozen`` refuses new billable work AND the rollover stops
+    — no data is deleted, and past exports stay available.
+
+    The grace is set only when it is currently unset, so a second failed invoice
+    (or a webhook replay) cannot roll the deadline forward indefinitely. That
+    idempotency is the whole anti-leak property.
+    """
+    now = as_utc(now or datetime.now(UTC))
+    if user.entitlement_grace_ends_at is None:
+        user.entitlement_grace_ends_at = now + timedelta(
+            days=settings.BILLING_PAST_DUE_GRACE_DAYS
+        )
+        _logger.info(
+            "entitlement: payment failed for user %s — grace until %s",
+            user.id, user.entitlement_grace_ends_at,
+        )
+    return as_utc(user.entitlement_grace_ends_at)
+
+
 def activate_paid_plan(
     user: User,
     *,
@@ -230,6 +256,15 @@ def apply_plan_change(
         # Whatever dunning was in flight is over.
         _clear_dunning(user)
         user.trial_ends_at = None
+    elif status == "past_due":
+        # P7 belt. invoice.payment_failed normally starts the grace, but it can
+        # be delayed, lost, or arrive before checkout has bound
+        # stripe_subscription_id — and a past_due account with a NULL grace is
+        # NOT frozen, so its window would keep rolling and hand a non-paying
+        # subscription a fresh bucket every month. Whichever event observes
+        # past_due first starts the clock; the "only when NULL" rule is what
+        # keeps the two from extending each other's deadline.
+        mark_payment_failed(user, now=now)
 
     # Scheduled cancellation, or its reversal. Writing None on the reversal is
     # deliberate: a customer who un-cancels must not stay pinned to a stale end
@@ -289,32 +324,6 @@ def end_subscription(user: User, *, now: datetime | None = None) -> None:
     _clear_dunning(user)
     user.pending_plan = None
     user.pending_records_limit = None
-
-
-def mark_payment_failed(user: User, *, now: datetime | None = None) -> datetime:
-    """P7 — start (but never extend) the dunning grace. Returns its end.
-
-    Stripe retries a failed invoice over several days. Freezing on the first
-    failure would cut off a customer whose card succeeds on retry 3; serving
-    forever would hand a non-paying subscription a fresh bucket every month. So
-    the account is served normally until the grace expires, after which
-    ``quota_window.is_frozen`` refuses new billable work AND the rollover stops
-    — no data is deleted, and past exports stay available.
-
-    The grace is set only when it is currently unset, so a second failed invoice
-    (or a webhook replay) cannot roll the deadline forward indefinitely. That
-    idempotency is the whole anti-leak property.
-    """
-    now = as_utc(now or datetime.now(UTC))
-    if user.entitlement_grace_ends_at is None:
-        user.entitlement_grace_ends_at = now + timedelta(
-            days=settings.BILLING_PAST_DUE_GRACE_DAYS
-        )
-        _logger.info(
-            "entitlement: payment failed for user %s — grace until %s",
-            user.id, user.entitlement_grace_ends_at,
-        )
-    return as_utc(user.entitlement_grace_ends_at)
 
 
 def mark_payment_succeeded(

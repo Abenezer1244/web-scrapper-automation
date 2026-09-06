@@ -1,4 +1,4 @@
-# Entitlement periods — design (AWAITING APPROVAL, nothing implemented)
+# Entitlement periods — design + review (IMPLEMENTED, commit `33efc05`)
 
 Branch: `feat/entitlement-periods`
 Worktree: `C:/Users/Windows/bridgeleads-worktrees/entitlement`
@@ -334,3 +334,90 @@ Existing quota/reservation tests are preserved unchanged, not weakened.
 - Step 6 shifts every existing subscriber's reset date once, with a bounded transitional
   window. The alternative (leave existing users on day-1 forever) would not meet the brief's
   completion bar.
+
+---
+
+# Review — what was built
+
+Branch `feat/entitlement-periods`, commit `33efc05` (+ follow-ups below), on top of
+`a009f15`. 25 files, ~4.3k insertions.
+
+## Shipped
+
+| Area | File | What |
+|---|---|---|
+| Window math | `src/api/quota_window.py` (new) | The ONE Python definition + the SQL builders every atomic statement splices |
+| Schema | `alembic/versions/088_*.py` (new) | 10 user columns, 1 job column, the `public.quota_*` SQL functions, a no-op backfill |
+| Enforcement | `src/api/quota.py` | Window-aware usage + `quota_block_reason` (separates "over limit" from "payment failed") |
+| Lifecycle | `src/api/billing_entitlement.py` (new) | The nine policies, testable without HTTP or a Stripe signature |
+| Webhooks | `src/api/routes/billing.py` | The four handlers rewritten + `invoice.payment_succeeded`; `_PRICE_TO_PLAN` gains `interval`; `/usage` reports the effective window |
+| Worker | `src/workers/tasks.py` | Reserve + settle roll the window in the SAME statement that charges |
+| Release | `src/workers/tasks_helpers/status.py` | Window-equality guard + retire-without-refund |
+| Beat | `src/workers/scheduler_helpers/billing.py`, `scheduler.py` | `reconcile_quota_periods` (hourly) added; the RECORDS half of the calendar reset RETIRED, leaving `reset_skip_trace_usage` |
+| Gates | `jobs.py`, `batches.py`, `dispatch.py`, `batch_tasks.py` | All four go through `quota_block_reason` |
+| Signup | `auth_helpers/registration.py` | The trial is its own window `[signup, trial_ends_at)` |
+| Ops | `scripts/backfill_quota_anchors.py` (new) | The separate later step; writes `quota_anchor_at` only |
+
+## What I found that Codex's design review did not
+
+- **Two more drift sites** beyond its four: `release_quota_reservation`'s month
+  comparison (correctness-critical) and `/usage`'s inline month arithmetic.
+- **The reservation bug is worse than "netting the wrong window."** With a 20th
+  anchor, a job reserving on the 19th and settling on the 21st read as "same
+  month", so settlement netted `billable − reserved = 0` against a counter the
+  rollover had already zeroed — the delivered records were charged to **nobody**.
+- **A gap in my own first cut:** `past_due` reached through
+  `customer.subscription.updated` alone never started the dunning grace, and a
+  `past_due` account with a NULL grace is not frozen — so its window kept rolling
+  and a non-paying subscription would have accrued a bucket a month. Fixed by
+  starting the clock in whichever event observes `past_due` first, with the same
+  "only when NULL" rule so the two paths cannot extend each other's deadline.
+- **`scripts/repair_records_used_from_ledger.py`** tested staleness with
+  `records_period_start < date_trunc('month', now())`. Under anchored windows a
+  perfectly live window starts in a previous calendar month, so the operator's
+  repair tool would have silently skipped every anchored subscriber. Now tests
+  `quota_period_end <= now`.
+
+## Verification
+
+- Full CI-equivalent suite: **2421 passed, 2 skipped** (baseline 2350/2).
+  `python -m pytest tests/ -m "not integration" -q -p no:cacheprovider -o addopts=""`
+- `ruff check src/ tests/ scripts/ alembic/` — clean.
+- Migration 088 applies to a fresh DB; the `public.quota_*` functions are proven
+  to agree with the Python module over a generated matrix of anchors × instants
+  (Jan 31, leap day, both DST transitions).
+- `schema/openapi.json` regenerated with `.venv-schema`; the diff touches ONLY
+  the two docstrings that changed.
+- `scripts/backfill_quota_anchors.py` and
+  `scripts/repair_records_used_from_ledger.py` both dry-run clean.
+
+## Deploy order (matters)
+
+1. Migration 088 + this code, together. Everyone lands on a day-1 grid, so
+   behaviour is unchanged on the way in and the retired calendar reset cannot
+   overlap an anchored window.
+2. Verify in prod: `/billing/usage` should report the same window every user had.
+3. THEN `railway run python scripts/backfill_quota_anchors.py` (dry-run first).
+   This is the only step that moves anyone's reset date.
+
+Never run step 3 before step 2 is verified: a non-day-1 anchor while the legacy
+reset still ran would be zeroed twice.
+
+## Follow-ups (NOT done)
+
+- 👤 `.env.example` needs `BILLING_PAST_DUE_GRACE_DAYS=7`. The tool sandbox denies
+  access to that file, so it could not be edited here. The setting has a safe
+  default of 7, so nothing breaks without it.
+- 👤 FE: `/billing/usage` now returns `period_basis: "entitlement_month_utc"`
+  (was `calendar_month_utc`) plus `pending_plan`, `pending_records_limit`,
+  `payment_state` and `entitlement_ends_at`. Pricing copy should stop saying
+  quotas reset on the 1st.
+- `docs/product/billing-period-semantics.md` still documents the calendar policy
+  as accepted. It should be superseded by this document once deployed.
+- Skip-trace quota remains calendar-metered — out of scope, deliberately.
+- `records_period_start` is now a MIRROR of `quota_period_start`, written in
+  lockstep for one release. Drop it in a later migration once the skip-trace beat
+  and `cleanup_watchdog_billed_dups.py` no longer read it.
+- ⏭️ **UNVERIFIED in production.** Nothing here has been deployed or run against
+  the live database. The `1007/1000` account behaviour is proven by test, not by
+  a production observation.

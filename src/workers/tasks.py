@@ -1340,7 +1340,14 @@ def run_scrape_job(self, job_id: str) -> None:
         # export would over-deliver. Fail before billing rather than guess —
         # same rule as the enriched re-export below.
         _capped_ids: list[str] = []
-        if user.records_limit != -1:
+        # EFFECTIVE limit, not the stored one: an Agency subscriber with a
+        # pending downgrade whose window has ended would otherwise skip the cap
+        # block entirely (records_limit == -1), export uncapped, and only then
+        # have settlement roll the window and apply the smaller limit — landing
+        # them at 5000/1000. (Codex)
+        from src.api.quota import effective_records_limit as _eff_limit
+
+        if _eff_limit(user) != -1:
             _cap_error: Exception | None = None
             if refreshed is None:
                 _cap_error = RuntimeError("post-enrichment refetch failed")

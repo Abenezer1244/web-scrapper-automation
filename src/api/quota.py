@@ -42,6 +42,7 @@ from src.api.quota_window import as_utc, effective_window, is_frozen, should_rol
 
 __all__ = [
     "current_period_start",
+    "effective_records_limit",
     "effective_records_used",
     "effective_window",
     "is_frozen",
@@ -87,17 +88,43 @@ def effective_records_used(user, now: datetime | None = None) -> int:
     return 0 if should_roll(user, now) else used
 
 
+def effective_records_limit(user, now: datetime | None = None) -> int:
+    """The limit that will apply once the window this operation charges is open.
+
+    Normally just ``records_limit``. But a DOWNGRADE parked in
+    ``pending_records_limit`` is applied BY the rollover, in the same statement
+    that zeroes the counter — so a caller deciding anything on the far side of a
+    boundary must ask for the post-rollover limit, not the current one.
+
+    The case that made this necessary: an Agency subscriber (``records_limit ==
+    -1``, unlimited) with a pending downgrade to Pro. The worker's cap block is
+    skipped entirely for unlimited users, so a job starting AFTER their window
+    ended would export every lead uncapped — and settlement would then roll the
+    window, apply the Pro limit, and leave them at 5000/1000. Asking for the
+    effective limit makes the cap block run and reserve against 1,000. (Codex)
+
+    Pending is only ever a downgrade (upgrades apply immediately), so this can
+    only ever tighten a limit, never loosen one.
+    """
+    if should_roll(user, now):
+        pending = getattr(user, "pending_records_limit", None)
+        if pending is not None:
+            return int(pending)
+    return user.records_limit
+
+
 def is_over_record_limit(user, now: datetime | None = None) -> bool:
     """True when the user has consumed their plan's records for THIS window.
 
-    ``records_limit == -1`` means unlimited and is never over. A pending
-    DOWNGRADE is deliberately NOT applied here: it takes effect at the next
-    boundary, so until then the customer is measured against the limit they
-    actually paid for.
+    ``-1`` means unlimited and is never over. Inside a live window the customer
+    is measured against the limit they actually paid for; a pending downgrade
+    only binds once the boundary they are being measured across has passed (see
+    ``effective_records_limit``).
     """
-    if user.records_limit == -1:
+    limit = effective_records_limit(user, now)
+    if limit == -1:
         return False
-    return effective_records_used(user, now) >= user.records_limit
+    return effective_records_used(user, now) >= limit
 
 
 def quota_block_reason(user, now: datetime | None = None) -> str | None:
@@ -121,7 +148,8 @@ def quota_block_reason(user, now: datetime | None = None) -> str | None:
         # belongs to the NEW window.
         return (
             f"Record limit reached "
-            f"({effective_records_used(user, now)}/{user.records_limit}). "
+            f"({effective_records_used(user, now)}/"
+            f"{effective_records_limit(user, now)}). "
             f"Your quota resets {as_utc(end).date().isoformat()} (UTC). "
             "Upgrade your plan to continue now."
         )

@@ -96,7 +96,7 @@ def _reset_skip_trace_usage_impl() -> None:
             _logger.warning("Could not send NULL-period ops alert: %s", exc)
 
 
-def _reconcile_quota_periods_impl() -> dict[str, int]:
+def _reconcile_quota_periods_impl(subscription_lookup=None) -> dict[str, int]:
     """Advance entitlement windows that have ended — RECONCILIATION, not the
     source of correctness.
 
@@ -126,7 +126,13 @@ def _reconcile_quota_periods_impl() -> dict[str, int]:
       * a paid entitlement whose end has PASSED with no ``subscription.deleted``
         ever arriving. The user is downgraded to Starter here, which also
         RELEASES the window (``entitlement_ends_at`` was what held it), so one
-        lost webhook cannot strand someone frozen forever;
+        lost webhook cannot strand someone frozen forever. Stripe is CONSULTED
+        first, because the reverse webhook can go missing too: a customer who
+        scheduled a cancellation and then reversed it would otherwise be
+        downgraded on the old end date and could later "resubscribe" into
+        another fresh window. Same doctrine as ``_expire_trials_impl`` — a
+        Stripe error means UNKNOWN, and we never downgrade a possible payer on a
+        transient failure;
       * configs still active under a plan that has since been downgraded.
 
     Returns a small summary so the beat task can log and tests can assert on it.
@@ -138,6 +144,7 @@ def _reconcile_quota_periods_impl() -> dict[str, int]:
     from src.config import settings
     from src.db.session import system_sync_session
 
+    lookup = subscription_lookup or _stripe_entitled_status
     now = datetime.now(UTC)
     changed_plan: set[str] = set()
 
@@ -145,25 +152,68 @@ def _reconcile_quota_periods_impl() -> dict[str, int]:
         # ── 1. Expired paid entitlement with no subscription.deleted ─────────
         # Runs BEFORE the rollover on purpose: clearing entitlement_ends_at is
         # exactly what makes such a window eligible to advance in the same pass.
-        lapsed = db.execute(
+        candidates = db.execute(
             text(
-                "UPDATE users SET "
-                "  plan = 'starter', "
-                "  records_limit = :starter_limit, "
-                "  stripe_subscription_id = NULL, "
-                "  subscription_status = 'canceled', "
-                "  paid_entitlement_ended_at = COALESCE(paid_entitlement_ended_at, "
-                "                                       entitlement_ends_at), "
-                "  entitlement_ends_at = NULL, "
-                "  pending_plan = NULL, "
-                "  pending_records_limit = NULL "
+                "SELECT id, stripe_subscription_id, stripe_customer_id "
+                "FROM users "
                 "WHERE entitlement_ends_at IS NOT NULL "
-                "  AND entitlement_ends_at <= CAST(:at AS timestamptz) "
-                "RETURNING id"
+                "  AND entitlement_ends_at <= CAST(:at AS timestamptz)"
             ),
-            {"at": now, "starter_limit": settings.PLAN_LIMITS["starter"]},
+            {"at": now},
         ).fetchall()
-        changed_plan.update(str(r[0]) for r in lapsed)
+
+        lapsed: list[str] = []
+        for row in candidates:
+            user_id, _sub_id, customer_id = str(row[0]), row[1], row[2]
+            if customer_id:
+                # Ask Stripe before taking anything away. A cancellation the
+                # customer REVERSED, whose update webhook was lost, must not be
+                # honoured on the stale end date.
+                try:
+                    status = lookup(customer_id)
+                except Exception as exc:  # noqa: BLE001 — any failure = unknown
+                    _logger.warning(
+                        "reconcile: Stripe lookup failed for user %s (customer "
+                        "%s) — skipping, NOT downgrading: %s",
+                        user_id, customer_id, str(exc)[:200],
+                    )
+                    continue
+                if status in _ENTITLED_SUB_STATUSES:
+                    # Still paying: the cancellation was reversed. Clear the end
+                    # date so their window can advance again, and self-heal the
+                    # status we had drifted from.
+                    db.execute(
+                        text(
+                            "UPDATE users SET entitlement_ends_at = NULL, "
+                            "subscription_status = :st "
+                            "WHERE id = CAST(:uid AS uuid)"
+                        ),
+                        {"uid": user_id, "st": status},
+                    )
+                    _logger.info(
+                        "reconcile: user %s is still entitled in Stripe (%s) — "
+                        "cancellation reversed, entitlement end cleared",
+                        user_id, status,
+                    )
+                    continue
+            db.execute(
+                text(
+                    "UPDATE users SET "
+                    "  plan = 'starter', "
+                    "  records_limit = :starter_limit, "
+                    "  stripe_subscription_id = NULL, "
+                    "  subscription_status = 'canceled', "
+                    "  paid_entitlement_ended_at = COALESCE(paid_entitlement_ended_at, "
+                    "                                       entitlement_ends_at), "
+                    "  entitlement_ends_at = NULL, "
+                    "  pending_plan = NULL, "
+                    "  pending_records_limit = NULL "
+                    "WHERE id = CAST(:uid AS uuid)"
+                ),
+                {"uid": user_id, "starter_limit": settings.PLAN_LIMITS["starter"]},
+            )
+            lapsed.append(user_id)
+        changed_plan.update(lapsed)
 
         # ── 2. Advance every window that has ended and may advance ───────────
         # records_used = w.base rather than a literal 0: base IS 0 for every row

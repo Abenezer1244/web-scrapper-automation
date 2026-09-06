@@ -34,7 +34,13 @@ from src.api.billing_entitlement import (
     mark_payment_succeeded,
 )
 from src.api.quota import effective_records_used, is_over_record_limit
-from src.api.quota_window import add_months, effective_window, is_frozen, should_roll
+from src.api.quota_window import (
+    add_months,
+    as_utc,
+    effective_window,
+    is_frozen,
+    should_roll,
+)
 from src.config import settings
 from src.db.models import User
 from src.db.session import SyncSessionLocal
@@ -466,6 +472,53 @@ def test_p7_a_second_failed_invoice_does_not_extend_the_grace():
     assert first == again
 
 
+def test_p7_past_due_seen_only_via_subscription_updated_still_starts_the_grace():
+    """A belt that closes a real leak.
+
+    invoice.payment_failed normally starts the dunning clock, but it can be
+    delayed, lost, or arrive before checkout has bound stripe_subscription_id —
+    and a past_due account with a NULL grace is NOT frozen, so its window would
+    keep rolling and hand a non-paying subscription a fresh bucket every month.
+    Whichever event observes past_due first must start the clock.
+    """
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, subscription_status="active", first_paid_at=NOW)
+        assert user.entitlement_grace_ends_at is None
+        apply_plan_change(
+            user, plan="pro", records_limit=1000, subscription_id="sub_1",
+            status="past_due", cancel_at_period_end=False, entitlement_end=None,
+            now=NOW,
+        )
+        db.flush()
+
+    assert user.entitlement_grace_ends_at == NOW + timedelta(
+        days=settings.BILLING_PAST_DUE_GRACE_DAYS
+    )
+    assert is_frozen(user, NOW) is False, "still inside the grace"
+    assert is_frozen(user, user.entitlement_grace_ends_at + timedelta(seconds=1)) is True
+
+
+def test_p7_the_two_past_due_paths_do_not_extend_each_others_deadline():
+    """Both events observing the same dunning must not push the deadline out."""
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, subscription_status="active", first_paid_at=NOW)
+        apply_plan_change(
+            user, plan="pro", records_limit=1000, subscription_id="sub_1",
+            status="past_due", cancel_at_period_end=False, entitlement_end=None,
+            now=NOW,
+        )
+        first = user.entitlement_grace_ends_at
+        mark_payment_failed(user, now=NOW + timedelta(days=2))
+        apply_plan_change(
+            user, plan="pro", records_limit=1000, subscription_id="sub_1",
+            status="past_due", cancel_at_period_end=False, entitlement_end=None,
+            now=NOW + timedelta(days=4),
+        )
+        db.flush()
+
+    assert user.entitlement_grace_ends_at == first
+
+
 def test_p7_a_frozen_account_does_not_accrue_a_bucket_a_month():
     start = datetime(2026, 6, 1, tzinfo=UTC)
     with SyncSessionLocal() as db:
@@ -776,3 +829,193 @@ def test_the_legacy_calendar_reset_no_longer_governs_record_quota():
         fresh = db.get(User, user_id)
         assert fresh.records_used == 900
         assert fresh.quota_period_end == datetime(2026, 9, 20, tzinfo=UTC)
+
+# ─── Defects found by the Codex review of this diff ──────────────────────────
+#
+# Each of these FAILED against the first implementation. They are kept as the
+# regression bar: every one is a way a customer ends up with the wrong number.
+
+def test_an_agency_downgrade_does_not_skip_the_cap_after_the_boundary():
+    """P1 (Codex): the cap block is skipped entirely for unlimited users.
+
+    An Agency subscriber (records_limit -1) with a pending downgrade to Pro whose
+    window has ENDED would export uncapped, and settlement would only then roll
+    the window and apply the Pro limit — landing them at 5000/1000. The cap
+    decision has to be made against the limit that will actually apply.
+    """
+    from src.api.quota import effective_records_limit
+
+    ended = NOW - timedelta(minutes=1)
+    with SyncSessionLocal() as db:
+        user = _mk_user(
+            db, plan="agency", records_limit=-1, records_used=0,
+            quota_period_start=ended - timedelta(days=30),
+            quota_period_end=ended,
+            pending_plan="pro", pending_records_limit=1000,
+            subscription_status="active",
+        )
+        db.flush()
+
+    assert should_roll(user, NOW) is True
+    assert effective_records_limit(user, NOW) == 1000, (
+        "the cap block must run, and reserve against the incoming Pro limit"
+    )
+    # Inside a LIVE window the paid-for unlimited plan still applies.
+    with SyncSessionLocal() as db:
+        live = _mk_user(
+            db, plan="agency", records_limit=-1,
+            pending_plan="pro", pending_records_limit=1000,
+            subscription_status="active",
+        )
+        db.flush()
+    assert effective_records_limit(live, NOW) == -1
+    assert is_over_record_limit(live, NOW) is False
+
+
+def test_a_stripe_side_trial_is_not_backfilled_as_already_paid():
+    """P1 (Codex): a `trialing` subscription has not paid anything.
+
+    Stamping first_paid_at for them would make their eventual conversion look
+    like an ordinary plan change, so a customer who consumed 1,000/1,000 on trial
+    and then paid $199 would stay at 1,000/1,000 — the exact defect this whole
+    change exists to fix.
+    """
+    with SyncSessionLocal() as db:
+        trialing = _mk_user(db, subscription_status="trialing", records_used=1000)
+        trialing.records_period_start = datetime(2026, 9, 1, tzinfo=UTC)
+        paying = _mk_user(db, subscription_status="active")
+        paying.records_period_start = datetime(2026, 9, 1, tzinfo=UTC)
+        trialing_id, paying_id = trialing.id, paying.id
+        db.commit()
+
+        _run_backfill(db)
+        db.commit()
+        db.expire_all()
+
+        assert db.get(User, trialing_id).first_paid_at is None
+        assert db.get(User, paying_id).first_paid_at is not None
+
+    # ...and their conversion therefore still grants the paid month.
+    with SyncSessionLocal() as db:
+        user = db.get(User, trialing_id)
+        outcome = apply_plan_change(
+            user, plan="pro", records_limit=1000, subscription_id="sub_1",
+            status="active", cancel_at_period_end=False, entitlement_end=None,
+            billing_cycle_anchor=NOW, now=NOW,
+        )
+        db.commit()
+
+    assert outcome == "converted"
+    assert user.records_used == 0
+
+
+def test_reconciliation_asks_stripe_before_taking_a_plan_away():
+    """P2 (Codex): the cancellation-REVERSAL webhook can go missing too.
+
+    A customer who scheduled a cancel and then reversed it would otherwise be
+    downgraded on the stale end date — and could later "resubscribe" into another
+    fresh window. Same doctrine as expire_trials: Stripe is the truth, and an
+    error means UNKNOWN, never a downgrade.
+    """
+    from src.workers.scheduler_helpers.billing import _reconcile_quota_periods_impl
+
+    past = datetime(2020, 2, 1, tzinfo=UTC)
+    # stripe_customer_id is UNIQUE, and these rows outlive the test.
+    live_cus = f"cus_live_{uuid.uuid4().hex[:8]}"
+    gone_cus = f"cus_gone_{uuid.uuid4().hex[:8]}"
+    with SyncSessionLocal() as db:
+        reversed_ = _mk_user(
+            db, plan="pro", records_limit=1000,
+            quota_period_start=datetime(2020, 1, 1, tzinfo=UTC),
+            quota_period_end=past, entitlement_ends_at=past,
+            subscription_status="active", stripe_customer_id=live_cus,
+            stripe_subscription_id="sub_live",
+        )
+        genuine = _mk_user(
+            db, plan="pro", records_limit=1000,
+            quota_period_start=datetime(2020, 1, 1, tzinfo=UTC),
+            quota_period_end=past, entitlement_ends_at=past,
+            subscription_status="active", stripe_customer_id=gone_cus,
+            stripe_subscription_id="sub_gone",
+        )
+        reversed_id, genuine_id = reversed_.id, genuine.id
+        db.commit()
+
+    _reconcile_quota_periods_impl(
+        subscription_lookup=lambda cid: "active" if cid == live_cus else None
+    )
+
+    with SyncSessionLocal() as db:
+        still_paying = db.get(User, reversed_id)
+        cancelled = db.get(User, genuine_id)
+
+    assert still_paying.plan == "pro", "an active payer must not be downgraded"
+    assert still_paying.entitlement_ends_at is None, "the stale end date is cleared"
+    assert still_paying.paid_entitlement_ended_at is None, (
+        "no lapse was recorded, so they cannot later resubscribe into a reset"
+    )
+    assert cancelled.plan == "starter"
+    assert cancelled.paid_entitlement_ended_at is not None
+
+
+def test_reconciliation_never_downgrades_on_a_stripe_error():
+    """A transient Stripe failure must not cost a customer their plan."""
+    from src.workers.scheduler_helpers.billing import _reconcile_quota_periods_impl
+
+    past = datetime(2020, 2, 1, tzinfo=UTC)
+    cus = f"cus_err_{uuid.uuid4().hex[:8]}"
+
+    def _boom(_customer_id):
+        raise RuntimeError("stripe timeout")
+
+    with SyncSessionLocal() as db:
+        user = _mk_user(
+            db, plan="business", records_limit=5000,
+            quota_period_start=datetime(2020, 1, 1, tzinfo=UTC),
+            quota_period_end=past, entitlement_ends_at=past,
+            subscription_status="active", stripe_customer_id=cus,
+        )
+        user_id = user.id
+        db.commit()
+
+    _reconcile_quota_periods_impl(subscription_lookup=_boom)
+
+    with SyncSessionLocal() as db:
+        fresh = db.get(User, user_id)
+
+    assert fresh.plan == "business"
+    assert fresh.entitlement_ends_at == past, "left for the next run to retry"
+
+
+async def test_a_new_signup_cannot_be_zeroed_by_the_retired_calendar_reset(db):
+    """P2 (Codex): mixed deploy.
+
+    The API can be new while a worker is still running the retired calendar
+    reset, which zeroes rows whose records_period_start is in an earlier month.
+    A signup-dated mirror column would let it wipe a brand-new trial user's
+    counter and hand them a second 1,000 records inside one 7-day trial. The
+    mirror therefore stays on the month start at signup — harmless, because the
+    ledger it scopes is empty until the first charge rewrites it in lockstep.
+    """
+    from src.api.routes.auth_helpers.registration import _create_real_user
+
+    user = await _create_real_user(
+        db,
+        email=f"mix_{uuid.uuid4().hex[:8]}@test.bridgeleads.io",
+        first_name="Mixed", last_name="Deploy",
+        password_hash=hash_password("TestPass123!"),
+        referred_by_id=None, referral_code=uuid.uuid4().hex[:8].upper(),
+    )
+    await db.flush()
+
+    month_start = datetime.now(UTC).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+    assert as_utc(user.records_period_start) == month_start, (
+        "the mirror must not match the retired task's stale predicate"
+    )
+    # ...while the real entitlement window is the 7-day trial.
+    assert as_utc(user.quota_period_start) > month_start
+    assert (
+        as_utc(user.quota_period_end) - as_utc(user.quota_period_start)
+    ) < timedelta(days=8)

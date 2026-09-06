@@ -220,11 +220,17 @@ BACKFILL_WINDOWS = """
 #: A user already paying has by definition converted. Stamping first_paid_at
 #: stops the trial->paid handler mistaking their next subscription webhook for a
 #: first conversion and zeroing a counter they legitimately owe.
+#:
+#: 'trialing' is deliberately NOT in this list. A Stripe-side trial has not paid
+#: anything yet: stamping it would make their eventual conversion look like an
+#: ordinary plan change, and a customer who consumed 1,000/1,000 on trial and
+#: then paid $199 would stay at 1,000/1,000 — reintroducing the exact defect
+#: this whole change exists to fix. (Codex)
 BACKFILL_FIRST_PAID = """
     UPDATE users
     SET first_paid_at = created_at
     WHERE first_paid_at IS NULL
-      AND subscription_status IN ('active', 'past_due', 'trialing')
+      AND subscription_status IN ('active', 'past_due')
 """
 
 #: Anyone who was ever granted a trial has consumed it. trial_ends_at is CLEARED

@@ -853,7 +853,18 @@ async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
         return
 
     plan_name, records_limit, _interval = plan_info
-    result = await db.execute(select(User).where(User.id == user_id))
+    # FOR UPDATE. checkout.session.completed and customer.subscription.updated
+    # are two DIFFERENT Stripe events describing ONE conversion, so the route's
+    # per-event Redis dedup does not stop them running concurrently on two API
+    # workers. Both would load a user with first_paid_at NULL, both would decide
+    # this is a fresh entitlement, and both would zero the counter — a free
+    # bucket, and worse, a stale second commit can wipe usage consumed between
+    # them. Locking serialises them: the loser blocks, re-reads the newer row
+    # version under READ COMMITTED, sees first_paid_at set and does nothing.
+    # Users-only lock, so the jobs -> users order is untouched. (Codex)
+    result = await db.execute(
+        select(User).where(User.id == user_id).with_for_update()
+    )
     user = result.scalar_one_or_none()
     if user is None:
         _logger.warning(
@@ -987,7 +998,12 @@ async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
         return
 
     plan_name, records_limit, _interval = plan_info
-    result = await db.execute(select(User).where(User.stripe_customer_id == customer_id))
+    # FOR UPDATE — see _handle_checkout_completed: this handler can also perform
+    # the one-time conversion reset, so it must serialise against the checkout
+    # handler for the same user.
+    result = await db.execute(
+        select(User).where(User.stripe_customer_id == customer_id).with_for_update()
+    )
     user = result.scalar_one_or_none()
     if user is None:
         # A real plan change for a customer we can't resolve to a user — lost

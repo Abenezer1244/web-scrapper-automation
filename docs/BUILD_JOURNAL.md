@@ -19,6 +19,123 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-06 — quota stops resetting on the 1st: entitlement periods
+
+**Built / Shipped:** `feat/entitlement-periods` → **`33efc05`** (the system) + **`ea98ac0`**
+(six Codex findings) + follow-ups. Not merged, not deployed.
+
+Record quota is now metered over an **entitlement window**: a half-open
+`[quota_period_start, quota_period_end)` on a monthly grid anchored at
+`users.quota_anchor_at`, always exactly one month long however Stripe invoices. New:
+`src/api/quota_window.py` (the one Python definition + the SQL builders every atomic
+statement splices), `src/api/billing_entitlement.py` (the nine policies), migration **088**
+(10 user columns, 1 job column, the `public.quota_*` SQL functions, a no-op backfill),
+`reconcile_quota_periods` (hourly beat), `scripts/backfill_quota_anchors.py`.
+
+**Tried / Decided:**
+- **The anchor moves on exactly three events** — first trial→paid conversion, resubscribe
+  after a genuine lapse, admin action. Upgrade, downgrade, cancel, dunning, recovery and
+  monthly↔annual change only plan/limit/status. That single invariant is what makes
+  upgrade-farming and cancel/resubscribe-farming worthless; nearly every policy question
+  answered itself once it was fixed.
+- **Rejected `quota_period_source`** (Codex was right: `plan=pro, status=active,
+  source=calendar` is representable and meaningless — pure drift). Rejected a bare
+  `quota_anchor_day` smallint too: storing the instant keeps a 14:37 conversion at 14:37 and
+  makes the "did we clamp 31 to 28 permanently?" bug structurally impossible.
+- **Rollover is LAZY and contiguous**: a new window starts where the old one ENDED, never at
+  "the grid cell containing now". Naively continuing to the next boundary after an anchor
+  moves gives `[Oct 1, Oct 2)` — a one-day window with a full bucket, immediately followed by
+  another. `transitional_end` snaps to the boundary *closest* to `old_end + 1 month` instead,
+  which converges onto the grid in one cell and bounds the one-off cutover shift to within
+  ~15 days of a month in either direction.
+- **Renewal is observed, never acted on.** `invoice.payment_succeeded` is handled now but
+  does not reset the counter or advance the window. Making payment the trigger would strand a
+  renewed payer at cap behind a late webhook and hand out a second bucket on a replay.
+- **The deploy is a no-op by construction.** Migration 088 puts everyone on a day-1 grid —
+  exactly the calendar behaviour they already had, `records_used` untouched. The legacy
+  records reset is retired in the SAME deploy; subscribers move to their real Stripe
+  anniversary LATER via a separate script. That ordering is the whole safety argument.
+
+**Caught & fixed (before shipping):**
+- 🛑 **The period rule was written out SEVEN times**, not the four Codex counted — and the
+  two it missed were the dangerous ones. `_reservation_is_current` and
+  `release_quota_reservation` both compared calendar MONTHS, which is only *accidentally*
+  right while every window starts on the 1st. With a 20th anchor, a job reserving on the 19th
+  and settling on the 21st reads as "same period", so settlement nets `billable − reserved = 0`
+  against a counter the rollover already zeroed — **the delivered records are charged to
+  nobody**. The release path is the mirror image: refunding into a window the grant was never
+  added to, destroying current-window usage. Both were latent, both go live the instant any
+  anchor is not day 1, both fixed here via `jobs.quota_period_start`.
+- 🛑 **Codex found an Agency downgrade skipping the cap entirely.** The worker's cap block is
+  gated on `records_limit != -1`, so an Agency subscriber with a pending downgrade whose
+  window had ended exported uncapped and settlement then applied the Pro limit — 5000/1000.
+- 🛑 **Codex found the migration marking Stripe-side `trialing` users as already paid**, which
+  would have reintroduced the exact defect the project exists to fix: consume 1,000/1,000 on
+  trial, pay $199, stay at 1,000/1,000.
+- 🛑 **Codex found the conversion reset had no lock.** `checkout.session.completed` and
+  `customer.subscription.updated` are two DIFFERENT events describing ONE conversion, so the
+  route's per-event Redis dedup does not stop them running concurrently. Both handlers now
+  load the user `FOR UPDATE`.
+- 🛑 **Codex found a mixed-deploy double-grant.** New API + old worker: the retired calendar
+  task zeroes rows whose `records_period_start` is in an earlier month, so a signup-dated
+  mirror column let it wipe a brand-new trial counter and hand out a second 1,000 records
+  inside one 7-day trial. The mirror stays on the month start at signup.
+- 🛑 **Codex found reconciliation downgrading payers whose un-cancel webhook was lost** — and
+  they could then "resubscribe" into another fresh window. It now asks Stripe first, under the
+  same doctrine `_expire_trials_impl` established: an error means UNKNOWN, never a downgrade.
+- I found the `past_due` leak independently and Codex reported it too: reached through
+  `subscription.updated` alone, the status was written but the dunning grace never was — and
+  `past_due` with a NULL grace is not frozen, so the window kept rolling for a non-paying
+  account. Whichever event sees `past_due` first now starts the clock.
+- `scripts/repair_records_used_from_ledger.py` tested staleness with
+  `records_period_start < date_trunc('month', now())`. Under anchored windows a *live* window
+  legitimately starts in a previous calendar month, so the operator's repair tool would have
+  silently skipped every anchored subscriber.
+
+**Failed / Blocked:**
+- `.env.example` could not be edited — the tool sandbox denies all access to that path. It
+  still needs `BILLING_PAST_DUE_GRACE_DAYS=7`; the setting has a safe default so nothing
+  breaks without it. 👤
+- Bash heredocs in this harness mangle content containing apostrophes; large file edits had to
+  go through the Write tool or a scratchpad patch script instead.
+
+**Pending / Handoff:**
+- ⏭️ **UNVERIFIED in production.** Nothing here has been deployed or run against the live DB.
+  The `1007/1000` account behaviour is proven by test, not by a production observation.
+- ⏭️ Not merged: no PR opened yet.
+- 👤 Deploy order matters: migration + code together, verify `/billing/usage` is unchanged for
+  every user, and ONLY THEN run `scripts/backfill_quota_anchors.py`. A non-day-1 anchor while
+  the legacy reset still ran would be zeroed twice.
+- 👤 FE: `/billing/usage` now returns `period_basis: "entitlement_month_utc"` (was
+  `calendar_month_utc`) plus `pending_plan`, `pending_records_limit`, `payment_state`,
+  `entitlement_ends_at`. Pricing copy should stop saying quotas reset on the 1st.
+- `docs/product/billing-period-semantics.md` still documents the calendar policy as accepted;
+  supersede it once this deploys.
+
+**Facts learned:**
+- 🔑 **A test that carries its own transcription of a rule proves only that the transcription
+  is self-consistent.** `test_quota_reservation.py` held hand-copied `_RESERVE_SQL` / `_settle`
+  constants that still encoded the *calendar* rule; all 18 tests passed against production
+  statements they no longer resembled. They now assemble from the same shared builders, and
+  the single most valuable test in the change is the one proving the Python module and the
+  Postgres functions agree over a generated matrix of anchors × instants.
+- 🔑 **Postgres month arithmetic on a `timestamptz` is evaluated in the SESSION timezone.**
+  Every boundary has to be re-cast `AT TIME ZONE 'UTC'` or a worker on a negative offset lands
+  on a different day — the same class of bug that made a healthy user read as stale in #223.
+- 🔑 **Adding a month to the previous boundary compounds the clamp**: Jan 31 → Feb 28 → Mar 28,
+  and the customer's reset day silently becomes the 28th forever. Always add whole months to
+  the ORIGINAL anchor. Postgres and `calendar.monthrange` agree on this and both clamp right.
+- 🛑 `date_trunc('month', ...)` is not merely *legacy* once windows exist — it is a live
+  correctness hazard anywhere it still governs record quota, because it is silently correct
+  for day-1 anchors and silently wrong for every other one.
+- 🔑 `ADD COLUMN ... DEFAULT date_trunc(...) AT TIME ZONE 'UTC' NOT NULL` is a syntax error;
+  the default expression needs parentheses. `ALTER COLUMN ... SET DEFAULT` (what 086 used)
+  parses without them, which is why the pattern looked safe to copy.
+- 🔑 Extracting a migration's backfill SQL into module-level constants lets tests execute the
+  *actual* statements via `importlib`, instead of re-typing them.
+
+---
+
 ## 2026-09-04 (Test 11) — a page with three rows on it looked like no page at all
 
 **Built / Shipped:** `fix/test11-completed-with-error` → **PR #217** (CI green: Test 5m5s,

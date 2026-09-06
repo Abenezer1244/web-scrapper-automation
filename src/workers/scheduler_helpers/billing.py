@@ -152,15 +152,25 @@ def _reconcile_quota_periods_impl(subscription_lookup=None) -> dict[str, int]:
         # ── 1. Expired paid entitlement with no subscription.deleted ─────────
         # Runs BEFORE the rollover on purpose: clearing entitlement_ends_at is
         # exactly what makes such a window eligible to advance in the same pass.
+        # Read the candidates and END the read transaction before touching
+        # Stripe. Each lookup is a network call, and holding a transaction open
+        # across N of them would keep every row this loop has already written
+        # locked for the duration — long enough to block a worker's reserve or
+        # settle on those same users. Each decision below commits on its own, so
+        # one slow or failing account cannot hold up the rest. Bounded, because
+        # an unbounded beat pass making unbounded Stripe calls is its own outage.
         candidates = db.execute(
             text(
                 "SELECT id, stripe_subscription_id, stripe_customer_id "
                 "FROM users "
                 "WHERE entitlement_ends_at IS NOT NULL "
-                "  AND entitlement_ends_at <= CAST(:at AS timestamptz)"
+                "  AND entitlement_ends_at <= CAST(:at AS timestamptz) "
+                "ORDER BY entitlement_ends_at "
+                "LIMIT :lim"
             ),
-            {"at": now},
+            {"at": now, "lim": _RECONCILE_LAPSED_LIMIT},
         ).fetchall()
+        db.commit()
 
         lapsed: list[str] = []
         for row in candidates:
@@ -190,6 +200,7 @@ def _reconcile_quota_periods_impl(subscription_lookup=None) -> dict[str, int]:
                         ),
                         {"uid": user_id, "st": status},
                     )
+                    db.commit()
                     _logger.info(
                         "reconcile: user %s is still entitled in Stripe (%s) — "
                         "cancellation reversed, entitlement end cleared",
@@ -212,6 +223,7 @@ def _reconcile_quota_periods_impl(subscription_lookup=None) -> dict[str, int]:
                 ),
                 {"uid": user_id, "starter_limit": settings.PLAN_LIMITS["starter"]},
             )
+            db.commit()
             lapsed.append(user_id)
         changed_plan.update(lapsed)
 
@@ -279,6 +291,12 @@ def _reconcile_quota_periods_impl(subscription_lookup=None) -> dict[str, int]:
 #: app-side trial expired out from under them. Everything else (canceled, unpaid,
 #: incomplete, incomplete_expired, paused, or NULL) is treated as not entitled.
 _ENTITLED_SUB_STATUSES = ("active", "trialing", "past_due")
+
+#: How many lapsed entitlements one reconciliation pass will resolve. Each one
+#: costs a Stripe round trip, so an unbounded pass would turn a backlog into a
+#: beat task that never finishes. The remainder is picked up next hour; nothing
+#: is lost, because the candidates query is a state test, not a queue.
+_RECONCILE_LAPSED_LIMIT = 200
 
 
 def _stripe_entitled_status(customer_id: str) -> str | None:

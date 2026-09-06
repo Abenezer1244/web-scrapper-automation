@@ -165,7 +165,15 @@ def _reconcile_quota_periods_impl(subscription_lookup=None) -> dict[str, int]:
                 "FROM users "
                 "WHERE entitlement_ends_at IS NOT NULL "
                 "  AND entitlement_ends_at <= CAST(:at AS timestamptz) "
-                "ORDER BY entitlement_ends_at "
+                # RANDOM, not oldest-first. Oldest-first looks fairer and is
+                # actually a starvation bug: if the oldest 200 rows all fail
+                # their Stripe lookup — a deleted customer raises every time —
+                # they are re-selected every hour forever and no lapsed user
+                # behind them is ever repaired. This is idempotent state repair,
+                # not a queue, so sampling gives every row a chance on every
+                # pass and a permanently-failing subset cannot monopolise it.
+                # (Codex)
+                "ORDER BY random() "
                 "LIMIT :lim"
             ),
             {"at": now, "lim": _RECONCILE_LAPSED_LIMIT},
@@ -279,6 +287,15 @@ def _reconcile_quota_periods_impl(subscription_lookup=None) -> dict[str, int]:
         "entitlement(s), reconciled configs for %d user(s)",
         now.isoformat(), len(rolled), len(lapsed), len(changed_plan),
     )
+    if len(candidates) >= _RECONCILE_LAPSED_LIMIT:
+        _logger.warning(
+            "reconcile_quota_periods hit its %d-row cap; a backlog drains over "
+            "the following hours. Candidates are sampled at random, so failing "
+            "rows cannot starve the rest — but a cap hit that persists for many "
+            "hours means the backlog is growing faster than it clears. Check "
+            "the skip warnings.",
+            _RECONCILE_LAPSED_LIMIT,
+        )
     return {
         "rolled": len(rolled),
         "lapsed": len(lapsed),
@@ -291,6 +308,13 @@ def _reconcile_quota_periods_impl(subscription_lookup=None) -> dict[str, int]:
 #: app-side trial expired out from under them. Everything else (canceled, unpaid,
 #: incomplete, incomplete_expired, paused, or NULL) is treated as not entitled.
 _ENTITLED_SUB_STATUSES = ("active", "trialing", "past_due")
+
+#: How many expired trials one pass will resolve. Every candidate now costs a
+#: Stripe round trip (a stored status is no longer taken on trust), so the pass
+#: is bounded and the remainder waits an hour. Sampled at random so a set of
+#: permanently-failing rows cannot monopolise the cap, and the task warns when it
+#: hits the cap so a real backlog is visible.
+_EXPIRE_TRIALS_LIMIT = 200
 
 #: How many lapsed entitlements one reconciliation pass will resolve. Each one
 #: costs a Stripe round trip, so an unbounded pass would turn a backlog into a
@@ -351,7 +375,7 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
     for trial -> paid -> cancel -> trial-again: ``trial_ends_at`` is CLEARED on
     conversion, so it cannot answer "did this account ever trial".
     """
-    from sqlalchemy import or_, select
+    from sqlalchemy import func, or_, select
 
     from src.api.entitlements import apply_reconciliation_sync
     from src.config import settings
@@ -368,9 +392,16 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
             user.trial_consumed_at = user.trial_ends_at or now
         _logger.info("Trial expired for %s — downgraded to starter", user.email)
         apply_reconciliation_sync(db, str(user.id), "starter")
+        db.commit()  # per-row, so a later Stripe failure cannot strand this one
 
     with SyncSessionLocal() as db:
         # Candidates: expired trial, still on a paid tier, NOT known-entitled.
+        # Bounded, and sampled at RANDOM rather than oldest-first. Every row
+        # here costs a Stripe round trip now that a stored status is no longer
+        # taken on trust, so an unbounded pass would be a beat task that never
+        # finishes — and a deterministic order would let a set of rows that fail
+        # their lookup every time monopolise the cap and starve everyone behind
+        # them. This is idempotent state repair, not a queue. (Codex)
         candidates = db.execute(
             select(User).where(
                 User.trial_ends_at.isnot(None),
@@ -380,8 +411,14 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
                     User.subscription_status.is_(None),
                     User.subscription_status.notin_(_ENTITLED_SUB_STATUSES),
                 ),
-            )
+            ).order_by(func.random()).limit(_EXPIRE_TRIALS_LIMIT)
         ).scalars().all()
+        # End the read transaction BEFORE the first network call. Holding it
+        # open across N Stripe round trips would keep every row this loop has
+        # already mutated locked for the whole run — the same hazard the quota
+        # reconciliation had. Each decision below commits on its own, so one
+        # slow or failing account cannot hold up the rest.
+        db.commit()
 
         downgraded = 0
         for user in candidates:
@@ -422,6 +459,7 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
                         user.first_paid_at = user.created_at or now
                     if user.trial_consumed_at is None:
                         user.trial_consumed_at = user.trial_ends_at or now
+                    db.commit()
                     _logger.info(
                         "expire_trials: user %s has entitled Stripe status %s — "
                         "protected + backfilled", user.id, status,
@@ -431,8 +469,15 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
                     _downgrade(db, user)
                     downgraded += 1
 
-        if candidates:
-            db.commit()
         _logger.info(
             "expire_trials: %d candidates, %d downgraded", len(candidates), downgraded
+        )
+    if len(candidates) >= _EXPIRE_TRIALS_LIMIT:
+        _logger.warning(
+            "expire_trials hit its %d-row cap; the remainder waits for the next "
+            "hourly run. Candidates are sampled at random, so this drains rather "
+            "than starving — but a cap hit that persists for many hours means "
+            "the backlog is growing faster than it clears. Check the skip "
+            "warnings above.",
+            _EXPIRE_TRIALS_LIMIT,
         )

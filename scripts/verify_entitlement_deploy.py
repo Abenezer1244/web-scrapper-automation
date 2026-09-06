@@ -7,39 +7,61 @@ if the migration moved nobody. This script is the evidence for that gate. It is
 STRICTLY READ-ONLY -- it opens a session, runs SELECTs, and never issues an
 UPDATE, INSERT or DDL statement.
 
-WHY IT CAN CHECK "the same window they already had" WITHOUT A PRE-SNAPSHOT
---------------------------------------------------------------------------
-``records_period_start`` is the PRE-088 column and is deliberately kept, written
-in lockstep with ``quota_period_start`` for one release. Migration 088 backfills
+THE TRAP THIS SCRIPT USED TO FALL INTO (fixed; read before editing)
+-------------------------------------------------------------------
+The first draft compared the new window against ``records_period_start`` and
+claimed no pre-deploy snapshot was needed, because that column holds the pre-088
+value. **That is wrong.** ``window_set_sql`` in ``src/api/quota_window.py`` ends
+with ``records_period_start = w.new_start`` -- the legacy column is written in
+LOCKSTEP with ``quota_period_start`` on every rollover. So as soon as any quota
+writer rolls a user, C1/C2 compare the new value against itself and PASS
+VACUOUSLY. Silently correct right after the migration, silently wrong later:
+exactly the class of bug this whole project exists to remove.
 
-    quota_anchor_at = quota_period_start = records_period_start
-    quota_period_end = records_period_start + 1 month
+Two independent defences, so the gate cannot pass vacuously:
 
-so the old value is still present in the same row. Comparing the new window
-against ``records_period_start`` IS the "did anyone move?" test, and it needs no
-snapshot taken beforehand. ``records_used`` is not touched by the migration at
-all, so it is reported rather than diffed.
+* **C7 (always on, no snapshot needed).** Migration 088 backfills
+  ``quota_anchor_at = quota_period_start = records_period_start``, so
+  immediately afterwards EVERY user satisfies ``quota_period_start ==
+  quota_anchor_at``. A rollover moves the window off the anchor and leaves it
+  there. C7 therefore detects "this user has rolled since the migration" exactly
+  -- and when it fails, **C1/C2 are reported as UNVERIFIABLE for that user
+  rather than passing**, because the baseline they compare against may already
+  have been overwritten.
+
+* **``--baseline`` (authoritative).** Take a snapshot BEFORE merging, then pass
+  it here. This is the only way to verify ``records_used`` was not changed, and
+  the only thing that still works after users have rolled.
 
 WHAT A CLEAN RUN LOOKS LIKE
 ---------------------------
 Every check reports 0 offenders and the script exits 0. Any non-zero count means
 STOP -- do not run the anchor backfill.
 
-    C1  quota_period_start  == records_period_start          (window unmoved)
-    C2  quota_anchor_at     == records_period_start          (day-1 grid)
-    C3  quota_period_end    == quota_period_start + 1 month  (exactly one month)
-    C4  anchor lands on day 1 of a month                     (legacy behaviour)
-    C5  effective window    == stored window                 (nothing already
-                                                              stale at deploy)
+    C1  quota_period_start  == pre-deploy period start   (window unmoved)
+    C2  quota_anchor_at     == pre-deploy period start   (day-1 grid)
+    C3  quota_period_end    == quota_period_start + 1 month
+    C4  anchor lands on day 1 of a month                 (legacy behaviour)
+    C5  effective window    == stored window             (nothing already stale)
     C6  no NULLs in the new NOT NULL columns
+    C7  quota_period_start  == quota_anchor_at           (nobody has rolled yet)
+    C8  records_used unchanged vs baseline               (--baseline only)
 
-C5 is the one that can legitimately be non-zero: a user whose window ended
-between the migration and this run has an effective window ahead of the stored
-one, which is the lazy rollover working as designed. Those are reported
-SEPARATELY from failures for exactly that reason -- read the note it prints.
+C5 and C7 can legitimately be non-zero if time has passed since the migration:
+a user whose window ended has rolled, which is the lazy rollover working as
+designed. They are reported SEPARATELY from hard failures for that reason -- but
+C7 failures downgrade C1/C2 to UNVERIFIABLE, which IS a hard failure unless a
+baseline was supplied. Run this promptly after the deploy, or use --baseline.
 
 USAGE
 -----
+    # BEFORE merging (against the pre-088 production DB):
+    railway run python scripts/verify_entitlement_deploy.py --snapshot pre088.json
+
+    # AFTER the migration:
+    railway run python scripts/verify_entitlement_deploy.py --baseline pre088.json
+
+    # without a baseline (only trustworthy while C7 holds for everyone):
     railway run python scripts/verify_entitlement_deploy.py
 
     # a specific account, e.g. the known over-cap one:
@@ -51,13 +73,14 @@ Exit codes: 0 = clean, 1 = at least one hard check failed, 2 = could not run.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from datetime import UTC, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sqlalchemy import select  # noqa: E402
+from sqlalchemy import select, text  # noqa: E402
 
 from src.api.quota_window import add_months, as_utc, effective_window  # noqa: E402
 from src.db.models import User  # noqa: E402
@@ -74,12 +97,66 @@ def _fmt(value: datetime | None) -> str:
     return as_utc(value).strftime("%Y-%m-%d %H:%M:%SZ")
 
 
-def _check_user(user: User, now: datetime) -> tuple[list[str], list[str]]:
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return as_utc(datetime.fromisoformat(value))
+
+
+def take_snapshot(path: str) -> int:
+    """Record the PRE-088 state. Safe to run before the migration exists.
+
+    Deliberately raw SQL over only the legacy columns: the ORM ``User`` model
+    already declares the 088 columns, so ``select(User)`` would fail against a
+    pre-migration database -- which is precisely when this must run.
+    """
+    try:
+        with system_sync_session() as db:
+            rows = db.execute(
+                text(
+                    "SELECT id, email, plan, records_used, records_limit, "
+                    "records_period_start FROM users"
+                )
+            ).mappings().all()
+    except Exception as exc:  # noqa: BLE001 - report, never mask
+        print(f"FATAL: could not read users: {exc!r}", file=sys.stderr)
+        return 2
+
+    if not rows:
+        print("FATAL: zero users read -- refusing to write an empty baseline.", file=sys.stderr)
+        return 2
+
+    payload = {
+        "taken_at": datetime.now(UTC).isoformat(),
+        "users": {
+            str(r["id"]): {
+                "email": r["email"],
+                "plan": r["plan"],
+                "records_used": r["records_used"],
+                "records_limit": r["records_limit"],
+                "records_period_start": (
+                    as_utc(r["records_period_start"]).isoformat()
+                    if r["records_period_start"] is not None
+                    else None
+                ),
+            }
+            for r in rows
+        },
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    print(f"Snapshot written: {path}  ({len(rows)} users, taken {payload['taken_at']})")
+    print("Keep this file. Pass it back with --baseline after the migration.")
+    return 0
+
+
+def _check_user(
+    user: User, now: datetime, base: dict | None
+) -> tuple[list[str], list[str]]:
     """Return (hard_failures, informational_notes) for one user."""
     failures: list[str] = []
     notes: list[str] = []
 
-    rps = user.records_period_start
     qps = user.quota_period_start
     qpe = user.quota_period_end
     anchor = user.quota_anchor_at
@@ -100,19 +177,77 @@ def _check_user(user: User, now: datetime) -> tuple[list[str], list[str]]:
 
     anchor_u, qps_u, qpe_u = as_utc(anchor), as_utc(qps), as_utc(qpe)
 
-    if rps is None:
-        notes.append("C1 skipped: records_period_start is NULL (pre-existing)")
+    # C7 -- has this user rolled since the migration? The 088 backfill sets
+    # quota_period_start == quota_anchor_at for everyone, and only a rollover
+    # moves the window off the anchor.
+    rolled_since_migration = qps_u != anchor_u
+    if rolled_since_migration:
+        notes.append(
+            f"C7 window has advanced past the anchor: quota_period_start={_fmt(qps_u)} "
+            f"!= quota_anchor_at={_fmt(anchor_u)} (this user has rolled since 088)"
+        )
+
+    # C1 / C2 -- the baseline comparison.
+    #
+    # The two checks do NOT have the same validity once a user has rolled, and
+    # conflating them is what made the first draft wrong:
+    #
+    #   C1 (window == pre-deploy start) is only meaningful while C7 holds. A
+    #       rollover moves the window LEGITIMATELY, so after one there is no way
+    #       to observe where the migration left it -- with or without a baseline.
+    #   C2 (anchor == pre-deploy start) stays meaningful forever, because the
+    #       anchor is immutable across rollovers by design (it moves on exactly
+    #       three events, none of which is a rollover). It only needs a
+    #       TRUSTWORTHY pre-deploy value to compare against.
+    #
+    # The in-row legacy column is trustworthy only while C7 holds, because
+    # window_set_sql rewrites records_period_start in lockstep on every roll.
+    if base is not None:
+        baseline_start = _parse_iso(base.get("records_period_start"))
+        baseline_source = "baseline snapshot"
+    elif not rolled_since_migration:
+        baseline_start = (
+            as_utc(user.records_period_start)
+            if user.records_period_start is not None
+            else None
+        )
+        baseline_source = "records_period_start (C7 holds, so still pre-088)"
     else:
-        rps_u = as_utc(rps)
-        if qps_u != rps_u:
+        baseline_start = None
+        baseline_source = None
+        failures.append(
+            "C2 UNVERIFIABLE: this user has rolled since the migration (C7), so "
+            "records_period_start was rewritten in lockstep with quota_period_start "
+            "and is no longer the pre-088 value. There is nothing trustworthy left "
+            "in the row to compare the anchor against. Re-run with --baseline "
+            "<snapshot taken before the deploy> to check this user."
+        )
+
+    if baseline_start is None and baseline_source is not None:
+        notes.append(f"C1/C2 skipped: no pre-deploy period start in {baseline_source}")
+    elif baseline_start is not None:
+        if rolled_since_migration:
+            notes.append(
+                "C1 not applicable: the window has legitimately rolled since the "
+                "migration, so its migration-time position is no longer observable. "
+                "C2 (anchor) still applies and was checked."
+            )
+        elif qps_u != baseline_start:
             failures.append(
                 f"C1 window MOVED: quota_period_start={_fmt(qps_u)} "
-                f"!= records_period_start={_fmt(rps_u)}"
+                f"!= pre-deploy {_fmt(baseline_start)} [{baseline_source}]"
             )
-        if anchor_u != rps_u:
+        if anchor_u != baseline_start:
             failures.append(
-                f"C2 anchor != legacy period start: quota_anchor_at={_fmt(anchor_u)} "
-                f"!= records_period_start={_fmt(rps_u)}"
+                f"C2 anchor != pre-deploy period start: quota_anchor_at={_fmt(anchor_u)} "
+                f"!= {_fmt(baseline_start)} [{baseline_source}]"
+            )
+
+    # C8 -- the migration must not touch the counter. Only a baseline can show this.
+    if base is not None and base.get("records_used") is not None:
+        if user.records_used != base["records_used"]:
+            failures.append(
+                f"C8 records_used CHANGED: {base['records_used']} -> {user.records_used}"
             )
 
     expected_end = add_months(qps_u, 1)
@@ -143,6 +278,18 @@ def _check_user(user: User, now: datetime) -> tuple[list[str], list[str]]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--snapshot",
+        default=None,
+        metavar="PATH",
+        help="PRE-deploy mode: write the current legacy state to PATH and exit.",
+    )
+    parser.add_argument(
+        "--baseline",
+        default=None,
+        metavar="PATH",
+        help="Compare against a snapshot taken before the deploy (authoritative).",
+    )
+    parser.add_argument(
         "--user",
         default=None,
         help="Only report on users whose id starts with this prefix.",
@@ -154,6 +301,25 @@ def main() -> int:
         help="Print at most this many offending users (0 = all).",
     )
     args = parser.parse_args()
+
+    if args.snapshot:
+        if args.baseline:
+            print("FATAL: --snapshot and --baseline are mutually exclusive.", file=sys.stderr)
+            return 2
+        return take_snapshot(args.snapshot)
+
+    baseline: dict[str, dict] | None = None
+    if args.baseline:
+        try:
+            with open(args.baseline, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            baseline = loaded["users"]
+        except Exception as exc:  # noqa: BLE001 - a bad baseline must not be ignored
+            print(f"FATAL: could not read baseline {args.baseline}: {exc!r}", file=sys.stderr)
+            return 2
+        if not baseline:
+            print("FATAL: baseline contains no users.", file=sys.stderr)
+            return 2
 
     now = datetime.now(UTC)
     # Cross-tenant read: this is a system-level audit of every user, so it must
@@ -178,11 +344,17 @@ def main() -> int:
     failed: list[tuple[User, list[str]]] = []
     rolled: list[tuple[User, list[str]]] = []
     watched: User | None = None
+    missing_from_baseline: list[User] = []
 
     for user in users:
         if str(user.id).startswith(WATCHED_USER_PREFIX):
             watched = user
-        failures, notes = _check_user(user, now)
+        base = baseline.get(str(user.id)) if baseline is not None else None
+        if baseline is not None and base is None:
+            # A user created after the snapshot. Not a defect, but C1/C2/C8
+            # cannot be judged for them, so say so instead of passing quietly.
+            missing_from_baseline.append(user)
+        failures, notes = _check_user(user, now, base)
         if failures:
             failed.append((user, failures))
         if notes:
@@ -191,6 +363,10 @@ def main() -> int:
     print("=" * 72)
     print("ENTITLEMENT DEPLOY VERIFICATION (step 2) -- READ-ONLY")
     print(f"clock: {_fmt(now)}   users examined: {total}")
+    print(
+        "baseline: "
+        + (f"{args.baseline} ({len(baseline)} users)" if baseline else "NONE (relying on C7)")
+    )
     print("=" * 72)
 
     shown = 0
@@ -203,12 +379,20 @@ def main() -> int:
             print(f"      {line}")
         shown += 1
 
+    if missing_from_baseline:
+        print(
+            f"\n{len(missing_from_baseline)} user(s) are absent from the baseline "
+            "(created after the snapshot). C1/C2/C8 were not judged for them."
+        )
+        for user in missing_from_baseline[: args.limit or len(missing_from_baseline)]:
+            print(f"  {user.id}  {user.email}")
+
     if rolled:
-        print(f"\n{len(rolled)} user(s) have an effective window ahead of the stored one.")
-        print("This is the LAZY ROLLOVER working, not a defect: the window advances")
-        print("inside the next statement that charges them, or hourly via")
-        print("reconcile_quota_periods. It is only a problem if the stored window")
-        print("ended long before this run and the beat is not running.")
+        print(f"\n{len(rolled)} user(s) carry an informational note (C5 / C7).")
+        print("A window that has advanced is the LAZY ROLLOVER working, not a defect:")
+        print("it advances inside the next statement that charges them, or hourly via")
+        print("reconcile_quota_periods. It only invalidates C1/C2 -- which is why those")
+        print("become hard failures above unless --baseline was supplied.")
         for user, notes in rolled[: args.limit or len(rolled)]:
             print(f"  {user.id}  {user.email}")
             for line in notes:
@@ -224,8 +408,10 @@ def main() -> int:
         print(f"  over cap        : {watched.records_used > watched.records_limit}")
         print(f"  records_period_start : {_fmt(watched.records_period_start)}")
         print(f"  quota_anchor_at      : {_fmt(watched.quota_anchor_at)}")
-        print(f"  stored window        : [{_fmt(watched.quota_period_start)} "
-              f"-> {_fmt(watched.quota_period_end)})")
+        print(
+            f"  stored window        : [{_fmt(watched.quota_period_start)} "
+            f"-> {_fmt(watched.quota_period_end)})"
+        )
         print(f"  effective window     : [{_fmt(eff_start)} -> {_fmt(eff_end)})")
         print("  EXPECTED: records_used 1007, limit 1000, over cap True,")
         print("            next reset 2026-10-01. Do NOT 'fix' this number.")
@@ -239,7 +425,7 @@ def main() -> int:
         print(f"        {len(failed)} FAILING -- STOP. Do not run backfill_quota_anchors.py.")
     else:
         print("        Migration 088 moved nobody. Step 2 verified.")
-    print(f"        {len(rolled)} with a lazily-rolled effective window (informational).")
+    print(f"        {len(rolled)} with an informational C5/C7 note.")
     print("=" * 72)
 
     return 1 if failed else 0

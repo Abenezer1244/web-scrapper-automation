@@ -79,6 +79,17 @@ go/no-go and **has not yet answered**. Do not deploy without it.
 
 Run this ONLY after the operator says go.
 
+0. **BEFORE merging anything — take the pre-deploy snapshot.** It reads the
+   legacy columns only, so it works against the pre-088 database, and it is the
+   only artefact that can later prove `records_used` was untouched:
+
+   ```
+   railway run python scripts/verify_entitlement_deploy.py --snapshot pre088.json
+   ```
+
+   Keep the file. Once the migration runs, the pre-088 values are no longer
+   recoverable from the database for any user who has rolled.
+
 1. **Merge BE #231.** Railway runs Build & Push + Run Migrations (migration
    **088**). The backfill puts every user on a **day-1 grid** — exactly the
    calendar behaviour they already had, `records_used` untouched — so nobody
@@ -89,14 +100,20 @@ Run this ONLY after the operator says go.
    already had**. This deploy is meant to be a behavioural no-op; if any user's
    window moved, stop and investigate before step 3. Report the actual numbers.
 
-   Run **`railway run python scripts/verify_entitlement_deploy.py`** — the
-   read-only step-2 verifier (added 2026-09-06). It checks all six invariants
-   (window unmoved vs `records_period_start`, day-1 grid, one-month window, no
-   NULLs, effective == stored) across every user and prints the watched
-   `01dc9396…` account in full. **Exit 0 = clean, 1 = at least one user moved
-   (STOP), 2 = could not run.** It never issues an UPDATE. It needs no
-   pre-deploy snapshot, because `records_period_start` is the pre-088 column and
-   is kept in lockstep — the old value is still in the same row.
+   Run **`railway run python scripts/verify_entitlement_deploy.py --baseline pre088.json`**
+   — the read-only step-2 verifier (added 2026-09-06). Eight checks across every
+   user (window unmoved, anchor on the day-1 grid, one-month window, no NULLs,
+   effective == stored, nobody rolled yet, `records_used` unchanged), and it
+   prints the watched `01dc9396…` account in full. **Exit 0 = clean, 1 = at
+   least one user moved (STOP), 2 = could not run.** It never issues an UPDATE.
+
+   🛑 **This needs step 0 below.** An earlier draft claimed no pre-deploy
+   snapshot was necessary because `records_period_start` holds the pre-088
+   value. **That was wrong** — `window_set_sql` writes it in lockstep with
+   `quota_period_start` on every rollover, so after any roll the window check
+   compares a value against itself. The script now detects that case (C7) and
+   reports it as UNVERIFIABLE rather than passing, but only a real snapshot can
+   check `records_used` or judge a user who has already rolled.
 3. **Only then** `railway run python scripts/backfill_quota_anchors.py`
    (dry-run is the default; `--commit --i-understand` to apply). This is the ONLY
    step that changes anyone's reset date. It writes `quota_anchor_at` and nothing
@@ -199,7 +216,15 @@ was charged to.
    the gap is disclosed as a comment on PR #116. **Re-run Codex on `ef3ba3d` once
    quota returns**, before or shortly after merging.
 
-   ⏭️ **RE-ATTEMPTED 2026-09-06 15:1x UTC — STILL BLOCKED.** `codex review --base
+   ✅ **RESOLVED 2026-09-06 ~17:00 UTC — Codex came back and reviewed both.**
+   FE `codex review --base master`: no findings. A follow-up **adversarial
+   challenge found 2 P1s that the plain review missed**, both verified real and
+   both now fixed (see §10). BE `codex review --commit e6c4d55`: 1 P2, also real
+   and fixed. The re-review of those fixes is recorded in §10.
+   The blocked attempt earlier the same day is kept below because the CLI facts
+   in it are durable.
+
+   ⏭️ ~~**RE-ATTEMPTED 2026-09-06 15:1x UTC — STILL BLOCKED.**~~ `codex review --base
    master` from the FE worktree returned the identical *"You've hit your usage
    limit … try again at Sep 9th, 2026 3:10 AM"*. Confirmed independently from the
    ChatGPT usage screen: **weekly limit 0% remaining, resets Wed 3:10 AM, 0

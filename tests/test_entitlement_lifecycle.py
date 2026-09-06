@@ -1114,3 +1114,131 @@ def test_the_migration_marks_unambiguous_legacy_payers_as_converted():
             "left for expire_trials to resolve against Stripe"
         )
         assert db.get(User, never_id).first_paid_at is None
+
+
+# ─── Round-4 Codex findings: decisions made before a network call ─────────────
+
+def test_an_ended_entitlement_stops_new_work_before_the_beat_catches_up():
+    """P2 (Codex): the window stops at entitlement_ends_at, but the counter it
+    leaves behind may still have room.
+
+    Between the term ending and either subscription.deleted arriving or the
+    hourly reconciliation downgrading them, a cancelled customer could keep
+    spending their final window's remainder — and a lost webhook makes that gap
+    unbounded.
+    """
+    from src.api.quota import quota_block_reason
+
+    ended = NOW - timedelta(hours=1)
+    with SyncSessionLocal() as db:
+        user = _mk_user(
+            db, plan="pro", records_used=200, records_limit=1000,
+            subscription_status="active", entitlement_ends_at=ended,
+            quota_period_start=ended - timedelta(days=20), quota_period_end=ended,
+        )
+        db.flush()
+
+    reason = quota_block_reason(user, NOW)
+    assert reason is not None
+    assert "subscription has ended" in reason
+    assert is_over_record_limit(user, NOW) is False, (
+        "they are blocked for entitlement, not for quota — the message matters"
+    )
+
+    # A cancellation still in the FUTURE must not block anything.
+    with SyncSessionLocal() as db:
+        still_paid = _mk_user(
+            db, plan="pro", records_used=200, records_limit=1000,
+            subscription_status="active",
+            entitlement_ends_at=NOW + timedelta(days=10),
+        )
+        db.flush()
+    assert quota_block_reason(still_paid, NOW) is None
+
+
+def test_reconciliation_does_not_clobber_a_resubscribe_that_lands_mid_lookup():
+    """P1 (Codex): the Stripe lookup is a network round trip, and a customer can
+    resubscribe inside it.
+
+    Checkout clears entitlement_ends_at; an unconditional downgrade afterwards
+    would strip the plan and subscription id off someone who has just paid. The
+    write carries a CAS on the value the decision was made from.
+    """
+    from src.workers.scheduler_helpers.billing import _reconcile_quota_periods_impl
+
+    past = datetime(2020, 2, 1, tzinfo=UTC)
+    cus = f"cus_race_{uuid.uuid4().hex[:8]}"
+    with SyncSessionLocal() as db:
+        user = _mk_user(
+            db, plan="pro", records_limit=1000,
+            quota_period_start=datetime(2020, 1, 1, tzinfo=UTC),
+            quota_period_end=past, entitlement_ends_at=past,
+            subscription_status="active", stripe_customer_id=cus,
+            stripe_subscription_id="sub_old",
+        )
+        user_id = user.id
+        db.commit()
+
+    def _lookup_then_resubscribe(_customer_id):
+        """Stripe says "not entitled" — and the customer pays before we write."""
+        with SyncSessionLocal() as inner:
+            fresh = inner.get(User, user_id)
+            activate_paid_plan(
+                fresh, plan="pro", records_limit=1000,
+                subscription_id="sub_new", status="active",
+                billing_cycle_anchor=datetime.now(UTC), now=datetime.now(UTC),
+            )
+            inner.commit()
+        return None
+
+    _reconcile_quota_periods_impl(subscription_lookup=_lookup_then_resubscribe)
+
+    with SyncSessionLocal() as db:
+        fresh = db.get(User, user_id)
+
+    assert fresh.plan == "pro", "the paying customer keeps their plan"
+    assert fresh.stripe_subscription_id == "sub_new"
+    assert fresh.entitlement_ends_at is None
+
+
+def test_expire_trials_does_not_downgrade_someone_who_paid_mid_lookup():
+    """P1 (Codex): the candidate read commits BEFORE the Stripe calls, so the
+    ORM objects acted on afterwards are stale.
+
+    A checkout landing in that gap activates a paid plan; writing the stale
+    decision would take it straight back off them. The downgrade carries the
+    whole candidate predicate as its WHERE clause, so a row that no longer
+    matches is skipped.
+    """
+    from src.workers.scheduler_helpers.billing import _expire_trials_impl
+
+    cus = f"cus_paid_mid_{uuid.uuid4().hex[:8]}"
+    with SyncSessionLocal() as db:
+        user = _mk_user(
+            db, plan="pro", records_limit=1000,
+            trial_ends_at=datetime.now(UTC) - timedelta(days=1),
+            subscription_status=None, stripe_customer_id=cus,
+        )
+        user_id = user.id
+        db.commit()
+
+    def _lookup_then_convert(_customer_id):
+        """Stripe has no entitled subscription yet — but checkout commits now."""
+        with SyncSessionLocal() as inner:
+            fresh = inner.get(User, user_id)
+            activate_paid_plan(
+                fresh, plan="pro", records_limit=1000,
+                subscription_id="sub_paid", status="active",
+                billing_cycle_anchor=datetime.now(UTC), now=datetime.now(UTC),
+            )
+            inner.commit()
+        return None
+
+    _expire_trials_impl(subscription_lookup=_lookup_then_convert)
+
+    with SyncSessionLocal() as db:
+        fresh = db.get(User, user_id)
+
+    assert fresh.plan == "pro", "a customer who just paid must not be downgraded"
+    assert fresh.records_limit == 1000
+    assert fresh.subscription_status == "active"

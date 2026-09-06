@@ -161,7 +161,8 @@ def _reconcile_quota_periods_impl(subscription_lookup=None) -> dict[str, int]:
         # an unbounded beat pass making unbounded Stripe calls is its own outage.
         candidates = db.execute(
             text(
-                "SELECT id, stripe_subscription_id, stripe_customer_id "
+                "SELECT id, stripe_subscription_id, stripe_customer_id, "
+                "       entitlement_ends_at "
                 "FROM users "
                 "WHERE entitlement_ends_at IS NOT NULL "
                 "  AND entitlement_ends_at <= CAST(:at AS timestamptz) "
@@ -183,6 +184,7 @@ def _reconcile_quota_periods_impl(subscription_lookup=None) -> dict[str, int]:
         lapsed: list[str] = []
         for row in candidates:
             user_id, _sub_id, customer_id = str(row[0]), row[1], row[2]
+            seen_end = row[3]
             if customer_id:
                 # Ask Stripe before taking anything away. A cancellation the
                 # customer REVERSED, whose update webhook was lost, must not be
@@ -200,13 +202,18 @@ def _reconcile_quota_periods_impl(subscription_lookup=None) -> dict[str, int]:
                     # Still paying: the cancellation was reversed. Clear the end
                     # date so their window can advance again, and self-heal the
                     # status we had drifted from.
+                    # CAS on the value the decision was made from. Between the
+                    # read and here we did a network round trip, and the customer
+                    # may have scheduled a NEW cancellation in the meantime —
+                    # clearing that would silently un-cancel them.
                     db.execute(
                         text(
                             "UPDATE users SET entitlement_ends_at = NULL, "
                             "subscription_status = :st "
-                            "WHERE id = CAST(:uid AS uuid)"
+                            "WHERE id = CAST(:uid AS uuid) "
+                            "  AND entitlement_ends_at = CAST(:seen AS timestamptz)"
                         ),
-                        {"uid": user_id, "st": status},
+                        {"uid": user_id, "st": status, "seen": seen_end},
                     )
                     db.commit()
                     _logger.info(
@@ -215,7 +222,13 @@ def _reconcile_quota_periods_impl(subscription_lookup=None) -> dict[str, int]:
                         user_id, status,
                     )
                     continue
-            db.execute(
+            # CAS on the entitlement end this decision was based on. The Stripe
+            # lookup above is a network round trip, and a customer can RESUBSCRIBE
+            # inside it: checkout would clear entitlement_ends_at, and an
+            # unconditional UPDATE here would then strip the plan and the
+            # subscription id off someone who has just paid. The predicate makes
+            # the write a no-op in exactly that case. (Codex)
+            applied = db.execute(
                 text(
                     "UPDATE users SET "
                     "  plan = 'starter', "
@@ -227,11 +240,22 @@ def _reconcile_quota_periods_impl(subscription_lookup=None) -> dict[str, int]:
                     "  entitlement_ends_at = NULL, "
                     "  pending_plan = NULL, "
                     "  pending_records_limit = NULL "
-                    "WHERE id = CAST(:uid AS uuid)"
+                    "WHERE id = CAST(:uid AS uuid) "
+                    "  AND entitlement_ends_at = CAST(:seen AS timestamptz)"
                 ),
-                {"uid": user_id, "starter_limit": settings.PLAN_LIMITS["starter"]},
-            )
+                {
+                    "uid": user_id,
+                    "starter_limit": settings.PLAN_LIMITS["starter"],
+                    "seen": seen_end,
+                },
+            ).rowcount
             db.commit()
+            if not applied:
+                _logger.info(
+                    "reconcile: user %s changed entitlement state during the "
+                    "Stripe lookup — downgrade not applied", user_id,
+                )
+                continue
             lapsed.append(user_id)
         changed_plan.update(lapsed)
 
@@ -375,7 +399,7 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
     for trial -> paid -> cancel -> trial-again: ``trial_ends_at`` is CLEARED on
     conversion, so it cannot answer "did this account ever trial".
     """
-    from sqlalchemy import func, or_, select
+    from sqlalchemy import func, or_, select, text
 
     from src.api.entitlements import apply_reconciliation_sync
     from src.config import settings
@@ -385,14 +409,60 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
     lookup = subscription_lookup or _stripe_entitled_status
     now = datetime.now(UTC)
 
-    def _downgrade(db, user) -> None:
-        user.plan = "starter"
-        user.records_limit = settings.PLAN_LIMITS["starter"]  # post-trial Starter limit
-        if user.trial_consumed_at is None:
-            user.trial_consumed_at = user.trial_ends_at or now
+    def _downgrade(db, user, *, record_canceled: bool = False) -> bool:
+        """Re-check the candidate predicate atomically, then downgrade.
+
+        The candidate list is read (and its transaction closed) BEFORE the Stripe
+        round trips, so by the time a decision is written the row may have moved:
+        the classic case is a `checkout.session.completed` landing in between and
+        activating a paid plan. Writing the stale decision would take the plan
+        away from a customer who has just paid.
+
+        So the write carries the whole candidate predicate as its WHERE clause —
+        trial expired, still on a paid tier, still not entitled — and a row that
+        no longer matches is simply skipped. Config reconciliation runs only if
+        the downgrade actually applied. Returns whether it did. (Codex)
+        """
+        applied = db.execute(
+            text(
+                "UPDATE users SET "
+                "  plan = 'starter', "
+                "  records_limit = :starter_limit, "
+                "  trial_consumed_at = COALESCE(trial_consumed_at, trial_ends_at, "
+                "                               CAST(:now AS timestamptz)), "
+                "  subscription_status = CASE WHEN :record_canceled "
+                "    THEN 'canceled' ELSE subscription_status END "
+                "WHERE id = CAST(:uid AS uuid) "
+                "  AND trial_ends_at IS NOT NULL "
+                "  AND trial_ends_at < CAST(:now AS timestamptz) "
+                "  AND plan <> 'starter' "
+                "  AND (subscription_status IS NULL "
+                "       OR subscription_status NOT IN "
+                "          ('active', 'trialing', 'past_due'))"
+            ),
+            {
+                "uid": str(user.id),
+                "starter_limit": settings.PLAN_LIMITS["starter"],
+                "now": now,
+                "record_canceled": record_canceled,
+            },
+        ).rowcount
+        if not applied:
+            # ROLLBACK, not commit. The ORM objects in this loop were loaded
+            # before the Stripe calls, so any attribute the caller set on a stale
+            # one is still pending — committing here would flush it over the
+            # fresher state that made the guard fail. That is how a customer who
+            # had just paid ended up with subscription_status 'canceled'.
+            db.rollback()
+            _logger.info(
+                "expire_trials: user %s changed state during the Stripe lookup "
+                "— not downgraded", user.id,
+            )
+            return False
         _logger.info("Trial expired for %s — downgraded to starter", user.email)
         apply_reconciliation_sync(db, str(user.id), "starter")
         db.commit()  # per-row, so a later Stripe failure cannot strand this one
+        return True
 
     with SyncSessionLocal() as db:
         # Candidates: expired trial, still on a paid tier, NOT known-entitled.
@@ -423,8 +493,8 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
         downgraded = 0
         for user in candidates:
             if not user.stripe_customer_id:
-                _downgrade(db, user)  # never reached Stripe -> genuine unpaid trial
-                downgraded += 1
+                # Never reached Stripe -> genuine unpaid trial.
+                downgraded += int(_downgrade(db, user))
             else:
                 # ANY customer id, whatever we think the status is: ask Stripe.
                 #
@@ -446,28 +516,41 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
                     )
                     continue
                 if status in _ENTITLED_SUB_STATUSES:
-                    user.subscription_status = status  # legacy payer: protect + self-heal
-                    # Stamp first_paid_at too. Without it this legacy payer keeps
-                    # a NULL first_paid_at, and their next
-                    # customer.subscription.updated would read as a FIRST
-                    # conversion — zeroing the counter and handing an
-                    # already-paying customer a free window. The migration
-                    # cannot reach these rows (it has no Stripe access and their
-                    # local status was NULL), so this is where they get healed.
-                    # (Codex)
-                    if user.first_paid_at is None:
-                        user.first_paid_at = user.created_at or now
-                    if user.trial_consumed_at is None:
-                        user.trial_consumed_at = user.trial_ends_at or now
+                    # Guarded + COALESCE rather than ORM writes: this object was
+                    # loaded before the Stripe call, so a value it shows as NULL
+                    # may since have been set by a checkout. Never overwrite a
+                    # fresher first_paid_at / trial_consumed_at with our own.
+                    db.execute(
+                        text(
+                            "UPDATE users SET "
+                            "  subscription_status = :st, "
+                            "  first_paid_at = COALESCE(first_paid_at, created_at, "
+                            "                           CAST(:now AS timestamptz)), "
+                            "  trial_consumed_at = COALESCE(trial_consumed_at, "
+                            "                               trial_ends_at, "
+                            "                               CAST(:now AS timestamptz)) "
+                            "WHERE id = CAST(:uid AS uuid)"
+                        ),
+                        {"uid": str(user.id), "st": status, "now": now},
+                    )
                     db.commit()
+                    # first_paid_at is stamped above for a reason: without it
+                    # this legacy payer keeps a NULL first_paid_at, and their
+                    # next customer.subscription.updated would read as a FIRST
+                    # conversion — zeroing the counter and handing an
+                    # already-paying customer a free window. The migration cannot
+                    # reach these rows (no Stripe access, local status NULL), so
+                    # this is where they heal. (Codex)
                     _logger.info(
                         "expire_trials: user %s has entitled Stripe status %s — "
                         "protected + backfilled", user.id, status,
                     )
                 else:
-                    user.subscription_status = "canceled"  # record non-entitlement
-                    _downgrade(db, user)
-                    downgraded += 1
+                    # 'canceled' is recorded INSIDE the guarded UPDATE, not on
+                    # this (stale) ORM object — see _downgrade.
+                    downgraded += int(
+                        _downgrade(db, user, record_canceled=True)
+                    )
 
         _logger.info(
             "expire_trials: %d candidates, %d downgraded", len(candidates), downgraded

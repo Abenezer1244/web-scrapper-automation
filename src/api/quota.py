@@ -140,6 +140,20 @@ def quota_block_reason(user, now: datetime | None = None) -> str | None:
             "are paused. Update your payment method to resume — your data and "
             "past exports are untouched."
         )
+    # Paid access that has ALREADY ENDED. The window stops advancing at
+    # entitlement_ends_at, but the counter it leaves behind may still have room,
+    # so without this check a cancelled customer could keep spending their final
+    # window's remainder in the gap between the term ending and either
+    # customer.subscription.deleted arriving or the hourly reconciliation
+    # downgrading them. Both of those CLEAR the field, so this only ever fires
+    # inside that gap — and it is the gap that a lost webhook makes unbounded.
+    # (Codex)
+    ends_at = getattr(user, "entitlement_ends_at", None)
+    if ends_at is not None and as_utc(now or datetime.now(UTC)) >= as_utc(ends_at):
+        return (
+            "Your subscription has ended, so new scrapes are paused. Resubscribe "
+            "to continue — your data and past exports are untouched."
+        )
     if is_over_record_limit(user, now):
         _, end = effective_window(user, now)
         # ISO date, not a locale-formatted one: %-d is not portable off glibc

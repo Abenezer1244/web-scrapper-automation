@@ -1627,10 +1627,25 @@ def run_scrape_job(self, job_id: str) -> None:
         # double-charges records_used. billed_count records the charged amount. The
         # Job CAS + the User increment commit together (a crash between the two
         # execute()s rolls both back — neither is committed until db.commit()).
+        # ONE database-clock reading, reused as the billing instant for BOTH the
+        # job anchor and the user's period decision below.
+        #
+        # Postgres NOW() is transaction_timestamp() — fixed when the transaction
+        # OPENED, which here is the billable-count SELECT above, potentially
+        # minutes earlier. A transaction that opens just before a UTC month
+        # boundary and reaches this point just after it would stamp
+        # billing_applied_at in the new month while NOW() still resolved to the
+        # old one, leaving records_period_start stale. The beat task would then
+        # read that user as stale and zero a charge that had just been applied
+        # inside the new period — the exact failure this whole change exists to
+        # prevent. clock_timestamp() reads the wall clock at statement time, and
+        # binding the single value into both statements makes the job anchor and
+        # the user period agree by construction rather than by luck. (Codex)
+        _billed_at = db.execute(sa_text("SELECT clock_timestamp()")).scalar()
         billed_now = db.execute(
             sa_update(Job)
             .where(Job.id == job_id, Job.billing_applied_at.is_(None))
-            .values(billed_count=billable_count, billing_applied_at=_now())
+            .values(billed_count=billable_count, billing_applied_at=_billed_at)
         ).rowcount
         if billed_now:
             # PERIOD-AWARE increment. The counter is rolled forward in the SAME
@@ -1658,16 +1673,17 @@ def run_scrape_job(self, job_id: str) -> None:
                     "UPDATE users SET "
                     "  records_used = CASE"
                     "    WHEN records_period_start IS NULL"
-                    "      OR records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+                    "      OR records_period_start < date_trunc('month', CAST(:billed_at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
                     "    THEN 0 ELSE records_used END + :billable, "
                     "  records_period_start = CASE"
                     "    WHEN records_period_start IS NULL"
-                    "      OR records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-                    "    THEN date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+                    "      OR records_period_start < date_trunc('month', CAST(:billed_at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+                    "    THEN date_trunc('month', CAST(:billed_at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
                     "    ELSE records_period_start END "
                     "WHERE id = CAST(:uid AS uuid)"
                 ),
-                {"billable": billable_count, "uid": str(user.id)},
+                {"billable": billable_count, "uid": str(user.id),
+                 "billed_at": _billed_at},
             ).rowcount
             if user_billed != 1:
                 # The job was CAS-marked billed but the user counter did NOT move

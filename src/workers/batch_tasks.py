@@ -117,9 +117,9 @@ def dispatch_batch_run(run_id: str) -> None:
             # records_used can change between create-time preflight and now (Codex);
             # re-check. -1 = unlimited. Over limit => a terminal run, no jobs.
             user = db.get(User, batch.user_id)
-            over_limit = bool(
-                user and user.records_limit != -1 and user.records_used >= user.records_limit
-            )
+            from src.api.quota import is_over_record_limit
+
+            over_limit = bool(user and is_over_record_limit(user))
             if over_limit:
                 run.status = "failed"
                 run.failed_children = [{"reason": "monthly record limit reached"}]

@@ -47,6 +47,14 @@ _MONTH_START = "date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
 
 
 def upgrade() -> None:
+    # Take the exclusive lock UP FRONT. Without it a writer could insert a row
+    # with an explicit NULL after the backfill but before SET NOT NULL, and the
+    # ALTER would fail the whole migration. Holding it for the entire
+    # backfill-then-constrain sequence makes the operation atomic against
+    # concurrent inserts. `users` is small and this runs in the deploy's
+    # migration step, so the blocking window is negligible. (Codex)
+    op.execute("LOCK TABLE users IN ACCESS EXCLUSIVE MODE")
+
     # 1. Adopt stragglers — stamp the period, PRESERVE the counters.
     op.execute(f"""
         UPDATE users

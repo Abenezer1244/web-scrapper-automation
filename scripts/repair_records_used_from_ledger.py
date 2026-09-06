@@ -33,6 +33,16 @@ SAFETY
   because the period is what scopes the SUM — without it the "current period"
   is undefined and the recomputed number would be meaningless. Run migration
   086 first.
+* SKIPS users whose ``records_period_start`` is STALE (an earlier month). The
+  SUM is scoped ``>= records_period_start``, so on a stale row it would sweep in
+  the PREVIOUS month's jobs and over-count. Let the rollover advance the period
+  first, then re-run.
+* INCREASES ONLY by default. The defect being repaired under-counts, so an
+  increase restores lost usage. A ledger BELOW the stored counter is a different
+  thing entirely and is usually legitimate: deleting a job removes its
+  ``billed_count`` from the ledger, but deleting data must never refund consumed
+  quota (see ``tests/test_quota_accounting.py``). Decreasing would hand back
+  quota to anyone who deleted a job. ``--allow-decrease`` opts in explicitly.
 * Each write is guarded on the value we measured (optimistic concurrency), so a
   job that bills concurrently mid-run cannot be silently clobbered; the row is
   skipped and reported instead.
@@ -65,7 +75,10 @@ _AUDIT_SQL = """
            COALESCE(SUM(j.billed_count) FILTER (
                WHERE j.billing_applied_at IS NOT NULL
                  AND j.billing_applied_at >= u.records_period_start
-           ), 0)                                       AS ledger
+           ), 0)                                       AS ledger,
+           (u.records_period_start
+              < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
+                                                       AS period_is_stale
     FROM users u
     LEFT JOIN jobs j ON j.user_id = u.id
     {user_filter}
@@ -110,6 +123,10 @@ def main() -> int:
                     help="required with --commit: this rewrites billing counters")
     ap.add_argument("--user-id", default=None,
                     help="restrict to a single user id (default: all users)")
+    ap.add_argument("--allow-decrease", action="store_true",
+                    help="also LOWER counters whose ledger is below the stored "
+                         "value. Off by default: a deleted job drops out of the "
+                         "ledger, and deleting data must not refund quota.")
     args = ap.parse_args()
 
     if args.commit and not args.i_understand:
@@ -122,10 +139,34 @@ def main() -> int:
         _assert_periods_populated(db, args.user_id)
         rows = _audit(db, args.user_id)
 
-        drifted = [r for r in rows if r["ledger"] != r["stored"]]
-        print(f"Users examined: {len(rows)}   with drift: {len(drifted)}")
+        # A stale period would scope the SUM back into the PREVIOUS month and
+        # over-count. Report and exclude; the rollover will advance it.
+        stale = [r for r in rows if r["period_is_stale"]]
+        for r in stale:
+            print(
+                f"  SKIPPING {str(r['user_id'])[:8]}: records_period_start "
+                f"{str(r['period_start'])[:10]} is STALE, so the ledger SUM would "
+                f"include last month. Let the rollover advance it, then re-run."
+            )
+
+        candidates = [r for r in rows if not r["period_is_stale"]]
+        drifted = [r for r in candidates if r["ledger"] != r["stored"]]
+
+        if not args.allow_decrease:
+            decreases = [r for r in drifted if r["ledger"] < r["stored"]]
+            for r in decreases:
+                print(
+                    f"  NOT LOWERING {str(r['user_id'])[:8]}: ledger "
+                    f"{r['ledger']} < stored {r['stored']}. Usually a deleted "
+                    f"job — deleting data must not refund quota. "
+                    f"Use --allow-decrease to override."
+                )
+            drifted = [r for r in drifted if r["ledger"] > r["stored"]]
+
+        print(f"\nUsers examined: {len(rows)}   skipped (stale period): "
+              f"{len(stale)}   to repair: {len(drifted)}")
         if not drifted:
-            print("Nothing to repair — every counter already matches the ledger.")
+            print("Nothing to repair.")
             return 0
 
         under = sum(r["ledger"] - r["stored"] for r in drifted
@@ -155,13 +196,20 @@ def main() -> int:
             # Guard on the value we measured: if a job billed this user between
             # the audit and now, the row no longer matches and we skip it rather
             # than overwrite a fresh, correct increment with a stale total.
+            # Guard on the period TOO, not just the counter. A concurrent job
+            # billing ZERO records rolls records_period_start forward while
+            # leaving records_used untouched — a counter-only guard would still
+            # match and would write a total computed for the OLD period into the
+            # new one. (Codex)
             moved = db.execute(
                 text(
                     "UPDATE users SET records_used = :ledger "
-                    "WHERE id = CAST(:uid AS uuid) AND records_used = :stored"
+                    "WHERE id = CAST(:uid AS uuid) "
+                    "  AND records_used = :stored "
+                    "  AND records_period_start = :period"
                 ),
                 {"ledger": r["ledger"], "uid": str(r["user_id"]),
-                 "stored": r["stored"]},
+                 "stored": r["stored"], "period": r["period_start"]},
             ).rowcount
             if moved == 1:
                 repaired += 1
@@ -169,15 +217,19 @@ def main() -> int:
                 skipped += 1
                 print(
                     f"  SKIPPED {str(r['user_id'])[:8]}: records_used changed "
-                    f"under us (was {r['stored']}). Re-run to pick it up."
+                    f"under us (was {r['stored']} @ {str(r['period_start'])[:10]}). "
+                    f"Re-run to pick it up."
                 )
         db.commit()
         print(f"\nRepaired {repaired} user(s); skipped {skipped}.")
 
         # Prove convergence from a fresh read rather than assuming the writes
         # landed — the same discipline the earlier backfill incidents demanded.
-        remaining = [x for x in _audit(db, args.user_id) if x["ledger"] != x["stored"]]
-        print(f"Post-repair drift: {len(remaining)} user(s)")
+        remaining = [
+            x for x in _audit(db, args.user_id)
+            if not x["period_is_stale"] and x["ledger"] > x["stored"]
+        ]
+        print(f"Post-repair under-count remaining: {len(remaining)} user(s)")
         return 0 if not remaining else 1
 
 

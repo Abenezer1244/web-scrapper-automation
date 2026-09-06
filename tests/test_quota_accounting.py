@@ -420,3 +420,64 @@ def test_unlimited_plan_is_never_capped():
         user = _mk_user(db, used=50_000, limit=-1)
         db.commit()
         assert user.records_limit == -1
+
+
+# ─── Period-aware enforcement gates ───────────────────────────────────────────
+
+def test_effective_used_is_zero_while_the_period_is_stale():
+    """The gates must not charge a user for LAST month's usage.
+
+    The rollover runs daily, not exactly at the boundary, and billing rolls a
+    user's period forward only when they are actually charged — so a healthy
+    user can legitimately sit on last month's period for a while. Reading the
+    raw counter during that window blocked them on usage they no longer owed.
+    """
+    from src.api.quota import effective_records_used, is_over_record_limit
+
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, used=1000, limit=1000,
+                        period=datetime(2020, 1, 1, tzinfo=UTC))
+        db.commit()
+        assert effective_records_used(user) == 0
+        assert is_over_record_limit(user) is False
+
+
+def test_effective_used_counts_a_current_period():
+    from src.api.quota import effective_records_used, is_over_record_limit
+
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, used=1000, limit=1000)
+        db.commit()
+        assert effective_records_used(user) == 1000
+        assert is_over_record_limit(user) is True
+
+
+def test_at_999_of_1000_the_gate_still_allows_a_run():
+    from src.api.quota import is_over_record_limit
+
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, used=999, limit=1000)
+        db.commit()
+        assert is_over_record_limit(user) is False
+
+
+def test_unlimited_plan_never_trips_the_gate():
+    from src.api.quota import is_over_record_limit
+
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, used=50_000, limit=-1)
+        db.commit()
+        assert is_over_record_limit(user) is False
+
+
+def test_a_null_period_is_treated_as_current_not_as_free_quota():
+    """Handing out quota is the destructive direction, so an unexpected NULL
+    must not read as 'fresh period, 0 used'. The rollover ops-alerts on it."""
+    from src.api.quota import effective_records_used
+
+    class _Detached:
+        records_used = 800
+        records_limit = 1000
+        records_period_start = None
+
+    assert effective_records_used(_Detached()) == 800

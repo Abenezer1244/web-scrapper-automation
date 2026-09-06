@@ -116,12 +116,17 @@ def _dispatch_due_jobs(db, now: datetime) -> list[str]:
         ):
             continue
 
-        # Record-limit gate BEFORE creating the job.
+        # Record-limit gate BEFORE creating the job. PERIOD-AWARE: a raw
+        # records_used read would skip a scheduled job on LAST month's
+        # usage during the window before the rollover catches up.
+        from src.api.quota import effective_records_used, is_over_record_limit
+
         user = db.execute(select(User).where(User.id == config.user_id)).scalar_one_or_none()
-        if user and user.records_limit != -1 and user.records_used >= user.records_limit:
+        if user and is_over_record_limit(user):
             _logger.info(
                 "Skipping %s — user %s at record limit (%d/%d)",
-                config.name, user.email, user.records_used, user.records_limit,
+                config.name, user.email, effective_records_used(user),
+                user.records_limit,
             )
             skipped_limit += 1
             continue
@@ -325,10 +330,12 @@ def _dispatch_due_batches(db, now: datetime) -> list[str]:
         ):
             continue
 
+        from src.api.quota import is_over_record_limit
+
         # Quota gate at fire time (same boundary as dispatch_scheduled_jobs);
         # dispatch_batch_run re-checks at materialize time.
         user = db.get(User, batch.user_id)
-        if user and user.records_limit != -1 and user.records_used >= user.records_limit:
+        if user and is_over_record_limit(user):
             _logger.info(
                 "dispatch_scheduled_batches: skipping batch %s — user at record limit",
                 batch.id,

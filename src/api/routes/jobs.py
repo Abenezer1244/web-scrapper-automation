@@ -176,15 +176,17 @@ async def enqueue_scrape_job(
                     ),
                 )
 
-    # Enforce record limit — HTTP 402 when over quota
-    if (
-        current_user.records_limit != -1
-        and current_user.records_used >= current_user.records_limit
-    ):
+    # Enforce record limit — HTTP 402 when over quota.
+    # PERIOD-AWARE: records_used only counts for the period named by
+    # records_period_start. Reading it raw rejected users on last month's usage
+    # during the window between the month boundary and the rollover catching up.
+    from src.api.quota import effective_records_used, is_over_record_limit
+
+    if is_over_record_limit(current_user):
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail=(
-                f"Monthly record limit reached ({current_user.records_used}/{current_user.records_limit}). "
+                f"Monthly record limit reached ({effective_records_used(current_user)}/{current_user.records_limit}). "
                 "Upgrade your plan to continue."
             ),
         )

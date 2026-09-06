@@ -249,6 +249,17 @@ def _fail_job_after_uncaught(job_id: str, reason: str, expected_started_at=None)
                 .returning(Job.user_id)
             ).fetchone()
             db.commit()
+            if row is not None:
+                # The crash may have happened after the plan cap RESERVED quota
+                # but before billing settled it. That reservation is already
+                # charged to the user, so without this it becomes a permanent
+                # charge for records they never received. The CAS above already
+                # required billing_applied_at IS NULL, so this cannot refund a
+                # job that legitimately billed.
+                from src.workers.tasks_helpers.status import (
+                    release_quota_reservation,
+                )
+                release_quota_reservation(db, job_id)
         if row is not None:
             r = _redis()
             _publish_log(r, job_id, "error", reason, db=None)
@@ -1330,24 +1341,92 @@ def run_scrape_job(self, job_id: str) -> None:
                 _cap_error = RuntimeError("post-enrichment refetch failed")
             else:
                 try:
-                    db.refresh(user)  # a concurrent job may have consumed quota
-                    # PERIOD-AWARE read, mirroring the billing increment below.
-                    # records_used is only meaningful for the period named by
-                    # records_period_start: if that period is stale (the daily
-                    # rollover has not caught up yet), the stored number belongs
-                    # to LAST month and counting it here would under-deliver a
-                    # user who is actually at 0 for the current period.
-                    _effective_used = db.execute(
+                    # ── RESERVE the quota, do not merely read it ───────────
+                    # Reading remaining quota here and only charging it later,
+                    # after the export, left the allowance unguarded in between:
+                    # two concurrent jobs (or two children of one batch) both
+                    # read the same remaining N and both delivered N. The atomic
+                    # increment at billing made the totals SUM correctly, which
+                    # faithfully records the over-delivery rather than
+                    # preventing it. A lock cannot span the gap either, because
+                    # this block commits before the export runs.
+                    #
+                    # LOCK ORDER: jobs, then users — the same order billing and
+                    # release_quota_reservation use. Locking users first (the
+                    # obvious way to write this) inverts against them and lets a
+                    # watchdog re-run deadlock with an attempt already in
+                    # billing: one holds users and wants jobs, the other holds
+                    # jobs and wants users. (Codex)
+                    _want = db.execute(
                         sa_text(
-                            "SELECT CASE"
-                            "  WHEN records_period_start IS NULL"
-                            "    OR records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-                            "  THEN 0 ELSE records_used END "
-                            "FROM users WHERE id = CAST(:uid AS uuid)"
+                            "SELECT count(*) FROM results "
+                            "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
+                            f"  AND is_duplicate = false AND {address_actionable_sql('results')}"
                         ),
-                        {"uid": str(user.id)},
+                        {"jid": job_id, "uid": str(job.user_id)},
                     ).scalar() or 0
-                    _remaining = max(0, user.records_limit - _effective_used)
+
+                    _reserved_at = db.execute(
+                        sa_text("SELECT clock_timestamp()")
+                    ).scalar()
+
+                    # 1. CAS-claim on the JOB. Only the attempt that flips
+                    #    reserved_at from NULL reserves, so a watchdog re-run of
+                    #    this same job reuses its grant instead of taking a
+                    #    second one.
+                    _claimed = db.execute(
+                        sa_text(
+                            "UPDATE jobs SET reserved_at = CAST(:at AS timestamptz) "
+                            "WHERE id = :jid AND reserved_at IS NULL"
+                        ),
+                        {"jid": job_id, "at": _reserved_at},
+                    ).rowcount
+
+                    if _claimed:
+                        # 2. Compute the grant and consume it in ONE statement.
+                        #    FOR UPDATE serialises concurrent reservations for
+                        #    this user: the loser blocks, then re-reads the
+                        #    already-decremented remainder (READ COMMITTED
+                        #    re-evaluates a locked row against the newer
+                        #    version) and is granted only what is truly left.
+                        #    The period CASE mirrors billing so a stale period
+                        #    reads as 0 used rather than under-delivering a user
+                        #    who is actually at 0 for this period.
+                        _remaining = int(db.execute(
+                            sa_text(
+                                "WITH cur AS ("
+                                "  SELECT u.id, u.records_limit, CASE"
+                                "      WHEN u.records_period_start IS NULL"
+                                "        OR u.records_period_start < date_trunc('month', CAST(:at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+                                "      THEN 0 ELSE u.records_used END AS base"
+                                "  FROM users u WHERE u.id = CAST(:uid AS uuid) FOR UPDATE"
+                                "), g AS ("
+                                "  SELECT id, base,"
+                                "         LEAST(:want, GREATEST(0, records_limit - base)) AS granted"
+                                "  FROM cur"
+                                ") UPDATE users u SET"
+                                "    records_used = g.base + g.granted,"
+                                "    records_period_start = date_trunc('month', CAST(:at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+                                "  FROM g WHERE u.id = g.id"
+                                "  RETURNING g.granted"
+                            ),
+                            {"want": _want, "uid": str(user.id), "at": _reserved_at},
+                        ).scalar() or 0)
+                        # 3. Record what was granted, so a failure can hand back
+                        #    exactly this much. Same job row, already locked by
+                        #    step 1 — no new lock is taken.
+                        db.execute(
+                            sa_text("UPDATE jobs SET reserved_count = :n WHERE id = :jid"),
+                            {"n": _remaining, "jid": job_id},
+                        )
+                    else:
+                        # Already reserved (watchdog re-run): reuse the grant.
+                        db.refresh(job)
+                        _remaining = int(job.reserved_count or 0)
+                        _logger.info(
+                            "Job %s: quota already reserved (%d) — reusing",
+                            job_id, _remaining,
+                        )
                     # Clear this job's previous marks first: on a watchdog re-run
                     # the ranking must start from the FULL actionable set, or each
                     # pass would renumber the survivors and mark a second batch,
@@ -1668,13 +1747,50 @@ def run_scrape_job(self, job_id: str) -> None:
             # One statement, evaluated atomically under the row lock Postgres
             # already takes for an UPDATE, so a concurrent bill for the same user
             # cannot interleave a read and a write (no lost update).
+            # SETTLE THE DELTA, not the whole amount. The plan cap already
+            # RESERVED this job's grant (migration 087) and charged it to
+            # records_used at that moment, which is what stops two concurrent
+            # jobs being allocated the same remaining quota. So the charge owed
+            # here is only the difference between what was actually delivered
+            # and what was held.
+            #
+            # For a job that delivered exactly its grant the delta is 0. For a
+            # job that never reserved — an unlimited-plan user, whose cap block
+            # is skipped entirely — reserved_count is 0 and the delta is the
+            # full billable_count, so this one expression covers both. In-flight
+            # jobs at deploy time also have reserved_count = 0 and bill exactly
+            # as they did before.
+            # Which period does this job's reservation belong to? A grant made
+            # in an EARLIER period was charged to that period's counter, and
+            # that counter has since rolled — so the charge is gone and the
+            # delta is meaningless. The leads are being delivered NOW, so the
+            # current period must carry them in full. Netting a stale grant off
+            # instead would deliver records nobody is charged for. (Codex)
+            _reserved = int(getattr(job, "reserved_count", 0) or 0)
+            _reservation_is_current = bool(db.execute(
+                sa_text(
+                    "SELECT j.reserved_at IS NOT NULL AND date_trunc('month', j.reserved_at AT TIME ZONE 'UTC')"
+                    "       = date_trunc('month', CAST(:billed_at AS timestamptz) AT TIME ZONE 'UTC') "
+                    "FROM jobs j WHERE j.id = :jid"
+                ),
+                {"jid": job_id, "billed_at": _billed_at},
+            ).scalar())
+            if not _reservation_is_current and _reserved:
+                _logger.warning(
+                    "Job %s: reservation of %d belongs to an earlier billing "
+                    "period — charging the full delivered count to the current "
+                    "one instead of netting a charge that has already rolled",
+                    job_id, _reserved,
+                )
+                _reserved = 0
+            _delta = billable_count - _reserved
             user_billed = db.execute(
                 sa_text(
                     "UPDATE users SET "
-                    "  records_used = CASE"
+                    "  records_used = GREATEST(0, CASE"
                     "    WHEN records_period_start IS NULL"
                     "      OR records_period_start < date_trunc('month', CAST(:billed_at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-                    "    THEN 0 ELSE records_used END + :billable, "
+                    "    THEN 0 ELSE records_used END + :delta), "
                     "  records_period_start = CASE"
                     "    WHEN records_period_start IS NULL"
                     "      OR records_period_start < date_trunc('month', CAST(:billed_at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
@@ -1682,7 +1798,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     "    ELSE records_period_start END "
                     "WHERE id = CAST(:uid AS uuid)"
                 ),
-                {"billable": billable_count, "uid": str(user.id),
+                {"delta": _delta, "uid": str(user.id),
                  "billed_at": _billed_at},
             ).rowcount
             if user_billed != 1:
@@ -1737,6 +1853,13 @@ def run_scrape_job(self, job_id: str) -> None:
             # charged) and suppress the success log, email, and webhook.
             db.rollback()
             db.refresh(job)
+            # The pending billing rolled back with that, but the plan cap's
+            # RESERVATION was committed earlier in its own transaction and is
+            # still charged to the user. A cancelled job delivers nothing, so
+            # hand it back rather than leaving a permanent phantom charge.
+            from src.workers.tasks_helpers.status import release_quota_reservation
+
+            release_quota_reservation(db, job_id)
             _logger.info(
                 "Job %s externally terminalized (%s) — suppressing completion delivery",
                 job_id, job.status,

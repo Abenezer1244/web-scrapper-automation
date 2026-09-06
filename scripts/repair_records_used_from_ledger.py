@@ -58,11 +58,16 @@ USAGE
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
-from sqlalchemy import text
+# Run directly (`railway run python scripts/...`) as the docstring documents,
+# without needing PYTHONPATH set: put the repo root on the path first.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.db.session import system_sync_session
+from sqlalchemy import text  # noqa: E402
+
+from src.db.session import system_sync_session  # noqa: E402
 
 # The stored counter next to what the billing anchor says it should be, for
 # every user, scoped to that user's OWN current period.

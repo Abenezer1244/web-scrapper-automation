@@ -75,6 +75,10 @@ app.conf.beat_schedule = {
         "task": "src.workers.scheduler.watchdog_stuck_jobs",
         "schedule": 300.0,  # every 5 minutes
     },
+    "sweep-stranded-quota-reservations": {
+        "task": "src.workers.scheduler.sweep_quota_reservations",
+        "schedule": 300.0,  # every 5 minutes, alongside the watchdog
+    },
     "canary-check": {
         "task": "src.workers.scheduler.canary_check",
         "schedule": 3600.0,  # every 1 hour
@@ -243,6 +247,22 @@ def dispatch_scheduled_batches() -> None:
 
 
 # ─── Task 2: Watchdog for stuck jobs ─────────────────────────────────────────
+
+@app.task(name="src.workers.scheduler.sweep_quota_reservations")
+def sweep_quota_reservations() -> int:
+    """Return quota held by terminal jobs that never billed.
+
+    The plan cap charges a reservation up front so concurrent jobs cannot be
+    allocated the same allowance. A job that ends without billing is therefore
+    holding records the user never received. The in-task release paths cover
+    normal failures; this catches whatever terminalized a job WITHOUT running
+    them — an external cancel, a batch force-finalize, the watchdog's permanent
+    fail — so a stranded grant can never become a silent permanent charge.
+    """
+    from src.workers.tasks_helpers.status import sweep_stranded_quota_reservations
+
+    return sweep_stranded_quota_reservations()
+
 
 @app.task(name="src.workers.scheduler.watchdog_stuck_jobs")
 def watchdog_stuck_jobs() -> None:

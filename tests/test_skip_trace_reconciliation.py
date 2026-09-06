@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 
 from src.workers.skip_trace_dispatcher import (
     _partition_submittable,
+    _release_is_safe,
     match_remote_queue,
     row_is_submittable,
 )
@@ -274,3 +275,55 @@ class TestSubmittability:
     def test_partition_of_all_invalid_yields_no_batch(self):
         ok, bad = _partition_submittable([_Row(rid="a", state=None)])
         assert ok == [] and len(bad) == 1
+
+
+class TestReleaseNeedsAWiderWindowThanAdoption:
+    """"Is this queue provably ours?" and "is it provable that NO queue is
+    ours?" are different questions (Codex round 2).
+
+    Adoption uses the tight window, because adopting the wrong queue
+    contaminates leads. Releasing is the dangerous direction for MONEY: release
+    a claim whose batch Tracerfy actually accepted and the next tick pays for it
+    twice. So a release additionally requires that no unaccounted-for queue of
+    the same trace_type sits anywhere near the claim -- wide enough to absorb
+    provider clock skew that the tight window would not.
+    """
+
+    def test_quiet_account_is_safe_to_release(self):
+        remote = [_q(id=1, created_at="2026-09-02T04:24:50.000000Z")]  # a day away
+        assert _release_is_safe(remote, CLAIM, "normal", set()) is True
+
+    def test_empty_account_is_safe_to_release(self):
+        assert _release_is_safe([], CLAIM, "normal", set()) is True
+
+    def test_nearby_unrecorded_queue_blocks_the_release(self):
+        # Outside the tight adoption window but well inside the quiet window:
+        # under clock skew this could still be ours, and it is already charged.
+        remote = [_q(id=9, created_at="2026-09-03T15:10:00.000000Z")]
+        assert _release_is_safe(remote, CLAIM, "normal", set()) is False
+
+    def test_nearby_queue_of_another_trace_type_does_not_block(self):
+        remote = [_q(id=9, trace_type="advanced",
+                     created_at="2026-09-03T15:10:00.000000Z")]
+        assert _release_is_safe(remote, CLAIM, "normal", set()) is True
+
+    def test_nearby_but_already_recorded_queue_does_not_block(self):
+        # It is booked to another batch, so it cannot also be ours.
+        remote = [_q(id=9, created_at="2026-09-03T15:10:00.000000Z")]
+        assert _release_is_safe(remote, CLAIM, "normal", {9}) is True
+
+    def test_unplaceable_timestamp_counts_against_releasing(self):
+        remote = [_q(id=9, created_at="garbage")]
+        assert _release_is_safe(remote, CLAIM, "normal", set()) is False
+
+    def test_the_637_row_production_case_still_releases(self):
+        # The real reason this matters: the actual backlog must still clear.
+        # Nearest Tracerfy queues are days away, far outside the quiet window.
+        remote = [
+            _q(id=158749, created_at="2026-09-02T04:24:50.307452Z", rows_uploaded=24),
+            _q(id=162455, created_at="2026-09-06T09:28:10.657913Z", rows_uploaded=2),
+            _q(id=162456, created_at="2026-09-06T09:28:11.189683Z",
+               trace_type="advanced", rows_uploaded=3),
+        ]
+        assert _release_is_safe(remote, CLAIM, "normal", set()) is True
+        assert match_remote_queue(remote, CLAIM, "normal", 374, set())[0] == "none"

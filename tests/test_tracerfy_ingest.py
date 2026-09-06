@@ -19,7 +19,10 @@ import pytest
 from sqlalchemy import text
 
 from src.db.session import system_sync_session
-from src.workers.tracerfy_ingest import ingest_tracerfy_batch
+from src.workers.tracerfy_ingest import (
+    _attribution_is_safe,
+    ingest_tracerfy_batch,
+)
 
 DOWNLOAD_URL = "https://tracerfy.nyc3.cdn.digitaloceanspaces.com/tracerfy/x.csv"
 
@@ -391,3 +394,41 @@ async def test_ambiguous_owner_attribution_is_refused_not_guessed(starter_user, 
         r = _result_row(row["result_id"])
         assert r.skip_trace_status == "errored"
         assert r.phone is None and r.email is None
+
+
+class _P:
+    """Minimal pending-row stand-in for the attribution guard."""
+
+    def __init__(self, first=None, last=None):
+        self.first_name = first
+        self.last_name = last
+
+
+class TestAttributionGuard:
+    """Codex round 2: the first version of this guard let two contamination
+    shapes through. Both are pinned here."""
+
+    def test_single_waiting_row_is_always_safe(self):
+        assert _attribution_is_safe([_P("A", "ALPHA")], 3) is True
+
+    def test_one_answer_one_owner_many_rows_is_safe(self):
+        # The only collision shape production has ever produced.
+        assert _attribution_is_safe([_P("JANE", "DOE"), _P("JANE", "DOE")], 1) is True
+
+    def test_one_answer_but_different_owners_is_refused(self):
+        # ESCAPED THE FIRST GUARD: a single contact would be stamped on both.
+        assert _attribution_is_safe([_P("A", "ALPHA"), _P("B", "BETA")], 1) is False
+
+    def test_several_answers_with_all_null_names_is_refused(self):
+        # ESCAPED THE FIRST GUARD: advanced traces send no name, so every row
+        # looked like "one owner" while several answers fought to overwrite.
+        assert _attribution_is_safe([_P(), _P()], 2) is False
+
+    def test_several_answers_same_owner_is_refused(self):
+        assert _attribution_is_safe([_P("JANE", "DOE"), _P("JANE", "DOE")], 2) is False
+
+    def test_case_and_padding_do_not_cause_a_false_refusal(self):
+        assert _attribution_is_safe([_P("jane", "doe"), _P("  JANE ", "Doe")], 1) is True
+
+    def test_null_and_named_owner_together_is_refused(self):
+        assert _attribution_is_safe([_P(), _P("JANE", "DOE")], 1) is False

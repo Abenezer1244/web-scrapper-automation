@@ -539,6 +539,39 @@ _STALE_CLAIM_AFTER = timedelta(minutes=30)
 _RECONCILE_BEFORE = timedelta(seconds=60)
 _RECONCILE_AFTER = timedelta(seconds=120)
 
+# "Is this queue provably OURS?" and "is it provable that NO queue is ours?" are
+# different questions and deserve different windows (Codex round 2). Adoption
+# uses the tight window above, because adopting the wrong queue contaminates
+# leads. RELEASING is the dangerous direction for money: release a claim whose
+# batch Tracerfy actually accepted and the next tick pays for it twice. So a
+# release additionally requires that no unaccounted-for queue of the same
+# trace_type exists anywhere NEAR the claim — wide enough to absorb provider
+# clock skew and a delayed created_at, which the tight window would not.
+_RELEASE_QUIET_WINDOW = timedelta(minutes=30)
+
+
+def _release_is_safe(
+    candidates: list[dict], claim_time: datetime, trace_type: str, known_queue_ids: set
+) -> bool:
+    """True only when NO unrecorded queue of this trace_type sits near the claim.
+
+    Absence of a tight-window match is not proof the batch was never accepted;
+    absence of any nearby unaccounted queue is much closer to proof.
+    """
+    lo = claim_time - _RELEASE_QUIET_WINDOW
+    hi = claim_time + _RELEASE_QUIET_WINDOW
+    for q in candidates:
+        if q.get("trace_type") != trace_type:
+            continue
+        if q.get("id") in known_queue_ids:
+            continue  # already booked to some other batch
+        created = _parse_tracerfy_ts(q.get("created_at"))
+        if created is None or lo <= created <= hi:
+            # Unparseable timestamps count AGAINST releasing: we cannot place
+            # the queue, so we cannot rule it out.
+            return False
+    return True
+
 
 def _parse_tracerfy_ts(value) -> datetime | None:
     """Parse Tracerfy's ISO-8601 created_at ('2026-09-06T09:28:11.189683Z')."""
@@ -761,6 +794,20 @@ def _reconcile_stale_claims(db) -> dict:
                     len(claimed), trace_type, claim_time,
                 )
             elif verdict == "none":
+                if not _release_is_safe(remote, claim_time, trace_type, known):
+                    # An unaccounted-for queue of this trace_type sits near the
+                    # claim without fitting it precisely. It may still be ours
+                    # under clock skew, and it has been charged — releasing
+                    # would resubmit and pay twice. Hold and let a human look.
+                    summary["ambiguous"] += len(claimed)
+                    _logger.error(
+                        "Reconciliation: no exact match for the %d %s row(s) claimed "
+                        "at %s, but an unrecorded %s queue sits nearby — refusing to "
+                        "release (double-charge risk)",
+                        len(claimed), trace_type, claim_time, trace_type,
+                    )
+                    _alert_ambiguous_reconciliation(len(claimed), trace_type, claim_time)
+                    continue
                 _logger.warning(
                     "Reconciliation: no Tracerfy queue for the %d %s row(s) claimed "
                     "at %s — never accepted, never charged. Releasing to 'queued'.",

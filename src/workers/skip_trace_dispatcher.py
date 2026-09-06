@@ -46,7 +46,7 @@ def dispatch_pending_skip_trace() -> dict:
 
     from sqlalchemy import and_, select, update
 
-    from src.db.models import PendingSkipTraceRow, Result, SkipTraceQueue
+    from src.db.models import PendingSkipTraceRow
     from src.db.session import system_sync_session
     from src.scrapers.enrichment.skip_trace import TracerfyError, submit_batch
 
@@ -60,7 +60,10 @@ def dispatch_pending_skip_trace() -> dict:
     # trace_type, not by user). This is a legitimate cross-tenant
     # system operation.
     with system_sync_session() as db:
-        _alert_stale_claims(db)
+        # Resolve anything stuck mid-submission from a previous tick BEFORE
+        # draining new work: a released claim rejoins the FIFO head below and
+        # goes out in this same tick instead of waiting another five minutes.
+        reconciled = _reconcile_stale_claims(db)
 
         for _ in range(max_batches):
             # Pick a trace_type to drain this pass. Prefer 'normal' first
@@ -88,6 +91,30 @@ def dispatch_pending_skip_trace() -> dict:
                     .all()
                 )
                 if not rows:
+                    continue
+
+                # Tracerfy's batch endpoint REQUIRES address + city + state on
+                # every row, and a row missing one is not rejected loudly — it is
+                # dropped from the upload. Production queue 162456: we sent 4 rows,
+                # Tracerfy reported rows_uploaded=3. The dropped row then never
+                # appears in the result CSV, so the ingest never matches it, so it
+                # sits at 'submitted' forever and its lead reads "Processing" in the
+                # UI indefinitely. Fail it HERE — terminally and visibly — instead of
+                # shipping it to be silently discarded.
+                rows, unsubmittable = _partition_submittable(rows)
+                if unsubmittable:
+                    _fail_unsubmittable(db, unsubmittable)
+                    msg = (
+                        f"{len(unsubmittable)} {trace_type} row(s) dropped before "
+                        "submit: missing address/city/state"
+                    )
+                    errors.append(msg)
+                    _logger.warning("Dispatcher: %s", msg)
+                if not rows:
+                    # Nothing submittable left: commit the failures on their own
+                    # (no claim follows to carry them).
+                    if unsubmittable:
+                        db.commit()
                     continue
 
                 # DURABLE CLAIM before the external POST (Codex High, 2026-09-02).
@@ -188,57 +215,42 @@ def dispatch_pending_skip_trace() -> dict:
                     return _tick_result(submitted_batches, submitted_rows, errors, deferred="unknown_outcome")
 
                 queue_id = response["queue_id"]
-                now = datetime.now(UTC)
-                ids = [c.id for c in claimed]
 
-                # Record the Tracerfy queue for webhook correlation.
-                # We associate with the first row's job_id; webhook
-                # ingest looks up all rows by tracerfy_queue_id anyway.
-                first = claimed[0]
-                queue_record = SkipTraceQueue(
-                    tracerfy_queue_id=queue_id,
-                    job_id=first.job_id,
-                    user_id=first.user_id,
-                    trace_type=trace_type,
-                    status="pending",
-                    # Tracerfy de-duplicates identical addresses, so this can be
-                    # smaller than len(claimed) (prod: 25 sent → 24 uploaded → all
-                    # 25 rows reconciled by the webhook). Informational only.
-                    rows_uploaded=response.get("rows_uploaded", len(claimed)),
-                    credits_deducted=0,  # filled in by webhook receiver
-                    submitted_at=now,
-                )
-                db.add(queue_record)
-
-                # Mark the claimed rows submitted + stamp the tracerfy queue_id
-                # for webhook correlation.
-                db.execute(
-                    update(PendingSkipTraceRow)
-                    .where(
-                        PendingSkipTraceRow.id.in_(ids),
-                        PendingSkipTraceRow.status == "submitting",
+                # PAST THIS LINE TRACERFY HAS ACCEPTED AND CHARGED FOR THE BATCH.
+                # The bookkeeping below used to run unguarded (Codex, 2026-09-06):
+                # any failure in it — a commit deadlock, a dropped connection, a
+                # unique collision on tracerfy_queue_id — escaped the whole task
+                # while the claim was already committed as 'submitting'. That left
+                # a PAID remote queue with no local SkipTraceQueue row, and the
+                # webhook that arrived later hit the ingest's 'unknown_queue'
+                # no-op and discarded the results permanently. Production carries
+                # 14 such orphaned Tracerfy queues (673 rows / 743 credits).
+                #
+                # The queue_id is now the one fact we refuse to lose: persist it,
+                # retry once on a FRESH session (the first may be poisoned by the
+                # failed transaction), and if even that fails, alert with the
+                # queue_id so it can be adopted. _reconcile_stale_claims is the
+                # backstop — it re-derives the association from Tracerfy's own
+                # queue list on a later tick.
+                try:
+                    _persist_submission(db, queue_id, claimed, trace_type, response)
+                except Exception as exc:  # noqa: BLE001 — a paid batch is at stake
+                    _logger.error(
+                        "Bookkeeping FAILED for accepted Tracerfy queue %s (%d rows): "
+                        "%s — retrying on a fresh session",
+                        queue_id, len(claimed), str(exc)[:200],
                     )
-                    .values(
-                        status="submitted",
-                        tracerfy_queue_id=queue_id,
-                        submitted_at=now,
-                    )
-                )
-                # Advance the matching Result rows 'queued' -> 'submitted' so the
-                # status reflects "sent to Tracerfy, awaiting webhook" instead of
-                # sitting at 'queued' (which reads as "not yet sent" — misleading
-                # for ops). The webhook ingest matches by result_id (not status),
-                # so hit/miss reconciliation is unaffected; the UI already renders
-                # 'submitted' the same as 'queued' ("Processing").
-                db.execute(
-                    update(Result)
-                    .where(
-                        Result.id.in_([c.result_id for c in claimed]),
-                        Result.skip_trace_status == "queued",
-                    )
-                    .values(skip_trace_status="submitted")
-                )
-                db.commit()
+                    try:
+                        db.rollback()
+                    except Exception:  # noqa: BLE001 — session may already be dead
+                        pass
+                    if not _persist_submission_retry(queue_id, claimed, trace_type, response):
+                        _alert_orphaned_queue(queue_id, trace_type, len(claimed))
+                        errors.append(f"bookkeeping failed for queue {queue_id}")
+                        return _tick_result(
+                            submitted_batches, submitted_rows, errors,
+                            deferred="bookkeeping_failed",
+                        )
 
                 submitted_batches += 1
                 submitted_rows += len(claimed)
@@ -252,7 +264,9 @@ def dispatch_pending_skip_trace() -> dict:
                 break
 
     result = _tick_result(submitted_batches, submitted_rows, errors)
-    if submitted_batches:
+    if any(reconciled.get(k) for k in ("released", "adopted", "ambiguous")):
+        result["reconciled"] = reconciled
+    if submitted_batches or result.get("reconciled"):
         _logger.info("Dispatcher tick complete: %s", result)
     return result
 
@@ -296,6 +310,191 @@ def classify_submit_failure(message: str) -> str:
     return "provider_error"
 
 
+# ─── Pre-submit validation ────────────────────────────────────────────────────
+
+# Tracerfy's POST /v1/api/trace/ documents address_column, city_column and
+# state_column as required (docs/vendor/tracerfy-api.md). A row missing any of
+# them is dropped from the upload rather than erroring the request, so the only
+# way to notice is to count rows_uploaded against what was sent.
+_REQUIRED_SUBMIT_FIELDS = ("property_address", "city", "state")
+
+
+def row_is_submittable(row) -> bool:
+    """True when a pending row carries every field Tracerfy requires.
+
+    Pure and attribute-based so it can be unit-tested against a stub row without
+    a database. `zip` is deliberately NOT required — Tracerfy documents it as
+    optional and returns it from its own data when omitted.
+    """
+    return all(
+        str(getattr(row, field, None) or "").strip()
+        for field in _REQUIRED_SUBMIT_FIELDS
+    )
+
+
+def _partition_submittable(rows: list) -> tuple[list, list]:
+    """Split rows into (submittable, unsubmittable), preserving FIFO order."""
+    ok: list = []
+    bad: list = []
+    for r in rows:
+        (ok if row_is_submittable(r) else bad).append(r)
+    return ok, bad
+
+
+def _fail_unsubmittable(db, rows: list) -> None:
+    """Terminally fail rows Tracerfy would silently drop.
+
+    Uses the existing 'errored' vocabulary on both the pending row and its
+    Result — the same states _release_claim("errored") produces — so the UI
+    renders "Error" instead of leaving the lead on "Processing" forever. These
+    rows are never charged: they are stopped before the POST.
+
+    Deliberately does NOT commit. The caller selected the FIFO head with
+    `FOR UPDATE SKIP LOCKED` and holds those row locks until the claim is
+    committed; committing here would release the locks on the *valid* rows in
+    the same batch before they are claimed, letting a concurrent tick claim and
+    submit them too (double pay). The caller commits this write together with
+    the claim, or on its own when nothing submittable is left.
+    """
+    if not rows:
+        return
+    from sqlalchemy import update
+
+    from src.db.models import PendingSkipTraceRow, Result
+
+    db.execute(
+        update(PendingSkipTraceRow)
+        .where(PendingSkipTraceRow.id.in_([r.id for r in rows]))
+        .values(status="errored")
+    )
+    db.execute(
+        update(Result)
+        .where(
+            Result.id.in_([r.result_id for r in rows]),
+            Result.skip_trace_status.in_(("queued", "submitted")),
+        )
+        .values(skip_trace_status="errored", skip_trace_attempted_at=datetime.now(UTC))
+    )
+
+
+# ─── Post-accept bookkeeping (a PAID batch depends on this) ───────────────────
+
+
+def _persist_submission(db, queue_id: int, claimed: list, trace_type: str, response: dict) -> None:
+    """Record an accepted Tracerfy batch: queue row + row/Result status flips.
+
+    Idempotent by construction so the retry path (and a future reconciler
+    adoption) can re-run it safely: the SkipTraceQueue insert is ON CONFLICT DO
+    NOTHING on the unique tracerfy_queue_id, and both updates are guarded on the
+    status they expect to move from.
+    """
+    from sqlalchemy import update
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    from src.db.models import PendingSkipTraceRow, Result, SkipTraceQueue
+
+    now = datetime.now(UTC)
+    first = claimed[0]
+    db.execute(
+        pg_insert(SkipTraceQueue)
+        .values(
+            tracerfy_queue_id=queue_id,
+            # NOTE: a batch is grouped by trace_type, not by tenant, so these two
+            # describe the FIRST row only and are not the batch's owner. Ingest
+            # correlates by tracerfy_queue_id and re-derives per-user attribution
+            # from pending_skip_trace_rows, so nothing reads these for tenancy.
+            job_id=first.job_id,
+            user_id=first.user_id,
+            trace_type=trace_type,
+            status="pending",
+            # Tracerfy de-duplicates identical addresses, so this can be smaller
+            # than len(claimed) (prod: 25 sent → 24 uploaded → all 25 rows
+            # reconciled by the webhook). Informational only.
+            rows_uploaded=response.get("rows_uploaded") or len(claimed),
+            credits_deducted=response.get("credits_deducted") or 0,
+            # Normally filled in by the webhook receiver. On the RECONCILER's
+            # adoption path the queue has often already completed, and carrying
+            # its download_url here is what makes the ingest redrive recoverable
+            # if the enqueue is lost (Codex).
+            download_url=response.get("download_url"),
+            submitted_at=now,
+        )
+        .on_conflict_do_nothing(index_elements=["tracerfy_queue_id"])
+    )
+    db.execute(
+        update(PendingSkipTraceRow)
+        .where(
+            PendingSkipTraceRow.id.in_([c.id for c in claimed]),
+            PendingSkipTraceRow.status == "submitting",
+        )
+        .values(status="submitted", tracerfy_queue_id=queue_id, submitted_at=now)
+    )
+    # Advance the matching Result rows 'queued' -> 'submitted' so the status
+    # reflects "sent to Tracerfy, awaiting webhook" instead of sitting at
+    # 'queued' (which reads as "not yet sent" — misleading for ops). The webhook
+    # ingest matches by result_id (not status), so hit/miss reconciliation is
+    # unaffected; the UI already renders 'submitted' the same as 'queued'.
+    db.execute(
+        update(Result)
+        .where(
+            Result.id.in_([c.result_id for c in claimed]),
+            Result.skip_trace_status == "queued",
+        )
+        .values(skip_trace_status="submitted")
+    )
+    db.commit()
+
+
+def _persist_submission_retry(
+    queue_id: int, claimed: list, trace_type: str, response: dict
+) -> bool:
+    """Retry _persist_submission on a brand-new session. True when it stuck.
+
+    Separate session because the caller's is likely poisoned (a failed commit
+    leaves it in PendingRollbackError), and losing the queue_id is the one
+    outcome worth a second connection.
+    """
+    try:
+        from src.db.session import system_sync_session
+
+        with system_sync_session() as db2:
+            _persist_submission(db2, queue_id, claimed, trace_type, response)
+        _logger.info(
+            "Bookkeeping recovered for Tracerfy queue %s on retry (%d rows)",
+            queue_id, len(claimed),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — caller alerts on False
+        _logger.error(
+            "Bookkeeping retry ALSO failed for Tracerfy queue %s: %s",
+            queue_id, str(exc)[:200],
+        )
+        return False
+
+
+def _alert_orphaned_queue(queue_id: int, trace_type: str, n_rows: int) -> None:
+    """Page ops about a PAID Tracerfy queue we could not record locally."""
+    try:
+        from src.workers.ops_alerts import send_ops_alert
+
+        send_ops_alert(
+            "skip_trace", f"orphaned_queue_{queue_id}",
+            "Tracerfy batch accepted but NOT recorded — results will be lost",
+            f"Tracerfy accepted (and charged for) queue_id={queue_id} "
+            f"({trace_type}, {n_rows} rows) but BridgeLeads failed twice to write "
+            f"the matching skip_trace_queues row. The completion webhook for this "
+            f"queue will hit the ingest's 'unknown_queue' no-op and the paid "
+            f"results will be discarded.\n\n"
+            f"To recover: insert a skip_trace_queues row with "
+            f"tracerfy_queue_id={queue_id} and stamp that id on the "
+            f"pending_skip_trace_rows still in status='submitting' for this batch, "
+            f"then replay the webhook (or re-ingest from the queue's download_url). "
+            f"The rows are deliberately never auto-resubmitted — that would pay twice.",
+        )
+    except Exception as exc:  # noqa: BLE001 — alerting is best-effort
+        _logger.warning("orphaned-queue ops alert failed: %s", str(exc)[:120])
+
+
 def _release_claim(db, claimed: list, to_status: str) -> None:
     """Move claimed ('submitting') rows to `to_status`; no-op for an empty list."""
     if not claimed:
@@ -330,6 +529,424 @@ def _release_claim(db, claimed: list, to_status: str) -> None:
 
 
 _STALE_CLAIM_AFTER = timedelta(minutes=30)
+
+# How far a Tracerfy queue's created_at may sit from our claim commit and still
+# be considered the same batch. The claim is committed immediately before the
+# POST and submit_batch's timeout is 30s, so a real acceptance lands within
+# seconds; the rest is clock skew. Deliberately MUCH tighter than the 5-minute
+# beat interval so two consecutive ticks of the same trace_type can never fall
+# into each other's window.
+_RECONCILE_BEFORE = timedelta(seconds=60)
+_RECONCILE_AFTER = timedelta(seconds=120)
+
+# "Is this queue provably OURS?" and "is it provable that NO queue is ours?" are
+# different questions and deserve different windows (Codex round 2). Adoption
+# uses the tight window above, because adopting the wrong queue contaminates
+# leads. RELEASING is the dangerous direction for money: release a claim whose
+# batch Tracerfy actually accepted and the next tick pays for it twice. So a
+# release additionally requires that no unaccounted-for queue of the same
+# trace_type exists anywhere NEAR the claim — wide enough to absorb provider
+# clock skew and a delayed created_at, which the tight window would not.
+_RELEASE_QUIET_WINDOW = timedelta(minutes=30)
+
+
+def _release_is_safe(
+    candidates: list[dict], claim_time: datetime, trace_type: str, known_queue_ids: set
+) -> bool:
+    """True only when NO unrecorded queue of this trace_type sits near the claim.
+
+    Absence of a tight-window match is not proof the batch was never accepted;
+    absence of any nearby unaccounted queue is much closer to proof.
+    """
+    lo = claim_time - _RELEASE_QUIET_WINDOW
+    hi = claim_time + _RELEASE_QUIET_WINDOW
+    for q in candidates:
+        if q.get("trace_type") != trace_type:
+            continue
+        if q.get("id") in known_queue_ids:
+            continue  # already booked to some other batch
+        created = _parse_tracerfy_ts(q.get("created_at"))
+        if created is None or lo <= created <= hi:
+            # Unparseable timestamps count AGAINST releasing: we cannot place
+            # the queue, so we cannot rule it out.
+            return False
+    return True
+
+
+def _parse_tracerfy_ts(value) -> datetime | None:
+    """Parse Tracerfy's ISO-8601 created_at ('2026-09-06T09:28:11.189683Z')."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def match_remote_queue(
+    candidates: list[dict],
+    claim_time: datetime,
+    trace_type: str,
+    n_claimed: int,
+    known_queue_ids: set,
+) -> tuple[str, dict | None]:
+    """Decide what a stale claim's remote counterpart is. Pure, so it is testable.
+
+    Returns (verdict, queue_or_None) where verdict is one of:
+      "one"       - exactly one remote queue provably fits; adopt it.
+      "none"      - Tracerfy holds no queue for this claim, so it was never
+                    accepted and never charged; the claim is safe to release.
+      "pending"   - a queue in our window is still processing and Tracerfy is
+                    withholding its counts; it MAY be ours and it HAS been
+                    charged, so defer and never release.
+      "ambiguous" - more than one queue fits, or a completed and a pending one
+                    both do; refuse and let a human look.
+
+    The predicate is deliberately conservative (Codex review). Misattributing a
+    queue is far worse than leaving rows stuck: adopting the wrong id would
+    attach one batch's results to another batch's pending rows and bill the
+    wrong tenants. Every clause below narrows toward "provably this batch":
+
+      * same trace_type — normal and advanced are submitted ~0.6s apart, so
+        this is what separates the pair;
+      * created_at inside a tight window around the claim commit;
+      * NOT already recorded locally — a queue that owns a skip_trace_queues
+        row belongs to a batch that was booked successfully, never to this one;
+      * queue_type == 'api' when Tracerfy reports it (never a UI upload);
+      * 0 < rows_uploaded <= n_claimed — NEVER equality: Tracerfy de-duplicates
+        identical addresses, so a 25-row batch legitimately uploads 24;
+      * exactly one survivor, else refuse and let a human look.
+    """
+    hits, deferred = candidate_queues(candidates, claim_time, trace_type, n_claimed,
+                                      known_queue_ids)
+    if deferred and hits:
+        # A completed candidate AND a still-pending one both fit. Undecidable
+        # now and not self-resolving in a useful direction — get a human.
+        return "ambiguous", None
+    if deferred:
+        # Tracerfy HIDES rows_uploaded/credits_deducted while an API queue is
+        # still pending (docs/vendor/tracerfy-api.md). A pending queue in our
+        # window therefore cannot be size-matched — and it may well be ours, and
+        # it has already been charged. Reporting "none" here would release the
+        # claim and the next tick would resubmit and pay a second time, which is
+        # precisely what the durable claim exists to prevent. Defer instead: the
+        # claim stays put and the next tick reconciles it once the queue
+        # completes and its counts become visible.
+        return "pending", None
+    if not hits:
+        return "none", None
+    if len(hits) == 1:
+        return "one", hits[0]
+    return "ambiguous", None
+
+
+def candidate_queues(
+    candidates: list[dict],
+    claim_time: datetime,
+    trace_type: str,
+    n_claimed: int,
+    known_queue_ids: set,
+) -> tuple[list[dict], list[dict]]:
+    """Split remote queues into (size-matched hits, undecidable pending ones).
+
+    Exposed separately from match_remote_queue so the reconciler can ask which
+    queues a claim COULD match before deciding — two stale claims whose windows
+    overlap must not both adopt the same queue.
+    """
+    lo = claim_time - _RECONCILE_BEFORE
+    hi = claim_time + _RECONCILE_AFTER
+    hits: list[dict] = []
+    deferred: list[dict] = []
+    for q in candidates:
+        if q.get("trace_type") != trace_type:
+            continue
+        if q.get("id") in known_queue_ids:
+            continue
+        qtype = q.get("queue_type")
+        if qtype is not None and qtype != "api":
+            continue
+        created = _parse_tracerfy_ts(q.get("created_at"))
+        if created is None or not (lo <= created <= hi):
+            continue
+        uploaded = q.get("rows_uploaded")
+        if q.get("pending") is True or not isinstance(uploaded, int):
+            # Still processing, or counts withheld: undecidable, never "absent".
+            deferred.append(q)
+            continue
+        if uploaded <= 0 or uploaded > n_claimed:
+            continue
+        hits.append(q)
+    return hits, deferred
+
+
+def _reconcile_stale_claims(db) -> dict:
+    """Resolve claims stuck mid-submission against Tracerfy's own queue list.
+
+    The dispatcher commits a durable claim BEFORE the POST and refuses to
+    auto-resubmit an unknown outcome, because re-sending a batch Tracerfy already
+    accepted pays for it twice. That safety left the rows parked in 'submitting'
+    forever waiting for a human to reconcile — and the ops alert asking for that
+    human goes nowhere while OPS_ALERT_EMAIL is unset. Production accumulated 637
+    such rows across 15 jobs and 3 users, stuck up to four days, every one of
+    them reading "Processing" in the UI.
+
+    The reconciliation is mechanical, so do it mechanically. Rows claimed in the
+    same tick share a submitted_at, which groups them back into their batch. For
+    each group ask Tracerfy what exists:
+
+      no matching queue  -> it never accepted the batch, we were never charged:
+                            release to 'queued' and let the next tick send it.
+      exactly one match  -> it accepted (and charged): adopt the queue_id so the
+                            batch is recorded, and re-drive ingest if the queue
+                            has already completed — that is what recovers a
+                            result set whose webhook hit 'unknown_queue'.
+      more than one      -> refuse to guess. Alert and leave the rows alone.
+
+    Never resubmits. Returns a small summary for the tick result.
+    """
+    summary = {"released": 0, "adopted": 0, "ambiguous": 0, "deferred": 0, "groups": 0}
+    try:
+        from sqlalchemy import func, select
+
+        from src.db.models import PendingSkipTraceRow, SkipTraceQueue
+        from src.scrapers.enrichment.skip_trace import TracerfyError, fetch_queues
+
+        _redrive_unigested_adoptions(db)
+
+        cutoff = datetime.now(UTC) - _STALE_CLAIM_AFTER
+        groups = db.execute(
+            select(
+                PendingSkipTraceRow.submitted_at,
+                PendingSkipTraceRow.trace_type,
+                func.count().label("n"),
+            )
+            .where(
+                PendingSkipTraceRow.status == "submitting",
+                PendingSkipTraceRow.submitted_at.isnot(None),
+                PendingSkipTraceRow.submitted_at < cutoff,
+            )
+            .group_by(PendingSkipTraceRow.submitted_at, PendingSkipTraceRow.trace_type)
+            .order_by(PendingSkipTraceRow.submitted_at)
+        ).all()
+        if not groups:
+            return summary
+        summary["groups"] = len(groups)
+
+        try:
+            remote = fetch_queues()
+        except TracerfyError as exc:
+            _logger.error(
+                "Stale-claim reconciliation could not reach Tracerfy (%d group(s) "
+                "left claimed): %s", len(groups), str(exc)[:200],
+            )
+            _alert_stale_claims(db)
+            return summary
+
+        known = {
+            r[0] for r in db.execute(select(SkipTraceQueue.tracerfy_queue_id))
+        }
+
+        # A queue that COULD belong to more than one stale claim must not be
+        # adopted by either (Codex). The dispatcher can submit two batches of the
+        # same trace_type seconds apart within one tick (max_batches > 1), so
+        # their windows overlap — and `rows_uploaded <= n_claimed` is a subset
+        # test, not identity. A 500-row claim that never reached Tracerfy would
+        # otherwise happily adopt the 100-row queue belonging to the claim beside
+        # it, attaching those results to the wrong leads and billing the wrong
+        # tenants. Contested queues are refused for every claimant.
+        contested: set = set()
+        seen_once: set = set()
+        for claim_time, trace_type, n, *_ in groups:
+            hits, deferred = candidate_queues(remote, claim_time, trace_type, n, known)
+            for q in hits + deferred:
+                qid = q.get("id")
+                (contested if qid in seen_once else seen_once).add(qid)
+
+        for claim_time, trace_type, n in groups:
+            verdict, queue = match_remote_queue(
+                remote, claim_time, trace_type, n, known
+            )
+            if verdict == "one" and queue.get("id") in contested:
+                _logger.error(
+                    "Reconciliation: Tracerfy queue %s fits MORE THAN ONE stale "
+                    "claim — refusing to adopt it for any of them",
+                    queue.get("id"),
+                )
+                verdict, queue = "ambiguous", None
+            rows = db.execute(
+                select(PendingSkipTraceRow).where(
+                    PendingSkipTraceRow.status == "submitting",
+                    PendingSkipTraceRow.submitted_at == claim_time,
+                    PendingSkipTraceRow.trace_type == trace_type,
+                )
+            ).scalars().all()
+            if not rows:
+                continue
+            claimed = [_Claim(r.id, r.result_id, r.job_id, r.user_id) for r in rows]
+
+            if verdict == "pending":
+                # Accepted (and charged) but still processing, so Tracerfy is
+                # withholding its counts. Leave the claim exactly where it is.
+                summary["deferred"] += len(claimed)
+                _logger.info(
+                    "Reconciliation: a still-pending Tracerfy queue may own the %d "
+                    "%s row(s) claimed at %s — deferring, never releasing",
+                    len(claimed), trace_type, claim_time,
+                )
+            elif verdict == "none":
+                if not _release_is_safe(remote, claim_time, trace_type, known):
+                    # An unaccounted-for queue of this trace_type sits near the
+                    # claim without fitting it precisely. It may still be ours
+                    # under clock skew, and it has been charged — releasing
+                    # would resubmit and pay twice. Hold and let a human look.
+                    summary["ambiguous"] += len(claimed)
+                    _logger.error(
+                        "Reconciliation: no exact match for the %d %s row(s) claimed "
+                        "at %s, but an unrecorded %s queue sits nearby — refusing to "
+                        "release (double-charge risk)",
+                        len(claimed), trace_type, claim_time, trace_type,
+                    )
+                    _alert_ambiguous_reconciliation(len(claimed), trace_type, claim_time)
+                    continue
+                _logger.warning(
+                    "Reconciliation: no Tracerfy queue for the %d %s row(s) claimed "
+                    "at %s — never accepted, never charged. Releasing to 'queued'.",
+                    len(claimed), trace_type, claim_time,
+                )
+                _release_claim(db, claimed, "queued")
+                summary["released"] += len(claimed)
+            elif verdict == "one":
+                queue_id = queue["id"]
+                _logger.warning(
+                    "Reconciliation: adopting Tracerfy queue %s for the %d %s row(s) "
+                    "claimed at %s (uploaded=%s, credits=%s)",
+                    queue_id, len(claimed), trace_type, claim_time,
+                    queue.get("rows_uploaded"), queue.get("credits_deducted"),
+                )
+                # Persist the download_url with the adoption so the redrive below
+                # is RECOVERABLE. Without it a failed .delay() (broker blip, or the
+                # process dying right after this commit) would leave the queue
+                # recorded — and therefore excluded from every future
+                # reconciliation pass — with nothing ever ingesting it (Codex).
+                _persist_submission(db, queue_id, claimed, trace_type, queue)
+                known.add(queue_id)
+                summary["adopted"] += len(claimed)
+                _redrive_completed_queue(queue)
+            else:
+                summary["ambiguous"] += len(claimed)
+                _logger.error(
+                    "Reconciliation AMBIGUOUS for the %d %s row(s) claimed at %s — "
+                    "multiple Tracerfy queues fit. Refusing to guess.",
+                    len(claimed), trace_type, claim_time,
+                )
+                _alert_ambiguous_reconciliation(len(claimed), trace_type, claim_time)
+    except Exception as exc:  # noqa: BLE001 — reconciliation must never break the tick
+        _logger.exception("Stale-claim reconciliation failed: %s", str(exc)[:200])
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+    return summary
+
+
+def _redrive_unigested_adoptions(db) -> None:
+    """Re-enqueue ingest for adopted queues whose redrive never landed.
+
+    Adoption commits the queue row (with its download_url) and THEN enqueues the
+    ingest best-effort. If that enqueue is lost — broker blip, or the process
+    dying immediately after the commit — the queue is now recorded, and being
+    recorded excludes it from every future reconciliation pass, so nothing would
+    ever ingest it (Codex). A queue still 'pending' locally while already
+    carrying a download_url is exactly that state; ingest is idempotent, so a
+    redundant redrive costs nothing.
+    """
+    try:
+        from sqlalchemy import select
+
+        from src.db.models import SkipTraceQueue
+
+        rows = db.execute(
+            select(
+                SkipTraceQueue.tracerfy_queue_id,
+                SkipTraceQueue.download_url,
+                SkipTraceQueue.rows_uploaded,
+                SkipTraceQueue.credits_deducted,
+            ).where(
+                SkipTraceQueue.status == "pending",
+                SkipTraceQueue.download_url.isnot(None),
+            )
+        ).all()
+        for qid, url, uploaded, credits in rows:
+            _logger.warning(
+                "Reconciliation: re-driving ingest for adopted queue %s whose "
+                "first enqueue was lost", qid,
+            )
+            _redrive_completed_queue({
+                "id": qid,
+                "pending": False,
+                "download_url": url,
+                "rows_uploaded": uploaded or 0,
+                "credits_deducted": credits or 0,
+            })
+    except Exception as exc:  # noqa: BLE001 — never break the tick
+        _logger.warning("adoption redrive sweep failed: %s", str(exc)[:120])
+
+
+def _redrive_completed_queue(queue: dict) -> None:
+    """Re-run ingest for an adopted queue that Tracerfy already finished.
+
+    Its completion webhook fired while no local skip_trace_queues row existed,
+    so the ingest took its 'unknown_queue' no-op and the paid results were
+    dropped. Now that the row exists the ingest can run; it is idempotent (it
+    locks the queue row and no-ops once completed/billed), so a redundant
+    re-drive is harmless.
+    """
+    if queue.get("pending") is not False:
+        return  # still processing — its webhook will arrive normally
+    download_url = queue.get("download_url")
+    if not download_url:
+        return
+    try:
+        from src.workers.tracerfy_ingest import ingest_tracerfy_batch
+
+        ingest_tracerfy_batch.delay(
+            queue_id=queue["id"],
+            download_url=download_url,
+            rows_uploaded=queue.get("rows_uploaded", 0),
+            credits_deducted=queue.get("credits_deducted", 0),
+        )
+        _logger.info(
+            "Reconciliation: re-drove ingest for completed Tracerfy queue %s",
+            queue["id"],
+        )
+    except Exception as exc:  # noqa: BLE001 — adoption already persisted
+        _logger.error(
+            "Reconciliation adopted queue %s but could not enqueue ingest: %s "
+            "— the queue row exists, so a webhook replay will still recover it",
+            queue.get("id"), str(exc)[:200],
+        )
+
+
+def _alert_ambiguous_reconciliation(n_rows: int, trace_type: str, claim_time) -> None:
+    """Page ops when more than one Tracerfy queue could be a stale claim's."""
+    try:
+        from src.workers.ops_alerts import send_ops_alert
+
+        send_ops_alert(
+            "skip_trace", f"ambiguous_reconcile_{claim_time}",
+            "Skip-trace reconciliation ambiguous — needs a human",
+            f"{n_rows} pending_skip_trace_rows claimed at {claim_time} "
+            f"({trace_type}) match MORE THAN ONE Tracerfy queue, so the "
+            f"reconciler refused to adopt one — picking wrong would attach this "
+            f"batch's results to another batch's leads and bill the wrong "
+            f"tenants.\n\nResolve by hand: compare the candidate queues' "
+            f"addresses via GET /v1/api/queue/:id against these rows, then "
+            f"either stamp the right tracerfy_queue_id on them (status "
+            f"'submitted') or set them back to 'queued'. They are never "
+            f"auto-resubmitted — that would pay twice.",
+        )
+    except Exception as exc:  # noqa: BLE001 — alerting is best-effort
+        _logger.warning("ambiguous-reconcile ops alert failed: %s", str(exc)[:120])
 
 
 def _alert_stale_claims(db) -> None:

@@ -479,6 +479,57 @@ def submit_batch(
     return data
 
 
+def fetch_queues(api_token: str | None = None, timeout: int = 30) -> list[dict]:
+    """GET /v1/api/queues/ — every batch Tracerfy holds for this account.
+
+    This is the reconciliation source of truth. The dispatcher commits a durable
+    claim BEFORE the POST and never auto-resubmits an unknown outcome (that would
+    pay twice), so when a claim goes stale the only way to learn what actually
+    happened is to ask Tracerfy which queues exist. Each entry carries::
+
+        id, created_at, pending, download_url, rows_uploaded,
+        credits_deducted, queue_type, trace_type, credits_per_lead
+
+    Same security posture as submit_batch: HTTPS required, SSRF-validated with
+    resolve=True before the bearer token is sent, no ambient proxy, no redirects.
+
+    Raises TracerfyError on any non-200 / non-list response.
+    """
+    token = api_token or settings.TRACERFY_API_TOKEN
+    if not token:
+        raise TracerfyError("TRACERFY_API_TOKEN is not configured")
+
+    url = f"{settings.TRACERFY_API_BASE_URL.rstrip('/')}/v1/api/queues/"
+    if not url.lower().startswith("https://"):
+        raise TracerfyError("TRACERFY_API_BASE_URL must use HTTPS")
+    try:
+        validate_scraping_target(url, require_allowlisted=False, resolve=True)
+    except ValueError as ssrf_exc:
+        raise TracerfyError(f"Refusing unsafe Tracerfy endpoint: {ssrf_exc}") from ssrf_exc
+
+    try:
+        _sess = requests.Session()
+        _sess.trust_env = False
+        resp = _sess.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=timeout,
+            allow_redirects=False,
+        )
+    except requests.RequestException as exc:
+        raise TracerfyError(f"Network error fetching queues: {type(exc).__name__}") from None
+
+    if resp.status_code >= 400:
+        raise TracerfyError(f"Tracerfy returned {resp.status_code} for queue list")
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise TracerfyError("Tracerfy queue list returned non-JSON") from exc
+    if not isinstance(data, list):
+        raise TracerfyError(f"Tracerfy queue list is {type(data).__name__}, expected list")
+    return data
+
+
 # ─── Webhook ingest ───────────────────────────────────────────────────────────
 
 def _parse_tracerfy_csv(csv_text: str) -> list[dict]:
@@ -800,6 +851,19 @@ def build_pending_row_payload(result) -> dict | None:
         parsed["city"] = mail_parsed["city"]
         parsed["state"] = mail_parsed["state"]
         parsed["zip"] = mail_parsed["zip"]
+
+    # Tracerfy REQUIRES address + city + state (docs/vendor/tracerfy-api.md) and
+    # drops a row missing any of them from the upload instead of erroring the
+    # request — so a state-less row is paid attention by nobody: it never reaches
+    # the result CSV, the webhook ingest never matches it, and its lead sits on
+    # "Processing" forever (prod queue 162456 sent 4 rows, rows_uploaded=3).
+    # After both fallbacks above have run, if the locality is still unknown then
+    # this row is not traceable — decline it rather than enqueue a row that can
+    # only ever fail. 'not_attempted' (the caller's behaviour for a None return)
+    # is deliberately the right terminal state: it is not an error, and a later
+    # GIS/assessor backfill that fills the situs makes the lead eligible again.
+    if not parsed["city"] or not parsed["state"]:
+        return None
 
     return {
         "job_id": result.job_id,

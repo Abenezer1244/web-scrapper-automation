@@ -166,27 +166,70 @@ class TestStructuredSitusLocality:
             "OLYMPIA", "WA", "98501")
 
     def test_blank_stored_parts_are_ignored(self):
+        """A whitespace-only / empty stored part is not a value.
+
+        Observable now as "it does not rescue the row from being declined":
+        with no locality from any source the row is not traceable at all
+        (Tracerfy requires city+state), so the payload is None. The positive
+        control — a REAL stored part filling the locality and yielding a
+        payload — is test_stored_situs_fills_missing_city above, so the pair
+        still pins the blank-vs-real distinction from both sides.
+        """
         payload = build_pending_row_payload(_result(
             property_address="9226 175TH STREET CT E", mailing_address=None,
             property_city="   ", property_state="", property_zip=None,
         ))
-        assert payload["city"] is None and payload["state"] is None
+        assert payload is None
 
     def test_mailing_fallback_is_atomic_never_blended_with_situs(self):
         """An absentee owner's mailing ZIP must never be pinned onto the
-        property's own city — that invents a locality that exists nowhere."""
+        property's own city — that invents a locality that exists nowhere.
+
+        The situs carries city AND state here so the row is submittable and the
+        anti-blending rule stays observable on the payload itself. (It used to
+        omit the state, which made this assertion ride on a row that Tracerfy
+        would have silently dropped anyway.)
+        """
         payload = build_pending_row_payload(_result(
             property_address="9226 175TH STREET CT E",
             mailing_address="1 OTHER ST, SEATTLE, WA 98101",
-            property_city="PUYALLUP", property_state=None, property_zip=None,
+            property_city="PUYALLUP", property_state="WA", property_zip=None,
         ))
-        # City came from the situs, so the Seattle mailing line contributes
-        # NOTHING to the property locality.
+        # City/state came from the situs, so the Seattle mailing line
+        # contributes NOTHING to the property locality — in particular its ZIP
+        # must not be pinned onto the Puyallup situs.
         assert payload["city"] == "PUYALLUP"
+        assert payload["state"] == "WA"
         assert payload["zip"] is None
         # ...but it is still sent as the owner's mailing address.
         assert payload["mail_city"] == "SEATTLE"
         assert payload["mail_zip"] == "98101"
+
+    def test_row_without_a_resolvable_state_is_declined(self):
+        """Tracerfy requires address+city+state and DROPS a row missing one
+        instead of erroring, so it never reaches the result CSV, the webhook
+        ingest never matches it, and its lead reads "Processing" forever
+        (prod queue 162456: 4 rows sent, rows_uploaded=3). Decline it at
+        enqueue instead of paying to have it discarded.
+
+        'not_attempted' (what the caller does with a None return) is the right
+        state: a later GIS/assessor backfill that fills the situs makes the
+        lead eligible again.
+        """
+        payload = build_pending_row_payload(_result(
+            property_address="325 HARVARD AVE E #401 98102",
+            mailing_address=None,
+            property_city="SEATTLE", property_state=None, property_zip=None,
+        ))
+        assert payload is None
+
+    def test_row_without_a_resolvable_city_is_declined(self):
+        payload = build_pending_row_payload(_result(
+            property_address="325 HARVARD AVE E #401 98102",
+            mailing_address=None,
+            property_city=None, property_state="WA", property_zip="98102",
+        ))
+        assert payload is None
 
     def test_mailing_still_used_when_there_is_no_situs_at_all(self):
         payload = build_pending_row_payload(_result(

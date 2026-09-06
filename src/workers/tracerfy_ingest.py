@@ -109,6 +109,126 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
     return {"outbox_id": outbox_id, "reported": True}
 
 
+def _attribution_is_safe(matches: list, n_csv_rows_for_key: int) -> bool:
+    """Can this address key's result(s) be assigned without guessing?
+
+    Pure and list-based so it is unit-testable without a database.
+
+    Safe when:
+      * only ONE of our rows waits on the key — there is a single target, so
+        nothing can be misassigned; or
+      * exactly ONE answer came back AND every waiting row names the same owner
+        — one property, one owner, several of our rows describing it (the only
+        collision shape production has ever produced).
+
+    Unsafe otherwise, and the two unsafe shapes are exactly the ones an earlier
+    version of this guard let through (Codex round 2):
+      * several answers for one key: whichever row is processed last silently
+        overwrites the others, including when every waiting row has NULL names
+        because they came from ADVANCED traces (which send no name by design);
+      * one answer but several differently-named owners waiting: that single
+        contact would be stamped onto all of them.
+
+    Names are normalised before comparison so case or padding differences cause
+    neither a false refusal nor a false match.
+    """
+    if len(matches) <= 1:
+        return True
+    if n_csv_rows_for_key > 1:
+        return False
+    owners = {
+        (
+            (p.first_name or "").strip().upper(),
+            (p.last_name or "").strip().upper(),
+        )
+        for p in matches
+    }
+    # A single unnamed owner set means every waiting row came from an advanced
+    # trace at one address: one answer legitimately applies to all of them.
+    return len(owners) == 1
+
+
+def mark_queue_permanently_failed(queue_id: int) -> None:
+    """Mark a SkipTraceQueue 'errored' once ingest has exhausted its retries.
+
+    The task docstring has always promised this ("After max_retries attempts the
+    task gives up and the batch is marked errored on the SkipTraceQueue row so
+    ops can see what happened") but nothing implemented it, so a permanently
+    failing batch sat at 'pending' forever (Codex round 2). That was merely
+    untidy until the reconciler's redrive sweep started looking for exactly that
+    state — every tick would re-enqueue the same doomed ingest for good.
+
+    Deliberately does NOT touch the pending rows or their Results: the batch was
+    accepted and charged, and a human may still recover it from the queue's
+    download_url. Only the queue's own status becomes terminal.
+    """
+    try:
+        from sqlalchemy import update
+
+        from src.db.models import SkipTraceQueue
+        from src.db.session import system_sync_session
+
+        with system_sync_session() as db:
+            db.execute(
+                update(SkipTraceQueue)
+                .where(
+                    SkipTraceQueue.tracerfy_queue_id == queue_id,
+                    SkipTraceQueue.status == "pending",
+                )
+                .values(status="errored")
+            )
+            db.commit()
+        _logger.error(
+            "Tracerfy ingest queue %d marked 'errored' after exhausting retries — "
+            "results were paid for but not applied; recover from its download_url",
+            queue_id,
+        )
+        from src.workers.ops_alerts import send_ops_alert
+
+        send_ops_alert(
+            "skip_trace", f"ingest_failed_{queue_id}",
+            "Skip-trace ingest failed permanently — paid results not applied",
+            f"ingest_tracerfy_batch exhausted its retries for Tracerfy queue "
+            f"{queue_id}. The batch was accepted and charged, but its results "
+            f"were never written to any lead. The queue row is now 'errored' so "
+            f"it stops being retried automatically; recover it by hand from the "
+            f"queue's download_url once the underlying failure is understood.",
+        )
+    except Exception as exc:  # noqa: BLE001 — a failure handler must not raise
+        _logger.warning("could not mark queue %s failed: %s", queue_id, str(exc)[:120])
+
+
+def _alert_unreconciled(
+    queue_id: int, n_unmatched: int, n_unmatched_csv: int, n_pending: int
+) -> None:
+    """Page ops when a completed batch left rows we could not match.
+
+    The address key is `(property_address, city, state)` compared verbatim
+    between what we sent and what Tracerfy echoed back. A systematic mismatch
+    (provider-side USPS standardisation, say) would show up here as a whole
+    batch failing at once rather than as leads quietly stuck on "Processing".
+    """
+    try:
+        from src.workers.ops_alerts import send_ops_alert
+
+        send_ops_alert(
+            "skip_trace", f"unreconciled_{queue_id}",
+            "Skip-trace results could not be matched back to leads",
+            f"Tracerfy queue {queue_id} completed, but {n_unmatched} of "
+            f"{n_pending} submitted row(s) never appeared in the result CSV "
+            f"({n_unmatched_csv} CSV row(s) also matched nothing on our side). "
+            f"Those leads are now marked 'errored' instead of sitting on "
+            f"'Processing' forever, and they were NOT billed to the user.\n\n"
+            f"Rows are matched on (property_address, city, state) compared "
+            f"verbatim against Tracerfy's echoed address. If this fires for a "
+            f"whole batch the provider is likely normalising addresses and the "
+            f"match key needs revisiting; if it fires for one or two rows they "
+            f"were probably rejected at upload for a malformed address.",
+        )
+    except Exception as exc:  # noqa: BLE001 — alerting is best-effort
+        _logger.warning("unreconciled-batch ops alert failed: %s", str(exc)[:120])
+
+
 def _host_is_tracerfy(download_url: str) -> bool:
     """REDTEAM B1/T3: confirm a webhook-supplied download_url points at a
     Tracerfy-owned host before we fetch it server-side.
@@ -170,9 +290,10 @@ def ingest_tracerfy_batch(
 ) -> dict:
     """Download a Tracerfy batch CSV and upsert phone/email into Results.
 
-    On failure, Celery auto-retries with exponential backoff. After
-    max_retries attempts the task gives up and the batch is marked
-    errored on the SkipTraceQueue row so ops can see what happened.
+    On failure, Celery auto-retries with exponential backoff. After max_retries
+    attempts the task gives up and the batch is marked errored on the
+    SkipTraceQueue row (see the on_failure hook below) so ops can see what
+    happened and the reconciler's redrive sweep stops re-enqueueing it.
     """
     from sqlalchemy import select, update
 
@@ -303,15 +424,62 @@ def ingest_tracerfy_batch(
             )
             pending_by_key.setdefault(key, []).append(p)
 
-        for csv_row in parsed:
-            csv_key = (
-                (csv_row.get("address") or "").strip().lower(),
-                (csv_row.get("city") or "").strip().lower(),
-                (csv_row.get("state") or "").strip().upper(),
+        # Reconciliation bookkeeping. Both directions of a mismatch used to be
+        # invisible: a CSV row matching nothing was silently `continue`d, and a
+        # pending row that no CSV row ever named simply stayed 'submitted' — so
+        # its lead read "Processing" forever and it was never billed (the usage
+        # rollup counts only status='completed'). Neither left a counter, a log
+        # line or a terminal state. Count both and settle them below.
+        unmatched_csv = 0
+        matched_pending_ids: set = set()
+
+        def _key_of(row: dict) -> tuple[str, str, str]:
+            return (
+                (row.get("address") or "").strip().lower(),
+                (row.get("city") or "").strip().lower(),
+                (row.get("state") or "").strip().upper(),
             )
+
+        # Rows are attributed on (address, city, state) compared against
+        # Tracerfy's echoed address. That is safe while a key names ONE property
+        # — several of our rows can share it (same property, same owner) and all
+        # correctly receive the same contacts. It stops being safe when the same
+        # key carries several DIFFERENT owners and Tracerfy returns a CSV row per
+        # owner: every CSV row then matches every pending row and the last one
+        # silently wins, stamping one person's phone and email onto another
+        # person's lead (Codex).
+        #
+        # Measured before deciding what to do about it: across every row ever
+        # submitted, production has exactly one in-batch key collision, and it is
+        # the benign shape (same owner, same tenant, two results at one address).
+        # Zero collisions carry different names; zero span tenants. So the key is
+        # left alone — narrowing it to include the name would break ADVANCED
+        # traces, which deliberately send no name and get back whichever owner
+        # Tracerfy identifies — and the dangerous shape is refused instead.
+        csv_key_counts: dict[tuple[str, str, str], int] = {}
+        for _row in parsed:
+            _k = _key_of(_row)
+            csv_key_counts[_k] = csv_key_counts.get(_k, 0) + 1
+
+        for csv_row in parsed:
+            csv_key = _key_of(csv_row)
             matches = pending_by_key.get(csv_key, [])
             if not matches:
+                unmatched_csv += 1
                 continue
+            if not _attribution_is_safe(matches, csv_key_counts[csv_key]):
+                # No sound way to say which answer belongs to which lead. Leave
+                # the rows unmatched — they settle terminally and alert below —
+                # rather than guess and stamp one person's contacts on another.
+                unmatched_csv += 1
+                _logger.error(
+                    "Tracerfy ingest queue %d: %d CSV row(s) and %d pending row(s) "
+                    "share one address key with no unambiguous owner — refusing "
+                    "to attribute",
+                    queue_id, csv_key_counts[csv_key], len(matches),
+                )
+                continue
+            matched_pending_ids.update(p.id for p in matches)
 
             phone = csv_row.get("phone")
             email = csv_row.get("email")
@@ -399,6 +567,48 @@ def ingest_tracerfy_batch(
                     .values(status="completed")
                 )
 
+        # Settle rows the result CSV never named. Tracerfy finished this batch,
+        # so these will never be answered: leaving them 'submitted' stranded the
+        # lead on "Processing" indefinitely (confirmed in production on queue
+        # 162456). Give them the existing terminal 'errored' state on BOTH the
+        # pending row and its Result so the UI shows "Error" and ops can see them.
+        #
+        # They stay OUT of the billing rollup below (which counts only
+        # 'completed'), so the user is not charged for a lookup they never
+        # received. That under-bills us against the credits Tracerfy consumed —
+        # a deliberate, now-VISIBLE tradeoff rather than the previous silent one.
+        unmatched_pending = [p for p in pending if p.id not in matched_pending_ids]
+        if unmatched_pending:
+            db.execute(
+                update(PendingSkipTraceRow)
+                .where(PendingSkipTraceRow.id.in_([p.id for p in unmatched_pending]))
+                .values(status="errored")
+            )
+            db.execute(
+                update(Result)
+                .where(
+                    Result.id.in_([p.result_id for p in unmatched_pending]),
+                    Result.skip_trace_status.in_(("queued", "submitted")),
+                )
+                .values(skip_trace_status="errored", skip_trace_attempted_at=now)
+            )
+            _logger.error(
+                "Tracerfy ingest queue %d: %d pending row(s) never appeared in the "
+                "result CSV and %d CSV row(s) matched no pending row — marked "
+                "'errored'. Sent %d, CSV carried %d.",
+                queue_id, len(unmatched_pending), unmatched_csv,
+                len(pending), len(parsed),
+            )
+            _alert_unreconciled(queue_id, len(unmatched_pending), unmatched_csv, len(pending))
+        elif unmatched_csv:
+            # Rows we did not send but Tracerfy returned. Not lead-affecting, but
+            # it means the address key drifted — worth knowing before it grows.
+            _logger.warning(
+                "Tracerfy ingest queue %d: %d CSV row(s) matched no pending row "
+                "(all %d pending rows were still reconciled)",
+                queue_id, unmatched_csv, len(pending),
+            )
+
         # Mark the Tracerfy queue record as completed
         db.execute(
             update(SkipTraceQueue)
@@ -471,4 +681,27 @@ def ingest_tracerfy_batch(
         "queue_id": queue_id,
         "hits": hit_count,
         "misses": miss_count,
+        # Surfaced so a reconciliation gap is visible in the task result and in
+        # Flower, not only in a log line nobody is tailing.
+        "unmatched_rows": len(unmatched_pending),
+        "unmatched_csv_rows": unmatched_csv,
     }
+
+
+def _ingest_on_failure(self, exc, task_id, args, kwargs, einfo):
+    """Celery calls this once retries are exhausted. Make the queue terminal.
+
+    Without it a permanently failing batch stays 'pending' forever and the
+    reconciler's redrive sweep re-enqueues the same doomed ingest on every tick
+    (Codex round 2).
+    """
+    queue_id = kwargs.get("queue_id") if kwargs else None
+    if queue_id is None and args:
+        queue_id = args[0]
+    if queue_id is not None:
+        mark_queue_permanently_failed(queue_id)
+
+
+ingest_tracerfy_batch.on_failure = _ingest_on_failure.__get__(
+    ingest_tracerfy_batch, type(ingest_tracerfy_batch)
+)

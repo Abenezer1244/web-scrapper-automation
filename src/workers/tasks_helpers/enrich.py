@@ -1166,10 +1166,18 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     enqueued_normal = 0
     enqueued_advanced = 0
 
+    skipped_ineligible = 0
     for rec in eligible:
         # Parse the combined address to get canonical city/state for the cache key
         payload = build_pending_row_payload(rec)
         if payload is None:
+            # Declined: no traceable party name, or no resolvable city/state
+            # (Tracerfy requires address+city+state and silently DROPS a row
+            # missing one, which used to strand the lead on "Processing"
+            # forever). Counted and reported below rather than vanishing —
+            # the lead stays 'not_attempted', so a later situs backfill
+            # re-qualifies it.
+            skipped_ineligible += 1
             continue
 
         cache_key = address_cache_key(
@@ -1266,6 +1274,16 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     except Exception:
         db.rollback()
         db.commit()
+
+    if skipped_ineligible:
+        _publish_log(
+            r, job_id, "info",
+            f"Skip trace skipped for {skipped_ineligible} lead(s): no traceable "
+            "owner name, or the property's city/state could not be determined "
+            "(the provider requires both). These leads stay eligible and will be "
+            "traced automatically once their address details are filled in.",
+            db=db,
+        )
 
     _publish_log(
         r, job_id, "info",

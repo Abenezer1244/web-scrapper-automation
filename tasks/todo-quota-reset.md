@@ -140,6 +140,89 @@ derived from visible rows, batches, or any UI aggregation.
       fixed. Full suite 2345 passed / 2 skipped.
 
 ### Note on the repaired account
-`01dc9396` now reads 1,001 / 1,000 and is therefore **over its cap**, so it
-cannot start new scrapes until the Oct 1 rollover. That is the correct number —
-it genuinely consumed 1,001 — not a residual bug.
+`01dc9396` reads over its cap and cannot start new scrapes until the Oct 1
+rollover. That is the correct number, not a residual bug: 1,001 restored by the
+repair plus 6 genuinely consumed by the reservation canary below = 1,007.
+
+### Also shipped
+- [x] **PR #226 `21c506b` MERGED + DEPLOYED** — a NULL billing period must never
+      zero the counter. `src/api/quota.py` PRESERVED `records_used` on NULL while
+      the worker's reserve/settle CASEs used `base = 0` and DISCARDED it, so the
+      two halves disagreed in the revenue-losing direction (a free period's
+      quota). Unreachable — migration 086 made the column NOT NULL, verified in
+      prod — hence P2, not a hotfix. Found by the Codex gate on the merged code.
+
+### Codex gate on the merged system — CLEAN
+Ran against `fb7cf43` after the CLI account was switched (the earlier attempt
+died on an account quota limit). Two of three questions came back with no
+defect: reserve -> crash -> watchdog re-run -> bill is correct at every point,
+and the sweep cannot race a billing job because the billing CAS and the
+done-status CAS commit in the SAME transaction. The third produced the NULL
+finding above, now fixed.
+
+### Reservation PROVEN in production (2026-09-06)
+Raised the test account's `records_limit` 1000 -> 1100 (headroom 99;
+`records_used` untouched), ran two real scrapes through `POST /jobs`, restored
+the limit to 1000.
+
+Job `7440e0ef` ("test 6", King trustee_sale, 6 records):
+
+    09:28:06   reserved_at SET, reserved_count = 6   <- cap RESERVED and charged
+    09:28:08   billed_at   SET, billed_count   = 6   <- settle: delta = 6 - 6 = 0
+    records_used  1001 -> 1007                       <- +6, exactly ONCE
+
+A double-charge would have read +12. A first job returning 0 records also
+stamped `reserved_at` with `reserved_count = 0`, proving the block runs even on
+an empty scrape. Post-run: **0 stranded reservations**, total counter-vs-ledger
+drift **0** across all users, UI **1,007 / 1,000** with `records_remaining: 0`.
+
+### Watch item
+`sweep_quota_reservations` runs on the beat every 5 minutes. If it ever logs
+"Released N stranded quota reservation(s)", jobs are terminalizing through a
+path that skips the in-task release. Not harmful — the sweep is the safety net —
+but worth investigating which path.
+
+### Remaining
+Nothing functional. The one open question is a deliberate product decision, not
+a defect: quota resets on the CALENDAR month while Stripe renews on the signup
+ANNIVERSARY. See "Billing period semantics" below.
+
+## Billing period semantics — DECIDED, documented
+
+Quota resets on the CALENDAR month (UTC); Stripe renews on the signup
+anniversary. Kept deliberately. Full decision record, quantified exposure and
+the known gaps: `docs/product/billing-period-semantics.md`.
+
+Codex reviewed the decision and confirmed the exposure model — up to **2x plan
+quota before the second charge** for a first period that crosses a reset
+(+1,000 records on a Pro payment, +5,000 on Business), amortizing to `1 + 1/N`
+over N months. It also confirmed **cancel-and-resubscribe is NOT an abuse
+vector**: no webhook resets `records_used`, so cycling a subscription inside one
+calendar month mints nothing.
+
+It surfaced four cases we had not considered, now recorded rather than
+inherited. The one that matters most is the only one that harms the USER:
+
+  **trial -> paid does not reset usage** — someone who consumes their trial
+  quota converts to paid and gets nothing until the calendar 1st. They have
+  paid for a month and may receive days of it.
+
+The others (upgrade/downgrade mid-month keeping `records_used`, `past_due` not
+suspending quota) all over-deliver, which is the safer direction to leave
+standing.
+
+NOT switching to anniversary periods now: doing it properly needs an app-level
+quota window populated from Stripe for monthly prices, derived sub-periods for
+ANNUAL prices (which advertise monthly records, so resetting on the Stripe
+renewal would be plainly wrong), app-managed windows for trial/Starter/admin
+users, lazy rollover so a late webhook cannot strand a renewed payer at cap, a
+reconciliation job, and a non-resetting backfill. That touches every paying
+customer and deserves its own cycle.
+
+Shipped instead: `GET /billing/usage` now returns `period_start`,
+`next_reset_at` and `period_basis`, so the boundary is explicit rather than
+inferred from a number that changes overnight. Calendar-month quota is
+defensible only if it is stated.
+
+⏭️ FE: surface the reset date; pricing copy should say quotas reset on the 1st
+of each calendar month (UTC).

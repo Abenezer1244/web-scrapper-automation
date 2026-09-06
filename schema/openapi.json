@@ -5577,7 +5577,7 @@
     },
     "/billing/usage": {
       "get": {
-        "description": "Return current plan, record usage, and limit for the settings page.",
+        "description": "Return current plan, record usage, limit, and the quota WINDOW.\n\n``period_start`` / ``next_reset_at`` are reported because the quota window\nis the CALENDAR month in UTC and is deliberately independent of the Stripe\nbilling anniversary — a subscriber who starts mid-month reaches a calendar\nreset before their second invoice. That is documented product policy (see\ndocs/product/billing-period-semantics.md), but it is only defensible if the\nboundary is visible, so the UI can say \"resets 1 Oct\" instead of leaving a\nuser to infer it from a number that changes overnight.\n\n``records_used`` is period-aware here for the same reason the enforcement\ngates are: the daily rollover is a catch-up task, so between the true month\nboundary and its next run a healthy user can still carry last month's\nperiod, and reporting the raw column would show usage they no longer owe.",
         "operationId": "get_usage_billing_usage_get",
         "responses": {
           "200": {

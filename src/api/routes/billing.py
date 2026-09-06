@@ -10,6 +10,8 @@ from src.api.auth import CurrentUser, require_admin
 from src.api.deps import get_rls_db
 from src.api.middleware import client_ip, rate_limit
 from src.config import settings
+from src.config.constants import TRIAL_PERIOD_DAYS
+from src.config.plans import PLAN_CATALOG
 from src.db import User, get_db
 from src.utils.logger import setup_logger
 
@@ -232,76 +234,12 @@ async def skip_trace_usage(
 
 # ─── Plan catalog ─────────────────────────────────────────────────────────────
 
-_PLANS = [
-    {
-        "id": "starter",
-        "name": "Starter",
-        "price_monthly": 0,
-        "records_limit": 50,
-        "features": ["50 records/month", "1 county", "CSV export", "Manual runs"],
-        "stripe_price_id": None,
-    },
-    {
-        "id": "pro",
-        "name": "Pro",
-        "price_monthly": 199,
-        "price_annual": 1910,  # ~$159/mo, ~20% off
-        "records_limit": 1000,
-        # Bullets describe ENFORCED entitlements only (value-metric build,
-        # docs/pricing-strategy-2026-06.md §4): Pro = 3 counties + the 4 core
-        # distress lists (incl. Auction Leads). Premium lists + overlap are a
-        # Business feature.
-        "features": [
-            "1,000 records/month",
-            "3 counties (your choice)",
-            "Probate, pre-foreclosure, tax-delinquent & auction lists",
-            "Skip tracing (250 included, then $0.08/lookup)",
-            "CSV + Excel export",
-            "Daily/weekly schedule",
-            "Email delivery",
-            "Batch scraping",
-        ],
-        "stripe_price_id": settings.STRIPE_PRICE_PRO,
-        "stripe_price_id_annual": settings.STRIPE_PRICE_PRO_ANNUAL,
-        "popular": True,
-    },
-    {
-        "id": "business",
-        "name": "Business",
-        "price_monthly": 499,
-        "price_annual": 4790,  # ~$399/mo, ~20% off
-        "records_limit": 5000,
-        "features": [
-            "5,000 records/month",
-            "10 counties (your choice)",
-            "All record types + overlap/intersection",
-            "All export formats",
-            "All schedules",
-            "Email + Webhook + dialer delivery",
-            "Skip tracing (1,000 included)",
-            "API access",
-        ],
-        "stripe_price_id": settings.STRIPE_PRICE_BUSINESS,
-        "stripe_price_id_annual": settings.STRIPE_PRICE_BUSINESS_ANNUAL,
-    },
-    {
-        "id": "agency",
-        "name": "Agency",
-        "price_monthly": 1499,
-        "price_annual": 14390,  # ~$1,199/mo, ~20% off
-        "records_limit": -1,
-        "features": [
-            "Unlimited counties + records",
-            "All record types + overlap/intersection",
-            "Skip tracing (2,000 included)",
-            "White-label (coming soon)",
-            "Priority queue + support",
-            "Dedicated account manager",
-        ],
-        "stripe_price_id": settings.STRIPE_PRICE_AGENCY,
-        "stripe_price_id_annual": settings.STRIPE_PRICE_AGENCY_ANNUAL,
-    },
-]
+# The catalog itself now lives in src/config/plans.py so the Celery workers
+# that quote a price or a record allowance in a transactional email read the
+# SAME numbers these endpoints serve. (The trial-expiry email had drifted to a
+# hardcoded "$79/mo" while Pro was $199.) This alias keeps the module-local
+# name, and plans.py holds this catalog verbatim.
+_PLANS = PLAN_CATALOG
 
 # price_id → (plan_name, records_limit). Includes BOTH the monthly and annual
 # Stripe Price IDs so the webhook maps an annual subscription to the right plan,
@@ -434,10 +372,17 @@ async def pricing_page() -> dict:
             "White-label": {"starter": False, "pro": False, "business": False, "agency": "Coming soon"},
             "Support": {"starter": "Community", "pro": "Email", "business": "Priority email", "agency": "Dedicated manager"},
         },
+        # Read from the same constants registration stamps and the welcome email
+        # quotes, so the three cannot drift apart the way the trial email's
+        # "$79/mo" drifted from the catalog's $199. The served values are
+        # unchanged (TRIAL_PERIOD_DAYS is 7, Pro is 1,000 records).
         "trial": {
-            "days": 7,
+            "days": TRIAL_PERIOD_DAYS,
             "plan": "pro",
-            "description": "7-day free Pro trial. No credit card required. 1,000 records/month.",
+            "description": (
+                f"{TRIAL_PERIOD_DAYS}-day free Pro trial. No credit card "
+                f"required. {settings.PLAN_LIMITS['pro']:,} records/month."
+            ),
         },
         "faq": [
             {"q": "What are motivated seller leads?", "a": "Public records (probate, foreclosure, tax delinquent, etc.) that indicate a property owner may be willing to sell below market value."},

@@ -1,12 +1,19 @@
 """Email delivery: send job results via Resend after successful export."""
 
-import html
-
 import requests
 import resend
 from celery.exceptions import SoftTimeLimitExceeded
 
 from src.config import settings
+from src.utils.email_layout import (
+    build_payload,
+    callout,
+    header_text,
+    paragraph,
+    render_email,
+    stat,
+    text_footer,
+)
 from src.utils.logger import setup_logger
 from src.workers import app
 
@@ -41,6 +48,14 @@ def _is_retryable_email_error(exc: Exception) -> bool:
     """
     if isinstance(exc, (requests.RequestException, SoftTimeLimitExceeded)):
         return True
+    # Celery's soft time limit firing mid-send is the DEFINITION of transient:
+    # soft_time_limit exists on this task only because the Resend SDK issues its
+    # POST with no timeout, so a hung request is exactly what it catches. Without
+    # this branch that exception fell through to the permanent default below and
+    # a hung send was logged "GAVE UP" with no retry, silently dropping a
+    # purchased delivery email (found by Codex).
+    if isinstance(exc, SoftTimeLimitExceeded):
+        return True
     if type(exc).__name__ in _PERMANENT_RESEND_ERRORS:
         return False
     code = getattr(exc, "code", None)
@@ -70,85 +85,54 @@ def _build_lead_delivery_email(
     Pure (no I/O) so it's unit-testable and the retryable send task can rebuild
     the identical message on every attempt.
     """
-    safe_name = html.escape(scraper_name)
-    subject = f"Your {scraper_name} leads are ready — {record_count:,} records"
+    # scraper_name is user input (ScraperConfig.name) and lands in a HEADER here,
+    # not in HTML, so it needs control-character stripping rather than escaping.
+    safe_subject_name = header_text(scraper_name, limit=80)
+    subject = f"Your {safe_subject_name} results are ready: {record_count:,} records"
 
-    # DNC/TCPA disclaimer is shown HERE (and the download UI), not inside the CSV
-    # — a disclaimer row corrupts a dialer/spreadsheet import. Single source in
-    # constants so every surface shows identical copy.
+    # DNC/TCPA disclaimer is shown HERE (and the download UI), not inside the CSV,
+    # because a disclaimer row corrupts a dialer/spreadsheet import. Single source
+    # in constants so every surface shows identical copy.
     from src.config.constants import DNC_DISCLAIMER
-    safe_disclaimer = html.escape(DNC_DISCLAIMER)
 
+    fmt_label = fmt.upper()
+    footer_note = (
+        f"You are receiving this because you set up automated delivery for "
+        f"{scraper_name}. Manage delivery settings in your BridgeLeads account."
+    )
     # Batch deliveries link to the in-app batch page (no expiry); per-job links
-    # are 48h presigns. Wrong copy on a batch email erodes trust (Codex P2).
-    # Fragments carry their own full line including indent + trailing newline,
-    # or empty string — so when empty, no stray whitespace line in the template.
-    expiry_html = (
-        "    <p class=\"expiry\">This download link expires in 48 hours.</p>\n"
-        if link_expires else ""
-    )
-    expiry_text = "This link expires in 48 hours.\n\n" if link_expires else ""
-    summary_html = (
-        f"    <p class=\"meta\" style=\"margin-top:-16px; margin-bottom:24px;\">"
-        f"{html.escape(summary_message)}</p>\n"
-        if summary_message else ""
-    )
+    # are 48h presigns. Wrong copy on a batch email erodes trust (Codex P2), so
+    # the expiry note is omitted entirely rather than shown unconditionally.
+    expiry_note = "This download link expires in 48 hours." if link_expires else None
+    expiry_text = f"{expiry_note}\n\n" if expiry_note else ""
     summary_text = f"{summary_message}\n\n" if summary_message else ""
 
-    html_body = f"""
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0b; color: #f0efe8; margin: 0; padding: 40px 20px; }}
-    .card {{ background: #111113; border: 1px solid #2a2a32; border-radius: 12px; max-width: 520px; margin: 0 auto; padding: 36px; }}
-    .logo {{ font-size: 18px; font-weight: 600; color: #f5a623; margin-bottom: 28px; }}
-    h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 8px; }}
-    .meta {{ color: #9998a0; font-size: 13px; margin-bottom: 28px; }}
-    .stat {{ background: #1a1208; border: 1px solid #7a4f08; border-radius: 8px; padding: 16px 20px; margin-bottom: 24px; }}
-    .stat-number {{ font-size: 36px; font-weight: 700; color: #f5a623; line-height: 1; }}
-    .stat-label {{ font-size: 12px; color: #9998a0; text-transform: uppercase; letter-spacing: 0.04em; margin-top: 4px; }}
-    .btn {{ display: inline-block; background: #f5a623; color: #0a0a0b; font-weight: 600; font-size: 15px; padding: 14px 28px; border-radius: 8px; text-decoration: none; margin-bottom: 24px; }}
-    .footer {{ font-size: 12px; color: #55545e; border-top: 1px solid #2a2a32; padding-top: 20px; margin-top: 8px; }}
-    .expiry {{ font-size: 12px; color: #55545e; margin-top: 12px; }}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="logo">BridgeLeads</div>
-    <h1>Your leads are ready</h1>
-    <p class="meta">{safe_name}</p>
+    blocks = [paragraph(scraper_name, muted=True)]
+    if summary_message:
+        blocks.append(paragraph(summary_message))
+    blocks += [
+        stat(f"{record_count:,}", "Records found"),
+        callout(DNC_DISCLAIMER, tone="warning"),
+    ]
 
-    <div class="stat">
-      <div class="stat-number">{record_count:,}</div>
-      <div class="stat-label">Records found</div>
-    </div>
-
-{summary_html}    <a href="{html.escape(download_url)}" class="btn">Download {fmt.upper()}</a>
-
-{expiry_html}
-    <div class="notice" style="font-size:12px; color:#d9b13a; background:#1a1208; border:1px solid #7a4f08; border-radius:8px; padding:12px 16px; margin-bottom:20px; line-height:1.5;">
-      {safe_disclaimer}
-    </div>
-
-    <div class="footer">
-      You're receiving this because you set up automated delivery for {safe_name}.<br>
-      Manage your delivery settings at app.bridgeleads.io
-    </div>
-  </div>
-</body>
-</html>
-"""
+    html_body = render_email(
+        title=subject,
+        preheader=f"{record_count:,} records ready to download.",
+        heading="Your results are ready",
+        blocks=blocks,
+        cta=(f"Download {fmt_label}", download_url),
+        cta_note=expiry_note,
+        footer_note=footer_note,
+    )
 
     text_body = (
-        f"Your {scraper_name} leads are ready.\n\n"
+        f"Your {scraper_name} results are ready.\n\n"
         f"{record_count:,} records found.\n\n"
         f"{summary_text}"
-        f"Download ({fmt.upper()}): {download_url}\n\n"
+        f"Download ({fmt_label}): {download_url}\n\n"
         f"{expiry_text}"
         f"{DNC_DISCLAIMER}\n\n"
-        "Manage delivery settings at app.bridgeleads.io"
+        f"{text_footer(footer_note=footer_note)}"
     )
 
     return subject, html_body, text_body
@@ -209,13 +193,12 @@ def deliver_job_email(
     )
 
     try:
-        resend.Emails.send({
-            "from": settings.EMAIL_FROM,
-            "to": recipient_emails,
-            "subject": subject,
-            "html": html_body,
-            "text": text_body,
-        })
+        resend.Emails.send(build_payload(
+            to=recipient_emails,
+            subject=subject,
+            html_body=html_body,
+            text_body=text_body,
+        ))
     except Exception as exc:
         attempt = self.request.retries + 1
         summary = _email_error_summary(exc)
@@ -261,57 +244,37 @@ def _send_payment_failed_email(email: str, attempt_count: int) -> None:
 
     ordinal = {1: "first", 2: "second", 3: "third"}.get(attempt_count, f"{attempt_count}th")
     subject = "Action required: your BridgeLeads payment failed"
+    url = f"{settings.FRONTEND_URL}/settings?tab=billing"
+    alert = (
+        f"This is the {ordinal} failed payment attempt. Update your payment "
+        f"method to keep your subscription active."
+    )
 
-    html_body = f"""
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0b; color: #f0efe8; margin: 0; padding: 40px 20px; }}
-    .card {{ background: #111113; border: 1px solid #2a2a32; border-radius: 12px; max-width: 520px; margin: 0 auto; padding: 36px; }}
-    .logo {{ font-size: 18px; font-weight: 600; color: #f5a623; margin-bottom: 28px; }}
-    h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 8px; }}
-    .alert {{ background: #1a0808; border: 1px solid #7a0808; border-radius: 8px; padding: 16px 20px; margin-bottom: 24px; color: #f87171; font-size: 14px; }}
-    .btn {{ display: inline-block; background: #f5a623; color: #0a0a0b; font-weight: 600; font-size: 15px; padding: 14px 28px; border-radius: 8px; text-decoration: none; margin-bottom: 24px; }}
-    .footer {{ font-size: 12px; color: #55545e; border-top: 1px solid #2a2a32; padding-top: 20px; margin-top: 8px; }}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="logo">BridgeLeads</div>
-    <h1>Payment failed</h1>
-
-    <div class="alert">
-      This is the {ordinal} failed payment attempt. Please update your payment method to keep your subscription active.
-    </div>
-
-    <a href="{settings.FRONTEND_URL}/settings?tab=billing" class="btn">Update Payment Method</a>
-
-    <div class="footer">
-      If you believe this is an error, contact us at support@bridgeleads.io<br>
-      Manage your subscription at app.bridgeleads.io
-    </div>
-  </div>
-</body>
-</html>
-"""
+    html_body = render_email(
+        title=subject,
+        preheader="Update your payment method to keep your subscription active.",
+        heading="Payment failed",
+        blocks=[
+            callout(alert, tone="warning"),
+            paragraph(
+                "We were not able to charge your card. Once the payment method "
+                "is updated we will retry automatically."
+            ),
+        ],
+        cta=("Update Payment Method", url),
+    )
 
     text_body = (
         f"Your BridgeLeads payment failed (attempt {attempt_count}).\n\n"
-        "Please update your payment method to keep your subscription active.\n\n"
-        f"Update payment: {settings.FRONTEND_URL}/settings?tab=billing\n\n"
-        "If you believe this is an error, contact support@bridgeleads.io"
+        f"{alert}\n\n"
+        f"Update your payment method: {url}\n\n"
+        f"{text_footer()}"
     )
 
     try:
-        resend.Emails.send({
-            "from": settings.EMAIL_FROM,
-            "to": [email],
-            "subject": subject,
-            "html": html_body,
-            "text": text_body,
-        })
+        resend.Emails.send(build_payload(
+            to=[email], subject=subject, html_body=html_body, text_body=text_body,
+        ))
         _logger.info("Payment failed email sent to %s (attempt %d)", email, attempt_count)
     except Exception as exc:
         _logger.error("Failed to send payment failed email to %s: %s", email, exc)
@@ -325,61 +288,44 @@ def send_lockout_notification(email: str, failure_count: int, ip: str) -> None:
     if not settings.RESEND_API_KEY:
         return
 
-    safe_ip = html.escape(ip)  # email is the recipient, never rendered in the body
+    # email is the recipient, never rendered in the body. ip IS rendered, and the
+    # layout's callout() escapes it (belt) as it is attacker-influenced.
     subject = "Security alert: suspicious login activity on your BridgeLeads account"
+    alert = (
+        f"We detected {failure_count} failed login attempts on your account "
+        f"from IP {ip}. Your account has been temporarily locked for your "
+        f"protection."
+    )
 
-    html_body = f"""
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0b; color: #f0efe8; margin: 0; padding: 40px 20px; }}
-    .card {{ background: #111113; border: 1px solid #2a2a32; border-radius: 12px; max-width: 520px; margin: 0 auto; padding: 36px; }}
-    .logo {{ font-size: 18px; font-weight: 600; color: #f5a623; margin-bottom: 28px; }}
-    h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 8px; }}
-    .alert {{ background: #1a0808; border: 1px solid #7a0808; border-radius: 8px; padding: 16px 20px; margin-bottom: 24px; color: #f87171; font-size: 14px; }}
-    .footer {{ font-size: 12px; color: #55545e; border-top: 1px solid #2a2a32; padding-top: 20px; margin-top: 8px; }}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="logo">BridgeLeads</div>
-    <h1>Suspicious login activity</h1>
-
-    <div class="alert">
-      We detected {failure_count} failed login attempts on your account from IP {safe_ip}.
-      Your account has been temporarily locked for your protection.
-    </div>
-
-    <p>If this was you, wait a few minutes and try again. If you didn't attempt to log in,
-    we recommend changing your password immediately.</p>
-
-    <div class="footer">
-      This is an automated security notification from BridgeLeads.<br>
-      Contact support@bridgeleads.io if you need help.
-    </div>
-  </div>
-</body>
-</html>
-"""
+    html_body = render_email(
+        title=subject,
+        preheader="Your account was temporarily locked after repeated failed logins.",
+        heading="Suspicious login activity",
+        blocks=[
+            callout(alert, tone="warning"),
+            paragraph(
+                "If this was you, wait a few minutes and try again. If you did "
+                "not attempt to log in, change your password as soon as you can."
+            ),
+        ],
+        footer_note="This is an automated security notification from BridgeLeads.",
+    )
 
     text_body = (
         f"Security alert: {failure_count} failed login attempts detected on your "
         f"BridgeLeads account from IP {ip}.\n\n"
         "Your account has been temporarily locked.\n\n"
-        "If this wasn't you, change your password immediately.\n"
-        "Contact support@bridgeleads.io if you need help."
+        "If this was you, wait a few minutes and try again. If you did not "
+        "attempt to log in, change your password as soon as you can.\n\n"
+        + text_footer(
+            footer_note="This is an automated security notification from BridgeLeads."
+        )
     )
 
     try:
-        resend.Emails.send({
-            "from": settings.EMAIL_FROM,
-            "to": [email],
-            "subject": subject,
-            "html": html_body,
-            "text": text_body,
-        })
+        resend.Emails.send(build_payload(
+            to=[email], subject=subject, html_body=html_body, text_body=text_body,
+        ))
         _logger.info("Lockout notification sent to %s (%d failures from %s)", email, failure_count, ip)
     except Exception as exc:
         _logger.error("Failed to send lockout notification to %s: %s", email, exc)
@@ -398,67 +344,44 @@ def send_password_reset_email(email: str, reset_link: str) -> None:
         _logger.warning("RESEND_API_KEY not configured — skipping password reset email to %s", email)
         return
 
-    # reset_link is a server-built FRONTEND_URL + signed token — escape
-    # it anyway so it is never an HTML-injection vector in the markup.
-    safe_link = html.escape(reset_link)
+    # reset_link is a server-built FRONTEND_URL + signed token. render_email
+    # escapes the href anyway so it can never be an HTML-injection vector.
     subject = "Reset your BridgeLeads password"
+    footer_note = (
+        "If you did not request this, you can safely ignore this email. Your "
+        "password will not change."
+    )
 
-    html_body = f"""
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0b; color: #f0efe8; margin: 0; padding: 40px 20px; }}
-    .card {{ background: #111113; border: 1px solid #2a2a32; border-radius: 12px; max-width: 520px; margin: 0 auto; padding: 36px; }}
-    .logo {{ font-size: 18px; font-weight: 600; color: #f5a623; margin-bottom: 28px; }}
-    h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 8px; }}
-    p {{ font-size: 14px; line-height: 1.5; color: #c9c8d0; }}
-    .btn {{ display: inline-block; background: #f5a623; color: #0a0a0b; font-weight: 600; font-size: 15px; padding: 14px 28px; border-radius: 8px; text-decoration: none; margin: 16px 0 24px; }}
-    .expiry {{ font-size: 12px; color: #55545e; margin-top: 12px; }}
-    .footer {{ font-size: 12px; color: #55545e; border-top: 1px solid #2a2a32; padding-top: 20px; margin-top: 8px; }}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="logo">BridgeLeads</div>
-    <h1>Reset your password</h1>
-
-    <p>We received a request to reset the password for your BridgeLeads account.
-    Click the button below to choose a new one.</p>
-
-    <a href="{safe_link}" class="btn">Reset Password</a>
-
-    <p class="expiry">This link expires in 30 minutes and can be used once.
-    For your security, resetting your password signs you out of all devices.</p>
-
-    <div class="footer">
-      If you didn't request this, you can safely ignore this email — your
-      password won't change.<br>
-      Contact support@bridgeleads.io if you need help.
-    </div>
-  </div>
-</body>
-</html>
-"""
+    html_body = render_email(
+        title=subject,
+        preheader="Choose a new password. This link expires in 30 minutes.",
+        heading="Reset your password",
+        blocks=[
+            paragraph(
+                "We received a request to reset the password for your "
+                "BridgeLeads account. Use the button below to choose a new one."
+            ),
+        ],
+        cta=("Reset Password", reset_link),
+        cta_note=(
+            "This link expires in 30 minutes and can be used once. For your "
+            "security, resetting your password signs you out of all devices."
+        ),
+        footer_note=footer_note,
+    )
 
     text_body = (
         "We received a request to reset your BridgeLeads password.\n\n"
         f"Reset your password: {reset_link}\n\n"
         "This link expires in 30 minutes and can be used once.\n"
         "For your security, resetting your password signs you out of all devices.\n\n"
-        "If you didn't request this, you can safely ignore this email.\n"
-        "Contact support@bridgeleads.io if you need help."
+        + text_footer(footer_note=footer_note)
     )
 
     try:
-        resend.Emails.send({
-            "from": settings.EMAIL_FROM,
-            "to": [email],
-            "subject": subject,
-            "html": html_body,
-            "text": text_body,
-        })
+        resend.Emails.send(build_payload(
+            to=[email], subject=subject, html_body=html_body, text_body=text_body,
+        ))
         _logger.info("Password reset email sent to %s", email)
     except Exception as exc:
         _logger.error("Failed to send password reset email to %s: %s", email, exc)

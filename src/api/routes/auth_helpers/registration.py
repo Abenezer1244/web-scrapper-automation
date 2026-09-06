@@ -28,6 +28,7 @@ from src.api.auth import create_refresh_token, create_secure_token, hash_passwor
 from src.api.middleware import audit_log, once_per, rate_limit, release_once
 from src.api.schemas import RegisterResponse, TokenResponse, UserRegister, VerifyEmailRequest
 from src.config import settings
+from src.config.constants import TRIAL_PERIOD_DAYS
 from src.db import PendingRegistration, User
 from src.utils.crypto import blind_index
 from src.utils.logger import email_fingerprint, setup_logger
@@ -168,8 +169,10 @@ async def _create_real_user(
         last_name=last_name,
         password_hash=password_hash,
         plan="pro",
-        records_limit=settings.PLAN_LIMITS["pro"],  # Pro limit during the 7-day trial
-        trial_ends_at=_now + timedelta(days=7),
+        records_limit=settings.PLAN_LIMITS["pro"],  # Pro limit for the trial window
+        # Read from the shared constant, not a literal, so the welcome email
+        # quotes the SAME trial length this stamps on trial_ends_at.
+        trial_ends_at=_now + timedelta(days=TRIAL_PERIOD_DAYS),
         records_period_start=_period_start,
         skip_trace_period_start=_period_start,
         referral_code=referral_code,

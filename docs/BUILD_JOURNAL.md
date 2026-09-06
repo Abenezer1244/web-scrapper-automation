@@ -19,6 +19,86 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+
+## 2026-09-06 - Transactional email: sender identity, readable headings, shared layout
+**Built / Shipped:** (branch `feat/transactional-email-identity`, 1 commit off main, NOT pushed at
+time of writing) User reported Gmail showing the sender as "leads" and headings rendering
+black-on-black. Both root-caused.
+- **New `src/utils/email_layout.py`** - single source for sender identity + an email-safe HTML shell.
+  `from_header()` is the ONLY place a From header is built; `build_payload()` the only place a Resend
+  dict is assembled (9 call sites incl. the verification email and ops alerts).
+- **New `src/config/plans.py`** - plan catalog lifted out of `billing.py`; `_PLANS` is now an alias,
+  so `/plans` and `/pricing` serve identical output while workers can read prices.
+- **All 10 user-facing templates** rewritten onto the shared layout, incl. `send_verification_email`.
+- **New `scripts/preview_emails.py`** renders all 11 locally with no network.
+- **New `tests/test_email_layout.py`** - 44 tests incl. a hard em-dash gate over every rendered
+  subject/HTML/text, a dark-mode coverage gate, and measured WCAG AA contrast in both schemes.
+
+**Tried / Decided:**
+- Light neutral surface over the old near-black card: a light ground survives a client's dark-mode
+  transform predictably, and a failed transform degrades to dark-on-light, not black-on-black.
+- Teal `#0F766E` from `design-system/bridgeleads/MASTER.md`, replacing two diverged ad-hoc palettes.
+- Sending ADDRESS untouched (only a display name added), so domain verification / DMARC are unaffected.
+- **Abandoned merging `feat/fields-output-visibility`.** It was 114 behind with 85 conflict hunks, and
+  investigation showed main had ALREADY gained nearly all of it via other PRs. Only `/scrapers/preview`
+  is genuinely unshipped. Rebased the email commit straight onto main instead.
+
+**Failed / Blocked:**
+- Codex was quota-limited on 2 attempts before running on the 3rd.
+- `.env.example` is blocked by permission settings; 3 new vars must be documented by hand.
+- A read-only prod damage assessment was blocked by the sandbox classifier (see incident below).
+
+**Caught & fixed:** 4 bugs I introduced, all found by MEASURING rather than looking:
+1. Mobile media query used the `padding` SHORTHAND, overwriting every cell's vertical rhythm with a
+   flat 24px (rendered gap 68px vs the intended 20px). Horizontal padding only now.
+2. The first dark-mode block was PARTIAL - dark card, light-mode `#374151` body copy on it. That is
+   the exact black-on-black bug this change exists to fix, in mirror image.
+3. `<body>` had no class, so the ground below the card stayed light in dark mode.
+4. The malformed-`EMAIL_FROM` guard never fired: `parseaddr` returns any bare token as an address.
+
+Codex found 4 more, all real (1-3 already fixed independently before its report landed):
+- **[P1]** `SoftTimeLimitExceeded` was classified PERMANENT by `_is_retryable_email_error`, so a hung
+  Resend POST (exactly what `soft_time_limit=30` exists to catch) logged "GAVE UP" with no retry,
+  silently dropping a purchased delivery email. PRE-EXISTING, fixed.
+- **[P1]** User-controlled `ScraperConfig.name` went RAW into the email SUBJECT. HTML escaping does
+  not protect a mail header. Fixed with `header_text()`.
+- **[P2]** `ops_alerts` bypassed `build_payload`. Fixed.
+- **[P2]** `/pricing` hardcoded trial facts. Now reads the constants.
+
+**Caught during the rebase** (textual auto-merge would have shipped all three):
+- Main's `_build_lead_delivery_email` had gained `link_expires` (batch links do NOT expire; wrong copy
+  on a batch email erodes trust) and `summary_message`. My version hardcoded the 48h line and would
+  have REVERTED both. Re-implemented on the new layout, with a regression check for each.
+- My extracted `PLAN_CATALOG` was a STALE snapshot. Main had since updated Pro to "3 counties",
+  "Skip tracing (250 included, then $0.08/lookup)" and new Business/Agency bullets. Keeping my copy
+  would have silently reverted a pricing change. Catalog re-extracted from main, byte-identical.
+- Main added a 10th template, `send_verification_email`, that my rewrite never saw. It auto-merged
+  into a file whose helpers I had deleted (would not even import), and it carried an em dash and a
+  hardcoded trial length.
+
+**Pending / Handoff:**
+- `.env.example` needs `EMAIL_FROM_NAME`, `EMAIL_REPLY_TO`, `SUPPORT_EMAIL`.
+- No test email sent to a real inbox; rendering verified in Chromium only.
+- `/pricing` comparison row still says `Counties: pro = 5` while the SAME file's plan features now say
+  "3 counties (your choice)". Main is internally inconsistent here. Reported, not guessed.
+- `feat/fields-output-visibility` is obsolete apart from `/scrapers/preview`; decide whether to port
+  that endpoint or close the branch.
+
+**Facts learned:**
+- **Gmail does not propagate an inherited `color` from `<body>` to block children.** Every element
+  that rendered correctly had an EXPLICIT colour; the broken one was the only one relying on
+  inheritance. That is the whole bug.
+- **A partial dark-mode override is worse than none.**
+- **`padding` shorthand in an email media query silently destroys vertical rhythm.**
+- **`email.utils.parseaddr` is lenient** - it returns any bare token as an "address".
+- **Outlook's Word engine drops `padding` on an `<a>`**; scope cell padding to `<!--[if mso]>`.
+- **HTML escaping does not protect a SUBJECT.** A subject is a header and needs a different sanitizer.
+- **Symbol-absence is not vulnerability-absence.** I flagged `_sanitize_json_value` missing from main
+  as an unshipped security fix. It was wrong: main had closed the same hole better, by routing JSON
+  through `build_lead_export_row` (which sanitizes every field and emits only flat scalars, so the
+  nested `enrichment_data` blob is never dumped). Applying the old fix on top would have
+  DOUBLE-sanitized and corrupted formula-guarded values.
+
 ## 2026-09-04 (Test 11) — a page with three rows on it looked like no page at all
 
 **Built / Shipped:** `fix/test11-completed-with-error` → **PR #217** (CI green: Test 5m5s,

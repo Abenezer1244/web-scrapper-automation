@@ -1,10 +1,30 @@
-"""Onboarding email sequence: welcome, activation nudge, trial expiry."""
+"""Onboarding email sequence: welcome, duplicate signup, nudges, trial expiry.
 
-import html
+All five templates render through src/utils/email_layout.py, which owns the
+sender identity (display name + Reply-To) and the email-safe HTML shell.
+
+Every plan number in this module is READ from config, never written here. The
+trial-expiry email used to hardcode "Pro ($79/mo)" long after billing moved Pro
+to $199, quoting customers a price we do not charge. Prices and record
+allowances come from src/config/plans.py (the same catalog /billing/plans
+serves) and the trial length from constants.TRIAL_PERIOD_DAYS (the same value
+registration stamps on trial_ends_at).
+"""
 
 import resend
 
 from src.config import settings
+from src.config.constants import TRIAL_PERIOD_DAYS
+from src.config.plans import format_price_monthly, get_plan, plan_records_limit
+from src.utils.email_layout import (
+    build_payload,
+    bullets,
+    callout,
+    numbered_steps,
+    paragraph,
+    render_email,
+    text_footer,
+)
 from src.utils.logger import setup_logger
 from src.workers import app
 
@@ -12,77 +32,91 @@ _logger = setup_logger("worker.onboarding")
 
 resend.api_key = settings.RESEND_API_KEY
 
-_CARD_STYLE = (
-    "background: #111113; border: 1px solid #2a2a32; border-radius: 12px;"
-    " max-width: 520px; margin: 0 auto; padding: 36px;"
-)
-_BTN_STYLE = (
-    "display: inline-block; background: #10b981; color: #0a0a0b;"
-    " font-weight: 600; font-size: 15px; padding: 14px 28px;"
-    " border-radius: 8px; text-decoration: none; margin: 24px 0;"
-)
-
 
 def _send(email: str, subject: str, html_body: str, text_body: str) -> None:
     if not settings.RESEND_API_KEY:
         _logger.warning("RESEND_API_KEY not set, skipping email to %s", email)
         return
     try:
-        resend.Emails.send({
-            "from": settings.EMAIL_FROM,
-            "to": [email],
-            "subject": subject,
-            "html": html_body,
-            "text": text_body,
-        })
+        resend.Emails.send(build_payload(
+            to=[email], subject=subject, html_body=html_body, text_body=text_body,
+        ))
         _logger.info("Sent '%s' to %s", subject, email)
     except Exception as exc:
         _logger.error("Failed to send '%s' to %s: %s", subject, email, exc)
 
 
+def _days_phrase(days: int) -> str:
+    """'today', '1 day' or 'N days' for trial-countdown copy."""
+    if days <= 0:
+        return "today"
+    return "1 day" if days == 1 else f"{days} days"
+
+
 # ─── Day 0: Welcome ─────────────────────────────────────────────────────────
 
 def send_welcome_email(email: str) -> None:
-    """Sent immediately after registration."""
+    """Sent immediately after registration.
+
+    Deliberately generic: the steps name no specific county or record type,
+    because the counties and record types a given recipient can reach depend on
+    their plan and on which connectors are live. The old copy told everyone to
+    pick Pierce or King and to choose probate.
+    """
     url = f"{settings.FRONTEND_URL}/scrapers/new"
-    subject = "Welcome to BridgeLeads — get your first leads in 5 minutes"
+    plan = get_plan("pro")
+    records = plan_records_limit("pro")
+    trial_days = TRIAL_PERIOD_DAYS
 
-    html_body = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style>
-body {{ font-family: -apple-system, sans-serif; background: #0a0a0b; color: #f0efe8; margin: 0; padding: 40px 20px; }}
-.card {{ {_CARD_STYLE} }}
-.logo {{ font-size: 18px; font-weight: 600; color: #10b981; margin-bottom: 28px; }}
-h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 12px; }}
-.step {{ display: flex; gap: 12px; margin-bottom: 14px; }}
-.num {{ background: #10b981; color: #0a0a0b; width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; flex-shrink: 0; }}
-.txt {{ font-size: 14px; color: #c8c7cf; }}
-.btn {{ {_BTN_STYLE} }}
-.foot {{ font-size: 12px; color: #55545e; border-top: 1px solid #2a2a32; padding-top: 20px; margin-top: 8px; }}
-</style></head><body>
-<div class="card">
-  <div class="logo">BridgeLeads</div>
-  <h1>Welcome! Get leads in 5 minutes.</h1>
-  <div style="margin: 24px 0;">
-    <div class="step"><div class="num">1</div><div class="txt"><b>Pick a county</b> — Pierce or King County, WA. 98% address coverage.</div></div>
-    <div class="step"><div class="num">2</div><div class="txt"><b>Choose probate</b> — Heirs are the most motivated sellers.</div></div>
-    <div class="step"><div class="num">3</div><div class="txt"><b>Click Run</b> — Scraped in real-time. Takes 2-5 minutes.</div></div>
-    <div class="step"><div class="num">4</div><div class="txt"><b>Download CSV</b> — Property + mailing address included. Mail letters today.</div></div>
-  </div>
-  <a href="{url}" class="btn">Set Up Your First Scraper</a>
-  <p style="font-size: 13px; color: #9998a0;">7-day free Pro trial. 1,000 records/month. No credit card.</p>
-  <div class="foot">Questions? Reply to this email.</div>
-</div></body></html>"""
+    subject = "Welcome to BridgeLeads. Get your first property records in minutes"
+    trial_line = (
+        f"Your free {plan['name']} trial runs for {trial_days} days and includes "
+        f"{records:,} records per month. No credit card required."
+    )
 
-    _send(email, subject, html_body, (
-        "Welcome to BridgeLeads!\n\n"
-        "1. Pick a county (Pierce or King, WA)\n"
-        "2. Choose probate records\n"
-        "3. Click Run (2-5 min)\n"
-        "4. Download CSV with addresses\n\n"
-        f"Start here: {url}\n\n"
-        "7-day free Pro trial. Questions? Reply to this email."
-    ))
+    html_body = render_email(
+        title=subject,
+        preheader="Set up your first scraper and export county records.",
+        heading="Welcome to BridgeLeads",
+        blocks=[
+            paragraph(
+                "Your account is ready. Here is how to pull your first list of "
+                "property records."
+            ),
+            numbered_steps([
+                ("Choose a county",
+                 "Pick any county your plan covers from the scraper setup screen."),
+                ("Choose a record type",
+                 "Probate, pre-foreclosure, tax delinquent and the other lists "
+                 "available on your plan."),
+                ("Run your scraper",
+                 "Records are pulled live from the county source and appear as "
+                 "they are found."),
+                ("Review or export your results",
+                 "Export to CSV or Excel. Property and mailing addresses are "
+                 "included where the county publishes them."),
+            ]),
+            callout(trial_line),
+        ],
+        cta=("Set Up Your First Scraper", url),
+    )
+
+    text_body = (
+        "Welcome to BridgeLeads\n\n"
+        "Your account is ready. Here is how to pull your first list of property "
+        "records.\n\n"
+        "1. Choose a county. Pick any county your plan covers.\n"
+        "2. Choose a record type. Probate, pre-foreclosure, tax delinquent and "
+        "the other lists available on your plan.\n"
+        "3. Run your scraper. Records are pulled live from the county source.\n"
+        "4. Review or export your results. Export to CSV or Excel with property "
+        "and mailing addresses.\n\n"
+        f"Set up your first scraper: {url}\n\n"
+        f"{trial_line}\n\n"
+        f"{text_footer()}"
+    )
+
+    _send(email, subject, html_body, text_body)
 
 
 # ─── Duplicate signup: "you already have an account" ───────────────────────
@@ -95,7 +129,7 @@ def send_duplicate_signup_email(email: str) -> None:
     legitimate returning user learns what to do instead).
 
     Run as a Celery task (off the request path) so it adds NO latency to the
-    register response — keeping the response time of an existing-email attempt
+    register response, keeping the response time of an existing-email attempt
     indistinguishable from a new-email attempt (no timing/enumeration oracle).
     The caller gates this to at most once per address per 24h.
 
@@ -107,42 +141,39 @@ def send_duplicate_signup_email(email: str) -> None:
     reset_url = f"{settings.FRONTEND_URL}/forgot-password"
     subject = "You already have a BridgeLeads account"
 
-    html_body = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style>
-body {{ font-family: -apple-system, sans-serif; background: #0a0a0b; color: #f0efe8; margin: 0; padding: 40px 20px; }}
-.card {{ {_CARD_STYLE} }}
-.logo {{ font-size: 18px; font-weight: 600; color: #10b981; margin-bottom: 28px; }}
-h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 12px; }}
-.btn {{ {_BTN_STYLE} }}
-.alt {{ font-size: 14px; color: #c8c7cf; }}
-.alt a {{ color: #10b981; }}
-.foot {{ font-size: 12px; color: #55545e; border-top: 1px solid #2a2a32; padding-top: 20px; margin-top: 8px; }}
-</style></head><body>
-<div class="card">
-  <div class="logo">BridgeLeads</div>
-  <h1>Looks like you already have an account</h1>
-  <p style="color: #c8c7cf; font-size: 14px;">
-    Someone just tried to create a BridgeLeads account with this email address,
-    but one already exists. If that was you, there&rsquo;s no need to sign up
-    again &mdash; just log in.
-  </p>
-  <a href="{login_url}" class="btn">Log in</a>
-  <p class="alt">Forgot your password? <a href="{reset_url}">Reset it here</a>.</p>
-  <div class="foot">
-    If this wasn&rsquo;t you, you can safely ignore this email &mdash; no account
-    changes were made.
-  </div>
-</div></body></html>"""
+    html_body = render_email(
+        title=subject,
+        preheader="Log in instead, or reset your password.",
+        heading="You already have an account",
+        blocks=[
+            paragraph(
+                "Someone just tried to create a BridgeLeads account with this "
+                "email address, but one already exists. If that was you, there "
+                "is no need to sign up again. Just log in."
+            ),
+            paragraph(f"Forgot your password? Reset it at {reset_url}", muted=True),
+        ],
+        cta=("Log In", login_url),
+        footer_note=(
+            "If this was not you, you can safely ignore this email. No account "
+            "changes were made."
+        ),
+    )
 
-    _send(email, subject, html_body, (
-        "Looks like you already have a BridgeLeads account.\n\n"
-        "Someone just tried to create an account with this email address, but one\n"
-        "already exists. If that was you, there's no need to sign up again - just log in.\n\n"
+    text_body = (
+        "You already have a BridgeLeads account.\n\n"
+        "Someone just tried to create an account with this email address, but one "
+        "already exists. If that was you, there is no need to sign up again. "
+        "Just log in.\n\n"
         f"Log in: {login_url}\n"
-        f"Forgot your password? Reset it here: {reset_url}\n\n"
-        "If this wasn't you, you can safely ignore this email - no account changes were made."
-    ))
+        f"Reset your password: {reset_url}\n\n"
+        + text_footer(footer_note=(
+            "If this was not you, you can safely ignore this email. No account "
+            "changes were made."
+        ))
+    )
+
+    _send(email, subject, html_body, text_body)
 
 
 # ─── Email verification: "confirm your email to finish signing up" ─────────
@@ -162,189 +193,209 @@ def send_verification_email(email: str, verify_link: str) -> None:
     Carries the single-use, ~24h verification link that, when clicked, creates
     the real account (POST /auth/verify-email) and logs the user in.
     """
-    safe_link = html.escape(verify_link, quote=True)
     subject = "Confirm your email to finish signing up"
+    trial_days = TRIAL_PERIOD_DAYS
+    footer_note = (
+        "If you did not try to sign up for BridgeLeads, you can safely ignore "
+        "this email. No account was created."
+    )
 
-    html_body = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style>
-body {{ font-family: -apple-system, sans-serif; background: #0a0a0b; color: #f0efe8; margin: 0; padding: 40px 20px; }}
-.card {{ {_CARD_STYLE} }}
-.logo {{ font-size: 18px; font-weight: 600; color: #10b981; margin-bottom: 28px; }}
-h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 12px; }}
-.btn {{ {_BTN_STYLE} }}
-.alt {{ font-size: 13px; color: #9998a0; word-break: break-all; }}
-.foot {{ font-size: 12px; color: #55545e; border-top: 1px solid #2a2a32; padding-top: 20px; margin-top: 8px; }}
-</style></head><body>
-<div class="card">
-  <div class="logo">BridgeLeads</div>
-  <h1>Confirm your email</h1>
-  <p style="color: #c8c7cf; font-size: 14px;">
-    You&rsquo;re one click away from your BridgeLeads account. Confirm this email
-    address to finish signing up and start your 7-day free Pro trial.
-  </p>
-  <a href="{safe_link}" class="btn">Confirm email &amp; start trial</a>
-  <p class="alt">Or paste this link into your browser:<br>{safe_link}</p>
-  <div class="foot">
-    This link expires in 24 hours. If you didn&rsquo;t try to sign up for
-    BridgeLeads, you can safely ignore this email &mdash; no account was created.
-  </div>
-</div></body></html>"""
+    html_body = render_email(
+        title=subject,
+        preheader="Confirm your email address to finish creating your account.",
+        heading="Confirm your email",
+        blocks=[
+            paragraph(
+                f"You are one click away from your BridgeLeads account. Confirm "
+                f"this email address to finish signing up and start your "
+                f"{trial_days}-day free Pro trial."
+            ),
+        ],
+        cta=("Confirm Email and Start Trial", verify_link),
+        cta_note="This link expires in 24 hours.",
+        footer_note=footer_note,
+    )
 
     text_body = (
         "Confirm your email to finish signing up for BridgeLeads.\n\n"
-        f"Click to confirm and start your 7-day free Pro trial:\n{verify_link}\n\n"
-        "This link expires in 24 hours. If you didn't try to sign up, you can\n"
-        "safely ignore this email - no account was created."
+        f"Confirm your address and start your {trial_days}-day free Pro trial:\n"
+        f"{verify_link}\n\n"
+        "This link expires in 24 hours.\n\n"
+        + text_footer(footer_note=footer_note)
     )
     # Direct send (NOT via _send) so any Resend/network error PROPAGATES to the
     # dispatcher, which classifies it (retryable -> backoff + retry; permanent ->
-    # mark the row 'failed' + ops-alert) instead of swallowing it.
-    resend.Emails.send({
-        "from": settings.EMAIL_FROM,
-        "to": [email],
-        "subject": subject,
-        "html": html_body,
-        "text": text_body,
-    })
+    # mark the row 'failed' + ops-alert) instead of swallowing it. It still uses
+    # build_payload so the From display name and Reply-To stay centralised.
+    resend.Emails.send(build_payload(
+        to=[email], subject=subject, html_body=html_body, text_body=text_body,
+    ))
     _logger.info("Sent verification email to %s", email)
 
 
 # ─── Day 1: "Having trouble getting started?" ──────────────────────────────
 
-def send_day1_nudge(email: str) -> None:
+def send_day1_nudge(email: str, days_left: int) -> None:
     """Sent on day 1 to users who haven't created a scraper yet.
 
-    Different from the welcome email (day 0) — this one acknowledges the
-    gap and offers help. Escalation sequence:
+    Different from the welcome email (day 0): this one acknowledges the gap and
+    offers help. Escalation sequence:
       Day 0: Welcome (send_welcome_email)
-      Day 1: Day-1 nudge (THIS)                — only if zero scrapers
-      Day 3: Activation reminder               — only if no download
-      Day 6-7: Trial expiry warning            — only if trial user
+      Day 1: Day-1 nudge (THIS)                only if zero scrapers
+      Day 3: Activation reminder               only if no download
+      Day 6-7: Trial expiry warning            only if trial user
+
+    ``days_left`` is the caller's real remaining trial days, not a literal. The
+    old copy always read "6 more days" regardless of the account's actual state.
     """
     url = f"{settings.FRONTEND_URL}/dashboard"
-    subject = "Need a hand getting your first leads?"
+    subject = "Getting started with your first scrape"
+    trial_line = (
+        f"Your free trial has {_days_phrase(days_left)} left."
+        if days_left > 0 else "Your free trial ends today."
+    )
 
-    html_body = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style>
-body {{ font-family: -apple-system, sans-serif; background: #0a0a0b; color: #f0efe8; margin: 0; padding: 40px 20px; }}
-.card {{ {_CARD_STYLE} }}
-.logo {{ font-size: 18px; font-weight: 600; color: #10b981; margin-bottom: 28px; }}
-h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 12px; }}
-.btn {{ {_BTN_STYLE} }}
-.hint {{ background: #0f1a15; border: 1px solid #1f3a2e; border-radius: 8px; padding: 16px 20px; margin: 20px 0; color: #c8c7cf; font-size: 13px; }}
-.foot {{ font-size: 12px; color: #55545e; border-top: 1px solid #2a2a32; padding-top: 20px; margin-top: 8px; }}
-</style></head><body>
-<div class="card">
-  <div class="logo">BridgeLeads</div>
-  <h1>Ready to pull your first leads?</h1>
-  <p style="color: #c8c7cf; font-size: 14px;">
-    You signed up yesterday &mdash; if you haven&rsquo;t run your first
-    scrape yet, we made it a one-click button on your dashboard.
-  </p>
-  <div class="hint">
-    <b style="color: #10b981;">The fastest path:</b> log in, click
-    <i>&ldquo;Run first scrape now&rdquo;</i> on your dashboard. We&rsquo;ll
-    pull the last 90 days of Pierce County probate records &mdash; our
-    highest-enrichment county &mdash; and show them live while they scrape.
-  </div>
-  <a href="{url}" class="btn">Go to dashboard</a>
-  <p style="font-size: 13px; color: #9998a0;">
-    Your free Pro trial is active for 6 more days &mdash; 1,000 records/month,
-    5 counties, daily auto-scrape.
-  </p>
-  <div class="foot">
-    Stuck on something? Just reply to this email and I&rsquo;ll help directly.
-  </div>
-</div></body></html>"""
+    html_body = render_email(
+        title=subject,
+        preheader="Your dashboard has a one click option to run your first scrape.",
+        heading="Ready to run your first scrape?",
+        blocks=[
+            paragraph(
+                "You signed up yesterday and have not run a scrape yet. Your "
+                "dashboard has a one click option that sets up a scraper and "
+                "runs it for you."
+            ),
+            callout(trial_line),
+        ],
+        cta=("Go to Dashboard", url),
+    )
 
-    _send(email, subject, html_body, (
-        "Ready to pull your first leads?\n\n"
-        "You signed up yesterday. If you haven't run your first scrape yet,\n"
-        "we made it a one-click button on your dashboard.\n\n"
-        "The fastest path: log in, click 'Run first scrape now'.\n"
-        "We'll pull the last 90 days of Pierce County probate records\n"
-        "and show them live while they scrape.\n\n"
-        f"Go to dashboard: {url}\n\n"
-        "Stuck? Reply to this email."
-    ))
+    text_body = (
+        "Ready to run your first scrape?\n\n"
+        "You signed up yesterday and have not run a scrape yet. Your dashboard "
+        "has a one click option that sets up a scraper and runs it for you.\n\n"
+        f"Go to your dashboard: {url}\n\n"
+        f"{trial_line}\n\n"
+        f"{text_footer()}"
+    )
+
+    _send(email, subject, html_body, text_body)
 
 
 # ─── Day 3: Activation nudge ────────────────────────────────────────────────
 
-def send_activation_reminder(email: str, has_scraper: bool, has_download: bool) -> None:
+def send_activation_reminder(
+    email: str, has_scraper: bool, has_download: bool, days_left: int
+) -> None:
     """Sent on day 3 if user hasn't completed activation."""
     if has_download:
         return  # Already activated
 
     if not has_scraper:
-        subject = "You haven't set up your scraper yet"
-        msg = "It only takes 30 seconds to create your first scraper."
-        cta = "Set Up a Scraper"
+        subject = "You have not set up a scraper yet"
+        heading = "Set up your first scraper"
+        message = (
+            "Creating a scraper takes about a minute. Choose a county and a "
+            "record type, and BridgeLeads pulls the records for you."
+        )
+        cta_label = "Set Up a Scraper"
         url = f"{settings.FRONTEND_URL}/scrapers/new"
     else:
-        subject = "Your leads are waiting"
-        msg = "You ran a scrape but haven't downloaded results. Fresh leads lose value fast."
-        cta = "Download Your Leads"
+        subject = "Your records are ready to export"
+        heading = "Your records are ready to export"
+        message = (
+            "You ran a scrape but have not exported the results yet. Records "
+            "are most useful while they are fresh."
+        )
+        cta_label = "View Your Results"
         url = f"{settings.FRONTEND_URL}/results"
 
-    safe_msg = html.escape(msg)
-    safe_cta = html.escape(cta)
+    trial_line = (
+        f"Your free trial has {_days_phrase(days_left)} left."
+        if days_left > 0 else "Your free trial ends today."
+    )
 
-    html_body = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style>
-body {{ font-family: -apple-system, sans-serif; background: #0a0a0b; color: #f0efe8; margin: 0; padding: 40px 20px; }}
-.card {{ {_CARD_STYLE} }}
-.logo {{ font-size: 18px; font-weight: 600; color: #10b981; margin-bottom: 28px; }}
-h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 12px; }}
-.btn {{ {_BTN_STYLE} }}
-.foot {{ font-size: 12px; color: #55545e; border-top: 1px solid #2a2a32; padding-top: 20px; margin-top: 8px; }}
-</style></head><body>
-<div class="card">
-  <div class="logo">BridgeLeads</div>
-  <h1>{html.escape(subject)}</h1>
-  <p style="color: #c8c7cf; font-size: 14px;">{safe_msg}</p>
-  <a href="{url}" class="btn">{safe_cta}</a>
-  <p style="font-size: 13px; color: #9998a0;">4 days left on your Pro trial.</p>
-  <div class="foot">Need help? Reply to this email.</div>
-</div></body></html>"""
+    html_body = render_email(
+        title=subject,
+        preheader=message,
+        heading=heading,
+        blocks=[paragraph(message), callout(trial_line)],
+        cta=(cta_label, url),
+    )
 
-    _send(email, subject, html_body, f"{msg}\n\n{cta}: {url}")
+    text_body = (
+        f"{heading}\n\n{message}\n\n"
+        f"{cta_label}: {url}\n\n"
+        f"{trial_line}\n\n"
+        f"{text_footer()}"
+    )
+
+    _send(email, subject, html_body, text_body)
 
 
 # ─── Day 6-7: Trial expiry ──────────────────────────────────────────────────
 
 def send_trial_ending_email(email: str, days_left: int) -> None:
-    """Sent when trial has 1-2 days remaining."""
+    """Sent when trial has 1-2 days remaining.
+
+    Everything factual here is read from config: the Pro price and feature list
+    from the billing plan catalog, and the post-trial allowance from the same
+    Starter limit that _expire_trials_impl actually applies when it downgrades
+    the account. No county cap is quoted, because per-tier county gating is not
+    enforced (settings.ENTITLEMENT_ENFORCEMENT is off) and the billing catalog
+    deliberately does not advertise one either.
+    """
+    pro = get_plan("pro")
+    starter_records = plan_records_limit("starter")
+    price = format_price_monthly("pro")
+
     if days_left <= 1:
-        subject = "Your BridgeLeads trial ends today"
-        headline = "Your trial ends today"
+        subject = f"Your BridgeLeads {pro['name']} trial ends today"
+        heading = f"Your {pro['name']} trial ends today"
     else:
-        subject = f"Your BridgeLeads trial ends in {days_left} days"
-        headline = f"Your trial ends in {days_left} days"
+        subject = f"Your BridgeLeads {pro['name']} trial ends in {days_left} days"
+        heading = f"Your {pro['name']} trial ends in {days_left} days"
 
     url = f"{settings.FRONTEND_URL}/settings?tab=billing"
+    after_trial = (
+        f"When your trial ends, your account moves to the Starter plan, which "
+        f"includes {starter_records:,} records per month. Your account, scrapers "
+        f"and past results stay in place."
+    )
+    price_line = f"{pro['name']} is {price} and includes:"
 
-    html_body = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style>
-body {{ font-family: -apple-system, sans-serif; background: #0a0a0b; color: #f0efe8; margin: 0; padding: 40px 20px; }}
-.card {{ {_CARD_STYLE} }}
-.logo {{ font-size: 18px; font-weight: 600; color: #10b981; margin-bottom: 28px; }}
-h1 {{ font-size: 22px; font-weight: 500; margin: 0 0 12px; }}
-.warn {{ background: #1a1208; border: 1px solid #7a4f08; border-radius: 8px; padding: 16px 20px; margin: 20px 0; color: #f5a623; font-size: 14px; }}
-.btn {{ {_BTN_STYLE} }}
-.foot {{ font-size: 12px; color: #55545e; border-top: 1px solid #2a2a32; padding-top: 20px; margin-top: 8px; }}
-</style></head><body>
-<div class="card">
-  <div class="logo">BridgeLeads</div>
-  <h1>{headline}</h1>
-  <div class="warn">After your trial, you move to Starter (50 records/month, 1 county). Upgrade to keep Pro access.</div>
-  <p style="color: #c8c7cf; font-size: 14px;">Pro ($79/mo) includes: 1,000 records, 5 counties, daily scraping, email delivery.</p>
-  <a href="{url}" class="btn">Upgrade to Pro</a>
-  <div class="foot">Questions? Reply or contact support@bridgeleads.io</div>
-</div></body></html>"""
+    html_body = render_email(
+        title=subject,
+        preheader=f"Upgrade to keep {pro['name']} access. {price}.",
+        heading=heading,
+        blocks=[
+            paragraph(f"Your BridgeLeads {pro['name']} trial is almost over."),
+            callout(after_trial, tone="warning"),
+            paragraph(price_line),
+            bullets(list(pro["features"])[:5]),
+        ],
+        cta=(f"Upgrade to {pro['name']}", url),
+        cta_note="You can cancel at any time from your billing settings.",
+    )
 
-    _send(email, subject, html_body, f"{headline}\n\nUpgrade: {url}")
+    text_body = (
+        f"{heading}\n\n"
+        f"Your BridgeLeads {pro['name']} trial is almost over.\n\n"
+        f"{after_trial}\n\n"
+        f"{price_line}\n"
+        + "".join(f"  - {f}\n" for f in list(pro["features"])[:5])
+        + f"\nUpgrade: {url}\n\n"
+        "You can cancel at any time from your billing settings.\n\n"
+        f"{text_footer()}"
+    )
+
+    _send(email, subject, html_body, text_body)
+
+
+__all__ = [
+    "send_activation_reminder",
+    "send_day1_nudge",
+    "send_duplicate_signup_email",
+    "send_trial_ending_email",
+    "send_welcome_email",
+]

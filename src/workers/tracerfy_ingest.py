@@ -343,15 +343,53 @@ def ingest_tracerfy_batch(
         unmatched_csv = 0
         matched_pending_ids: set = set()
 
-        for csv_row in parsed:
-            csv_key = (
-                (csv_row.get("address") or "").strip().lower(),
-                (csv_row.get("city") or "").strip().lower(),
-                (csv_row.get("state") or "").strip().upper(),
+        def _key_of(row: dict) -> tuple[str, str, str]:
+            return (
+                (row.get("address") or "").strip().lower(),
+                (row.get("city") or "").strip().lower(),
+                (row.get("state") or "").strip().upper(),
             )
+
+        # Rows are attributed on (address, city, state) compared against
+        # Tracerfy's echoed address. That is safe while a key names ONE property
+        # — several of our rows can share it (same property, same owner) and all
+        # correctly receive the same contacts. It stops being safe when the same
+        # key carries several DIFFERENT owners and Tracerfy returns a CSV row per
+        # owner: every CSV row then matches every pending row and the last one
+        # silently wins, stamping one person's phone and email onto another
+        # person's lead (Codex).
+        #
+        # Measured before deciding what to do about it: across every row ever
+        # submitted, production has exactly one in-batch key collision, and it is
+        # the benign shape (same owner, same tenant, two results at one address).
+        # Zero collisions carry different names; zero span tenants. So the key is
+        # left alone — narrowing it to include the name would break ADVANCED
+        # traces, which deliberately send no name and get back whichever owner
+        # Tracerfy identifies — and the dangerous shape is refused instead.
+        csv_key_counts: dict[tuple[str, str, str], int] = {}
+        for _row in parsed:
+            _k = _key_of(_row)
+            csv_key_counts[_k] = csv_key_counts.get(_k, 0) + 1
+
+        for csv_row in parsed:
+            csv_key = _key_of(csv_row)
             matches = pending_by_key.get(csv_key, [])
             if not matches:
                 unmatched_csv += 1
+                continue
+            if csv_key_counts[csv_key] > 1 and len(
+                {(p.first_name or "", p.last_name or "") for p in matches}
+            ) > 1:
+                # Several results for this address AND several distinct owners
+                # waiting on it: there is no sound way to say which is whose.
+                # Leave the rows unmatched — they settle terminally and alert
+                # below — rather than guess and contaminate a lead.
+                unmatched_csv += 1
+                _logger.error(
+                    "Tracerfy ingest queue %d: %d CSV rows and %d differently-named "
+                    "pending rows share one address key — refusing to attribute",
+                    queue_id, csv_key_counts[csv_key], len(matches),
+                )
                 continue
             matched_pending_ids.update(p.id for p in matches)
 

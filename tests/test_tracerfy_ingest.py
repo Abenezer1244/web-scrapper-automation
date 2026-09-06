@@ -328,3 +328,66 @@ async def test_case_and_whitespace_differences_still_match(starter_user, _stub_c
 
     assert out["hits"] == 1 and out["unmatched_rows"] == 0
     assert _result_row(seed["rows"][0]["result_id"]).skip_trace_status == "hit"
+
+
+@pytest.mark.asyncio
+async def test_same_address_same_owner_shares_contacts(starter_user, _stub_csv):
+    """Two results for ONE property with the same owner legitimately share the
+    contact data — Tracerfy de-duplicates the address and returns one CSV row.
+    This is the only in-batch key collision production has ever seen."""
+    qid = _next_queue_id()
+    seed = _seed(starter_user.id, qid, [
+        ("1609 121ST ST S", "TACOMA", "WA"),
+        ("1609 121ST ST S", "TACOMA", "WA"),
+    ])
+    _stub_csv(_csv(
+        "1609 121ST ST S,TACOMA,WA,JANE,DOE,2065550177,Mobile,2065550177,,,j@x.com,"
+    ))
+
+    out = ingest_tracerfy_batch(
+        queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=1, credits_deducted=1
+    )
+
+    assert out["unmatched_rows"] == 0
+    for row in seed["rows"]:
+        r = _result_row(row["result_id"])
+        assert r.skip_trace_status == "hit"
+        assert r.phone == "2065550177"
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_owner_attribution_is_refused_not_guessed(starter_user, _stub_csv):
+    """Same address key, DIFFERENT owners, and a CSV row per owner: every CSV
+    row matches every pending row and the last would silently win, stamping one
+    person's contacts onto the other's lead. Refuse instead."""
+    qid = _next_queue_id()
+    seed = _seed(starter_user.id, qid, [
+        ("77 DUPLEX WAY", "TACOMA", "WA"),
+        ("77 DUPLEX WAY", "TACOMA", "WA"),
+    ])
+    with system_sync_session() as db:
+        for pid, first, last in (
+            (seed["rows"][0]["pending_id"], "ALICE", "ALPHA"),
+            (seed["rows"][1]["pending_id"], "BOB", "BETA"),
+        ):
+            db.execute(
+                text("""UPDATE pending_skip_trace_rows
+                        SET first_name = :f, last_name = :l WHERE id = :id"""),
+                {"f": first, "l": last, "id": pid},
+            )
+        db.commit()
+    _stub_csv(_csv(
+        "77 DUPLEX WAY,TACOMA,WA,ALICE,ALPHA,2065550188,Mobile,2065550188,,,a@x.com,",
+        "77 DUPLEX WAY,TACOMA,WA,BOB,BETA,2065550199,Mobile,2065550199,,,b@x.com,",
+    ))
+
+    out = ingest_tracerfy_batch(
+        queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=2, credits_deducted=2
+    )
+
+    # Neither lead gets a contact rather than one lead getting the wrong person's.
+    assert out["unmatched_rows"] == 2
+    for row in seed["rows"]:
+        r = _result_row(row["result_id"])
+        assert r.skip_trace_status == "errored"
+        assert r.phone is None and r.email is None

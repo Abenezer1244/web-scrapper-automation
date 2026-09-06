@@ -83,6 +83,41 @@ class TokenBlacklist:
         result = await r.set(key, "1", nx=True, ex=expires_in_seconds)
         return result is not None
 
+    # ─── Replay grace window (single-use rotation, concurrent clients) ────────
+    # Single-use rotation is correct but brittle for a browser: one page load
+    # fires many parallel requests, and when several 401 at once the client can
+    # present the SAME refresh token twice before the first rotation's cookie has
+    # propagated. The loser then gets "already used" and the session dies even
+    # though the user did nothing wrong — verified against production, where two
+    # concurrent /auth/refresh calls reliably return 200 and 401.
+    #
+    # So for a SHORT window after a successful rotation we remember what that jti
+    # was exchanged for, and hand the same pair back to a replay instead of
+    # failing. This is the standard approach (Auth0, Okta) and it does not make
+    # rotation a no-op: outside the window a replay still 401s, so a token
+    # surfacing later — the actual theft signal — is still caught. The trade-off
+    # is bounded and deliberate: a token replayed INSIDE the window receives the
+    # same pair the legitimate client already holds, gaining nothing it could not
+    # have had by racing the original request.
+    _REPLAY_PREFIX = "bl:refresh_replay:"
+    REPLAY_GRACE_SECONDS = 30
+
+    @staticmethod
+    async def remember_rotation(jti: str, payload: str) -> None:
+        """Cache what `jti` was exchanged for, for REPLAY_GRACE_SECONDS."""
+        r = _get_redis()
+        await r.set(
+            f"{TokenBlacklist._REPLAY_PREFIX}{jti}",
+            payload,
+            ex=TokenBlacklist.REPLAY_GRACE_SECONDS,
+        )
+
+    @staticmethod
+    async def recall_rotation(jti: str) -> str | None:
+        """Return what `jti` was exchanged for, if still inside the window."""
+        r = _get_redis()
+        return await r.get(f"{TokenBlacklist._REPLAY_PREFIX}{jti}")
+
     @staticmethod
     async def is_blacklisted(jti: str) -> bool:
         """Return True if this jti has been blacklisted.

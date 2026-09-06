@@ -560,3 +560,53 @@ def test_a_stale_period_still_zeroes_the_counter():
 
     with SyncSessionLocal() as db:
         assert db.get(User, user_id).records_used == 25, "stale period still resets"
+
+
+# ─── /billing/usage reports the quota WINDOW, not just a bare number ──────────
+
+def test_usage_window_helpers_agree_with_the_reset_boundary():
+    """The window /billing/usage reports must be the same boundary the rollover
+    and the billing path use, or the UI would advertise a reset date that is not
+    when the counter actually moves."""
+    from src.api.quota import current_period_start
+
+    start = current_period_start()
+    assert (start.day, start.hour, start.minute, start.second) == (1, 0, 0, 0)
+    assert start.tzinfo is not None, "the boundary is UTC-anchored, never naive"
+
+    # next_reset_at, computed the way the route computes it.
+    nxt = (
+        start.replace(year=start.year + 1, month=1)
+        if start.month == 12
+        else start.replace(month=start.month + 1)
+    )
+    assert nxt > start
+    assert nxt.day == 1
+    # Exactly one month later, and it must roll the YEAR at December.
+    assert (nxt.year, nxt.month) == (
+        (start.year + 1, 1) if start.month == 12 else (start.year, start.month + 1)
+    )
+
+
+def test_usage_reports_period_aware_usage_not_the_raw_column():
+    """A stale period must not be reported as usage the user still owes — the
+    same rule the enforcement gates follow."""
+    from src.api.quota import effective_records_used
+
+    with SyncSessionLocal() as db:
+        stale = _mk_user(db, used=900, period=datetime(2020, 1, 1, tzinfo=UTC))
+        current = _mk_user(db, used=900)
+        db.commit()
+        assert effective_records_used(stale) == 0
+        assert effective_records_used(current) == 900
+
+
+def test_december_boundary_rolls_into_january_of_the_next_year():
+    """The one arithmetic case a naive month+1 gets wrong."""
+    dec = datetime(2026, 12, 1, tzinfo=UTC)
+    nxt = (
+        dec.replace(year=dec.year + 1, month=1)
+        if dec.month == 12
+        else dec.replace(month=dec.month + 1)
+    )
+    assert (nxt.year, nxt.month, nxt.day) == (2027, 1, 1)

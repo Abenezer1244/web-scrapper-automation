@@ -454,16 +454,42 @@ async def pricing_page() -> dict:
 
 @router.get("/usage")
 async def get_usage(request: Request, current_user: CurrentUser) -> dict:
-    """Return current plan, record usage, and limit for the settings page."""
+    """Return current plan, record usage, limit, and the quota WINDOW.
+
+    ``period_start`` / ``next_reset_at`` are reported because the quota window
+    is the CALENDAR month in UTC and is deliberately independent of the Stripe
+    billing anniversary — a subscriber who starts mid-month reaches a calendar
+    reset before their second invoice. That is documented product policy (see
+    docs/product/billing-period-semantics.md), but it is only defensible if the
+    boundary is visible, so the UI can say "resets 1 Oct" instead of leaving a
+    user to infer it from a number that changes overnight.
+
+    ``records_used`` is period-aware here for the same reason the enforcement
+    gates are: the daily rollover is a catch-up task, so between the true month
+    boundary and its next run a healthy user can still carry last month's
+    period, and reporting the raw column would show usage they no longer owe.
+    """
     await rate_limit(request, zone="general", identifier=current_user.id)
+    from src.api.quota import current_period_start, effective_records_used
+
     limit = current_user.records_limit
-    used = current_user.records_used
+    used = effective_records_used(current_user)
+    period_start = current_period_start()
+    # First instant of the following month, in UTC.
+    next_reset = (
+        period_start.replace(year=period_start.year + 1, month=1)
+        if period_start.month == 12
+        else period_start.replace(month=period_start.month + 1)
+    )
     return {
         "plan": current_user.plan,
         "records_used": used,
         "records_limit": limit,
         "records_remaining": max(0, limit - used) if limit != -1 else None,
         "percent_used": round((used / limit) * 100, 1) if limit and limit != -1 else 0,
+        "period_start": period_start.isoformat(),
+        "next_reset_at": next_reset.isoformat(),
+        "period_basis": "calendar_month_utc",
     }
 
 

@@ -88,6 +88,15 @@ Run this ONLY after the operator says go.
 2. **STOP AND VERIFY.** `/billing/usage` must report the **same window every user
    already had**. This deploy is meant to be a behavioural no-op; if any user's
    window moved, stop and investigate before step 3. Report the actual numbers.
+
+   Run **`railway run python scripts/verify_entitlement_deploy.py`** — the
+   read-only step-2 verifier (added 2026-09-06). It checks all six invariants
+   (window unmoved vs `records_period_start`, day-1 grid, one-month window, no
+   NULLs, effective == stored) across every user and prints the watched
+   `01dc9396…` account in full. **Exit 0 = clean, 1 = at least one user moved
+   (STOP), 2 = could not run.** It never issues an UPDATE. It needs no
+   pre-deploy snapshot, because `records_period_start` is the pre-088 column and
+   is kept in lockstep — the old value is still in the same row.
 3. **Only then** `railway run python scripts/backfill_quota_anchors.py`
    (dry-run is the default; `--commit --i-understand` to apply). This is the ONLY
    step that changes anyone's reset date. It writes `quota_anchor_at` and nothing
@@ -189,16 +198,68 @@ was charged to.
    none.** It was hand-reviewed (which found 2 real bugs, fixed in `ef3ba3d`) and
    the gap is disclosed as a comment on PR #116. **Re-run Codex on `ef3ba3d` once
    quota returns**, before or shortly after merging.
+
+   ⏭️ **RE-ATTEMPTED 2026-09-06 15:1x UTC — STILL BLOCKED.** `codex review --base
+   master` from the FE worktree returned the identical *"You've hit your usage
+   limit … try again at Sep 9th, 2026 3:10 AM"*. Confirmed independently from the
+   ChatGPT usage screen: **weekly limit 0% remaining, resets Wed 3:10 AM, 0
+   credits** — so there is no credit top-up path either. Active account verified
+   by decoding `~/.codex/auth.json` → `tokens.id_token` → `email` claim:
+   `memiki70@gmail.com`, plan `plus`. CLI is `codex-cli 0.152.1`.
+   🛑 In 0.152.1 a custom `[PROMPT]` and `--base <BRANCH>` are **mutually
+   exclusive** (`error: the argument '[PROMPT]' cannot be used with '--base'`), so
+   a focused base-branch review needs either a bare `codex review --base master`
+   or a `codex exec` with the diff described in the prompt.
+   🛑 Switching accounts is NOT a free workaround: per the prior session's recipe,
+   starting a `codex login --device-auth` flow **revokes the existing refresh
+   token**, so the current `auth.json` is not a safe rollback. Needs the operator.
 2. **Nothing has run against production.** Not deployed; the anchor backfill has
    never executed. Everything below is proven by TEST only.
+
+   ⏭️ **Still true on 2026-09-06.** This gap cannot close without the deploy go.
+   What was done instead is to make step 2 one command:
+   `scripts/verify_entitlement_deploy.py` (new, read-only). It was **exercised
+   against a real local Postgres** — a throwaway `bridgeleads_entverify` DB with
+   `alembic upgrade head` through 088 and four seeded users — and all three exit
+   paths were observed: **0** on a clean set, **1** on a deliberately planted
+   non-day-1 anchor (it caught C1/C2/C4), **2** when the filter matched no users.
+   The DB was dropped afterwards. **It has NOT been run against production.**
+   🛑 Running it found a real defect in its own first draft: the `→` in the report
+   raised `UnicodeEncodeError` on a cp1252 console and killed the script
+   MID-REPORT with exit 1 — a verifier that dies reads as a FAIL. Output is now
+   pure ASCII. Static review would not have caught that; running it did.
+
+   ⚠️ **The commits added on 2026-09-06 (this verifier + the doc supersede) are
+   NOT covered by the 5 clean Codex rounds**, which reviewed the `9e8ea21`
+   lineage. Queue them for the same Wed Codex pass as FE `ef3ba3d`.
 3. `tests/test_auth.py::test_brute_force_lockout_after_five_failures` fails in a
    full LOCAL run on the shared Redis rig; it passes 36/36 in isolation and CI is
    green. Rig flake, not a defect.
-4. `docs/product/billing-period-semantics.md` still documents the OLD
-   calendar-month policy as accepted. Supersede it on deploy.
+4. ~~`docs/product/billing-period-semantics.md` still documents the OLD
+   calendar-month policy as accepted.~~ ✅ **DONE 2026-09-06.** Rewritten as
+   SUPERSEDED: the new policy up top, a gap-by-gap disposition table for the five
+   it listed (1/3/4/5 fixed, 2 kept deliberately as anti-farming), and the
+   original preserved verbatim below as the historical record. It carries a
+   ⏭️ marker saying the replacement is **not yet deployed** — flip that one line
+   when the deploy lands, so the doc never claims a policy is live before it is.
 5. `lib/api-types.generated.ts` (FE) still carries the pre-088 `/usage` docstring.
    I predicted the drift gate would fail — **it did not, CI is green** — but
    regenerate after BE merges so the types match the live contract.
+
+   ⏭️ **STILL OPEN, and it CANNOT be closed before BE #231 merges.** Verified
+   2026-09-06: `.github/workflows/ci.yml` regenerates from
+   `raw.githubusercontent.com/.../web-scrapper-automation/**main**/schema/openapi.json`
+   and fails if the committed file differs. So regenerating today is a no-op
+   (main still serves the old schema), and hand-writing the post-088 file would
+   turn FE CI **red** until the backend merges.
+   🔑 **The post-merge change was measured, not guessed:** generating from the
+   branch schema with the repo's own `openapi-typescript` 7.13.0 produces a
+   **63-line diff that is 100% JSDoc `@description` comments — zero type
+   changes**, in exactly two places (`/billing/usage`, `/billing/webhook`). So
+   this carries no runtime or type risk; it is a comment refresh.
+   **Post-merge:** `npm run gen:api-types && git commit lib/api-types.generated.ts`
+   (and per the standing landmine, `gh run rerun --failed` on any FE run that
+   raced the merge).
 6. `records_period_start` is now a MIRROR of `quota_period_start`, written in
    lockstep for one release. Drop it in a later migration once the skip-trace beat
    and `cleanup_watchdog_billed_dups.py` stop reading it.

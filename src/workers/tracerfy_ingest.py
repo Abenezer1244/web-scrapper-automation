@@ -109,6 +109,37 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
     return {"outbox_id": outbox_id, "reported": True}
 
 
+def _alert_unreconciled(
+    queue_id: int, n_unmatched: int, n_unmatched_csv: int, n_pending: int
+) -> None:
+    """Page ops when a completed batch left rows we could not match.
+
+    The address key is `(property_address, city, state)` compared verbatim
+    between what we sent and what Tracerfy echoed back. A systematic mismatch
+    (provider-side USPS standardisation, say) would show up here as a whole
+    batch failing at once rather than as leads quietly stuck on "Processing".
+    """
+    try:
+        from src.workers.ops_alerts import send_ops_alert
+
+        send_ops_alert(
+            "skip_trace", f"unreconciled_{queue_id}",
+            "Skip-trace results could not be matched back to leads",
+            f"Tracerfy queue {queue_id} completed, but {n_unmatched} of "
+            f"{n_pending} submitted row(s) never appeared in the result CSV "
+            f"({n_unmatched_csv} CSV row(s) also matched nothing on our side). "
+            f"Those leads are now marked 'errored' instead of sitting on "
+            f"'Processing' forever, and they were NOT billed to the user.\n\n"
+            f"Rows are matched on (property_address, city, state) compared "
+            f"verbatim against Tracerfy's echoed address. If this fires for a "
+            f"whole batch the provider is likely normalising addresses and the "
+            f"match key needs revisiting; if it fires for one or two rows they "
+            f"were probably rejected at upload for a malformed address.",
+        )
+    except Exception as exc:  # noqa: BLE001 — alerting is best-effort
+        _logger.warning("unreconciled-batch ops alert failed: %s", str(exc)[:120])
+
+
 def _host_is_tracerfy(download_url: str) -> bool:
     """REDTEAM B1/T3: confirm a webhook-supplied download_url points at a
     Tracerfy-owned host before we fetch it server-side.
@@ -303,6 +334,15 @@ def ingest_tracerfy_batch(
             )
             pending_by_key.setdefault(key, []).append(p)
 
+        # Reconciliation bookkeeping. Both directions of a mismatch used to be
+        # invisible: a CSV row matching nothing was silently `continue`d, and a
+        # pending row that no CSV row ever named simply stayed 'submitted' — so
+        # its lead read "Processing" forever and it was never billed (the usage
+        # rollup counts only status='completed'). Neither left a counter, a log
+        # line or a terminal state. Count both and settle them below.
+        unmatched_csv = 0
+        matched_pending_ids: set = set()
+
         for csv_row in parsed:
             csv_key = (
                 (csv_row.get("address") or "").strip().lower(),
@@ -311,7 +351,9 @@ def ingest_tracerfy_batch(
             )
             matches = pending_by_key.get(csv_key, [])
             if not matches:
+                unmatched_csv += 1
                 continue
+            matched_pending_ids.update(p.id for p in matches)
 
             phone = csv_row.get("phone")
             email = csv_row.get("email")
@@ -399,6 +441,48 @@ def ingest_tracerfy_batch(
                     .values(status="completed")
                 )
 
+        # Settle rows the result CSV never named. Tracerfy finished this batch,
+        # so these will never be answered: leaving them 'submitted' stranded the
+        # lead on "Processing" indefinitely (confirmed in production on queue
+        # 162456). Give them the existing terminal 'errored' state on BOTH the
+        # pending row and its Result so the UI shows "Error" and ops can see them.
+        #
+        # They stay OUT of the billing rollup below (which counts only
+        # 'completed'), so the user is not charged for a lookup they never
+        # received. That under-bills us against the credits Tracerfy consumed —
+        # a deliberate, now-VISIBLE tradeoff rather than the previous silent one.
+        unmatched_pending = [p for p in pending if p.id not in matched_pending_ids]
+        if unmatched_pending:
+            db.execute(
+                update(PendingSkipTraceRow)
+                .where(PendingSkipTraceRow.id.in_([p.id for p in unmatched_pending]))
+                .values(status="errored")
+            )
+            db.execute(
+                update(Result)
+                .where(
+                    Result.id.in_([p.result_id for p in unmatched_pending]),
+                    Result.skip_trace_status.in_(("queued", "submitted")),
+                )
+                .values(skip_trace_status="errored", skip_trace_attempted_at=now)
+            )
+            _logger.error(
+                "Tracerfy ingest queue %d: %d pending row(s) never appeared in the "
+                "result CSV and %d CSV row(s) matched no pending row — marked "
+                "'errored'. Sent %d, CSV carried %d.",
+                queue_id, len(unmatched_pending), unmatched_csv,
+                len(pending), len(parsed),
+            )
+            _alert_unreconciled(queue_id, len(unmatched_pending), unmatched_csv, len(pending))
+        elif unmatched_csv:
+            # Rows we did not send but Tracerfy returned. Not lead-affecting, but
+            # it means the address key drifted — worth knowing before it grows.
+            _logger.warning(
+                "Tracerfy ingest queue %d: %d CSV row(s) matched no pending row "
+                "(all %d pending rows were still reconciled)",
+                queue_id, unmatched_csv, len(pending),
+            )
+
         # Mark the Tracerfy queue record as completed
         db.execute(
             update(SkipTraceQueue)
@@ -471,4 +555,8 @@ def ingest_tracerfy_batch(
         "queue_id": queue_id,
         "hits": hit_count,
         "misses": miss_count,
+        # Surfaced so a reconciliation gap is visible in the task result and in
+        # Flower, not only in a log line nobody is tailing.
+        "unmatched_rows": len(unmatched_pending),
+        "unmatched_csv_rows": unmatched_csv,
     }

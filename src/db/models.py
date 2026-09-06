@@ -604,6 +604,20 @@ class Job(Base):
     # not recomputed: no-dedup_hash billable rows aren't in delivered_records).
     billed_count = Column(Integer, nullable=False, server_default="0", default=0)
     billing_applied_at = Column(DateTime(timezone=True), nullable=True)
+    # Migration 087: quota RESERVATION. The plan cap used to read remaining
+    # quota and only charge it much later, in a different transaction, after the
+    # export — so two concurrent jobs (or two children of one batch) could both
+    # read the same remaining N and both deliver N. A lock cannot span that gap
+    # because the cap block commits before the export runs. Instead the cap
+    # CLAIMS the quota in the same atomic statement that computes it.
+    # reserved_at is the CAS gate: only the attempt that flips it from NULL
+    # reserves, so a watchdog re-run reuses the grant rather than taking a
+    # second one. reserved_count is what was granted — the amount to hand back
+    # if the job never bills. Billing then settles the DELTA
+    # (billable_count - reserved_count), which reduces to the full charge for a
+    # job that never reserved (reserved_count = 0).
+    reserved_count = Column(Integer, nullable=False, server_default="0", default=0)
+    reserved_at = Column(DateTime(timezone=True), nullable=True)
     # Phase 5 (migration 039): set once the dialer-push sweep has handled this
     # job (after skip-trace settles). NULL = not yet evaluated; the sweep claims
     # only done jobs with a dialer_webhook_url whose skip-trace is settled and

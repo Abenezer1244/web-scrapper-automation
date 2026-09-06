@@ -178,6 +178,76 @@ def _set_status(
     return rowcount == 1
 
 
+def release_quota_reservation(db, job_id: str) -> int:
+    """Hand back a quota grant this job claimed but never billed. Returns freed.
+
+    The plan cap RESERVES quota (migration 087) and charges it to
+    ``users.records_used`` immediately, which is what stops two concurrent jobs
+    being allocated the same remaining allowance. That means a job which dies
+    between the cap and the bill is holding records the user never received —
+    so every terminal-without-billing path has to release, or the reservation
+    becomes a silent permanent charge.
+
+    Guards, all necessary:
+      * ``billing_applied_at IS NULL`` — a job that DID bill settled its own
+        delta and owns its charge; releasing would refund a real delivery.
+      * ``reserved_at IS NOT NULL`` — nothing to give back otherwise, and this
+        makes a double-release a no-op.
+      * the user's period must not have rolled since the reservation. After a
+        rollover the stored counter belongs to a NEW period that this grant was
+        never added to, and subtracting from it would destroy current-period
+        usage — the exact class of bug this whole area is recovering from.
+      * ``GREATEST(0, ...)`` so a counter can never be driven negative.
+
+    Clearing ``reserved_at`` lets a watchdog re-run of this job reserve afresh
+    rather than reusing a grant that has already been handed back.
+    """
+    try:
+        freed = db.execute(
+            text(
+                "WITH held AS ("
+                "  SELECT j.reserved_count AS amount, j.user_id AS uid"
+                "  FROM jobs j"
+                "  WHERE j.id = :jid"
+                "    AND j.reserved_at IS NOT NULL"
+                "    AND j.billing_applied_at IS NULL"
+                "    AND j.reserved_count > 0"
+                "    AND EXISTS ("
+                "      SELECT 1 FROM users u"
+                "      WHERE u.id = j.user_id"
+                "        AND u.records_period_start <= j.reserved_at"
+                "    )"
+                "), cleared AS ("
+                "  UPDATE jobs SET reserved_count = 0, reserved_at = NULL"
+                "  WHERE id = :jid AND EXISTS (SELECT 1 FROM held)"
+                "), refunded AS ("
+                "  UPDATE users u"
+                "  SET records_used = GREATEST(0, u.records_used - held.amount)"
+                "  FROM held WHERE u.id = held.uid"
+                "  RETURNING held.amount"
+                ") SELECT COALESCE((SELECT amount FROM refunded), 0)"
+            ),
+            {"jid": job_id},
+        ).scalar() or 0
+        db.commit()
+        if freed:
+            _logger.info(
+                "Job %s: released %d reserved records back to the user's quota",
+                job_id, freed,
+            )
+        return int(freed)
+    except Exception as exc:  # noqa: BLE001 — never mask the original failure
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _logger.error(
+            "Job %s: could not release its quota reservation: %s",
+            job_id, str(exc)[:200],
+        )
+        return 0
+
+
 def _fail_job(db, job, r, job_id: str, reason: str, expected_started_at=None) -> bool:
     """Transition job to FAILED with a human-readable error message.
 
@@ -240,6 +310,10 @@ def _fail_job(db, job, r, job_id: str, reason: str, expected_started_at=None) ->
         return cas_ok
     # Publish the failure log via a fresh session (db=None) so it
     # is not coupled to the main session's transaction state.
+    # A failed job delivered nothing, so any quota it reserved must go back.
+    # Doing it here rather than at each call site means every failure path is
+    # covered, including ones added later. No-op when nothing was reserved.
+    release_quota_reservation(db, job_id)
     _publish_log(r, job_id, "error", reason, db=None)
     r.publish(f"job_logs:{job_id}", json.dumps({"type": "failed", "error": reason}))
     _logger.error("Job %s failed: %s", job_id, reason)

@@ -213,20 +213,18 @@ async def create_batch(
             detail="Skip trace requires a Pro plan or higher.",
         )
 
-    # 4. Quota preflight — don't launch a batch when already at the monthly cap.
+    # 4. Quota preflight — don't launch a batch when already at the entitlement
+    #    cap, or when the account is frozen for a failed payment.
     #    (Records-per-scrape isn't predictable; this honest check blocks a batch
-    #    that would only error at the quota wall.) -1/None = unlimited.
-    from src.api.quota import effective_records_used
+    #    that would only error at the quota wall.) -1/None = unlimited, and
+    #    quota_block_reason already treats that as never over.
+    from src.api.quota import quota_block_reason
 
-    limit = current_user.records_limit
-    if (
-        limit is not None
-        and limit >= 0
-        and effective_records_used(current_user) >= limit
-    ):
+    _blocked = quota_block_reason(current_user)
+    if _blocked:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail="Monthly record limit reached — upgrade or wait for reset before running a batch.",
+            detail=_blocked,
         )
 
     # 5. Validate EVERY (county, record_type) against the connector registry for

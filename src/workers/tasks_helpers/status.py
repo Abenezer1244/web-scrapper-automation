@@ -16,10 +16,30 @@ from typing import TypedDict, Unpack
 import redis as sync_redis
 from sqlalchemy import text
 
+from src.api.quota_window import reservation_is_current_sql
 from src.config import settings
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("worker.task")
+
+#: Is the grant this job is holding still sitting in the user's counter?
+#:
+#: ``rolling="false"`` because RELEASE never rolls a window — unlike settlement,
+#: which advances the window in the same statement it charges and must therefore
+#: refuse to net a grant against a base it has just zeroed. Here the stored
+#: window is the counter's window: if it still matches the one the grant was
+#: charged to, the grant is still in there and must come back; if it does not,
+#: the rollover already discarded it and there is nothing to refund. With
+#: ``rolling`` false the expression reduces to exactly that equality, and a
+#: pre-migration-088 job (NULL window) keeps the calendar-month test it was
+#: written under.
+_RESERVATION_STILL_HELD = reservation_is_current_sql(
+    job_window="jobs.quota_period_start",
+    job_reserved_at="jobs.reserved_at",
+    user_window="u.quota_period_start",
+    user_records_period_start="u.records_period_start",
+    rolling="false",
+)
 
 # Delivery download links: prefer a revocable app download-token URL (honors
 # logout-all + the jti blacklist, scoped to user+job) over a raw 48h R2
@@ -201,16 +221,26 @@ def release_quota_reservation(db, job_id: str) -> int:
     Guards, all necessary:
       * ``billing_applied_at IS NULL`` — a job that DID bill settled its own
         delta and owns its charge; releasing would refund a real delivery.
-      * the reservation must belong to the user's CURRENT period. After a
-        rollover the counter belongs to a new period this grant was never added
-        to, and subtracting from it would destroy current-period usage — the
-        exact class of bug this whole area is recovering from. Compared by
-        MONTH, not ``<=``: the latter is only accidentally right for tidy
-        month-start values and is far too broad as a correctness guard. (Codex)
+      * the reservation must belong to the user's CURRENT ENTITLEMENT WINDOW.
+        After a rollover the counter belongs to a new window this grant was
+        never added to, and subtracting from it would destroy current-window
+        usage — the exact class of bug this whole area is recovering from.
+        The test is now an equality on ``quota_period_start`` rather than a
+        comparison of calendar MONTHS: month equality is only accidentally
+        right while every window starts on the 1st, and with (say) a 20th
+        anchor a grant taken on the 19th and released on the 21st would have
+        been refunded out of a window that never held it. A job that reserved
+        before migration 088 has a NULL ``jobs.quota_period_start`` and keeps
+        the month comparison it was written under — correct for exactly those
+        rows, and a set that drains. (Codex, extended)
       * ``GREATEST(0, ...)`` so a counter can never be driven negative.
 
     Clearing ``reserved_at`` also lets a watchdog re-run reserve afresh rather
     than reusing a grant that has already been handed back.
+
+    A grant whose window HAS rolled is retired rather than refunded (see below):
+    there is nothing left to give back, but leaving the bookkeeping set would
+    keep the row in the beat sweep's result set forever.
     """
     try:
         # Exclusive claim. reserved_count is deliberately NOT written here, so
@@ -225,15 +255,34 @@ def release_quota_reservation(db, job_id: str) -> int:
                 "  AND EXISTS ("
                 "    SELECT 1 FROM users u "
                 "    WHERE u.id = jobs.user_id "
-                "      AND date_trunc('month', u.records_period_start AT TIME ZONE 'UTC')"
-                "        = date_trunc('month', jobs.reserved_at AT TIME ZONE 'UTC')"
+                "      AND " + _RESERVATION_STILL_HELD + ""
                 "  ) "
                 "RETURNING user_id, reserved_count"
             ),
             {"jid": job_id},
         ).fetchone()
         if row is None:
+            # Nothing to refund. If the ONLY reason is that the window has
+            # rolled — the grant was zeroed along with it — retire the
+            # bookkeeping so the 5-minute sweep does not re-examine this job
+            # for the rest of its life. Never touches the user's counter.
+            retired = db.execute(
+                text(
+                    "UPDATE jobs SET reserved_at = NULL, reserved_count = 0 "
+                    "WHERE id = :jid "
+                    "  AND reserved_at IS NOT NULL "
+                    "  AND billing_applied_at IS NULL "
+                    "  AND reserved_count > 0"
+                ),
+                {"jid": job_id},
+            ).rowcount
             db.commit()
+            if retired:
+                _logger.info(
+                    "Job %s: quota reservation belonged to an entitlement "
+                    "window that has already rolled — retired without refund",
+                    job_id,
+                )
             return 0
         user_id, amount = str(row[0]), int(row[1])
         db.execute(

@@ -1,5 +1,7 @@
 """Stripe billing routes: checkout, portal, webhooks, plans, usage."""
 
+from datetime import UTC, datetime
+
 import stripe
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
@@ -7,6 +9,13 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser, require_admin
+from src.api.billing_entitlement import (
+    activate_paid_plan,
+    apply_plan_change,
+    end_subscription,
+    mark_payment_failed,
+    mark_payment_succeeded,
+)
 from src.api.deps import get_rls_db
 from src.api.middleware import client_ip, rate_limit
 from src.config import settings
@@ -303,13 +312,23 @@ _PLANS = [
     },
 ]
 
-# price_id → (plan_name, records_limit). Includes BOTH the monthly and annual
-# Stripe Price IDs so the webhook maps an annual subscription to the right plan,
-# not just the monthly one.
-_PRICE_TO_PLAN: dict[str, tuple[str, int]] = {
-    pid: (p["id"], p["records_limit"])
+# price_id → (plan_name, records_limit, interval). Includes BOTH the monthly and
+# annual Stripe Price IDs so the webhook maps an annual subscription to the right
+# plan, not just the monthly one.
+#
+# The INTERVAL is now carried because the map used to collapse monthly and annual
+# onto the same tuple, leaving the code unable to tell them apart. It is NOT used
+# to size the entitlement window — that is always one month, so an annual Pro
+# subscriber gets twelve 1,000-record windows rather than 1,000 records for a
+# year — but it is needed to report the subscription honestly and to recognise a
+# monthly<->annual switch as a no-op for quota rather than as a plan change.
+_PRICE_TO_PLAN: dict[str, tuple[str, int, str]] = {
+    pid: (p["id"], p["records_limit"], interval)
     for p in _PLANS
-    for pid in (p.get("stripe_price_id"), p.get("stripe_price_id_annual"))
+    for pid, interval in (
+        (p.get("stripe_price_id"), "month"),
+        (p.get("stripe_price_id_annual"), "year"),
+    )
     if pid
 }
 
@@ -454,33 +473,33 @@ async def pricing_page() -> dict:
 
 @router.get("/usage")
 async def get_usage(request: Request, current_user: CurrentUser) -> dict:
-    """Return current plan, record usage, limit, and the quota WINDOW.
+    """Return current plan, record usage, limit, and the ENTITLEMENT WINDOW.
 
-    ``period_start`` / ``next_reset_at`` are reported because the quota window
-    is the CALENDAR month in UTC and is deliberately independent of the Stripe
-    billing anniversary — a subscriber who starts mid-month reaches a calendar
-    reset before their second invoice. That is documented product policy (see
-    docs/product/billing-period-semantics.md), but it is only defensible if the
-    boundary is visible, so the UI can say "resets 1 Oct" instead of leaving a
-    user to infer it from a number that changes overnight.
+    Quota no longer resets on the 1st. It resets on the user's own entitlement
+    anniversary — the monthly grid anchored at ``users.quota_anchor_at`` — so a
+    subscriber who starts on the 20th is metered from the 20th and an annual
+    subscriber still gets a fresh month every month.
 
-    ``records_used`` is period-aware here for the same reason the enforcement
-    gates are: the daily rollover is a catch-up task, so between the true month
-    boundary and its next run a healthy user can still carry last month's
-    period, and reporting the raw column would show usage they no longer owe.
+    The window reported here is the EFFECTIVE one, not the stored pair. Rollover
+    is lazy: it happens inside the statement that next charges the user, with an
+    hourly reconciliation for people who never transact. Between a boundary and
+    whichever of those comes first, the stored window has legitimately expired,
+    and echoing it would tell a user their quota resets on a date that has
+    already passed. ``records_used`` is window-aware for the same reason the
+    enforcement gates are — reporting the raw column would show usage they no
+    longer owe.
+
+    ``payment_state`` is reported separately from usage on purpose: a customer
+    frozen for a failed payment is not "over their limit", and sending them to
+    the upgrade page would not fix anything.
     """
     await rate_limit(request, zone="general", identifier=current_user.id)
-    from src.api.quota import current_period_start, effective_records_used
+    from src.api.quota import effective_records_used, effective_window, is_frozen
 
     limit = current_user.records_limit
     used = effective_records_used(current_user)
-    period_start = current_period_start()
-    # First instant of the following month, in UTC.
-    next_reset = (
-        period_start.replace(year=period_start.year + 1, month=1)
-        if period_start.month == 12
-        else period_start.replace(month=period_start.month + 1)
-    )
+    period_start, period_end = effective_window(current_user)
+    frozen = is_frozen(current_user)
     return {
         "plan": current_user.plan,
         "records_used": used,
@@ -488,8 +507,19 @@ async def get_usage(request: Request, current_user: CurrentUser) -> dict:
         "records_remaining": max(0, limit - used) if limit != -1 else None,
         "percent_used": round((used / limit) * 100, 1) if limit and limit != -1 else 0,
         "period_start": period_start.isoformat(),
-        "next_reset_at": next_reset.isoformat(),
-        "period_basis": "calendar_month_utc",
+        # The window END is the reset instant: the boundary belongs to the NEW
+        # window, so "resets at" and "current window ends" are the same moment.
+        "next_reset_at": period_end.isoformat(),
+        "period_basis": "entitlement_month_utc",
+        # A pending downgrade is visible but NOT yet applied — the customer keeps
+        # the cap they paid for until the boundary above.
+        "pending_plan": current_user.pending_plan,
+        "pending_records_limit": current_user.pending_records_limit,
+        "payment_state": "frozen" if frozen else "ok",
+        "entitlement_ends_at": (
+            current_user.entitlement_ends_at.isoformat()
+            if current_user.entitlement_ends_at else None
+        ),
     }
 
 
@@ -659,10 +689,19 @@ async def stripe_webhook(
     """Handle Stripe webhook events to keep plan state in sync.
 
     Registers for:
-      - checkout.session.completed      → activate new plan
-      - customer.subscription.updated   → handle upgrades / downgrades
+      - checkout.session.completed      → activate new plan (trial → paid)
+      - customer.subscription.updated   → upgrades / downgrades / cancellation
       - customer.subscription.deleted   → downgrade to starter
-      - invoice.payment_failed          → notify user by email
+      - invoice.payment_failed          → start the dunning grace + notify
+      - invoice.payment_succeeded       → lift the dunning freeze
+
+    NOTE what these handlers deliberately do NOT do: advance a quota window.
+    Record quota rolls on the user's entitlement anniversary, lazily, inside the
+    statement that next charges them (and hourly via reconcile_quota_periods).
+    Making a webhook the mechanism would strand a renewed payer at cap behind a
+    late delivery and hand out a second bucket on a replay — Stripe retries for
+    three days and can deliver out of order. Webhooks update plan, limit, status
+    and lifecycle dates; the window advances on its own.
     """
     if not settings.STRIPE_WEBHOOK_SECRET or len(settings.STRIPE_WEBHOOK_SECRET) < 20:
         raise HTTPException(status_code=503, detail="Webhook not configured")
@@ -725,10 +764,33 @@ async def stripe_webhook(
     elif event_type == "invoice.payment_failed":
         await _handle_payment_failed(data, db)
 
+    elif event_type == "invoice.payment_succeeded":
+        await _handle_payment_succeeded(data, db)
+
     return {"received": True}
 
 
 # ─── Webhook handlers ─────────────────────────────────────────────────────────
+
+def _stripe_ts(value: object) -> datetime | None:
+    """Stripe unix seconds -> an aware UTC datetime, or None.
+
+    Stripe sends every timestamp as an integer epoch. Building a NAIVE datetime
+    from one (``datetime.fromtimestamp`` without a tz) would interpret it in the
+    server's local zone, which on a Railway box happens to be UTC and on a
+    developer's box does not — a boundary that is silently right in production
+    and silently wrong in testing is worse than one that is always wrong.
+    Tolerates None/garbage so a Stripe field we do not receive is simply absent
+    rather than a 500 on a webhook Stripe would then retry for three days.
+    """
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.fromtimestamp(int(value), tz=UTC)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OSError, OverflowError):
+        _logger.warning("stripe timestamp not parseable: %r", value)
+        return None
+
 
 def _alert_billing_gap(reason: str, dedup_key: str, **ctx: object) -> None:
     """Loudly surface a webhook event that silently dropped payment/entitlement state.
@@ -790,7 +852,7 @@ async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
         )
         return
 
-    plan_name, records_limit = plan_info
+    plan_name, records_limit, _interval = plan_info
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if user is None:
@@ -820,14 +882,23 @@ async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
         if not user.stripe_customer_id:
             user.stripe_customer_id = session_customer_id
 
-    user.plan = plan_name
-    user.records_limit = records_limit
-    # Durable entitlement (migration 077) + end the app-side 7-day trial: a
-    # converted user is no longer "on trial", so expire_trials must not consider
-    # them. subscription["status"] is authoritative (retrieved above).
-    user.stripe_subscription_id = subscription_id
-    user.subscription_status = subscription.get("status")
-    user.trial_ends_at = None
+    # P1 (trial -> paid) / P9 (resubscribe). Durable entitlement (migration 077)
+    # plus the entitlement window (migration 088): a customer who consumed their
+    # trial allowance and then PAID starts a fresh paid month AT CONVERSION,
+    # instead of receiving nothing until the calendar 1st. The reset is gated on
+    # first_paid_at / paid_entitlement_ended_at, not on this event, so a Stripe
+    # replay — or a second event describing the same conversion — cannot zero
+    # the counter twice. subscription["status"] is authoritative (retrieved
+    # above, so it reflects Stripe NOW rather than whenever the event was
+    # queued).
+    activate_paid_plan(
+        user,
+        plan=plan_name,
+        records_limit=records_limit,
+        subscription_id=subscription_id,
+        status=subscription.get("status"),
+        billing_cycle_anchor=_stripe_ts(subscription.get("billing_cycle_anchor")),
+    )
     await db.flush()
 
     # Sprint 7.3: grant referral credit if this is the referee's
@@ -866,10 +937,35 @@ async def _grant_referral_credit(db: AsyncSession, referee: User) -> None:
 
 
 async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
-    """Handle plan changes (upgrades or downgrades) mid-cycle."""
+    """Handle plan changes (upgrades or downgrades) and scheduled cancellation.
+
+    RE-READS the subscription from Stripe rather than trusting the event body.
+    Stripe retries for three days and does not guarantee ordering, so a delayed
+    ``updated`` describing a plan the customer has since changed again would
+    otherwise overwrite newer state — silently restoring a cancelled downgrade
+    or an old cap. Retrieving makes the LAST handler to run write the CURRENT
+    truth, whatever order the events arrived in, and needs no extra column to
+    track event times. If Stripe is unreachable we fall back to the event body
+    (the previous behaviour) rather than dropping a real plan change.
+    """
     customer_id = data.get("customer")
     if not customer_id:
         return
+
+    subscription_id = data.get("id")
+    if subscription_id:
+        try:
+            data = dict(
+                stripe.Subscription.retrieve(
+                    subscription_id, expand=["items.data.price"]
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — never 500 a webhook
+            _logger.warning(
+                "customer.subscription.updated: could not re-read %s from Stripe "
+                "(%s) — applying the event payload, which may be out of order",
+                subscription_id, str(exc)[:200],
+            )
 
     items = (data.get("items") or {}).get("data", [])
     if not items:
@@ -890,7 +986,7 @@ async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
         )
         return
 
-    plan_name, records_limit = plan_info
+    plan_name, records_limit, _interval = plan_info
     result = await db.execute(select(User).where(User.stripe_customer_id == customer_id))
     user = result.scalar_one_or_none()
     if user is None:
@@ -903,21 +999,50 @@ async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
             customer_id, plan_name, records_limit,
         )
         return
-    user.plan = plan_name
-    user.records_limit = records_limit
-    # Keep the durable entitlement state in sync (migration 077). An entitled
+
+    # P4 / P5 / P6a: upgrades take effect now and keep both the window and the
+    # counter; downgrades are parked and applied at the next entitlement
+    # boundary so nobody is cut to a smaller cap on quota they already paid for;
+    # a scheduled cancellation records when paid access stops. The durable
+    # entitlement state (migration 077) is kept in sync throughout — an entitled
     # status ends the app-side trial so expire_trials won't downgrade a payer.
-    user.stripe_subscription_id = data.get("id")
-    user.subscription_status = data.get("status")
-    if data.get("status") in ("active", "trialing"):
-        user.trial_ends_at = None
+    outcome = apply_plan_change(
+        user,
+        plan=plan_name,
+        records_limit=records_limit,
+        subscription_id=data.get("id"),
+        status=data.get("status"),
+        cancel_at_period_end=bool(data.get("cancel_at_period_end")),
+        entitlement_end=_stripe_ts(data.get("cancel_at"))
+        or _stripe_ts(data.get("current_period_end")),
+        billing_cycle_anchor=_stripe_ts(data.get("billing_cycle_anchor")),
+    )
     await db.flush()
-    from src.api.entitlements import apply_reconciliation_async
-    await apply_reconciliation_async(db, str(user.id), user.plan)
+    _logger.info(
+        "customer.subscription.updated: user %s -> %s (%s)",
+        user.id, plan_name, outcome,
+    )
+    # A DEFERRED downgrade must not pause the customer's scrapers yet — they
+    # keep the plan they paid for until the boundary, and the rollover triggers
+    # reconciliation then (via reconcile_quota_periods).
+    if outcome != "downgrade_pending":
+        from src.api.entitlements import apply_reconciliation_async
+        await apply_reconciliation_async(db, str(user.id), user.plan)
 
 
 async def _handle_subscription_deleted(data: dict, db: AsyncSession) -> None:
-    """Downgrade user to starter when their subscription ends."""
+    """P6b/P6c — the paid term has actually ended. Downgrade to Starter.
+
+    Stripe sends this event both when a cancel-at-period-end reaches its end and
+    when a subscription is cancelled immediately, so one handler covers both.
+
+    ``records_used``, the entitlement window and the anchor are left ALONE: the
+    customer already received those records, so refunding the counter would be a
+    small free grant on every cancellation and would break the invariant that no
+    plan change ever resets quota. They regain quota at their own next boundary,
+    at the Starter cap. ``paid_entitlement_ended_at`` is stamped here, and it is
+    the only thing that later lets a genuine resubscribe mint a fresh window.
+    """
     customer_id = data.get("customer")
     if not customer_id:
         return
@@ -925,11 +1050,7 @@ async def _handle_subscription_deleted(data: dict, db: AsyncSession) -> None:
     result = await db.execute(select(User).where(User.stripe_customer_id == customer_id))
     user = result.scalar_one_or_none()
     if user:
-        user.plan = "starter"
-        user.records_limit = settings.PLAN_LIMITS["starter"]
-        # Clear the entitlement so any future trial logic treats them as unpaid.
-        user.stripe_subscription_id = None
-        user.subscription_status = "canceled"
+        end_subscription(user)
         await db.flush()
         from src.api.entitlements import apply_reconciliation_async
         await apply_reconciliation_async(db, str(user.id), user.plan)
@@ -957,6 +1078,29 @@ async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:
     if not user:
         return
 
+    # P7: start the dunning grace. Until it expires the customer is served
+    # normally (Stripe's retries span days, and freezing someone whose card
+    # succeeds on retry 3 would be a self-inflicted outage). After it, the
+    # account freezes: no new billable work, and the entitlement window stops
+    # advancing, so an unpaid subscription cannot accrue a fresh bucket every
+    # month. Nothing is deleted; results and past exports stay available.
+    #
+    # Only a SUBSCRIPTION invoice may do this. Skip-trace overage is billed on
+    # its own metered invoice, and letting one of those failures mark the
+    # subscription past_due would freeze a customer who is paying for the plan
+    # perfectly well.
+    invoice_sub = data.get("subscription")
+    if invoice_sub and user.stripe_subscription_id and (
+        invoice_sub == user.stripe_subscription_id
+    ):
+        grace_until = mark_payment_failed(user)
+        user.subscription_status = "past_due"
+        await db.flush()
+        _logger.info(
+            "invoice.payment_failed: user %s served until %s, then frozen",
+            user.id, grace_until.isoformat(),
+        )
+
     # Send notification — imported here to avoid circular at startup
     from src.workers.delivery import _send_payment_failed_email
     _send_payment_failed_email(user.email, attempt_count)
@@ -968,3 +1112,48 @@ async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:
         emit_payment_notification.delay(str(user.id), attempt_count)
     except Exception as exc:  # enqueue failure must not fail the webhook
         _logger.warning("payment notification enqueue failed (non-fatal): %s", exc)
+
+
+async def _handle_payment_succeeded(data: dict, db: AsyncSession) -> None:
+    """Payment recovered, or a renewal invoice was paid.
+
+    Previously unhandled, which meant nothing in the system ever observed a
+    renewal. It is handled now — but note carefully what it does NOT do: it does
+    not reset the counter and it does not advance the entitlement window.
+
+    Making payment the trigger for fresh quota is the obvious design and the
+    wrong one. Stripe retries for three days and can deliver out of order, so a
+    late delivery would strand a renewed payer at cap while a replay would hand
+    them a second bucket. The window advances on its own, lazily, from the
+    anchor — so a webhook that never arrives at all cannot cost a paying
+    customer their month.
+
+    What this DOES do is lift the dunning freeze from P7. The advance is then
+    automatic: the next quota operation (or the hourly reconciliation) sees a
+    window that ended while the account was frozen and rolls it forward to the
+    window containing now — exactly one bucket, never one per frozen month.
+    """
+    customer_id = data.get("customer")
+    if not customer_id:
+        return
+
+    result = await db.execute(select(User).where(User.stripe_customer_id == customer_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        return
+
+    # Only a SUBSCRIPTION invoice clears dunning. A paid skip-trace overage
+    # invoice says nothing about whether the plan itself is being paid for.
+    invoice_sub = data.get("subscription")
+    if not (invoice_sub and user.stripe_subscription_id
+            and invoice_sub == user.stripe_subscription_id):
+        return
+
+    was_frozen = user.entitlement_grace_ends_at is not None
+    mark_payment_succeeded(user, status="active")
+    await db.flush()
+    if was_frozen:
+        _logger.info(
+            "invoice.payment_succeeded: user %s recovered — dunning freeze lifted",
+            user.id,
+        )

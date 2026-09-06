@@ -161,6 +161,20 @@ async def _create_real_user(
     _period_start = _now.replace(
         day=1, hour=0, minute=0, second=0, microsecond=0
     )
+    # The TRIAL is its own entitlement window: [signup, trial_ends_at), not a
+    # calendar month (migration 088). Under the calendar rule a 7-day trial that
+    # straddled the 1st was reset mid-trial and handed out 2,000 free records —
+    # twice the advertised allowance, for free, purely as a function of the
+    # signup date. The trial now grants exactly what it says.
+    #
+    # The anchor is the SIGNUP instant, so when the trial ends the window rolls
+    # onto a grid of that user's own rather than back to the 1st. A conversion to
+    # paid re-anchors to Stripe's billing_cycle_anchor; that is one of only three
+    # events allowed to move an anchor.
+    #
+    # skip_trace_period_start stays on the calendar month — skip-trace is billed
+    # on its own Stripe meter and is deliberately out of scope here.
+    _trial_ends = _now + timedelta(days=7)
     user = User(
         id=str(uuid.uuid4()),
         email=email,
@@ -169,8 +183,11 @@ async def _create_real_user(
         password_hash=password_hash,
         plan="pro",
         records_limit=settings.PLAN_LIMITS["pro"],  # Pro limit during the 7-day trial
-        trial_ends_at=_now + timedelta(days=7),
-        records_period_start=_period_start,
+        trial_ends_at=_trial_ends,
+        quota_anchor_at=_now,
+        quota_period_start=_now,
+        quota_period_end=_trial_ends,
+        records_period_start=_now,
         skip_trace_period_start=_period_start,
         referral_code=referral_code,
         referred_by_user_id=referred_by_id,

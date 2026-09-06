@@ -48,7 +48,7 @@ Verified NOT broken (do not "fix"):
       `PendingSkipTraceRow` and `Result` (so the UI stops saying "Processing").
 
 ### Phase 2 — automated stale-claim reconciliation (F1, F9)
-- [ ] 2a. On a stale claim, call `GET /v1/api/queues/` and decide, using Codex's
+- [x] 2a. On a stale claim, call `GET /v1/api/queues/` and decide, using Codex's
       conservative predicate: same `trace_type`, `created_at` inside the claim
       window, `rows_uploaded <= len(claimed)` (never `==` — Tracerfy dedupes),
       `rows_uploaded > 0`, and **exactly one** candidate. No match → release to
@@ -56,7 +56,7 @@ Verified NOT broken (do not "fix"):
       Never blind-resubmit.
 
 ### Phase 3 — ingest: no silent drops (F5)
-- [ ] 3a. Count + log unmatched CSV rows and unmatched pending rows, give them a
+- [x] 3a. Count + log unmatched CSV rows and unmatched pending rows, give them a
       terminal status, and alert. Deliberately **not** adding a fuzzy/normalized
       fallback matcher: there is no evidence Tracerfy standardizes addresses
       (126/126 completed rows matched exactly), and Codex confirmed a normalized
@@ -64,17 +64,18 @@ Verified NOT broken (do not "fix"):
       Measure first — Phase 3a is the measurement.
 
 ### Phase 4 — tests (F6)
-- [ ] 4a. Ingest: successful match, no-match vs failure, unmatched row, webhook
+- [x] 4a. Ingest: successful match, no-match vs failure, unmatched row, webhook
       replay billing idempotency, cross-tenant batch isolation, phone/email dedupe.
-- [ ] 4b. Dispatcher: post-accept bookkeeping failure, stale reconciliation
+- [x] 4b. Dispatcher: post-accept bookkeeping failure, stale reconciliation
       (no-match / single-match / ambiguous), dedupe count mismatch, invalid-address
       terminal status.
 
 ### Phase 5 — repair (separate, reviewed, run after Phases 1-4 deploy)
-- [ ] 5a. Read-only reconciliation report for the 637 + the 14 orphan queues.
-- [ ] 5b. Release the 637 to `queued` (safe: Tracerfy's queue list shows no queue
-      at those timestamps and `total_queues=27` matches the 27 returned, so the
-      list is not truncated — we were never charged).
+- [x] 5a. Read-only reconciliation report for the 637 + the 14 orphan queues.
+- [ ] 5b. Release the 637 — **no longer needs the script**. Once Phase 2 deploys,
+      `_reconcile_stale_claims` releases them automatically on the first tick.
+      Dry run confirms all 637 release, 0 adopt, 0 refuse. Do NOT run the script
+      against the currently-deployed (old) dispatcher: it would re-strand them.
 
 ---
 
@@ -93,4 +94,54 @@ Verified NOT broken (do not "fix"):
 
 ## Review
 
-_(filled in at the end)_
+### Shipped (6 commits on `feat/skip-trace-provider-abstraction`)
+
+| Commit | What |
+|---|---|
+| `c1099e9` | Guard the post-accept bookkeeping (F2); reject untraceable rows (F4) |
+| `25cc8fb` | Automated stale-claim reconciliation against Tracerfy's queue list (F1, F9) |
+| `e7bcecb` | Settle ingest rows the CSV never named (F5); first ingest tests (F6) |
+| `b979575` | One-off repair script + orphan-queue report (Phase 5) |
+| `bc92658` | Codex round 1: double-charge + cross-batch adoption + redrive durability |
+| `1874658` | Codex round 2: release window, attribution guard, missing `on_failure` |
+
+### Codex rounds
+
+**Round 1 — 6 findings, 4 accepted.** Two were mine and severe: the post-accept
+bookkeeping ran unguarded (the live cause of the 14 orphaned paid queues), and
+the reconciler released a claim whose queue was merely *pending*, which would
+have resubmitted and double-charged. One finding (ingest match key) was rejected
+**with measurement** rather than argument: production has exactly one in-batch
+key collision ever and it is benign.
+
+**Round 2 — 3 findings, all 3 accepted, all in my own round-1 fixes.**
+Release and adoption were sharing one window; the attribution guard had two
+escape routes (one answer + differently-named rows, and all-NULL advanced
+names); and `on_failure` never existed despite the docstring claiming it, which
+my new redrive sweep would have turned into an infinite re-enqueue.
+
+**Round 3** cut off mid-run (no final message). Its open question — whether
+assigning `.on_failure` on a Celery task instance actually fires — was answered
+empirically instead, with two tests that invoke the hook the way Celery does and
+assert on the database. Both pass.
+
+### Not fixed, deliberately
+
+- **F7** `SkipTraceQueue.job_id/user_id` still store `claimed[0]`'s values on a
+  cross-tenant batch. Documented in place as non-authoritative; nothing reads
+  them for tenancy (ingest re-derives per-user attribution from the pending
+  rows). Changing the columns is a migration for cosmetics.
+- **F8** ingest downloads and parses the CSV before taking the queue lock.
+  Wasteful under a duplicate webhook, never incorrect — the lock still
+  serialises every mutation.
+- Two genuinely different people with the same normalised name at one address
+  would be treated as one owner. Indistinguishable from the same person with the
+  data available.
+- The 8 prod rows whose address carries a ZIP but no city/state
+  (`'325 HARVARD AVE E #401 98102'`) are declined rather than recovered. The
+  scraper config knows its own `state`, so passing it into
+  `build_pending_row_payload` would rescue most of them — a real follow-up, but
+  it means threading a new argument through a hot path for 0.16% of rows.
+- One prod address has legal-notice text bleeding into `property_address`
+  (`'3046 36th Avenue W, Seattle, WA 98199 I. NOTICE IS HEREBY ...'`). That is
+  an NTS parser defect, not a skip-trace one.

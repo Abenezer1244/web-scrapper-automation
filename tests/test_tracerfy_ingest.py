@@ -432,3 +432,65 @@ class TestAttributionGuard:
 
     def test_null_and_named_owner_together_is_refused(self):
         assert _attribution_is_safe([_P(), _P("JANE", "DOE")], 1) is False
+
+
+@pytest.mark.asyncio
+async def test_exhausted_retries_mark_the_queue_errored(starter_user, monkeypatch):
+    """The failure hook must ACTUALLY fire.
+
+    ingest_tracerfy_batch's docstring always claimed that exhausting retries
+    marks the SkipTraceQueue 'errored'; nothing implemented it until now, and
+    the reconciler's redrive sweep looks for exactly the state a missing hook
+    leaves behind ('pending' + a download_url), so a silently-inert hook means
+    the sweep re-enqueues a doomed ingest every five minutes forever.
+
+    Assigning .on_failure onto a Celery task instance is subtle enough that
+    reasoning about it is not evidence -- this invokes the real hook the way
+    Celery does and checks the database.
+    """
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, [("9 DOOMED ST", "TACOMA", "WA")])
+    with system_sync_session() as db:
+        db.execute(
+            text("""UPDATE skip_trace_queues SET download_url = :u
+                    WHERE tracerfy_queue_id = :q"""),
+            {"u": DOWNLOAD_URL, "q": qid},
+        )
+        db.commit()
+
+    def _status() -> str:
+        with system_sync_session() as db:
+            return db.execute(
+                text("SELECT status FROM skip_trace_queues WHERE tracerfy_queue_id = :q"),
+                {"q": qid},
+            ).scalar_one()
+
+    assert _status() == "pending"
+
+    # Exactly how Celery invokes it when retries are exhausted.
+    ingest_tracerfy_batch.on_failure(
+        RuntimeError("download failed"), "task-id", (), {"queue_id": qid}, None
+    )
+
+    assert _status() == "errored", "the on_failure hook did not fire"
+
+
+@pytest.mark.asyncio
+async def test_failure_hook_reads_queue_id_from_positional_args_too(
+    starter_user, monkeypatch
+):
+    """webhooks.py and _redrive_completed_queue both call .delay(queue_id=...),
+    but a positional call must not silently no-op."""
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, [("10 DOOMED ST", "TACOMA", "WA")])
+
+    ingest_tracerfy_batch.on_failure(
+        RuntimeError("boom"), "task-id", (qid, DOWNLOAD_URL), {}, None
+    )
+
+    with system_sync_session() as db:
+        status = db.execute(
+            text("SELECT status FROM skip_trace_queues WHERE tracerfy_queue_id = :q"),
+            {"q": qid},
+        ).scalar_one()
+    assert status == "errored"

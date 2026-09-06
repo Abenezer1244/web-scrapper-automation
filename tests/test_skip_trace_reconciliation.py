@@ -327,3 +327,36 @@ class TestReleaseNeedsAWiderWindowThanAdoption:
         ]
         assert _release_is_safe(remote, CLAIM, "normal", set()) is True
         assert match_remote_queue(remote, CLAIM, "normal", 374, set())[0] == "none"
+
+    def test_busy_but_healthy_account_does_not_livelock(self):
+        """The quiet-window check must not strand rows forever on an account
+        that submits constantly. Only UNRECORDED queues block a release, and on
+        a healthy system every accepted queue gets a skip_trace_queues row --
+        so a busy account with a dozen nearby ticks still releases cleanly."""
+        busy = [
+            _q(id=1000 + i, created_at=f"2026-09-03T15:{i:02d}:00.000000Z")
+            for i in range(0, 30, 5)
+        ]
+        known = {q["id"] for q in busy}  # all booked, as on a healthy system
+        assert _release_is_safe(busy, CLAIM, "normal", known) is True
+
+    def test_a_single_unrecorded_neighbour_is_enough_to_hold(self):
+        """...and one orphan among them is enough to stop the release, because
+        an orphan is precisely a queue that may have been charged and lost."""
+        busy = [
+            _q(id=1000 + i, created_at=f"2026-09-03T15:{i:02d}:00.000000Z")
+            for i in range(0, 30, 5)
+        ]
+        known = {q["id"] for q in busy} - {1005}
+        assert _release_is_safe(busy, CLAIM, "normal", known) is False
+
+    def test_stale_threshold_means_the_quiet_window_is_fully_in_the_past(self):
+        """_STALE_CLAIM_AFTER (30 min) >= _RELEASE_QUIET_WINDOW (30 min), so by
+        the time a claim is reconciled its whole quiet window has elapsed and no
+        new queue can still appear inside it. Without that, a queue created
+        after the check could be missed."""
+        from src.workers.skip_trace_dispatcher import (
+            _RELEASE_QUIET_WINDOW,
+            _STALE_CLAIM_AFTER,
+        )
+        assert _STALE_CLAIM_AFTER >= _RELEASE_QUIET_WINDOW

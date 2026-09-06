@@ -801,6 +801,19 @@ def build_pending_row_payload(result) -> dict | None:
         parsed["state"] = mail_parsed["state"]
         parsed["zip"] = mail_parsed["zip"]
 
+    # Tracerfy REQUIRES address + city + state (docs/vendor/tracerfy-api.md) and
+    # drops a row missing any of them from the upload instead of erroring the
+    # request — so a state-less row is paid attention by nobody: it never reaches
+    # the result CSV, the webhook ingest never matches it, and its lead sits on
+    # "Processing" forever (prod queue 162456 sent 4 rows, rows_uploaded=3).
+    # After both fallbacks above have run, if the locality is still unknown then
+    # this row is not traceable — decline it rather than enqueue a row that can
+    # only ever fail. 'not_attempted' (the caller's behaviour for a None return)
+    # is deliberately the right terminal state: it is not an error, and a later
+    # GIS/assessor backfill that fills the situs makes the lead eligible again.
+    if not parsed["city"] or not parsed["state"]:
+        return None
+
     return {
         "job_id": result.job_id,
         "result_id": result.id,

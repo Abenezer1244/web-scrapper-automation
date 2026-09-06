@@ -1,74 +1,96 @@
-# Test 11 — "Completed with errors" root cause + fix
+# Tracerfy skip-trace: audit + hardening
 
-Branch: `fix/test11-completed-with-error`  ·  Worktree: `C:/Users/Windows/bridgeleads-worktrees/test11-dq`
+Branch: `feat/skip-trace-provider-abstraction`
+Worktree: `C:/Users/Windows/bridgeleads-worktrees/skiptrace-provider` (off `origin/main` @ 11c8ca7)
 
-## What Test 11 is
-- `scraper_batches` row `437a4939…` name **"Test 11"**, one `batch_runs` row `019048aa…` status **`partial`**.
-- FE `app/(dashboard)/batches/[id]/page.tsx:33` maps `partial` → **"Completed with errors"**.
-- Children: `Test 11 - Pierce Probate` (`caa255a9…`, **done**) and
-  `Test 11 - Pierce Pre Foreclosure` (`25a8ea53…`, **failed**, retry=2).
-
-## Confirmed root cause (reproduced, not inferred)
-`src/scrapers/pierce_wa_probate.py::_extract_records` picks the ARMS results grid with
-`if len(data_rows) < 5: continue`. The grid has 1 header `<tr>` + 1 `<tr>` per record, so a
-page holding **1–3 records** is skipped, `data_table` is None, the record-count marker is
-non-zero, and it raises `TransientScrapeError` → 2 retries → job **failed**.
-
-Evidence:
-- `06/04/2026–09/01/2026` = 228 records / 10 pages → last page has 3 rows → **exact repro**
-  (fails after `page=9/10`, matching the prod row `page_current=9, page_total=10`).
-- Single days with exactly 3 records (05/26, 12/26/2025, 09/02) all raise.
-- Divorce `08/24–08/28` = **1 record** → also raises. Affects probate + pre_foreclosure + divorce.
-
-## Plan
-- [x] Locate Test 11 in prod; dump job/batch/job_logs
-- [x] Reproduce the failure against `origin/main` code
-- [x] Prove the row-count threshold is the cause; rule out other candidates
-- [x] Verify the replacement table-picker on 0 / 1 / 3 / 5 / 9 / 228-record pages, 3 record types
-- [ ] Consult Codex on the fix before implementing
-- [ ] Implement fix + regression tests
-- [ ] Full pytest, ruff, mypy
-- [ ] Codex diff review
-- [ ] Live re-run in prod + browser verification
-- [ ] Data-quality audit of the resulting leads
-
-## Not defects (verified)
-- `08/24` "5 found / 4 extracted": row 3 dropped by the deliberate *no person party* filter
-  (both parties corporate). Logged with a reason.
-- Batch status `partial` is **correctly** assigned — one child succeeded, one failed.
+Scope: keep Tracerfy. Audit, harden, make failures visible. No provider swap,
+no provider-abstraction rewrite — the current architecture does not need one.
 
 ---
 
-## Review (2026-09-04)
+## Findings (all verified against prod + Tracerfy's live API, not inferred)
 
-### Changes
-| File | Change |
-|---|---|
-| `src/scrapers/pierce_wa_probate.py` | Grid identified by row SHAPE (`_own_rows`, `_is_grid_row`, `_is_grid_signature_row`, `_ARMS_MIN_ROW_CELLS`) instead of `len(rows) < 5`. |
-| `src/api/routes/batches.py` | A batch child that is not `done` reports `record_count=0`. |
-| `tests/test_pierce_arms_small_result_page.py` | New. 14 tests; 7 fail on `origin/main` with the production error. |
-| `tests/test_batches_read.py` | +1 test (`partial_batch` fixture); fails on `origin/main` with `assert 210 == 0`. |
-| `scripts/diag_test11_repro.py`, `scripts/diag_test11_rowthreshold.py` | Reproduction harnesses. |
+| # | Sev | Finding | Evidence |
+|---|-----|---------|----------|
+| F1 | **Critical, LIVE** | 637 pending rows (15 jobs, 3 users) stuck at `status='submitting'` since 2026-09-03/09-05, up to 4 days. Their 637 Results sit at `skip_trace_status='queued'` → UI reads "Processing" forever. | prod query; all 637 have `tracerfy_queue_id IS NULL` |
+| F2 | **Critical, LIVE** | Dispatcher's post-accept bookkeeping (`skip_trace_dispatcher.py:190-241`) is **outside any try**. If `db.add`/`db.execute`/`db.commit` raises after Tracerfy accepted+charged the batch, the exception escapes the task: claim stays `submitting`, no `SkipTraceQueue` row exists, and the later webhook hits the `unknown_queue` no-op → **paid results permanently discarded**. | code read; **found by Codex**, confirmed by me |
+| F3 | High | 14 Tracerfy queues (Jun 7 – Jul 4; 673 rows, **743 credits**) exist on the account with no local `SkipTraceQueue` row. Their webhooks all no-op'd. This is F2's signature. Two pairs look like identical double-submissions (98183/98193, both 147 advanced rows / 144 credits, 45 min apart). | `GET /v1/api/queues/` vs local `skip_trace_queues` |
+| F4 | High | Rows are submitted with NULL/empty `state` (7 stuck + 1 stranded). Tracerfy requires address+city+state. On queue 162456 we sent 4 rows, Tracerfy's `rows_uploaded=3` — it **silently dropped** the state-less row. No pre-submit validation exists. | prod query + queue 162456 |
+| F5 | High | Ingest matches Tracerfy's echoed CSV address to our pending address by **exact lowercased string equality**. A non-matching row is silently `continue`d: no counter, no log, no terminal status. Row stays `submitted` forever and is never billed (`report_usage_from_webhook` counts only `'completed'`). | `tracerfy_ingest.py:306-314`; 1 live case on q162456 |
+| F6 | High | **Zero test coverage** on the entire ingest path — the code that maps provider results to leads, writes contacts, and advances billing. | no test references `ingest_tracerfy_batch` / `ingest_webhook_csv` |
+| F7 | Medium | `SkipTraceQueue.job_id/user_id` store only `claimed[0]`'s values, but batches are **cross-tenant**. Misleading ops/tenancy metadata. | `skip_trace_dispatcher.py:198` |
+| F8 | Medium | Ingest downloads + parses the CSV **before** taking the queue lock. Concurrent duplicate webhooks both download and parse; only the DB mutation is serialized. Wasteful, not incorrect. | `tracerfy_ingest.py:231` |
+| F9 | Medium | Orphan remote queues (F3) can never be ingested — the precheck rejects a missing `SkipTraceQueue`. No controlled adoption path exists. | `tracerfy_ingest.py:218` |
 
-### Verification
-- Exact failing range `06/04–09/01/2026`: **raised on page 10 before, 222 records after**.
-- A/B `06/04–09/02/2026`: **223 records before and after** — zero regression.
-- Live: 05/26, 12/26/2025, 09/02 now extract; a genuine 0-record day still returns 0.
-- `ruff check src/ tests/` clean. Full suite **2260 passed, 2 skipped**. CI green on #217.
-- Prod UI captured with Chromium: "Completed with errors", failed child "210 leads".
+Alerting context (corrected after Codex challenge): `send_ops_alert` is **not**
+a silent no-op — it logs a WARNING and persists a durable `audit_events` row from
+a `finally`. But `OPS_ALERT_EMAIL` is empty in prod, so no human was ever paged,
+and under FORCE RLS the app role cannot SELECT `audit_events` to find the trail.
 
-### Codex gate
-| Round | Result |
-|---|---|
-| Consult (pre-implementation) | 6 findings; all verified independently, 2 became fixes, 1 declined with reasoning |
-| Diff review r1 | **2 × P1** — chrome table could score a blocked page as healthy 0; zeroing a non-done child hides rows that reach the combined CSV. Both fixed. |
-| Diff review r2 | **1 × P1** (`_retry_scrape_job` resets `record_count` to 0, so `min()` still hides rows) + 2 × P2. All fixed. |
-| Diff review r3 | ⏭️ **NOT RUN** — CLI usage limit again (resets 10:27). Its two questions were self-verified: `is_duplicate` is `nullable=False` so `IS NOT TRUE` ≡ `= FALSE`; `clean()` only strips control chars and collapses whitespace, so it can never create digits and the signature can only be more permissive than `_map_row`, never reject a real row. |
+Verified NOT broken (do not "fix"):
+- `phone_dnc_flag` is always NULL from batch trace — **correct**. Tracerfy's batch
+  CSV carries no DNC (only the Instant Trace endpoint does). `map_dnc_status`
+  honestly reports "unknown" and `dialer_filters` excludes NULL from the TCPA-safe
+  default. Working as designed.
+- Phones/emails are encrypted at rest (`fe1:` Fernet). Confirmed, no plaintext.
+- Webhook auth, SSRF pinning, replay idempotency under the queue lock: all sound.
 
-### Open
-- ⏭️ **#217 not merged** — user holding. In-product re-run of Test 11 therefore UNVERIFIED.
-- ⏭️ Same-family row-count guards in 4 other scraper templates: reported, not changed.
-- 📋 A non-done child's count is *non-duplicate saved rows*. The combined CSV additionally
-  applies actionability, the tax cap and dedup buckets, so it can still sit slightly above what
-  downloads — an approximation, never a fabrication. The accurate delivered number is the
-  batch-level `combined_record_count`, which reads the run's `delivery_counts`.
+---
+
+## Plan
+
+### Phase 1 — dispatcher: stop losing paid batches (F2, F4)
+- [x] 1a. Wrap the post-accept bookkeeping in a guard; on failure, durably record
+      the `queue_id` ↔ claim association and alert. Never leave a charged remote
+      queue with no local record.
+- [x] 1b. Pre-submit validation: rows missing address/city/state are removed from
+      the payload **before** the POST and marked terminally on **both**
+      `PendingSkipTraceRow` and `Result` (so the UI stops saying "Processing").
+
+### Phase 2 — automated stale-claim reconciliation (F1, F9)
+- [ ] 2a. On a stale claim, call `GET /v1/api/queues/` and decide, using Codex's
+      conservative predicate: same `trace_type`, `created_at` inside the claim
+      window, `rows_uploaded <= len(claimed)` (never `==` — Tracerfy dedupes),
+      `rows_uploaded > 0`, and **exactly one** candidate. No match → release to
+      `queued`. One match → adopt its `queue_id`. Ambiguous → alert, never guess.
+      Never blind-resubmit.
+
+### Phase 3 — ingest: no silent drops (F5)
+- [ ] 3a. Count + log unmatched CSV rows and unmatched pending rows, give them a
+      terminal status, and alert. Deliberately **not** adding a fuzzy/normalized
+      fallback matcher: there is no evidence Tracerfy standardizes addresses
+      (126/126 completed rows matched exactly), and Codex confirmed a normalized
+      street match risks cross-lead contamination (units, duplexes, directionals).
+      Measure first — Phase 3a is the measurement.
+
+### Phase 4 — tests (F6)
+- [ ] 4a. Ingest: successful match, no-match vs failure, unmatched row, webhook
+      replay billing idempotency, cross-tenant batch isolation, phone/email dedupe.
+- [ ] 4b. Dispatcher: post-accept bookkeeping failure, stale reconciliation
+      (no-match / single-match / ambiguous), dedupe count mismatch, invalid-address
+      terminal status.
+
+### Phase 5 — repair (separate, reviewed, run after Phases 1-4 deploy)
+- [ ] 5a. Read-only reconciliation report for the 637 + the 14 orphan queues.
+- [ ] 5b. Release the 637 to `queued` (safe: Tracerfy's queue list shows no queue
+      at those timestamps and `total_queues=27` matches the 27 returned, so the
+      list is not truncated — we were never charged).
+
+---
+
+## Open decisions for the owner
+
+1. **Billing an accepted-but-unmatched row.** Tracerfy charges per accepted row.
+   Today an unmatched row is silently not billed to the user. Codex argues for
+   billing it ("provider attempted the lookup"). I disagree on defaulting to that:
+   an unmatched row is *our* reconciliation bug, and charging a user for a lead
+   they never received is user-hostile. Phase 3a makes it visible and alertable
+   without changing who pays. **Billing policy change is yours to make.**
+2. `OPS_ALERT_EMAIL` is unset in production. Every one of the 15 alert call sites
+   is currently mute. This is the reason F1 ran for 4 days unnoticed.
+
+---
+
+## Review
+
+_(filled in at the end)_

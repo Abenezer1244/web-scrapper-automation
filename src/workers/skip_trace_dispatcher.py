@@ -46,7 +46,7 @@ def dispatch_pending_skip_trace() -> dict:
 
     from sqlalchemy import and_, select, update
 
-    from src.db.models import PendingSkipTraceRow, Result, SkipTraceQueue
+    from src.db.models import PendingSkipTraceRow
     from src.db.session import system_sync_session
     from src.scrapers.enrichment.skip_trace import TracerfyError, submit_batch
 
@@ -88,6 +88,30 @@ def dispatch_pending_skip_trace() -> dict:
                     .all()
                 )
                 if not rows:
+                    continue
+
+                # Tracerfy's batch endpoint REQUIRES address + city + state on
+                # every row, and a row missing one is not rejected loudly — it is
+                # dropped from the upload. Production queue 162456: we sent 4 rows,
+                # Tracerfy reported rows_uploaded=3. The dropped row then never
+                # appears in the result CSV, so the ingest never matches it, so it
+                # sits at 'submitted' forever and its lead reads "Processing" in the
+                # UI indefinitely. Fail it HERE — terminally and visibly — instead of
+                # shipping it to be silently discarded.
+                rows, unsubmittable = _partition_submittable(rows)
+                if unsubmittable:
+                    _fail_unsubmittable(db, unsubmittable)
+                    msg = (
+                        f"{len(unsubmittable)} {trace_type} row(s) dropped before "
+                        "submit: missing address/city/state"
+                    )
+                    errors.append(msg)
+                    _logger.warning("Dispatcher: %s", msg)
+                if not rows:
+                    # Nothing submittable left: commit the failures on their own
+                    # (no claim follows to carry them).
+                    if unsubmittable:
+                        db.commit()
                     continue
 
                 # DURABLE CLAIM before the external POST (Codex High, 2026-09-02).
@@ -188,57 +212,42 @@ def dispatch_pending_skip_trace() -> dict:
                     return _tick_result(submitted_batches, submitted_rows, errors, deferred="unknown_outcome")
 
                 queue_id = response["queue_id"]
-                now = datetime.now(UTC)
-                ids = [c.id for c in claimed]
 
-                # Record the Tracerfy queue for webhook correlation.
-                # We associate with the first row's job_id; webhook
-                # ingest looks up all rows by tracerfy_queue_id anyway.
-                first = claimed[0]
-                queue_record = SkipTraceQueue(
-                    tracerfy_queue_id=queue_id,
-                    job_id=first.job_id,
-                    user_id=first.user_id,
-                    trace_type=trace_type,
-                    status="pending",
-                    # Tracerfy de-duplicates identical addresses, so this can be
-                    # smaller than len(claimed) (prod: 25 sent → 24 uploaded → all
-                    # 25 rows reconciled by the webhook). Informational only.
-                    rows_uploaded=response.get("rows_uploaded", len(claimed)),
-                    credits_deducted=0,  # filled in by webhook receiver
-                    submitted_at=now,
-                )
-                db.add(queue_record)
-
-                # Mark the claimed rows submitted + stamp the tracerfy queue_id
-                # for webhook correlation.
-                db.execute(
-                    update(PendingSkipTraceRow)
-                    .where(
-                        PendingSkipTraceRow.id.in_(ids),
-                        PendingSkipTraceRow.status == "submitting",
+                # PAST THIS LINE TRACERFY HAS ACCEPTED AND CHARGED FOR THE BATCH.
+                # The bookkeeping below used to run unguarded (Codex, 2026-09-06):
+                # any failure in it — a commit deadlock, a dropped connection, a
+                # unique collision on tracerfy_queue_id — escaped the whole task
+                # while the claim was already committed as 'submitting'. That left
+                # a PAID remote queue with no local SkipTraceQueue row, and the
+                # webhook that arrived later hit the ingest's 'unknown_queue'
+                # no-op and discarded the results permanently. Production carries
+                # 14 such orphaned Tracerfy queues (673 rows / 743 credits).
+                #
+                # The queue_id is now the one fact we refuse to lose: persist it,
+                # retry once on a FRESH session (the first may be poisoned by the
+                # failed transaction), and if even that fails, alert with the
+                # queue_id so it can be adopted. _reconcile_stale_claims is the
+                # backstop — it re-derives the association from Tracerfy's own
+                # queue list on a later tick.
+                try:
+                    _persist_submission(db, queue_id, claimed, trace_type, response)
+                except Exception as exc:  # noqa: BLE001 — a paid batch is at stake
+                    _logger.error(
+                        "Bookkeeping FAILED for accepted Tracerfy queue %s (%d rows): "
+                        "%s — retrying on a fresh session",
+                        queue_id, len(claimed), str(exc)[:200],
                     )
-                    .values(
-                        status="submitted",
-                        tracerfy_queue_id=queue_id,
-                        submitted_at=now,
-                    )
-                )
-                # Advance the matching Result rows 'queued' -> 'submitted' so the
-                # status reflects "sent to Tracerfy, awaiting webhook" instead of
-                # sitting at 'queued' (which reads as "not yet sent" — misleading
-                # for ops). The webhook ingest matches by result_id (not status),
-                # so hit/miss reconciliation is unaffected; the UI already renders
-                # 'submitted' the same as 'queued' ("Processing").
-                db.execute(
-                    update(Result)
-                    .where(
-                        Result.id.in_([c.result_id for c in claimed]),
-                        Result.skip_trace_status == "queued",
-                    )
-                    .values(skip_trace_status="submitted")
-                )
-                db.commit()
+                    try:
+                        db.rollback()
+                    except Exception:  # noqa: BLE001 — session may already be dead
+                        pass
+                    if not _persist_submission_retry(queue_id, claimed, trace_type, response):
+                        _alert_orphaned_queue(queue_id, trace_type, len(claimed))
+                        errors.append(f"bookkeeping failed for queue {queue_id}")
+                        return _tick_result(
+                            submitted_batches, submitted_rows, errors,
+                            deferred="bookkeeping_failed",
+                        )
 
                 submitted_batches += 1
                 submitted_rows += len(claimed)
@@ -294,6 +303,186 @@ def classify_submit_failure(message: str) -> str:
     if status and status.group(1).startswith("5"):
         return "provider_unavailable"
     return "provider_error"
+
+
+# ─── Pre-submit validation ────────────────────────────────────────────────────
+
+# Tracerfy's POST /v1/api/trace/ documents address_column, city_column and
+# state_column as required (docs/vendor/tracerfy-api.md). A row missing any of
+# them is dropped from the upload rather than erroring the request, so the only
+# way to notice is to count rows_uploaded against what was sent.
+_REQUIRED_SUBMIT_FIELDS = ("property_address", "city", "state")
+
+
+def row_is_submittable(row) -> bool:
+    """True when a pending row carries every field Tracerfy requires.
+
+    Pure and attribute-based so it can be unit-tested against a stub row without
+    a database. `zip` is deliberately NOT required — Tracerfy documents it as
+    optional and returns it from its own data when omitted.
+    """
+    return all(
+        str(getattr(row, field, None) or "").strip()
+        for field in _REQUIRED_SUBMIT_FIELDS
+    )
+
+
+def _partition_submittable(rows: list) -> tuple[list, list]:
+    """Split rows into (submittable, unsubmittable), preserving FIFO order."""
+    ok: list = []
+    bad: list = []
+    for r in rows:
+        (ok if row_is_submittable(r) else bad).append(r)
+    return ok, bad
+
+
+def _fail_unsubmittable(db, rows: list) -> None:
+    """Terminally fail rows Tracerfy would silently drop.
+
+    Uses the existing 'errored' vocabulary on both the pending row and its
+    Result — the same states _release_claim("errored") produces — so the UI
+    renders "Error" instead of leaving the lead on "Processing" forever. These
+    rows are never charged: they are stopped before the POST.
+
+    Deliberately does NOT commit. The caller selected the FIFO head with
+    `FOR UPDATE SKIP LOCKED` and holds those row locks until the claim is
+    committed; committing here would release the locks on the *valid* rows in
+    the same batch before they are claimed, letting a concurrent tick claim and
+    submit them too (double pay). The caller commits this write together with
+    the claim, or on its own when nothing submittable is left.
+    """
+    if not rows:
+        return
+    from sqlalchemy import update
+
+    from src.db.models import PendingSkipTraceRow, Result
+
+    db.execute(
+        update(PendingSkipTraceRow)
+        .where(PendingSkipTraceRow.id.in_([r.id for r in rows]))
+        .values(status="errored")
+    )
+    db.execute(
+        update(Result)
+        .where(
+            Result.id.in_([r.result_id for r in rows]),
+            Result.skip_trace_status.in_(("queued", "submitted")),
+        )
+        .values(skip_trace_status="errored", skip_trace_attempted_at=datetime.now(UTC))
+    )
+
+
+# ─── Post-accept bookkeeping (a PAID batch depends on this) ───────────────────
+
+
+def _persist_submission(db, queue_id: int, claimed: list, trace_type: str, response: dict) -> None:
+    """Record an accepted Tracerfy batch: queue row + row/Result status flips.
+
+    Idempotent by construction so the retry path (and a future reconciler
+    adoption) can re-run it safely: the SkipTraceQueue insert is ON CONFLICT DO
+    NOTHING on the unique tracerfy_queue_id, and both updates are guarded on the
+    status they expect to move from.
+    """
+    from sqlalchemy import update
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    from src.db.models import PendingSkipTraceRow, Result, SkipTraceQueue
+
+    now = datetime.now(UTC)
+    first = claimed[0]
+    db.execute(
+        pg_insert(SkipTraceQueue)
+        .values(
+            tracerfy_queue_id=queue_id,
+            # NOTE: a batch is grouped by trace_type, not by tenant, so these two
+            # describe the FIRST row only and are not the batch's owner. Ingest
+            # correlates by tracerfy_queue_id and re-derives per-user attribution
+            # from pending_skip_trace_rows, so nothing reads these for tenancy.
+            job_id=first.job_id,
+            user_id=first.user_id,
+            trace_type=trace_type,
+            status="pending",
+            # Tracerfy de-duplicates identical addresses, so this can be smaller
+            # than len(claimed) (prod: 25 sent → 24 uploaded → all 25 rows
+            # reconciled by the webhook). Informational only.
+            rows_uploaded=response.get("rows_uploaded", len(claimed)),
+            credits_deducted=0,  # filled in by webhook receiver
+            submitted_at=now,
+        )
+        .on_conflict_do_nothing(index_elements=["tracerfy_queue_id"])
+    )
+    db.execute(
+        update(PendingSkipTraceRow)
+        .where(
+            PendingSkipTraceRow.id.in_([c.id for c in claimed]),
+            PendingSkipTraceRow.status == "submitting",
+        )
+        .values(status="submitted", tracerfy_queue_id=queue_id, submitted_at=now)
+    )
+    # Advance the matching Result rows 'queued' -> 'submitted' so the status
+    # reflects "sent to Tracerfy, awaiting webhook" instead of sitting at
+    # 'queued' (which reads as "not yet sent" — misleading for ops). The webhook
+    # ingest matches by result_id (not status), so hit/miss reconciliation is
+    # unaffected; the UI already renders 'submitted' the same as 'queued'.
+    db.execute(
+        update(Result)
+        .where(
+            Result.id.in_([c.result_id for c in claimed]),
+            Result.skip_trace_status == "queued",
+        )
+        .values(skip_trace_status="submitted")
+    )
+    db.commit()
+
+
+def _persist_submission_retry(
+    queue_id: int, claimed: list, trace_type: str, response: dict
+) -> bool:
+    """Retry _persist_submission on a brand-new session. True when it stuck.
+
+    Separate session because the caller's is likely poisoned (a failed commit
+    leaves it in PendingRollbackError), and losing the queue_id is the one
+    outcome worth a second connection.
+    """
+    try:
+        from src.db.session import system_sync_session
+
+        with system_sync_session() as db2:
+            _persist_submission(db2, queue_id, claimed, trace_type, response)
+        _logger.info(
+            "Bookkeeping recovered for Tracerfy queue %s on retry (%d rows)",
+            queue_id, len(claimed),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — caller alerts on False
+        _logger.error(
+            "Bookkeeping retry ALSO failed for Tracerfy queue %s: %s",
+            queue_id, str(exc)[:200],
+        )
+        return False
+
+
+def _alert_orphaned_queue(queue_id: int, trace_type: str, n_rows: int) -> None:
+    """Page ops about a PAID Tracerfy queue we could not record locally."""
+    try:
+        from src.workers.ops_alerts import send_ops_alert
+
+        send_ops_alert(
+            "skip_trace", f"orphaned_queue_{queue_id}",
+            "Tracerfy batch accepted but NOT recorded — results will be lost",
+            f"Tracerfy accepted (and charged for) queue_id={queue_id} "
+            f"({trace_type}, {n_rows} rows) but BridgeLeads failed twice to write "
+            f"the matching skip_trace_queues row. The completion webhook for this "
+            f"queue will hit the ingest's 'unknown_queue' no-op and the paid "
+            f"results will be discarded.\n\n"
+            f"To recover: insert a skip_trace_queues row with "
+            f"tracerfy_queue_id={queue_id} and stamp that id on the "
+            f"pending_skip_trace_rows still in status='submitting' for this batch, "
+            f"then replay the webhook (or re-ingest from the queue's download_url). "
+            f"The rows are deliberately never auto-resubmitted — that would pay twice.",
+        )
+    except Exception as exc:  # noqa: BLE001 — alerting is best-effort
+        _logger.warning("orphaned-queue ops alert failed: %s", str(exc)[:120])
 
 
 def _release_claim(db, claimed: list, to_status: str) -> None:

@@ -30,8 +30,8 @@ Two independent defences, so the gate cannot pass vacuously:
   have been overwritten.
 
 * **``--baseline`` (authoritative).** Take a snapshot BEFORE merging, then pass
-  it here. This is the only way to verify ``records_used`` was not changed, and
-  the only thing that still works after users have rolled.
+  it here. It is the only thing that still works once users have rolled, and the
+  only way to say anything at all about ``records_used``.
 
 WHAT A CLEAN RUN LOOKS LIKE
 ---------------------------
@@ -45,13 +45,20 @@ STOP -- do not run the anchor backfill.
     C5  effective window    == stored window             (nothing already stale)
     C6  no NULLs in the new NOT NULL columns
     C7  quota_period_start  == quota_anchor_at           (nobody has rolled yet)
-    C8  records_used unchanged vs baseline               (--baseline only)
+    C8  records_used vs baseline    (--baseline; INFORMATIONAL unless
+                                     --strict-counter, see below)
 
-C5 and C7 can legitimately be non-zero if time has passed since the migration:
-a user whose window ended has rolled, which is the lazy rollover working as
-designed. They are reported SEPARATELY from hard failures for that reason -- but
-C7 failures downgrade C1/C2 to UNVERIFIABLE, which IS a hard failure unless a
-baseline was supplied. Run this promptly after the deploy, or use --baseline.
+C5, C7 and C8 can legitimately be non-zero if time has passed since the
+migration: a user whose window ended has rolled, and live traffic moves the
+counter. Those are the lazy rollover and ordinary usage working as designed, so
+they are reported SEPARATELY from hard failures. Two consequences:
+
+* C7 failures DO downgrade C1/C2 to UNVERIFIABLE, which IS a hard failure unless
+  a baseline was supplied. Run this promptly after the deploy, or use --baseline.
+* C8 is a NOTE, not a failure. The deploy does not quiesce production, so a
+  reservation, a release or a rollover can all move ``records_used`` between the
+  snapshot and this run. Failing on that would block a good deploy on ordinary
+  traffic. Pass --strict-counter only when production really is quiesced.
 
 USAGE
 -----
@@ -151,7 +158,7 @@ def take_snapshot(path: str) -> int:
 
 
 def _check_user(
-    user: User, now: datetime, base: dict | None
+    user: User, now: datetime, base: dict | None, strict_counter: bool = False
 ) -> tuple[list[str], list[str]]:
     """Return (hard_failures, informational_notes) for one user."""
     failures: list[str] = []
@@ -243,12 +250,30 @@ def _check_user(
                 f"!= {_fmt(baseline_start)} [{baseline_source}]"
             )
 
-    # C8 -- the migration must not touch the counter. Only a baseline can show this.
+    # C8 -- the counter. Only a baseline can say anything about it at all.
+    #
+    # INFORMATIONAL BY DEFAULT, and that is not laziness. The deploy does not
+    # quiesce production, so between the snapshot and this run a reservation can
+    # legitimately raise records_used, a release can lower it, and a rollover can
+    # zero it. Treating any diff as a migration failure would block a perfectly
+    # good deploy on ordinary traffic -- the gate would cry wolf and get ignored,
+    # which is worse than not having it.
+    #
+    # Use --strict-counter only when production really is quiesced; then any
+    # diff IS the migration and should stop the deploy.
     if base is not None and base.get("records_used") is not None:
-        if user.records_used != base["records_used"]:
-            failures.append(
-                f"C8 records_used CHANGED: {base['records_used']} -> {user.records_used}"
+        before, after = base["records_used"], user.records_used
+        if before != after:
+            delta = after - before
+            message = (
+                f"C8 records_used moved {before} -> {after} ({delta:+d}) since the "
+                "snapshot. Expected under live traffic; migration 088 does not "
+                "touch this column."
             )
+            if strict_counter:
+                failures.append(f"{message} [--strict-counter]")
+            else:
+                notes.append(message)
 
     expected_end = add_months(qps_u, 1)
     if qpe_u != expected_end:
@@ -288,6 +313,15 @@ def main() -> int:
         default=None,
         metavar="PATH",
         help="Compare against a snapshot taken before the deploy (authoritative).",
+    )
+    parser.add_argument(
+        "--strict-counter",
+        action="store_true",
+        help=(
+            "Treat any records_used difference from the baseline as a hard failure. "
+            "Only correct when production is quiesced -- under live traffic the "
+            "counter moves for legitimate reasons and this will fail spuriously."
+        ),
     )
     parser.add_argument(
         "--user",
@@ -354,7 +388,7 @@ def main() -> int:
             # A user created after the snapshot. Not a defect, but C1/C2/C8
             # cannot be judged for them, so say so instead of passing quietly.
             missing_from_baseline.append(user)
-        failures, notes = _check_user(user, now, base)
+        failures, notes = _check_user(user, now, base, args.strict_counter)
         if failures:
             failed.append((user, failures))
         if notes:

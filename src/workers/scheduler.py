@@ -26,7 +26,8 @@ from src.workers.scheduler_helpers.batch import (  # noqa: F401
 )
 from src.workers.scheduler_helpers.billing import (
     _expire_trials_impl,
-    _reset_monthly_usage_impl,
+    _reconcile_quota_periods_impl,
+    _reset_skip_trace_usage_impl,
 )
 from src.workers.scheduler_helpers.county import (
     _purge_old_records_impl,
@@ -83,14 +84,30 @@ app.conf.beat_schedule = {
         "task": "src.workers.scheduler.canary_check",
         "schedule": 3600.0,  # every 1 hour
     },
-    "reset-monthly-usage": {
-        # H5 (full-SaaS review): daily catch-up instead of cron-on-1st.
-        # The task is idempotent — it only resets users whose
-        # records_period_start is earlier than the current month, so
-        # running it daily has the same net effect when Beat is
-        # healthy and catches up cleanly when Beat was down at the
-        # instant of the 1st-of-month rollover.
-        "task": "src.workers.scheduler.reset_monthly_usage",
+    "reconcile-quota-periods": {
+        # Record quota is metered over each user's own ENTITLEMENT WINDOW, not
+        # the calendar month (migration 088). Correctness does NOT live here:
+        # reserve and settle advance the window atomically in the statement that
+        # charges. This is the safety net for users those paths never touch, and
+        # the repair for a Stripe webhook that never arrived — so it runs hourly
+        # rather than daily, and being late costs at most an hour of a stale
+        # /billing/usage reading, never a wrong charge.
+        "task": "src.workers.scheduler.reconcile_quota_periods",
+        "schedule": 3600.0,  # every 1 hour
+    },
+    "reset-skip-trace-usage": {
+        # Formerly "reset-monthly-usage". The RECORDS half of that task was
+        # retired when entitlement windows landed: running it alongside anchored
+        # windows would zero a 20th-anchored subscriber twice, once on their own
+        # boundary and again on the 1st. What remains is skip-trace, which is
+        # billed on its own Stripe meter against its own period column and is
+        # still calendar-metered by deliberate decision.
+        #
+        # Still DAILY rather than a cron on the 1st: Celery Beat does not
+        # backfill missed ticks, so a redeploy at that instant would skip a
+        # whole month. Idempotent — it only touches users whose
+        # skip_trace_period_start is earlier than the current month.
+        "task": "src.workers.scheduler.reset_skip_trace_usage",
         "schedule": crontab(hour=0, minute=5),  # 00:05 UTC daily
     },
     "scrape-county-daily": {
@@ -288,31 +305,48 @@ def canary_check() -> None:
     return _canary_check_impl()
 
 
-# ─── Task 4: Monthly usage reset (daily catch-up) ────────────────────────────
+# ─── Task 4: Entitlement-window reconciliation + skip-trace reset ────────────
 
-@app.task(name="src.workers.scheduler.reset_monthly_usage")
-def reset_monthly_usage() -> None:
-    """Roll over monthly usage counters when the billing period ends.
+@app.task(name="src.workers.scheduler.reconcile_quota_periods")
+def reconcile_quota_periods() -> dict[str, int]:
+    """Advance record-quota entitlement windows that have ended.
 
-    H5 (full-SaaS review): previously this ran on a crontab at
-    day_of_month=1, hour=0, minute=0. Celery Beat does NOT backfill
-    missed cron ticks — if Beat was down at that instant (Railway
-    redeploy, broker hiccup) the reset was SKIPPED ENTIRELY and every
-    user carried last month's records_used forward into the new
-    month. A user at 500/500 last month started the new month
-    instantly at cap.
+    Record quota resets on each user's own entitlement anniversary, not on the
+    1st (migration 088). The authoritative rollover happens LAZILY, inside the
+    atomic statement that reserves or settles a job's quota — so a user who is
+    actively scraping is always metered against the right window without this
+    task existing at all.
 
-    Now runs daily at 00:05 UTC. On each run, finds users whose
-    records_period_start points at a month strictly earlier than
-    this run's current month and resets their counters +
-    advances records_period_start to the first of the current
-    month. Idempotent: a user who was already reset this month
-    has records_period_start = this month and is skipped.
+    This is the reconciliation for everyone else: users who transact rarely,
+    plus the repair for a Stripe ``customer.subscription.deleted`` that never
+    arrived. It is idempotent, tolerates missed runs, skips users a worker is
+    mid-charge on (SKIP LOCKED) rather than blocking them, and can never grant a
+    duplicate bucket — a user gone for three months gets ONE window, not three.
 
-    The same logic applies to skip_trace_used_this_month +
-    skip_trace_period_start for Sprint 4 billing.
+    Hourly, because being late costs at most a stale ``/billing/usage`` reading
+    and never a wrong charge.
     """
-    return _reset_monthly_usage_impl()
+    return _reconcile_quota_periods_impl()
+
+
+@app.task(name="src.workers.scheduler.reset_skip_trace_usage")
+def reset_skip_trace_usage() -> None:
+    """Roll over the SKIP-TRACE counter on the calendar month.
+
+    Formerly ``reset_monthly_usage``, which also reset record quota. That half
+    is retired: record quota now follows the entitlement window, and running
+    both would zero a 20th-anchored subscriber on their own boundary AND again
+    on the 1st. Skip-trace is billed on its own Stripe meter against its own
+    ``skip_trace_period_start`` column and stays calendar-metered deliberately.
+
+    H5 (full-SaaS review): runs DAILY at 00:05 UTC rather than on a cron at the
+    1st. Celery Beat does not backfill missed ticks, so if Beat was down at that
+    instant (Railway redeploy, broker hiccup) the reset was skipped entirely and
+    every user carried last month's usage into the new month. Idempotent: a user
+    already rolled this month has skip_trace_period_start = this month and is
+    skipped.
+    """
+    return _reset_skip_trace_usage_impl()
 
 
 # ─── Task 5: Expire free trials ──────────────────────────────────────────────

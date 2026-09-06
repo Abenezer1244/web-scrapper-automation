@@ -176,19 +176,21 @@ async def enqueue_scrape_job(
                     ),
                 )
 
-    # Enforce record limit — HTTP 402 when over quota.
-    # PERIOD-AWARE: records_used only counts for the period named by
-    # records_period_start. Reading it raw rejected users on last month's usage
-    # during the window between the month boundary and the rollover catching up.
-    from src.api.quota import effective_records_used, is_over_record_limit
+    # Enforce record limit — HTTP 402 when over quota or frozen for non-payment.
+    # WINDOW-AWARE: records_used only counts for the user's current ENTITLEMENT
+    # window. Reading it raw rejected users on the previous window's usage during
+    # the gap between a boundary and the lazy rollover catching up.
+    #
+    # quota_block_reason distinguishes the two reasons on purpose: telling a
+    # customer whose card failed that they are "over their limit" sends them to
+    # the upgrade page, which does not fix a failed payment.
+    from src.api.quota import quota_block_reason
 
-    if is_over_record_limit(current_user):
+    _blocked = quota_block_reason(current_user)
+    if _blocked:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=(
-                f"Monthly record limit reached ({effective_records_used(current_user)}/{current_user.records_limit}). "
-                "Upgrade your plan to continue."
-            ),
+            detail=_blocked,
         )
 
     job = Job(

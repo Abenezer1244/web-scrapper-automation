@@ -117,12 +117,16 @@ def dispatch_batch_run(run_id: str) -> None:
             # records_used can change between create-time preflight and now (Codex);
             # re-check. -1 = unlimited. Over limit => a terminal run, no jobs.
             user = db.get(User, batch.user_id)
-            from src.api.quota import is_over_record_limit
+            from src.api.quota import quota_block_reason
 
-            over_limit = bool(user and is_over_record_limit(user))
+            _blocked = quota_block_reason(user) if user else None
+            over_limit = bool(_blocked)
             if over_limit:
                 run.status = "failed"
-                run.failed_children = [{"reason": "monthly record limit reached"}]
+                # The reason is recorded verbatim so the run explains itself:
+                # "record limit reached" and "payment failed" send the customer
+                # to completely different remedies.
+                run.failed_children = [{"reason": _blocked}]
                 run.completed_at = datetime.now(UTC)
                 db.commit()
             else:

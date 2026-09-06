@@ -116,17 +116,19 @@ def _dispatch_due_jobs(db, now: datetime) -> list[str]:
         ):
             continue
 
-        # Record-limit gate BEFORE creating the job. PERIOD-AWARE: a raw
-        # records_used read would skip a scheduled job on LAST month's
-        # usage during the window before the rollover catches up.
-        from src.api.quota import effective_records_used, is_over_record_limit
+        # Record-limit gate BEFORE creating the job. WINDOW-AWARE: a raw
+        # records_used read would skip a scheduled job on the PREVIOUS
+        # entitlement window's usage during the gap before the lazy rollover
+        # catches up. Also refuses a run for an account frozen on a failed
+        # payment, with the honest reason in the log.
+        from src.api.quota import quota_block_reason
 
         user = db.execute(select(User).where(User.id == config.user_id)).scalar_one_or_none()
-        if user and is_over_record_limit(user):
+        _blocked = quota_block_reason(user) if user else None
+        if _blocked:
             _logger.info(
-                "Skipping %s — user %s at record limit (%d/%d)",
-                config.name, user.email, effective_records_used(user),
-                user.records_limit,
+                "Skipping %s — user %s blocked: %s",
+                config.name, user.email, _blocked,
             )
             skipped_limit += 1
             continue
@@ -330,15 +332,17 @@ def _dispatch_due_batches(db, now: datetime) -> list[str]:
         ):
             continue
 
-        from src.api.quota import is_over_record_limit
+        from src.api.quota import quota_block_reason
 
         # Quota gate at fire time (same boundary as dispatch_scheduled_jobs);
-        # dispatch_batch_run re-checks at materialize time.
+        # dispatch_batch_run re-checks at materialize time. Covers both an
+        # exhausted entitlement window and a payment freeze.
         user = db.get(User, batch.user_id)
-        if user and is_over_record_limit(user):
+        _blocked = quota_block_reason(user) if user else None
+        if _blocked:
             _logger.info(
-                "dispatch_scheduled_batches: skipping batch %s — user at record limit",
-                batch.id,
+                "dispatch_scheduled_batches: skipping batch %s — %s",
+                batch.id, _blocked,
             )
             continue
 

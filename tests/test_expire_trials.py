@@ -148,15 +148,59 @@ def test_entitled_status_is_protected(cleanup_users, status):
         assert _get(db, uid).plan == "pro", f"{status} must protect from expiry"
 
 
-def test_canceled_status_is_downgraded(cleanup_users):
+def test_canceled_status_is_downgraded_once_stripe_confirms_it(cleanup_users):
+    """A locally-recorded "canceled" is now VERIFIED before it costs a plan.
+
+    This test previously asserted the opposite — that a stored non-entitled
+    status was acted on without asking Stripe. That is wrong in the one
+    direction that matters: our copy of the status is a cache, it can be stale
+    (a mis-ordered webhook, a cancellation the customer reversed), and
+    downgrading on it takes a plan away from someone who is paying. Stripe is
+    the source of truth for entitlement. (Codex)
+    """
     uid = _create(
         cleanup_users, trial_offset_days=-1,
         stripe_customer_id="cus_x", stripe_subscription_id="sub_dead",
         subscription_status="canceled",
     )
-    _expire_trials_impl(subscription_lookup=_boom)  # known non-entitled, no Stripe
+    _expire_trials_impl(subscription_lookup=lambda _c: None)  # Stripe agrees
     with SyncSessionLocal() as db:
         assert _get(db, uid).plan == "starter"
+
+
+def test_a_canceled_status_stripe_contradicts_does_not_cost_the_plan(cleanup_users):
+    """The reason the verification exists: our cache said canceled, Stripe says
+    active. The customer is paying, so they keep their plan — and the stale
+    status is healed rather than acted on."""
+    uid = _create(
+        cleanup_users, trial_offset_days=-1,
+        stripe_customer_id="cus_really_paying", stripe_subscription_id="sub_live",
+        subscription_status="canceled",
+    )
+    _expire_trials_impl(subscription_lookup=lambda _c: "active")
+    with SyncSessionLocal() as db:
+        user = _get(db, uid)
+        assert user.plan == "pro", "an active payer must not be downgraded"
+        assert user.subscription_status == "active", "the stale cache is healed"
+        assert user.first_paid_at is not None, (
+            "and they are marked as already converted, so their next "
+            "subscription.updated cannot read as a first conversion and zero "
+            "their counter"
+        )
+
+
+def test_a_stripe_outage_defers_the_downgrade_rather_than_guessing(cleanup_users):
+    """Never downgrade a possible payer on a transient failure — the standing
+    doctrine, now applied to stored-status rows too. The row is simply retried
+    on the next hourly run."""
+    uid = _create(
+        cleanup_users, trial_offset_days=-1,
+        stripe_customer_id="cus_unknown", stripe_subscription_id="sub_?",
+        subscription_status="canceled",
+    )
+    _expire_trials_impl(subscription_lookup=_boom)
+    with SyncSessionLocal() as db:
+        assert _get(db, uid).plan == "pro"
 
 
 def test_active_trial_is_not_downgraded(cleanup_users):

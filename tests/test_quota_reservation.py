@@ -18,11 +18,17 @@ Real Postgres, real settings, no mocks — per the project testing rules.
 """
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import text
 
 from src.api.auth import hash_password
+from src.api.quota_window import (
+    add_months,
+    reservation_is_current_sql,
+    window_cte_sql,
+    window_set_sql,
+)
 from src.db.models import Job, ScraperConfig, User
 from src.db.session import SyncSessionLocal
 
@@ -33,7 +39,15 @@ def _month_start(dt: datetime | None = None) -> datetime:
 
 
 def _mk_user(db, *, used: int = 0, limit: int = 1000,
-             period: datetime | None = None) -> User:
+             period: datetime | None = None,
+             window_end: datetime | None = None) -> User:
+    """``period`` is the start of the user's ENTITLEMENT WINDOW (migration 088).
+
+    ``window_end`` defaults to one month later. Pass it explicitly to place a
+    boundary somewhere a test needs it — that is how the reservation-crossing
+    cases below put a window end between a reserve and its settlement.
+    """
+    start = period or _month_start()
     user = User(
         id=str(uuid.uuid4()),
         email=f"resv_{uuid.uuid4().hex[:8]}@test.bridgeleads.io",
@@ -41,8 +55,11 @@ def _mk_user(db, *, used: int = 0, limit: int = 1000,
         plan="pro",
         records_used=used,
         records_limit=limit,
-        records_period_start=period or _month_start(),
-        skip_trace_period_start=period or _month_start(),
+        records_period_start=start,
+        skip_trace_period_start=start,
+        quota_anchor_at=start,
+        quota_period_start=start,
+        quota_period_end=window_end or add_months(start, 1),
     )
     db.add(user)
     db.flush()
@@ -77,58 +94,108 @@ def _mk_job(db, user_id: str, config_id: str) -> Job:
     return job
 
 
+# The reserve and settle statements are assembled from the SAME shared builders
+# production uses (src/api/quota_window.py), not hand-copied. A test that carries
+# its own transcription of the rule proves only that the transcription is
+# self-consistent — which is exactly how seven copies of the old period rule came
+# to disagree, two of them wrongly, without a single failing test.
+
 _RESERVE_SQL = (
-    "WITH grant_calc AS ("
-    "  SELECT LEAST(:want, GREATEST(0, u.records_limit - CASE"
-    "      WHEN u.records_period_start IS NULL"
-    "        OR u.records_period_start < date_trunc('month', CAST(:at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-    "      THEN 0 ELSE u.records_used END)) AS granted"
+    "WITH cur AS ("
+    "  SELECT u.id, u.records_used, u.records_limit, u.quota_anchor_at,"
+    "         u.quota_period_start, u.quota_period_end, u.subscription_status,"
+    "         u.entitlement_grace_ends_at, u.entitlement_ends_at,"
+    "         u.pending_plan, u.pending_records_limit"
     "  FROM users u WHERE u.id = CAST(:uid AS uuid) FOR UPDATE"
+    "), w AS ("
+    "  SELECT cur.*, " + window_cte_sql("", ":at") + " FROM cur"
+    "), g AS ("
+    "  SELECT w.*, LEAST(:want, GREATEST(0, eff_limit - base)) AS granted FROM w"
     "), claim AS ("
-    "  UPDATE jobs SET reserved_count = (SELECT granted FROM grant_calc),"
-    "                  reserved_at = CAST(:at AS timestamptz)"
+    "  UPDATE jobs SET reserved_count = (SELECT granted FROM g),"
+    "                  reserved_at = CAST(:at AS timestamptz),"
+    "                  quota_period_start = (SELECT new_start FROM g)"
     "  WHERE id = :jid AND reserved_at IS NULL"
     "  RETURNING reserved_count"
     "), charge AS ("
-    "  UPDATE users SET"
-    "    records_used = CASE"
-    "      WHEN records_period_start IS NULL"
-    "        OR records_period_start < date_trunc('month', CAST(:at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-    "      THEN 0 ELSE records_used END"
-    "      + COALESCE((SELECT reserved_count FROM claim), 0),"
-    "    records_period_start = CASE"
-    "      WHEN records_period_start IS NULL"
-    "        OR records_period_start < date_trunc('month', CAST(:at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-    "      THEN date_trunc('month', CAST(:at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-    "      ELSE records_period_start END"
-    "  WHERE id = CAST(:uid AS uuid)"
+    "  UPDATE users u SET"
+    "    records_used = g.base + COALESCE((SELECT reserved_count FROM claim), 0),"
+    + window_set_sql("g")
+    + "  FROM g WHERE u.id = g.id"
     ") SELECT COALESCE((SELECT reserved_count FROM claim), -1)"
 )
 
+_SETTLE_SQL = (
+    "WITH cur AS ("
+    "  SELECT u.id, u.records_used, u.records_limit, u.quota_anchor_at,"
+    "         u.quota_period_start, u.quota_period_end, u.subscription_status,"
+    "         u.entitlement_grace_ends_at, u.entitlement_ends_at,"
+    "         u.pending_plan, u.pending_records_limit, u.records_period_start,"
+    "         j.quota_period_start AS job_window, j.reserved_at AS job_reserved_at,"
+    "         j.reserved_count AS job_reserved"
+    "  FROM users u JOIN jobs j ON j.user_id = u.id"
+    "  WHERE j.id = :jid FOR UPDATE OF u"
+    "), w AS ("
+    "  SELECT cur.*, " + window_cte_sql("", ":at") + " FROM cur"
+    "), s AS ("
+    "  SELECT w.*, CASE WHEN "
+    + reservation_is_current_sql(
+        job_window="job_window",
+        job_reserved_at="job_reserved_at",
+        user_window="quota_period_start",
+        user_records_period_start="records_period_start",
+    )
+    + "    THEN job_reserved ELSE 0 END AS applied_reserved"
+    "  FROM w"
+    ") UPDATE users u SET"
+    "    records_used = GREATEST(0, s.base + (:billable - s.applied_reserved)),"
+    + window_set_sql("s")
+    + "  FROM s WHERE u.id = s.id"
+    "  RETURNING s.applied_reserved"
+)
 
-def _reserve(db, job_id: str, user_id: str, want: int) -> int:
+
+def _reserve(db, job_id: str, user_id: str, want: int, at: datetime | None = None) -> int:
     """The atomic reserve-and-charge the plan cap performs (workers/tasks.py).
 
     Returns the granted amount, or -1 when this job had already reserved.
     """
-    at = db.execute(text("SELECT clock_timestamp()")).scalar()
+    at = at or db.execute(text("SELECT clock_timestamp()")).scalar()
     return db.execute(
         text(_RESERVE_SQL),
         {"want": want, "uid": user_id, "jid": job_id, "at": at},
     ).scalar()
 
 
+def _settle_job(db, job_id: str, billable: int, at: datetime | None = None) -> int:
+    """The delta settlement the billing block applies. Returns what it netted off."""
+    at = at or db.execute(text("SELECT clock_timestamp()")).scalar()
+    return db.execute(
+        text(_SETTLE_SQL),
+        {"jid": job_id, "billable": billable, "at": at},
+    ).scalar()
+
+
 def _settle(db, user_id: str, delta: int) -> None:
-    """The delta settlement the billing block applies."""
+    """Legacy shim for the tests below that charge a bare delta with no job."""
+    from src.api.quota_window import window_cte_sql as _w
+    from src.api.quota_window import window_set_sql as _ws
+
     db.execute(
         text(
-            "UPDATE users SET records_used = GREATEST(0, CASE"
-            "    WHEN records_period_start IS NULL"
-            "      OR records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-            "    THEN 0 ELSE records_used END + :delta) "
-            "WHERE id = CAST(:uid AS uuid)"
+            "WITH cur AS ("
+            "  SELECT u.id, u.records_used, u.records_limit, u.quota_anchor_at,"
+            "         u.quota_period_start, u.quota_period_end, u.subscription_status,"
+            "         u.entitlement_grace_ends_at, u.entitlement_ends_at,"
+            "         u.pending_plan, u.pending_records_limit"
+            "  FROM users u WHERE u.id = CAST(:uid AS uuid) FOR UPDATE"
+            "), w AS (SELECT cur.*, " + _w("", ":at") + " FROM cur"
+            ") UPDATE users u SET"
+            "    records_used = GREATEST(0, w.base + :delta),"
+            + _ws("w")
+            + "  FROM w WHERE u.id = w.id"
         ),
-        {"delta": delta, "uid": user_id},
+        {"delta": delta, "uid": user_id, "at": datetime.now(UTC)},
     )
 
 
@@ -578,3 +645,256 @@ def test_release_is_month_scoped_not_merely_less_than_or_equal():
 
     with SyncSessionLocal() as db:
         assert db.get(User, user_id).records_used == 200, "current period untouched"
+
+
+# ─── Reservations that cross an entitlement boundary ─────────────────────────
+#
+# The handoff's question: a job reserves 200 at 11:59, the window ends at 12:00,
+# the job settles at 12:05. Which window owns those records?
+#
+# The OLD test asked "same calendar month?", which is only accidentally right
+# while every window starts on the 1st. With a 20th anchor, a job reserving on
+# the 19th and settling on the 21st read as "same period" — so settlement netted
+# its grant off a counter the 20th's rollover had already zeroed, and the
+# delivered records ended up charged to NOBODY. These pin the real rule.
+
+def _job_window(db, job_id: str):
+    return db.execute(
+        text("SELECT quota_period_start FROM jobs WHERE id = :j"), {"j": job_id}
+    ).scalar()
+
+
+def test_a_reservation_records_the_window_it_was_charged_to():
+    """Without this column the question cannot even be asked."""
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, used=0, limit=1000)
+        config = _mk_config(db, user.id)
+        job = _mk_job(db, user.id, config.id)
+        user_id, job_id = user.id, job.id
+        db.commit()
+
+    with SyncSessionLocal() as db:
+        _reserve(db, job_id, user_id, want=200)
+        db.commit()
+        assert _job_window(db, job_id) == db.get(User, user_id).quota_period_start
+
+
+def test_a_boundary_between_reserve_and_settle_charges_the_LIVE_window_in_full():
+    """Reserve 200 just before the boundary; settle 200 just after it.
+
+    The rollover zeroed the counter, taking the 200 with it. Netting
+    (billable - reserved) = 0 against the new window would deliver 200 records
+    charged to nobody. The leads are being delivered NOW, so the live window
+    carries them in full.
+    """
+    boundary = datetime.now(UTC) - timedelta(minutes=5)
+    with SyncSessionLocal() as db:
+        # A window that ended five minutes ago; the reservation was taken inside it.
+        user = _mk_user(
+            db, used=0, limit=1000,
+            period=boundary - timedelta(days=30), window_end=boundary,
+        )
+        config = _mk_config(db, user.id)
+        job = _mk_job(db, user.id, config.id)
+        user_id, job_id = user.id, job.id
+        db.commit()
+
+    with SyncSessionLocal() as db:
+        granted = _reserve(db, job_id, user_id, want=200,
+                           at=boundary - timedelta(minutes=1))
+        db.commit()
+    assert granted == 200
+
+    with SyncSessionLocal() as db:
+        # Settling now: the statement rolls the window in the same breath.
+        applied = _settle_job(db, job_id, billable=200)
+        db.commit()
+        fresh = db.get(User, user_id)
+
+    assert applied == 0, "a grant from the previous window must not be netted off"
+    assert fresh.records_used == 200, "the live window carries the delivery in full"
+    assert fresh.quota_period_start >= boundary, "and the window did roll"
+
+
+def test_a_reservation_inside_the_live_window_still_settles_as_a_delta():
+    """The ordinary case must be untouched: reserve 200, deliver 200, net zero."""
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, used=0, limit=1000)
+        config = _mk_config(db, user.id)
+        job = _mk_job(db, user.id, config.id)
+        user_id, job_id = user.id, job.id
+        db.commit()
+
+    with SyncSessionLocal() as db:
+        _reserve(db, job_id, user_id, want=200)
+        db.commit()
+        assert db.get(User, user_id).records_used == 200
+
+    with SyncSessionLocal() as db:
+        applied = _settle_job(db, job_id, billable=200)
+        db.commit()
+        assert applied == 200
+        assert db.get(User, user_id).records_used == 200, "charged exactly once"
+
+
+def test_delivering_fewer_records_than_reserved_refunds_the_difference():
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, used=0, limit=1000)
+        config = _mk_config(db, user.id)
+        job = _mk_job(db, user.id, config.id)
+        user_id, job_id = user.id, job.id
+        db.commit()
+
+    with SyncSessionLocal() as db:
+        _reserve(db, job_id, user_id, want=200)
+        db.commit()
+
+    with SyncSessionLocal() as db:
+        _settle_job(db, job_id, billable=150)
+        db.commit()
+        assert db.get(User, user_id).records_used == 150
+
+
+def test_releasing_a_reservation_from_a_rolled_window_refunds_nothing():
+    """The mirror image of the settlement bug.
+
+    Refunding into a window the grant was never added to would DESTROY
+    current-window usage — the exact class of bug PR #223 exists to fix. The
+    bookkeeping is retired instead, so the 5-minute sweep stops re-examining the
+    job for the rest of its life.
+    """
+    from src.workers.tasks_helpers.status import release_quota_reservation
+
+    boundary = datetime.now(UTC) - timedelta(minutes=5)
+    with SyncSessionLocal() as db:
+        user = _mk_user(
+            db, used=0, limit=1000,
+            period=boundary - timedelta(days=30), window_end=boundary,
+        )
+        config = _mk_config(db, user.id)
+        job = _mk_job(db, user.id, config.id)
+        user_id, job_id = user.id, job.id
+        db.commit()
+
+    with SyncSessionLocal() as db:
+        _reserve(db, job_id, user_id, want=200, at=boundary - timedelta(minutes=1))
+        db.commit()
+
+    # The window rolls (a beat pass, or another job), then this job fails.
+    with SyncSessionLocal() as db:
+        db.execute(
+            text(
+                "UPDATE users SET records_used = 40, "
+                "quota_period_start = :s, quota_period_end = :e, "
+                "records_period_start = :s WHERE id = CAST(:u AS uuid)"
+            ),
+            {"s": boundary, "e": add_months(boundary, 1), "u": user_id},
+        )
+        db.commit()
+
+    with SyncSessionLocal() as db:
+        freed = release_quota_reservation(db, job_id)
+
+    with SyncSessionLocal() as db:
+        fresh = db.get(User, user_id)
+        job_row = db.execute(
+            text("SELECT reserved_at, reserved_count FROM jobs WHERE id = :j"),
+            {"j": job_id},
+        ).one()
+
+    assert freed == 0, "there is nothing left to refund"
+    assert fresh.records_used == 40, "current-window usage must not be eaten"
+    assert job_row.reserved_at is None and job_row.reserved_count == 0, (
+        "retired, so the sweep does not re-examine it forever"
+    )
+
+
+def test_releasing_a_reservation_inside_the_live_window_still_refunds():
+    """The ordinary failure path must be untouched."""
+    from src.workers.tasks_helpers.status import release_quota_reservation
+
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, used=0, limit=1000)
+        config = _mk_config(db, user.id)
+        job = _mk_job(db, user.id, config.id)
+        user_id, job_id = user.id, job.id
+        db.commit()
+
+    with SyncSessionLocal() as db:
+        _reserve(db, job_id, user_id, want=200)
+        db.commit()
+        assert db.get(User, user_id).records_used == 200
+
+    with SyncSessionLocal() as db:
+        freed = release_quota_reservation(db, job_id)
+
+    with SyncSessionLocal() as db:
+        assert freed == 200
+        assert db.get(User, user_id).records_used == 0
+
+
+def test_a_legacy_reservation_with_no_window_keeps_its_calendar_behaviour():
+    """A job that reserved BEFORE migration 088 has a NULL jobs.quota_period_start.
+
+    Those in-flight jobs must settle exactly as they did on the day they started
+    — under the calendar-month comparison they were written with — the same
+    deploy seam migration 087 used for reserved_count.
+    """
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, used=0, limit=1000)
+        config = _mk_config(db, user.id)
+        job = _mk_job(db, user.id, config.id)
+        user_id, job_id = user.id, job.id
+        db.commit()
+
+    with SyncSessionLocal() as db:
+        _reserve(db, job_id, user_id, want=120)
+        # Erase the new column to reproduce a pre-088 in-flight job exactly.
+        db.execute(
+            text("UPDATE jobs SET quota_period_start = NULL WHERE id = :j"),
+            {"j": job_id},
+        )
+        db.commit()
+
+    with SyncSessionLocal() as db:
+        applied = _settle_job(db, job_id, billable=120)
+        db.commit()
+        assert applied == 120, "the legacy month comparison still nets its grant"
+        assert db.get(User, user_id).records_used == 120
+
+
+def test_two_workers_rolling_the_same_user_cannot_double_reset():
+    """Concurrent rollover.
+
+    Both sessions meet an ended window and both charge. The rollover is a clause
+    inside the statement that already holds the row, so the first commit makes
+    the predicate false and the second simply adds its own delta to the counter
+    the first established — no double reset, no lost usage, no over-allocation.
+    """
+    boundary = datetime.now(UTC) - timedelta(minutes=1)
+    with SyncSessionLocal() as db:
+        user = _mk_user(
+            db, used=900, limit=1000,
+            period=boundary - timedelta(days=30), window_end=boundary,
+        )
+        config = _mk_config(db, user.id)
+        job_a = _mk_job(db, user.id, config.id)
+        job_b = _mk_job(db, user.id, config.id)
+        user_id, a_id, b_id = user.id, job_a.id, job_b.id
+        db.commit()
+
+    with SyncSessionLocal() as sess_a, SyncSessionLocal() as sess_b:
+        granted_a = _reserve(sess_a, a_id, user_id, want=300)
+        sess_a.commit()
+        granted_b = _reserve(sess_b, b_id, user_id, want=300)
+        sess_b.commit()
+
+    with SyncSessionLocal() as db:
+        fresh = db.get(User, user_id)
+
+    # The window rolled ONCE: the stale 900 is gone, and both grants are honoured
+    # against the fresh 1,000 rather than one being lost or duplicated.
+    assert granted_a == 300
+    assert granted_b == 300
+    assert fresh.records_used == 600
+    assert fresh.quota_period_start >= boundary

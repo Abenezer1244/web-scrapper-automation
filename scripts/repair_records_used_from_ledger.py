@@ -33,10 +33,17 @@ SAFETY
   because the period is what scopes the SUM — without it the "current period"
   is undefined and the recomputed number would be meaningless. Run migration
   086 first.
-* SKIPS users whose ``records_period_start`` is STALE (an earlier month). The
-  SUM is scoped ``>= records_period_start``, so on a stale row it would sweep in
-  the PREVIOUS month's jobs and over-count. Let the rollover advance the period
-  first, then re-run.
+* SKIPS users whose ENTITLEMENT WINDOW has ended (``quota_period_end <= now``).
+  The SUM is scoped ``>= records_period_start``, so on a window that has already
+  expired it would sweep in the PREVIOUS window's jobs and over-count. Let the
+  rollover advance the window first, then re-run.
+
+  Migration 088 is why this is a window test and no longer a calendar-month one.
+  Quota resets on each user's own entitlement anniversary, so a perfectly live
+  window can START in a previous calendar month — a subscriber anchored on the
+  20th is legitimately mid-window on the 6th. The old ``records_period_start <
+  date_trunc('month', now())`` test would have called every such account stale
+  and silently refused to repair any of them.
 * INCREASES ONLY by default. The defect being repaired under-counts, so an
   increase restores lost usage. A ledger BELOW the stored counter is a different
   thing entirely and is usually legitimate: deleting a job removes its
@@ -81,9 +88,7 @@ _AUDIT_SQL = """
                WHERE j.billing_applied_at IS NOT NULL
                  AND j.billing_applied_at >= u.records_period_start
            ), 0)                                       AS ledger,
-           (u.records_period_start
-              < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
-                                                       AS period_is_stale
+           (u.quota_period_end <= NOW())               AS period_is_stale
     FROM users u
     LEFT JOIN jobs j ON j.user_id = u.id
     {user_filter}
@@ -144,13 +149,14 @@ def main() -> int:
         _assert_periods_populated(db, args.user_id)
         rows = _audit(db, args.user_id)
 
-        # A stale period would scope the SUM back into the PREVIOUS month and
-        # over-count. Report and exclude; the rollover will advance it.
+        # An EXPIRED entitlement window would scope the SUM back into the
+        # previous window and over-count. Report and exclude; the rollover (lazy,
+        # or the hourly reconcile_quota_periods) will advance it.
         stale = [r for r in rows if r["period_is_stale"]]
         for r in stale:
             print(
-                f"  SKIPPING {str(r['user_id'])[:8]}: records_period_start "
-                f"{str(r['period_start'])[:10]} is STALE, so the ledger SUM would "
+                f"  SKIPPING {str(r['user_id'])[:8]}: entitlement window "
+                f"starting {str(r['period_start'])[:10]} has ENDED, so the ledger SUM would "
                 f"include last month. Let the rollover advance it, then re-run."
             )
 

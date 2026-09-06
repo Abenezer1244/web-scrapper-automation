@@ -55,14 +55,18 @@ they are reported SEPARATELY from hard failures. Two consequences:
 
 * C7 failures DO downgrade C1/C2 to UNVERIFIABLE, which IS a hard failure unless
   a baseline was supplied. Run this promptly after the deploy, or use --baseline.
-* C8 splits on DIRECTION, because that is where the signal is. An INCREASE is a
-  reservation or settlement -- ordinary work -- and is a note. A DECREASE with no
-  rollover is a hard failure: no benign deploy-time path lowers a live counter,
-  and that is the exact shape of the #223-#226 quota wipe. ``--strict-counter``
-  makes any movement fail, and is only sound against a quiesced production.
-  When C8 notes exist the final verdict says the WINDOWS were verified and
-  ``records_used`` was NOT -- it never prints an unqualified "moved nobody",
-  because that would let a counter regression through the gate.
+* C8 is REPORTED, never judged, because against live traffic no delta is
+  diagnostic in either direction. Up is a reservation or settlement; down is
+  equally ordinary, since settling fewer delivered records than were reserved
+  charges ``billable - reserved`` and a release subtracts the whole reservation,
+  both with C7 still holding. There is no shape to key on, so the only honest
+  options are to report it or to quiesce.
+  What the script does NOT do is let that slide by quietly: whenever a delta
+  exists the final verdict reads "WINDOWS verified ... records_used NOT
+  verified" and names how many users drifted, instead of an unqualified "moved
+  nobody" that would walk a counter regression straight through the gate.
+  ``--strict-counter`` fails on any movement and is sound only against a
+  genuinely quiesced production.
 
 USAGE
 -----
@@ -269,13 +273,18 @@ def _check_user(
     #
     # Use --strict-counter only when production really is quiesced; then any
     # diff IS the migration and should stop the deploy.
-    # The DIRECTION carries the signal. An increase is a reservation or a
-    # settlement: ordinary work, and the counter is monotonic inside a window.
-    # A DECREASE with no rollover is the fingerprint of the thing this gate
-    # exists to catch -- a counter being wiped or lowered underneath a live
-    # window, which is the #223-#226 incident class. That is a hard failure even
-    # without --strict-counter, because no benign deploy-time path produces it
-    # except a release, which is itself worth stopping for at this moment.
+    # Against LIVE traffic, no delta is diagnostic -- in either direction. Up is
+    # a reservation or settlement. Down is just as ordinary: settling fewer
+    # delivered records than were reserved charges ``billable - reserved``, and
+    # release_quota_reservation() subtracts the whole reservation, both inside
+    # the current window with C7 still holding. An earlier revision hard-failed
+    # on a decrease, which would have stopped the deploy on a job that reserved
+    # 200 and delivered 150. There is no shape to key on.
+    #
+    # So the delta is REPORTED, never judged, and the final verdict refuses to
+    # claim the counter was verified whenever one exists. --strict-counter is
+    # the only sound way to actually check it, and it is only sound because it
+    # presumes a quiesced production where nothing else can move the number.
     if base is not None and base.get("records_used") is not None:
         before, after = base["records_used"], user.records_used
         if before != after:
@@ -286,19 +295,12 @@ def _check_user(
                     f"{moved}. [--strict-counter] Production was declared quiesced, "
                     "so any movement is the migration."
                 )
-            elif delta < 0 and not rolled_since_migration:
-                failures.append(
-                    f"{moved}. A DECREASE with no rollover (C7) is not ordinary traffic "
-                    "-- it is the shape of a counter being wiped or lowered underneath a "
-                    "live window. Migration 088 must not touch this column. Investigate "
-                    "before going anywhere near backfill_quota_anchors.py."
-                )
             else:
                 notes.append(
-                    f"{moved}. Expected under live traffic (a reservation or settlement, "
-                    "or a rollover reset); migration 088 does not touch this column. "
-                    "NOT proof the migration left it alone -- only a quiesced run with "
-                    "--strict-counter can show that."
+                    f"{moved}. Ordinary under live traffic in EITHER direction (reserve, "
+                    "settle-for-less, release, or a rollover reset); migration 088 does "
+                    "not touch this column. NOT proof the migration left it alone -- only "
+                    "a quiesced run with --strict-counter can show that."
                 )
                 counter_drift.append(user)
 

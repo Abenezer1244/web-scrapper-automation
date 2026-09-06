@@ -108,14 +108,19 @@ Run this ONLY after the operator says go.
    least one user moved (STOP), 2 = could not run.** It never issues an UPDATE.
 
    ⚠️ **`records_used` is reported, not proven unchanged, and the tool says so.**
-   Production is not quiesced during the deploy, so a reservation or settlement
-   moves the counter for reasons that have nothing to do with the migration. An
-   INCREASE is therefore a note; a **DECREASE with no rollover is a hard
-   failure**, because no benign path lowers a live counter and that is the shape
-   of the #223–#226 wipe. When any counter delta exists the verdict explicitly
-   reads *"WINDOWS verified … records_used NOT verified"* rather than a clean
-   pass. If you want the counter proven too, quiesce the workers and add
-   `--strict-counter`, which fails on any movement at all.
+   Production is not quiesced during the deploy, so the counter moves for
+   reasons that have nothing to do with the migration — **in both directions.**
+   Up is a reservation or settlement; down is just as ordinary, because settling
+   fewer delivered records than were reserved charges `billable − reserved` and
+   a release subtracts the whole reservation. There is no shape to key on, so
+   every delta is a note. What the tool will not do is paper over it: whenever
+   one exists the verdict reads *"WINDOWS verified … records_used NOT verified"*
+   and names how many users drifted, rather than a clean pass.
+
+   To prove the counter as well, **quiesce the workers** and add
+   `--strict-counter`, which fails on any movement at all. That is the only
+   sound way to check it, and it is sound only because nothing else can be
+   moving the number.
 
    🛑 **This needs step 0 below.** An earlier draft claimed no pre-deploy
    snapshot was necessary because `records_period_start` holds the pre-088

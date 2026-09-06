@@ -1341,7 +1341,7 @@ def run_scrape_job(self, job_id: str) -> None:
                         sa_text(
                             "SELECT CASE"
                             "  WHEN records_period_start IS NULL"
-                            "    OR records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC')"
+                            "    OR records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
                             "  THEN 0 ELSE records_used END "
                             "FROM users WHERE id = CAST(:uid AS uuid)"
                         ),
@@ -1658,12 +1658,12 @@ def run_scrape_job(self, job_id: str) -> None:
                     "UPDATE users SET "
                     "  records_used = CASE"
                     "    WHEN records_period_start IS NULL"
-                    "      OR records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC')"
+                    "      OR records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
                     "    THEN 0 ELSE records_used END + :billable, "
                     "  records_period_start = CASE"
                     "    WHEN records_period_start IS NULL"
-                    "      OR records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC')"
-                    "    THEN date_trunc('month', NOW() AT TIME ZONE 'UTC')"
+                    "      OR records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+                    "    THEN date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
                     "    ELSE records_period_start END "
                     "WHERE id = CAST(:uid AS uuid)"
                 ),

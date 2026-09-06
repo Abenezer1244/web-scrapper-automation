@@ -43,7 +43,7 @@ down_revision = "085"
 branch_labels = None
 depends_on = None
 
-_MONTH_START = "date_trunc('month', NOW() AT TIME ZONE 'UTC')"
+_MONTH_START = "date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
 
 
 def upgrade() -> None:

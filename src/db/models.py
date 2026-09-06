@@ -119,7 +119,7 @@ class User(Base):
     records_period_start = Column(
         DateTime(timezone=True),
         nullable=False,
-        server_default=text("date_trunc('month', NOW() AT TIME ZONE 'UTC')"),
+        server_default=text("date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"),
     )
     stripe_customer_id = Column(String(64), nullable=True)
     # Durable Stripe ENTITLEMENT (migration 077). stripe_customer_id only means
@@ -140,7 +140,7 @@ class User(Base):
     skip_trace_period_start = Column(
         DateTime(timezone=True),
         nullable=False,
-        server_default=text("date_trunc('month', NOW() AT TIME ZONE 'UTC')"),
+        server_default=text("date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"),
     )
     # Sprint 7.3: referral program — each user has a unique shareable
     # code; referred_by_user_id is set when they sign up via another

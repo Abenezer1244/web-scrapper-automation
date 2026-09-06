@@ -13,6 +13,12 @@ from src.utils.lead_export import LEAD_CSV_COLUMNS, build_lead_export_row
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
+def _current_month_start() -> datetime:
+    """First instant of the current UTC month — the billing-period boundary."""
+    now = datetime.now(UTC)
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
 def _create_sync_user(db: Session, plan: str = "starter", records_used: int = 0) -> User:
     user = User(
         id=str(uuid.uuid4()),
@@ -576,12 +582,14 @@ def test_watchdog_ignores_fresh_pending_job():
 
 # ─── Monthly reset ────────────────────────────────────────────────────────────
 
-def test_monthly_reset_clears_records_used():
-    """reset_monthly_usage must set records_used = 0 for all users."""
+def test_monthly_reset_rolls_over_a_stale_period():
+    """A period from a PREVIOUS month is rolled over: counter zeroed, period advanced."""
     from src.workers.scheduler import reset_monthly_usage
 
     with SyncSessionLocal() as db:
         user = _create_sync_user(db, records_used=42)
+        user.records_period_start = datetime(2020, 1, 1, tzinfo=UTC)
+        user.skip_trace_period_start = datetime(2020, 1, 1, tzinfo=UTC)
         user_id = user.id
         db.commit()
 
@@ -590,16 +598,111 @@ def test_monthly_reset_clears_records_used():
     with SyncSessionLocal() as db:
         refreshed = db.get(User, user_id)
         assert refreshed.records_used == 0
+        assert refreshed.records_period_start == _current_month_start()
 
 
-def test_monthly_reset_affects_all_users():
-    """All users must be reset, not just one."""
+def test_monthly_reset_does_NOT_touch_a_current_period():
+    """The regression guard.
+
+    The rollover used to zero every user it could match, which destroyed usage
+    belonging to the CURRENT period two ways: a new user whose period_start was
+    NULL, and a late catch-up run after Beat missed the 1st. Both wiped real,
+    already-billed consumption. A user whose period is the current month must
+    come through untouched no matter how many times the task runs.
+    """
+    from src.workers.scheduler import reset_monthly_usage
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db, records_used=999)
+        user.records_period_start = _current_month_start()
+        user_id = user.id
+        db.commit()
+
+    reset_monthly_usage()
+    reset_monthly_usage()  # idempotent: running twice must not zero either
+
+    with SyncSessionLocal() as db:
+        assert db.get(User, user_id).records_used == 999
+
+
+def test_monthly_reset_adopts_a_null_period_without_zeroing():
+    """A NULL period is ADOPTED, never zeroed.
+
+    Zeroing is the financially destructive direction — it hands out free quota
+    and lets a user exceed their cap invisibly — so an unexpected NULL must cost
+    us a stamped period, not the counter. (This is the exact shape of the
+    production incident: every newly registered user had a NULL period and lost
+    their entire month's usage on their first 00:05 UTC run.)
+    """
+    from sqlalchemy import text as _text
+
+    from src.workers.scheduler import reset_monthly_usage
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db, records_used=777)
+        user_id = user.id
+        db.commit()
+        # The column is NOT NULL as of migration 086, so force the legacy shape
+        # the way only pre-086 data could have been written.
+        db.execute(
+            _text("ALTER TABLE users ALTER COLUMN records_period_start DROP NOT NULL")
+        )
+        db.execute(
+            _text("UPDATE users SET records_period_start = NULL WHERE id = :i"),
+            {"i": user_id},
+        )
+        db.commit()
+
+    try:
+        reset_monthly_usage()
+
+        with SyncSessionLocal() as db:
+            refreshed = db.get(User, user_id)
+            assert refreshed.records_used == 777, "NULL period must not cost the counter"
+            assert refreshed.records_period_start == _current_month_start()
+    finally:
+        with SyncSessionLocal() as db:
+            db.execute(
+                _text(
+                    "ALTER TABLE users ALTER COLUMN records_period_start SET NOT NULL"
+                )
+            )
+            db.commit()
+
+
+def test_monthly_reset_rolls_skip_trace_on_its_OWN_period():
+    """Skip-trace must key on skip_trace_period_start, not records_period_start.
+
+    It used to be gated on records_period_start, so drift between the two
+    columns could reset Stripe-metered skip-trace usage early, or never.
+    """
+    from src.workers.scheduler import reset_monthly_usage
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db, records_used=10)
+        user.records_period_start = _current_month_start()      # current
+        user.skip_trace_used_this_month = 25
+        user.skip_trace_period_start = datetime(2020, 1, 1, tzinfo=UTC)  # stale
+        user_id = user.id
+        db.commit()
+
+    reset_monthly_usage()
+
+    with SyncSessionLocal() as db:
+        refreshed = db.get(User, user_id)
+        assert refreshed.records_used == 10, "records period was current — leave it"
+        assert refreshed.skip_trace_used_this_month == 0, "its own period was stale"
+
+
+def test_monthly_reset_rolls_over_all_stale_users():
+    """All stale users roll over, not just one."""
     from src.workers.scheduler import reset_monthly_usage
 
     ids = []
     with SyncSessionLocal() as db:
         for _ in range(3):
             u = _create_sync_user(db, records_used=100)
+            u.records_period_start = datetime(2020, 1, 1, tzinfo=UTC)
             ids.append(u.id)
         db.commit()
 
@@ -607,8 +710,7 @@ def test_monthly_reset_affects_all_users():
 
     with SyncSessionLocal() as db:
         for uid in ids:
-            u = db.get(User, uid)
-            assert u.records_used == 0
+            assert db.get(User, uid).records_used == 0
 
 
 # ─── Delivery: payment failed email ───────────────────────────────────────────

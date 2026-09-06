@@ -55,10 +55,14 @@ they are reported SEPARATELY from hard failures. Two consequences:
 
 * C7 failures DO downgrade C1/C2 to UNVERIFIABLE, which IS a hard failure unless
   a baseline was supplied. Run this promptly after the deploy, or use --baseline.
-* C8 is a NOTE, not a failure. The deploy does not quiesce production, so a
-  reservation, a release or a rollover can all move ``records_used`` between the
-  snapshot and this run. Failing on that would block a good deploy on ordinary
-  traffic. Pass --strict-counter only when production really is quiesced.
+* C8 splits on DIRECTION, because that is where the signal is. An INCREASE is a
+  reservation or settlement -- ordinary work -- and is a note. A DECREASE with no
+  rollover is a hard failure: no benign deploy-time path lowers a live counter,
+  and that is the exact shape of the #223-#226 quota wipe. ``--strict-counter``
+  makes any movement fail, and is only sound against a quiesced production.
+  When C8 notes exist the final verdict says the WINDOWS were verified and
+  ``records_used`` was NOT -- it never prints an unqualified "moved nobody",
+  because that would let a counter regression through the gate.
 
 USAGE
 -----
@@ -158,7 +162,11 @@ def take_snapshot(path: str) -> int:
 
 
 def _check_user(
-    user: User, now: datetime, base: dict | None, strict_counter: bool = False
+    user: User,
+    now: datetime,
+    base: dict | None,
+    strict_counter: bool,
+    counter_drift: list,
 ) -> tuple[list[str], list[str]]:
     """Return (hard_failures, informational_notes) for one user."""
     failures: list[str] = []
@@ -261,19 +269,38 @@ def _check_user(
     #
     # Use --strict-counter only when production really is quiesced; then any
     # diff IS the migration and should stop the deploy.
+    # The DIRECTION carries the signal. An increase is a reservation or a
+    # settlement: ordinary work, and the counter is monotonic inside a window.
+    # A DECREASE with no rollover is the fingerprint of the thing this gate
+    # exists to catch -- a counter being wiped or lowered underneath a live
+    # window, which is the #223-#226 incident class. That is a hard failure even
+    # without --strict-counter, because no benign deploy-time path produces it
+    # except a release, which is itself worth stopping for at this moment.
     if base is not None and base.get("records_used") is not None:
         before, after = base["records_used"], user.records_used
         if before != after:
             delta = after - before
-            message = (
-                f"C8 records_used moved {before} -> {after} ({delta:+d}) since the "
-                "snapshot. Expected under live traffic; migration 088 does not "
-                "touch this column."
-            )
+            moved = f"C8 records_used moved {before} -> {after} ({delta:+d}) since the snapshot"
             if strict_counter:
-                failures.append(f"{message} [--strict-counter]")
+                failures.append(
+                    f"{moved}. [--strict-counter] Production was declared quiesced, "
+                    "so any movement is the migration."
+                )
+            elif delta < 0 and not rolled_since_migration:
+                failures.append(
+                    f"{moved}. A DECREASE with no rollover (C7) is not ordinary traffic "
+                    "-- it is the shape of a counter being wiped or lowered underneath a "
+                    "live window. Migration 088 must not touch this column. Investigate "
+                    "before going anywhere near backfill_quota_anchors.py."
+                )
             else:
-                notes.append(message)
+                notes.append(
+                    f"{moved}. Expected under live traffic (a reservation or settlement, "
+                    "or a rollover reset); migration 088 does not touch this column. "
+                    "NOT proof the migration left it alone -- only a quiesced run with "
+                    "--strict-counter can show that."
+                )
+                counter_drift.append(user)
 
     expected_end = add_months(qps_u, 1)
     if qpe_u != expected_end:
@@ -375,6 +402,7 @@ def main() -> int:
         print("FATAL: no users matched -- refusing to report a vacuous PASS.", file=sys.stderr)
         return 2
 
+    counter_drift: list[User] = []
     failed: list[tuple[User, list[str]]] = []
     rolled: list[tuple[User, list[str]]] = []
     watched: User | None = None
@@ -388,7 +416,9 @@ def main() -> int:
             # A user created after the snapshot. Not a defect, but C1/C2/C8
             # cannot be judged for them, so say so instead of passing quietly.
             missing_from_baseline.append(user)
-        failures, notes = _check_user(user, now, base, args.strict_counter)
+        failures, notes = _check_user(
+            user, now, base, args.strict_counter, counter_drift
+        )
         if failures:
             failed.append((user, failures))
         if notes:
@@ -457,6 +487,20 @@ def main() -> int:
     print(f"RESULT: {total - len(failed)}/{total} users pass all hard checks.")
     if failed:
         print(f"        {len(failed)} FAILING -- STOP. Do not run backfill_quota_anchors.py.")
+    elif counter_drift:
+        # Never print an unqualified "moved nobody" while a counter mismatch is
+        # sitting in the notes: the windows were verified, records_used was NOT,
+        # and saying otherwise would let the quota-counter regression this gate
+        # exists for walk straight through step 2.
+        print("        WINDOWS verified: migration 088 moved nobody's window or anchor.")
+        print(
+            f"        records_used NOT verified -- it moved for {len(counter_drift)} "
+            "user(s) since the snapshot."
+        )
+        print("        Live traffic explains that, but this run cannot prove it. To")
+        print("        verify the counter, re-run against a quiesced production with")
+        print("        --strict-counter, or read the C8 notes above and satisfy yourself")
+        print("        each delta is ordinary usage before running the anchor backfill.")
     else:
         print("        Migration 088 moved nobody. Step 2 verified.")
     print(f"        {len(rolled)} with an informational C5/C7 note.")

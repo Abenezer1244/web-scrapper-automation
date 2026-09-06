@@ -103,9 +103,19 @@ Run this ONLY after the operator says go.
    Run **`railway run python scripts/verify_entitlement_deploy.py --baseline pre088.json`**
    — the read-only step-2 verifier (added 2026-09-06). Eight checks across every
    user (window unmoved, anchor on the day-1 grid, one-month window, no NULLs,
-   effective == stored, nobody rolled yet, `records_used` unchanged), and it
+   effective == stored, nobody rolled yet, and the `records_used` delta), and it
    prints the watched `01dc9396…` account in full. **Exit 0 = clean, 1 = at
    least one user moved (STOP), 2 = could not run.** It never issues an UPDATE.
+
+   ⚠️ **`records_used` is reported, not proven unchanged, and the tool says so.**
+   Production is not quiesced during the deploy, so a reservation or settlement
+   moves the counter for reasons that have nothing to do with the migration. An
+   INCREASE is therefore a note; a **DECREASE with no rollover is a hard
+   failure**, because no benign path lowers a live counter and that is the shape
+   of the #223–#226 wipe. When any counter delta exists the verdict explicitly
+   reads *"WINDOWS verified … records_used NOT verified"* rather than a clean
+   pass. If you want the counter proven too, quiesce the workers and add
+   `--strict-counter`, which fails on any movement at all.
 
    🛑 **This needs step 0 below.** An earlier draft claimed no pre-deploy
    snapshot was necessary because `records_period_start` holds the pre-088

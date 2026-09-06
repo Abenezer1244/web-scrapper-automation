@@ -138,6 +138,48 @@ class TestSingleMatch:
         assert verdict == "one" and q["id"] == 101
 
 
+class TestPendingQueueMustNeverBeReadAsAbsent:
+    """The double-charge trap.
+
+    Tracerfy HIDES rows_uploaded and credits_deducted while an API queue is
+    still pending (docs/vendor/tracerfy-api.md). Size-matching such a queue is
+    impossible, so an earlier version of the predicate rejected it as a
+    candidate and returned "none" -- which releases the claim, and the next tick
+    resubmits and pays for the same batch a second time. That is precisely what
+    the durable claim exists to prevent. A pending queue in our window must
+    DEFER, never read as "never accepted".
+    """
+
+    def test_pending_queue_with_hidden_counts_defers(self):
+        remote = [_q(pending=True, rows_uploaded=None, credits_deducted=None)]
+        verdict, q = match_remote_queue(remote, CLAIM, "normal", 10, set())
+        assert verdict == "pending"
+        assert q is None
+
+    def test_pending_flag_alone_defers_even_with_counts_present(self):
+        remote = [_q(pending=True, rows_uploaded=10)]
+        assert match_remote_queue(remote, CLAIM, "normal", 10, set())[0] == "pending"
+
+    def test_missing_rows_uploaded_key_defers(self):
+        q = _q()
+        del q["rows_uploaded"]
+        assert match_remote_queue([q], CLAIM, "normal", 10, set())[0] == "pending"
+
+    def test_a_pending_queue_outside_the_window_is_still_irrelevant(self):
+        remote = [_q(pending=True, rows_uploaded=None,
+                     created_at="2026-09-03T15:30:00.000000Z")]
+        assert match_remote_queue(remote, CLAIM, "normal", 10, set())[0] == "none"
+
+    def test_pending_beside_a_completed_match_is_ambiguous_not_adopted(self):
+        # Can't tell which one is ours, and one of them is already charged.
+        remote = [
+            _q(id=1, rows_uploaded=10),
+            _q(id=2, pending=True, rows_uploaded=None,
+               created_at="2026-09-03T15:00:03.000000Z"),
+        ]
+        assert match_remote_queue(remote, CLAIM, "normal", 10, set())[0] == "ambiguous"
+
+
 class TestAmbiguous:
     """Refuse rather than guess. Adopting the wrong queue cross-contaminates."""
 

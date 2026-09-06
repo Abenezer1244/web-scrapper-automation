@@ -410,8 +410,13 @@ def _persist_submission(db, queue_id: int, claimed: list, trace_type: str, respo
             # Tracerfy de-duplicates identical addresses, so this can be smaller
             # than len(claimed) (prod: 25 sent → 24 uploaded → all 25 rows
             # reconciled by the webhook). Informational only.
-            rows_uploaded=response.get("rows_uploaded", len(claimed)),
-            credits_deducted=0,  # filled in by webhook receiver
+            rows_uploaded=response.get("rows_uploaded") or len(claimed),
+            credits_deducted=response.get("credits_deducted") or 0,
+            # Normally filled in by the webhook receiver. On the RECONCILER's
+            # adoption path the queue has often already completed, and carrying
+            # its download_url here is what makes the ingest redrive recoverable
+            # if the enqueue is lost (Codex).
+            download_url=response.get("download_url"),
             submitted_at=now,
         )
         .on_conflict_do_nothing(index_elements=["tracerfy_queue_id"])
@@ -554,7 +559,15 @@ def match_remote_queue(
 ) -> tuple[str, dict | None]:
     """Decide what a stale claim's remote counterpart is. Pure, so it is testable.
 
-    Returns ("none"|"one"|"ambiguous", queue_or_None).
+    Returns (verdict, queue_or_None) where verdict is one of:
+      "one"       - exactly one remote queue provably fits; adopt it.
+      "none"      - Tracerfy holds no queue for this claim, so it was never
+                    accepted and never charged; the claim is safe to release.
+      "pending"   - a queue in our window is still processing and Tracerfy is
+                    withholding its counts; it MAY be ours and it HAS been
+                    charged, so defer and never release.
+      "ambiguous" - more than one queue fits, or a completed and a pending one
+                    both do; refuse and let a human look.
 
     The predicate is deliberately conservative (Codex review). Misattributing a
     queue is far worse than leaving rows stuck: adopting the wrong id would
@@ -571,9 +584,46 @@ def match_remote_queue(
         identical addresses, so a 25-row batch legitimately uploads 24;
       * exactly one survivor, else refuse and let a human look.
     """
+    hits, deferred = candidate_queues(candidates, claim_time, trace_type, n_claimed,
+                                      known_queue_ids)
+    if deferred and hits:
+        # A completed candidate AND a still-pending one both fit. Undecidable
+        # now and not self-resolving in a useful direction — get a human.
+        return "ambiguous", None
+    if deferred:
+        # Tracerfy HIDES rows_uploaded/credits_deducted while an API queue is
+        # still pending (docs/vendor/tracerfy-api.md). A pending queue in our
+        # window therefore cannot be size-matched — and it may well be ours, and
+        # it has already been charged. Reporting "none" here would release the
+        # claim and the next tick would resubmit and pay a second time, which is
+        # precisely what the durable claim exists to prevent. Defer instead: the
+        # claim stays put and the next tick reconciles it once the queue
+        # completes and its counts become visible.
+        return "pending", None
+    if not hits:
+        return "none", None
+    if len(hits) == 1:
+        return "one", hits[0]
+    return "ambiguous", None
+
+
+def candidate_queues(
+    candidates: list[dict],
+    claim_time: datetime,
+    trace_type: str,
+    n_claimed: int,
+    known_queue_ids: set,
+) -> tuple[list[dict], list[dict]]:
+    """Split remote queues into (size-matched hits, undecidable pending ones).
+
+    Exposed separately from match_remote_queue so the reconciler can ask which
+    queues a claim COULD match before deciding — two stale claims whose windows
+    overlap must not both adopt the same queue.
+    """
     lo = claim_time - _RECONCILE_BEFORE
     hi = claim_time + _RECONCILE_AFTER
     hits: list[dict] = []
+    deferred: list[dict] = []
     for q in candidates:
         if q.get("trace_type") != trace_type:
             continue
@@ -586,15 +636,14 @@ def match_remote_queue(
         if created is None or not (lo <= created <= hi):
             continue
         uploaded = q.get("rows_uploaded")
-        if not isinstance(uploaded, int) or uploaded <= 0 or uploaded > n_claimed:
+        if q.get("pending") is True or not isinstance(uploaded, int):
+            # Still processing, or counts withheld: undecidable, never "absent".
+            deferred.append(q)
+            continue
+        if uploaded <= 0 or uploaded > n_claimed:
             continue
         hits.append(q)
-
-    if not hits:
-        return "none", None
-    if len(hits) == 1:
-        return "one", hits[0]
-    return "ambiguous", None
+    return hits, deferred
 
 
 def _reconcile_stale_claims(db) -> dict:
@@ -622,12 +671,14 @@ def _reconcile_stale_claims(db) -> dict:
 
     Never resubmits. Returns a small summary for the tick result.
     """
-    summary = {"released": 0, "adopted": 0, "ambiguous": 0, "groups": 0}
+    summary = {"released": 0, "adopted": 0, "ambiguous": 0, "deferred": 0, "groups": 0}
     try:
         from sqlalchemy import func, select
 
         from src.db.models import PendingSkipTraceRow, SkipTraceQueue
         from src.scrapers.enrichment.skip_trace import TracerfyError, fetch_queues
+
+        _redrive_unigested_adoptions(db)
 
         cutoff = datetime.now(UTC) - _STALE_CLAIM_AFTER
         groups = db.execute(
@@ -662,10 +713,33 @@ def _reconcile_stale_claims(db) -> dict:
             r[0] for r in db.execute(select(SkipTraceQueue.tracerfy_queue_id))
         }
 
+        # A queue that COULD belong to more than one stale claim must not be
+        # adopted by either (Codex). The dispatcher can submit two batches of the
+        # same trace_type seconds apart within one tick (max_batches > 1), so
+        # their windows overlap — and `rows_uploaded <= n_claimed` is a subset
+        # test, not identity. A 500-row claim that never reached Tracerfy would
+        # otherwise happily adopt the 100-row queue belonging to the claim beside
+        # it, attaching those results to the wrong leads and billing the wrong
+        # tenants. Contested queues are refused for every claimant.
+        contested: set = set()
+        seen_once: set = set()
+        for claim_time, trace_type, n, *_ in groups:
+            hits, deferred = candidate_queues(remote, claim_time, trace_type, n, known)
+            for q in hits + deferred:
+                qid = q.get("id")
+                (contested if qid in seen_once else seen_once).add(qid)
+
         for claim_time, trace_type, n in groups:
             verdict, queue = match_remote_queue(
                 remote, claim_time, trace_type, n, known
             )
+            if verdict == "one" and queue.get("id") in contested:
+                _logger.error(
+                    "Reconciliation: Tracerfy queue %s fits MORE THAN ONE stale "
+                    "claim — refusing to adopt it for any of them",
+                    queue.get("id"),
+                )
+                verdict, queue = "ambiguous", None
             rows = db.execute(
                 select(PendingSkipTraceRow).where(
                     PendingSkipTraceRow.status == "submitting",
@@ -677,7 +751,16 @@ def _reconcile_stale_claims(db) -> dict:
                 continue
             claimed = [_Claim(r.id, r.result_id, r.job_id, r.user_id) for r in rows]
 
-            if verdict == "none":
+            if verdict == "pending":
+                # Accepted (and charged) but still processing, so Tracerfy is
+                # withholding its counts. Leave the claim exactly where it is.
+                summary["deferred"] += len(claimed)
+                _logger.info(
+                    "Reconciliation: a still-pending Tracerfy queue may own the %d "
+                    "%s row(s) claimed at %s — deferring, never releasing",
+                    len(claimed), trace_type, claim_time,
+                )
+            elif verdict == "none":
                 _logger.warning(
                     "Reconciliation: no Tracerfy queue for the %d %s row(s) claimed "
                     "at %s — never accepted, never charged. Releasing to 'queued'.",
@@ -693,10 +776,12 @@ def _reconcile_stale_claims(db) -> dict:
                     queue_id, len(claimed), trace_type, claim_time,
                     queue.get("rows_uploaded"), queue.get("credits_deducted"),
                 )
-                _persist_submission(
-                    db, queue_id, claimed, trace_type,
-                    {"rows_uploaded": queue.get("rows_uploaded", len(claimed))},
-                )
+                # Persist the download_url with the adoption so the redrive below
+                # is RECOVERABLE. Without it a failed .delay() (broker blip, or the
+                # process dying right after this commit) would leave the queue
+                # recorded — and therefore excluded from every future
+                # reconciliation pass — with nothing ever ingesting it (Codex).
+                _persist_submission(db, queue_id, claimed, trace_type, queue)
                 known.add(queue_id)
                 summary["adopted"] += len(claimed)
                 _redrive_completed_queue(queue)
@@ -715,6 +800,49 @@ def _reconcile_stale_claims(db) -> dict:
         except Exception:  # noqa: BLE001
             pass
     return summary
+
+
+def _redrive_unigested_adoptions(db) -> None:
+    """Re-enqueue ingest for adopted queues whose redrive never landed.
+
+    Adoption commits the queue row (with its download_url) and THEN enqueues the
+    ingest best-effort. If that enqueue is lost — broker blip, or the process
+    dying immediately after the commit — the queue is now recorded, and being
+    recorded excludes it from every future reconciliation pass, so nothing would
+    ever ingest it (Codex). A queue still 'pending' locally while already
+    carrying a download_url is exactly that state; ingest is idempotent, so a
+    redundant redrive costs nothing.
+    """
+    try:
+        from sqlalchemy import select
+
+        from src.db.models import SkipTraceQueue
+
+        rows = db.execute(
+            select(
+                SkipTraceQueue.tracerfy_queue_id,
+                SkipTraceQueue.download_url,
+                SkipTraceQueue.rows_uploaded,
+                SkipTraceQueue.credits_deducted,
+            ).where(
+                SkipTraceQueue.status == "pending",
+                SkipTraceQueue.download_url.isnot(None),
+            )
+        ).all()
+        for qid, url, uploaded, credits in rows:
+            _logger.warning(
+                "Reconciliation: re-driving ingest for adopted queue %s whose "
+                "first enqueue was lost", qid,
+            )
+            _redrive_completed_queue({
+                "id": qid,
+                "pending": False,
+                "download_url": url,
+                "rows_uploaded": uploaded or 0,
+                "credits_deducted": credits or 0,
+            })
+    except Exception as exc:  # noqa: BLE001 — never break the tick
+        _logger.warning("adoption redrive sweep failed: %s", str(exc)[:120])
 
 
 def _redrive_completed_queue(queue: dict) -> None:

@@ -17,11 +17,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def main():
-    import requests
     from sqlalchemy import text
 
     from src.config import settings
     from src.db.session import system_sync_session
+    from src.scrapers.enrichment.skip_trace import TracerfyError, fetch_queues
 
     print("== Ops alerting config ==")
     print(f"  OPS_ALERT_EMAIL set : {bool(getattr(settings, 'OPS_ALERT_EMAIL', ''))}")
@@ -68,24 +68,18 @@ def main():
             print(f"  {r.status:<12} no_state={r.no_state:<5} no_city={r.no_city:<5} total={r.total}")
 
     print("\n== Tracerfy account reconciliation (GET /v1/api/queues/) ==")
-    token = settings.TRACERFY_API_TOKEN
-    if not token:
+    if not settings.TRACERFY_API_TOKEN:
         print("  TRACERFY_API_TOKEN not set in this env — cannot reconcile.")
         return
+    # Go through the hardened client, not a bare requests.get: fetch_queues()
+    # requires HTTPS, SSRF-validates the host with resolve=True BEFORE the bearer
+    # token is sent, disables ambient proxies and refuses redirects. A diagnostic
+    # is still a process holding a live credential (Codex).
     try:
-        resp = requests.get(
-            f"{settings.TRACERFY_API_BASE_URL.rstrip('/')}/v1/api/queues/",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30,
-        )
-    except Exception as exc:
-        print(f"  request failed: {type(exc).__name__}")
+        queues = fetch_queues()
+    except TracerfyError as exc:
+        print(f"  queue fetch failed: {exc}")
         return
-    print(f"  HTTP {resp.status_code}")
-    if resp.status_code != 200:
-        print(f"  body: {resp.text[:300]}")
-        return
-    queues = resp.json()
     print(f"  Tracerfy reports {len(queues)} queues on this account.")
     print(f"  {'id':<10} {'created_at':<30} {'pending':<8} {'rows':<7} {'credits':<8} type")
     for q in sorted(queues, key=lambda x: x.get("id", 0), reverse=True)[:40]:
@@ -107,16 +101,12 @@ def main():
               f"rows={q.get('rows_uploaded')} credits={q.get('credits_deducted')} "
               f"type={q.get('trace_type')} pending={q.get('pending')}")
 
-    print("\n== Analytics (credit balance) ==")
-    try:
-        a = requests.get(
-            f"{settings.TRACERFY_API_BASE_URL.rstrip('/')}/v1/api/analytics/",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30,
-        )
-        print(f"  HTTP {a.status_code}: {a.text[:300] if a.status_code == 200 else ''}")
-    except Exception as exc:
-        print(f"  request failed: {type(exc).__name__}")
+    completed = [q for q in queues if q.get("pending") is False]
+    print(
+        f"\n  {len(completed)} of {len(queues)} queues are complete. A PENDING queue "
+        "hides its rows_uploaded/credits_deducted, which is why the reconciler "
+        "defers on one rather than reading the absence as 'never accepted'."
+    )
 
 
 if __name__ == "__main__":

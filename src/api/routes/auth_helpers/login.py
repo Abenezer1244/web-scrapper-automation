@@ -3,6 +3,7 @@
 route decorators + signatures stay in auth.py; these hold the moved bodies.
 """
 
+import json
 import time
 from datetime import UTC, datetime
 
@@ -381,6 +382,34 @@ async def login_break_glass_redeem(
     return LoginResponse(access_token=token, refresh_token=refresh)
 
 
+# How long a racer waits for the winner to publish its rotation result before
+# concluding the token is genuinely a replay. Only ever paid on the loser of a
+# concurrent refresh, never on the normal path.
+_ROTATION_PUBLISH_WAIT_SECONDS = 1.5
+_ROTATION_POLL_INTERVAL_SECONDS = 0.05
+
+
+async def _await_rotation_result(jti: str) -> str | None:
+    """Poll for the rotation result the winner of this jti is about to publish.
+
+    Returns the cached pair as soon as it appears, or None once the wait lapses —
+    at which point the token really is a replay from outside the grace window
+    (or the winner died before publishing), and the caller rejects it.
+    """
+    import asyncio
+
+    from src.api.middleware.auth_hardening import TokenBlacklist
+
+    deadline = time.monotonic() + _ROTATION_PUBLISH_WAIT_SECONDS
+    while True:
+        cached = await TokenBlacklist.recall_rotation(jti)
+        if cached:
+            return cached
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(_ROTATION_POLL_INTERVAL_SECONDS)
+
+
 async def refresh_tokens(
     body,
     request: Request,
@@ -436,6 +465,26 @@ async def refresh_tokens(
         if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
             raise HTTPException(status_code=401, detail="Refresh token revoked")
         if not await TokenBlacklist.consume_once(jti, ttl):
+            # Already consumed. Inside the grace window this is almost always a
+            # benign client race (parallel requests presenting the same token
+            # before the first rotation's cookie propagated), not theft — so
+            # hand back the SAME pair that consumption produced rather than
+            # killing a healthy session. Outside the window it still 401s, which
+            # is where a genuinely stolen token surfaces.
+            #
+            # Wait briefly rather than asking once. The winner claims the jti
+            # BEFORE it mints the new pair, so between its SET NX and its
+            # remember_rotation there is a real gap — a user lookup plus two JWT
+            # signings. A racer that lands inside that gap would read an empty
+            # cache and get the very 401 this window exists to prevent, which is
+            # exactly the concurrent case we are fixing.
+            replayed = await _await_rotation_result(jti)
+            if replayed:
+                cached = json.loads(replayed)
+                return TokenResponse(
+                    access_token=cached["access_token"],
+                    refresh_token=cached["refresh_token"],
+                )
             raise HTTPException(status_code=401, detail="Refresh token already used")
     except _redis_exceptions.RedisError:
         raise revocation_unavailable_503()
@@ -466,4 +515,16 @@ async def refresh_tokens(
     new_refresh = create_refresh_token(
         user.id, amr=propagated_amr, auth_time=propagated_auth_time
     )
+    # Record what this jti bought, so a replay racing inside the grace window
+    # gets the same pair instead of a 401 that would end a healthy session.
+    # Best-effort: the rotation itself already succeeded, and a Redis hiccup here
+    # must not fail a request that is otherwise complete — it only means a
+    # concurrent racer falls back to the strict "already used" answer.
+    try:
+        await TokenBlacklist.remember_rotation(
+            jti,
+            json.dumps({"access_token": new_access, "refresh_token": new_refresh}),
+        )
+    except _redis_exceptions.RedisError:
+        pass
     return TokenResponse(access_token=new_access, refresh_token=new_refresh)

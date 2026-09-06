@@ -69,3 +69,67 @@ idempotent billing + release-on-failure in 3 error paths. Deferred deliberately.
 - Calendar-month reset KEPT (matches "1,000 records/month" copy). Stripe-anniversary
   divergence documented as a known gap, not changed. (user decision)
 - Concurrency over-allocation: fix approved, scheduled as Phase 3. (user decision)
+
+---
+
+## Review
+
+### What `2 / 1,000` meant
+Records **CONSUMED** this calendar month. Confirmed live: `/billing/usage`
+returned `records_used: 2, records_limit: 1000, records_remaining: 998,
+percent_used: 0.2`, and the UI rendered `2 / 1,000` on both dashboard and
+settings. The backend itself reports 2 — a backend accounting defect, not a
+frontend rendering one. Refresh and logout/login left it unchanged.
+
+### Verified correct usage
+**1,001 records** for account `01dc9396` in the 2026-09 period, from
+`SUM(jobs.billed_count)` over 16 jobs with `billing_applied_at` in September.
+That is ABOVE the 1,000 cap — the account silently exceeded its plan.
+Second account `b6d2095d`: **140**, stored 73.
+
+### Was it a legitimate reset?
+**No.** `records_period_start` moved from NULL to 2026-09-01 — the same month
+the usage occurred in. No billing period rolled and no Stripe event fired.
+
+### Root cause
+Two defects in `_reset_monthly_usage_impl`, both proven against prod:
+1. `records_period_start` was NULL on every user registered after migration
+   020 (nullable, no server_default, never set at creation), and the rollover's
+   `IS NULL` arm zeroed them mid-month.
+2. The rollover zeroed unconditionally, so a late catch-up run after Beat
+   missed the 1st wiped usage already billed inside the new period.
+
+### Architecture
+Authoritative source = `jobs.billed_count` + `jobs.billing_applied_at`, a
+durable per-job anchor written under a CAS. `users.records_used` is a cached
+rollup of it and is therefore deterministically reconstructible. Usage is NOT
+derived from visible rows, batches, or any UI aggregation.
+
+### Verification
+- Full suite **2327 passed, 2 skipped** (CI's exact target).
+- `ruff` clean across `src/`, `tests/`, `scripts/`, `alembic/`.
+- Migration 086 applies cleanly on a fresh DB.
+- Live headless-Chromium check against production (above).
+
+### Notes
+- The new tests caught a **timezone bug in my own fix**: naive
+  `date_trunc(...)` compared to a `timestamptz` column is re-interpreted in the
+  session zone, which under a negative UTC offset reads a current-period user
+  as stale and zeroes them. Every boundary now carries the `AT TIME ZONE 'UTC'`
+  re-cast.
+- Codex caught a **[P1] I missed**: Postgres `NOW()` is transaction-start time,
+  so a transaction straddling the month boundary broke the central safety
+  claim. Fixed with one bound `clock_timestamp()` for both statements.
+- Independently found (before Codex reported the same): the repair script must
+  skip STALE periods, and must not DECREASE a counter by default — a deleted
+  job leaves the ledger, and deleting data must never refund quota.
+
+### Still open
+- [ ] Merge + deploy (api + worker + migration).
+- [ ] Run `scripts/repair_records_used_from_ledger.py` (dry run, then
+      `--commit --i-understand`) to restore 1,001 / 140. **NOT YET RUN.**
+- [ ] Phase 3: over-allocation reservation (concurrent jobs can each be
+      allocated the same remaining quota). Approved, deliberately deferred —
+      cap and billing are in separate transactions with the export between
+      them, so it needs an atomic reservation + release-on-failure, not a lock.
+- [ ] **UNVERIFIED**: post-deploy behaviour and the repaired counter in the UI.

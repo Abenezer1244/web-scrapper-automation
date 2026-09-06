@@ -481,3 +481,82 @@ def test_a_null_period_is_treated_as_current_not_as_free_quota():
         records_period_start = None
 
     assert effective_records_used(_Detached()) == 800
+
+
+# ─── NULL period must never zero the COUNTER (worker == API gate) ─────────────
+
+def _bill_worker_sql(db, user_id: str, delta: int) -> None:
+    """The settlement statement exactly as workers/tasks.py issues it."""
+    db.execute(
+        text(
+            "UPDATE users SET "
+            "  records_used = GREATEST(0, CASE"
+            "    WHEN records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+            "    THEN 0 ELSE records_used END + :delta), "
+            "  records_period_start = CASE"
+            "    WHEN records_period_start IS NULL"
+            "      OR records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+            "    THEN date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+            "    ELSE records_period_start END "
+            "WHERE id = CAST(:uid AS uuid)"
+        ),
+        {"delta": delta, "uid": user_id},
+    )
+
+
+def test_a_null_period_does_not_zero_the_counter_in_the_worker():
+    """The worker must agree with src/api/quota.py::effective_records_used.
+
+    They used to disagree, and in the revenue-losing direction: the API gate
+    preserved records_used on a NULL period while the worker's CASE discarded
+    it, silently granting a free period's quota. Unreachable today (migration
+    086 made the column NOT NULL) but pinned so the two halves cannot drift
+    apart again.
+    """
+    from src.api.quota import effective_records_used
+
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, used=300, limit=1000)
+        user_id = user.id
+        db.commit()
+        # Force the legacy NULL shape the constraint now forbids.
+        db.execute(text(
+            "ALTER TABLE users ALTER COLUMN records_period_start DROP NOT NULL"))
+        db.execute(
+            text("UPDATE users SET records_period_start = NULL WHERE id = CAST(:u AS uuid)"),
+            {"u": user_id},
+        )
+        db.commit()
+
+    try:
+        with SyncSessionLocal() as db:
+            _bill_worker_sql(db, user_id, delta=25)
+            db.commit()
+
+        with SyncSessionLocal() as db:
+            u = db.get(User, user_id)
+            assert u.records_used == 325, "prior usage must survive a NULL period"
+            assert u.records_period_start is not None, "the period IS adopted"
+            # And the API gate agrees with the worker.
+            assert effective_records_used(u) == 325
+    finally:
+        with SyncSessionLocal() as db:
+            db.execute(text(
+                "ALTER TABLE users ALTER COLUMN records_period_start SET NOT NULL"))
+            db.commit()
+
+
+def test_a_stale_period_still_zeroes_the_counter():
+    """The change must not weaken the real rollover: STALE still resets."""
+    with SyncSessionLocal() as db:
+        user = _mk_user(db, used=300, limit=1000,
+                        period=datetime(2020, 1, 1, tzinfo=UTC))
+        user_id = user.id
+        db.commit()
+
+    with SyncSessionLocal() as db:
+        _bill_worker_sql(db, user_id, delta=25)
+        db.commit()
+
+    with SyncSessionLocal() as db:
+        assert db.get(User, user_id).records_used == 25, "stale period still resets"

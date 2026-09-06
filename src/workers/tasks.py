@@ -1396,8 +1396,8 @@ def run_scrape_job(self, job_id: str) -> None:
                             sa_text(
                                 "WITH cur AS ("
                                 "  SELECT u.id, u.records_limit, CASE"
-                                "      WHEN u.records_period_start IS NULL"
-                                "        OR u.records_period_start < date_trunc('month', CAST(:at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+                                # A NULL period deliberately does NOT zero the base — see below.
+                                "      WHEN u.records_period_start < date_trunc('month', CAST(:at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
                                 "      THEN 0 ELSE u.records_used END AS base"
                                 "  FROM users u WHERE u.id = CAST(:uid AS uuid) FOR UPDATE"
                                 "), g AS ("
@@ -1766,6 +1766,15 @@ def run_scrape_job(self, job_id: str) -> None:
             # delta is meaningless. The leads are being delivered NOW, so the
             # current period must carry them in full. Netting a stale grant off
             # instead would deliver records nobody is charged for. (Codex)
+            # NULL-PERIOD RULE (must match src/api/quota.py::effective_records_used):
+            # a NULL records_period_start never zeroes the COUNTER. It is
+            # unreachable — migration 086 made the column NOT NULL with a
+            # server_default — but the two halves used to disagree, and they
+            # disagreed in the revenue-losing direction: the API gate preserved
+            # the counter on NULL while the worker discarded it, silently handing
+            # out a free period's quota. Only a genuinely STALE period zeroes.
+            # The period column itself is still stamped on NULL (adopted), which
+            # matches how the rollover treats it. (Codex)
             _reserved = int(getattr(job, "reserved_count", 0) or 0)
             _reservation_is_current = bool(db.execute(
                 sa_text(
@@ -1788,8 +1797,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 sa_text(
                     "UPDATE users SET "
                     "  records_used = GREATEST(0, CASE"
-                    "    WHEN records_period_start IS NULL"
-                    "      OR records_period_start < date_trunc('month', CAST(:billed_at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
+                    "    WHEN records_period_start < date_trunc('month', CAST(:billed_at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
                     "    THEN 0 ELSE records_used END + :delta), "
                     "  records_period_start = CASE"
                     "    WHEN records_period_start IS NULL"

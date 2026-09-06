@@ -124,12 +124,22 @@ derived from visible rows, batches, or any UI aggregation.
   skip STALE periods, and must not DECREASE a counter by default — a deleted
   job leaves the ledger, and deleting data must never refund quota.
 
-### Still open
-- [ ] Merge + deploy (api + worker + migration).
-- [ ] Run `scripts/repair_records_used_from_ledger.py` (dry run, then
-      `--commit --i-understand`) to restore 1,001 / 140. **NOT YET RUN.**
-- [ ] Phase 3: over-allocation reservation (concurrent jobs can each be
-      allocated the same remaining quota). Approved, deliberately deferred —
-      cap and billing are in separate transactions with the export between
-      them, so it needs an atomic reservation + release-on-failure, not a lock.
-- [ ] **UNVERIFIED**: post-deploy behaviour and the repaired counter in the UI.
+### Shipped
+- [x] **PR #223 merged `46c8ed1` + DEPLOYED** (Build & Push + Run Migrations
+      green, so migration 086 is live).
+- [x] **Repair APPLIED and CONVERGED**: 2 users repaired, 1,066 records
+      restored, post-repair drift 0. `01dc9396` 2 -> 1001, `b6d2095d` 73 -> 140.
+- [x] **Live-verified in the UI**: `1,001 / 1,000`, `records_remaining: 0`,
+      `percent_used: 100.1`, stable across refresh and logout/login. Displayed
+      usage, backend usage and the billing ledger now all agree.
+- [x] **Phase 3 — PR #224 merged `f4934ab` + DEPLOYED** (migration 087 live).
+      Cap now RESERVES atomically; billing settles the delta; release on every
+      failure path plus a state-based beat sweep for paths that bypass them.
+      Codex found 4 P1s in it (lock-order inversion, non-concurrency-safe
+      release, cross-period settlement, terminal paths with no release) — all
+      fixed. Full suite 2345 passed / 2 skipped.
+
+### Note on the repaired account
+`01dc9396` now reads 1,001 / 1,000 and is therefore **over its cap**, so it
+cannot start new scrapes until the Oct 1 rollover. That is the correct number —
+it genuinely consumed 1,001 — not a residual bug.

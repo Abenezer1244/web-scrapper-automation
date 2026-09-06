@@ -354,6 +354,26 @@ anchor backfill.
 If the answer is "not yet": the only other useful work is **re-running Codex on FE
 `ef3ba3d` once its quota returns (Sep 9, 3:10 AM)** — see §6.1.
 
+### The Wed Codex pass — exact commands (turnkey)
+
+Two things need it: FE `ef3ba3d` (never reviewed) and the BE commits added
+2026-09-06 (`e6c4d55`, outside the 5 clean rounds). Run both bare — on
+`codex-cli` 0.152.1 a prompt and `--base` cannot be combined:
+
+```bash
+# 1. FRONTEND — the never-reviewed half
+cd C:/Users/Windows/bridgeleads-web-worktrees/entitlement-fe
+codex review --base master -c 'model_reasoning_effort="high"' -c 'mcp_servers={}' < /dev/null
+
+# 2. BACKEND — only the commits the 5 rounds did not cover
+cd C:/Users/Windows/bridgeleads-worktrees/entitlement
+codex review --commit e6c4d55 -c 'model_reasoning_effort="high"' -c 'mcp_servers={}' < /dev/null
+```
+
+Backgrounding these is fine (~5-10 min); wait for the completion notification
+rather than reading the output file early. Any Critical/High from either =
+NO-GO until fixed, per `.claude/rules/codex-collaboration.md`.
+
 Read `tasks/todo-entitlement-periods.md` for the full design, the nine policies,
 the 5-round Codex table and the §14 security review. Read
 `docs/BUILD_JOURNAL.md` (top entry) for the narrative.

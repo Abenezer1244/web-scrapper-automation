@@ -19,6 +19,73 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-06 — entitlement periods: closing the disclosed gaps (no deploy)
+
+Follow-on session. The operator did **not** give the deploy go, so nothing was
+merged, deployed or run against production. Work was confined to the four gaps
+the handoff disclosed. **2 of 4 closed, 2 provably cannot close yet.**
+
+**Built / Shipped:** `e6c4d55` on `feat/entitlement-periods`.
+- `docs/product/billing-period-semantics.md` rewritten as **SUPERSEDED** (gap 3,
+  closed). New policy up top, a gap-by-gap disposition of the five it listed
+  (1/3/4/5 fixed, 2 kept **deliberately** — resetting on upgrade is exactly what
+  would make upgrade-farming pay), and the original preserved verbatim as
+  history. Carries a marker that the replacement is not yet deployed, so the doc
+  never claims a policy is live before it is.
+- `scripts/verify_entitlement_deploy.py` (new) — the read-only evidence for
+  deploy step 2, which previously had no tool behind it. Six invariants per user,
+  exit 0/1/2, prints the watched `01dc9396` account in full.
+
+**Tried / Decided:**
+- **The step-2 check needs no pre-deploy snapshot.** `records_period_start` is
+  the pre-088 column and is kept in lockstep for one release, so the old value is
+  still in the same row — comparing the new window against it IS the "did anyone
+  move?" test. That is what makes a verifier possible at all without having taken
+  a snapshot before the migration nobody has run yet.
+- Reads cross-tenant under `system_sync_session`, not `SyncSessionLocal`. Under
+  an RLS context the SELECT returns zero rows, so an empty result is a **FATAL**,
+  never a vacuous PASS.
+- **Did not** commit regenerated FE api-types. Verified the CI gate regenerates
+  from the backend's **main** branch, so doing it today is a no-op and
+  hand-writing it would turn FE CI red until #231 merges.
+
+**Failed / Blocked:**
+- 🛑 **Codex is still hard-blocked** (gap 1, open). `codex review --base master`
+  returned *"You've hit your usage limit … try again at Sep 9th, 2026 3:10 AM"*,
+  confirmed independently on the ChatGPT usage screen: **weekly 0% remaining, 0
+  credits** — no top-up path. Account verified by decoding
+  `~/.codex/auth.json` → `id_token` → `email`: `memiki70@gmail.com`. Switching
+  accounts revokes the current refresh token, so it needs the operator. **The FE
+  and `e6c4d55` are queued for the Wed pass; exact commands are in the handoff.**
+- Gap 2 (nothing run against production) cannot close without the deploy go.
+
+**Caught & fixed:**
+- 🛑 **Running the verifier found a defect reading it would not have.** The `→`
+  in its report raised `UnicodeEncodeError` on a cp1252 console and killed the
+  script **mid-report with exit 1** — a healthy production run would have read as
+  a FAIL. Output is now pure ASCII. Exercised against a real local Postgres
+  (throwaway DB, `alembic upgrade head` through 088, four seeded users) and all
+  three exit paths observed, including a deliberately planted non-day-1 anchor it
+  caught on C1/C2/C4. DB dropped afterwards.
+- 🛑 Burned two invocations rediscovering that `codex review` rejects a prompt
+  alongside `--base` — **already recorded in memory.** Read the tooling memory
+  before shelling out to a CLI with known quirks.
+
+**Facts learned:**
+- 🔑 **The post-088 FE api-types change was measured, not assumed:** generating
+  from the branch schema with the repo's own `openapi-typescript` 7.13.0 gives a
+  63-line diff that is **100% JSDoc comments, zero type changes**, in exactly two
+  endpoints. The drift gate will still fail until it is regenerated, but it
+  carries no runtime or type risk.
+- 🛑 An ops script's own output encoding is part of its correctness. Non-ASCII in
+  a report crashes on a cp1252 console, and a verifier that dies is worse than
+  one that fails cleanly.
+
+**Pending / Handoff:** deploy go/no-go (operator); Wed Codex pass on FE
+`ef3ba3d` + BE `e6c4d55`; FE api-types regen after #231 merges.
+
+---
+
 ## 2026-09-06 — quota stops resetting on the 1st: entitlement periods
 
 **Built / Shipped:** `feat/entitlement-periods`, **`33efc05`..`38df1f1`** (7 commits: the

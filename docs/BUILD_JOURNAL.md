@@ -21,8 +21,9 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ## 2026-09-06 — quota stops resetting on the 1st: entitlement periods
 
-**Built / Shipped:** `feat/entitlement-periods` → **`33efc05`** (the system) + **`ea98ac0`**
-(six Codex findings) + follow-ups. Not merged, not deployed.
+**Built / Shipped:** `feat/entitlement-periods`, **`33efc05`..`38df1f1`** (7 commits: the
+system, then four rounds of Codex findings). Full suite **2437 passed, 2 skipped** (baseline
+2350). **Not merged, not deployed.**
 
 Record quota is now metered over an **entitlement window**: a half-open
 `[quota_period_start, quota_period_end)` on a monthly grid anchored at
@@ -56,6 +57,11 @@ statement splices), `src/api/billing_entitlement.py` (the nine policies), migrat
   records reset is retired in the SAME deploy; subscribers move to their real Stripe
   anniversary LATER via a separate script. That ordering is the whole safety argument.
 
+**Codex gate — 5 rounds, ending clean.** Design review before any code (4 high-risk findings,
+all verified and adopted), then `33efc05` → 6 defects, `ea98ac0` → 3, `aea2eb5`+`0284a67` → 2,
+`1b279f6` → 3, and `9e8ea21` → **NO DEFECTS FOUND, "I would deploy this"**. Every finding was
+verified against the code before being adopted; none was taken on trust.
+
 **Caught & fixed (before shipping):**
 - 🛑 **The period rule was written out SEVEN times**, not the four Codex counted — and the
   two it missed were the dangerous ones. `_reservation_is_current` and
@@ -87,6 +93,22 @@ statement splices), `src/api/billing_entitlement.py` (the nine policies), migrat
   `subscription.updated` alone, the status was written but the dunning grace never was — and
   `past_due` with a NULL grace is not frozen, so the window kept rolling for a non-paying
   account. Whichever event sees `past_due` first now starts the clock.
+- 🛑 Rounds 3-5 were all the same shape, and it is the durable lesson of this session:
+  **ending a read transaction before a network call (the right fix for holding locks) widens
+  the window in which the decision you are about to write went stale.** The reconcile and
+  expire-trials loops each read candidates, called Stripe, and then wrote an unconditional
+  UPDATE — so a `checkout.session.completed` landing in between had its paid plan taken
+  straight back off it. Both writes now carry the predicate the decision was based on as their
+  WHERE clause. A first attempt at the expire-trials fix still failed its own test: the
+  not-applied path **committed**, which flushed a pending stale ORM attribute write over the
+  fresher value. It rolls back instead.
+- 🛑 Deterministic `ORDER BY` + a `LIMIT` on a loop that can fail per row is a **starvation
+  bug**: the oldest 200 rows failing their Stripe lookup are re-selected every hour forever and
+  nothing behind them is ever repaired. Both beat tasks now sample at `random()` — this is
+  idempotent state repair, not a queue.
+- 🛑 `_expire_trials_impl` never cleared `entitlement_ends_at` on downgrade, so a trial user who
+  had reached a subscription would be frozen at Starter forever once the spend gate started
+  honouring that field.
 - `scripts/repair_records_used_from_ledger.py` tested staleness with
   `records_period_start < date_trunc('month', now())`. Under anchored windows a *live* window
   legitimately starts in a previous calendar month, so the operator's repair tool would have
@@ -767,6 +789,11 @@ commit `f6e29fb`) + FE `fix/auction-date-relative-label` (`a90d477`). Not pushed
 - Couldn't use the shared `bl-testenv` pytest rig: another session was actively running against
   `bridgeleads_test` (pg.log live). Created a separate `bridgeleads_t4_test` database on the same
   server instead — isolated tables, no interference. 1884 passed, 2 skipped.
+
+**Codex gate — 5 rounds, ending clean.** Design review before any code (4 high-risk findings,
+all verified and adopted), then `33efc05` → 6 defects, `ea98ac0` → 3, `aea2eb5`+`0284a67` → 2,
+`1b279f6` → 3, and `9e8ea21` → **NO DEFECTS FOUND, "I would deploy this"**. Every finding was
+verified against the code before being adopted; none was taken on trust.
 
 **Caught & fixed (before shipping):**
 - My own first cut made `build_lead_export_row(rec, today=X)` silently ignore `X` for the auction

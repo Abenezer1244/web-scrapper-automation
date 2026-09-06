@@ -1,4 +1,4 @@
-# Entitlement periods — design + review (IMPLEMENTED, commit `33efc05`)
+# Entitlement periods — design + review (IMPLEMENTED, `33efc05`..`38df1f1`)
 
 Branch: `feat/entitlement-periods`
 Worktree: `C:/Users/Windows/bridgeleads-worktrees/entitlement`
@@ -378,9 +378,28 @@ Branch `feat/entitlement-periods`, commit `33efc05` (+ follow-ups below), on top
   repair tool would have silently skipped every anchored subscriber. Now tests
   `quota_period_end <= now`.
 
+## Codex gate — 5 rounds, ending CLEAN
+
+| Round | Target | Findings |
+|---|---|---|
+| Design (pre-code) | the proposal | 4 high-risk + 8 answers; all verified, all adopted |
+| 1 | `33efc05` | 6 (4×P1, 2×P2) — all real, all fixed in `ea98ac0` |
+| 2 | `ea98ac0` | 3 (2×P1, 1×P2) — the P2 was already fixed in `0284a67`; P1s fixed in `aea2eb5` |
+| 3 | `aea2eb5`+`0284a67` | 2×P2 — one already fixed while it ran; both closed in `1b279f6` |
+| 4 | `1b279f6` | 3 (2×P1, 1×P2) — all real, fixed in `9e8ea21` |
+| 5 | `9e8ea21` | **NO DEFECTS FOUND — "I would deploy this"** |
+
+Its stated residual risk: a Stripe outage delaying lapsed-entitlement repair.
+Bounded by the spend gate added in `9e8ea21`, which refuses work on an ended
+entitlement without waiting for the beat.
+
+Two defects I found that Codex did not: the `release_quota_reservation` /
+`/usage` drift sites, and the `past_due`-via-`subscription.updated` leak (which
+Codex then reported independently in round 1).
+
 ## Verification
 
-- Full CI-equivalent suite: **2421 passed, 2 skipped** (baseline 2350/2).
+- Full CI-equivalent suite: **2437 passed, 2 skipped** (baseline 2350/2).
   `python -m pytest tests/ -m "not integration" -q -p no:cacheprovider -o addopts=""`
 - `ruff check src/ tests/ scripts/ alembic/` — clean.
 - Migration 088 applies to a fresh DB; the `public.quota_*` functions are proven

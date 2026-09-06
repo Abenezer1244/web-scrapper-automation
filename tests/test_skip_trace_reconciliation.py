@@ -11,7 +11,7 @@ leads and bills the wrong tenants. These tests pin the conservative predicate --
 especially every case where it must REFUSE rather than guess.
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from src.workers.skip_trace_dispatcher import (
     _partition_submittable,

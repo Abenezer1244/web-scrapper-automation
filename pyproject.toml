@@ -44,6 +44,18 @@ ignore = [
 # heuristic can't see the binding. Scoped per-file so the rule stays active elsewhere.
 "src/workers/tasks.py" = ["S608"]
 "src/workers/tasks_helpers/dedup.py" = ["S608"]   # membership/property_key SQL builders moved here from tasks.py
+# The ONLY interpolation is _RESERVATION_STILL_HELD, a module-level constant that
+# src.api.quota_window builds from literal column names — no parameter, no caller
+# input, and nothing reachable from a request touches it. It is spliced rather
+# than duplicated precisely so the "is this grant still held?" rule cannot drift
+# from the settlement site that shares it.
+"src/workers/tasks_helpers/status.py" = ["S608"]
+# Same shape: the reconciliation UPDATE splices window_cte_sql/window_set_sql,
+# module-level SQL builders made of literal column names. Every value (:at, the
+# starter limit) is bound. Sharing the text rather than duplicating it is the
+# point — a second copy of the rollover rule is exactly what this change exists
+# to remove.
+"src/workers/scheduler_helpers/billing.py" = ["S608"]
 "src/workers/tasks_helpers/enrich.py" = ["S608"]  # duplicate-reuse SQL builder moved here from tasks.py
 "src/api/routes/scrapers.py" = ["S608"]
 "src/api/routes/segments.py" = ["S608"]   # segment SQL interpolates only generated tax_cap_sql/{county_clause} placeholders; values bound via params

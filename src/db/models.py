@@ -119,7 +119,7 @@ class User(Base):
     records_period_start = Column(
         DateTime(timezone=True),
         nullable=False,
-        server_default=text("date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"),
+        server_default=text("(date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')"),
     )
     stripe_customer_id = Column(String(64), nullable=True)
     # Durable Stripe ENTITLEMENT (migration 077). stripe_customer_id only means
@@ -132,6 +132,73 @@ class User(Base):
     stripe_subscription_id = Column(String(64), nullable=True)
     subscription_status = Column(String(32), nullable=True)
     trial_ends_at = Column(DateTime(timezone=True), nullable=True)
+    # ── Entitlement window (migration 088) ───────────────────────────────────
+    # Record quota is metered over [quota_period_start, quota_period_end), a
+    # window that is ALWAYS one month long however Stripe invoices — an annual
+    # Pro subscriber gets twelve monthly windows, not 1,000 records for a year.
+    # It replaces the calendar-month rule, under which a first-cycle subscriber
+    # crossing the 1st could receive up to 2x their plan quota on one payment
+    # and a converting trial user received nothing until the 1st.
+    #
+    # quota_anchor_at is the IMMUTABLE origin of the monthly grid: every
+    # boundary is quota_anchor_at + k whole months, always added to the anchor
+    # itself so a February clamp cannot compound (Jan 31 walks Feb 28, Mar 31,
+    # Apr 30 — never Mar 28). It moves on exactly three events: the first
+    # trial->paid conversion, a resubscribe after the previous entitlement
+    # genuinely lapsed, and explicit admin action. Upgrades, downgrades,
+    # cancellation, dunning and monthly<->annual switches never move it, which
+    # is what makes upgrade- and resubscribe-farming worthless.
+    #
+    # All three are NOT NULL with a calendar-month server_default: migration 086
+    # is the standing lesson that a nullable period column with no default lets
+    # a rollover zero a brand-new user's counter inside their own signup month.
+    # The arithmetic lives in src/api/quota_window.py and the matching
+    # public.quota_* SQL functions — never re-derive it inline.
+    quota_anchor_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("(date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')"),
+    )
+    quota_period_start = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("(date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')"),
+    )
+    quota_period_end = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text(
+            "((date_trunc('month', NOW() AT TIME ZONE 'UTC') + interval '1 month') AT TIME ZONE 'UTC')"
+        ),
+    )
+    # When paid access stops (Stripe cancel_at_period_end / cancel_at). NULL =
+    # open-ended. The rollover refuses to open a window at or beyond it, so a
+    # cancelling customer keeps what they paid for and not a month more.
+    entitlement_ends_at = Column(DateTime(timezone=True), nullable=True)
+    # End of the past_due dunning grace. Set on the FIRST invoice.payment_failed
+    # and cleared on recovery. Until it passes the customer is served normally
+    # (Stripe's own retries span days; freezing someone whose card succeeds on
+    # retry 3 would be a self-inflicted outage); after it, the account freezes —
+    # no new billable work AND no window advance, so an unpaid subscription
+    # cannot quietly accrue a fresh bucket every month.
+    entitlement_grace_ends_at = Column(DateTime(timezone=True), nullable=True)
+    # The app trial has been used. PERMANENT — this is the anti-farming control,
+    # not the window logic. trial_ends_at is CLEARED on conversion, so it cannot
+    # answer "did this account ever trial"; only this column can.
+    trial_consumed_at = Column(DateTime(timezone=True), nullable=True)
+    # Idempotency key for the ONE-TIME trial->paid quota reset. The conversion
+    # handler CASes on this being NULL, so a webhook replay — or a second event
+    # describing the same conversion — cannot zero the counter twice.
+    first_paid_at = Column(DateTime(timezone=True), nullable=True)
+    # When the last paid entitlement genuinely lapsed. Gates the only branch
+    # that mints a fresh window on resubscribe; cleared by that same branch, so
+    # cancel-and-resubscribe inside a live entitlement mints nothing.
+    paid_entitlement_ended_at = Column(DateTime(timezone=True), nullable=True)
+    # A DOWNGRADE queued for the next entitlement boundary. Applying a lower cap
+    # mid-window would strand a customer at (say) 3000/1000 on quota they had
+    # already paid for, so the change is held here and applied by the rollover.
+    pending_plan = Column(String(32), nullable=True)
+    pending_records_limit = Column(Integer, nullable=True)
     # Sprint 4: skip-trace usage counter for bundled-quota + overage billing
     skip_trace_used_this_month = Column(Integer, nullable=False, default=0)
     # Migration 086: same treatment as records_period_start. The daily rollover
@@ -140,7 +207,7 @@ class User(Base):
     skip_trace_period_start = Column(
         DateTime(timezone=True),
         nullable=False,
-        server_default=text("date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"),
+        server_default=text("(date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')"),
     )
     # Sprint 7.3: referral program — each user has a unique shareable
     # code; referred_by_user_id is set when they sign up via another
@@ -618,6 +685,22 @@ class Job(Base):
     # job that never reserved (reserved_count = 0).
     reserved_count = Column(Integer, nullable=False, server_default="0", default=0)
     reserved_at = Column(DateTime(timezone=True), nullable=True)
+    # Which ENTITLEMENT WINDOW the reservation was charged to (migration 088),
+    # stamped in the same statement as reserved_at.
+    #
+    # Settlement and release used to ask "is the reservation current?" by
+    # comparing calendar MONTHS (date_trunc('month', reserved_at) against the
+    # user's period). That is only accidentally right while every window starts
+    # on the 1st. With a 20th anchor, a job reserving on the 19th and settling
+    # on the 21st reads as the same month, so settlement nets its grant off a
+    # counter the 20th's rollover had already zeroed — and the delivered records
+    # end up charged to NOBODY. Comparing this column with
+    # users.quota_period_start asks the real question instead.
+    #
+    # NULL = never reserved, or reserved before this deploy: those jobs keep the
+    # reserved_count-based behaviour they started under, the same deploy seam
+    # migration 087 used.
+    quota_period_start = Column(DateTime(timezone=True), nullable=True)
     # Phase 5 (migration 039): set once the dialer-push sweep has handled this
     # job (after skip-trace settles). NULL = not yet evaluated; the sweep claims
     # only done jobs with a dialer_webhook_url whose skip-trace is settled and

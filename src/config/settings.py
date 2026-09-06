@@ -315,6 +315,16 @@ class Settings(BaseSettings):
         "agency": -1,
     }
 
+    # ─── past_due dunning grace, in days ─────────────────────────────────────
+    # How long a subscriber whose payment failed keeps full quota before their
+    # account freezes (no new billable work, and the entitlement window stops
+    # advancing so an unpaid subscription cannot accrue a fresh bucket every
+    # month). Stripe's own retry schedule spans several days, so freezing a
+    # customer whose card succeeds on retry 3 would be a self-inflicted outage;
+    # serving indefinitely would be free records. 7 days covers the retries.
+    # Nothing is ever deleted by the frozen state — data and past exports stay.
+    BILLING_PAST_DUE_GRACE_DAYS: int = 7
+
     # ─── AI scrape job limits per month (-1 = unlimited) ─────────────────────
     AI_JOB_LIMITS: ClassVar[dict[str, int]] = {
         "starter": 5,

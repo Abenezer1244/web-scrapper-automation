@@ -20,6 +20,11 @@ from src.api.lead_actionability import (
     address_actionable_sql,
     is_actionable,
 )
+from src.api.quota_window import (
+    reservation_is_current_sql,
+    window_cte_sql,
+    window_set_sql,
+)
 from src.config.constants import (
     PRIORITY_QUEUE_PLANS,
     SCRAPE_TRANSIENT_BACKOFF_SECONDS,
@@ -1335,7 +1340,14 @@ def run_scrape_job(self, job_id: str) -> None:
         # export would over-deliver. Fail before billing rather than guess —
         # same rule as the enriched re-export below.
         _capped_ids: list[str] = []
-        if user.records_limit != -1:
+        # EFFECTIVE limit, not the stored one: an Agency subscriber with a
+        # pending downgrade whose window has ended would otherwise skip the cap
+        # block entirely (records_limit == -1), export uncapped, and only then
+        # have settlement roll the window and apply the smaller limit — landing
+        # them at 5000/1000. (Codex)
+        from src.api.quota import effective_records_limit as _eff_limit
+
+        if _eff_limit(user) != -1:
             _cap_error: Exception | None = None
             if refreshed is None:
                 _cap_error = RuntimeError("post-enrichment refetch failed")
@@ -1389,35 +1401,56 @@ def run_scrape_job(self, job_id: str) -> None:
                         #    already-decremented remainder (READ COMMITTED
                         #    re-evaluates a locked row against the newer
                         #    version) and is granted only what is truly left.
-                        #    The period CASE mirrors billing so a stale period
-                        #    reads as 0 used rather than under-delivering a user
-                        #    who is actually at 0 for this period.
-                        _remaining = int(db.execute(
+                        #    LAZY ROLLOVER lives in this same statement. The
+                        #    entitlement window is advanced, the counter zeroed
+                        #    and any pending downgrade applied atomically with
+                        #    the grant, so a boundary crossed between two
+                        #    concurrent reservations cannot be seen half-applied
+                        #    — and the grant is computed against the POST-
+                        #    rollover limit, so a boundary cannot leak one job's
+                        #    worth of the outgoing cap into the new window.
+                        #    (window_cte_sql / WINDOW_SET_SQL in
+                        #    src/api/quota_window.py — the ONE definition.)
+                        _res_row = db.execute(
                             sa_text(
                                 "WITH cur AS ("
-                                "  SELECT u.id, u.records_limit, CASE"
-                                # A NULL period deliberately does NOT zero the base — see below.
-                                "      WHEN u.records_period_start < date_trunc('month', CAST(:at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-                                "      THEN 0 ELSE u.records_used END AS base"
+                                "  SELECT u.id, u.records_used, u.records_limit,"
+                                "         u.quota_anchor_at, u.quota_period_start,"
+                                "         u.quota_period_end, u.subscription_status,"
+                                "         u.entitlement_grace_ends_at, u.entitlement_ends_at,"
+                                "         u.pending_plan, u.pending_records_limit"
                                 "  FROM users u WHERE u.id = CAST(:uid AS uuid) FOR UPDATE"
+                                "), w AS ("
+                                "  SELECT cur.*, " + window_cte_sql() + " FROM cur"
                                 "), g AS ("
-                                "  SELECT id, base,"
-                                "         LEAST(:want, GREATEST(0, records_limit - base)) AS granted"
-                                "  FROM cur"
+                                "  SELECT w.*,"
+                                "         LEAST(:want, GREATEST(0, eff_limit - base))"
+                                "           AS granted"
+                                "  FROM w"
                                 ") UPDATE users u SET"
                                 "    records_used = g.base + g.granted,"
-                                "    records_period_start = date_trunc('month', CAST(:at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-                                "  FROM g WHERE u.id = g.id"
-                                "  RETURNING g.granted"
+                                + window_set_sql("g")
+                                + "  FROM g WHERE u.id = g.id"
+                                "  RETURNING g.granted, g.new_start"
                             ),
                             {"want": _want, "uid": str(user.id), "at": _reserved_at},
-                        ).scalar() or 0)
-                        # 3. Record what was granted, so a failure can hand back
-                        #    exactly this much. Same job row, already locked by
-                        #    step 1 — no new lock is taken.
+                        ).one()
+                        _remaining = int(_res_row.granted or 0)
+                        # 3. Record what was granted AND which entitlement
+                        #    window it was charged to, so settlement and release
+                        #    can tell "still current" from "the window this was
+                        #    charged to has since rolled and been zeroed".
+                        #    Comparing calendar months (the previous test) is
+                        #    only accidentally right while every window starts
+                        #    on the 1st. Same job row, already locked by step 1
+                        #    — no new lock is taken.
                         db.execute(
-                            sa_text("UPDATE jobs SET reserved_count = :n WHERE id = :jid"),
-                            {"n": _remaining, "jid": job_id},
+                            sa_text(
+                                "UPDATE jobs SET reserved_count = :n, "
+                                "quota_period_start = CAST(:ws AS timestamptz) "
+                                "WHERE id = :jid"
+                            ),
+                            {"n": _remaining, "jid": job_id, "ws": _res_row.new_start},
                         )
                     else:
                         # Already reserved (watchdog re-run): reuse the grant.
@@ -1775,40 +1808,69 @@ def run_scrape_job(self, job_id: str) -> None:
             # out a free period's quota. Only a genuinely STALE period zeroes.
             # The period column itself is still stamped on NULL (adopted), which
             # matches how the rollover treats it. (Codex)
-            _reserved = int(getattr(job, "reserved_count", 0) or 0)
-            _reservation_is_current = bool(db.execute(
+            # WHICH ENTITLEMENT WINDOW does the reservation belong to, and is
+            # that still the live one? Both questions are now answered INSIDE
+            # the charging statement, under the users row lock, rather than by a
+            # separate unlocked SELECT. That matters: the previous shape read
+            # "is it current?" first and charged second, so a rollover landing
+            # between the two would net a grant off a counter the rollover had
+            # already zeroed — under-charging by exactly the reserved amount.
+            #
+            # jobs -> users lock order is preserved: this job's row was already
+            # locked by the billing CAS above, and FOR UPDATE OF u takes only
+            # the users row. Locking users first here would invert against a
+            # concurrent watchdog re-run and deadlock.
+            _settle = db.execute(
                 sa_text(
-                    "SELECT j.reserved_at IS NOT NULL AND date_trunc('month', j.reserved_at AT TIME ZONE 'UTC')"
-                    "       = date_trunc('month', CAST(:billed_at AS timestamptz) AT TIME ZONE 'UTC') "
-                    "FROM jobs j WHERE j.id = :jid"
+                    "WITH cur AS ("
+                    "  SELECT u.id, u.records_used, u.records_limit,"
+                    "         u.quota_anchor_at, u.quota_period_start,"
+                    "         u.quota_period_end, u.subscription_status,"
+                    "         u.entitlement_grace_ends_at, u.entitlement_ends_at,"
+                    "         u.pending_plan, u.pending_records_limit,"
+                    "         u.records_period_start,"
+                    "         j.quota_period_start AS job_window,"
+                    "         j.reserved_at AS job_reserved_at,"
+                    "         j.reserved_count AS job_reserved"
+                    "  FROM users u JOIN jobs j ON j.user_id = u.id"
+                    "  WHERE j.id = :jid FOR UPDATE OF u"
+                    "), w AS ("
+                    "  SELECT cur.*, " + window_cte_sql("", ":billed_at") + " FROM cur"
+                    "), s AS ("
+                    "  SELECT w.*, CASE WHEN "
+                    + reservation_is_current_sql(
+                        job_window="job_window",
+                        job_reserved_at="job_reserved_at",
+                        user_window="quota_period_start",
+                        user_records_period_start="records_period_start",
+                    )
+                    + "    THEN job_reserved ELSE 0 END AS applied_reserved"
+                    "  FROM w"
+                    ") UPDATE users u SET"
+                    "    records_used = GREATEST(0, s.base + (:billable - s.applied_reserved)),"
+                    + window_set_sql("s")
+                    + "  FROM s WHERE u.id = s.id"
+                    "  RETURNING s.applied_reserved, s.job_reserved, s.rolling"
                 ),
-                {"jid": job_id, "billed_at": _billed_at},
-            ).scalar())
-            if not _reservation_is_current and _reserved:
-                _logger.warning(
-                    "Job %s: reservation of %d belongs to an earlier billing "
-                    "period — charging the full delivered count to the current "
-                    "one instead of netting a charge that has already rolled",
-                    job_id, _reserved,
-                )
-                _reserved = 0
-            _delta = billable_count - _reserved
-            user_billed = db.execute(
-                sa_text(
-                    "UPDATE users SET "
-                    "  records_used = GREATEST(0, CASE"
-                    "    WHEN records_period_start < date_trunc('month', CAST(:billed_at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-                    "    THEN 0 ELSE records_used END + :delta), "
-                    "  records_period_start = CASE"
-                    "    WHEN records_period_start IS NULL"
-                    "      OR records_period_start < date_trunc('month', CAST(:billed_at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-                    "    THEN date_trunc('month', CAST(:billed_at AS timestamptz) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-                    "    ELSE records_period_start END "
-                    "WHERE id = CAST(:uid AS uuid)"
-                ),
-                {"delta": _delta, "uid": str(user.id),
+                {"jid": job_id, "billable": billable_count,
                  "billed_at": _billed_at},
-            ).rowcount
+            ).fetchone()
+            user_billed = 0 if _settle is None else 1
+            if _settle is not None:
+                _reserved = int(_settle.job_reserved or 0)
+                if _reserved and not _settle.applied_reserved:
+                    # The grant was charged to a window that has since rolled and
+                    # been zeroed, so there is no charge left to net against. The
+                    # leads are being delivered NOW, so the live window carries
+                    # them in full rather than the customer receiving records
+                    # nobody is charged for.
+                    _logger.warning(
+                        "Job %s: reservation of %d belongs to an earlier "
+                        "entitlement window — charging the full delivered count "
+                        "to the current one instead of netting a charge that has "
+                        "already rolled",
+                        job_id, _reserved,
+                    )
             if user_billed != 1:
                 # The job was CAS-marked billed but the user counter did NOT move
                 # (deleted user / bad id / RLS scope). Don't leave the job marked

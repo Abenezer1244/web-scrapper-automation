@@ -1,4 +1,5 @@
-"""Body logic for the billing beat tasks: reset_monthly_usage + expire_trials."""
+"""Body logic for the billing beat tasks: skip-trace rollover, quota
+reconciliation, and trial expiry."""
 
 from datetime import UTC, datetime
 
@@ -7,53 +8,40 @@ from src.utils.logger import setup_logger
 _logger = setup_logger("worker.scheduler")
 
 
-def _reset_monthly_usage_impl() -> None:
-    """Roll over monthly usage counters when the billing period ends.
+def _reset_skip_trace_usage_impl() -> None:
+    """Roll over the SKIP-TRACE counter on the calendar month.
 
-    H5 (full-SaaS review): previously this ran on a crontab at
-    day_of_month=1, hour=0, minute=0. Celery Beat does NOT backfill
-    missed cron ticks — if Beat was down at that instant (Railway
-    redeploy, broker hiccup) the reset was SKIPPED ENTIRELY and every
-    user carried last month's records_used forward into the new
-    month. A user at 500/500 last month started the new month
-    instantly at cap. So it now runs DAILY at 00:05 UTC and catches up.
+    This task used to reset record quota too. It no longer does, and that is the
+    whole point of migration 088: record quota is metered over each user's own
+    ENTITLEMENT WINDOW (``users.quota_period_start`` / ``quota_period_end``),
+    advanced by ``reconcile_quota_periods`` and by the lazy rollover inside the
+    statements that charge. Leaving the old blanket
 
-    QUOTA-LOSS FIX: that catch-up design used a single blanket
-    ``SET records_used = 0 WHERE records_period_start IS NULL OR
-    records_period_start < this_month``, which destroyed usage TWO ways:
+        UPDATE users SET records_used = 0
+        WHERE records_period_start < date_trunc('month', now())
 
-      1. ``records_period_start`` had no server_default and was never set
-         at registration, so EVERY new user was NULL and got zeroed on
-         their first 00:05 run — inside their own signup month, with no
-         billing event. (Prod: a user billed 999 records on day 1 and
-         woke up at 2.)
-      2. Zeroing was unconditional, so when Beat DID miss the 1st — the
-         very case this task exists for — the late run also wiped usage
-         already billed inside the NEW period. (Prod: 67 records billed
-         Sep 2 destroyed by a Sep 3 catch-up run.)
+    in place alongside anchored windows would be a DOUBLE GRANT: a subscriber
+    anchored on the 20th would be zeroed by their own boundary on the 20th and
+    again by this task on the 1st. Retiring the records half in the same deploy
+    that introduces windows is what guarantees exactly one mechanism owns the
+    counter at every instant — never two, and never none.
 
-    Both are fixed by splitting the blanket UPDATE into two statements
-    with different semantics, and by making billing itself roll the
-    period forward atomically (see ``_bill_records_used`` in
-    workers/tasks.py). Because billing advances records_period_start in
-    the same statement that increments records_used, a period_start that
-    is STILL stale here PROVES no job billed in the current period — so
-    zeroing those rows is correct by construction, not by hope.
+    Skip-trace stays calendar-metered on purpose. It is billed to Stripe on its
+    own meter against its own ``skip_trace_period_start`` column, was never part
+    of the entitlement-window decision, and moving it is a separate change with
+    its own billing consequences.
 
-      * NULL period_start  -> ADOPT: stamp the period, keep the counter.
-        Zeroing is the financially destructive direction (it grants free
-        quota and lets a user exceed their cap invisibly), so an
-        unexpected NULL must never cost us the counter. NULL should be
-        unreachable after migration 086 + the registration fix; if one
-        appears anyway it is a bug, so we alert on it.
+    The two-statement shape is kept verbatim from the records version, because
+    the reasoning behind it is unchanged and was learned expensively:
+
+      * NULL period_start  -> ADOPT: stamp the period, keep the counter. Zeroing
+        is the financially destructive direction, so an unexpected NULL must
+        never cost us the counter. NULL is unreachable after migration 086; if
+        one appears, an insert path is writing an explicit NULL, so we alert.
       * STALE period_start -> ROLL OVER: zero the counter and advance.
 
-    Skip-trace gets the SAME two-statement treatment, keyed on its OWN
-    ``skip_trace_period_start``. It was previously gated on
-    ``records_period_start``, so a drift between the two columns could
-    reset skip-trace early or never reset it at all — skip-trace is
-    metered to Stripe, so that is a billing-correctness bug in its own
-    right.
+    Runs daily rather than on a cron at the 1st: Celery Beat does not backfill
+    missed ticks, so a redeploy at that instant would skip a whole month.
     """
     from sqlalchemy import text
 
@@ -61,35 +49,16 @@ def _reset_monthly_usage_impl() -> None:
 
     now = datetime.now(UTC)
 
-    # NOTE: every statement below recomputes the boundary with the same
-    # expression rather than sharing an interpolated constant, so the SQL stays
-    # static (no string-built queries) and Postgres evaluates one consistent
-    # NOW() per statement.
-
+    # NOTE: each statement recomputes the boundary with the same expression
+    # rather than sharing an interpolated constant, so the SQL stays static (no
+    # string-built queries) and Postgres evaluates one consistent NOW() per
+    # statement.
     with system_sync_session() as db:
-        # ── 1. ADOPT rows with no period at all (stamp only, never zero) ──────
-        adopted_records = db.execute(
-            text("""
-                UPDATE users
-                SET records_period_start = date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
-                WHERE records_period_start IS NULL
-            """)
-        ).rowcount
         adopted_skip = db.execute(
             text("""
                 UPDATE users
                 SET skip_trace_period_start = date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
                 WHERE skip_trace_period_start IS NULL
-            """)
-        ).rowcount
-
-        # ── 2. ROLL OVER genuinely stale periods (zero + advance) ─────────────
-        rolled_records = db.execute(
-            text("""
-                UPDATE users
-                SET records_used = 0,
-                    records_period_start = date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
-                WHERE records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
             """)
         ).rowcount
         rolled_skip = db.execute(
@@ -103,33 +72,259 @@ def _reset_monthly_usage_impl() -> None:
         db.commit()
 
     _logger.info(
-        "Daily usage rollover at %s: rolled %d records / %d skip-trace periods; "
-        "adopted %d records / %d skip-trace NULL periods",
-        now.isoformat(), rolled_records, rolled_skip, adopted_records, adopted_skip,
+        "Daily skip-trace rollover at %s: rolled %d period(s); adopted %d NULL period(s)",
+        now.isoformat(), rolled_skip, adopted_skip,
     )
 
-    # A NULL period_start is unreachable once migration 086 has run and
-    # registration stamps both columns. If one shows up, an insert path is
-    # bypassing that — surface it instead of silently absorbing it.
-    if adopted_records or adopted_skip:
+    if adopted_skip:
         try:
             from src.workers.ops_alerts import send_ops_alert
 
             send_ops_alert(
                 kind="billing",
                 key="null_billing_period",
-                subject="Quota rollover adopted NULL billing periods",
+                subject="Skip-trace rollover adopted NULL billing periods",
                 body=(
-                    f"reset_monthly_usage stamped {adopted_records} NULL "
-                    f"records_period_start and {adopted_skip} NULL "
-                    f"skip_trace_period_start rows. Both columns are NOT NULL "
-                    f"with a server_default as of migration 086, so this means "
-                    f"an insert path is writing an explicit NULL. Counters were "
-                    f"PRESERVED (not zeroed); investigate the insert path."
+                    f"reset_skip_trace_usage stamped {adopted_skip} NULL "
+                    f"skip_trace_period_start rows. The column is NOT NULL with a "
+                    f"server_default as of migration 086, so this means an insert "
+                    f"path is writing an explicit NULL. The counter was PRESERVED "
+                    f"(not zeroed); investigate the insert path."
                 ),
             )
         except Exception as exc:  # noqa: BLE001 — alerting must never break the beat
             _logger.warning("Could not send NULL-period ops alert: %s", exc)
+
+
+def _reconcile_quota_periods_impl(subscription_lookup=None) -> dict[str, int]:
+    """Advance entitlement windows that have ended — RECONCILIATION, not the
+    source of correctness.
+
+    Quota correctness does not depend on this task, on Stripe webhooks, on cron
+    or on the user logging in. Every authoritative quota operation (reserve and
+    settle) advances the window itself, atomically, inside the statement that
+    charges. This exists for the users those paths never touch: someone who runs
+    no scrape for two months still needs a true window when they come back, and
+    ``/billing/usage`` should not be the only thing that knows it.
+
+    It is therefore idempotent, tolerates missed runs, and cannot grant a
+    duplicate bucket:
+
+      * ``quota_should_roll`` is re-evaluated under the row lock, so a window a
+        worker has just advanced no longer qualifies;
+      * ``SKIP LOCKED`` steps over any user currently being charged rather than
+        blocking behind them — that worker is performing the same rollover, and
+        anyone genuinely missed is picked up on the next run;
+      * a user away for months lands on the window containing NOW and is zeroed
+        ONCE, so unused entitlement never accumulates;
+      * a frozen (unpaid, or past_due beyond its grace) subscription is excluded
+        by the predicate, so failing to pay cannot mint a fresh bucket monthly.
+
+    It also repairs two states a webhook may have failed to deliver — which is
+    the difference between reconciliation and a second quota system:
+
+      * a paid entitlement whose end has PASSED with no ``subscription.deleted``
+        ever arriving. The user is downgraded to Starter here, which also
+        RELEASES the window (``entitlement_ends_at`` was what held it), so one
+        lost webhook cannot strand someone frozen forever. Stripe is CONSULTED
+        first, because the reverse webhook can go missing too: a customer who
+        scheduled a cancellation and then reversed it would otherwise be
+        downgraded on the old end date and could later "resubscribe" into
+        another fresh window. Same doctrine as ``_expire_trials_impl`` — a
+        Stripe error means UNKNOWN, and we never downgrade a possible payer on a
+        transient failure;
+      * configs still active under a plan that has since been downgraded.
+
+    Returns a small summary so the beat task can log and tests can assert on it.
+    """
+    from sqlalchemy import text
+
+    from src.api.entitlements import apply_reconciliation_sync
+    from src.api.quota_window import window_cte_sql, window_set_sql
+    from src.config import settings
+    from src.db.session import system_sync_session
+
+    lookup = subscription_lookup or _stripe_entitled_status
+    now = datetime.now(UTC)
+    changed_plan: set[str] = set()
+
+    with system_sync_session() as db:
+        # ── 1. Expired paid entitlement with no subscription.deleted ─────────
+        # Runs BEFORE the rollover on purpose: clearing entitlement_ends_at is
+        # exactly what makes such a window eligible to advance in the same pass.
+        # Read the candidates and END the read transaction before touching
+        # Stripe. Each lookup is a network call, and holding a transaction open
+        # across N of them would keep every row this loop has already written
+        # locked for the duration — long enough to block a worker's reserve or
+        # settle on those same users. Each decision below commits on its own, so
+        # one slow or failing account cannot hold up the rest. Bounded, because
+        # an unbounded beat pass making unbounded Stripe calls is its own outage.
+        candidates = db.execute(
+            text(
+                "SELECT id, stripe_subscription_id, stripe_customer_id, "
+                "       entitlement_ends_at "
+                "FROM users "
+                "WHERE entitlement_ends_at IS NOT NULL "
+                "  AND entitlement_ends_at <= CAST(:at AS timestamptz) "
+                # RANDOM, not oldest-first. Oldest-first looks fairer and is
+                # actually a starvation bug: if the oldest 200 rows all fail
+                # their Stripe lookup — a deleted customer raises every time —
+                # they are re-selected every hour forever and no lapsed user
+                # behind them is ever repaired. This is idempotent state repair,
+                # not a queue, so sampling gives every row a chance on every
+                # pass and a permanently-failing subset cannot monopolise it.
+                # (Codex)
+                "ORDER BY random() "
+                "LIMIT :lim"
+            ),
+            {"at": now, "lim": _RECONCILE_LAPSED_LIMIT},
+        ).fetchall()
+        db.commit()
+
+        lapsed: list[str] = []
+        for row in candidates:
+            user_id, _sub_id, customer_id = str(row[0]), row[1], row[2]
+            seen_end = row[3]
+            if customer_id:
+                # Ask Stripe before taking anything away. A cancellation the
+                # customer REVERSED, whose update webhook was lost, must not be
+                # honoured on the stale end date.
+                try:
+                    status = lookup(customer_id)
+                except Exception as exc:  # noqa: BLE001 — any failure = unknown
+                    _logger.warning(
+                        "reconcile: Stripe lookup failed for user %s (customer "
+                        "%s) — skipping, NOT downgrading: %s",
+                        user_id, customer_id, str(exc)[:200],
+                    )
+                    continue
+                if status in _ENTITLED_SUB_STATUSES:
+                    # Still paying: the cancellation was reversed. Clear the end
+                    # date so their window can advance again, and self-heal the
+                    # status we had drifted from.
+                    # CAS on the value the decision was made from. Between the
+                    # read and here we did a network round trip, and the customer
+                    # may have scheduled a NEW cancellation in the meantime —
+                    # clearing that would silently un-cancel them.
+                    db.execute(
+                        text(
+                            "UPDATE users SET entitlement_ends_at = NULL, "
+                            "subscription_status = :st "
+                            "WHERE id = CAST(:uid AS uuid) "
+                            "  AND entitlement_ends_at = CAST(:seen AS timestamptz)"
+                        ),
+                        {"uid": user_id, "st": status, "seen": seen_end},
+                    )
+                    db.commit()
+                    _logger.info(
+                        "reconcile: user %s is still entitled in Stripe (%s) — "
+                        "cancellation reversed, entitlement end cleared",
+                        user_id, status,
+                    )
+                    continue
+            # CAS on the entitlement end this decision was based on. The Stripe
+            # lookup above is a network round trip, and a customer can RESUBSCRIBE
+            # inside it: checkout would clear entitlement_ends_at, and an
+            # unconditional UPDATE here would then strip the plan and the
+            # subscription id off someone who has just paid. The predicate makes
+            # the write a no-op in exactly that case. (Codex)
+            applied = db.execute(
+                text(
+                    "UPDATE users SET "
+                    "  plan = 'starter', "
+                    "  records_limit = :starter_limit, "
+                    "  stripe_subscription_id = NULL, "
+                    "  subscription_status = 'canceled', "
+                    "  paid_entitlement_ended_at = COALESCE(paid_entitlement_ended_at, "
+                    "                                       entitlement_ends_at), "
+                    "  entitlement_ends_at = NULL, "
+                    "  pending_plan = NULL, "
+                    "  pending_records_limit = NULL "
+                    "WHERE id = CAST(:uid AS uuid) "
+                    "  AND entitlement_ends_at = CAST(:seen AS timestamptz)"
+                ),
+                {
+                    "uid": user_id,
+                    "starter_limit": settings.PLAN_LIMITS["starter"],
+                    "seen": seen_end,
+                },
+            ).rowcount
+            db.commit()
+            if not applied:
+                _logger.info(
+                    "reconcile: user %s changed entitlement state during the "
+                    "Stripe lookup — downgrade not applied", user_id,
+                )
+                continue
+            lapsed.append(user_id)
+        changed_plan.update(lapsed)
+
+        # ── 2. Advance every window that has ended and may advance ───────────
+        # records_used = w.base rather than a literal 0: base IS 0 for every row
+        # this statement can reach (the predicate guarantees it), and writing it
+        # through the shared projection keeps this site from being the one that
+        # quietly disagrees with the others.
+        rolled = db.execute(
+            text(
+                "WITH cur AS ("
+                "  SELECT u.id, u.records_used, u.records_limit, u.quota_anchor_at,"
+                "         u.quota_period_start, u.quota_period_end,"
+                "         u.subscription_status, u.entitlement_grace_ends_at,"
+                "         u.entitlement_ends_at, u.pending_plan,"
+                "         u.pending_records_limit"
+                "  FROM users u"
+                "  WHERE public.quota_should_roll(u.quota_period_end,"
+                "        u.subscription_status, u.entitlement_grace_ends_at,"
+                "        u.entitlement_ends_at, CAST(:at AS timestamptz))"
+                "  ORDER BY u.id"
+                "  FOR UPDATE SKIP LOCKED"
+                "), w AS ("
+                "  SELECT cur.*, " + window_cte_sql("", ":at") + " FROM cur"
+                ") UPDATE users u SET"
+                "    records_used = w.base,"
+                + window_set_sql("w")
+                + "  FROM w WHERE u.id = w.id"
+                "  RETURNING u.id, w.pending_plan"
+            ),
+            {"at": now},
+        ).fetchall()
+        changed_plan.update(str(r[0]) for r in rolled if r[1] is not None)
+
+        db.commit()
+
+        # ── 3. Bring scraper configs back in line with any plan that moved ───
+        # Deliberately after the commit: apply_reconciliation_sync issues its own
+        # SELECT plus per-config UPDATEs and must not run inside the locked
+        # window above. A no-op unless ENTITLEMENT_ENFORCEMENT is on.
+        for user_id in changed_plan:
+            plan = db.execute(
+                text("SELECT plan FROM users WHERE id = CAST(:uid AS uuid)"),
+                {"uid": user_id},
+            ).scalar()
+            if plan:
+                apply_reconciliation_sync(db, user_id, plan)
+        if changed_plan:
+            db.commit()
+
+    _logger.info(
+        "Quota reconciliation at %s: rolled %d window(s), retired %d lapsed "
+        "entitlement(s), reconciled configs for %d user(s)",
+        now.isoformat(), len(rolled), len(lapsed), len(changed_plan),
+    )
+    if len(candidates) >= _RECONCILE_LAPSED_LIMIT:
+        _logger.warning(
+            "reconcile_quota_periods hit its %d-row cap; a backlog drains over "
+            "the following hours. Candidates are sampled at random, so failing "
+            "rows cannot starve the rest — but a cap hit that persists for many "
+            "hours means the backlog is growing faster than it clears. Check "
+            "the skip warnings.",
+            _RECONCILE_LAPSED_LIMIT,
+        )
+    return {
+        "rolled": len(rolled),
+        "lapsed": len(lapsed),
+        "plans_reconciled": len(changed_plan),
+    }
 
 
 #: Stripe subscription statuses that GRANT entitlement — a user in any of these
@@ -137,6 +332,19 @@ def _reset_monthly_usage_impl() -> None:
 #: app-side trial expired out from under them. Everything else (canceled, unpaid,
 #: incomplete, incomplete_expired, paused, or NULL) is treated as not entitled.
 _ENTITLED_SUB_STATUSES = ("active", "trialing", "past_due")
+
+#: How many expired trials one pass will resolve. Every candidate now costs a
+#: Stripe round trip (a stored status is no longer taken on trust), so the pass
+#: is bounded and the remainder waits an hour. Sampled at random so a set of
+#: permanently-failing rows cannot monopolise the cap, and the task warns when it
+#: hits the cap so a real backlog is visible.
+_EXPIRE_TRIALS_LIMIT = 200
+
+#: How many lapsed entitlements one reconciliation pass will resolve. Each one
+#: costs a Stripe round trip, so an unbounded pass would turn a backlog into a
+#: beat task that never finishes. The remainder is picked up next hour; nothing
+#: is lost, because the candidates query is a state test, not a queue.
+_RECONCILE_LAPSED_LIMIT = 200
 
 
 def _stripe_entitled_status(customer_id: str) -> str | None:
@@ -164,18 +372,34 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
     when a user merely OPENS checkout), so the gate uses the durable subscription
     state (migration 077). Per-row decision:
       * known-entitled status (active/trialing/past_due) -> excluded by the query.
-      * known non-entitled status (e.g. canceled)        -> downgrade.
       * no stripe_customer_id (never reached Stripe)      -> downgrade.
-      * AMBIGUOUS (customer id present, status NULL — a legacy payer OR an
-        abandoned checkout) -> ask Stripe (the source of truth): entitled ->
-        protect + record the status (self-heal); not entitled -> downgrade +
-        record; Stripe error -> SKIP (never downgrade a possible payer).
+      * ANY stripe_customer_id -> ask Stripe (the source of truth): entitled ->
+        protect, self-heal the status, and stamp first_paid_at / trial_consumed_at;
+        not entitled -> downgrade + record; Stripe error -> SKIP (never downgrade
+        a possible payer).
+
+    A locally-recorded "canceled" is NOT taken at face value any more. Our copy
+    of the status is a cache and can be wrong — a mis-ordered webhook, a
+    cancellation the customer reversed — and acting on it unverified takes a plan
+    away from someone who is paying for it. (Codex)
 
     This resolves BOTH Codex P1s: legacy payers are never wrongly downgraded, and
     future abandoned-checkout trials DO expire — automatically, no manual backfill.
     `subscription_lookup` is injectable for tests (default = live Stripe).
+
+    ENTITLEMENT WINDOWS (migration 088): the downgrade is applied IMMEDIATELY
+    rather than deferred to the next boundary like a paid downgrade, because an
+    expired trial is not something the customer paid for — deferring would hand
+    them another month of Pro quota for free. The window itself needs no special
+    handling: a trial user's window ENDS at ``trial_ends_at``, so it is already
+    eligible to roll and the next charging statement (or the reconciliation)
+    advances it to a post-trial window at the Starter limit set here.
+
+    ``trial_consumed_at`` is stamped permanently. It is the anti-farming control
+    for trial -> paid -> cancel -> trial-again: ``trial_ends_at`` is CLEARED on
+    conversion, so it cannot answer "did this account ever trial".
     """
-    from sqlalchemy import or_, select
+    from sqlalchemy import func, or_, select, text
 
     from src.api.entitlements import apply_reconciliation_sync
     from src.config import settings
@@ -185,14 +409,78 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
     lookup = subscription_lookup or _stripe_entitled_status
     now = datetime.now(UTC)
 
-    def _downgrade(db, user) -> None:
-        user.plan = "starter"
-        user.records_limit = settings.PLAN_LIMITS["starter"]  # post-trial Starter limit
+    def _downgrade(db, user, *, record_canceled: bool = False) -> bool:
+        """Re-check the candidate predicate atomically, then downgrade.
+
+        The candidate list is read (and its transaction closed) BEFORE the Stripe
+        round trips, so by the time a decision is written the row may have moved:
+        the classic case is a `checkout.session.completed` landing in between and
+        activating a paid plan. Writing the stale decision would take the plan
+        away from a customer who has just paid.
+
+        So the write carries the whole candidate predicate as its WHERE clause —
+        trial expired, still on a paid tier, still not entitled — and a row that
+        no longer matches is simply skipped. Config reconciliation runs only if
+        the downgrade actually applied. Returns whether it did. (Codex)
+        """
+        applied = db.execute(
+            text(
+                "UPDATE users SET "
+                "  plan = 'starter', "
+                "  records_limit = :starter_limit, "
+                "  trial_consumed_at = COALESCE(trial_consumed_at, trial_ends_at, "
+                "                               CAST(:now AS timestamptz)), "
+                "  subscription_status = CASE WHEN :record_canceled "
+                "    THEN 'canceled' ELSE subscription_status END, "
+                # A Starter account has no paid entitlement end, and leaving a
+                # stale one set is not cosmetic: it stops the window advancing
+                # (quota_should_roll refuses to open one at or beyond it) AND
+                # refuses new work outright. Cleared here for the same reason
+                # end_subscription clears it. Reachable for a trial user who had
+                # reached a subscription before the trial lapsed.
+                "  entitlement_ends_at = NULL, "
+                "  pending_plan = NULL, "
+                "  pending_records_limit = NULL "
+                "WHERE id = CAST(:uid AS uuid) "
+                "  AND trial_ends_at IS NOT NULL "
+                "  AND trial_ends_at < CAST(:now AS timestamptz) "
+                "  AND plan <> 'starter' "
+                "  AND (subscription_status IS NULL "
+                "       OR subscription_status NOT IN "
+                "          ('active', 'trialing', 'past_due'))"
+            ),
+            {
+                "uid": str(user.id),
+                "starter_limit": settings.PLAN_LIMITS["starter"],
+                "now": now,
+                "record_canceled": record_canceled,
+            },
+        ).rowcount
+        if not applied:
+            # ROLLBACK, not commit. The ORM objects in this loop were loaded
+            # before the Stripe calls, so any attribute the caller set on a stale
+            # one is still pending — committing here would flush it over the
+            # fresher state that made the guard fail. That is how a customer who
+            # had just paid ended up with subscription_status 'canceled'.
+            db.rollback()
+            _logger.info(
+                "expire_trials: user %s changed state during the Stripe lookup "
+                "— not downgraded", user.id,
+            )
+            return False
         _logger.info("Trial expired for %s — downgraded to starter", user.email)
         apply_reconciliation_sync(db, str(user.id), "starter")
+        db.commit()  # per-row, so a later Stripe failure cannot strand this one
+        return True
 
     with SyncSessionLocal() as db:
         # Candidates: expired trial, still on a paid tier, NOT known-entitled.
+        # Bounded, and sampled at RANDOM rather than oldest-first. Every row
+        # here costs a Stripe round trip now that a stored status is no longer
+        # taken on trust, so an unbounded pass would be a beat task that never
+        # finishes — and a deterministic order would let a set of rows that fail
+        # their lookup every time monopolise the cap and starve everyone behind
+        # them. This is idempotent state repair, not a queue. (Codex)
         candidates = db.execute(
             select(User).where(
                 User.trial_ends_at.isnot(None),
@@ -202,19 +490,31 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
                     User.subscription_status.is_(None),
                     User.subscription_status.notin_(_ENTITLED_SUB_STATUSES),
                 ),
-            )
+            ).order_by(func.random()).limit(_EXPIRE_TRIALS_LIMIT)
         ).scalars().all()
+        # End the read transaction BEFORE the first network call. Holding it
+        # open across N Stripe round trips would keep every row this loop has
+        # already mutated locked for the whole run — the same hazard the quota
+        # reconciliation had. Each decision below commits on its own, so one
+        # slow or failing account cannot hold up the rest.
+        db.commit()
 
         downgraded = 0
         for user in candidates:
-            if user.subscription_status is not None:
-                _downgrade(db, user)  # known non-entitled (canceled/unpaid/…)
-                downgraded += 1
-            elif not user.stripe_customer_id:
-                _downgrade(db, user)  # never reached Stripe -> genuine unpaid trial
-                downgraded += 1
+            if not user.stripe_customer_id:
+                # Never reached Stripe -> genuine unpaid trial.
+                downgraded += int(_downgrade(db, user))
             else:
-                # AMBIGUOUS: customer id present, status NULL. Stripe is the truth.
+                # ANY customer id, whatever we think the status is: ask Stripe.
+                #
+                # This used to trust a locally-recorded non-entitled status
+                # ("canceled", "unpaid") and downgrade without checking. Our copy
+                # of that status can be wrong — a webhook we mis-ordered, a
+                # reversal we never received — and downgrading a customer Stripe
+                # says is ACTIVE takes away a plan they are paying for. Stripe is
+                # the source of truth for entitlement; the local column is a
+                # cache. Verifying costs one API call on a row that is, by
+                # definition, already exceptional. (Codex)
                 try:
                     status = lookup(user.stripe_customer_id)
                 except Exception as exc:  # noqa: BLE001 - any failure = unknown
@@ -225,18 +525,51 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
                     )
                     continue
                 if status in _ENTITLED_SUB_STATUSES:
-                    user.subscription_status = status  # legacy payer: protect + self-heal
+                    # Guarded + COALESCE rather than ORM writes: this object was
+                    # loaded before the Stripe call, so a value it shows as NULL
+                    # may since have been set by a checkout. Never overwrite a
+                    # fresher first_paid_at / trial_consumed_at with our own.
+                    db.execute(
+                        text(
+                            "UPDATE users SET "
+                            "  subscription_status = :st, "
+                            "  first_paid_at = COALESCE(first_paid_at, created_at, "
+                            "                           CAST(:now AS timestamptz)), "
+                            "  trial_consumed_at = COALESCE(trial_consumed_at, "
+                            "                               trial_ends_at, "
+                            "                               CAST(:now AS timestamptz)) "
+                            "WHERE id = CAST(:uid AS uuid)"
+                        ),
+                        {"uid": str(user.id), "st": status, "now": now},
+                    )
+                    db.commit()
+                    # first_paid_at is stamped above for a reason: without it
+                    # this legacy payer keeps a NULL first_paid_at, and their
+                    # next customer.subscription.updated would read as a FIRST
+                    # conversion — zeroing the counter and handing an
+                    # already-paying customer a free window. The migration cannot
+                    # reach these rows (no Stripe access, local status NULL), so
+                    # this is where they heal. (Codex)
                     _logger.info(
                         "expire_trials: user %s has entitled Stripe status %s — "
                         "protected + backfilled", user.id, status,
                     )
                 else:
-                    user.subscription_status = "canceled"  # record non-entitlement
-                    _downgrade(db, user)
-                    downgraded += 1
+                    # 'canceled' is recorded INSIDE the guarded UPDATE, not on
+                    # this (stale) ORM object — see _downgrade.
+                    downgraded += int(
+                        _downgrade(db, user, record_canceled=True)
+                    )
 
-        if candidates:
-            db.commit()
         _logger.info(
             "expire_trials: %d candidates, %d downgraded", len(candidates), downgraded
+        )
+    if len(candidates) >= _EXPIRE_TRIALS_LIMIT:
+        _logger.warning(
+            "expire_trials hit its %d-row cap; the remainder waits for the next "
+            "hourly run. Candidates are sampled at random, so this drains rather "
+            "than starving — but a cap hit that persists for many hours means "
+            "the backlog is growing faster than it clears. Check the skip "
+            "warnings above.",
+            _EXPIRE_TRIALS_LIMIT,
         )

@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from sqlalchemy import text
 
 from src.api.auth import hash_password
+from src.api.quota_window import add_months
 from src.db.models import Job, ScraperConfig, User
 from src.db.session import SyncSessionLocal
 
@@ -30,6 +31,13 @@ def _month_start(dt: datetime | None = None) -> datetime:
 
 def _mk_user(db, *, used: int = 0, limit: int = 1000,
              period: datetime | None = None) -> User:
+    # ``period`` now names the ENTITLEMENT WINDOW, not a calendar month
+    # (migration 088). The window columns are the authority; records_period_start
+    # is written in lockstep as a mirror for the skip-trace beat and operator
+    # queries, so the fixture keeps them consistent exactly as production does.
+    # A "stale period" in these tests therefore means a window whose END has
+    # passed, which is what the gates actually test.
+    start = period or _month_start()
     user = User(
         id=str(uuid.uuid4()),
         email=f"quota_{uuid.uuid4().hex[:8]}@test.bridgeleads.io",
@@ -37,8 +45,11 @@ def _mk_user(db, *, used: int = 0, limit: int = 1000,
         plan="pro",
         records_used=used,
         records_limit=limit,
-        records_period_start=period or _month_start(),
-        skip_trace_period_start=period or _month_start(),
+        records_period_start=start,
+        skip_trace_period_start=start,
+        quota_anchor_at=start,
+        quota_period_start=start,
+        quota_period_end=add_months(start, 1),
     )
     db.add(user)
     db.flush()
@@ -64,22 +75,31 @@ def _mk_config(db, user_id: str) -> ScraperConfig:
 
 
 def _bill(db, user_id: str, amount: int) -> int:
-    """The exact period-aware statement workers/tasks.py uses to charge a job."""
+    """The exact window-aware statement workers/tasks.py uses to charge a job.
+
+    Built from the SAME shared SQL builders as production (window_cte_sql /
+    window_set_sql), so this helper cannot quietly test a rule the worker does
+    not follow — which is the failure mode the seven duplicated copies of the
+    old period rule made easy.
+    """
+    from src.api.quota_window import window_cte_sql, window_set_sql
+
     return db.execute(
         text(
-            "UPDATE users SET "
-            "  records_used = CASE"
-            "    WHEN records_period_start IS NULL"
-            "      OR records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-            "    THEN 0 ELSE records_used END + :billable, "
-            "  records_period_start = CASE"
-            "    WHEN records_period_start IS NULL"
-            "      OR records_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-            "    THEN date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"
-            "    ELSE records_period_start END "
-            "WHERE id = CAST(:uid AS uuid)"
+            "WITH cur AS ("
+            "  SELECT u.id, u.records_used, u.records_limit, u.quota_anchor_at,"
+            "         u.quota_period_start, u.quota_period_end,"
+            "         u.subscription_status, u.entitlement_grace_ends_at,"
+            "         u.entitlement_ends_at, u.pending_plan, u.pending_records_limit"
+            "  FROM users u WHERE u.id = CAST(:uid AS uuid) FOR UPDATE"
+            "), w AS ("
+            "  SELECT cur.*, " + window_cte_sql("", ":at") + " FROM cur"
+            ") UPDATE users u SET"
+            "    records_used = GREATEST(0, w.base + :billable),"
+            + window_set_sql("w")
+            + "  FROM w WHERE u.id = w.id"
         ),
-        {"billable": amount, "uid": user_id},
+        {"billable": amount, "uid": user_id, "at": datetime.now(UTC)},
     ).rowcount
 
 
@@ -170,31 +190,33 @@ def test_billing_rolls_a_stale_period_forward_itself():
         assert user.records_period_start.astimezone(UTC) == _month_start()
 
 
-def test_a_late_rollover_cannot_wipe_new_period_usage():
-    """The second production defect, pinned.
+def test_a_late_reconciliation_cannot_wipe_new_window_usage():
+    """The second production defect, pinned against the mechanism that owns it.
 
-    The task runs daily so a Beat outage on the 1st does not skip a month. But
-    running late is exactly when usage already exists in the new period. A user
-    billed inside the current period must survive the catch-up run.
+    The reconciliation runs hourly, so a redeploy cannot skip a boundary. But
+    running late is exactly when usage already exists in the NEW window: billing
+    advances the window forward in the same statement that charges, so by the
+    time the beat catches up the counter holds consumption that belongs to the
+    live window. A catch-up that zeroed unconditionally would destroy it.
     """
-    from src.workers.scheduler import reset_monthly_usage
+    from src.workers.scheduler import reconcile_quota_periods
 
     with SyncSessionLocal() as db:
-        # Stale period, as after a missed 1st.
+        # An ended window, as after a boundary nothing has caught up with yet.
         user = _mk_user(db, used=0, period=datetime(2020, 1, 1, tzinfo=UTC))
         user_id = user.id
         db.commit()
-        _bill(db, user_id, 67)  # a job bills before the catch-up run fires
+        _bill(db, user_id, 67)  # a job bills, and rolls the window itself
         db.commit()
 
-    reset_monthly_usage()  # the late catch-up
+    reconcile_quota_periods()  # the late catch-up
 
     with SyncSessionLocal() as db:
         assert db.get(User, user_id).records_used == 67
 
 
-def test_no_premature_reset_within_the_same_month():
-    from src.workers.scheduler import reset_monthly_usage
+def test_no_premature_reset_inside_a_live_window():
+    from src.workers.scheduler import reconcile_quota_periods
 
     with SyncSessionLocal() as db:
         user = _mk_user(db, used=500)
@@ -202,7 +224,7 @@ def test_no_premature_reset_within_the_same_month():
         db.commit()
 
     for _ in range(3):
-        reset_monthly_usage()
+        reconcile_quota_periods()
 
     with SyncSessionLocal() as db:
         assert db.get(User, user_id).records_used == 500

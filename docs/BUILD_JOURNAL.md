@@ -19,6 +19,212 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-06 — entitlement periods: closing the disclosed gaps (no deploy)
+
+Follow-on session. The operator did **not** give the deploy go, so nothing was
+merged, deployed or run against production. Work was confined to the four gaps
+the handoff disclosed. **2 of 4 closed, 2 provably cannot close yet.**
+
+**Built / Shipped:** `e6c4d55` on `feat/entitlement-periods`.
+- `docs/product/billing-period-semantics.md` rewritten as **SUPERSEDED** (gap 3,
+  closed). New policy up top, a gap-by-gap disposition of the five it listed
+  (1/3/4/5 fixed, 2 kept **deliberately** — resetting on upgrade is exactly what
+  would make upgrade-farming pay), and the original preserved verbatim as
+  history. Carries a marker that the replacement is not yet deployed, so the doc
+  never claims a policy is live before it is.
+- `scripts/verify_entitlement_deploy.py` (new) — the read-only evidence for
+  deploy step 2, which previously had no tool behind it. Six invariants per user,
+  exit 0/1/2, prints the watched `01dc9396` account in full.
+
+**Tried / Decided:**
+- **The step-2 check needs no pre-deploy snapshot.** `records_period_start` is
+  the pre-088 column and is kept in lockstep for one release, so the old value is
+  still in the same row — comparing the new window against it IS the "did anyone
+  move?" test. That is what makes a verifier possible at all without having taken
+  a snapshot before the migration nobody has run yet.
+- Reads cross-tenant under `system_sync_session`, not `SyncSessionLocal`. Under
+  an RLS context the SELECT returns zero rows, so an empty result is a **FATAL**,
+  never a vacuous PASS.
+- **Did not** commit regenerated FE api-types. Verified the CI gate regenerates
+  from the backend's **main** branch, so doing it today is a no-op and
+  hand-writing it would turn FE CI red until #231 merges.
+
+**Failed / Blocked:**
+- 🛑 **Codex is still hard-blocked** (gap 1, open). `codex review --base master`
+  returned *"You've hit your usage limit … try again at Sep 9th, 2026 3:10 AM"*,
+  confirmed independently on the ChatGPT usage screen: **weekly 0% remaining, 0
+  credits** — no top-up path. Account verified by decoding
+  `~/.codex/auth.json` → `id_token` → `email`: `memiki70@gmail.com`. Switching
+  accounts revokes the current refresh token, so it needs the operator. **The FE
+  and `e6c4d55` are queued for the Wed pass; exact commands are in the handoff.**
+- Gap 2 (nothing run against production) cannot close without the deploy go.
+
+**Caught & fixed:**
+- 🛑 **Running the verifier found a defect reading it would not have.** The `→`
+  in its report raised `UnicodeEncodeError` on a cp1252 console and killed the
+  script **mid-report with exit 1** — a healthy production run would have read as
+  a FAIL. Output is now pure ASCII. Exercised against a real local Postgres
+  (throwaway DB, `alembic upgrade head` through 088, four seeded users) and all
+  three exit paths observed, including a deliberately planted non-day-1 anchor it
+  caught on C1/C2/C4. DB dropped afterwards.
+- 🛑 Burned two invocations rediscovering that `codex review` rejects a prompt
+  alongside `--base` — **already recorded in memory.** Read the tooling memory
+  before shelling out to a CLI with known quirks.
+
+**Facts learned:**
+- 🔑 **The post-088 FE api-types change was measured, not assumed:** generating
+  from the branch schema with the repo's own `openapi-typescript` 7.13.0 gives a
+  63-line diff that is **100% JSDoc comments, zero type changes**, in exactly two
+  endpoints. The drift gate will still fail until it is regenerated, but it
+  carries no runtime or type risk.
+- 🛑 An ops script's own output encoding is part of its correctness. Non-ASCII in
+  a report crashes on a cp1252 console, and a verifier that dies is worse than
+  one that fails cleanly.
+
+**Pending / Handoff:** deploy go/no-go (operator); Wed Codex pass on FE
+`ef3ba3d` + BE `e6c4d55`; FE api-types regen after #231 merges.
+
+---
+
+## 2026-09-06 — quota stops resetting on the 1st: entitlement periods
+
+**Built / Shipped:** `feat/entitlement-periods`, **`33efc05`..`38df1f1`** (7 commits: the
+system, then four rounds of Codex findings). Full suite **2437 passed, 2 skipped** (baseline
+2350). **Not merged, not deployed.**
+
+Record quota is now metered over an **entitlement window**: a half-open
+`[quota_period_start, quota_period_end)` on a monthly grid anchored at
+`users.quota_anchor_at`, always exactly one month long however Stripe invoices. New:
+`src/api/quota_window.py` (the one Python definition + the SQL builders every atomic
+statement splices), `src/api/billing_entitlement.py` (the nine policies), migration **088**
+(10 user columns, 1 job column, the `public.quota_*` SQL functions, a no-op backfill),
+`reconcile_quota_periods` (hourly beat), `scripts/backfill_quota_anchors.py`.
+
+**Tried / Decided:**
+- **The anchor moves on exactly three events** — first trial→paid conversion, resubscribe
+  after a genuine lapse, admin action. Upgrade, downgrade, cancel, dunning, recovery and
+  monthly↔annual change only plan/limit/status. That single invariant is what makes
+  upgrade-farming and cancel/resubscribe-farming worthless; nearly every policy question
+  answered itself once it was fixed.
+- **Rejected `quota_period_source`** (Codex was right: `plan=pro, status=active,
+  source=calendar` is representable and meaningless — pure drift). Rejected a bare
+  `quota_anchor_day` smallint too: storing the instant keeps a 14:37 conversion at 14:37 and
+  makes the "did we clamp 31 to 28 permanently?" bug structurally impossible.
+- **Rollover is LAZY and contiguous**: a new window starts where the old one ENDED, never at
+  "the grid cell containing now". Naively continuing to the next boundary after an anchor
+  moves gives `[Oct 1, Oct 2)` — a one-day window with a full bucket, immediately followed by
+  another. `transitional_end` snaps to the boundary *closest* to `old_end + 1 month` instead,
+  which converges onto the grid in one cell and bounds the one-off cutover shift to within
+  ~15 days of a month in either direction.
+- **Renewal is observed, never acted on.** `invoice.payment_succeeded` is handled now but
+  does not reset the counter or advance the window. Making payment the trigger would strand a
+  renewed payer at cap behind a late webhook and hand out a second bucket on a replay.
+- **The deploy is a no-op by construction.** Migration 088 puts everyone on a day-1 grid —
+  exactly the calendar behaviour they already had, `records_used` untouched. The legacy
+  records reset is retired in the SAME deploy; subscribers move to their real Stripe
+  anniversary LATER via a separate script. That ordering is the whole safety argument.
+
+**Codex gate — 5 rounds, ending clean.** Design review before any code (4 high-risk findings,
+all verified and adopted), then `33efc05` → 6 defects, `ea98ac0` → 3, `aea2eb5`+`0284a67` → 2,
+`1b279f6` → 3, and `9e8ea21` → **NO DEFECTS FOUND, "I would deploy this"**. Every finding was
+verified against the code before being adopted; none was taken on trust.
+
+**Caught & fixed (before shipping):**
+- 🛑 **The period rule was written out SEVEN times**, not the four Codex counted — and the
+  two it missed were the dangerous ones. `_reservation_is_current` and
+  `release_quota_reservation` both compared calendar MONTHS, which is only *accidentally*
+  right while every window starts on the 1st. With a 20th anchor, a job reserving on the 19th
+  and settling on the 21st reads as "same period", so settlement nets `billable − reserved = 0`
+  against a counter the rollover already zeroed — **the delivered records are charged to
+  nobody**. The release path is the mirror image: refunding into a window the grant was never
+  added to, destroying current-window usage. Both were latent, both go live the instant any
+  anchor is not day 1, both fixed here via `jobs.quota_period_start`.
+- 🛑 **Codex found an Agency downgrade skipping the cap entirely.** The worker's cap block is
+  gated on `records_limit != -1`, so an Agency subscriber with a pending downgrade whose
+  window had ended exported uncapped and settlement then applied the Pro limit — 5000/1000.
+- 🛑 **Codex found the migration marking Stripe-side `trialing` users as already paid**, which
+  would have reintroduced the exact defect the project exists to fix: consume 1,000/1,000 on
+  trial, pay $199, stay at 1,000/1,000.
+- 🛑 **Codex found the conversion reset had no lock.** `checkout.session.completed` and
+  `customer.subscription.updated` are two DIFFERENT events describing ONE conversion, so the
+  route's per-event Redis dedup does not stop them running concurrently. Both handlers now
+  load the user `FOR UPDATE`.
+- 🛑 **Codex found a mixed-deploy double-grant.** New API + old worker: the retired calendar
+  task zeroes rows whose `records_period_start` is in an earlier month, so a signup-dated
+  mirror column let it wipe a brand-new trial counter and hand out a second 1,000 records
+  inside one 7-day trial. The mirror stays on the month start at signup.
+- 🛑 **Codex found reconciliation downgrading payers whose un-cancel webhook was lost** — and
+  they could then "resubscribe" into another fresh window. It now asks Stripe first, under the
+  same doctrine `_expire_trials_impl` established: an error means UNKNOWN, never a downgrade.
+- I found the `past_due` leak independently and Codex reported it too: reached through
+  `subscription.updated` alone, the status was written but the dunning grace never was — and
+  `past_due` with a NULL grace is not frozen, so the window kept rolling for a non-paying
+  account. Whichever event sees `past_due` first now starts the clock.
+- 🛑 Rounds 3-5 were all the same shape, and it is the durable lesson of this session:
+  **ending a read transaction before a network call (the right fix for holding locks) widens
+  the window in which the decision you are about to write went stale.** The reconcile and
+  expire-trials loops each read candidates, called Stripe, and then wrote an unconditional
+  UPDATE — so a `checkout.session.completed` landing in between had its paid plan taken
+  straight back off it. Both writes now carry the predicate the decision was based on as their
+  WHERE clause. A first attempt at the expire-trials fix still failed its own test: the
+  not-applied path **committed**, which flushed a pending stale ORM attribute write over the
+  fresher value. It rolls back instead.
+- 🛑 Deterministic `ORDER BY` + a `LIMIT` on a loop that can fail per row is a **starvation
+  bug**: the oldest 200 rows failing their Stripe lookup are re-selected every hour forever and
+  nothing behind them is ever repaired. Both beat tasks now sample at `random()` — this is
+  idempotent state repair, not a queue.
+- 🛑 `_expire_trials_impl` never cleared `entitlement_ends_at` on downgrade, so a trial user who
+  had reached a subscription would be frozen at Starter forever once the spend gate started
+  honouring that field.
+- `scripts/repair_records_used_from_ledger.py` tested staleness with
+  `records_period_start < date_trunc('month', now())`. Under anchored windows a *live* window
+  legitimately starts in a previous calendar month, so the operator's repair tool would have
+  silently skipped every anchored subscriber.
+
+**Failed / Blocked:**
+- `.env.example` could not be edited — the tool sandbox denies all access to that path. It
+  still needs `BILLING_PAST_DUE_GRACE_DAYS=7`; the setting has a safe default so nothing
+  breaks without it. 👤
+- Bash heredocs in this harness mangle content containing apostrophes; large file edits had to
+  go through the Write tool or a scratchpad patch script instead.
+
+**Pending / Handoff:**
+- ⏭️ **UNVERIFIED in production.** Nothing here has been deployed or run against the live DB.
+  The `1007/1000` account behaviour is proven by test, not by a production observation.
+- ⏭️ Not merged: no PR opened yet.
+- 👤 Deploy order matters: migration + code together, verify `/billing/usage` is unchanged for
+  every user, and ONLY THEN run `scripts/backfill_quota_anchors.py`. A non-day-1 anchor while
+  the legacy reset still ran would be zeroed twice.
+- 👤 FE: `/billing/usage` now returns `period_basis: "entitlement_month_utc"` (was
+  `calendar_month_utc`) plus `pending_plan`, `pending_records_limit`, `payment_state`,
+  `entitlement_ends_at`. Pricing copy should stop saying quotas reset on the 1st.
+- `docs/product/billing-period-semantics.md` still documents the calendar policy as accepted;
+  supersede it once this deploys.
+
+**Facts learned:**
+- 🔑 **A test that carries its own transcription of a rule proves only that the transcription
+  is self-consistent.** `test_quota_reservation.py` held hand-copied `_RESERVE_SQL` / `_settle`
+  constants that still encoded the *calendar* rule; all 18 tests passed against production
+  statements they no longer resembled. They now assemble from the same shared builders, and
+  the single most valuable test in the change is the one proving the Python module and the
+  Postgres functions agree over a generated matrix of anchors × instants.
+- 🔑 **Postgres month arithmetic on a `timestamptz` is evaluated in the SESSION timezone.**
+  Every boundary has to be re-cast `AT TIME ZONE 'UTC'` or a worker on a negative offset lands
+  on a different day — the same class of bug that made a healthy user read as stale in #223.
+- 🔑 **Adding a month to the previous boundary compounds the clamp**: Jan 31 → Feb 28 → Mar 28,
+  and the customer's reset day silently becomes the 28th forever. Always add whole months to
+  the ORIGINAL anchor. Postgres and `calendar.monthrange` agree on this and both clamp right.
+- 🛑 `date_trunc('month', ...)` is not merely *legacy* once windows exist — it is a live
+  correctness hazard anywhere it still governs record quota, because it is silently correct
+  for day-1 anchors and silently wrong for every other one.
+- 🔑 `ADD COLUMN ... DEFAULT date_trunc(...) AT TIME ZONE 'UTC' NOT NULL` is a syntax error;
+  the default expression needs parentheses. `ALTER COLUMN ... SET DEFAULT` (what 086 used)
+  parses without them, which is why the pattern looked safe to copy.
+- 🔑 Extracting a migration's backfill SQL into module-level constants lets tests execute the
+  *actual* statements via `importlib`, instead of re-typing them.
+
+---
+
 ## 2026-09-04 (Test 11) — a page with three rows on it looked like no page at all
 
 **Built / Shipped:** `fix/test11-completed-with-error` → **PR #217** (CI green: Test 5m5s,
@@ -650,6 +856,11 @@ commit `f6e29fb`) + FE `fix/auction-date-relative-label` (`a90d477`). Not pushed
 - Couldn't use the shared `bl-testenv` pytest rig: another session was actively running against
   `bridgeleads_test` (pg.log live). Created a separate `bridgeleads_t4_test` database on the same
   server instead — isolated tables, no interference. 1884 passed, 2 skipped.
+
+**Codex gate — 5 rounds, ending clean.** Design review before any code (4 high-risk findings,
+all verified and adopted), then `33efc05` → 6 defects, `ea98ac0` → 3, `aea2eb5`+`0284a67` → 2,
+`1b279f6` → 3, and `9e8ea21` → **NO DEFECTS FOUND, "I would deploy this"**. Every finding was
+verified against the code before being adopted; none was taken on trust.
 
 **Caught & fixed (before shipping):**
 - My own first cut made `build_lead_export_row(rec, today=X)` silently ignore `X` for the auction

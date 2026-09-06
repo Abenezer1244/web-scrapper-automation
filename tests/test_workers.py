@@ -580,52 +580,227 @@ def test_watchdog_ignores_fresh_pending_job():
         assert refreshed.status == "pending"
 
 
-# ─── Monthly reset ────────────────────────────────────────────────────────────
+# --- Entitlement-window reconciliation + skip-trace reset ---------------------
+#
+# These used to exercise reset_monthly_usage, one task that reset BOTH the record
+# counter (on the calendar month) and skip-trace. The records half was retired
+# when entitlement windows landed: quota now rolls on each user's own
+# anniversary, advanced lazily by the statement that charges and hourly by
+# reconcile_quota_periods. Keeping the calendar reset alongside anchored windows
+# would zero a 20th-anchored subscriber twice — once on their own boundary and
+# again on the 1st.
+#
+# Every invariant the old tests protected is still asserted below: a stale period
+# rolls, a live one is untouched however often the task runs, all stale users
+# roll, a NULL period is adopted rather than zeroed, and skip-trace keys on its
+# OWN period. They are simply asserted against whichever mechanism now owns each.
 
-def test_monthly_reset_rolls_over_a_stale_period():
-    """A period from a PREVIOUS month is rolled over: counter zeroed, period advanced."""
-    from src.workers.scheduler import reset_monthly_usage
+def _window(user, start, end) -> None:
+    """Put a user in an explicit entitlement window (mirror column kept in step)."""
+    user.quota_anchor_at = start
+    user.quota_period_start = start
+    user.quota_period_end = end
+    user.records_period_start = start
+
+
+def test_reconciliation_rolls_over_an_ended_window():
+    """A window whose end has passed is advanced: counter zeroed, window moved."""
+    from src.workers.scheduler import reconcile_quota_periods
 
     with SyncSessionLocal() as db:
         user = _create_sync_user(db, records_used=42)
-        user.records_period_start = datetime(2020, 1, 1, tzinfo=UTC)
-        user.skip_trace_period_start = datetime(2020, 1, 1, tzinfo=UTC)
+        _window(user, datetime(2020, 1, 1, tzinfo=UTC), datetime(2020, 2, 1, tzinfo=UTC))
         user_id = user.id
         db.commit()
 
-    reset_monthly_usage()
+    reconcile_quota_periods()
 
     with SyncSessionLocal() as db:
         refreshed = db.get(User, user_id)
         assert refreshed.records_used == 0
-        assert refreshed.records_period_start == _current_month_start()
+        # Lands on the window containing NOW — not the next cell after the one it
+        # left, and not five years of accumulated buckets.
+        assert refreshed.quota_period_start <= datetime.now(UTC)
+        assert refreshed.quota_period_end > datetime.now(UTC)
+        # records_period_start is a mirror of the window start for one release.
+        assert refreshed.records_period_start == refreshed.quota_period_start
 
 
-def test_monthly_reset_does_NOT_touch_a_current_period():
-    """The regression guard.
+def test_reconciliation_does_NOT_touch_a_live_window():
+    """The regression guard, unchanged in spirit.
 
-    The rollover used to zero every user it could match, which destroyed usage
+    The old rollover zeroed every user it could match, which destroyed usage
     belonging to the CURRENT period two ways: a new user whose period_start was
     NULL, and a late catch-up run after Beat missed the 1st. Both wiped real,
-    already-billed consumption. A user whose period is the current month must
-    come through untouched no matter how many times the task runs.
+    already-billed consumption. A user whose window is still open must come
+    through untouched no matter how many times the task runs.
     """
-    from src.workers.scheduler import reset_monthly_usage
+    from src.workers.scheduler import reconcile_quota_periods
 
+    now = datetime.now(UTC)
     with SyncSessionLocal() as db:
         user = _create_sync_user(db, records_used=999)
-        user.records_period_start = _current_month_start()
+        _window(user, now - timedelta(days=3), now + timedelta(days=20))
         user_id = user.id
         db.commit()
 
-    reset_monthly_usage()
-    reset_monthly_usage()  # idempotent: running twice must not zero either
+    reconcile_quota_periods()
+    reconcile_quota_periods()  # idempotent: running twice must not zero either
 
     with SyncSessionLocal() as db:
         assert db.get(User, user_id).records_used == 999
 
 
-def test_monthly_reset_adopts_a_null_period_without_zeroing():
+def test_a_late_reconciliation_cannot_wipe_new_window_usage():
+    """The second production defect, pinned against the new mechanism.
+
+    Running late is exactly when usage already exists in the NEW window: the
+    charging statement advances the window itself, so by the time the beat
+    catches up the counter holds consumption belonging to the live window. A
+    reconciliation that zeroed on a stale-looking column would destroy it.
+    """
+    from src.workers.scheduler import reconcile_quota_periods
+
+    now = datetime.now(UTC)
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db, records_used=67)
+        # The window a job already rolled this user into, moments ago.
+        _window(user, now - timedelta(minutes=5), now + timedelta(days=29))
+        user_id = user.id
+        db.commit()
+
+    reconcile_quota_periods()  # the late catch-up
+
+    with SyncSessionLocal() as db:
+        assert db.get(User, user_id).records_used == 67
+
+
+def test_reconciliation_grants_ONE_window_after_months_away():
+    """Unused entitlement must never accumulate.
+
+    A user whose last window ended long ago comes back to the CURRENT window's
+    allowance, not one bucket per month they were absent. The counter is zeroed
+    exactly once, wherever the window lands.
+    """
+    from src.workers.scheduler import reconcile_quota_periods
+
+    now = datetime.now(UTC)
+    anchor = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=200)
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db, records_used=48)
+        _window(user, anchor, anchor + timedelta(days=30))
+        user_id = user.id
+        db.commit()
+
+    reconcile_quota_periods()
+
+    with SyncSessionLocal() as db:
+        refreshed = db.get(User, user_id)
+        assert refreshed.records_used == 0
+        assert refreshed.quota_period_start <= now < refreshed.quota_period_end
+        # One month wide, not the whole absence.
+        assert (refreshed.quota_period_end - refreshed.quota_period_start) < timedelta(days=32)
+
+
+def test_reconciliation_does_not_roll_a_frozen_account():
+    """A subscription that stopped paying must not accrue a bucket a month.
+
+    Its window stays put until payment recovers, at which point it advances to
+    the window containing NOW — one bucket, not one per frozen month.
+    """
+    from src.workers.scheduler import reconcile_quota_periods
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db, records_used=50)
+        _window(user, datetime(2020, 1, 1, tzinfo=UTC), datetime(2020, 2, 1, tzinfo=UTC))
+        user.subscription_status = "unpaid"
+        user_id = user.id
+        db.commit()
+
+    reconcile_quota_periods()
+
+    with SyncSessionLocal() as db:
+        refreshed = db.get(User, user_id)
+        assert refreshed.records_used == 50, "a frozen account gets no fresh quota"
+        assert refreshed.quota_period_end == datetime(2020, 2, 1, tzinfo=UTC)
+
+
+def test_reconciliation_retires_a_lapsed_entitlement_without_a_webhook():
+    """A customer.subscription.deleted that never arrived must not strand anyone.
+
+    entitlement_ends_at is what holds the window while a cancellation is pending.
+    If the webhook is lost nothing would ever clear it and the account would stay
+    frozen forever — so the reconciliation performs the downgrade itself, which
+    also releases the window.
+    """
+    from src.workers.scheduler import reconcile_quota_periods
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db, plan="pro", records_used=10)
+        user.records_limit = 1000
+        _window(user, datetime(2020, 1, 1, tzinfo=UTC), datetime(2020, 2, 1, tzinfo=UTC))
+        user.entitlement_ends_at = datetime(2020, 2, 1, tzinfo=UTC)
+        user.subscription_status = "active"
+        user.stripe_subscription_id = "sub_gone"
+        user_id = user.id
+        db.commit()
+
+    reconcile_quota_periods()
+
+    with SyncSessionLocal() as db:
+        refreshed = db.get(User, user_id)
+        assert refreshed.plan == "starter"
+        assert refreshed.entitlement_ends_at is None, "must release the window"
+        assert refreshed.paid_entitlement_ended_at is not None
+        assert refreshed.stripe_subscription_id is None
+        # Released in the same pass, so the user is not left a month behind.
+        assert refreshed.quota_period_end > datetime.now(UTC)
+
+
+def test_reconciliation_applies_a_pending_downgrade_at_the_boundary():
+    """P5: a downgrade is deferred, then applied by the rollover — never before."""
+    from src.workers.scheduler import reconcile_quota_periods
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db, plan="business", records_used=3000)
+        user.records_limit = 5000
+        _window(user, datetime(2020, 1, 1, tzinfo=UTC), datetime(2020, 2, 1, tzinfo=UTC))
+        user.pending_plan = "pro"
+        user.pending_records_limit = 1000
+        user_id = user.id
+        db.commit()
+
+    reconcile_quota_periods()
+
+    with SyncSessionLocal() as db:
+        refreshed = db.get(User, user_id)
+        assert refreshed.plan == "pro"
+        assert refreshed.records_limit == 1000
+        assert refreshed.records_used == 0, "the new window starts at the new cap"
+        assert refreshed.pending_plan is None
+        assert refreshed.pending_records_limit is None
+
+
+def test_reconciliation_rolls_over_all_ended_windows():
+    """All eligible users roll over, not just one."""
+    from src.workers.scheduler import reconcile_quota_periods
+
+    ids = []
+    with SyncSessionLocal() as db:
+        for _ in range(3):
+            u = _create_sync_user(db, records_used=100)
+            _window(u, datetime(2020, 1, 1, tzinfo=UTC), datetime(2020, 2, 1, tzinfo=UTC))
+            ids.append(u.id)
+        db.commit()
+
+    reconcile_quota_periods()
+
+    with SyncSessionLocal() as db:
+        for uid in ids:
+            assert db.get(User, uid).records_used == 0
+
+
+def test_skip_trace_reset_adopts_a_null_period_without_zeroing():
     """A NULL period is ADOPTED, never zeroed.
 
     Zeroing is the financially destructive direction — it hands out free quota
@@ -633,84 +808,76 @@ def test_monthly_reset_adopts_a_null_period_without_zeroing():
     us a stamped period, not the counter. (This is the exact shape of the
     production incident: every newly registered user had a NULL period and lost
     their entire month's usage on their first 00:05 UTC run.)
+
+    Only skip-trace can still reach this state. The RECORD counter no longer has
+    a nullable period at all — it is governed by quota_period_start/end, both NOT
+    NULL with a server_default since migration 088 — so the arm that caused the
+    incident is now structurally unreachable rather than merely guarded.
     """
     from sqlalchemy import text as _text
 
-    from src.workers.scheduler import reset_monthly_usage
+    from src.workers.scheduler import reset_skip_trace_usage
 
     with SyncSessionLocal() as db:
-        user = _create_sync_user(db, records_used=777)
+        user = _create_sync_user(db)
+        user.skip_trace_used_this_month = 777
         user_id = user.id
         db.commit()
         # The column is NOT NULL as of migration 086, so force the legacy shape
         # the way only pre-086 data could have been written.
         db.execute(
-            _text("ALTER TABLE users ALTER COLUMN records_period_start DROP NOT NULL")
+            _text("ALTER TABLE users ALTER COLUMN skip_trace_period_start DROP NOT NULL")
         )
         db.execute(
-            _text("UPDATE users SET records_period_start = NULL WHERE id = :i"),
+            _text("UPDATE users SET skip_trace_period_start = NULL WHERE id = :i"),
             {"i": user_id},
         )
         db.commit()
 
     try:
-        reset_monthly_usage()
+        reset_skip_trace_usage()
 
         with SyncSessionLocal() as db:
             refreshed = db.get(User, user_id)
-            assert refreshed.records_used == 777, "NULL period must not cost the counter"
-            assert refreshed.records_period_start == _current_month_start()
+            assert refreshed.skip_trace_used_this_month == 777, (
+                "NULL period must not cost the counter"
+            )
+            assert refreshed.skip_trace_period_start == _current_month_start()
     finally:
         with SyncSessionLocal() as db:
             db.execute(
                 _text(
-                    "ALTER TABLE users ALTER COLUMN records_period_start SET NOT NULL"
+                    "ALTER TABLE users ALTER COLUMN skip_trace_period_start SET NOT NULL"
                 )
             )
             db.commit()
 
 
-def test_monthly_reset_rolls_skip_trace_on_its_OWN_period():
-    """Skip-trace must key on skip_trace_period_start, not records_period_start.
+def test_skip_trace_reset_keys_on_its_OWN_period():
+    """Skip-trace keys on skip_trace_period_start, and never touches records.
 
-    It used to be gated on records_period_start, so drift between the two
-    columns could reset Stripe-metered skip-trace usage early, or never.
+    It used to be gated on records_period_start, so drift between the two columns
+    could reset Stripe-metered skip-trace usage early, or never. The two are now
+    governed by entirely different mechanisms, which makes the separation
+    structural: this task cannot reach the record counter at all.
     """
-    from src.workers.scheduler import reset_monthly_usage
+    from src.workers.scheduler import reset_skip_trace_usage
 
+    now = datetime.now(UTC)
     with SyncSessionLocal() as db:
         user = _create_sync_user(db, records_used=10)
-        user.records_period_start = _current_month_start()      # current
+        _window(user, now - timedelta(days=1), now + timedelta(days=29))  # live
         user.skip_trace_used_this_month = 25
         user.skip_trace_period_start = datetime(2020, 1, 1, tzinfo=UTC)  # stale
         user_id = user.id
         db.commit()
 
-    reset_monthly_usage()
+    reset_skip_trace_usage()
 
     with SyncSessionLocal() as db:
         refreshed = db.get(User, user_id)
-        assert refreshed.records_used == 10, "records period was current — leave it"
+        assert refreshed.records_used == 10, "record quota is not this task's business"
         assert refreshed.skip_trace_used_this_month == 0, "its own period was stale"
-
-
-def test_monthly_reset_rolls_over_all_stale_users():
-    """All stale users roll over, not just one."""
-    from src.workers.scheduler import reset_monthly_usage
-
-    ids = []
-    with SyncSessionLocal() as db:
-        for _ in range(3):
-            u = _create_sync_user(db, records_used=100)
-            u.records_period_start = datetime(2020, 1, 1, tzinfo=UTC)
-            ids.append(u.id)
-        db.commit()
-
-    reset_monthly_usage()
-
-    with SyncSessionLocal() as db:
-        for uid in ids:
-            assert db.get(User, uid).records_used == 0
 
 
 # ─── Delivery: payment failed email ───────────────────────────────────────────

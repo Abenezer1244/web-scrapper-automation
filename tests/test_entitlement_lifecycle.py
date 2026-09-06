@@ -1019,3 +1019,98 @@ async def test_a_new_signup_cannot_be_zeroed_by_the_retired_calendar_reset(db):
     assert (
         as_utc(user.quota_period_end) - as_utc(user.quota_period_start)
     ) < timedelta(days=8)
+
+
+# ─── Round-2 Codex findings: legacy payers ────────────────────────────────────
+#
+# A "legacy payer" is a real paying customer from before migration 077 recorded a
+# durable subscription_status. Both of these hand such a customer a free window,
+# and both were live in the first cut.
+
+def test_a_known_subscription_is_not_treated_as_a_first_conversion():
+    """P1 (Codex): a legacy payer with first_paid_at NULL.
+
+    Their next routine customer.subscription.updated would otherwise take the
+    conversion branch and zero the counter of someone who has been paying for
+    months. Having already recorded THIS subscription id is the tell: on a
+    genuine first conversion checkout binds the id and stamps first_paid_at in
+    the same locked transaction, so the two can never be out of step that way.
+    """
+    with SyncSessionLocal() as db:
+        legacy = _mk_user(
+            db, plan="pro", records_used=640, records_limit=1000,
+            subscription_status=None, first_paid_at=None,
+            stripe_subscription_id="sub_legacy",
+        )
+        outcome = apply_plan_change(
+            legacy, plan="pro", records_limit=1000, subscription_id="sub_legacy",
+            status="active", cancel_at_period_end=False, entitlement_end=None,
+            billing_cycle_anchor=NOW, now=NOW,
+        )
+        db.flush()
+
+    assert outcome != "converted"
+    assert legacy.records_used == 640, "a paying customer keeps their usage"
+
+
+def test_an_unknown_subscription_still_converts():
+    """The guard must not block a REAL conversion that arrives as an update
+    before checkout has bound the subscription id."""
+    with SyncSessionLocal() as db:
+        user = _mk_user(
+            db, records_used=1000, trial_ends_at=NOW,
+            subscription_status=None, first_paid_at=None,
+            stripe_subscription_id=None,
+        )
+        outcome = apply_plan_change(
+            user, plan="pro", records_limit=1000, subscription_id="sub_new",
+            status="active", cancel_at_period_end=False, entitlement_end=None,
+            billing_cycle_anchor=NOW, now=NOW,
+        )
+        db.flush()
+
+    assert outcome == "converted"
+    assert user.records_used == 0
+
+
+def test_the_migration_marks_unambiguous_legacy_payers_as_converted():
+    """P1 (Codex): status NULL, on a paid tier, reached Stripe, trial cleared.
+
+    The checkout handler is what clears trial_ends_at, so a NULL trial on a paid
+    tier with a Stripe customer is a converted payer whose status column simply
+    predates migration 077. Someone still carrying a trial_ends_at is NOT
+    reachable from here — indistinguishable from an abandoned checkout — and is
+    left to expire_trials, which asks Stripe.
+    """
+    period = datetime(2026, 9, 1, tzinfo=UTC)
+    with SyncSessionLocal() as db:
+        legacy = _mk_user(
+            db, plan="pro", subscription_status=None, trial_ends_at=None,
+            stripe_customer_id=f"cus_legacy_{uuid.uuid4().hex[:8]}",
+            quota_period_start=period,
+        )
+        legacy.records_period_start = period
+        ambiguous = _mk_user(
+            db, plan="pro", subscription_status=None,
+            trial_ends_at=NOW + timedelta(days=2),
+            stripe_customer_id=f"cus_maybe_{uuid.uuid4().hex[:8]}",
+            quota_period_start=period,
+        )
+        ambiguous.records_period_start = period
+        never = _mk_user(
+            db, plan="pro", subscription_status=None, trial_ends_at=None,
+            stripe_customer_id=None, quota_period_start=period,
+        )
+        never.records_period_start = period
+        legacy_id, ambiguous_id, never_id = legacy.id, ambiguous.id, never.id
+        db.commit()
+
+        _run_backfill(db)
+        db.commit()
+        db.expire_all()
+
+        assert db.get(User, legacy_id).first_paid_at is not None
+        assert db.get(User, ambiguous_id).first_paid_at is None, (
+            "left for expire_trials to resolve against Stripe"
+        )
+        assert db.get(User, never_id).first_paid_at is None

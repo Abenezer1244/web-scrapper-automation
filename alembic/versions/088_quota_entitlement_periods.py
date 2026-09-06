@@ -230,7 +230,29 @@ BACKFILL_FIRST_PAID = """
     UPDATE users
     SET first_paid_at = created_at
     WHERE first_paid_at IS NULL
-      AND subscription_status IN ('active', 'past_due')
+      AND (
+            subscription_status IN ('active', 'past_due')
+        OR  (
+              -- Legacy payers, from before migration 077 recorded a durable
+              -- status: no subscription_status at all, but they reached Stripe
+              -- AND are on a paid tier AND are no longer on the app trial (the
+              -- checkout handler is what clears trial_ends_at). Leaving them
+              -- NULL would make their next customer.subscription.updated read
+              -- as a FIRST conversion, zeroing the counter and handing an
+              -- already-paying customer a free window.
+              --
+              -- Legacy payers who still carry a trial_ends_at are NOT reachable
+              -- from here: they are indistinguishable from someone who merely
+              -- OPENED checkout and never paid, and guessing would deny a real
+              -- convert their paid month. expire_trials already asks Stripe
+              -- about exactly that set hourly, and now stamps first_paid_at when
+              -- Stripe says they are entitled. (Codex)
+              subscription_status IS NULL
+          AND stripe_customer_id IS NOT NULL
+          AND plan <> 'starter'
+          AND trial_ends_at IS NULL
+        )
+      )
 """
 
 #: Anyone who was ever granted a trial has consumed it. trial_ends_at is CLEARED

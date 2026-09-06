@@ -324,12 +324,16 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
     when a user merely OPENS checkout), so the gate uses the durable subscription
     state (migration 077). Per-row decision:
       * known-entitled status (active/trialing/past_due) -> excluded by the query.
-      * known non-entitled status (e.g. canceled)        -> downgrade.
       * no stripe_customer_id (never reached Stripe)      -> downgrade.
-      * AMBIGUOUS (customer id present, status NULL — a legacy payer OR an
-        abandoned checkout) -> ask Stripe (the source of truth): entitled ->
-        protect + record the status (self-heal); not entitled -> downgrade +
-        record; Stripe error -> SKIP (never downgrade a possible payer).
+      * ANY stripe_customer_id -> ask Stripe (the source of truth): entitled ->
+        protect, self-heal the status, and stamp first_paid_at / trial_consumed_at;
+        not entitled -> downgrade + record; Stripe error -> SKIP (never downgrade
+        a possible payer).
+
+    A locally-recorded "canceled" is NOT taken at face value any more. Our copy
+    of the status is a cache and can be wrong — a mis-ordered webhook, a
+    cancellation the customer reversed — and acting on it unverified takes a plan
+    away from someone who is paying for it. (Codex)
 
     This resolves BOTH Codex P1s: legacy payers are never wrongly downgraded, and
     future abandoned-checkout trials DO expire — automatically, no manual backfill.
@@ -381,14 +385,20 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
 
         downgraded = 0
         for user in candidates:
-            if user.subscription_status is not None:
-                _downgrade(db, user)  # known non-entitled (canceled/unpaid/…)
-                downgraded += 1
-            elif not user.stripe_customer_id:
+            if not user.stripe_customer_id:
                 _downgrade(db, user)  # never reached Stripe -> genuine unpaid trial
                 downgraded += 1
             else:
-                # AMBIGUOUS: customer id present, status NULL. Stripe is the truth.
+                # ANY customer id, whatever we think the status is: ask Stripe.
+                #
+                # This used to trust a locally-recorded non-entitled status
+                # ("canceled", "unpaid") and downgrade without checking. Our copy
+                # of that status can be wrong — a webhook we mis-ordered, a
+                # reversal we never received — and downgrading a customer Stripe
+                # says is ACTIVE takes away a plan they are paying for. Stripe is
+                # the source of truth for entitlement; the local column is a
+                # cache. Verifying costs one API call on a row that is, by
+                # definition, already exceptional. (Codex)
                 try:
                     status = lookup(user.stripe_customer_id)
                 except Exception as exc:  # noqa: BLE001 - any failure = unknown
@@ -400,6 +410,18 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
                     continue
                 if status in _ENTITLED_SUB_STATUSES:
                     user.subscription_status = status  # legacy payer: protect + self-heal
+                    # Stamp first_paid_at too. Without it this legacy payer keeps
+                    # a NULL first_paid_at, and their next
+                    # customer.subscription.updated would read as a FIRST
+                    # conversion — zeroing the counter and handing an
+                    # already-paying customer a free window. The migration
+                    # cannot reach these rows (it has no Stripe access and their
+                    # local status was NULL), so this is where they get healed.
+                    # (Codex)
+                    if user.first_paid_at is None:
+                        user.first_paid_at = user.created_at or now
+                    if user.trial_consumed_at is None:
+                        user.trial_consumed_at = user.trial_ends_at or now
                     _logger.info(
                         "expire_trials: user %s has entitled Stripe status %s — "
                         "protected + backfilled", user.id, status,

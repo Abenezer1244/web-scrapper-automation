@@ -236,7 +236,19 @@ def apply_plan_change(
     # update alone (a Stripe-side trial converting, an incomplete payment
     # finally succeeding), and that path must not be the one that forgets to
     # give them their paid month.
-    if status in ("active", "trialing") and (
+    # A subscription we ALREADY have recorded is not a first conversion, even
+    # when first_paid_at is NULL. That combination means a legacy payer whose
+    # subscription we knew about before we started recording payments — and
+    # treating their next routine update as a conversion would zero the counter
+    # of someone who has been paying for months. On a genuine first conversion
+    # checkout binds the id and stamps first_paid_at in the same locked
+    # transaction, so the two can never be out of step that way; and when this
+    # handler legitimately arrives FIRST, stripe_subscription_id is still NULL
+    # and the conversion branch runs as it should. (Codex)
+    _already_known = bool(
+        subscription_id and user.stripe_subscription_id == subscription_id
+    )
+    if status in ("active", "trialing") and not _already_known and (
         user.first_paid_at is None or user.paid_entitlement_ended_at is not None
     ):
         activate_paid_plan(

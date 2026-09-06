@@ -382,6 +382,34 @@ async def login_break_glass_redeem(
     return LoginResponse(access_token=token, refresh_token=refresh)
 
 
+# How long a racer waits for the winner to publish its rotation result before
+# concluding the token is genuinely a replay. Only ever paid on the loser of a
+# concurrent refresh, never on the normal path.
+_ROTATION_PUBLISH_WAIT_SECONDS = 1.5
+_ROTATION_POLL_INTERVAL_SECONDS = 0.05
+
+
+async def _await_rotation_result(jti: str) -> str | None:
+    """Poll for the rotation result the winner of this jti is about to publish.
+
+    Returns the cached pair as soon as it appears, or None once the wait lapses —
+    at which point the token really is a replay from outside the grace window
+    (or the winner died before publishing), and the caller rejects it.
+    """
+    import asyncio
+
+    from src.api.middleware.auth_hardening import TokenBlacklist
+
+    deadline = time.monotonic() + _ROTATION_PUBLISH_WAIT_SECONDS
+    while True:
+        cached = await TokenBlacklist.recall_rotation(jti)
+        if cached:
+            return cached
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(_ROTATION_POLL_INTERVAL_SECONDS)
+
+
 async def refresh_tokens(
     body,
     request: Request,
@@ -443,7 +471,14 @@ async def refresh_tokens(
             # hand back the SAME pair that consumption produced rather than
             # killing a healthy session. Outside the window it still 401s, which
             # is where a genuinely stolen token surfaces.
-            replayed = await TokenBlacklist.recall_rotation(jti)
+            #
+            # Wait briefly rather than asking once. The winner claims the jti
+            # BEFORE it mints the new pair, so between its SET NX and its
+            # remember_rotation there is a real gap — a user lookup plus two JWT
+            # signings. A racer that lands inside that gap would read an empty
+            # cache and get the very 401 this window exists to prevent, which is
+            # exactly the concurrent case we are fixing.
+            replayed = await _await_rotation_result(jti)
             if replayed:
                 cached = json.loads(replayed)
                 return TokenResponse(

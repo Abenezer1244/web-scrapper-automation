@@ -123,3 +123,59 @@ async def test_row_claimed_by_another_tick_is_not_resubmitted(starter_user, _dis
     assert status == "submitting"
     assert submitted_at is not None
     assert _result_status(result_id) == "queued"
+
+
+@pytest.mark.asyncio
+async def test_release_cannot_clobber_a_newer_claim_on_the_same_rows(
+    starter_user, _dispatcher_enabled
+):
+    """The double-pay race Codex found (2026-09-07).
+
+    The reconciler reads stale claims WITHOUT a lock. Between its read and its
+    write, another tick can release those rows, the dispatcher can re-claim them
+    under a NEW submitted_at, and POST them. They are legitimately 'submitting'
+    again at that instant, so a release guarded only on status would free a batch
+    that is already in flight -- and the next tick would submit and pay for it a
+    second time.
+
+    Releasing therefore pins the exact claim it read via submitted_at.
+    """
+    from src.workers.skip_trace_dispatcher import _Claim, _release_claim
+
+    stale = datetime.now(UTC) - timedelta(hours=2)
+    pending_id, result_id = _seed_pending(
+        starter_user.id, status="submitting", submitted_at=stale)
+
+    # A newer claim lands on the same row while the reconciler holds its snapshot.
+    newer = datetime.now(UTC)
+    with system_sync_session() as db:
+        db.execute(
+            text("UPDATE pending_skip_trace_rows SET submitted_at = :t WHERE id = :i"),
+            {"t": newer, "i": pending_id},
+        )
+        db.commit()
+
+    # The reconciler now tries to release using the OLD claim time it read.
+    with system_sync_session() as db:
+        _release_claim(
+            db,
+            [_Claim(pending_id, result_id, "j", starter_user.id)],
+            "queued",
+            claim_time=stale,
+        )
+        db.commit()
+
+    status, submitted_at = _pending_state(pending_id)
+    assert status == "submitting", "the in-flight claim was released — double-pay"
+    assert submitted_at is not None
+
+    # ...and pinning the CURRENT claim time still releases normally.
+    with system_sync_session() as db:
+        _release_claim(
+            db,
+            [_Claim(pending_id, result_id, "j", starter_user.id)],
+            "queued",
+            claim_time=newer,
+        )
+        db.commit()
+    assert _pending_state(pending_id)[0] == "queued"

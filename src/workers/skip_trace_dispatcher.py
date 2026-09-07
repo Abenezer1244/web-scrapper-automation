@@ -499,20 +499,37 @@ def _alert_orphaned_queue(queue_id: int, trace_type: str, n_rows: int) -> None:
         _logger.warning("orphaned-queue ops alert failed: %s", str(exc)[:120])
 
 
-def _release_claim(db, claimed: list, to_status: str) -> None:
-    """Move claimed ('submitting') rows to `to_status`; no-op for an empty list."""
+def _release_claim(db, claimed: list, to_status: str, claim_time=None) -> None:
+    """Move claimed ('submitting') rows to `to_status`; no-op for an empty list.
+
+    `claim_time` pins the release to ONE specific claim and is mandatory from the
+    reconciler (Codex, 2026-09-07). `status == 'submitting'` alone is not enough:
+    the reconciler reads stale claims without holding a lock, so between its read
+    and its write another tick can release those rows, the dispatcher can re-claim
+    them under a NEW submitted_at, and POST them. They are legitimately
+    'submitting' again at that moment, so an unpinned release would free a batch
+    that is already in flight — and the next tick would submit and pay for it a
+    second time. Matching submitted_at makes the update a no-op unless the claim
+    is still the exact one that was read.
+
+    The submit path may pass claim_time=None: it holds the rows from its own
+    claim commit through to the release with no window in between.
+    """
     if not claimed:
         return
     from sqlalchemy import update
 
     from src.db.models import PendingSkipTraceRow
 
+    where = [
+        PendingSkipTraceRow.id.in_([c.id for c in claimed]),
+        PendingSkipTraceRow.status == "submitting",
+    ]
+    if claim_time is not None:
+        where.append(PendingSkipTraceRow.submitted_at == claim_time)
     db.execute(
         update(PendingSkipTraceRow)
-        .where(
-            PendingSkipTraceRow.id.in_([c.id for c in claimed]),
-            PendingSkipTraceRow.status == "submitting",
-        )
+        .where(*where)
         .values(status=to_status, submitted_at=None)
     )
     if to_status == "errored":
@@ -758,10 +775,30 @@ def _reconcile_stale_claims(db) -> dict:
         # otherwise happily adopt the 100-row queue belonging to the claim beside
         # it, attaching those results to the wrong leads and billing the wrong
         # tenants. Contested queues are refused for every claimant.
+        # Contention must be computed against EVERY in-flight claim, not just the
+        # stale ones (Codex, 2026-09-07). A claim that is still fresh has not
+        # recorded its queue id yet, so that queue is absent from `known` and sits
+        # inside a stale neighbour's window — the stale claim would adopt the
+        # FRESH claim's queue, attaching its results to the wrong leads and
+        # billing the wrong tenants. Widening the scan to all 'submitting' rows
+        # makes such a queue contested, and contested queues are adopted by nobody.
+        all_claims = db.execute(
+            select(
+                PendingSkipTraceRow.submitted_at,
+                PendingSkipTraceRow.trace_type,
+                func.count().label("n"),
+            )
+            .where(
+                PendingSkipTraceRow.status == "submitting",
+                PendingSkipTraceRow.submitted_at.isnot(None),
+            )
+            .group_by(PendingSkipTraceRow.submitted_at, PendingSkipTraceRow.trace_type)
+        ).all()
+
         contested: set = set()
         seen_once: set = set()
-        for claim_time, trace_type, n, *_ in groups:
-            hits, deferred = candidate_queues(remote, claim_time, trace_type, n, known)
+        for c_time, c_type, c_n in all_claims:
+            hits, deferred = candidate_queues(remote, c_time, c_type, c_n, known)
             for q in hits + deferred:
                 qid = q.get("id")
                 (contested if qid in seen_once else seen_once).add(qid)
@@ -817,7 +854,7 @@ def _reconcile_stale_claims(db) -> dict:
                     "at %s — never accepted, never charged. Releasing to 'queued'.",
                     len(claimed), trace_type, claim_time,
                 )
-                _release_claim(db, claimed, "queued")
+                _release_claim(db, claimed, "queued", claim_time=claim_time)
                 summary["released"] += len(claimed)
             elif verdict == "one":
                 queue_id = queue["id"]
@@ -909,6 +946,28 @@ def _redrive_completed_queue(queue: dict) -> None:
         return  # still processing — its webhook will arrive normally
     download_url = queue.get("download_url")
     if not download_url:
+        # Completed but no URL to fetch: nothing can ingest it, and because the
+        # queue is now recorded it is excluded from future reconciliation AND
+        # from the redrive sweep (which requires a download_url). That is a
+        # silent dead end, so say so loudly (Codex, 2026-09-07).
+        _logger.error(
+            "Reconciliation adopted completed Tracerfy queue %s but it carries NO "
+            "download_url — its paid results cannot be ingested automatically",
+            queue.get("id"),
+        )
+        try:
+            from src.workers.ops_alerts import send_ops_alert
+
+            send_ops_alert(
+                "skip_trace", f"adopted_no_url_{queue.get('id')}",
+                "Adopted skip-trace batch has no download URL",
+                f"Tracerfy queue {queue.get('id')} completed and was adopted, but "
+                f"the queue list carries no download_url, so nothing can ingest "
+                f"its results. The batch was charged. Fetch the queue directly "
+                f"(GET /v1/api/queue/{queue.get('id')}) to recover it by hand.",
+            )
+        except Exception as exc:  # noqa: BLE001 — alerting is best-effort
+            _logger.warning("adopted-no-url alert failed: %s", str(exc)[:120])
         return
     try:
         from src.workers.tracerfy_ingest import ingest_tracerfy_batch

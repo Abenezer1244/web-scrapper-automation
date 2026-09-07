@@ -195,6 +195,53 @@ RECORD_TYPES_BY_PLAN: dict[str, frozenset[str]] = {
 }
 
 
+# ─── Display labels ──────────────────────────────────────────────────────────
+# Slugs are the storage/wire form; these are the ONLY forms a customer should
+# ever read. A plan reaches the user as "Starter", never as "starter" and never
+# inside quotes.
+PLAN_LABELS: dict[str, str] = {
+    Plan.STARTER.value: "Starter",
+    Plan.PRO.value: "Pro",
+    Plan.BUSINESS.value: "Business",
+    Plan.AGENCY.value: "Agency",
+}
+
+# Mirrors src/api/routes/segments._RECORD_TYPE_LABELS and
+# src/workers/batch_export._RECORD_TYPE_LABELS, which predate this module-level
+# copy. Those two are byte-identical to each other today; folding them into this
+# one is a separate cleanup, not part of the copy fix that introduced this map.
+RECORD_TYPE_LABELS: dict[str, str] = {
+    "probate": "Probate",
+    "pre_foreclosure": "Pre-Foreclosure",
+    "tax_delinquent": "Tax Delinquent",
+    "code_violation": "Code Violation",
+    "divorce": "Divorce",
+    "death_certificate": "Death Certificate",
+    "trustee_sale": "Trustee Sale",
+}
+
+
+def plan_label(plan: str | None) -> str:
+    """Customer-facing name for a plan slug. An unknown/empty plan reads as the
+    entry tier, matching how every gate treats it (fail closed to starter)."""
+    key = (plan or "").strip().lower()
+    return PLAN_LABELS.get(key) or PLAN_LABELS[Plan.STARTER.value]
+
+
+def record_type_label(slug: str) -> str:
+    """Customer-facing name for a record-type slug. An unmapped slug degrades to
+    a title-cased version of itself rather than leaking the raw underscore form."""
+    key = (slug or "").strip().lower()
+    return RECORD_TYPE_LABELS.get(key) or key.replace("_", " ").title()
+
+
+def count_label(n: int, singular: str, plural: str) -> str:
+    """"1 county" / "2 counties". English pluralization is not the caller's job to
+    re-derive at every message site, and getting it wrong is the kind of detail a
+    customer reads as sloppiness."""
+    return f"{n} {singular if n == 1 else plural}"
+
+
 # Export formats DataExporter.export() can actually produce — the single source
 # of truth shared by the DeliverConfig save-time validator (reject bad NEW
 # saves), the exporter dispatch (the runtime switch), and the worker (coerce a

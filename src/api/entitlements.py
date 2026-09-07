@@ -33,6 +33,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.config.constants import (
     COUNTY_LIMIT_BY_PLAN,
     RECORD_TYPES_BY_PLAN,
+    count_label,
+    plan_label,
+    record_type_label,
 )
 from src.config.settings import settings
 from src.db.models import ScraperConfig, User
@@ -45,7 +48,131 @@ def _plan_of(user: User) -> str:
     return (user.plan or "starter").lower()
 
 
-def record_type_violations(plan: str, record_types: Iterable[str]) -> set[str]:
+# --- Customer-facing copy ---------------------------------------------------
+# A plan limit is NOT an application error: the product is working, the account
+# simply does not cover what was asked for. Every string below is written to be
+# read by a customer, so: no slugs, no quoted plan names, no internal vocabulary
+# ("distinct counties"), no em dashes, and pluralization that is actually right.
+CODE_COUNTY_LIMIT = "county_limit"
+CODE_RECORD_TYPE = "record_type"
+CODE_PLAN_LIMIT = "plan_limit"
+
+
+@dataclass(frozen=True)
+class Violation:
+    """One entitlement failure, carried as structured data rather than prose.
+
+    ``__str__`` is the message, so the pre-existing consumers that interpolate a
+    violation into a log line or a job-failure reason keep working unchanged.
+    Do NOT classify a violation by regex-matching its message: read ``code``.
+    """
+
+    code: str
+    title: str
+    message: str
+
+    def __str__(self) -> str:
+        return self.message
+
+
+def _join_english(items: list[str]) -> str:
+    """['A'] -> 'A'; ['A','B'] -> 'A and B'; ['A','B','C'] -> 'A, B and C'."""
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+def _county_word(n: int) -> str:
+    return count_label(n, "county", "counties")
+
+
+def county_cap_violation(plan: str, projected: int, cap: int) -> Violation:
+    """Create-time: this request would push the account past its county cap.
+
+    ``projected`` is the account-wide distinct-county total, NOT the count in
+    this one request, so the copy says "your account". That keeps it true whether
+    the caller is a single scraper create or a batch fan-out, and true when the
+    overage comes from scrapers the user already saved.
+    """
+    return Violation(
+        code=CODE_COUNTY_LIMIT,
+        title="County limit reached",
+        message=(
+            f"Your {plan_label(plan)} plan includes {_county_word(cap)}. "
+            f"This would put your account at {_county_word(projected)}."
+        ),
+    )
+
+
+def county_outside_plan_violation(plan: str, state: str, county: str, cap: int) -> Violation:
+    """Run-time: this county is not one of the ones the plan currently covers."""
+    where = f"{(county or '').strip().title()}, {(state or '').strip().upper()}"
+    return Violation(
+        code=CODE_COUNTY_LIMIT,
+        title="County limit reached",
+        message=(
+            f"Your {plan_label(plan)} plan includes {_county_word(cap)}. "
+            f"{where} is outside that limit."
+        ),
+    )
+
+
+def record_type_violation(plan: str, record_types: Iterable[str]) -> Violation:
+    """Create- and run-time: one or more requested record types are not covered.
+
+    Deliberately does NOT enumerate what the plan DOES include: on Business that
+    is a seven-item list that buries the one thing the reader needs to know.
+    """
+    labels = sorted({record_type_label(rt) for rt in record_types})
+    subject = _join_english(labels)
+    verb = "is" if len(labels) == 1 else "are"
+    return Violation(
+        code=CODE_RECORD_TYPE,
+        title="Record type not in your plan",
+        message=f"{subject} {verb} not included in your {plan_label(plan)} plan.",
+    )
+
+
+def combine_violations(violations: list[Violation]) -> Violation:
+    """One notice for the whole request. A create can break the county cap AND
+    the record-type matrix at once; showing only the first would send the user
+    back for a second rejection after they fixed it."""
+    if len(violations) == 1:
+        return violations[0]
+    return Violation(
+        code=CODE_PLAN_LIMIT,
+        title="Plan limit reached",
+        message=" ".join(v.message for v in violations),
+    )
+
+
+# Appended to the message on the wire so a non-browser API consumer (which has no
+# Upgrade button to read) still gets a complete instruction.
+_UPGRADE_SENTENCE = "Upgrade your plan to continue."
+
+
+def _plan_limit_http(violation: Violation) -> HTTPException:
+    """402 whose body is structured, not prose.
+
+    The frontend renders ``title`` and ``message`` as a calm plan notice, so the
+    copy must not be reverse-engineered from a sentence. FastAPI serializes a
+    dict detail as-is, and main.py registers no HTTPException handler that would
+    stringify it. Older clients that read ``detail`` as a string will now see an
+    object, so the tolerant frontend parser has to ship first.
+    """
+    return HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        detail={
+            "code": violation.code,
+            "title": violation.title,
+            "message": f"{violation.message} {_UPGRADE_SENTENCE}",
+        },
+    )
+
+
+def disallowed_record_types(plan: str, record_types: Iterable[str]) -> set[str]:
     """Return the requested record types NOT allowed for this plan (lowercased).
 
     Fails CLOSED: an unknown/typo'd plan is treated as the most restrictive tier
@@ -143,33 +270,23 @@ async def enforce_entitlements(
             {"uid": str(user.id)},
         )
 
-    problems: list[str] = []
+    problems: list[Violation] = []
 
-    bad_types = record_type_violations(plan, record_types)
+    bad_types = disallowed_record_types(plan, record_types)
     if bad_types:
-        allowed = sorted(RECORD_TYPES_BY_PLAN.get(plan, RECORD_TYPES_BY_PLAN["starter"]))
-        problems.append(
-            f"record type(s) {sorted(bad_types)} are not in your '{plan}' plan "
-            f"(allowed: {allowed})"
-        )
+        problems.append(record_type_violation(plan, bad_types))
 
     overage = await projected_county_overage(db, user.id, plan, state, counties)
     if overage is not None:
         projected, cap = overage
-        problems.append(
-            f"this would span {projected} distinct counties but your '{plan}' "
-            f"plan allows {cap}"
-        )
+        problems.append(county_cap_violation(plan, projected, cap))
 
     if not problems:
         return
 
-    summary = "; ".join(problems)
+    summary = " ".join(v.message for v in problems)
     if settings.ENTITLEMENT_ENFORCEMENT:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Plan limit reached — {summary}. Upgrade your plan to continue.",
-        )
+        raise _plan_limit_http(combine_violations(problems))
     # Audit/log-only: infrastructure shipped, enforcement deferred.
     _logger.info(
         "entitlement audit (NOT enforced) user=%s plan=%s context=%s would_block: %s",
@@ -239,46 +356,44 @@ def config_run_violation(
     county: str,
     record_type: str,
     active_rows: Iterable[ConfigRow],
-) -> str | None:
-    """Return a human-readable reason if running this (county, record_type) is NOT
-    permitted under the user's CURRENT plan, else None. Fails closed on unknown plan."""
+) -> Violation | None:
+    """Return why running this (county, record_type) is NOT permitted under the
+    user's CURRENT plan, else None. Fails closed on unknown plan.
+
+    Returns a ``Violation``, not a bare string, so the HTTP wrapper can render a
+    titled notice without parsing English. ``Violation.__str__`` is the message,
+    so the worker/scheduler call sites that interpolate the result into a log line
+    or a job-failure reason keep working unchanged."""
     plan = (plan or "starter").lower()
     rt = (record_type or "").lower()
     allowed_types = RECORD_TYPES_BY_PLAN.get(plan, RECORD_TYPES_BY_PLAN["starter"])
     if rt not in allowed_types:
-        return (
-            f"record type '{rt}' is not in your '{plan}' plan "
-            f"(allowed: {sorted(allowed_types)})"
-        )
+        return record_type_violation(plan, [rt])
     allowed = allowed_county_set(active_rows, plan)
     if allowed is not None:
         key = _norm_county(state, county)
         if key not in allowed:
             cap = COUNTY_LIMIT_BY_PLAN.get(plan, COUNTY_LIMIT_BY_PLAN["starter"])
-            return (
-                f"county {key[1]}, {key[0]} is outside your '{plan}' plan's "
-                f"{cap}-county limit"
-            )
+            return county_outside_plan_violation(plan, state, county, cap)
     return None
 
 
-def enforce_runnable_http(violation: str | None, *, user: User, context: str) -> None:
+def enforce_runnable_http(violation: Violation | None, *, user: User, context: str) -> None:
     """API call sites: raise 402 when enforcement is ON and a violation exists,
     else audit-log. No-op when violation is None."""
     if not violation:
         return
     if settings.ENTITLEMENT_ENFORCEMENT:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Plan limit reached — {violation}. Upgrade your plan to continue.",
-        )
+        raise _plan_limit_http(violation)
     _logger.info(
         "entitlement audit (NOT enforced) user=%s plan=%s context=%s would_block: %s",
         user.id, _plan_of(user), context, violation,
     )
 
 
-def should_block_run(violation: str | None, *, user_id: str, plan: str, context: str) -> bool:
+def should_block_run(
+    violation: Violation | None, *, user_id: str, plan: str, context: str
+) -> bool:
     """Worker/scheduler call sites: returns True (caller must block/skip/fail) only
     when enforcement is ON and a violation exists; always audit-logs the would-block."""
     if not violation:

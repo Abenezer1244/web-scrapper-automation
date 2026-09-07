@@ -567,6 +567,22 @@ is true but weak on its own. These are the load-bearing facts:
 ### What remains UNVERIFIED
 
 **What actually changed it.** Railway's log retention did not reach back to the
-22:35Z–01:40Z window. The change is consistent with a manual repair reverting the
-canary's +6 alongside the deletion of 8 `@bl.test` rows created the same day, but
-**no author was identified and none should be asserted.**
+22:35Z–01:40Z window, so **no author was identified and none should be asserted.**
+
+⏭️ **Leading hypothesis, found afterwards — still a hypothesis.** A separate
+workstream records that **production was wiped a second time on 2026-09-06,
+14:40–15:36 UTC** (pytest conftest teardown, same mechanism as 2026-06-29) and
+was restored via PITR — see the 2026-09-07 skip-trace entry in
+`docs/BUILD_JOURNAL.md`. That is the same afternoon the 8 `@bl.test` rows
+appeared (15:37 / 16:09, minutes after the wipe window) and were later removed,
+and a PITR restore to a point before the reservation canary is exactly what
+returns `records_used` to its pre-canary **1001**.
+
+🛑 It does not fit cleanly on the clock — the restore predates the 21:44Z and
+22:35Z readings that both showed 1007 — so the mover was the ongoing cleanup
+rather than the restore itself.
+
+🔑 **The durable lesson:** a second workstream was operating on this same
+production database throughout the deploy, invisible from here. "I cannot
+explain this change" was the correct report; the explanation was in someone
+else's journal entry, not in the data.

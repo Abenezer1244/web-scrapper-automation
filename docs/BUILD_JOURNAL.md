@@ -55,6 +55,118 @@ reservation at all.
 - 🔑 **Railway log retention did not reach the 22:35Z–01:40Z window**, so what
   actually changed the counter is **UNVERIFIED and no author was asserted.**
 
+**⏭️ Likely explanation, found afterwards while merging — still a hypothesis.**
+The entry below records that **production was wiped a second time on 2026-09-06,
+14:40–15:36 UTC**, by the pytest conftest teardown, and restored via PITR. That
+is the same afternoon the 8 `@bl.test` rows appeared (15:37 and 16:09, minutes
+after the wipe window) and were later cleaned up, and a PITR restore to a point
+before the reservation canary is exactly what returns `records_used` to its
+pre-canary **1001**.
+
+🛑 It does NOT fit cleanly on the clock: the restore predates my 21:44Z and
+22:35Z readings, both of which still showed 1007, so something in the ongoing
+cleanup — not the restore itself — moved it afterwards. Recorded as the leading
+hypothesis, **not** as the answer. 🔑 The real lesson is that a second
+workstream was operating on the same production database throughout this deploy
+and I had no visibility into it; "I cannot explain this change" was the correct
+report, and the explanation lived in someone else's journal entry.
+---
+
+## 2026-09-07 — DEPLOYED: skip trace stops losing paid batches; and prod was wiped again
+
+Started as "replace Tracify with SkipMatrix". Ended as a Tracerfy audit, a
+production incident, and a second prod wipe by the pytest teardown.
+
+**Built / Shipped:** PR #232, squash-merged as `85a52fc2`, deployed and verified
+against live traffic.
+- **The post-accept bookkeeping ran outside any `try`.** Everything from
+  `queue_id = response["queue_id"]` to `db.commit()` was unguarded, so a commit
+  failure *after* Tracerfy accepted and charged left a paid queue with no local
+  `skip_trace_queues` row — and the webhook then hit the ingest's
+  `unknown_queue` no-op and dropped the results for good. Production held **14
+  such orphaned queues: 673 rows, 743 credits, never applied to any lead.**
+  Codex found this; I had read past it.
+- **`_reconcile_stale_claims`** — the dispatcher never auto-resubmits an unknown
+  outcome (correct: that pays twice) and deferred to an ops alert that was mute.
+  It now reconciles against `GET /v1/api/queues/`: no queue → release; exactly
+  one → adopt and re-drive ingest; anything ambiguous → refuse and alert.
+- **Pre-submit validation.** Tracerfy requires address+city+state and silently
+  DROPS a row missing one (prod queue 162456: 4 sent, `rows_uploaded=3`), which
+  stranded the lead on "Processing" forever. Now declined at enqueue and failed
+  terminally in the dispatcher.
+- **No silent ingest drops** + the first tests for the ingest path, which had
+  **zero** despite deciding which homeowner's phone lands on which lead and what
+  the tenant is charged. Skip-trace coverage 87 → 164.
+
+**Tried / Decided:**
+- **SkipMatrix has no API — verified, not assumed.** Their own help centre:
+  "proprietary software developed for internal use… no public API." It is a
+  white-glove CSV + invoice + Box-link service. Stopped rather than fabricate a
+  provider client. **Also: the codebase spells it Tracerfy, not Tracify.**
+- **Rejected Codex's match-key change on measurement.** It flagged
+  `(address, city, state)` as a contamination risk. Real in principle, but prod
+  has exactly ONE in-batch collision ever and it is benign (same owner, same
+  tenant). Narrowing the key to include the name would have broken ADVANCED
+  traces, which send no name by design — the fix would have caused a bigger
+  outage than the bug. Added a targeted refusal guard instead.
+- **Measured the city/state gate before shipping it:** 9 of 5000 real Results
+  (0.18%), every one a row Tracerfy would have dropped anyway.
+
+**Failed / Blocked:**
+- **Production was wiped a second time**, 2026-09-06 between 14:40–15:36 UTC,
+  same mechanism as 2026-06-29: the pytest conftest teardown ran against prod.
+  `tests/_db_safety.py` existed but **12 worktrees predated it**, including the
+  MAIN directory — which holds `.env` and the Railway link. Guard now installed
+  in all of them and adversarially verified. Restored via PITR; all 8 tables back.
+- **My first root-cause hypothesis was wrong.** I said cascade-from-`users`.
+  Codex disproved it: `delivered_records` cascades from users and survived with
+  54,251 rows. Its FK to `results` is `ON DELETE SET NULL`, which is exactly why.
+- **I cried wolf on an "active deletion"** — `skip_trace_cache` 381 → 29 came
+  from `n_live_tup`, a stale planner estimate. `COUNT(*)` showed a steady 381.
+- Codex round 3 died mid-run; answered its open question with a test instead.
+
+**Caught & fixed:** Codex ran three rounds and found seven real issues. **Three
+were bugs in my own fixes**, two of them P1:
+- The reconciler read a *pending* Tracerfy queue as "never accepted" and released
+  the claim → **double charge**. Tracerfy hides `rows_uploaded` while a queue is
+  pending (`docs/vendor/tracerfy-api.md` line 30). I had rebuilt the exact
+  failure the durable claim exists to prevent.
+- `rows_uploaded <= claimed` is a subset test, not identity — one claim could
+  adopt another's queue, attaching results to the wrong leads and billing the
+  wrong tenants.
+- `ingest_tracerfy_batch`'s docstring had always promised an `on_failure` that
+  **never existed**. Harmless for months, until my redrive sweep started
+  depending on that exact state.
+
+**Pending / Handoff:**
+- 👤 **Top up Tracerfy ~800 credits.** 635 leads are queued behind a 787-credit
+  shortfall; the dispatcher drains them automatically once funded. The alert
+  fired correctly at 07:24 UTC — the channel works now.
+- 👤 **Billing policy:** an accepted-but-unmatched row is NOT charged to the user,
+  so we absorb the Tracerfy credit. Codex argued for billing it. Made visible and
+  alertable without changing who pays; the call is the owner's.
+- Not fixed deliberately: `SkipTraceQueue.job_id/user_id` hold `claimed[0]` on a
+  cross-tenant batch (documented, nothing reads them for tenancy); ingest
+  downloads before the queue lock (wasteful, never incorrect); passing the
+  scraper config's own `state` into `build_pending_row_payload` would rescue the
+  ~8 rows that carry a ZIP but no city/state.
+
+**Facts learned:**
+- **A pending provider queue is not an absent one.** Absence of a size-match is
+  not proof a batch was never accepted. "Is this queue provably ours?" and "is it
+  provable that NO queue is ours?" need *different* time windows — tight for
+  adoption, wide for release, because release is the direction that costs money.
+- **`n_live_tup` is a stale estimate. Use `COUNT(*)`.** It read 0 for tables with
+  rows and 29 for a table with 381.
+- **How to tell RLS from real data loss:** a table returning 0 under a `qual=true`
+  system policy while ANOTHER table with the same role and same `true` qual
+  returns rows = real loss. `alembic_version` reading 0 is usually just RLS and is
+  a red herring on its own.
+- **Contacts are Fernet-encrypted at rest** (`fe1:`). Read them through the ORM in
+  tests; a raw `SELECT` returns ciphertext and makes assertions silently vacuous.
+- A docstring is not a contract — grep for the implementation before depending on
+  behaviour another function claims to have.
+
 ---
 
 ## 2026-09-06 — entitlement periods: closing the disclosed gaps (no deploy)

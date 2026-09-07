@@ -8,12 +8,15 @@ and an em dash the product owner explicitly banned.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from src.api.entitlements import (
     CODE_COUNTY_LIMIT,
     CODE_PLAN_LIMIT,
     CODE_RECORD_TYPE,
+    ConfigRow,
     Violation,
     _plan_limit_http,
     combine_violations,
@@ -23,8 +26,7 @@ from src.api.entitlements import (
     disallowed_record_types,
     record_type_violation,
 )
-from src.api.entitlements import ConfigRow
-from datetime import UTC, datetime
+from src.config.constants import COUNTY_LIMIT_BY_PLAN, RECORD_TYPES_BY_PLAN
 
 # Every dash a copywriter might reach for that the owner banned outright, plus
 # the two forms that survive a naive find-and-replace.
@@ -214,3 +216,52 @@ def test_disallowed_record_types_still_returns_the_raw_slugs():
     # The gate works in slugs; only the copy layer works in labels.
     assert disallowed_record_types("starter", ["probate", "divorce"]) == {"divorce"}
     assert disallowed_record_types("agency", ["divorce"]) == set()
+
+
+# ── the copy must agree with the gate, not with what the gate MEANT ──────────
+
+
+def test_an_untrimmed_plan_value_reads_as_the_tier_actually_enforced():
+    """A stored plan of "pro " (trailing space) misses every gate lookup, so the
+    account is enforced on STARTER limits. The copy must say Starter too.
+
+    An earlier `plan_label` trimmed before looking up, which produced "Divorce is
+    not included in your Pro plan." for a user being held to Starter's single
+    record type. Pro does include more types; the sentence was simply false, and
+    it would have sent that customer to support insisting their plan was right.
+    """
+    from src.api.entitlements import _plan_of
+    from src.db.models import User
+
+    padded = _plan_of(User(plan="pro "))
+    assert padded not in RECORD_TYPES_BY_PLAN  # the gate does not recognize it
+    assert record_type_violation(padded, ["pre_foreclosure"]).message == (
+        "Pre-Foreclosure is not included in your Starter plan."
+    )
+    assert county_cap_violation(padded, 2, COUNTY_LIMIT_BY_PLAN["starter"]).message == (
+        "Your Starter plan includes 1 county. This would put your account at 2 counties."
+    )
+
+
+def test_plan_names_come_from_the_billing_catalog():
+    """One source of truth for what a plan is called. plans.py exists because a
+    duplicated plan constant once drifted and quoted a price we do not charge;
+    a duplicated NAME would drift the same way."""
+    from src.config.plans import PLAN_CATALOG, plan_label
+
+    for entry in PLAN_CATALOG:
+        assert plan_label(entry["id"]) == entry["name"]
+        assert plan_label(entry["id"]) in county_cap_violation(entry["id"], 99, 1).message
+
+
+def test_record_type_labels_come_from_one_map_shared_with_the_exporters():
+    from src.api.routes.segments import _label as segments_label
+    from src.config.constants import record_type_label
+    from src.workers.batch_export import _label as export_label
+
+    assert segments_label is record_type_label
+    assert export_label is record_type_label
+    # The behaviour the two private copies had, preserved.
+    assert record_type_label("pre_foreclosure") == "Pre-Foreclosure"
+    assert record_type_label("tax_delinquent") == "Tax Delinquent"
+    assert record_type_label("unknown_x") == "Unknown X"

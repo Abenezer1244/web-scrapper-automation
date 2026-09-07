@@ -43,6 +43,12 @@ from src.api.schemas import (
     SegmentUnionResponse,
 )
 from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
+
+# Human-readable record-type labels for the CSV `lists` column. ONE map, shared
+# with src/workers/batch_export.py: both files used to carry an identical private
+# copy of it. The fallback still title-cases an unknown slug so an export never
+# shows a raw token.
+from src.config.constants import record_type_label as _label
 from src.utils.crypto import decrypt_field
 from src.utils.lead_export import PROBATE_SUBTYPE_AGG_SQL, write_lead_csv_with_overlap
 from src.utils.logger import setup_logger
@@ -51,21 +57,6 @@ _logger = setup_logger("api.segments")
 
 router = APIRouter(prefix="/segments", tags=["segments"])
 
-# Human-readable list labels for the CSV `lists` column (matches the frontend).
-# Fallback title-cases an unknown slug so the export never shows a raw token.
-_RECORD_TYPE_LABELS = {
-    "probate": "Probate",
-    "death_certificate": "Death Certificate",
-    "pre_foreclosure": "Pre-Foreclosure",
-    "tax_delinquent": "Tax Delinquent",
-    "divorce": "Divorce",
-    "code_violation": "Code Violation",
-    "eviction": "Eviction",
-}
-
-
-def _label(slug: str) -> str:
-    return _RECORD_TYPE_LABELS.get(slug, slug.replace("_", " ").title())
 
 
 def _filing_sort_key(date_recorded: str | None) -> int:

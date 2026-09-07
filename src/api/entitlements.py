@@ -34,9 +34,9 @@ from src.config.constants import (
     COUNTY_LIMIT_BY_PLAN,
     RECORD_TYPES_BY_PLAN,
     count_label,
-    plan_label,
     record_type_label,
 )
+from src.config.plans import plan_label
 from src.config.settings import settings
 from src.db.models import ScraperConfig, User
 from src.utils.logger import setup_logger

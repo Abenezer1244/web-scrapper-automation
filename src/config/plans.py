@@ -96,6 +96,25 @@ PLAN_CATALOG: list[dict[str, Any]] = [
 _BY_ID: dict[str, dict[str, Any]] = {p["id"]: p for p in PLAN_CATALOG}
 
 
+def plan_label(plan_id: str | None) -> str:
+    """Customer-facing name for a plan id ("starter" -> "Starter").
+
+    Reads the catalog rather than keeping a second name map: this module exists
+    because a duplicated plan constant drifted and quoted a price we do not
+    charge, and a duplicated NAME would drift the same way.
+
+    Normalization is `.lower()` and nothing else, ON PURPOSE. It has to match
+    what the entitlement gates do to `user.plan` exactly. They lower without
+    trimming, so a stored `"pro "` falls through their `.get(plan, starter)` and
+    is enforced as Starter. If this stripped, the same account would be refused
+    on Starter limits while being told it was on Pro, which is a message that is
+    simply false. An unrecognized plan reads as the entry tier, the same tier it
+    is being enforced as.
+    """
+    entry = _BY_ID.get((plan_id or "").lower())
+    return str((entry or _BY_ID["starter"])["name"])
+
+
 def get_plan(plan_id: str) -> dict[str, Any]:
     """Return the catalog entry for ``plan_id``.
 

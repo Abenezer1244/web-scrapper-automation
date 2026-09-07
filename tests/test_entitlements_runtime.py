@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 from src.api.entitlements import (
+    CODE_RECORD_TYPE,
     PAUSED_REASON_ENTITLEMENT,
     ConfigRow,
     allowed_county_set,
@@ -35,7 +36,10 @@ def test_allowed_county_set_unlimited_returns_none():
 def test_run_violation_blocks_disallowed_record_type():
     rows = [_row(1, "King", rt="pre_foreclosure")]
     v = config_run_violation("starter", "WA", "King", "pre_foreclosure", rows)
-    assert v is not None and "record type" in v
+    # Assert the CODE, not the prose. This used to read `"record type" in v` and
+    # so pinned the customer-facing sentence to an implementation phrase; the
+    # copy now says "Pre-Foreclosure is not included in your Starter plan."
+    assert v is not None and v.code == CODE_RECORD_TYPE
 
 
 def test_run_violation_blocks_county_over_cap():

@@ -197,19 +197,14 @@ RECORD_TYPES_BY_PLAN: dict[str, frozenset[str]] = {
 
 # ─── Display labels ──────────────────────────────────────────────────────────
 # Slugs are the storage/wire form; these are the ONLY forms a customer should
-# ever read. A plan reaches the user as "Starter", never as "starter" and never
-# inside quotes.
-PLAN_LABELS: dict[str, str] = {
-    Plan.STARTER.value: "Starter",
-    Plan.PRO.value: "Pro",
-    Plan.BUSINESS.value: "Business",
-    Plan.AGENCY.value: "Agency",
-}
-
-# Mirrors src/api/routes/segments._RECORD_TYPE_LABELS and
-# src/workers/batch_export._RECORD_TYPE_LABELS, which predate this module-level
-# copy. Those two are byte-identical to each other today; folding them into this
-# one is a separate cleanup, not part of the copy fix that introduced this map.
+# ever read. Plan NAMES are not here: they live on the catalog entries in
+# src/config/plans.py (`plan_label`), which is the single source of truth for
+# anything a customer is shown about a plan.
+#
+# This is the one record-type label map. src/api/routes/segments.py and
+# src/workers/batch_export.py both used to carry their own identical copy; the
+# worker kept a local one only to avoid importing an API route module, which
+# this module is not.
 RECORD_TYPE_LABELS: dict[str, str] = {
     "probate": "Probate",
     "pre_foreclosure": "Pre-Foreclosure",
@@ -218,14 +213,10 @@ RECORD_TYPE_LABELS: dict[str, str] = {
     "divorce": "Divorce",
     "death_certificate": "Death Certificate",
     "trustee_sale": "Trustee Sale",
+    # No live connector yet, but it was in both of the maps this replaces and
+    # the fallback would render it identically anyway.
+    "eviction": "Eviction",
 }
-
-
-def plan_label(plan: str | None) -> str:
-    """Customer-facing name for a plan slug. An unknown/empty plan reads as the
-    entry tier, matching how every gate treats it (fail closed to starter)."""
-    key = (plan or "").strip().lower()
-    return PLAN_LABELS.get(key) or PLAN_LABELS[Plan.STARTER.value]
 
 
 def record_type_label(slug: str) -> str:

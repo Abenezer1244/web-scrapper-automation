@@ -98,6 +98,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy import text  # noqa: E402
 
+from src.api.quota import is_over_record_limit  # noqa: E402
 from src.api.quota_window import add_months, as_utc, effective_window  # noqa: E402
 from src.db.session import system_sync_session  # noqa: E402
 
@@ -417,7 +418,8 @@ def main() -> int:
                     "SELECT id, plan, records_used, records_limit, "
                     "records_period_start, quota_anchor_at, quota_period_start, "
                     "quota_period_end, subscription_status, entitlement_ends_at, "
-                    "entitlement_grace_ends_at FROM users"
+                    "entitlement_grace_ends_at, pending_plan, pending_records_limit "
+                    "FROM users"
                 )
             ).mappings().all()
     except Exception as exc:  # noqa: BLE001 - report, never mask, a connect failure
@@ -501,7 +503,9 @@ def main() -> int:
         print(f"  plan            : {watched.plan}")
         print(f"  records_used    : {watched.records_used}")
         print(f"  records_limit   : {watched.records_limit}")
-        print(f"  over cap        : {watched.records_used > watched.records_limit}")
+        # Same predicate as the gates, not `used > limit`: the product blocks at
+        # `used >= limit`, so a raw `>` would print False at exactly 1000/1000.
+        print(f"  over cap        : {is_over_record_limit(watched, now)}")
         print(f"  records_period_start : {_fmt(watched.records_period_start)}")
         print(f"  quota_anchor_at      : {_fmt(watched.quota_anchor_at)}")
         print(
@@ -524,9 +528,16 @@ def main() -> int:
                 f"{WATCHED_EXPECTED_USED}. Confirm which is intended before "
                 "trusting this run, and update WATCHED_EXPECTED_USED."
             )
-        if watched.records_used <= watched.records_limit:
+        # Ask the SAME predicate enforcement asks, never a hand-rolled compare.
+        # is_over_record_limit() is `used >= limit` (and -1 is never over), so a
+        # raw `used <= limit` here would report "no longer over cap" at exactly
+        # 1000/1000 — a state the product still blocks. Since this line is the
+        # invariant operators are told to trust, it has to agree with the gates
+        # rather than approximate them. (Codex)
+        if not is_over_record_limit(watched, now):
             print(
-                "  ** This account is NO LONGER over cap. That is a real state "
+                "  ** This account is NO LONGER over its record limit, per the "
+                "same predicate the enforcement gates use. That is a real state "
                 "change -- it should stay blocked until 2026-10-01."
             )
         print("-" * 72)

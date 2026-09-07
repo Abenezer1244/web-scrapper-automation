@@ -627,3 +627,66 @@ async def test_dedup_shrinking_the_upload_also_suppresses_unmatched_billing(
     # The two rows at 9 SAME ST reconciled from one CSV row and bill; the
     # unmatched 10 OTHER ST does not, because the upload shrank.
     assert _usage(starter_user.id) == before + 2
+
+
+@pytest.mark.asyncio
+async def test_unmatched_settlement_cannot_touch_another_tenants_lead(
+    starter_user, business_user, _stub_csv
+):
+    """A Tracerfy batch is grouped by trace_type, so it spans tenants. The
+    terminal 'errored' update on unmatched rows must be pinned to (id, user_id),
+    not id alone -- the project rule is that every query filters by user_id, with
+    RLS as belt and the query filter as suspenders (Codex, 2026-09-07).
+    """
+    qid = _next_queue_id()
+    mine = _seed(starter_user.id, qid, [("40 MINE ST", "TACOMA", "WA")])
+    # Second tenant joins the SAME batch. _seed cannot be reused here because it
+    # inserts a skip_trace_queues row and tracerfy_queue_id is UNIQUE -- which is
+    # itself the point: one queue, several tenants.
+    theirs_rid, theirs_pid = str(uuid.uuid4()), str(uuid.uuid4())
+    theirs_sc, theirs_job = str(uuid.uuid4()), str(uuid.uuid4())
+    with system_sync_session() as db:
+        db.execute(text("""
+            INSERT INTO scraper_configs (id, user_id, name, county, state, record_type,
+                fields, enrichment, schedule, deliver, skip_trace_enabled, active)
+            VALUES (:sc, :u, 'tenant2', 'pierce', 'WA', 'probate', '[]'::json,
+                    '[]'::json, '{"frequency":"manual"}'::json,
+                    '{"format":"csv","emails":[]}'::json, true, true)"""),
+            {"sc": theirs_sc, "u": business_user.id})
+        db.execute(text("""
+            INSERT INTO jobs (id, user_id, scraper_config_id, status, trigger,
+                page_current, page_total, record_count, retry_count)
+            VALUES (:j, :u, :sc, 'done', 'manual', 0, 0, 0, 0)"""),
+            {"j": theirs_job, "u": business_user.id, "sc": theirs_sc})
+        db.execute(text("""
+            INSERT INTO results (id, job_id, user_id, is_duplicate, skip_trace_status,
+                party_name, property_address, created_at)
+            VALUES (:r, :j, :u, false, 'submitted', 'DOE JOHN', '41 THEIRS ST', now())"""),
+            {"r": theirs_rid, "j": theirs_job, "u": business_user.id})
+        db.execute(text("""
+            INSERT INTO pending_skip_trace_rows (id, job_id, result_id, user_id,
+                property_address, city, state, trace_type, status, enqueued_at,
+                submitted_at, tracerfy_queue_id)
+            VALUES (:p, :j, :r, :u, '41 THEIRS ST', 'TACOMA', 'WA', 'normal',
+                    'submitted', now(), now(), :q)"""),
+            {"p": theirs_pid, "j": theirs_job, "r": theirs_rid,
+             "u": business_user.id, "q": qid})
+        db.commit()
+    theirs = {"rows": [{"result_id": theirs_rid, "pending_id": theirs_pid}]}
+    # Nothing matches: both tenants' rows go unmatched in the same batch.
+    _stub_csv(_csv("99 NOBODY ST,TACOMA,WA,J,D,,,,,,,"))
+
+    out = ingest_tracerfy_batch(
+        queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=2, credits_deducted=2
+    )
+
+    assert out["unmatched_rows"] == 2
+    # Each tenant's own lead is settled, and settled as its OWN row.
+    for seed, uid in ((mine, starter_user.id), (theirs, business_user.id)):
+        rid = seed["rows"][0]["result_id"]
+        assert _result_row(rid).skip_trace_status == "errored"
+        with system_sync_session() as db:
+            owner = db.execute(
+                text("SELECT user_id FROM results WHERE id = :r"), {"r": rid}
+            ).scalar_one()
+        assert str(owner) == str(uid), "a lead was settled under the wrong tenant"

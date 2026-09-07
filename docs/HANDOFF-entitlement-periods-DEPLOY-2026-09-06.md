@@ -9,9 +9,14 @@
 > **Step 2 verified against production: 12/12 users pass all hard checks,
 > "Migration 088 moved nobody."** `records_used` identical to the pre-deploy
 > snapshot for all 12; window start unchanged for all 12; zero rollovers.
-> The watched account `01dc9396-9a36-49b5-9b98-5343ec107232` is **1007 / 1000,
+> The watched account `01dc9396-9a36-49b5-9b98-5343ec107232` was **1007 / 1000,
 > over cap, window [2026-09-01 → 2026-10-01), next reset 2026-10-01** — exactly
-> as required.
+> as required, confirmed twice after the migration.
+>
+> ⚠️ **It later read 1001 (the canary's +6 reverted), by something outside this
+> deploy. The operator confirmed on 2026-09-07 that 1001 is the intended
+> value.** Still over the 1000 cap, still blocked until 2026-10-01, which is the
+> property that actually matters. See §11.
 >
 > **Step 3 (`backfill_quota_anchors.py`) was a genuine NO-OP and was NOT
 > applied.** The dry run found **0 candidates**: production has **zero users
@@ -181,12 +186,20 @@ main repo's entry).
 CI. Confirm the Test check reads SUCCESS before merging.
 
 ### The live account to explain afterwards
-`zowiegirma29@gmail.com` (user id `01dc9396…`), plan pro, **`records_used = 1007`,
-`records_limit = 1000`, `records_period_start = 2026-09-01`**. That 1007 is
-CORRECT — 1,001 restored by an earlier incident repair + 6 from a live reservation
-canary. Migration 088 must leave it at **1007, still over cap, next reset
-2026-10-01**. Do NOT "fix" it to a nicer number. Proven by test
-(`test_migration_does_not_rescue_the_known_over_cap_account`), never in prod.
+`zowiegirma29@gmail.com` (user id `01dc9396…`), plan pro,
+**`records_limit = 1000`, `records_period_start = 2026-09-01`**.
+
+`records_used` was **1007** going into the deploy — 1,001 restored by an earlier
+incident repair + 6 from a live reservation canary — and migration 088 left it
+at 1007, confirmed twice in production. **It now reads 1001; the operator
+confirmed 2026-09-07 that 1001 is intended.** See §11 for what changed it.
+
+🔑 **The number is not the invariant — being over cap is.** Either value exceeds
+the 1000 limit, so the account stays blocked until its window rolls on
+2026-10-01. Do NOT "fix" it to a nicer number in either direction. Pinned by
+test (`test_migration_does_not_rescue_the_known_over_cap_account`) and by
+`WATCHED_EXPECTED_USED` in `scripts/verify_entitlement_deploy.py`, which now
+prints a loud MISMATCH rather than passing silently if it moves again.
 
 ---
 
@@ -514,3 +527,46 @@ a quiesced production.
 and had already convinced myself were correct. The FE `challenge` mode also
 found two P1s that plain `codex review` reported as clean — **the adversarial
 pass is not optional on this project.**
+
+---
+
+## 11. THE WATCHED ACCOUNT MOVED 1007 → 1001 (not the deploy)
+
+Observed on the post-`#234` verification run. **Operator confirmed 2026-09-07:
+1001 is the intended value.** No database change was made — production already
+read 1001; only the artefacts that asserted 1007 were corrected.
+
+### Why this was not the deploy — by mechanism, not by timeline
+
+The timeline argument (*"I saw 1007 after the migration, so it changed later"*)
+is true but weak on its own. These are the load-bearing facts:
+
+- **Migration 088 never writes `records_used`** — the column appears in that
+  file only in comments.
+- **The stranded-reservation sweep is PRE-EXISTING**, already in the base
+  `a009f15` on a 300s beat. The deploy neither introduced nor re-enabled it, so
+  it cannot have "suddenly fired".
+- **Live worker logs:** `sweep_quota_reservations` returns **0** on every run,
+  and the new `reconcile_quota_periods` reports `rolled 0 window(s), retired 0
+  lapsed, reconciled 0 user(s)`. The shipped beats are inert.
+- **No job for that user holds a reservation** (`reserved_at` NULL,
+  `reserved_count` 0), so the sweep's WHERE clause matches nothing for them.
+
+### Two claims that had to be retracted — do not re-derive them
+
+- 🛑 *"My change refunds less for pre-088 jobs, so it cannot have caused a −6."*
+  **FALSE.** A job with a NULL `jobs.quota_period_start` **keeps the month
+  comparison it was written under**. Behaviour for those rows is UNCHANGED, not
+  reduced. This one is seductive because it sounds like the retire-without-refund
+  path; it is not.
+- 🛑 *"`users.updated_at` still reads 2026-09-05, so nothing wrote the row."*
+  **Overstated.** A raw SQL `UPDATE` that does not touch `updated_at` leaves it
+  stale — which is exactly what a repair script does. A stale `updated_at` is
+  consistent with no write; it is not evidence of one.
+
+### What remains UNVERIFIED
+
+**What actually changed it.** Railway's log retention did not reach back to the
+22:35Z–01:40Z window. The change is consistent with a manual repair reverting the
+canary's +6 alongside the deletion of 8 `@bl.test` rows created the same day, but
+**no author was identified and none should be asserted.**

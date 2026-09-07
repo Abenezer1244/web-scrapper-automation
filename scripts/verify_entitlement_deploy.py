@@ -101,9 +101,22 @@ from sqlalchemy import text  # noqa: E402
 from src.api.quota_window import add_months, as_utc, effective_window  # noqa: E402
 from src.db.session import system_sync_session  # noqa: E402
 
-# The account the handoff calls out by name. Its 1007/1000 is CORRECT and must
-# survive the deploy untouched; it is printed in full whether or not it passes.
+# The account the handoff calls out by name. Printed in full whether or not it
+# passes, because it is the one row an operator should eyeball by hand.
 WATCHED_USER_PREFIX = "01dc9396"
+
+# Its expected counter. Was 1007 through the 088 deploy (1001 from an earlier
+# incident repair + 6 from a live reservation canary), and 1007 was confirmed
+# twice in production AFTER the migration ran. It later read 1001 — the
+# canary's +6 reverted by something outside this deploy, during a window whose
+# logs no longer reach back. **The operator confirmed 1001 is the intended
+# value on 2026-09-07**, so that is what this asserts.
+#
+# Still over the 1000 limit either way, which is the property that actually
+# matters: this account must stay BLOCKED until its window rolls on 2026-10-01.
+# Do not "fix" it to a nicer number in either direction without asking.
+WATCHED_EXPECTED_USED = 1001
+WATCHED_EXPECTED_LIMIT = 1000
 
 
 def _fmt(value: datetime | None) -> str:
@@ -496,8 +509,26 @@ def main() -> int:
             f"-> {_fmt(watched.quota_period_end)})"
         )
         print(f"  effective window     : [{_fmt(eff_start)} -> {_fmt(eff_end)})")
-        print("  EXPECTED: records_used 1007, limit 1000, over cap True,")
+        print(
+            f"  EXPECTED: records_used {WATCHED_EXPECTED_USED}, "
+            f"limit {WATCHED_EXPECTED_LIMIT}, over cap True,"
+        )
         print("            next reset 2026-10-01. Do NOT 'fix' this number.")
+        if watched.records_used != WATCHED_EXPECTED_USED:
+            # Loud, but not a hard failure: the expected value is a hand-maintained
+            # constant, and this account legitimately moves the day it converts to
+            # paid (P1 re-anchors and zeroes it). Say so rather than either passing
+            # silently or blocking a deploy on a stale literal.
+            print(
+                f"  ** MISMATCH: reads {watched.records_used}, expected "
+                f"{WATCHED_EXPECTED_USED}. Confirm which is intended before "
+                "trusting this run, and update WATCHED_EXPECTED_USED."
+            )
+        if watched.records_used <= watched.records_limit:
+            print(
+                "  ** This account is NO LONGER over cap. That is a real state "
+                "change -- it should stay blocked until 2026-10-01."
+            )
         print("-" * 72)
     else:
         print(f"\nNOTE: no user id starting {WATCHED_USER_PREFIX!r} was found.")

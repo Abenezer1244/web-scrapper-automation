@@ -1,7 +1,29 @@
-# HANDOFF — branch `fix/pricing-county-row` (PR #235)
+# HANDOFF — branch `fix/pricing-county-row` (PR #235) — ✅ CLOSED 2026-09-07
 
-**Written:** 2026-09-07 · **Branch:** `fix/pricing-county-row` · **PR:** #235 (OPEN, CI green, MERGEABLE/CLEAN)
-**Read this first. It is the complete state. Do not re-derive it from git log.**
+> # ⚠️ THIS HANDOFF IS RESOLVED AND PARTLY WRONG. DO NOT ACT ON IT.
+> Kept for history only. The live record is `docs/BUILD_JOURNAL.md` (entry
+> "2026-09-07 — Codex was dead for a day, and I nearly rebuilt an endpoint we deleted on purpose").
+>
+> **All of it shipped:**
+> - §6 decision: operator chose **Option A**. **PR #235 merged → `d8a32c5`** (page now 1 / 3 / 10 / Unlimited).
+> - §4a's attribution was wrong and was corrected in **#240 `a440927`** — BOTH create paths use
+>   `get_rls_db` (which wraps `get_db`); they do not differ. The conclusion still held.
+> - §5's Codex outage: root cause was a **server-side model rotation to `gpt-6-astra`
+>   (`minimal_client_version: 0.153.0`) that CLI 0.152.1 could not use** — not quota, not auth.
+>   Fixed by upgrading to 0.153.4 and repinning. The roster is queryable:
+>   `GET https://chatgpt.com/backend-api/codex/models?client_version=<ver>`.
+>
+> **🛑 §4c IS DANGEROUSLY WRONG — do not follow it.** It says `POST /scrapers/preview` is
+> "the ONLY thing genuinely absent from main… rewrite the endpoint fresh if wanted."
+> That endpoint was **deleted deliberately** in **#128 (`493072a`)** because it persisted
+> `active=False` configs that ran and **billed real records** but never appeared on the dashboard —
+> the "I scraped and nothing shows" bug. `tests/test_scraper_single_start_run.py` locks it out from
+> both sides. Acting on §4c re-opens a closed bug; it was tried on 2026-09-07 and reverted.
+> The branch is retired — tip preserved as tag `archive-fields-output-visibility` (`1311448`).
+>
+> **Absence from `main` is not a TODO. Check for a deletion commit and a regression test first.**
+
+**Written:** 2026-09-07 · **Branch:** `fix/pricing-county-row` (deleted) · **PR:** #235 (MERGED `d8a32c5`)
 
 ---
 

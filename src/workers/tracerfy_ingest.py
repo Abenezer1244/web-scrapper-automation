@@ -295,7 +295,7 @@ def ingest_tracerfy_batch(
     SkipTraceQueue row (see the on_failure hook below) so ops can see what
     happened and the reconciler's redrive sweep stops re-enqueueing it.
     """
-    from sqlalchemy import select, update
+    from sqlalchemy import select, tuple_, update
 
     from src.db.models import (
         PendingSkipTraceRow,
@@ -597,10 +597,19 @@ def ingest_tracerfy_batch(
                 .where(PendingSkipTraceRow.id.in_([p.id for p in unmatched_pending]))
                 .values(status="unmatched")
             )
+            # Tenant filter is MANDATORY here, not decorative: a Tracerfy batch
+            # is grouped by trace_type and spans tenants, and the project rule is
+            # that every query filters by user_id (RLS is belt, this is
+            # suspenders). The matched path above already pairs id with user_id;
+            # this one did not, so it is pinned with a (id, user_id) tuple that
+            # preserves the pairing instead of matching ids from any tenant
+            # (Codex, 2026-09-07).
             db.execute(
                 update(Result)
                 .where(
-                    Result.id.in_([p.result_id for p in unmatched_pending]),
+                    tuple_(Result.id, Result.user_id).in_(
+                        [(p.result_id, p.user_id) for p in unmatched_pending]
+                    ),
                     Result.skip_trace_status.in_(("queued", "submitted")),
                 )
                 .values(skip_trace_status="errored", skip_trace_attempted_at=now)

@@ -358,7 +358,7 @@ def _fail_unsubmittable(db, rows: list) -> None:
     """
     if not rows:
         return
-    from sqlalchemy import update
+    from sqlalchemy import tuple_, update
 
     from src.db.models import PendingSkipTraceRow, Result
 
@@ -367,10 +367,14 @@ def _fail_unsubmittable(db, rows: list) -> None:
         .where(PendingSkipTraceRow.id.in_([r.id for r in rows]))
         .values(status="errored")
     )
+    # Same mandatory tenant pairing as the ingest path: the FIFO head this was
+    # selected from spans tenants, so ids are pinned to their owner.
     db.execute(
         update(Result)
         .where(
-            Result.id.in_([r.result_id for r in rows]),
+            tuple_(Result.id, Result.user_id).in_(
+                [(r.result_id, r.user_id) for r in rows]
+            ),
             Result.skip_trace_status.in_(("queued", "submitted")),
         )
         .values(skip_trace_status="errored", skip_trace_attempted_at=datetime.now(UTC))

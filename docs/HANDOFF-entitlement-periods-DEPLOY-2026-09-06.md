@@ -1,7 +1,39 @@
-# HANDOFF — entitlement periods, ready to deploy
+# HANDOFF — entitlement periods — ✅ DEPLOYED 2026-09-06
 
-**Written 2026-09-06.** Paste this whole file into a fresh Claude Code session.
-The work is **built, reviewed and merge-ready**. Nothing has touched production.
+> ## ✅ SHIPPED. This document is now a record, not a plan.
+>
+> **BE #231 merged `e323678`** — Build & Push + **Run Migrations (088) both
+> succeeded** in production.
+> **FE #116 merged `bfa7a50`** — master CI green, Vercel deployed.
+>
+> **Step 2 verified against production: 12/12 users pass all hard checks,
+> "Migration 088 moved nobody."** `records_used` identical to the pre-deploy
+> snapshot for all 12; window start unchanged for all 12; zero rollovers.
+> The watched account `01dc9396-9a36-49b5-9b98-5343ec107232` is **1007 / 1000,
+> over cap, window [2026-09-01 → 2026-10-01), next reset 2026-10-01** — exactly
+> as required.
+>
+> **Step 3 (`backfill_quota_anchors.py`) was a genuine NO-OP and was NOT
+> applied.** The dry run found **0 candidates**: production has **zero users
+> with a `stripe_subscription_id`** (12 users, 0 sub ids, 3 customer ids, 1
+> non-null subscription_status). There is no Stripe anniversary to move anyone
+> to. Everyone stays day-1 anchored, which is correct — future conversions
+> anchor themselves at `billing_cycle_anchor` via P1. **Re-run the dry run
+> before ever applying it, once real subscriptions exist.**
+>
+> Pre-deploy snapshot kept at
+> `C:/Users/Windows/bridgeleads-deploy-2026-09-06/pre088.json` (12 users, taken
+> 21:26:49Z, before the merge). It is the only record of the pre-088 state.
+>
+> 🛑 **The verifier failed its FIRST production run** —
+> `InvalidToken('unencrypted value rejected under strict mode')`. The ORM read
+> decrypts `email` and one legacy row holds an unencrypted value, so the whole
+> audit aborted on a deploy where the quota data was fine. Fixed in `b824cb2`
+> (raw SQL, never loads the column). Found by RUNNING it, not by four rounds of
+> review.
+
+**Written 2026-09-06.** The sections below are the plan as it stood before the
+deploy, preserved for the reasoning and the landmines.
 
 ---
 

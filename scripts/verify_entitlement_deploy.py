@@ -92,13 +92,13 @@ import json
 import os
 import sys
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sqlalchemy import select, text  # noqa: E402
+from sqlalchemy import text  # noqa: E402
 
 from src.api.quota_window import add_months, as_utc, effective_window  # noqa: E402
-from src.db.models import User  # noqa: E402
 from src.db.session import system_sync_session  # noqa: E402
 
 # The account the handoff calls out by name. Its 1007/1000 is CORRECT and must
@@ -166,7 +166,7 @@ def take_snapshot(path: str) -> int:
 
 
 def _check_user(
-    user: User,
+    user: SimpleNamespace,
     now: datetime,
     base: dict | None,
     strict_counter: bool,
@@ -389,12 +389,29 @@ def main() -> int:
     # run without an RLS context. Under a per-user session the SELECT returns
     # zero rows and the script would report a vacuous PASS -- which is why the
     # empty result below is a FATAL, not a clean run.
+    #
+    # Raw SQL over named columns rather than select(User), for the same reason
+    # take_snapshot() does it: the ORM model maps `email` through the field
+    # encryptor, and a single legacy row with an unencrypted value aborts the
+    # WHOLE read with InvalidToken under strict mode. A quota audit has no
+    # business decrypting anybody's email -- it never prints one -- so it does
+    # not load the column at all. (Observed against production: this exact
+    # failure, on a deploy where nothing was wrong with the quota data.)
     try:
         with system_sync_session() as db:
-            users = list(db.execute(select(User)).scalars())
+            rows = db.execute(
+                text(
+                    "SELECT id, plan, records_used, records_limit, "
+                    "records_period_start, quota_anchor_at, quota_period_start, "
+                    "quota_period_end, subscription_status, entitlement_ends_at, "
+                    "entitlement_grace_ends_at FROM users"
+                )
+            ).mappings().all()
     except Exception as exc:  # noqa: BLE001 - report, never mask, a connect failure
         print(f"FATAL: could not read users: {exc!r}", file=sys.stderr)
         return 2
+
+    users = [SimpleNamespace(**dict(r)) for r in rows]
 
     if args.user:
         users = [u for u in users if str(u.id).startswith(args.user)]
@@ -404,11 +421,11 @@ def main() -> int:
         print("FATAL: no users matched -- refusing to report a vacuous PASS.", file=sys.stderr)
         return 2
 
-    counter_drift: list[User] = []
-    failed: list[tuple[User, list[str]]] = []
-    rolled: list[tuple[User, list[str]]] = []
-    watched: User | None = None
-    missing_from_baseline: list[User] = []
+    counter_drift: list[SimpleNamespace] = []
+    failed: list[tuple[SimpleNamespace, list[str]]] = []
+    rolled: list[tuple[SimpleNamespace, list[str]]] = []
+    watched: SimpleNamespace | None = None
+    missing_from_baseline: list[SimpleNamespace] = []
 
     for user in users:
         if str(user.id).startswith(WATCHED_USER_PREFIX):
@@ -440,7 +457,7 @@ def main() -> int:
         if args.limit and shown >= args.limit:
             print(f"... {len(failed) - shown} more failing users not shown (--limit)")
             break
-        print(f"\nFAIL  {user.id}  {user.email}  plan={user.plan}")
+        print(f"\nFAIL  {user.id}  plan={user.plan}")
         for line in failures:
             print(f"      {line}")
         shown += 1
@@ -451,7 +468,7 @@ def main() -> int:
             "(created after the snapshot). C1/C2/C8 were not judged for them."
         )
         for user in missing_from_baseline[: args.limit or len(missing_from_baseline)]:
-            print(f"  {user.id}  {user.email}")
+            print(f"  {user.id}")
 
     if rolled:
         print(f"\n{len(rolled)} user(s) carry an informational note (C5 / C7).")
@@ -460,14 +477,14 @@ def main() -> int:
         print("reconcile_quota_periods. It only invalidates C1/C2 -- which is why those")
         print("become hard failures above unless --baseline was supplied.")
         for user, notes in rolled[: args.limit or len(rolled)]:
-            print(f"  {user.id}  {user.email}")
+            print(f"  {user.id}")
             for line in notes:
                 print(f"      {line}")
 
     if watched is not None:
         eff_start, eff_end = effective_window(watched, now)
         print("\n" + "-" * 72)
-        print(f"WATCHED ACCOUNT  {watched.id}  {watched.email}")
+        print(f"WATCHED ACCOUNT  {watched.id}")
         print(f"  plan            : {watched.plan}")
         print(f"  records_used    : {watched.records_used}")
         print(f"  records_limit   : {watched.records_limit}")

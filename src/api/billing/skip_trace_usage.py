@@ -255,7 +255,25 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
     committing (the caller commits).
 
     Reads pending_skip_trace_rows for the given Tracerfy queue_id, groups by
-    user_id, and calls report_lookups_for_user for each user. The counter
+    user_id, and calls report_lookups_for_user for each user.
+
+    WHAT COUNTS AS A BILLABLE LOOKUP (owner decision, 2026-09-07):
+
+      'completed' — reconciled normally. A hit AND a miss both bill: the
+                    provider searched, and "no contact exists" is a real answer.
+      'unmatched' — Tracerfy accepted the row and charged a credit for it, but
+                    our address reconciliation could not map the answer back to
+                    the lead. The lookup was genuinely performed and genuinely
+                    paid for, so it counts against the customer's quota.
+
+    Deliberately EXCLUDED:
+
+      'errored'   — rejected by the dispatcher's pre-submit validation, so
+                    Tracerfy never saw the row and never charged for it.
+                    Billing these would charge customers for lookups that were
+                    never sent. This is why ingest marks its unmatched rows
+                    'unmatched' rather than reusing 'errored'.
+      'queued' / 'submitting' / 'submitted' — not yet settled. The counter
     advances land in the CALLER'S transaction (the ingest worker commits them
     alongside the SkipTraceQueue status flip, per REDTEAM B1).
 
@@ -293,16 +311,53 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
     # batches share users could otherwise lock them in opposite orders (U1→U2
     # vs U2→U1) and deadlock. Taking the locks in a deterministic ascending
     # user_id order across all batches makes a deadlock impossible.
+    # Only bill 'unmatched' rows when Tracerfy demonstrably accepted EVERY row
+    # we sent for this batch.
+    #
+    # Tracerfy both DROPS rows it cannot use and DEDUPLICATES identical
+    # addresses (prod: 25 sent -> 24 uploaded). A row it never accepted also
+    # never appears in the result CSV, so it lands on 'unmatched' looking exactly
+    # like a row that was accepted, charged, and merely failed to reconcile.
+    # Billing those would charge the customer for a lookup the provider never
+    # performed -- which is NOT the decision that was made.
+    #
+    # There is no way to tell WHICH specific rows were dropped, so rather than
+    # invent an apportionment we use the only signal that is certain: if
+    # rows_uploaded covers everything we submitted, no row was dropped or
+    # deduped and every unmatched row was genuinely paid for. If it does not,
+    # this batch bills 'completed' rows only -- erring toward the customer.
+    accepted_all = db.execute(
+        text("""
+            SELECT COALESCE(q.rows_uploaded, 0) >= COUNT(p.id)
+            FROM skip_trace_queues q
+            JOIN pending_skip_trace_rows p
+              ON p.tracerfy_queue_id = q.tracerfy_queue_id
+            WHERE q.tracerfy_queue_id = :qid
+            GROUP BY q.rows_uploaded
+        """),
+        {"qid": queue_id},
+    ).scalar()
+
+    billable_states = ("completed", "unmatched") if accepted_all else ("completed",)
+    if not accepted_all:
+        _logger.warning(
+            "Skip-trace billing queue %d: Tracerfy uploaded fewer rows than we "
+            "submitted (dropped or de-duplicated), so unmatched rows are NOT "
+            "billed for this batch — the customer is not charged for a lookup "
+            "the provider never ran.",
+            queue_id,
+        )
+
     rows = db.execute(
         text("""
             SELECT user_id, COUNT(*) as n
             FROM pending_skip_trace_rows
             WHERE tracerfy_queue_id = :qid
-              AND status = 'completed'
+              AND status = ANY(:states)
             GROUP BY user_id
             ORDER BY user_id
         """),
-        {"qid": queue_id},
+        {"qid": queue_id, "states": list(billable_states)},
     ).fetchall()
 
     summary: dict = {"queue_id": queue_id, "users": [], "outbox_ids": []}

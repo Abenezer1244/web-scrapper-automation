@@ -570,19 +570,32 @@ def ingest_tracerfy_batch(
         # Settle rows the result CSV never named. Tracerfy finished this batch,
         # so these will never be answered: leaving them 'submitted' stranded the
         # lead on "Processing" indefinitely (confirmed in production on queue
-        # 162456). Give them the existing terminal 'errored' state on BOTH the
-        # pending row and its Result so the UI shows "Error" and ops can see them.
+        # 162456).
         #
-        # They stay OUT of the billing rollup below (which counts only
-        # 'completed'), so the user is not charged for a lookup they never
-        # received. That under-bills us against the credits Tracerfy consumed —
-        # a deliberate, now-VISIBLE tradeoff rather than the previous silent one.
+        # Status is 'unmatched', NOT 'errored', and the distinction is a BILLING
+        # one (owner decision, 2026-09-07: the customer pays for these).
+        #
+        #   'errored'   — rejected BEFORE the POST by the dispatcher's pre-submit
+        #                 validation. Tracerfy never saw the row and never charged
+        #                 for it, so the customer must NEVER be billed. These rows
+        #                 carry tracerfy_queue_id IS NULL.
+        #   'unmatched' — Tracerfy ACCEPTED the row and charged a credit for it;
+        #                 only our address reconciliation failed. The lookup was
+        #                 really performed, so it counts against the customer's
+        #                 quota exactly like a hit or a miss.
+        #
+        # Collapsing both onto 'errored' (the previous behaviour) would make it
+        # impossible to bill one without also billing the other, i.e. charging
+        # customers for lookups that were never sent.
+        #
+        # The Result still shows 'errored': from the customer's side the lead
+        # genuinely has no contact data, and saying otherwise would be a lie.
         unmatched_pending = [p for p in pending if p.id not in matched_pending_ids]
         if unmatched_pending:
             db.execute(
                 update(PendingSkipTraceRow)
                 .where(PendingSkipTraceRow.id.in_([p.id for p in unmatched_pending]))
-                .values(status="errored")
+                .values(status="unmatched")
             )
             db.execute(
                 update(Result)
@@ -595,7 +608,7 @@ def ingest_tracerfy_batch(
             _logger.error(
                 "Tracerfy ingest queue %d: %d pending row(s) never appeared in the "
                 "result CSV and %d CSV row(s) matched no pending row — marked "
-                "'errored'. Sent %d, CSV carried %d.",
+                "'unmatched' (charged by the provider, so billed). Sent %d, CSV carried %d.",
                 queue_id, len(unmatched_pending), unmatched_csv,
                 len(pending), len(parsed),
             )

@@ -646,7 +646,22 @@ class Job(Base):
     user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     scraper_config_id = Column(UUID(as_uuid=False), ForeignKey("scraper_configs.id", ondelete="CASCADE"), nullable=False, index=True)
     status = Column(String(32), nullable=False, default="pending", index=True)
-    trigger = Column(String(32), nullable=False, default="manual")  # manual | scheduled | test
+    # manual | scheduled | batch | test. Free-text on purpose (no CHECK, no enum):
+    # adding a trigger needs no migration. The two halves of the set live apart:
+    # the CLIENT may only send "manual" or "test" (JobCreate.valid_trigger in
+    # src/api/schemas.py whitelists exactly those two), while SERVER code sets
+    # "scheduled" (src/workers/scheduler_helpers/dispatch.py) and "batch"
+    # (src/workers/batch_tasks.py). Those four are every value CURRENTLY WRITTEN
+    # -- verified by grepping every trigger= literal. Rows already in the database
+    # may carry retired values, so read this as "what the app emits today", NOT as
+    # a safe assumption when querying historical jobs. Keep it in sync: it drifted
+    # once and read "manual | scheduled | test" long after "batch" shipped (the
+    # comment dates from 31157c1; "batch" arrived later in 25651ca).
+    # There is deliberately NO "preview": the one-off preview path was REMOVED in
+    # #128 (it persisted active=False configs that billed real records but never
+    # appeared on the dashboard). tests/test_scraper_single_start_run.py locks that
+    # out; do not add a preview trigger without reading that test first.
+    trigger = Column(String(32), nullable=False, default="manual")
     page_current = Column(Integer, nullable=False, default=0)
     page_total = Column(Integer, nullable=False, default=0)
     record_count = Column(Integer, nullable=False, default=0)

@@ -46,7 +46,9 @@ def _send_onboarding_emails_impl() -> None:
                     select(ScraperConfig).where(ScraperConfig.user_id == user.id)
                 ).scalar_one_or_none() is not None
                 if not has_scraper:
-                    send_day1_nudge(user.email)
+                    # days_left is this user's REAL remaining trial, not a
+                    # literal. The copy used to always read "6 more days".
+                    send_day1_nudge(user.email, days_left)
                     day1_sent += 1
 
             # Day 3: activation nudge (scraper exists but no downloads yet)
@@ -59,7 +61,9 @@ def _send_onboarding_emails_impl() -> None:
                     select(Job).where(Job.user_id == user.id, Job.export_key.isnot(None))
                 ).scalar_one_or_none() is not None
 
-                send_activation_reminder(user.email, has_scraper, has_download)
+                send_activation_reminder(
+                    user.email, has_scraper, has_download, days_left
+                )
                 day3_sent += 1
 
             # Day 6 or 7: trial expiry warning

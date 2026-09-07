@@ -181,21 +181,28 @@ def send_ops_alert(kind: str, key: str, subject: str, body: str) -> bool:
         import resend
 
         resend.api_key = settings.RESEND_API_KEY
-        resend.Emails.send(
-            {
-                "from": settings.EMAIL_FROM,
-                "to": [settings.OPS_ALERT_EMAIL],
-                "subject": f"[BridgeLeads OPS] {subject}",
-                "html": (
-                    "<div style='font-family:monospace;font-size:13px'>"
-                    f"<p><b>{html.escape(subject)}</b></p>"
-                    f"<pre style='white-space:pre-wrap'>{html.escape(body)}</pre>"
-                    f"<p style='color:#888'>kind={html.escape(kind)} key={html.escape(key)} · "
-                    f"cooldown {settings.OPS_ALERT_COOLDOWN_SECONDS}s</p>"
-                    "</div>"
-                ),
-            }
+        from src.utils.email_layout import build_payload, header_text
+
+        # Internal ops mail, so it deliberately keeps the plain monospace dump
+        # rather than the customer-facing layout. It still goes through
+        # build_payload so the From display name and Reply-To are the same
+        # single source as every other send site, and it now carries a
+        # text/plain part (it had none, which hurts spam scoring).
+        meta = (
+            f"kind={kind} key={key} · cooldown {settings.OPS_ALERT_COOLDOWN_SECONDS}s"
         )
+        resend.Emails.send(build_payload(
+            to=[settings.OPS_ALERT_EMAIL],
+            subject=f"[BridgeLeads OPS] {header_text(subject)}",
+            html_body=(
+                "<div style='font-family:monospace;font-size:13px;color:#111827'>"
+                f"<p style='color:#111827'><b>{html.escape(subject)}</b></p>"
+                f"<pre style='white-space:pre-wrap;color:#111827'>{html.escape(body)}</pre>"
+                f"<p style='color:#6B7280'>{html.escape(meta)}</p>"
+                "</div>"
+            ),
+            text_body=f"{subject}\n\n{body}\n\n{meta}",
+        ))
         _logger.info("ops alert sent [%s:%s] %s", kind, key, subject)
         delivered = True
         return True

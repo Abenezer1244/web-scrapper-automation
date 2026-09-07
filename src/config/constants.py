@@ -83,6 +83,12 @@ STUCK_CHECK_STATUSES: frozenset[str] = frozenset({
 })
 
 
+# Length of the free Pro trial granted at registration, in days. Single source
+# of truth: the registration handler stamps trial_ends_at from this, and the
+# welcome email quotes it. They previously each carried their own literal 7.
+TRIAL_PERIOD_DAYS: int = 7
+
+
 class Plan(str, Enum):
     """Subscription tiers."""
 

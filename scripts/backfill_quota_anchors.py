@@ -33,12 +33,25 @@ SAFETY
 * Skips any user with no ``stripe_subscription_id`` — Starter, free and
   admin-granted accounts keep the anchor they were migrated with, which is
   correct: they have no subscription anniversary to follow.
-* Skips (never guesses) on any Stripe error or a subscription with no anchor.
-  A transient Stripe failure must not re-anchor anybody.
-* Each write is guarded on the anchor value we measured, so a concurrent
-  conversion (which legitimately re-anchors) is skipped and reported rather than
-  clobbered.
+* Skips (never guesses) on any Stripe error or a subscription with no
+  ``billing_cycle_anchor``. A transient Stripe failure must not re-anchor
+  anybody, and ``start_date`` is NOT a substitute for the recurring anchor.
+* **Skips a FUTURE ``billing_cycle_anchor``.** The grid only walks forward, so
+  an anchor beyond the current window's end stretches the transitional window to
+  reach it — measured: anchor 2027-01-20 against a window ending 2026-10-01
+  gives a **111-day** window on one month's quota, against 19 days for a past
+  anchor. Stripe sets a future anchor legitimately (scheduled cycle change,
+  unconverted trial), so the row is left for the live conversion path.
+* Each write is guarded on **both** the anchor value AND the subscription id we
+  measured, so a concurrent conversion, resubscribe **or cancellation** is
+  skipped and reported rather than clobbered. (Cancellation clears the
+  subscription id but preserves the anchor, so an anchor-only guard would still
+  have matched.)
 * Idempotent: a second run finds the anchors already equal and does nothing.
+* ⚠️ It re-anchors ANY subscriber whose stored anchor differs from Stripe's,
+  including one set earlier by a conversion or by admin action. That is intended
+  for the one-off cutover; if you re-run it later, scope it with ``--user-id``
+  rather than letting it sweep accounts that were anchored on purpose.
 
 USAGE
 -----
@@ -77,24 +90,39 @@ _CANDIDATES_SQL = """
     ORDER BY id
 """
 
-#: Guarded on the anchor we measured. A concurrent trial->paid conversion or
-#: resubscribe legitimately re-anchors the user; this must lose that race, not
-#: win it.
+#: Guarded on BOTH the anchor and the subscription id we measured. A concurrent
+#: trial->paid conversion or resubscribe legitimately re-anchors the user; this
+#: must lose that race, not win it.
+#:
+#: The subscription-id half matters on its own: ``end_subscription()`` CLEARS
+#: ``stripe_subscription_id`` but deliberately PRESERVES the anchor, so a
+#: cancellation landing between the SELECT and this UPDATE leaves the anchor
+#: unchanged — the anchor-only guard would still match and write a now-Starter
+#: account's anchor from the subscription they just cancelled. (Codex)
 _UPDATE_SQL = """
     UPDATE users
     SET quota_anchor_at = CAST(:new_anchor AS timestamptz)
     WHERE id = CAST(:uid AS uuid)
       AND quota_anchor_at = CAST(:expected AS timestamptz)
+      AND stripe_subscription_id = :expected_sub
 """
 
 
 def _stripe_anchor(subscription_id: str) -> datetime | None:
-    """The subscription's stable recurring anchor, or None if Stripe has none."""
+    """The subscription's stable recurring anchor, or None if Stripe has none.
+
+    ``billing_cycle_anchor`` ONLY. An earlier revision fell back to
+    ``start_date``, which contradicts this script's own safety contract
+    ("Skips (never guesses)"): the two are not interchangeable, and writing a
+    start date as though it were the recurring anchor silently moves the
+    customer's reset day to whatever date they happened to sign up on. If
+    Stripe has no billing anchor, that user is skipped and reported. (Codex)
+    """
     import stripe
 
     stripe.api_key = settings.STRIPE_SECRET_KEY
     sub = stripe.Subscription.retrieve(subscription_id)
-    raw = sub.get("billing_cycle_anchor") or sub.get("start_date")
+    raw = sub.get("billing_cycle_anchor")
     if not raw:
         return None
     return datetime.fromtimestamp(int(raw), tz=UTC)
@@ -125,6 +153,9 @@ def main() -> int:
 
     planned: list[tuple] = []
     skipped: list[tuple] = []
+    # One clock reading for the whole run, so the future-anchor test cannot give
+    # different answers to two rows in the same pass.
+    now = datetime.now(UTC)
 
     with system_sync_session() as db:
         rows = db.execute(text(sql), params).mappings().all()
@@ -139,15 +170,42 @@ def main() -> int:
             if anchor is None:
                 skipped.append((row["user_id"], "Stripe has no billing anchor"))
                 continue
+            # A FUTURE billing_cycle_anchor must never be written here.
+            #
+            # The grid only walks forward from the anchor, so an anchor after
+            # the current window's end makes the transitional window stretch to
+            # reach it: measured with the real helpers, anchor 2027-01-20 against
+            # a window ending 2026-10-01 yields [2026-10-01 -> 2027-01-20) — a
+            # 111-DAY window carrying ONE month's quota, versus 19 days for a
+            # past anchor. That hands ~3.7 months of allowance for one payment
+            # and breaks both the "always exactly one month" invariant and the
+            # ~15-day transitional bound.
+            #
+            # Stripe sets a future anchor legitimately (a scheduled cycle change,
+            # a trial that has not converted yet), so this is not corrupt data —
+            # it is data this script is not entitled to act on. The live
+            # conversion path handles it deliberately; a bulk backfill has no
+            # business guessing. Skip and report; re-run once it is in the past. (Codex)
+            if anchor > now:
+                skipped.append(
+                    (
+                        row["user_id"],
+                        f"billing_cycle_anchor is in the FUTURE ({anchor}) — would "
+                        "stretch the transitional window; left for the conversion path",
+                    )
+                )
+                continue
             current = row["anchor"]
             if current is not None and current.tzinfo is None:
                 current = current.replace(tzinfo=UTC)
             if current == anchor:
                 skipped.append((row["user_id"], "already anchored"))
                 continue
-            planned.append((row["user_id"], current, anchor, row["window_end"]))
+            planned.append(
+                (row["user_id"], current, anchor, row["window_end"], row["subscription_id"])
+            )
 
-        for user_id, current, anchor, window_end in planned:
+        for user_id, current, anchor, window_end, _sub in planned:
             print(
                 f"  {user_id}  anchor {current} -> {anchor}   "
                 f"(current window ends {window_end}; the grid shifts at that "
@@ -164,18 +222,26 @@ def main() -> int:
             return 0
 
         applied = raced = 0
-        for user_id, current, anchor, _end in planned:
+        for user_id, current, anchor, _end, sub_id in planned:
             rowcount = db.execute(
                 text(_UPDATE_SQL),
-                {"uid": str(user_id), "new_anchor": anchor, "expected": current},
+                {
+                    "uid": str(user_id),
+                    "new_anchor": anchor,
+                    "expected": current,
+                    "expected_sub": sub_id,
+                },
             ).rowcount
             if rowcount == 1:
                 applied += 1
             else:
                 raced += 1
                 print(
-                    f"  RACED {user_id}: anchor changed under us (a concurrent "
-                    f"conversion re-anchors legitimately) — left alone"
+                    f"  RACED {user_id}: the anchor OR the subscription id changed "
+                    "under us between the read and the write — a concurrent "
+                    "conversion re-anchors legitimately, and a cancellation clears "
+                    "the subscription while keeping the anchor. Left alone; re-run "
+                    "to pick it up if it still qualifies."
                 )
         db.commit()
         print(f"\nAPPLIED {applied} anchor(s); {raced} raced; {len(skipped)} skipped.")

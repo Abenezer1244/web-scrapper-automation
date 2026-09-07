@@ -19,7 +19,7 @@ from src.api.billing_entitlement import (
 from src.api.deps import get_rls_db
 from src.api.middleware import client_ip, rate_limit
 from src.config import settings
-from src.config.constants import TRIAL_PERIOD_DAYS
+from src.config.constants import COUNTY_LIMIT_BY_PLAN, TRIAL_PERIOD_DAYS
 from src.config.plans import PLAN_CATALOG
 from src.db import User, get_db
 from src.utils.logger import setup_logger
@@ -378,7 +378,16 @@ async def pricing_page() -> dict:
         "founding_offer": founding,
         "comparison": {
             "Records per month": {"starter": "50", "pro": "1,000", "business": "5,000", "agency": "Unlimited"},
-            "Counties": {"starter": "1", "pro": "5", "business": "Unlimited", "agency": "Unlimited"},
+            # Derived from the ENFORCED cap, never re-typed. These cells had
+            # drifted to the pre-2026-06 pricing (pro "5", business
+            # "Unlimited") while COUNTY_LIMIT_BY_PLAN caps them at 3 and 10.
+            # With ENTITLEMENT_ENFORCEMENT on in production that is not a
+            # cosmetic typo: the page promised counties the API answers 402 for.
+            "Counties": {
+                plan: ("Unlimited" if COUNTY_LIMIT_BY_PLAN[plan] < 0
+                       else f"{COUNTY_LIMIT_BY_PLAN[plan]:,}")
+                for plan in ("starter", "pro", "business", "agency")
+            },
             "Record types": {"starter": "Probate", "pro": "All", "business": "All", "agency": "All"},
             "Data freshness": {"starter": "7-day delay", "pro": "Daily", "business": "Daily", "agency": "Daily"},
             "Export formats": {"starter": "CSV", "pro": "CSV, Excel", "business": "CSV, Excel, JSON, API", "agency": "CSV, Excel, JSON, API"},

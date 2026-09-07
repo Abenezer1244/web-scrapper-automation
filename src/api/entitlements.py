@@ -77,10 +77,16 @@ async def projected_county_overage(
     top of RLS), unioned with the counties being added. Fails CLOSED on an
     unknown plan (starter cap). -1 cap = unlimited (returns None).
 
-    NOTE (pre-enforcement TODO): this read-then-decide is not atomic — two
-    concurrent creates could each pass when enforcement is ON. Harmless while the
-    flag is OFF; before flipping, gate the create in one transaction (e.g. lock
-    the user row) so the count can't be raced.
+    CONCURRENCY: this read-then-decide is not atomic on its own, but the caller
+    closes the race. enforce_entitlements() takes a per-user
+    pg_advisory_xact_lock BEFORE calling this whenever ENTITLEMENT_ENFORCEMENT is
+    on, and that lock is transaction-scoped, so it is still held when the route
+    inserts the new config and is only released at commit. Both create paths are
+    covered (routes/scrapers.py via get_db, routes/batches.py via get_rls_db);
+    neither commits between the check and the insert. Do NOT read this function
+    in isolation and conclude the count can be raced -- an earlier version of
+    this note said the gating was still outstanding long after it had landed,
+    which is worse than no note at all.
     """
     cap = COUNTY_LIMIT_BY_PLAN.get(plan, COUNTY_LIMIT_BY_PLAN["starter"])
     if cap < 0:

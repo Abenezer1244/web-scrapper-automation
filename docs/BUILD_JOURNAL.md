@@ -19,6 +19,89 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-07 — Codex was dead for a day, and I nearly rebuilt an endpoint we deleted on purpose
+
+> **Provenance:** commits, paths and line numbers below were re-verified against the repo and
+> fact-checked by a Codex pass, which refuted one claim and forced five rewordings. The
+> narrative parts (attempt counts, ordering, who noticed what) are **session recollection**,
+> not independently evidenced — read them as such.
+
+**Built / Shipped:**
+- **#235 `d8a32c5`** — `/billing/pricing` advertised county counts the API answers 402 for. The
+  comparison row said Pro 5 / Business Unlimited while `COUNTY_LIMIT_BY_PLAN` enforces 3 / 10 and
+  `ENTITLEMENT_ENFORCEMENT` is ON in prod. Operator chose **Option A** (page drops to match
+  enforcement) over raising the caps. Row is now derived from the constant, never re-typed.
+- **#240 `a440927`** — corrected the concurrency note #235 itself added: it claimed
+  "scrapers.py via get_db, batches.py via get_rls_db". Both use `get_rls_db`, which wraps `get_db`.
+  Conclusion was right, attribution wrong.
+- **#243 `161ac52`** — `Job.trigger`'s comment listed `manual | scheduled | test` long after
+  `batch` shipped, and now records why there is deliberately no `preview`.
+
+**Tried / Decided:**
+- Consulted Codex on the design BEFORE coding, per `.claude/rules/codex-collaboration.md`. It
+  **refuted** my headline claim that an inactive preview config would let a Starter user scrape
+  unlimited counties free. Narrowly stated: current creation checks the incoming county when
+  enforcement is enabled (`scrapers.py:228`, gated at `entitlements.py:168`) and always persists
+  `active=True` (`scrapers.py:278`). That gate ALONE does not disprove the bypass — existing
+  counties are counted from active configs only (`entitlements.py:105`), so hypothetical inactive
+  creations would not accumulate slots. Codex made this correction to my correction.
+- Retired `feat/fields-output-visibility`. Tip preserved as tag `archive-fields-output-visibility`
+  (`1311448`), pushed to the remote so it survives this machine.
+
+**Failed / Blocked — the big one:**
+- 🛑 **I implemented `POST /scrapers/preview` and had to revert it wholesale.** The handoff called
+  it "the ONLY thing genuinely absent from main… rewrite it fresh if wanted." It is absent
+  **by design**: **#128 `493072a`** deleted it because it persisted `active=False` configs that ran
+  and billed real records but never appeared on the dashboard — the root cause of the
+  "I scraped and nothing shows" bug. `tests/test_scraper_single_start_run.py` locks it out from
+  both sides. **The existing test caught me, not the review.** Absence in `main` is not a TODO.
+- 🛑 **Codex CLI was unusable for a day** with `404 gpt-5.5 does not exist`. Prior session spent
+  ~10 attempts and blamed quota, then auth, then a config comment — all wrong.
+- 🛑 The Codex **hook `trusted_hash` scheme** resisted 3 rounds of reverse-engineering (sha256 of
+  command, of JSON in several shapes, with/without timeout — none matched). Abandoned deliberately.
+- 🛑 Codex hit its **usage limit mid-gate** on #243; switched account to finish.
+
+**Caught & fixed (by review, before shipping):**
+- Codex found my #243 comment cited `workers/…` where the real paths are `src/workers/…` — a
+  wrong path in a comment whose entire job is accuracy.
+- It flagged "those four are the whole set" as overclaiming: that is what the app *emits today*;
+  rows already in the database may carry retired values. Reworded.
+- 🔑 It reported the diff contained **four changed files** when my tree was clean. That meant
+  **`main` had moved again** (#241, #242) and my branch was silently behind, the diff showing
+  main's newer commits as phantom deletions. Rebased. The reflog puts #242 (`ff5c1d3`) at
+  04:18:58 and #241 (`4230126`) at 04:51:36, with the rebase at 04:53 — so the drift is evidenced,
+  though the diff alone does not establish who noticed it.
+
+**Facts learned (durable):**
+- 🔑 **The authoritative Codex model roster is an endpoint, not a guess:**
+  `GET https://chatgpt.com/backend-api/codex/models?client_version=<ver>` with the stored bearer
+  token. It returned `gpt-6-astra` with `minimal_client_version: 0.153.0` — so **CLI 0.152.1 could
+  not use it at all**. Real root cause: server-side model rotation + a stale CLI. Fix was
+  `npm install -g @openai/codex@latest` + repin, NOT an account change.
+- 🔑 **The two Codex errors mean different things.** HTTP 400 *"not supported when using Codex with
+  a ChatGPT account"* = **wrong slug**. HTTP 404 *"does not exist or you do not have access"* = real
+  slug, retired at the inference layer. Neither means the plan is wrong. Both accounts returned
+  **identical rosters**, which undercuts the earlier note that the model was account-specific —
+  though an identical roster is not by itself proof of identical inference access.
+- 🛑 **`.codex/hooks.json` invoked two scripts that no longer exist** (`hook-handler.cjs`,
+  `auto-memory-hook.mjs` — absence verified). Every Codex run observed this session logged
+  `hook: <Event> Failed`. The `%CLAUDE_PROJECT_DIR%` variable in them was a second, separate
+  defect, not the cause.
+- 🛑 **`AGENTS.md` — the file Codex reads every session — pointed at `.Codex/rules/*`. That path
+  does not exist** (verified: Windows resolves it to `.codex/`, which has no `rules/`; the rules
+  live in `.claude/rules/`). Those rule files could not have been loaded via that reference.
+  `AGENTS.md` is untracked with no git history, so how long it had been wrong is NOT established.
+  It also ordered Codex to query `/graphify` FIRST, an MCP server that does not connect here.
+  Rewritten.
+- 🛑 A `codex exec` smoke test that greps for the REPLY text is a **misleading probe** — it matches
+  the echoed prompt, so every model looks healthy. Grep for the error strings instead.
+
+**Pending / Handoff:**
+- ⏭️ The `security-codex-reminder` hook is still skipped pending Codex's interactive `trusted_hash`
+  approval. Needs one interactive `codex` run from a real terminal. Low value now that AGENTS.md
+  carries the same content.
+- ⏭️ Account is now `memiki70@gmail.com`; `zowiegirma29@gmail.com` quota resets ~07:06 daily.
+
 ## 2026-09-07 — the watched account moved 1007 → 1001, and what that cost to prove
 
 **Decided:** the operator confirmed **1001 is the intended value**. No database

@@ -196,7 +196,7 @@ The scraper system is county-agnostic. Each county is a plugin — adding one re
 4. Insert row into `county_connectors` table
 5. Done — scheduler, watchdog, canary, and all job infrastructure pick it up automatically
 
-**Supported record types (live):** probate, pre_foreclosure, tax_delinquent, code_violation, divorce, death_certificate — the canonical set is `ALL_RECORD_TYPES` in `src/config/constants.py` (keep this list in sync with it).
+**Supported record types (live):** probate, pre_foreclosure, tax_delinquent, code_violation, divorce, death_certificate, trustee_sale — the canonical set is `ALL_RECORD_TYPES` in `src/config/constants.py` (keep this list in sync with it; `trustee_sale` was missing here while in active production use).
 **Roadmap (no live connector yet):** eviction.
 **Expansion path:** WA counties → top 10 investor states → national
 

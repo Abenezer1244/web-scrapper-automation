@@ -98,12 +98,26 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy import text  # noqa: E402
 
+from src.api.quota import is_over_record_limit  # noqa: E402
 from src.api.quota_window import add_months, as_utc, effective_window  # noqa: E402
 from src.db.session import system_sync_session  # noqa: E402
 
-# The account the handoff calls out by name. Its 1007/1000 is CORRECT and must
-# survive the deploy untouched; it is printed in full whether or not it passes.
+# The account the handoff calls out by name. Printed in full whether or not it
+# passes, because it is the one row an operator should eyeball by hand.
 WATCHED_USER_PREFIX = "01dc9396"
+
+# Its expected counter. Was 1007 through the 088 deploy (1001 from an earlier
+# incident repair + 6 from a live reservation canary), and 1007 was confirmed
+# twice in production AFTER the migration ran. It later read 1001 — the
+# canary's +6 reverted by something outside this deploy, during a window whose
+# logs no longer reach back. **The operator confirmed 1001 is the intended
+# value on 2026-09-07**, so that is what this asserts.
+#
+# Still over the 1000 limit either way, which is the property that actually
+# matters: this account must stay BLOCKED until its window rolls on 2026-10-01.
+# Do not "fix" it to a nicer number in either direction without asking.
+WATCHED_EXPECTED_USED = 1001
+WATCHED_EXPECTED_LIMIT = 1000
 
 
 def _fmt(value: datetime | None) -> str:
@@ -404,7 +418,8 @@ def main() -> int:
                     "SELECT id, plan, records_used, records_limit, "
                     "records_period_start, quota_anchor_at, quota_period_start, "
                     "quota_period_end, subscription_status, entitlement_ends_at, "
-                    "entitlement_grace_ends_at FROM users"
+                    "entitlement_grace_ends_at, pending_plan, pending_records_limit "
+                    "FROM users"
                 )
             ).mappings().all()
     except Exception as exc:  # noqa: BLE001 - report, never mask, a connect failure
@@ -488,7 +503,9 @@ def main() -> int:
         print(f"  plan            : {watched.plan}")
         print(f"  records_used    : {watched.records_used}")
         print(f"  records_limit   : {watched.records_limit}")
-        print(f"  over cap        : {watched.records_used > watched.records_limit}")
+        # Same predicate as the gates, not `used > limit`: the product blocks at
+        # `used >= limit`, so a raw `>` would print False at exactly 1000/1000.
+        print(f"  over cap        : {is_over_record_limit(watched, now)}")
         print(f"  records_period_start : {_fmt(watched.records_period_start)}")
         print(f"  quota_anchor_at      : {_fmt(watched.quota_anchor_at)}")
         print(
@@ -496,8 +513,33 @@ def main() -> int:
             f"-> {_fmt(watched.quota_period_end)})"
         )
         print(f"  effective window     : [{_fmt(eff_start)} -> {_fmt(eff_end)})")
-        print("  EXPECTED: records_used 1007, limit 1000, over cap True,")
+        print(
+            f"  EXPECTED: records_used {WATCHED_EXPECTED_USED}, "
+            f"limit {WATCHED_EXPECTED_LIMIT}, over cap True,"
+        )
         print("            next reset 2026-10-01. Do NOT 'fix' this number.")
+        if watched.records_used != WATCHED_EXPECTED_USED:
+            # Loud, but not a hard failure: the expected value is a hand-maintained
+            # constant, and this account legitimately moves the day it converts to
+            # paid (P1 re-anchors and zeroes it). Say so rather than either passing
+            # silently or blocking a deploy on a stale literal.
+            print(
+                f"  ** MISMATCH: reads {watched.records_used}, expected "
+                f"{WATCHED_EXPECTED_USED}. Confirm which is intended before "
+                "trusting this run, and update WATCHED_EXPECTED_USED."
+            )
+        # Ask the SAME predicate enforcement asks, never a hand-rolled compare.
+        # is_over_record_limit() is `used >= limit` (and -1 is never over), so a
+        # raw `used <= limit` here would report "no longer over cap" at exactly
+        # 1000/1000 — a state the product still blocks. Since this line is the
+        # invariant operators are told to trust, it has to agree with the gates
+        # rather than approximate them. (Codex)
+        if not is_over_record_limit(watched, now):
+            print(
+                "  ** This account is NO LONGER over its record limit, per the "
+                "same predicate the enforcement gates use. That is a real state "
+                "change -- it should stay blocked until 2026-10-01."
+            )
         print("-" * 72)
     else:
         print(f"\nNOTE: no user id starting {WATCHED_USER_PREFIX!r} was found.")

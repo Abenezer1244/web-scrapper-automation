@@ -19,6 +19,59 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-07 — the watched account moved 1007 → 1001, and what that cost to prove
+
+**Decided:** the operator confirmed **1001 is the intended value**. No database
+change — production already read 1001. Only the artefacts still asserting 1007
+were corrected: `WATCHED_EXPECTED_USED` in `scripts/verify_entitlement_deploy.py`
+(now prints a loud MISMATCH instead of passing silently, plus a separate alarm if
+the account ever stops being over cap), the handoff, and this journal.
+
+**Tried / Decided:** the deploy is exonerated **by mechanism, not by timeline.**
+Migration 088 never writes `records_used`; the stranded-reservation sweep is
+pre-existing (already in base `a009f15`, 300s beat) so it cannot have newly
+fired; live logs show `sweep_quota_reservations` returning 0 every run and
+`reconcile_quota_periods` rolling 0 windows; and no job for that user holds a
+reservation at all.
+
+**Failed / Blocked — two of my own claims had to be retracted:**
+- 🛑 *"My change refunds less for pre-088 jobs, so it can't have caused a −6."*
+  **FALSE.** A NULL `jobs.quota_period_start` **keeps the month comparison it was
+  written under** — unchanged, not reduced. Seductive because it sounds like the
+  retire-without-refund path. I caught it only by reading the code I had written
+  rather than trusting my memory of it.
+- 🛑 *"`updated_at` still reads 09-05, so nothing wrote the row."* **Overstated.**
+  A raw `UPDATE` that skips `updated_at` leaves it stale — exactly what a repair
+  script does. Consistent with no write; not evidence of one.
+
+**Facts learned:**
+- 🔑 **The number was never the invariant — being over cap is.** 1007 and 1001
+  both exceed the 1000 limit, so the account stays blocked until 2026-10-01
+  either way. Pinning the literal made a cosmetic change look like an incident.
+  The verifier now asserts the literal *and* checks the property separately.
+- 🛑 **A self-exculpatory claim deserves the harshest check**, because the
+  evidence that flatters you is the evidence you stop testing. Asked to confirm
+  my own conclusion, the conclusion survived but two of its supports did not.
+- 🔑 **Railway log retention did not reach the 22:35Z–01:40Z window**, so what
+  actually changed the counter is **UNVERIFIED and no author was asserted.**
+
+**⏭️ Likely explanation, found afterwards while merging — still a hypothesis.**
+The entry below records that **production was wiped a second time on 2026-09-06,
+14:40–15:36 UTC**, by the pytest conftest teardown, and restored via PITR. That
+is the same afternoon the 8 `@bl.test` rows appeared (15:37 and 16:09, minutes
+after the wipe window) and were later cleaned up, and a PITR restore to a point
+before the reservation canary is exactly what returns `records_used` to its
+pre-canary **1001**.
+
+🛑 It does NOT fit cleanly on the clock: the restore predates my 21:44Z and
+22:35Z readings, both of which still showed 1007, so something in the ongoing
+cleanup — not the restore itself — moved it afterwards. Recorded as the leading
+hypothesis, **not** as the answer. 🔑 The real lesson is that a second
+workstream was operating on the same production database throughout this deploy
+and I had no visibility into it; "I cannot explain this change" was the correct
+report, and the explanation lived in someone else's journal entry.
+---
+
 ## 2026-09-07 — DEPLOYED: skip trace stops losing paid batches; and prod was wiped again
 
 Started as "replace Tracify with SkipMatrix". Ended as a Tracerfy audit, a
@@ -194,9 +247,14 @@ deployed).
 
 **Verified in production, not by test:** 12/12 users pass every hard check,
 `records_used` identical to the pre-deploy snapshot for all 12, window start
-unchanged for all 12, zero rollovers. The watched account is **1007 / 1000,
-still over cap, next reset 2026-10-01** — untouched, exactly as required. The
-deploy was the behavioural no-op it was designed to be.
+unchanged for all 12, zero rollovers. The watched account was **1007 / 1000,
+still over cap, next reset 2026-10-01** — untouched, exactly as required,
+confirmed twice after the migration. The deploy was the behavioural no-op it was
+designed to be.
+
+⚠️ **It later read 1001** (the canary's +6 reverted) by something outside this
+deploy — see the 09-07 entry above. **Operator confirmed 1001 is intended.**
+Still over cap either way, which is the property that matters.
 
 **Tried / Decided:**
 - **Step 0 (pre-deploy snapshot) earned its place immediately.** Taken before

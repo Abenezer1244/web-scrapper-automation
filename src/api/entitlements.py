@@ -82,8 +82,13 @@ async def projected_county_overage(
     pg_advisory_xact_lock BEFORE calling this whenever ENTITLEMENT_ENFORCEMENT is
     on, and that lock is transaction-scoped, so it is still held when the route
     inserts the new config and is only released at commit. Both create paths are
-    covered (routes/scrapers.py via get_db, routes/batches.py via get_rls_db);
-    neither commits between the check and the insert. Do NOT read this function
+    covered: routes/scrapers.py create_scraper and routes/batches.py both declare
+    Depends(get_rls_db), and get_rls_db wraps get_db (src/api/deps.py) -- it only
+    issues set_config(..., local=true) on that same session and returns it, so the
+    single commit is still get_db's teardown, AFTER the insert. An earlier version
+    of this line said scrapers.py used get_db directly, implying the two routes
+    differed; they do not. Verify the route signature, not this sentence.
+    Neither path commits between the check and the insert. Do NOT read this function
     in isolation and conclude the count can be raced -- an earlier version of
     this note said the gating was still outstanding long after it had landed,
     which is worse than no note at all.

@@ -22,6 +22,7 @@ import hashlib
 import io
 import re
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
 
 import requests
 
@@ -695,6 +696,35 @@ def ingest_webhook_csv(csv_text: str) -> list[dict]:
     return out
 
 
+
+def _safe_host(url: str) -> str:
+    """Hostname for logging, or a placeholder. NEVER raises and never returns
+    the query string (which is where the signed token lives)."""
+    try:
+        return urlsplit(url).hostname or "<none>"
+    except Exception:  # noqa: BLE001 — a parse failure must not become the leak
+        return "<unparseable>"
+
+
+def _redact_url(message: str, url: str) -> str:
+    """Strip a signed URL out of an error message, keeping the diagnosis.
+
+    Removes the whole URL and, defensively, the bare path+query on its own:
+    some libraries quote only part of the link. What remains is the reason
+    ("host resolves to a private range") without the credential.
+    """
+    out = message.replace(url, "<redacted-url>")
+    try:
+        parts = urlsplit(url)
+        if parts.query:
+            out = out.replace(parts.query, "<redacted>")
+        if parts.path and len(parts.path) > 1:
+            out = out.replace(parts.path, "<redacted>")
+    except Exception:  # noqa: BLE001 — best-effort second pass
+        pass
+    return out
+
+
 def download_tracerfy_csv(download_url: str) -> str:
     """Fetch the completion CSV from Tracerfy's CDN.
 
@@ -719,7 +749,29 @@ def download_tracerfy_csv(download_url: str) -> str:
             timeout=60,
         )
     except ValueError as exc:
-        raise TracerfyError(f"Refusing to download from disallowed URL: {exc}") from exc
+        # The SSRF guard's message legitimately quotes the URL it refused, and
+        # that URL carries the signed token — so interpolating it put a working
+        # credential into the error message and, via `from exc`, into any
+        # traceback that printed the chain.
+        #
+        # REDACT rather than discard (Codex): collapsing everything to
+        # "ValueError" would have destroyed the one thing an operator needs, and
+        # ValueError here covers DNS failure, a blocked address, an HTTPS
+        # downgrade, a malformed URL and redirect exhaustion alike. Substituting
+        # the URL out of the reason keeps the diagnosis and drops the credential.
+        #
+        # _safe_host() must not raise: urlsplit() rejects some malformed inputs
+        # (bad IPv6 brackets), and an exception escaping HERE would propagate
+        # with the original ValueError — URL and all — as its __context__, which
+        # is exactly the leak this block exists to prevent (Codex).
+        reason = _redact_url(str(exc), download_url)
+        _logger.warning(
+            "Refusing Tracerfy CSV download from host %s: %s",
+            _safe_host(download_url), reason,
+        )
+        raise TracerfyError(
+            f"Refusing to download from disallowed URL: {reason}"
+        ) from None
     except requests.RequestException as exc:
         # M2: never interpolate the requests exception — its string embeds the
         # full URL, and the Tracerfy CDN download_url carries a signed token

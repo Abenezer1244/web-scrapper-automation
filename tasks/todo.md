@@ -72,10 +72,14 @@ Verified NOT broken (do not "fix"):
 
 ### Phase 5 — repair (separate, reviewed, run after Phases 1-4 deploy)
 - [x] 5a. Read-only reconciliation report for the 637 + the 14 orphan queues.
-- [ ] 5b. Release the 637 — **no longer needs the script**. Once Phase 2 deploys,
-      `_reconcile_stale_claims` releases them automatically on the first tick.
-      Dry run confirms all 637 release, 0 adopt, 0 refuse. Do NOT run the script
-      against the currently-deployed (old) dispatcher: it would re-strand them.
+- [x] 5b. Release the 637 — **DONE, and the script was never needed.** Deploying
+      Phase 2 released them automatically, verified in production 2026-09-07:
+      `pending_skip_trace_rows` with status='submitting' is now **0** (was 637),
+      635 sit at 'queued' awaiting submission, 2 were terminally 'errored' by the
+      new pre-submit validation, and no Result is left showing "Processing".
+      Those rows were claimed 09-03/09-05, so any PITR restore point would have
+      brought them back as 'submitting' — the move to 'queued' can only have come
+      from the reconciler.
 
 ---
 

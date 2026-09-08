@@ -20,6 +20,11 @@ from sqlalchemy import select, text, update
 
 from src.api.lead_actionability import actionable_sql
 from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
+
+# Human-readable record-type labels. The private copy this replaces existed only
+# to keep a worker from importing an API route module; this is a config module,
+# not a route, so both call sites can share the one map.
+from src.config.constants import record_type_label as _label
 from src.db.models import BatchRun, Job, ScraperBatch
 from src.utils.crypto import decrypt_field
 from src.utils.data_exporter import DataExporter
@@ -30,21 +35,6 @@ _logger = setup_logger("worker.batch_export")
 
 EXPORT_CAP = 50_000
 
-# Human-readable list labels (mirror src/api/routes/segments._RECORD_TYPE_LABELS;
-# kept local so a worker doesn't import an API route module).
-_RECORD_TYPE_LABELS = {
-    "probate": "Probate",
-    "death_certificate": "Death Certificate",
-    "pre_foreclosure": "Pre-Foreclosure",
-    "tax_delinquent": "Tax Delinquent",
-    "divorce": "Divorce",
-    "code_violation": "Code Violation",
-    "eviction": "Eviction",
-}
-
-
-def _label(slug: str) -> str:
-    return _RECORD_TYPE_LABELS.get(slug, slug.replace("_", " ").title())
 
 
 # Combined set over the batch's jobs. Dedup bucket (prefixed — the prefixes make

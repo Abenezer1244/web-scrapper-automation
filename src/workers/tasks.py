@@ -460,8 +460,10 @@ def run_scrape_job(self, job_id: str) -> None:
             [ConfigRow(*r) for r in _active],
         )
         if should_block_run(_violation, user_id=str(job.user_id), plan=(user.plan or "starter"), context="worker_run"):
-            _publish_log(r, job_id, "error", f"Plan limit reached: {_violation}", db=db)
-            _fail_job(db, job, r, job_id, f"Plan limit reached: {_violation}")
+            # _violation is an entitlements.Violation; str() is its customer-facing
+            # message. Both strings below reach the user (live log + job error).
+            _publish_log(r, job_id, "error", f"{_violation.title}. {_violation.message}", db=db)
+            _fail_job(db, job, r, job_id, f"{_violation.title}. {_violation.message}")
             return
 
         # Liveness heartbeat DISABLED (rollback 2026-06-18). The daemon thread shared

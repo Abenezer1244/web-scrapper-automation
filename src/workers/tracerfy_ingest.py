@@ -65,7 +65,10 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
     """
     from datetime import UTC, datetime
 
+    from sqlalchemy import text
+
     from src.api.billing.skip_trace_usage import (
+        _MissingCustomerError,
         _StripeNotConfiguredError,
         report_meter_event_to_stripe,
     )
@@ -85,20 +88,45 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
             # beat sweep. Idempotent no-op.
             return {"outbox_id": outbox_id, "skipped": "already_reported"}
 
-        # Terminal no-ops (_StripeNotConfiguredError) still stamp reported_at so the
-        # row stops being swept; transient Stripe failures propagate to
-        # autoretry. The stable identifier inside makes any retry idempotent.
+        # The customer id is re-resolved from the users table, not trusted from
+        # the snapshot taken when the outbox row was written. A user who had no
+        # customer id at ingest time has one the moment they check out, and the
+        # snapshot never learns that.
+        customer_id = row.stripe_customer_id
+        if not customer_id:
+            customer_id = db.execute(
+                text("SELECT stripe_customer_id FROM users WHERE id = :uid"),
+                {"uid": str(row.user_id)},
+            ).scalar()
+            if customer_id:
+                row.stripe_customer_id = customer_id
+
+        # _StripeNotConfiguredError is terminal (Stripe is off): stamp
+        # reported_at so the row stops being swept. _MissingCustomerError is
+        # NOT: the usage is real and billable, and the user simply has no
+        # customer id yet. Leaving reported_at NULL keeps the row claimable.
+        # The sweep skips it until a customer id exists, so this is a hold, not
+        # a retry loop. Transient Stripe failures still propagate to autoretry,
+        # and the stable identifier inside makes any retry idempotent.
         try:
             report_meter_event_to_stripe(
                 user_id=str(row.user_id),
                 queue_id=row.tracerfy_queue_id,
                 billable_units=row.billable_units,
-                stripe_customer_id=row.stripe_customer_id,
+                stripe_customer_id=customer_id,
                 plan=row.plan or "",
             )
+        except _MissingCustomerError:
+            db.commit()  # keep the re-resolution attempt, if any
+            _logger.warning(
+                "Skip-trace meter outbox %s: user has no Stripe customer id; "
+                "holding %d billable unit(s), NOT written off",
+                outbox_id, row.billable_units,
+            )
+            return {"outbox_id": outbox_id, "held": "no_customer_id"}
         except _StripeNotConfiguredError as exc:
             _logger.warning(
-                "Skip-trace meter outbox %s: terminal no-op (%s) — marking "
+                "Skip-trace meter outbox %s: terminal no-op (%s), marking "
                 "reported to stop the sweep",
                 outbox_id, exc,
             )

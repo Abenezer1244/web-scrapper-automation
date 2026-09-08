@@ -222,6 +222,15 @@ async def skip_trace_usage(
     Used by the frontend billing page to render a progress bar and
     overage estimate. Values are read from the cached counter on the
     User row — no external calls.
+
+    The period reported is the user's ENTITLEMENT WINDOW, the same one records
+    are metered over and the same one the counter now rolls on. It used to
+    report the raw `skip_trace_period_start`, which was a calendar month, so the
+    page told a subscriber anchored on the 20th that their lookups reset on the
+    1st while their records reset on the 20th and Stripe invoiced on the 20th.
+    `effective_window` is used rather than the stored pair for the same reason
+    /billing/usage uses it: a window that has ended but not yet rolled would
+    otherwise be reported as the current one.
     """
     await rate_limit(request, zone="general", identifier=current_user.id)
     plan = (current_user.plan or "starter").lower()
@@ -240,6 +249,10 @@ async def skip_trace_usage(
 
     estimated_charges_usd = round(overage_units * (overage_rate_usd or 0), 2)
 
+    from src.api.quota import effective_window
+
+    _window_start, _window_end = effective_window(current_user)
+
     return {
         "plan": plan,
         "quota": quota,
@@ -248,11 +261,8 @@ async def skip_trace_usage(
         "overage_units": overage_units,
         "overage_rate_usd": overage_rate_usd,
         "estimated_charges_usd": estimated_charges_usd,
-        "period_start": (
-            current_user.skip_trace_period_start.isoformat()
-            if current_user.skip_trace_period_start
-            else None
-        ),
+        "period_start": _window_start.isoformat(),
+        "period_end": _window_end.isoformat(),
     }
 
 # ─── Plan catalog ─────────────────────────────────────────────────────────────

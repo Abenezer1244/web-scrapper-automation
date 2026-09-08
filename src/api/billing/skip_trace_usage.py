@@ -90,7 +90,7 @@ def report_lookups_for_user(
     user_row = db.execute(
         text("""
             SELECT plan, stripe_customer_id, skip_trace_used_this_month,
-                   skip_trace_period_start
+                   skip_trace_period_start, quota_period_start
             FROM users
             WHERE id = :uid
             FOR UPDATE
@@ -108,19 +108,41 @@ def report_lookups_for_user(
     used_before = user_row.skip_trace_used_this_month or 0
     used_after = used_before + new_lookups
 
-    # Reset the counter if the billing period has rolled (month boundary).
-    # We only track the start; the monthly reset task clears it. As a
-    # defensive belt-and-suspenders, if period_start is null or >35 days
-    # old, treat this as a fresh period.
+    # Reset the counter when the user's ENTITLEMENT WINDOW has rolled.
+    #
+    # This used to key off the calendar month, which put the free allowance and
+    # the billed overage on two different clocks. Records reset on the
+    # subscriber's own anniversary (migration 088) and a Stripe metered
+    # subscription item bills usage over the SUBSCRIPTION period, so a customer
+    # who signed up on the 20th had their 250 free lookups reset on the 1st,
+    # halfway through the period Stripe was invoicing. That is two free
+    # allowances inside one paid month, and neither number matches the invoice.
+    #
+    # `skip_trace_period_start` now holds the START OF THE ENTITLEMENT WINDOW the
+    # counter belongs to. Same column, new meaning, no migration: the value is
+    # only ever compared against `quota_period_start` and stamped from it.
+    #
+    # The comparison is strictly less-than, so this can only ever RESET a
+    # counter, never resurrect a spent one. A window that has ended but not yet
+    # rolled leaves both values equal and nothing happens, which is the same
+    # lag the records half already has and is bounded by the hourly
+    # reconciliation.
     now = datetime.now(UTC)
     period_start = user_row.skip_trace_period_start
-    if period_start is None or (now - period_start).days > 35:
-        _logger.info("Resetting skip-trace period for user %s", user_id)
+    window_start = user_row.quota_period_start
+    rolled = period_start is None or (
+        window_start is not None and period_start < window_start
+    )
+    if rolled:
+        _logger.info(
+            "Skip-trace allowance rolled for user %s: window starts %s",
+            user_id[:8], window_start,
+        )
         used_before = 0
         used_after = new_lookups
         db.execute(
-            text("UPDATE users SET skip_trace_period_start = :now WHERE id = :uid"),
-            {"now": now, "uid": user_id},
+            text("UPDATE users SET skip_trace_period_start = :start WHERE id = :uid"),
+            {"start": window_start or now, "uid": user_id},
         )
 
     # Compute billable units — only the portion ABOVE the bundled quota
@@ -167,6 +189,16 @@ def report_lookups_for_user(
         )
 
     return result
+
+
+class _MissingCustomerError(Exception):
+    """The user has no Stripe customer id YET, so this event cannot be sent.
+
+    Distinct from _StripeNotConfiguredError on purpose. "Stripe is off" is
+    terminal and the outbox row should stop being swept; "no customer id" is a
+    state the user leaves the moment they check out, and the usage is real and
+    billable. Collapsing the two is how a billable event got written off.
+    """
 
 
 class _StripeNotConfiguredError(Exception):
@@ -216,15 +248,19 @@ def report_meter_event_to_stripe(
         raise _StripeNotConfiguredError("stripe_not_configured")
 
     if not stripe_customer_id:
-        # No customer id is a terminal data condition, not a transient fault —
-        # retrying cannot conjure a customer id. Treat as a reported no-op so
-        # the outbox row stops being swept, but surface it loudly.
+        # NOT terminal. This used to raise the same signal as "Stripe is off",
+        # and the caller stamped reported_at on it, which permanently wrote off
+        # real billable overage for a customer whose stripe_customer_id had
+        # simply not been written YET. On this deployment plans are set by hand
+        # and most users have no customer id at all, so that was not a corner
+        # case. The caller now leaves the row unreported and the sweep holds it
+        # until the user subscribes; see report_skip_trace_meter_event.
         _logger.error(
-            "User %s has no stripe_customer_id — cannot bill %d skip-trace "
-            "overage units (queue %d)",
+            "User %s has no stripe_customer_id: holding %d billable skip-trace "
+            "unit(s) from queue %d until one exists",
             user_id[:8], billable_units, queue_id,
         )
-        raise _StripeNotConfiguredError("no_customer_id")
+        raise _MissingCustomerError("no_customer_id")
 
     # H12 (full-SaaS review): the identifier must be STABLE across webhook
     # replays so Stripe's own dedup kicks in. Keyed on (queue_id, user_id)

@@ -942,34 +942,24 @@ async def test_overlap_and_intersection_are_business_and_above(
 @pytest.mark.integration
 @pytest.mark.asyncio
 @pytest.mark.parametrize("plan", ["pro", "business", "agency"])
-@pytest.mark.parametrize("mode", ["overlaps_only", "everything"])
-async def test_a_batch_keeps_its_overlaps_only_default_on_every_plan_that_has_batch(
-    client, db, make_user, plan, mode
-):
-    """The overlap gate stops at /segments, on purpose.
-
-    `delivery_mode="overlaps_only"` is the DEFAULT for a batch and "Batch
-    scraping" is a Pro card line, so gating it would leave Pro able to create a
-    batch and unable to receive the only export it makes by default. That is a
-    worse contradiction than the one it would close.
-
-    The two are not the same product: a batch dedupes across the counties and
-    record types of the one run its owner paid for, while /segments overlaps the
-    user's whole result history across lists. Pinned so nobody closes the second
-    door without moving the Pro card with it."""
+async def test_every_plan_with_batch_can_still_create_one(client, db, make_user, plan):
+    """"Batch scraping" is a Pro card line, and the overlap gate must not have
+    quietly broken it. An earlier version of this test pinned the opposite
+    decision (overlaps_only ungated everywhere); the gate now refuses an
+    EXPLICIT overlaps_only below Business and coerces the DEFAULT to
+    "everything", so a batch still runs on every plan that is sold one."""
     _user, token = await make_user(plan)
     r = await client.post(
         "/batches",
         json={
-            "name": "Overlap batch",
+            "name": "Batch still works",
             "state": "WA",
             "counties": ["king"],
             "record_types": ["probate"],
-            "delivery_mode": mode,
         },
         headers=_auth(token),
     )
-    assert r.status_code == 201, f"{plan}/{mode}: {r.text}"
+    assert r.status_code == 201, f"{plan}: {r.text}"
 
 
 # -- Agency-only lines -------------------------------------------------------
@@ -1301,3 +1291,219 @@ def test_documents_that_a_non_canonical_plan_string_loses_paid_features(stored):
     # .lower() alone is not enough: entitlements._plan_of lowercases but does not strip.
     assert "business " .strip() == "business"
     assert "business " not in COUNTY_LIMIT_BY_PLAN
+
+
+# -- The three items the first pass left open --------------------------------
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plan", ["pro", "business"])
+async def test_an_explicit_overlaps_only_batch_is_a_business_line(
+    client, db, make_user, plan
+):
+    """Asking for the overlap product BY NAME is refused below Business, the same
+    as /segments. The batch was the second door to the same thing."""
+    from src.config.constants import OVERLAP_PLANS
+
+    _user, token = await make_user(plan)
+    r = await client.post(
+        "/batches",
+        json={
+            "name": "Explicit overlap",
+            "state": "WA",
+            "counties": ["king"],
+            "record_types": ["probate"],
+            "delivery_mode": "overlaps_only",
+        },
+        headers=_auth(token),
+    )
+    if plan in OVERLAP_PLANS:
+        assert r.status_code == 201, r.text
+    else:
+        assert r.status_code == 402, r.text
+        assert r.json()["detail"]["code"] == "overlap"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_a_pro_batch_that_says_nothing_still_runs_and_delivers_everything(
+    client, db, make_user
+):
+    """`delivery_mode` DEFAULTS to overlaps_only and "Batch scraping" is a Pro card
+    line, so refusing the default would leave Pro able to create a batch and
+    unable to receive the only export it makes. Omitted below Business becomes
+    "everything": more rows, not fewer, and the overlap filter is the part that
+    was never sold at this tier."""
+    from sqlalchemy import text as _text
+
+    _user, token = await make_user("pro")
+    r = await client.post(
+        "/batches",
+        json={
+            "name": "Default batch",
+            "state": "WA",
+            "counties": ["king"],
+            "record_types": ["probate"],
+        },
+        headers=_auth(token),
+    )
+    assert r.status_code == 201, r.text
+    stored = (
+        await db.execute(
+            _text("SELECT delivery_mode FROM scraper_batches WHERE id = CAST(:b AS uuid)"),
+            {"b": r.json()["batch_id"]},
+        )
+    ).scalar()
+    assert stored == "everything"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_a_business_batch_keeps_the_overlaps_only_default(
+    client, db, make_user
+):
+    _user, token = await make_user("business")
+    from sqlalchemy import text as _text
+
+    r = await client.post(
+        "/batches",
+        json={
+            "name": "Default batch",
+            "state": "WA",
+            "counties": ["king"],
+            "record_types": ["probate"],
+        },
+        headers=_auth(token),
+    )
+    assert r.status_code == 201, r.text
+    stored = (
+        await db.execute(
+            _text("SELECT delivery_mode FROM scraper_batches WHERE id = CAST(:b AS uuid)"),
+            {"b": r.json()["batch_id"]},
+        )
+    ).scalar()
+    assert stored == "overlaps_only"
+
+
+def test_a_missing_customer_id_is_not_the_same_signal_as_stripe_being_off():
+    """These two used to raise ONE exception type, and the caller stamped
+    reported_at on it, which permanently wrote off real billable overage for a
+    customer whose stripe_customer_id had simply not been written yet. On this
+    deployment plans are set by hand and most users have no customer id at all,
+    so that was not a corner case."""
+    import src.api.billing.skip_trace_usage as st
+
+    assert st._MissingCustomerError is not st._StripeNotConfiguredError
+    assert not issubclass(st._MissingCustomerError, st._StripeNotConfiguredError)
+    assert not issubclass(st._StripeNotConfiguredError, st._MissingCustomerError)
+
+    # _stripe_enabled() is checked first and is False without the meter env, so
+    # the customer-id branch is only reachable with Stripe configured.
+    import pytest as _pytest
+
+    monkeypatch = _pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(st, "_stripe_enabled", lambda: True)
+        with pytest.raises(st._MissingCustomerError):
+            st.report_meter_event_to_stripe(
+                user_id="u" * 36,
+                queue_id=1,
+                billable_units=5,
+                stripe_customer_id=None,
+                plan="pro",
+            )
+        # Stripe genuinely off stays the OTHER signal, and stays terminal.
+        monkeypatch.setattr(st, "_stripe_enabled", lambda: False)
+        with pytest.raises(st._StripeNotConfiguredError):
+            st.report_meter_event_to_stripe(
+                user_id="u" * 36,
+                queue_id=1,
+                billable_units=5,
+                stripe_customer_id="cus_x",
+                plan="pro",
+            )
+    finally:
+        monkeypatch.undo()
+
+
+def test_the_outbox_sweep_holds_unbillable_rows_instead_of_looping_on_them():
+    """The sweep runs every three minutes. Leaving a row unreported without also
+    teaching the sweep to skip it would re-enqueue it forever. The join is a
+    hold: the row is picked up the moment a customer id exists."""
+    import inspect
+
+    from src.workers.scheduler_helpers import meter
+
+    src = inspect.getsource(meter)
+    assert "JOIN users u ON u.id = e.user_id" in src
+    assert "u.stripe_customer_id IS NOT NULL" in src
+    # And a hold nobody can see is worse than the write-off it replaced.
+    assert "skip_trace_meter_held" in src
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_the_skip_trace_allowance_rolls_on_the_entitlement_window(
+    db, make_user, sync_db
+):
+    """Records reset on the subscriber's anniversary and a Stripe metered item
+    bills over the SUBSCRIPTION period, so a calendar-month allowance gave a
+    customer anchored on the 20th two free buckets inside one paid month. The
+    counter now rolls on the same window the records do.
+
+    The comparison is strictly less-than, so it can only ever RESET a counter,
+    never resurrect a spent one."""
+    from datetime import timedelta
+
+    from sqlalchemy import text as _text
+
+    from src.api.billing.skip_trace_usage import report_lookups_for_user
+
+    quota = settings.SKIP_TRACE_BUNDLED_QUOTAS["pro"]
+    user, _token = await make_user("pro")
+    uid = str(user.id)
+
+    # Spend the whole allowance inside the current window.
+    first = report_lookups_for_user(sync_db, uid, quota, queue_id=910001)
+    assert first["used_after"] == quota
+    assert first["billable_units"] == 0
+    sync_db.commit()
+
+    # A calendar rollover with the window unchanged must NOT hand out a second
+    # bucket. This is the case the old code got wrong.
+    same_window = report_lookups_for_user(sync_db, uid, 1, queue_id=910002)
+    assert same_window["used_after"] == quota + 1
+    assert same_window["billable_units"] == 1
+    sync_db.commit()
+
+    # Advance the ENTITLEMENT window; the allowance comes back.
+    sync_db.execute(
+        _text(
+            "UPDATE users SET quota_period_start = quota_period_start + INTERVAL '1 month'"
+            " WHERE id = CAST(:u AS uuid)"
+        ),
+        {"u": uid},
+    )
+    sync_db.commit()
+    rolled = report_lookups_for_user(sync_db, uid, 1, queue_id=910003)
+    assert rolled["used_before"] == 0
+    assert rolled["used_after"] == 1
+    assert rolled["billable_units"] == 0
+    sync_db.rollback()
+
+
+def test_the_daily_rollover_keys_off_the_window_not_the_calendar():
+    import inspect
+
+    from src.workers.scheduler_helpers import billing as sched_billing
+
+    src = inspect.getsource(sched_billing)
+    assert "skip_trace_period_start < quota_period_start" in src
+    assert "SET skip_trace_period_start = quota_period_start" in src
+    # The module's docstring still QUOTES the retired records-half SQL as
+    # history, so a blunt "date_trunc is absent" check reads that prose and
+    # fails. What matters is that no skip-trace UPDATE keys off the calendar.
+    for stmt in src.split("UPDATE users")[1:]:
+        head = stmt[:400]
+        if "skip_trace" in head:
+            assert "date_trunc" not in head, head[:200]

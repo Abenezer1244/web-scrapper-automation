@@ -5589,7 +5589,7 @@
     },
     "/billing/skip-trace-usage": {
       "get": {
-        "description": "Return the user's skip-trace lookup usage + bundled quota.\n\nUsed by the frontend billing page to render a progress bar and\noverage estimate. Values are read from the cached counter on the\nUser row — no external calls.",
+        "description": "Return the user's skip-trace lookup usage + bundled quota.\n\nUsed by the frontend billing page to render a progress bar and\noverage estimate. Values are read from the cached counter on the\nUser row — no external calls.\n\nThe period reported is the user's ENTITLEMENT WINDOW, the same one records\nare metered over and the same one the counter now rolls on. It used to\nreport the raw `skip_trace_period_start`, which was a calendar month, so the\npage told a subscriber anchored on the 20th that their lookups reset on the\n1st while their records reset on the 20th and Stripe invoiced on the 20th.\n`effective_window` is used rather than the stored pair for the same reason\n/billing/usage uses it: a window that has ended but not yet rolled would\notherwise be reported as the current one.",
         "operationId": "skip_trace_usage_billing_skip_trace_usage_get",
         "responses": {
           "200": {

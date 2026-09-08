@@ -23,6 +23,8 @@ from src.api.entitlements import (
     disallowed_export_formats,
     enforce_entitlements,
     export_format_violation,
+    overlap_allowed,
+    overlap_violation,
     raise_plan_features,
     schedule_frequency_allowed,
     schedule_frequency_violation,
@@ -229,17 +231,34 @@ async def create_batch(
         _problems.append(export_format_violation(plan, _bad_formats))
     if not schedule_frequency_allowed(plan, body.schedule.frequency):
         _problems.append(schedule_frequency_violation(plan, body.schedule.frequency))
-    # NOT gated here, deliberately: `delivery_mode="overlaps_only"` is the DEFAULT
-    # for a batch, and "Batch scraping" is a Pro card line. Gating it would leave
-    # Pro able to create a batch and unable to receive the only export it makes by
-    # default, which is a worse contradiction than the one it would close.
+    # `overlaps_only` IS the overlap product, reached through a second door, so it
+    # carries the same Business gate as /segments. But the field DEFAULTS to
+    # overlaps_only and "Batch scraping" is a Pro card line, so refusing the
+    # default outright would leave Pro able to create a batch and unable to
+    # receive the only export it makes. Both halves of that are avoidable:
     #
-    # The two are not the same product. A batch dedupes across the counties and
-    # record types of the one run its owner paid for; /segments overlaps the
-    # user's whole result history across lists, which is the "crown jewel" the
-    # pricing strategy gates at Business. If the owner decides a Pro batch must
-    # deliver "everything", that is a product change to the Pro batch, not a gate
-    # to add here, and the card has to move with it.
+    #   * asked for EXPLICITLY below Business -> refused, like any other
+    #     Business feature. The caller asked for the crown jewel by name.
+    #   * left to the DEFAULT below Business -> quietly becomes "everything".
+    #     The batch still runs and still delivers, with more rows rather than
+    #     fewer: "everything" is the whole deduped list, and the overlap filter
+    #     is the part that was never sold at this tier.
+    #
+    # model_fields_set is what separates the two. It is the only thing that can:
+    # an explicit {"delivery_mode": "overlaps_only"} and an omitted field are the
+    # same value by the time the model is built.
+    #
+    # delivery_mode only filters the EXPORT (src/workers/batch_export.py). Record
+    # counts and billing come from the child jobs and are untouched by this, so
+    # the coercion cannot cost or charge anyone anything.
+    effective_delivery_mode = body.delivery_mode
+    if not overlap_allowed(plan):
+        if "delivery_mode" in body.model_fields_set and (
+            body.delivery_mode == "overlaps_only"
+        ):
+            _problems.append(overlap_violation(plan))
+        else:
+            effective_delivery_mode = "everything"
     raise_plan_features(_problems)
 
     # 4. Quota preflight — don't launch a batch when already at the entitlement
@@ -325,7 +344,7 @@ async def create_batch(
         ),
         deliver=body.deliver.model_dump(),
         status="active",
-        delivery_mode=body.delivery_mode,
+        delivery_mode=effective_delivery_mode,
     )
     db.add(batch)
     await db.flush()

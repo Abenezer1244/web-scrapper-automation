@@ -19,6 +19,93 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-08 — My own checker said "0 remaining" three times and was wrong every time
+
+**Built / Shipped:**
+- **FE #118 `c0d8976`** + **BE #255 `9ef443f`** — the em-dash sweep the plan-notice work
+  deferred. 90 frontend rewrites across 43 files, plus the customer-facing backend strings:
+  `quota.py`'s two 402 block reasons, two 422 details, ten live `_publish_log` job-log
+  messages, five job-failure reasons, `progress_label`, two pricing FAQ answers, the
+  ops-alert subjects and bodies that email a human, and four OpenAPI parameter descriptions.
+- **FE #119 `75f34b1`** — four more found by auditing the DEPLOYED site.
+- **FE #120** — one rewrite of mine that read worse than the original.
+- `scripts/find-user-facing-dashes.mjs` (FE) parses with TypeScript's own parser so the
+  sweep is re-runnable; the backend equivalent walks the AST and drops docstrings.
+- **BE `8e88d09`** — regenerated `schema/openapi.json`; **FE `cd5da11`** — regenerated
+  `lib/api-types.generated.ts`.
+
+**Tried / Decided:**
+- Grep is the wrong tool: this codebase uses em dashes heavily in comments and docstrings by
+  house style, and a comment is not copy. Both scanners parse and classify by the call each
+  literal feeds (`HTTPException` detail, `_fail_job` reason, `_publish_log`, `send_ops_alert`,
+  `Query(description=)`, logger format).
+- Rewrote sentences rather than swapping in hyphens: a dash became a period, colon, comma or
+  joining word depending on what the sentence needed.
+- Left alone deliberately: en dashes in numeric ranges (`10–72 characters`), the bare `—`
+  used as an empty-value glyph in table cells, and the `·` separator in the batch summary.
+  None of those is the banned punctuation.
+- **Did NOT touch the generated `party_name`** in the two code-violation scrapers. Codex was
+  right that `"{label} — {address}"` is customer-visible in exports, and wrong that it should
+  change: it is an input to `_compute_dedup_hash`, whose docstring says the scheme keys
+  `delivered_records` for BILLING and must never change. For a record with no parcel or
+  address the fallback hashes that exact string, so rewriting it re-delivers and **re-bills**
+  already-paid leads.
+
+**Failed / Blocked:**
+- **Three false "0 remaining" from my own tooling**, and only the third was caught by luck:
+  1. The Python classifier tested `INTERNAL_HINTS = ("logger", "log", ...)` BEFORE the
+     `USER_FACING` set. `_publish_log` contains `log`, so every message a customer watches
+     scroll past in the live job log was filed as an internal logger call and never
+     reported. Ten of them, on the happy path. **Codex found it.**
+  2. The TS scanner dropped three whole categories (`call-other`, `object-other`,
+     `jsx-prop-other`) from its count, but `message={...}` and `{body: "..."}` render copy.
+     "0" was a claim about what the script chose to look at. **Codex found it.**
+  3. The TS scanner truncates findings to 150 chars for display and I tested that truncated
+     field. Four strings carry their dash past character 150; **two shipped to production**,
+     including the DNC/TCPA warning above the results table. Found only by fetching the
+     deployed pages and counting there.
+- Codex round 2 on the sweep hit an OpenAI usage limit partway through and could not be
+  re-run before session end. Its outstanding questions were answered by hand instead:
+  reachability across every customer path, tests pinning old strings, and a read-back of all
+  90 frontend rewrites (which is how #120 was found).
+- `railway variables` could not read the deployed env (no linked project); the
+  `ENTITLEMENT_ENFORCEMENT` question was answered from this journal's own #235 entry instead.
+
+**Caught & fixed:**
+- My claim that raw exception text never reaches a customer was **false as stated**. It holds
+  for `_run_scraper`, which substitutes fixed copy, but not for enrichment, which appended
+  `str(exc)[:120]` to a customer-visible log line. (#253 then superseded that fix entirely by
+  not publishing the exception at all.)
+- Six comma splices I introduced, two flagged by Codex and four found in my own read-back of
+  ops-alert subjects (`"Tracerfy out of credits, skip trace stalled"`).
+- One edit left a sentence starting lowercase (`"...out of this list). flipping the default"`).
+- Two CI gates I did not anticipate: a `Query(description=)` is part of the OpenAPI contract,
+  so `schema/openapi.json` went stale, and once that merged the frontend's generated types
+  went stale too.
+
+**Pending / Handoff:**
+- **FE #120 is open** (one-line copy fix), CI pending at hand-off.
+- One em dash remains in a human-readable backend string: `scrapers/reliability.py`'s
+  exception format. Internal, and verifiably never customer-visible.
+- Codex round 2 on the sweep was never completed. Worth re-running after the quota resets.
+
+**Facts learned:**
+- 🔑 **Verify against the artifact users receive.** Fetching `app.bridgeleads.io` and counting
+  em dashes in the served HTML and JS chunks caught what three source scans missed. Separate
+  the deliberate glyph by counting `>—<` apart from prose.
+- 🔑 A public route that imports the same module is a legitimate way to reach an auth-gated
+  bundle: `/register` imports `@/lib/errors`, which is how the plan notice was confirmed live
+  in production without a session.
+- 🛑 `git checkout --theirs <file>` takes the WHOLE file, not the conflicted hunks. It
+  silently reverted seven of my edits elsewhere in the same file that had merged cleanly.
+- 🔑 `ENTITLEMENT_ENFORCEMENT` is ON in prod (per the #235 entry below), so the plan notice
+  fires for real customers today. The code default of False is not the production value.
+- 🔑 #253 had independently made five of the same de-dashing edits, character for character,
+  while this branch was open. Two people reaching for the same fix is a signal the copy was
+  visibly wrong, not a coincidence.
+
+---
+
 ## 2026-09-07 — The plan-limit alert was an error toast, and that was the whole bug
 
 **Built / Shipped:**

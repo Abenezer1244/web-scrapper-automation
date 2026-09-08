@@ -39,7 +39,8 @@ already correct.
 - [x] Codex review round 1
 - [x] Fix Codex findings: `/signup` referral link, overpromising CTA labels,
       circular test oracle, trial-less "Pro trial" fixture
-- [x] ruff clean, full pytest suite green
+- [x] `ruff check src/ tests/` clean (CI's exact command, ruff 0.15.6)
+- [x] Full pytest suite on an isolated DB: 2664 passed, 2 skipped, 0 failed
 - [x] Playwright end-to-end against the fixed API response
 - [ ] Codex review round 2 (quota-blocked, retry after 6:10 AM)
 
@@ -63,3 +64,11 @@ Four of five onboarding routes and the referral share link were dead. The fix is
 worth less than the guard: `tests/test_onboarding_routes.py` holds its own literal
 copy of the frontend's page list, so a route that does not correspond to a real
 `page.tsx` fails, and any `/dashboard/`-prefixed route fails outright.
+
+## Test-run note
+Two intermediate suite runs showed scattered failures in files this diff does not
+touch (tax cap, brute-force lockout, break-glass, mailing recovery), each run a
+DIFFERENT set. Cause was contention on the shared local Postgres, not the change:
+another agent's pytest was running, and a leftover uvicorn of mine held
+connections to the same DB. With those gone, the 134 tests in the affected files
+passed, and the full suite came back 2664 passed / 0 failed.

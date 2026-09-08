@@ -638,7 +638,8 @@ async def _batch_enrich_king_county(
         # make every recovered parcel fail that check and silently drop its
         # mailing address. Copied per pid so the caller's dict is never mutated.
         _seeded = {pid: dict((results_seed or {}).get(pid) or {}) for pid in tax_urls_in}
-        return await _king_mailing_phase(_seeded, dict(tax_urls_in), st, _over_budget, pace_s)
+        return await _king_mailing_phase(
+            _seeded, dict(tax_urls_in), st, _over_budget, pace_s, _admission=_admission)
 
     if not clean:
         return results
@@ -905,10 +906,20 @@ async def _batch_enrich_king_county(
         st["mailing_candidates"] = len(tax_urls)
         return results
 
-    return await _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s)
+    if _admission is not None and not getattr(_admission, "admitted", True):
+        # The lease was lost during phase 1. Its branch set budget_exhausted, but
+        # `_over_budget()` only reads the DEADLINE, so phase 2 used to run anyway
+        # and issue its mailing navigations with no lease at all (Codex).
+        _logger.warning("King phase 2: skipped, the source lease was lost in phase 1")
+        st["deferred"].extend(tax_urls)
+        st.setdefault("unreached", []).extend(tax_urls)
+        return results
+    return await _king_mailing_phase(
+        results, tax_urls, st, _over_budget, pace_s, _admission=_admission)
 
 
-async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
+async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s,
+                              _admission=None):
     """Phase 2 — Playwright mailing lookups for parcels with a tax-bill URL.
 
     Split out of batch_enrich_king_county so a chunking caller can run it AFTER
@@ -964,6 +975,19 @@ async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
                     break
                 if i % 25 == 0:
                     _logger.info("  Mailing: %d / %d ...", i, len(pids_to_lookup))
+                # Mailing is the SLOW phase (5-10 s per parcel), so an unrenewed
+                # 200-parcel pass can outlive the lease on its own and overlap
+                # another worker. Renew here too, and stop the moment it is gone.
+                if (i and i % 10 == 0 and _admission is not None
+                        and not _admission.still_held()):
+                    _logger.warning(
+                        "King phase 2: lost the source lease after %d/%d lookups",
+                        i, len(pids_to_lookup),
+                    )
+                    st["budget_exhausted"] = True
+                    st["deferred"].extend(pids_to_lookup[i:])
+                    st.setdefault("unreached", []).extend(pids_to_lookup[i:])
+                    break
                 st["mailing_attempted"] += 1
                 st.setdefault("requested_pids", []).append(pid)
                 # A MAILING attempt specifically. The recovery sweep charges its
@@ -986,13 +1010,22 @@ async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
                         url, wait_until="domcontentloaded", timeout_ms=8_000
                     )
 
+                    # Did the page actually SETTLE? The 4s wait can time out and its
+                    # exception was swallowed, so a page that had rendered the parcel
+                    # number but not yet the mailing section satisfied "our parcel,
+                    # no Mailing Address block" and became a TERMINAL "none" — the
+                    # sweep then cleared the marker after that single attempt. That
+                    # is permanent silent loss, the exact class of defect this whole
+                    # change exists to remove (Codex).
+                    _rendered = False
                     try:
                         await scraper.page.wait_for_function(
                             "() => document.body.innerText.includes('Mailing Address') || document.body.innerText.includes('No accounts')",
                             timeout=4_000,
                         )
+                        _rendered = True
                     except Exception:
-                        pass
+                        _logger.debug("King mailing: parcel=%s never settled in 4s", pid)
 
                     body = await scraper.page.inner_text("body")
                     # "none" ONLY when the rendered page is provably this parcel's
@@ -1011,7 +1044,11 @@ async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
                     # render) is UNKNOWN, not empty — treating it as a real answer
                     # let the sweep clear the marker permanently on the first
                     # attempt (Codex).
-                    if "No accounts" in body or (_page_is_ours and "Mailing Address" not in body):
+                    # `_rendered` is load-bearing: the absence of a section on a page
+                    # we never saw finish is not evidence that the section is empty.
+                    if "No accounts" in body or (
+                        _rendered and _page_is_ours and "Mailing Address" not in body
+                    ):
                         results[pid]["mailing_lookup"] = "none"
                     # IDENTITY GATE (Codex). The extraction below used to be
                     # independent of the check above: any rendered page carrying a

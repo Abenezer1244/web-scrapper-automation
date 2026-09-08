@@ -441,16 +441,20 @@ async def test_patch_batch_child_409(client, db, starter_user, starter_token):
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_patch_switch_to_since_last_run_persists(client, db, starter_user, starter_token):
+async def test_patch_switch_to_since_last_run_persists(client, db, business_user, business_token):
+    """Business, not Starter: the subject here is that `date_range_mode` survives
+    a PATCH, and it needs a frequency the plan covers to get past the schedule
+    gate. Starter runs manually, so pairing it with "daily" would test the gate
+    instead of the field."""
     from src.db.models import ScraperConfig
-    config = await _make_config(db, starter_user)
+    config = await _make_config(db, business_user)
     r = await client.patch(
         f"/scrapers/{config.id}",
         json={
             "updated_at": config.updated_at.isoformat(),
             "schedule": {"frequency": "daily", "date_range_mode": "since_last_run"},
         },
-        headers=_auth(starter_token),
+        headers=_auth(business_token),
     )
     assert r.status_code == 200
     fresh = (await db.execute(

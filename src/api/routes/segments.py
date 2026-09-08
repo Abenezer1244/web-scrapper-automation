@@ -33,6 +33,11 @@ from starlette.responses import Response
 
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
+from src.api.entitlements import (
+    overlap_allowed,
+    overlap_violation,
+    plan_limit_http,
+)
 from src.api.lead_actionability import actionable_sql
 from src.api.middleware import rate_limit
 from src.api.schemas import (
@@ -55,7 +60,28 @@ from src.utils.logger import setup_logger
 
 _logger = setup_logger("api.segments")
 
-router = APIRouter(prefix="/segments", tags=["segments"])
+async def _require_overlap_plan(current_user: CurrentUser) -> None:
+    """Overlap and intersection lists are a Business and Agency line.
+
+    This router shipped with authentication and tenant scoping but no plan
+    dependency at all, so a Starter bearer token reached the whole thing by
+    calling the API directly. The plan cards sell "All record types +
+    overlap/intersection" on Business and Agency, and the pricing strategy gates
+    the distress-list overlap there deliberately.
+
+    A router-level dependency rather than a check per handler: there are four
+    endpoints (two previews, two exports) and adding a fifth without the gate is
+    exactly how the hole would come back.
+    """
+    if not overlap_allowed(current_user.plan):
+        raise plan_limit_http(overlap_violation(current_user.plan))
+
+
+router = APIRouter(
+    prefix="/segments",
+    tags=["segments"],
+    dependencies=[Depends(_require_overlap_plan)],
+)
 
 
 

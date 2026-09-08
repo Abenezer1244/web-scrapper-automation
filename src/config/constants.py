@@ -299,6 +299,82 @@ class ScraperFrequency(str, Enum):
     MONTHLY = "monthly"
 
 
+# ── Per-plan export / schedule / segment access ──────────────────────────────
+# The other half of the value-metric matrix. These three are what the plan cards
+# sell as "CSV export" / "CSV + Excel export" / "All export formats",
+# "Manual runs" / "Daily/weekly schedule" / "All schedules", and
+# "All record types + overlap/intersection".
+#
+# All three shipped ungated: DeliverConfig validated `formats` against
+# SUPPORTED_EXPORT_FORMATS alone, ScheduleConfig only checked that a frequency
+# was a known word, and the /segments router carried no plan dependency at all.
+# A Starter account could save a JSON export and a daily schedule, and reach the
+# overlap lists sold on Business, by calling the API directly. Enforced from
+# src/api/entitlements.py, at create and at edit, on the ENABLE-DELTA so a
+# downgrade does not break a config its owner is only renaming.
+#
+# Unlike the county and record-type gates these are NOT behind
+# ENTITLEMENT_ENFORCEMENT: that flag exists to stage the value-metric rollout for
+# accounts that pre-date it, and it is true in production anyway.
+
+# "xlsx" is the on-disk alias of "excel"; a plan that gets one gets the other, or
+# the same file would be allowed under one name and refused under the other.
+EXPORT_FORMATS_BY_PLAN: dict[str, frozenset[str]] = {
+    Plan.STARTER.value: frozenset({"csv"}),
+    Plan.PRO.value: frozenset({"csv", "excel", "xlsx"}),
+    Plan.BUSINESS.value: SUPPORTED_EXPORT_FORMATS,
+    Plan.AGENCY.value: SUPPORTED_EXPORT_FORMATS,
+}
+
+ALL_SCHEDULE_FREQUENCIES: frozenset[str] = frozenset(
+    {"manual", "daily", "weekly", "monthly"}
+)
+
+# "manual" is in every set: it is the absence of a schedule, not a schedule, and
+# refusing it would mean a Starter could not save a scraper at all.
+SCHEDULE_FREQUENCIES_BY_PLAN: dict[str, frozenset[str]] = {
+    Plan.STARTER.value: frozenset({"manual"}),
+    Plan.PRO.value: frozenset({"manual", "daily", "weekly"}),
+    Plan.BUSINESS.value: ALL_SCHEDULE_FREQUENCIES,
+    Plan.AGENCY.value: ALL_SCHEDULE_FREQUENCIES,
+}
+
+# Overlap / intersection lead lists (/segments/*, and the batch
+# delivery_mode="overlaps_only" export). Business and above, per the plan cards
+# and docs/pricing-strategy-2026-06.md, which calls the distress-list overlap the
+# crown jewel and gates it here deliberately.
+OVERLAP_PLANS: frozenset[str] = frozenset({Plan.BUSINESS.value, Plan.AGENCY.value})
+
+# Customer-facing names for export formats. "xlsx" and "excel" are one format
+# with two spellings and must never be shown as two.
+EXPORT_FORMAT_LABELS: dict[str, str] = {
+    "csv": "CSV",
+    "excel": "Excel",
+    "xlsx": "Excel",
+    "json": "JSON",
+}
+
+
+def export_format_label(fmt: str) -> str:
+    """Customer-facing name for an export format slug."""
+    key = (fmt or "").strip().lower()
+    return EXPORT_FORMAT_LABELS.get(key) or key.upper()
+
+
+def allowed_export_formats(plan: str) -> frozenset[str]:
+    """Formats this plan may select. Fails CLOSED on an unknown plan."""
+    return EXPORT_FORMATS_BY_PLAN.get(
+        normalize_plan(plan), EXPORT_FORMATS_BY_PLAN[Plan.STARTER.value]
+    )
+
+
+def allowed_schedule_frequencies(plan: str) -> frozenset[str]:
+    """Frequencies this plan may select. Fails CLOSED on an unknown plan."""
+    return SCHEDULE_FREQUENCIES_BY_PLAN.get(
+        normalize_plan(plan), SCHEDULE_FREQUENCIES_BY_PLAN[Plan.STARTER.value]
+    )
+
+
 class DateRangeMode(str, Enum):
     """`schedule.date_range_mode` values in ScraperConfig."""
 

@@ -41,6 +41,7 @@ from src.config.constants import (
     PRIORITY_QUEUE_PLANS,
     RECORD_TYPES_BY_PLAN,
     SKIP_TRACE_ADDON_PLANS,
+    SUPPORTED_EXPORT_FORMATS,
 )
 from src.config.plans import PLAN_CATALOG, get_plan
 from src.config.settings import settings
@@ -424,31 +425,196 @@ async def test_a_lookup_straddling_the_allowance_bills_only_its_overage(
     sync_db.rollback()
 
 
-def test_documents_that_a_metered_lookup_never_reaches_an_invoice():
-    """MISMATCH, and the most expensive one. The Pro card sells "then $0.08 per
-    lookup". Checkout builds the subscription with a single licensed line item
-    (src/api/routes/billing.py, create_checkout) and nothing in the codebase ever
-    adds a subscription item priced against the skip-trace meter, so the
-    MeterEvent this path fires has no price to settle against.
+def test_the_metered_price_is_attached_to_the_subscription_at_checkout(monkeypatch):
+    """The most expensive gap the audit found. The Pro card sells "then $0.08 per
+    lookup"; checkout built the subscription with a single licensed line item and
+    nothing ever added one priced against the skip-trace meter, so the MeterEvent
+    the ingest path fires had nothing to settle against and every over-quota
+    lookup was recorded, metered, and free.
 
-    The three configured metered price ids are the proof: they exist in settings,
-    they are set in production, and no runtime module reads them.
-
-    Rewrite this test when the metered price is attached at checkout."""
-    import src.api.billing.skip_trace_usage as st
+    Asserts the line items the route actually hands Stripe. A metered price must
+    carry NO quantity: Stripe rejects the item if it does."""
     import src.api.routes.billing as billing
 
-    for slot in (
-        "STRIPE_PRICE_SKIP_TRACE_PRO",
-        "STRIPE_PRICE_SKIP_TRACE_BUSINESS_OVERAGE",
-        "STRIPE_PRICE_SKIP_TRACE_AGENCY_OVERAGE",
-    ):
-        assert hasattr(settings, slot)
-        assert slot not in inspect.getsource(billing)
-        assert slot not in inspect.getsource(st)
+    monkeypatch.setattr(
+        billing,
+        "_SKIP_TRACE_METERED_PRICE",
+        {
+            "pro": {"month": "price_st_pro_m", "year": "price_st_pro_y"},
+            "business": {"month": "price_st_biz_m", "year": ""},
+            "agency": {"month": "price_st_agy_m", "year": ""},
+        },
+    )
 
-    create_checkout_src = inspect.getsource(billing.create_checkout)
-    assert 'line_items=[{"price": stripe_price_id, "quantity": 1}]' in create_checkout_src
+    assert billing._metered_skip_trace_price("pro", "month") == "price_st_pro_m"
+    assert billing._metered_skip_trace_price("pro", "year") == "price_st_pro_y"
+    # Starter has no allowance and no metered price.
+    assert billing._metered_skip_trace_price("starter", "month") is None
+    # An interval with nothing provisioned sells the plan unmetered rather than
+    # failing the checkout: Stripe requires one recurring interval per
+    # subscription, so a monthly metered price cannot ride on a yearly plan.
+    assert billing._metered_skip_trace_price("business", "year") is None
+
+
+def test_a_bad_metered_price_id_does_not_take_the_sale_down_with_it(monkeypatch):
+    """A product id in a price slot is how a STRIPE_PRICE_* env has been
+    misconfigured before. Losing the overage is bad; losing the subscription is
+    worse."""
+    import src.api.routes.billing as billing
+
+    monkeypatch.setattr(
+        billing, "_SKIP_TRACE_METERED_PRICE", {"pro": {"month": "prod_oops"}}
+    )
+    assert billing._metered_skip_trace_price("pro", "month") is None
+
+
+def test_the_plan_is_read_from_the_licensed_item_not_from_index_zero():
+    """Every reader took items[0], which was safe only while a subscription had
+    one item. With the metered item attached, index 0 is whichever Stripe returns
+    first, and a plan lookup on the metered price would miss the map, alert
+    "price not in plan map", and refuse to activate a plan the customer had just
+    paid for."""
+    import src.api.routes.billing as billing
+
+    plan_price = next(iter(billing._PRICE_TO_PLAN), None)
+    if plan_price is None:
+        pytest.skip("no STRIPE_PRICE_* configured in this environment")
+
+    metered_first = [
+        {"price": {"id": "price_skip_trace_meter"}},
+        {"price": {"id": plan_price}},
+    ]
+    assert billing._plan_item_price_id(metered_first) == plan_price
+    assert billing._plan_item_price_id(list(reversed(metered_first))) == plan_price
+    assert billing._plan_item_price_id([{"price": {"id": "price_unknown"}}]) is None
+    assert billing._plan_item_price_id([]) is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_checkout_sends_two_line_items_and_no_quantity_on_the_metered_one(
+    client, db, make_user, monkeypatch
+):
+    """End to end through POST /billing/checkout, watching what reaches Stripe."""
+    import src.api.routes.billing as billing
+
+    plan_price = next(
+        (pid for pid, info in billing._PRICE_TO_PLAN.items() if info[0] == "pro"), None
+    )
+    if plan_price is None:
+        pytest.skip("no Pro STRIPE_PRICE_* configured in this environment")
+
+    monkeypatch.setattr(
+        billing, "_SKIP_TRACE_METERED_PRICE", {"pro": {"month": "price_st_pro_m"}}
+    )
+
+    captured: dict = {}
+
+    class _FakeSession:
+        url = "https://checkout.example/session"
+
+    def _fake_create(**kwargs):
+        captured.update(kwargs)
+        return _FakeSession()
+
+    monkeypatch.setattr(billing.stripe.checkout.Session, "create", _fake_create)
+    monkeypatch.setattr(
+        billing.stripe.Customer, "list", lambda **kw: {"data": []}
+    )
+    monkeypatch.setattr(
+        billing.stripe.Customer, "create", lambda **kw: {"id": "cus_audit"}
+    )
+
+    _user, token = await make_user("pro")
+    r = await client.post(
+        "/billing/checkout", json={"price_id": plan_price}, headers=_auth(token)
+    )
+    assert r.status_code == 200, r.text
+
+    items = captured["line_items"]
+    assert items[0] == {"price": plan_price, "quantity": 1}
+    assert items[1] == {"price": "price_st_pro_m"}
+    assert "quantity" not in items[1]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plan", PLANS)
+async def test_the_metered_skip_trace_addon_is_pro_and_above(client, db, make_user, plan):
+    _user, token = await make_user(plan)
+    r = await client.post(
+        "/scrapers", json=_body("king", skip_trace_enabled=True), headers=_auth(token)
+    )
+    if plan in SKIP_TRACE_ADDON_PLANS:
+        assert r.status_code == 201, r.text
+    else:
+        assert r.status_code == 402, r.text
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plan", PLANS)
+async def test_the_enrichment_skip_tracing_toggle_is_gated_to_business_and_above(
+    client, db, make_user, plan
+):
+    _user, token = await make_user(plan)
+    r = await client.post(
+        "/scrapers",
+        json=_body("king", enrichment={"skip_tracing": True}),
+        headers=_auth(token),
+    )
+    if plan in BUSINESS_FEATURES_PLANS:
+        assert r.status_code == 201, r.text
+    else:
+        assert r.status_code == 402, r.text
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_only_the_units_above_the_bundled_quota_are_metered(db, make_user, sync_db):
+    """Below the included allowance nothing is billable; above it only the excess
+    is, and a later batch does not re-bill the earlier one's overage.
+
+    Calls the production function against a real user row rather than restating
+    its formula: a test that re-implements the arithmetic it is checking proves
+    only that the test author can subtract."""
+    from src.api.billing.skip_trace_usage import report_lookups_for_user
+
+    quota = settings.SKIP_TRACE_BUNDLED_QUOTAS["pro"]
+    user, _token = await make_user("pro")
+    uid = str(user.id)
+
+    # Everything inside the allowance: nothing to bill.
+    first = report_lookups_for_user(sync_db, uid, quota, queue_id=900001)
+    assert first["quota"] == quota
+    assert first["used_after"] == quota
+    assert first["billable_units"] == 0
+
+    # One past it: exactly one unit.
+    second = report_lookups_for_user(sync_db, uid, 1, queue_id=900002)
+    assert second["used_after"] == quota + 1
+    assert second["billable_units"] == 1
+
+    # A later batch bills only its own excess, not the running total.
+    third = report_lookups_for_user(sync_db, uid, 10, queue_id=900003)
+    assert third["billable_units"] == 10
+    sync_db.rollback()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_a_lookup_straddling_the_allowance_bills_only_its_overage(
+    db, make_user, sync_db
+):
+    from src.api.billing.skip_trace_usage import report_lookups_for_user
+
+    quota = settings.SKIP_TRACE_BUNDLED_QUOTAS["pro"]
+    user, _token = await make_user("pro")
+    uid = str(user.id)
+    report_lookups_for_user(sync_db, uid, quota - 5, queue_id=900004)
+    straddle = report_lookups_for_user(sync_db, uid, 10, queue_id=900005)
+    assert straddle["billable_units"] == 5
+    sync_db.rollback()
 
 
 @pytest.mark.integration
@@ -471,22 +637,87 @@ async def test_the_usage_endpoint_reports_the_right_included_amount_and_rate(
 @pytest.mark.integration
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fmt", ["csv", "excel", "xlsx", "json"])
-async def test_documents_that_export_format_carries_no_plan_gate(
-    client, db, make_user, fmt
-):
-    """MISMATCH. The Starter card sells "CSV export" and Pro "CSV + Excel", but
-    DeliverConfig validates `formats` against SUPPORTED_EXPORT_FORMATS alone and
-    no route consults the plan. A Starter account saves JSON here.
+@pytest.mark.parametrize("plan", PLANS)
+async def test_export_format_matches_what_the_card_sells(client, db, make_user, plan, fmt):
+    """Starter "CSV export", Pro "CSV + Excel export", Business and Agency "All
+    export formats". This carried no gate at any layer, so a Starter bearer token
+    saved JSON. "xlsx" and "excel" are one format with two spellings and must
+    move together, or the same file is allowed under one name and refused under
+    the other."""
+    from src.config.constants import allowed_export_formats
 
-    Rewrite this test when the gate lands; do not delete it."""
-    _user, token = await make_user("starter")
+    _user, token = await make_user(plan)
     r = await client.post(
         "/scrapers",
         json=_body("king", deliver={"formats": [fmt], "emails": []}),
         headers=_auth(token),
     )
-    assert r.status_code == 201, r.text
-    assert r.json()["deliver"]["formats"] == [fmt]
+    if fmt in allowed_export_formats(plan):
+        assert r.status_code == 201, f"{plan}/{fmt} refused: {r.text}"
+        assert r.json()["deliver"]["formats"] == [fmt]
+    else:
+        assert r.status_code == 402, f"{plan}/{fmt} allowed: {r.text}"
+        assert r.json()["detail"]["code"] == "export_format"
+
+
+def test_the_card_export_wording_is_the_matrix():
+    """Read the bullets, not the constant: this is the promise being audited."""
+    from src.config.constants import allowed_export_formats
+
+    assert allowed_export_formats("starter") == frozenset({"csv"})
+    assert allowed_export_formats("pro") == frozenset({"csv", "excel", "xlsx"})
+    # "All export formats" has to mean every format the exporter can produce.
+    assert allowed_export_formats("business") == SUPPORTED_EXPORT_FORMATS
+    assert allowed_export_formats("agency") == SUPPORTED_EXPORT_FORMATS
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_an_edit_cannot_add_a_format_above_the_plan_but_can_keep_one(
+    client, db, make_user
+):
+    """The enable-delta rule. A config that already exports a format its owner has
+    since downgraded out of stays renameable; adding a second one does not."""
+    _user, token = await make_user("business")
+    created = await client.post(
+        "/scrapers",
+        json=_body("king", deliver={"formats": ["json"], "emails": []}),
+        headers=_auth(token),
+    )
+    assert created.status_code == 201, created.text
+    config_id = created.json()["id"]
+
+    # Downgrade under the config's feet.
+    from sqlalchemy import text as _text
+
+    await db.execute(
+        _text("UPDATE users SET plan = 'starter' WHERE id = CAST(:u AS uuid)"),
+        {"u": _user.id},
+    )
+    await db.commit()
+
+    async def _token_of(cid: str) -> str:
+        got = await client.get(f"/scrapers/{cid}", headers=_auth(token))
+        assert got.status_code == 200, got.text
+        return got.json()["updated_at"]
+
+    renamed = await client.patch(
+        f"/scrapers/{config_id}",
+        json={"name": "Renamed", "updated_at": await _token_of(config_id)},
+        headers=_auth(token),
+    )
+    assert renamed.status_code == 200, renamed.text
+
+    widened = await client.patch(
+        f"/scrapers/{config_id}",
+        json={
+            "deliver": {"formats": ["json", "excel"]},
+            "updated_at": await _token_of(config_id),
+        },
+        headers=_auth(token),
+    )
+    assert widened.status_code == 402, widened.text
+    assert widened.json()["detail"]["code"] == "export_format"
 
 
 # -- Schedules ---------------------------------------------------------------
@@ -494,22 +725,66 @@ async def test_documents_that_export_format_carries_no_plan_gate(
 @pytest.mark.integration
 @pytest.mark.asyncio
 @pytest.mark.parametrize("frequency", ["manual", "daily", "weekly", "monthly"])
-async def test_documents_that_schedule_frequency_carries_no_plan_gate(
-    client, db, make_user, frequency
+@pytest.mark.parametrize("plan", PLANS)
+async def test_schedule_frequency_matches_what_the_card_sells(
+    client, db, make_user, plan, frequency
 ):
-    """MISMATCH. The Starter card sells "Manual runs" and Pro "Daily/weekly", but
-    ScheduleConfig only checks the value is a known frequency. A Starter account
-    saves a monthly recurring schedule here and the beat dispatcher fires it.
+    """Starter "Manual runs", Pro "Daily/weekly schedule", Business and Agency
+    "All schedules". Nothing gated this, so a Starter saved a daily schedule and
+    the beat fired it every morning. "manual" is in every plan: it is the absence
+    of a schedule, not a schedule."""
+    from src.config.constants import allowed_schedule_frequencies
 
-    Rewrite this test when the gate lands; do not delete it."""
-    _user, token = await make_user("starter")
+    _user, token = await make_user(plan)
     r = await client.post(
         "/scrapers",
         json=_body("king", schedule={"frequency": frequency}),
         headers=_auth(token),
     )
-    assert r.status_code == 201, r.text
-    assert r.json()["schedule"]["frequency"] == frequency
+    if frequency in allowed_schedule_frequencies(plan):
+        assert r.status_code == 201, f"{plan}/{frequency} refused: {r.text}"
+        assert r.json()["schedule"]["frequency"] == frequency
+    else:
+        assert r.status_code == 402, f"{plan}/{frequency} allowed: {r.text}"
+        assert r.json()["detail"]["code"] == "schedule"
+
+
+def test_a_starter_refusal_talks_about_scheduling_not_about_a_frequency():
+    """Starter was never offered daily or weekly, so naming the one it asked for
+    reads as a near miss. Every other plan is missing one specific frequency and
+    is told which one."""
+    from src.api.entitlements import schedule_frequency_violation
+
+    assert schedule_frequency_violation("starter", "daily").message == (
+        "Your Starter plan runs scrapes when you start them. "
+        "Scheduled runs are not included."
+    )
+    assert schedule_frequency_violation("pro", "monthly").message == (
+        "Monthly scheduling is not included in your Pro plan."
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_one_save_that_breaks_two_gates_is_refused_once(client, db, make_user):
+    """A notice per violation would send the customer back for a second refusal
+    after they fixed the first."""
+    _user, token = await make_user("starter")
+    r = await client.post(
+        "/scrapers",
+        json=_body(
+            "king",
+            deliver={"formats": ["json"], "emails": []},
+            schedule={"frequency": "daily"},
+        ),
+        headers=_auth(token),
+    )
+    assert r.status_code == 402, r.text
+    detail = r.json()["detail"]
+    assert detail["code"] == "plan_limit"
+    assert detail["title"] == "Plan limit reached"
+    assert "JSON export is not included in your Starter plan." in detail["message"]
+    assert "Scheduled runs are not included." in detail["message"]
 
 
 # -- Delivery ----------------------------------------------------------------
@@ -638,23 +913,63 @@ async def test_a_key_minted_on_business_stops_working_after_a_downgrade(
 @pytest.mark.integration
 @pytest.mark.asyncio
 @pytest.mark.parametrize("plan", PLANS)
-async def test_documents_that_overlap_segments_carry_no_plan_gate(
-    client, db, make_user, plan
+@pytest.mark.parametrize(
+    "path", ["/segments/intersection", "/segments/union", "/segments/intersection/export"]
+)
+async def test_overlap_and_intersection_are_business_and_above(
+    client, db, make_user, plan, path
 ):
-    """MISMATCH. "All record types + overlap/intersection" is sold as a Business
-    and Agency line, and /segments/intersection has no plan dependency, so a
-    Starter account reaches it. lib/entitlements.ts already carries a
-    canUseOverlap() helper left deliberately unwired for this reason: hiding a
-    backend-allowed feature in the UI would be the wrong half to fix.
+    """"All record types + overlap/intersection" is a Business and Agency line,
+    and the strategy doc gates the distress-list overlap there deliberately. The
+    router shipped with authentication and tenant scoping but no plan dependency,
+    so a Starter bearer token reached all four endpoints.
 
-    Rewrite this test when the backend gate lands; do not delete it."""
+    Every endpoint on the router is checked, not just the preview: the export is
+    the one that hands over the leads."""
+    from src.config.constants import OVERLAP_PLANS
+
     _user, token = await make_user(plan)
     r = await client.post(
-        "/segments/intersection",
-        json={"record_types": ["probate", "pre_foreclosure"]},
+        path, json={"record_types": ["probate", "pre_foreclosure"]}, headers=_auth(token)
+    )
+    if plan in OVERLAP_PLANS:
+        assert r.status_code == 200, f"{plan} {path}: {r.text}"
+    else:
+        assert r.status_code == 402, f"{plan} {path}: {r.text}"
+        assert r.json()["detail"]["code"] == "overlap"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plan", ["pro", "business", "agency"])
+@pytest.mark.parametrize("mode", ["overlaps_only", "everything"])
+async def test_a_batch_keeps_its_overlaps_only_default_on_every_plan_that_has_batch(
+    client, db, make_user, plan, mode
+):
+    """The overlap gate stops at /segments, on purpose.
+
+    `delivery_mode="overlaps_only"` is the DEFAULT for a batch and "Batch
+    scraping" is a Pro card line, so gating it would leave Pro able to create a
+    batch and unable to receive the only export it makes by default. That is a
+    worse contradiction than the one it would close.
+
+    The two are not the same product: a batch dedupes across the counties and
+    record types of the one run its owner paid for, while /segments overlaps the
+    user's whole result history across lists. Pinned so nobody closes the second
+    door without moving the Pro card with it."""
+    _user, token = await make_user(plan)
+    r = await client.post(
+        "/batches",
+        json={
+            "name": "Overlap batch",
+            "state": "WA",
+            "counties": ["king"],
+            "record_types": ["probate"],
+            "delivery_mode": mode,
+        },
         headers=_auth(token),
     )
-    assert r.status_code == 200, r.text
+    assert r.status_code == 201, f"{plan}/{mode}: {r.text}"
 
 
 # -- Agency-only lines -------------------------------------------------------

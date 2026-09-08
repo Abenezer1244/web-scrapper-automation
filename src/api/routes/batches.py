@@ -18,7 +18,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
-from src.api.entitlements import enforce_entitlements
+from src.api.entitlements import (
+    Violation,
+    disallowed_export_formats,
+    enforce_entitlements,
+    export_format_violation,
+    raise_plan_features,
+    schedule_frequency_allowed,
+    schedule_frequency_violation,
+    skip_trace_violation,
+)
 from src.api.lead_actionability import actionable_condition
 from src.api.middleware.rate_limit import rate_limit
 from src.api.schemas import (
@@ -201,18 +210,37 @@ async def create_batch(
                 "combined CSV by email."
             ),
         )
-    # 3b. Skip-trace entitlement — SAME gate as a single scrape (a batch must not
-    #     let a lower plan run paid skip trace).
-    if body.enrichment.skip_tracing and plan not in BUSINESS_FEATURES_PLANS:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail="Skip tracing enrichment requires a Business or Agency plan",
-        )
-    if body.skip_trace_enabled and plan not in SKIP_TRACE_ADDON_PLANS:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail="Skip trace requires a Pro plan or higher.",
-        )
+    # 3b. Per-config plan gates: the SAME ones a single scrape runs, or a batch
+    #     becomes the way around every one of them. Skip trace (a batch must not
+    #     let a lower plan run paid lookups), export format, schedule frequency,
+    #     and the overlaps-only delivery mode, which is the same overlap product
+    #     the /segments routes serve and is sold on Business and Agency.
+    _problems: list[Violation] = []
+    # Two fields, one capability, two tiers: the enrichment toggle is Business and
+    # above, the metered flag is Pro and above. Reported once either way, because
+    # two sentences about skip tracing in one notice reads as a bug.
+    _skip_trace_refused = (
+        body.enrichment.skip_tracing and plan not in BUSINESS_FEATURES_PLANS
+    ) or (body.skip_trace_enabled and plan not in SKIP_TRACE_ADDON_PLANS)
+    if _skip_trace_refused:
+        _problems.append(skip_trace_violation(plan))
+    _bad_formats = disallowed_export_formats(plan, body.deliver.formats)
+    if _bad_formats:
+        _problems.append(export_format_violation(plan, _bad_formats))
+    if not schedule_frequency_allowed(plan, body.schedule.frequency):
+        _problems.append(schedule_frequency_violation(plan, body.schedule.frequency))
+    # NOT gated here, deliberately: `delivery_mode="overlaps_only"` is the DEFAULT
+    # for a batch, and "Batch scraping" is a Pro card line. Gating it would leave
+    # Pro able to create a batch and unable to receive the only export it makes by
+    # default, which is a worse contradiction than the one it would close.
+    #
+    # The two are not the same product. A batch dedupes across the counties and
+    # record types of the one run its owner paid for; /segments overlaps the
+    # user's whole result history across lists, which is the "crown jewel" the
+    # pricing strategy gates at Business. If the owner decides a Pro batch must
+    # deliver "everything", that is a product change to the Pro batch, not a gate
+    # to add here, and the card has to move with it.
+    raise_plan_features(_problems)
 
     # 4. Quota preflight — don't launch a batch when already at the entitlement
     #    cap, or when the account is frozen for a failed payment.
@@ -316,7 +344,11 @@ async def create_batch(
                     enrichment=body.enrichment.model_dump(),
                     schedule=dict(child_schedule),   # batch-chosen window ({} = per-type default)
                     deliver={},    # suppressed — batch owns delivery
-                    skip_trace_enabled=body.skip_trace_enabled,
+                    # Mirrors the single-scrape route: `enrichment.skip_tracing`
+                    # is read by no worker, so a batch that set only that toggle
+                    # ran no lookups. Both are gated above.
+                    skip_trace_enabled=bool(body.skip_trace_enabled)
+                    or bool(body.enrichment.skip_tracing),
                     # Phase 3: probate children get the new TOD default (False) or the
                     # batch-level opt-in; non-probate children leave the flag NULL.
                     include_living_owner_tod=(

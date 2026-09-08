@@ -18,7 +18,7 @@ from src.api.entitlements import (
     CODE_RECORD_TYPE,
     ConfigRow,
     Violation,
-    _plan_limit_http,
+    plan_limit_http,
     combine_violations,
     config_run_violation,
     county_cap_violation,
@@ -51,7 +51,7 @@ def test_starter_two_counties_reads_like_the_agreed_copy():
 
 
 def test_the_wire_payload_is_structured_and_carries_the_instruction():
-    exc = _plan_limit_http(county_cap_violation("starter", projected=2, cap=1))
+    exc = plan_limit_http(county_cap_violation("starter", projected=2, cap=1))
     assert exc.status_code == 402
     assert exc.detail == {
         "code": "county_limit",
@@ -111,7 +111,7 @@ def test_no_banned_dash_in_any_generated_string():
         ),
     ]
     texts = [t for v in violations for t in _all_strings(v)]
-    texts.append(_plan_limit_http(violations[0]).detail["message"])
+    texts.append(plan_limit_http(violations[0]).detail["message"])
     offenders = [t for t in texts if any(c in t for c in BANNED_CHARS)]
     assert offenders == []
 

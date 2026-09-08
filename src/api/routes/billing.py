@@ -19,7 +19,21 @@ from src.api.billing_entitlement import (
 from src.api.deps import get_rls_db
 from src.api.middleware import client_ip, rate_limit
 from src.config import settings
-from src.config.constants import COUNTY_LIMIT_BY_PLAN, TRIAL_PERIOD_DAYS
+from src.config.constants import (
+    ALL_RECORD_TYPES,
+    ALL_SCHEDULE_FREQUENCIES,
+    BATCH_PLANS,
+    COUNTY_LIMIT_BY_PLAN,
+    OVERLAP_PLANS,
+    PRIORITY_QUEUE_PLANS,
+    RECORD_TYPES_BY_PLAN,
+    SUPPORTED_EXPORT_FORMATS,
+    TRIAL_PERIOD_DAYS,
+    allowed_export_formats,
+    allowed_schedule_frequencies,
+    export_format_label,
+    record_type_label,
+)
 from src.config.plans import PLAN_CATALOG
 from src.db import User, get_db
 from src.utils.logger import setup_logger
@@ -365,6 +379,41 @@ async def list_plans() -> dict:
     return {"plans": _PLANS, "founding_offer": founding}
 
 
+# ── Comparison-table cells, derived from the enforced matrix ─────────────────
+# Every one of these used to be a hand-typed string, and three of them had
+# drifted away from the gate they describe. Deriving costs a few lines and
+# makes the drift impossible rather than merely unlikely.
+
+def _record_types_cell(plan: str) -> str:
+    allowed = RECORD_TYPES_BY_PLAN[plan]
+    if allowed == ALL_RECORD_TYPES:
+        return "All"
+    return ", ".join(sorted(record_type_label(rt) for rt in allowed))
+
+
+def _export_formats_cell(plan: str) -> str:
+    allowed = allowed_export_formats(plan)
+    if allowed == SUPPORTED_EXPORT_FORMATS:
+        return "All formats"
+    # xlsx is the on-disk alias of excel; one format, one label.
+    return ", ".join(sorted({export_format_label(f) for f in allowed}))
+
+
+def _scheduling_cell(plan: str) -> str:
+    allowed = allowed_schedule_frequencies(plan)
+    recurring = sorted(allowed - {"manual"})
+    if not recurring:
+        return "Manual only"
+    if allowed == ALL_SCHEDULE_FREQUENCIES:
+        return "All frequencies"
+    return ", ".join(f.title() for f in recurring)
+
+
+def _skip_trace_cell(plan: str) -> str | bool:
+    quota = settings.SKIP_TRACE_BUNDLED_QUOTAS.get(plan, 0)
+    return f"{quota:,} included" if quota else False
+
+
 @router.get("/pricing")
 async def pricing_page() -> dict:
     """Return full pricing page data including feature comparison matrix.
@@ -388,15 +437,53 @@ async def pricing_page() -> dict:
                        else f"{COUNTY_LIMIT_BY_PLAN[plan]:,}")
                 for plan in ("starter", "pro", "business", "agency")
             },
-            "Record types": {"starter": "Probate", "pro": "All", "business": "All", "agency": "All"},
+            # Derived, never re-typed. This row said Pro got "All" record types
+            # while RECORD_TYPES_BY_PLAN gives it four of seven and the API
+            # answers 402 for the rest, in the SAME response whose plan bullets
+            # named the correct four. The Counties row above had drifted the same
+            # way and was fixed the same way in #235.
+            "Record types": {
+                plan: _record_types_cell(plan)
+                for plan in ("starter", "pro", "business", "agency")
+            },
             "Data freshness": {"starter": "7-day delay", "pro": "Daily", "business": "Daily", "agency": "Daily"},
-            "Export formats": {"starter": "CSV", "pro": "CSV, Excel", "business": "CSV, Excel, JSON, API", "agency": "CSV, Excel, JSON, API"},
-            "Scheduling": {"starter": "Manual only", "pro": "Daily, Weekly", "business": "All frequencies", "agency": "All frequencies"},
-            "Email delivery": {"starter": False, "pro": True, "business": True, "agency": True},
+            "Export formats": {
+                plan: _export_formats_cell(plan)
+                for plan in ("starter", "pro", "business", "agency")
+            },
+            "Scheduling": {
+                plan: _scheduling_cell(plan)
+                for plan in ("starter", "pro", "business", "agency")
+            },
+            # Starter read False here and nothing enforced it: `deliver.emails` is
+            # accepted on every plan, and the Starter card never claimed otherwise.
+            # A row nothing implements is a promise in the wrong direction.
+            "Email delivery": {"starter": True, "pro": True, "business": True, "agency": True},
             "Webhook delivery": {"starter": False, "pro": False, "business": True, "agency": True},
-            "Skip tracing": {"starter": False, "pro": "Per-lookup", "business": "1,000 included", "agency": "2,000 included"},
+            "Dialer delivery": {"starter": False, "pro": False, "business": True, "agency": True},
+            # Pro read "Per-lookup", which dropped the 250 lookups its own card
+            # bullet includes. Derived from the same quotas the meter bills on.
+            "Skip tracing": {
+                plan: _skip_trace_cell(plan)
+                for plan in ("starter", "pro", "business", "agency")
+            },
+            "Overlap and intersection lists": {
+                plan: plan in OVERLAP_PLANS
+                for plan in ("starter", "pro", "business", "agency")
+            },
+            "Batch scraping": {
+                plan: plan in BATCH_PLANS
+                for plan in ("starter", "pro", "business", "agency")
+            },
             "API access": {"starter": False, "pro": False, "business": True, "agency": True},
-            "Team members": {"starter": "1", "pro": "1", "business": "5", "agency": "Unlimited"},
+            "Priority queue": {
+                plan: plan in PRIORITY_QUEUE_PLANS
+                for plan in ("starter", "pro", "business", "agency")
+            },
+            # "Team members" used to sit here as 1 / 1 / 5 / Unlimited. There is no
+            # seat model anywhere in this application: no invite flow, no member
+            # table, no route. The row was a promise with nothing behind it, so it
+            # is gone rather than restated. Put it back when seats exist.
             "White-label": {"starter": False, "pro": False, "business": False, "agency": "Coming soon"},
             "Support": {"starter": "Community", "pro": "Email", "business": "Priority email", "agency": "Dedicated manager"},
         },
@@ -418,7 +505,7 @@ async def pricing_page() -> dict:
             {"q": "What counties do you cover?", "a": "22 Washington State counties are live and scraped daily. We can add any US county in 30 seconds. Request yours after signing up."},
             {"q": "Does it include phone and email?", "a": "Yes. Skip tracing is built in: every lead gets phone number, phone type, and email via Tracerfy within 10-15 minutes."},
             {"q": "Can I cancel anytime?", "a": "Yes. No contracts, no cancellation fees. Your data exports remain available for 30 days after cancellation."},
-            {"q": "What export formats do you support?", "a": "CSV, Excel, and JSON. Business and Agency plans also get API access for direct integration."},
+            {"q": "What export formats do you support?", "a": "CSV, Excel, and JSON. Each run delivers one file in the format you pick. Starter is CSV, Pro adds Excel, and Business and Agency get every format plus API access for direct integration."},
         ],
     }
 
@@ -497,7 +584,16 @@ async def get_subscription(request: Request, current_user: CurrentUser) -> dict:
             return {"status": "none", "plan": current_user.plan}
 
         sub = subscriptions.data[0]
-        price = sub["items"]["data"][0]["price"]
+        # The LICENSED plan item, not items[0]: the metered skip-trace item
+        # sits on the same subscription and has unit_amount 8 (cents per
+        # lookup), which as "amount_monthly" would read to the customer as a
+        # $0 plan.
+        _items = sub["items"]["data"]
+        _plan_price_id = _plan_item_price_id(_items)
+        price = next(
+            (i["price"] for i in _items if i["price"]["id"] == _plan_price_id),
+            _items[0]["price"],
+        )
         return {
             "status": sub["status"],
             "plan": current_user.plan,
@@ -518,6 +614,74 @@ async def get_subscription(request: Request, current_user: CurrentUser) -> dict:
 
 
 # ─── Checkout ─────────────────────────────────────────────────────────────────
+
+# plan id -> the metered skip-trace Price for each billing interval.
+_SKIP_TRACE_METERED_PRICE: dict[str, dict[str, str]] = {
+    "pro": {
+        "month": settings.STRIPE_PRICE_SKIP_TRACE_PRO,
+        "year": settings.STRIPE_PRICE_SKIP_TRACE_PRO_ANNUAL,
+    },
+    "business": {
+        "month": settings.STRIPE_PRICE_SKIP_TRACE_BUSINESS_OVERAGE,
+        "year": settings.STRIPE_PRICE_SKIP_TRACE_BUSINESS_ANNUAL,
+    },
+    "agency": {
+        "month": settings.STRIPE_PRICE_SKIP_TRACE_AGENCY_OVERAGE,
+        "year": settings.STRIPE_PRICE_SKIP_TRACE_AGENCY_ANNUAL,
+    },
+}
+
+
+def _metered_skip_trace_price(plan: str, interval: str) -> str | None:
+    """The metered skip-trace Price to put on this subscription, or None.
+
+    None is a deliberate, survivable outcome, not an error:
+
+      * Starter has no skip-trace allowance and no metered price;
+      * an interval with no provisioned price (today: every annual one)
+        would otherwise fail the whole checkout, because Stripe requires
+        every item in a subscription to share one recurring interval and
+        the monthly price cannot ride on a yearly subscription.
+
+    Selling a plan is more important than metering its overage, so an
+    unprovisioned interval logs loudly and checkout proceeds unmetered.
+    """
+    price = (_SKIP_TRACE_METERED_PRICE.get(plan) or {}).get(interval, "")
+    if not price:
+        if plan in _SKIP_TRACE_METERED_PRICE:
+            _logger.warning(
+                "checkout: no metered skip-trace price configured for plan %s on "
+                "a %sly subscription. Over-quota lookups will be recorded and "
+                "NOT billed. Provision one and set the matching STRIPE_PRICE_"
+                "SKIP_TRACE_* env on api AND worker.",
+                plan, interval,
+            )
+        return None
+    if not price.startswith("price_"):
+        _logger.error(
+            "checkout: metered skip-trace id %r for plan %s is not a 'price_' "
+            "id. Skipping it rather than failing the sale.",
+            price, plan,
+        )
+        return None
+    return price
+
+
+def _plan_item_price_id(items: list) -> str | None:
+    """The LICENSED plan price among a subscription's items.
+
+    Every reader here used to take ``items[0]``, which was safe only while a
+    subscription had exactly one item. With the metered skip-trace item
+    attached, index 0 is whichever Stripe returns first, so a plan lookup on
+    it would miss the map, alert "price not in plan map", and refuse to
+    activate a plan the customer had just paid for.
+    """
+    for item in items or []:
+        pid = ((item or {}).get("price") or {}).get("id")
+        if pid and pid in _PRICE_TO_PLAN:
+            return pid
+    return None
+
 
 class CheckoutRequest(BaseModel):
     price_id: str
@@ -596,11 +760,20 @@ async def create_checkout(
             user.stripe_customer_id = customer_id
             await db.flush()
 
+        # The plan item, plus the metered skip-trace item when one is
+        # provisioned for this plan and interval. A metered price must NOT
+        # carry a quantity: Stripe rejects the item outright if it does.
+        _plan_id, _limit, _interval = _PRICE_TO_PLAN[stripe_price_id]
+        line_items: list[dict] = [{"price": stripe_price_id, "quantity": 1}]
+        metered_price = _metered_skip_trace_price(_plan_id, _interval)
+        if metered_price:
+            line_items.append({"price": metered_price})
+
         session = stripe.checkout.Session.create(
             customer=customer_id,
             mode="subscription",
             payment_method_types=["card"],
-            line_items=[{"price": stripe_price_id, "quantity": 1}],
+            line_items=line_items,
             success_url=f"{settings.FRONTEND_URL}/settings?upgrade=success",
             cancel_url=f"{settings.FRONTEND_URL}/settings?upgrade=cancelled",
             metadata={"user_id": current_user.id, "price_id": price_or_product_id},
@@ -788,8 +961,8 @@ async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
         subscription_id,
         expand=["items.data.price"],
     )
-    price_id = subscription["items"]["data"][0]["price"]["id"]
-    plan_info = _PRICE_TO_PLAN.get(price_id)
+    price_id = _plan_item_price_id(subscription["items"]["data"])
+    plan_info = _PRICE_TO_PLAN.get(price_id) if price_id else None
 
     if not plan_info:
         # Paid checkout but the price isn't in our plan map — entitlement would be
@@ -936,8 +1109,8 @@ async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
     if not items:
         return
 
-    price_id = items[0]["price"]["id"]
-    plan_info = _PRICE_TO_PLAN.get(price_id)
+    price_id = _plan_item_price_id(items)
+    plan_info = _PRICE_TO_PLAN.get(price_id) if price_id else None
 
     if not plan_info:
         # Subscription changed to a price we don't map — the plan change would be

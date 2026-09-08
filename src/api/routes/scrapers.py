@@ -2,6 +2,7 @@
 
 import re
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -10,7 +11,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser, require_admin_mfa
 from src.api.deps import get_rls_db
-from src.api.entitlements import enforce_entitlements
+from src.api.entitlements import (
+    CODE_SKIP_TRACE,
+    Violation,
+    delivery_violation,
+    disallowed_export_formats,
+    enforce_entitlements,
+    export_format_violation,
+    raise_plan_features,
+    schedule_frequency_allowed,
+    schedule_frequency_violation,
+    skip_trace_violation,
+)
 from src.api.middleware.rate_limit import rate_limit
 from src.api.middleware.security import audit_log
 from src.api.schemas import (
@@ -169,41 +181,62 @@ def _validate_doc_types(
 def _enforce_plan_feature_gates(
     current_user,
     *,
-    has_webhook: bool,
-    skip_tracing: bool,
-    skip_trace_enabled: bool,
+    has_webhook: bool = False,
+    has_dialer: bool = False,
+    skip_tracing: bool = False,
+    skip_trace_enabled: bool = False,
+    export_formats: Iterable[str] = (),
+    schedule_frequency: str | None = None,
 ) -> None:
-    """Plan/tier gates for the gated delivery + enrichment features. Shared by
-    create and edit so they can't drift. Create passes the payload's ABSOLUTE
-    values; edit passes the ENABLE-DELTA (only the features this PATCH is newly
-    turning on) so an edit can neither bypass a tier nor punish a config whose
-    owner downgraded after creating it (the feature stays grandfathered until the
-    user toggles it). Raises 402.
+    """Plan gates for the per-config features. Shared by create and edit so they
+    cannot drift. Create passes the payload's ABSOLUTE values; edit passes the
+    ENABLE-DELTA (only what this PATCH is newly turning on) so an edit can
+    neither bypass a tier nor punish a config whose owner downgraded after
+    creating it: the feature stays grandfathered until the user toggles it.
+
+    Raises ONE 402 carrying every violation in the request. A save can break the
+    format gate and the schedule gate at once, and refusing them one at a time
+    sends the customer back for a second rejection after they fixed the first.
+
+    The body is the structured {code, title, message} shape, not a bare sentence.
+    That is not cosmetic: the frontend routes every 402 through one notice, and
+    an unstructured one gets the neutral "Manage billing" action because the only
+    other thing that arrives unstructured is a failed payment. These refusals are
+    plan limits and have to offer "Upgrade plan".
     """
+    plan = normalize_plan(current_user.plan)
+    problems: list[Violation] = []
+
     # Phase 5: the dialer push is a second outbound destination that POSTs lead
     # PII, so it carries the SAME entitlement as the job-summary webhook — gate
     # both, or a lower plan could exfiltrate PII via dialer_webhook_url (Codex).
-    plan = normalize_plan(current_user.plan)
     if has_webhook and plan not in BUSINESS_FEATURES_PLANS:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail="Webhook delivery requires a Business or Agency plan",
-        )
+        problems.append(delivery_violation(plan, "Webhook delivery"))
+    if has_dialer and plan not in BUSINESS_FEATURES_PLANS:
+        problems.append(delivery_violation(plan, "Dialer delivery"))
     if skip_tracing and plan not in BUSINESS_FEATURES_PLANS:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail="Skip tracing enrichment requires a Business or Agency plan",
-        )
-    # Sprint 4: dedicated skip_trace_enabled flag (metered add-on). Available on
-    # Pro/Business/Agency. Starter gets 402 with upsell text.
-    if skip_trace_enabled and plan not in SKIP_TRACE_ADDON_PLANS:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=(
-                "Skip trace ($0.08/lookup) requires a Pro plan or higher. "
-                "Upgrade to Pro to unlock phone + email lookups."
-            ),
-        )
+        problems.append(skip_trace_violation(plan))
+    # Sprint 4: dedicated skip_trace_enabled flag (metered add-on), Pro and above.
+    # Only reported once even when the enrichment toggle tripped too: they are one
+    # capability to the reader, and two sentences about skip tracing in one notice
+    # reads as a bug.
+    if (
+        skip_trace_enabled
+        and plan not in SKIP_TRACE_ADDON_PLANS
+        and not any(p.code == CODE_SKIP_TRACE for p in problems)
+    ):
+        problems.append(skip_trace_violation(plan))
+
+    bad_formats = disallowed_export_formats(plan, export_formats)
+    if bad_formats:
+        problems.append(export_format_violation(plan, bad_formats))
+
+    if schedule_frequency is not None and not schedule_frequency_allowed(
+        plan, schedule_frequency
+    ):
+        problems.append(schedule_frequency_violation(plan, schedule_frequency))
+
+    raise_plan_features(problems)
 
 
 async def _build_scraper_config(
@@ -253,13 +286,14 @@ async def _build_scraper_config(
         # even without a dialer_webhook_url, so it is gated like the webhooks (Codex)
         # — otherwise a non-Business user could save a config the worker then refuses
         # to run.
-        has_webhook=bool(
-            body.deliver.webhook_url
-            or body.deliver.dialer_webhook_url
-            or body.deliver.dialer_type
+        has_webhook=bool(body.deliver.webhook_url),
+        has_dialer=bool(
+            body.deliver.dialer_webhook_url or body.deliver.dialer_type
         ),
         skip_tracing=body.enrichment.skip_tracing,
         skip_trace_enabled=body.skip_trace_enabled,
+        export_formats=body.deliver.formats,
+        schedule_frequency=body.schedule.frequency,
     )
 
     # `enrichment.skip_tracing` and `skip_trace_enabled` are two fields asking
@@ -687,11 +721,33 @@ async def update_scraper(
     # that has the dead toggle stored true, which is the opposite of a fix.
     if skip_tracing_added:
         eff_skip_trace = True
+    # Same enable-delta rule for the two new gates: only formats this PATCH
+    # ADDS and a frequency it CHANGES are checked, so a downgraded account can
+    # still rename a config that already exports JSON on a daily schedule, but
+    # cannot add a second format or move to a frequency above its plan.
+    stored_formats = {
+        str(f).strip().lower() for f in (stored_deliver.get("formats") or []) if f
+    }
+    added_formats = {
+        str(f).strip().lower() for f in (eff_deliver.get("formats") or []) if f
+    } - stored_formats
+    stored_frequency = (
+        (config.schedule or {}).get("frequency")
+        if isinstance(config.schedule, dict)
+        else None
+    )
+    eff_frequency = (
+        eff_schedule.get("frequency") if isinstance(eff_schedule, dict) else None
+    )
+    frequency_changed = (eff_frequency or "manual") != (stored_frequency or "manual")
     _enforce_plan_feature_gates(
         current_user,
-        has_webhook=webhook_added or dialer_url_added or dialer_native_added,
+        has_webhook=webhook_added,
+        has_dialer=dialer_url_added or dialer_native_added,
         skip_tracing=skip_tracing_added,
         skip_trace_enabled=eff_skip_trace and not bool(config.skip_trace_enabled),
+        export_formats=added_formats,
+        schedule_frequency=eff_frequency if frequency_changed else None,
     )
 
     # 8. Detect the changed fields (full value compare, incl. secret values so a

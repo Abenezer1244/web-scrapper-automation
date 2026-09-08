@@ -56,7 +56,7 @@ pins them together.
 
 ---
 
-## 2. The matrix, as enforced
+## 2. The matrix, as enforced AFTER the fixes in section 6
 
 | Capability | Starter | Pro | Business | Agency | Enforced by |
 |---|---|---|---|---|---|
@@ -65,21 +65,21 @@ pins them together.
 | Record types | probate | probate, pre-foreclosure, tax-delinquent, trustee sale | all 7 | all 7 | `entitlements.py`, create and run time |
 | Skip trace included | 0 | 250 | 1,000 | 2,000 | counter + meter math |
 | Metered skip-trace toggle | no | yes | yes | yes | `SKIP_TRACE_ADDON_PLANS` |
-| Skip-trace overage charged | n/a | **no** | **no** | **no** | **nothing** |
-| Export formats | **all 4** | **all 4** | all 4 | all 4 | **nothing** |
-| Schedule frequency | **all 4** | **all 4** | all 4 | all 4 | **nothing** |
-| Email delivery | **yes** | yes | yes | yes | **nothing** |
+| Skip-trace overage charged | n/a | yes, monthly | yes, monthly | yes, monthly | metered price attached at checkout (annual unpriced, see 6) |
+| Export formats | CSV | CSV, Excel | all 4 | all 4 | `EXPORT_FORMATS_BY_PLAN`, create and edit |
+| Schedule frequency | manual | manual, daily, weekly | all 4 | all 4 | `SCHEDULE_FREQUENCIES_BY_PLAN`, create and edit |
+| Email delivery | yes | yes | yes | yes | ungated on purpose; the comparison row now says so |
 | Webhook delivery | no | no | yes | yes | `BUSINESS_FEATURES_PLANS` |
 | Dialer delivery | no | no | yes | yes | `BUSINESS_FEATURES_PLANS` |
 | Batch scraping | no | yes (25 combos) | yes (100) | yes (250) | `BATCH_PLANS` |
 | API access | no | no | yes | yes | `require_plan` + the api-key auth path |
-| Overlap / intersection | **yes** | **yes** | yes | yes | **nothing** |
-| Priority queue | no | **manual runs only** | **manual runs only** | | `PRIORITY_QUEUE_PLANS` at 2 of 4 enqueue sites |
-| 7-day data delay | yes on the rolling window, **bypassable** | n/a | n/a | n/a | `dates.py`, rolling branch only |
-| White-label | no | no | no | no (not built) | n/a |
-| Seats | 1 | 1 | 1 | 1 (no seat model exists) | n/a |
+| Overlap / intersection | no | no | yes | yes | `OVERLAP_PLANS`, router dependency on `/segments` |
+| Priority queue | no | no | yes | yes | `PRIORITY_QUEUE_PLANS`, all four enqueue sites |
+| 7-day data delay | yes, on every date mode | n/a | n/a | n/a | `dates.py`, rolling and custom |
+| White-label | no | no | no | not built, labelled "coming soon" everywhere | n/a |
+| Seats | none | none | none | none | no seat model exists; the claim is gone from both pricing surfaces |
 
-Bold cells are where enforcement is weaker than the card.
+Section 3 records what the audit found BEFORE these fixes.
 
 ---
 
@@ -282,10 +282,82 @@ a customer who subscribes on the 20th gets a partial first skip-trace month.
 
 ---
 
-## 5. What this branch changes
+## 5. What was fixed
 
-Nothing that alters an entitlement, a price, a Stripe object, or a line of customer-facing
-copy. It adds `tests/test_plan_entitlement_audit.py` and this document.
+The owner chose the most complete option on all four decisions. Every finding in
+section 3 is closed except the two noted at the end.
 
-Every fix above either changes what a paying customer is charged or removes access
-somebody has today. Both are the owner's call.
+**Not product decisions, just defects:**
+
+* Priority queue: the scheduled dispatcher and the batch fan-out now pass the queue,
+  resolved from the owner's plan. `scrape_queue_for_plan()` is the one place that
+  decision is made, and all four enqueue sites use it.
+* Plan normalization: `normalize_plan()` strips and lowercases, and every gate goes
+  through it, the dialer's SQL filter included. `plan_label` follows, so the tier a
+  customer is enforced on is the tier the notice names.
+* Starter freshness: a custom window's end is clamped to the plan's freshness edge. A
+  window entirely inside the embargo collapses to the edge instead of inverting.
+* The dead `enrichment.skip_tracing` toggle now sets the column the worker reads, on
+  create and on the edit enable-delta only. Mirroring the effective value would have let
+  an unrelated PATCH start paid lookups on a legacy config with the dead toggle stored
+  true, which is the opposite of a fix.
+
+**The three missing gates:**
+
+* Export format: `EXPORT_FORMATS_BY_PLAN`, enforced on create and on the edit
+  enable-delta, mirrored in the wizard as a locked chip that says why.
+* Schedule frequency: `SCHEDULE_FREQUENCIES_BY_PLAN`, same shape. "manual" is in every
+  plan: it is the absence of a schedule, not a schedule, and locking it would leave a
+  Starter unable to save a scraper at all.
+* Overlap and intersection: a router-level dependency on `/segments`, so a fifth endpoint
+  cannot be added without it. `canUseOverlap()` is now wired in the frontend, the nav item
+  is hidden below Business, and the page explains itself rather than rendering a screen
+  whose every button ends in a refusal.
+
+All of these raise the structured `{code, title, message}` 402 the plan notice renders.
+The webhook, dialer and skip-trace refusals were converted to the same shape: they were
+bare sentences, and an unstructured 402 gets the neutral "Manage billing" action, because
+the only other thing that arrives unstructured is a failed payment.
+
+**Billing:**
+
+* The plan's metered skip-trace price is attached as a second subscription item at
+  checkout, so an over-quota lookup produces a real invoice line. A metered price carries
+  no quantity; Stripe rejects the item if it does.
+* Every reader that took `items[0]` now finds the licensed item by price id. With two
+  items on the subscription, index 0 is whichever Stripe returns first, and a plan lookup
+  on the metered price would have alerted "price not in plan map" and refused to activate
+  a plan the customer had just paid for. The same applies to `GET /billing/subscription`,
+  where the metered item's unit_amount of 8 would have shown the customer a $0 plan.
+
+**Copy, on both surfaces:**
+
+* Every comparison cell that describes a gate is derived from that gate. Pro no longer
+  reads "All" record types; export, scheduling and skip tracing are derived; overlap,
+  batch and priority queue are new rows.
+* The public pricing page states the county caps instead of denying them, adds auction
+  notices to Pro, shows Agency overage at 5 cents, and labels white-label "Coming soon"
+  instead of a plain checkmark.
+* "Team members" and "Team seats" are gone from both. There is no seat model: no invite
+  flow, no member table, no route.
+
+### Two things deliberately left
+
+1. **A batch's `delivery_mode="overlaps_only"` is NOT gated.** It is the DEFAULT for a
+   batch and "Batch scraping" is a Pro card line, so gating it would leave Pro able to
+   create a batch and unable to receive the only export it makes by default. A batch
+   dedupes across the counties and record types of the one run its owner paid for;
+   `/segments` overlaps the whole result history across lists, which is what the strategy
+   doc gates. If a Pro batch should deliver "everything" instead, that is a change to the
+   Pro batch and the card has to move with it. Pinned by a test either way.
+2. **Annual subscriptions are still unmetered.** Stripe requires every item in one
+   subscription to share a recurring interval, and the three metered skip-trace prices are
+   monthly. An annual checkout therefore attaches nothing and logs a warning rather than
+   failing the sale. Three yearly metered prices need creating in Stripe and setting as
+   `STRIPE_PRICE_SKIP_TRACE_*_ANNUAL` on api and worker. The settings slots exist and are
+   read; only the Stripe objects are missing, and creating live Stripe prices is not
+   something to do unasked.
+
+Reported and not fixed: the meter outbox stamps a billable event as reported when the
+customer has no `stripe_customer_id` (P2-6), and the skip-trace allowance resets on the
+calendar month while records reset on the subscriber's anniversary (P3-2).

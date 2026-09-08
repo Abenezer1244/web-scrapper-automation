@@ -143,9 +143,23 @@ class Settings(BaseSettings):
     STRIPE_PRODUCT_SKIP_TRACE: str = ""
     STRIPE_METER_SKIP_TRACE: str = ""
     STRIPE_METER_EVENT_NAME_SKIP_TRACE: str = "skip_trace_lookup"
+    # Metered ("usage-based") Prices on the skip-trace meter, one per tier.
+    # These are ATTACHED to the subscription at checkout: a Stripe MeterEvent
+    # only becomes an invoice line when the customer's subscription carries an
+    # item priced against that meter. They existed and were set in production
+    # for months while nothing read them, so every over-quota lookup was
+    # counted, metered, and free.
     STRIPE_PRICE_SKIP_TRACE_PRO: str = ""
     STRIPE_PRICE_SKIP_TRACE_BUSINESS_OVERAGE: str = ""
     STRIPE_PRICE_SKIP_TRACE_AGENCY_OVERAGE: str = ""
+    # Stripe requires every item in one subscription to share a recurring
+    # interval, and the three above are monthly. An ANNUAL plan therefore
+    # needs its own yearly metered price or checkout fails outright. Empty =
+    # not provisioned yet, and an annual checkout stays unmetered rather than
+    # breaking: see _metered_skip_trace_price().
+    STRIPE_PRICE_SKIP_TRACE_PRO_ANNUAL: str = ""
+    STRIPE_PRICE_SKIP_TRACE_BUSINESS_ANNUAL: str = ""
+    STRIPE_PRICE_SKIP_TRACE_AGENCY_ANNUAL: str = ""
     # Bundled monthly quotas by plan — the webhook ingest reports usage
     # only for lookups BEYOND these quotas. Below the quota, the user is
     # not billed per-trace (the cost is absorbed into the base plan price).

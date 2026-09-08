@@ -86,18 +86,25 @@ async def test_the_most_complete_row_survives(
     db, starter_user: User, scraper_config: ScraperConfig,
 ):
     """The losers stop being delivered, so whatever they alone carried is lost.
-    Keep the row a customer can actually act on."""
+    Keep the row a customer can act on.
+
+    Both rows necessarily carry the same parcel and property address -- that is
+    what produced the shared strong hash -- so completeness is decided by what
+    else they have.
+    """
     job_id = await _job(db, starter_user, scraper_config)
     h = uuid.uuid4().hex
-    bare = await _row(db, job_id, starter_user.id, h, party_name="BARE")
+    thin = await _row(db, job_id, starter_user.id, h, party_name="",
+                      parcel_id="0123456", property_address="9 MAIN ST",
+                      date_recorded="2026-01-01")
     full = await _row(db, job_id, starter_user.id, h, party_name="FULL",
-                      property_address="9 MAIN ST", mailing_address="PO BOX 1",
-                      parcel_id="0123456")
+                      parcel_id="0123456", property_address="9 MAIN ST",
+                      mailing_address="PO BOX 1", date_recorded="2026-06-01")
 
     assert await _collapse(db, job_id, starter_user.id) == 1
-    st = await _state(db, [bare, full])
-    assert st[full][0] is False, "the row with address + parcel must survive"
-    assert st[bare][0] is True
+    st = await _state(db, [thin, full])
+    assert st[full][0] is False, "the row with a mailing address must survive"
+    assert st[thin][0] is True
 
 
 async def test_collapse_is_idempotent(
@@ -135,3 +142,46 @@ async def test_collapse_never_touches_another_account(
 
     assert await _collapse(db, mine_job, starter_user.id) == 0
     assert all(not dup for dup, _ in (await _state(db, [t1, t2])).values())
+
+
+# ─── Codex P1s: what the collapse must NOT do ──────────────────────────────────
+
+async def test_weak_name_date_hashes_are_never_collapsed(
+    db, starter_user: User, scraper_config: ScraperConfig,
+):
+    """A dedup_hash is only a PROPERTY when it came from parcel|address. Without a
+    usable parcel and address the worker falls back to a NAME|DATE hash, which
+    identifies a FILING: two addressless filings by the same party on the same day
+    share it without being the same lead. Collapsing them would silently stop
+    delivering one."""
+    job_id = await _job(db, starter_user, scraper_config)
+    weak = uuid.uuid4().hex  # same hash, but neither row has property identity
+    a = await _row(db, job_id, starter_user.id, weak, party_name="SMITH",
+                   date_recorded="2026-01-02", mailing_address="PO BOX 1")
+    b = await _row(db, job_id, starter_user.id, weak, party_name="SMITH",
+                   date_recorded="2026-01-02", mailing_address="PO BOX 2")
+
+    assert await _collapse(db, job_id, starter_user.id) == 0
+    assert all(not dup for dup, _ in (await _state(db, [a, b])).values())
+
+
+async def test_an_undeliverable_row_never_wins_over_a_usable_one(
+    db, starter_user: User, scraper_config: ScraperConfig,
+):
+    """'(enrichment unavailable)' is a populated string but is not an address
+    anywhere the customer looks. Letting it win would hide the usable sibling
+    while the property stayed claimed."""
+    job_id = await _job(db, starter_user, scraper_config)
+    h = uuid.uuid4().hex
+    placeholder = await _row(db, job_id, starter_user.id, h, party_name="A",
+                             parcel_id="0123456",
+                             property_address="(enrichment unavailable)",
+                             date_recorded="2026-01-01")
+    usable = await _row(db, job_id, starter_user.id, h, party_name="B",
+                        parcel_id="0123456", property_address="5 MAIN ST",
+                        date_recorded="2026-06-01")
+
+    assert await _collapse(db, job_id, starter_user.id) == 1
+    st = await _state(db, [placeholder, usable])
+    assert st[usable][0] is False, "the deliverable row must survive"
+    assert st[placeholder][0] is True

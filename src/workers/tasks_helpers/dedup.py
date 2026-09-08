@@ -6,6 +6,7 @@ to the originals in tasks.py.
 """
 
 import time
+from collections import defaultdict
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
@@ -14,6 +15,7 @@ from sqlalchemy.exc import OperationalError
 
 from src.utils.logger import setup_logger
 from src.workers.property_identity import compute_property_key as _compute_property_key
+from src.workers.property_identity import legacy_strong_signature
 
 _logger = setup_logger("worker.task")
 
@@ -318,8 +320,59 @@ def release_capped_dedup_claims(db, user_id: str, job_id: str, capped_ids: list[
 
 # ─── Same-run sibling collapse (all record types) ──────────────────────────────
 
+def _collapse_loser_ids(rows: list[dict]) -> list:
+    """Ids to mark duplicate so each PROPERTY keeps ONE row. Pure, so the rule is
+    unit-testable without a database.
+
+    Only groups rows whose dedup_hash came from the STRONG branch. That branch is
+    ``legacy_strong_signature(parcel_id, property_address)``; when it returns
+    None the worker falls back to a ``NAME|DATE`` hash, which identifies a FILING
+    rather than a property. Two addressless filings by the same party on the same
+    date share that hash without being the same lead, and collapsing them would
+    silently stop delivering one (Codex P1). The function itself is called here
+    rather than reimplemented in SQL, so the rule cannot drift from the one that
+    produced the hash.
+
+    Survivor ranking, in order:
+      1. ACTIONABLE first. A row whose only address is blank or the
+         '(enrichment unavailable)' placeholder is not deliverable anywhere the
+         customer looks, and keeping it would hide the usable sibling while the
+         property stayed claimed (Codex P2).
+      2. then most complete: mailing address, parcel, party name.
+      3. then oldest by (date_recorded, id), so a re-run picks the same winner
+         and the delivered set does not shrink on every pass.
+    """
+    from src.api.lead_actionability import ADDRESS_PLACEHOLDER
+
+    def _usable(v) -> bool:
+        v = (v or "").strip()
+        return bool(v) and v != ADDRESS_PLACEHOLDER
+
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        # Same call the worker used to build the hash. None == weak identity.
+        if legacy_strong_signature(row.get("parcel_id"), row.get("property_address")) is None:
+            continue
+        groups[row.get("dedup_hash")].append(row)
+
+    losers: list = []
+    for grp in groups.values():
+        if len(grp) <= 1:
+            continue
+        ordered = sorted(grp, key=lambda r: (
+            not (_usable(r.get("property_address")) or _usable(r.get("mailing_address"))),
+            not _usable(r.get("mailing_address")),
+            not (r.get("parcel_id") or "").strip(),
+            not (r.get("party_name") or "").strip(),
+            (r.get("date_recorded") or ""),
+            str(r.get("id")),
+        ))
+        losers.extend(r.get("id") for r in ordered[1:])
+    return losers
+
+
 def collapse_same_run_siblings(db, job_id: str, user_id) -> int:
-    """Collapse rows in ONE job that share a dedup_hash, so a property bills once.
+    """Collapse rows in ONE job that share a PROPERTY, so it bills once.
 
     ``dedup_hash`` (parcel|address) is the app-wide BILLING key. The cross-job
     dedup only records that a hash was CLAIMED once; it leaves same-JOB rows
@@ -329,54 +382,45 @@ def collapse_same_run_siblings(db, job_id: str, user_id) -> int:
     trustee_sale has collapsed its own siblings since 2026-07-03. Nothing else
     did, and an audit on 2026-09-08 found 8 completed jobs across probate and
     pre_foreclosure that had charged 50 records for properties already billed in
-    the same run — including one 122-record job that covered 120 properties.
+    the same run, including a 122-record job that covered 120 properties.
 
-    Survivor rule: keep the MOST COMPLETE row, because the collapsed siblings
-    stop being delivered and whatever they alone carried would be lost. Ranked by
-    having a property address, then a mailing address, then a parcel id, then a
-    party name, then oldest by (date_recorded, id) so the choice is deterministic
-    and a re-run picks the same winner. trustee_sale keeps its own auction-aware
-    rule (soonest auction date) and does not use this.
-
-    Marks losers ``duplicate_reason='same_run'`` pointing at this job, so the
-    results page says "combined" rather than "already delivered" -- they were
+    Losers are marked ``duplicate_reason='same_run'`` pointing at this job, so
+    the results page says "combined" rather than "already delivered" -- they were
     never delivered before, they are being seen for the first time.
 
     Returns the number NEWLY collapsed, for the caller's dup_count. Does NOT
-    commit; the caller's transaction owns the write, alongside billing.
+    commit; the caller's transaction owns the write.
+
+    NOTE for the caller: a collapsed sibling leaves the plan cap's view, because
+    the cap ranks non-duplicates only. If the SURVIVOR is later capped, its
+    siblings must inherit that exclusion, or a property nobody paid for is still
+    delivered through the duplicate-keeping paths (lists, batch combine). The cap
+    block in tasks.py propagates it; see DELIVERY_EXCLUDED_KEY there.
     """
-    result = db.execute(
+    rows = db.execute(
         sa_text(
-            """
-            WITH ranked AS (
-                SELECT id,
-                       row_number() OVER (
-                           PARTITION BY dedup_hash
-                           ORDER BY
-                             (COALESCE(btrim(property_address), '') <> '') DESC,
-                             (COALESCE(btrim(mailing_address), '') <> '') DESC,
-                             (COALESCE(btrim(parcel_id), '') <> '') DESC,
-                             (COALESCE(btrim(party_name), '') <> '') DESC,
-                             date_recorded NULLS LAST,
-                             id
-                       ) AS rn
-                FROM results
-                WHERE job_id = :jid
-                  AND user_id = CAST(:uid AS uuid)
-                  AND dedup_hash IS NOT NULL
-                  AND is_duplicate = false
-            )
-            UPDATE results r
-            SET is_duplicate = true,
-                duplicate_reason = 'same_run',
-                duplicate_source_job_id = :jid,
-                duplicate_source_at = NULL
-            FROM ranked
-            WHERE r.id = ranked.id
-              AND ranked.rn > 1
-              AND r.user_id = CAST(:uid AS uuid)
-            """
+            "SELECT id, dedup_hash, parcel_id, property_address, mailing_address, "
+            "       party_name, date_recorded "
+            "FROM results "
+            "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
+            "  AND dedup_hash IS NOT NULL AND is_duplicate = false"
         ),
         {"jid": job_id, "uid": str(user_id)},
+    ).fetchall()
+
+    losers = _collapse_loser_ids([dict(r._mapping) for r in rows])
+    if not losers:
+        return 0
+
+    result = db.execute(
+        sa_text(
+            "UPDATE results SET is_duplicate = true, "
+            "  duplicate_reason = 'same_run', "
+            "  duplicate_source_job_id = :jid, "
+            "  duplicate_source_at = NULL "
+            "WHERE id = ANY(CAST(:ids AS uuid[])) "
+            "  AND user_id = CAST(:uid AS uuid)"
+        ),
+        {"ids": [str(i) for i in losers], "jid": job_id, "uid": str(user_id)},
     )
     return result.rowcount or 0

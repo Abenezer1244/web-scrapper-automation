@@ -152,11 +152,15 @@ async def test_breaking_both_limits_at_once_returns_one_combined_notice(
 async def test_a_first_county_within_the_plan_is_not_refused(
     client, db, starter_user, starter_token, enforcement_on
 ):
-    """Guard against the notice firing on a legitimate create."""
+    """Guard against the notice firing on a legitimate create.
+
+    Asserts 201, not `!= 402`. A negative assertion here would also be satisfied
+    by a 422 from the connector or schema checks that run BEFORE the entitlement
+    gate, so it could pass while proving nothing about entitlements."""
     r = await client.post(
         "/scrapers", json=_create_body("king"), headers=_auth(starter_token)
     )
-    assert r.status_code != 402
+    assert r.status_code == 201, r.text
 
 
 @pytest.mark.integration
@@ -165,10 +169,13 @@ async def test_nothing_is_refused_while_enforcement_is_still_dark(
     client, db, starter_user, starter_token
 ):
     """No `enforcement_on` fixture here. The flag defaults off in production, and
-    the copy change must not have turned an audit log into a live gate."""
+    the copy change must not have turned an audit log into a live gate.
+
+    Asserts 201 for the same reason as above: the create has to actually SUCCEED
+    past the second-county check, not merely fail for some other reason."""
     assert settings.ENTITLEMENT_ENFORCEMENT is False
     await _existing_config(db, starter_user, "king")
     r = await client.post(
         "/scrapers", json=_create_body("pierce"), headers=_auth(starter_token)
     )
-    assert r.status_code != 402
+    assert r.status_code == 201, r.text

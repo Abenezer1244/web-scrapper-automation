@@ -196,7 +196,38 @@ Verified in Chromium, all passing:
 Rig torn down afterwards: servers stopped, FE `.env.local` deleted, verify DB
 dropped.
 
-### Not done
+### Shipped
+
+- BE **#258** squashed to `main` as `97f41eb`. CI green (full suite), Build &
+  Push and Run Migrations both succeeded. Migration 089 confirmed live: all
+  three `duplicate_*` columns present on `results` in production.
+- FE **#122** squashed to `master` as `6bdc190`. The api-types drift gate failed
+  until the backend merged, then passed on rerun, as expected.
+- `ix_results_duplicate_source` built **CONCURRENTLY** against 108,745 rows via
+  the `DATABASE_URL_MIGRATE` owner connection (session port, autocommit).
+  Verified `indisvalid = true`. No table lock, no downtime.
+- `backfill_duplicate_provenance.py --apply`: **2,021 rows stamped** across 25
+  jobs / 3 users. Converged exactly (82,256 - 2,021 = 80,235) and a re-run
+  reports 0 recoverable, so it is idempotent. The 80,235 that stay unattributed
+  are the dangling-claim population; they were never recoverable and the copy
+  handles them.
+
+### Verified in production after deploy
+
+Logged into the reported account and loaded the run from the screenshot:
+
+- `previous_job_id` = `fa573bfd` (the June run). It was `437ecba1`, the
+  September run, before this change. **The reported bug is gone.**
+- banner: "All 49 records from Mar 26, 2026 to Jun 24, 2026 were already picked
+  up by your run on Jun 22, 2026" (Jun 22 local = the Jun 23 05:39 UTC run;
+  every date on the page renders local, same as "Last scraped Jul 1 08:58 PM"
+  for a 03:55 UTC job)
+- "View previous results" links to `/results/fa573bfd`
+- table reads "No new leads in this run."
+- a direct URL to another account's run still returns 404 from the API
+
+### Remaining
+
 - Nothing is merged or deployed, so the corrected page has not been seen in
   PRODUCTION. The bug was verified live in production; the fix was verified live
   only against the local stack.
@@ -205,3 +236,8 @@ dropped.
   named run.
 - `scripts/create_result_duplicate_source_index.sql` has not been run. The
   grouping query falls back to the existing `job_id` index until it is.
+- The plan-cap sibling guard and the post-crash claim release are latent fixes:
+  production currently has 0 stranded claims and 0 same-run collapse rows, so
+  neither has been exercised against real data yet. They are covered by tests.
+- 33,522 duplicate rows still have no surviving claim. They are 1 user / 2 jobs,
+  all dated 2026-09-04, and predate this work. Not investigated here.

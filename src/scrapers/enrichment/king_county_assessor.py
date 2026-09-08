@@ -80,6 +80,10 @@ _PARCEL_ECHO_RE = re.compile(
 # (layout change) may still be trusted.
 _KING_PIN_DIGITS = 10
 
+# Delay before each parcel-repair candidate lookup. Repair is rare and its
+# requests are extra, so they are paced conservatively.
+_REPAIR_PACE_S = 0.5
+
 
 def _digits(value: str | None) -> str:
     return re.sub(r"\D", "", value or "")
@@ -134,6 +138,100 @@ def parcel_page_is_for(page_html: str, requested_pid: str) -> bool:
 
 class KingOwnerLookupBlockedError(RuntimeError):
     """Raised when eRealProperty appears to be throttling/blocking lookups."""
+
+
+class _Phase1Ledger:
+    """Outcome accounting for the phase-1 fetch loop.
+
+    Three defects made the 2026-09-04/09-07 King incidents unreadable and worse
+    than they had to be, and all three came from the accounting being scattered
+    through the loop body rather than centralised here:
+
+    1. THE BREAKER COULD NOT SEE AN EXCEPTION-ONLY OUTAGE. The threshold test sat
+       inside the `try`, AFTER a successful `safe_get`. A DNS/TLS/timeout outage
+       appended `True` from the `except` and then never evaluated the threshold,
+       so fifty straight connection failures ran on to the time budget instead of
+       tripping (Codex).
+    2. ONE REQUEST COULD RECORD TWO OBSERVATIONS. An exception raised while
+       PARSING a response that had already been recorded fell into the same
+       `except` and appended a second observation for one request (Codex).
+    3. WE KEPT ONLY `last status=`. The persisted reason named the status of the
+       50th request and nothing about the other 49, and the per-parcel detail
+       logged at DEBUG while production runs at INFO. The real incident is
+       therefore unattributable after the fact: `last status=302` is all we have.
+
+    So: one observation per request, recorded in exactly one place, with a
+    histogram that survives into the persisted reason.
+    """
+
+    def __init__(self, window: int, min_failures: int) -> None:
+        self._window: deque[bool] = deque(maxlen=max(1, window))
+        self._min_failures = min_failures
+        self.statuses: dict[str, int] = {}
+        self.redirects: dict[str, int] = {}
+        self.attempted = 0
+        self.failed = 0
+
+    def record(self, response, exc: BaseException | None) -> bool:
+        """Record ONE request. Returns True if this request was a failure."""
+        self.attempted += 1
+        if exc is not None:
+            key = type(exc).__name__
+            failed = True
+        elif response.status_code != 200:
+            key = f"HTTP{response.status_code}"
+            failed = True
+            hint = _redirect_target(response)
+            if hint:
+                self.redirects[hint] = self.redirects.get(hint, 0) + 1
+        else:
+            key = "HTTP200"
+            failed = False
+        self.statuses[key] = self.statuses.get(key, 0) + 1
+        self._window.append(failed)
+        self.failed += int(failed)
+        return failed
+
+    def should_trip(self) -> bool:
+        return (
+            len(self._window) == self._window.maxlen
+            and self._window.count(True) >= self._min_failures
+        )
+
+    def histogram(self) -> str:
+        """Compact, ordered outcome breakdown for the persisted reason."""
+        parts = [f"{k}x{v}" for k, v in sorted(self.statuses.items(), key=lambda kv: -kv[1])]
+        if self.redirects:
+            parts += [f"->{k}x{v}" for k, v in sorted(self.redirects.items(), key=lambda kv: -kv[1])]
+        return " ".join(parts) or "no requests"
+
+    @property
+    def window_failures(self) -> int:
+        return self._window.count(True)
+
+    @property
+    def window_size(self) -> int:
+        return len(self._window)
+
+
+def _redirect_target(response) -> str:
+    """`host/path` a 3xx pointed at, or "". NEVER the query or fragment.
+
+    Where a redirect points is the single most useful fact about it, and it is
+    exactly what the last incident could not tell us. The query string is dropped
+    because on this endpoint it carries the parcel number, and a Location can
+    carry a session token.
+    """
+    if response is None or response.status_code not in (301, 302, 303, 307, 308):
+        return ""
+    location = response.headers.get("Location")
+    if not location:
+        return ""
+    from urllib.parse import urljoin, urlparse
+
+    parsed = urlparse(urljoin(response.url or "", location))  # resolve a relative Location
+    target = f"{parsed.netloc}{parsed.path}" if parsed.netloc else parsed.path
+    return target[:120]
 
 
 @dataclass(frozen=True)
@@ -194,10 +292,52 @@ async def _fetch_king_owner(pid: str, *, max_attempts: int = 1) -> tuple[str | N
     return None, True
 
 
-async def batch_extract_king_owners(
+async def batch_extract_king_owners(parcel_ids: list[str], delay: float = 0.1, **kwargs):
+    """Admission-controlled wrapper around the owner-only lookup.
+
+    The lease used to guard only `batch_enrich_king_county`, leaving THIS path
+    unguarded even though it hits the very same eRealProperty endpoint (Codex).
+    Inline enrichment calls it for every King tax lead that already has a mailing
+    address, so an owner pass could run alongside another job's enrichment, or
+    alongside the recovery sweep, or alongside another owner pass. The health gate
+    answers "is the source available", never "how many of us are on it right now".
+
+    A caller that cannot get in returns what it has rather than queueing: the
+    owner-only path is re-runnable by design (the rows still carry a placeholder),
+    so deferring costs a later pass, not the data.
+    """
+    import time as _t
+
+    from src.scrapers.enrichment.source_admission import SourceAdmission
+
+    _t0 = _t.monotonic()
+    with SourceAdmission(KING_EREALPROPERTY, max_wait_s=45.0) as admission:
+        _waited = _t.monotonic() - _t0
+        _budget = kwargs.get("time_budget_s")
+        if _waited > 0.5 and _budget is not None:
+            # NEVER floor this to a positive number: `max(5.0, budget - waited)`
+            # turned a 1-second budget after a 46-second wait into 5 MORE seconds
+            # of work, past the caller's own cancellation (Codex). If the wait
+            # consumed the budget there is nothing left to spend.
+            kwargs["time_budget_s"] = _budget - _waited
+            if kwargs["time_budget_s"] <= 0:
+                admission.admitted = False
+        if not admission.admitted:
+            _logger.info(
+                "King owner lookup: another pass holds the source lease; skipping "
+                "%d parcel(s) this run (re-runnable)", len(parcel_ids),
+            )
+            out = kwargs.get("out")
+            return out if out is not None else {}
+        return await _batch_extract_king_owners(
+            parcel_ids, delay, _admission=admission, **kwargs)
+
+
+async def _batch_extract_king_owners(
     parcel_ids: list[str],
     delay: float = 0.1,
     *,
+    _admission=None,
     circuit_window: int = 50,
     max_transient_rate: float = 0.10,
     max_unresolved_rate: float = 0.50,
@@ -264,6 +404,12 @@ async def batch_extract_king_owners(
             break
         if i % 100 == 0 and i > 0:
             _logger.info("  owner HTTP: %d / %d ...", i, len(clean))
+        if i and i % 50 == 0 and _admission is not None and not _admission.still_held():
+            _logger.warning(
+                "Owner-only lookup: lost the source lease after %d/%d parcels "
+                "(%d resolved, kept)", i, len(clean), len(owners),
+            )
+            break
         owner, errored = await _fetch_king_owner(pid, max_attempts=fetch_attempts)
         if owner:
             owners[pid] = owner
@@ -321,7 +467,17 @@ def _gis_exists(candidates: list[str]) -> set[str]:
 
 def _owner_of(pin: str) -> str | None:
     """Assessor owner for one candidate, echo-verified (a page that names another
-    parcel yields None, so a truncating answer can never break the tie)."""
+    parcel yields None, so a truncating answer can never break the tie).
+
+    PACED. Parcel repair tries several candidate PINs, repeated per party, and
+    every one of them is a real eRealProperty request that used to be issued with
+    no delay at all — an unmetered second stream against the very source the main
+    loop is carefully pacing (Codex). This is the cheapest correct bound; the
+    requests stay outside the phase-1 ledger, which is recorded as a known gap.
+    """
+    import time as _t
+
+    _t.sleep(_REPAIR_PACE_S)
     try:
         r = safe_get(f"{_ERP_URL}{pin}", headers=_HEADERS, timeout=10)
     except Exception:  # noqa: BLE001 — a lookup failure must only cost a repair
@@ -348,7 +504,69 @@ def resolve_malformed_parcel(source_pid: str, party_name: str | None,
 
 async def batch_enrich_king_county(
     parcel_ids: list[str],
+    **kwargs,
+) -> dict[str, dict[str, str | None]]:
+    """Admission-controlled wrapper around the real King enrichment pass.
+
+    The pacing inside the pass bounds ONE pass and knows nothing about any other,
+    so concurrent King jobs used to make independent request streams against one
+    county server with nothing able to see the total. Two 17,157-parcel jobs
+    overlapped for about half an hour on 2026-09-04 and the first circuit-breaker
+    trip landed that morning.
+
+    A shared lease admits one pass at a time, so concurrent jobs SERIALISE against
+    the county rather than multiplying against it. A caller that cannot get in
+    within the wait window defers its parcels instead of queueing until its
+    enrichment budget is gone: the background recovery sweep will collect them,
+    which is a far better outcome than a job that blocks and then does nothing.
+
+    A thin wrapper rather than a `with` block inside the pass so the lease is
+    released on EVERY exit path, including the circuit breaker raising.
+    """
+    import time as _t
+
+    from src.scrapers.enrichment.source_admission import SourceAdmission
+
+    _t0 = _t.monotonic()
+    with SourceAdmission(KING_EREALPROPERTY, max_wait_s=45.0) as admission:
+        # The wait for admission spends the CALLER'S wall clock. The inner budget
+        # was computed before this call, and the caller's own kill-switch timer is
+        # already running, so leaving it unadjusted meant a pass admitted after 40s
+        # would plan work past the moment it gets cancelled — and because results
+        # are returned only at the end, every lookup it had already paid for would
+        # be thrown away (Codex). Charge the wait to the budget instead.
+        _waited = _t.monotonic() - _t0
+        _budget = kwargs.get("time_budget_s")
+        if _waited > 0.5 and _budget is not None:
+            # NEVER floor this to a positive number: `max(5.0, budget - waited)`
+            # turned a 1-second budget after a 46-second wait into 5 MORE seconds
+            # of work, past the caller's own cancellation (Codex). If the wait
+            # consumed the budget there is nothing left to spend.
+            kwargs["time_budget_s"] = _budget - _waited
+            if kwargs["time_budget_s"] <= 0:
+                admission.admitted = False
+        if not admission.admitted:
+            st = kwargs.get("stats")
+            owned = list(kwargs.get("tax_urls_in") or parcel_ids or [])
+            if st is not None:
+                st.update({"requested": len(owned), "property_found": 0,
+                           "mailing_candidates": 0, "mailing_attempted": 0,
+                           "mailing_found": 0, "deferred": owned, "unreached": owned,
+                           "budget_exhausted": True, "parcel_mismatch": 0,
+                           "parcel_recovered": 0,
+                           "phase1_outcomes": "not admitted (source busy)"})
+            _logger.info(
+                "King enrichment: another pass holds the source lease; deferring "
+                "%d parcel(s) to the background recovery sweep", len(owned),
+            )
+            return {}
+        return await _batch_enrich_king_county(parcel_ids, _admission=admission, **kwargs)
+
+
+async def _batch_enrich_king_county(
+    parcel_ids: list[str],
     *,
+    _admission=None,
     time_budget_s: float | None = None,
     stats: dict | None = None,
     party_names: dict[str, list[str]] | None = None,
@@ -379,6 +597,28 @@ async def batch_enrich_king_county(
     st = stats if stats is not None else {}
     st.update({"requested": len(clean), "property_found": 0, "mailing_candidates": 0,
                "mailing_attempted": 0, "mailing_found": 0, "deferred": [],
+               # `deferred` is the DURABLE MARKER set: every parcel that still has
+               # no mailing address, whether we tried it or not. `unreached` is the
+               # strict subset we never issued a request for. A retrying caller
+               # needs the difference: charging a retry attempt to a parcel that
+               # was never tried would burn its ceiling on work that never
+               # happened, and NOT charging one that was tried and failed lets a
+               # permanently unanswerable parcel retry forever (Codex).
+               "unreached": [],
+               # POSITIVE evidence that we issued a request for a parcel.
+               # NAMED `requested_pids`, not `attempted`: king_parcel_repair is
+               # handed THIS SAME dict and bumps an int counter it calls
+               # "attempted", so reusing that name made the repair path raise
+               # `can only concatenate list (not "int") to list` and swallowed the
+               # whole parcel. Caught by an existing test. A
+               # retrying caller must charge an attempt on evidence that the work
+               # HAPPENED, not on the absence of it from `unreached`: an exception
+               # anywhere (a mid-run health raise, a browser that fails to start,
+               # a cancellation) leaves `unreached` empty and every selected parcel
+               # then looks attempted. `stats` is caller-owned and mutated in
+               # place, so whatever lands here survives even a cancelled coroutine
+               # (Codex).
+               "requested_pids": [],
                "budget_exhausted": False, "parcel_mismatch": 0, "parcel_recovered": 0})
     deadline = (_time.monotonic() + time_budget_s) if time_budget_s is not None else None
 
@@ -430,40 +670,83 @@ async def batch_enrich_king_county(
     # eRealProperty IP rate-block incident. Mirrors the owner-only path's breaker:
     # a sustained failure rate aborts the run AND is persisted, so the next worker
     # does not immediately start hammering a source that is still refusing us.
-    _p1_window: deque[bool] = deque(maxlen=_PHASE1_BREAKER_WINDOW)  # True = failed
+    _p1 = _Phase1Ledger(_PHASE1_BREAKER_WINDOW, _PHASE1_BREAKER_MIN_FAILURES)
+    _p1_pace = 0.1 if pace_s <= 0.2 else pace_s
 
     for i, pid in enumerate(clean):
         if _over_budget():
             _logger.warning("King phase 1: time budget exhausted after %d/%d parcels", i, len(clean))
             st["budget_exhausted"] = True
             st["deferred"].extend(clean[i:])
+            st["unreached"].extend(clean[i:])
             break
         if i % 100 == 0 and i > 0:
             _logger.info("  HTTP: %d / %d ...", i, len(clean))
+        # Renew the shared lease as we go and STOP if we no longer hold it: a
+        # fixed TTL with no renewal lets a long pass outlive its lease while a
+        # second worker starts on the same source (Codex).
+        if i and i % 50 == 0 and _admission is not None and not _admission.still_held():
+            st["budget_exhausted"] = True
+            st["deferred"].extend(clean[i:])
+            st["unreached"].extend(clean[i:])
+            break
 
+        # EVERY path through this body pays the pace, including a failed fetch.
+        # It used to `continue` straight past the sleep at the bottom, so the
+        # instant King started refusing us the loop stopped pacing altogether: a
+        # 302 comes back in ~50 ms where a real page takes ~290 ms, so we sped UP
+        # by roughly 6x exactly when the source was asking us to slow down. That
+        # is a positive feedback loop, and it is part of why a blip became a
+        # 50/50 wipeout rather than a handful of retries (Codex).
+        _tripped = False
         try:
-            # S4: safe_http (SSRF defense-in-depth). Fixed HTTPS eRealProperty
-            # endpoint, but safe_get re-validates (resolve=True), disables
-            # ambient proxy, and refuses redirect-to-internal. Same Response API.
-            r = safe_get(
-                f"{_ERP_URL}{pid}", headers=_HEADERS, timeout=10
-            )
-            _p1_window.append(r.status_code != 200)
-            if (len(_p1_window) == _PHASE1_BREAKER_WINDOW
-                    and _p1_window.count(True) >= _PHASE1_BREAKER_MIN_FAILURES):
+            r = None
+            exc: BaseException | None = None
+            try:
+                # S4: safe_http (SSRF defense-in-depth). Fixed HTTPS eRealProperty
+                # endpoint, but safe_get re-validates (resolve=True), disables
+                # ambient proxy, and refuses redirect-to-internal. Same Response API.
+                # allow_redirects stays FALSE: parcel_page_is_for() trusts a page
+                # with no parcel cell when the requested id is a well-formed 10-digit
+                # King PIN, so following a 302 to a block page would hand us a 200
+                # we would then record as "this parcel has no data" — precisely what
+                # this breaker exists to prevent. We record where it pointed instead.
+                r = safe_get(f"{_ERP_URL}{pid}", headers=_HEADERS, timeout=10)
+            except Exception as fetch_exc:  # noqa: BLE001
+                exc = fetch_exc
+                _logger.debug(
+                    "Property URL fetch failed for parcel=%s: %s", pid, str(fetch_exc)[:200]
+                )
+            # ONE observation per request, recorded before anything can raise.
+            st["requested_pids"].append(pid)
+            failed = _p1.record(r, exc)
+
+            if _p1.should_trip():
                 msg = (
                     "King phase-1 circuit breaker tripped: "
-                    f"{_p1_window.count(True)}/{len(_p1_window)} recent eRealProperty "
-                    f"fetches failed (last status={r.status_code}) after {i} of "
-                    f"{len(clean)} parcels. Aborting so a block is never recorded as "
-                    "'this parcel has no data'."
+                    f"{_p1.window_failures}/{_p1.window_size} recent eRealProperty "
+                    f"fetches failed after {i} of {len(clean)} parcels. "
+                    f"Outcomes this run: {_p1.histogram()}. "
+                    "Aborting so a block is never recorded as 'this parcel has no data'."
                 )
                 _logger.warning(msg)
                 record_source_blocked(KING_EREALPROPERTY, msg)
                 st["budget_exhausted"] = True
+                # clean[i:] covers this parcel and everything after it. The parcels
+                # BEFORE it that already failed were deferred as they failed (below),
+                # so the marker now covers every unresolved parcel rather than only
+                # the tail — the old shape left the 49 failures with no durable
+                # marker at all, which is why no later sweep could ever find them.
                 st["deferred"].extend(clean[i:])
-                break
-            if r.status_code != 200:
+                # clean[i] was attempted (its failure is what tripped the breaker);
+                # only the tail after it was never reached.
+                st["unreached"].extend(clean[i + 1:])
+                _tripped = True
+                break  # runs the `finally` below, which skips the pace and exits
+            if failed:
+                # A failed lookup is UNKNOWN, not "no data". Mark it deferred so the
+                # recovery sweep can come back to it.
+                st["deferred"].append(pid)
                 continue
 
             # The county may have silently truncated our id and served ANOTHER
@@ -495,8 +778,41 @@ async def batch_enrich_king_county(
                     if resolved is not None:
                         break
                 if resolved is not None:
-                    rr = safe_get(f"{_ERP_URL}{resolved.parcel_id}", headers=_HEADERS, timeout=10)
-                    if rr.status_code == 200 and parcel_page_is_for(rr.text, resolved.parcel_id):
+                    # A second real eRealProperty request. It must be paced and
+                    # counted like any other, or the repair path becomes an
+                    # unmetered second stream against a source we are rate-limiting.
+                    await asyncio.sleep(_p1_pace)
+                    st["requested_pids"].append(pid)
+                    try:
+                        rr = safe_get(
+                            f"{_ERP_URL}{resolved.parcel_id}", headers=_HEADERS, timeout=10
+                        )
+                        _p1.record(rr, None)
+                    except Exception as _rexc:  # noqa: BLE001
+                        # A repair fetch that RAISES is still a request King saw,
+                        # and it used to skip the ledger entirely: two requests
+                        # could leave a ledger reading HTTP200x1, so a repair-heavy
+                        # run could hide a developing outage from the breaker
+                        # (Codex).
+                        _p1.record(None, _rexc)
+                        rr = None
+                    # Evaluate the breaker on this observation too, or a run whose
+                    # failures are concentrated in the repair path never trips.
+                    if _p1.should_trip():
+                        msg = (
+                            "King phase-1 circuit breaker tripped during parcel repair: "
+                            f"{_p1.window_failures}/{_p1.window_size} recent eRealProperty "
+                            f"fetches failed after {i} of {len(clean)} parcels. "
+                            f"Outcomes this run: {_p1.histogram()}."
+                        )
+                        _logger.warning(msg)
+                        record_source_blocked(KING_EREALPROPERTY, msg)
+                        st["budget_exhausted"] = True
+                        st["deferred"].extend(clean[i:])
+                        st["unreached"].extend(clean[i + 1:])
+                        _tripped = True
+                        break
+                    if rr is not None and rr.status_code == 200 and parcel_page_is_for(rr.text, resolved.parcel_id):
                         _logger.info(
                             "King enrichment: recovered %s -> %s via %s",
                             pid, resolved.parcel_id, resolved.method,
@@ -514,8 +830,7 @@ async def batch_enrich_king_county(
                             # mailing address back onto the right lead.
                             tax_urls[pid] = tax_url
                         st["parcel_recovered"] += 1
-                        await asyncio.sleep(0.1 if pace_s <= 0.2 else pace_s)
-                        continue
+                        continue  # the `finally` below still paces this iteration
                 results[pid] = {
                     "property_address": None,
                     "mailing_address": None,
@@ -546,21 +861,41 @@ async def batch_enrich_king_county(
                     tax_urls[pid] = tax_url
 
         except Exception as exc:
-            # A hard block / DNS or TLS failure RAISES rather than returning a
-            # non-200, so the breaker must see these too — otherwise a total
-            # outage looks like a run of parcels that merely "had no data".
-            _p1_window.append(True)
-            _logger.debug(
-                "Property URL fetch failed for parcel=%s: %s",
-                pid, str(exc)[:200],
+            # Reached only when PARSING or the malformed-PID recovery raises, never
+            # for the fetch itself (that is handled above). Deliberately does NOT
+            # touch the ledger: the request was already recorded, and appending here
+            # is what let one request count twice (Codex). The parcel is unresolved,
+            # so it is deferred like any other unknown.
+            st["deferred"].append(pid)
+            _logger.warning(
+                "King phase 1: parcel=%s failed after a successful fetch: %s: %s",
+                pid, type(exc).__name__, str(exc)[:200],
             )
+        finally:
+            # job: 0.1 s; backfill: slow. In a `finally` so `continue` cannot skip it.
+            if not _tripped:
+                await asyncio.sleep(_p1_pace)
 
-        await asyncio.sleep(0.1 if pace_s <= 0.2 else pace_s)  # job: 0.1 s; backfill: slow
+    # FINALIZE across every requested parcel. Two paths used to return a parcel
+    # with no tax URL and no marker: an unrepaired mismatch, and a 200 that parsed
+    # nothing. Phase 2 only ever looks at `tax_urls`, so such a parcel had neither
+    # a mailing address nor anything a later sweep could find, and the job could
+    # still announce enrichment complete (Codex). Anything we asked about that did
+    # not produce a tax-bill URL is unresolved, full stop.
+    _resolved = set(tax_urls)
+    _already = set(st["deferred"])
+    for _pid in clean:
+        if _pid not in _resolved and _pid not in _already:
+            st["deferred"].append(_pid)
 
     st["property_found"] = sum(1 for r in results.values() if r.get("property_address"))
-    _logger.info("Phase 1 done: %d/%d property addresses, %d tax URLs, %d parcel mismatches "
-                 "(%d recovered)", st["property_found"], len(clean), len(tax_urls),
-                 st["parcel_mismatch"], st["parcel_recovered"])
+    st["phase1_outcomes"] = _p1.histogram()
+    _logger.info(
+        "Phase 1 done: %d/%d property addresses, %d tax URLs, %d parcel mismatches "
+        "(%d recovered); %d/%d fetches failed [%s]",
+        st["property_found"], len(clean), len(tax_urls), st["parcel_mismatch"],
+        st["parcel_recovered"], _p1.failed, _p1.attempted, _p1.histogram(),
+    )
 
     if tax_urls_out is not None:
         tax_urls_out.update(tax_urls)
@@ -595,6 +930,7 @@ async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
     if len(pids_to_lookup) > _MAX_MAILING_LOOKUPS:
         _logger.info("Capping mailing lookups: %d → %d (to avoid timeout)", len(pids_to_lookup), _MAX_MAILING_LOOKUPS)
         st["deferred"].extend(pids_to_lookup[_MAX_MAILING_LOOKUPS:])
+        st.setdefault("unreached", []).extend(pids_to_lookup[_MAX_MAILING_LOOKUPS:])
         pids_to_lookup = pids_to_lookup[:_MAX_MAILING_LOOKUPS]
 
     _logger.info("Phase 2: Playwright lookup for %d mailing addresses...", len(pids_to_lookup))
@@ -611,6 +947,7 @@ async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
         _logger.warning("King phase 2: budget exhausted before mailing lookups; %d deferred", len(pids_to_lookup))
         st["budget_exhausted"] = True
         st["deferred"].extend(pids_to_lookup)
+        st.setdefault("unreached", []).extend(pids_to_lookup)
         pids_to_lookup = []
     if pids_to_lookup:
         async with BridgeScraper() as scraper:
@@ -623,10 +960,19 @@ async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
                                     i, len(pids_to_lookup))
                     st["budget_exhausted"] = True
                     st["deferred"].extend(pids_to_lookup[i:])
+                    st.setdefault("unreached", []).extend(pids_to_lookup[i:])
                     break
                 if i % 25 == 0:
                     _logger.info("  Mailing: %d / %d ...", i, len(pids_to_lookup))
                 st["mailing_attempted"] += 1
+                st.setdefault("requested_pids", []).append(pid)
+                # A MAILING attempt specifically. The recovery sweep charges its
+                # retry ceiling off this list, not off all-phase `attempted`: a
+                # parcel whose phase 1 succeeded but which phase 2 never reached
+                # would otherwise spend a mailing retry without a mailing request
+                # ever being made, and five such ticks would terminalise it
+                # unlooked-at (Codex).
+                st.setdefault("mailing_attempted_pids", []).append(pid)
                 # setdefault, not results[pid]: in mailing-only mode a pid may have
                 # no phase-1 row at all, and a KeyError here is swallowed upstream
                 # as a whole-chunk failure (so phase 2 would appear to do nothing).
@@ -657,9 +1003,33 @@ async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
                     # RECOVERED parcel the page names the resolved PIN, not the
                     # malformed one we key results by (Codex P2).
                     _probe = (results.get(pid, {}).get("resolved_parcel_id") or pid)
-                    if "No accounts" in body or _probe.replace("-", "") in body.replace("-", ""):
+                    _page_is_ours = _probe.replace("-", "") in body.replace("-", "")
+                    # "none" needs AFFIRMATIVE evidence that there is no mailing
+                    # address: either the county's explicit "No accounts", or this
+                    # parcel's own page with no Mailing Address block at all. A
+                    # block that IS present but yields no address lines (a partial
+                    # render) is UNKNOWN, not empty — treating it as a real answer
+                    # let the sweep clear the marker permanently on the first
+                    # attempt (Codex).
+                    if "No accounts" in body or (_page_is_ours and "Mailing Address" not in body):
                         results[pid]["mailing_lookup"] = "none"
-                    if "Mailing Address" in body:
+                    # IDENTITY GATE (Codex). The extraction below used to be
+                    # independent of the check above: any rendered page carrying a
+                    # "Mailing Address" block wrote its address onto THIS pid, even
+                    # when the page never named this parcel. A stale tab, a wrong tax
+                    # URL, or a redirect to another account would then attach a
+                    # stranger's mailing address to this lead — the same class of
+                    # defect as the eRealProperty truncation, and one that a paid
+                    # skip trace would then bill against. A page that does not name
+                    # our parcel is not evidence about our parcel, so it stays
+                    # "error" (unknown) rather than becoming a wrong "found".
+                    if "Mailing Address" in body and not _page_is_ours:
+                        results[pid]["mailing_lookup"] = "identity_unverified"
+                        _logger.warning(
+                            "King mailing: rendered tax page never named parcel %s — "
+                            "discarding its Mailing Address block", _probe,
+                        )
+                    elif "Mailing Address" in body:
                         idx = body.index("Mailing Address") + len("Mailing Address")
                         after = body[idx:idx + 200]
                         lines = [ln.strip() for ln in after.split("\n") if ln.strip()]
@@ -676,8 +1046,21 @@ async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
                             results[pid]["mailing_address"] = mailing
                             results[pid]["mailing_lookup"] = "found"
 
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001 -- best-effort per parcel
+                    _logger.debug(
+                        "King mailing: parcel=%s lookup failed: %s: %s",
+                        pid, type(exc).__name__, str(exc)[:160],
+                    )
+
+                # An attempted parcel whose outcome is UNKNOWN ("error", or a page
+                # that never named it) still has no mailing address, so it needs the
+                # durable marker like any other unresolved parcel. Without this a
+                # navigation timeout left the parcel with neither an address nor a
+                # marker, so no later sweep could find it and the job could still
+                # report enrichment complete (Codex). Only "found" and "none" are
+                # real answers; everything else is unknown.
+                if results.get(pid, {}).get("mailing_lookup") not in ("found", "none"):
+                    st["deferred"].append(pid)
 
                 await asyncio.sleep(pace_s)
 
@@ -686,7 +1069,9 @@ async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
     found_prop = sum(1 for r in results.values() if r.get("property_address"))
     st["mailing_found"] = found_mail
     # Parcels beyond the per-call mailing cap were never attempted either.
-    st["deferred"].extend(p for p in tax_urls if p not in pids_to_lookup)
+    _never = [p for p in tax_urls if p not in pids_to_lookup]
+    st["deferred"].extend(_never)
+    st.setdefault("unreached", []).extend(_never)
     # `requested` (not the enclosing scope's parcel list — this phase is also
     # reachable standalone via tax_urls_in, where no such list exists).
     _n = st.get("requested") or len(tax_urls)

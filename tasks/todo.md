@@ -146,4 +146,50 @@ Phased, each phase small enough to verify on its own.
 
 ## 7. Review section
 
-(to be filled in after implementation)
+### What shipped (2 commits on `fix/king-source-health-recovery`)
+
+**The recovery path that never existed**
+- `enrichment_source_canary` beat task (every 5 min). Probes each blocked source whose cooldown expired, then clears or escalates it. `sources_due_for_probe`, `mark_probe_failed` and the recovery transition finally have a production caller.
+- `claim_probe` / `resolve_probe`: the probe is claimed atomically (so two ticks cannot escalate one outage two rungs) and the verdict is applied under a generation token (so a probe in flight when a fresh outage lands cannot erase it).
+- `source_probe.py`: one cheap, bounded liveness check per source, using the same 200-plus-parseable-plus-right-parcel standard the enrichment path applies. A 200 that no longer parses does not count as recovery.
+
+**Cooldown policy**
+- Ladder `24/48/72h` becomes `1/6/24/48/72h`. Rung 0 fires before any probe has confirmed anything; the long rungs are now reached only on evidence.
+- An expired cooldown means "due for a claimed probe", not "open to traffic". A 6-hour backstop releases traffic anyway if nothing is probing, so the canary cannot become a new single point of failure.
+
+**Phase-1 accounting (three defects, all confirmed in the code)**
+- A failed fetch `continue`d past the pacing sleep. Now every path pays the pace via `finally`.
+- The breaker threshold was only evaluated after a successful `safe_get`, so an exception-only outage could never trip it. Now one `_Phase1Ledger.record()` per request, evaluated every time.
+- Parcels that failed before the trip got no `deferred` marker. Now every unresolved parcel is marked.
+- The persisted reason carries a status/exception histogram plus the redirect target (host and path only, never the query).
+
+**Wrong-parcel hole**
+- The mailing extraction was independent of the parcel identity check, so any page with a "Mailing Address" block wrote onto whichever parcel we were asking about. Now gated; a page that does not name our parcel yields `identity_unverified`, not a wrong address.
+
+**Deferred recovery**
+- `mailing_recovery.py`: bounded beat sweep (every 10 min), gated on source health, mailing-only. Never bills, never reserves quota, never creates a job, never enqueues a skip trace. Per-row attempt counter and terminal policy.
+
+**Rate bound**
+- `source_admission.py`: a Redis lease admits one King enrichment pass at a time, so concurrent jobs serialise against the county instead of multiplying against it. Ownership token on release; fail-open if Redis is down.
+
+**Honest status**
+- "Enrichment complete" after 0 of 153 mailing lookups is replaced by an accurate partial line. The raw exception (internal service name, exception class, breaker threshold) no longer reaches the user's log stream; it goes to the worker log.
+
+### Defects found in my own work while building it
+1. `continue` inside `try/finally` never reached the `break`, so the breaker trip would not have stopped the loop. Caught by reading my own diff.
+2. `enrichment_data` is `JSON`, not `JSONB`, so the `||` merge raised and the sweep would have written NOTHING while appearing to run. Caught by a test.
+3. The King probe query had no county filter and could pick a **Pierce** parcel, which would keep King blocked forever with a canary running. Caught by Codex; verified against production (`9900000021` is in the unfiltered top 5).
+4. Broadening `deferred` made the sweep stop charging attempts to parcels that failed, so unanswerable parcels would retry forever. Caught by Codex. Split into `deferred` (superset) and `unreached` (never requested).
+5. `_run_chunk`'s stats merge handled list/bool/int but not `str`, so `phase1_outcomes` never reached the summary and the incident log always printed "n/a", silently defeating the diagnostic I had just added. Caught in self-review.
+
+### Production actions taken
+- `king_erealproperty` cleared to `healthy` after a live probe passed (`scripts/ops_clear_source_health.py --apply`). It had been throttled since 2026-09-04.
+
+### Backlog this uncovered
+Production carries **67,603 deferred King rows across 17,295 distinct parcels**: 50,840 on `done` jobs (eligible for the sweep) and 16,763 on `failed` jobs (not eligible). At 60 parcels per 10-minute tick the eligible backlog drains in roughly two days.
+
+### Still open
+- Codex review round 2 did not run (usage limit, retries 19:44). Round 1 produced two findings, both real and both fixed.
+- Live end-to-end verification needs this deployed: the canary and the sweep are beat tasks.
+- **Separate defect, not fixed here:** two non-duplicate rows in the incident job share a `dedup_hash` (`SANNES RICHARD` / `SANNES RICHARD / SANNES HEIDI`, parcel `2154900130`), so one property was billed twice. Different subsystem; wants its own PR.
+- `failed`-job rows (16,763) are deliberately outside the sweep. Whether they should be recoverable is a product call.

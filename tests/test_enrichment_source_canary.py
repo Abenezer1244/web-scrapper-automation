@@ -197,3 +197,44 @@ class TestProbeTargetsAreKingOnly:
         assert "lower(sc.county) = 'king'" in src
         assert "upper(sc.state) = 'WA'" in src
         assert "JOIN jobs j" in src and "JOIN scraper_configs sc" in src
+
+
+class TestAbandonedProbeDoesNotBlockForever:
+    def test_a_stale_probe_claim_stops_holding_traffic(self, sync_db):
+        """`claim_probe` stamps last_probe_at BEFORE the request.
+
+        A worker killed between the claim and the verdict leaves that stamp
+        behind. Treating it as proof a canary is running held traffic permanently
+        on one abandoned claim, which is the same indefinite silent block this
+        change exists to remove (Codex).
+        """
+        mark_source_unhealthy(sync_db, _KEY, "blocked in test")
+        sync_db.execute(
+            text(
+                "UPDATE external_source_health SET cooldown_until = :c, "
+                "last_probe_at = :p WHERE source_key = :k"
+            ),
+            {
+                "c": datetime.now(UTC) - timedelta(hours=8),
+                "p": datetime.now(UTC) - timedelta(hours=7),
+                "k": _KEY,
+            },
+        )
+        sync_db.commit()
+        assert is_source_available(sync_db, _KEY) is True
+
+    def test_a_fresh_probe_claim_still_holds_traffic(self, sync_db):
+        mark_source_unhealthy(sync_db, _KEY, "blocked in test")
+        sync_db.execute(
+            text(
+                "UPDATE external_source_health SET cooldown_until = :c, "
+                "last_probe_at = :p WHERE source_key = :k"
+            ),
+            {
+                "c": datetime.now(UTC) - timedelta(hours=8),
+                "p": datetime.now(UTC) - timedelta(minutes=2),
+                "k": _KEY,
+            },
+        )
+        sync_db.commit()
+        assert is_source_available(sync_db, _KEY) is False

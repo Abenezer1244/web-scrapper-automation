@@ -72,14 +72,28 @@ _MAX_ATTEMPTS = 5
 # request forever and never fill the window that is supposed to stop it (Codex).
 _BATCH_PARCELS = 60
 
-# Hard wall-clock bound for one tick, comfortably inside the 10-minute schedule
-# so ticks cannot pile up on each other.
-_TICK_BUDGET_S = 240.0
+# Hard wall-clock bound for one tick, inside the 10-minute schedule so ticks
+# cannot pile up on each other.
+#
+# Sized so a tick FINISHES its batch. A batch that phase 1 covers but phase 2
+# cannot reach is pure waste: this sweep persists only the mailing address, so a
+# phase-1 fetch whose parcel never reaches phase 2 bought nothing and still cost
+# King a request. Measured phase-1 latency is ~0.3 s and the code's own estimate
+# for a phase-2 Playwright lookup is 5-10 s, so at `_BATCH_PARCELS` = 60 and
+# `_SWEEP_PACE_S` = 0.5 one tick needs roughly 60*(0.3+0.5) + 60*(5+0.5) ~= 378 s.
+# 480 s covers that with headroom and still leaves 2 minutes before the next tick.
+_TICK_BUDGET_S = 480.0
+
+# Pace between requests inside the sweep. Slower than a live job (0.1 s), because
+# nothing is waiting on this and King has blocked us before, but not so slow that
+# phase 1 eats the budget phase 2 needs.
+_SWEEP_PACE_S = 0.5
 
 # Single-flight lock TTL. Longer than the tick budget so a crashed tick's lock
-# still expires on its own.
+# still expires on its own, and long enough that a slow-but-live tick never has
+# its lease expire underneath it.
 _LOCK_KEY = "bl:mailing_recovery:lock"
-_LOCK_TTL_S = 600
+_LOCK_TTL_S = 1200
 
 
 def _now() -> datetime:
@@ -209,9 +223,10 @@ def _recover_impl(stats: dict) -> dict:
                         parcels,
                         time_budget_s=max(10.0, deadline - time.monotonic() - 30),
                         stats=king_stats,
-                        # Pace like a background job, not like a live one. Nothing
-                        # is waiting on this, so it can afford to be gentle.
-                        pace_s=1.0,
+                        # Gentler than a live job (0.1 s): nothing is waiting on
+                        # this and King has blocked us before. See _SWEEP_PACE_S
+                        # for why it is not slower still.
+                        pace_s=_SWEEP_PACE_S,
                     ),
                     timeout=max(30.0, deadline - time.monotonic()),
                 )
@@ -224,21 +239,22 @@ def _recover_impl(stats: dict) -> dict:
             stats["skipped"] = f"{type(exc).__name__}: {str(exc)[:120]}"
             _logger.warning("Mailing recovery: lookup failed: %s", stats["skipped"])
 
-        # Parcels the time budget or a mid-run trip never reached must NOT be
-        # charged an attempt: they were not tried, and burning the retry ceiling
-        # on work that never happened is how a bounded sweep quietly abandons its
-        # own backlog. They stay deferred with their counter untouched.
+        # Charge an attempt ONLY on positive evidence that a request was issued.
         #
-        # `unreached`, NOT `deferred` (Codex). `deferred` is the durable marker
-        # set and now correctly includes parcels that WERE attempted and failed.
-        # Reading it here would mean a parcel that fails every single time is
-        # never charged an attempt, so the terminal policy would never fire for
-        # exactly the parcels most likely to be unanswerable, and they would
-        # retry forever.
-        never_tried = {p for p in king_stats.get("unreached", []) if p in by_parcel}
-        attempted = [p for p in parcels if p not in never_tried]
+        # Deriving it as "everything not in `unreached`" was wrong on every
+        # exceptional exit (Codex): if the batch raises after seeding `unreached`
+        # empty — a mid-run health block, a browser that fails to start, a
+        # cancellation — then nothing is in `unreached` and EVERY selected parcel
+        # looks attempted. Five such ticks would exhaust the ceiling and clear the
+        # marker on parcels that were never once looked up, which is precisely the
+        # silent permanent loss this whole change exists to end.
+        #
+        # `attempted` is appended the moment a request is issued, into the
+        # caller-owned stats dict, so it survives a cancelled coroutine.
+        attempted = [p for p in dict.fromkeys(king_stats.get("attempted", []))
+                     if p in by_parcel]
         stats["parcels"] = len(attempted)
-        stats["unreached"] = len(never_tried)
+        stats["unreached"] = len(parcels) - len(attempted)
         _apply(db, by_parcel, attempted, enriched, stats)
     return stats
 

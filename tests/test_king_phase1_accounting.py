@@ -280,3 +280,105 @@ class TestUnreachedIsNotTheSameAsDeferred:
         assert set(stats["deferred"]) == set(pids)
         assert set(stats["unreached"]) == set(pids[50:])
         assert pids[49] not in stats["unreached"]
+
+
+class TestChunkStatsMerge:
+    """The per-chunk outcome histogram has to survive the merge to be useful."""
+
+    def test_string_stats_reach_the_summary(self):
+        """`phase1_outcomes` is a string, and the merge only handled list/bool/int.
+
+        Strings fell through every branch and vanished, so the incident log always
+        printed "n/a" for the histogram that had just been added to explain
+        incidents. A diagnostic that never reaches the log is not a diagnostic.
+        """
+        king_stats: dict = {}
+
+        def _merge(_cs):
+            for _k, _v in _cs.items():
+                if isinstance(_v, list):
+                    king_stats.setdefault(_k, []).extend(_v)
+                elif isinstance(_v, bool):
+                    king_stats[_k] = king_stats.get(_k, False) or _v
+                elif isinstance(_v, int):
+                    king_stats[_k] = king_stats.get(_k, 0) + _v
+                elif isinstance(_v, str) and _v:
+                    _prev = king_stats.get(_k)
+                    king_stats[_k] = f"{_prev} | {_v}" if _prev else _v
+
+        import inspect
+
+        from src.workers.tasks_helpers import enrich
+
+        # The production merge must carry strings; pin it against the source so
+        # this cannot silently regress back to dropping them.
+        src = inspect.getsource(enrich._run_inline_enrichment)
+        assert "isinstance(_v, str)" in src
+
+        _merge({"phase1_outcomes": "HTTP200x40 HTTP302x10"})
+        _merge({"phase1_outcomes": "HTTP200x60"})
+        assert king_stats["phase1_outcomes"] == "HTTP200x40 HTTP302x10 | HTTP200x60"
+
+
+class TestAttemptedIsPositiveEvidence:
+    """A retry ceiling must be spent on work that HAPPENED.
+
+    Deriving "attempted" as "everything not in `unreached`" broke on every
+    exceptional exit: nothing lands in `unreached`, so every selected parcel looks
+    attempted and five such ticks abandon parcels never once looked up (Codex).
+    `attempted` is appended as each request is issued, into the caller-owned stats
+    dict, so it survives a raise or a cancellation.
+    """
+
+    def test_attempted_lists_only_parcels_we_requested(self, monkeypatch, offline,
+                                                       no_admission, instant_sleep):
+        monkeypatch.setattr(kca, "safe_get", lambda *a, **k: _Resp(404))
+        pids = _pids(4)
+        stats: dict = {}
+        asyncio.run(kca.batch_enrich_king_county(
+            pids, stats=stats, do_mailing=False, pace_s=0.1,
+        ))
+        assert set(stats["attempted"]) == set(pids)
+
+    def test_attempted_survives_a_mid_run_raise(self, monkeypatch, offline,
+                                                no_admission, instant_sleep):
+        calls = {"n": 0}
+
+        def _boom_after_two(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] > 2:
+                raise RuntimeError("source blocked mid-run")
+            return _Resp(200, "")
+
+        monkeypatch.setattr(kca, "safe_get", _boom_after_two)
+        pids = _pids(5)
+        stats: dict = {}
+        asyncio.run(kca.batch_enrich_king_county(
+            pids, stats=stats, do_mailing=False, pace_s=0.1,
+        ))
+        assert stats["attempted"], "attempts must survive a mid-run failure"
+        assert set(stats["attempted"]).issubset(set(pids))
+
+    def test_nothing_is_attempted_when_admission_is_refused(self, monkeypatch, offline):
+        class _Refused:
+            admitted = False
+
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return None
+
+        monkeypatch.setattr(
+            "src.scrapers.enrichment.source_admission.SourceAdmission", _Refused
+        )
+        pids = _pids(3)
+        stats: dict = {}
+        asyncio.run(kca.batch_enrich_king_county(
+            pids, stats=stats, do_mailing=False, pace_s=0.1,
+        ))
+        assert stats.get("attempted", []) == []
+        assert set(stats["unreached"]) == set(pids)

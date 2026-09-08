@@ -147,3 +147,53 @@ class TestIdentityGate:
             out = asyncio.run(_go())[pid]
         assert out["mailing_address"] == "PO BOX 7, SEATTLE WA 98101"
         assert out["mailing_lookup"] == "found"
+
+
+class TestAttemptedButUnknownIsDeferred:
+    """An attempted parcel with an UNKNOWN outcome still needs the durable marker.
+
+    Navigation and extraction errors were swallowed, and the end-of-phase
+    bookkeeping only deferred parcels OUTSIDE the lookup list. So a parcel that was
+    actually visited and failed had neither a mailing address nor a marker: no
+    later sweep could find it, and the job could still report enrichment complete
+    (Codex).
+    """
+
+    def _run_stats(self, body: str, pid: str = "1234500000") -> dict:
+        import contextlib
+
+        results = {pid: {}}
+        tax_urls = {pid: "https://payment.kingcounty.gov/Home/Index?Search=" + pid}
+        st: dict = {"requested": 1, "deferred": [], "unreached": [],
+                    "attempted": [], "mailing_attempted": 0}
+
+        async def _go():
+            return await kca._king_mailing_phase(results, tax_urls, st, lambda: False, 0.0)
+
+        with contextlib.ExitStack() as stack:
+            mp = stack.enter_context(pytest.MonkeyPatch.context())
+            mp.setattr(kca, "BridgeScraper", lambda *a, **k: _Scraper(body))
+            real_sleep = asyncio.sleep
+
+            async def _noop(_s):
+                await real_sleep(0)
+
+            mp.setattr(kca.asyncio, "sleep", _noop)
+            asyncio.run(_go())
+        return st
+
+    def test_an_unreadable_page_defers_the_parcel(self):
+        st = self._run_stats("some unrelated page with no mailing block\n")
+        assert "1234500000" in st["deferred"]
+        assert "1234500000" in st["attempted"]
+        assert "1234500000" not in st["unreached"]
+
+    def test_a_page_for_another_parcel_defers_the_parcel(self):
+        st = self._run_stats(_SOMEONE_ELSE)
+        assert "1234500000" in st["deferred"]
+
+    def test_a_real_answer_does_not_defer(self):
+        st = self._run_stats(_OURS)
+        assert st["deferred"] == []
+        st_none = self._run_stats("Parcel 123450-0000\nBilling Details\n")
+        assert st_none["deferred"] == []

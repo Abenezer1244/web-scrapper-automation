@@ -654,6 +654,15 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                         king_stats[_k] = king_stats.get(_k, False) or _v
                     elif isinstance(_v, int):
                         king_stats[_k] = king_stats.get(_k, 0) + _v
+                    elif isinstance(_v, str) and _v:
+                        # Strings used to fall through every branch and vanish, so
+                        # the per-chunk outcome histogram (`phase1_outcomes`) never
+                        # reached the summary and the incident log always read
+                        # "n/a" — silently defeating the diagnostic it was added
+                        # for. Chunks are joined so a multi-chunk pass shows each
+                        # chunk's outcomes rather than only the last.
+                        _prev = king_stats.get(_k)
+                        king_stats[_k] = f"{_prev} | {_v}" if _prev else _v
                 return _cs
 
             # ── Pass 1: property + OWNER for EVERY parcel (cheap HTTP) ────────
@@ -839,8 +848,15 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                     try:
                         _publish_log(
                             r, job_id, "warning",
-                            "Owner names are still being looked up. County records were "
-                            "slow to respond, so this will finish automatically.",
+                            # Says only what is true. The background recovery sweep
+                            # fills MAILING ADDRESSES and explicitly never touches
+                            # party_name, so promising owner names "will finish
+                            # automatically" would be a promise with nothing behind
+                            # it (Codex) -- the same shape of defect as the
+                            # deferred marker that no sweep ever read.
+                            "Owner name lookup stopped early because county records "
+                            "were slow to respond. Names already found are saved. "
+                            "Re-run this scraper to resolve the rest.",
                             db=db,
                         )
                     except Exception:

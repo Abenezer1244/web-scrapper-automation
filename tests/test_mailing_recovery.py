@@ -71,6 +71,11 @@ def found_mailing(monkeypatch):
         st = kw.get("stats")
         if st is not None:
             st["deferred"] = []
+            st["unreached"] = []
+            # The sweep charges an attempt only on POSITIVE evidence that a
+            # request was issued, so a fixture standing in for a completed batch
+            # must say which parcels it actually looked up.
+            st["attempted"] = list(parcels)
         return {p: {"mailing_address": f"PO BOX {p[-4:]}, RENO, NV 89501",
                     "mailing_lookup": "found"} for p in parcels}
 
@@ -86,6 +91,11 @@ def no_mailing(monkeypatch):
         st = kw.get("stats")
         if st is not None:
             st["deferred"] = []
+            st["unreached"] = []
+            # The sweep charges an attempt only on POSITIVE evidence that a
+            # request was issued, so a fixture standing in for a completed batch
+            # must say which parcels it actually looked up.
+            st["attempted"] = list(parcels)
         return {p: {"mailing_address": None, "mailing_lookup": "none"} for p in parcels}
 
     monkeypatch.setattr(
@@ -100,6 +110,11 @@ def lookup_errors(monkeypatch):
         st = kw.get("stats")
         if st is not None:
             st["deferred"] = []
+            st["unreached"] = []
+            # The sweep charges an attempt only on POSITIVE evidence that a
+            # request was issued, so a fixture standing in for a completed batch
+            # must say which parcels it actually looked up.
+            st["attempted"] = list(parcels)
         return {p: {"mailing_address": None, "mailing_lookup": "error"} for p in parcels}
 
     monkeypatch.setattr(
@@ -201,6 +216,8 @@ class TestNeverDamagesExistingData:
             st = kw.get("stats")
             if st is not None:
                 st["deferred"] = []
+                st["unreached"] = []
+                st["attempted"] = list(parcels)
             # The repair lands between the SELECT and the UPDATE.
             from src.db.session import SyncSessionLocal
             with SyncSessionLocal() as s:
@@ -354,3 +371,78 @@ class TestGating:
 
         stats = await asyncio.to_thread(mr.recover_deferred_king_mailing)
         assert stats["candidates"] == 0
+
+
+class TestRegisteredForProduction:
+    async def test_the_sweep_module_is_in_the_celery_include_list(self):
+        """Beat publishes a task NAME; a worker that never imported the module
+        discards the message as unregistered and the sweep silently never runs.
+
+        Tests import this module themselves, which hides the failure completely.
+        Third time this trap has been hit in this codebase (Codex)."""
+        import inspect
+
+        import src.workers as workers_pkg
+
+        assert '"src.workers.mailing_recovery"' in inspect.getsource(workers_pkg)
+
+    async def test_the_beat_entry_matches_the_registered_task_name(self):
+        from src.workers.scheduler import app
+
+        entry = app.conf.beat_schedule["recover-deferred-mailing"]["task"]
+        assert entry in app.tasks, f"{entry} is scheduled but not registered"
+
+
+class TestAttemptAccountingUnderFailure:
+    async def test_a_batch_that_raises_charges_nobody(self, db, business_user,
+                                                      monkeypatch):
+        """The exception path used to charge EVERY selected parcel.
+
+        Five such ticks would exhaust the ceiling and clear the marker on parcels
+        that were never once looked up (Codex)."""
+        _, job_id = await _king_job(db, business_user)
+        rid = await _deferred_row(db, business_user, job_id, parcel="1234500020")
+
+        async def _raises(parcels, **kw):
+            st = kw.get("stats")
+            if st is not None:
+                st["deferred"] = []
+                st["unreached"] = []
+                st["attempted"] = []
+            raise RuntimeError("source blocked between the gate and the request")
+
+        monkeypatch.setattr(
+            "src.scrapers.enrichment.king_county_assessor.batch_enrich_king_county", _raises
+        )
+        await asyncio.to_thread(mr.recover_deferred_king_mailing)
+
+        ed = (await db.execute(
+            text("SELECT enrichment_data FROM results WHERE id = :i"), {"i": rid})).scalar()
+        assert ed.get("mailing_recovery_attempts") in (None, 0)
+        assert ed["mailing_lookup_deferred"] is True
+
+    async def test_only_attempted_parcels_are_charged(self, db, business_user,
+                                                      monkeypatch):
+        _, job_id = await _king_job(db, business_user)
+        tried = await _deferred_row(db, business_user, job_id, parcel="1234500021")
+        untried = await _deferred_row(db, business_user, job_id, parcel="1234500022")
+
+        async def _partial(parcels, **kw):
+            st = kw.get("stats")
+            if st is not None:
+                st["deferred"] = []
+                st["unreached"] = ["1234500022"]
+                st["attempted"] = ["1234500021"]
+            return {"1234500021": {"mailing_address": None, "mailing_lookup": "error"}}
+
+        monkeypatch.setattr(
+            "src.scrapers.enrichment.king_county_assessor.batch_enrich_king_county", _partial
+        )
+        await asyncio.to_thread(mr.recover_deferred_king_mailing)
+
+        a = (await db.execute(
+            text("SELECT enrichment_data FROM results WHERE id = :i"), {"i": tried})).scalar()
+        b = (await db.execute(
+            text("SELECT enrichment_data FROM results WHERE id = :i"), {"i": untried})).scalar()
+        assert a["mailing_recovery_attempts"] == 1
+        assert b.get("mailing_recovery_attempts") in (None, 0)

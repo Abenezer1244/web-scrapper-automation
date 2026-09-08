@@ -460,7 +460,7 @@ def run_scrape_job(self, job_id: str) -> None:
             [ConfigRow(*r) for r in _active],
         )
         if should_block_run(_violation, user_id=str(job.user_id), plan=(user.plan or "starter"), context="worker_run"):
-            _publish_log(r, job_id, "error", f"Plan limit — {_violation}", db=db)
+            _publish_log(r, job_id, "error", f"Plan limit reached: {_violation}", db=db)
             _fail_job(db, job, r, job_id, f"Plan limit reached: {_violation}")
             return
 
@@ -474,7 +474,7 @@ def run_scrape_job(self, job_id: str) -> None:
         # restores scraping and reverts the watchdog to its started_at fallback. Re-enable
         # ONLY with a dedicated NullPool engine for the heartbeat (Codex; BUILD_JOURNAL).
         # _hb.start(job.started_at)  # DISABLED — do not re-enable without pool isolation
-        _publish_log(r, job_id, "info", f"Job queued — {config.name} ({config.county}, {config.state})", db=db)
+        _publish_log(r, job_id, "info", f"Job queued: {config.name} ({config.county}, {config.state})", db=db)
 
         # ── PROBING ───────────────────────────────────────────────────────────
         if not _set_status(db, job, "probing"):
@@ -503,7 +503,7 @@ def run_scrape_job(self, job_id: str) -> None:
             _logger.info("Job %s externally terminalized (%s) — aborting", job_id, job.status)
             return
         record_label = config.record_type.replace("_", " ").title()
-        _publish_log(r, job_id, "success", f"Starting scrape — {record_label} records", db=db)
+        _publish_log(r, job_id, "success", f"Starting scrape: {record_label} records", db=db)
 
         from typing import cast
 
@@ -662,7 +662,7 @@ def run_scrape_job(self, job_id: str) -> None:
                         )
                     _publish_log(
                         r, job_id, "warning",
-                        f"Transient error — retrying in ~{max(1, countdown // 60)} min "
+                        f"Transient error, retrying in ~{max(1, countdown // 60)} min "
                         f"(retry {job.retry_count} of {SCRAPE_TRANSIENT_MAX_RETRIES}).",
                         db=db,
                     )
@@ -690,7 +690,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 )
             return
 
-        _publish_log(r, job_id, "success", f"Scrape complete — {len(records)} records found", db=db)
+        _publish_log(r, job_id, "success", f"Scrape complete: {len(records)} records found", db=db)
 
         # ── Phase 3: honest probate output ────────────────────────────────────
         # Drop LIVING-owner Transfer-on-Death estate-planning deeds unless the
@@ -1958,7 +1958,7 @@ def run_scrape_job(self, job_id: str) -> None:
         if user.records_limit != -1 and user.records_used > user.records_limit:
             overage = user.records_used - user.records_limit
             _publish_log(r, job_id, "warning", f"Plan limit exceeded by {overage} records. Upgrade to keep scraping.", db=db)
-        _publish_log(r, job_id, "success", f"Job complete — {display_count} new leads ({dup_count} duplicates filtered)", db=db)
+        _publish_log(r, job_id, "success", f"Job complete: {display_count} new leads ({dup_count} duplicates filtered)", db=db)
         r.publish(f"job_logs:{job_id}", json.dumps({"type": "done", "record_count": display_count}))
 
         # ── IN-APP NOTIFICATION (best-effort; gated by CAS already confirmed above) ──
@@ -2015,7 +2015,7 @@ def run_scrape_job(self, job_id: str) -> None:
         _wh_plan_ok = (user.plan or "starter").lower() in BUSINESS_FEATURES_PLANS
         if webhook_url and object_key and not _wh_plan_ok:
             _publish_log(r, job_id, "warning",
-                         "Webhook delivery skipped — requires Business plan", db=db)
+                         "Webhook delivery skipped. Webhooks require the Business plan.", db=db)
         if webhook_url and object_key and _wh_plan_ok:
             try:
                 from src.workers.webhook_delivery import (
@@ -2060,7 +2060,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 )
                 _publish_log(
                     r, job_id, "warning",
-                    "Webhook queue unavailable — job completed successfully",
+                    "Webhook queue unavailable. Your job completed successfully.",
                     db=db,
                 )
                 from src.workers.ops_alerts import send_ops_alert

@@ -54,6 +54,14 @@ _UNHEALTHY = ("throttled", "blocked")
 # scheduler outage costs hours, not days, of missing enrichment.
 _CANARY_BACKSTOP = timedelta(hours=6)
 
+# How long a probe claim counts as "a probe is in flight". `claim_probe` stamps
+# `last_probe_at` BEFORE the request, so a worker that dies mid-probe leaves a
+# stamp behind; without an expiry that single abandoned claim would hold traffic
+# for good. Comfortably longer than a probe (3 requests, ~10s) and shorter than
+# the canary's own 10-minute claim floor, so a live canary always re-claims
+# before this lapses.
+_PROBE_INFLIGHT_GRACE = timedelta(minutes=20)
+
 
 class SourceUnavailableError(RuntimeError):
     """Raised when a source is in cooldown. Callers should degrade, not retry."""
@@ -153,12 +161,25 @@ def is_source_available(db, source_key: str) -> bool:
     now = datetime.now(UTC)
     if now < r.cooldown_until:
         return False
-    # Cooldown expired. Normally the canary probes and clears; hold traffic.
-    probed_since_expiry = r.last_probe_at is not None and r.last_probe_at >= r.cooldown_until
-    if not probed_since_expiry and now >= r.cooldown_until + _CANARY_BACKSTOP:
+    # Cooldown expired. Normally the canary probes and clears; hold traffic while
+    # a probe could plausibly be in flight.
+    #
+    # "In flight" must EXPIRE (Codex). `claim_probe` writes `last_probe_at` BEFORE
+    # making the request, so a worker killed between the claim and the verdict
+    # leaves a timestamp that satisfies `last_probe_at >= cooldown_until` forever.
+    # Treating that as proof a canary is running held traffic permanently on the
+    # strength of one abandoned claim, which is the same shape of silent
+    # indefinite block this whole change exists to remove. A claim is evidence of
+    # a live canary only while it is RECENT.
+    probe_is_recent = (
+        r.last_probe_at is not None and now - r.last_probe_at < _PROBE_INFLIGHT_GRACE
+    )
+    if probe_is_recent:
+        return False
+    if now >= r.cooldown_until + _CANARY_BACKSTOP:
         _logger.warning(
-            "Source %s: cooldown expired %s ago with no probe — assuming no canary "
-            "is running and allowing traffic",
+            "Source %s: cooldown expired %s ago and no probe since — assuming no "
+            "canary is running and allowing traffic",
             source_key, now - r.cooldown_until,
         )
         return True

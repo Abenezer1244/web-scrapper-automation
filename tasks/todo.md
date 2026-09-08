@@ -1,50 +1,39 @@
-# Plan-limit notice + em-dash sweep — DONE, shipped, deployed
+# Plan entitlement audit (2026-09-08)
 
-## 1. The plan-limit notice (closed)
+Branch: `chore/entitlement-audit` (BE) / `chore/entitlement-audit-fe` (FE)
+Worktrees: `C:/Users/Windows/bridgeleads-worktrees/entitlement-audit`,
+`C:/Users/Windows/bridgeleads-web-worktrees/entitlement-audit-fe`
 
-**Root cause:** there was no bespoke alert component. `lib/errors.ts::toastError()` routes
-**every** HTTP 402 to `toastUpgrade()`, which called `toast.error`; under the app's
-`richColors` + `closeButton` Toaster that supplies the pale-red card, red text, red close
-button and near-black action button. Picking the error channel for a plan gate was the whole
-visual bug. The message came from `src/api/entitlements.py`.
+## Phase 1 - locate authoritative config
+- [x] `src/config/plans.py` PLAN_CATALOG (price, records_limit, marketed features) - source of the 4 in-app cards
+- [x] `src/config/settings.py` PLAN_LIMITS (records) - DUPLICATE of catalog, currently agrees
+- [x] `src/config/settings.py` SKIP_TRACE_BUNDLED_QUOTAS, ENTITLEMENT_ENFORCEMENT, STRIPE_PRICE_*
+- [x] `src/config/constants.py` COUNTY_LIMIT_BY_PLAN, RECORD_TYPES_BY_PLAN, BATCH_PLANS,
+      BUSINESS_FEATURES_PLANS, SKIP_TRACE_ADDON_PLANS, PRIORITY_QUEUE_PLANS, SUPPORTED_EXPORT_FORMATS
+- [x] `src/api/entitlements.py` - county + record-type validator (flag-gated)
+- [x] FE `lib/entitlements.ts` - mirror; FE `app/(marketing)/_monopo/data.ts` - SEPARATE static marketing copy
+- [x] `src/api/routes/billing.py` `pricing_page().comparison` - THIRD copy of the matrix
 
-- [x] Backend: structured 402 `{code, title, message}`; `Violation` dataclass; plural-correct,
-      Title-Cased, unquoted plan names.
-- [x] Frontend: `components/plan-limit-notice.tsx`, tolerant `readErrorBody`, `toastUpgrade`
-      renders the notice.
-- [x] Verified in Chromium at 320/375/390/430/768/1024/1440, both themes, `pointer: coarse`.
-- [x] Contrast AA, keyboard, focus ring, live region, every dismissal path.
-- [x] Shipped: **FE #117 `8dcc70b`**, **BE #252 `019a8c1`**. Frontend deployed first, on
-      purpose: an old FE build reads `detail` as a string and would render `[object Object]`.
-- [x] Confirmed live in the production bundle (via `/register`, a public route that imports
-      the same module), including the toast-id race fix.
+## Phase 2-19 verification
+- [x] Records limits (quota.py + worker reservation)
+- [x] County limits (entitlements.py, both create paths + 4 run-time call sites)
+- [x] Record types (RECORD_TYPES_BY_PLAN + call sites)
+- [x] Skip tracing (bundled quotas, counter, meter events, overage price wiring)
+- [x] Exports (SUPPORTED_EXPORT_FORMATS, DeliverConfig)
+- [x] Schedules (ScraperFrequency, DeliverConfig/ScheduleConfig)
+- [x] Delivery (email / webhook / dialer)
+- [x] Batch (BATCH_PLANS, BATCH_MAX_COMBINATIONS)
+- [x] API access (require_plan + api-key auth path)
+- [x] Overlap / intersection (/segments/*, batch delivery_mode)
+- [x] Priority queue (celery task_queues + start.sh WORKER_QUEUES)
+- [x] White-label / account manager / seats / data freshness
+- [x] Stripe mapping (_PRICE_TO_PLAN, checkout line_items)
+- [ ] Run targeted pytest subset against local test DB
+- [ ] Live UI verification (Playwright/Chromium) of the served pricing surfaces
+- [ ] Codex independent review + independent verification of its findings
 
-**Copy deviation, deliberate:** asked for "This scraper includes 2 counties", shipped "This
-would put your account at 2 counties". `projected` is the account-wide distinct-county total,
-so the requested wording is false whenever an already-saved scraper causes the overage, and
-false for every batch create.
+## Phase 20 - fixes
+- [ ] Await owner decisions on the policy items (see report section 21)
 
-## 2. The em-dash sweep (closed)
-
-- [x] 90 frontend rewrites across 43 files + the customer-facing backend strings.
-- [x] Re-runnable checkers: `scripts/find-user-facing-dashes.mjs` (FE, TypeScript parser) and
-      an AST walk on the backend that drops docstrings.
-- [x] Shipped: **FE #118 `c0d8976`**, **BE #255 `9ef443f`**, **FE #119 `75f34b1`**.
-- [x] Regenerated `schema/openapi.json` and `lib/api-types.generated.ts` (a reworded
-      `Query(description=)` trips both gates).
-- [x] **Production audit across 7 pages: 0 prose em dashes served.**
-
-## Deliberately NOT changed
-
-- The generated `party_name` in the two code-violation scrapers. It is customer-visible, and
-  it is an input to `_compute_dedup_hash`, which keys billing dedup. Rewriting it would
-  re-deliver and **re-bill** already-paid leads.
-- en dashes in numeric ranges, the `—` empty-value glyph in table cells, the `·` separator.
-- `scrapers/reliability.py`'s exception format: internal, verifiably never customer-visible.
-- Plan limits, billing/Stripe, quota enforcement, county counting, scraper behaviour.
-
-## Open at hand-off
-
-- **FE #120** (one-line copy fix from the final read-back) is open, CI pending.
-- **Codex round 2 on the sweep never completed** (OpenAI usage limit). Its questions were
-  answered by hand; worth re-running after the quota resets.
+## Review
+(to be filled in)

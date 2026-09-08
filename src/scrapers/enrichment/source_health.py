@@ -57,9 +57,11 @@ _CANARY_BACKSTOP = timedelta(hours=6)
 # How long a probe claim counts as "a probe is in flight". `claim_probe` stamps
 # `last_probe_at` BEFORE the request, so a worker that dies mid-probe leaves a
 # stamp behind; without an expiry that single abandoned claim would hold traffic
-# for good. Comfortably longer than a probe (3 requests, ~10s) and shorter than
-# the canary's own 10-minute claim floor, so a live canary always re-claims
-# before this lapses.
+# for good. Comfortably longer than a probe (3 requests, ~10 s) and than the
+# canary's 10-minute claim floor, so a live canary always re-claims and
+# re-stamps well inside this window. An abandoned claim therefore looks recent
+# for up to 20 minutes and then stops counting, at which point the separate
+# 6-hour backstop can apply.
 _PROBE_INFLIGHT_GRACE = timedelta(minutes=20)
 
 
@@ -149,17 +151,22 @@ def is_source_available(db, source_key: str) -> bool:
 
     BACKSTOP: making recovery depend on the canary would let a canary that is not
     running block a source forever, which is a worse failure than the one being
-    fixed. So if the cooldown expired more than `_CANARY_BACKSTOP` ago and no
-    probe has run since, we conclude nothing is probing and fall back to the old
-    permissive behaviour rather than blocking indefinitely.
+    fixed. So once the anchor (`cooldown_until`, or `first_seen_at` when there is
+    no cooldown) is more than `_CANARY_BACKSTOP` old with no RECENT probe, we
+    conclude nothing is probing and allow traffic rather than blocking forever.
     """
     r = _row(db, source_key)
     if r is None or r.status not in _UNHEALTHY:
         return True
-    if r.cooldown_until is None:
-        return False
     now = datetime.now(UTC)
-    if now < r.cooldown_until:
+    # A NULL cooldown used to return False before ever reaching the backstop, so
+    # an unhealthy row without one stayed blocked forever if no canary was running
+    # (Codex). Anchor on when the outage was first seen instead; with no anchor at
+    # all there is nothing to time out against, so it stays blocked.
+    anchor = r.cooldown_until or r.first_seen_at
+    if anchor is None:
+        return False
+    if now < anchor:
         return False
     # Cooldown expired. Normally the canary probes and clears; hold traffic while
     # a probe could plausibly be in flight.
@@ -176,11 +183,11 @@ def is_source_available(db, source_key: str) -> bool:
     )
     if probe_is_recent:
         return False
-    if now >= r.cooldown_until + _CANARY_BACKSTOP:
+    if now >= anchor + _CANARY_BACKSTOP:
         _logger.warning(
-            "Source %s: cooldown expired %s ago and no probe since — assuming no "
-            "canary is running and allowing traffic",
-            source_key, now - r.cooldown_until,
+            "Source %s: blocked %s with no probe since — assuming no canary is "
+            "running and allowing traffic",
+            source_key, now - anchor,
         )
         return True
     return False

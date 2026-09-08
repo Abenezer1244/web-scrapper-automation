@@ -165,7 +165,7 @@ class TestAttemptedButUnknownIsDeferred:
         results = {pid: {}}
         tax_urls = {pid: "https://payment.kingcounty.gov/Home/Index?Search=" + pid}
         st: dict = {"requested": 1, "deferred": [], "unreached": [],
-                    "attempted": [], "mailing_attempted": 0}
+                    "requested_pids": [], "mailing_attempted": 0}
 
         async def _go():
             return await kca._king_mailing_phase(results, tax_urls, st, lambda: False, 0.0)
@@ -185,7 +185,7 @@ class TestAttemptedButUnknownIsDeferred:
     def test_an_unreadable_page_defers_the_parcel(self):
         st = self._run_stats("some unrelated page with no mailing block\n")
         assert "1234500000" in st["deferred"]
-        assert "1234500000" in st["attempted"]
+        assert "1234500000" in st["requested_pids"]
         assert "1234500000" not in st["unreached"]
 
     def test_a_page_for_another_parcel_defers_the_parcel(self):

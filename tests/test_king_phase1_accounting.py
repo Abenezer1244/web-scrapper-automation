@@ -338,7 +338,7 @@ class TestAttemptedIsPositiveEvidence:
         asyncio.run(kca.batch_enrich_king_county(
             pids, stats=stats, do_mailing=False, pace_s=0.1,
         ))
-        assert set(stats["attempted"]) == set(pids)
+        assert set(stats["requested_pids"]) == set(pids)
 
     def test_attempted_survives_a_mid_run_raise(self, monkeypatch, offline,
                                                 no_admission, instant_sleep):
@@ -356,8 +356,8 @@ class TestAttemptedIsPositiveEvidence:
         asyncio.run(kca.batch_enrich_king_county(
             pids, stats=stats, do_mailing=False, pace_s=0.1,
         ))
-        assert stats["attempted"], "attempts must survive a mid-run failure"
-        assert set(stats["attempted"]).issubset(set(pids))
+        assert stats["requested_pids"], "attempts must survive a mid-run failure"
+        assert set(stats["requested_pids"]).issubset(set(pids))
 
     def test_nothing_is_attempted_when_admission_is_refused(self, monkeypatch, offline):
         class _Refused:
@@ -380,5 +380,5 @@ class TestAttemptedIsPositiveEvidence:
         asyncio.run(kca.batch_enrich_king_county(
             pids, stats=stats, do_mailing=False, pace_s=0.1,
         ))
-        assert stats.get("attempted", []) == []
+        assert stats.get("requested_pids", []) == []
         assert set(stats["unreached"]) == set(pids)

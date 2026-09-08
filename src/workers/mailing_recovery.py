@@ -67,10 +67,14 @@ OUTCOME_KEY = "mailing_recovery_outcome"
 # unanswerable parcel can consume.
 _MAX_ATTEMPTS = 5
 
-# Parcels per tick. Deliberately >= the phase-1 breaker window (50): the breaker
-# counts within ONE call, so a sweep that asked for 20 at a time could fail every
-# request forever and never fill the window that is supposed to stop it (Codex).
-_BATCH_PARCELS = 60
+# Distinct parcels per tick, sized against MEASURED latency rather than against
+# the breaker window. 60 did not fit: phase 2 costs 5-10 s per parcel, so 60
+# needs 378-678 s against a 480 s tick and the overflow was pure waste (Codex).
+# 30 needs roughly 189-339 s and completes. The breaker is NOT relied on to fill
+# inside one sweep tick: the sweep is gated by source health, which the canary
+# maintains, and a batch inflated purely to fill a 50-request window would cost
+# King more requests than it saves.
+_BATCH_PARCELS = 30
 
 # Hard wall-clock bound for one tick, inside the 10-minute schedule so ticks
 # cannot pile up on each other.
@@ -137,6 +141,29 @@ def _release_single_flight(client) -> None:
 # the same low-id rows be re-selected every tick and starve everything behind
 # them (Codex); rotating by attempt count means every row gets its turn before
 # any row gets a second one.
+# Distinct eligible PARCELS first. The row limit used to be applied before
+# deduplication, so 120 rows that happened to be four copies of each parcel
+# yielded only 30 lookups — and a phase-1 pass of 30 can never fill the 50-request
+# breaker window that is supposed to stop a developing outage (Codex).
+_CANDIDATE_PARCELS_SQL = """
+    SELECT DISTINCT ON (btrim(r.parcel_id)) btrim(r.parcel_id) AS parcel_id,
+           coalesce((r.enrichment_data->>'mailing_recovery_attempts')::int, 0) AS attempts,
+           coalesce(r.enrichment_data->>'mailing_recovery_last_at', '') AS last_at
+    FROM results r
+    JOIN jobs j ON j.id = r.job_id
+    JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+    WHERE r.mailing_address IS NULL
+      AND r.parcel_id IS NOT NULL
+      AND length(btrim(r.parcel_id)) >= 6
+      AND coalesce(r.enrichment_data->>'mailing_lookup_deferred', '') = 'true'
+      AND coalesce((r.enrichment_data->>'mailing_recovery_attempts')::int, 0) < :max_attempts
+      AND j.status = 'done'
+      AND lower(sc.county) = 'king'
+      AND upper(sc.state) = 'WA'
+    ORDER BY btrim(r.parcel_id),
+             coalesce((r.enrichment_data->>'mailing_recovery_attempts')::int, 0) ASC
+"""
+
 _CANDIDATE_SQL = """
     SELECT r.id, r.user_id, r.parcel_id, r.enrichment_data
     FROM results r
@@ -150,10 +177,8 @@ _CANDIDATE_SQL = """
       AND j.status = 'done'
       AND lower(sc.county) = 'king'
       AND upper(sc.state) = 'WA'
-    ORDER BY coalesce((r.enrichment_data->>'mailing_recovery_attempts')::int, 0) ASC,
-             coalesce(r.enrichment_data->>'mailing_recovery_last_at', '') ASC,
-             r.id ASC
-    LIMIT :limit
+      AND btrim(r.parcel_id) = ANY(:parcels)
+    ORDER BY r.id ASC
 """
 
 
@@ -190,9 +215,20 @@ def _recover_impl(stats: dict) -> dict:
             stats["skipped"] = "king_erealproperty is in cooldown"
             return stats
 
+        # Pick the PARCELS first (fewest attempts, oldest attempt), then fetch
+        # every eligible row naming them.
+        parcel_rows = db.execute(
+            sa_text(_CANDIDATE_PARCELS_SQL), {"max_attempts": _MAX_ATTEMPTS}
+        ).all()
+        parcels = [r.parcel_id for r in
+                   sorted(parcel_rows, key=lambda r: (r.attempts, r.last_at, r.parcel_id))
+                   ][:_BATCH_PARCELS]
+        if not parcels:
+            db.rollback()
+            return stats
         rows = db.execute(
             sa_text(_CANDIDATE_SQL),
-            {"max_attempts": _MAX_ATTEMPTS, "limit": _BATCH_PARCELS * 2},
+            {"max_attempts": _MAX_ATTEMPTS, "parcels": parcels},
         ).all()
         db.rollback()  # release the read snapshot before any network I/O
         if not rows:
@@ -204,7 +240,6 @@ def _recover_impl(stats: dict) -> dict:
         by_parcel: dict[str, list] = {}
         for row in rows:
             by_parcel.setdefault(row.parcel_id.strip(), []).append(row)
-        parcels = list(by_parcel)[:_BATCH_PARCELS]
         stats["parcels"] = len(parcels)
 
         _logger.info(
@@ -251,7 +286,14 @@ def _recover_impl(stats: dict) -> dict:
         #
         # `attempted` is appended the moment a request is issued, into the
         # caller-owned stats dict, so it survives a cancelled coroutine.
-        attempted = [p for p in dict.fromkeys(king_stats.get("attempted", []))
+        # MAILING attempts only (Codex). Charging off all-phase `attempted` meant a
+        # parcel whose phase 1 succeeded but which phase 2 never reached spent a
+        # mailing retry with no mailing request ever made; five such ticks
+        # terminalised it unlooked-at. A phase-1 failure leaves the parcel
+        # deferred and uncharged, which is safe: if phase 1 keeps failing, the
+        # breaker and the health gate stop the sweep entirely rather than letting
+        # it spin.
+        attempted = [p for p in dict.fromkeys(king_stats.get("mailing_attempted_pids", []))
                      if p in by_parcel]
         stats["parcels"] = len(attempted)
         stats["unreached"] = len(parcels) - len(attempted)

@@ -75,7 +75,9 @@ def found_mailing(monkeypatch):
             # The sweep charges an attempt only on POSITIVE evidence that a
             # request was issued, so a fixture standing in for a completed batch
             # must say which parcels it actually looked up.
-            st["attempted"] = list(parcels)
+            st["requested_pids"] = list(parcels)
+            # The sweep charges its retry ceiling off MAILING attempts only.
+            st["mailing_attempted_pids"] = list(parcels)
         return {p: {"mailing_address": f"PO BOX {p[-4:]}, RENO, NV 89501",
                     "mailing_lookup": "found"} for p in parcels}
 
@@ -95,7 +97,9 @@ def no_mailing(monkeypatch):
             # The sweep charges an attempt only on POSITIVE evidence that a
             # request was issued, so a fixture standing in for a completed batch
             # must say which parcels it actually looked up.
-            st["attempted"] = list(parcels)
+            st["requested_pids"] = list(parcels)
+            # The sweep charges its retry ceiling off MAILING attempts only.
+            st["mailing_attempted_pids"] = list(parcels)
         return {p: {"mailing_address": None, "mailing_lookup": "none"} for p in parcels}
 
     monkeypatch.setattr(
@@ -114,7 +118,9 @@ def lookup_errors(monkeypatch):
             # The sweep charges an attempt only on POSITIVE evidence that a
             # request was issued, so a fixture standing in for a completed batch
             # must say which parcels it actually looked up.
-            st["attempted"] = list(parcels)
+            st["requested_pids"] = list(parcels)
+            # The sweep charges its retry ceiling off MAILING attempts only.
+            st["mailing_attempted_pids"] = list(parcels)
         return {p: {"mailing_address": None, "mailing_lookup": "error"} for p in parcels}
 
     monkeypatch.setattr(
@@ -217,7 +223,9 @@ class TestNeverDamagesExistingData:
             if st is not None:
                 st["deferred"] = []
                 st["unreached"] = []
-                st["attempted"] = list(parcels)
+                st["requested_pids"] = list(parcels)
+            # The sweep charges its retry ceiling off MAILING attempts only.
+            st["mailing_attempted_pids"] = list(parcels)
             # The repair lands between the SELECT and the UPDATE.
             from src.db.session import SyncSessionLocal
             with SyncSessionLocal() as s:
@@ -408,7 +416,8 @@ class TestAttemptAccountingUnderFailure:
             if st is not None:
                 st["deferred"] = []
                 st["unreached"] = []
-                st["attempted"] = []
+                st["requested_pids"] = []
+                st["mailing_attempted_pids"] = []
             raise RuntimeError("source blocked between the gate and the request")
 
         monkeypatch.setattr(
@@ -432,7 +441,8 @@ class TestAttemptAccountingUnderFailure:
             if st is not None:
                 st["deferred"] = []
                 st["unreached"] = ["1234500022"]
-                st["attempted"] = ["1234500021"]
+                st["requested_pids"] = ["1234500021"]
+                st["mailing_attempted_pids"] = ["1234500021"]
             return {"1234500021": {"mailing_address": None, "mailing_lookup": "error"}}
 
         monkeypatch.setattr(

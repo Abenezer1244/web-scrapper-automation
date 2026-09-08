@@ -110,6 +110,42 @@ class SourceAdmission:
                 return self
             time.sleep(_POLL_S)
 
+    def still_held(self) -> bool:
+        """Renew the lease if we still own it. False means we LOST it.
+
+        A fixed TTL with no renewal is not exclusion: an owner backfill paces
+        2,000 rows at 0.6 s, which exceeds the lease on pacing alone, and at
+        expiry a second worker enters while the first keeps going. Token-protected
+        release stops us deleting a successor's lease; it does nothing about the
+        overlap itself (Codex). A long-running caller therefore renews as it goes
+        and STOPS issuing requests the moment renewal fails.
+
+        Fails OPEN on a Redis error, for the same reason acquisition does: losing
+        enrichment entirely because a lock backend blipped is the worse outcome.
+        """
+        if not self._client or not self.admitted:
+            return True  # never acquired a real lease; nothing to lose
+        try:
+            renewed = self._client.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] "
+                "then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+                1, _key(self.source_key), self._token, _LEASE_TTL_S,
+            )
+            if not renewed:
+                _logger.warning(
+                    "Source admission: lost the %s lease mid-pass — stopping requests",
+                    self.source_key,
+                )
+                self.admitted = False
+                return False
+            return True
+        except Exception as exc:  # noqa: BLE001 -- fail OPEN
+            _logger.warning(
+                "Source admission: renewal check failed (%s) — continuing",
+                str(exc)[:120],
+            )
+            return True
+
     def __exit__(self, *exc_info) -> None:
         if not self._client or not self.admitted:
             return

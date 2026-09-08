@@ -18,7 +18,7 @@ from src.api.billing_entitlement import (
 )
 from src.api.deps import get_rls_db
 from src.api.middleware import client_ip, rate_limit
-from src.config import settings
+from src.config import frontend_routes, settings
 from src.config.constants import COUNTY_LIMIT_BY_PLAN, TRIAL_PERIOD_DAYS
 from src.config.plans import PLAN_CATALOG
 from src.db import User, get_db
@@ -185,7 +185,10 @@ async def referral_status(
     paid_conversions = paid_res.scalar() or 0
 
     base = settings.PUBLIC_APP_URL.rstrip("/") if hasattr(settings, "PUBLIC_APP_URL") else "https://app.bridgeleads.io"
-    share_url = f"{base}/signup?ref={user.referral_code}"
+    # /signup is not a page and is not public: a prospect following the shared
+    # link was bounced to /login and the ref code was dropped. /register is both,
+    # and it reads ?ref= at mount.
+    share_url = f"{base}{frontend_routes.referral_signup(user.referral_code)}"
 
     return {
         "code": user.referral_code,

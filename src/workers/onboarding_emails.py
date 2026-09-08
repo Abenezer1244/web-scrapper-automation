@@ -13,7 +13,7 @@ registration stamps on trial_ends_at).
 
 import resend
 
-from src.config import settings
+from src.config import frontend_routes, settings
 from src.config.constants import TRIAL_PERIOD_DAYS
 from src.config.plans import format_price_monthly, get_plan, plan_records_limit
 from src.utils.email_layout import (
@@ -63,7 +63,7 @@ def send_welcome_email(email: str) -> None:
     their plan and on which connectors are live. The old copy told everyone to
     pick Pierce or King and to choose probate.
     """
-    url = f"{settings.FRONTEND_URL}/scrapers/new"
+    url = frontend_routes.absolute(frontend_routes.SCRAPERS_NEW)
     plan = get_plan("pro")
     records = plan_records_limit("pro")
     trial_days = TRIAL_PERIOD_DAYS
@@ -137,8 +137,8 @@ def send_duplicate_signup_email(email: str) -> None:
     was ATTEMPTED for this address (which the inbox owner can see anyway) and
     offers login + reset. It does not echo any other account detail.
     """
-    login_url = f"{settings.FRONTEND_URL}/login"
-    reset_url = f"{settings.FRONTEND_URL}/forgot-password"
+    login_url = frontend_routes.absolute(frontend_routes.LOGIN)
+    reset_url = frontend_routes.absolute(frontend_routes.FORGOT_PASSWORD)
     subject = "You already have a BridgeLeads account"
 
     html_body = render_email(
@@ -248,7 +248,7 @@ def send_day1_nudge(email: str, days_left: int) -> None:
     ``days_left`` is the caller's real remaining trial days, not a literal. The
     old copy always read "6 more days" regardless of the account's actual state.
     """
-    url = f"{settings.FRONTEND_URL}/dashboard"
+    url = frontend_routes.absolute(frontend_routes.DASHBOARD)
     subject = "Getting started with your first scrape"
     trial_line = (
         f"Your free trial has {_days_phrase(days_left)} left."
@@ -299,7 +299,7 @@ def send_activation_reminder(
             "record type, and BridgeLeads pulls the records for you."
         )
         cta_label = "Set Up a Scraper"
-        url = f"{settings.FRONTEND_URL}/scrapers/new"
+        url = frontend_routes.absolute(frontend_routes.SCRAPERS_NEW)
     else:
         subject = "Your records are ready to export"
         heading = "Your records are ready to export"
@@ -308,7 +308,7 @@ def send_activation_reminder(
             "are most useful while they are fresh."
         )
         cta_label = "View Your Results"
-        url = f"{settings.FRONTEND_URL}/results"
+        url = frontend_routes.absolute(frontend_routes.RESULTS)
 
     trial_line = (
         f"Your free trial has {_days_phrase(days_left)} left."
@@ -356,7 +356,7 @@ def send_trial_ending_email(email: str, days_left: int) -> None:
         subject = f"Your BridgeLeads {pro['name']} trial ends in {days_left} days"
         heading = f"Your {pro['name']} trial ends in {days_left} days"
 
-    url = f"{settings.FRONTEND_URL}/settings?tab=billing"
+    url = frontend_routes.absolute(frontend_routes.BILLING)
     after_trial = (
         f"When your trial ends, your account moves to the Starter plan, which "
         f"includes {starter_records:,} records per month. Your account, scrapers "

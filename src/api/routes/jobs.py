@@ -1212,7 +1212,10 @@ async def download_export(
 
         csv_bytes = output.getvalue().encode("utf-8")
 
+        from starlette.background import BackgroundTask
         from starlette.responses import Response
+
+        from src.api.download_tracking import mark_leads_downloaded
 
         return Response(
             content=csv_bytes,
@@ -1221,6 +1224,16 @@ async def download_export(
                 "Content-Disposition": f'attachment; filename="bridgeleads_{job_id[:8]}.csv"',
                 "Cache-Control": "private, max-age=3600",
             },
+            # Activation signal, recorded AFTER the bytes go out. As a background
+            # task it cannot turn a bookkeeping failure into a failed download,
+            # and it cannot be reached by the `except Exception -> 500` below.
+            # Only when the file carried leads: the header-only responses above
+            # (all-duplicate, all-over-quota, a filter that matched nothing) are
+            # a valid CSV but not leads in anyone's hands.
+            background=(
+                BackgroundTask(mark_leads_downloaded, str(user.id))
+                if records else None
+            ),
         )
     except HTTPException:
         raise

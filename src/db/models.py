@@ -132,6 +132,23 @@ class User(Base):
     stripe_subscription_id = Column(String(64), nullable=True)
     subscription_status = Column(String(32), nullable=True)
     trial_ends_at = Column(DateTime(timezone=True), nullable=True)
+    # ── Activation: did this person ever actually receive a leads CSV? ────────
+    # (migration 090) Stamped by src/api/download_tracking.py when a download
+    # endpoint hands over bytes: per-job, combined batch, or segment export. It
+    # replaces `jobs.export_key IS NOT NULL`, which the worker sets when it marks
+    # a job DONE and therefore answered "an export was produced", not "someone
+    # downloaded it". NULL means unobserved, never "did not download": nothing
+    # before migration 090 was measured, and the column is deliberately NOT
+    # backfilled so the funnel cannot report an invented download.
+    first_leads_downloaded_at = Column(DateTime(timezone=True), nullable=True)
+    # Presentation only, and separate on purpose. Set by migration 090 for users
+    # who already had a finished export at cutover, so their onboarding checklist
+    # does not regress from 5/5 and re-nag them to download something they may
+    # well have downloaded months ago. The funnel must NOT read this: it records
+    # what we assume, whereas first_leads_downloaded_at records what we saw.
+    onboarding_download_grandfathered = Column(
+        Boolean, nullable=False, server_default="false", default=False
+    )
     # ── Entitlement window (migration 088) ───────────────────────────────────
     # Record quota is metered over [quota_period_start, quota_period_end), a
     # window that is ALWAYS one month long however Stripe invoices — an annual

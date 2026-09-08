@@ -265,6 +265,31 @@ def _fail_job_after_uncaught(job_id: str, reason: str, expected_started_at=None)
                     release_quota_reservation,
                 )
                 release_quota_reservation(db, job_id)
+                # The crash may ALSO have happened after the dedup step claimed
+                # hashes in delivered_records (it commits at the dedup step, long
+                # before delivery) but before anything was delivered. Releasing
+                # the quota and keeping the claims is the worst of both: the user
+                # is not charged, gets no leads, and every FUTURE run silently
+                # drops those same leads as "already delivered" — permanently
+                # unreachable. Every other failure path in this file already
+                # releases; this one released quota only (2026-09-08 audit).
+                #
+                # first_job_id scopes the delete to claims THIS job made, so a
+                # hash an earlier run legitimately owns is untouched.
+                try:
+                    db.execute(
+                        sa_text(
+                            "DELETE FROM delivered_records "
+                            "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
+                        ),
+                        {"jid": job_id, "uid": str(row.user_id)},
+                    )
+                    db.commit()
+                except Exception as _rel_exc:  # noqa: BLE001
+                    db.rollback()
+                    _alert_dedup_release_failed(
+                        job_id, row.user_id, "post_crash_cleanup", _rel_exc
+                    )
         if row is not None:
             r = _redis()
             _publish_log(r, job_id, "error", reason, db=None)
@@ -1007,14 +1032,34 @@ def run_scrape_job(self, job_id: str) -> None:
                 # Cast text[] to uuid[] — results.id is UUID type but
                 # duplicate_result_ids are Python strings. Without the
                 # cast, Postgres raises "operator does not exist: uuid = text".
+                #
+                # Migration 089: stamp WHICH run holds the claim, NOW, while the
+                # answer is still knowable. The results page tells the user these
+                # were "already delivered"; without this it could not show them
+                # where, and the link it offered instead was chosen by an
+                # unrelated rule that pointed at a run two months LATER (see
+                # get_results). delivered_records cannot answer it after the fact:
+                # claims are released and re-claimed, source jobs are purged, and
+                # the request path holds no privilege on that table at all.
+                # LEFT JOIN, so a hash whose claim has already gone stamps NULL
+                # and is reported as unattributed rather than mis-attributed.
                 for j in range(0, len(duplicate_result_ids), 500):
                     chunk = duplicate_result_ids[j:j + 500]
                     db.execute(
                         sa_text(
-                            "UPDATE results SET is_duplicate = true "
-                            "WHERE id = ANY(CAST(:ids AS uuid[]))"
+                            "UPDATE results r SET is_duplicate = true, "
+                            "  duplicate_reason = 'prior_run', "
+                            "  duplicate_source_job_id = dr.first_job_id, "
+                            "  duplicate_source_at = dr.first_delivered_at "
+                            "FROM results src "
+                            "LEFT JOIN delivered_records dr "
+                            "  ON dr.user_id = CAST(:uid AS uuid) "
+                            " AND dr.dedup_hash = src.dedup_hash "
+                            "WHERE r.id = src.id "
+                            "  AND r.user_id = CAST(:uid AS uuid) "
+                            "  AND src.id = ANY(CAST(:ids AS uuid[]))"
                         ),
-                        {"ids": chunk},
+                        {"ids": chunk, "uid": str(job.user_id)},
                     )
                 db.commit()
 
@@ -1501,9 +1546,15 @@ def run_scrape_job(self, job_id: str) -> None:
                         # them. Keeping the claim would make the lead permanently
                         # unreachable — the same invariant the re-export failure
                         # path protects.
-                        db.execute(
-                            sa_text('DELETE FROM delivered_records dr USING results r WHERE dr.user_id = CAST(:uid AS uuid)   AND dr.first_job_id = :jid   AND dr.dedup_hash = r.dedup_hash   AND r.id = ANY(CAST(:ids AS uuid[]))   AND r.user_id = CAST(:uid AS uuid)   AND r.dedup_hash IS NOT NULL'),
-                            {"uid": str(job.user_id), "jid": job_id, "ids": _capped_ids},
+                        # Release what the cap excluded, KEEPING any claim a
+                        # surviving deliverable sibling in this job still needs.
+                        # The statement lives in tasks_helpers/dedup.py so the
+                        # tests can run the real one instead of a copy (Codex).
+                        from src.workers.tasks_helpers.dedup import (
+                            release_capped_dedup_claims,
+                        )
+                        release_capped_dedup_claims(
+                            db, str(job.user_id), job_id, _capped_ids
                         )
                     db.commit()
                 except Exception as exc:

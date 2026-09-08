@@ -10,7 +10,7 @@ from decimal import Decimal
 
 import pytest
 
-from src.api.entitlements import record_type_violations
+from src.api.entitlements import disallowed_record_types
 from src.config.constants import ALL_RECORD_TYPES, RECORD_TYPES_BY_PLAN
 from src.db.models import NtsNotice
 from src.scrapers.registry import _ALLOWED_SCRAPER_MODULES
@@ -64,8 +64,8 @@ class TestPlanWiring:
 
     def test_entitlement_allows_pro_but_not_starter(self):
         # Pro may request it; Starter is a violation (gated).
-        assert record_type_violations("pro", ["trustee_sale"]) == set()
-        assert record_type_violations("starter", ["trustee_sale"]) == {"trustee_sale"}
+        assert disallowed_record_types("pro", ["trustee_sale"]) == set()
+        assert disallowed_record_types("starter", ["trustee_sale"]) == {"trustee_sale"}
 
 
 class TestRegistryAllowlist:

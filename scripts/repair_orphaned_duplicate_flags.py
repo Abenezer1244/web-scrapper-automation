@@ -28,11 +28,15 @@ The repair restores a coherent state per (user, hash):
   * rows on jobs that never finished are left alone. A failed run delivered
     nothing, so its rows are not a delivery and must not become one.
 
-Deliberately does NOT touch ``record_count``, ``billed_count`` or
-``billing_applied_at``. Those are billing-time snapshots of what was actually
-charged, and this repair charges nothing. ``new_count`` on the results page is a
-live count and will legitimately exceed ``record_count`` for a repaired job --
-the same divergence get_results already documents for post-finalization repairs.
+Touches ``record_count``, because that is the DELIVERY headline the jobs list,
+the email and the webhook render. Leaving it at 0 while the repaired run now
+exposes thousands of leads is the two-surfaces-two-rules bug the results page was
+already fixed for once.
+
+Deliberately does NOT touch ``billed_count``, ``billing_applied_at`` or
+``users.records_used``. Those record what was actually CHARGED, and this repair
+charges nothing. A repaired job therefore reads record_count > billed_count = 0,
+which is the honest description of a delivery nobody paid for.
 
 Idempotent: once a hash has a claim it is no longer an orphan, so a re-run is a
 no-op.
@@ -62,9 +66,15 @@ WITH orphan AS (
     WHERE r.is_duplicate IS TRUE
       AND r.dedup_hash IS NOT NULL
       AND (CAST(:uid AS uuid) IS NULL OR r.user_id = CAST(:uid AS uuid))
-      AND (CAST(:jid AS uuid) IS NULL OR r.dedup_hash IN (
-              SELECT dedup_hash FROM results
-              WHERE job_id = CAST(:jid AS uuid) AND dedup_hash IS NOT NULL))
+      -- Scoped to the seed job's OWNER as well as its hashes. Matching on
+      -- dedup_hash alone made an orphan in a DIFFERENT account eligible
+      -- whenever it shared a parcel|address, which for one production job was
+      -- 40,999 rows belonging to someone else (Codex P1).
+      AND (CAST(:jid AS uuid) IS NULL OR EXISTS (
+              SELECT 1 FROM results seed
+              WHERE seed.job_id = CAST(:jid AS uuid)
+                AND seed.user_id = r.user_id
+                AND seed.dedup_hash = r.dedup_hash))
       AND NOT EXISTS (
           SELECT 1 FROM delivered_records dr
           WHERE dr.user_id = r.user_id AND dr.dedup_hash = r.dedup_hash
@@ -124,16 +134,31 @@ UPDATE results SET is_duplicate = false,
 WHERE id = ANY(CAST(:ids AS uuid[]))
 """
 
+# Re-points every duplicate at the run that now holds the claim.
+#
+# Deliberately does NOT skip rows that already carry a duplicate_reason (Codex
+# P2): the whole reason this repair exists is that provenance can name a
+# claimant whose claim was released, and skipping those would preserve exactly
+# the stale attribution being fixed. 'same_run' is left alone, because a
+# within-run collapse is a different fact and was never about a claim.
+#
+# Never stamps a row on the winning job itself (it would point at itself), and
+# never stamps a row on a run that did not finish -- a failed run's rows are not
+# a delivery and get no provenance.
 _Q_STAMP = """
 UPDATE results r
 SET duplicate_source_job_id = dr.first_job_id,
     duplicate_source_at = dr.first_delivered_at,
     duplicate_reason = 'prior_run'
-FROM delivered_records dr
+FROM delivered_records dr, jobs own
 WHERE dr.user_id = r.user_id
   AND dr.dedup_hash = r.dedup_hash
+  AND own.id = r.job_id
+  AND own.user_id = r.user_id
+  AND own.status = 'done'
+  AND r.job_id <> dr.first_job_id
   AND r.is_duplicate IS TRUE
-  AND r.duplicate_reason IS NULL
+  AND COALESCE(r.duplicate_reason, '') <> 'same_run'
   AND dr.first_result_id = ANY(CAST(:ids AS uuid[]))
 """
 
@@ -203,6 +228,39 @@ def main() -> None:
             {"ids": won},
         ).rowcount
         print(f"duplicates given a source run: {stamped}")
+
+        # record_count is the DELIVERY headline the jobs list, the email and the
+        # webhook all render -- NOT the billing record, which is billed_count and
+        # billing_applied_at and stays untouched. Leaving it at 0 while the run
+        # now exposes restored leads recreates exactly the two-surfaces-two-rules
+        # bug the results page was fixed for: the list saying 0 next to a detail
+        # page listing thousands (Codex P2).
+        headline = db.execute(
+            text("""
+            UPDATE jobs j SET record_count = live.n
+            FROM (
+                SELECT r2.job_id, r2.user_id, count(*) AS n
+                FROM results r2
+                WHERE r2.job_id IN (
+                        SELECT DISTINCT job_id FROM results
+                        WHERE id = ANY(CAST(:ids AS uuid[])))
+                  AND r2.is_duplicate IS FALSE
+                  AND COALESCE(
+                        r2.enrichment_data->>'delivery_excluded_reason', ''
+                      ) <> 'over_quota'
+                  AND (COALESCE(btrim(r2.property_address), '')
+                           NOT IN ('', '(enrichment unavailable)')
+                       OR COALESCE(btrim(r2.mailing_address), '')
+                           NOT IN ('', '(enrichment unavailable)'))
+                GROUP BY r2.job_id, r2.user_id
+            ) AS live
+            WHERE j.id = live.job_id
+              AND j.user_id = live.user_id
+              AND j.record_count <> live.n
+            """),
+            {"ids": won},
+        ).rowcount
+        print(f"delivery headlines corrected: {headline} job(s)")
 
         db.commit()
 

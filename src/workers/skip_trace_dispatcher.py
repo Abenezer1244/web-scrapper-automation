@@ -483,7 +483,7 @@ def _alert_orphaned_queue(queue_id: int, trace_type: str, n_rows: int) -> None:
 
         send_ops_alert(
             "skip_trace", f"orphaned_queue_{queue_id}",
-            "Tracerfy batch accepted but NOT recorded, so results will be lost",
+            "Tracerfy batch accepted but NOT recorded: results will be lost",
             f"Tracerfy accepted (and charged for) queue_id={queue_id} "
             f"({trace_type}, {n_rows} rows) but BridgeLeads failed twice to write "
             f"the matching skip_trace_queues row. The completion webhook for this "
@@ -997,7 +997,7 @@ def _alert_ambiguous_reconciliation(n_rows: int, trace_type: str, claim_time) ->
 
         send_ops_alert(
             "skip_trace", f"ambiguous_reconcile_{claim_time}",
-            "Skip-trace reconciliation ambiguous, needs a human",
+            "Skip-trace reconciliation ambiguous: needs a human",
             f"{n_rows} pending_skip_trace_rows claimed at {claim_time} "
             f"({trace_type}) match MORE THAN ONE Tracerfy queue, so the "
             f"reconciler refused to adopt one. Picking wrong would attach this "
@@ -1034,7 +1034,7 @@ def _alert_stale_claims(db) -> None:
         _logger.error("Skip trace: %d rows stuck in 'submitting' since %s", stale, oldest)
         send_ops_alert(
             "skip_trace", "stale_claims",
-            "Skip trace rows stuck mid-submission, reconcile with Tracerfy",
+            "Skip trace rows stuck mid-submission: reconcile with Tracerfy",
             f"{stale} pending_skip_trace_rows have status='submitting' for more than "
             f"{int(_STALE_CLAIM_AFTER.total_seconds() // 60)} minutes (oldest claim {oldest}). "
             "A dispatcher tick died between the Tracerfy POST and its bookkeeping, or the "
@@ -1087,7 +1087,7 @@ def _alert_out_of_credits(db, message: str, trace_type: str, batch_size: int) ->
         ).one()
         send_ops_alert(
             "skip_trace", "out_of_credits",
-            "Tracerfy out of credits, skip trace stalled",
+            "Tracerfy out of credits: skip trace stalled",
             f"Tracerfy rejected a {batch_size}-row {trace_type} batch with 402. "
             f"{queued[0]} rows across {queued[1]} jobs are queued and will not be "
             f"traced until the account is topped up at tracerfy.com. "

@@ -1250,13 +1250,29 @@ def run_scrape_job(self, job_id: str) -> None:
         # actually relying on anyway.
         _publish_log(r, job_id, "info", "Looking up property and mailing addresses...", db=db)
         try:
-            _run_inline_enrichment(db, job, r, job_id, config)
-            _publish_log(r, job_id, "success", "Enrichment complete: addresses added", db=db)
+            # `enrich_summary` lets this line tell the truth. It used to announce
+            # "Enrichment complete" unconditionally, so a job that looked up 0 of
+            # 153 mailing addresses still reported success, two lines under its own
+            # warning. A partially enriched job is not a failed job, but it is not
+            # a complete one either, and the user needs to be able to tell the
+            # difference between "scrape failed" and "some enrichment is pending".
+            enrich_summary: dict = {}
+            _run_inline_enrichment(db, job, r, job_id, config, summary=enrich_summary)
+            _pending_mail = int(enrich_summary.get("mailing_deferred") or 0)
+            if _pending_mail:
+                _publish_log(
+                    r, job_id, "info",
+                    f"Address enrichment partly complete. Property addresses were added, "
+                    f"and {_pending_mail} mailing address lookups are still pending.",
+                    db=db,
+                )
+            else:
+                _publish_log(r, job_id, "success", "Enrichment complete: addresses added", db=db)
         except Exception as exc:
             _logger.warning("Inline enrichment error: %s", str(exc)[:200])
             _publish_log(
                 r, job_id, "warning",
-                "Address enrichment failed. Leads delivered without enriched fields",
+                "Address enrichment failed. Leads were delivered without enriched fields.",
                 db=db,
             )
 
@@ -2001,7 +2017,7 @@ def run_scrape_job(self, job_id: str) -> None:
         _wh_plan_ok = (user.plan or "starter").lower() in BUSINESS_FEATURES_PLANS
         if webhook_url and object_key and not _wh_plan_ok:
             _publish_log(r, job_id, "warning",
-                         "Webhook delivery skipped: requires Business plan", db=db)
+                         "Webhook delivery skipped. Webhooks require the Business plan.", db=db)
         if webhook_url and object_key and _wh_plan_ok:
             try:
                 from src.workers.webhook_delivery import (
@@ -2046,7 +2062,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 )
                 _publish_log(
                     r, job_id, "warning",
-                    "Webhook queue unavailable. The job completed successfully",
+                    "Webhook queue unavailable. Your job completed successfully.",
                     db=db,
                 )
                 from src.workers.ops_alerts import send_ops_alert

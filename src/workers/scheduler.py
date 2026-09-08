@@ -47,6 +47,7 @@ from src.workers.scheduler_helpers.dispatch import (  # noqa: F401
 from src.workers.scheduler_helpers.health import (  # noqa: F401
     _canary_check_impl,
     _canary_scrape,
+    _enrichment_source_canary_impl,
     _watchdog_stuck_jobs_impl,
 )
 from src.workers.scheduler_helpers.meter import _flush_skip_trace_meter_outbox_impl
@@ -83,6 +84,23 @@ app.conf.beat_schedule = {
     "canary-check": {
         "task": "src.workers.scheduler.canary_check",
         "schedule": 3600.0,  # every 1 hour
+    },
+    "enrichment-source-canary": {
+        # The recovery half of external_source_health, which shipped without one:
+        # probe each blocked enrichment source whose cooldown has expired and
+        # either clear it or escalate. Until this existed, a blocked source could
+        # only leave cooldown by passive expiry, and the next real job then spent
+        # a full circuit-breaker window rediscovering the block and re-armed it.
+        # Verified in production: king_erealproperty sat throttled for three days
+        # with last_probe_at NULL while the source answered 60/60 with HTTP 200.
+        #
+        # Every 5 minutes, but the cost is NOT one probe per 5 minutes: a healthy
+        # source has no row and is never probed, and a source still inside its
+        # cooldown is not due. The claim also enforces a 10-minute floor between
+        # probes of the same source. So this is a handful of requests per OUTAGE,
+        # not per tick, and it keeps recovery latency under the shortest ladder rung.
+        "task": "src.workers.scheduler.enrichment_source_canary",
+        "schedule": 300.0,  # every 5 minutes
     },
     "reconcile-quota-periods": {
         # Record quota is metered over each user's own ENTITLEMENT WINDOW, not
@@ -220,6 +238,19 @@ app.conf.beat_schedule = {
         "task": "src.workers.nts_crawler.crawl_nts_columbian_clark",
         "schedule": crontab(hour=10, minute=35, day_of_week="*"),  # 10:35 UTC daily
     },
+    "recover-deferred-mailing": {
+        # The recovery half of `mailing_lookup_deferred`, which shipped as a
+        # marker that nothing ever read: parcels a source outage skipped were
+        # deferred with a comment promising "a later sweep can find them", and no
+        # sweep existed. Bounded, gated on source health, mailing-only. It never
+        # bills, never creates a job and never enqueues a skip trace.
+        #
+        # Every 10 minutes, but a tick with no deferred King rows is a single
+        # indexed query and exits, and a tick while King is in cooldown makes no
+        # request at all.
+        "task": "src.workers.mailing_recovery.recover_deferred_mailing",
+        "schedule": 600.0,  # every 10 minutes
+    },
     "batch-completion-sweep": {
         # Piece 2: finalize batch_runs whose child jobs are ALL terminal — build
         # the one combined CSV + deliver. Claims each run via a reclaimable lease;
@@ -292,6 +323,19 @@ def watchdog_stuck_jobs() -> None:
 
 
 # ─── Task 3: Canary health checks ────────────────────────────────────────────
+
+@app.task(name="src.workers.scheduler.enrichment_source_canary")
+def enrichment_source_canary() -> None:
+    """Probe blocked ENRICHMENT SOURCES whose cooldown expired; clear or escalate.
+
+    Sibling of canary_check, deliberately separate: that one asks "can we still
+    scrape this county portal" (county_connectors), this one asks "can we still
+    enrich from this external source" (external_source_health). Different tables,
+    different failure modes, and conflating them would mean a portal outage could
+    clear an enrichment block or vice versa.
+    """
+    return _enrichment_source_canary_impl()
+
 
 @app.task(name="src.workers.scheduler.canary_check")
 def canary_check() -> None:

@@ -32,6 +32,13 @@ app = Celery(
         # and the batch finalizer. Must be imported here or the task is
         # unregistered and the enqueue is silently dropped (same trap as above).
         "src.workers.delivery",
+        # Deferred-mailing recovery: recover_deferred_mailing is a BEAT task. Beat
+        # publishes a task NAME; if no worker has imported the module the message
+        # is discarded as unregistered and the sweep never runs — it would look
+        # perfectly healthy in tests (which import the module themselves) while
+        # doing nothing at all in production. Third time this trap has been hit
+        # here; see batch_tasks and nts_crawler above (Codex).
+        "src.workers.mailing_recovery",
     ],
 )
 

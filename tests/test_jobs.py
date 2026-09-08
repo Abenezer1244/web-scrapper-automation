@@ -304,7 +304,7 @@ async def test_sse_replays_existing_logs(
 ):
     # Seed log entries and mark job done using an inline session
     async with _db_session.AsyncSessionLocal() as s:
-        for msg in ["Job queued — Pierce County", "Probing county portal..."]:
+        for msg in ["Job queued: Pierce County", "Probing county portal..."]:
             s.add(JobLog(
                 id=str(uuid.uuid4()),
                 job_id=pending_job.id,
@@ -331,7 +331,7 @@ async def test_sse_replays_existing_logs(
     messages = [json.loads(line[len("data: "):]) for line in lines]
 
     log_messages = [m["message"] for m in messages if "message" in m]
-    assert "Job queued — Pierce County" in log_messages
+    assert "Job queued: Pierce County" in log_messages
     assert "Probing county portal..." in log_messages
 
 

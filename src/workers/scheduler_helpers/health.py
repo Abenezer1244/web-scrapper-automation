@@ -407,3 +407,85 @@ def _canary_probe_historical(scraper_class, today) -> bool:
             )
             return True
     return False
+
+
+# ─── Enrichment-source canary ────────────────────────────────────────────────
+# `source_health` was designed around a canary that was never written. Its own
+# docstring says a blocked source stays blocked "until a canary clears it", and
+# `sources_due_for_probe` / `mark_probe_failed` / the recovery transition had no
+# production caller at all -- only tests. The result, verified in production on
+# 2026-09-07: `king_erealproperty` sat `throttled` from 2026-09-04 11:15Z with
+# `last_probe_at = NULL` and `consecutive_probe_failures = 0`. Three days, zero
+# probes, while the source itself answered 60/60 requests with HTTP 200.
+#
+# `canary_check` above probes county CONNECTORS (can we still scrape the portal).
+# This probes enrichment SOURCES (can we still enrich from them). Different
+# tables, different failure modes, deliberately separate tasks.
+#
+# One probe per due source per tick, claimed atomically so overlapping ticks
+# cannot double-escalate one outage, and applied under the claim token so a
+# probe that was in flight when a fresh outage landed cannot erase it.
+_SOURCE_PROBE_MIN_INTERVAL = timedelta(minutes=10)
+
+
+def _enrichment_source_canary_impl() -> None:
+    """Probe each enrichment source whose cooldown has expired; clear or escalate."""
+    from src.db.session import system_sync_session
+    from src.scrapers.enrichment.source_health import (
+        claim_probe,
+        resolve_probe,
+        sources_due_for_probe,
+    )
+    from src.scrapers.enrichment.source_probe import PROBES
+
+    with system_sync_session() as db:
+        try:
+            due = sources_due_for_probe(db)
+        except Exception as exc:  # noqa: BLE001 -- a health read must not kill the beat
+            _logger.error("Enrichment canary: could not list due sources: %s", str(exc)[:200])
+            return
+        if not due:
+            return
+        _logger.info("Enrichment canary: %d source(s) due for probe: %s", len(due), ", ".join(due))
+        for source_key in due:
+            probe = PROBES.get(source_key)
+            if probe is None:
+                # Leave it alone rather than guess. Clearing a source we cannot
+                # actually verify would put real traffic back onto it blind.
+                _logger.warning(
+                    "Enrichment canary: no probe registered for %s — leaving it in cooldown",
+                    source_key,
+                )
+                continue
+            token = claim_probe(db, source_key, _SOURCE_PROBE_MIN_INTERVAL)
+            if token is None:
+                continue  # another tick already claimed it
+            try:
+                healthy, detail = probe(db)
+            except Exception as exc:  # noqa: BLE001 -- a probe crash is a failed probe
+                healthy = False
+                detail = f"probe raised {type(exc).__name__}: {str(exc)[:180]}"
+            if not resolve_probe(db, source_key, token, healthy=healthy, reason=detail):
+                continue  # stale verdict, already logged
+            _alert_source_probe(source_key, healthy, detail)
+
+
+def _alert_source_probe(source_key: str, healthy: bool, detail: str) -> None:
+    """Tell ops that an enrichment source recovered or is still refusing us."""
+    from src.workers.ops_alerts import send_ops_alert
+
+    try:
+        if healthy:
+            send_ops_alert(
+                "enrichment_source", f"{source_key}/recovered",
+                f"Enrichment source recovered: {source_key}",
+                f"{source_key} answered a liveness probe and is back in service.\n\n{detail}",
+            )
+        else:
+            send_ops_alert(
+                "enrichment_source", f"{source_key}/down",
+                f"Enrichment source still unavailable: {source_key}",
+                f"{source_key} failed its liveness probe and stays in cooldown.\n\n{detail}",
+            )
+    except Exception as exc:  # noqa: BLE001 -- alerting must never break the canary
+        _logger.error("Enrichment canary: alert failed for %s: %s", source_key, str(exc)[:200])

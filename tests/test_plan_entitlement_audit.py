@@ -1044,6 +1044,28 @@ def test_a_custom_date_range_cannot_reach_past_the_starter_freshness_edge():
 
     assert _to("starter") == today - timedelta(days=7)
     assert _to("pro") == today
+
+    # A PAID plan is not clamped at all, including a window that ends in the
+    # FUTURE. trustee_sale reads the window's LENGTH as a forward auction
+    # horizon (src/scrapers/trustee_sale.py, _window_span_days), so truncating a
+    # future end would shorten the horizon a customer asked for, or erase it
+    # entirely once the span went non-positive and the scraper fell back to
+    # "every upcoming auction". The guard is `end_date < today`, not the plan
+    # name, and this is the test that says why.
+    forward = {
+        "date_range_mode": "custom",
+        "date_from": today.isoformat(),
+        "date_to": (today + timedelta(days=90)).isoformat(),
+    }
+    for paid in ("pro", "business", "agency"):
+        start, end = _resolve_date_range(forward, user_plan=paid)
+        assert datetime.strptime(end, "%m/%d/%Y").date() == today + timedelta(days=90), paid
+        span = (
+            datetime.strptime(end, "%m/%d/%Y").date()
+            - datetime.strptime(start, "%m/%d/%Y").date()
+        ).days
+        assert span == 90, paid
+
     # A window that sits entirely inside the embargo collapses to the edge
     # rather than inverting into garbage the portals cannot answer.
     inside = {

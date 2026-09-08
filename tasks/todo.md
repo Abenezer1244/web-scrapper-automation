@@ -1,39 +1,53 @@
-# Plan entitlement audit (2026-09-08)
+# Plan entitlement audit (2026-09-08) — COMPLETE
 
-Branch: `chore/entitlement-audit` (BE) / `chore/entitlement-audit-fe` (FE)
-Worktrees: `C:/Users/Windows/bridgeleads-worktrees/entitlement-audit`,
-`C:/Users/Windows/bridgeleads-web-worktrees/entitlement-audit-fe`
+Branches: `chore/entitlement-audit` (BE), `chore/entitlement-audit-fe` (FE).
+Report: `docs/ENTITLEMENT-AUDIT-2026-09-08.md`.
+Tests: `tests/test_plan_entitlement_audit.py` (162), run via `run-audit-tests.sh`.
 
-## Phase 1 - locate authoritative config
-- [x] `src/config/plans.py` PLAN_CATALOG (price, records_limit, marketed features) - source of the 4 in-app cards
-- [x] `src/config/settings.py` PLAN_LIMITS (records) - DUPLICATE of catalog, currently agrees
-- [x] `src/config/settings.py` SKIP_TRACE_BUNDLED_QUOTAS, ENTITLEMENT_ENFORCEMENT, STRIPE_PRICE_*
-- [x] `src/config/constants.py` COUNTY_LIMIT_BY_PLAN, RECORD_TYPES_BY_PLAN, BATCH_PLANS,
-      BUSINESS_FEATURES_PLANS, SKIP_TRACE_ADDON_PLANS, PRIORITY_QUEUE_PLANS, SUPPORTED_EXPORT_FORMATS
-- [x] `src/api/entitlements.py` - county + record-type validator (flag-gated)
-- [x] FE `lib/entitlements.ts` - mirror; FE `app/(marketing)/_monopo/data.ts` - SEPARATE static marketing copy
-- [x] `src/api/routes/billing.py` `pricing_page().comparison` - THIRD copy of the matrix
+## Audit
+- [x] Locate every plan/entitlement definition (12 sources, listed in the report)
+- [x] Build the matrix from verified code and runtime behavior
+- [x] Records, counties, record types, skip tracing, exports, schedules, delivery,
+      batch, API, overlap, priority queue, white-label, seats, freshness
+- [x] Stripe price/product mapping verified against the live account
+- [x] Frontend vs backend for every capability
+- [x] Codex independent review, findings verified independently
 
-## Phase 2-19 verification
-- [x] Records limits (quota.py + worker reservation)
-- [x] County limits (entitlements.py, both create paths + 4 run-time call sites)
-- [x] Record types (RECORD_TYPES_BY_PLAN + call sites)
-- [x] Skip tracing (bundled quotas, counter, meter events, overage price wiring)
-- [x] Exports (SUPPORTED_EXPORT_FORMATS, DeliverConfig)
-- [x] Schedules (ScraperFrequency, DeliverConfig/ScheduleConfig)
-- [x] Delivery (email / webhook / dialer)
-- [x] Batch (BATCH_PLANS, BATCH_MAX_COMBINATIONS)
-- [x] API access (require_plan + api-key auth path)
-- [x] Overlap / intersection (/segments/*, batch delivery_mode)
-- [x] Priority queue (celery task_queues + start.sh WORKER_QUEUES)
-- [x] White-label / account manager / seats / data freshness
-- [x] Stripe mapping (_PRICE_TO_PLAN, checkout line_items)
-- [ ] Run targeted pytest subset against local test DB
-- [ ] Live UI verification (Playwright/Chromium) of the served pricing surfaces
-- [ ] Codex independent review + independent verification of its findings
+## Fixes (all four owner decisions approved)
+- [x] Priority queue on scheduled + batch enqueue
+- [x] normalize_plan() at every gate; plan_label follows
+- [x] Starter freshness clamp, delay-only (Codex caught it clamping paid plans)
+- [x] enrichment.skip_tracing mirrored onto the column the worker reads
+- [x] Export-format gate (create + edit delta, FE mirror)
+- [x] Schedule-frequency gate (create + edit delta, FE mirror)
+- [x] Overlap gate on /segments (router dependency, FE nav + page)
+- [x] Metered skip-trace price attached at checkout; licensed item resolved by id
+- [x] /billing/pricing comparison derived from the matrix
+- [x] Public pricing page corrected
 
-## Phase 20 - fixes
-- [ ] Await owner decisions on the policy items (see report section 21)
+## Verification
+- [x] 2685 non-integration + 179 integration passing, isolated DB
+- [x] `python scripts/export_openapi.py --check` clean
+- [x] FE `tsc --noEmit` and `eslint --quiet` clean
+- [x] Zero em dashes added to either repo
+
+## Owner follow-ups
+- [ ] Create three YEARLY metered skip-trace Prices in Stripe and set
+      STRIPE_PRICE_SKIP_TRACE_{PRO,BUSINESS,AGENCY}_ANNUAL on api and worker.
+      Annual subscriptions are unmetered until then (logged, not broken).
+- [ ] Decide whether a Pro batch should keep the overlaps_only default
+      (see report section 5, "Two things deliberately left")
+- [ ] P2-6: the meter outbox stamps a billable event reported when the customer
+      has no stripe_customer_id
+- [ ] P3-2: skip-trace allowance resets on the calendar month; records reset on
+      the subscriber anniversary
+- [ ] Codex round 2 hit its usage limit mid-review (resets 07:35). Worth
+      re-running against the final diff.
 
 ## Review
-(to be filled in)
+The audit found nine gaps; four were defects and five were product decisions the
+owner approved in full. Codex found four of the nine independently, corrected one
+of my findings (the Starter freshness delay IS implemented; two greps ending in
+`| head -N` both cut before it), and caught a regression I introduced (the clamp
+applied to paid plans, which shortens the forward auction horizon trustee_sale
+derives from the window's length).

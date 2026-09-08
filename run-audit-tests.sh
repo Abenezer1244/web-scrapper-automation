@@ -7,6 +7,10 @@
 # mid-request, which surfaces as 401s, "Could not refresh instance", and FK
 # violations that look like product bugs and are not. Isolation is the fix, not
 # a retry loop. Redis db 1 for the same reason (conftest flushes the whole db).
+#
+# This includes YOUR OWN runs: two of these going at once (an integration pass
+# beside a non-integration one) delete each other's users and produce the same
+# scattered, different-every-time failures. Run them one at a time.
 set -u
 export TEST_DATABASE_URL="postgresql+asyncpg://bridgeleads:testpassword@127.0.0.1:5432/bridgeleads_entaudit_test"
 export TEST_DATABASE_URL_SYNC="postgresql+psycopg2://bridgeleads:testpassword@127.0.0.1:5432/bridgeleads_entaudit_test"

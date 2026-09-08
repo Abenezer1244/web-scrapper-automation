@@ -731,15 +731,22 @@ async def update_scraper(
     added_formats = {
         str(f).strip().lower() for f in (eff_deliver.get("formats") or []) if f
     } - stored_formats
+    def _freq(value: object) -> str:
+        # Normalized both sides. ScheduleConfig lowercases and trims on the way
+        # in, but a row saved before that validator existed can hold "Daily",
+        # and comparing it raw would read an unrelated PATCH as a frequency
+        # CHANGE and refuse a grandfathered config on a field it never touched.
+        return str(value or "manual").strip().lower()
+
     stored_frequency = (
-        (config.schedule or {}).get("frequency")
+        _freq((config.schedule or {}).get("frequency"))
         if isinstance(config.schedule, dict)
-        else None
+        else "manual"
     )
     eff_frequency = (
-        eff_schedule.get("frequency") if isinstance(eff_schedule, dict) else None
+        _freq(eff_schedule.get("frequency")) if isinstance(eff_schedule, dict) else "manual"
     )
-    frequency_changed = (eff_frequency or "manual") != (stored_frequency or "manual")
+    frequency_changed = eff_frequency != stored_frequency
     _enforce_plan_feature_gates(
         current_user,
         has_webhook=webhook_added,

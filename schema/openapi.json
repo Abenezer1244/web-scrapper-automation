@@ -5437,7 +5437,7 @@
     },
     "/billing/portal": {
       "post": {
-        "description": "Return a Stripe Customer Portal URL for managing subscriptions.",
+        "description": "Return a Stripe Customer Portal URL for managing subscriptions.\n\nThe portal here is payment method, invoices and cancel. Plan CHANGES go\nthrough create_checkout, which is what the plan cards call.\n\nThat distinction now matters. Subscriptions carry a usage-based skip-trace\nitem, and Stripe restricts the portal's plan-switch flow for subscriptions\nthat have one. This deployment is unaffected: the live portal configuration\n(bpc_1TGRdU..., the default) has subscription_update DISABLED, verified\nagainst the account, so the portal never offered a plan switch. If someone\nturns \"Switch plan\" on in the Dashboard, check it against a subscription\nthat actually has the metered item before trusting it (Codex raised this).",
         "operationId": "customer_portal_billing_portal_post",
         "responses": {
           "200": {

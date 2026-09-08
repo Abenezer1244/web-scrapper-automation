@@ -44,13 +44,17 @@ def _to_mmddyyyy(date_str: str) -> str:
 
 
 def _clamp_to_window_end(date_to: str, end_date) -> str:
-    """Never let a caller-supplied window end past the plan's freshness edge.
+    """Pull a caller-supplied window end back to the plan's freshness edge.
 
-    ``end_date`` is today for a paid plan and today minus the Starter delay for
-    a free one, so on a paid plan this is a no-op for any window that is not in
-    the future. An unparseable string is returned untouched: the portal
-    normalizer downstream owns that failure, and swallowing it here would turn
-    a bad date into a silently different one.
+    Only called when a delay is in force (``end_date < today``). Do NOT call it
+    on a paid plan: ``end_date`` is today there, and a window ending in the
+    future is legitimate. trustee_sale uses the window's LENGTH as a forward
+    auction horizon, so truncating a future end silently shortens or erases the
+    horizon a paid customer asked for.
+
+    An unparseable string is returned untouched: the portal normalizer
+    downstream owns that failure, and swallowing it here would turn a bad date
+    into a silently different one.
     """
     try:
         requested = datetime.strptime(date_to, "%m/%d/%Y").date()
@@ -125,17 +129,27 @@ def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: st
             # Normalize to MM/DD/YYYY — frontend may send YYYY-MM-DD (ISO) — and
             # guard against a backwards custom range slipping through.
             #
-            # The end of the window is clamped to `end_date`, which carries the
-            # plan's freshness edge. Without this the custom branch returned the
-            # caller's own date_to untouched, so a Starter asking for a window
-            # ending today got today: the 7-day delay applied to the rolling
-            # window and to nothing else, and daily freshness is the paid moat.
-            # An entirely-inside-the-embargo window inverts, and _ordered_window
-            # already collapses that to the single day at the edge.
-            return _ordered_window(
-                _to_mmddyyyy(date_from),
-                _clamp_to_window_end(_to_mmddyyyy(date_to), end_date),
-            )
+            # The end is clamped to the plan's freshness edge, but ONLY when a
+            # delay is actually in force. The clamp exists because the custom
+            # branch used to return the caller's own date_to untouched, so a
+            # Starter asking for a window ending today got today and the 7-day
+            # delay applied to the rolling window and to nothing else.
+            #
+            # `end_date < today` is the guard, not `user_plan != starter`, and
+            # the difference is not cosmetic: clamping every plan to today would
+            # also truncate a window ending in the FUTURE, and trustee_sale reads
+            # the window's LENGTH as a forward auction horizon
+            # (src/scrapers/trustee_sale.py, _window_span_days). A paid customer
+            # asking for the next 90 days of auctions would have had that horizon
+            # shortened to the part of the window already in the past, or erased
+            # entirely once the span went non-positive. Codex caught this.
+            #
+            # A window sitting entirely inside a Starter's embargo still inverts,
+            # and _ordered_window collapses that to the single day at the edge.
+            clamped_to = _to_mmddyyyy(date_to)
+            if end_date < today:
+                clamped_to = _clamp_to_window_end(clamped_to, end_date)
+            return _ordered_window(_to_mmddyyyy(date_from), clamped_to)
         # Fall through to rolling_90 if custom dates are missing
 
     if range_mode == "since_last_run":

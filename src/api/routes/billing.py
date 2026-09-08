@@ -791,7 +791,19 @@ async def create_checkout(
 
 @router.post("/portal")
 async def customer_portal(request: Request, current_user: CurrentUser) -> dict:
-    """Return a Stripe Customer Portal URL for managing subscriptions."""
+    """Return a Stripe Customer Portal URL for managing subscriptions.
+
+    The portal here is payment method, invoices and cancel. Plan CHANGES go
+    through create_checkout, which is what the plan cards call.
+
+    That distinction now matters. Subscriptions carry a usage-based skip-trace
+    item, and Stripe restricts the portal's plan-switch flow for subscriptions
+    that have one. This deployment is unaffected: the live portal configuration
+    (bpc_1TGRdU..., the default) has subscription_update DISABLED, verified
+    against the account, so the portal never offered a plan switch. If someone
+    turns "Switch plan" on in the Dashboard, check it against a subscription
+    that actually has the metered item before trusting it (Codex raised this).
+    """
     await rate_limit(request, zone="stripe", identifier=current_user.id)
     if not current_user.stripe_customer_id:
         raise HTTPException(

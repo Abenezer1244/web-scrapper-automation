@@ -25,12 +25,30 @@ QUEUES="${WORKER_QUEUES:-scrape-priority,scrape,enrichment}"
 # have migrated by then" is a race, not a guarantee.
 #
 # scripts/migrate.py is advisory-locked and idempotent, so whichever service gets
-# there first applies the migration and the rest block, then no-op. Fail closed:
-# a service that cannot confirm the schema does not start.
+# there first applies the migration and the rest block, then no-op.
+#
+# The API keeps failing CLOSED, as it always has: serving requests against a
+# stale schema is worse than not serving. Worker and beat fail OPEN, and that is
+# deliberate. migrate.py needs DATABASE_URL_MIGRATE or DATABASE_URL_SYNC and
+# refuses a :6543 pooler DSN; those variables are set per Railway service, and a
+# worker whose env differs from the API's would go from "briefly fails queries
+# until the API migrates" to "never starts at all", which does not self-heal.
+# Failing open leaves the worker exactly where it is today in that case, and
+# closes the window in every normal one. The failure is loud either way.
 run_migrations() {
-  echo "Running migrations (advisory-locked)..."
-  python scripts/migrate.py || { echo "migration run failed; refusing to start ${1:-service}"; exit 1; }
-  echo "Migrations applied."
+  _svc="${1:-service}"
+  echo "Running migrations (advisory-locked) for ${_svc}..."
+  if python scripts/migrate.py; then
+    echo "Migrations applied."
+    return 0
+  fi
+  if [ "$_svc" = "API" ]; then
+    echo "migration run failed; refusing to start API"
+    exit 1
+  fi
+  echo "WARNING: migration run failed for ${_svc}; starting anyway against the"
+  echo "WARNING: schema that is there. Queries naming a column from an unapplied"
+  echo "WARNING: migration will fail until the API applies it."
 }
 
 if [ "$RAILWAY_SERVICE_NAME" = "worker" ]; then

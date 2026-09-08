@@ -671,10 +671,16 @@ def _csv_has_a_lead(data: bytes) -> bool:
 
     Parsed rather than counting newlines: a lead's address or party name can
     contain a quoted newline, which would make a line count claim rows that are
-    not there. csv.reader is lazy over the buffer, so this stops after the second
-    record instead of walking a large export.
+    not there.
+
+    Wrapped over the existing bytes rather than decoding them: `data` is already
+    the whole response body in memory, and `data.decode()` would make a second
+    full copy of a potentially multi-megabyte export just to look at two records.
+    TextIOWrapper decodes lazily and csv.reader stops at the second record.
     """
-    reader = csv.reader(io.StringIO(data.decode("utf-8", errors="replace")))
+    reader = csv.reader(
+        io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace")
+    )
     next(reader, None)  # header
     return next(reader, None) is not None
 

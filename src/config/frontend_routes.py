@@ -8,10 +8,10 @@ carry no ``/dashboard`` prefix: the create-scraper page is ``/scrapers/new``, an
 name as a URL segment is exactly what sent the onboarding "New Scraper" CTA to
 the 404 page for every brand-new account (2026-09-08).
 
-Two backend surfaces hand a user a link into the app: the ``next_action.route``
-of GET /auth/onboarding (rendered as the dashboard onboarding CTA) and the
-lifecycle emails. Both build their paths from here so they cannot drift apart
-again. A path added here must correspond to a real ``page.tsx`` in the frontend
+Three backend surfaces hand a user a link into the app: the ``next_action.route``
+of GET /auth/onboarding (rendered as the dashboard onboarding CTA), the lifecycle
+emails, and the referral share URL. They all build their paths from here so they
+cannot drift apart again. A path added here must correspond to a real ``page.tsx`` in the frontend
 repo; ``tests/test_onboarding_routes.py`` guards the onboarding side of that.
 """
 

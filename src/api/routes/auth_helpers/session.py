@@ -42,7 +42,7 @@ async def onboarding_status_for_user(
         "scraper_configured": len(configs) > 0,
         "first_scrape_run": len(jobs) > 0,
         "first_scrape_completed": len(done_jobs) > 0,
-        # Observed, not inferred (migration 089). export_key is written by the
+        # Observed, not inferred (migration 090). export_key is written by the
         # worker when it marks a job DONE, so the old predicate answered "an
         # export exists" and ticked this box for users who never downloaded.
         # The grandfather flag covers accounts that already had a finished

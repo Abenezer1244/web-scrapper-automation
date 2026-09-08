@@ -217,7 +217,7 @@ async def test_completed_onboarding_points_at_the_create_scraper_page(
     )
     db.add(job)
     # The export existing is NOT the download. Only an observed one completes
-    # the checklist (migration 089).
+    # the checklist (migration 090).
     starter_user.first_leads_downloaded_at = datetime.now(UTC)
     await db.commit()
 

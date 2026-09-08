@@ -32,6 +32,23 @@ from src.db.models import Base  # noqa: E402
 target_metadata = Base.metadata
 
 
+# Indexes that are built OUT OF BAND with CREATE INDEX CONCURRENTLY, because
+# building them inline would hold ACCESS EXCLUSIVE on a large table for a full
+# scan. They are declared on the models so create_all gives the test database
+# one, which means autogenerate sees them missing on any database that has not
+# had the manual script run and helpfully proposes a plain, blocking
+# op.create_index. Exclude them: the scripts own these (Codex).
+CONCURRENT_INDEXES = {
+    "ix_results_duplicate_source",   # scripts/create_result_duplicate_source_index.sql
+}
+
+
+def _include_object(obj, name, type_, reflected, compare_to):
+    if type_ == "index" and name in CONCURRENT_INDEXES:
+        return False
+    return True
+
+
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
     context.configure(
@@ -40,6 +57,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
+        include_object=_include_object,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -50,6 +68,7 @@ def _run(connection) -> None:
         connection=connection,
         target_metadata=target_metadata,
         compare_type=True,
+        include_object=_include_object,
     )
     with context.begin_transaction():
         context.run_migrations()

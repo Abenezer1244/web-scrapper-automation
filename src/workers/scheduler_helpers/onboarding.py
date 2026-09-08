@@ -67,7 +67,7 @@ def _send_onboarding_emails_impl() -> None:
             if days_since_signup == 3:
                 has_scraper = _exists(db, ScraperConfig.user_id == user.id)
 
-                # Observed download (migration 089), not "an export exists". The
+                # Observed download (migration 090), not "an export exists". The
                 # old predicate read jobs.export_key, which the worker writes
                 # when it marks a job DONE, so this email told users who had
                 # never downloaded that they were already activated.

@@ -21,14 +21,14 @@ Adds two columns, deliberately kept apart:
     Set here for users who already had a finished export, so their checklist does
     not regress from 5/5 and re-nag them. The funnel must never read it.
 
-Revision ID: 089
-Revises: 088
+Revision ID: 090
+Revises: 089
 """
 import sqlalchemy as sa
 from alembic import op
 
-revision = "089"
-down_revision = "088"
+revision = "090"
+down_revision = "089"
 branch_labels = None
 depends_on = None
 

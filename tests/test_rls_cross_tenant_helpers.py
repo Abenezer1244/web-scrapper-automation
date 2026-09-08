@@ -135,7 +135,7 @@ def test_activation_funnel_counts_seeded_user() -> None:
         # The seeded user advances signup → first_scraper → first_job. It does
         # NOT advance first_download: the job carries an export_key, which is
         # what the worker writes when it marks a job done, and that is exactly
-        # the thing this funnel used to miscount as a download (migration 089).
+        # the thing this funnel used to miscount as a download (migration 090).
         # Assert deltas, not absolutes, so the test is robust against whatever
         # else is in the window.
         assert after.signups == base.signups + 1

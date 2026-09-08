@@ -133,15 +133,15 @@ class User(Base):
     subscription_status = Column(String(32), nullable=True)
     trial_ends_at = Column(DateTime(timezone=True), nullable=True)
     # ── Activation: did this person ever actually receive a leads CSV? ────────
-    # (migration 089) Stamped by src/api/download_tracking.py when a download
+    # (migration 090) Stamped by src/api/download_tracking.py when a download
     # endpoint hands over bytes: per-job, combined batch, or segment export. It
     # replaces `jobs.export_key IS NOT NULL`, which the worker sets when it marks
     # a job DONE and therefore answered "an export was produced", not "someone
     # downloaded it". NULL means unobserved, never "did not download": nothing
-    # before migration 089 was measured, and the column is deliberately NOT
+    # before migration 090 was measured, and the column is deliberately NOT
     # backfilled so the funnel cannot report an invented download.
     first_leads_downloaded_at = Column(DateTime(timezone=True), nullable=True)
-    # Presentation only, and separate on purpose. Set by migration 089 for users
+    # Presentation only, and separate on purpose. Set by migration 090 for users
     # who already had a finished export at cutover, so their onboarding checklist
     # does not regress from 5/5 and re-nag them to download something they may
     # well have downloaded months ago. The funnel must NOT read this: it records
@@ -821,6 +821,28 @@ class Result(Base):
     # Sprint 6.4: cross-job deduplication
     dedup_hash = Column(String(64), nullable=True, index=True)
     is_duplicate = Column(Boolean, nullable=False, default=False)
+    # Migration 089: WHY this row was flagged duplicate, stamped at the moment
+    # it is flagged. `delivered_records` cannot answer this later — it is a
+    # CLAIM ledger (a row exists before the job finishes), it is MUTABLE (the
+    # plan cap, upload failure and the stranded-claim script all delete claims,
+    # after which a later job re-claims the hash), and 82% of production claims
+    # already point at a purged jobs row. It is also unreadable from the request
+    # path: bridgeleads_app holds no privilege on it, enforced by a hard-fail
+    # verifier in provision_rls_roles.sql. So provenance lives here instead.
+    #
+    # duplicate_reason: 'prior_run' — an earlier run of this user's genuinely
+    # delivered it; 'same_run' — the trustee_sale sibling collapse
+    # (trustee_sale_finalize.py) flagged it so one property bills once, and it
+    # was NEVER previously delivered. Copy must not call the second "already
+    # received". NULL on all three = classified before 089; the API reports
+    # those as unattributed rather than guessing.
+    #
+    # No FK on duplicate_source_job_id, deliberately, matching
+    # delivered_records.first_job_id: purging the source job must never cascade
+    # into a live lead row. A dangling pointer degrades to "unattributed".
+    duplicate_source_job_id = Column(UUID(as_uuid=False), nullable=True)
+    duplicate_source_at = Column(DateTime(timezone=True), nullable=True)
+    duplicate_reason = Column(String(16), nullable=True)
     raw_html_hash = Column(String(32), nullable=True, index=True)
     # Phase 3 (migration 037; re-keyed 2026-06-12): the post-enrichment OVERLAP
     # identity — parcel-primary + county/state-scoped (property_identity.
@@ -927,6 +949,18 @@ class Result(Base):
             "source_fingerprint",
             unique=True,
             postgresql_where=text("source_fingerprint IS NOT NULL"),
+        ),
+        # Migration 089: the results page groups a job's duplicates by the run
+        # that first claimed them. Partial — only duplicate rows carry these
+        # columns. Declared here so create_all (tests) has it; PROD builds it
+        # CONCURRENTLY out-of-band (scripts/create_result_duplicate_source_index
+        # .sql) because building it inside the migration would hold `results`
+        # under ACCESS EXCLUSIVE for a full table scan.
+        Index(
+            "ix_results_duplicate_source",
+            "job_id",
+            "duplicate_source_job_id",
+            postgresql_where=text("is_duplicate IS TRUE"),
         ),
     )
 
@@ -1097,9 +1131,19 @@ class SkipTraceCache(Base):
 
     When a parcel appears in a new scrape, the dispatcher first checks this
     cache. If there's a hit less than 90 days old, the phone/email are copied
-    directly to the Result row — no Tracerfy credit consumed. Keyed on a
-    SHA-256 hash of the normalized property address + city + state so that
-    minor formatting variations resolve to the same cache key.
+    directly to the Result row — no Tracerfy credit consumed.
+
+    PER-TENANT, not global. The key is a SHA-256 hash of (user_id, normalized
+    property address, city, state) — see skip_trace.address_cache_key. One
+    tenant never reads skip-traced PII another tenant paid Tracerfy to source
+    (cross-tenant reuse decision, 2026-06-10); a tenant re-scraping its OWN
+    address still hits its own cache. Minor formatting variations (punctuation,
+    whitespace, casing) collapse to the same key within a tenant.
+
+    This docstring previously described the key as address-only, which is how it
+    was built originally. A duplicate-scope audit (2026-09-08) read it, believed
+    the cache was global, and had to be corrected by review — an out-of-date
+    comment on a tenant boundary is worse than no comment.
     """
 
     __tablename__ = "skip_trace_cache"

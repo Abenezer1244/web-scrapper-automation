@@ -1507,3 +1507,53 @@ def test_the_daily_rollover_keys_off_the_window_not_the_calendar():
         head = stmt[:400]
         if "skip_trace" in head:
             assert "date_trunc" not in head, head[:200]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_a_lookup_after_a_window_ends_is_not_billed_against_the_old_one(
+    db, make_user, sync_db
+):
+    """The rollover is LAZY. Between a window ending and the hourly
+    reconciliation catching up, `users.quota_period_start` still names the OLD
+    window. Reading it raw said "no roll", left the exhausted counter in place,
+    and billed the customer for lookups that belonged to the new window's free
+    allowance: charged for something they were owed for free.
+
+    The fix asks `effective_window`, the same helper the records side uses, so
+    the answer does not depend on whether a background task has run yet. Codex
+    found this in review."""
+    from sqlalchemy import text as _text
+
+    from src.api.billing.skip_trace_usage import report_lookups_for_user
+
+    quota = settings.SKIP_TRACE_BUNDLED_QUOTAS["pro"]
+    user, _token = await make_user("pro")
+    uid = str(user.id)
+
+    # Spend the whole allowance inside the current window.
+    spent = report_lookups_for_user(sync_db, uid, quota, queue_id=920001)
+    assert spent["used_after"] == quota
+    assert spent["billable_units"] == 0
+    sync_db.commit()
+
+    # The window ENDS, and nothing has rolled it yet: period_start/end still
+    # name the old window, exactly as production sits between the boundary and
+    # the next reconciliation tick.
+    sync_db.execute(
+        _text(
+            "UPDATE users"
+            " SET quota_period_start = quota_period_start - INTERVAL '1 month',"
+            "     quota_period_end = quota_period_end - INTERVAL '1 month',"
+            "     skip_trace_period_start = quota_period_start - INTERVAL '1 month'"
+            " WHERE id = CAST(:u AS uuid)"
+        ),
+        {"u": uid},
+    )
+    sync_db.commit()
+
+    after = report_lookups_for_user(sync_db, uid, 1, queue_id=920002)
+    assert after["used_before"] == 0, "the ended window's counter was carried over"
+    assert after["used_after"] == 1
+    assert after["billable_units"] == 0, "billed for a lookup inside the free allowance"
+    sync_db.rollback()

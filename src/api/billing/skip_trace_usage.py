@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import text
 
+from src.api.quota_window import effective_window
 from src.config import settings
 from src.utils.logger import setup_logger
 
@@ -90,7 +91,9 @@ def report_lookups_for_user(
     user_row = db.execute(
         text("""
             SELECT plan, stripe_customer_id, skip_trace_used_this_month,
-                   skip_trace_period_start, quota_period_start
+                   skip_trace_period_start, quota_period_start, quota_period_end,
+                   quota_anchor_at, subscription_status, entitlement_grace_ends_at,
+                   entitlement_ends_at
             FROM users
             WHERE id = :uid
             FOR UPDATE
@@ -123,13 +126,20 @@ def report_lookups_for_user(
     # only ever compared against `quota_period_start` and stamped from it.
     #
     # The comparison is strictly less-than, so this can only ever RESET a
-    # counter, never resurrect a spent one. A window that has ended but not yet
-    # rolled leaves both values equal and nothing happens, which is the same
-    # lag the records half already has and is bounded by the hourly
-    # reconciliation.
+    # counter, never resurrect a spent one.
+    #
+    # It compares against the EFFECTIVE window, not the stored one. The stored `quota_period_start`
+    # only advances when the lazy rollover or the hourly reconciliation gets to
+    # it, so between a window ending and that catching up it still names the OLD
+    # window. Comparing against it there says "no roll", leaves an exhausted
+    # counter in place, and bills the customer for lookups that belong to the new
+    # window's free allowance. Charging someone for something they were owed for
+    # free is the one direction that must not happen, and it is exactly what
+    # `effective_records_used` already avoids on the records side by asking the
+    # same question through the same helper. Codex found this.
     now = datetime.now(UTC)
     period_start = user_row.skip_trace_period_start
-    window_start = user_row.quota_period_start
+    window_start, _window_end = effective_window(user_row, now)
     rolled = period_start is None or (
         window_start is not None and period_start < window_start
     )

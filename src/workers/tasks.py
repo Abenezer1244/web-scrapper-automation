@@ -26,7 +26,7 @@ from src.api.quota_window import (
     window_set_sql,
 )
 from src.config.constants import (
-    PRIORITY_QUEUE_PLANS,
+    scrape_queue_for_plan,
     SCRAPE_TRANSIENT_BACKOFF_SECONDS,
     SCRAPE_TRANSIENT_MAX_RETRIES,
 )
@@ -643,11 +643,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     backoffs=SCRAPE_TRANSIENT_BACKOFF_SECONDS,
                 )
                 if countdown is not None:
-                    queue = (
-                        "scrape-priority"
-                        if user.plan in PRIORITY_QUEUE_PLANS
-                        else "scrape"
-                    )
+                    queue = scrape_queue_for_plan(user.plan if user else None)
                     try:
                         run_scrape_job.apply_async(
                             args=[job_id], queue=queue, countdown=countdown

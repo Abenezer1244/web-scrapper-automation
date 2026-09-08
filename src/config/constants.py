@@ -101,6 +101,48 @@ class Plan(str, Enum):
 # Plans that get the high-priority Celery queue. Business+ paid tiers.
 PRIORITY_QUEUE_PLANS: frozenset[str] = frozenset({Plan.BUSINESS.value, Plan.AGENCY.value})
 
+# The queue names run_scrape_job can be published to. `scrape-priority` is
+# consumed ahead of `scrape` in WORKER_QUEUES, which under the Redis broker's
+# default round-robin strategy means a paid job never waits behind the whole
+# free-tier backlog. It is NOT strict priority; kombu would need
+# broker_transport_options={"queue_order_strategy": "priority"} for that.
+SCRAPE_QUEUE_PRIORITY = "scrape-priority"
+SCRAPE_QUEUE_DEFAULT = "scrape"
+
+
+def normalize_plan(plan: str | None) -> str:
+    """The canonical slug for a stored plan value.
+
+    Every gate in this codebase keys off the lowercase catalog ids, but plans are
+    not always written by the Stripe webhook: on this deployment they are also set
+    by hand in the database, which is how a "Business" or a "pro " gets in. Half
+    the call sites used to compare raw and the other half lowercased without
+    stripping, so the same stored value could be refused webhook delivery, routed
+    off the priority queue, and enforced as Starter, all silently and all in
+    different directions. One helper, used everywhere, is the fix.
+
+    Unknown values are returned as-is (lowercased and stripped) rather than
+    coerced to a default: the gates already fail closed on an unrecognized plan,
+    and silently renaming it here would hide the bad row instead of denying it.
+    """
+    return (plan or "starter").strip().lower()
+
+
+def scrape_queue_for_plan(plan: str | None) -> str:
+    """Which queue a scrape job for this plan is published to.
+
+    Used by EVERY enqueue site. The scheduled dispatcher and the batch fan-out
+    used to call ``run_scrape_job.delay()``, which takes the task's declared
+    route (``scrape``) regardless of plan, so the Agency "Priority queue" line
+    applied to a manual button press and to nothing else. Recurring runs are
+    exactly the work the tier is bought for.
+    """
+    return (
+        SCRAPE_QUEUE_PRIORITY
+        if normalize_plan(plan) in PRIORITY_QUEUE_PLANS
+        else SCRAPE_QUEUE_DEFAULT
+    )
+
 # Transient scrape-failure retry policy (Codex-reconciled). When a scrape phase
 # raises a TransientScrapeError / Playwright infra error, the worker re-queues the
 # job with escalating backoff instead of permanently failing the whole day's run
@@ -111,9 +153,15 @@ PRIORITY_QUEUE_PLANS: frozenset[str] = frozenset({Plan.BUSINESS.value, Plan.AGEN
 SCRAPE_TRANSIENT_MAX_RETRIES: int = 2
 SCRAPE_TRANSIENT_BACKOFF_SECONDS: tuple[int, ...] = (300, 1200)  # 5 min, then 20 min
 
-# Plans allowed to use the per-config webhook delivery feature and the
-# `enrichment.skip_tracing` toggle (the always-on enrichment, included
-# with the plan).
+# Plans allowed to use the per-config webhook delivery feature, the dialer push,
+# and the `enrichment.skip_tracing` toggle.
+#
+# NOTE on `enrichment.skip_tracing`: this comment used to call it "the always-on
+# enrichment, included with the plan". It is not. The worker's skip-trace entry
+# point reads the `skip_trace_enabled` COLUMN and never looks at the enrichment
+# blob, so the toggle is gated, persisted, and read by nothing. It is kept gated
+# (a Business+ field should stay a Business+ field) but the route now mirrors it
+# onto `skip_trace_enabled`, which is the flag that actually runs a lookup.
 BUSINESS_FEATURES_PLANS: frozenset[str] = frozenset({Plan.BUSINESS.value, Plan.AGENCY.value})
 
 # Registered dialer-push connector ids (the `deliver.dialer_type` discriminator).

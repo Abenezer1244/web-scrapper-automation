@@ -101,7 +101,9 @@ def report_lookups_for_user(
         _logger.warning("report_lookups_for_user: user %s not found", user_id)
         return {"billable_units": 0, "meter_event_id": None, "error": "user_not_found"}
 
-    plan = (user_row.plan or "starter").lower()
+    from src.config.constants import normalize_plan
+
+    plan = normalize_plan(user_row.plan)
     quota = settings.SKIP_TRACE_BUNDLED_QUOTAS.get(plan, 0)
     used_before = user_row.skip_trace_used_this_month or 0
     used_after = used_before + new_lookups

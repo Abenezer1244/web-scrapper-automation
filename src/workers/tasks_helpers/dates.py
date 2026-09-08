@@ -43,6 +43,29 @@ def _to_mmddyyyy(date_str: str) -> str:
     return date_str  # Return as-is if nothing works
 
 
+def _clamp_to_window_end(date_to: str, end_date) -> str:
+    """Never let a caller-supplied window end past the plan's freshness edge.
+
+    ``end_date`` is today for a paid plan and today minus the Starter delay for
+    a free one, so on a paid plan this is a no-op for any window that is not in
+    the future. An unparseable string is returned untouched: the portal
+    normalizer downstream owns that failure, and swallowing it here would turn
+    a bad date into a silently different one.
+    """
+    try:
+        requested = datetime.strptime(date_to, "%m/%d/%Y").date()
+    except (ValueError, TypeError):
+        return date_to
+    if requested <= end_date:
+        return date_to
+    clamped = end_date.strftime("%m/%d/%Y")
+    _logger.info(
+        "custom window end %s is past this plan's freshness edge — clamped to %s",
+        date_to, clamped,
+    )
+    return clamped
+
+
 def _ordered_window(date_from: str, date_to: str) -> tuple[str, str]:
     """Never hand a scraper an inverted (date_from > date_to) window.
 
@@ -84,8 +107,10 @@ def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: st
 
     # Starter (free) tier gets a 7-day data delay — daily freshness
     # is the paid moat. Starter users see records from 7+ days ago.
+    from src.config.constants import normalize_plan
+
     _STARTER_DELAY_DAYS = 7
-    if user_plan == "starter":
+    if normalize_plan(user_plan) == "starter":
         end_date = today - timedelta(days=_STARTER_DELAY_DAYS)
         _logger.info("Starter plan: applying %d-day data delay (end_date=%s)", _STARTER_DELAY_DAYS, end_date)
     else:
@@ -99,7 +124,18 @@ def _resolve_date_range(schedule: dict, config_id: str | None = None, job_id: st
         if date_from and date_to:
             # Normalize to MM/DD/YYYY — frontend may send YYYY-MM-DD (ISO) — and
             # guard against a backwards custom range slipping through.
-            return _ordered_window(_to_mmddyyyy(date_from), _to_mmddyyyy(date_to))
+            #
+            # The end of the window is clamped to `end_date`, which carries the
+            # plan's freshness edge. Without this the custom branch returned the
+            # caller's own date_to untouched, so a Starter asking for a window
+            # ending today got today: the 7-day delay applied to the rolling
+            # window and to nothing else, and daily freshness is the paid moat.
+            # An entirely-inside-the-embargo window inverts, and _ordered_window
+            # already collapses that to the single day at the edge.
+            return _ordered_window(
+                _to_mmddyyyy(date_from),
+                _clamp_to_window_end(_to_mmddyyyy(date_to), end_date),
+            )
         # Fall through to rolling_90 if custom dates are missing
 
     if range_mode == "since_last_run":

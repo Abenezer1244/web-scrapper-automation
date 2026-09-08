@@ -706,13 +706,12 @@ def test_the_starter_seven_day_data_delay_is_real_on_the_rolling_window():
     assert _d(starter_to) == today - timedelta(days=7)
 
 
-def test_documents_that_a_custom_date_range_bypasses_the_starter_delay():
-    """MISMATCH. The delay is applied to the rolling window only. The custom
-    branch returns the caller's own date_to without clamping it to the delayed
-    end, so a Starter asking for today gets today.
-
-    Rewrite this test when the custom branch clamps; do not delete it."""
-    from datetime import date
+def test_a_custom_date_range_cannot_reach_past_the_starter_freshness_edge():
+    """The delay used to apply to the rolling window and nothing else, so a
+    Starter asking for a custom window ending today got today: the paid
+    freshness moat, available for free to anyone who typed a date. The custom
+    branch now clamps its end to the same edge, and leaves a paid plan alone."""
+    from datetime import timedelta
     from zoneinfo import ZoneInfo
 
     from src.workers.tasks_helpers.dates import _resolve_date_range
@@ -720,27 +719,43 @@ def test_documents_that_a_custom_date_range_bypasses_the_starter_delay():
     today = datetime.now(ZoneInfo("US/Pacific")).date()
     schedule = {
         "date_range_mode": "custom",
-        "date_from": (today.replace(day=1)).isoformat(),
+        "date_from": (today - timedelta(days=60)).isoformat(),
         "date_to": today.isoformat(),
     }
-    _, starter_to = _resolve_date_range(schedule, user_plan="starter")
-    assert datetime.strptime(starter_to, "%m/%d/%Y").date() == today
+
+    def _to(plan: str):
+        _, end = _resolve_date_range(schedule, user_plan=plan)
+        return datetime.strptime(end, "%m/%d/%Y").date()
+
+    assert _to("starter") == today - timedelta(days=7)
+    assert _to("pro") == today
+    # A window that sits entirely inside the embargo collapses to the edge
+    # rather than inverting into garbage the portals cannot answer.
+    inside = {
+        "date_range_mode": "custom",
+        "date_from": (today - timedelta(days=2)).isoformat(),
+        "date_to": today.isoformat(),
+    }
+    start, end = _resolve_date_range(inside, user_plan="starter")
+    assert start == end
+    assert datetime.strptime(end, "%m/%d/%Y").date() == today - timedelta(days=7)
 
 
 # -- The enrichment.skip_tracing toggle --------------------------------------
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_documents_that_enrichment_skip_tracing_alone_runs_no_trace(
+async def test_the_enrichment_toggle_sets_the_column_the_worker_actually_reads(
     client, db, make_user
 ):
-    """MISMATCH. `enrichment.skip_tracing` is gated to Business and Agency and
-    persisted onto the config, but the worker's skip-trace entry point reads the
-    separate `skip_trace_enabled` COLUMN and never looks at the enrichment blob
-    (src/workers/tasks_helpers/enrich.py, the `skip_trace_enabled` guard). A
-    Business account that flips only this toggle gets no lookups.
+    """`enrichment.skip_tracing` used to be gated, persisted, and read by
+    nothing: the worker's skip-trace entry point keys off the
+    `skip_trace_enabled` COLUMN and never opens the enrichment blob, so a
+    Business account that flipped only this toggle got a 201 and no lookups.
 
-    Rewrite this test when the two are reconciled; do not delete it."""
+    The create route now mirrors it onto that column. The worker guard is
+    asserted too, because the mirror is only correct while that is what the
+    worker reads."""
     from src.workers.tasks_helpers import enrich
 
     _user, token = await make_user("business")
@@ -752,37 +767,147 @@ async def test_documents_that_enrichment_skip_tracing_alone_runs_no_trace(
     assert r.status_code == 201, r.text
     body = r.json()
     assert body["enrichment"]["skip_tracing"] is True
-    assert body["skip_trace_enabled"] is False
+    assert body["skip_trace_enabled"] is True
 
-    # The guard the worker actually runs, and the absence of any read of the
-    # enrichment blob's skip_tracing key anywhere in the module.
     source = inspect.getsource(enrich)
     assert 'getattr(config, "skip_trace_enabled", False)' in source
-    assert 'skip_tracing' not in source
+    assert "skip_tracing" not in source
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_the_enrichment_toggle_does_not_widen_who_can_run_a_trace(
+    client, db, make_user
+):
+    """The mirror must not become a second door into paid lookups. The toggle
+    is Business and above, which is stricter than the metered flag's Pro and
+    above, so no plan reaches skip tracing through it that could not already
+    reach it through `skip_trace_enabled`."""
+    for plan in ("starter", "pro"):
+        _user, token = await make_user(plan)
+        r = await client.post(
+            "/scrapers",
+            json=_body("king", enrichment={"skip_tracing": True}),
+            headers=_auth(token),
+        )
+        assert r.status_code == 402, f"{plan}: {r.text}"
 
 
 # -- Priority queue routing --------------------------------------------------
 
-def test_documents_that_only_manual_runs_reach_the_priority_queue():
-    """MISMATCH. Agency is sold a "Priority queue". POST /jobs routes Business
-    and Agency to `scrape-priority` explicitly, and so does the transient-retry
-    path, but the scheduled dispatcher and the batch fan-out both enqueue with
-    `run_scrape_job.delay(...)`, which takes the task's default route.
-
-    That default is the ordinary `scrape` queue for every plan, which is what
-    this asserts. Recurring work is exactly the work a priority tier is for.
-
-    Rewrite this test when the two dispatch paths carry the queue; do not
-    delete it."""
+def test_the_declared_route_is_the_ordinary_queue_so_delay_can_never_prioritize():
+    """`run_scrape_job.delay(...)` takes the task's declared route, which is the
+    ordinary `scrape` queue for every plan. That is why an enqueue site has to
+    pass the queue explicitly, and why a `.delay()` anywhere in a dispatch path
+    is a silent loss of the Agency priority line rather than a style choice."""
     from src.workers import app as celery_app
-    from src.workers.scheduler_helpers import dispatch as dispatch_mod
-    from src.workers import batch_tasks as batch_mod
 
     route = celery_app.amqp.router.route({}, "src.workers.tasks.run_scrape_job")
     assert route["queue"].name == "scrape"
 
-    assert "run_scrape_job.delay(jid)" in inspect.getsource(dispatch_mod)
-    assert "run_scrape_job.delay(jid)" in inspect.getsource(batch_mod)
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("plan", "expected"),
+    [
+        ("starter", "scrape"),
+        ("pro", "scrape"),
+        ("business", "scrape-priority"),
+        ("agency", "scrape-priority"),
+    ],
+)
+def test_a_scheduled_run_is_published_to_the_queue_the_plan_pays_for(
+    monkeypatch, plan, expected
+):
+    """The one that was broken. The scheduled dispatcher published with
+    `.delay()`, so a Business or Agency account got priority on a button press
+    and ordinary service on every recurring run, which is the work the tier is
+    bought for.
+
+    Watches the actual publish rather than reading the source: a comment that
+    mentions `.delay(jid)` would satisfy a grep, and one did."""
+    from datetime import UTC, datetime
+
+    from src.api.auth import hash_password as _hash
+    from src.db.models import ScraperConfig as _Config
+    from src.db.models import User as _User
+    from src.db.session import SyncSessionLocal
+    from src.workers import tasks as tasks_mod
+    from src.workers.scheduler_helpers import dispatch as dispatch_mod
+
+    published: list[tuple[str, str | None]] = []
+
+    def _capture(args=None, queue=None, **kwargs):
+        published.append((str((args or [None])[0]), queue))
+
+    monkeypatch.setattr(tasks_mod.run_scrape_job, "apply_async", _capture)
+
+    now = datetime.now(UTC)
+    uid = str(uuid.uuid4())
+    cid = str(uuid.uuid4())
+    with SyncSessionLocal() as db:
+        db.add(
+            _User(
+                id=uid,
+                email=f"queue_{uuid.uuid4().hex[:8]}@test.bridgeleads.io",
+                password_hash=_hash("TestPass123!"),
+                plan=plan,
+                records_used=0,
+                records_limit=get_plan(plan)["records_limit"],
+            )
+        )
+        db.add(
+            _Config(
+                id=cid,
+                user_id=uid,
+                name="Queue routing",
+                county="king",
+                state="WA",
+                record_type="probate",
+                fields=["party_name"],
+                enrichment=[],
+                # Due at this minute, so the real dispatcher picks it up on a
+                # real clock without a fixed-tick seam.
+                schedule={
+                    "frequency": "daily",
+                    "run_at_hour": now.hour,
+                    "run_at_minute": now.minute,
+                },
+                deliver={},
+                active=True,
+            )
+        )
+        db.commit()
+
+    try:
+        dispatch_mod._dispatch_scheduled_jobs_impl()
+        mine = [q for jid, q in published if jid]
+        assert mine, "the dispatcher published nothing; the config was not due"
+        assert set(mine) == {expected}, published
+    finally:
+        from sqlalchemy import text
+
+        with SyncSessionLocal() as db:
+            db.execute(
+                text("DELETE FROM jobs WHERE user_id = CAST(:u AS uuid)"), {"u": uid}
+            )
+            db.execute(
+                text("DELETE FROM scraper_configs WHERE user_id = CAST(:u AS uuid)"),
+                {"u": uid},
+            )
+            db.execute(text("DELETE FROM users WHERE id = CAST(:u AS uuid)"), {"u": uid})
+            db.commit()
+
+
+def test_the_batch_fan_out_publishes_to_the_owners_queue():
+    """The batch path resolves one queue for the whole run from the batch
+    owner's plan, before the branch, so a recovery re-dispatch routes the same
+    way as the first one."""
+    from src.workers import batch_tasks as batch_mod
+
+    source = inspect.getsource(batch_mod.dispatch_batch_run)
+    assert "queue = scrape_queue_for_plan(_owner_plan)" in source
+    assert "run_scrape_job.apply_async(args=[jid], queue=queue)" in source
 
 
 def test_the_priority_queue_is_round_robin_not_strict_priority():

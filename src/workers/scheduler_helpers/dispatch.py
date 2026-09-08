@@ -228,6 +228,10 @@ def _dispatch_scheduled_jobs_impl() -> None:
     job 'pending' if the message was consumed pre-commit). A lost publish leaves a
     committed fresh-pending job that the watchdog re-delivers (health.py).
     """
+    from sqlalchemy import select
+
+    from src.config.constants import SCRAPE_QUEUE_DEFAULT, scrape_queue_for_plan
+    from src.db.models import Job, User
     from src.db.session import SyncSessionLocal
     from src.workers.tasks import run_scrape_job
 
@@ -236,11 +240,29 @@ def _dispatch_scheduled_jobs_impl() -> None:
         created = _dispatch_due_jobs(db, now)
         db.commit()
 
+        # Resolve each job's queue from the OWNER'S plan, in one query, after the
+        # rows are committed. This used to be a bare run_scrape_job.delay(jid),
+        # which takes the task's declared route (`scrape`) for every plan — so
+        # the Business/Agency priority queue applied to a manual button press and
+        # to no scheduled run at all, which is the work a priority tier is bought
+        # for. Reading the persisted owner (rather than threading the plan out of
+        # _dispatch_due_jobs) keeps that function's tested return contract intact.
+        queue_by_job: dict[str, str] = {}
+        if created:
+            for jid, plan in db.execute(
+                select(Job.id, User.plan)
+                .join(User, User.id == Job.user_id)
+                .where(Job.id.in_(created))
+            ).all():
+                queue_by_job[str(jid)] = scrape_queue_for_plan(plan)
+
     # Enqueue AFTER commit. Per-item try/except: a broker failure on one must not
     # abort the rest, and a lost publish is recovered by the watchdog.
     for jid in created:
         try:
-            run_scrape_job.delay(jid)
+            run_scrape_job.apply_async(
+                args=[jid], queue=queue_by_job.get(jid, SCRAPE_QUEUE_DEFAULT)
+            )
         except Exception as exc:  # noqa: BLE001 — recovered by the watchdog
             _logger.warning(
                 "dispatch_scheduled_jobs: enqueue of %s failed (watchdog recovers): %s",

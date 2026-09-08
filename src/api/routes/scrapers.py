@@ -28,6 +28,7 @@ from src.config.constants import (
     ACTIVE_STATUSES,
     BUSINESS_FEATURES_PLANS,
     SKIP_TRACE_ADDON_PLANS,
+    normalize_plan,
 )
 from src.db import CountyConnector, ScraperConfig, get_db
 from src.scrapers.probate import (
@@ -182,19 +183,20 @@ def _enforce_plan_feature_gates(
     # Phase 5: the dialer push is a second outbound destination that POSTs lead
     # PII, so it carries the SAME entitlement as the job-summary webhook — gate
     # both, or a lower plan could exfiltrate PII via dialer_webhook_url (Codex).
-    if has_webhook and current_user.plan not in BUSINESS_FEATURES_PLANS:
+    plan = normalize_plan(current_user.plan)
+    if has_webhook and plan not in BUSINESS_FEATURES_PLANS:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail="Webhook delivery requires a Business or Agency plan",
         )
-    if skip_tracing and current_user.plan not in BUSINESS_FEATURES_PLANS:
+    if skip_tracing and plan not in BUSINESS_FEATURES_PLANS:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail="Skip tracing enrichment requires a Business or Agency plan",
         )
     # Sprint 4: dedicated skip_trace_enabled flag (metered add-on). Available on
     # Pro/Business/Agency. Starter gets 402 with upsell text.
-    if skip_trace_enabled and (current_user.plan or "starter").lower() not in SKIP_TRACE_ADDON_PLANS:
+    if skip_trace_enabled and plan not in SKIP_TRACE_ADDON_PLANS:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail=(
@@ -260,6 +262,18 @@ async def _build_scraper_config(
         skip_trace_enabled=body.skip_trace_enabled,
     )
 
+    # `enrichment.skip_tracing` and `skip_trace_enabled` are two fields asking
+    # for the same thing, and only the second one ran: the worker gates on the
+    # `skip_trace_enabled` COLUMN and never reads the enrichment blob, so a
+    # caller who set only the enrichment toggle got a 201 and no lookups. The
+    # frontend only ever sends the toggle as false, so this changes nothing for
+    # the wizard; it makes the API field mean what its name says. Both are
+    # already gated above (Business+ for the enrichment toggle, Pro+ for the
+    # metered one), so the OR cannot widen access.
+    eff_skip_trace_enabled = bool(body.skip_trace_enabled) or bool(
+        body.enrichment.skip_tracing
+    )
+
     schedule = body.schedule.model_dump()
     config = ScraperConfig(
         id=str(uuid.uuid4()),
@@ -272,7 +286,7 @@ async def _build_scraper_config(
         enrichment=body.enrichment.model_dump(),
         schedule=schedule,
         deliver=body.deliver.model_dump(),
-        skip_trace_enabled=body.skip_trace_enabled,
+        skip_trace_enabled=eff_skip_trace_enabled,
         doc_types=body.doc_types,  # Phase 2b: None = legacy/full output
         include_living_owner_tod=eff_include_living_owner_tod,  # Phase 3
         active=True,  # visible/usable; recurrence is governed by schedule.frequency
@@ -664,10 +678,19 @@ async def update_scraper(
     webhook_added = bool(eff_deliver.get("webhook_url")) and not bool(stored_deliver.get("webhook_url"))
     dialer_url_added = bool(eff_deliver.get("dialer_webhook_url")) and not bool(stored_deliver.get("dialer_webhook_url"))
     dialer_native_added = bool(eff_deliver.get("dialer_type")) and not bool(stored_deliver.get("dialer_type"))
+    skip_tracing_added = bool(eff_enrichment_dict.get("skip_tracing")) and not bool(
+        stored_enrichment.get("skip_tracing")
+    )
+    # Mirror the enrichment toggle onto the column the worker actually reads,
+    # but ONLY on the enable-delta. Mirroring the effective value would let an
+    # unrelated PATCH (a rename) silently start paid lookups on a legacy config
+    # that has the dead toggle stored true, which is the opposite of a fix.
+    if skip_tracing_added:
+        eff_skip_trace = True
     _enforce_plan_feature_gates(
         current_user,
         has_webhook=webhook_added or dialer_url_added or dialer_native_added,
-        skip_tracing=bool(eff_enrichment_dict.get("skip_tracing")) and not bool(stored_enrichment.get("skip_tracing")),
+        skip_tracing=skip_tracing_added,
         skip_trace_enabled=eff_skip_trace and not bool(config.skip_trace_enabled),
     )
 

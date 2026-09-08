@@ -34,6 +34,7 @@ from src.config.constants import (
     COUNTY_LIMIT_BY_PLAN,
     RECORD_TYPES_BY_PLAN,
     count_label,
+    normalize_plan,
     record_type_label,
 )
 from src.config.plans import plan_label
@@ -45,7 +46,7 @@ _logger = setup_logger("api.entitlements")
 
 
 def _plan_of(user: User) -> str:
-    return (user.plan or "starter").lower()
+    return normalize_plan(user.plan)
 
 
 # --- Customer-facing copy ---------------------------------------------------
@@ -320,7 +321,7 @@ def allowed_county_set(
     claim a slot (a disallowed-type config is paused on type grounds and must not
     evict a valid county). ACTIVE configs claim slots first (earliest created_at
     wins); entitlement-paused configs fill only remaining slots. None = unlimited."""
-    plan = (plan or "starter").lower()
+    plan = normalize_plan(plan)
     cap = COUNTY_LIMIT_BY_PLAN.get(plan, COUNTY_LIMIT_BY_PLAN["starter"])
     if cap < 0:
         return None
@@ -364,7 +365,7 @@ def config_run_violation(
     titled notice without parsing English. ``Violation.__str__`` is the message,
     so the worker/scheduler call sites that interpolate the result into a log line
     or a job-failure reason keep working unchanged."""
-    plan = (plan or "starter").lower()
+    plan = normalize_plan(plan)
     rt = (record_type or "").lower()
     allowed_types = RECORD_TYPES_BY_PLAN.get(plan, RECORD_TYPES_BY_PLAN["starter"])
     if rt not in allowed_types:
@@ -414,7 +415,7 @@ def plan_reconciliation(
     revive_ids = entitlement-paused configs now permitted again.
     User-paused configs (paused_reason None, active False) are never touched."""
     rows = list(rows)
-    plan = (plan or "starter").lower()
+    plan = normalize_plan(plan)
     allowed_counties = allowed_county_set(rows, plan)
     allowed_types = RECORD_TYPES_BY_PLAN.get(plan, RECORD_TYPES_BY_PLAN["starter"])
 

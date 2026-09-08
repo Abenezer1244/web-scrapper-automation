@@ -1156,7 +1156,9 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     if not getattr(config, "skip_trace_enabled", False):
         return
     # Plan gate: Starter excluded. Pro/Business/Agency allowed.
-    if (job.user.plan or "starter").lower() == "starter":
+    from src.config.constants import normalize_plan
+
+    if normalize_plan(job.user.plan) == "starter":
         _publish_log(
             r, job_id, "warning",
             "Skip trace requested but user plan (starter) does not include it. "

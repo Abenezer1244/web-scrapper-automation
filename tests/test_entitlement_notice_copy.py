@@ -222,24 +222,49 @@ def test_disallowed_record_types_still_returns_the_raw_slugs():
 
 
 def test_an_untrimmed_plan_value_reads_as_the_tier_actually_enforced():
-    """A stored plan of "pro " (trailing space) misses every gate lookup, so the
-    account is enforced on STARTER limits. The copy must say Starter too.
+    """The copy has to name the tier the gate is actually applying. This test used
+    to prove that by asserting the OPPOSITE outcome, and it was right to at the
+    time: nothing trimmed, so a stored "pro " missed every `.get(plan, starter)`,
+    was enforced on Starter limits, and had to be TOLD "Starter" or the sentence
+    would have been false.
 
-    An earlier `plan_label` trimmed before looking up, which produced "Divorce is
-    not included in your Pro plan." for a user being held to Starter's single
-    record type. Pro does include more types; the sentence was simply false, and
-    it would have sent that customer to support insisting their plan was right.
+    Both halves now normalize through `constants.normalize_plan`, which strips as
+    well as lowers, so "pro " is enforced as Pro and reads as Pro. The invariant
+    is unchanged and is what this asserts: whatever tier the gate resolves, the
+    copy names that same tier. Only the resolved tier moved.
     """
     from src.api.entitlements import _plan_of
+    from src.config.constants import normalize_plan
     from src.db.models import User
 
+    for stored, resolved in (("pro ", "pro"), (" Business", "business"), ("AGENCY", "agency")):
+        assert _plan_of(User(plan=stored)) == resolved
+        assert normalize_plan(stored) == resolved
+
     padded = _plan_of(User(plan="pro "))
-    assert padded not in RECORD_TYPES_BY_PLAN  # the gate does not recognize it
-    assert record_type_violation(padded, ["pre_foreclosure"]).message == (
-        "Pre-Foreclosure is not included in your Starter plan."
+    assert padded in RECORD_TYPES_BY_PLAN  # the gate now recognizes it
+    assert "pre_foreclosure" in RECORD_TYPES_BY_PLAN[padded]
+    assert record_type_violation(padded, ["divorce"]).message == (
+        "Divorce is not included in your Pro plan."
     )
-    assert county_cap_violation(padded, 2, COUNTY_LIMIT_BY_PLAN["starter"]).message == (
-        "Your Starter plan includes 1 county. This would put your account at 2 counties."
+    assert county_cap_violation(padded, 4, COUNTY_LIMIT_BY_PLAN[padded]).message == (
+        "Your Pro plan includes 3 counties. This would put your account at 4 counties."
+    )
+
+
+def test_an_unrecognized_plan_is_still_enforced_and_named_as_the_entry_tier():
+    """Normalizing is not the same as accepting anything. A plan value that is not
+    a catalog id after trimming and lowering still fails closed to Starter in the
+    gate, and still reads as Starter in the copy, so the two cannot disagree."""
+    from src.api.entitlements import _plan_of
+    from src.config.plans import plan_label
+    from src.db.models import User
+
+    junk = _plan_of(User(plan="platinum"))
+    assert junk not in RECORD_TYPES_BY_PLAN
+    assert plan_label(junk) == "Starter"
+    assert record_type_violation(junk, ["pre_foreclosure"]).message == (
+        "Pre-Foreclosure is not included in your Starter plan."
     )
 
 

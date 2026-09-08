@@ -301,8 +301,8 @@ async def get_auth_context(
         # API access is a Business+ capability — an always-on feature gate (mirrors
         # the create-time require_plan("business","agency") gate and the generic-
         # webhook gate). A key minted while on Business stops working after downgrade.
-        from src.config.constants import BUSINESS_FEATURES_PLANS
-        if (user_match.plan or "starter").lower() not in BUSINESS_FEATURES_PLANS:
+        from src.config.constants import BUSINESS_FEATURES_PLANS, normalize_plan
+        if normalize_plan(user_match.plan) not in BUSINESS_FEATURES_PLANS:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="API access requires a Business or Agency plan.",
@@ -388,7 +388,12 @@ def require_plan(*plans: str):
         @router.post("/scrapers", dependencies=[Depends(require_plan("pro", "business", "agency"))])
     """
     async def _check(user: Annotated[User, Depends(get_current_user)]) -> User:
-        if user.plan not in plans:
+        # normalize_plan, not a raw compare: a hand-set "Business" in the
+        # database would otherwise be refused a capability the account has
+        # paid for, with a 403 naming the very plan it appears to be on.
+        from src.config.constants import normalize_plan
+
+        if normalize_plan(user.plan) not in plans:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"This feature requires one of: {', '.join(plans)}",

@@ -39,6 +39,7 @@ from src.config.constants import (
     BATCH_PLANS,
     BUSINESS_FEATURES_PLANS,
     SKIP_TRACE_ADDON_PLANS,
+    normalize_plan,
 )
 from src.db import CountyConnector
 from src.db.models import BatchRun, Job, Result, ScraperBatch, ScraperConfig
@@ -162,7 +163,7 @@ async def create_batch(
     db: AsyncSession = Depends(get_rls_db),
 ) -> BatchCreateResponse:
     await rate_limit(request, zone="general", identifier=current_user.id)
-    plan = (current_user.plan or "starter").lower()
+    plan = normalize_plan(current_user.plan)
 
     # 1. Plan gate — batch is Pro+ (fans out into many paid scrapes).
     if plan not in BATCH_PLANS:

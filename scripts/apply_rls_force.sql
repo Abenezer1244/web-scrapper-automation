@@ -25,6 +25,7 @@ DO $guard$
 DECLARE
     grc regprocedure := to_regprocedure('public.grant_referral_credit(uuid)');
     af  regprocedure := to_regprocedure('public.activation_funnel(integer)');
+    af2 regprocedure := to_regprocedure('public.activation_funnel_v2(integer)');
     owners_bypass boolean;
     t text;
     tbls text[] := ARRAY[
@@ -57,11 +58,12 @@ BEGIN
 
     SELECT bool_and(r.rolbypassrls) INTO owners_bypass
     FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner
-    WHERE p.oid IN (grc, af);
+    WHERE p.oid IN (grc, af, af2);
 
     IF owners_bypass IS NOT TRUE THEN
         RAISE EXCEPTION 'apply_rls_force: a SECURITY DEFINER function owner lacks '
-            'BYPASSRLS — FORCE would break grant_referral_credit / activation_funnel. '
+            'BYPASSRLS — FORCE would break grant_referral_credit / activation_funnel '
+            '(and _v2). '
             'Make the function owner a BYPASSRLS role before forcing RLS.';
     END IF;
 

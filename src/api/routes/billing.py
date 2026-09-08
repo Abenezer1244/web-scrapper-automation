@@ -31,6 +31,55 @@ stripe.api_key = settings.STRIPE_SECRET_KEY
 router = APIRouter(prefix="/billing", tags=["billing"])
 
 
+def step_conversions(
+    *,
+    signups: int,
+    first_scraper: int,
+    first_job: int,
+    first_download: int,
+    scraper_and_job: int,
+    job_and_download: int,
+    downloaded_and_paid: int,
+) -> dict[str, float]:
+    """Participation overlap between funnel stages.
+
+    PRECONDITION: the intersections come from activation_funnel_v2, where each is
+    a COUNT(*) FILTER over the same one-row-per-user CTE and so is bounded by both
+    of its populations by construction. Given that, every value is 0-100. This
+    does NOT clamp: handed an intersection larger than its population it will
+    return more than 100, on purpose, because that would mean the SQL had broken
+    and hiding it behind a min() is how a wrong funnel goes unnoticed.
+
+    Each rate is "of the users at stage A, the share who are ALSO at stage B",
+    built from a real intersection (migration 091). It is NOT an ordered
+    conversion: this data cannot show that somebody paid AFTER downloading,
+    because plan and stripe_customer_id are current values and migration 088
+    backfilled first_paid_at from created_at.
+
+    Dividing one stage COUNT by another is what this replaces. Those counts are
+    independent marginals over populations that are not nested: the download
+    stamp lives on `users` and outlives that user's job rows, and being on a paid
+    plan has nothing to do with downloading. Two paid users and one downloader
+    reported 200%.
+
+    signup_to_scraper stays a plain share of signups, because every stage here is
+    drawn from the signup cohort by construction, so that one IS nested.
+
+    Lives out here, not inside the handler, so it can be tested without an
+    admin+MFA HTTP round trip. Inline, reverting it to the marginal division left
+    the whole suite green.
+    """
+    def _share(part: int, whole: int) -> float:
+        return round(100 * part / whole, 1) if whole else 0.0
+
+    return {
+        "signup_to_scraper": _share(first_scraper, signups),
+        "scraper_to_job": _share(scraper_and_job, first_scraper),
+        "job_to_download": _share(job_and_download, first_job),
+        "download_to_paid": _share(downloaded_and_paid, first_download),
+    }
+
+
 async def _rate_limit_activation_funnel(request: Request) -> None:
     """IP-keyed limiter that runs BEFORE require_admin (Codex P2).
 
@@ -57,12 +106,25 @@ async def activation_funnel(
 ) -> dict:
     """Sprint 5.5: activation funnel metrics (admin-only).
 
-    Returns the conversion funnel across the last `days` days:
+    Returns the activation funnel across the last `days` days:
       signup -> first scraper -> first job -> first download -> paid upgrade
 
-    All derived from existing tables — no new schema needed.
-    Percentages are computed from signup count, so every step shows both
-    an absolute count and a conversion rate from signup.
+    All derived from existing tables. Each step shows an absolute count and its
+    share of signups.
+
+    What the window actually means, because it is easy to read too much into it:
+    this is the CURRENT state of currently-active users who SIGNED UP in the last
+    `days` days. It is not "events in the last N days", and not "converted within
+    N days of signing up". Plan, stripe_customer_id and first_leads_downloaded_at
+    are current values, so a user who upgrades today moves the bar for the window
+    they signed up in. Recent signups have had less time to progress, and download
+    observation only begins at migration 090, so cohorts older than that read as
+    not-downloaded until they age out.
+
+    step_conversions are participation OVERLAP, not ordered conversion: "of the
+    users at stage A, the share who are also at stage B". They come from real
+    intersections (migration 091) rather than one stage count divided by another,
+    which is what let download_to_paid report 200%.
 
     Access (H2-P5): require_admin gates this route — non-admins get 404 (endpoint
     hidden) and admins who have not enrolled MFA get 403
@@ -87,7 +149,7 @@ async def activation_funnel(
     # ONLY the funnel counts — no raw cross-tenant rows leak. The % math below
     # stays in Python.
     result = await db.execute(
-        text("SELECT * FROM public.activation_funnel(:days)"),
+        text("SELECT * FROM public.activation_funnel_v2(:days)"),
         {"days": days},
     )
     row = result.fetchone()
@@ -99,6 +161,15 @@ async def activation_funnel(
     first_job = row.first_job or 0
     first_download = row.first_download or 0
     paid_upgrade = row.paid_upgrade or 0
+    # Intersections (migration 091). A stage count on its own is a marginal, and
+    # dividing one marginal by another only reads as a rate when one population
+    # is provably inside the other. These are not: the download stamp lives on
+    # `users` and survives its jobs, and paid is a CURRENT plan check that has
+    # nothing to do with downloading. Dividing all paid users by downloaders is
+    # what produced 200%.
+    scraper_and_job = row.scraper_and_job or 0
+    job_and_download = row.job_and_download or 0
+    downloaded_and_paid = row.downloaded_and_paid or 0
 
     def _pct(n: int) -> float:
         return round(100 * n / signups, 1) if signups else 0.0
@@ -113,13 +184,15 @@ async def activation_funnel(
             {"step": "first_download", "count": first_download, "pct_from_signup": _pct(first_download)},
             {"step": "paid_upgrade", "count": paid_upgrade, "pct_from_signup": _pct(paid_upgrade)},
         ],
-        # Step-to-step conversion rates (what the dropoff looks like)
-        "step_conversions": {
-            "signup_to_scraper": _pct(first_scraper),
-            "scraper_to_job": round(100 * first_job / first_scraper, 1) if first_scraper else 0.0,
-            "job_to_download": round(100 * first_download / first_job, 1) if first_job else 0.0,
-            "download_to_paid": round(100 * paid_upgrade / first_download, 1) if first_download else 0.0,
-        },
+        "step_conversions": step_conversions(
+            signups=signups,
+            first_scraper=first_scraper,
+            first_job=first_job,
+            first_download=first_download,
+            scraper_and_job=scraper_and_job,
+            job_and_download=job_and_download,
+            downloaded_and_paid=downloaded_and_paid,
+        ),
     }
 
 

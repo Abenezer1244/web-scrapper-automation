@@ -40,6 +40,10 @@ BEGIN;
 --    roles were provisioned relative to migration 029) ─────────────────────
 GRANT EXECUTE ON FUNCTION public.grant_referral_credit(uuid) TO bridgeleads_app;
 GRANT EXECUTE ON FUNCTION public.activation_funnel(integer)  TO bridgeleads_app;
+-- v2 (migration 091) is what the admin funnel route actually calls. Migration
+-- 091 grants it too, but only if the role already exists; this backfill is the
+-- authoritative path when the roles are provisioned AFTER the migration.
+GRANT EXECUTE ON FUNCTION public.activation_funnel_v2(integer) TO bridgeleads_app;
 GRANT SELECT ON public.public_sample_cache TO bridgeleads_app;
 GRANT SELECT, INSERT, UPDATE ON public.public_sample_cache TO bridgeleads_system;
 

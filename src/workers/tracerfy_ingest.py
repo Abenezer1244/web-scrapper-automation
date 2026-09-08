@@ -117,7 +117,10 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
                 plan=row.plan or "",
             )
         except _MissingCustomerError:
-            db.commit()  # keep the re-resolution attempt, if any
+            # Nothing to commit here: this branch is only reachable when the
+            # re-resolution above found nothing, so the row is unchanged. The
+            # session is discarded and reported_at stays NULL, which is the
+            # whole point.
             _logger.warning(
                 "Skip-trace meter outbox %s: user has no Stripe customer id; "
                 "holding %d billable unit(s), NOT written off",

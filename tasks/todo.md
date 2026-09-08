@@ -32,17 +32,25 @@ Tests: `tests/test_plan_entitlement_audit.py` (162), run via `run-audit-tests.sh
 - [x] Zero em dashes added to either repo
 
 ## Owner follow-ups
-- [ ] Create three YEARLY metered skip-trace Prices in Stripe and set
-      STRIPE_PRICE_SKIP_TRACE_{PRO,BUSINESS,AGENCY}_ANNUAL on api and worker.
-      Annual subscriptions are unmetered until then (logged, not broken).
-- [ ] Decide whether a Pro batch should keep the overlaps_only default
-      (see report section 5, "Two things deliberately left")
-- [ ] P2-6: the meter outbox stamps a billable event reported when the customer
-      has no stripe_customer_id
-- [ ] P3-2: skip-trace allowance resets on the calendar month; records reset on
-      the subscriber anniversary
-- [ ] Codex round 2 hit its usage limit mid-review (resets 07:35). Worth
-      re-running against the final diff.
+- [x] Three YEARLY metered skip-trace Prices created live and idempotently
+      (price_1UDNZQ.. pro, price_1UDNZR..5SMHjj11 business,
+      price_1UDNZR..SuH1gO90 agency), verified, and set on api AND worker with
+      --skip-deploys. Annual checkouts now attach a metered item.
+- [x] Pro batch overlaps_only: EXPLICIT is refused below Business, the DEFAULT
+      coerces to "everything". Neither card becomes false.
+- [x] P2-6: _MissingCustomerError is its own signal; the customer id is
+      re-resolved from users, the row is HELD not written off, the sweep joins
+      users so it does not hot-loop, and held rows are alerted.
+- [x] P3-2: skip_trace_period_start now holds the entitlement window start.
+      Same column, new meaning, no migration.
+- [ ] **Codex review gate still owed.** Its usage limit has not reset (checked
+      04:40 and 05:15; resets 07:35). Nothing in this batch has had a second
+      reviewer. Run `codex exec` against `git diff origin/main` when it is back.
+- [ ] Neither branch is pushed and no PRs are open.
+- [ ] A Business account that downgrades keeps batches with overlaps_only
+      STORED, and re-runs still deliver overlaps. That is the same
+      grandfathering the edit enable-delta uses everywhere else, but it is a
+      choice, not an accident.
 
 ## Review
 The audit found nine gaps; four were defects and five were product decisions the

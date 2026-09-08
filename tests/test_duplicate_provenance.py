@@ -28,11 +28,11 @@ from datetime import UTC, datetime, timedelta
 
 from httpx import AsyncClient
 
-import src.db.session as _db_session
 from src.db.models import Job, Result, ScraperConfig, User
 
 
 async def _job(
+    db,
     user: User,
     config: ScraperConfig,
     *,
@@ -40,38 +40,43 @@ async def _job(
     status: str = "done",
     record_count: int = 0,
 ) -> str:
+    """Write through the `db` fixture's session on purpose.
+
+    Opening a second AsyncSessionLocal here (as some older test modules do) races
+    with the fixture session that created the user and config, and shows up as an
+    intermittent FK violation on a row whose parent was committed moments ago.
+    One session, one visibility story.
+    """
     job_id = str(uuid.uuid4())
-    async with _db_session.AsyncSessionLocal() as s:
-        s.add(Job(
-            id=job_id,
-            user_id=user.id,
-            scraper_config_id=config.id,
-            status=status,
-            trigger="manual",
-            record_count=record_count,
-            created_at=created_at,
-        ))
-        await s.commit()
+    db.add(Job(
+        id=job_id,
+        user_id=user.id,
+        scraper_config_id=config.id,
+        status=status,
+        trigger="manual",
+        record_count=record_count,
+        created_at=created_at,
+    ))
+    await db.commit()
     return job_id
 
 
-async def _rows(job_id: str, user_id: str, specs: list[dict]) -> None:
+async def _rows(db, job_id: str, user_id: str, specs: list[dict]) -> None:
     """specs: {duplicate, source_job, source_at, reason, hash}."""
-    async with _db_session.AsyncSessionLocal() as s:
-        for i, spec in enumerate(specs):
-            s.add(Result(
-                id=str(uuid.uuid4()),
-                job_id=job_id,
-                user_id=user_id,
-                party_name=f"OWNER {i}",
-                property_address=f"{i} MAIN ST",
-                dedup_hash=spec.get("hash") or uuid.uuid4().hex,
-                is_duplicate=spec["duplicate"],
-                duplicate_source_job_id=spec.get("source_job"),
-                duplicate_source_at=spec.get("source_at"),
-                duplicate_reason=spec.get("reason"),
-            ))
-        await s.commit()
+    for i, spec in enumerate(specs):
+        db.add(Result(
+            id=str(uuid.uuid4()),
+            job_id=job_id,
+            user_id=user_id,
+            party_name=f"OWNER {i}",
+            property_address=f"{i} MAIN ST",
+            dedup_hash=spec.get("hash") or uuid.uuid4().hex,
+            is_duplicate=spec["duplicate"],
+            duplicate_source_job_id=spec.get("source_job"),
+            duplicate_source_at=spec.get("source_at"),
+            duplicate_reason=spec.get("reason"),
+        ))
+    await db.commit()
 
 
 async def _results(client: AsyncClient, job_id: str, token: str) -> dict:
@@ -90,6 +95,7 @@ NOW = datetime.now(UTC)
 async def test_previous_results_link_never_points_at_a_later_run(
     client: AsyncClient, starter_user: User, starter_token: str,
     scraper_config: ScraperConfig,
+    db,
 ):
     """The reported bug, reduced to its shape.
 
@@ -98,18 +104,19 @@ async def test_previous_results_link_never_points_at_a_later_run(
     bound picked the later run, which is what production served.
     """
     earlier = await _job(
-        starter_user, scraper_config, created_at=NOW - timedelta(days=60),
+        db, starter_user, scraper_config, created_at=NOW - timedelta(days=60),
         record_count=122,
     )
-    await _rows(earlier, starter_user.id, [{"duplicate": False}] * 3)
+    await _rows(db, earlier, starter_user.id, [{"duplicate": False}] * 3)
 
     viewed = await _job(
-        starter_user, scraper_config, created_at=NOW - timedelta(days=30)
+        db, starter_user, scraper_config, created_at=NOW - timedelta(days=30)
     )
-    await _rows(viewed, starter_user.id, [{"duplicate": True}] * 4)
+    await _rows(db, viewed, starter_user.id, [{"duplicate": True}] * 4)
 
-    later = await _job(starter_user, scraper_config, created_at=NOW, record_count=32)
-    await _rows(later, starter_user.id, [{"duplicate": False}] * 3)
+    later = await _job(
+        db, starter_user, scraper_config, created_at=NOW, record_count=32)
+    await _rows(db, later, starter_user.id, [{"duplicate": False}] * 3)
 
     body = await _results(client, viewed, starter_token)
 
@@ -123,16 +130,18 @@ async def test_previous_results_link_never_points_at_a_later_run(
 async def test_previous_link_is_absent_when_no_earlier_run_exists(
     client: AsyncClient, starter_user: User, starter_token: str,
     scraper_config: ScraperConfig,
+    db,
 ):
     """With only a later run to choose from, offer nothing rather than the wrong
     thing — the UI falls back to 'View all records'."""
     viewed = await _job(
-        starter_user, scraper_config, created_at=NOW - timedelta(days=30)
+        db, starter_user, scraper_config, created_at=NOW - timedelta(days=30)
     )
-    await _rows(viewed, starter_user.id, [{"duplicate": True}] * 2)
+    await _rows(db, viewed, starter_user.id, [{"duplicate": True}] * 2)
 
-    later = await _job(starter_user, scraper_config, created_at=NOW, record_count=5)
-    await _rows(later, starter_user.id, [{"duplicate": False}] * 2)
+    later = await _job(
+        db, starter_user, scraper_config, created_at=NOW, record_count=5)
+    await _rows(db, later, starter_user.id, [{"duplicate": False}] * 2)
 
     body = await _results(client, viewed, starter_token)
     assert body["previous_job_id"] is None
@@ -143,14 +152,16 @@ async def test_previous_link_is_absent_when_no_earlier_run_exists(
 async def test_previous_link_carries_its_date_so_the_copy_can_name_it(
     client: AsyncClient, starter_user: User, starter_token: str,
     scraper_config: ScraperConfig,
+    db,
 ):
     earlier_at = NOW - timedelta(days=60)
     earlier = await _job(
-        starter_user, scraper_config, created_at=earlier_at, record_count=9
+        db, starter_user, scraper_config, created_at=earlier_at, record_count=9
     )
-    await _rows(earlier, starter_user.id, [{"duplicate": False}] * 2)
-    viewed = await _job(starter_user, scraper_config, created_at=NOW)
-    await _rows(viewed, starter_user.id, [{"duplicate": True}] * 2)
+    await _rows(db, earlier, starter_user.id, [{"duplicate": False}] * 2)
+    viewed = await _job(
+        db, starter_user, scraper_config, created_at=NOW)
+    await _rows(db, viewed, starter_user.id, [{"duplicate": True}] * 2)
 
     body = await _results(client, viewed, starter_token)
     assert body["previous_job_id"] == earlier
@@ -162,15 +173,17 @@ async def test_previous_link_carries_its_date_so_the_copy_can_name_it(
 async def test_duplicates_report_the_run_that_actually_delivered_them(
     client: AsyncClient, starter_user: User, starter_token: str,
     scraper_config: ScraperConfig,
+    db,
 ):
     source_at = NOW - timedelta(days=60)
     source = await _job(
-        starter_user, scraper_config, created_at=source_at, record_count=122
+        db, starter_user, scraper_config, created_at=source_at, record_count=122
     )
-    await _rows(source, starter_user.id, [{"duplicate": False}] * 2)
+    await _rows(db, source, starter_user.id, [{"duplicate": False}] * 2)
 
-    viewed = await _job(starter_user, scraper_config, created_at=NOW)
-    await _rows(viewed, starter_user.id, [
+    viewed = await _job(
+        db, starter_user, scraper_config, created_at=NOW)
+    await _rows(db, viewed, starter_user.id, [
         {"duplicate": True, "source_job": source, "source_at": source_at,
          "reason": "prior_run"}
     ] * 3)
@@ -190,19 +203,23 @@ async def test_duplicates_report_the_run_that_actually_delivered_them(
 async def test_multiple_source_runs_are_reported_as_groups_not_one_link(
     client: AsyncClient, starter_user: User, starter_token: str,
     scraper_config: ScraperConfig,
+    db,
 ):
     """One link cannot explain a banner whose duplicates came from two runs. The
     API returns groups, descending by count, so the UI names the dominant one and
     says there were others rather than silently picking."""
     a_at = NOW - timedelta(days=90)
     b_at = NOW - timedelta(days=45)
-    a = await _job(starter_user, scraper_config, created_at=a_at, record_count=5)
-    await _rows(a, starter_user.id, [{"duplicate": False}])
-    b = await _job(starter_user, scraper_config, created_at=b_at, record_count=5)
-    await _rows(b, starter_user.id, [{"duplicate": False}])
+    a = await _job(
+        db, starter_user, scraper_config, created_at=a_at, record_count=5)
+    await _rows(db, a, starter_user.id, [{"duplicate": False}])
+    b = await _job(
+        db, starter_user, scraper_config, created_at=b_at, record_count=5)
+    await _rows(db, b, starter_user.id, [{"duplicate": False}])
 
-    viewed = await _job(starter_user, scraper_config, created_at=NOW)
-    await _rows(viewed, starter_user.id, (
+    viewed = await _job(
+        db, starter_user, scraper_config, created_at=NOW)
+    await _rows(db, viewed, starter_user.id, (
         [{"duplicate": True, "source_job": a, "source_at": a_at,
           "reason": "prior_run"}] * 4
         + [{"duplicate": True, "source_job": b, "source_at": b_at,
@@ -219,18 +236,20 @@ async def test_multiple_source_runs_are_reported_as_groups_not_one_link(
 async def test_rows_without_provenance_are_unattributed_not_guessed(
     client: AsyncClient, starter_user: User, starter_token: str,
     scraper_config: ScraperConfig,
+    db,
 ):
     """Every row classified before provenance was recorded carries NULL. The API
     must count those separately so the copy can drop the specific claim, instead
     of attaching them to whichever run happens to be handy."""
     earlier = await _job(
-        starter_user, scraper_config, created_at=NOW - timedelta(days=60),
+        db, starter_user, scraper_config, created_at=NOW - timedelta(days=60),
         record_count=9,
     )
-    await _rows(earlier, starter_user.id, [{"duplicate": False}] * 2)
+    await _rows(db, earlier, starter_user.id, [{"duplicate": False}] * 2)
 
-    viewed = await _job(starter_user, scraper_config, created_at=NOW)
-    await _rows(viewed, starter_user.id, [{"duplicate": True}] * 5)
+    viewed = await _job(
+        db, starter_user, scraper_config, created_at=NOW)
+    await _rows(db, viewed, starter_user.id, [{"duplicate": True}] * 5)
 
     body = await _results(client, viewed, starter_token)
     assert body["duplicate_sources"] == []
@@ -243,13 +262,15 @@ async def test_rows_without_provenance_are_unattributed_not_guessed(
 async def test_a_purged_source_run_is_reported_but_not_linkable(
     client: AsyncClient, starter_user: User, starter_token: str,
     scraper_config: ScraperConfig,
+    db,
 ):
     """duplicate_source_job_id has no foreign key on purpose, so it outlives the
     job it names. The group still explains the count; job_available says the link
     must not be offered."""
     gone = str(uuid.uuid4())
-    viewed = await _job(starter_user, scraper_config, created_at=NOW)
-    await _rows(viewed, starter_user.id, [
+    viewed = await _job(
+        db, starter_user, scraper_config, created_at=NOW)
+    await _rows(db, viewed, starter_user.id, [
         {"duplicate": True, "source_job": gone,
          "source_at": NOW - timedelta(days=30), "reason": "prior_run"}
     ] * 2)
@@ -263,16 +284,18 @@ async def test_a_purged_source_run_is_reported_but_not_linkable(
 async def test_a_source_run_that_never_finished_is_not_called_a_delivery(
     client: AsyncClient, starter_user: User, starter_token: str,
     scraper_config: ScraperConfig,
+    db,
 ):
     """A claim is written before its job completes, so a claim alone is not
     evidence the customer received anything. A failed source run must not be
     presented as the run that delivered these leads."""
     crashed = await _job(
-        starter_user, scraper_config, created_at=NOW - timedelta(days=10),
+        db, starter_user, scraper_config, created_at=NOW - timedelta(days=10),
         status="failed",
     )
-    viewed = await _job(starter_user, scraper_config, created_at=NOW)
-    await _rows(viewed, starter_user.id, [
+    viewed = await _job(
+        db, starter_user, scraper_config, created_at=NOW)
+    await _rows(db, viewed, starter_user.id, [
         {"duplicate": True, "source_job": crashed,
          "source_at": NOW - timedelta(days=10), "reason": "prior_run"}
     ] * 3)
@@ -284,12 +307,14 @@ async def test_a_source_run_that_never_finished_is_not_called_a_delivery(
 async def test_same_run_collapse_is_not_reported_as_a_prior_delivery(
     client: AsyncClient, starter_user: User, starter_token: str,
     scraper_config: ScraperConfig,
+    db,
 ):
     """trustee_sale collapses two filings on one property so it bills once. Those
     rows carry is_duplicate=true but were never delivered before, and the banner
     must not tell the user they already received them."""
-    viewed = await _job(starter_user, scraper_config, created_at=NOW)
-    await _rows(viewed, starter_user.id, [
+    viewed = await _job(
+        db, starter_user, scraper_config, created_at=NOW)
+    await _rows(db, viewed, starter_user.id, [
         {"duplicate": True, "source_job": viewed, "reason": "same_run"}
     ] * 3)
 
@@ -315,8 +340,8 @@ async def test_another_accounts_run_is_not_readable_by_id(
     )
     db.add(other_config)
     await db.commit()
-    theirs = await _job(business_user, other_config, created_at=NOW, record_count=5)
-    await _rows(theirs, business_user.id, [{"duplicate": False}] * 2)
+    theirs = await _job(db, business_user, other_config, created_at=NOW, record_count=5)
+    await _rows(db, theirs, business_user.id, [{"duplicate": False}] * 2)
 
     resp = await client.get(
         f"/jobs/{theirs}/results", headers={"Authorization": f"Bearer {starter_token}"}
@@ -337,10 +362,11 @@ async def test_provenance_never_names_another_accounts_run(
     )
     db.add(other_config)
     await db.commit()
-    theirs = await _job(business_user, other_config, created_at=NOW - timedelta(days=5))
+    theirs = await _job(db, business_user, other_config, created_at=NOW - timedelta(days=5))
 
-    viewed = await _job(starter_user, scraper_config, created_at=NOW)
-    await _rows(viewed, starter_user.id, [
+    viewed = await _job(
+        db, starter_user, scraper_config, created_at=NOW)
+    await _rows(db, viewed, starter_user.id, [
         {"duplicate": True, "source_job": theirs,
          "source_at": NOW - timedelta(days=5), "reason": "prior_run"}
     ])
@@ -359,79 +385,62 @@ async def test_provenance_never_names_another_accounts_run(
 
 from sqlalchemy import text as _text  # noqa: E402
 
-from src.api.lead_actionability import address_actionable_sql  # noqa: E402
-
-
-async def _claim(user_id: str, job_id: str, dedup_hash: str) -> None:
-    async with _db_session.AsyncSessionLocal() as s:
-        await s.execute(_text(
-            "INSERT INTO delivered_records "
-            "(id, user_id, dedup_hash, first_job_id, first_delivered_at) "
-            "VALUES (:i, CAST(:u AS uuid), :h, :j, NOW())"
-        ), {"i": str(uuid.uuid4()), "u": user_id, "h": dedup_hash, "j": job_id})
-        await s.commit()
-
-
-async def _claim_count(user_id: str, dedup_hash: str) -> int:
-    async with _db_session.AsyncSessionLocal() as s:
-        return (await s.execute(_text(
-            "SELECT count(*) FROM delivered_records "
-            "WHERE user_id = CAST(:u AS uuid) AND dedup_hash = :h"
-        ), {"u": user_id, "h": dedup_hash})).scalar_one()
-
-
-# The plan-cap release, verbatim from workers/tasks.py.
-_CAP_RELEASE = (
-    'DELETE FROM delivered_records dr USING results r '
-    'WHERE dr.user_id = CAST(:uid AS uuid) '
-    '  AND dr.first_job_id = :jid '
-    '  AND dr.dedup_hash = r.dedup_hash '
-    '  AND r.id = ANY(CAST(:ids AS uuid[])) '
-    '  AND r.user_id = CAST(:uid AS uuid) '
-    '  AND r.dedup_hash IS NOT NULL '
-    '  AND NOT EXISTS ( '
-    '        SELECT 1 FROM results keep '
-    '        WHERE keep.job_id = :jid '
-    '          AND keep.user_id = CAST(:uid AS uuid) '
-    '          AND keep.dedup_hash = dr.dedup_hash '
-    '          AND keep.is_duplicate = false '
-    '          AND NOT (keep.id = ANY(CAST(:ids AS uuid[]))) '
-    '          AND {keep_rule} '
-    '  )'.format(keep_rule=address_actionable_sql("keep"))
+from src.workers.tasks_helpers.dedup import (  # noqa: E402
+    release_capped_dedup_claims,
 )
 
 
-async def _run_cap_release(user_id: str, job_id: str, capped_ids: list[str]) -> None:
-    async with _db_session.AsyncSessionLocal() as s:
-        await s.execute(
-            _text(_CAP_RELEASE),
-            {"uid": user_id, "jid": job_id, "ids": capped_ids},
-        )
-        await s.commit()
+async def _claim(db, user_id: str, job_id: str, dedup_hash: str) -> None:
+    await db.execute(_text(
+        "INSERT INTO delivered_records "
+        "(id, user_id, dedup_hash, first_job_id, first_delivered_at) "
+        "VALUES (:i, CAST(:u AS uuid), :h, :j, NOW())"
+    ), {"i": str(uuid.uuid4()), "u": user_id, "h": dedup_hash, "j": job_id})
+    await db.commit()
+
+
+async def _claim_count(db, user_id: str, dedup_hash: str) -> int:
+    return (await db.execute(_text(
+        "SELECT count(*) FROM delivered_records "
+        "WHERE user_id = CAST(:u AS uuid) AND dedup_hash = :h"
+    ), {"u": user_id, "h": dedup_hash})).scalar_one()
+
+
+# Run the REAL production statement, not a copy of it. These tests previously
+# held their own `_CAP_RELEASE` string, which meant deleting the guard in
+# workers/tasks.py left all five of them green — a test that mirrors its
+# implementation asserts nothing (Codex).
+async def _run_cap_release(db, user_id: str, job_id: str, capped_ids: list[str]) -> None:
+    def _call(sync_session):
+        return release_capped_dedup_claims(sync_session, user_id, job_id, capped_ids)
+
+    await db.run_sync(_call)
+    await db.commit()
 
 
 async def test_cap_release_keeps_a_claim_a_shipped_sibling_still_needs(
     starter_user: User, scraper_config: ScraperConfig,
+    db,
 ):
     """Two rows in one job on the SAME property: one over the plan cap, one
     shipped and billed. Releasing the excluded row's claim also released the
     shipped row's, so the next run delivered and billed that property again."""
-    job_id = await _job(starter_user, scraper_config, created_at=NOW)
+    job_id = await _job(
+        db, starter_user, scraper_config, created_at=NOW)
     shared = uuid.uuid4().hex
-    async with _db_session.AsyncSessionLocal() as s:
-        shipped_id, capped_id = str(uuid.uuid4()), str(uuid.uuid4())
-        for rid in (shipped_id, capped_id):
-            s.add(Result(
-                id=rid, job_id=job_id, user_id=starter_user.id,
-                party_name="OWNER", property_address="1 MAIN ST",
-                dedup_hash=shared, is_duplicate=False,
-            ))
-        await s.commit()
-    await _claim(starter_user.id, job_id, shared)
+    shipped_id, capped_id = str(uuid.uuid4()), str(uuid.uuid4())
+    for rid in (shipped_id, capped_id):
+        db.add(Result(
+            id=rid, job_id=job_id, user_id=starter_user.id,
+            party_name="OWNER", property_address="1 MAIN ST",
+            dedup_hash=shared, is_duplicate=False,
+        ))
+    await db.commit()
+    await _claim(db, starter_user.id, job_id, shared)
 
-    await _run_cap_release(starter_user.id, job_id, [capped_id])
+    await _run_cap_release(db, starter_user.id, job_id, [capped_id])
 
-    assert await _claim_count(starter_user.id, shared) == 1, (
+    assert await _claim_count(db, starter_user.id, shared) == 1, (
         "the shipped sibling was billed for this property but no longer holds "
         "its dedup claim, so the next run will bill for it again"
     )
@@ -439,97 +448,146 @@ async def test_cap_release_keeps_a_claim_a_shipped_sibling_still_needs(
 
 async def test_cap_release_still_frees_a_claim_no_shipped_row_needs(
     starter_user: User, scraper_config: ScraperConfig,
+    db,
 ):
     """The guard must not become a leak in the other direction: when EVERY row on
     that hash was excluded, the claim has to go, or the lead is suppressed
     forever without ever being delivered."""
-    job_id = await _job(starter_user, scraper_config, created_at=NOW)
+    job_id = await _job(
+        db, starter_user, scraper_config, created_at=NOW)
     lonely = uuid.uuid4().hex
-    async with _db_session.AsyncSessionLocal() as s:
-        capped_id = str(uuid.uuid4())
-        s.add(Result(
-            id=capped_id, job_id=job_id, user_id=starter_user.id,
-            party_name="OWNER", property_address="2 MAIN ST",
-            dedup_hash=lonely, is_duplicate=False,
-        ))
-        await s.commit()
-    await _claim(starter_user.id, job_id, lonely)
+    capped_id = str(uuid.uuid4())
+    db.add(Result(
+        id=capped_id, job_id=job_id, user_id=starter_user.id,
+        party_name="OWNER", property_address="2 MAIN ST",
+        dedup_hash=lonely, is_duplicate=False,
+    ))
+    await db.commit()
+    await _claim(db, starter_user.id, job_id, lonely)
 
-    await _run_cap_release(starter_user.id, job_id, [capped_id])
+    await _run_cap_release(db, starter_user.id, job_id, [capped_id])
 
-    assert await _claim_count(starter_user.id, lonely) == 0
+    assert await _claim_count(db, starter_user.id, lonely) == 0
 
 
 async def test_cap_release_ignores_a_duplicate_sibling(
     starter_user: User, scraper_config: ScraperConfig,
+    db,
 ):
     """A sibling already flagged is_duplicate is not being delivered, so it is not
     a reason to keep the claim."""
-    job_id = await _job(starter_user, scraper_config, created_at=NOW)
+    job_id = await _job(
+        db, starter_user, scraper_config, created_at=NOW)
     shared = uuid.uuid4().hex
-    async with _db_session.AsyncSessionLocal() as s:
-        dup_id, capped_id = str(uuid.uuid4()), str(uuid.uuid4())
-        s.add(Result(
-            id=dup_id, job_id=job_id, user_id=starter_user.id, party_name="A",
-            property_address="3 MAIN ST", dedup_hash=shared, is_duplicate=True,
-        ))
-        s.add(Result(
-            id=capped_id, job_id=job_id, user_id=starter_user.id, party_name="B",
-            property_address="3 MAIN ST", dedup_hash=shared, is_duplicate=False,
-        ))
-        await s.commit()
-    await _claim(starter_user.id, job_id, shared)
+    dup_id, capped_id = str(uuid.uuid4()), str(uuid.uuid4())
+    db.add(Result(
+        id=dup_id, job_id=job_id, user_id=starter_user.id, party_name="A",
+        property_address="3 MAIN ST", dedup_hash=shared, is_duplicate=True,
+    ))
+    db.add(Result(
+        id=capped_id, job_id=job_id, user_id=starter_user.id, party_name="B",
+        property_address="3 MAIN ST", dedup_hash=shared, is_duplicate=False,
+    ))
+    await db.commit()
+    await _claim(db, starter_user.id, job_id, shared)
 
-    await _run_cap_release(starter_user.id, job_id, [capped_id])
+    await _run_cap_release(db, starter_user.id, job_id, [capped_id])
 
-    assert await _claim_count(starter_user.id, shared) == 0
+    assert await _claim_count(db, starter_user.id, shared) == 0
 
 
 async def test_cap_release_never_touches_another_accounts_claim(
     starter_user: User, business_user: User, scraper_config: ScraperConfig,
+    db,
 ):
     """The same parcel is routinely claimed by many accounts. Releasing one
     account's claim must leave every other account's intact."""
-    job_id = await _job(starter_user, scraper_config, created_at=NOW)
+    job_id = await _job(
+        db, starter_user, scraper_config, created_at=NOW)
     shared = uuid.uuid4().hex
-    async with _db_session.AsyncSessionLocal() as s:
-        capped_id = str(uuid.uuid4())
-        s.add(Result(
-            id=capped_id, job_id=job_id, user_id=starter_user.id, party_name="A",
-            property_address="4 MAIN ST", dedup_hash=shared, is_duplicate=False,
-        ))
-        await s.commit()
-    await _claim(starter_user.id, job_id, shared)
-    await _claim(business_user.id, str(uuid.uuid4()), shared)
+    capped_id = str(uuid.uuid4())
+    db.add(Result(
+        id=capped_id, job_id=job_id, user_id=starter_user.id, party_name="A",
+        property_address="4 MAIN ST", dedup_hash=shared, is_duplicate=False,
+    ))
+    await db.commit()
+    await _claim(db, starter_user.id, job_id, shared)
+    await _claim(db, business_user.id, str(uuid.uuid4()), shared)
 
-    await _run_cap_release(starter_user.id, job_id, [capped_id])
+    await _run_cap_release(db, starter_user.id, job_id, [capped_id])
 
-    assert await _claim_count(starter_user.id, shared) == 0
-    assert await _claim_count(business_user.id, shared) == 1
+    assert await _claim_count(db, starter_user.id, shared) == 0
+    assert await _claim_count(db, business_user.id, shared) == 1
 
 
 async def test_cap_release_frees_a_claim_pinned_only_by_an_addressless_row(
     starter_user: User, scraper_config: ScraperConfig,
+    db,
 ):
     """An address-less row is never exported and never billed. Treating it as a
     reason to keep the claim would suppress that lead from every future run while
     the user had never received it once."""
-    job_id = await _job(starter_user, scraper_config, created_at=NOW)
+    job_id = await _job(
+        db, starter_user, scraper_config, created_at=NOW)
     shared = uuid.uuid4().hex
-    async with _db_session.AsyncSessionLocal() as s:
-        capped_id, blank_id = str(uuid.uuid4()), str(uuid.uuid4())
-        s.add(Result(
-            id=capped_id, job_id=job_id, user_id=starter_user.id, party_name="A",
-            property_address="5 MAIN ST", dedup_hash=shared, is_duplicate=False,
-        ))
-        s.add(Result(
-            id=blank_id, job_id=job_id, user_id=starter_user.id, party_name="B",
-            property_address=None, mailing_address=None,
-            dedup_hash=shared, is_duplicate=False,
-        ))
-        await s.commit()
-    await _claim(starter_user.id, job_id, shared)
+    capped_id, blank_id = str(uuid.uuid4()), str(uuid.uuid4())
+    db.add(Result(
+        id=capped_id, job_id=job_id, user_id=starter_user.id, party_name="A",
+        property_address="5 MAIN ST", dedup_hash=shared, is_duplicate=False,
+    ))
+    db.add(Result(
+        id=blank_id, job_id=job_id, user_id=starter_user.id, party_name="B",
+        property_address=None, mailing_address=None,
+        dedup_hash=shared, is_duplicate=False,
+    ))
+    await db.commit()
+    await _claim(db, starter_user.id, job_id, shared)
 
-    await _run_cap_release(starter_user.id, job_id, [capped_id])
+    await _run_cap_release(db, starter_user.id, job_id, [capped_id])
 
-    assert await _claim_count(starter_user.id, shared) == 0
+    assert await _claim_count(db, starter_user.id, shared) == 0
+
+
+async def test_the_three_duplicate_buckets_always_reconcile(
+    client: AsyncClient, starter_user: User, starter_token: str,
+    scraper_config: ScraperConfig,
+    db,
+):
+    """duplicate_count is what the banner says. If the three explanations of it
+    do not add back up to it, the page is describing a different set of rows than
+    the one it is counting, which is the whole class of bug this change exists to
+    remove (Codex asked for this explicitly).
+
+    A deliberately mixed run: some duplicates traced to an earlier run, some with
+    no recoverable source, some collapsed within this run.
+    """
+    src_at = NOW - timedelta(days=40)
+    source = await _job(
+        db, starter_user, scraper_config, created_at=src_at, record_count=7
+    )
+    await _rows(db, source, starter_user.id, [{"duplicate": False}] * 2)
+
+    viewed = await _job(
+        db, starter_user, scraper_config, created_at=NOW)
+    await _rows(db, viewed, starter_user.id, (
+        [{"duplicate": True, "source_job": source, "source_at": src_at,
+          "reason": "prior_run"}] * 5
+        + [{"duplicate": True}] * 3                                   # unattributed
+        + [{"duplicate": True, "source_job": viewed, "reason": "same_run"}] * 2
+        + [{"duplicate": False}] * 1                                  # a real new lead
+    ))
+
+    body = await _results(client, viewed, starter_token)
+
+    attributed = sum(s["duplicate_count"] for s in body["duplicate_sources"])
+    assert attributed == 5
+    assert body["unattributed_duplicate_count"] == 3
+    assert body["same_run_duplicate_count"] == 2
+    assert attributed + body["unattributed_duplicate_count"] \
+        + body["same_run_duplicate_count"] == body["duplicate_count"] == 10
+    # And the one genuinely new lead is still delivered.
+    assert body["new_count"] == 1
+
+    # With anything unattributed, no single run may be named as the source of all
+    # of them — the UI's naming rule depends on this being visible.
+    assert body["unattributed_duplicate_count"] > 0

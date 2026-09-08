@@ -1550,41 +1550,15 @@ def run_scrape_job(self, job_id: str) -> None:
                         # them. Keeping the claim would make the lead permanently
                         # unreachable — the same invariant the re-export failure
                         # path protects.
-                        # NOT EXISTS guard (2026-09-08 audit): two rows in ONE job
-                        # can share a dedup_hash (the same parcel|address filed
-                        # twice). If the cap excludes one and SHIPS the other, the
-                        # unguarded delete dropped the claim anyway — so a lead
-                        # that was delivered AND billed no longer held its dedup
-                        # claim, and the next run delivered and billed the same
-                        # identity a second time.
-                        #
-                        # "Still needed" has to mean exactly the set that ships:
-                        # non-duplicate, NOT capped, AND address-actionable. The
-                        # address half matters in both directions — drop it and an
-                        # address-less row (never exported, never billed) would
-                        # pin the claim and suppress that lead from every future
-                        # run; it is the same predicate the ranking above uses to
-                        # choose _capped_ids, so the two cannot drift apart.
-                        db.execute(
-                            sa_text(
-                                'DELETE FROM delivered_records dr USING results r '
-                                'WHERE dr.user_id = CAST(:uid AS uuid) '
-                                '  AND dr.first_job_id = :jid '
-                                '  AND dr.dedup_hash = r.dedup_hash '
-                                '  AND r.id = ANY(CAST(:ids AS uuid[])) '
-                                '  AND r.user_id = CAST(:uid AS uuid) '
-                                '  AND r.dedup_hash IS NOT NULL '
-                                '  AND NOT EXISTS ( '
-                                '        SELECT 1 FROM results keep '
-                                '        WHERE keep.job_id = :jid '
-                                '          AND keep.user_id = CAST(:uid AS uuid) '
-                                '          AND keep.dedup_hash = dr.dedup_hash '
-                                '          AND keep.is_duplicate = false '
-                                '          AND NOT (keep.id = ANY(CAST(:ids AS uuid[]))) '
-                                '          AND {keep_rule} '
-                                '  )'.format(keep_rule=address_actionable_sql("keep"))
-                            ),
-                            {"uid": str(job.user_id), "jid": job_id, "ids": _capped_ids},
+                        # Release what the cap excluded, KEEPING any claim a
+                        # surviving deliverable sibling in this job still needs.
+                        # The statement lives in tasks_helpers/dedup.py so the
+                        # tests can run the real one instead of a copy (Codex).
+                        from src.workers.tasks_helpers.dedup import (
+                            release_capped_dedup_claims,
+                        )
+                        release_capped_dedup_claims(
+                            db, str(job.user_id), job_id, _capped_ids
                         )
                     db.commit()
                 except Exception as exc:

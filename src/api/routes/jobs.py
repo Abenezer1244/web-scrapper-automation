@@ -485,41 +485,39 @@ async def get_results(
     # Total scraped (including duplicates) and duplicate count — both scoped to
     # ACTIONABLE rows so the "all N records were duplicates" banner can never be
     # driven by rows that are not leads (Codex).
-    total_scraped_result = await db.execute(
-        select(func.count()).where(
+    # ONE aggregate, not four (Codex). These counts explain each other on the
+    # page: the banner renders `duplicate_count`, and the UI derives
+    # "duplicates from an earlier run" as duplicate_count - same_run_count.
+    # Read under separate READ COMMITTED snapshots, a finalize committing
+    # between two of them could return a same_run_count larger than the
+    # duplicate_count taken moments earlier, and the UI would render a negative
+    # number. One statement, one snapshot, and the arithmetic cannot go
+    # inconsistent no matter what commits alongside it.
+    #
+    # new_count is deliberately NOT tax-capped, matching workers/tasks.py's
+    # billable_count exactly — it must track jobs.record_count, which is what the
+    # list, the email and the webhook all report, not `total`.
+    counts_row = (await db.execute(
+        select(
+            func.count().label("total_scraped"),
+            func.count().filter(Result.is_duplicate.is_(True)).label("duplicates"),
+            func.count().filter(Result.is_duplicate.is_(False)).label("new_leads"),
+            func.count()
+            .filter(
+                Result.is_duplicate.is_(True),
+                Result.duplicate_reason == "same_run",
+            )
+            .label("same_run"),
+        ).where(
             Result.job_id == job_id,
             Result.user_id == current_user.id,
             actionable_condition(),
         )
-    )
-    total_scraped = total_scraped_result.scalar_one()
-
-    dup_count_result = await db.execute(
-        select(func.count()).where(
-            Result.job_id == job_id,
-            Result.user_id == current_user.id,
-            Result.is_duplicate.is_(True),
-            actionable_condition(),
-        )
-    )
-    duplicate_count = dup_count_result.scalar_one()
-
-    # New (non-duplicate, actionable) leads — the SAME predicate workers/tasks.py
-    # uses for billable_count, which is what it writes to jobs.record_count and
-    # reports in the completion log / email / webhook. Returned explicitly so the
-    # results page can render the number the jobs list renders instead
-    # of falling back to `total` (which includes duplicates) and showing "4" for a
-    # job the list correctly shows as "0". Deliberately NOT tax-capped, matching
-    # billable_count exactly — this must track record_count, not `total`.
-    new_count_result = await db.execute(
-        select(func.count()).where(
-            Result.job_id == job_id,
-            Result.user_id == current_user.id,
-            Result.is_duplicate.is_(False),
-            actionable_condition(),
-        )
-    )
-    new_count = new_count_result.scalar_one()
+    )).one()
+    total_scraped = counts_row.total_scraped
+    duplicate_count = counts_row.duplicates
+    new_count = counts_row.new_leads
+    same_run_duplicate_count = counts_row.same_run
 
     # ── Where this job's duplicates came from (migration 089) ───────────────
     # Read off results.duplicate_source_* — stamped by the worker at the moment
@@ -588,19 +586,6 @@ async def get_results(
         for g in named
     ]
 
-    # Same-run collapses (trustee_sale siblings on one property). These were
-    # never previously delivered, so they are counted apart and the copy for
-    # them must not say "already received".
-    same_run_result = await db.execute(
-        select(func.count()).where(
-            Result.job_id == job_id,
-            Result.user_id == current_user.id,
-            Result.is_duplicate.is_(True),
-            Result.duplicate_reason == "same_run",
-            actionable_condition(),
-        )
-    )
-    same_run_duplicate_count = same_run_result.scalar_one()
 
     # When results are empty (all duplicates or no new leads), find
     # the most recent previous job for the same county/record_type

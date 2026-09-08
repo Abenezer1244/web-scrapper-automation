@@ -12,12 +12,15 @@ It cannot recover everything, and deliberately does not try:
 
   * 82% of production claims point at a purged jobs row. Those stay NULL.
   * A claim released and re-claimed by a LATER job now names the wrong run.
-    Guarded on the CLAIM time, not the job's creation time (Codex): a job
-    created earlier can still execute, retry, or re-claim a released hash AFTER
-    the viewed run finished, and comparing created_at alone would stamp that as
-    the original source forever. first_delivered_at is when the claim was
-    actually made, so requiring it to precede the viewed run is the real
-    evidence. created_at is kept as well because both must hold.
+    Guarded on SOURCE COMPLETION, not on job creation time (Codex, twice).
+    Comparing created_at alone is wrong because a job created earlier can still
+    execute, retry, or re-claim a released hash long after the viewed run
+    classified it. Comparing first_delivered_at is closer but still not enough:
+    it is written with NOW(), which in Postgres is the TRANSACTION START time, so
+    an older transaction that stalls and then acquires a released claim passes
+    that test too. Requiring source.finished_at < own.created_at is the actual
+    evidence - the source run had already ENDED before the viewed run began, so
+    it cannot have acquired the claim afterwards. All three must hold.
   * A claim held by a job that never reached 'done' is not evidence of delivery.
     Guarded by requiring status='done'.
 
@@ -53,6 +56,8 @@ JOIN jobs source   ON source.id = dr.first_job_id
                   AND source.status = 'done'
                   AND source.created_at < own.created_at
                   AND dr.first_delivered_at < own.created_at
+                  AND source.finished_at IS NOT NULL
+                  AND source.finished_at < own.created_at
 WHERE r.id = src.id
   AND src.is_duplicate IS TRUE
   AND src.dedup_hash IS NOT NULL
@@ -71,6 +76,8 @@ JOIN jobs source   ON source.id = dr.first_job_id
                   AND source.status = 'done'
                   AND source.created_at < own.created_at
                   AND dr.first_delivered_at < own.created_at
+                  AND source.finished_at IS NOT NULL
+                  AND source.finished_at < own.created_at
 WHERE src.is_duplicate IS TRUE
   AND src.dedup_hash IS NOT NULL
   AND src.duplicate_reason IS NULL

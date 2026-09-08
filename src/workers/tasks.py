@@ -122,7 +122,7 @@ def _alert_dedup_release_failed(job_id: str, user_id, context: str, exc: Excepti
         send_ops_alert(
             "dedup_release_failed",
             f"{context}:{job_id}",
-            "Dedup-claim release failed — leads may be permanently suppressed",
+            "Dedup-claim release failed, leads may be permanently suppressed",
             f"Job {job_id} (user {user_id}) could not release its delivered_records "
             f"claims on the '{context}' path: {str(exc)[:400]}. "
             "Those leads were not delivered and not billed, but they remain claimed, "
@@ -675,7 +675,7 @@ def run_scrape_job(self, job_id: str) -> None:
                         countdown, str(exc)[:200],
                     )
                     return
-            reason = "Scraper encountered an error — our team has been notified."
+            reason = "Scraper encountered an error. Our team has been notified."
             # Attempt-scoped: only fail the job if THIS attempt still owns it
             # (started_at unchanged). If a newer attempt re-claimed it — or the
             # retry CAS above no-oped on an ownership change — this no-ops instead
@@ -1216,8 +1216,8 @@ def run_scrape_job(self, job_id: str) -> None:
             # scheduled scraper makes a fresh job on its next occurrence; a manual
             # run must be re-triggered by the user. Don't promise auto-retry.
             reason = (
-                "Export upload to cloud storage failed after multiple attempts — "
-                "no file was produced and you were not charged. Please run the "
+                "Export upload to cloud storage failed after multiple attempts. "
+                "No file was produced and you were not charged. Please run the "
                 "scraper again; contact support if it keeps failing."
             )
             if _fail_job(db, job, r, job_id, reason):
@@ -1521,7 +1521,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     )
                     _alert_dedup_release_failed(job_id, _boot_user_id, "plan_cap_failure", cleanup_exc)
                 reason = (
-                    'The lead list could not be re-read after enrichment, so your plan quota could not be applied — no file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.' if refreshed is None else 'Your plan quota could not be applied to this run — no file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.'
+                    'The lead list could not be re-read after enrichment, so your plan quota could not be applied. No file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.' if refreshed is None else 'Your plan quota could not be applied to this run. No file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.'
                 )
                 if _fail_job(db, job, r, job_id, reason):
                     from src.workers.notification_emit import create_notification
@@ -1628,8 +1628,8 @@ def run_scrape_job(self, job_id: str) -> None:
                     )
                     _alert_dedup_release_failed(job_id, _boot_user_id, "reexport_failure", cleanup_exc)
                 reason = (
-                    "The lead file could not be refreshed with enriched addresses — "
-                    "no file was delivered and you were not charged. Please run the "
+                    "The lead file could not be refreshed with enriched addresses. "
+                    "No file was delivered and you were not charged. Please run the "
                     "scraper again; contact support if it keeps failing."
                 )
                 if _fail_job(db, job, r, job_id, reason):

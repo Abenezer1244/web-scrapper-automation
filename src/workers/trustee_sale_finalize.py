@@ -242,7 +242,7 @@ def null_amount_alert(
     body = (
         f"Job {job_id} ({county}) delivered {null_count} of {total} trustee_sale lead(s) "
         f"with no default_amount. This is allowed (the notice may state no sum owing) "
-        f"but it is also the signature of a section-IV parser gap — check the source "
+        f"but it is also the signature of a section-IV parser gap, so check the source "
         f"notices for these nts_notices ids: {', '.join(notice_ids) or 'n/a'}. "
         f"If the source states an amount, fix the parser and run "
         f"scripts/repair_trustee_sale_from_notices.py."

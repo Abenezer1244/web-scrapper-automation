@@ -195,8 +195,8 @@ async def create_batch(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
-                "Webhook and dialer delivery aren't available for batch scrapes — "
-                "set them on an individual scraper instead. A batch delivers one "
+                "Webhook and dialer delivery aren't available for batch scrapes. "
+                "Set them on an individual scraper instead. A batch delivers one "
                 "combined CSV by email."
             ),
         )
@@ -925,7 +925,7 @@ async def list_batch_leads(
         description=(
             "Narrow the combined list to leads MATCHING this record type. The set is "
             "deduped, so an overlapping lead carries several record types and is "
-            "returned by each of them — per-type subtotals therefore sum to MORE than "
+            "returned by each of them, so per-type subtotals sum to MORE than "
             "the unfiltered total. That is the overlap, not double counting."
         ),
     ),
@@ -966,7 +966,7 @@ async def list_batch_run_leads(
         description=(
             "Narrow the combined list to leads MATCHING this record type. The set is "
             "deduped, so an overlapping lead carries several record types and is "
-            "returned by each of them — per-type subtotals therefore sum to MORE than "
+            "returned by each of them, so per-type subtotals sum to MORE than "
             "the unfiltered total. That is the overlap, not double counting."
         ),
     ),

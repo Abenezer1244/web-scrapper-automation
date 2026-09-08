@@ -96,8 +96,8 @@ async def list_scrapers(
             "instead of one row per county x record_type child. "
             "Default False on purpose: other callers legitimately need the children "
             "(the grandfathered-probate TOD notice counts EVERY probate config, and "
-            "/scrapers/{id}/records resolves a child config out of this list) — "
-            "flipping the default would silently break both."
+            "/scrapers/{id}/records resolves a child config out of this list). "
+            "Flipping the default would silently break both."
         ),
     ),
     db: AsyncSession = Depends(get_rls_db),
@@ -497,7 +497,7 @@ async def update_scraper(
             detail=(
                 "Cannot change identity field(s): "
                 f"{', '.join(sorted(locked))}. County, state, and record_type are "
-                "fixed for a scraper — create a new one instead."
+                "fixed for a scraper. Create a new one instead."
             ),
         )
 

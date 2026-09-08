@@ -1088,7 +1088,7 @@ class JobResponse(BaseModel):
             self.estimated_seconds_remaining = 0
             self.estimated_time_remaining = "Done" if self.status == JobStatus.DONE else None
             self.progress_label = (
-                f"Complete — {self.record_count} records"
+                f"Complete: {self.record_count} records"
                 if self.status == JobStatus.DONE
                 else self.status.value.title()
             )

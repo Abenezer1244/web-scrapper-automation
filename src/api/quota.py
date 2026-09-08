@@ -137,7 +137,7 @@ def quota_block_reason(user, now: datetime | None = None) -> str | None:
     if is_frozen(user, now):
         return (
             "Your subscription payment could not be completed, so new scrapes "
-            "are paused. Update your payment method to resume — your data and "
+            "are paused. Update your payment method to resume. Your data and "
             "past exports are untouched."
         )
     # Paid access that has ALREADY ENDED. The window stops advancing at
@@ -152,7 +152,7 @@ def quota_block_reason(user, now: datetime | None = None) -> str | None:
     if ends_at is not None and as_utc(now or datetime.now(UTC)) >= as_utc(ends_at):
         return (
             "Your subscription has ended, so new scrapes are paused. Resubscribe "
-            "to continue — your data and past exports are untouched."
+            "to continue. Your data and past exports are untouched."
         )
     if is_over_record_limit(user, now):
         _, end = effective_window(user, now)

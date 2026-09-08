@@ -140,6 +140,39 @@ def main() -> None:
         db.commit()
         print(f"released {deleted} claims; 0 remain. Those leads are reachable again.")
 
+        # Releasing a claim does not un-say what other jobs already said about it.
+        # A DONE job that flagged rows is_duplicate=true against these claims still
+        # tells the user "you already received these" for leads nobody delivered,
+        # and now there is no claim left to back the assertion. That orphaned state
+        # persisted in production for four days across 33,522 rows (Codex).
+        #
+        # Report it here, always. Repairing it promotes the earliest DONE job's row
+        # back to a delivery and re-claims the hash, which is a judgement about who
+        # owns the lead, so it stays a separate deliberate command rather than a
+        # side effect of releasing.
+        orphaned = db.execute(
+            text("""
+                SELECT count(*) FROM results r
+                WHERE r.user_id = CAST(:u AS uuid)
+                  AND r.is_duplicate IS TRUE
+                  AND r.dedup_hash IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM delivered_records dr
+                      WHERE dr.user_id = r.user_id AND dr.dedup_hash = r.dedup_hash)
+            """),
+            {"u": job.uid},
+        ).scalar()
+        if orphaned:
+            print("")
+            print(f"WARNING: {orphaned} row(s) for this user now say 'already "
+                  "delivered' with no claim behind them.")
+            print("Those results pages describe a delivery that never happened.")
+            print("Fix with:")
+            print("  python scripts/repair_orphaned_duplicate_flags.py "
+                  f"--user {job.uid} --dry-run")
+        else:
+            print("no orphaned duplicate flags left behind.")
+
 
 if __name__ == "__main__":
     main()

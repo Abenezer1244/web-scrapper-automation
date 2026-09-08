@@ -7,6 +7,7 @@ delivery + schedule are SUPPRESSED. The BatchRun + child Jobs are created async
 by the dispatch worker (system-written), so this route only persists the parent
 + children, then kicks off the fan-out.
 """
+import csv
 import io
 import uuid
 from datetime import UTC, datetime
@@ -15,9 +16,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response,
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.background import BackgroundTask
 
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
+from src.api.download_tracking import mark_leads_downloaded
 from src.api.entitlements import (
     Violation,
     disallowed_export_formats,
@@ -715,6 +718,47 @@ async def download_batch(
     return await _stream_run_csv(batch_id, run, batch.fields, batch.delivery_mode or "everything")
 
 
+def _csv_has_a_lead(data: bytes) -> bool:
+    """True if the rendered CSV holds at least one row under its header.
+
+    Parsed rather than counting newlines: a lead's address or party name can
+    contain a quoted newline, which would make a line count claim rows that are
+    not there.
+
+    Wrapped over the existing bytes rather than decoding them: `data` is already
+    the whole response body in memory, and `data.decode()` would make a second
+    full copy of a potentially multi-megabyte export just to look at two records.
+    TextIOWrapper decodes lazily and the scan stops at the first real record.
+
+    A CSV parsing failure does not fail the download. csv.reader refuses a field
+    over 131,072 characters, and legal_description and heirs are uncapped Text
+    that no writer bounds, so a single outsized lead used to turn a perfectly
+    good export into a 500 from OUTSIDE the caller's error handler. This is a
+    bookkeeping question, so an unreadable file answers "no lead" and
+    under-counts one activation instead.
+
+    Not a validity check on the CSV: it stops at the first record and parses
+    permissively, so it says nothing about whether the export is well formed.
+    """
+    try:
+        reader = csv.reader(
+            io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace")
+        )
+        next(reader, None)  # header
+        for row in reader:
+            # A blank line parses as an empty record. It is not a lead, and the
+            # renderer emitting one would otherwise read as activation.
+            if row:
+                return True
+        return False
+    except (csv.Error, UnicodeError, ValueError):
+        _logger.warning(
+            "batch CSV could not be parsed to check for leads; not recording a "
+            "download for this response", exc_info=True,
+        )
+        return False
+
+
 async def _stream_run_csv(
     batch_id: str, run: BatchRun | None, batch_fields: object = None,
     delivery_mode: str = "everything",
@@ -756,6 +800,16 @@ async def _stream_run_csv(
         io.BytesIO(data),
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        # Both batch download routes come through here, so recording once at the
+        # response covers them both. Stamped on the OWNER, not on the run's child
+        # jobs: the combined CSV is a filtered, deduplicated selection across
+        # them, so "which job did this row come from" is not a question this
+        # response can answer honestly. Skipped for a header-only file, which a
+        # zero-row overlaps_only run legitimately produces.
+        background=(
+            BackgroundTask(mark_leads_downloaded, str(run.user_id))
+            if _csv_has_a_lead(data) else None
+        ),
     )
 
 

@@ -132,14 +132,43 @@ def test_activation_funnel_counts_seeded_user() -> None:
         )
 
         after = conn.execute(text("SELECT * FROM public.activation_funnel(30)")).fetchone()
-        # The seeded user advances signup → first_scraper → first_job →
-        # first_download (export_key set). Assert deltas, not absolutes, so the
-        # test is robust against whatever else is in the window.
+        # The seeded user advances signup → first_scraper → first_job. It does
+        # NOT advance first_download: the job carries an export_key, which is
+        # what the worker writes when it marks a job done, and that is exactly
+        # the thing this funnel used to miscount as a download (migration 090).
+        # Assert deltas, not absolutes, so the test is robust against whatever
+        # else is in the window.
         assert after.signups == base.signups + 1
         assert after.first_scraper == base.first_scraper + 1
         assert after.first_job == base.first_job + 1
-        assert after.first_download == base.first_download + 1
+        assert after.first_download == base.first_download
         # starter plan + no stripe_customer_id → not a paid upgrade.
         assert after.paid_upgrade == base.paid_upgrade
+
+        # Only an OBSERVED download advances the step.
+        conn.execute(
+            text(
+                "UPDATE users SET first_leads_downloaded_at = NOW() WHERE id = :u"
+            ),
+            {"u": user_id},
+        )
+        downloaded = conn.execute(
+            text("SELECT * FROM public.activation_funnel(30)")
+        ).fetchone()
+        assert downloaded.first_download == base.first_download + 1
+
+        # The onboarding grandfather flag is presentation state; the funnel must
+        # not read it, or it would report a download nobody watched happen.
+        conn.execute(
+            text(
+                "UPDATE users SET first_leads_downloaded_at = NULL, "
+                "onboarding_download_grandfathered = true WHERE id = :u"
+            ),
+            {"u": user_id},
+        )
+        grandfathered = conn.execute(
+            text("SELECT * FROM public.activation_funnel(30)")
+        ).fetchone()
+        assert grandfathered.first_download == base.first_download
 
         conn.rollback()

@@ -95,6 +95,17 @@ async def analytics_summary(
         # Standing product rule: a row with no property AND no mailing address is
         # not a lead anywhere the customer looks (see lead_actionability).
         actionable_condition(),
+        # A run that never finished delivered nothing, so its rows are not leads
+        # the customer has. Without this, a job that scraped 17k records and then
+        # failed on the plan cap still counted every one of them on the dashboard
+        # -- rows the customer was never charged for, never emailed, and cannot
+        # download, because /download requires an export_key the failed run never
+        # wrote. Found 2026-09-08 when repairing that exact incident made the
+        # same leads count twice: once on the failed run and once on the
+        # completed run that now owns them (Codex).
+        Result.job_id.in_(
+            select(Job.id).where(Job.user_id == uid, Job.status == "done")
+        ),
         Result.created_at >= start_dt,
         local_day >= start,
         # Upper bound at today's local day so a future-dated created_at (clock

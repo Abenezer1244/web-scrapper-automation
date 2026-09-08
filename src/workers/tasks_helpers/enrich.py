@@ -222,8 +222,20 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
     return result.rowcount or 0
 
 
-def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
-    """Run GIS + King County enrichment inline (before job marks done)."""
+def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None = None) -> None:
+    """Run GIS + King County enrichment inline (before job marks done).
+
+    ``summary`` is an optional out-parameter the caller may pass to learn what
+    actually happened, so the completion log can tell the truth. It was added
+    because a job whose mailing pass looked up 0 of 153 parcels still announced
+    "Enrichment complete", which is the one thing the user reading that line
+    needs to know is false. An out-param rather than a return value on purpose:
+    this function has many early-exit paths, and every one of them should leave
+    the caller with "nothing to report" rather than needing its own return.
+
+    Keys (all optional): ``mailing_deferred`` -- parcels whose mailing lookup did
+    not happen and is now queued for background recovery.
+    """
     from sqlalchemy import func
     from sqlalchemy import select as sa_select
 
@@ -721,12 +733,31 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                     _logger.warning("Job %s: deferred-marker commit failed: %s", job_id, str(exc)[:120])
                     db.rollback()
             if king_error or deferred:
+                # ENGINEERING DETAIL goes to the worker log, never to the user's
+                # log stream. The old line published the raw exception straight
+                # into the UI, so a paying customer read
+                # "SourceUnavailableError: king_erealproperty is throttled until
+                # 2026-09-08T03:02:14.040806+00:00 - King phase-1 circuit breaker
+                # tripped: 50/50 rec". That names an internal service, an
+                # exception class and a breaker threshold, and still does not tell
+                # them the one thing that matters: their leads are not lost.
+                _logger.warning(
+                    "Job %s: King mailing pass incomplete — requested=%d attempted=%d "
+                    "found=%d deferred=%d phase1_outcomes=%s error=%s",
+                    job_id, len(pids), king_stats.get("mailing_attempted", 0), found,
+                    len(deferred), king_stats.get("phase1_outcomes", "n/a"),
+                    king_error or "none",
+                )
+                if summary is not None:
+                    summary["mailing_deferred"] = len(deferred)
+                # USER-FACING: what happened, what was kept, what happens next.
                 _publish_log(
                     r, job_id, "warning",
-                    f"King County mailing lookup stopped early: {len(pids)} parcels requested, "
-                    f"{king_stats.get('mailing_attempted', 0)} looked up, {found} mailing addresses found; "
-                    f"{len(deferred)} deferred (property address kept)"
-                    + (f" — {king_error}" if king_error else ""),
+                    f"Mailing addresses are still being looked up for {len(deferred)} "
+                    f"of {len(pids)} properties. County records were slow to respond, "
+                    "so those lookups will finish automatically in the background. "
+                    "Property addresses already found are saved and your leads are "
+                    "not affected.",
                     db=db,
                 )
             else:
@@ -808,7 +839,8 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                     try:
                         _publish_log(
                             r, job_id, "warning",
-                            "Owner-name resolution paused because King County appears to be throttling lookups.",
+                            "Owner names are still being looked up. County records were "
+                            "slow to respond, so this will finish automatically.",
                             db=db,
                         )
                     except Exception:

@@ -136,6 +136,100 @@ class KingOwnerLookupBlockedError(RuntimeError):
     """Raised when eRealProperty appears to be throttling/blocking lookups."""
 
 
+class _Phase1Ledger:
+    """Outcome accounting for the phase-1 fetch loop.
+
+    Three defects made the 2026-09-04/09-07 King incidents unreadable and worse
+    than they had to be, and all three came from the accounting being scattered
+    through the loop body rather than centralised here:
+
+    1. THE BREAKER COULD NOT SEE AN EXCEPTION-ONLY OUTAGE. The threshold test sat
+       inside the `try`, AFTER a successful `safe_get`. A DNS/TLS/timeout outage
+       appended `True` from the `except` and then never evaluated the threshold,
+       so fifty straight connection failures ran on to the time budget instead of
+       tripping (Codex).
+    2. ONE REQUEST COULD RECORD TWO OBSERVATIONS. An exception raised while
+       PARSING a response that had already been recorded fell into the same
+       `except` and appended a second observation for one request (Codex).
+    3. WE KEPT ONLY `last status=`. The persisted reason named the status of the
+       50th request and nothing about the other 49, and the per-parcel detail
+       logged at DEBUG while production runs at INFO. The real incident is
+       therefore unattributable after the fact: `last status=302` is all we have.
+
+    So: one observation per request, recorded in exactly one place, with a
+    histogram that survives into the persisted reason.
+    """
+
+    def __init__(self, window: int, min_failures: int) -> None:
+        self._window: deque[bool] = deque(maxlen=max(1, window))
+        self._min_failures = min_failures
+        self.statuses: dict[str, int] = {}
+        self.redirects: dict[str, int] = {}
+        self.attempted = 0
+        self.failed = 0
+
+    def record(self, response, exc: BaseException | None) -> bool:
+        """Record ONE request. Returns True if this request was a failure."""
+        self.attempted += 1
+        if exc is not None:
+            key = type(exc).__name__
+            failed = True
+        elif response.status_code != 200:
+            key = f"HTTP{response.status_code}"
+            failed = True
+            hint = _redirect_target(response)
+            if hint:
+                self.redirects[hint] = self.redirects.get(hint, 0) + 1
+        else:
+            key = "HTTP200"
+            failed = False
+        self.statuses[key] = self.statuses.get(key, 0) + 1
+        self._window.append(failed)
+        self.failed += int(failed)
+        return failed
+
+    def should_trip(self) -> bool:
+        return (
+            len(self._window) == self._window.maxlen
+            and self._window.count(True) >= self._min_failures
+        )
+
+    def histogram(self) -> str:
+        """Compact, ordered outcome breakdown for the persisted reason."""
+        parts = [f"{k}x{v}" for k, v in sorted(self.statuses.items(), key=lambda kv: -kv[1])]
+        if self.redirects:
+            parts += [f"->{k}x{v}" for k, v in sorted(self.redirects.items(), key=lambda kv: -kv[1])]
+        return " ".join(parts) or "no requests"
+
+    @property
+    def window_failures(self) -> int:
+        return self._window.count(True)
+
+    @property
+    def window_size(self) -> int:
+        return len(self._window)
+
+
+def _redirect_target(response) -> str:
+    """`host/path` a 3xx pointed at, or "". NEVER the query or fragment.
+
+    Where a redirect points is the single most useful fact about it, and it is
+    exactly what the last incident could not tell us. The query string is dropped
+    because on this endpoint it carries the parcel number, and a Location can
+    carry a session token.
+    """
+    if response is None or response.status_code not in (301, 302, 303, 307, 308):
+        return ""
+    location = response.headers.get("Location")
+    if not location:
+        return ""
+    from urllib.parse import urljoin, urlparse
+
+    parsed = urlparse(urljoin(response.url or "", location))  # resolve a relative Location
+    target = f"{parsed.netloc}{parsed.path}" if parsed.netloc else parsed.path
+    return target[:120]
+
+
 @dataclass(frozen=True)
 class _OwnerLookupOutcome:
     resolved: bool
@@ -348,6 +442,48 @@ def resolve_malformed_parcel(source_pid: str, party_name: str | None,
 
 async def batch_enrich_king_county(
     parcel_ids: list[str],
+    **kwargs,
+) -> dict[str, dict[str, str | None]]:
+    """Admission-controlled wrapper around the real King enrichment pass.
+
+    The pacing inside the pass bounds ONE pass and knows nothing about any other,
+    so concurrent King jobs used to make independent request streams against one
+    county server with nothing able to see the total. Two 17,157-parcel jobs
+    overlapped for about half an hour on 2026-09-04 and the first circuit-breaker
+    trip landed that morning.
+
+    A shared lease admits one pass at a time, so concurrent jobs SERIALISE against
+    the county rather than multiplying against it. A caller that cannot get in
+    within the wait window defers its parcels instead of queueing until its
+    enrichment budget is gone: the background recovery sweep will collect them,
+    which is a far better outcome than a job that blocks and then does nothing.
+
+    A thin wrapper rather than a `with` block inside the pass so the lease is
+    released on EVERY exit path, including the circuit breaker raising.
+    """
+    from src.scrapers.enrichment.source_admission import SourceAdmission
+
+    with SourceAdmission(KING_EREALPROPERTY, max_wait_s=45.0) as admission:
+        if not admission.admitted:
+            st = kwargs.get("stats")
+            owned = list(kwargs.get("tax_urls_in") or parcel_ids or [])
+            if st is not None:
+                st.update({"requested": len(owned), "property_found": 0,
+                           "mailing_candidates": 0, "mailing_attempted": 0,
+                           "mailing_found": 0, "deferred": owned,
+                           "budget_exhausted": True, "parcel_mismatch": 0,
+                           "parcel_recovered": 0,
+                           "phase1_outcomes": "not admitted (source busy)"})
+            _logger.info(
+                "King enrichment: another pass holds the source lease; deferring "
+                "%d parcel(s) to the background recovery sweep", len(owned),
+            )
+            return {}
+        return await _batch_enrich_king_county(parcel_ids, **kwargs)
+
+
+async def _batch_enrich_king_county(
+    parcel_ids: list[str],
     *,
     time_budget_s: float | None = None,
     stats: dict | None = None,
@@ -430,7 +566,8 @@ async def batch_enrich_king_county(
     # eRealProperty IP rate-block incident. Mirrors the owner-only path's breaker:
     # a sustained failure rate aborts the run AND is persisted, so the next worker
     # does not immediately start hammering a source that is still refusing us.
-    _p1_window: deque[bool] = deque(maxlen=_PHASE1_BREAKER_WINDOW)  # True = failed
+    _p1 = _Phase1Ledger(_PHASE1_BREAKER_WINDOW, _PHASE1_BREAKER_MIN_FAILURES)
+    _p1_pace = 0.1 if pace_s <= 0.2 else pace_s
 
     for i, pid in enumerate(clean):
         if _over_budget():
@@ -441,29 +578,58 @@ async def batch_enrich_king_county(
         if i % 100 == 0 and i > 0:
             _logger.info("  HTTP: %d / %d ...", i, len(clean))
 
+        # EVERY path through this body pays the pace, including a failed fetch.
+        # It used to `continue` straight past the sleep at the bottom, so the
+        # instant King started refusing us the loop stopped pacing altogether: a
+        # 302 comes back in ~50 ms where a real page takes ~290 ms, so we sped UP
+        # by roughly 6x exactly when the source was asking us to slow down. That
+        # is a positive feedback loop, and it is part of why a blip became a
+        # 50/50 wipeout rather than a handful of retries (Codex).
+        _tripped = False
         try:
-            # S4: safe_http (SSRF defense-in-depth). Fixed HTTPS eRealProperty
-            # endpoint, but safe_get re-validates (resolve=True), disables
-            # ambient proxy, and refuses redirect-to-internal. Same Response API.
-            r = safe_get(
-                f"{_ERP_URL}{pid}", headers=_HEADERS, timeout=10
-            )
-            _p1_window.append(r.status_code != 200)
-            if (len(_p1_window) == _PHASE1_BREAKER_WINDOW
-                    and _p1_window.count(True) >= _PHASE1_BREAKER_MIN_FAILURES):
+            r = None
+            exc: BaseException | None = None
+            try:
+                # S4: safe_http (SSRF defense-in-depth). Fixed HTTPS eRealProperty
+                # endpoint, but safe_get re-validates (resolve=True), disables
+                # ambient proxy, and refuses redirect-to-internal. Same Response API.
+                # allow_redirects stays FALSE: parcel_page_is_for() trusts a page
+                # with no parcel cell when the requested id is a well-formed 10-digit
+                # King PIN, so following a 302 to a block page would hand us a 200
+                # we would then record as "this parcel has no data" — precisely what
+                # this breaker exists to prevent. We record where it pointed instead.
+                r = safe_get(f"{_ERP_URL}{pid}", headers=_HEADERS, timeout=10)
+            except Exception as fetch_exc:  # noqa: BLE001
+                exc = fetch_exc
+                _logger.debug(
+                    "Property URL fetch failed for parcel=%s: %s", pid, str(fetch_exc)[:200]
+                )
+            # ONE observation per request, recorded before anything can raise.
+            failed = _p1.record(r, exc)
+
+            if _p1.should_trip():
                 msg = (
                     "King phase-1 circuit breaker tripped: "
-                    f"{_p1_window.count(True)}/{len(_p1_window)} recent eRealProperty "
-                    f"fetches failed (last status={r.status_code}) after {i} of "
-                    f"{len(clean)} parcels. Aborting so a block is never recorded as "
-                    "'this parcel has no data'."
+                    f"{_p1.window_failures}/{_p1.window_size} recent eRealProperty "
+                    f"fetches failed after {i} of {len(clean)} parcels. "
+                    f"Outcomes this run: {_p1.histogram()}. "
+                    "Aborting so a block is never recorded as 'this parcel has no data'."
                 )
                 _logger.warning(msg)
                 record_source_blocked(KING_EREALPROPERTY, msg)
                 st["budget_exhausted"] = True
+                # clean[i:] covers this parcel and everything after it. The parcels
+                # BEFORE it that already failed were deferred as they failed (below),
+                # so the marker now covers every unresolved parcel rather than only
+                # the tail — the old shape left the 49 failures with no durable
+                # marker at all, which is why no later sweep could ever find them.
                 st["deferred"].extend(clean[i:])
-                break
-            if r.status_code != 200:
+                _tripped = True
+                break  # runs the `finally` below, which skips the pace and exits
+            if failed:
+                # A failed lookup is UNKNOWN, not "no data". Mark it deferred so the
+                # recovery sweep can come back to it.
+                st["deferred"].append(pid)
                 continue
 
             # The county may have silently truncated our id and served ANOTHER
@@ -495,7 +661,12 @@ async def batch_enrich_king_county(
                     if resolved is not None:
                         break
                 if resolved is not None:
+                    # A second real eRealProperty request. It must be paced and
+                    # counted like any other, or the repair path becomes an
+                    # unmetered second stream against a source we are rate-limiting.
+                    await asyncio.sleep(_p1_pace)
                     rr = safe_get(f"{_ERP_URL}{resolved.parcel_id}", headers=_HEADERS, timeout=10)
+                    _p1.record(rr, None)
                     if rr.status_code == 200 and parcel_page_is_for(rr.text, resolved.parcel_id):
                         _logger.info(
                             "King enrichment: recovered %s -> %s via %s",
@@ -514,8 +685,7 @@ async def batch_enrich_king_county(
                             # mailing address back onto the right lead.
                             tax_urls[pid] = tax_url
                         st["parcel_recovered"] += 1
-                        await asyncio.sleep(0.1 if pace_s <= 0.2 else pace_s)
-                        continue
+                        continue  # the `finally` below still paces this iteration
                 results[pid] = {
                     "property_address": None,
                     "mailing_address": None,
@@ -546,21 +716,29 @@ async def batch_enrich_king_county(
                     tax_urls[pid] = tax_url
 
         except Exception as exc:
-            # A hard block / DNS or TLS failure RAISES rather than returning a
-            # non-200, so the breaker must see these too — otherwise a total
-            # outage looks like a run of parcels that merely "had no data".
-            _p1_window.append(True)
-            _logger.debug(
-                "Property URL fetch failed for parcel=%s: %s",
-                pid, str(exc)[:200],
+            # Reached only when PARSING or the malformed-PID recovery raises, never
+            # for the fetch itself (that is handled above). Deliberately does NOT
+            # touch the ledger: the request was already recorded, and appending here
+            # is what let one request count twice (Codex). The parcel is unresolved,
+            # so it is deferred like any other unknown.
+            st["deferred"].append(pid)
+            _logger.warning(
+                "King phase 1: parcel=%s failed after a successful fetch: %s: %s",
+                pid, type(exc).__name__, str(exc)[:200],
             )
-
-        await asyncio.sleep(0.1 if pace_s <= 0.2 else pace_s)  # job: 0.1 s; backfill: slow
+        finally:
+            # job: 0.1 s; backfill: slow. In a `finally` so `continue` cannot skip it.
+            if not _tripped:
+                await asyncio.sleep(_p1_pace)
 
     st["property_found"] = sum(1 for r in results.values() if r.get("property_address"))
-    _logger.info("Phase 1 done: %d/%d property addresses, %d tax URLs, %d parcel mismatches "
-                 "(%d recovered)", st["property_found"], len(clean), len(tax_urls),
-                 st["parcel_mismatch"], st["parcel_recovered"])
+    st["phase1_outcomes"] = _p1.histogram()
+    _logger.info(
+        "Phase 1 done: %d/%d property addresses, %d tax URLs, %d parcel mismatches "
+        "(%d recovered); %d/%d fetches failed [%s]",
+        st["property_found"], len(clean), len(tax_urls), st["parcel_mismatch"],
+        st["parcel_recovered"], _p1.failed, _p1.attempted, _p1.histogram(),
+    )
 
     if tax_urls_out is not None:
         tax_urls_out.update(tax_urls)
@@ -657,9 +835,26 @@ async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
                     # RECOVERED parcel the page names the resolved PIN, not the
                     # malformed one we key results by (Codex P2).
                     _probe = (results.get(pid, {}).get("resolved_parcel_id") or pid)
-                    if "No accounts" in body or _probe.replace("-", "") in body.replace("-", ""):
+                    _page_is_ours = _probe.replace("-", "") in body.replace("-", "")
+                    if "No accounts" in body or _page_is_ours:
                         results[pid]["mailing_lookup"] = "none"
-                    if "Mailing Address" in body:
+                    # IDENTITY GATE (Codex). The extraction below used to be
+                    # independent of the check above: any rendered page carrying a
+                    # "Mailing Address" block wrote its address onto THIS pid, even
+                    # when the page never named this parcel. A stale tab, a wrong tax
+                    # URL, or a redirect to another account would then attach a
+                    # stranger's mailing address to this lead — the same class of
+                    # defect as the eRealProperty truncation, and one that a paid
+                    # skip trace would then bill against. A page that does not name
+                    # our parcel is not evidence about our parcel, so it stays
+                    # "error" (unknown) rather than becoming a wrong "found".
+                    if "Mailing Address" in body and not _page_is_ours:
+                        results[pid]["mailing_lookup"] = "identity_unverified"
+                        _logger.warning(
+                            "King mailing: rendered tax page never named parcel %s — "
+                            "discarding its Mailing Address block", _probe,
+                        )
+                    elif "Mailing Address" in body:
                         idx = body.index("Mailing Address") + len("Mailing Address")
                         after = body[idx:idx + 200]
                         lines = [ln.strip() for ln in after.split("\n") if ln.strip()]

@@ -1,151 +1,149 @@
-# Tracerfy skip-trace: audit + hardening
+# King County mailing enrichment: why it stopped, and how it recovers
 
-Branch: `feat/skip-trace-provider-abstraction`
-Worktree: `C:/Users/Windows/bridgeleads-worktrees/skiptrace-provider` (off `origin/main` @ 11c8ca7)
+Branch: `fix/king-source-health-recovery` · Worktree: `C:/Users/Windows/bridgeleads-worktrees/king-source-recovery`
 
-Scope: keep Tracerfy. Audit, harden, make failures visible. No provider swap,
-no provider-abstraction rewrite — the current architecture does not need one.
+Incident job: `7afdda0c-0362-46ff-9849-0c60b62a3ce8` (config `dsergtyujkmn`, king/WA pre_foreclosure, 2026-09-07 13:25 UTC)
 
 ---
 
-## Findings (all verified against prod + Tracerfy's live API, not inferred)
+## 1. What the evidence says
 
-| # | Sev | Finding | Evidence |
-|---|-----|---------|----------|
-| F1 | **Critical, LIVE** | 637 pending rows (15 jobs, 3 users) stuck at `status='submitting'` since 2026-09-03/09-05, up to 4 days. Their 637 Results sit at `skip_trace_status='queued'` → UI reads "Processing" forever. | prod query; all 637 have `tracerfy_queue_id IS NULL` |
-| F2 | **Critical, LIVE** | Dispatcher's post-accept bookkeeping (`skip_trace_dispatcher.py:190-241`) is **outside any try**. If `db.add`/`db.execute`/`db.commit` raises after Tracerfy accepted+charged the batch, the exception escapes the task: claim stays `submitting`, no `SkipTraceQueue` row exists, and the later webhook hits the `unknown_queue` no-op → **paid results permanently discarded**. | code read; **found by Codex**, confirmed by me |
-| F3 | High | 14 Tracerfy queues (Jun 7 – Jul 4; 673 rows, **743 credits**) exist on the account with no local `SkipTraceQueue` row. Their webhooks all no-op'd. This is F2's signature. Two pairs look like identical double-submissions (98183/98193, both 147 advanced rows / 144 credits, 45 min apart). | `GET /v1/api/queues/` vs local `skip_trace_queues` |
-| F4 | High | Rows are submitted with NULL/empty `state` (7 stuck + 1 stranded). Tracerfy requires address+city+state. On queue 162456 we sent 4 rows, Tracerfy's `rows_uploaded=3` — it **silently dropped** the state-less row. No pre-submit validation exists. | prod query + queue 162456 |
-| F5 | High | Ingest matches Tracerfy's echoed CSV address to our pending address by **exact lowercased string equality**. A non-matching row is silently `continue`d: no counter, no log, no terminal status. Row stays `submitted` forever and is never billed (`report_usage_from_webhook` counts only `'completed'`). | `tracerfy_ingest.py:306-314`; 1 live case on q162456 |
-| F6 | High | **Zero test coverage** on the entire ingest path — the code that maps provider results to leads, writes contacts, and advances billing. | no test references `ingest_tracerfy_batch` / `ingest_webhook_csv` |
-| F7 | Medium | `SkipTraceQueue.job_id/user_id` store only `claimed[0]`'s values, but batches are **cross-tenant**. Misleading ops/tenancy metadata. | `skip_trace_dispatcher.py:198` |
-| F8 | Medium | Ingest downloads + parses the CSV **before** taking the queue lock. Concurrent duplicate webhooks both download and parse; only the DB mutation is serialized. Wasteful, not incorrect. | `tracerfy_ingest.py:231` |
-| F9 | Medium | Orphan remote queues (F3) can never be ingested — the precheck rejects a missing `SkipTraceQueue`. No controlled adoption path exists. | `tracerfy_ingest.py:218` |
+All of this was read out of production, read-only.
 
-Alerting context (corrected after Codex challenge): `send_ops_alert` is **not**
-a silent no-op — it logs a WARNING and persists a durable `audit_events` row from
-a `finally`. But `OPS_ALERT_EMAIL` is empty in prod, so no human was ever paged,
-and under FORCE RLS the app role cannot SELECT `audit_events` to find the trail.
+### 1.1 The persisted block
 
-Verified NOT broken (do not "fix"):
-- `phone_dnc_flag` is always NULL from batch trace — **correct**. Tracerfy's batch
-  CSV carries no DNC (only the Instant Trace endpoint does). `map_dnc_status`
-  honestly reports "unknown" and `dialer_filters` excludes NULL from the TCPA-safe
-  default. Working as designed.
-- Phones/emails are encrypted at rest (`fe1:` Fernet). Confirmed, no plaintext.
-- Webhook auth, SSRF pinning, replay idempotency under the queue lock: all sound.
+`external_source_health` holds exactly one row:
 
----
+```
+source_key                 = king_erealproperty
+status                     = throttled
+first_seen_at              = 2026-09-04 11:15:39Z
+updated_at                 = 2026-09-07 03:02:14Z
+cooldown_until             = 2026-09-08 03:02:14Z
+consecutive_probe_failures = 0
+last_probe_at              = NULL
+last_success_at            = NULL
+reason = "King phase-1 circuit breaker tripped: 50/50 recent eRealProperty fetches
+          failed (last status=302) after 49 of 200 parcels. Aborting so a block is
+          never recorded as 'this parcel has no data'."
+```
 
-## Plan
+### 1.2 Timeline
 
-### Phase 1 — dispatcher: stop losing paid batches (F2, F4)
-- [x] 1a. Wrap the post-accept bookkeeping in a guard; on failure, durably record
-      the `queue_id` ↔ claim association and alert. Never leave a charged remote
-      queue with no local record.
-- [x] 1b. Pre-submit validation: rows missing address/city/state are removed from
-      the payload **before** the POST and marked terminally on **both**
-      `PendingSkipTraceRow` and `Result` (so the UI stops saying "Processing").
+| When (UTC) | Job | What happened |
+|---|---|---|
+| 09-04 07:40 - 10:33 | `60a0e80c` | King tax_delinquent, **17,157 parcels**. 173 looked up, 99 mailing found, 16,984 deferred. Budget exhausted, no error. |
+| 09-04 09:03 - 09:32 | `68d83263` | King tax_delinquent, **17,157 parcels**, **overlapping the job above**. 173 looked up, 16,983 deferred. |
+| 09-04 10:48 - 12:13 | `035501e3` | King tax_delinquent, **17,157 parcels**, third overlapping run. Breaker tripped **30/50** at 11:15:39. Source marked throttled, cooldown to 09-05 11:15. |
+| 09-05, 09-06 | (none) | No King jobs. Cooldown expired 09-05 11:15 and nothing probed the source. |
+| 09-07 01:37 - 03:10 | `230a1d0f` | King tax_delinquent, 17,157 parcels. Phase 1 tripped **50/50, last status=302** at 03:02:14. Re-armed to 09-08 03:02. 17,107 deferred. |
+| 09-07 13:25 - 13:32 | `7afdda0c` | **The reported job.** Never made a single eRealProperty request: the gate raised `SourceUnavailableError` immediately. 153 parcels deferred. |
 
-### Phase 2 — automated stale-claim reconciliation (F1, F9)
-- [x] 2a. On a stale claim, call `GET /v1/api/queues/` and decide, using Codex's
-      conservative predicate: same `trace_type`, `created_at` inside the claim
-      window, `rows_uploaded <= len(claimed)` (never `==` — Tracerfy dedupes),
-      `rows_uploaded > 0`, and **exactly one** candidate. No match → release to
-      `queued`. One match → adopt its `queue_id`. Ambiguous → alert, never guess.
-      Never blind-resubmit.
+### 1.3 Live probes I ran
 
-### Phase 3 — ingest: no silent drops (F5)
-- [x] 3a. Count + log unmatched CSV rows and unmatched pending rows, give them a
-      terminal status, and alert. Deliberately **not** adding a fuzzy/normalized
-      fallback matcher: there is no evidence Tracerfy standardizes addresses
-      (126/126 completed rows matched exactly), and Codex confirmed a normalized
-      street match risks cross-lead contamination (units, duplexes, directionals).
-      Measure first — Phase 3a is the measurement.
+* From my workstation and from the **production worker container**, `blue.kingcounty.com/Assessor/eRealProperty/Dashboard.aspx?ParcelNbr=` returns **200** today, no redirect, no cookies. Parsers all still match: Site Address, the `Parcel Number` echo cell, the owner `Name` cell, and the `payment.kingcounty.gov` tax link all extract correctly on real parcels from this job.
+* Leading-zero King tax parcel ids (`0000800015`, ...) are **not** the trigger. All 200, all echoing correctly.
+* **60 consecutive requests at the exact production pacing (`asyncio.sleep(0.1)`), from the production worker's own IP: 60/60 = 200, avg 0.29 s, p95 0.45 s, 23.7 s wall.** Effective serial rate is **2.5 req/s**, not the ~10 req/s the code's docstring assumes.
 
-### Phase 4 — tests (F6)
-- [x] 4a. Ingest: successful match, no-match vs failure, unmatched row, webhook
-      replay billing idempotency, cross-tenant batch isolation, phone/email dedupe.
-- [x] 4b. Dispatcher: post-accept bookkeeping failure, stale reconciliation
-      (no-match / single-match / ambiguous), dedupe count mismatch, invalid-address
-      terminal status.
+So the upstream condition is over, the endpoint has not moved, the request format is unchanged, and production pacing at this volume does not self-throttle.
 
-### Phase 5 — repair (separate, reviewed, run after Phases 1-4 deploy)
-- [x] 5a. Read-only reconciliation report for the 637 + the 14 orphan queues.
-- [x] 5b. Release the 637 — **DONE, and the script was never needed.** Deploying
-      Phase 2 released them automatically, verified in production 2026-09-07:
-      `pending_skip_trace_rows` with status='submitting' is now **0** (was 637),
-      635 sit at 'queued' awaiting submission, 2 were terminally 'errored' by the
-      new pre-submit validation, and no Result is left showing "Processing".
-      Those rows were claimed 09-03/09-05, so any PITR restore point would have
-      brought them back as 'submitting' — the move to 'queued' can only have come
-      from the reconciler.
+### 1.4 Why property succeeded and mailing did not
+
+They are **different sources**.
+
+* Property address: `county_gis.batch_enrich_parcels_gis` to the King **ArcGIS** parcel layer, batched. Not gated by `king_erealproperty` health. 153 parcels in 3 seconds, 109 rows filled.
+* Mailing address: **eRealProperty** HTTP (phase 1, for the tax-bill URL) then **payment.kingcounty.gov** via Playwright (phase 2). Gated by `check_source_or_raise(KING_EREALPROPERTY)`, which raised before request #1.
+
+The property pass never touched the throttled source. That is the whole explanation.
 
 ---
 
-## Open decisions for the owner
+## 2. Root cause, in layers
 
-1. **Billing an accepted-but-unmatched row.** Tracerfy charges per accepted row.
-   Today an unmatched row is silently not billed to the user. Codex argues for
-   billing it ("provider attempted the lookup"). I disagree on defaulting to that:
-   an unmatched row is *our* reconciliation bug, and charging a user for a lead
-   they never received is user-hostile. Phase 3a makes it visible and alertable
-   without changing who pays. **Billing policy change is yours to make.**
-2. `OPS_ALERT_EMAIL` is unset in production. Every one of the 15 alert call sites
-   is currently mute. This is the reason F1 ran for 4 days unnoticed.
+**L1 - upstream, transient, and over.** Something at King answered a run of phase-1 fetches with failures on 09-04 and again on 09-07 (the 50th was a `302`). It is no longer happening. What made it happen is *not* provable from the telemetry we kept (see L4). The 09-04 event coincides with **three 17,157-parcel King jobs running concurrently** with no cross-job rate coordination, which is the most plausible trigger for the first trip.
+
+**L2 - THE REAL BUG: the cooldown has no recovery path.**
+`sources_due_for_probe()`, `mark_probe_failed()` and `mark_source_healthy()` in `src/scrapers/enrichment/source_health.py` are called **only from `tests/test_source_health.py`**. There is no production caller. The module docstring promises a source stays unhealthy "until a canary clears it". That canary was never built. `canary_check` in the beat schedule probes **county connectors**, not enrichment sources.
+
+The database proves it: `last_probe_at = NULL` and `consecutive_probe_failures = 0` after three days of being throttled. The only way out is passive expiry, and then the next King job spends 50 requests rediscovering the block and re-arms another 24 hours.
+
+**L3 - "deferred" is a dead end.** `enrichment_data["mailing_lookup_deferred"] = True` is written at `src/workers/tasks_helpers/enrich.py:715` and **read nowhere in production code**. The comment says "so a later sweep can find them (never a silent gap)". There is no sweep. Deferred means *permanently skipped* unless a human re-runs the job. Outstanding today: 153 + 17,107 + 16,983 + 16,984 parcels.
+
+**L4 - we cannot attribute the failures.** The breaker's reason keeps only `last status=`. The other 49 failures could be any mix of non-200s and exceptions; the exception path logs at DEBUG and production runs at INFO. **I cannot claim all 50 were 302 - only the 50th was.**
+
+**L5 - the job reported success it did not have.** "Enrichment complete - addresses added" after 0/153 mailing lookups, and the user-facing log copy contains em dashes.
 
 ---
 
-## Review
+## 3. Counts, reconciled (no billing defect in the headline numbers)
 
-### Shipped (6 commits on `feat/skip-trace-provider-abstraction`)
+| Number | Meaning | Verified |
+|---|---|---|
+| 155 | rows scraped and persisted to `results` | `count(*) = 155` |
+| 46 | `is_duplicate = true` | yes |
+| 109 | `is_duplicate = false` | yes |
+| 76 | non-duplicate **and** actionable (has property or mailing address) = `record_count` = `billed_count` | yes |
+| 33 | non-duplicate with **no** address | yes |
+| 13 | duplicate with no address | yes |
+| 46 | "no deliverable address" = 33 + 13 | reconciles exactly |
 
-| Commit | What |
-|---|---|
-| `c1099e9` | Guard the post-accept bookkeeping (F2); reject untraceable rows (F4) |
-| `25cc8fb` | Automated stale-claim reconciliation against Tracerfy's queue list (F1, F9) |
-| `e7bcecb` | Settle ingest rows the CSV never named (F5); first ingest tests (F6) |
-| `b979575` | One-off repair script + orphan-queue report (Phase 5) |
-| `bc92658` | Codex round 1: double-charge + cross-batch adoption + redrive durability |
-| `1874658` | Codex round 2: release window, attribution guard, missing `on_failure` |
+**108 vs 109 is real but harmless.** "108 new leads" is `len(claimed_hashes)`, the count of distinct dedup hashes claimed. Two non-duplicate rows share one hash, so 109 rows claimed 108 hashes.
 
-### Codex rounds
+> **Separate pre-existing defect, found while reconciling (NOT part of this fix):** those two rows are `SANNES RICHARD` and `SANNES RICHARD / SANNES HEIDI`, same parcel `2154900130`, same address, different recording dates, **same `dedup_hash`, both `is_duplicate = false`, both actionable** - so the same property was billed twice in this job. Intra-job hash collisions are not being collapsed. Reporting for a separate PR; it is a different subsystem and mixing it in here would be wrong.
 
-**Round 1 — 6 findings, 4 accepted.** Two were mine and severe: the post-accept
-bookkeeping ran unguarded (the live cause of the 14 orphaned paid queues), and
-the reconciler released a claim whose queue was merely *pending*, which would
-have resubmitted and double-charged. One finding (ingest match key) was rejected
-**with measurement** rather than argument: production has exactly one in-batch
-key collision ever and it is benign.
+---
 
-**Round 2 — 3 findings, all 3 accepted, all in my own round-1 fixes.**
-Release and adoption were sharing one window; the attribution guard had two
-escape routes (one answer + differently-named rows, and all-NULL advanced
-names); and `on_failure` never existed despite the docstring claiming it, which
-my new redrive sweep would have turned into an infinite re-enqueue.
+## 4. CSV timing (not a bug)
 
-**Round 3** cut off mid-run (no final message). Its open question — whether
-assigning `.on_failure` on a Celery task instance actually fires — was answered
-empirically instead, with two tests that invoke the hook the way Celery does and
-assert on the database. Both pass.
+The CSV is built at 13:32:40 from the **persisted rows**, uploaded, and then **re-exported after enrichment to the same R2 object key** (`src/workers/tasks.py:1569-1590`, guarded on the post-enrichment refetch succeeding). The first export's comment says so explicitly: "Mailing is NULL pre-enrichment; the later re-export refreshes it."
 
-### Not fixed, deliberately
+Still to verify with the actual file: the R2 credentials available to me have no read grant (`GetObject` returns 401), so I will confirm through the app's own download path during live verification.
 
-- **F7** `SkipTraceQueue.job_id/user_id` still store `claimed[0]`'s values on a
-  cross-tenant batch. Documented in place as non-authoritative; nothing reads
-  them for tenancy (ingest re-derives per-user attribution from the pending
-  rows). Changing the columns is a migration for cosmetics.
-- **F8** ingest downloads and parses the CSV before taking the queue lock.
-  Wasteful under a duplicate webhook, never incorrect — the lock still
-  serialises every mutation.
-- Two genuinely different people with the same normalised name at one address
-  would be treated as one owner. Indistinguishable from the same person with the
-  data available.
-- The 8 prod rows whose address carries a ZIP but no city/state
-  (`'325 HARVARD AVE E #401 98102'`) are declined rather than recovered. The
-  scraper config knows its own `state`, so passing it into
-  `build_pending_row_payload` would rescue most of them — a real follow-up, but
-  it means threading a new argument through a hot path for 0.16% of rows.
-- One prod address has legal-notice text bleeding into `property_address`
-  (`'3046 36th Avenue W, Seattle, WA 98199 I. NOTICE IS HEREBY ...'`). That is
-  an NTS parser defect, not a skip-trace one.
+---
+
+## 5. Tracerfy: nothing was charged and nothing is at risk
+
+* All 155 rows are `skip_trace_status = 'not_attempted'`, `pending_skip_trace_rows` for this job = 0. This config has `skip_trace_enabled` off, so the enqueue returned before any work.
+* Skip trace keys off **`property_address`**, not mailing. A deferred mailing lookup neither blocks nor degrades it.
+* The enqueue filter is `skip_trace_status == 'not_attempted' AND is_duplicate is False AND property_address IS NOT NULL AND actionable_condition()`. Any recovery that only fills `mailing_address` cannot re-trigger a trace, and the recovery sweep will not call the enqueue at all.
+
+---
+
+## 6. Plan
+
+Phased, each phase small enough to verify on its own.
+
+### Phase 1 - the missing canary (the headline fix)
+- [ ] Beat task that calls `sources_due_for_probe()`, issues **one** cheap probe per due source, then `mark_source_healthy()` or `mark_probe_failed()`. Uses only functions that already exist and are already tested.
+- [ ] Register it in `src/workers/scheduler.py`.
+- [ ] Tests: recovery after cooldown, probe failure escalates, healthy source is not probed.
+
+### Phase 2 - proportionate first cooldown rung
+- [ ] Ladder `24/48/72h` becomes `1h/6h/24h/48h/72h`. A transient blip clears in an hour; a genuinely angry source still escalates to days. Justified by evidence: both outages were over within hours yet blocked us for days. This is **not** shortening a cooldown to silence a warning; the canary added in Phase 1 is what actually decides recovery.
+- [ ] Tests for each rung.
+
+### Phase 3 - deferred mailing recovery
+- [ ] Bounded beat sweep: rows with `mailing_lookup_deferred` and no mailing address, oldest first, capped per tick, respecting the source-health gate.
+- [ ] Must not enqueue skip trace, must not create a job, must not touch quota or billing, must clear the marker on success.
+- [ ] Tests: retry fills mailing, does not duplicate a lead, does not consume quota, does not enqueue Tracerfy, preserves existing property/mailing values, leaves missing source values NULL.
+
+### Phase 4 - breaker diagnostics
+- [ ] Record a status-code / exception-class histogram plus the redirect target host and path (no query string) in the persisted reason and in one structured log line.
+- [ ] **Deliberately NOT switching eRealProperty to `safe_get_following`.** `parcel_page_is_for()` trusts a page with no parcel cell when the requested id is a well-formed 10-digit King PIN, so following a 302 to a block page would give us a 200 we would then record as "this parcel has no data", exactly what the breaker exists to prevent. Keep `allow_redirects=False`; only record where the redirect pointed, so the next occurrence names itself.
+
+### Phase 5 - honest status and no em dashes
+- [ ] Report partial enrichment accurately when property succeeded and mailing was deferred.
+- [ ] Keep user-facing copy free of internal service names, exception class names and breaker details.
+- [ ] Zero em dashes in modified user-facing copy.
+
+### Phase 6 - cross-job request-rate bound
+- [ ] Shared lease so concurrent King jobs serialise their eRealProperty use instead of multiplying the rate (three concurrent 17k jobs on 09-04 is the evidence).
+
+### Deliberate non-changes
+- Not raising `30/50` or `50/50`. Not disabling the breaker. Not touching billing, plan limits or Tracerfy. Not changing other counties' scrapers.
+
+---
+
+## 7. Review section
+
+(to be filled in after implementation)

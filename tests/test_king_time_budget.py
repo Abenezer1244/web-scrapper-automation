@@ -130,7 +130,9 @@ def test_mailing_only_mode_seeds_a_row_for_every_parcel():
     seeded = {}
     captured = {}
 
-    async def _fake_phase(results, tax_urls, st, over, pace):
+    async def _fake_phase(results, tax_urls, st, over, pace, **kwargs):
+        # **kwargs so the stub tolerates phase 2's admission parameter. The
+        # assertion below is about ROW SEEDING and is untouched by it.
         captured.update({"results": results, "tax_urls": tax_urls})
         return results
 

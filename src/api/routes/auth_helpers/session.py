@@ -1,5 +1,5 @@
-"""Body logic for GET /auth/onboarding. Extracted from auth.py — the route
-decorator + signature stay in auth.py; this holds the moved handler body.
+"""Body logic for GET /auth/onboarding. Extracted from auth.py: the route
+decorator and signature stay in auth.py, this holds the moved handler body.
 
 ``next_action.route`` is rendered straight into a next/link href by the dashboard
 onboarding card, so every value here comes from ``src.config.frontend_routes``
@@ -62,7 +62,7 @@ async def onboarding_status_for_user(
         next_action = {
             "action": "run_scrape",
             "title": f"Run your first scrape on {config.county.title()}, {config.state.upper()}",
-            "description": "Click 'Run Now' to start pulling records from the county portal.",
+            "description": "Open your scrapers and click 'Run now' to start pulling records from the county portal.",
             "cta": "Open Scrapers",
             "route": frontend_routes.SCRAPERS,
         }

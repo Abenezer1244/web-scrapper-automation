@@ -1,37 +1,65 @@
 # Fix: onboarding next_action routes 404 (dead `/dashboard/*` prefix)
 
-## Reproduced (live, prod)
-- Fresh account `memiki70+bl404repro@gmail.com` registered + verified on prod.
-- `GET https://api.bridgeleads.io/auth/onboarding` returns
+## Reproduced (live, production)
+- Registered + verified a controlled fresh account on prod
+  (`memiki70+bl404repro@gmail.com`), Pro trial, 6 days remaining.
+- `GET https://api.bridgeleads.io/auth/onboarding` returned
   `next_action.route = "/dashboard/scrapers/new"`.
-- Playwright/Chromium against `https://app.bridgeleads.io`: clicking the
-  onboarding "New Scraper" CTA lands on `/dashboard/scrapers/new` and renders the
-  404 page. Confirmed at 320 / 375 / 390 / 430 / 1440.
+- Playwright/Chromium against `https://app.bridgeleads.io`: the onboarding
+  "New Scraper" CTA carried `href="/dashboard/scrapers/new"`, landed there, and
+  rendered the 404 page. Reproduced at 320 / 375 / 390 / 430 / 1440.
+  Network showed `404 /dashboard/scrapers/new` plus two RSC prefetch 404s.
 
 ## Root cause
-The Next.js app puts every signed-in page under the route GROUP
-`app/(dashboard)/...`. A parenthesised segment is NOT part of the URL, so the real
-paths are `/scrapers/new`, `/results/<id>`, `/scrapers`. The backend's
-`onboarding_status_for_user` hardcodes a literal `/dashboard` prefix that the
-frontend has never served. Four of the five `next_action.route` values are dead.
+The Next.js app keeps every signed-in page inside the route GROUP
+`app/(dashboard)/...`. A parenthesised segment contributes NOTHING to the URL, so
+the served paths are `/scrapers/new`, `/results/<id>`, `/scrapers`. The backend's
+`onboarding_status_for_user` hardcoded a `/dashboard` prefix that the frontend has
+never served. Not a bad href: the frontend renders whatever route string the API
+hands it, and every one of the frontend's own nine scraper-creation links was
+already correct.
 
-| next_action | emitted route | real route |
+| next_action | was | now |
 |---|---|---|
 | create_scraper | `/dashboard/scrapers/new` | `/scrapers/new` |
-| run_scrape | `/dashboard/scrapers/<id>` | `/scrapers` (Run now lives on the list row; no per-scraper detail page exists) |
-| wait_for_scrape | `/dashboard` | `/dashboard` (valid) |
-| download_export | `/dashboard/jobs/<id>` | `/results/<id>` (job detail page) |
+| run_scrape | `/dashboard/scrapers/<id>` | `/scrapers` (no per-scraper page exists; Run now is a list row) |
+| wait_for_scrape | `/dashboard` | `/dashboard` (unchanged, real page) |
+| download_export | `/dashboard/jobs/<id>` | `/results/<id>` (no /jobs page exists) |
 | complete | `/dashboard/scrapers/new` | `/scrapers/new` |
 
-## Todo
-- [ ] Consult Codex on the approach before writing code
-- [ ] Add `src/config/frontend_routes.py` (single definition of the app paths)
-- [ ] Point `onboarding_status_for_user` at those helpers
-- [ ] Reuse the helpers in `src/workers/onboarding_emails.py` (already correct, but
-      duplicated literals are what drifted)
-- [ ] Tests: every onboarding state emits a known-good route; no emitted route
-      starts with `/dashboard/`
-- [ ] Run pytest via `bl-testenv/run-full-pytest.sh` (never bare pytest)
-- [ ] Codex review of the diff
-- [ ] Playwright re-verify against a locally served frontend + patched API
-- [ ] Review section
+## Done
+- [x] Reproduce live on prod, fresh account, all viewports
+- [x] Trace the CTA to its source (server-supplied `next_action.route`)
+- [x] Audit every backend-emitted frontend path
+- [x] `src/config/frontend_routes.py` as the single definition
+- [x] `onboarding_status_for_user` uses it
+- [x] `onboarding_emails.py` uses it (was already correct, but duplicated)
+- [x] `tests/test_onboarding_routes.py`: every onboarding state, plan gating,
+      unauthenticated, and a literal transcription of the frontend page list
+- [x] Codex review round 1
+- [x] Fix Codex findings: `/signup` referral link, overpromising CTA labels,
+      circular test oracle, trial-less "Pro trial" fixture
+- [x] ruff clean, full pytest suite green
+- [x] Playwright end-to-end against the fixed API response
+- [ ] Codex review round 2 (quota-blocked, retry after 6:10 AM)
+
+## Also found and fixed (same defect class)
+`GET /billing/referral` handed the referrer `<app>/signup?ref=<code>`. `/signup`
+is not a page and is not public, so a prospect following a shared link was
+redirected to `/login` and the ref code was dropped. Verified on prod:
+`/signup?ref=ABC123` -> 307 to login, `/register?ref=ABC123` -> 200, and the
+register page reads `?ref=` at mount. Now `/register?ref=<code>`.
+
+## Known, pre-existing, NOT fixed here
+`first_export_downloaded` is set from `job.export_key`, which the worker writes
+when it marks the job done, before anyone downloads anything. So a successful job
+skips the `download_export` state entirely and jumps to `complete`, and the
+`download_export` branch only fires for a done job with no export (whose export
+endpoint 404s by design). Milestone naming, not routing. Worth its own change.
+
+## Review
+The bug was one class: the backend inventing a frontend URL from a folder name.
+Four of five onboarding routes and the referral share link were dead. The fix is
+worth less than the guard: `tests/test_onboarding_routes.py` holds its own literal
+copy of the frontend's page list, so a route that does not correspond to a real
+`page.tsx` fails, and any `/dashboard/`-prefixed route fails outright.

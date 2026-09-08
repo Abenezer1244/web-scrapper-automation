@@ -130,7 +130,8 @@ async def test_trial_user_on_pro_gets_the_same_creation_route(
     data = await _onboarding(client, create_secure_token(user.id))
     assert data["next_action"]["route"] == "/scrapers/new"
     assert data["steps"]["scraper_configured"] is False
-    assert data["trial_days_remaining"] == 5  # 6 days out, minus the part-day
+    # 6 days out, so the whole-day count reads 5 (or 6 on an exact-second read).
+    assert data["trial_days_remaining"] in (5, 6)
 
 
 # ─── The later onboarding states ──────────────────────────────────────────────

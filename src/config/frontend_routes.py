@@ -1,4 +1,4 @@
-"""Canonical frontend paths — the single place the API decides where in the app
+"""Canonical frontend paths: the single place the API decides where in the app
 a link should land.
 
 The Next.js app keeps every signed-in page inside the ``app/(dashboard)/`` route

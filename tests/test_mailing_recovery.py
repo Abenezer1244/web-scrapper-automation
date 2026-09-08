@@ -456,3 +456,37 @@ class TestAttemptAccountingUnderFailure:
             text("SELECT enrichment_data FROM results WHERE id = :i"), {"i": untried})).scalar()
         assert a["mailing_recovery_attempts"] == 1
         assert b.get("mailing_recovery_attempts") in (None, 0)
+
+
+class TestUnattemptedParcelsRotate:
+    async def test_a_parcel_we_could_not_reach_moves_to_the_back(self, db, business_user,
+                                                                 monkeypatch):
+        """Ordering is (attempts, last_at). A parcel we requested but could not
+        mailing-attempt keeps its attempt count, so without touching `last_at` the
+        same thirty unresolvable parcels are the first thirty candidates on every
+        tick and starve the whole backlog behind them (Codex)."""
+        _, job_id = await _king_job(db, business_user)
+        rid = await _deferred_row(db, business_user, job_id, parcel="1234500030")
+
+        async def _phase1_only(parcels, **kw):
+            st = kw.get("stats")
+            if st is not None:
+                st["deferred"] = list(parcels)
+                st["unreached"] = []
+                st["requested_pids"] = list(parcels)
+                st["mailing_attempted_pids"] = []   # phase 2 never reached it
+            return {}
+
+        monkeypatch.setattr(
+            "src.scrapers.enrichment.king_county_assessor.batch_enrich_king_county",
+            _phase1_only,
+        )
+        await asyncio.to_thread(mr.recover_deferred_king_mailing)
+
+        ed = (await db.execute(
+            text("SELECT enrichment_data FROM results WHERE id = :i"), {"i": rid})).scalar()
+        # No mailing retry spent...
+        assert ed.get("mailing_recovery_attempts") in (None, 0)
+        assert ed["mailing_lookup_deferred"] is True
+        # ...but it no longer sits at the head of the queue.
+        assert ed.get("mailing_recovery_last_at")

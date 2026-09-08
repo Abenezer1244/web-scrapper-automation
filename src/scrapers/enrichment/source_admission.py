@@ -46,6 +46,10 @@ _logger = setup_logger("enrichment.source_admission")
 # most this long before the source frees up again.
 _LEASE_TTL_S = 900
 
+# How long we may keep working after a renewal we could not confirm. Short
+# enough that an unconfirmed holder stops well inside the lease TTL.
+_RENEWAL_GRACE_S = 120.0
+
 # How long a caller waits for admission before giving up and deferring its work.
 _MAX_WAIT_S = 60.0
 _POLL_S = 2.0
@@ -72,6 +76,14 @@ class SourceAdmission:
         self.source_key = source_key
         self.max_wait_s = max_wait_s
         self.admitted = False
+        # PERMISSION TO WORK (`admitted`) and OWNERSHIP REQUIRING CLEANUP
+        # (`holds_lease`) are different facts. Conflating them meant a caller that
+        # acquired the lease and then found its budget spent set `admitted=False`,
+        # and `__exit__` skipped the release: the source stayed locked for the full
+        # TTL while nobody was using it (Codex).
+        self.holds_lease = False
+        self._lost = False
+        self._confirmed_at = 0.0
         self._token = uuid.uuid4().hex
         self._client = None
 
@@ -92,6 +104,8 @@ class SourceAdmission:
                 if self._client.set(_key(self.source_key), self._token,
                                     nx=True, ex=_LEASE_TTL_S):
                     self.admitted = True
+                    self.holds_lease = True
+                    self._confirmed_at = time.monotonic()
                     return self
             except Exception as exc:  # noqa: BLE001 -- fail OPEN
                 _logger.warning(
@@ -123,7 +137,9 @@ class SourceAdmission:
         Fails OPEN on a Redis error, for the same reason acquisition does: losing
         enrichment entirely because a lock backend blipped is the worse outcome.
         """
-        if not self._client or not self.admitted:
+        if self._lost:
+            return False  # already established that we lost it; stay stopped
+        if not self._client or not self.holds_lease:
             return True  # never acquired a real lease; nothing to lose
         try:
             renewed = self._client.eval(
@@ -137,17 +153,39 @@ class SourceAdmission:
                     self.source_key,
                 )
                 self.admitted = False
+                self.holds_lease = False
+                self._lost = True
                 return False
+            self._confirmed_at = time.monotonic()
             return True
-        except Exception as exc:  # noqa: BLE001 -- fail OPEN
+        except Exception as exc:  # noqa: BLE001
+            # NOT a blanket fail-open. Returning True here regardless would keep a
+            # worker running on ownership it can no longer establish, right past
+            # the TTL, alongside whoever acquired the lease next (Codex). A short
+            # blip is tolerated; beyond a conservative local bound we stop, because
+            # after that we genuinely do not know whether we still hold it.
+            _stale = time.monotonic() - self._confirmed_at
+            if _stale > _RENEWAL_GRACE_S:
+                _logger.warning(
+                    "Source admission: cannot confirm the %s lease for %.0fs (%s) — "
+                    "stopping requests rather than assuming we still hold it",
+                    self.source_key, _stale, str(exc)[:100],
+                )
+                self.admitted = False
+                self.holds_lease = False
+                self._lost = True
+                return False
             _logger.warning(
-                "Source admission: renewal check failed (%s) — continuing",
+                "Source admission: renewal check failed (%s) — continuing for now",
                 str(exc)[:120],
             )
             return True
 
     def __exit__(self, *exc_info) -> None:
-        if not self._client or not self.admitted:
+        # Release on OWNERSHIP, not on permission-to-work: a caller whose budget
+        # was consumed during acquisition still holds the lease and must hand it
+        # back, or the source stays locked for the whole TTL for nothing.
+        if not self._client or not self.holds_lease:
             return
         try:
             # Compare-and-delete: only the holder that wrote this token may

@@ -161,7 +161,9 @@ _CANDIDATE_PARCELS_SQL = """
       AND lower(sc.county) = 'king'
       AND upper(sc.state) = 'WA'
     ORDER BY btrim(r.parcel_id),
-             coalesce((r.enrichment_data->>'mailing_recovery_attempts')::int, 0) ASC
+             coalesce((r.enrichment_data->>'mailing_recovery_attempts')::int, 0) ASC,
+             coalesce(r.enrichment_data->>'mailing_recovery_last_at', '') ASC,
+             r.id ASC
 """
 
 _CANDIDATE_SQL = """
@@ -298,7 +300,50 @@ def _recover_impl(stats: dict) -> dict:
         stats["parcels"] = len(attempted)
         stats["unreached"] = len(parcels) - len(attempted)
         _apply(db, by_parcel, attempted, enriched, stats)
+
+        # Parcels we REQUESTED but could not mailing-attempt (phase 1 failed, or
+        # the budget ran out before phase 2 reached them) keep their attempt count
+        # — they have not spent a mailing retry — but they must not keep their
+        # place at the head of the queue. Ordering is (attempts, last_at), so
+        # without touching last_at the same thirty unresolvable parcels are the
+        # first thirty candidates on every single tick and starve the entire
+        # backlog behind them (Codex). Touching the timestamp rotates them.
+        _touch = [p for p in parcels if p not in set(attempted)]
+        if _touch:
+            _rotate(db, by_parcel, _touch, stats)
     return stats
+
+
+def _rotate(db, by_parcel: dict, parcels: list[str], stats: dict) -> None:
+    """Move un-attempted parcels to the back of the queue without charging them."""
+    now_iso = _now().isoformat()
+    payload = _json({LAST_AT_KEY: now_iso})
+    moved = 0
+    for pid in parcels:
+        for row in by_parcel.get(pid, []):
+            try:
+                db.execute(
+                    sa_text(
+                        "UPDATE results SET enrichment_data = "
+                        "  (COALESCE(enrichment_data::jsonb, '{}'::jsonb) "
+                        "   || CAST(:payload AS jsonb))::json "
+                        "WHERE id = :rid AND user_id = :uid AND mailing_address IS NULL"
+                    ),
+                    {"rid": row.id, "uid": row.user_id, "payload": payload},
+                )
+                db.commit()
+                moved += 1
+            except Exception as exc:  # noqa: BLE001
+                db.rollback()
+                _logger.warning(
+                    "Mailing recovery: could not rotate row %s: %s",
+                    str(row.id)[:8], str(exc)[:120],
+                )
+    if moved:
+        _logger.info(
+            "Mailing recovery: rotated %d row(s) across %d un-attempted parcel(s) "
+            "to the back of the queue", moved, len(parcels),
+        )
 
 
 def _apply(db, by_parcel: dict, parcels: list[str], enriched: dict, stats: dict) -> None:

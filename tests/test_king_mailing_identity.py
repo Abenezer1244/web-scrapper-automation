@@ -197,3 +197,56 @@ class TestAttemptedButUnknownIsDeferred:
         assert st["deferred"] == []
         st_none = self._run_stats("Parcel 123450-0000\nBilling Details\n")
         assert st_none["deferred"] == []
+
+
+class TestPartialRenderIsNeverTerminal:
+    """A page we never saw finish is not evidence that a section is empty.
+
+    `wait_for_function` has a 4s timeout whose exception was swallowed, so a page
+    that had rendered the parcel number but not yet the mailing section satisfied
+    "our parcel, no Mailing Address block" and became a TERMINAL `none`. The sweep
+    then cleared the deferred marker after that single attempt: permanent silent
+    loss, the exact class of defect this whole change exists to remove (Codex).
+    """
+
+    class _NeverSettles(_Page):
+        async def wait_for_function(self, *_a, **_k):
+            raise TimeoutError("render never settled")
+
+    def _run_unsettled(self, body: str, pid: str = "1234500000") -> dict:
+        import contextlib
+
+        class _S(_Scraper):
+            def __init__(self, b):
+                self.page = TestPartialRenderIsNeverTerminal._NeverSettles(b)
+
+        results = {pid: {}}
+        tax_urls = {pid: "https://payment.kingcounty.gov/Home/Index?Search=" + pid}
+        st: dict = {"requested": 1, "deferred": [], "unreached": [],
+                    "requested_pids": [], "mailing_attempted": 0}
+
+        async def _go():
+            return await kca._king_mailing_phase(results, tax_urls, st, lambda: False, 0.0)
+
+        with contextlib.ExitStack() as stack:
+            mp = stack.enter_context(pytest.MonkeyPatch.context())
+            mp.setattr(kca, "BridgeScraper", lambda *a, **k: _S(body))
+            real_sleep = asyncio.sleep
+
+            async def _noop(_s):
+                await real_sleep(0)
+
+            mp.setattr(kca.asyncio, "sleep", _noop)
+            asyncio.run(_go())
+        return {"result": results[pid], "stats": st}
+
+    def test_a_page_that_never_settled_is_not_none(self):
+        out = self._run_unsettled("Parcel 123450-0000\nLoading...\n")
+        # Unknown, so the parcel stays recoverable instead of being written off.
+        assert out["result"]["mailing_lookup"] != "none"
+        assert "1234500000" in out["stats"]["deferred"]
+
+    def test_an_explicit_no_accounts_is_still_terminal_even_unsettled(self):
+        # The county's own answer needs no render guarantee.
+        out = self._run_unsettled("No accounts found for this search\n")
+        assert out["result"]["mailing_lookup"] == "none"

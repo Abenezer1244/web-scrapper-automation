@@ -18,7 +18,14 @@ from src.api.dialer_filters import dialer_ready_conditions
 from src.api.lead_actionability import actionable_condition, has_address_condition
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.owner_filters import build_owner_conditions
-from src.api.schemas import JobCreate, JobResponse, LogLine, ResultRow, ResultsPage
+from src.api.schemas import (
+    DuplicateSource,
+    JobCreate,
+    JobResponse,
+    LogLine,
+    ResultRow,
+    ResultsPage,
+)
 from src.api.tax_filters import build_tax_conditions, tax_cap_condition
 from src.config import settings
 from src.config.constants import CANCELLABLE_STATUSES, PRIORITY_QUEUE_PLANS
@@ -514,12 +521,94 @@ async def get_results(
     )
     new_count = new_count_result.scalar_one()
 
+    # ── Where this job's duplicates came from (migration 089) ───────────────
+    # Read off results.duplicate_source_* — stamped by the worker at the moment
+    # each row was classified. NOT a live join against delivered_records: that
+    # table is worker-only (bridgeleads_app holds no privilege on it and
+    # provision_rls_roles.sql hard-fails if it ever does), its claims are
+    # released and re-claimed so a read-time join answers "who holds this now"
+    # rather than "who held it then", and 82% of its production rows already
+    # point at a purged job.
+    #
+    # Scoped to the SAME actionable predicate as duplicate_count above, so the
+    # groups sum to the number the banner renders instead of disagreeing with it.
+    # Rows stamped before 089 have a NULL source and land in `unattributed`.
+    dup_source_rows = await db.execute(
+        select(
+            Result.duplicate_source_job_id,
+            func.max(Result.duplicate_source_at).label("run_at"),
+            func.count().label("n"),
+        )
+        .where(
+            Result.job_id == job_id,
+            Result.user_id == current_user.id,
+            Result.is_duplicate.is_(True),
+            actionable_condition(),
+            func.coalesce(Result.duplicate_reason, "prior_run") != "same_run",
+        )
+        .group_by(Result.duplicate_source_job_id)
+        .order_by(func.count().desc())
+    )
+    grouped = dup_source_rows.all()
+    unattributed_duplicate_count = sum(
+        g.n for g in grouped if g.duplicate_source_job_id is None
+    )
+    named = [g for g in grouped if g.duplicate_source_job_id is not None]
+
+    # A source job may have been purged. Confirm each still exists, still belongs
+    # to this user, and actually FINISHED before offering a link to it. The id is
+    # stamped without a foreign key on purpose, so a dangling pointer is expected
+    # rather than exceptional. The `done` check is separate and load-bearing: a
+    # claim is written BEFORE its job completes, so a run that crashed after
+    # claiming (and then released those claims) must never be presented as the
+    # run that delivered these leads.
+    #
+    # One batched query, not one per group: the group count is bounded by this
+    # user's prior runs of this scraper, which is small but not fixed, and an
+    # unbounded per-group round trip on a read path is how a results page starts
+    # timing out for the heaviest accounts.
+    linkable: set[str] = set()
+    if named:
+        avail = await db.execute(
+            select(Job.id).where(
+                Job.id.in_([g.duplicate_source_job_id for g in named]),
+                Job.user_id == current_user.id,
+                Job.status == "done",
+            )
+        )
+        linkable = {str(j) for j in avail.scalars().all()}
+
+    duplicate_sources = [
+        DuplicateSource(
+            job_id=g.duplicate_source_job_id,
+            run_at=g.run_at,
+            duplicate_count=g.n,
+            job_available=str(g.duplicate_source_job_id) in linkable,
+        )
+        for g in named
+    ]
+
+    # Same-run collapses (trustee_sale siblings on one property). These were
+    # never previously delivered, so they are counted apart and the copy for
+    # them must not say "already received".
+    same_run_result = await db.execute(
+        select(func.count()).where(
+            Result.job_id == job_id,
+            Result.user_id == current_user.id,
+            Result.is_duplicate.is_(True),
+            Result.duplicate_reason == "same_run",
+            actionable_condition(),
+        )
+    )
+    same_run_duplicate_count = same_run_result.scalar_one()
+
     # When results are empty (all duplicates or no new leads), find
     # the most recent previous job for the same county/record_type
     # that has actual Result rows, so the user can navigate there.
     # Searches across ALL scraper configs for the same county+type,
     # not just the same config_id.
     previous_job_id = None
+    previous_job_run_at = None
     # Skip the empty-scrape "previous job" suggestion when ANY view filter is
     # active: total==0 then means "no rows matched the filter", NOT "the job
     # scraped nothing", and the prior job wasn't checked against the same filter
@@ -551,12 +640,22 @@ async def get_results(
             # that has at least 1 non-duplicate Result row
             from sqlalchemy import exists
             prev_result = await db.execute(
-                select(Job.id)
+                select(Job.id, Job.created_at)
                 .where(
                     Job.scraper_config_id.in_(sibling_ids),
                     Job.user_id == current_user.id,
                     Job.id != job_id,
                     Job.status == "done",
+                    # The link is labelled "View previous results". Without this
+                    # bound it ordered by created_at DESC across ALL sibling
+                    # jobs, so opening an OLD all-duplicate run linked to the
+                    # NEWEST run — in production, a run two months LATER that
+                    # delivered none of the leads being explained. The page
+                    # asserted "you already received these" and then offered a
+                    # link that appeared to disprove it, which is how a correct
+                    # duplicate classification was reported as a cross-tenant
+                    # leak (2026-09-08). Previous means previous.
+                    Job.created_at < job.created_at,
                     exists(
                         select(Result.id).where(
                             Result.job_id == Job.id,
@@ -572,9 +671,13 @@ async def get_results(
                 .order_by(Job.created_at.desc())
                 .limit(1)
             )
-            prev_row = prev_result.scalar_one_or_none()
+            prev_row = prev_result.first()
             if prev_row:
-                previous_job_id = prev_row
+                previous_job_id = prev_row.id
+                # Dated so the banner can name the run instead of saying
+                # only "previous", which is what left the reader with no
+                # way to check the claim.
+                previous_job_run_at = prev_row.created_at
 
     # NTS Tier 1: show the Auction Date / Default Owed columns for EVERY
     # pre_foreclosure job (user pref: consistent columns across scrapes — the cells
@@ -605,6 +708,10 @@ async def get_results(
         new_count=new_count,
         date_range_mode=date_range_mode,
         previous_job_id=previous_job_id,
+        previous_job_run_at=previous_job_run_at,
+        duplicate_sources=duplicate_sources,
+        unattributed_duplicate_count=unattributed_duplicate_count,
+        same_run_duplicate_count=same_run_duplicate_count,
         has_auction_data=has_auction_data,
     )
 

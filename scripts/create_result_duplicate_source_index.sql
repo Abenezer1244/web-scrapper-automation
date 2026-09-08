@@ -1,0 +1,43 @@
+-- ============================================================================
+-- create_result_duplicate_source_index.sql — duplicate provenance grouping index
+-- ----------------------------------------------------------------------------
+-- Run OUT-OF-BAND (not in an Alembic migration): CREATE INDEX CONCURRENTLY
+-- cannot run inside a transaction, and a plain CREATE takes an ACCESS EXCLUSIVE
+-- lock on the live results table for the whole build, blocking every read and
+-- write on the largest table in the product. Same rule as
+-- create_result_fingerprint_index.sql and create_owner_flag_indexes.sql.
+--
+-- Supports the results page's "which of my earlier runs delivered these"
+-- grouping (migration 089, src/api/routes/jobs.py get_results):
+--
+--     SELECT duplicate_source_job_id, max(duplicate_source_at), count(*)
+--     FROM results
+--     WHERE job_id = ... AND user_id = ... AND is_duplicate IS TRUE ...
+--     GROUP BY duplicate_source_job_id
+--
+-- Partial on is_duplicate so it stays small: duplicates are a minority of rows
+-- and only they carry these columns.
+--
+-- DEPLOY ORDER:
+--   1. `alembic upgrade head` — migration 089 adds the three nullable columns.
+--      Nullable with no default is a metadata-only catalog change, so its
+--      ACCESS EXCLUSIVE lock is held for microseconds and is safe inline.
+--   2. Run THIS script. It is safe to run before, during or after the API
+--      deploy: without the index the grouping query falls back to the existing
+--      job_id index, which is how every other per-job read is already served.
+--
+-- IF NOT EXISTS so a rerun is a no-op. If a previous attempt was interrupted,
+-- Postgres leaves an INVALID index behind — drop it first:
+--
+--   SELECT indexrelid::regclass FROM pg_index
+--    WHERE NOT indisvalid AND indrelid = 'results'::regclass;
+--   DROP INDEX CONCURRENTLY ix_results_duplicate_source;
+--
+-- Usage:
+--   railway run --service worker psql "$DATABASE_URL_SYNC" \
+--     -f scripts/create_result_duplicate_source_index.sql
+-- ============================================================================
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_results_duplicate_source
+    ON results (job_id, duplicate_source_job_id)
+    WHERE is_duplicate IS TRUE;

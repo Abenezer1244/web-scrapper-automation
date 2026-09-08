@@ -1488,6 +1488,46 @@
         "title": "DeliverUpdate",
         "type": "object"
       },
+      "DuplicateSource": {
+        "description": "One earlier run that a share of this job's duplicates was claimed by.\n\n`run_at` is when the claim was first made, which is the closest thing to a\ndelivery timestamp that exists. It is stamped at claim time, before the\nsource job finished, so it is honest to render as \"your run on <date>\" and\ndishonest to render as \"delivered to you at <time>\".\n\n`job_id` may name a job that has since been purged; the UI links to it only\nwhen `job_available` is true.",
+        "properties": {
+          "duplicate_count": {
+            "default": 0,
+            "title": "Duplicate Count",
+            "type": "integer"
+          },
+          "job_available": {
+            "default": false,
+            "title": "Job Available",
+            "type": "boolean"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run At"
+          }
+        },
+        "title": "DuplicateSource",
+        "type": "object"
+      },
       "EnrichmentConfig": {
         "properties": {
           "property_lookup": {
@@ -2708,6 +2748,14 @@
             "title": "Duplicate Count",
             "type": "integer"
           },
+          "duplicate_sources": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/DuplicateSource"
+            },
+            "title": "Duplicate Sources",
+            "type": "array"
+          },
           "enriched_count": {
             "default": 0,
             "title": "Enriched Count",
@@ -2758,6 +2806,23 @@
             ],
             "title": "Previous Job Id"
           },
+          "previous_job_run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Job Run At"
+          },
+          "same_run_duplicate_count": {
+            "default": 0,
+            "title": "Same Run Duplicate Count",
+            "type": "integer"
+          },
           "total": {
             "title": "Total",
             "type": "integer"
@@ -2765,6 +2830,11 @@
           "total_scraped": {
             "default": 0,
             "title": "Total Scraped",
+            "type": "integer"
+          },
+          "unattributed_duplicate_count": {
+            "default": 0,
+            "title": "Unattributed Duplicate Count",
             "type": "integer"
           }
         },

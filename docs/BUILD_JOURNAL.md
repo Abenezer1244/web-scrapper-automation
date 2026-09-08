@@ -19,6 +19,99 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-07 — The plan-limit alert was an error toast, and that was the whole bug
+
+**Built / Shipped:**
+- **BE `8857881`** — `src/api/entitlements.py` now raises a 402 whose `detail` is
+  `{code, title, message}` instead of a prose sentence. `config_run_violation` returns a
+  `Violation` dataclass; `Violation.__str__` is the message, which is what keeps
+  `workers/tasks.py`, `workers/batch_tasks.py`, `scheduler_helpers/dispatch.py` and
+  `api/routes/jobs.py` working unchanged (all four interpolate the result into a string).
+  `record_type_violations` renamed to `disallowed_record_types`.
+- **BE `a0d219f`** — `plan_label` lives in `src/config/plans.py` off `PLAN_CATALOG`; one
+  `RECORD_TYPE_LABELS` map in `src/config/constants.py`, with `segments.py` and
+  `batch_export.py` importing it as `_label` instead of each keeping a copy.
+- **BE `a88dd99`** — the two negative wire-contract tests assert 201, not `!= 402`.
+- **FE `7878b77`** — `components/plan-limit-notice.tsx`: neutral card, teal CTA, real close
+  control. **FE `4eadb83`** + **`c1e18ec`** — toast identity fixes (below).
+- New tests: `tests/test_entitlement_notice_copy.py` (22) and
+  `tests/test_entitlement_402_wire_contract.py` (6, integration).
+
+**Tried / Decided:**
+- The owner's requested copy was "This scraper includes 2 counties." **Rejected as false.**
+  `projected` is the account-wide distinct (state, county) total unioned with the request, so
+  that sentence is wrong whenever an already-saved scraper contributes, and wrong for every
+  batch create, which calls the same helper. Shipped "This would put your account at 2
+  counties." Codex independently reached the same conclusion and killed the branch-on-case
+  variant I had planned.
+- The record-type message names only what is NOT covered. Listing what the plan does include
+  is a seven-item list on Business.
+- CTA stacked below the copy at every width rather than beside it above a breakpoint. A sonner
+  toast is ~356px on desktop no matter how wide the window is, so a viewport `sm:` would have
+  been decoration, not layout.
+- Did NOT touch plan limits, Stripe, quota, county counting or enforcement.
+  `ENTITLEMENT_ENFORCEMENT` still defaults off.
+
+**Failed / Blocked:**
+- First read of the focus ring said there was none: `outlineWidth: 0px`, an all-transparent
+  box-shadow. Wrong. The Button's `transition-all` animates the ring in, and the probe read it
+  at t=0. At +600ms it is the standard 3px teal at 50% alpha, same as every Button in the app.
+  **A computed style read immediately after a synthetic event can be measuring an animation,
+  not a bug.**
+- A record-type-only 402 could not be provoked with `king` + `divorce`: the route runs
+  `_validate_connector_supports` BEFORE the entitlement gate, so a county that does not offer
+  that type 422s as unavailable and never reaches the plan check. Used `king` +
+  `pre_foreclosure`.
+- The full-suite run was declined twice on memory pressure; ran a 293-test targeted subset over
+  every touched module plus all four `config_run_violation` consumers instead. The full suite
+  did pass earlier in the session at `8857881`.
+
+**Caught & fixed:**
+- Codex r1 **P2**: `duration: Infinity` with no toast id meant every refusal mounted another
+  permanent notice. Past the Toaster's `visibleToasts` limit sonner hides the older ones with
+  CSS but leaves their controls in the tab order, so a keyboard user tabs into an invisible
+  "Upgrade plan" link.
+- Codex r2 **P2**, and the fix for the above caused it: sonner keeps a dismissed toast in state
+  for `TIME_BEFORE_UNMOUNT` (200ms). Reusing the id inside that window updates the *dismissing*
+  instance, whose removal timer then fires and takes the new notice with it. Dismiss, retry,
+  get refused, **see nothing**. Reproduced in Chromium: swallowed at 0/30/80/150ms, fine at
+  190ms. The id is now released the moment a notice starts going away.
+- Codex r1 **P3**: `plan_label` trimmed its lookup key; the gates do not. A stored `"pro "`
+  misses `COUNTY_LIMIT_BY_PLAN.get` and is **enforced as Starter** while the label said "Pro" —
+  a message that is simply false to the customer being refused.
+- Codex r1 **P3**: my new `PLAN_LABELS` duplicated `PLAN_CATALOG`, in a module whose docstring
+  exists because a duplicated plan constant once drifted and quoted a price we do not charge.
+- Codex r2 **P3**: two tests asserted `status_code != 402`, which a pre-gate 422 satisfies.
+- `tests/test_entitlements_runtime.py` was **asserting the old prose** (`"record type" in v`),
+  pinning customer copy to an implementation phrase. Now asserts `v.code`.
+
+**Pending / Handoff:**
+- Branches `fix/plan-limit-notice` in both repos, committed and unpushed. No PRs opened.
+- **Deploy order matters: the frontend must ship first.** An old FE build reads `detail` as a
+  string and would render `[object Object]` against the new backend. Nothing in CI guards this:
+  `schema/openapi.json` declares no 402 responses at all, so the wire contract can change with
+  the schema gate green.
+- Em dashes remain in user-facing strings this change did not touch, e.g. the 422 in
+  `routes/batches.py` ("aren't available for batch scrapes — set them on an individual
+  scraper") and `quota.py`'s frozen-account copy. Out of scope here; worth a sweep.
+
+**Facts learned:**
+- The red alert was never a component. `toastError` routes **every** 402 to `toastUpgrade`, and
+  `toast.error` under a `richColors` Toaster supplies the pale-red card, the red text and the
+  near-black action button. Picking the error channel was the entire visual bug.
+- That shared path also carries `quota_block_reason`'s **failed payment** message. Titling that
+  "Plan limit reached" or telling that customer to upgrade is wrong on both counts, so an
+  unstructured 402 now gets no title and a "Manage billing" CTA.
+- FastAPI's own 422 puts an **array** in `detail`. `body.detail ?? body.message` handed that
+  straight to `new Error(...)`.
+- sonner wraps its toasts in a `<section aria-live="polite">` — the `<li>` carries nothing. The
+  notice is announced correctly, and adding `role="status"` inside would announce it twice.
+- `toast.custom` opts out of three things sonner otherwise does: the Toaster's global
+  `closeButton` is suppressed, a custom CTA does not auto-dismiss, and there is no timer pause
+  on keyboard focus.
+
+---
+
 ## 2026-09-07 — Codex was dead for a day, and I nearly rebuilt an endpoint we deleted on purpose
 
 > **Provenance:** commits, paths and line numbers below were re-verified against the repo and

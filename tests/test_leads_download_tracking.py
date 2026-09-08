@@ -136,9 +136,55 @@ async def test_recording_only_touches_the_downloading_user(
     assert business_user.first_leads_downloaded_at is None
 
 
-async def test_recording_an_unknown_user_is_a_no_op(db: AsyncSession):
-    """A conditional UPDATE that matches nothing must not raise."""
-    await mark_leads_downloaded(str(uuid.uuid4()))
+async def test_recording_an_unknown_user_is_a_no_op(
+    db: AsyncSession, starter_user: User, caplog
+):
+    """A conditional UPDATE that matches nothing is a real no-op, not a failure.
+
+    Asserting only "it did not raise" would also pass if the write blew up, since
+    the tracker swallows and logs. So this checks the log stayed clean AND that
+    nobody was stamped.
+    """
+    import logging
+
+    from src.api import download_tracking
+
+    logger_name = download_tracking._logger.name
+    with caplog.at_level(logging.ERROR, logger=logger_name):
+        await mark_leads_downloaded(str(uuid.uuid4()))
+
+    assert not [r for r in caplog.records if r.name == logger_name], [
+        r.getMessage() for r in caplog.records
+    ]
+    await db.refresh(starter_user)
+    assert starter_user.first_leads_downloaded_at is None
+
+
+async def test_a_failed_write_is_logged_and_does_not_escape(
+    starter_user: User, caplog, monkeypatch
+):
+    """Proves the companion assertion above is not vacuous.
+
+    The tracker swallows so a bookkeeping failure cannot cost someone their
+    download, which makes "nothing was logged" meaningless unless a real failure
+    demonstrably DOES get logged. Induce one and watch it land.
+    """
+    import logging
+
+    from src.api import download_tracking
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("database is on fire")
+
+    monkeypatch.setattr(download_tracking, "AsyncSessionLocal", _boom)
+    logger_name = download_tracking._logger.name
+
+    with caplog.at_level(logging.ERROR, logger=logger_name):
+        await download_tracking.mark_leads_downloaded(str(starter_user.id))
+
+    errors = [r for r in caplog.records if r.name == logger_name]
+    assert errors, "a failed write must be logged"
+    assert "database is on fire" in caplog.text
 
 
 async def test_new_users_start_unobserved(db: AsyncSession, starter_user: User):
@@ -401,3 +447,36 @@ def test_segment_response_only_tracks_when_there_are_rows():
 
     empty = _segment_csv_response([], "bridgeleads_overlap_none", "user-1")
     assert empty.background is None
+
+
+# ─── The lead check must never cost someone their download ───────────────────
+
+def test_an_outsized_field_does_not_blow_up_the_lead_check():
+    """csv.reader refuses a field over 131,072 chars.
+
+    legal_description and heirs are uncapped Text, and this check runs OUTSIDE
+    the caller's error handler, so one outsized lead used to turn a good export
+    into a 500. It must answer, not raise.
+    """
+    from src.api.routes.batches import _csv_has_a_lead
+
+    big = "x" * 200_000
+    oversized = f'party_name,legal_description\n"DOE","{big}"\n'.encode()
+    assert _csv_has_a_lead(oversized) is False  # unreadable, so not counted
+
+
+def test_a_blank_line_is_not_a_lead():
+    from src.api.routes.batches import _csv_has_a_lead
+
+    assert _csv_has_a_lead(b"party_name,address\n\n") is False
+    # ...but a real row after a blank line still is one.
+    assert _csv_has_a_lead(b"party_name,address\n\nDOE,123 Main St\n") is True
+
+
+def test_lead_check_handles_crlf_and_invalid_utf8():
+    from src.api.routes.batches import _csv_has_a_lead
+
+    assert _csv_has_a_lead(b"party_name,address\r\n") is False
+    assert _csv_has_a_lead(b"party_name,address\r\nDOE,123 Main St\r\n") is True
+    # errors="replace": undecodable bytes must not raise out of the check.
+    assert _csv_has_a_lead(b"party_name,address\nDOE,\xff\xfe bad\n") is True

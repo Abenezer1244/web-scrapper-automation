@@ -676,13 +676,35 @@ def _csv_has_a_lead(data: bytes) -> bool:
     Wrapped over the existing bytes rather than decoding them: `data` is already
     the whole response body in memory, and `data.decode()` would make a second
     full copy of a potentially multi-megabyte export just to look at two records.
-    TextIOWrapper decodes lazily and csv.reader stops at the second record.
+    TextIOWrapper decodes lazily and the scan stops at the first real record.
+
+    A CSV parsing failure does not fail the download. csv.reader refuses a field
+    over 131,072 characters, and legal_description and heirs are uncapped Text
+    that no writer bounds, so a single outsized lead used to turn a perfectly
+    good export into a 500 from OUTSIDE the caller's error handler. This is a
+    bookkeeping question, so an unreadable file answers "no lead" and
+    under-counts one activation instead.
+
+    Not a validity check on the CSV: it stops at the first record and parses
+    permissively, so it says nothing about whether the export is well formed.
     """
-    reader = csv.reader(
-        io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace")
-    )
-    next(reader, None)  # header
-    return next(reader, None) is not None
+    try:
+        reader = csv.reader(
+            io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace")
+        )
+        next(reader, None)  # header
+        for row in reader:
+            # A blank line parses as an empty record. It is not a lead, and the
+            # renderer emitting one would otherwise read as activation.
+            if row:
+                return True
+        return False
+    except (csv.Error, UnicodeError, ValueError):
+        _logger.warning(
+            "batch CSV could not be parsed to check for leads; not recording a "
+            "download for this response", exc_info=True,
+        )
+        return False
 
 
 async def _stream_run_csv(

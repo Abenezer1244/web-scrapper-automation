@@ -65,9 +65,13 @@ def assert_servable(route: str) -> None:
     )
     if _page_of(route) in FRONTEND_PAGES:
         return
+    # The only dynamic page a next_action can point at is /results/<job id>.
+    # Exactly one more segment: /results/<id>/anything is not a page either.
     prefix = frontend_routes.RESULTS + "/"
-    assert route.startswith(prefix) and len(route) > len(prefix), (
-        f"{route!r} is not a page the frontend serves"
+    assert route.startswith(prefix), f"{route!r} is not a page the frontend serves"
+    tail = route[len(prefix):]
+    assert tail and "/" not in tail, (
+        f"{route!r} has extra path segments under /results; that is not a page"
     )
 
 
@@ -130,8 +134,9 @@ async def test_trial_user_on_pro_gets_the_same_creation_route(
     data = await _onboarding(client, create_secure_token(user.id))
     assert data["next_action"]["route"] == "/scrapers/new"
     assert data["steps"]["scraper_configured"] is False
-    # 6 days out, so the whole-day count reads 5 (or 6 on an exact-second read).
-    assert data["trial_days_remaining"] in (5, 6)
+    # timedelta.days floors, and the handler reads the clock after the fixture
+    # set the end date, so 6 days out always reports 5 whole days remaining.
+    assert data["trial_days_remaining"] == 5
 
 
 # ─── The later onboarding states ──────────────────────────────────────────────
@@ -268,3 +273,39 @@ def test_absolute_joins_frontend_url_without_doubling_the_slash(monkeypatch):
         frontend_routes.absolute(frontend_routes.SCRAPERS_NEW)
         == "https://app.example.test/scrapers/new"
     )
+
+
+# ─── The referral share link (same defect class, different endpoint) ──────────
+
+async def test_referral_endpoint_shares_the_register_page_not_signup(
+    client: AsyncClient, starter_token: str
+):
+    """Reverting this endpoint to /signup must fail here, not just in the helper.
+
+    /signup is not a page and is not in the frontend middleware's public list, so
+    a prospect following a shared link was bounced to /login and the ref code was
+    dropped on the way.
+    """
+    resp = await client.get(
+        "/billing/referral", headers={"Authorization": f"Bearer {starter_token}"}
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+
+    code = data["code"]
+    assert code, "the endpoint must backfill a referral code"
+    assert "/signup" not in data["share_url"]
+    assert data["share_url"].endswith(f"/register?ref={code}")
+
+    path = data["share_url"].split("bridgeleads.io", 1)[-1]
+    assert_servable(path)
+
+
+async def test_referral_share_url_is_absolute(
+    client: AsyncClient, starter_token: str
+):
+    """It is pasted into messages and emails, so it must carry a host."""
+    resp = await client.get(
+        "/billing/referral", headers={"Authorization": f"Bearer {starter_token}"}
+    )
+    assert resp.json()["share_url"].startswith("https://")

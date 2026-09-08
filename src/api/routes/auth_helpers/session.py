@@ -1,5 +1,12 @@
-"""Body logic for GET /auth/onboarding. Extracted VERBATIM from auth.py — the
-route decorator + signature stay in auth.py; this holds the moved handler body.
+"""Body logic for GET /auth/onboarding. Extracted from auth.py — the route
+decorator + signature stay in auth.py; this holds the moved handler body.
+
+``next_action.route`` is rendered straight into a next/link href by the dashboard
+onboarding card, so every value here comes from ``src.config.frontend_routes``
+rather than a literal. The literals it replaced carried a ``/dashboard`` prefix
+taken from the frontend's ``app/(dashboard)/`` route GROUP, which contributes
+nothing to the URL: four of the five actions pointed at pages that do not exist,
+and a brand-new account's "New Scraper" CTA landed on the 404 page.
 """
 
 from datetime import UTC, datetime
@@ -7,6 +14,7 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.config import frontend_routes
 from src.db import User
 
 
@@ -47,7 +55,7 @@ async def onboarding_status_for_user(
             "title": "Set up your first scraper",
             "description": "Choose a county and record type to start pulling leads.",
             "cta": "New Scraper",
-            "route": "/dashboard/scrapers/new",
+            "route": frontend_routes.SCRAPERS_NEW,
         }
     elif not steps["first_scrape_run"]:
         config = configs[0]
@@ -56,7 +64,7 @@ async def onboarding_status_for_user(
             "title": f"Run your first scrape on {config.county.title()}, {config.state.upper()}",
             "description": "Click 'Run Now' to start pulling records from the county portal.",
             "cta": "Run Now",
-            "route": f"/dashboard/scrapers/{config.id}",
+            "route": frontend_routes.SCRAPERS,
         }
     elif not steps["first_scrape_completed"]:
         next_action = {
@@ -64,7 +72,7 @@ async def onboarding_status_for_user(
             "title": "Your scrape is running",
             "description": "Records are being pulled from the county portal. This usually takes 2-5 minutes.",
             "cta": "View Progress",
-            "route": "/dashboard",
+            "route": frontend_routes.DASHBOARD,
         }
     elif not steps["first_export_downloaded"]:
         job = done_jobs[0]
@@ -73,7 +81,7 @@ async def onboarding_status_for_user(
             "title": f"Download your {job.record_count or 0} leads",
             "description": "Your records are ready. Download the CSV and start mailing today.",
             "cta": "Download CSV",
-            "route": f"/dashboard/jobs/{job.id}",
+            "route": frontend_routes.job_detail(job.id),
         }
     else:
         next_action = {
@@ -81,7 +89,7 @@ async def onboarding_status_for_user(
             "title": "You're all set!",
             "description": "Set up a daily schedule to get fresh leads automatically, or add more counties.",
             "cta": "Add Another County",
-            "route": "/dashboard/scrapers/new",
+            "route": frontend_routes.SCRAPERS_NEW,
         }
 
     return {

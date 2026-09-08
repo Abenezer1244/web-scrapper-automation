@@ -1,50 +1,37 @@
-# Plan-limit notice + em-dash sweep — DONE, shipped, deployed
+# Fix: onboarding next_action routes 404 (dead `/dashboard/*` prefix)
 
-## 1. The plan-limit notice (closed)
+## Reproduced (live, prod)
+- Fresh account `memiki70+bl404repro@gmail.com` registered + verified on prod.
+- `GET https://api.bridgeleads.io/auth/onboarding` returns
+  `next_action.route = "/dashboard/scrapers/new"`.
+- Playwright/Chromium against `https://app.bridgeleads.io`: clicking the
+  onboarding "New Scraper" CTA lands on `/dashboard/scrapers/new` and renders the
+  404 page. Confirmed at 320 / 375 / 390 / 430 / 1440.
 
-**Root cause:** there was no bespoke alert component. `lib/errors.ts::toastError()` routes
-**every** HTTP 402 to `toastUpgrade()`, which called `toast.error`; under the app's
-`richColors` + `closeButton` Toaster that supplies the pale-red card, red text, red close
-button and near-black action button. Picking the error channel for a plan gate was the whole
-visual bug. The message came from `src/api/entitlements.py`.
+## Root cause
+The Next.js app puts every signed-in page under the route GROUP
+`app/(dashboard)/...`. A parenthesised segment is NOT part of the URL, so the real
+paths are `/scrapers/new`, `/results/<id>`, `/scrapers`. The backend's
+`onboarding_status_for_user` hardcodes a literal `/dashboard` prefix that the
+frontend has never served. Four of the five `next_action.route` values are dead.
 
-- [x] Backend: structured 402 `{code, title, message}`; `Violation` dataclass; plural-correct,
-      Title-Cased, unquoted plan names.
-- [x] Frontend: `components/plan-limit-notice.tsx`, tolerant `readErrorBody`, `toastUpgrade`
-      renders the notice.
-- [x] Verified in Chromium at 320/375/390/430/768/1024/1440, both themes, `pointer: coarse`.
-- [x] Contrast AA, keyboard, focus ring, live region, every dismissal path.
-- [x] Shipped: **FE #117 `8dcc70b`**, **BE #252 `019a8c1`**. Frontend deployed first, on
-      purpose: an old FE build reads `detail` as a string and would render `[object Object]`.
-- [x] Confirmed live in the production bundle (via `/register`, a public route that imports
-      the same module), including the toast-id race fix.
+| next_action | emitted route | real route |
+|---|---|---|
+| create_scraper | `/dashboard/scrapers/new` | `/scrapers/new` |
+| run_scrape | `/dashboard/scrapers/<id>` | `/scrapers` (Run now lives on the list row; no per-scraper detail page exists) |
+| wait_for_scrape | `/dashboard` | `/dashboard` (valid) |
+| download_export | `/dashboard/jobs/<id>` | `/results/<id>` (job detail page) |
+| complete | `/dashboard/scrapers/new` | `/scrapers/new` |
 
-**Copy deviation, deliberate:** asked for "This scraper includes 2 counties", shipped "This
-would put your account at 2 counties". `projected` is the account-wide distinct-county total,
-so the requested wording is false whenever an already-saved scraper causes the overage, and
-false for every batch create.
-
-## 2. The em-dash sweep (closed)
-
-- [x] 90 frontend rewrites across 43 files + the customer-facing backend strings.
-- [x] Re-runnable checkers: `scripts/find-user-facing-dashes.mjs` (FE, TypeScript parser) and
-      an AST walk on the backend that drops docstrings.
-- [x] Shipped: **FE #118 `c0d8976`**, **BE #255 `9ef443f`**, **FE #119 `75f34b1`**.
-- [x] Regenerated `schema/openapi.json` and `lib/api-types.generated.ts` (a reworded
-      `Query(description=)` trips both gates).
-- [x] **Production audit across 7 pages: 0 prose em dashes served.**
-
-## Deliberately NOT changed
-
-- The generated `party_name` in the two code-violation scrapers. It is customer-visible, and
-  it is an input to `_compute_dedup_hash`, which keys billing dedup. Rewriting it would
-  re-deliver and **re-bill** already-paid leads.
-- en dashes in numeric ranges, the `—` empty-value glyph in table cells, the `·` separator.
-- `scrapers/reliability.py`'s exception format: internal, verifiably never customer-visible.
-- Plan limits, billing/Stripe, quota enforcement, county counting, scraper behaviour.
-
-## Open at hand-off
-
-- **FE #120** (one-line copy fix from the final read-back) is open, CI pending.
-- **Codex round 2 on the sweep never completed** (OpenAI usage limit). Its questions were
-  answered by hand; worth re-running after the quota resets.
+## Todo
+- [ ] Consult Codex on the approach before writing code
+- [ ] Add `src/config/frontend_routes.py` (single definition of the app paths)
+- [ ] Point `onboarding_status_for_user` at those helpers
+- [ ] Reuse the helpers in `src/workers/onboarding_emails.py` (already correct, but
+      duplicated literals are what drifted)
+- [ ] Tests: every onboarding state emits a known-good route; no emitted route
+      starts with `/dashboard/`
+- [ ] Run pytest via `bl-testenv/run-full-pytest.sh` (never bare pytest)
+- [ ] Codex review of the diff
+- [ ] Playwright re-verify against a locally served frontend + patched API
+- [ ] Review section

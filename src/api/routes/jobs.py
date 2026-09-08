@@ -38,7 +38,7 @@ async def list_jobs(
         description=(
             "Exclude jobs that belong to a batch (their config carries a batch_id). "
             "The Results page sets this so a batch's child scrapes don't consume the "
-            "newest-100 window — the batch shows as one combined row instead."
+            "newest-100 window. The batch shows as one combined row instead."
         ),
     ),
     db: AsyncSession = Depends(get_rls_db),

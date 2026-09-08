@@ -187,7 +187,7 @@ def mark_queue_permanently_failed(queue_id: int) -> None:
 
         send_ops_alert(
             "skip_trace", f"ingest_failed_{queue_id}",
-            "Skip-trace ingest failed permanently — paid results not applied",
+            "Skip-trace ingest failed permanently, paid results not applied",
             f"ingest_tracerfy_batch exhausted its retries for Tracerfy queue "
             f"{queue_id}. The batch was accepted and charged, but its results "
             f"were never written to any lead. The queue row is now 'errored' so "

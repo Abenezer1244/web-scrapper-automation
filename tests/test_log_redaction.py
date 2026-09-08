@@ -39,7 +39,7 @@ def test_secrets_are_redacted(msg):
     "msg",
     [
         "record saved for 123 Main St, Tacoma WA",
-        "Scrape complete — 152 new leads (8 duplicates)",
+        "Scrape complete: 152 new leads (8 duplicates)",
         "Navigated to https://recordsearch.kingcounty.gov/search",
     ],
 )

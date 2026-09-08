@@ -415,8 +415,8 @@ async def pricing_page() -> dict:
         "faq": [
             {"q": "What are motivated seller leads?", "a": "Public records (probate, foreclosure, tax delinquent, etc.) that indicate a property owner may be willing to sell below market value."},
             {"q": "How fresh is the data?", "a": "We scrape county portals daily. Paid plans get same-day data. Free tier has a 7-day delay."},
-            {"q": "What counties do you cover?", "a": "22 Washington State counties are live and scraped daily. We can add any US county in 30 seconds — request yours after signing up."},
-            {"q": "Does it include phone and email?", "a": "Yes. Skip tracing is built in — every lead gets phone number, phone type, and email via Tracerfy within 10-15 minutes."},
+            {"q": "What counties do you cover?", "a": "22 Washington State counties are live and scraped daily. We can add any US county in 30 seconds. Request yours after signing up."},
+            {"q": "Does it include phone and email?", "a": "Yes. Skip tracing is built in: every lead gets phone number, phone type, and email via Tracerfy within 10-15 minutes."},
             {"q": "Can I cancel anytime?", "a": "Yes. No contracts, no cancellation fees. Your data exports remain available for 30 days after cancellation."},
             {"q": "What export formats do you support?", "a": "CSV, Excel, and JSON. Business and Agency plans also get API access for direct integration."},
         ],
@@ -795,7 +795,7 @@ async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
         # Paid checkout but the price isn't in our plan map — entitlement would be
         # silently lost. Alert with recovery ids; do NOT grant a fallback plan.
         _alert_billing_gap(
-            "checkout.session.completed price not in plan map — user PAID but "
+            "checkout.session.completed price not in plan map: user PAID but "
             "plan NOT activated",
             f"unmapped-price:{price_id}",
             event=data.get("id"),
@@ -943,7 +943,7 @@ async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
         # Subscription changed to a price we don't map — the plan change would be
         # silently lost. Alert with recovery ids; do NOT guess a plan.
         _alert_billing_gap(
-            "customer.subscription.updated price not in plan map — plan change "
+            "customer.subscription.updated price not in plan map: plan change "
             "NOT applied",
             f"unmapped-price:{price_id}",
             price_id=price_id,

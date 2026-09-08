@@ -373,7 +373,7 @@ def canonical_tokens_or_raise(county: str, state: str, doc_types: list[str]) -> 
         if tok is None:
             raise ValueError(
                 f"document type {d!r} is not mappable for {county}, {state} "
-                f"(stale selection after a registry change?) — refusing to broaden output"
+                f"(stale selection after a registry change?). Refusing to broaden output"
             )
         if isinstance(tok, list):
             out.extend(tok)

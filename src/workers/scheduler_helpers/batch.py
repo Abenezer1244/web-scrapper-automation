@@ -268,7 +268,7 @@ def _batch_recovery_sweep_impl() -> None:
                 give_up_alerts.append((
                     "batch",
                     str(rid),
-                    f"Batch run gave up — dispatch never materialized ({rid})",
+                    f"Batch run gave up: dispatch never materialized ({rid})",
                     f"run_id={rid}\nage > {BATCH_FORCE_MINUTES} min in 'pending' "
                     "despite recovery re-dispatch (broker/worker issue likely)",
                 ))

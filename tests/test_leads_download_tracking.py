@@ -397,15 +397,23 @@ async def test_beat_helper_survives_a_user_with_several_scrapers(
 # ─── A file is not leads ──────────────────────────────────────────────────────
 
 async def test_an_empty_segment_export_does_not_count_as_activation(
-    client: AsyncClient, db: AsyncSession, starter_user: User, starter_token: str
+    client: AsyncClient, db: AsyncSession, business_user: User, business_token: str
 ):
     """The fabrication Codex found: a user with NO jobs could export an empty
     Lists CSV and register a download, which made the funnel able to report more
     downloads than jobs.
+
+    The plan is no longer incidental. This test was written on a Starter fixture
+    because any authenticated user reached /segments; overlap/intersection is a
+    Business and Agency line and the router now carries a plan dependency, so
+    Starter gets a 402 here and never reaches the question this test asks. Moved
+    to Business — the SUBJECT is "an empty export is not an activation", not the
+    entitlement. The gate itself is pinned across every plan and every endpoint
+    on the router by test_overlap_and_intersection_are_business_and_above.
     """
     resp = await client.post(
         "/segments/intersection/export",
-        headers={"Authorization": f"Bearer {starter_token}"},
+        headers={"Authorization": f"Bearer {business_token}"},
         json={"record_types": ["probate", "pre_foreclosure"]},
     )
     assert resp.status_code == 200
@@ -413,8 +421,8 @@ async def test_an_empty_segment_export_does_not_count_as_activation(
     # A header row and nothing under it.
     assert len(resp.text.strip().splitlines()) <= 1
 
-    await db.refresh(starter_user)
-    assert starter_user.first_leads_downloaded_at is None
+    await db.refresh(business_user)
+    assert business_user.first_leads_downloaded_at is None
 
 
 def test_header_only_batch_csv_is_not_a_lead():

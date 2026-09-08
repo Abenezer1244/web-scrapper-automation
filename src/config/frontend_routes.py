@@ -15,6 +15,8 @@ again. A path added here must correspond to a real ``page.tsx`` in the frontend
 repo; ``tests/test_onboarding_routes.py`` guards the onboarding side of that.
 """
 
+from urllib.parse import quote
+
 from src.config.settings import settings
 
 # ─── Pages (paths, as used in-app by next/link) ───────────────────────────────
@@ -24,6 +26,7 @@ SCRAPERS = "/scrapers"
 SCRAPERS_NEW = "/scrapers/new"
 RESULTS = "/results"
 LOGIN = "/login"
+REGISTER = "/register"
 FORGOT_PASSWORD = "/forgot-password"
 BILLING = "/settings?tab=billing"
 
@@ -31,7 +34,16 @@ BILLING = "/settings?tab=billing"
 # next_action never points anywhere outside this set, which is what catches a
 # route invented from a folder name rather than from a real page.
 ALL_PATHS: frozenset[str] = frozenset(
-    {DASHBOARD, SCRAPERS, SCRAPERS_NEW, RESULTS, LOGIN, FORGOT_PASSWORD, BILLING}
+    {
+        DASHBOARD,
+        SCRAPERS,
+        SCRAPERS_NEW,
+        RESULTS,
+        LOGIN,
+        REGISTER,
+        FORGOT_PASSWORD,
+        BILLING,
+    }
 )
 
 
@@ -42,6 +54,16 @@ def job_detail(job_id: str) -> str:
     the id). There is no ``/jobs/<id>`` page in the app.
     """
     return f"{RESULTS}/{job_id}"
+
+
+def referral_signup(code: str) -> str:
+    """The signup page for a shared referral link, carrying the ref code.
+
+    The page is ``/register`` and it reads ``?ref=`` at mount. ``/signup`` is not
+    a page: it is not public either, so a prospect following that link was bounced
+    to /login and the referral code was dropped on the floor.
+    """
+    return f"{REGISTER}?ref={quote(code, safe='')}"
 
 
 def absolute(path: str) -> str:

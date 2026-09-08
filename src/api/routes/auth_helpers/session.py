@@ -63,7 +63,7 @@ async def onboarding_status_for_user(
             "action": "run_scrape",
             "title": f"Run your first scrape on {config.county.title()}, {config.state.upper()}",
             "description": "Click 'Run Now' to start pulling records from the county portal.",
-            "cta": "Run Now",
+            "cta": "Open Scrapers",
             "route": frontend_routes.SCRAPERS,
         }
     elif not steps["first_scrape_completed"]:
@@ -80,7 +80,7 @@ async def onboarding_status_for_user(
             "action": "download_export",
             "title": f"Download your {job.record_count or 0} leads",
             "description": "Your records are ready. Download the CSV and start mailing today.",
-            "cta": "Download CSV",
+            "cta": "View Results",
             "route": frontend_routes.job_detail(job.id),
         }
     else:

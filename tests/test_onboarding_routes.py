@@ -14,9 +14,42 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.config import frontend_routes
 from src.db.models import Job, ScraperConfig, User
 
-# Paths the frontend actually serves, taken from the app router's page.tsx files.
-# A next_action route is either one of these or a job detail page under /results.
-VALID_PAGES = frontend_routes.ALL_PATHS
+# The pages the frontend actually serves, transcribed from the app router's
+# page.tsx files. Deliberately a LITERAL list and not frontend_routes.ALL_PATHS:
+# checking the module against itself would pass on a constant renamed to a page
+# that does not exist. A next_action route is one of these, or a job detail page
+# under /results.
+#
+# app/(auth)/ and app/(dashboard)/ are route GROUPS and contribute nothing to the
+# URL, which is the whole reason this list looks the way it does.
+FRONTEND_PAGES = frozenset(
+    {
+        "/",
+        "/pricing",
+        "/coverage",
+        "/privacy",
+        "/terms",
+        "/login",
+        "/register",
+        "/forgot-password",
+        "/reset-password",
+        "/verify-email",
+        "/dashboard",
+        "/scrapers",
+        "/scrapers/new",
+        "/results",
+        "/segments",
+        "/deliver",
+        "/settings",
+        "/admin/connectors",
+        "/admin/funnel",
+    }
+)
+
+
+def _page_of(path: str) -> str:
+    """Strip a query string, so "/settings?tab=billing" checks as "/settings"."""
+    return path.split("?", 1)[0]
 
 
 def assert_servable(route: str) -> None:
@@ -30,7 +63,7 @@ def assert_servable(route: str) -> None:
         f"{route!r} uses the (dashboard) route GROUP as a URL segment. "
         "The group contributes nothing to the URL, so this path 404s."
     )
-    if route in VALID_PAGES:
+    if _page_of(route) in FRONTEND_PAGES:
         return
     prefix = frontend_routes.RESULTS + "/"
     assert route.startswith(prefix) and len(route) > len(prefix), (
@@ -76,6 +109,8 @@ async def test_trial_user_on_pro_gets_the_same_creation_route(
 
     The reported 404 was hit on a Pro trial, so plan must not change the route.
     """
+    from datetime import UTC, datetime, timedelta
+
     from src.api.auth import create_secure_token, hash_password
 
     user = User(
@@ -85,6 +120,9 @@ async def test_trial_user_on_pro_gets_the_same_creation_route(
         plan="pro",
         records_used=0,
         records_limit=1000,
+        # A real signup carries a trial end date. Without it a route decision
+        # gated on trial_ends_at would slip past this fixture untested.
+        trial_ends_at=datetime.now(UTC) + timedelta(days=6),
     )
     db.add(user)
     await db.commit()
@@ -92,6 +130,7 @@ async def test_trial_user_on_pro_gets_the_same_creation_route(
     data = await _onboarding(client, create_secure_token(user.id))
     assert data["next_action"]["route"] == "/scrapers/new"
     assert data["steps"]["scraper_configured"] is False
+    assert data["trial_days_remaining"] == 5  # 6 days out, minus the part-day
 
 
 # ─── The later onboarding states ──────────────────────────────────────────────
@@ -191,11 +230,29 @@ async def test_onboarding_requires_authentication(client: AsyncClient):
 
 # ─── The shared route table ───────────────────────────────────────────────────
 
+def test_every_declared_path_is_a_page_the_frontend_serves():
+    """The route table must not drift onto a page that does not exist."""
+    for path in frontend_routes.ALL_PATHS:
+        assert _page_of(path) in FRONTEND_PAGES, path
+
+
 def test_no_declared_path_uses_the_route_group_as_a_segment():
     """Every path the backend can hand out must survive the group-prefix rule."""
     for path in frontend_routes.ALL_PATHS:
         assert not path.startswith("/dashboard/"), path
     assert not frontend_routes.job_detail("abc").startswith("/dashboard/")
+
+
+def test_referral_link_targets_the_signup_page_that_exists():
+    """/signup is not a page and is not public; /register is both."""
+    link = frontend_routes.referral_signup("ABC123")
+    assert link == "/register?ref=ABC123"
+    assert _page_of(link) in FRONTEND_PAGES
+    assert not link.startswith("/signup")
+
+
+def test_referral_link_escapes_the_code():
+    assert frontend_routes.referral_signup("a b&c") == "/register?ref=a%20b%26c"
 
 
 def test_job_detail_builds_the_results_page_path():

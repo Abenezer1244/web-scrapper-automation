@@ -726,7 +726,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config) -> None:
                     f"King County mailing lookup stopped early: {len(pids)} parcels requested, "
                     f"{king_stats.get('mailing_attempted', 0)} looked up, {found} mailing addresses found; "
                     f"{len(deferred)} deferred (property address kept)"
-                    + (f" — {king_error}" if king_error else ""),
+                    + (f". {king_error}" if king_error else ""),
                     db=db,
                 )
             else:

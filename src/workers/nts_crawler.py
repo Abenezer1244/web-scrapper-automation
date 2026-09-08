@@ -745,13 +745,13 @@ def _barren_alert_reason(
     is down/blocked, not sale-free — so we still alert (Codex P2).
     """
     if discovered == 0:
-        return "0 notices discovered — listing/PDF discovery may have broken"
+        return "0 notices discovered. Listing/PDF discovery may have broken"
     if alert_on_zero_upserts and upserted == 0:
-        return f"{discovered} notices discovered but 0 upserted — parser may have broken"
+        return f"{discovered} notices discovered but 0 upserted. The parser may have broken"
     if not alert_on_zero_upserts and upserted == 0 and errored >= discovered:
         return (
-            f"{discovered} ads discovered but all {errored} detail fetches failed — "
-            "source may be down or blocking"
+            f"{discovered} ads discovered but all {errored} detail fetches failed. "
+            "The source may be down or blocking"
         )
     return None
 

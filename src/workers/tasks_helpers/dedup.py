@@ -258,3 +258,59 @@ def validate_tax_delinquent_records(records, record_type: str) -> None:
                 f"date={getattr(rec, 'date_recorded', None)!r}). A tax lead must "
                 f"carry both an owed amount and a bill year."
             )
+
+
+# ─── Plan-cap dedup-claim release ──────────────────────────────────────────────
+
+def release_capped_dedup_claims(db, user_id: str, job_id: str, capped_ids: list[str]) -> int:
+    """Hand back the dedup claims of rows the plan cap is NOT delivering.
+
+    Keeping a claim for a lead that was never delivered makes it permanently
+    unreachable: every later run drops it as "already delivered" while the user
+    has never seen it once. So the cap releases what it excluded.
+
+    The NOT EXISTS guard is the other half, and it is load-bearing in the
+    opposite direction. Two rows in ONE job can share a dedup_hash (the same
+    parcel|address filed twice). If the cap excludes one and SHIPS the other, an
+    unguarded delete drops the claim anyway, so a lead that WAS delivered and
+    billed no longer holds it, and the next run delivers and bills the same
+    identity again.
+
+    "Still needed" therefore means exactly the set that ships: non-duplicate, not
+    capped, and address-actionable. The address half matters both ways: without
+    it an address-less row (never exported, never billed) would pin the claim and
+    suppress that lead forever. It is the same predicate the cap's own ranking
+    uses to choose ``capped_ids``, so the two cannot drift apart.
+
+    Lives here rather than inline in tasks.py so the tests can exercise the REAL
+    statement. They used to hold a copy, which meant deleting the guard in
+    production left every one of them green (Codex).
+
+    Returns the number of claims released.
+    """
+    from src.api.lead_actionability import address_actionable_sql
+
+    if not capped_ids:
+        return 0
+    result = db.execute(
+        sa_text(
+            'DELETE FROM delivered_records dr USING results r '
+            'WHERE dr.user_id = CAST(:uid AS uuid) '
+            '  AND dr.first_job_id = :jid '
+            '  AND dr.dedup_hash = r.dedup_hash '
+            '  AND r.id = ANY(CAST(:ids AS uuid[])) '
+            '  AND r.user_id = CAST(:uid AS uuid) '
+            '  AND r.dedup_hash IS NOT NULL '
+            '  AND NOT EXISTS ( '
+            '        SELECT 1 FROM results keep '
+            '        WHERE keep.job_id = :jid '
+            '          AND keep.user_id = CAST(:uid AS uuid) '
+            '          AND keep.dedup_hash = dr.dedup_hash '
+            '          AND keep.is_duplicate = false '
+            '          AND NOT (keep.id = ANY(CAST(:ids AS uuid[]))) '
+            '          AND {keep_rule} '
+            '  )'.format(keep_rule=address_actionable_sql("keep"))
+        ),
+        {"uid": str(user_id), "jid": job_id, "ids": capped_ids},
+    )
+    return result.rowcount or 0

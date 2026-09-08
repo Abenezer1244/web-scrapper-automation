@@ -153,12 +153,25 @@ def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
     dup_ids = _sibling_duplicate_ids([dict(r._mapping) for r in sib_rows])
     collapsed = len(dup_ids)
     if dup_ids:
+        # duplicate_reason='same_run' (migration 089): these rows were NEVER
+        # delivered before — they are two notices on one property inside THIS
+        # run, collapsed so the property bills once. The cross-job dedup above
+        # left them is_duplicate=false, so nothing here is a prior delivery.
+        # Without the distinction the results page told the user they had
+        # "already received" leads it was showing them for the first time.
+        # duplicate_source_job_id is this job: the collapse is self-inflicted,
+        # and pointing at the run the user is already looking at is the honest
+        # answer.
         db.execute(
             _sa_text(
-                "UPDATE results SET is_duplicate = true "
-                "WHERE id = ANY(CAST(:ids AS uuid[]))"
+                "UPDATE results SET is_duplicate = true, "
+                "  duplicate_reason = 'same_run', "
+                "  duplicate_source_job_id = :jid, "
+                "  duplicate_source_at = NULL "
+                "WHERE id = ANY(CAST(:ids AS uuid[])) "
+                "  AND user_id = CAST(:uid AS uuid)"
             ),
-            {"ids": [str(i) for i in dup_ids]},
+            {"ids": [str(i) for i in dup_ids], "jid": job_id, "uid": str(user_id)},
         )
 
     # Fail-closed verification: no trustee_sale result may reach delivery without the

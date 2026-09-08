@@ -1235,6 +1235,24 @@ class ResultRow(BaseModel):
         object.__setattr__(self, "days_to_auction", sig["days_to_auction"])
 
 
+class DuplicateSource(BaseModel):
+    """One earlier run that a share of this job's duplicates was claimed by.
+
+    `run_at` is when the claim was first made, which is the closest thing to a
+    delivery timestamp that exists. It is stamped at claim time, before the
+    source job finished, so it is honest to render as "your run on <date>" and
+    dishonest to render as "delivered to you at <time>".
+
+    `job_id` may name a job that has since been purged; the UI links to it only
+    when `job_available` is true.
+    """
+
+    job_id: str | None = None
+    run_at: datetime | None = None
+    duplicate_count: int = 0
+    job_available: bool = False
+
+
 class ResultsPage(BaseModel):
     job_id: str
     total: int
@@ -1261,7 +1279,29 @@ class ResultsPage(BaseModel):
     # the scrape, not the current view filter.
     new_count: int = 0
     date_range_mode: str = ""    # rolling_90 | since_last_run | custom etc.
-    previous_job_id: str | None = None  # most recent job with results (for "view previous" link)
+    # Most recent EARLIER job with visible leads (for the "view previous" link).
+    # The "earlier" bound is load-bearing — see get_results.
+    previous_job_id: str | None = None
+    previous_job_run_at: datetime | None = None
+    # Migration 089: which run(s) this job's duplicates were first claimed by,
+    # read off the results rows (stamped at classification time), never from
+    # delivered_records — the request path holds no privilege on that table and
+    # its claims are mutable besides. Descending by count.
+    #
+    # Deliberately a LIST with an explicit unattributed count rather than one
+    # id: a run's duplicates can come from several earlier runs, and every row
+    # classified before 089 (plus any whose claim had already been released)
+    # carries no provenance at all. Copy that names a single source run would
+    # be guessing for those, which is the exact failure this whole change
+    # exists to remove.
+    duplicate_sources: list["DuplicateSource"] = []
+    # Duplicates with no recoverable source run. If this equals duplicate_count,
+    # the UI must fall back to wording that claims nothing about WHICH run.
+    unattributed_duplicate_count: int = 0
+    # Duplicates that were collapsed within THIS run (trustee_sale siblings on
+    # one property) and were never previously delivered to anyone. Counted in
+    # duplicate_count, but the copy for them is different.
+    same_run_duplicate_count: int = 0
     # NTS Tier 1: True if the JOB has ANY auction-matched lead (independent of the
     # current page/filter). The frontend gates the Auction Date / Default Owed
     # columns on this so they don't flicker by page when auction matches are sparse.

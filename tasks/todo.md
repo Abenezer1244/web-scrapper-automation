@@ -40,9 +40,10 @@ already correct.
 - [x] Fix Codex findings: `/signup` referral link, overpromising CTA labels,
       circular test oracle, trial-less "Pro trial" fixture
 - [x] `ruff check src/ tests/` clean (CI's exact command, ruff 0.15.6)
-- [x] Full pytest suite on an isolated DB: 2664 passed, 2 skipped, 0 failed
+- [x] Full pytest suite on an isolated DB: 2666 passed, 2 skipped, 0 failed
 - [x] Playwright end-to-end against the fixed API response
-- [ ] Codex review round 2 (quota-blocked, retry after 6:10 AM)
+- [x] Codex review round 2: no P1, no P2, two P3 test gaps, both fixed and
+      mutation-verified
 
 ## Also found and fixed (same defect class)
 `GET /billing/referral` handed the referrer `<app>/signup?ref=<code>`. `/signup`
@@ -72,3 +73,14 @@ DIFFERENT set. Cause was contention on the shared local Postgres, not the change
 another agent's pytest was running, and a leftover uvicorn of mine held
 connections to the same DB. With those gone, the 134 tests in the affected files
 passed, and the full suite came back 2664 passed / 0 failed.
+
+## Mutation evidence
+Each guard was proven by breaking the code and watching the suite go red:
+- reintroduce the `/dashboard` prefix in session.py -> 4 failed
+- revert billing.py to the `/signup` share URL -> 1 failed (this one PASSED before
+  the round-2 endpoint test, which is exactly why Codex flagged it)
+- make `job_detail` return `/results/<id>/download` -> 2 failed
+
+## Pre-existing, confirmed, left alone
+`PUBLIC_APP_URL` is never declared in `Settings`, so `billing.py` always takes its
+hardcoded `https://app.bridgeleads.io` fallback. Predates this change.

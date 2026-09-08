@@ -111,8 +111,13 @@ def _segment_csv_response(rows: list, filename_slug: str, user_id: str) -> Respo
             "Cache-Control": "private, no-store",
         },
         # A Lists CSV is leads in the user's hands just as much as a per-job one,
-        # so it counts toward activation. Recorded after the bytes are sent.
-        background=BackgroundTask(mark_leads_downloaded, user_id),
+        # so it counts toward activation. Recorded after the bytes are sent, and
+        # only when there was something in it: an empty segment export is a
+        # header row, and counting it would let a user with no jobs at all
+        # register as having downloaded leads.
+        background=(
+            BackgroundTask(mark_leads_downloaded, user_id) if ordered else None
+        ),
     )
 
 # Representative rows returned in the JSON preview. The CSV export returns the

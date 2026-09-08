@@ -1135,7 +1135,13 @@ async def download_export(
             # Activation signal, recorded AFTER the bytes go out. As a background
             # task it cannot turn a bookkeeping failure into a failed download,
             # and it cannot be reached by the `except Exception -> 500` below.
-            background=BackgroundTask(mark_leads_downloaded, str(user.id)),
+            # Only when the file carried leads: the header-only responses above
+            # (all-duplicate, all-over-quota, a filter that matched nothing) are
+            # a valid CSV but not leads in anyone's hands.
+            background=(
+                BackgroundTask(mark_leads_downloaded, str(user.id))
+                if records else None
+            ),
         )
     except HTTPException:
         raise

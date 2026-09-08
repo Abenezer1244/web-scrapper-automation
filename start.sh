@@ -15,7 +15,26 @@ CONCURRENCY="${WORKER_CONCURRENCY:-2}"
 # "enrichment" = enrichment jobs only
 QUEUES="${WORKER_QUEUES:-scrape-priority,scrape,enrichment}"
 
+# ─── Schema gate (all services) ──────────────────────────────────────────────
+# Every service must agree not to run against a stale schema. The API has always
+# done this; worker and beat used to skip it and start on whatever schema was
+# there. That is a real failure mode, not a theoretical one: adding a column to
+# `users` makes every ORM `select(User)` name it, so a worker that boots on new
+# code before the migration lands fails ordinary tenant queries, scrape execution
+# included. Rolling deploys start these services independently, so "the API will
+# have migrated by then" is a race, not a guarantee.
+#
+# scripts/migrate.py is advisory-locked and idempotent, so whichever service gets
+# there first applies the migration and the rest block, then no-op. Fail closed:
+# a service that cannot confirm the schema does not start.
+run_migrations() {
+  echo "Running migrations (advisory-locked)..."
+  python scripts/migrate.py || { echo "migration run failed; refusing to start ${1:-service}"; exit 1; }
+  echo "Migrations applied."
+}
+
 if [ "$RAILWAY_SERVICE_NAME" = "worker" ]; then
+  run_migrations worker
   echo "Starting Celery worker (concurrency=$CONCURRENCY, queues=$QUEUES)..."
 
   # Expand /dev/shm for multiple Chromium instances (default 64MB is too small)
@@ -44,20 +63,18 @@ if [ "$RAILWAY_SERVICE_NAME" = "worker" ]; then
     --hostname="worker-${RAILWAY_REPLICA_ID:-0}@%h" \
     --max-tasks-per-child=3
 elif [ "$RAILWAY_SERVICE_NAME" = "beat" ]; then
+  run_migrations beat
   echo "Starting Celery beat scheduler..."
   exec celery -A src.workers beat --loglevel=info --scheduler celery.beat.PersistentScheduler
 else
   echo "Starting API server..."
-  # Run Alembic migrations from the API service only (worker + beat skip this).
-  # The API service runs MULTIPLE replicas and rolling deploys overlap old + new
+  # The API runs MULTIPLE replicas and rolling deploys overlap old + new
   # instances, so two fresh replicas can race the same revision: one wins, the
   # loser's `UPDATE alembic_version WHERE version=<prev>` matches 0 rows and
   # Alembic aborts that boot. scripts/migrate.py serializes the runners behind a
   # PostgreSQL advisory lock (held on a direct, non-pgbouncer connection) so the
-  # losers wait, then run a no-op upgrade and start cleanly. If the upgrade fails
-  # we refuse to start uvicorn instead of serving against a stale schema.
-  echo "Running migrations (advisory-locked)..."
-  python scripts/migrate.py || { echo "migration run failed; refusing to start API"; exit 1; }
-  echo "Migrations applied."
+  # losers wait, then run a no-op upgrade and start cleanly. The same lock is what
+  # lets worker and beat call this too.
+  run_migrations API
   exec uvicorn main:app --host 0.0.0.0 --port "${PORT:-8000}"
 fi

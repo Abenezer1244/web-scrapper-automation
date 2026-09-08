@@ -11,11 +11,10 @@ observed one counts, and the presentation-only grandfather flag never leaks into
 anything that claims to measure.
 """
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.download_tracking import mark_leads_downloaded
@@ -237,31 +236,72 @@ async def test_a_failed_download_records_nothing(
 
 # ─── The day-3 activation email reads the same signal ────────────────────────
 
+def _run_beat_capturing_activation_reminders(monkeypatch) -> list[dict]:
+    """Run the real beat task, capturing what it decided to tell each user.
+
+    monkeypatch (pytest's own, not a mock library) is the only way to observe the
+    decision: send_activation_reminder ends in Resend, which no-ops without an API
+    key and so reports nothing either way.
+    """
+    from src.workers import onboarding_emails
+    from src.workers.scheduler_helpers import onboarding as beat
+
+    sent: list[dict] = []
+
+    def _capture(email, has_scraper, has_download, days_left):
+        sent.append(
+            {
+                "email": email,
+                "has_scraper": has_scraper,
+                "has_download": has_download,
+            }
+        )
+
+    monkeypatch.setattr(onboarding_emails, "send_activation_reminder", _capture)
+    monkeypatch.setattr(onboarding_emails, "send_day1_nudge", lambda *a, **k: None)
+    monkeypatch.setattr(onboarding_emails, "send_trial_ending_email", lambda *a, **k: None)
+    beat._send_onboarding_emails_impl()
+    return sent
+
+
 @pytest.mark.parametrize(
-    ("downloaded_at", "grandfathered", "expected"),
+    ("downloaded", "grandfathered", "expected"),
     [
-        (None, False, False),
-        (None, True, True),
-        ("now", False, True),
+        (False, False, False),   # an export exists, nothing was downloaded
+        (False, True, True),     # grandfathered at cutover
+        (True, False, True),     # observed download
     ],
 )
-async def test_activation_email_uses_the_observed_download(
-    db: AsyncSession, starter_user: User, downloaded_at, grandfathered, expected
+async def test_day3_email_reads_the_observed_download(
+    db: AsyncSession,
+    starter_user: User,
+    scraper_config: ScraperConfig,
+    monkeypatch,
+    downloaded,
+    grandfathered,
+    expected,
 ):
-    """The email's has_download must agree with the checklist, not with export_key."""
-    if downloaded_at == "now":
+    """Drives the real beat task, not a copy of its predicate.
+
+    The user is placed exactly 3 days past signup with a finished, exported job,
+    which is the state the old export_key rule scored as activated.
+    """
+    await _finished_job(db, starter_user, scraper_config)
+    starter_user.created_at = datetime.now(UTC) - timedelta(days=3)
+    starter_user.trial_ends_at = datetime.now(UTC) + timedelta(days=4)
+    if downloaded:
         starter_user.first_leads_downloaded_at = datetime.now(UTC)
     starter_user.onboarding_download_grandfathered = grandfathered
     await db.commit()
 
-    refreshed = (
-        await db.execute(select(User).where(User.id == starter_user.id))
-    ).scalar_one()
-    has_download = (
-        refreshed.first_leads_downloaded_at is not None
-        or bool(refreshed.onboarding_download_grandfathered)
+    sent = await db.run_sync(
+        lambda _s: _run_beat_capturing_activation_reminders(monkeypatch)
     )
-    assert has_download is expected
+
+    mine = [m for m in sent if m["email"] == starter_user.email]
+    assert len(mine) == 1, f"expected one day-3 reminder, got {len(mine)}"
+    assert mine[0]["has_scraper"] is True
+    assert mine[0]["has_download"] is expected
 
 
 async def test_beat_helper_survives_a_user_with_several_scrapers(
@@ -306,3 +346,58 @@ async def test_beat_helper_survives_a_user_with_several_scrapers(
         return _exists(sync_session, ScraperConfig.user_id == starter_user.id)
 
     assert await db.run_sync(_check) is True
+
+
+# ─── A file is not leads ──────────────────────────────────────────────────────
+
+async def test_an_empty_segment_export_does_not_count_as_activation(
+    client: AsyncClient, db: AsyncSession, starter_user: User, starter_token: str
+):
+    """The fabrication Codex found: a user with NO jobs could export an empty
+    Lists CSV and register a download, which made the funnel able to report more
+    downloads than jobs.
+    """
+    resp = await client.post(
+        "/segments/intersection/export",
+        headers={"Authorization": f"Bearer {starter_token}"},
+        json={"record_types": ["probate", "pre_foreclosure"]},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/csv")
+    # A header row and nothing under it.
+    assert len(resp.text.strip().splitlines()) <= 1
+
+    await db.refresh(starter_user)
+    assert starter_user.first_leads_downloaded_at is None
+
+
+def test_header_only_batch_csv_is_not_a_lead():
+    from src.api.routes.batches import _csv_has_a_lead
+
+    assert _csv_has_a_lead(b"party_name,property_address\n") is False
+    assert _csv_has_a_lead(b"") is False
+
+
+def test_a_batch_csv_with_a_row_is_a_lead():
+    from src.api.routes.batches import _csv_has_a_lead
+
+    assert _csv_has_a_lead(b"party_name,property_address\nDOE JANE,123 Main St\n") is True
+
+
+def test_a_quoted_newline_inside_a_field_is_not_counted_as_a_row():
+    """Counting lines instead of parsing would call this header-only file a lead."""
+    from src.api.routes.batches import _csv_has_a_lead
+
+    header_only_with_wrapped_heading = b'"party\nname",address\n'
+    assert _csv_has_a_lead(header_only_with_wrapped_heading) is False
+
+    one_row_spanning_lines = b'party_name,address\n"DOE,\nJANE","123 Main St"\n'
+    assert _csv_has_a_lead(one_row_spanning_lines) is True
+
+
+def test_segment_response_only_tracks_when_there_are_rows():
+    """The gate lives on the shared helper, so both segment exports inherit it."""
+    from src.api.routes.segments import _segment_csv_response
+
+    empty = _segment_csv_response([], "bridgeleads_overlap_none", "user-1")
+    assert empty.background is None

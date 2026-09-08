@@ -20,6 +20,11 @@ the bytes are sent, so a bookkeeping failure cannot cost the user the download t
 already have. It is deliberately not retried, so a process dying mid-task loses one
 observation. Under-counting an activation metric is the acceptable failure here;
 denying someone their leads is not.
+
+Attach it only when the response actually carried at least one lead. A header-only
+CSV (every row a duplicate, an empty segment, a filter that matched nothing) is a
+file, not leads, and counting it would let a user with no jobs at all register as
+activated.
 """
 
 from datetime import UTC, datetime
@@ -40,8 +45,10 @@ async def mark_leads_downloaded(user_id: str) -> None:
     earliest recorded one rather than racing to overwrite it, and a user's tenth
     download does not move the timestamp.
 
-    Opens its own session: the request's session has already been committed and
-    closed by the time a BackgroundTask runs.
+    Opens its own session rather than reusing the request's: FastAPI holds the
+    request's dependency scope open across the background task, so writing through
+    it would put `get_db` through rollback on any failure here, and the response is
+    already gone by then.
     """
     try:
         async with AsyncSessionLocal() as session:
@@ -62,9 +69,11 @@ async def mark_leads_downloaded(user_id: str) -> None:
             )
             await session.commit()
     except Exception:
-        # The CSV has already been sent. Surface the failure in the logs and let
-        # it propagate to the ASGI server's error handler rather than swallowing
-        # it: a persistently failing write means the activation funnel is going
-        # quietly wrong, which is exactly what this module exists to stop.
+        # Log loudly and stop here. The response has already been sent, so raising
+        # buys no retry and no persistence: Starlette cannot send a replacement
+        # 500 after the response has started, the request's dependency teardown
+        # gets dragged through rollback, and uvicorn closes the connection,
+        # costing an unrelated keep-alive. The traceback is the actionable part,
+        # and a persistently failing write shows up as a funnel that stops
+        # moving, which is what this module exists to make visible.
         _logger.exception("Failed to record leads download for user %s", user_id)
-        raise

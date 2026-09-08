@@ -7,6 +7,7 @@ delivery + schedule are SUPPRESSED. The BatchRun + child Jobs are created async
 by the dispatch worker (system-written), so this route only persists the parent
 + children, then kicks off the fan-out.
 """
+import csv
 import io
 import uuid
 from datetime import UTC, datetime
@@ -665,6 +666,19 @@ async def download_batch(
     return await _stream_run_csv(batch_id, run, batch.fields, batch.delivery_mode or "everything")
 
 
+def _csv_has_a_lead(data: bytes) -> bool:
+    """True if the rendered CSV holds at least one row under its header.
+
+    Parsed rather than counting newlines: a lead's address or party name can
+    contain a quoted newline, which would make a line count claim rows that are
+    not there. csv.reader is lazy over the buffer, so this stops after the second
+    record instead of walking a large export.
+    """
+    reader = csv.reader(io.StringIO(data.decode("utf-8", errors="replace")))
+    next(reader, None)  # header
+    return next(reader, None) is not None
+
+
 async def _stream_run_csv(
     batch_id: str, run: BatchRun | None, batch_fields: object = None,
     delivery_mode: str = "everything",
@@ -710,8 +724,12 @@ async def _stream_run_csv(
         # response covers them both. Stamped on the OWNER, not on the run's child
         # jobs: the combined CSV is a filtered, deduplicated selection across
         # them, so "which job did this row come from" is not a question this
-        # response can answer honestly.
-        background=BackgroundTask(mark_leads_downloaded, str(run.user_id)),
+        # response can answer honestly. Skipped for a header-only file, which a
+        # zero-row overlaps_only run legitimately produces.
+        background=(
+            BackgroundTask(mark_leads_downloaded, str(run.user_id))
+            if _csv_has_a_lead(data) else None
+        ),
     )
 
 

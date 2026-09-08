@@ -42,7 +42,15 @@ async def onboarding_status_for_user(
         "scraper_configured": len(configs) > 0,
         "first_scrape_run": len(jobs) > 0,
         "first_scrape_completed": len(done_jobs) > 0,
-        "first_export_downloaded": any(j.export_key for j in done_jobs),
+        # Observed, not inferred (migration 089). export_key is written by the
+        # worker when it marks a job DONE, so the old predicate answered "an
+        # export exists" and ticked this box for users who never downloaded.
+        # The grandfather flag covers accounts that already had a finished
+        # export at cutover, whose real downloads were never instrumented.
+        "first_export_downloaded": (
+            current_user.first_leads_downloaded_at is not None
+            or bool(current_user.onboarding_download_grandfathered)
+        ),
     }
 
     completed = sum(1 for v in steps.values() if v)

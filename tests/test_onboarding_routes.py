@@ -204,6 +204,8 @@ async def test_completed_onboarding_points_at_the_create_scraper_page(
     scraper_config: ScraperConfig,
 ):
     """The "Add Another County" CTA is the same creation page, not a dead route."""
+    from datetime import UTC, datetime
+
     job = Job(
         id=str(uuid.uuid4()),
         user_id=starter_user.id,
@@ -214,6 +216,9 @@ async def test_completed_onboarding_points_at_the_create_scraper_page(
         export_key="exports/whatever.csv",
     )
     db.add(job)
+    # The export existing is NOT the download. Only an observed one completes
+    # the checklist (migration 089).
+    starter_user.first_leads_downloaded_at = datetime.now(UTC)
     await db.commit()
 
     data = await _onboarding(client, starter_token)

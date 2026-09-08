@@ -15,9 +15,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response,
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.background import BackgroundTask
 
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
+from src.api.download_tracking import mark_leads_downloaded
 from src.api.entitlements import enforce_entitlements
 from src.api.lead_actionability import actionable_condition
 from src.api.middleware.rate_limit import rate_limit
@@ -704,6 +706,12 @@ async def _stream_run_csv(
         io.BytesIO(data),
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        # Both batch download routes come through here, so recording once at the
+        # response covers them both. Stamped on the OWNER, not on the run's child
+        # jobs: the combined CSV is a filtered, deduplicated selection across
+        # them, so "which job did this row come from" is not a question this
+        # response can answer honestly.
+        background=BackgroundTask(mark_leads_downloaded, str(run.user_id)),
     )
 
 

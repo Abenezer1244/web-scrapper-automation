@@ -29,10 +29,12 @@ from types import SimpleNamespace
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.background import BackgroundTask
 from starlette.responses import Response
 
 from src.api.auth import CurrentUser
 from src.api.deps import get_rls_db
+from src.api.download_tracking import mark_leads_downloaded
 from src.api.lead_actionability import actionable_sql
 from src.api.middleware import rate_limit
 from src.api.schemas import (
@@ -71,7 +73,7 @@ def _filing_sort_key(date_recorded: str | None) -> int:
         return 0
 
 
-def _segment_csv_response(rows: list, filename_slug: str) -> Response:
+def _segment_csv_response(rows: list, filename_slug: str, user_id: str) -> Response:
     """Render decoded segment rows to the unified dialer-ready overlap CSV.
 
     Sort is hottest-first: most lists -> contactable (has phone/email) -> most
@@ -108,6 +110,9 @@ def _segment_csv_response(rows: list, filename_slug: str) -> Response:
             "Content-Disposition": f'attachment; filename="{filename_slug}.csv"',
             "Cache-Control": "private, no-store",
         },
+        # A Lists CSV is leads in the user's hands just as much as a per-job one,
+        # so it counts toward activation. Recorded after the bytes are sent.
+        background=BackgroundTask(mark_leads_downloaded, user_id),
     )
 
 # Representative rows returned in the JSON preview. The CSV export returns the
@@ -560,7 +565,9 @@ async def intersection_export(
         )
 
     types_slug = "_".join(body.record_types)[:60]
-    return _segment_csv_response(rows, f"bridgeleads_overlap_{types_slug}")
+    return _segment_csv_response(
+        rows, f"bridgeleads_overlap_{types_slug}", str(current_user.id)
+    )
 
 
 async def _fetch_union(
@@ -683,4 +690,6 @@ async def union_export(
         )
 
     types_slug = "_".join(body.record_types)[:60]
-    return _segment_csv_response(rows, f"bridgeleads_combined_{types_slug}")
+    return _segment_csv_response(
+        rows, f"bridgeleads_combined_{types_slug}", str(current_user.id)
+    )

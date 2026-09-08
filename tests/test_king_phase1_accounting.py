@@ -222,3 +222,61 @@ class TestSuccessPathUnchanged:
         assert tax_urls["1234500000"].startswith("https://payment.kingcounty.gov")
         assert stats["deferred"] == []
         assert stats["property_found"] == 1
+
+
+class TestUnreachedIsNotTheSameAsDeferred:
+    """`deferred` is the durable marker set; `unreached` is what we never tried.
+
+    A retrying caller needs the difference. Charging a retry attempt to a parcel
+    that was never tried burns its ceiling on work that never happened; NOT
+    charging one that was tried and failed lets a permanently unanswerable parcel
+    retry forever, which is how a bounded sweep starves its own backlog (Codex).
+    """
+
+    def test_a_failed_fetch_is_deferred_but_not_unreached(self, monkeypatch, offline,
+                                                          no_admission, instant_sleep):
+        monkeypatch.setattr(kca, "safe_get", lambda *a, **k: _Resp(404))
+        pids = _pids(3)
+        stats: dict = {}
+        asyncio.run(kca.batch_enrich_king_county(
+            pids, stats=stats, do_mailing=False, pace_s=0.1,
+        ))
+        assert set(stats["deferred"]) == set(pids)
+        # We DID ask the county about all three. They must be chargeable.
+        assert stats["unreached"] == []
+
+    def test_the_budget_tail_is_both_deferred_and_unreached(self, monkeypatch, offline,
+                                                            no_admission):
+        real_sleep = asyncio.sleep
+
+        async def _slow(_s):
+            await real_sleep(0.02)
+
+        monkeypatch.setattr(kca.asyncio, "sleep", _slow)
+        monkeypatch.setattr(kca, "safe_get", lambda *a, **k: _Resp(200, ""))
+
+        pids = _pids(40)
+        stats: dict = {}
+        asyncio.run(kca.batch_enrich_king_county(
+            pids, stats=stats, do_mailing=False, pace_s=0.1, time_budget_s=0.05,
+        ))
+        assert stats["budget_exhausted"] is True
+        assert stats["unreached"], "the parcels the budget never reached must be marked"
+        # Everything unreached is also deferred; the reverse is not true.
+        assert set(stats["unreached"]).issubset(set(stats["deferred"]))
+
+    def test_the_parcel_that_tripped_the_breaker_counts_as_attempted(
+        self, monkeypatch, offline, no_admission, instant_sleep
+    ):
+        monkeypatch.setattr(kca, "record_source_blocked", lambda *_a, **_k: None)
+        monkeypatch.setattr(kca, "safe_get", lambda *a, **k: _Resp(503))
+
+        pids = _pids(120)
+        stats: dict = {}
+        asyncio.run(kca.batch_enrich_king_county(
+            pids, stats=stats, do_mailing=False, pace_s=0.1,
+        ))
+        # The breaker trips on the 50th request, so parcels 0..49 were all tried.
+        assert set(stats["deferred"]) == set(pids)
+        assert set(stats["unreached"]) == set(pids[50:])
+        assert pids[49] not in stats["unreached"]

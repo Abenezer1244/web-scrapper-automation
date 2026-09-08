@@ -470,7 +470,7 @@ async def batch_enrich_king_county(
             if st is not None:
                 st.update({"requested": len(owned), "property_found": 0,
                            "mailing_candidates": 0, "mailing_attempted": 0,
-                           "mailing_found": 0, "deferred": owned,
+                           "mailing_found": 0, "deferred": owned, "unreached": owned,
                            "budget_exhausted": True, "parcel_mismatch": 0,
                            "parcel_recovered": 0,
                            "phase1_outcomes": "not admitted (source busy)"})
@@ -515,6 +515,14 @@ async def _batch_enrich_king_county(
     st = stats if stats is not None else {}
     st.update({"requested": len(clean), "property_found": 0, "mailing_candidates": 0,
                "mailing_attempted": 0, "mailing_found": 0, "deferred": [],
+               # `deferred` is the DURABLE MARKER set: every parcel that still has
+               # no mailing address, whether we tried it or not. `unreached` is the
+               # strict subset we never issued a request for. A retrying caller
+               # needs the difference: charging a retry attempt to a parcel that
+               # was never tried would burn its ceiling on work that never
+               # happened, and NOT charging one that was tried and failed lets a
+               # permanently unanswerable parcel retry forever (Codex).
+               "unreached": [],
                "budget_exhausted": False, "parcel_mismatch": 0, "parcel_recovered": 0})
     deadline = (_time.monotonic() + time_budget_s) if time_budget_s is not None else None
 
@@ -574,6 +582,7 @@ async def _batch_enrich_king_county(
             _logger.warning("King phase 1: time budget exhausted after %d/%d parcels", i, len(clean))
             st["budget_exhausted"] = True
             st["deferred"].extend(clean[i:])
+            st["unreached"].extend(clean[i:])
             break
         if i % 100 == 0 and i > 0:
             _logger.info("  HTTP: %d / %d ...", i, len(clean))
@@ -624,6 +633,9 @@ async def _batch_enrich_king_county(
                 # the tail — the old shape left the 49 failures with no durable
                 # marker at all, which is why no later sweep could ever find them.
                 st["deferred"].extend(clean[i:])
+                # clean[i] was attempted (its failure is what tripped the breaker);
+                # only the tail after it was never reached.
+                st["unreached"].extend(clean[i + 1:])
                 _tripped = True
                 break  # runs the `finally` below, which skips the pace and exits
             if failed:
@@ -773,6 +785,7 @@ async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
     if len(pids_to_lookup) > _MAX_MAILING_LOOKUPS:
         _logger.info("Capping mailing lookups: %d → %d (to avoid timeout)", len(pids_to_lookup), _MAX_MAILING_LOOKUPS)
         st["deferred"].extend(pids_to_lookup[_MAX_MAILING_LOOKUPS:])
+        st.setdefault("unreached", []).extend(pids_to_lookup[_MAX_MAILING_LOOKUPS:])
         pids_to_lookup = pids_to_lookup[:_MAX_MAILING_LOOKUPS]
 
     _logger.info("Phase 2: Playwright lookup for %d mailing addresses...", len(pids_to_lookup))
@@ -789,6 +802,7 @@ async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
         _logger.warning("King phase 2: budget exhausted before mailing lookups; %d deferred", len(pids_to_lookup))
         st["budget_exhausted"] = True
         st["deferred"].extend(pids_to_lookup)
+        st.setdefault("unreached", []).extend(pids_to_lookup)
         pids_to_lookup = []
     if pids_to_lookup:
         async with BridgeScraper() as scraper:
@@ -801,6 +815,7 @@ async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
                                     i, len(pids_to_lookup))
                     st["budget_exhausted"] = True
                     st["deferred"].extend(pids_to_lookup[i:])
+                    st.setdefault("unreached", []).extend(pids_to_lookup[i:])
                     break
                 if i % 25 == 0:
                     _logger.info("  Mailing: %d / %d ...", i, len(pids_to_lookup))
@@ -881,7 +896,9 @@ async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s):
     found_prop = sum(1 for r in results.values() if r.get("property_address"))
     st["mailing_found"] = found_mail
     # Parcels beyond the per-call mailing cap were never attempted either.
-    st["deferred"].extend(p for p in tax_urls if p not in pids_to_lookup)
+    _never = [p for p in tax_urls if p not in pids_to_lookup]
+    st["deferred"].extend(_never)
+    st.setdefault("unreached", []).extend(_never)
     # `requested` (not the enclosing scope's parcel list — this phase is also
     # reachable standalone via tax_urls_in, where no such list exists).
     _n = st.get("requested") or len(tax_urls)

@@ -56,12 +56,23 @@ _KING_FALLBACK_PARCEL = "3879900805"
 def _king_probe_parcels(db) -> list[str]:
     """Recently scraped King parcel ids to probe with, newest first."""
     try:
+        # MUST be filtered to King. `results` holds Pierce, Snohomish and Clark
+        # parcels too, and several counties also use 10 digits: verified in
+        # production, the unfiltered version of this query returned
+        # 9900000021, a PIERCE parcel, in its top 5. Feeding that to
+        # eRealProperty yields a page that is not about it, `parcel_page_is_for`
+        # fails, and the probe reports King as still refusing us. King would then
+        # stay blocked forever WITH a canary running, which is worse than the
+        # outage this whole change exists to fix (Codex).
         rows = db.execute(
             text(
-                "SELECT DISTINCT parcel_id FROM results "
-                "WHERE parcel_id IS NOT NULL AND length(btrim(parcel_id)) = 10 "
-                "AND btrim(parcel_id) ~ '^[0-9]+$' "
-                "ORDER BY parcel_id DESC LIMIT :n"
+                "SELECT DISTINCT r.parcel_id FROM results r "
+                "JOIN jobs j ON j.id = r.job_id "
+                "JOIN scraper_configs sc ON sc.id = j.scraper_config_id "
+                "WHERE r.parcel_id IS NOT NULL AND length(btrim(r.parcel_id)) = 10 "
+                "AND btrim(r.parcel_id) ~ '^[0-9]+$' "
+                "AND lower(sc.county) = 'king' AND upper(sc.state) = 'WA' "
+                "ORDER BY r.parcel_id DESC LIMIT :n"
             ),
             {"n": _MAX_PROBE_PARCELS},
         ).all()

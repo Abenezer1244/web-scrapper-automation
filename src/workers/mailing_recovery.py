@@ -228,7 +228,14 @@ def _recover_impl(stats: dict) -> dict:
         # charged an attempt: they were not tried, and burning the retry ceiling
         # on work that never happened is how a bounded sweep quietly abandons its
         # own backlog. They stay deferred with their counter untouched.
-        never_tried = {p for p in king_stats.get("deferred", []) if p in by_parcel}
+        #
+        # `unreached`, NOT `deferred` (Codex). `deferred` is the durable marker
+        # set and now correctly includes parcels that WERE attempted and failed.
+        # Reading it here would mean a parcel that fails every single time is
+        # never charged an attempt, so the terminal policy would never fire for
+        # exactly the parcels most likely to be unanswerable, and they would
+        # retry forever.
+        never_tried = {p for p in king_stats.get("unreached", []) if p in by_parcel}
         attempted = [p for p in parcels if p not in never_tried]
         stats["parcels"] = len(attempted)
         stats["unreached"] = len(never_tried)

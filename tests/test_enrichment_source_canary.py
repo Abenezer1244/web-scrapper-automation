@@ -175,3 +175,25 @@ class TestEndToEndRecovery:
 
         # Only now, on evidence, does traffic resume.
         assert is_source_available(sync_db, _KEY) is True
+
+
+class TestProbeTargetsAreKingOnly:
+    def test_the_king_probe_query_is_filtered_to_king(self):
+        """A Pierce parcel would make the King probe fail forever.
+
+        `results` holds Pierce, Snohomish and Clark rows, and several counties
+        also use 10-digit parcel ids. Verified in production: the unfiltered
+        version of this query returned 9900000021, a PIERCE parcel, in its top 5.
+        Feeding that to eRealProperty yields a page that is not about it,
+        `parcel_page_is_for` fails, and the canary reports King as still
+        refusing us — so King stays blocked forever WITH a canary running, which
+        is worse than the outage this change exists to fix (Codex).
+        """
+        import inspect
+
+        from src.scrapers.enrichment import source_probe
+
+        src = inspect.getsource(source_probe._king_probe_parcels)
+        assert "lower(sc.county) = 'king'" in src
+        assert "upper(sc.state) = 'WA'" in src
+        assert "JOIN jobs j" in src and "JOIN scraper_configs sc" in src

@@ -314,3 +314,69 @@ def release_capped_dedup_claims(db, user_id: str, job_id: str, capped_ids: list[
         {"uid": str(user_id), "jid": job_id, "ids": capped_ids},
     )
     return result.rowcount or 0
+
+
+# ─── Same-run sibling collapse (all record types) ──────────────────────────────
+
+def collapse_same_run_siblings(db, job_id: str, user_id) -> int:
+    """Collapse rows in ONE job that share a dedup_hash, so a property bills once.
+
+    ``dedup_hash`` (parcel|address) is the app-wide BILLING key. The cross-job
+    dedup only records that a hash was CLAIMED once; it leaves same-JOB rows
+    sharing a hash all ``is_duplicate=false``, and billing counts ROWS. So a run
+    that scraped two filings on one property charged for both.
+
+    trustee_sale has collapsed its own siblings since 2026-07-03. Nothing else
+    did, and an audit on 2026-09-08 found 8 completed jobs across probate and
+    pre_foreclosure that had charged 50 records for properties already billed in
+    the same run — including one 122-record job that covered 120 properties.
+
+    Survivor rule: keep the MOST COMPLETE row, because the collapsed siblings
+    stop being delivered and whatever they alone carried would be lost. Ranked by
+    having a property address, then a mailing address, then a parcel id, then a
+    party name, then oldest by (date_recorded, id) so the choice is deterministic
+    and a re-run picks the same winner. trustee_sale keeps its own auction-aware
+    rule (soonest auction date) and does not use this.
+
+    Marks losers ``duplicate_reason='same_run'`` pointing at this job, so the
+    results page says "combined" rather than "already delivered" -- they were
+    never delivered before, they are being seen for the first time.
+
+    Returns the number NEWLY collapsed, for the caller's dup_count. Does NOT
+    commit; the caller's transaction owns the write, alongside billing.
+    """
+    result = db.execute(
+        sa_text(
+            """
+            WITH ranked AS (
+                SELECT id,
+                       row_number() OVER (
+                           PARTITION BY dedup_hash
+                           ORDER BY
+                             (COALESCE(btrim(property_address), '') <> '') DESC,
+                             (COALESCE(btrim(mailing_address), '') <> '') DESC,
+                             (COALESCE(btrim(parcel_id), '') <> '') DESC,
+                             (COALESCE(btrim(party_name), '') <> '') DESC,
+                             date_recorded NULLS LAST,
+                             id
+                       ) AS rn
+                FROM results
+                WHERE job_id = :jid
+                  AND user_id = CAST(:uid AS uuid)
+                  AND dedup_hash IS NOT NULL
+                  AND is_duplicate = false
+            )
+            UPDATE results r
+            SET is_duplicate = true,
+                duplicate_reason = 'same_run',
+                duplicate_source_job_id = :jid,
+                duplicate_source_at = NULL
+            FROM ranked
+            WHERE r.id = ranked.id
+              AND ranked.rn > 1
+              AND r.user_id = CAST(:uid AS uuid)
+            """
+        ),
+        {"jid": job_id, "uid": str(user_id)},
+    )
+    return result.rowcount or 0

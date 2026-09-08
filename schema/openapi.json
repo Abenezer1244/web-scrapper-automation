@@ -5015,7 +5015,7 @@
             }
           },
           {
-            "description": "Narrow the combined list to leads MATCHING this record type. The set is deduped, so an overlapping lead carries several record types and is returned by each of them — per-type subtotals therefore sum to MORE than the unfiltered total. That is the overlap, not double counting.",
+            "description": "Narrow the combined list to leads MATCHING this record type. The set is deduped, so an overlapping lead carries several record types and is returned by each of them, so per-type subtotals sum to MORE than the unfiltered total. That is the overlap, not double counting.",
             "in": "query",
             "name": "record_type",
             "required": false,
@@ -5029,7 +5029,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Narrow the combined list to leads MATCHING this record type. The set is deduped, so an overlapping lead carries several record types and is returned by each of them — per-type subtotals therefore sum to MORE than the unfiltered total. That is the overlap, not double counting.",
+              "description": "Narrow the combined list to leads MATCHING this record type. The set is deduped, so an overlapping lead carries several record types and is returned by each of them, so per-type subtotals sum to MORE than the unfiltered total. That is the overlap, not double counting.",
               "title": "Record Type"
             }
           },
@@ -5240,7 +5240,7 @@
             }
           },
           {
-            "description": "Narrow the combined list to leads MATCHING this record type. The set is deduped, so an overlapping lead carries several record types and is returned by each of them — per-type subtotals therefore sum to MORE than the unfiltered total. That is the overlap, not double counting.",
+            "description": "Narrow the combined list to leads MATCHING this record type. The set is deduped, so an overlapping lead carries several record types and is returned by each of them, so per-type subtotals sum to MORE than the unfiltered total. That is the overlap, not double counting.",
             "in": "query",
             "name": "record_type",
             "required": false,
@@ -5254,7 +5254,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Narrow the combined list to leads MATCHING this record type. The set is deduped, so an overlapping lead carries several record types and is returned by each of them — per-type subtotals therefore sum to MORE than the unfiltered total. That is the overlap, not double counting.",
+              "description": "Narrow the combined list to leads MATCHING this record type. The set is deduped, so an overlapping lead carries several record types and is returned by each of them, so per-type subtotals sum to MORE than the unfiltered total. That is the overlap, not double counting.",
               "title": "Record Type"
             }
           },
@@ -5677,13 +5677,13 @@
         "operationId": "list_jobs_jobs_get",
         "parameters": [
           {
-            "description": "Exclude jobs that belong to a batch (their config carries a batch_id). The Results page sets this so a batch's child scrapes don't consume the newest-100 window — the batch shows as one combined row instead.",
+            "description": "Exclude jobs that belong to a batch (their config carries a batch_id). The Results page sets this so a batch's child scrapes don't consume the newest-100 window. The batch shows as one combined row instead.",
             "in": "query",
             "name": "exclude_batch_children",
             "required": false,
             "schema": {
               "default": false,
-              "description": "Exclude jobs that belong to a batch (their config carries a batch_id). The Results page sets this so a batch's child scrapes don't consume the newest-100 window — the batch shows as one combined row instead.",
+              "description": "Exclude jobs that belong to a batch (their config carries a batch_id). The Results page sets this so a batch's child scrapes don't consume the newest-100 window. The batch shows as one combined row instead.",
               "title": "Exclude Batch Children",
               "type": "boolean"
             }
@@ -6571,13 +6571,13 @@
         "operationId": "list_scrapers_scrapers_get",
         "parameters": [
           {
-            "description": "Exclude configs that are children of a batch (batch_id is set). The Scrapers list sets this so one user-initiated batch renders as ONE row instead of one row per county x record_type child. Default False on purpose: other callers legitimately need the children (the grandfathered-probate TOD notice counts EVERY probate config, and /scrapers/{id}/records resolves a child config out of this list) — flipping the default would silently break both.",
+            "description": "Exclude configs that are children of a batch (batch_id is set). The Scrapers list sets this so one user-initiated batch renders as ONE row instead of one row per county x record_type child. Default False on purpose: other callers legitimately need the children (the grandfathered-probate TOD notice counts EVERY probate config, and /scrapers/{id}/records resolves a child config out of this list). Flipping the default would silently break both.",
             "in": "query",
             "name": "exclude_batch_children",
             "required": false,
             "schema": {
               "default": false,
-              "description": "Exclude configs that are children of a batch (batch_id is set). The Scrapers list sets this so one user-initiated batch renders as ONE row instead of one row per county x record_type child. Default False on purpose: other callers legitimately need the children (the grandfathered-probate TOD notice counts EVERY probate config, and /scrapers/{id}/records resolves a child config out of this list) — flipping the default would silently break both.",
+              "description": "Exclude configs that are children of a batch (batch_id is set). The Scrapers list sets this so one user-initiated batch renders as ONE row instead of one row per county x record_type child. Default False on purpose: other callers legitimately need the children (the grandfathered-probate TOD notice counts EVERY probate config, and /scrapers/{id}/records resolves a child config out of this list). Flipping the default would silently break both.",
               "title": "Exclude Batch Children",
               "type": "boolean"
             }

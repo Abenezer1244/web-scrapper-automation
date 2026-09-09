@@ -310,3 +310,163 @@ Full findings with file:line are in
 `C:/Users/Windows/AppData/Local/Temp/claude/.../scratchpad/gate2_final.md` for this
 session only; everything material from it is reproduced above, because that path will
 not survive.
+
+
+---
+
+## 9. The two P1s: RESOLVED into a specification (2026-09-08, second session)
+
+Codex was consulted twice (463k + 660k tokens, one resumed session). Nothing below is
+implemented. Every Stripe claim marked "verified" was checked against the installed
+`stripe==11.4.0` or the live API docs in this session; claims Codex itself marked
+UNVERIFIED are carried through as UNVERIFIED rather than smoothed over.
+
+### Two of my own claims were wrong; both corrected
+
+* I said Stripe's `identifier` dedup would permanently swallow a corrected re-fire.
+  **Wrong** — uniqueness is guaranteed for "at least 24 hours", not forever. The
+  permanence comes from OUR OWN `reported_at` stamp, not from Stripe.
+* I said `flush()` exposes `stripe_customer_id`. **Wrong** — `get_db`
+  (`src/db/session.py:69-77`) commits after the route returns, and `create_checkout`
+  uses `get_rls_db` which depends on it. The id still lands before payment. The bug is
+  unchanged; the mechanism was.
+
+### Facts established this session (verified in-repo, not inherited)
+
+* **The outbox cannot express the answer.** `skip_trace_meter_events` has exactly
+  `id, tracerfy_queue_id, user_id, billable_units, stripe_customer_id, plan,
+  created_at, reported_at`. `reported_at` is the ONLY disposition field, so
+  "billed", "deliberately non-billable" and "still held" are indistinguishable.
+* **`reported_at` does not mean "reported".** `tracerfy_ingest.py:137` stamps it
+  unconditionally after the try/except, including on the `_StripeNotConfiguredError`
+  path. Existing `reported_at` rows have ambiguous provenance and must NOT be
+  relabelled "billed" without reconciliation.
+* **`created_at` is NOT usage time.** It is `server_default=func.now()`, i.e. the
+  Postgres transaction clock at outbox INSERT during ingest reconciliation — not when
+  the lookup was performed. `SkipTraceQueue.submitted_at` is overwritten during
+  adoption, so it is not a substitute. **The true provider-execution time for
+  historical rows is UNVERIFIED and may not be recoverable.** This is the single
+  biggest scope surprise: a correct `usage_at` is a prerequisite for A2/A3 below and
+  is not sitting in a column waiting to be read.
+* **There is no consent storage** anywhere on `users`.
+* **Customer adoption inspects only 5 results.** `billing.py:756` is
+  `stripe.Customer.list(email=..., limit=5)` with no pagination, first metadata match
+  wins. With more than five Stripe customers on that email the right one can be
+  missed, a duplicate customer is created, and the new guard would then enumerate the
+  WRONG customer's subscriptions. **This is an eighth finding, not in section 6.**
+* `pg_advisory_xact_lock(4242, hashtext(:uid))` already exists at
+  `entitlements.py:367`; the checkout guard should use a separate key namespace.
+
+### P1-a — the complete set of firing paths (one choke point, not two)
+
+Codex's first answer said to enforce in "both the sweep and the reporting task". The
+call graph says the task alone is authoritative, and Codex agreed on review:
+
+* `report_meter_event_to_stripe` has exactly ONE production caller —
+  `tracerfy_ingest.py:112`, inside `report_skip_trace_meter_event`.
+* `report_skip_trace_meter_event` is enqueued from exactly TWO places —
+  `meter.py:67` (sweep) and `tracerfy_ingest.py:725` (inline post-commit).
+
+Both funnel into the same task. The task must recheck immediately before reporting;
+the sweep's SQL is an optimisation, not a second gate. Duplicating the predicate into
+sweep SQL would create two copies of a billing rule that must agree. Use ONE shared
+evaluator; classification and timestamp attribution also belong at outbox creation.
+
+### P1-a — the decision
+
+**Do not auto-charge the pre-subscription backlog.** Given zero historical
+subscriptions, existing unreported rows are `non_billable / pre_subscription`.
+
+Outbox gains `disposition` (`pending` | `reported` | `non_billable` | `needs_review` |
+`written_off_manual` | `settled_manual`), plus `disposition_at`, `disposition_reason`,
+`usage_at`, `billing_terms_id`. `reported_at` keeps ONLY its literal meaning
+(acknowledged Stripe submission). Sweep only `pending`.
+
+Always pass an explicit `timestamp=int(usage_at.timestamp())`. **Never** fall back to
+submission time — that fallback IS the retroactive-charge failure. Older than Stripe's
+35-day backdating limit at release: `needs_review / timestamp_expired`, no MeterEvent
+attempted.
+
+A new `billing_terms` record (user, customer, subscription, subscription_item, price,
+checkout_session, effective_from/to) is the billing evidence. **No consent-capture UI
+is required** — a completed hosted Checkout is the purchase evidence, PROVIDED it
+presents the applicable overage price. **Whether our live Checkout actually discloses
+it is UNVERIFIED and must be checked before relying on this.**
+
+Automatic reporting is deliberately limited to the CURRENT active period of the
+subscription named in the terms. Late-but-legitimate usage (A6: incurred inside a paid
+period, reported after cancellation) is `needs_review / closed_billing_period` — it
+must NOT be attached to a later subscription, and it does not become free merely
+because subscription state moved on. Whether a MeterEvent submitted after cancellation
+lands on the final invoice is **UNVERIFIED**.
+
+Rollout order matters: pause/drain meter reporting, apply additive schema, classify
+historical rows, deploy, then resume — because old workers can otherwise release rows
+under the old predicate mid-migration.
+
+### P1-b — the decision: 409 guard now, `Subscription.modify` deferred
+
+Deferral is technical, not cautious: monthly to annual cannot leave the metered price
+on a monthly interval (Stripe interval constraint) — both prices must move, and mixed
+intervals need flexible billing on API version `2025-06-30.basil`+. Codex has **not**
+sandbox-verified the two-item transition.
+
+Guard specification, all APIs verified present in `stripe==11.4.0`:
+
+```
+validate price -> advisory lock (own namespace) -> REFRESH user from DB
+  -> resolve/adopt/create customer (paginated!) -> enumerate subscriptions
+  -> expire outstanding open subscription-mode Sessions -> re-enumerate -> Session.create
+```
+
+* Enumerate with `stripe.Subscription.list(customer=..., status="all", limit=100)`
+  and `.auto_paging_iter()`. **Verified in the pinned SDK: "If no value is supplied,
+  all subscriptions that have not been canceled are returned"** — the default is
+  non-canceled, NOT active-only, so `status="all"` is required to see everything.
+* Blocking = any status NOT in `{canceled, incomplete_expired}`. Unknown statuses
+  fail closed. Do not filter by requested price.
+* The advisory lock ALONE is insufficient: it serialises requests, but the first
+  Session stays purchasable. `stripe.checkout.Session.list(customer=..., status="open")`
+  + `Session.expire(...)` (both verified present in 11.4.0), then re-enumerate. If an
+  expire loses a race to completion, stop and reconcile — never continue blindly.
+* Refresh the user AFTER taking the lock: `current_user` may predate the wait.
+* Stripe enumeration failure -> `503`, "Billing is temporarily unavailable. Please try
+  again later." Create no replacement Session.
+* Existing subscription -> `409`, `code: subscription_exists`, "You already have a
+  subscription. Contact support to change your plan or billing frequency." Do NOT
+  offer the portal as the plan-switch destination; `subscription_update` is disabled
+  on `bpc_1TGRdU...` so it genuinely cannot perform the switch.
+
+B6, the flows the guard must NOT wrongly block:
+
+* Actually `canceled` but app entitlement not yet lapsed -> **allow**. Residual
+  entitlement is not a live Stripe obligation.
+* `cancel_at_period_end=true`, still active -> **block**, the subscription exists.
+* `incomplete` -> block NEW subscription creation, but offer continuation of the
+  existing payment rather than a dead end ("Your subscription payment is incomplete.
+  Complete payment to continue."). Stripe's initial-payment window is ~23 hours;
+  once `incomplete_expired`, allow fresh checkout. Without this branch the guard
+  locks a customer out for a day after one failed card.
+
+### What this changes about the plan
+
+P1-b is fully specified and implementable now. **P1-a is materially larger than
+section 6 implied** — it is a migration plus a new `billing_terms` table plus a
+drain-ordered rollout, and it rests on a `usage_at` whose provenance for historical
+rows is unresolved. The safe minimum that stops the bleeding is narrower than the full
+spec: stop the wrong release, and classify the existing backlog. The attribution
+machinery can follow behind that.
+
+### Merge state at the time of writing
+
+`origin/main` merged forward as `7803bc4` (4 conflicts, 3 of them import-block only).
+One real seam that auto-merge hid: main's
+`test_an_empty_segment_export_does_not_count_as_activation` used a Starter fixture
+against `/segments/intersection/export`, which this branch now gates — re-pinned to
+Business in `8056834`, not deleted. Suites after the merge: **2,750 non-integration
+passed / 0 failed**, **182 integration passed / 9 skipped / 0 failed**.
+
+The isolated database needed `alembic upgrade head` (089 -> 090) after the merge: the
+suite does not migrate it, so it will lag again on the next merge carrying a migration.
+That produced 245 failures + 331 errors whose every exception was the same missing
+column — an environment lag, not a product defect.

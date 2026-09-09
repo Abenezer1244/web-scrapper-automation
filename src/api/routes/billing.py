@@ -1,5 +1,6 @@
 """Stripe billing routes: checkout, portal, webhooks, plans, usage."""
 
+import asyncio
 from datetime import UTC, datetime
 
 import stripe
@@ -19,7 +20,21 @@ from src.api.billing_entitlement import (
 from src.api.deps import get_rls_db
 from src.api.middleware import client_ip, rate_limit
 from src.config import frontend_routes, settings
-from src.config.constants import COUNTY_LIMIT_BY_PLAN, TRIAL_PERIOD_DAYS
+from src.config.constants import (
+    ALL_RECORD_TYPES,
+    ALL_SCHEDULE_FREQUENCIES,
+    BATCH_PLANS,
+    COUNTY_LIMIT_BY_PLAN,
+    OVERLAP_PLANS,
+    PRIORITY_QUEUE_PLANS,
+    RECORD_TYPES_BY_PLAN,
+    SUPPORTED_EXPORT_FORMATS,
+    TRIAL_PERIOD_DAYS,
+    allowed_export_formats,
+    allowed_schedule_frequencies,
+    export_format_label,
+    record_type_label,
+)
 from src.config.plans import PLAN_CATALOG
 from src.db import User, get_db
 from src.utils.logger import setup_logger
@@ -284,6 +299,15 @@ async def skip_trace_usage(
     Used by the frontend billing page to render a progress bar and
     overage estimate. Values are read from the cached counter on the
     User row — no external calls.
+
+    The period reported is the user's ENTITLEMENT WINDOW, the same one records
+    are metered over and the same one the counter now rolls on. It used to
+    report the raw `skip_trace_period_start`, which was a calendar month, so the
+    page told a subscriber anchored on the 20th that their lookups reset on the
+    1st while their records reset on the 20th and Stripe invoiced on the 20th.
+    `effective_window` is used rather than the stored pair for the same reason
+    /billing/usage uses it: a window that has ended but not yet rolled would
+    otherwise be reported as the current one.
     """
     await rate_limit(request, zone="general", identifier=current_user.id)
     plan = (current_user.plan or "starter").lower()
@@ -302,6 +326,10 @@ async def skip_trace_usage(
 
     estimated_charges_usd = round(overage_units * (overage_rate_usd or 0), 2)
 
+    from src.api.quota import effective_window
+
+    _window_start, _window_end = effective_window(current_user)
+
     return {
         "plan": plan,
         "quota": quota,
@@ -310,11 +338,8 @@ async def skip_trace_usage(
         "overage_units": overage_units,
         "overage_rate_usd": overage_rate_usd,
         "estimated_charges_usd": estimated_charges_usd,
-        "period_start": (
-            current_user.skip_trace_period_start.isoformat()
-            if current_user.skip_trace_period_start
-            else None
-        ),
+        "period_start": _window_start.isoformat(),
+        "period_end": _window_end.isoformat(),
     }
 
 # ─── Plan catalog ─────────────────────────────────────────────────────────────
@@ -441,6 +466,41 @@ async def list_plans() -> dict:
     return {"plans": _PLANS, "founding_offer": founding}
 
 
+# ── Comparison-table cells, derived from the enforced matrix ─────────────────
+# Every one of these used to be a hand-typed string, and three of them had
+# drifted away from the gate they describe. Deriving costs a few lines and
+# makes the drift impossible rather than merely unlikely.
+
+def _record_types_cell(plan: str) -> str:
+    allowed = RECORD_TYPES_BY_PLAN[plan]
+    if allowed == ALL_RECORD_TYPES:
+        return "All"
+    return ", ".join(sorted(record_type_label(rt) for rt in allowed))
+
+
+def _export_formats_cell(plan: str) -> str:
+    allowed = allowed_export_formats(plan)
+    if allowed == SUPPORTED_EXPORT_FORMATS:
+        return "All formats"
+    # xlsx is the on-disk alias of excel; one format, one label.
+    return ", ".join(sorted({export_format_label(f) for f in allowed}))
+
+
+def _scheduling_cell(plan: str) -> str:
+    allowed = allowed_schedule_frequencies(plan)
+    recurring = sorted(allowed - {"manual"})
+    if not recurring:
+        return "Manual only"
+    if allowed == ALL_SCHEDULE_FREQUENCIES:
+        return "All frequencies"
+    return ", ".join(f.title() for f in recurring)
+
+
+def _skip_trace_cell(plan: str) -> str | bool:
+    quota = settings.SKIP_TRACE_BUNDLED_QUOTAS.get(plan, 0)
+    return f"{quota:,} included" if quota else False
+
+
 @router.get("/pricing")
 async def pricing_page() -> dict:
     """Return full pricing page data including feature comparison matrix.
@@ -464,15 +524,53 @@ async def pricing_page() -> dict:
                        else f"{COUNTY_LIMIT_BY_PLAN[plan]:,}")
                 for plan in ("starter", "pro", "business", "agency")
             },
-            "Record types": {"starter": "Probate", "pro": "All", "business": "All", "agency": "All"},
+            # Derived, never re-typed. This row said Pro got "All" record types
+            # while RECORD_TYPES_BY_PLAN gives it four of seven and the API
+            # answers 402 for the rest, in the SAME response whose plan bullets
+            # named the correct four. The Counties row above had drifted the same
+            # way and was fixed the same way in #235.
+            "Record types": {
+                plan: _record_types_cell(plan)
+                for plan in ("starter", "pro", "business", "agency")
+            },
             "Data freshness": {"starter": "7-day delay", "pro": "Daily", "business": "Daily", "agency": "Daily"},
-            "Export formats": {"starter": "CSV", "pro": "CSV, Excel", "business": "CSV, Excel, JSON, API", "agency": "CSV, Excel, JSON, API"},
-            "Scheduling": {"starter": "Manual only", "pro": "Daily, Weekly", "business": "All frequencies", "agency": "All frequencies"},
-            "Email delivery": {"starter": False, "pro": True, "business": True, "agency": True},
+            "Export formats": {
+                plan: _export_formats_cell(plan)
+                for plan in ("starter", "pro", "business", "agency")
+            },
+            "Scheduling": {
+                plan: _scheduling_cell(plan)
+                for plan in ("starter", "pro", "business", "agency")
+            },
+            # Starter read False here and nothing enforced it: `deliver.emails` is
+            # accepted on every plan, and the Starter card never claimed otherwise.
+            # A row nothing implements is a promise in the wrong direction.
+            "Email delivery": {"starter": True, "pro": True, "business": True, "agency": True},
             "Webhook delivery": {"starter": False, "pro": False, "business": True, "agency": True},
-            "Skip tracing": {"starter": False, "pro": "Per-lookup", "business": "1,000 included", "agency": "2,000 included"},
+            "Dialer delivery": {"starter": False, "pro": False, "business": True, "agency": True},
+            # Pro read "Per-lookup", which dropped the 250 lookups its own card
+            # bullet includes. Derived from the same quotas the meter bills on.
+            "Skip tracing": {
+                plan: _skip_trace_cell(plan)
+                for plan in ("starter", "pro", "business", "agency")
+            },
+            "Overlap and intersection lists": {
+                plan: plan in OVERLAP_PLANS
+                for plan in ("starter", "pro", "business", "agency")
+            },
+            "Batch scraping": {
+                plan: plan in BATCH_PLANS
+                for plan in ("starter", "pro", "business", "agency")
+            },
             "API access": {"starter": False, "pro": False, "business": True, "agency": True},
-            "Team members": {"starter": "1", "pro": "1", "business": "5", "agency": "Unlimited"},
+            "Priority queue": {
+                plan: plan in PRIORITY_QUEUE_PLANS
+                for plan in ("starter", "pro", "business", "agency")
+            },
+            # "Team members" used to sit here as 1 / 1 / 5 / Unlimited. There is no
+            # seat model anywhere in this application: no invite flow, no member
+            # table, no route. The row was a promise with nothing behind it, so it
+            # is gone rather than restated. Put it back when seats exist.
             "White-label": {"starter": False, "pro": False, "business": False, "agency": "Coming soon"},
             "Support": {"starter": "Community", "pro": "Email", "business": "Priority email", "agency": "Dedicated manager"},
         },
@@ -494,7 +592,7 @@ async def pricing_page() -> dict:
             {"q": "What counties do you cover?", "a": "22 Washington State counties are live and scraped daily. We can add any US county in 30 seconds. Request yours after signing up."},
             {"q": "Does it include phone and email?", "a": "Yes. Skip tracing is built in: every lead gets phone number, phone type, and email via Tracerfy within 10-15 minutes."},
             {"q": "Can I cancel anytime?", "a": "Yes. No contracts, no cancellation fees. Your data exports remain available for 30 days after cancellation."},
-            {"q": "What export formats do you support?", "a": "CSV, Excel, and JSON. Business and Agency plans also get API access for direct integration."},
+            {"q": "What export formats do you support?", "a": "CSV, Excel, and JSON. Each run delivers one file in the format you pick. Starter is CSV, Pro adds Excel, and Business and Agency get every format plus API access for direct integration."},
         ],
     }
 
@@ -573,7 +671,16 @@ async def get_subscription(request: Request, current_user: CurrentUser) -> dict:
             return {"status": "none", "plan": current_user.plan}
 
         sub = subscriptions.data[0]
-        price = sub["items"]["data"][0]["price"]
+        # The LICENSED plan item, not items[0]: the metered skip-trace item
+        # sits on the same subscription and has unit_amount 8 (cents per
+        # lookup), which as "amount_monthly" would read to the customer as a
+        # $0 plan.
+        _items = sub["items"]["data"]
+        _plan_price_id = _plan_item_price_id(_items)
+        price = next(
+            (i["price"] for i in _items if i["price"]["id"] == _plan_price_id),
+            _items[0]["price"],
+        )
         return {
             "status": sub["status"],
             "plan": current_user.plan,
@@ -594,6 +701,209 @@ async def get_subscription(request: Request, current_user: CurrentUser) -> dict:
 
 
 # ─── Checkout ─────────────────────────────────────────────────────────────────
+
+# plan id -> the metered skip-trace Price for each billing interval.
+_SKIP_TRACE_METERED_PRICE: dict[str, dict[str, str]] = {
+    "pro": {
+        "month": settings.STRIPE_PRICE_SKIP_TRACE_PRO,
+        "year": settings.STRIPE_PRICE_SKIP_TRACE_PRO_ANNUAL,
+    },
+    "business": {
+        "month": settings.STRIPE_PRICE_SKIP_TRACE_BUSINESS_OVERAGE,
+        "year": settings.STRIPE_PRICE_SKIP_TRACE_BUSINESS_ANNUAL,
+    },
+    "agency": {
+        "month": settings.STRIPE_PRICE_SKIP_TRACE_AGENCY_OVERAGE,
+        "year": settings.STRIPE_PRICE_SKIP_TRACE_AGENCY_ANNUAL,
+    },
+}
+
+
+def _metered_skip_trace_price(plan: str, interval: str) -> str | None:
+    """The metered skip-trace Price to put on this subscription, or None.
+
+    None is a deliberate, survivable outcome, not an error:
+
+      * Starter has no skip-trace allowance and no metered price;
+      * an interval with no provisioned price (today: every annual one)
+        would otherwise fail the whole checkout, because Stripe requires
+        every item in a subscription to share one recurring interval and
+        the monthly price cannot ride on a yearly subscription.
+
+    Selling a plan is more important than metering its overage, so an
+    unprovisioned interval logs loudly and checkout proceeds unmetered.
+    """
+    price = (_SKIP_TRACE_METERED_PRICE.get(plan) or {}).get(interval, "")
+    if not price:
+        if plan in _SKIP_TRACE_METERED_PRICE:
+            _logger.warning(
+                "checkout: no metered skip-trace price configured for plan %s on "
+                "a %sly subscription. Over-quota lookups will be recorded and "
+                "NOT billed. Provision one and set the matching STRIPE_PRICE_"
+                "SKIP_TRACE_* env on api AND worker.",
+                plan, interval,
+            )
+        return None
+    if not price.startswith("price_"):
+        _logger.error(
+            "checkout: metered skip-trace id %r for plan %s is not a 'price_' "
+            "id. Skipping it rather than failing the sale.",
+            price, plan,
+        )
+        return None
+    return price
+
+
+def _plan_item_price_id(items: list) -> str | None:
+    """The LICENSED plan price among a subscription's items.
+
+    Every reader here used to take ``items[0]``, which was safe only while a
+    subscription had exactly one item. With the metered skip-trace item
+    attached, index 0 is whichever Stripe returns first, so a plan lookup on
+    it would miss the map, alert "price not in plan map", and refuse to
+    activate a plan the customer had just paid for.
+    """
+    for item in items or []:
+        pid = ((item or {}).get("price") or {}).get("id")
+        if pid and pid in _PRICE_TO_PLAN:
+            return pid
+    return None
+
+
+# ─── Checkout guard: one subscription per customer ────────────────────────────
+
+# A subscription in any of these states is OVER. Everything else is a live
+# obligation, including the ones that are easy to read as "not really active":
+# `past_due` and `unpaid` still bill, `paused` still exists, `trialing` becomes
+# active on its own, and `incomplete` can still be paid within Stripe's ~23h
+# initial-payment window. Anything Stripe adds later is unknown to this set and
+# therefore blocks — the set names what is SAFE, so a new status fails closed.
+_TERMINAL_SUBSCRIPTION_STATUSES = frozenset({"canceled", "incomplete_expired"})
+
+
+class _StripeStateUnavailableError(Exception):
+    """Stripe could not be asked what subscriptions this customer has.
+
+    Raised rather than swallowed: not knowing is not the same as knowing there
+    is none, and treating an outage as "no subscription" is exactly how a
+    customer ends up paying twice.
+    """
+
+
+def _resolve_existing_customer(email: str, user_id: str) -> str | None:
+    """The Stripe customer already belonging to this user, or None.
+
+    Paginated. This used to read `Customer.list(email=..., limit=5)` and take
+    the first metadata match in that page, so a user with more than five Stripe
+    customers on one address could have their real one sit on page two: we
+    would create a SIXTH customer, and the subscription guard below would then
+    enumerate the wrong customer's subscriptions and wave through a duplicate
+    subscription. The guard is only as good as the customer it is pointed at.
+
+    Metadata must match this user_id exactly. A customer with someone else's
+    user_id, or with none, is never adopted — reusing another account's Stripe
+    customer would cross-bill two tenants.
+    """
+    for customer in stripe.Customer.list(email=email, limit=100).auto_paging_iter():
+        if ((customer.get("metadata") or {}).get("user_id")) == user_id:
+            return customer["id"]
+    return None
+
+
+def _live_subscription(customer_id: str) -> dict | None:
+    """The customer's first non-terminal subscription, or None.
+
+    `status="all"` is REQUIRED, not defensive. The Stripe SDK documents the
+    default as "all subscriptions that have not been canceled" — which sounds
+    like what we want and is not: it omits `canceled` (fine) but the point of
+    this call is to see EVERY state, and relying on an unstated default to pick
+    the right ones is how the wrong set gets enumerated after an SDK bump.
+
+    Deliberately NOT filtered by price: the question is "does this customer
+    already owe Stripe money on a subscription", not "does this customer
+    already have the plan they just clicked". Buying annual while holding
+    monthly is the exact case that produced two live obligations.
+    """
+    try:
+        for sub in stripe.Subscription.list(
+            customer=customer_id, status="all", limit=100,
+        ).auto_paging_iter():
+            if sub.get("status") not in _TERMINAL_SUBSCRIPTION_STATUSES:
+                return sub
+    except Exception as exc:  # noqa: BLE001 — any Stripe/network failure is "unknown"
+        raise _StripeStateUnavailableError(str(exc)[:200]) from exc
+    return None
+
+
+def _expire_open_checkout_sessions(customer_id: str) -> int:
+    """Expire this customer's open subscription-mode Checkout Sessions.
+
+    The advisory lock below serialises two concurrent /checkout CALLS; it does
+    nothing about two Sessions that already exist. A session stays purchasable
+    until it expires on its own, so a customer with two tabs open can pay for
+    both and end up with two subscriptions having passed a guard that was
+    correct at the moment each request ran.
+
+    Only `mode="subscription"` sessions are touched. A one-off payment session
+    is not a competing obligation and expiring it would cancel a purchase this
+    guard has no business cancelling.
+    """
+    expired = 0
+    try:
+        sessions = stripe.checkout.Session.list(
+            customer=customer_id, status="open", limit=100,
+        ).auto_paging_iter()
+        for session in sessions:
+            if session.get("mode") != "subscription":
+                continue
+            stripe.checkout.Session.expire(session["id"])
+            expired += 1
+    except Exception as exc:  # noqa: BLE001 — same rule as the enumeration above
+        raise _StripeStateUnavailableError(str(exc)[:200]) from exc
+    return expired
+
+
+def _subscription_conflict(sub: dict) -> HTTPException:
+    """The 409 for a customer who already has a live subscription.
+
+    `incomplete` gets its own message on purpose. It means the first payment
+    has not settled yet and Stripe still accepts it for about 23 hours, so the
+    customer's actual next step is to finish paying, not to talk to a human.
+    Sending them to support for a card that just needs retrying would lock them
+    out of their own purchase for a day.
+
+    Everyone else is routed to /billing/change-plan, which modifies the
+    subscription they already have. NOT the customer portal: the live portal
+    configuration has `subscription_update` DISABLED, so offering it as the
+    place to switch plans sends people somewhere that genuinely cannot do it.
+    """
+    if sub.get("status") == "incomplete":
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "subscription_incomplete",
+                "message": (
+                    "Your subscription payment is incomplete. Complete that "
+                    "payment to continue — starting a new checkout would "
+                    "create a second subscription."
+                ),
+            },
+        )
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "subscription_exists",
+            "message": (
+                "You already have a subscription. Change your plan or billing "
+                "frequency instead of starting a new one."
+            ),
+            # The endpoint that CAN do this. Checkout only ever creates, so
+            # sending the caller back here would produce the second subscription
+            # this refusal exists to prevent.
+            "action": "change_plan",
+        },
+    )
+
 
 class CheckoutRequest(BaseModel):
     price_id: str
@@ -639,62 +949,583 @@ async def create_checkout(
             detail="Billing is temporarily unavailable. Please try again later.",
         )
 
+    # Serialise this user's checkout attempts. Two requests in flight (two tabs,
+    # a double-click, a retry after a slow response) would otherwise both read
+    # "no subscription", both pass the guard below, and both create a Session.
+    # Its own key namespace (4243) so it cannot contend with the entitlement
+    # lock at src/api/entitlements.py, which guards a different invariant.
+    # Transaction-scoped: released when this request's transaction ends.
     try:
-        customer_id = current_user.stripe_customer_id
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(4243, hashtext(:uid))"),
+            {"uid": str(current_user.id)},
+        )
+
+        # Re-read the user AFTER taking the lock. `current_user` was loaded
+        # before we started waiting, so on the losing side of a race it
+        # describes the world as it was before the winner ran — including a
+        # stripe_customer_id the winner has just written.
+        _row = await db.execute(select(User).where(User.id == current_user.id))
+        user = _row.scalar_one()
+
+        # Resolve the customer WITHOUT persisting it yet. The write is deferred
+        # to after the Session exists, deliberately: `stripe_customer_id` is the
+        # signal the skip-trace meter sweep uses to release held usage, so
+        # persisting it on a checkout we are about to REFUSE would fire a
+        # customer's held backlog for a subscription that never happened.
+        customer_id = user.stripe_customer_id
+        newly_resolved = False
         if not customer_id:
-            # C3 (full-SaaS review): check Stripe for an existing
-            # customer with this email before creating a new one.
-            # If one exists AND its metadata matches this user_id,
-            # adopt it — prevents orphaned Stripe customers when a
-            # user completes checkout in multiple browser tabs or
-            # when a prior checkout was abandoned after customer
-            # creation but before success. If an existing customer
-            # has mismatched metadata, we refuse to adopt and
-            # create a fresh one so we never reuse another
-            # account's Stripe customer.
-            existing = stripe.Customer.list(email=current_user.email, limit=5)
-            reusable = None
-            for c in (existing.get("data") or []):
-                md_user_id = (c.get("metadata") or {}).get("user_id")
-                if md_user_id == current_user.id:
-                    reusable = c
-                    break
-            if reusable is not None:
-                customer_id = reusable["id"]
-            else:
-                customer = stripe.Customer.create(
-                    email=current_user.email,
-                    metadata={"user_id": current_user.id},
-                )
-                customer_id = customer["id"]
-            result = await db.execute(select(User).where(User.id == current_user.id))
-            user = result.scalar_one()
-            user.stripe_customer_id = customer_id
-            await db.flush()
+            # Adopt this user's existing Stripe customer if there is one —
+            # abandoned checkouts and multi-tab starts leave them behind, and
+            # creating another would fragment the subscription history the
+            # guard below reads.
+            customer_id = _resolve_existing_customer(user.email, str(user.id))
+            if not customer_id:
+                customer_id = stripe.Customer.create(
+                    email=user.email,
+                    metadata={"user_id": str(user.id)},
+                )["id"]
+            newly_resolved = True
+
+        # THE GUARD. Asked of Stripe, never of `users.plan`: on this deployment
+        # plans are set by hand in the database and no user carries a
+        # stripe_subscription_id, so a plan-based check would refuse checkout to
+        # every real account we have while still missing an actual duplicate.
+        existing = _live_subscription(customer_id)
+        if existing is not None:
+            _logger.info(
+                "checkout refused for user %s: subscription %s is %s",
+                user.id, existing.get("id"), existing.get("status"),
+            )
+            raise _subscription_conflict(existing)
+
+        # Kill any Session already outstanding, then ASK AGAIN. Expiring is not
+        # instantaneous and a session can be paid while we are expiring it; the
+        # second read is what catches a subscription created in that window.
+        _expire_open_checkout_sessions(customer_id)
+        existing = _live_subscription(customer_id)
+        if existing is not None:
+            _logger.warning(
+                "checkout refused for user %s: subscription %s (%s) appeared "
+                "while expiring outstanding sessions",
+                user.id, existing.get("id"), existing.get("status"),
+            )
+            raise _subscription_conflict(existing)
+
+        # The plan item, plus the metered skip-trace item when one is
+        # provisioned for this plan and interval. A metered price must NOT
+        # carry a quantity: Stripe rejects the item outright if it does.
+        _plan_id, _limit, _interval = _PRICE_TO_PLAN[stripe_price_id]
+        line_items: list[dict] = [{"price": stripe_price_id, "quantity": 1}]
+        metered_price = _metered_skip_trace_price(_plan_id, _interval)
+        if metered_price:
+            line_items.append({"price": metered_price})
 
         session = stripe.checkout.Session.create(
             customer=customer_id,
             mode="subscription",
+
             payment_method_types=["card"],
-            line_items=[{"price": stripe_price_id, "quantity": 1}],
+            line_items=line_items,
             success_url=f"{settings.FRONTEND_URL}/settings?upgrade=success",
             cancel_url=f"{settings.FRONTEND_URL}/settings?upgrade=cancelled",
             metadata={"user_id": current_user.id, "price_id": price_or_product_id},
             allow_promotion_codes=True,
         )
+
+        # Persist the customer id only now that a Session exists. Before the
+        # guard this write happened first, which meant a REFUSED checkout still
+        # published the id that releases held skip-trace meter events.
+        if newly_resolved:
+            user.stripe_customer_id = customer_id
+            await db.flush()
+
         return {"checkout_url": session.url}
     except HTTPException:
         raise
+    except _StripeStateUnavailableError as exc:
+        # We could not establish whether this customer already has a
+        # subscription. Failing CLOSED: creating a Session here is the one
+        # outcome that can charge someone twice, and "try again" costs a
+        # customer seconds where a duplicate subscription costs them money and
+        # us a refund.
+        _logger.error(
+            "checkout: could not read Stripe subscription state for user %s "
+            "(%s) — refusing rather than risking a duplicate subscription",
+            current_user.id, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Billing is temporarily unavailable. Please try again later.",
+        ) from exc
     except Exception:
         _logger.exception("Checkout failed for user %s", current_user.id)
         raise HTTPException(status_code=502, detail="Checkout temporarily unavailable")
+
+
+# ─── Plan switching: modify the subscription, never create a second ───────────
+
+
+class _UnrecognisedSubscriptionError(Exception):
+    """The live subscription does not carry a price this deployment sells."""
+
+
+def _plan_change_items(sub: dict, new_price: str, new_plan: str, new_interval: str) -> list[dict]:
+    """The `items` array that turns `sub` into the requested plan. Pure.
+
+    ONE array, ONE Subscription.modify call. Sequential calls would leave the
+    subscription briefly holding a monthly metered price beside an annual plan
+    price, and Stripe requires every item on a subscription to share a recurring
+    interval — the second call would be rejected and the customer left stranded
+    mid-transition, which is a worse state than either end of it.
+
+    The metered item is REPLACED (delete + add), never re-priced in place, on any
+    change of price. Updating an item keeps its id and its `created`, and
+    assert_billable uses exactly that field to refuse billing usage at a rate
+    agreed after the usage happened. Re-pricing in place would leave an item that
+    looks like it had always carried the new rate, so this period's earlier
+    lookups would be charged at it. Replacing gives the new item a new `created`,
+    so pre-switch usage fails that check and goes to needs_review instead.
+
+    That is a deliberate trade, not an oversight: a review-queue row costs a
+    conversation, a silent retroactive re-rate costs a customer money they never
+    agreed to pay.
+    """
+    items: list[dict] = []
+    # Every metered price this deployment knows about, derived from the same map
+    # _metered_skip_trace_price selects from. Read from that rather than
+    # importing the worker's copy so the item this identifies and the item that
+    # gets attached can never come from two different sources of truth.
+    metered_ids = {
+        pid
+        for by_interval in _SKIP_TRACE_METERED_PRICE.values()
+        for pid in by_interval.values()
+        if pid and pid.startswith("price_")
+    }
+
+    licensed: list = []
+    metered: list = []
+    unknown: list = []
+    for item in (sub.get("items") or {}).get("data") or []:
+        pid = ((item or {}).get("price") or {}).get("id")
+        if pid in _PRICE_TO_PLAN:
+            licensed.append(item)
+        elif pid in metered_ids:
+            metered.append(item)
+        else:
+            unknown.append(pid)
+
+    # The shape is VALIDATED, not sampled. The first version of this loop kept
+    # the LAST match of each kind while _plan_item_price_id reads the FIRST, so a
+    # subscription carrying two licensed items would have had only one re-priced
+    # and the other left attached — two plan charges after a same-interval
+    # switch, or a stranded monthly item that makes an annual switch fail the
+    # interval rule. Codex reproduced it. Anything we cannot describe exactly is
+    # refused for a human to reconcile, because every way of proceeding here
+    # leaves the customer on a subscription nobody chose.
+    if len(licensed) != 1:
+        raise _UnrecognisedSubscriptionError(
+            f"expected exactly one plan price, found {len(licensed)}"
+        )
+    if len(metered) > 1:
+        raise _UnrecognisedSubscriptionError(
+            f"expected at most one metered price, found {len(metered)}"
+        )
+    if unknown:
+        raise _UnrecognisedSubscriptionError(
+            f"subscription carries {len(unknown)} price(s) this deployment does "
+            "not recognise"
+        )
+
+    licensed_item = licensed[0]
+    metered_item = metered[0] if metered else None
+
+    items.append({"id": licensed_item["id"], "price": new_price})
+
+    target_metered = _metered_skip_trace_price(new_plan, new_interval)
+    current_metered = ((metered_item or {}).get("price") or {}).get("id")
+
+    if current_metered != target_metered:
+        if metered_item is not None:
+            items.append({"id": metered_item["id"], "deleted": True})
+        if target_metered:
+            items.append({"price": target_metered})
+
+    return items
+
+
+# The sync pool this borrows from is pool_size=2 / max_overflow=3, so more than
+# five concurrent plan changes would queue on it and surface a 30s timeout as an
+# unhandled 500 (Codex). Bounded here instead, well under that, so the failure
+# mode is a clean 503 that says "try again" rather than a stack trace.
+#
+# Created lazily, per running loop, rather than at import. A module-level
+# Semaphore binds to whichever loop first contends on it, and a process that
+# runs more than one loop over its lifetime — test clients, a loop restart —
+# then raises RuntimeError on a later acquire.
+_stranded_slots_by_loop: dict = {}
+
+
+def _stranded_mark_slots() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _stranded_slots_by_loop.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(3)
+        _stranded_slots_by_loop[loop] = sem
+    return sem
+
+
+def _mark_stranded_metered_usage(user_id: str, period_start: int) -> int:
+    """Move this period's REPORTED meter events to needs_review. Own transaction.
+
+    Runs on an independent session, and that is not incidental. The obvious
+    thing — issuing this on the request's session and committing — would commit
+    the REQUEST's transaction, and the checkout/plan-change guard is held by
+    `pg_advisory_xact_lock`, which is transaction-scoped. Committing to make the
+    marking durable would therefore release the lock while the plan change is
+    still in flight and let a concurrent checkout through the guard, trading a
+    lost-revenue bug for a duplicate-subscription one.
+
+    So it gets its own connection: durable on its own, and the caller's
+    transaction (and its lock) are untouched. `system_sync_session` because this
+    is deliberately a system-level write; the tenant is pinned explicitly in the
+    predicate below rather than by an RLS GUC.
+
+    Off the event loop via asyncio.to_thread — it is a sync session inside an
+    async route, and a blocking call there stalls every other request.
+    """
+    from src.db.session import system_sync_session
+
+    with system_sync_session() as db:
+        # A REAL bound, on the database, which can stop the statement. This runs
+        # while the caller holds the plan-change advisory lock, so a statement
+        # that blocks here blocks that user's plan change; better to fail it and
+        # let the caller 503 than to sit on the connection.
+        db.execute(text("SET LOCAL lock_timeout = '5s'"))
+        db.execute(text("SET LOCAL statement_timeout = '15s'"))
+        rows = db.execute(
+            text("""
+                UPDATE skip_trace_meter_events
+                   SET disposition = 'needs_review',
+                       disposition_at = NOW(),
+                       disposition_reason = 'metered_item_replaced_before_invoice'
+                 WHERE user_id = CAST(:uid AS uuid)
+                   AND disposition = 'reported'
+                   AND (
+                         (usage_at IS NOT NULL
+                          AND usage_at >= to_timestamp(:period_start))
+                         -- Rows written before migration 093 carry no usage_at
+                         -- at all. They were still reported and are still
+                         -- stranded by the delete, so they are placed by the
+                         -- outbox write time instead: it is at or after the
+                         -- usage, which over-includes rather than misses one.
+                      OR (usage_at IS NULL
+                          AND created_at >= to_timestamp(:period_start))
+                   )
+                RETURNING id
+            """),
+            {"uid": user_id, "period_start": period_start},
+        ).fetchall()
+        db.commit()
+        return len(rows)
+
+
+def _no_subscription_conflict() -> HTTPException:
+    """409 for a plan change on an account that has no subscription yet."""
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "no_subscription",
+            "message": (
+                "You do not have a subscription to change yet. Choose a plan to "
+                "get started."
+            ),
+        },
+    )
+
+
+class ChangePlanRequest(BaseModel):
+    price_id: str
+
+
+@router.post("/change-plan")
+async def change_plan(
+    request: Request,
+    body: ChangePlanRequest,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_rls_db),
+) -> dict:
+    """Move an EXISTING subscriber to a different plan or billing interval.
+
+    Checkout creates a subscription; this changes the one that already exists.
+    They are separate endpoints because they are separate operations, and
+    conflating them is what produced the defect: create_checkout always built a
+    subscription-mode Session and nothing modified or cancelled the old one, so a
+    monthly subscriber buying annual ended up holding BOTH — two live
+    obligations, and with the metered skip-trace item attached, two metered items
+    on one meter for one customer.
+
+    Nothing in here can create a subscription. If there is no live one to modify
+    this returns 409 and points at checkout, which is the endpoint that may.
+    """
+    await rate_limit(request, zone="stripe", identifier=current_user.id)
+
+    _PRODUCT_TO_PRICE = {
+        settings.STRIPE_PRODUCT_PRO: settings.STRIPE_PRICE_PRO,
+        settings.STRIPE_PRODUCT_BUSINESS: settings.STRIPE_PRICE_BUSINESS,
+        settings.STRIPE_PRODUCT_AGENCY: settings.STRIPE_PRICE_AGENCY,
+    }
+    stripe_price_id = _PRODUCT_TO_PRICE.get(body.price_id, body.price_id)
+
+    if stripe_price_id not in _PRICE_TO_PLAN:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
+    if not stripe_price_id.startswith("price_"):
+        _logger.error(
+            "change-plan: resolved id %r is not a price id — STRIPE_PRICE_* is "
+            "misconfigured (check Railway env on api AND worker).",
+            stripe_price_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Billing is temporarily unavailable. Please try again later.",
+        )
+
+    new_plan, _limit, new_interval = _PRICE_TO_PLAN[stripe_price_id]
+
+    try:
+        # The SAME lock namespace as checkout (4243). Between them these two
+        # guard ONE invariant — this customer has exactly one subscription — so
+        # they must not run at once. A separate key here would let a checkout and
+        # a plan change interleave and produce the second subscription that both
+        # of them exist to prevent.
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(4243, hashtext(:uid))"),
+            {"uid": str(current_user.id)},
+        )
+
+        _row = await db.execute(select(User).where(User.id == current_user.id))
+        user = _row.scalar_one()
+
+        customer_id = user.stripe_customer_id
+        if not customer_id:
+            # No customer means no subscription. Deliberately NOT creating one:
+            # the purpose of this endpoint is to avoid a second subscription, and
+            # a customer minted here would be one more thing for the checkout
+            # guard to have to enumerate correctly.
+            raise _no_subscription_conflict()
+
+        # Read AFTER the lock. A checkout that won the race may have just created
+        # the subscription we are about to modify, and a pre-lock read misses it.
+        sub = _live_subscription(customer_id)
+        if sub is None:
+            raise _no_subscription_conflict()
+
+        if sub.get("status") in ("past_due", "unpaid"):
+            # create_prorations credits the UNUSED portion of the current period
+            # — but only "unused" is checked, never "paid". On a subscription
+            # whose latest invoice has not settled, that issues a credit against
+            # money we never received, and Stripe documents exactly this risk.
+            # The customer's real next step is the outstanding invoice.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "subscription_unpaid",
+                    "message": (
+                        "There is an unpaid invoice on your subscription. Settle "
+                        "that first and you will be able to change your plan."
+                    ),
+                },
+            )
+
+        if sub.get("status") == "incomplete":
+            # The first payment has not settled and Stripe still accepts it for
+            # about 23 hours. Modifying the subscription underneath an in-flight
+            # payment changes what the customer is being charged mid-transaction.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "subscription_incomplete",
+                    "message": (
+                        "Your subscription payment is incomplete. Complete that "
+                        "payment first, then change your plan."
+                    ),
+                },
+            )
+
+        # Shape FIRST, then the same-plan shortcut. The other way round, a
+        # subscription carrying two licensed items or an unrecognised price
+        # answered "you are already on that plan" and nobody ever heard about
+        # it, because the only thing that inspects the shape is
+        # _plan_change_items and the shortcut returned before reaching it
+        # (Codex). A malformed subscription is worth saying out loud even when
+        # the caller is asking for nothing.
+        items = _plan_change_items(sub, stripe_price_id, new_plan, new_interval)
+
+        current_price = _plan_item_price_id((sub.get("items") or {}).get("data") or [])
+        if current_price == stripe_price_id:
+            # Not an error, and deliberately not a Stripe call: modifying a
+            # subscription to what it already is can still write prorations.
+            return {
+                "status": "unchanged",
+                "plan": new_plan,
+                "message": "You are already on that plan.",
+            }
+
+        current_interval = (_PRICE_TO_PLAN.get(current_price) or (None, None, None))[2]
+        interval_changed = current_interval != new_interval
+
+        modify_kwargs: dict = {
+            "items": items,
+            # Credit the unused remainder of what they already paid for and charge
+            # the new plan pro rata. The alternative makes an upgrade free until
+            # the next invoice and a downgrade a donation.
+            "proration_behavior": "create_prorations",
+            "metadata": {"user_id": str(user.id), "price_id": body.price_id},
+        }
+        if interval_changed:
+            # A monthly-to-annual move cannot leave the old period running: the
+            # items recur yearly now, and the period they were billed in was
+            # monthly. Restarting the cycle makes that boundary explicit rather
+            # than leaving Stripe to infer one, and it is the boundary the
+            # skip-trace entitlement window keys off.
+            modify_kwargs["billing_cycle_anchor"] = "now"
+
+        # Usage already REPORTED against a metered item we are about to delete
+        # will never be invoiced: Stripe does not carry a deleted subscription
+        # item's usage onto the invoice. Our rows still say `reported`, which
+        # reads as "on its way to an invoice", so without this the money is
+        # silently uncollectable with nothing pointing at it.
+        #
+        # Deleting is still right — keeping the item re-rates this period's
+        # earlier lookups at the new price — so the usage is HANDED OVER rather
+        # than abandoned: needs_review, where the ops alert names it and the
+        # settle script recovers it on an invoice.
+        #
+        # BEFORE the Stripe call, and that ordering is the whole point. Written
+        # afterwards it was not retry-safe: if this UPDATE or the request's
+        # commit failed after Stripe had already changed the subscription, the
+        # rows stayed `reported` and a retry took the same-plan shortcut and
+        # never came back to them (Codex). Marking first can only over-flag —
+        # if Stripe then refuses, some rows sit in review that did not need to,
+        # and a human releases them. That is the survivable direction; the other
+        # one loses revenue with no record that it existed.
+        if any(i.get("deleted") for i in items):
+            period_start = sub.get("current_period_start")
+            if period_start is not None:
+                try:
+                    # No asyncio.timeout here, deliberately. It looked like a
+                    # bound and was not: to_thread cannot be cancelled, so a
+                    # timeout would stop us AWAITING the thread while the thread
+                    # kept running and committed anyway — after we had already
+                    # returned 503 — and would release the semaphore slot while
+                    # still holding the connection (Codex reproduced it). The
+                    # real bound is inside the session, on the database, where
+                    # it can actually stop the statement.
+                    async with _stranded_mark_slots():
+                        n_stranded = await asyncio.to_thread(
+                            _mark_stranded_metered_usage,
+                            str(user.id), int(period_start),
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    # This runs BEFORE Stripe, so failing here has changed
+                    # nothing: no subscription was modified and no usage was
+                    # marked. Refusing is therefore free, and proceeding is not
+                    # — the whole reason the marking comes first is that a plan
+                    # change without it strands revenue silently.
+                    _logger.error(
+                        "change-plan: could not record stranded skip-trace usage "
+                        "for user %s (%s) — refusing the plan change rather than "
+                        "making it without the record",
+                        user.id, str(exc)[:200],
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Billing is temporarily unavailable. Please try again later.",
+                    ) from exc
+                if n_stranded:
+                    _logger.warning(
+                        "change-plan: user %s has %d reported skip-trace meter "
+                        "event(s) against the metered item about to be replaced. "
+                        "Stripe will not invoice them; moved to needs_review for "
+                        "manual recovery BEFORE the subscription is modified.",
+                        user.id, n_stranded,
+                    )
+
+        try:
+            updated = stripe.Subscription.modify(sub["id"], **modify_kwargs)
+        except Exception as exc:  # noqa: BLE001 — surfaced, never swallowed
+            _logger.exception(
+                "change-plan: Stripe refused to modify subscription %s for user %s "
+                "(%s -> %s)", sub.get("id"), user.id, current_price, stripe_price_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Could not change your plan. Please try again or contact support.",
+            ) from exc
+
+        _logger.info(
+            "change-plan: user %s %s -> %s on subscription %s (interval_changed=%s)",
+            user.id, current_price, stripe_price_id, sub["id"], interval_changed,
+        )
+
+        # users.plan is NOT written here. customer.subscription.updated is the
+        # single writer for it, so the plan the app enforces always reflects what
+        # Stripe actually did rather than what we asked it to do. If the modify
+        # half-succeeds, the app stays on the plan Stripe still says is in force.
+        return {
+            "status": "updated",
+            "plan": new_plan,
+            "subscription_id": (updated or {}).get("id") or sub["id"],
+            "interval_changed": interval_changed,
+        }
+    except HTTPException:
+        raise
+    except _UnrecognisedSubscriptionError as exc:
+        _logger.error(
+            "change-plan: subscription for user %s carries no recognised plan "
+            "price (%s) — refusing to guess which item to re-price",
+            current_user.id, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "subscription_unrecognised",
+                "message": (
+                    "Your subscription could not be matched to a plan. Please "
+                    "contact support."
+                ),
+            },
+        ) from exc
+    except _StripeStateUnavailableError as exc:
+        _logger.error(
+            "change-plan: could not read Stripe subscription state for user %s "
+            "(%s) — refusing rather than acting on an unknown subscription",
+            current_user.id, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Billing is temporarily unavailable. Please try again later.",
+        ) from exc
 
 
 # ─── Customer portal ──────────────────────────────────────────────────────────
 
 @router.post("/portal")
 async def customer_portal(request: Request, current_user: CurrentUser) -> dict:
-    """Return a Stripe Customer Portal URL for managing subscriptions."""
+    """Return a Stripe Customer Portal URL for managing subscriptions.
+
+    The portal here is payment method, invoices and cancel. Plan CHANGES go
+    through create_checkout, which is what the plan cards call.
+
+    That distinction now matters. Subscriptions carry a usage-based skip-trace
+    item, and Stripe restricts the portal's plan-switch flow for subscriptions
+    that have one. This deployment is unaffected: the live portal configuration
+    (bpc_1TGRdU..., the default) has subscription_update DISABLED, verified
+    against the account, so the portal never offered a plan switch. If someone
+    turns "Switch plan" on in the Dashboard, check it against a subscription
+    that actually has the metered item before trusting it (Codex raised this).
+    """
     await rate_limit(request, zone="stripe", identifier=current_user.id)
     if not current_user.stripe_customer_id:
         raise HTTPException(
@@ -864,8 +1695,8 @@ async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
         subscription_id,
         expand=["items.data.price"],
     )
-    price_id = subscription["items"]["data"][0]["price"]["id"]
-    plan_info = _PRICE_TO_PLAN.get(price_id)
+    price_id = _plan_item_price_id(subscription["items"]["data"])
+    plan_info = _PRICE_TO_PLAN.get(price_id) if price_id else None
 
     if not plan_info:
         # Paid checkout but the price isn't in our plan map — entitlement would be
@@ -1012,8 +1843,8 @@ async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
     if not items:
         return
 
-    price_id = items[0]["price"]["id"]
-    plan_info = _PRICE_TO_PLAN.get(price_id)
+    price_id = _plan_item_price_id(items)
+    plan_info = _PRICE_TO_PLAN.get(price_id) if price_id else None
 
     if not plan_info:
         # Subscription changed to a price we don't map — the plan change would be

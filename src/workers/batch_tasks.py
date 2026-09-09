@@ -94,7 +94,12 @@ def _resolve_run(db, ref: str) -> "BatchRun | None":
 
 @app.task(name="src.workers.batch_tasks.dispatch_batch_run")
 def dispatch_batch_run(run_id: str) -> None:
+    from src.config.constants import SCRAPE_QUEUE_DEFAULT, scrape_queue_for_plan
+
     enqueued: list[str] = []
+    # Resolved inside the session from the batch owner's plan; the publish below
+    # happens after the session closes, so it has to be captured here.
+    queue: str = SCRAPE_QUEUE_DEFAULT
     with system_sync_session() as db:
         # Lock the run row FOR UPDATE so concurrent dispatches serialize: exactly
         # one transitions pending->running + creates jobs; the rest see 'running'
@@ -107,6 +112,14 @@ def dispatch_batch_run(run_id: str) -> None:
         if batch is None:
             _logger.warning("dispatch_batch_run: batch %s not found", run.batch_id)
             return
+
+        # One queue decision for the whole fan-out: every child belongs to the
+        # batch owner. Read here, before either branch, so the RECOVERY branch
+        # (which never loads `user`) routes identically to the first dispatch.
+        _owner_plan = db.execute(
+            select(User.plan).where(User.id == batch.user_id)
+        ).scalar_one_or_none()
+        queue = scrape_queue_for_plan(_owner_plan)
 
         if run.status == "pending":
             # MATERIALIZE the pending intent: create child jobs + flip to running
@@ -209,6 +222,13 @@ def dispatch_batch_run(run_id: str) -> None:
             pass
 
     # Enqueue AFTER commit so a worker can't pick up an uncommitted job row.
+    # Every child of a batch belongs to the batch's owner, so one queue decision
+    # covers the whole fan-out. This used to be run_scrape_job.delay(jid), which
+    # routes to `scrape` for every plan and left a Business/Agency batch, the
+    # single largest thing they can run, off the priority queue they pay for.
     for jid in enqueued:
-        run_scrape_job.delay(jid)
-    _logger.info("dispatch_batch_run %s: dispatched %d child jobs", run_id, len(enqueued))
+        run_scrape_job.apply_async(args=[jid], queue=queue)
+    _logger.info(
+        "dispatch_batch_run %s: dispatched %d child jobs to %s",
+        run_id, len(enqueued), queue,
+    )

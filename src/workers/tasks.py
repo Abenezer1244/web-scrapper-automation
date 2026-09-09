@@ -26,9 +26,9 @@ from src.api.quota_window import (
     window_set_sql,
 )
 from src.config.constants import (
-    PRIORITY_QUEUE_PLANS,
     SCRAPE_TRANSIENT_BACKOFF_SECONDS,
     SCRAPE_TRANSIENT_MAX_RETRIES,
+    scrape_queue_for_plan,
 )
 from src.scrapers.probate import (
     classify_probate_signal_for_row,
@@ -675,11 +675,15 @@ def run_scrape_job(self, job_id: str) -> None:
                     backoffs=SCRAPE_TRANSIENT_BACKOFF_SECONDS,
                 )
                 if countdown is not None:
-                    queue = (
-                        "scrape-priority"
-                        if user.plan in PRIORITY_QUEUE_PLANS
-                        else "scrape"
-                    )
+                    # BOTH sides of this merge were needed. This branch replaced
+                    # the inline PRIORITY_QUEUE_PLANS test with
+                    # scrape_queue_for_plan, which normalizes the plan first — an
+                    # untrimmed or uppercased plan silently fell to the standard
+                    # queue and a paying customer lost priority. main
+                    # independently added `published = True`, which the except
+                    # below flips to False and the watchdog branch depends on.
+                    # Taking either side alone would have dropped the other.
+                    queue = scrape_queue_for_plan(user.plan if user else None)
                     published = True
                     try:
                         run_scrape_job.apply_async(

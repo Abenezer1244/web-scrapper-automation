@@ -1204,6 +1204,24 @@ class SkipTraceQueue(Base):
     error_message = Column(Text, nullable=True)
     submitted_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at = Column(DateTime(timezone=True), nullable=True)
+    # When the PROVIDER received this batch (migration 093), and the only
+    # timestamp here that overage may be billed against.
+    #
+    # `submitted_at` above looks like it should serve and does not:
+    # _persist_submission also runs on the reconciler's ADOPTION path, where it
+    # inserts the row for the first time with `now`, so for an adopted queue it
+    # is the adoption clock — days after the work. `completed_at` is set by the
+    # ingest worker in the same transaction that bills, so it reads as provider
+    # settlement and is really our own clock.
+    #
+    # This one is written once, from Tracerfy's own `created_at` where the
+    # response carries it, otherwise the moment we finished the POST — and on
+    # the adoption path from Tracerfy's value ONLY, staying NULL when there is
+    # none. Every accepted value is therefore at or before the lookups: a LOWER
+    # bound, which can only push usage out of a billable window and never into
+    # one. NULL means "no time we can defend"; assert_billable refuses it and
+    # the row goes to a human.
+    provider_submitted_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class PendingSkipTraceRow(Base):
@@ -1322,7 +1340,43 @@ class SkipTraceMeterEvent(Base):
     )
     # NULL until the Stripe MeterEvent is durably reported; the partial index
     # in migration 026 makes the "unreported" sweep cheap.
+    #
+    # NOT a billing fact. report_skip_trace_meter_event stamps this after the
+    # try/except — the _StripeNotConfiguredError branch included — so it can be
+    # set when no MeterEvent was ever sent, and Stripe accepting an event is not
+    # the same as an invoice charging for it. `disposition` is the state; this
+    # stays a timestamp of "we made the call".
     reported_at = Column(DateTime(timezone=True), nullable=True)
+
+    # The actual state of this row (migration 092). Only 'pending' is eligible
+    # for the sweep:
+    #   pending             not yet decided; may be reported when eligible
+    #   reported            a MeterEvent was accepted by Stripe
+    #   non_billable        deliberately not billable, reason says why
+    #   needs_review        a human has to look (e.g. too old to backdate)
+    #   written_off_manual  an operator waived otherwise billable usage
+    #   settled_manual      recovered outside MeterEvents (invoice ref required)
+    disposition = Column(
+        String(32), nullable=False, server_default="pending",
+    )
+    disposition_at = Column(DateTime(timezone=True), nullable=True)
+    # Text: a machine reason fits in 64 chars, an operator's explanation does
+    # not, and an over-length reason makes Postgres reject the whole settlement.
+    disposition_reason = Column(Text, nullable=True)
+    # Who decided, and what recovered it. Separate columns because these are the
+    # two questions asked long after the fact, and neither should need a
+    # sentence parsed to answer it.
+    disposition_actor = Column(String(128), nullable=True)
+    disposition_reference = Column(String(128), nullable=True)
+
+    # When the usage HAPPENED — not when this row was written. `created_at` is
+    # server_default=now(), the transaction clock during ingest reconciliation,
+    # which can be well after the lookup. Stripe bills a MeterEvent into the
+    # subscription period containing its timestamp and refuses one older than 35
+    # days, so billing against `created_at` would charge the wrong period.
+    # NULL for rows written before migration 092: it cannot be reconstructed,
+    # and inventing one would produce a confident, billable lie.
+    usage_at = Column(DateTime(timezone=True), nullable=True)
 
 
 # ─── Sprint 7.3: Referral program ────────────────────────────────────────────

@@ -110,6 +110,92 @@ to understand *why* the code is the way it is and *what's been attempted before*
   `AnimatedCounter` digit strips and for any **inline** element that wraps (the rect is the
   UNION of its line boxes). Both produced confident failures on correct markup. Screenshot
   before believing an assertion, and always run an unchanged CONTROL page through the same test.
+## 2026-09-09 — skip-trace overage can finally be billed, and three gate rounds to earn it
+
+> **Provenance:** commit SHAs, suite counts and the Codex verdicts below were read back from
+> `git`, the test logs and the gate transcripts in-session. Which order I realised things in is
+> session recollection — read that part as such.
+
+**Built / Shipped:** (branch `chore/entitlement-audit`, not pushed)
+- **`46842a5`** — migration **093** `skip_trace_queues.provider_submitted_at`, and
+  `USAGE_PROVENANCE_IS_TRUSTWORTHY` flipped to **True**. Automatic overage billing had been off
+  since `e09dc22` because nothing recorded when the provider ran the lookups.
+- **`fa8097b`** — **`POST /billing/change-plan`** (`stripe.Subscription.modify`), so an existing
+  subscriber changes the subscription they have. `10f6886`'s 409 had stopped the duplicate but
+  left no way to switch.
+- **`f5d0a02`**, **`db3068f`** — the gate findings against both of the above.
+- Frontend **`83e5e0b`** on `chore/entitlement-audit-fe` — the plan cards actually call the new
+  endpoint. Until then the switch existed and was unreachable.
+- `scripts/settle_skip_trace_meter_rows.py` — `needs_review` was a destination nothing could
+  write out of. An alert naming a problem nobody can action trains people to ignore it.
+
+**Tried / Decided:**
+- **Flipping the switch alone would have been a no-op**, and that is the whole reason this was a
+  build and not a one-line change. `assert_billable` refuses a NULL `usage_at` independently of
+  the flag, and nothing wrote a `usage_at`. Turning billing on *required* first recording a
+  defensible time.
+- **`claim_time`, not `now`.** The value is taken before the rows are marked `submitting` and
+  **committed before the POST**, so nothing the provider does can precede it. A lower bound is the
+  fail-safe direction: it can only push usage OUT of a billable window, never into one.
+- **The metered item is replaced, never re-priced in place.** Updating an item keeps its `created`,
+  and `assert_billable` uses exactly that to refuse a rate agreed after the usage. An in-place
+  re-price would silently re-rate the period's earlier lookups.
+- **Two findings resolved toward holding rather than charging** — cross-window quantities and
+  usage stranded by a metered-item delete both go to `needs_review`. Both cost a human a
+  conversation; the alternative costs a customer money they never agreed to.
+- **`Subscription.modify` over a scheduled transition.** The handoff had deferred it as
+  UNVERIFIED; it is built now, but the period-end scheduled variant Codex prefers for P1-4 is
+  still not sandbox-verified.
+
+**Failed / Blocked:**
+- **I claimed a lower bound I had not got.** `46842a5`'s message says the dispatch timestamp is
+  "at or before the lookups". It was not: bookkeeping runs *after* the POST returns, and the retry
+  path minted a fresh, later clock. Same class of error as the `submitted_at` mistake the column
+  was built to replace — a value that *looks* like a lower bound.
+- **My `billing_proof` guard was not a guard.** It only rejected `None`; Codex passed `{}` and got
+  a real MeterEvent out with billing off and no timestamp. The token was never bound to what it
+  vouched for, so a proof for one customer authorised a send for any other. Removed entirely.
+- **Fixing P1-4 moved the bug instead of removing it.** Written after the Stripe call, the recovery
+  was not retry-safe. Reordering it then exposed a second trap: committing to make it durable
+  would have released the **transaction-scoped** advisory lock and let a concurrent checkout
+  through — trading lost revenue for a duplicate subscription. It runs on its own connection now.
+- **Moving the gate into the sender left the old call in place**, doubling Stripe subscription
+  reads on every single report. Caught by the re-gate, not by me.
+- **The machine ran out of memory three times.** Each time it killed the *wrapper* while pytest
+  kept running, and twice it took Postgres with it. A 44-failure run was 100% DB connection
+  errors and **zero assertion failures** — environmental, not a regression.
+
+**Caught & fixed (before shipping):**
+- A database that already ran the OLD 092 keeps `varchar(64)` and lacks the audit columns; alembic
+  never re-runs an edited migration. **094** adds them conditionally and retracts the old blanket
+  `non_billable` write-off, but only for owners who do have a Stripe customer and only where the
+  reason is the automatic one — a human's decision is never touched.
+- `change_plan` returned `"unchanged"` *before* validating the subscription shape, so a
+  subscription with two licensed items answered "you are already on that plan".
+- Prorations were being issued against `past_due`/`unpaid` subscriptions — credit for money never
+  received.
+- The item loop kept the LAST match while `_plan_item_price_id` reads the FIRST.
+- The settle script printed a successful dry run for values the real UPDATE would reject.
+
+**Pending / Handoff:**
+- 👤 **Merge order is backend first.** The frontend calls an endpoint that does not exist on `main`
+  yet, and its `lib/api-types.generated.ts` regen depends on the backend schema being there.
+- ⏭️ The **fully automatic** alternatives to the two holds — historical-window allocation, and a
+  period-end scheduled plan switch — both need Stripe sandbox verification nobody has done.
+- ⏭️ FE `api-types.generated.ts` needs a regen once the backend merges (backend docstrings moved).
+- Nothing pushed, no PR opened for the backend, no deploy.
+
+**Facts learned:**
+- **Every clock in the skip-trace path is the wrong one.** `created_at` is `server_default=now()`
+  at ingest; `completed_at` is set by the ingest worker in the same transaction that bills;
+  `submitted_at` is rewritten on the reconciler's adoption path. The only defensible values are
+  Tracerfy's own `created_at` and the pre-POST `claim_time`.
+- **`ON CONFLICT DO NOTHING` protects nothing on the adoption path** — the row does not exist yet,
+  so the insert actually inserts, with the adoption clock.
+- **`pg_advisory_xact_lock` dies with the transaction.** Any mid-request commit releases it.
+- **Stripe does not invoice usage recorded against a deleted subscription item.**
+- Migration 092 leaves every pre-existing row `reported`/`non_billable`/`needs_review` and never
+  `pending`, so turning billing on cannot convert a held row into a charge. Verified directly.
 
 ---
 
@@ -218,6 +304,109 @@ to understand *why* the code is the way it is and *what's been attempted before*
   property twice.
 - **§7E** — dependabot **#251** (stripe 11.4.0 → 15.6.1) still open and still must NOT be merged:
   `StripeObject` is not a dict in v15 and ~17 `.get()` call sites raise.
+## 2026-09-08 — Nine ways the plan cards were not the product
+
+**Built / Shipped:**
+- `tests/test_plan_entitlement_audit.py` (162 tests) drives every advertised entitlement
+  through the real routes with a real user row per plan, plus
+  `docs/ENTITLEMENT-AUDIT-2026-09-08.md`. Branches `chore/entitlement-audit` (BE) and
+  `chore/entitlement-audit-fe` (FE), 3 commits and 1 commit, unpushed.
+- **Four defects:** the priority queue reached only manual runs (the scheduler and batch
+  fan-out published with `.delay()`, which takes the task route, `scrape`, for every
+  plan); six gates compared `user.plan` raw and three lowered without stripping; the
+  Starter 7-day delay applied to the rolling window only; `enrichment.skip_tracing` was
+  gated, persisted and read by nothing.
+- **Three missing gates:** export format, schedule frequency, and overlap/intersection.
+  All three are on the cards and in the 2026-06 strategy doc, and none existed at any
+  layer. A Starter bearer token saved a JSON export on a daily schedule and reached
+  `/segments`. Enforced on create and on the edit enable-delta, mirrored in the wizard.
+- **The billing one:** checkout built the subscription with one licensed line item, so
+  the three metered skip-trace prices (set in production, read by nothing) never settled
+  anything and Pro's "then $0.08/lookup" could not produce an invoice line. The plan's
+  metered price is now a second item, and every reader that took `items[0]` resolves the
+  licensed item by id instead.
+- **Copy:** every `/billing/pricing` comparison cell that describes a gate is derived from
+  it. The public pricing page said "There is no per-plan county cap" while the API
+  answered 402 for a Pro customer's fourth county, and showed white-label as a plain
+  checkmark for Agency.
+
+**Tried / Decided:**
+- Owner chose the most complete option on all four decisions.
+- Did NOT gate a batch's `delivery_mode="overlaps_only"`. It is the DEFAULT for a batch
+  and "Batch scraping" is a Pro card line, so gating it leaves Pro able to create a batch
+  and unable to receive the only export it makes by default. Pinned by a test either way.
+- Annual subscriptions stay unmetered rather than broken: Stripe requires one recurring
+  interval per subscription and the three metered prices are monthly. Slots exist
+  (`STRIPE_PRICE_SKIP_TRACE_*_ANNUAL`), the Stripe objects do not.
+- Removed "Team members" / "Team seats" from both pricing surfaces. No seat model exists:
+  no invite flow, no member table, no route.
+
+**Failed / Blocked:**
+- **My grep lied twice, the same way.** I reported the Starter 7-day delay as unimplemented
+  after two sweeps that both ended in `| head -N` and both cut before `dates.py`. Codex
+  found it. Same failure mode as the 2026-09-08 entry below this one.
+- Local test failures that looked like product bugs (401s, "Could not refresh instance",
+  FK violations on `jobs.user_id`) were another session running pytest against the SHARED
+  `bridgeleads_test`, whose conftest teardown deletes every `@test.bridgeleads.io` user.
+  It was deleting my fixture rows mid-request. `run-audit-tests.sh` now uses an isolated
+  database and Redis db 1. Then I reproduced it against MYSELF: running the integration
+  pass beside the non-integration one on the isolated database gave 16 scattered failures,
+  a different set each time, including files I had not touched. Two pytest runs on one
+  database is the same bug no matter who owns the second one.
+- Codex round 2 hit its OpenAI usage limit mid-review. It had already produced two real
+  findings; the rest of that pass was never completed.
+- `codex review --base <branch>` rejects a prompt argument in CLI 0.153.4. Use
+  `codex exec` and let it run the diff itself.
+
+**Caught & fixed:**
+- **Codex caught a regression I introduced.** The freshness clamp applied to every plan,
+  and `trustee_sale` reads the window's LENGTH as a forward auction horizon
+  (`_window_span_days`). A paid customer asking for the next 90 days of auctions would
+  have had that horizon truncated to the part already in the past, or erased once the
+  span went non-positive and the scraper fell back to "every upcoming auction". The guard
+  is now `end_date < today`, not the plan name.
+- Attaching a second subscription item breaks every reader that took `items[0]`: the
+  webhook would have alerted "price not in plan map" and refused to activate a plan the
+  customer had just paid for, and `GET /billing/subscription` would have shown them a $0
+  plan (the metered item's unit_amount is 8 cents).
+- Gating `/segments` broke nothing, but gating the batch's `overlaps_only` default broke
+  Pro batch creation outright. Caught by my own test on the first run.
+- `tests/test_entitlement_notice_copy.py` was asserting the untrimmed behaviour, correctly
+  for its time. Re-pinned to the invariant it was protecting: the copy names whatever tier
+  the gate resolves.
+- `test_patch_switch_to_since_last_run_persists` used a Starter fixture with a daily
+  schedule. Its subject is `date_range_mode`, so it moved to a Business fixture rather
+  than testing the new gate by accident.
+
+**Pending / Handoff:**
+- Both branches are committed and UNPUSHED. No PRs opened.
+- Owner: create three yearly metered Prices in Stripe and set the `_ANNUAL` env on api
+  AND worker, or annual subscribers keep getting free over-quota lookups.
+- Owner: decide whether a Pro batch keeps the overlaps_only default.
+- P2-6 (meter outbox stamps a billable event reported when there is no
+  `stripe_customer_id`) and P3-2 (skip-trace resets on the calendar month, records on the
+  anniversary) are reported and not fixed.
+- Re-run the Codex gate on the final diff after the quota resets.
+
+**Facts learned:**
+- 🔑 There is no single source of truth for a plan. Twelve places define part of one, and
+  three had drifted: `/billing/pricing` served Pro "All" record types in the SAME response
+  whose bullets correctly named four, because the bullets had a test and the comparison
+  dict did not.
+- 🛑 `.delay()` takes the task's DECLARED route. Any enqueue site that does not pass a
+  queue silently opts out of plan-based routing, and reads as ordinary code.
+- 🛑 A Stripe MeterEvent only becomes money when the subscription carries an item priced
+  against that meter. Configured price ids that nothing reads look exactly like working
+  billing.
+- 🔑 An unstructured 402 gets the neutral "Manage billing" action in the frontend, because
+  the only other thing that arrives unstructured is a failed payment. A new plan gate that
+  raises a bare sentence sends the customer to the wrong remedy.
+- 🔑 The live Stripe portal config (`bpc_1TGRdU...`) has `subscription_update` DISABLED, so
+  the usage-based restriction on portal plan switching does not apply here. Read the
+  account, not the docs, when the question is "does this deployment break".
+- 🛑 The local `bridgeleads_test` database is shared by every worktree on this machine and
+  its teardown deletes ALL fixture users. Two sessions running tests at once produce
+  failures that look like product bugs. Isolate the database, do not retry.
 
 ---
 

@@ -26,10 +26,17 @@ def _reset_skip_trace_usage_impl() -> None:
     that introduces windows is what guarantees exactly one mechanism owns the
     counter at every instant — never two, and never none.
 
-    Skip-trace stays calendar-metered on purpose. It is billed to Stripe on its
-    own meter against its own ``skip_trace_period_start`` column, was never part
-    of the entitlement-window decision, and moving it is a separate change with
-    its own billing consequences.
+    Skip-trace has now been MOVED onto the same entitlement window, which is the
+    "separate change with its own billing consequences" this docstring used to
+    defer. The reason it could not stay on the calendar: a Stripe metered
+    subscription item bills usage over the SUBSCRIPTION period, so a customer
+    anchored on the 20th had their included allowance reset on the 1st, halfway
+    through the period Stripe was invoicing. Two free allowances inside one paid
+    month, and neither number matching the invoice. It mattered more the moment
+    the metered price was actually attached to the subscription.
+
+    ``skip_trace_period_start`` now holds the start of the entitlement window
+    the counter belongs to. Same column, new meaning, no migration.
 
     The two-statement shape is kept verbatim from the records version, because
     the reasoning behind it is unchanged and was learned expensively:
@@ -57,16 +64,18 @@ def _reset_skip_trace_usage_impl() -> None:
         adopted_skip = db.execute(
             text("""
                 UPDATE users
-                SET skip_trace_period_start = date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+                SET skip_trace_period_start = quota_period_start
                 WHERE skip_trace_period_start IS NULL
+                  AND quota_period_start IS NOT NULL
             """)
         ).rowcount
         rolled_skip = db.execute(
             text("""
                 UPDATE users
                 SET skip_trace_used_this_month = 0,
-                    skip_trace_period_start = date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
-                WHERE skip_trace_period_start < date_trunc('month', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+                    skip_trace_period_start = quota_period_start
+                WHERE quota_period_start IS NOT NULL
+                  AND skip_trace_period_start < quota_period_start
             """)
         ).rowcount
         db.commit()

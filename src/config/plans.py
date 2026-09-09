@@ -103,15 +103,22 @@ def plan_label(plan_id: str | None) -> str:
     because a duplicated plan constant drifted and quoted a price we do not
     charge, and a duplicated NAME would drift the same way.
 
-    Normalization is `.lower()` and nothing else, ON PURPOSE. It has to match
-    what the entitlement gates do to `user.plan` exactly. They lower without
-    trimming, so a stored `"pro "` falls through their `.get(plan, starter)` and
-    is enforced as Starter. If this stripped, the same account would be refused
-    on Starter limits while being told it was on Pro, which is a message that is
-    simply false. An unrecognized plan reads as the entry tier, the same tier it
+    Normalization has to match what the entitlement gates do to `user.plan`
+    EXACTLY, or an account is refused on one tier while being told it is on
+    another. This used to lower without trimming, on purpose, because the
+    gates did too: a stored `"pro "` fell through every `.get(plan, starter)`
+    and was enforced as Starter, so labelling it "Pro" would have been a
+    message that was simply false.
+
+    The gates now go through `constants.normalize_plan`, which strips as well
+    as lowers, so this does too. Keeping the old behaviour here would invert
+    the same bug: `"pro "` would be enforced as Pro and labelled "Starter".
+    An unrecognized plan still reads as the entry tier, which is the tier it
     is being enforced as.
     """
-    entry = _BY_ID.get((plan_id or "").lower())
+    from src.config.constants import normalize_plan
+
+    entry = _BY_ID.get(normalize_plan(plan_id))
     return str((entry or _BY_ID["starter"])["name"])
 
 

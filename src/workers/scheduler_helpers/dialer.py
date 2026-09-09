@@ -126,7 +126,10 @@ def _dialer_push_sweep_impl() -> None:
             .where(
                 Job.status == "done",
                 Job.dialer_pushed_at.is_(None),
-                User.plan.in_(BUSINESS_FEATURES_PLANS),
+                # lower(trim(...)), matching constants.normalize_plan: a plan set
+                # by hand as "Business" would otherwise drop out of the candidate
+                # set and silently stop the customer's dialer pushes.
+                func.lower(func.trim(User.plan)).in_(BUSINESS_FEATURES_PLANS),
                 # A dialer-push candidate has EITHER a generic webhook URL OR a
                 # native vendor dialer_type (e.g. phoneburner, which has no URL —
                 # it pushes from the outbox). ->> returns NULL for a missing key.

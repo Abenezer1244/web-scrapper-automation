@@ -65,6 +65,27 @@ jobs:
       STRIPE_PRICE_PRO: price_fake_pro
       STRIPE_PRICE_BUSINESS: price_fake_business
       STRIPE_PRICE_AGENCY: price_fake_agency
+      # The ANNUAL plan prices and the six METERED skip-trace prices.
+      #
+      # Without these, _PRICE_TO_PLAN has no annual entries and
+      # _configured_metered_price_ids() returns an empty set — so the billing
+      # rule refuses everything with "no_metered_price_configured" BEFORE
+      # reaching the behaviour a test meant to exercise, and the plan-switch
+      # tests build subscriptions out of empty-string price ids that nothing
+      # recognises. run-audit-tests.sh has set them locally since a4f6e8c for
+      # exactly this reason; CI did not, so six tests passed on my machine and
+      # failed here. Same trap the suite already documents for the plan prices:
+      # an unset price id does not fail loudly, it quietly moves the refusal
+      # earlier than the assertion.
+      STRIPE_PRICE_PRO_ANNUAL: price_fake_pro_annual
+      STRIPE_PRICE_BUSINESS_ANNUAL: price_fake_business_annual
+      STRIPE_PRICE_AGENCY_ANNUAL: price_fake_agency_annual
+      STRIPE_PRICE_SKIP_TRACE_PRO: price_fake_st_pro_m
+      STRIPE_PRICE_SKIP_TRACE_PRO_ANNUAL: price_fake_st_pro_y
+      STRIPE_PRICE_SKIP_TRACE_BUSINESS_OVERAGE: price_fake_st_biz_m
+      STRIPE_PRICE_SKIP_TRACE_BUSINESS_ANNUAL: price_fake_st_biz_y
+      STRIPE_PRICE_SKIP_TRACE_AGENCY_OVERAGE: price_fake_st_agy_m
+      STRIPE_PRICE_SKIP_TRACE_AGENCY_ANNUAL: price_fake_st_agy_y
       RESEND_API_KEY: re_fake
       EMAIL_FROM: noreply@bridgeleads.io
       FRONTEND_URL: http://localhost:3000

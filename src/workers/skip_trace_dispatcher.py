@@ -233,7 +233,10 @@ def dispatch_pending_skip_trace() -> dict:
                 # backstop — it re-derives the association from Tracerfy's own
                 # queue list on a later tick.
                 try:
-                    _persist_submission(db, queue_id, claimed, trace_type, response)
+                    _persist_submission(
+                        db, queue_id, claimed, trace_type, response,
+                        claim_time=claim_time,
+                    )
                 except Exception as exc:  # noqa: BLE001 — a paid batch is at stake
                     _logger.error(
                         "Bookkeeping FAILED for accepted Tracerfy queue %s (%d rows): "
@@ -244,7 +247,9 @@ def dispatch_pending_skip_trace() -> dict:
                         db.rollback()
                     except Exception:  # noqa: BLE001 — session may already be dead
                         pass
-                    if not _persist_submission_retry(queue_id, claimed, trace_type, response):
+                    if not _persist_submission_retry(
+                        queue_id, claimed, trace_type, response, claim_time=claim_time,
+                    ):
                         _alert_orphaned_queue(queue_id, trace_type, len(claimed))
                         errors.append(f"bookkeeping failed for queue {queue_id}")
                         return _tick_result(
@@ -384,13 +389,31 @@ def _fail_unsubmittable(db, rows: list) -> None:
 # ─── Post-accept bookkeeping (a PAID batch depends on this) ───────────────────
 
 
-def _persist_submission(db, queue_id: int, claimed: list, trace_type: str, response: dict) -> None:
+def _persist_submission(
+    db, queue_id: int, claimed: list, trace_type: str, response: dict,
+    adopted: bool = False, claim_time=None,
+) -> None:
     """Record an accepted Tracerfy batch: queue row + row/Result status flips.
 
-    Idempotent by construction so the retry path (and a future reconciler
-    adoption) can re-run it safely: the SkipTraceQueue insert is ON CONFLICT DO
-    NOTHING on the unique tracerfy_queue_id, and both updates are guarded on the
-    status they expect to move from.
+    Idempotent by construction so the retry path (and the reconciler adoption)
+    can re-run it safely: the SkipTraceQueue insert is ON CONFLICT DO NOTHING on
+    the unique tracerfy_queue_id, and both updates are guarded on the status
+    they expect to move from.
+
+    `claim_time` is the instant the rows were claimed, committed BEFORE the POST
+    went out. It is passed IN rather than computed here because everything
+    computable at this point is later than the provider receiving the batch —
+    including on the retry path, which runs on a fresh session after a failed
+    commit and would otherwise mint a clock later still.
+
+    `adopted` says WHICH path this is, and it exists because the two disagree
+    about what time it is. On the live path we have just completed the POST, so
+    `now` is a true send time. On the reconciler's adoption path the batch was
+    sent on some earlier tick that never recorded it — often days ago — and the
+    row is being inserted for the first time, so ON CONFLICT protects nothing
+    and `now` is the adoption clock. Billing overage against that would place
+    usage inside a subscription period that had not begun when the lookups ran.
+    See migration 093.
     """
     from sqlalchemy import update
     from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -399,6 +422,8 @@ def _persist_submission(db, queue_id: int, claimed: list, trace_type: str, respo
 
     now = datetime.now(UTC)
     first = claimed[0]
+
+    provider_submitted_at = provider_submitted_time(response, claim_time, adopted)
     db.execute(
         pg_insert(SkipTraceQueue)
         .values(
@@ -422,6 +447,7 @@ def _persist_submission(db, queue_id: int, claimed: list, trace_type: str, respo
             # if the enqueue is lost (Codex).
             download_url=response.get("download_url"),
             submitted_at=now,
+            provider_submitted_at=provider_submitted_at,
         )
         .on_conflict_do_nothing(index_elements=["tracerfy_queue_id"])
     )
@@ -450,7 +476,7 @@ def _persist_submission(db, queue_id: int, claimed: list, trace_type: str, respo
 
 
 def _persist_submission_retry(
-    queue_id: int, claimed: list, trace_type: str, response: dict
+    queue_id: int, claimed: list, trace_type: str, response: dict, claim_time=None
 ) -> bool:
     """Retry _persist_submission on a brand-new session. True when it stuck.
 
@@ -462,7 +488,9 @@ def _persist_submission_retry(
         from src.db.session import system_sync_session
 
         with system_sync_session() as db2:
-            _persist_submission(db2, queue_id, claimed, trace_type, response)
+            _persist_submission(
+                db2, queue_id, claimed, trace_type, response, claim_time=claim_time,
+            )
         _logger.info(
             "Bookkeeping recovered for Tracerfy queue %s on retry (%d rows)",
             queue_id, len(claimed),
@@ -592,6 +620,48 @@ def _release_is_safe(
             # the queue, so we cannot rule it out.
             return False
     return True
+
+
+def provider_submitted_time(response: dict, claim_time, adopted: bool):
+    """When the PROVIDER got this batch, or None if we cannot defend an answer.
+
+    Pure, so the rule can be tested without a database — this is the value skip
+    trace overage is billed against, and getting it wrong charges a customer for
+    usage in a period they never agreed to.
+
+    Tracerfy's own ``created_at`` first. It is the provider's record of when it
+    received the batch, it reads the same whether we ask now or on an adoption
+    three days later, and it is therefore the only value correct on both paths.
+
+    Failing that, ``claim_time`` — and specifically NOT `now`. This is the
+    correction to the first version of this function, which used the moment
+    bookkeeping ran and called it a lower bound. It is not one: bookkeeping runs
+    AFTER the POST returns, and the provider can begin work the instant it
+    receives the batch, so lookups can predate that value. The bookkeeping-retry
+    path made it worse by computing a FRESH clock, later still (Codex).
+
+    `claim_time` is taken before the rows are marked 'submitting' and committed
+    BEFORE the POST is issued, so nothing the provider does can precede it. It is
+    computed once per tick and passed in, so a retry cannot advance it.
+
+    On the adoption path there is no defensible fallback at all: the batch went
+    out on some earlier tick that never recorded it, and every clock still
+    available is later than the work. That returns None, and the usage goes to a
+    human.
+    """
+    ts = _parse_tracerfy_ts(response.get("created_at"))
+    if ts is not None:
+        if ts.tzinfo is None:
+            # A naive value in a timestamptz column is read back in the server's
+            # timezone, shifting the billing period by the offset. Tracerfy
+            # sends Z-suffixed UTC; anything else is assumed to be the same.
+            ts = ts.replace(tzinfo=UTC)
+        return ts
+    if adopted or claim_time is None:
+        return None
+    if claim_time.tzinfo is None:
+        claim_time = claim_time.replace(tzinfo=UTC)
+    return claim_time
 
 
 def _parse_tracerfy_ts(value) -> datetime | None:
@@ -869,7 +939,7 @@ def _reconcile_stale_claims(db) -> dict:
                 # process dying right after this commit) would leave the queue
                 # recorded — and therefore excluded from every future
                 # reconciliation pass — with nothing ever ingesting it (Codex).
-                _persist_submission(db, queue_id, claimed, trace_type, queue)
+                _persist_submission(db, queue_id, claimed, trace_type, queue, adopted=True)
                 known.add(queue_id)
                 summary["adopted"] += len(claimed)
                 _redrive_completed_queue(queue)

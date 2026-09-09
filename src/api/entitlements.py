@@ -32,8 +32,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.constants import (
     COUNTY_LIMIT_BY_PLAN,
+    OVERLAP_PLANS,
     RECORD_TYPES_BY_PLAN,
+    allowed_export_formats,
+    allowed_schedule_frequencies,
     count_label,
+    export_format_label,
+    normalize_plan,
     record_type_label,
 )
 from src.config.plans import plan_label
@@ -45,7 +50,7 @@ _logger = setup_logger("api.entitlements")
 
 
 def _plan_of(user: User) -> str:
-    return (user.plan or "starter").lower()
+    return normalize_plan(user.plan)
 
 
 # --- Customer-facing copy ---------------------------------------------------
@@ -56,6 +61,11 @@ def _plan_of(user: User) -> str:
 CODE_COUNTY_LIMIT = "county_limit"
 CODE_RECORD_TYPE = "record_type"
 CODE_PLAN_LIMIT = "plan_limit"
+CODE_EXPORT_FORMAT = "export_format"
+CODE_SCHEDULE = "schedule"
+CODE_OVERLAP = "overlap"
+CODE_DELIVERY = "delivery"
+CODE_SKIP_TRACE = "skip_trace"
 
 
 @dataclass(frozen=True)
@@ -135,6 +145,94 @@ def record_type_violation(plan: str, record_types: Iterable[str]) -> Violation:
     )
 
 
+def export_format_violation(plan: str, formats: Iterable[str]) -> Violation:
+    """One or more requested export formats are above this plan.
+
+    Deduplicates on the LABEL, not the slug: "excel" and "xlsx" are one format
+    with two spellings, and a customer who asked for both must not be told
+    "Excel and Excel are not included".
+    """
+    labels = sorted({export_format_label(f) for f in formats})
+    subject = _join_english(labels)
+    verb = "is" if len(labels) == 1 else "are"
+    return Violation(
+        code=CODE_EXPORT_FORMAT,
+        title="Export format not in your plan",
+        message=(
+            f"{subject} export {verb} not included in your {plan_label(plan)} plan."
+        ),
+    )
+
+
+def schedule_frequency_violation(plan: str, frequency: str) -> Violation:
+    """A recurring schedule this plan does not cover.
+
+    Starter has no schedule at all, so it gets a sentence about running
+    manually rather than one about a frequency it was never offered. Every
+    other plan is missing one specific frequency and is told which.
+    """
+    label = plan_label(plan)
+    if allowed_schedule_frequencies(plan) == frozenset({"manual"}):
+        message = (
+            f"Your {label} plan runs scrapes when you start them. "
+            "Scheduled runs are not included."
+        )
+    else:
+        message = (
+            f"{(frequency or '').strip().title()} scheduling is not included in "
+            f"your {label} plan."
+        )
+    return Violation(
+        code=CODE_SCHEDULE, title="Scheduling not in your plan", message=message
+    )
+
+
+def overlap_violation(plan: str) -> Violation:
+    """Overlap / intersection lead lists are a Business and Agency line."""
+    return Violation(
+        code=CODE_OVERLAP,
+        title="Overlap lists not in your plan",
+        message=(
+            "Overlap and intersection lists are not included in your "
+            f"{plan_label(plan)} plan."
+        ),
+    )
+
+
+def delivery_violation(plan: str, what: str) -> Violation:
+    """An outbound delivery destination above this plan (webhook, dialer)."""
+    return Violation(
+        code=CODE_DELIVERY,
+        title="Delivery method not in your plan",
+        message=f"{what} is not included in your {plan_label(plan)} plan.",
+    )
+
+
+def skip_trace_violation(plan: str) -> Violation:
+    """Skip tracing, either the enrichment toggle or the metered add-on."""
+    return Violation(
+        code=CODE_SKIP_TRACE,
+        title="Skip tracing not in your plan",
+        message=f"Skip tracing is not included in your {plan_label(plan)} plan.",
+    )
+
+
+def disallowed_export_formats(plan: str, formats: Iterable[str]) -> set[str]:
+    """Requested formats NOT allowed for this plan (lowercased). Fails closed."""
+    allowed = allowed_export_formats(plan)
+    return {f.strip().lower() for f in formats if f} - allowed
+
+
+def schedule_frequency_allowed(plan: str, frequency: str | None) -> bool:
+    """True when this plan covers the frequency. A missing value is manual."""
+    return (frequency or "manual").strip().lower() in allowed_schedule_frequencies(plan)
+
+
+def overlap_allowed(plan: str) -> bool:
+    """True when this plan includes the overlap / intersection lists."""
+    return normalize_plan(plan) in OVERLAP_PLANS
+
+
 def combine_violations(violations: list[Violation]) -> Violation:
     """One notice for the whole request. A create can break the county cap AND
     the record-type matrix at once; showing only the first would send the user
@@ -153,7 +251,7 @@ def combine_violations(violations: list[Violation]) -> Violation:
 _UPGRADE_SENTENCE = "Upgrade your plan to continue."
 
 
-def _plan_limit_http(violation: Violation) -> HTTPException:
+def plan_limit_http(violation: Violation) -> HTTPException:
     """402 whose body is structured, not prose.
 
     The frontend renders ``title`` and ``message`` as a calm plan notice, so the
@@ -286,7 +384,7 @@ async def enforce_entitlements(
 
     summary = " ".join(v.message for v in problems)
     if settings.ENTITLEMENT_ENFORCEMENT:
-        raise _plan_limit_http(combine_violations(problems))
+        raise plan_limit_http(combine_violations(problems))
     # Audit/log-only: infrastructure shipped, enforcement deferred.
     _logger.info(
         "entitlement audit (NOT enforced) user=%s plan=%s context=%s would_block: %s",
@@ -320,7 +418,7 @@ def allowed_county_set(
     claim a slot (a disallowed-type config is paused on type grounds and must not
     evict a valid county). ACTIVE configs claim slots first (earliest created_at
     wins); entitlement-paused configs fill only remaining slots. None = unlimited."""
-    plan = (plan or "starter").lower()
+    plan = normalize_plan(plan)
     cap = COUNTY_LIMIT_BY_PLAN.get(plan, COUNTY_LIMIT_BY_PLAN["starter"])
     if cap < 0:
         return None
@@ -364,7 +462,7 @@ def config_run_violation(
     titled notice without parsing English. ``Violation.__str__`` is the message,
     so the worker/scheduler call sites that interpolate the result into a log line
     or a job-failure reason keep working unchanged."""
-    plan = (plan or "starter").lower()
+    plan = normalize_plan(plan)
     rt = (record_type or "").lower()
     allowed_types = RECORD_TYPES_BY_PLAN.get(plan, RECORD_TYPES_BY_PLAN["starter"])
     if rt not in allowed_types:
@@ -384,7 +482,7 @@ def enforce_runnable_http(violation: Violation | None, *, user: User, context: s
     if not violation:
         return
     if settings.ENTITLEMENT_ENFORCEMENT:
-        raise _plan_limit_http(violation)
+        raise plan_limit_http(violation)
     _logger.info(
         "entitlement audit (NOT enforced) user=%s plan=%s context=%s would_block: %s",
         user.id, _plan_of(user), context, violation,
@@ -414,7 +512,7 @@ def plan_reconciliation(
     revive_ids = entitlement-paused configs now permitted again.
     User-paused configs (paused_reason None, active False) are never touched."""
     rows = list(rows)
-    plan = (plan or "starter").lower()
+    plan = normalize_plan(plan)
     allowed_counties = allowed_county_set(rows, plan)
     allowed_types = RECORD_TYPES_BY_PLAN.get(plan, RECORD_TYPES_BY_PLAN["starter"])
 
@@ -553,3 +651,22 @@ def apply_reconciliation_sync(
         )
 
     return len(pause_ids), len(revive_ids)
+
+
+def raise_plan_features(violations: list[Violation]) -> None:
+    """Raise ONE structured 402 for a list of feature violations, or return.
+
+    Always raised, never flag-gated: ENTITLEMENT_ENFORCEMENT stages the county
+    and record-type rollout for accounts that pre-date the value metric, and the
+    delivery, skip-trace and batch gates it sits beside have always been
+    unconditional. Adding a second, quieter mode for export format and scheduling
+    would mean the same request is refused or allowed depending on which gate it
+    trips, which is not something a customer can be told.
+
+    One notice for the whole request: a save can break the format gate and the
+    schedule gate at once, and showing only the first sends the user back for a
+    second refusal after they fixed it.
+    """
+    if not violations:
+        return
+    raise plan_limit_http(combine_violations(violations))

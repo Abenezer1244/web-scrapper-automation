@@ -992,6 +992,19 @@
         "title": "CachedResultsPage",
         "type": "object"
       },
+      "ChangePlanRequest": {
+        "properties": {
+          "price_id": {
+            "title": "Price Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "price_id"
+        ],
+        "title": "ChangePlanRequest",
+        "type": "object"
+      },
       "CheckoutRequest": {
         "properties": {
           "price_id": {
@@ -5454,6 +5467,55 @@
         ]
       }
     },
+    "/billing/change-plan": {
+      "post": {
+        "description": "Move an EXISTING subscriber to a different plan or billing interval.\n\nCheckout creates a subscription; this changes the one that already exists.\nThey are separate endpoints because they are separate operations, and\nconflating them is what produced the defect: create_checkout always built a\nsubscription-mode Session and nothing modified or cancelled the old one, so a\nmonthly subscriber buying annual ended up holding BOTH — two live\nobligations, and with the metered skip-trace item attached, two metered items\non one meter for one customer.\n\nNothing in here can create a subscription. If there is no live one to modify\nthis returns 409 and points at checkout, which is the endpoint that may.",
+        "operationId": "change_plan_billing_change_plan_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePlanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Change Plan Billing Change Plan Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Change Plan",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
     "/billing/checkout": {
       "post": {
         "description": "Create a Stripe Checkout session to upgrade the user's plan.",
@@ -5529,7 +5591,7 @@
     },
     "/billing/portal": {
       "post": {
-        "description": "Return a Stripe Customer Portal URL for managing subscriptions.",
+        "description": "Return a Stripe Customer Portal URL for managing subscriptions.\n\nThe portal here is payment method, invoices and cancel. Plan CHANGES go\nthrough create_checkout, which is what the plan cards call.\n\nThat distinction now matters. Subscriptions carry a usage-based skip-trace\nitem, and Stripe restricts the portal's plan-switch flow for subscriptions\nthat have one. This deployment is unaffected: the live portal configuration\n(bpc_1TGRdU..., the default) has subscription_update DISABLED, verified\nagainst the account, so the portal never offered a plan switch. If someone\nturns \"Switch plan\" on in the Dashboard, check it against a subscription\nthat actually has the metered item before trusting it (Codex raised this).",
         "operationId": "customer_portal_billing_portal_post",
         "responses": {
           "200": {
@@ -5611,7 +5673,7 @@
     },
     "/billing/skip-trace-usage": {
       "get": {
-        "description": "Return the user's skip-trace lookup usage + bundled quota.\n\nUsed by the frontend billing page to render a progress bar and\noverage estimate. Values are read from the cached counter on the\nUser row — no external calls.",
+        "description": "Return the user's skip-trace lookup usage + bundled quota.\n\nUsed by the frontend billing page to render a progress bar and\noverage estimate. Values are read from the cached counter on the\nUser row — no external calls.\n\nThe period reported is the user's ENTITLEMENT WINDOW, the same one records\nare metered over and the same one the counter now rolls on. It used to\nreport the raw `skip_trace_period_start`, which was a calendar month, so the\npage told a subscriber anchored on the 20th that their lookups reset on the\n1st while their records reset on the 20th and Stripe invoiced on the 20th.\n`effective_window` is used rather than the stored pair for the same reason\n/billing/usage uses it: a window that has ended but not yet rolled would\notherwise be reported as the current one.",
         "operationId": "skip_trace_usage_billing_skip_trace_usage_get",
         "responses": {
           "200": {

@@ -28,7 +28,11 @@ from src.api.schemas import (
 )
 from src.api.tax_filters import build_tax_conditions, tax_cap_condition
 from src.config import settings
-from src.config.constants import CANCELLABLE_STATUSES, PRIORITY_QUEUE_PLANS
+from src.config.constants import (
+    CANCELLABLE_STATUSES,
+    normalize_plan,
+    scrape_queue_for_plan,
+)
 from src.db import CountyConnector, Job, JobLog, Result, ScraperConfig, User
 from src.utils.logger import setup_logger
 
@@ -144,7 +148,9 @@ async def enqueue_scrape_job(
     )
     connector = connector_result.scalars().first()
     if connector and getattr(connector, "scraper_mode", "manual") == "ai":
-        ai_limit = settings.AI_JOB_LIMITS.get(current_user.plan, 5)
+        ai_limit = settings.AI_JOB_LIMITS.get(
+            normalize_plan(current_user.plan), settings.AI_JOB_LIMITS["starter"]
+        )
         if ai_limit != -1:
             # Count AI jobs this month. H4 (full-SaaS review): the
             # old query joined Job → ScraperConfig → CountyConnector
@@ -226,7 +232,7 @@ async def enqueue_scrape_job(
     # it (its atomic claim dedupes), so we never strand it.
     from src.workers.tasks import run_scrape_job
 
-    queue = "scrape-priority" if current_user.plan in PRIORITY_QUEUE_PLANS else "scrape"
+    queue = scrape_queue_for_plan(current_user.plan)
     try:
         run_scrape_job.apply_async(args=[job.id], queue=queue)
     except Exception:

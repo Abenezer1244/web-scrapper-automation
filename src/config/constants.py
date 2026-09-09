@@ -134,6 +134,48 @@ class Plan(str, Enum):
 # Plans that get the high-priority Celery queue. Business+ paid tiers.
 PRIORITY_QUEUE_PLANS: frozenset[str] = frozenset({Plan.BUSINESS.value, Plan.AGENCY.value})
 
+# The queue names run_scrape_job can be published to. `scrape-priority` is
+# consumed ahead of `scrape` in WORKER_QUEUES, which under the Redis broker's
+# default round-robin strategy means a paid job never waits behind the whole
+# free-tier backlog. It is NOT strict priority; kombu would need
+# broker_transport_options={"queue_order_strategy": "priority"} for that.
+SCRAPE_QUEUE_PRIORITY = "scrape-priority"
+SCRAPE_QUEUE_DEFAULT = "scrape"
+
+
+def normalize_plan(plan: str | None) -> str:
+    """The canonical slug for a stored plan value.
+
+    Every gate in this codebase keys off the lowercase catalog ids, but plans are
+    not always written by the Stripe webhook: on this deployment they are also set
+    by hand in the database, which is how a "Business" or a "pro " gets in. Half
+    the call sites used to compare raw and the other half lowercased without
+    stripping, so the same stored value could be refused webhook delivery, routed
+    off the priority queue, and enforced as Starter, all silently and all in
+    different directions. One helper, used everywhere, is the fix.
+
+    Unknown values are returned as-is (lowercased and stripped) rather than
+    coerced to a default: the gates already fail closed on an unrecognized plan,
+    and silently renaming it here would hide the bad row instead of denying it.
+    """
+    return (plan or "starter").strip().lower()
+
+
+def scrape_queue_for_plan(plan: str | None) -> str:
+    """Which queue a scrape job for this plan is published to.
+
+    Used by EVERY enqueue site. The scheduled dispatcher and the batch fan-out
+    used to call ``run_scrape_job.delay()``, which takes the task's declared
+    route (``scrape``) regardless of plan, so the Agency "Priority queue" line
+    applied to a manual button press and to nothing else. Recurring runs are
+    exactly the work the tier is bought for.
+    """
+    return (
+        SCRAPE_QUEUE_PRIORITY
+        if normalize_plan(plan) in PRIORITY_QUEUE_PLANS
+        else SCRAPE_QUEUE_DEFAULT
+    )
+
 # Transient scrape-failure retry policy (Codex-reconciled). When a scrape phase
 # raises a TransientScrapeError / Playwright infra error, the worker re-queues the
 # job with escalating backoff instead of permanently failing the whole day's run
@@ -144,9 +186,15 @@ PRIORITY_QUEUE_PLANS: frozenset[str] = frozenset({Plan.BUSINESS.value, Plan.AGEN
 SCRAPE_TRANSIENT_MAX_RETRIES: int = 2
 SCRAPE_TRANSIENT_BACKOFF_SECONDS: tuple[int, ...] = (300, 1200)  # 5 min, then 20 min
 
-# Plans allowed to use the per-config webhook delivery feature and the
-# `enrichment.skip_tracing` toggle (the always-on enrichment, included
-# with the plan).
+# Plans allowed to use the per-config webhook delivery feature, the dialer push,
+# and the `enrichment.skip_tracing` toggle.
+#
+# NOTE on `enrichment.skip_tracing`: this comment used to call it "the always-on
+# enrichment, included with the plan". It is not. The worker's skip-trace entry
+# point reads the `skip_trace_enabled` COLUMN and never looks at the enrichment
+# blob, so the toggle is gated, persisted, and read by nothing. It is kept gated
+# (a Business+ field should stay a Business+ field) but the route now mirrors it
+# onto `skip_trace_enabled`, which is the flag that actually runs a lookup.
 BUSINESS_FEATURES_PLANS: frozenset[str] = frozenset({Plan.BUSINESS.value, Plan.AGENCY.value})
 
 # Registered dialer-push connector ids (the `deliver.dialer_type` discriminator).
@@ -282,6 +330,82 @@ class ScraperFrequency(str, Enum):
     DAILY = "daily"
     WEEKLY = "weekly"
     MONTHLY = "monthly"
+
+
+# ── Per-plan export / schedule / segment access ──────────────────────────────
+# The other half of the value-metric matrix. These three are what the plan cards
+# sell as "CSV export" / "CSV + Excel export" / "All export formats",
+# "Manual runs" / "Daily/weekly schedule" / "All schedules", and
+# "All record types + overlap/intersection".
+#
+# All three shipped ungated: DeliverConfig validated `formats` against
+# SUPPORTED_EXPORT_FORMATS alone, ScheduleConfig only checked that a frequency
+# was a known word, and the /segments router carried no plan dependency at all.
+# A Starter account could save a JSON export and a daily schedule, and reach the
+# overlap lists sold on Business, by calling the API directly. Enforced from
+# src/api/entitlements.py, at create and at edit, on the ENABLE-DELTA so a
+# downgrade does not break a config its owner is only renaming.
+#
+# Unlike the county and record-type gates these are NOT behind
+# ENTITLEMENT_ENFORCEMENT: that flag exists to stage the value-metric rollout for
+# accounts that pre-date it, and it is true in production anyway.
+
+# "xlsx" is the on-disk alias of "excel"; a plan that gets one gets the other, or
+# the same file would be allowed under one name and refused under the other.
+EXPORT_FORMATS_BY_PLAN: dict[str, frozenset[str]] = {
+    Plan.STARTER.value: frozenset({"csv"}),
+    Plan.PRO.value: frozenset({"csv", "excel", "xlsx"}),
+    Plan.BUSINESS.value: SUPPORTED_EXPORT_FORMATS,
+    Plan.AGENCY.value: SUPPORTED_EXPORT_FORMATS,
+}
+
+ALL_SCHEDULE_FREQUENCIES: frozenset[str] = frozenset(
+    {"manual", "daily", "weekly", "monthly"}
+)
+
+# "manual" is in every set: it is the absence of a schedule, not a schedule, and
+# refusing it would mean a Starter could not save a scraper at all.
+SCHEDULE_FREQUENCIES_BY_PLAN: dict[str, frozenset[str]] = {
+    Plan.STARTER.value: frozenset({"manual"}),
+    Plan.PRO.value: frozenset({"manual", "daily", "weekly"}),
+    Plan.BUSINESS.value: ALL_SCHEDULE_FREQUENCIES,
+    Plan.AGENCY.value: ALL_SCHEDULE_FREQUENCIES,
+}
+
+# Overlap / intersection lead lists (/segments/*, and the batch
+# delivery_mode="overlaps_only" export). Business and above, per the plan cards
+# and docs/pricing-strategy-2026-06.md, which calls the distress-list overlap the
+# crown jewel and gates it here deliberately.
+OVERLAP_PLANS: frozenset[str] = frozenset({Plan.BUSINESS.value, Plan.AGENCY.value})
+
+# Customer-facing names for export formats. "xlsx" and "excel" are one format
+# with two spellings and must never be shown as two.
+EXPORT_FORMAT_LABELS: dict[str, str] = {
+    "csv": "CSV",
+    "excel": "Excel",
+    "xlsx": "Excel",
+    "json": "JSON",
+}
+
+
+def export_format_label(fmt: str) -> str:
+    """Customer-facing name for an export format slug."""
+    key = (fmt or "").strip().lower()
+    return EXPORT_FORMAT_LABELS.get(key) or key.upper()
+
+
+def allowed_export_formats(plan: str) -> frozenset[str]:
+    """Formats this plan may select. Fails CLOSED on an unknown plan."""
+    return EXPORT_FORMATS_BY_PLAN.get(
+        normalize_plan(plan), EXPORT_FORMATS_BY_PLAN[Plan.STARTER.value]
+    )
+
+
+def allowed_schedule_frequencies(plan: str) -> frozenset[str]:
+    """Frequencies this plan may select. Fails CLOSED on an unknown plan."""
+    return SCHEDULE_FREQUENCIES_BY_PLAN.get(
+        normalize_plan(plan), SCHEDULE_FREQUENCIES_BY_PLAN[Plan.STARTER.value]
+    )
 
 
 class DateRangeMode(str, Enum):

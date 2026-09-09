@@ -10,8 +10,11 @@ These tests pin the new rule: an export existing is not a download, only an
 observed one counts, and the presentation-only grandfather flag never leaks into
 anything that claims to measure.
 """
+import csv
+import io
 import uuid
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from httpx import AsyncClient
@@ -416,67 +419,92 @@ async def test_an_empty_segment_export_does_not_count_as_activation(
     await db.refresh(starter_user)
     assert starter_user.first_leads_downloaded_at is None
 
+# ─── A file is not leads: the count comes from the renderer now ──────────────
+# The old _csv_has_a_lead parsed the rendered bytes back to answer this, which
+# could raise on an oversized field and 500 a good download (#264). The renderer
+# returns the row count it already had, so there is nothing left to parse and
+# nothing left to raise. See tests/test_batch_export.py for its coverage.
 
-def test_header_only_batch_csv_is_not_a_lead():
-    from src.api.routes.batches import _csv_has_a_lead
+async def test_row_count_is_the_number_of_rows_actually_written(monkeypatch):
+    """Ties the count to the real writer's output, not to a constant.
 
-    assert _csv_has_a_lead(b"party_name,property_address\n") is False
-    assert _csv_has_a_lead(b"") is False
-
-
-def test_a_batch_csv_with_a_row_is_a_lead():
-    from src.api.routes.batches import _csv_has_a_lead
-
-    assert _csv_has_a_lead(b"party_name,property_address\nDOE JANE,123 Main St\n") is True
-
-
-def test_a_quoted_newline_inside_a_field_is_not_counted_as_a_row():
-    """Counting lines instead of parsing would call this header-only file a lead."""
-    from src.api.routes.batches import _csv_has_a_lead
-
-    header_only_with_wrapped_heading = b'"party\nname",address\n'
-    assert _csv_has_a_lead(header_only_with_wrapped_heading) is False
-
-    one_row_spanning_lines = b'party_name,address\n"DOE,\nJANE","123 Main St"\n'
-    assert _csv_has_a_lead(one_row_spanning_lines) is True
-
-
-def test_segment_response_only_tracks_when_there_are_rows():
-    """The gate lives on the shared helper, so both segment exports inherit it."""
-    from src.api.routes.segments import _segment_csv_response
-
-    empty = _segment_csv_response([], "bridgeleads_overlap_none", "user-1")
-    assert empty.background is None
-
-
-# ─── The lead check must never cost someone their download ───────────────────
-
-def test_an_outsized_field_does_not_blow_up_the_lead_check():
-    """csv.reader refuses a field over 131,072 chars.
-
-    legal_description and heirs are uncapped Text, and this check runs OUTSIDE
-    the caller's error handler, so one outsized lead used to turn a good export
-    into a 500. It must answer, not raise.
+    Patches `src.db.session.system_sync_session`, NOT the batch_export attribute:
+    render_combined_csv imports it INSIDE the function, so patching the module
+    attribute is a no-op that leaves the test talking to a real session.
     """
-    from src.api.routes.batches import _csv_has_a_lead
+    from src.db import session as db_session
+    from src.workers import batch_export
 
-    big = "x" * 200_000
-    oversized = f'party_name,legal_description\n"DOE","{big}"\n'.encode()
-    assert _csv_has_a_lead(oversized) is False  # unreadable, so not counted
+    class _FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def rollback(self):
+            pass
+
+    monkeypatch.setattr(db_session, "system_sync_session", lambda: _FakeSession())
+
+    def _pairs(n: int):
+        return [
+            (
+                SimpleNamespace(
+                    party_name=f"DOE,\nJANE {i}",  # a quoted newline inside a field
+                    property_address=f"{i} Main St",
+                    mailing_address=None,
+                    parcel_id=None,
+                    date_recorded=None,
+                    county="pierce",
+                    phone=None,
+                    email=None,
+                ),
+                {"lists_count": 1, "lists": "probate", "counties": "pierce"},
+            )
+            for i in range(n)
+        ]
+
+    for n in (0, 1, 3):
+        monkeypatch.setattr(batch_export, "_combined_pairs_all", lambda *a, n=n, **k: _pairs(n))
+        rendered = batch_export.render_combined_csv("user-1", ["job-1"])
+
+        assert rendered.row_count == n
+        # Count CSV RECORDS, not lines: the party names above span lines.
+        reader = csv.reader(io.StringIO(rendered.data.decode("utf-8")))
+        records = [r for r in reader if r]
+        assert len(records) == n + 1, f"expected header + {n} rows"
 
 
-def test_a_blank_line_is_not_a_lead():
-    from src.api.routes.batches import _csv_has_a_lead
+async def test_the_batch_download_tracks_only_when_it_carried_rows(monkeypatch):
+    """The route's gate, not the NamedTuple's truthiness.
 
-    assert _csv_has_a_lead(b"party_name,address\n\n") is False
-    # ...but a real row after a blank line still is one.
-    assert _csv_has_a_lead(b"party_name,address\n\nDOE,123 Main St\n") is True
+    Asserting on RenderedCsv alone would pass with the route's condition inverted
+    or deleted, which is the whole failure mode this is here to catch.
+    """
+    from src.api.download_tracking import mark_leads_downloaded
+    from src.api.routes.batches import _stream_run_csv
+    from src.workers import batch_export
 
+    run = SimpleNamespace(
+        id=str(uuid.uuid4()),
+        user_id=str(uuid.uuid4()),
+        status="done",
+        child_job_ids=[str(uuid.uuid4())],
+    )
 
-def test_lead_check_handles_crlf_and_invalid_utf8():
-    from src.api.routes.batches import _csv_has_a_lead
+    async def _render(count: int):
+        monkeypatch.setattr(
+            batch_export,
+            "render_combined_csv",
+            lambda *a, **k: batch_export.RenderedCsv(b"party_name\nDOE\n", count),
+        )
+        return await _stream_run_csv(str(uuid.uuid4()), run, None, "everything")
 
-    assert _csv_has_a_lead(b"party_name,address\r\n") is False
-    assert _csv_has_a_lead(b"party_name,address\r\nDOE,123 Main St\r\n") is True
-    # errors="replace": undecodable bytes must not raise out of the check.
-    assert _csv_has_a_lead(b"party_name,address\nDOE,\xff\xfe bad\n") is True
+    empty = await _render(0)
+    assert empty.background is None, "a header-only export is not leads"
+
+    carried = await _render(2)
+    assert carried.background is not None
+    assert carried.background.func is mark_leads_downloaded
+    assert carried.background.args == (str(run.user_id),)

@@ -438,11 +438,24 @@ async def test_checkout_sends_two_line_items_and_no_quantity_on_the_metered_one(
         return _FakeSession()
 
     monkeypatch.setattr(billing.stripe.checkout.Session, "create", _fake_create)
+    # The checkout guard added Subscription.list / Session.list / Session.expire
+    # to this path, and moved customer adoption onto auto_paging_iter(). Patching
+    # only Customer.list (and as a plain dict) would leave the rest reaching the
+    # real Stripe and 503 before this test could look at its line items.
     monkeypatch.setattr(
-        billing.stripe.Customer, "list", lambda **kw: {"data": []}
+        billing.stripe.Customer, "list", lambda **kw: _FakeStripeList([])
     )
     monkeypatch.setattr(
         billing.stripe.Customer, "create", lambda **kw: {"id": "cus_audit"}
+    )
+    monkeypatch.setattr(
+        billing.stripe.Subscription, "list", lambda **kw: _FakeStripeList([])
+    )
+    monkeypatch.setattr(
+        billing.stripe.checkout.Session, "list", lambda **kw: _FakeStripeList([])
+    )
+    monkeypatch.setattr(
+        billing.stripe.checkout.Session, "expire", lambda sid, **kw: {"id": sid}
     )
 
     _user, token = await make_user("pro")
@@ -1476,3 +1489,390 @@ async def test_a_lookup_after_a_window_ends_is_not_billed_against_the_old_one(
     assert after["used_after"] == 1
     assert after["billable_units"] == 0, "billed for a lookup inside the free allowance"
     sync_db.rollback()
+
+
+# ─── The checkout guard: one subscription per customer ────────────────────────
+#
+# Stripe is the one dependency these tests stand in for. The project rule is no
+# mocks; the exception it names is an external API, and creating real live
+# subscriptions to prove we refuse to create a second one is not a test anyone
+# can run twice. Everything else here is a real user row, a real request through
+# the real route, and the real guard.
+
+
+class _FakeStripeList:
+    """A Stripe ListObject stand-in that only knows how to page.
+
+    Deliberately does NOT support `.get("data")`. The production code moved from
+    reading one page to `auto_paging_iter()`, and a fake that answers both would
+    let the pagination regression this guards against pass unnoticed.
+    """
+
+    def __init__(self, items):
+        self._items = list(items)
+
+    def auto_paging_iter(self):
+        return iter(self._items)
+
+
+def _sub(status: str, sid: str = "sub_test") -> dict:
+    return {"id": sid, "status": status}
+
+
+def _patch_checkout_stripe(
+    monkeypatch,
+    billing,
+    *,
+    customers=(),
+    subscriptions=(),
+    sessions=(),
+    expired=None,
+    created=None,
+):
+    """Point every Stripe call create_checkout makes at in-memory data."""
+    monkeypatch.setattr(
+        billing.stripe.Customer, "list", lambda **kw: _FakeStripeList(customers)
+    )
+    monkeypatch.setattr(
+        billing.stripe.Customer, "create", lambda **kw: {"id": "cus_new"}
+    )
+    monkeypatch.setattr(
+        billing.stripe.Subscription, "list", lambda **kw: _FakeStripeList(subscriptions)
+    )
+    monkeypatch.setattr(
+        billing.stripe.checkout.Session, "list", lambda **kw: _FakeStripeList(sessions)
+    )
+
+    def _expire(sid, **kw):
+        if expired is not None:
+            expired.append(sid)
+        return {"id": sid, "status": "expired"}
+
+    monkeypatch.setattr(billing.stripe.checkout.Session, "expire", _expire)
+
+    class _FakeSession:
+        url = "https://checkout.example/session"
+
+    def _create(**kwargs):
+        if created is not None:
+            created.append(kwargs)
+        return _FakeSession()
+
+    monkeypatch.setattr(billing.stripe.checkout.Session, "create", _create)
+
+
+def _pro_price(billing):
+    return next(
+        (pid for pid, info in billing._PRICE_TO_PLAN.items() if info[0] == "pro"), None
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status", ["active", "trialing", "past_due", "unpaid", "paused"]
+)
+async def test_checkout_refuses_when_a_live_subscription_exists(
+    client, db, make_user, monkeypatch, status
+):
+    """A second subscription is a second obligation, whatever the first's state.
+
+    `past_due` and `unpaid` are the ones worth naming: they read like "not
+    really subscribed", and they still bill. Selling this customer another plan
+    leaves them owing on two.
+    """
+    import src.api.routes.billing as billing
+
+    price = _pro_price(billing)
+    if price is None:
+        pytest.skip("no Pro STRIPE_PRICE_* configured in this environment")
+
+    created: list = []
+    _patch_checkout_stripe(
+        monkeypatch, billing, subscriptions=[_sub(status)], created=created
+    )
+
+    _user, token = await make_user("pro")
+    r = await client.post(
+        "/billing/checkout", json={"price_id": price}, headers=_auth(token)
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "subscription_exists"
+    assert created == [], "refused checkout must not create a Session"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["canceled", "incomplete_expired"])
+async def test_checkout_is_allowed_after_a_terminal_subscription(
+    client, db, make_user, monkeypatch, status
+):
+    """A finished subscription is not an obligation — resubscribing must work.
+
+    The guard's failure mode in this direction is silent and total: a customer
+    who cancelled and wants to come back simply cannot, and nothing in the
+    product tells them why.
+    """
+    import src.api.routes.billing as billing
+
+    price = _pro_price(billing)
+    if price is None:
+        pytest.skip("no Pro STRIPE_PRICE_* configured in this environment")
+
+    created: list = []
+    _patch_checkout_stripe(
+        monkeypatch, billing, subscriptions=[_sub(status)], created=created
+    )
+
+    _user, token = await make_user("pro")
+    r = await client.post(
+        "/billing/checkout", json={"price_id": price}, headers=_auth(token)
+    )
+    assert r.status_code == 200, r.text
+    assert len(created) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_an_incomplete_subscription_is_told_to_finish_paying(
+    client, db, make_user, monkeypatch
+):
+    """`incomplete` blocks, but must not read as "contact support".
+
+    Stripe holds a first payment open for roughly 23 hours. Routing a customer
+    whose card needs one retry to a support queue locks them out of their own
+    purchase for a day, so this status gets its own message.
+    """
+    import src.api.routes.billing as billing
+
+    price = _pro_price(billing)
+    if price is None:
+        pytest.skip("no Pro STRIPE_PRICE_* configured in this environment")
+
+    _patch_checkout_stripe(monkeypatch, billing, subscriptions=[_sub("incomplete")])
+
+    _user, token = await make_user("pro")
+    r = await client.post(
+        "/billing/checkout", json={"price_id": price}, headers=_auth(token)
+    )
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["code"] == "subscription_incomplete"
+    assert "support" not in detail["message"].lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_an_unknown_subscription_status_fails_closed(
+    client, db, make_user, monkeypatch
+):
+    """A status Stripe adds later must BLOCK, not sail through.
+
+    The terminal set names what is safe. Written as a deny-list it would have
+    let every future status create a duplicate subscription, and nobody would
+    look until a customer was billed twice.
+    """
+    import src.api.routes.billing as billing
+
+    price = _pro_price(billing)
+    if price is None:
+        pytest.skip("no Pro STRIPE_PRICE_* configured in this environment")
+
+    _patch_checkout_stripe(
+        monkeypatch, billing, subscriptions=[_sub("some_status_stripe_adds_in_2027")]
+    )
+
+    _user, token = await make_user("pro")
+    r = await client.post(
+        "/billing/checkout", json={"price_id": price}, headers=_auth(token)
+    )
+    assert r.status_code == 409, r.text
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_a_refused_checkout_does_not_publish_stripe_customer_id(
+    client, db, make_user, monkeypatch
+):
+    """The interaction between this guard and the held skip-trace backlog.
+
+    `users.stripe_customer_id` is the signal the meter outbox sweep uses to
+    release held usage. The old order resolved-and-PERSISTED the customer before
+    doing anything else, so a checkout that gets refused here would still have
+    published that id — firing a customer's entire held backlog for a
+    subscription that was never created. The write now happens only after a
+    Session exists.
+    """
+    from sqlalchemy import select as _select
+
+    import src.api.routes.billing as billing
+    from src.db.models import User as _User
+
+    price = _pro_price(billing)
+    if price is None:
+        pytest.skip("no Pro STRIPE_PRICE_* configured in this environment")
+
+    _patch_checkout_stripe(monkeypatch, billing, subscriptions=[_sub("active")])
+
+    user, token = await make_user("pro")
+    assert user.stripe_customer_id is None
+
+    r = await client.post(
+        "/billing/checkout", json={"price_id": price}, headers=_auth(token)
+    )
+    assert r.status_code == 409, r.text
+
+    fresh = (
+        await db.execute(_select(_User).where(_User.id == user.id))
+    ).scalar_one()
+    await db.refresh(fresh)
+    assert fresh.stripe_customer_id is None, (
+        "a refused checkout published the customer id that releases held "
+        "skip-trace meter events"
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_checkout_fails_closed_when_stripe_state_cannot_be_read(
+    client, db, make_user, monkeypatch
+):
+    """Not knowing is not the same as knowing there is none.
+
+    If the subscription enumeration fails we cannot tell whether this customer
+    already owes Stripe money. Creating the Session anyway is the single outcome
+    that can charge someone twice, so this refuses with a 503 instead.
+    """
+    import src.api.routes.billing as billing
+
+    price = _pro_price(billing)
+    if price is None:
+        pytest.skip("no Pro STRIPE_PRICE_* configured in this environment")
+
+    created: list = []
+    _patch_checkout_stripe(monkeypatch, billing, created=created)
+
+    def _boom(**kw):
+        raise RuntimeError("stripe is down")
+
+    monkeypatch.setattr(billing.stripe.Subscription, "list", _boom)
+
+    _user, token = await make_user("pro")
+    r = await client.post(
+        "/billing/checkout", json={"price_id": price}, headers=_auth(token)
+    )
+    assert r.status_code == 503, r.text
+    assert created == [], "must not create a Session when Stripe state is unknown"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_outstanding_subscription_sessions_are_expired_first(
+    client, db, make_user, monkeypatch
+):
+    """The advisory lock serialises CALLS; it does not retire live Sessions.
+
+    Two tabs each holding a purchasable Session can both be paid after any
+    number of correct guard checks. One-off payment sessions are left alone —
+    expiring those would cancel a purchase this guard has no business touching.
+    """
+    import src.api.routes.billing as billing
+
+    price = _pro_price(billing)
+    if price is None:
+        pytest.skip("no Pro STRIPE_PRICE_* configured in this environment")
+
+    expired: list = []
+    _patch_checkout_stripe(
+        monkeypatch,
+        billing,
+        sessions=[
+            {"id": "cs_sub_1", "mode": "subscription"},
+            {"id": "cs_payment", "mode": "payment"},
+            {"id": "cs_sub_2", "mode": "subscription"},
+        ],
+        expired=expired,
+    )
+
+    _user, token = await make_user("pro")
+    r = await client.post(
+        "/billing/checkout", json={"price_id": price}, headers=_auth(token)
+    )
+    assert r.status_code == 200, r.text
+    assert expired == ["cs_sub_1", "cs_sub_2"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_customer_adoption_looks_past_the_first_page(
+    client, db, make_user, monkeypatch
+):
+    """The eighth finding: adoption read one page of five and took the first match.
+
+    A user with more than five Stripe customers on one address could have their
+    real one sit past that page. We would create yet another customer, and the
+    guard above would then enumerate the WRONG customer's subscriptions — so the
+    duplicate-subscription hole reopens through the back door. The guard is only
+    as good as the customer it is pointed at.
+    """
+    import src.api.routes.billing as billing
+
+    price = _pro_price(billing)
+    if price is None:
+        pytest.skip("no Pro STRIPE_PRICE_* configured in this environment")
+
+    user, token = await make_user("pro")
+
+    # Six unrelated customers on this address, then theirs.
+    others = [
+        {"id": f"cus_other_{i}", "metadata": {"user_id": str(uuid.uuid4())}}
+        for i in range(6)
+    ]
+    theirs = {"id": "cus_theirs", "metadata": {"user_id": str(user.id)}}
+
+    created: list = []
+    _patch_checkout_stripe(
+        monkeypatch, billing, customers=[*others, theirs], created=created
+    )
+
+    def _must_not_create(**kw):
+        raise AssertionError(
+            "created a new Stripe customer while the user already had one"
+        )
+
+    monkeypatch.setattr(billing.stripe.Customer, "create", _must_not_create)
+
+    r = await client.post(
+        "/billing/checkout", json={"price_id": price}, headers=_auth(token)
+    )
+    assert r.status_code == 200, r.text
+    assert created[0]["customer"] == "cus_theirs"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_a_hand_set_plan_does_not_block_checkout(
+    client, db, make_user, monkeypatch
+):
+    """The guard must ask Stripe, never `users.plan`.
+
+    Every real account on this deployment has its plan set by hand in the
+    database and carries no stripe_subscription_id. A guard keyed on the stored
+    plan would refuse checkout to all of them while still missing an actual
+    duplicate, which is the wrong answer twice.
+    """
+    import src.api.routes.billing as billing
+
+    price = _pro_price(billing)
+    if price is None:
+        pytest.skip("no Pro STRIPE_PRICE_* configured in this environment")
+
+    created: list = []
+    _patch_checkout_stripe(monkeypatch, billing, subscriptions=[], created=created)
+
+    _user, token = await make_user("agency")  # a paid plan, no Stripe subscription
+    r = await client.post(
+        "/billing/checkout", json={"price_id": price}, headers=_auth(token)
+    )
+    assert r.status_code == 200, r.text
+    assert len(created) == 1

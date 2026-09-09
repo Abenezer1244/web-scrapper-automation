@@ -769,6 +769,137 @@ def _plan_item_price_id(items: list) -> str | None:
     return None
 
 
+# ─── Checkout guard: one subscription per customer ────────────────────────────
+
+# A subscription in any of these states is OVER. Everything else is a live
+# obligation, including the ones that are easy to read as "not really active":
+# `past_due` and `unpaid` still bill, `paused` still exists, `trialing` becomes
+# active on its own, and `incomplete` can still be paid within Stripe's ~23h
+# initial-payment window. Anything Stripe adds later is unknown to this set and
+# therefore blocks — the set names what is SAFE, so a new status fails closed.
+_TERMINAL_SUBSCRIPTION_STATUSES = frozenset({"canceled", "incomplete_expired"})
+
+
+class _StripeStateUnavailableError(Exception):
+    """Stripe could not be asked what subscriptions this customer has.
+
+    Raised rather than swallowed: not knowing is not the same as knowing there
+    is none, and treating an outage as "no subscription" is exactly how a
+    customer ends up paying twice.
+    """
+
+
+def _resolve_existing_customer(email: str, user_id: str) -> str | None:
+    """The Stripe customer already belonging to this user, or None.
+
+    Paginated. This used to read `Customer.list(email=..., limit=5)` and take
+    the first metadata match in that page, so a user with more than five Stripe
+    customers on one address could have their real one sit on page two: we
+    would create a SIXTH customer, and the subscription guard below would then
+    enumerate the wrong customer's subscriptions and wave through a duplicate
+    subscription. The guard is only as good as the customer it is pointed at.
+
+    Metadata must match this user_id exactly. A customer with someone else's
+    user_id, or with none, is never adopted — reusing another account's Stripe
+    customer would cross-bill two tenants.
+    """
+    for customer in stripe.Customer.list(email=email, limit=100).auto_paging_iter():
+        if ((customer.get("metadata") or {}).get("user_id")) == user_id:
+            return customer["id"]
+    return None
+
+
+def _live_subscription(customer_id: str) -> dict | None:
+    """The customer's first non-terminal subscription, or None.
+
+    `status="all"` is REQUIRED, not defensive. The Stripe SDK documents the
+    default as "all subscriptions that have not been canceled" — which sounds
+    like what we want and is not: it omits `canceled` (fine) but the point of
+    this call is to see EVERY state, and relying on an unstated default to pick
+    the right ones is how the wrong set gets enumerated after an SDK bump.
+
+    Deliberately NOT filtered by price: the question is "does this customer
+    already owe Stripe money on a subscription", not "does this customer
+    already have the plan they just clicked". Buying annual while holding
+    monthly is the exact case that produced two live obligations.
+    """
+    try:
+        for sub in stripe.Subscription.list(
+            customer=customer_id, status="all", limit=100,
+        ).auto_paging_iter():
+            if sub.get("status") not in _TERMINAL_SUBSCRIPTION_STATUSES:
+                return sub
+    except Exception as exc:  # noqa: BLE001 — any Stripe/network failure is "unknown"
+        raise _StripeStateUnavailableError(str(exc)[:200]) from exc
+    return None
+
+
+def _expire_open_checkout_sessions(customer_id: str) -> int:
+    """Expire this customer's open subscription-mode Checkout Sessions.
+
+    The advisory lock below serialises two concurrent /checkout CALLS; it does
+    nothing about two Sessions that already exist. A session stays purchasable
+    until it expires on its own, so a customer with two tabs open can pay for
+    both and end up with two subscriptions having passed a guard that was
+    correct at the moment each request ran.
+
+    Only `mode="subscription"` sessions are touched. A one-off payment session
+    is not a competing obligation and expiring it would cancel a purchase this
+    guard has no business cancelling.
+    """
+    expired = 0
+    try:
+        sessions = stripe.checkout.Session.list(
+            customer=customer_id, status="open", limit=100,
+        ).auto_paging_iter()
+        for session in sessions:
+            if session.get("mode") != "subscription":
+                continue
+            stripe.checkout.Session.expire(session["id"])
+            expired += 1
+    except Exception as exc:  # noqa: BLE001 — same rule as the enumeration above
+        raise _StripeStateUnavailableError(str(exc)[:200]) from exc
+    return expired
+
+
+def _subscription_conflict(sub: dict) -> HTTPException:
+    """The 409 for a customer who already has a live subscription.
+
+    `incomplete` gets its own message on purpose. It means the first payment
+    has not settled yet and Stripe still accepts it for about 23 hours, so the
+    customer's actual next step is to finish paying, not to talk to a human.
+    Sending them to support for a card that just needs retrying would lock them
+    out of their own purchase for a day.
+
+    Everyone else is routed to support rather than the customer portal: the
+    live portal configuration has `subscription_update` DISABLED, so offering
+    the portal as the place to switch plans sends people somewhere that
+    genuinely cannot do it.
+    """
+    if sub.get("status") == "incomplete":
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "subscription_incomplete",
+                "message": (
+                    "Your subscription payment is incomplete. Complete that "
+                    "payment to continue — starting a new checkout would "
+                    "create a second subscription."
+                ),
+            },
+        )
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "subscription_exists",
+            "message": (
+                "You already have a subscription. Contact support to change "
+                "your plan or billing frequency."
+            ),
+        },
+    )
+
+
 class CheckoutRequest(BaseModel):
     price_id: str
 
@@ -813,38 +944,69 @@ async def create_checkout(
             detail="Billing is temporarily unavailable. Please try again later.",
         )
 
+    # Serialise this user's checkout attempts. Two requests in flight (two tabs,
+    # a double-click, a retry after a slow response) would otherwise both read
+    # "no subscription", both pass the guard below, and both create a Session.
+    # Its own key namespace (4243) so it cannot contend with the entitlement
+    # lock at src/api/entitlements.py, which guards a different invariant.
+    # Transaction-scoped: released when this request's transaction ends.
     try:
-        customer_id = current_user.stripe_customer_id
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(4243, hashtext(:uid))"),
+            {"uid": str(current_user.id)},
+        )
+
+        # Re-read the user AFTER taking the lock. `current_user` was loaded
+        # before we started waiting, so on the losing side of a race it
+        # describes the world as it was before the winner ran — including a
+        # stripe_customer_id the winner has just written.
+        _row = await db.execute(select(User).where(User.id == current_user.id))
+        user = _row.scalar_one()
+
+        # Resolve the customer WITHOUT persisting it yet. The write is deferred
+        # to after the Session exists, deliberately: `stripe_customer_id` is the
+        # signal the skip-trace meter sweep uses to release held usage, so
+        # persisting it on a checkout we are about to REFUSE would fire a
+        # customer's held backlog for a subscription that never happened.
+        customer_id = user.stripe_customer_id
+        newly_resolved = False
         if not customer_id:
-            # C3 (full-SaaS review): check Stripe for an existing
-            # customer with this email before creating a new one.
-            # If one exists AND its metadata matches this user_id,
-            # adopt it — prevents orphaned Stripe customers when a
-            # user completes checkout in multiple browser tabs or
-            # when a prior checkout was abandoned after customer
-            # creation but before success. If an existing customer
-            # has mismatched metadata, we refuse to adopt and
-            # create a fresh one so we never reuse another
-            # account's Stripe customer.
-            existing = stripe.Customer.list(email=current_user.email, limit=5)
-            reusable = None
-            for c in (existing.get("data") or []):
-                md_user_id = (c.get("metadata") or {}).get("user_id")
-                if md_user_id == current_user.id:
-                    reusable = c
-                    break
-            if reusable is not None:
-                customer_id = reusable["id"]
-            else:
-                customer = stripe.Customer.create(
-                    email=current_user.email,
-                    metadata={"user_id": current_user.id},
-                )
-                customer_id = customer["id"]
-            result = await db.execute(select(User).where(User.id == current_user.id))
-            user = result.scalar_one()
-            user.stripe_customer_id = customer_id
-            await db.flush()
+            # Adopt this user's existing Stripe customer if there is one —
+            # abandoned checkouts and multi-tab starts leave them behind, and
+            # creating another would fragment the subscription history the
+            # guard below reads.
+            customer_id = _resolve_existing_customer(user.email, str(user.id))
+            if not customer_id:
+                customer_id = stripe.Customer.create(
+                    email=user.email,
+                    metadata={"user_id": str(user.id)},
+                )["id"]
+            newly_resolved = True
+
+        # THE GUARD. Asked of Stripe, never of `users.plan`: on this deployment
+        # plans are set by hand in the database and no user carries a
+        # stripe_subscription_id, so a plan-based check would refuse checkout to
+        # every real account we have while still missing an actual duplicate.
+        existing = _live_subscription(customer_id)
+        if existing is not None:
+            _logger.info(
+                "checkout refused for user %s: subscription %s is %s",
+                user.id, existing.get("id"), existing.get("status"),
+            )
+            raise _subscription_conflict(existing)
+
+        # Kill any Session already outstanding, then ASK AGAIN. Expiring is not
+        # instantaneous and a session can be paid while we are expiring it; the
+        # second read is what catches a subscription created in that window.
+        _expire_open_checkout_sessions(customer_id)
+        existing = _live_subscription(customer_id)
+        if existing is not None:
+            _logger.warning(
+                "checkout refused for user %s: subscription %s (%s) appeared "
+                "while expiring outstanding sessions",
+                user.id, existing.get("id"), existing.get("status"),
+            )
+            raise _subscription_conflict(existing)
 
         # The plan item, plus the metered skip-trace item when one is
         # provisioned for this plan and interval. A metered price must NOT
@@ -858,6 +1020,7 @@ async def create_checkout(
         session = stripe.checkout.Session.create(
             customer=customer_id,
             mode="subscription",
+
             payment_method_types=["card"],
             line_items=line_items,
             success_url=f"{settings.FRONTEND_URL}/settings?upgrade=success",
@@ -865,9 +1028,32 @@ async def create_checkout(
             metadata={"user_id": current_user.id, "price_id": price_or_product_id},
             allow_promotion_codes=True,
         )
+
+        # Persist the customer id only now that a Session exists. Before the
+        # guard this write happened first, which meant a REFUSED checkout still
+        # published the id that releases held skip-trace meter events.
+        if newly_resolved:
+            user.stripe_customer_id = customer_id
+            await db.flush()
+
         return {"checkout_url": session.url}
     except HTTPException:
         raise
+    except _StripeStateUnavailableError as exc:
+        # We could not establish whether this customer already has a
+        # subscription. Failing CLOSED: creating a Session here is the one
+        # outcome that can charge someone twice, and "try again" costs a
+        # customer seconds where a duplicate subscription costs them money and
+        # us a refund.
+        _logger.error(
+            "checkout: could not read Stripe subscription state for user %s "
+            "(%s) — refusing rather than risking a duplicate subscription",
+            current_user.id, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Billing is temporarily unavailable. Please try again later.",
+        ) from exc
     except Exception:
         _logger.exception("Checkout failed for user %s", current_user.id)
         raise HTTPException(status_code=502, detail="Checkout temporarily unavailable")

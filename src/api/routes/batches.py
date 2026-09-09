@@ -7,7 +7,6 @@ delivery + schedule are SUPPRESSED. The BatchRun + child Jobs are created async
 by the dispatch worker (system-written), so this route only persists the parent
 + children, then kicks off the fan-out.
 """
-import csv
 import io
 import uuid
 from datetime import UTC, datetime
@@ -429,17 +428,43 @@ async def create_batch(
 # (scraper_configs, jobs). A run is at-most-one per batch in on-demand 2A.
 
 
+# Terminal child statuses that delivered nothing. Not merely "not done": a child
+# still running has rows worth reporting as progress, while these two are final
+# and their rows are unreachable everywhere.
+_UNDELIVERABLE_CHILD_STATUSES = ("failed", "cancelled")
+
+
 def _child_lead_count(
     job: tuple[str, str, int], persisted: dict[str, int]
 ) -> int:
     """Leads to report for one batch child, given ``(job_id, status, record_count)``.
 
-    See the call site for why a non-done child is counted from its rows instead of
-    from ``jobs.record_count``.
+    A DONE child's ``record_count`` is final and authoritative — it is what
+    billing charged — so it is reported as-is, including when retention has since
+    removed the rows behind it.
+
+    A FAILED or CANCELLED child reports 0. This used to count its rows, on the
+    grounds that "batch_export selects every child_job_id with no status filter
+    ... zeroing would hide leads the user is holding". That premise is gone:
+    _COMBINED_CTES now joins ``j.status = 'done'``, so those rows reach neither
+    the emailed combined CSV nor the in-app download; segments and analytics
+    filter on done as well; and ``export_key``, which gates the per-job download,
+    is written only inside the mark-done transaction, so a non-done job has none
+    (0 do in production, against 48 of 48 done jobs). Printing a figure now would
+    advertise leads nobody can reach (Codex).
+
+    Any OTHER child is still IN FLIGHT, and is counted from its rows rather than
+    from ``jobs.record_count`` — which cannot be trusted in either direction
+    there. The progress callback writes it mid-scrape, so it runs ahead of what
+    was saved (Test 11's failed child said 210 with ZERO rows, and the UI printed
+    "210 leads" and summed it into the batch total), and _retry_scrape_job RESETS
+    it to 0 on a re-queue, so it also runs behind rows already saved.
     """
     job_id, status, record_count = job
     if status == "done":
         return record_count
+    if status in _UNDELIVERABLE_CHILD_STATUSES:
+        return 0
     return persisted.get(job_id, 0)
 
 
@@ -659,24 +684,9 @@ async def get_batch(
                 record_type=record_type,
                 job_id=job[0] if job else None,
                 status=child_status,
-                # A DONE child's record_count is final and authoritative (it is
-                # what billing charged), so it is reported as-is — including when
-                # retention has since removed the rows behind it.
-                #
-                # For any OTHER child that field cannot be trusted in EITHER
-                # direction. The progress callback writes it mid-scrape, so it runs
-                # ahead of what was saved (Test 11's failed child said 210 with ZERO
-                # rows, and the UI printed "210 leads" and summed it into the batch
-                # total); and _retry_scrape_job RESETS it to 0 on a re-queue, so it
-                # also runs behind rows that were already saved. Count the rows
-                # instead — the same non-duplicate rule record_count itself uses,
-                # measured from what exists rather than from a counter.
-                #
-                # Counted, not zeroed (Codex): a failed or cancelled child can still
-                # have persisted rows that reach the delivered combined CSV —
-                # batch_export selects every child_job_id with no status filter, and
-                # force-finalize CANCELS still-active children after they may have
-                # saved rows. Zeroing would hide leads the user is holding.
+                # done -> the billed record_count; failed/cancelled -> 0 (their rows
+                # are unreachable now that the combined export filters on done);
+                # in flight -> counted rows. See _child_lead_count.
                 record_count=_child_lead_count(job, persisted) if job else 0,
             )
         )
@@ -718,47 +728,6 @@ async def download_batch(
     return await _stream_run_csv(batch_id, run, batch.fields, batch.delivery_mode or "everything")
 
 
-def _csv_has_a_lead(data: bytes) -> bool:
-    """True if the rendered CSV holds at least one row under its header.
-
-    Parsed rather than counting newlines: a lead's address or party name can
-    contain a quoted newline, which would make a line count claim rows that are
-    not there.
-
-    Wrapped over the existing bytes rather than decoding them: `data` is already
-    the whole response body in memory, and `data.decode()` would make a second
-    full copy of a potentially multi-megabyte export just to look at two records.
-    TextIOWrapper decodes lazily and the scan stops at the first real record.
-
-    A CSV parsing failure does not fail the download. csv.reader refuses a field
-    over 131,072 characters, and legal_description and heirs are uncapped Text
-    that no writer bounds, so a single outsized lead used to turn a perfectly
-    good export into a 500 from OUTSIDE the caller's error handler. This is a
-    bookkeeping question, so an unreadable file answers "no lead" and
-    under-counts one activation instead.
-
-    Not a validity check on the CSV: it stops at the first record and parses
-    permissively, so it says nothing about whether the export is well formed.
-    """
-    try:
-        reader = csv.reader(
-            io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace")
-        )
-        next(reader, None)  # header
-        for row in reader:
-            # A blank line parses as an empty record. It is not a lead, and the
-            # renderer emitting one would otherwise read as activation.
-            if row:
-                return True
-        return False
-    except (csv.Error, UnicodeError, ValueError):
-        _logger.warning(
-            "batch CSV could not be parsed to check for leads; not recording a "
-            "download for this response", exc_info=True,
-        )
-        return False
-
-
 async def _stream_run_csv(
     batch_id: str, run: BatchRun | None, batch_fields: object = None,
     delivery_mode: str = "everything",
@@ -784,7 +753,7 @@ async def _stream_run_csv(
     try:
         # render_combined_csv opens a sync session + builds the CSV — run off the
         # event loop so the DB/CSV work can't block other requests.
-        data = await run_in_threadpool(
+        rendered = await run_in_threadpool(
             render_combined_csv, run.user_id, run.child_job_ids or [],
             hidden_fields, delivery_mode,
         )
@@ -797,7 +766,7 @@ async def _stream_run_csv(
     # Run-suffixed so files from different occurrences don't overwrite each other.
     filename = f"batch-{batch_id[:8]}-{run.id[:8]}.csv"
     return StreamingResponse(
-        io.BytesIO(data),
+        io.BytesIO(rendered.data),
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         # Both batch download routes come through here, so recording once at the
@@ -805,10 +774,12 @@ async def _stream_run_csv(
         # jobs: the combined CSV is a filtered, deduplicated selection across
         # them, so "which job did this row come from" is not a question this
         # response can answer honestly. Skipped for a header-only file, which a
-        # zero-row overlaps_only run legitimately produces.
+        # zero-row overlaps_only run legitimately produces. The count comes from
+        # the renderer, which counted the rows as it wrote them; parsing the
+        # bytes back to find out is what could 500 the download (#264).
         background=(
             BackgroundTask(mark_leads_downloaded, str(run.user_id))
-            if _csv_has_a_lead(data) else None
+            if rendered.row_count else None
         ),
     )
 

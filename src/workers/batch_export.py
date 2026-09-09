@@ -15,6 +15,7 @@ import json
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import NamedTuple
 
 from sqlalchemy import select, text, update
 
@@ -77,7 +78,16 @@ WITH candidates AS (
                ELSE 'id:' || r.id::text
            END AS bucket
     FROM results r
+    -- j.status = 'done': a batch child that FAILED or was cancelled at the
+    -- deadline delivered nothing. Its rows were never charged and cannot be
+    -- downloaded per-job, because export_key is written only inside the
+    -- mark-done transaction. Without this filter finalize_batch_run handed
+    -- EVERY child_job_id to the combined CSV, so a failed child's leads went
+    -- out in the emailed partial-batch file while Lists — which filters on
+    -- done — showed nothing. segments and analytics closed the same gap on
+    -- 2026-09-08; this was the last path still open (Codex).
     JOIN jobs j ON j.id = r.job_id AND j.user_id = CAST(:uid AS uuid)
+                AND j.status = 'done'
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = CAST(:uid AS uuid)
     WHERE r.user_id = CAST(:uid AS uuid)
       AND r.job_id = ANY(CAST(:job_ids AS uuid[]))
@@ -328,12 +338,27 @@ def compute_delivery_counts(db, user_id: str, job_ids: list[str]) -> dict[str, i
     }
 
 
+class RenderedCsv(NamedTuple):
+    """A rendered CSV and how many lead rows went into it.
+
+    The row count is returned rather than re-derived because the caller needs to
+    know whether the download carried any leads (it is the activation signal),
+    and the only other way to find out is to parse the bytes back. That parse was
+    a real bug: csv.reader refuses a field over 131,072 characters and
+    legal_description and heirs are uncapped, so an outsized lead turned a good
+    export into a 500 (#264). The renderer already has the number.
+    """
+
+    data: bytes
+    row_count: int
+
+
 def render_combined_csv(
     user_id: str,
     job_ids: list[str],
     hidden_fields: set[str] | None = None,
     delivery_mode: str = "everything",
-) -> bytes:
+) -> RenderedCsv:
     """Build the combined, deduped, overlap-flagged CSV ON DEMAND from the DB
     (NOT the stored R2 snapshot). Used by the download endpoint so:
       - a re-download reflects later async skip-trace fills (fresh contacts), and
@@ -353,7 +378,8 @@ def render_combined_csv(
         buf = io.StringIO()
         write_lead_csv_with_overlap(pairs, buf, hidden_fields=hidden_fields)
         db.rollback()  # read-only
-        return buf.getvalue().encode("utf-8")
+        # One CSV row per pair, so len(pairs) IS the lead count in the file.
+        return RenderedCsv(buf.getvalue().encode("utf-8"), len(pairs))
 
 
 def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = None) -> None:

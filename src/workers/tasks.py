@@ -1140,7 +1140,9 @@ def run_scrape_job(self, job_id: str) -> None:
             # covered 120 properties. Runs BEFORE billing, in the same
             # transaction, so the charge reflects the collapse.
             from src.workers.tasks_helpers.dedup import collapse_same_run_siblings
-            _collapsed = collapse_same_run_siblings(db, job_id, job.user_id)
+            _collapsed = collapse_same_run_siblings(
+                db, job_id, job.user_id, config.record_type
+            )
             if _collapsed:
                 dup_count += _collapsed
                 _publish_log(
@@ -1361,6 +1363,46 @@ def run_scrape_job(self, job_id: str) -> None:
             except Exception as exc:
                 db.rollback()
                 _logger.warning("Job %s: NTS inline match failed: %s", job_id, str(exc)[:120])
+
+        # Re-elect each same-run group's survivor now that enrichment has
+        # settled. collapse_same_run_siblings had to run before the export and
+        # the billing count, so it ranked on the addresses as SCRAPED — and the
+        # Pierce legal-description repair inside _run_inline_enrichment can fill
+        # an address onto the row that lost, leaving the survivor undeliverable
+        # and the one actionable row flagged is_duplicate with no retry able to
+        # revisit it (Codex P2).
+        #
+        # HERE specifically: after enrichment and the NTS match, and BEFORE the
+        # refetch below — the re-export and the property membership both read
+        # from that refetch, and the plan cap ranks non-duplicates, so a swap
+        # after either would be invisible to the CSV or rank the wrong row.
+        # Nothing else reads is_duplicate between the two points.
+        #
+        # Elects exactly one survivor per group, so the duplicate count and the
+        # charge cannot move. Non-fatal: a delivered job must not fail here.
+        try:
+            from src.workers.tasks_helpers.dedup import (
+                reconcile_same_run_survivors,
+            )
+            _swapped = reconcile_same_run_survivors(
+                db, job_id, job.user_id, config.record_type
+            )
+            # Commit unconditionally: the pass also merges the losers' source-only
+            # fields onto each survivor, and those writes happen even when no
+            # survivor actually moved. Gating the commit on _swapped would leave
+            # them riding on someone else's transaction, to be lost by the next
+            # rollback.
+            db.commit()
+            if _swapped:
+                _logger.info(
+                    "Job %s: re-elected %d same-run survivor(s) after enrichment",
+                    job_id, _swapped,
+                )
+        except Exception as exc:
+            db.rollback()
+            _logger.warning(
+                "Job %s: same-run reconciliation failed: %s", job_id, str(exc)[:160]
+            )
 
         # Fetch post-enrichment rows ONCE; reused by re-export AND membership.
         # Same deterministic order as the in-app download (jobs.py) so the emailed/

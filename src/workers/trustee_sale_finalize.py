@@ -18,12 +18,19 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import text as _sa_text
 
 from src.utils.logger import setup_logger
+from src.workers.tasks_helpers.dedup import (
+    _GROUP_COLUMNS,
+    _apply_survivor_merge,
+    _merged_survivor_fields,
+    _repoint_claim_anchor,
+    auction_survivor_sort_key,
+)
 
 _logger = setup_logger("workers.trustee_sale_finalize")
 
@@ -70,6 +77,19 @@ def _nts_update_params(row_id: Any, src: dict) -> dict:
 def _sibling_duplicate_ids(rows: list[dict]) -> list:
     """Ids to mark duplicate so each ``dedup_hash`` keeps ONE (soonest-auction) row.
 
+    Thin view over _sibling_groups, kept because the ids alone are what the
+    is_duplicate write needs and what the unit tests assert on.
+    """
+    return [
+        loser.get("id")
+        for _survivor, losers in _sibling_groups(rows)
+        for loser in losers
+    ]
+
+
+def _sibling_groups(rows: list[dict]) -> list:
+    """``(survivor, losers)`` per ``dedup_hash``, survivor = soonest auction.
+
     Groups by ``dedup_hash`` — the app-wide billing key (parcel|address) — because the
     product decision (2026-07-03) is that Auction Leads dedups EXACTLY like every other
     list, no more aggressively. The shared cross-job scan enforces one-per-hash ACROSS
@@ -80,14 +100,16 @@ def _sibling_duplicate_ids(rows: list[dict]) -> list:
     groups: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
         groups[row.get("dedup_hash")].append(row)
-    dup_ids: list = []
+    collapsed: list = []
     for grp in groups.values():
         if len(grp) <= 1:
             continue
         # Keep the most-urgent (soonest auction_date; None sorts last), stable by id.
-        ordered = sorted(grp, key=lambda r: (r.get("auction_date") or date.max, str(r.get("id"))))
-        dup_ids.extend(r.get("id") for r in ordered[1:])
-    return dup_ids
+        # The key lives in dedup.py so the post-enrichment reconciliation re-ranks
+        # these groups by THIS rule and not by the actionability one (Codex).
+        ordered = sorted(grp, key=auction_survivor_sort_key)
+        collapsed.append((ordered[0], ordered[1:]))
+    return collapsed
 
 
 def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
@@ -144,13 +166,14 @@ def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
     # the caller's dup_count. Runs before billing.
     sib_rows = db.execute(
         _sa_text(
-            "SELECT id, dedup_hash, auction_date FROM results "
+            f"SELECT {_GROUP_COLUMNS} FROM results "
             "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
             "AND dedup_hash IS NOT NULL AND is_duplicate = false"
         ),
         {"jid": job_id, "uid": str(user_id)},
     ).fetchall()
-    dup_ids = _sibling_duplicate_ids([dict(r._mapping) for r in sib_rows])
+    sib_groups = _sibling_groups([dict(r._mapping) for r in sib_rows])
+    dup_ids = [loser.get("id") for _s, losers in sib_groups for loser in losers]
     collapsed = len(dup_ids)
     if dup_ids:
         # duplicate_reason='same_run' (migration 089): these rows were NEVER
@@ -173,6 +196,28 @@ def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
             ),
             {"ids": [str(i) for i in dup_ids], "jid": job_id, "uid": str(user_id)},
         )
+        # Carry the losers' source-only facts onto the survivor, and point the
+        # dedup claim at the row that actually survived. The claim's
+        # first_result_id comes from whichever row PostgreSQL reached first in
+        # the cross-job batched upsert, which has nothing to do with the
+        # soonest-auction rule above — so without this the claim can name a row
+        # this collapse just flagged is_duplicate, and
+        # _reuse_enrichment_for_duplicates would then copy enrichment FROM a
+        # suppressed row (Codex).
+        for survivor, losers in sib_groups:
+            _apply_survivor_merge(
+                db,
+                user_id,
+                survivor.get("id"),
+                _merged_survivor_fields(survivor, [survivor] + losers, "trustee_sale"),
+            )
+            _repoint_claim_anchor(
+                db,
+                user_id,
+                survivor.get("dedup_hash"),
+                survivor.get("id"),
+                [loser.get("id") for loser in losers],
+            )
 
     # Fail-closed verification: no trustee_sale result may reach delivery without the
     # two load-bearing fields — auction_date (the urgency signal + freshness gate) and

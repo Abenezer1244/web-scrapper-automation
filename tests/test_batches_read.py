@@ -455,15 +455,29 @@ async def test_failed_child_reports_zero_not_its_in_flight_scrape_counter(
     assert sum(c["record_count"] for c in body["children"]) == 0
 
 
-async def test_failed_child_that_did_persist_rows_still_reports_them(
+async def test_failed_child_reports_zero_now_that_its_rows_are_unreachable(
     db: AsyncSession, client: AsyncClient, starter_user: User, starter_token: str,
     partial_batch: SimpleNamespace,
 ):
-    """Do NOT key the count on status (Codex P1). finalize_batch_run builds the
-    combined CSV from every child_job_id with no status filter, and force-finalize
-    CANCELS still-active children after they may have persisted rows — so a
+    """This test used to assert the OPPOSITE, under "do NOT key the count on
+    status (Codex P1)". That ruling rested on one fact: "finalize_batch_run builds
+    the combined CSV from every child_job_id with no status filter ... so a
     failed/cancelled child's rows can be in the delivered CSV. Those must stay
-    visible; only the count that outran persistence is capped."""
+    visible."
+
+    That premise is gone. _COMBINED_CTES now joins j.status = 'done', so a failed
+    or cancelled child's rows reach neither the emailed combined CSV nor the
+    in-app download. Nor anything else: segments and analytics filter on done, and
+    export_key — which gates the per-job download — is written only inside the
+    mark-done transaction, so a non-done job has none (0 do in production, against
+    48 of 48 done jobs).
+
+    So the rows are no longer visible ANYWHERE, and reporting a count for them
+    would advertise leads nobody can reach. The rule the old P1 protected is now
+    served by zero, not by the row count.
+
+    The per-row counting rules it guarded have not been dropped — they moved to
+    the in-flight cases below, where a count is still meaningful."""
     job_id = (
         await db.execute(
             select(Job.id).join(
@@ -487,9 +501,10 @@ async def test_failed_child_that_did_persist_rows_still_reports_them(
     assert resp.status_code == 200
     child = {c["record_type"]: c for c in resp.json()["children"]}["pre_foreclosure"]
     assert child["status"] == "failed"
-    # 3 rows exist, so they are reported — not zeroed away, and not the mid-scrape
-    # 210 either.
-    assert child["record_count"] == 3
+    # 3 rows exist and are persisted, but the run failed: they are not in the
+    # combined CSV, not in Lists, and have no per-job export. Report 0, not 3 —
+    # and certainly not the mid-scrape 210.
+    assert child["record_count"] == 0
 
 
 async def test_unactionable_rows_are_not_counted_as_leads(
@@ -498,10 +513,13 @@ async def test_unactionable_rows_are_not_counted_as_leads(
 ):
     """The count must use the same per-row rules the combined export applies:
     a row with neither a property nor a mailing address is not a lead, so it must
-    not be reported as one (Codex round 3)."""
-    job_id = (
+    not be reported as one (Codex round 3).
+
+    Exercised on an IN-FLIGHT child, which is where a counted figure still means
+    something. A terminal non-done child reports 0 regardless of its rows."""
+    job = (
         await db.execute(
-            select(Job.id).join(
+            select(Job).join(
                 ScraperConfig, ScraperConfig.id == Job.scraper_config_id
             ).where(
                 ScraperConfig.batch_id == partial_batch.batch_id,
@@ -509,6 +527,8 @@ async def test_unactionable_rows_are_not_counted_as_leads(
             )
         )
     ).scalar_one()
+    job.status = "scraping"   # still running: the count is progress, not a claim
+    job_id = job.id
     db.add(Result(
         id=str(uuid.uuid4()), job_id=job_id, user_id=starter_user.id,
         party_name="HAS AN ADDRESS", property_address="5 PINE ST",
@@ -526,13 +546,16 @@ async def test_unactionable_rows_are_not_counted_as_leads(
     assert child["record_count"] == 1
 
 
-async def test_failed_child_rows_survive_a_retry_that_reset_record_count(
+async def test_requeued_child_rows_survive_a_retry_that_reset_record_count(
     db: AsyncSession, client: AsyncClient, starter_user: User, starter_token: str,
     partial_batch: SimpleNamespace,
 ):
     """_retry_scrape_job sets record_count=0 on a re-queue, so the counter also runs
     BEHIND rows that were already saved. Counting the rows keeps them visible where
-    min(record_count, rows) would have hidden them (Codex round 2)."""
+    min(record_count, rows) would have hidden them (Codex round 2).
+
+    A re-queued job is QUEUED, not failed — the retry is exactly what moves it back
+    in flight, which is where the row count is the honest number."""
     job = (
         await db.execute(
             select(Job).join(
@@ -543,7 +566,8 @@ async def test_failed_child_rows_survive_a_retry_that_reset_record_count(
             )
         )
     ).scalar_one()
-    job.record_count = 0  # what a watchdog re-queue leaves behind
+    job.record_count = 0     # what a watchdog re-queue leaves behind
+    job.status = "queued"    # ... and it is back in flight, not terminal
     for _ in range(2):
         db.add(Result(
             id=str(uuid.uuid4()), job_id=job.id, user_id=starter_user.id,
@@ -562,10 +586,12 @@ async def test_duplicate_rows_are_not_counted_as_leads(
     db: AsyncSession, client: AsyncClient, starter_user: User, starter_token: str,
     partial_batch: SimpleNamespace,
 ):
-    """record_count counts NEW non-duplicate rows, so counting rows must too."""
-    job_id = (
+    """record_count counts NEW non-duplicate rows, so counting rows must too.
+
+    On an IN-FLIGHT child, where a counted figure is still reported."""
+    job = (
         await db.execute(
-            select(Job.id).join(
+            select(Job).join(
                 ScraperConfig, ScraperConfig.id == Job.scraper_config_id
             ).where(
                 ScraperConfig.batch_id == partial_batch.batch_id,
@@ -573,6 +599,8 @@ async def test_duplicate_rows_are_not_counted_as_leads(
             )
         )
     ).scalar_one()
+    job.status = "scraping"
+    job_id = job.id
     db.add(Result(
         id=str(uuid.uuid4()), job_id=job_id, user_id=starter_user.id,
         party_name="NEW LEAD", property_address="3 ELM ST",

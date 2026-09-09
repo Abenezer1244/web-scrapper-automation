@@ -1373,7 +1373,6 @@ async def test_the_skip_trace_allowance_rolls_on_the_entitlement_window(
 
     The comparison is strictly less-than, so it can only ever RESET a counter,
     never resurrect a spent one."""
-    from datetime import timedelta
 
     from sqlalchemy import text as _text
 

@@ -1322,7 +1322,36 @@ class SkipTraceMeterEvent(Base):
     )
     # NULL until the Stripe MeterEvent is durably reported; the partial index
     # in migration 026 makes the "unreported" sweep cheap.
+    #
+    # NOT a billing fact. report_skip_trace_meter_event stamps this after the
+    # try/except — the _StripeNotConfiguredError branch included — so it can be
+    # set when no MeterEvent was ever sent, and Stripe accepting an event is not
+    # the same as an invoice charging for it. `disposition` is the state; this
+    # stays a timestamp of "we made the call".
     reported_at = Column(DateTime(timezone=True), nullable=True)
+
+    # The actual state of this row (migration 092). Only 'pending' is eligible
+    # for the sweep:
+    #   pending             not yet decided; may be reported when eligible
+    #   reported            a MeterEvent was accepted by Stripe
+    #   non_billable        deliberately not billable, reason says why
+    #   needs_review        a human has to look (e.g. too old to backdate)
+    #   written_off_manual  an operator waived otherwise billable usage
+    #   settled_manual      recovered outside MeterEvents (invoice ref required)
+    disposition = Column(
+        String(32), nullable=False, server_default="pending",
+    )
+    disposition_at = Column(DateTime(timezone=True), nullable=True)
+    disposition_reason = Column(String(64), nullable=True)
+
+    # When the usage HAPPENED — not when this row was written. `created_at` is
+    # server_default=now(), the transaction clock during ingest reconciliation,
+    # which can be well after the lookup. Stripe bills a MeterEvent into the
+    # subscription period containing its timestamp and refuses one older than 35
+    # days, so billing against `created_at` would charge the wrong period.
+    # NULL for rows written before migration 092: it cannot be reconstructed,
+    # and inventing one would produce a confident, billable lie.
+    usage_at = Column(DateTime(timezone=True), nullable=True)
 
 
 # ─── Sprint 7.3: Referral program ────────────────────────────────────────────

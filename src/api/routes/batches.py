@@ -376,17 +376,43 @@ async def create_batch(
 # (scraper_configs, jobs). A run is at-most-one per batch in on-demand 2A.
 
 
+# Terminal child statuses that delivered nothing. Not merely "not done": a child
+# still running has rows worth reporting as progress, while these two are final
+# and their rows are unreachable everywhere.
+_UNDELIVERABLE_CHILD_STATUSES = ("failed", "cancelled")
+
+
 def _child_lead_count(
     job: tuple[str, str, int], persisted: dict[str, int]
 ) -> int:
     """Leads to report for one batch child, given ``(job_id, status, record_count)``.
 
-    See the call site for why a non-done child is counted from its rows instead of
-    from ``jobs.record_count``.
+    A DONE child's ``record_count`` is final and authoritative — it is what
+    billing charged — so it is reported as-is, including when retention has since
+    removed the rows behind it.
+
+    A FAILED or CANCELLED child reports 0. This used to count its rows, on the
+    grounds that "batch_export selects every child_job_id with no status filter
+    ... zeroing would hide leads the user is holding". That premise is gone:
+    _COMBINED_CTES now joins ``j.status = 'done'``, so those rows reach neither
+    the emailed combined CSV nor the in-app download; segments and analytics
+    filter on done as well; and ``export_key``, which gates the per-job download,
+    is written only inside the mark-done transaction, so a non-done job has none
+    (0 do in production, against 48 of 48 done jobs). Printing a figure now would
+    advertise leads nobody can reach (Codex).
+
+    Any OTHER child is still IN FLIGHT, and is counted from its rows rather than
+    from ``jobs.record_count`` — which cannot be trusted in either direction
+    there. The progress callback writes it mid-scrape, so it runs ahead of what
+    was saved (Test 11's failed child said 210 with ZERO rows, and the UI printed
+    "210 leads" and summed it into the batch total), and _retry_scrape_job RESETS
+    it to 0 on a re-queue, so it also runs behind rows already saved.
     """
     job_id, status, record_count = job
     if status == "done":
         return record_count
+    if status in _UNDELIVERABLE_CHILD_STATUSES:
+        return 0
     return persisted.get(job_id, 0)
 
 
@@ -606,24 +632,9 @@ async def get_batch(
                 record_type=record_type,
                 job_id=job[0] if job else None,
                 status=child_status,
-                # A DONE child's record_count is final and authoritative (it is
-                # what billing charged), so it is reported as-is — including when
-                # retention has since removed the rows behind it.
-                #
-                # For any OTHER child that field cannot be trusted in EITHER
-                # direction. The progress callback writes it mid-scrape, so it runs
-                # ahead of what was saved (Test 11's failed child said 210 with ZERO
-                # rows, and the UI printed "210 leads" and summed it into the batch
-                # total); and _retry_scrape_job RESETS it to 0 on a re-queue, so it
-                # also runs behind rows that were already saved. Count the rows
-                # instead — the same non-duplicate rule record_count itself uses,
-                # measured from what exists rather than from a counter.
-                #
-                # Counted, not zeroed (Codex): a failed or cancelled child can still
-                # have persisted rows that reach the delivered combined CSV —
-                # batch_export selects every child_job_id with no status filter, and
-                # force-finalize CANCELS still-active children after they may have
-                # saved rows. Zeroing would hide leads the user is holding.
+                # done -> the billed record_count; failed/cancelled -> 0 (their rows
+                # are unreachable now that the combined export filters on done);
+                # in flight -> counted rows. See _child_lead_count.
                 record_count=_child_lead_count(job, persisted) if job else 0,
             )
         )

@@ -78,7 +78,16 @@ WITH candidates AS (
                ELSE 'id:' || r.id::text
            END AS bucket
     FROM results r
+    -- j.status = 'done': a batch child that FAILED or was cancelled at the
+    -- deadline delivered nothing. Its rows were never charged and cannot be
+    -- downloaded per-job, because export_key is written only inside the
+    -- mark-done transaction. Without this filter finalize_batch_run handed
+    -- EVERY child_job_id to the combined CSV, so a failed child's leads went
+    -- out in the emailed partial-batch file while Lists — which filters on
+    -- done — showed nothing. segments and analytics closed the same gap on
+    -- 2026-09-08; this was the last path still open (Codex).
     JOIN jobs j ON j.id = r.job_id AND j.user_id = CAST(:uid AS uuid)
+                AND j.status = 'done'
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = CAST(:uid AS uuid)
     WHERE r.user_id = CAST(:uid AS uuid)
       AND r.job_id = ANY(CAST(:job_ids AS uuid[]))

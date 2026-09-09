@@ -13,7 +13,9 @@ Module map:
                  _delivery_download_url, JobUpdateFields, _TERMINAL_STATUSES,
                  _DELIVERY_TOKEN_TTL
   dedup.py     — _extract_tax_fields, _upsert_property_membership,
-                 _write_result_property_keys, _TRUSTED_TAX_SOURCES
+                 _write_result_property_keys, _TRUSTED_TAX_SOURCES,
+                 release_capped_dedup_claims, collapse_same_run_siblings,
+                 reconcile_same_run_survivors, survivor_sort_key
   enrich.py    — _run_scraper, _reuse_enrichment_for_duplicates,
                  _run_inline_enrichment, _enqueue_skip_trace_rows
   dates.py     — _to_mmddyyyy, _resolve_date_range

@@ -2154,9 +2154,16 @@ def test_a_settled_row_is_never_re_evaluated(monkeypatch):
         plan = "pro"
         stripe_customer_id = "cus_1"
 
+    class _Result:
+        # The owner lookup and the advisory lock the task now takes before it
+        # reads the row. Returning a user id lets it reach the disposition
+        # check, which is what this test is actually about.
+        def scalar(self): return "u1"
+
     class _Session:
         def __enter__(self): return self
         def __exit__(self, *a): return False
+        def execute(self, *a, **kw): return _Result()
         def get(self, *a, **kw): return _Row()
         def commit(self): raise AssertionError("a settled row must not be written")
 
@@ -2296,8 +2303,12 @@ def test_a_null_usage_at_reaches_a_human_rather_than_a_write_off(monkeypatch):
     import src.workers.tracerfy_ingest as ti
 
     src = inspect.getsource(ti.report_skip_trace_meter_event)
-    assert '"no_customer_id", "no_subscription_ever"' in src, (
-        "only those two refusals may be written off; the rest need a human"
+    assert 'refusal.reason == "no_subscription_ever"' in src, (
+        "only a Stripe-confirmed 'never had a subscription' may be written off"
+    )
+    assert '"no_customer_id"' not in src.split("row.disposition = (")[1][:200], (
+        "no_customer_id must NOT be written off: it is a fact about our own "
+        "row, it is mutable, and it can be stale"
     )
 
 
@@ -2740,8 +2751,8 @@ def test_the_gate_is_asked_once_per_report(monkeypatch):
     # ...and the refusal must still be turned into a disposition here, or the
     # rule would run with nobody writing down the answer.
     assert "_NotBillableError as refusal" in src
-    assert '"no_customer_id", "no_subscription_ever"' in src, (
-        "only those two refusals may be written off; everything else is "
+    assert 'refusal.reason == "no_subscription_ever"' in src, (
+        "the ONE write-off is the Stripe-confirmed one; everything else is "
         "uncertainty and goes to a human"
     )
 
@@ -2852,3 +2863,102 @@ def test_usage_is_held_when_the_counted_window_cannot_be_established():
         "a missing counted window must hold the row, not wave it through"
     )
     assert "usage_outside_counted_window" in src
+# ─── Round-4 gate findings, pinned ───────────────────────────────────────────
+
+
+def test_the_meter_worker_takes_the_same_lock_as_the_plan_change():
+    """Otherwise a report can slip into the middle of a plan change.
+
+    The route marks this period's reported rows as stranded, then asks Stripe to
+    delete the old metered item. Holding no lock, this worker could claim a
+    still-pending row in that window, pass the gate against the item that is
+    about to vanish, and report it — landing usage on an item Stripe deletes a
+    moment later, after the marking that would have caught it had already run.
+    """
+    import inspect
+
+    from src.workers import tracerfy_ingest as ti
+
+    src = inspect.getsource(ti.report_skip_trace_meter_event)
+    assert "pg_advisory_xact_lock(4243" in src, (
+        "the worker must serialise against checkout and change-plan, which both "
+        "hold namespace 4243 for this same invariant"
+    )
+    # Before the row is read, or it is not a barrier at all.
+    assert src.index("pg_advisory_xact_lock(4243") < src.index("with_for_update=True"), (
+        "the lock must be taken before the row is read"
+    )
+
+
+def test_a_missing_customer_id_is_not_a_write_off():
+    """Only Stripe gets to say a customer never had a subscription.
+
+    `no_customer_id` and `no_subscription_ever` look equally certain and are not.
+    The first is a fact about OUR row: create_checkout writes that column, most
+    accounts here have no customer id at all because plans are set by hand, and
+    the value can appear a moment after we looked. The second is confirmed by the
+    system that would do the billing. non_billable is permanent, so only the
+    second earns it (Codex).
+    """
+    import inspect
+
+    from src.workers import tracerfy_ingest as ti
+
+    src = inspect.getsource(ti.report_skip_trace_meter_event)
+    mapping = src.split("row.disposition = (")[1][:300]
+    assert '"no_subscription_ever"' in mapping
+    assert '"no_customer_id"' not in mapping, (
+        "a missing customer id is mutable local state; writing it off "
+        "permanently discards usage for a customer who is mid-checkout"
+    )
+
+
+def test_wrongly_stranded_rows_can_be_released_but_nothing_else_can():
+    """Pre-marking can only over-flag, so there has to be a way back.
+
+    If the marking commits and Stripe then refuses, the old item is still on the
+    subscription and those rows were never stranded. Without a release path they
+    sit in review forever and the script can only settle or write them off —
+    turning an over-flag into a manual write-off.
+
+    Scoped to the one reason on purpose: this must not be able to reverse a
+    human's settle or write-off.
+    """
+    src = open("scripts/settle_skip_trace_meter_rows.py", encoding="utf-8").read()
+
+    assert "--release" in src
+    assert '_RELEASABLE_REASON = "metered_item_replaced_before_invoice"' in src
+    # The release statements must both be pinned to that reason.
+    for stmt in ("_RELEASE_BY_ID", "_RELEASE_BY_USER"):
+        block = src.split(stmt, 1)[1][:600]
+        assert "disposition_reason = :releasable" in block, (
+            f"{stmt} must only ever release the abandoned-plan-change reason"
+        )
+        assert "disposition = 'needs_review'" in block, (
+            f"{stmt} must only move rows OUT of review, never out of a decision"
+        )
+
+
+def test_the_stranded_marking_fails_the_plan_change_rather_than_skipping_it():
+    """It runs before Stripe, so refusing costs nothing and proceeding costs revenue.
+
+    Nothing has been modified at that point, so a failure here is free to
+    surface. Carrying on would perform the plan change without the record that
+    the marking exists to create.
+    """
+    import inspect
+
+    from src.api.routes import billing as b
+
+    src = inspect.getsource(b.change_plan)
+    # Up to the Stripe call: everything between the marking and the modify is
+    # the window this assertion is about.
+    guard = src.split("_mark_stranded_metered_usage")[1].split(
+        "stripe.Subscription.modify"
+    )[0]
+    assert "HTTP_503_SERVICE_UNAVAILABLE" in guard, (
+        "a failure to record stranded usage must refuse the plan change"
+    )
+    assert "_STRANDED_MARK_SLOTS" in src, (
+        "the sync pool is small; unbounded use surfaces a timeout as a 500"
+    )

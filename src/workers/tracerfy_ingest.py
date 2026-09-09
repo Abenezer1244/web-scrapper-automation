@@ -77,6 +77,38 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
     from src.db.session import system_sync_session
 
     with system_sync_session() as db:
+        # The SAME per-user advisory lock the checkout and plan-change routes
+        # take (namespace 4243), and for the same invariant seen from the other
+        # side.
+        #
+        # A plan change marks this period's reported rows as stranded, then asks
+        # Stripe to delete the old metered item. This worker held no lock, so it
+        # could claim a still-pending row in that window, pass the gate against
+        # the item that is about to disappear, and report it — landing usage on
+        # an item Stripe deletes a moment later, which then never invoices it.
+        # The marking had already run, so nothing catches the new row (Codex).
+        #
+        # Taken before the row is read and held to commit, so a plan change
+        # either completes before this reads, or waits behind it.
+        #
+        # The owner is read UNLOCKED first, which is safe because it is the one
+        # column on this row that never changes; the lock is on the tenant, and
+        # the tenant is what the row belongs to. Hashed from the string form so
+        # it lands on the same lock the routes take from str(user.id).
+        lock_uid = db.execute(
+            text("SELECT user_id::text FROM skip_trace_meter_events WHERE id = CAST(:oid AS uuid)"),
+            {"oid": str(outbox_id)},
+        ).scalar()
+        if lock_uid is None:
+            _logger.warning(
+                "Skip-trace meter outbox %s: row not found — nothing to report",
+                outbox_id,
+            )
+            return {"outbox_id": outbox_id, "skipped": "not_found"}
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(4243, hashtext(:uid))"),
+            {"uid": lock_uid},
+        )
         # FOR UPDATE. Checking an unlocked read is not a claim: an operator can
         # commit `written_off_manual` in the gap between this check and the
         # Stripe call, and the worker would then bill the row and overwrite
@@ -161,20 +193,32 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
             # renewal simply closed the window we could bill it in, so settling
             # non_billable would quietly discard real revenue.
             #
-            # non_billable is a WRITE-OFF, and only two refusals are certain
-            # enough to earn one: the customer has no Stripe customer at all, or
-            # has never held a subscription of any status. Everything else — a
-            # closed period, a cancelled subscription, a replaced metered item,
-            # usage we cannot place in time — is uncertainty, and uncertainty
-            # goes to a human. Discarding revenue silently is the same class of
-            # error as charging for something never agreed.
+            # non_billable is a WRITE-OFF, and exactly ONE refusal is certain
+            # enough to earn one: Stripe itself says this customer has never
+            # held a subscription of any status.
+            #
+            # `no_customer_id` used to be written off beside it and no longer is.
+            # The two look equally certain and are not: "we have never written a
+            # stripe_customer_id for this user" is a fact about OUR row, and it
+            # is mutable and can be stale — create_checkout writes that column,
+            # most accounts on this deployment have no customer id at all
+            # because plans are set by hand, and the value can appear a moment
+            # after we looked. "Stripe has no subscription for this customer" is
+            # a fact confirmed by the system that would do the billing (Codex).
+            # Only the second one is safe to make permanent.
+            #
+            # Everything else — a closed period, a cancelled subscription, a
+            # replaced metered item, usage we cannot place in time — is
+            # uncertainty, and uncertainty goes to a human. Discarding revenue
+            # silently is the same class of error as charging for something
+            # never agreed, and only one of those two is reversible.
             #
             # It also has to be caught: _NotBillableError is not in the sender's
             # terminal set, so without this it escapes into
             # autoretry_for=(Exception,) and retries a permanent refusal forever.
             row.disposition = (
                 "non_billable"
-                if refusal.reason in ("no_customer_id", "no_subscription_ever")
+                if refusal.reason == "no_subscription_ever"
                 else "needs_review"
             )
             row.disposition_at = datetime.now(UTC)

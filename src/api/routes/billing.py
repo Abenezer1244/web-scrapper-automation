@@ -1155,6 +1155,13 @@ def _plan_change_items(sub: dict, new_price: str, new_plan: str, new_interval: s
     return items
 
 
+# The sync pool this borrows from is pool_size=2 / max_overflow=3, so more than
+# five concurrent plan changes would queue on it and surface a 30s timeout as an
+# unhandled 500 (Codex). Bounded here instead, well under that, so the failure
+# mode is a clean 503 that says "try again" rather than a stack trace.
+_STRANDED_MARK_SLOTS = asyncio.Semaphore(3)
+
+
 def _mark_stranded_metered_usage(user_id: str, period_start: int) -> int:
     """Move this period's REPORTED meter events to needs_review. Own transaction.
 
@@ -1386,9 +1393,29 @@ async def change_plan(
         if any(i.get("deleted") for i in items):
             period_start = sub.get("current_period_start")
             if period_start is not None:
-                n_stranded = await asyncio.to_thread(
-                    _mark_stranded_metered_usage, str(user.id), int(period_start),
-                )
+                try:
+                    async with asyncio.timeout(20):
+                        async with _STRANDED_MARK_SLOTS:
+                            n_stranded = await asyncio.to_thread(
+                                _mark_stranded_metered_usage,
+                                str(user.id), int(period_start),
+                            )
+                except Exception as exc:  # noqa: BLE001 — incl. the timeout above
+                    # This runs BEFORE Stripe, so failing here has changed
+                    # nothing: no subscription was modified and no usage was
+                    # marked. Refusing is therefore free, and proceeding is not
+                    # — the whole reason the marking comes first is that a plan
+                    # change without it strands revenue silently.
+                    _logger.error(
+                        "change-plan: could not record stranded skip-trace usage "
+                        "for user %s (%s) — refusing the plan change rather than "
+                        "making it without the record",
+                        user.id, str(exc)[:200],
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Billing is temporarily unavailable. Please try again later.",
+                    ) from exc
                 if n_stranded:
                     _logger.warning(
                         "change-plan: user %s has %d reported skip-trace meter "

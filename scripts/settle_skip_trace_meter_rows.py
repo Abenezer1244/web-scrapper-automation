@@ -53,6 +53,18 @@ from src.db.session import system_sync_session  # noqa: E402
 
 _SETTLEABLE = ("needs_review",)
 
+# The one reason a row can be moved BACK out of review rather than settled.
+#
+# A plan change marks this period's reported usage as stranded BEFORE it asks
+# Stripe to replace the metered item, because doing it afterwards was not
+# retry-safe. That ordering can only ever over-flag: if Stripe then refuses, the
+# old item is still on the subscription, the usage was never stranded, and those
+# rows are sitting in review for a transition that did not happen (Codex).
+#
+# --release exists for exactly that, and ONLY for that reason, so it cannot be
+# used to quietly undo a real decision.
+_RELEASABLE_REASON = "metered_item_replaced_before_invoice"
+
 
 def _rows(db, user_id=None, row_id=None):
     where = ["disposition = ANY(:states)"]
@@ -125,6 +137,15 @@ def main() -> int:
     ap.add_argument("--reference", help="invoice / credit-note reference (required to settle)")
     ap.add_argument("--reason", help="why (required to write off)")
     ap.add_argument("--actor", help="who is deciding this")
+    ap.add_argument(
+        "--release", metavar="ROW_ID",
+        help="put a row wrongly flagged by an ABANDONED plan change back to 'reported' "
+             "(only rows whose reason is metered_item_replaced_before_invoice)",
+    )
+    ap.add_argument(
+        "--release-user", metavar="USER_ID",
+        help="release every such row for a user",
+    )
     ap.add_argument("--yes", action="store_true", help="actually write; default is a dry run")
     a = ap.parse_args()
 
@@ -164,10 +185,74 @@ def main() -> int:
         # Exactly one action. Accepting several and silently picking a branch
         # means an operator can believe they wrote off one row while the script
         # wrote off a different one.
-        chosen = [f for f in (a.settle, a.writeoff, a.writeoff_user) if f]
+        chosen = [
+            f for f in
+            (a.settle, a.writeoff, a.writeoff_user, a.release, a.release_user)
+            if f
+        ]
         if len(chosen) > 1:
             print("--settle, --writeoff and --writeoff-user are mutually exclusive.")
             return 2
+
+        if a.release or a.release_user:
+            # Back to 'reported', which is where these rows were before the
+            # abandoned plan change touched them. Scoped to the one reason, so a
+            # human's settle or write-off can never be reversed by this.
+            # Two whole statements rather than one built by concatenation.
+            # They differ by a single predicate, but assembling SQL from pieces
+            # is the shape that hides an injection even when every piece here is
+            # a literal, and a linter that cannot tell the difference is right
+            # to refuse to try.
+            _RELEASE_BY_ID = """
+                UPDATE skip_trace_meter_events
+                   SET disposition = 'reported',
+                       disposition_at = :now,
+                       disposition_reason = :reason
+                 WHERE disposition = 'needs_review'
+                   AND disposition_reason = :releasable
+                   AND id = ANY(CAST(:ids AS uuid[]))
+                RETURNING id
+            """
+            _RELEASE_BY_USER = """
+                UPDATE skip_trace_meter_events
+                   SET disposition = 'reported',
+                       disposition_at = :now,
+                       disposition_reason = :reason
+                 WHERE disposition = 'needs_review'
+                   AND disposition_reason = :releasable
+                   AND user_id = CAST(:uid AS uuid)
+                RETURNING id
+            """
+            params = {
+                "now": datetime.now(UTC),
+                "reason": f"released after abandoned plan change [by {a.actor}]",
+                "releasable": _RELEASABLE_REASON,
+            }
+            if a.release:
+                sql, params = _RELEASE_BY_ID, {**params, "ids": [a.release]}
+            else:
+                sql, params = _RELEASE_BY_USER, {**params, "uid": a.release_user}
+            released = db.execute(text(sql), params).fetchall()
+            if not released:
+                print(
+                    "Nothing to release. Only rows held as "
+                    f"{_RELEASABLE_REASON} can be released, and only from "
+                    "needs_review."
+                )
+                return 0
+            print(
+                f"{'WOULD RELEASE' if not a.yes else 'RELEASING'} "
+                f"{len(released)} row(s) back to 'reported':"
+            )
+            for r in released:
+                print(f"  {r.id}")
+            if not a.yes:
+                db.rollback()
+                print(chr(10) + "Dry run. Re-run with --yes to apply.")
+                return 0
+            db.commit()
+            print(chr(10) + f"Done. {len(released)} row(s) released, recorded against {a.actor}.")
+            return 0
 
         if a.settle:
             if not a.reference:

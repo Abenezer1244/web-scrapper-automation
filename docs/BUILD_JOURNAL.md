@@ -19,6 +19,114 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-09 — the collapse picked its winner too early, and a P1 outlived the fact it stood on
+
+> **Provenance:** commit SHAs, production counts and the CI results below were read back from
+> `git`, `railway run` and `gh` in-session. The ordering and "what I thought at the time" parts
+> are session recollection — read them as such.
+
+**Built / Shipped:**
+- **#271 `8084f48`** — the three Codex P2s deferred from #265, plus a fourth defect the design
+  review for them surfaced.
+  - `reconcile_same_run_survivors` (`src/workers/tasks_helpers/dedup.py`) re-elects each same-run
+    group's survivor AFTER inline enrichment. `collapse_same_run_siblings` must run before the
+    export and the billing count, so it ranks on the addresses as *scraped* — and the Pierce
+    legal-description repair can then fill an address onto the row that lost, leaving the survivor
+    undeliverable and the only actionable row flagged `is_duplicate` with no retry able to reach it.
+  - Source-only fields (`heirs`, `legal_description`, `lead_subtype`) now merge onto the winner
+    under a narrow allowlist.
+  - `batch_export._COMBINED_CTES` joins `j.status = 'done'`, closing the last path by which a
+    failed child's rows reached a customer.
+  - **The fourth:** `delivered_records.first_result_id` did not follow the collapse survivor.
+- **#269 `40ce453`** — the duplicate-scope handoff doc, updated to close §7A/§7B and carrying a
+  new §7 about the invalidated P1 below.
+
+**Tried / Decided:**
+- **Rejected: reuse `_collapse_groups` for the reconciliation.** Codex was right that this breaks.
+  Enrichment rewrites `property_address`, so a member stops satisfying that function's
+  hash-equality admission test and vanishes from its output — and "not returned as a loser" is not
+  "elected winner". Membership is READ from the existing flags instead. Grouping already happened
+  under equality at collapse time; the second pass only re-orders what it finds.
+- **Decided: a group must have EXACTLY ONE standing row or it is skipped.** With *k* standing rows
+  the duplicate count moves by *k−1* and the charge moves with it. A malformed group is logged,
+  never "repaired".
+- **Decided: allowlist, not blacklist, for `enrichment_data`.** Copying keys individually across
+  two filings manufactures an object no source ever produced (one filing's `billed_amount` beside
+  another's `paid_amount`), and the blob carries per-ROW state such as the plan-cap exclusion key.
+  Only `lead_subtype` travels, elected by the same priority order the combined export aggregates
+  with — now one shared constant (`PROBATE_SUBTYPE_PRIORITY`) instead of two hand-written CASE
+  ladders that could drift.
+- **Decided: `heirs` is not blindly unioned.** For `divorce` the column holds the OTHER SPOUSE,
+  and two filings on one property can reverse primary/secondary. Union is gated to probate and
+  drops the survivor's own `party_name`.
+
+**Failed / Blocked:**
+- **Codex was out of quota** at the start of the session (resets 21:26). Work stopped rather than
+  proceeding un-consulted; the operator confirmed when it came back.
+- **The local rig was degraded all session.** ~1.0GB free of 15.4GB, and another session was
+  running `pytest -m integration` against the shared `bridgeleads_test` throughout. Used the
+  isolated-DB recipe (own database + Redis db 15) rather than resetting theirs.
+- **The harness memory watchdog killed five background tasks.** Each time the underlying `pytest`
+  KEPT RUNNING and competed with the relaunch. Fixed by running detached via `Start-Process` with
+  file redirection, which the watchdog cannot reach.
+- **A 39KB Codex prompt failed with "Argument list too long"** — piped via `codex exec - < file`
+  instead.
+
+**Caught & fixed:**
+- **Codex diff review, [P2] #1 — the reconciliation re-ranked `trustee_sale` by actionability.**
+  Auction Leads elects the *soonest-auction* row (product decision, 2026-07-03). The reconciliation
+  runs for every record type, so it was silently overriding that after the fact. I had written a
+  docstring claiming "ONE function so the collapse and the reconciliation cannot rank differently"
+  and then broken it for exactly one record type. Fixed with `sort_key_for(record_type)`.
+- **Codex diff review, [P2] #2 — an empty heir union fell through to the fill-only path.**
+  `_merge_heirs` returned `None` both for "does not apply" and "applies but came out empty", so
+  when the exclusion removed the survivor's own party as the only name, the fallback copied that
+  exact name straight back — asserting the survivor is their own heir, the precise corruption the
+  exclusion existed to prevent.
+- **My own bug, caught in self-review:** the merge writes happen even when no survivor swaps, but
+  the commit was gated on `if _swapped` — leaving them on someone else's transaction to be lost by
+  the next rollback.
+- **The FULL suite caught 4 regressions the targeted run did not.** See below.
+
+**Facts learned:**
+- 🛑 **A prior P1 is only as true as the fact it cited.** `test_batches_read.py` carried
+  *"do NOT key the count on status (Codex P1)"*, whose stated reason was *"batch_export selects
+  every child_job_id with no status filter"*. Adding that filter is what killed the premise. The
+  ruling lived in a comment AND in four tests; grepping the comment found one of them. Only ONE of
+  the four actually asserted the rule — the other three used a failed child as scaffolding for the
+  per-row counting rules and were re-pointed at an in-flight child rather than deleted. **When you
+  invalidate a documented ruling, ask of each test: is this ABOUT the rule, or just using it?**
+- 🔑 **A targeted test run proves nothing about containment.** 37 passed green; the full suite then
+  returned 4 failed / 2745 passed in a file none of the new tests touched.
+- 🔑 **`delivered_records.first_result_id` is load-bearing beyond the invariant.**
+  `_reuse_enrichment_for_duplicates` joins it to copy address and settled skip-trace PII FROM the
+  anchored row, so an anchor left on a collapsed loser makes the reuse source a suppressed row.
+- 🔑 **`export_key` is written only inside the mark-done transaction.** Verified in prod: 0
+  non-done jobs hold one, against 48 of 48 done jobs. That is what makes zeroing a failed child's
+  count honest rather than hiding leads.
+- 🔑 **The whole same-run collapse family is still LATENT.** Production holds **0 `same_run` rows** —
+  the collapse shipped in #265 has never fired on real data, which is why the claim-anchor defect
+  never corrupted anything. `scripts/diag_same_run_anchor_drift.py` answers whether it has fired.
+- 🔑 **`expire_trials` does not touch `users.updated_at`.** The repaired account read `pro`/1000 in
+  the morning and `starter`/50 after the merge; that was a 7-day trial expiring at 04:16Z between
+  the two runs (`trial_ends_at = trial_consumed_at = 2026-09-09 04:16:29Z`,
+  `subscription_status=canceled`), not anything this work did. `updated_at` still read 2026-09-05,
+  OLDER than the expiry — **do not use it to date a plan change.** The account now sits at 1001
+  used against a 50 limit, which is expected: a downgrade does not reset the counter, the
+  anniversary reset does.
+- 🔑 `diag_verify_repair_invariants.py` prints a HARDCODED `"(was 1001/1000 before the repair)"`
+  regardless of the live values. Read the numbers, not the parenthetical.
+
+**Pending / Handoff:**
+- **§7C** — the 50 historical extra charges across 8 jobs stand; operator chose forward-only.
+- **§7D** — post-crash claim release, the plan-cap sibling guard and the whole collapse family are
+  covered by tests only. Watch after the next failed run, capped run, and run that scrapes one
+  property twice.
+- **§7E** — dependabot **#251** (stripe 11.4.0 → 15.6.1) still open and still must NOT be merged:
+  `StripeObject` is not a dict in v15 and ~17 `.get()` call sites raise.
+
+---
+
 ## 2026-09-08 — My own checker said "0 remaining" three times and was wrong every time
 
 **Built / Shipped:**

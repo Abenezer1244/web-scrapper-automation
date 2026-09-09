@@ -19,6 +19,95 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-09 — skip-trace overage can finally be billed, and three gate rounds to earn it
+
+> **Provenance:** commit SHAs, suite counts and the Codex verdicts below were read back from
+> `git`, the test logs and the gate transcripts in-session. Which order I realised things in is
+> session recollection — read that part as such.
+
+**Built / Shipped:** (branch `chore/entitlement-audit`, not pushed)
+- **`46842a5`** — migration **093** `skip_trace_queues.provider_submitted_at`, and
+  `USAGE_PROVENANCE_IS_TRUSTWORTHY` flipped to **True**. Automatic overage billing had been off
+  since `e09dc22` because nothing recorded when the provider ran the lookups.
+- **`fa8097b`** — **`POST /billing/change-plan`** (`stripe.Subscription.modify`), so an existing
+  subscriber changes the subscription they have. `10f6886`'s 409 had stopped the duplicate but
+  left no way to switch.
+- **`f5d0a02`**, **`db3068f`** — the gate findings against both of the above.
+- Frontend **`83e5e0b`** on `chore/entitlement-audit-fe` — the plan cards actually call the new
+  endpoint. Until then the switch existed and was unreachable.
+- `scripts/settle_skip_trace_meter_rows.py` — `needs_review` was a destination nothing could
+  write out of. An alert naming a problem nobody can action trains people to ignore it.
+
+**Tried / Decided:**
+- **Flipping the switch alone would have been a no-op**, and that is the whole reason this was a
+  build and not a one-line change. `assert_billable` refuses a NULL `usage_at` independently of
+  the flag, and nothing wrote a `usage_at`. Turning billing on *required* first recording a
+  defensible time.
+- **`claim_time`, not `now`.** The value is taken before the rows are marked `submitting` and
+  **committed before the POST**, so nothing the provider does can precede it. A lower bound is the
+  fail-safe direction: it can only push usage OUT of a billable window, never into one.
+- **The metered item is replaced, never re-priced in place.** Updating an item keeps its `created`,
+  and `assert_billable` uses exactly that to refuse a rate agreed after the usage. An in-place
+  re-price would silently re-rate the period's earlier lookups.
+- **Two findings resolved toward holding rather than charging** — cross-window quantities and
+  usage stranded by a metered-item delete both go to `needs_review`. Both cost a human a
+  conversation; the alternative costs a customer money they never agreed to.
+- **`Subscription.modify` over a scheduled transition.** The handoff had deferred it as
+  UNVERIFIED; it is built now, but the period-end scheduled variant Codex prefers for P1-4 is
+  still not sandbox-verified.
+
+**Failed / Blocked:**
+- **I claimed a lower bound I had not got.** `46842a5`'s message says the dispatch timestamp is
+  "at or before the lookups". It was not: bookkeeping runs *after* the POST returns, and the retry
+  path minted a fresh, later clock. Same class of error as the `submitted_at` mistake the column
+  was built to replace — a value that *looks* like a lower bound.
+- **My `billing_proof` guard was not a guard.** It only rejected `None`; Codex passed `{}` and got
+  a real MeterEvent out with billing off and no timestamp. The token was never bound to what it
+  vouched for, so a proof for one customer authorised a send for any other. Removed entirely.
+- **Fixing P1-4 moved the bug instead of removing it.** Written after the Stripe call, the recovery
+  was not retry-safe. Reordering it then exposed a second trap: committing to make it durable
+  would have released the **transaction-scoped** advisory lock and let a concurrent checkout
+  through — trading lost revenue for a duplicate subscription. It runs on its own connection now.
+- **Moving the gate into the sender left the old call in place**, doubling Stripe subscription
+  reads on every single report. Caught by the re-gate, not by me.
+- **The machine ran out of memory three times.** Each time it killed the *wrapper* while pytest
+  kept running, and twice it took Postgres with it. A 44-failure run was 100% DB connection
+  errors and **zero assertion failures** — environmental, not a regression.
+
+**Caught & fixed (before shipping):**
+- A database that already ran the OLD 092 keeps `varchar(64)` and lacks the audit columns; alembic
+  never re-runs an edited migration. **094** adds them conditionally and retracts the old blanket
+  `non_billable` write-off, but only for owners who do have a Stripe customer and only where the
+  reason is the automatic one — a human's decision is never touched.
+- `change_plan` returned `"unchanged"` *before* validating the subscription shape, so a
+  subscription with two licensed items answered "you are already on that plan".
+- Prorations were being issued against `past_due`/`unpaid` subscriptions — credit for money never
+  received.
+- The item loop kept the LAST match while `_plan_item_price_id` reads the FIRST.
+- The settle script printed a successful dry run for values the real UPDATE would reject.
+
+**Pending / Handoff:**
+- 👤 **Merge order is backend first.** The frontend calls an endpoint that does not exist on `main`
+  yet, and its `lib/api-types.generated.ts` regen depends on the backend schema being there.
+- ⏭️ The **fully automatic** alternatives to the two holds — historical-window allocation, and a
+  period-end scheduled plan switch — both need Stripe sandbox verification nobody has done.
+- ⏭️ FE `api-types.generated.ts` needs a regen once the backend merges (backend docstrings moved).
+- Nothing pushed, no PR opened for the backend, no deploy.
+
+**Facts learned:**
+- **Every clock in the skip-trace path is the wrong one.** `created_at` is `server_default=now()`
+  at ingest; `completed_at` is set by the ingest worker in the same transaction that bills;
+  `submitted_at` is rewritten on the reconciler's adoption path. The only defensible values are
+  Tracerfy's own `created_at` and the pre-POST `claim_time`.
+- **`ON CONFLICT DO NOTHING` protects nothing on the adoption path** — the row does not exist yet,
+  so the insert actually inserts, with the adoption clock.
+- **`pg_advisory_xact_lock` dies with the transaction.** Any mid-request commit releases it.
+- **Stripe does not invoice usage recorded against a deleted subscription item.**
+- Migration 092 leaves every pre-existing row `reported`/`non_billable`/`needs_review` and never
+  `pending`, so turning billing on cannot convert a held row into a charge. Verified directly.
+
+---
+
 ## 2026-09-09 — the collapse picked its winner too early, and a P1 outlived the fact it stood on
 
 > **Provenance:** commit SHAs, production counts and the CI results below were read back from

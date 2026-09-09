@@ -350,8 +350,24 @@ def _collapse_loser_ids(rows: list[dict]) -> list:
 
     groups: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
-        # Same call the worker used to build the hash. None == weak identity.
-        if legacy_strong_signature(row.get("parcel_id"), row.get("property_address")) is None:
+        # Require the strong signature of the row's CURRENT parcel + address to
+        # EQUAL its stored dedup_hash. Checking only that a signature exists is
+        # not enough (Codex P1): the hash was computed from the values at INSERT
+        # time, and enrichment mutates property_address afterwards. On a watchdog
+        # retry a row that hashed weakly as NAME|DATE, and has since had an
+        # address filled in, would pass an existence check and then be grouped by
+        # that weak hash -- collapsing two filings that are not the same property.
+        #
+        # Equality also covers insert-time truncation, and any other drift
+        # between the hashed inputs and what is in the row now.
+        #
+        # It deliberately UNDER-collapses: a strong row whose address was later
+        # rewritten no longer matches, so it is skipped and that property bills
+        # twice, exactly as it does today. Billing one property twice is the
+        # status quo; silently not delivering a lead is not.
+        if legacy_strong_signature(
+            row.get("parcel_id"), row.get("property_address")
+        ) != row.get("dedup_hash"):
             continue
         groups[row.get("dedup_hash")].append(row)
 

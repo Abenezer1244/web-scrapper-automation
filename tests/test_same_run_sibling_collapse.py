@@ -15,7 +15,21 @@ Real DB (conftest `db` fixture) -- no mocks.
 import uuid
 
 from src.db.models import Job, Result, ScraperConfig, User
+from src.workers.property_identity import legacy_strong_signature
 from src.workers.tasks_helpers.dedup import collapse_same_run_siblings
+
+
+def _strong(parcel: str, address: str) -> str:
+    """The REAL hash the worker would store for these values.
+
+    Tests must not invent a dedup_hash: the collapse only groups rows whose
+    stored hash still equals the strong signature of their current parcel and
+    address, which is what stops an enriched weak-hash row collapsing under
+    its old NAME|DATE key.
+    """
+    h = legacy_strong_signature(parcel, address)
+    assert h is not None, "test inputs must form a strong identity"
+    return h
 
 
 async def _job(db, user: User, config: ScraperConfig) -> str:
@@ -54,11 +68,11 @@ async def test_two_filings_on_one_property_bill_once(
 ):
     """The defect, reduced. Both rows survived the cross-job dedup and both billed."""
     job_id = await _job(db, starter_user, scraper_config)
-    h = uuid.uuid4().hex
+    h = _strong("0123456", "1 MAIN ST")
     a = await _row(db, job_id, starter_user.id, h, party_name="A",
-                   property_address="1 MAIN ST")
+                   parcel_id="0123456", property_address="1 MAIN ST")
     b = await _row(db, job_id, starter_user.id, h, party_name="B",
-                   property_address="1 MAIN ST")
+                   parcel_id="0123456", property_address="1 MAIN ST")
 
     assert await _collapse(db, job_id, starter_user.id) == 1
 
@@ -93,7 +107,7 @@ async def test_the_most_complete_row_survives(
     else they have.
     """
     job_id = await _job(db, starter_user, scraper_config)
-    h = uuid.uuid4().hex
+    h = _strong("0123456", "9 MAIN ST")
     thin = await _row(db, job_id, starter_user.id, h, party_name="",
                       parcel_id="0123456", property_address="9 MAIN ST",
                       date_recorded="2026-01-01")
@@ -112,10 +126,10 @@ async def test_collapse_is_idempotent(
 ):
     """A watchdog re-run must not shrink the delivered set every pass."""
     job_id = await _job(db, starter_user, scraper_config)
-    h = uuid.uuid4().hex
+    h = _strong("0123456", "7 MAIN ST")
     for i in range(3):
         await _row(db, job_id, starter_user.id, h, party_name=f"P{i}",
-                   property_address="7 MAIN ST")
+                   parcel_id="0123456", property_address="7 MAIN ST")
 
     assert await _collapse(db, job_id, starter_user.id) == 2
     assert await _collapse(db, job_id, starter_user.id) == 0
@@ -132,13 +146,13 @@ async def test_collapse_never_touches_another_account(
     await db.commit()
     theirs_job = await _job(db, business_user, other)
     mine_job = await _job(db, starter_user, scraper_config)
-    h = uuid.uuid4().hex
+    h = _strong("0123456", "3 MAIN ST")
     t1 = await _row(db, theirs_job, business_user.id, h, party_name="T1",
-                    property_address="3 MAIN ST")
+                    parcel_id="0123456", property_address="3 MAIN ST")
     t2 = await _row(db, theirs_job, business_user.id, h, party_name="T2",
-                    property_address="3 MAIN ST")
+                    parcel_id="0123456", property_address="3 MAIN ST")
     await _row(db, mine_job, starter_user.id, h, party_name="M",
-               property_address="3 MAIN ST")
+               parcel_id="0123456", property_address="3 MAIN ST")
 
     assert await _collapse(db, mine_job, starter_user.id) == 0
     assert all(not dup for dup, _ in (await _state(db, [t1, t2])).values())
@@ -172,16 +186,42 @@ async def test_an_undeliverable_row_never_wins_over_a_usable_one(
     anywhere the customer looks. Letting it win would hide the usable sibling
     while the property stayed claimed."""
     job_id = await _job(db, starter_user, scraper_config)
-    h = uuid.uuid4().hex
+    h = _strong("0123456", "5 MAIN ST")
     placeholder = await _row(db, job_id, starter_user.id, h, party_name="A",
                              parcel_id="0123456",
-                             property_address="(enrichment unavailable)",
+                             property_address="5 MAIN ST",
+                             mailing_address="(enrichment unavailable)",
                              date_recorded="2026-01-01")
     usable = await _row(db, job_id, starter_user.id, h, party_name="B",
                         parcel_id="0123456", property_address="5 MAIN ST",
+                        mailing_address="PO BOX 7",
                         date_recorded="2026-06-01")
 
     assert await _collapse(db, job_id, starter_user.id) == 1
     st = await _state(db, [placeholder, usable])
     assert st[usable][0] is False, "the deliverable row must survive"
     assert st[placeholder][0] is True
+
+
+async def test_enrichment_filling_an_address_cannot_retro_collapse_a_weak_hash(
+    db, starter_user: User, scraper_config: ScraperConfig,
+):
+    """The hash is computed at INSERT time; enrichment mutates property_address
+    afterwards. On a watchdog retry, two rows that hashed weakly as NAME|DATE and
+    have since had addresses filled in must NOT collapse under that old hash --
+    they were never proven to be the same property.
+
+    Simulated the way it actually happens: rows share a weak hash, and the
+    address they now carry would hash strongly to something else entirely.
+    """
+    job_id = await _job(db, starter_user, scraper_config)
+    weak = uuid.uuid4().hex
+    a = await _row(db, job_id, starter_user.id, weak, party_name="SMITH",
+                   date_recorded="2026-01-02", parcel_id="0123456",
+                   property_address="11 MAIN ST")   # enrichment filled this in
+    b = await _row(db, job_id, starter_user.id, weak, party_name="SMITH",
+                   date_recorded="2026-01-02", parcel_id="0123456",
+                   property_address="11 MAIN ST")
+
+    assert await _collapse(db, job_id, starter_user.id) == 0
+    assert all(not dup for dup, _ in (await _state(db, [a, b])).values())

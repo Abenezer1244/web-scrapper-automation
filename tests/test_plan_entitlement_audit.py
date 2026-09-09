@@ -2108,3 +2108,139 @@ def test_the_meter_event_carries_an_explicit_timestamp(monkeypatch):
     assert captured["timestamp"] == int(when.timestamp()), (
         "the event must be dated when the usage happened, not when it was sent"
     )
+
+
+# ─── The four defects the Codex gate found in the fixes above ────────────────
+
+
+def test_a_settled_row_is_never_re_evaluated(monkeypatch):
+    """A decision is not a suggestion.
+
+    The task used to claim rows on `reported_at`, which is NULL for every
+    settled-but-unsent disposition — non_billable, written_off_manual,
+    settled_manual. So a task already on the queue, or re-enqueued by the sweep,
+    walked past the decision, re-ran the predicate, and could bill a row a human
+    had explicitly written off.
+    """
+    import src.workers.tracerfy_ingest as ti
+
+    class _Row:
+        disposition = "written_off_manual"
+        reported_at = None
+        usage_at = None
+        billable_units = 99
+        user_id = "u1"
+        tracerfy_queue_id = 1
+        plan = "pro"
+        stripe_customer_id = "cus_1"
+
+    class _Session:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, *a, **kw): return _Row()
+        def commit(self): raise AssertionError("a settled row must not be written")
+
+    import src.db.session as _sess
+    monkeypatch.setattr(_sess, "system_sync_session", lambda: _Session())
+
+    def _must_not_report(**kw):
+        raise AssertionError("a written-off row was sent to Stripe")
+
+    import src.api.billing.skip_trace_usage as st
+    monkeypatch.setattr(st, "report_meter_event_to_stripe", _must_not_report)
+
+    out = ti.report_skip_trace_meter_event(str(uuid.uuid4()))
+    assert out["skipped"] == "written_off_manual"
+
+
+def test_a_renewal_between_lookup_and_report_does_not_discard_the_usage(
+    monkeypatch,
+):
+    """Usage at 23:59, renewal at 00:00, reported at 00:01.
+
+    The customer genuinely owes this. Refusing it is correct — the period it
+    belongs to has closed — but settling it `non_billable` throws real revenue
+    away silently, which is the same stranding failure this work exists to stop.
+    It has to reach a human.
+    """
+    import src.api.billing.skip_trace_usage as st
+
+    price = _metered_price(st)
+    now = int(datetime.now(UTC).timestamp())
+    # The subscription started a month ago and renewed an hour ago.
+    sub = _sub_with(price, start=now - 3600, end=now + 86400)
+    sub["start_date"] = now - 30 * 86400
+    sub["items"]["data"][0]["created"] = now - 30 * 86400
+    _patch_subs(monkeypatch, st, [sub])
+
+    just_before_renewal = datetime.now(UTC) - timedelta(hours=2)
+    with pytest.raises(st._NotBillableError) as e:
+        st.assert_billable("cus_1", just_before_renewal)
+    assert e.value.reason == "closed_billing_period", (
+        "a closed period is not the same as no agreement — one is reviewable "
+        "revenue, the other is a write-off"
+    )
+
+
+def test_a_metered_item_added_later_does_not_price_earlier_usage(monkeypatch):
+    """The item's presence today says nothing about last week.
+
+    Period opens Sept 1, usage Sept 7, metered item added Sept 8, reported
+    Sept 9. The usage falls inside the current period and the item is on the
+    subscription, so the naive check passes — and charges per-lookup for usage
+    incurred before any per-lookup price was agreed.
+    """
+    import src.api.billing.skip_trace_usage as st
+
+    price = _metered_price(st)
+    now = int(datetime.now(UTC).timestamp())
+    sub = _sub_with(price, start=now - 8 * 86400, end=now + 22 * 86400)
+    sub["start_date"] = now - 8 * 86400
+    sub["items"]["data"][0]["created"] = now - 86400  # added yesterday
+
+    _patch_subs(monkeypatch, st, [sub])
+
+    usage_before_the_item_existed = datetime.now(UTC) - timedelta(days=2)
+    with pytest.raises(st._NotBillableError):
+        st.assert_billable("cus_1", usage_before_the_item_existed)
+
+
+def test_usage_at_is_a_lower_bound_that_ingest_cannot_move():
+    """The provenance defect: usage_at read the reconciliation clock.
+
+    report_usage_from_webhook runs inside the ingest transaction that has just
+    set `completed_at = now`, so COALESCE(completed_at, NOW()) was the time we
+    RECONCILED, dressed up as the time the provider settled. A batch that
+    finished days ago and is reconciled today would be stamped today — making
+    pre-subscription usage look covered, and 35-day-old usage look fresh.
+
+    `submitted_at` is written only by the dispatcher, never by ingest, and the
+    lookups cannot predate it. A lower bound can only push usage OUT of a
+    billable window, which is the direction that fails safe.
+    """
+    import inspect
+
+    from src.api.billing import skip_trace_usage as st
+
+    # Comments stripped: the phrase this asserts against deliberately survives
+    # in the comment explaining why it was replaced, and matching that would
+    # make the test fail for the documentation rather than the code.
+    code = [
+        line for line in inspect.getsource(st.report_usage_from_webhook).splitlines()
+        if not line.lstrip().startswith("#")
+    ]
+    assert any("SELECT submitted_at" in line for line in code), (
+        "usage_at must come from a column ingest does not write"
+    )
+    assert not any("COALESCE(completed_at" in line for line in code), (
+        "completed_at is set by this very transaction — it is the "
+        "reconciliation clock, not provider settlement"
+    )
+
+    ingest = inspect.getsource(
+        __import__("src.workers.tracerfy_ingest", fromlist=["x"])
+    )
+    assert "completed_at=now" in ingest, (
+        "if ingest stopped writing completed_at, revisit which timestamp is "
+        "the trustworthy one — this test is the reason submitted_at was chosen"
+    )

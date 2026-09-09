@@ -337,20 +337,45 @@ def assert_billable(stripe_customer_id: str | None, usage_at, now=None) -> dict:
         # strength of an outage.
         raise
 
+    ts = int(usage_at.timestamp())
+    covered_but_closed = False
+
     for sub in subs:
         if sub.get("status") != "active":
             continue
+
+        # The metered ITEM must have existed when the usage happened. Its
+        # presence today says the customer agreed to a per-lookup price NOW; it
+        # says nothing about a week ago. Adding the item on the 8th does not
+        # retroactively price usage from the 7th, and billing it would be the
+        # retroactive charge wearing a different hat (Codex).
         items = ((sub.get("items") or {}).get("data")) or []
         if not any(
-            ((i or {}).get("price") or {}).get("id") in metered for i in items
+            ((i or {}).get("price") or {}).get("id") in metered
+            and (i.get("created") is None or i["created"] <= ts)
+            for i in items
         ):
             continue
+
         start, end = sub.get("current_period_start"), sub.get("current_period_end")
         if start is None or end is None:
             continue
-        if start <= int(usage_at.timestamp()) < end:
+        if start <= ts < end:
             return sub
 
+        # The usage predates this period but the subscription itself already
+        # existed and carried the item: it was covered by an agreement, in a
+        # period that has since closed. A renewal between the lookup and this
+        # report is enough — usage at 23:59, renewal at 00:00, reported at
+        # 00:01. Calling that "no agreement" and settling it non_billable
+        # silently discards revenue the customer genuinely owes, which is the
+        # stranding failure this whole change exists to stop, just narrower.
+        started = sub.get("start_date")
+        if started is not None and started <= ts < start:
+            covered_but_closed = True
+
+    if covered_but_closed:
+        raise _NotBillableError("closed_billing_period")
     raise _NotBillableError("no_covering_agreement")
 
 
@@ -552,19 +577,29 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
         {"qid": queue_id, "states": list(billable_states)},
     ).fetchall()
 
-    # When the usage actually happened, captured ONCE for this batch.
+    # When the usage actually happened, captured ONCE for this batch, as the
+    # EARLIEST time it could have happened.
     #
-    # Not `created_at`: that is server_default=now(), the transaction clock of
-    # this reconciliation, which can be long after the provider ran the
-    # lookups. Not `submitted_at` either — it is rewritten when a queue is
-    # adopted, so it does not reliably describe this batch. `completed_at` is
-    # when the provider batch settled, which is the closest recorded fact to
-    # "when the customer consumed these lookups", and it is what Stripe will
-    # bill the period of. NOW() only when the queue has no completed_at, which
-    # for a batch being reconciled right now is a near-identical value.
+    # This first used COALESCE(completed_at, NOW()) and that was wrong in the
+    # one direction that costs a customer money (Codex found it). This function
+    # runs inside the ingest transaction that has just set
+    # `completed_at = now` a few statements earlier, so it was reading the
+    # reconciliation clock while claiming to read provider settlement. A batch
+    # that finished days ago and is only being reconciled now — a stalled queue,
+    # a replayed webhook — would be stamped today, which makes usage from BEFORE
+    # a subscription look like usage inside it, and makes usage past Stripe's
+    # 35-day backdating limit look fresh.
+    #
+    # `submitted_at` is when WE sent the batch to the provider. The lookups
+    # cannot have happened before that, and ingest never writes this column —
+    # only the dispatcher does, when it actually submits. That makes it a
+    # trustworthy LOWER BOUND, and a lower bound is the fail-safe direction: it
+    # can only push usage out of a billable window (refused, reviewed by a
+    # human), never into one. An upper bound does the opposite, which is how
+    # this was wrong the first time.
     usage_at = db.execute(
         text("""
-            SELECT COALESCE(completed_at, NOW()) AS usage_at
+            SELECT submitted_at
             FROM skip_trace_queues
             WHERE tracerfy_queue_id = :qid
         """),

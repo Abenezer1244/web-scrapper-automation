@@ -85,9 +85,22 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
                 outbox_id,
             )
             return {"outbox_id": outbox_id, "skipped": "not_found"}
+        # Claim on DISPOSITION, not on reported_at.
+        #
+        # reported_at only ever meant "we tried". A row settled as
+        # non_billable, written_off_manual or settled_manual has reported_at
+        # NULL, so this check let an already-queued or re-enqueued task walk
+        # straight past a decision that had been made — including a human's
+        # write-off — re-evaluate it, and bill it. Codex found it by executing
+        # the worker body rather than reading it.
+        #
+        # 'pending' is the only state this task may act on. Everything else is
+        # someone's answer, and a retry is not a licence to overturn it.
+        if row.disposition != "pending":
+            return {"outbox_id": outbox_id, "skipped": row.disposition}
         if row.reported_at is not None:
-            # Already reported by a prior attempt / the inline enqueue / a
-            # beat sweep. Idempotent no-op.
+            # Belt and braces for any row written before migration 092 that
+            # still carries reported_at without a disposition to match.
             return {"outbox_id": outbox_id, "skipped": "already_reported"}
 
         # The customer id is re-resolved from the users table, not trusted from
@@ -117,9 +130,15 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
             # billing agreement that covered it. Recording WHY on the row is the
             # point — "why was this never billed" has to be answerable from the
             # database a month later, not from a log line nobody kept.
+            # needs_review means "a human has to decide", NOT "we decided no".
+            # closed_billing_period belongs here: the customer DID owe this and
+            # a renewal simply closed the window we could bill it in, so
+            # settling it non_billable would quietly discard real revenue.
             row.disposition = (
                 "needs_review"
-                if refusal.reason in ("timestamp_expired", "usage_at_unknown")
+                if refusal.reason in (
+                    "timestamp_expired", "usage_at_unknown", "closed_billing_period",
+                )
                 else "non_billable"
             )
             row.disposition_at = datetime.now(UTC)

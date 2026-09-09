@@ -25,7 +25,7 @@ import pytest_asyncio
 import redis as sync_redis
 from httpx import ASGITransport, AsyncClient
 from main import app
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -124,12 +124,36 @@ async def db() -> AsyncSession:
         await session.execute(delete(PropertyListMembership))
         await session.execute(delete(Job))
         await session.execute(delete(ScraperConfig))
-        # H3: email is encrypted at rest, so a SQL LIKE on the domain no longer
-        # matches. Decrypt per row (EncryptedString) and delete the test-domain
-        # users by id. The test DB is small, so a full scan is fine.
-        for u in (await session.execute(select(User))).scalars().all():
-            if u.email and u.email.endswith("@test.bridgeleads.io"):
-                await session.delete(u)
+        # Every user, not just one hardcoded domain.
+        #
+        # This used to decrypt each row and delete only those ending
+        # "@test.bridgeleads.io". Three fixture factories disagree about the
+        # domain they mint — this file uses @test.bridgeleads.io, the
+        # notification tests use @bl.test, the analytics tests use @test.local —
+        # so two thirds of the users created by the suite were never cleaned up
+        # by ANY run, passing or failing. They accumulate: a scan of the audit
+        # database found 134 of them, all leaked, none matching the filter.
+        #
+        # That is not cosmetic. Once enough pile up, every test that asserts on
+        # a global shape starts failing on rows it never created — "empty
+        # account all zeros", tenant isolation, "only own with unread count" —
+        # and it presents as flakiness that worsens over weeks and clears if you
+        # happen to recreate the database. It reproduces on a pristine checkout,
+        # so it reads as a product bug and is not one.
+        #
+        # Deleting every user is the only rule that cannot drift from the
+        # fixtures, because it does not name them. It is safe by construction:
+        # assert_engine_is_test above has already refused to run anywhere but a
+        # test database, and a row in a test database IS fixture data. The
+        # previous per-test policy was already "delete every user this filter
+        # can see", so this widens the filter rather than changing the contract.
+        #
+        # It also stops the teardown reading `u.email` at all, which matters:
+        # that attribute DECRYPTS, so one row whose ciphertext no longer matches
+        # the current key raised inside the teardown and aborted the cleanup for
+        # the whole run — the failure mode that hides this bug behind a
+        # different one.
+        await session.execute(delete(User))
         await session.commit()
 
 

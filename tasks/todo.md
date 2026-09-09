@@ -88,12 +88,38 @@ plus the eight-then-three findings the review gate raised against the fixes.
 
 ## Gate rounds
 - [x] Round 1 (uncommitted work): 1 P1 + 5 P2 + 1 P3 — all fixed
-- [x] Round 2 (`46842a5`+`fa8097b`): FAIL, 5 P1 + 2 P2 + 1 P3 — all fixed in `f5d0a02`
+- [x] Round 2 (`46842a5`+`fa8097b`): FAIL, 5 P1 + 2 P2 + 1 P3 — fixed in `f5d0a02`
 - [x] Round 3 (`f5d0a02`): FAIL, 1 new P1 + 2 P2 + 2 partials — fixed in `db3068f`
-- [ ] Round 4 on `db3068f` — NOT RUN. Three gate rounds found something every time,
-      so treat "no round 4" as unverified rather than clean.
-- [ ] Frontend gate on `83e5e0b` — started, killed by the machine running out of
-      memory before it emitted a verdict. Not run.
+- [x] Round 4 (`db3068f`): FAIL, 3 P1 + 4 P2 — fixed in `7a8941b`
+- [x] Round 5 (`7a8941b`): FAIL, 4 P1 — fixed in `8077700`
+- [x] Frontend gate (`83e5e0b`): request changes, 2 P1 + 3 P2 + 1 P3 — fixed in
+      FE `f866f84`
+- [ ] Round 6 on `8077700` — NOT RUN. Five rounds have each found something, so
+      treat "no round 6" as unverified rather than clean.
+
+### P2s accepted rather than fixed, with reasons
+- **Release is scoped by REASON, not by a plan-change attempt id.** It cannot
+  resurrect a `settled_manual` / `written_off_manual` decision, which is the
+  dangerous direction. It CAN release a review row created by a *successful*
+  transition, because success and abandonment write the same reason. Fixing it
+  properly means persisting an attempt id and outcome. Worth doing before this
+  path sees real volume; harmless while it is a hand-run recovery tool.
+- **The pre-read of `user_id` relies on an immutability the schema does not
+  enforce.** No application code updates that column, and a deleted row surfaces
+  as `row is None` later. A recheck after taking the lock would close it.
+- **The review alert repeats its whole backlog** every time the cooldown expires,
+  and `send_ops_alert` records every occurrence. Once `no_customer_id` rows drain
+  themselves this is much smaller, but the right shape is alerting on newly
+  entered rows rather than on the standing total.
+- **No RLS policy for `system_sync_session` on `skip_trace_meter_events`.** Not a
+  leak today (the UPDATE is explicitly user-scoped, and user ids are globally
+  unique), but a future non-BYPASSRLS role would have this path denied rather
+  than scoped. That is a repo-wide migration concern, not this branch's.
+- **Same-plan requests now 409 on an unrecognised price.** There are no legacy
+  subscription shapes on a deployment with zero subscriptions, and refusing
+  loudly beats acting on a shape we cannot describe.
+- **094 runs idempotent DDL on a current-092 database.** Making it conditional on
+  detecting the old shape adds more moving parts than it removes.
 
 ## Still open
 - [ ] Neither branch pushed; BE PR #268 still a draft; FE PR would be new.

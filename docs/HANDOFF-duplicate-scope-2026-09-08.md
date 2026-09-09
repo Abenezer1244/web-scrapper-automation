@@ -1,9 +1,13 @@
 # Handoff: duplicate scope, dedup-claim integrity, and same-run billing
 
-**Date:** 2026-09-08
+**Date:** 2026-09-08 (§7A/§7B closed 2026-09-09)
 **Status:** all work MERGED and DEPLOYED. Nothing is in flight.
-**Branch to continue on:** none exists. Cut a fresh branch from `origin/main`
-(currently at `b511797`). The old worktree branches are merged and dead.
+**Branch to continue on:** none exists. Cut a fresh branch from `origin/main`.
+
+> **2026-09-09 — §7A and §7B are now DONE.** PR **#271** (`8084f48`) shipped all
+> three deferred P2s plus a fourth defect its own design review surfaced, and the
+> `rev7` gate was re-run to **GATE PASS**. See §7 for what that changed and §9 for
+> what is genuinely left. CI green; all 13 ledger invariants still 0 afterwards.
 
 ---
 
@@ -47,6 +51,7 @@ Chasing it turned up four more real defects, described below.
 | BE #262 | `34fa2bd` | 13 ledger invariants as a runnable check |
 | BE #263 | `890bbfe` | analytics job-status filter, delivery headline, 2 latent repair bugs |
 | BE #265 | `cb387ed` | same-run sibling collapse (billing), segments job-status filter |
+| BE #271 | `8084f48` | post-enrichment survivor reconciliation, claim-anchor coordination, source-field merge, batch_export job-status filter |
 
 FE repo is `Abenezer1244/bridgeleads-web`, base branch `master`.
 BE repo is `Abenezer1244/web-scrapper-automation`, base branch `main`.
@@ -183,36 +188,109 @@ those leads were reachable via Lists all along. That path is now closed too
 
 ---
 
-## 7. Next steps — what is actually left
+## 7. The `batch_export` filter invalidated an earlier Codex P1
+
+Worth its own section, because it is the trap most likely to catch the next person.
+
+The per-child `record_count` in `src/api/routes/batches.py` used to count a FAILED
+child's rows, under an explicit earlier Codex **P1**: *"do NOT key the count on
+status"*. Its stated reason was **the very gap #271 closed** — *"finalize_batch_run
+builds the combined CSV from every child_job_id with no status filter ... so a
+failed/cancelled child's rows can be in the delivered CSV. Those must stay
+visible."*
+
+Adding `j.status = 'done'` makes that premise false. Those rows now reach neither
+the combined CSV nor Lists nor analytics, and a non-done job has no `export_key`
+to download (0 non-done jobs hold one in production, against 48 of 48 done jobs —
+it is written only inside the mark-done transaction). So a failed or cancelled
+child now reports **0**, and an in-flight one still reports its counted rows.
+
+**The ruling was encoded in two places, and grepping for the comment found only
+one.** The other was four tests in `tests/test_batches_read.py`, which the
+targeted run did not touch and only the FULL suite caught (4 failed / 2745
+passed). One of them asserted the old rule and now asserts 0 with the reasoning
+recorded; **the other three only used a failed child as a vehicle** for the
+per-row counting rules (actionability, duplicates, the retry that resets
+`record_count`) and were re-pointed at an in-flight child so no coverage was lost.
+
+🔑 **When you invalidate a documented ruling, hunt for every place it is asserted —
+comment, test and docstring — and for each ask whether the test is ABOUT the rule
+or merely using it as scaffolding.**
+
+## 8. Next steps — what is actually left
 
 Nothing is broken or half-finished. These are the open items, in priority order.
 
-### A. Codex P2s from #265, recorded and deliberately not taken
+### A. The three deferred Codex P2s — DONE (PR #271, `8084f48`)
 
-1. **Survivor selection runs before inline enrichment.** Two addressless rows
-   sharing a strong parcel hash pick a survivor before a Pierce legal-description
-   recovery could make only the *collapsed* sibling actionable. That sibling is
-   then excluded from per-job delivery and skip-tracing, and retries never
-   reconsider it because the SELECT excludes duplicates.
-   *Fix shape:* rank after address recovery, and allow reconsidering existing
-   `same_run` siblings.
-2. **Collapse discards source-only fields.** `heirs`, legal description,
-   `lead_subtype` and other `enrichment_data` keys on a loser are neither ranked
-   nor merged. A later filing carrying the only heir vanishes from the per-job
-   export.
-   *Fix shape:* merge those fields onto the survivor before marking the loser.
-3. **`src/workers/batch_export.py:79` still has no job-status filter**, where
-   `segments` and `analytics` now do. A failed child's actionable rows can appear
-   in an emailed partial-batch CSV but not in Lists. This is the same question
-   already answered "yes" twice; closing it is a consistency fix.
+All three shipped, and the design review for them surfaced a **fourth** defect in
+already-shipped code that shipped in the same PR.
 
-### B. The unfinished gate
+1. **Survivor selection ran before inline enrichment.** ✅ Fixed by
+   `reconcile_same_run_survivors`, which re-elects each group's survivor after
+   enrichment and before the refetch — the only point where the re-export, the
+   property membership and the plan cap all still see the result.
 
-The final narrow Codex round on #265 (`rev7`) confirmed the hash-equality guard
-closes the demonstrated hole and that skipping is safe, then **hit its usage
-limit mid-answer**. Two of its four questions were answered by me, not
-independently. Re-run that check if you want the gate formally closed:
-`scratchpad/rev7_prompt.txt` has the prompt.
+   Two things it deliberately does NOT do, both because Codex was right about them:
+   - it does **not** re-run `_collapse_groups`. Enrichment rewrites
+     `property_address`, so a member stops satisfying that function's
+     hash-equality admission test and vanishes from its output — and "not
+     returned as a loser" is not "elected winner";
+   - it does **not** touch a group without exactly one standing row. With *k* the
+     duplicate count moves by *k−1* and the charge with it, so a malformed group
+     is logged and skipped, never "repaired".
+
+2. **Collapse discarded source-only fields.** ✅ Fixed with a narrow ALLOWLIST:
+   `heirs` (union, probate only, dropping the survivor's own `party_name`),
+   `legal_description` (fill-only), `lead_subtype` (elected by the same priority
+   order the combined export aggregates with, now one shared constant). Every
+   other `enrichment_data` key is deliberately left alone — copying keys
+   individually across two filings manufactures an object no source produced, and
+   the blob carries per-row state such as the plan-cap exclusion key.
+
+3. **`batch_export` had no job-status filter.** ✅ Fixed. See §7 — this one had a
+   consequence nobody had written down.
+
+### A2. The fourth defect: the dedup claim did not follow the survivor
+
+`delivered_records.first_result_id` is set from whichever row PostgreSQL reached
+first inside the batched `INSERT ... ON CONFLICT DO NOTHING`; the collapse elects
+its survivor by actionability. **Nothing coordinated the two**, so the claim could
+name a row the collapse had just flagged `is_duplicate`.
+
+That is invariant #5 — and it matters beyond the invariant, because
+`_reuse_enrichment_for_duplicates` joins `results ro ON ro.id = dr.first_result_id`
+and copies address plus settled skip-trace PII **from** the anchored row. An
+anchor left on a collapsed loser makes the reuse source a row the run suppressed.
+
+**It was LATENT, never active:** production held 0 `same_run` rows, so the collapse
+shipped in #265 had never fired on real data. Proven with
+`scripts/diag_same_run_anchor_drift.py` (added by #271). The `trustee_sale` path
+had the identical gap and was fixed too.
+
+### B. The unfinished gate — DONE
+
+`rev7` was re-run on 2026-09-09 and returned **GATE PASS**. All four questions were
+answered independently this time: the hash-equality guard fully closes the
+weak-hash hole, it admits nothing new, under-collapsing is safe, and the check
+itself breaks nothing (normalization matches the frozen insert-time formula; the
+SQL excludes NULL hashes).
+
+### B2. What the diff review caught — worth reading before touching this code
+
+Codex's review of #271 returned GATE PASS with two [P2]s. **Both were real bugs**,
+and both are the same class of mistake:
+
+- **The reconciliation re-ranked `trustee_sale` by actionability.** Auction Leads
+  elects the *soonest-auction* row — a product decision from 2026-07-03. The
+  reconciliation runs for every record type, so it was silently overriding that
+  rule after the fact. Fixed with `sort_key_for(record_type)`; the auction key now
+  lives in `dedup.py` beside `survivor_sort_key` so both paths read one definition.
+- **An empty heir union fell through to the fill-only path.** `_merge_heirs`
+  returned `None` both for "does not apply" and for "applies but came out empty",
+  so when the exclusion removed the survivor's own party as the only name, the
+  fallback copied that exact name straight back — making them their own heir, the
+  precise corruption the exclusion existed to prevent.
 
 ### C. Historical charges not refunded
 
@@ -222,10 +300,15 @@ with its own dry-run and verification pass.
 
 ### D. Latent, never exercised in production
 
-Post-crash claim release and the plan-cap sibling guard have never fired against
-real data (0 stranded claims, 0 same-run rows before #265 shipped). They are
-covered by tests only. Watch for them after the next failed run and the next
-capped run.
+Post-crash claim release, the plan-cap sibling guard, and now the whole same-run
+collapse family — the collapse itself, the post-enrichment reconciliation and the
+claim-anchor repoint — have never fired against real data (0 stranded claims, and
+still **0 `same_run` rows** in production as of 2026-09-09). They are covered by
+tests only.
+
+Watch for them after the next failed run, the next capped run, and the next run
+that scrapes one property twice. `scripts/diag_same_run_anchor_drift.py` answers
+"has any of this fired yet, and did it leave a claim naming a duplicate row".
 
 ### E. Unrelated but flagged
 
@@ -237,7 +320,7 @@ capped run.
 
 ---
 
-## 8. How to verify anything in here
+## 9. How to verify anything in here
 
 ```bash
 # ledger integrity, schema-wide (13 checks, all must be 0)
@@ -250,8 +333,24 @@ railway run --service worker python scripts/diag_dup_scope_audit.py <email>
 railway run --service worker python scripts/backfill_duplicate_provenance.py --dry-run
 ```
 
+```bash
+# has the collapse fired yet, and does any claim name a duplicate row?
+railway run --service worker python scripts/diag_same_run_anchor_drift.py
+```
+
 Local full suite (never bare pytest):
 
 ```bash
 bash C:/Users/Windows/bl-testenv/run-full-pytest.sh <path-to-worktree>
 ```
+
+Two rig notes from the 2026-09-09 session:
+
+- **A targeted run is not enough.** The four `test_batches_read` regressions lived
+  in a file none of the new tests touched. Run the full suite before believing a
+  behavior change is contained.
+- **If another session is using the shared rig, build your own database** rather
+  than resetting `bridgeleads_test` — see the isolated-DB recipe in memory. And a
+  background test task reported "killed for low memory" kills only the WRAPPER:
+  the `pytest` process keeps running and will compete with your relaunch. Check
+  for the orphan first.

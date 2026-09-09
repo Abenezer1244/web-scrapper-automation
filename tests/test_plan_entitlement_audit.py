@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import inspect
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1359,19 +1359,58 @@ def test_a_missing_customer_id_is_not_the_same_signal_as_stripe_being_off():
         monkeypatch.undo()
 
 
-def test_the_outbox_sweep_holds_unbillable_rows_instead_of_looping_on_them():
-    """The sweep runs every three minutes. Leaving a row unreported without also
-    teaching the sweep to skip it would re-enqueue it forever. The join is a
-    hold: the row is picked up the moment a customer id exists."""
-    import inspect
+def test_the_outbox_sweep_selects_pending_rows_and_nothing_else():
+    """The sweep must not re-enqueue a row whose disposition is already decided.
 
+    Re-pinned twice over. It used to assert the sweep JOINed `users` and
+    required a stripe_customer_id — the P1 rule, now gone — and it asserted it
+    by SEARCHING THE SOURCE TEXT, which is the weaker of the two problems: a
+    source-text assertion passes for code that is never executed and says
+    nothing about what the query returns. It now runs the statement against the
+    database and looks at the rows.
+
+    Every settled disposition is checked, not just one, because the failure this
+    guards against is a sweep that keeps firing MeterEvents for usage somebody
+    already decided was not billable.
+    """
+    import re
+
+    from sqlalchemy import text as _text
+
+    from src.db.session import system_sync_session
     from src.workers.scheduler_helpers import meter
 
     src = inspect.getsource(meter)
-    assert "JOIN users u ON u.id = e.user_id" in src
-    assert "u.stripe_customer_id IS NOT NULL" in src
-    # And a hold nobody can see is worse than the write-off it replaced.
+    # A hold nobody can see is worse than the write-off it replaced.
     assert "skip_trace_meter_held" in src
+
+    m = re.search(r'text\("""(\s*SELECT e\.id.*?)"""\)', src, re.S)
+    assert m, "could not find the sweep's selection query"
+    sweep_sql = m.group(1)
+    assert "stripe_customer_id" not in sweep_sql, (
+        "the sweep is keying off the customer id again — that id is written "
+        "when the checkout SESSION is created, before payment"
+    )
+
+    with system_sync_session() as db:
+        for disposition in (
+            "pending", "reported", "non_billable", "needs_review",
+            "written_off_manual", "settled_manual",
+        ):
+            got = db.execute(
+                _text(
+                    "SELECT COUNT(*) FROM (" + sweep_sql + ") s "
+                    "JOIN skip_trace_meter_events e2 ON e2.id = s.id "
+                    "WHERE e2.disposition = :d"
+                ),
+                {"d": disposition},
+            ).scalar()
+            if disposition == "pending":
+                continue
+            assert got == 0, (
+                f"the sweep would re-enqueue rows already settled as "
+                f"{disposition}"
+            )
 
 
 @pytest.mark.integration
@@ -1876,3 +1915,196 @@ async def test_a_hand_set_plan_does_not_block_checkout(
     )
     assert r.status_code == 200, r.text
     assert len(created) == 1
+
+
+# ─── P1: held usage must not release on "the customer has a Stripe id" ────────
+#
+# The old rule was `users.stripe_customer_id IS NOT NULL`, and create_checkout
+# writes that id when the checkout SESSION is created — before payment. So
+# starting checkout and walking away released a whole pre-subscription backlog.
+# These pin the rule that replaced it.
+
+
+def _sub_with(price_id, *, status="active", start=None, end=None):
+    """A Stripe subscription shaped the way assert_billable reads one."""
+    now = int(datetime.now(UTC).timestamp())
+    return {
+        "id": "sub_x",
+        "status": status,
+        "current_period_start": start if start is not None else now - 86400,
+        "current_period_end": end if end is not None else now + 86400,
+        "items": {"data": [{"price": {"id": price_id}}]},
+    }
+
+
+def _patch_subs(monkeypatch, st, subs):
+    class _L:
+        def __init__(self, items): self._i = list(items)
+        def auto_paging_iter(self): return iter(self._i)
+
+    import stripe as _stripe
+    monkeypatch.setattr(_stripe.Subscription, "list", lambda **kw: _L(subs))
+    monkeypatch.setattr(st.settings, "STRIPE_SECRET_KEY", "sk_test_fake")
+
+
+def _metered_price(st):
+    ids = st._configured_metered_price_ids()
+    if not ids:
+        pytest.skip("no metered skip-trace price configured in this environment")
+    return sorted(ids)[0]
+
+
+def test_a_customer_id_alone_no_longer_authorises_billing(monkeypatch):
+    """THE P1, stated as a test.
+
+    A user who started checkout has a stripe_customer_id and no subscription.
+    Under the old rule the sweep released their entire backlog on that alone.
+    """
+    import src.api.billing.skip_trace_usage as st
+
+    _patch_subs(monkeypatch, st, [])
+    with pytest.raises(st._NotBillableError) as e:
+        st.assert_billable("cus_started_checkout", datetime.now(UTC))
+    assert e.value.reason == "no_covering_agreement"
+
+
+def test_a_subscription_without_the_metered_item_does_not_authorise_overage(
+    monkeypatch,
+):
+    """Buying a PLAN is not agreeing to a per-lookup rate.
+
+    The metered item is the only artefact that says the customer was shown, and
+    accepted, a price per lookup. Billing overage against a plan-only
+    subscription charges for something never quoted.
+    """
+    import src.api.billing.skip_trace_usage as st
+
+    _patch_subs(monkeypatch, st, [_sub_with("price_plan_only_not_metered")])
+    with pytest.raises(st._NotBillableError) as e:
+        st.assert_billable("cus_1", datetime.now(UTC))
+    assert e.value.reason == "no_covering_agreement"
+
+
+@pytest.mark.parametrize("status", ["trialing", "past_due", "unpaid", "paused"])
+def test_only_an_active_subscription_authorises_billing(monkeypatch, status):
+    """`trialing` is not permission to bill trial usage, and a subscription
+    whose last invoice did not clear is not somewhere to quietly add more."""
+    import src.api.billing.skip_trace_usage as st
+
+    price = _metered_price(st)
+    _patch_subs(monkeypatch, st, [_sub_with(price, status=status)])
+    with pytest.raises(st._NotBillableError) as e:
+        st.assert_billable("cus_1", datetime.now(UTC))
+    assert e.value.reason == "no_covering_agreement"
+
+
+def test_usage_from_before_the_subscription_is_not_swept_into_it(monkeypatch):
+    """The retroactive charge, arrived at politely.
+
+    Usage incurred before this subscription existed does not become billable
+    because a subscription exists NOW. That is the second half of the P1: the
+    first half strands the usage, this half charges for it.
+    """
+    import src.api.billing.skip_trace_usage as st
+
+    price = _metered_price(st)
+    now = int(datetime.now(UTC).timestamp())
+    sub = _sub_with(price, start=now - 3600, end=now + 86400)
+    _patch_subs(monkeypatch, st, [sub])
+
+    before_the_subscription = datetime.now(UTC) - timedelta(days=3)
+    with pytest.raises(st._NotBillableError) as e:
+        st.assert_billable("cus_1", before_the_subscription)
+    assert e.value.reason == "no_covering_agreement"
+
+
+def test_usage_inside_an_active_metered_period_is_billable(monkeypatch):
+    """The one case that SHOULD bill, so the rule is not just 'refuse'."""
+    import src.api.billing.skip_trace_usage as st
+
+    price = _metered_price(st)
+    _patch_subs(monkeypatch, st, [_sub_with(price)])
+    sub = st.assert_billable("cus_1", datetime.now(UTC))
+    assert sub["id"] == "sub_x"
+
+
+def test_usage_older_than_stripes_backdating_limit_goes_to_a_human(monkeypatch):
+    """Too old to bill honestly, so it is not billed at all.
+
+    Stripe refuses a meter event over 35 days old. The tempting fallback is to
+    send it with today's date, which silently moves a customer's usage into a
+    period they did not incur it in. needs_review instead.
+    """
+    import src.api.billing.skip_trace_usage as st
+
+    price = _metered_price(st)
+    _patch_subs(monkeypatch, st, [_sub_with(price)])
+    with pytest.raises(st._NotBillableError) as e:
+        st.assert_billable("cus_1", datetime.now(UTC) - timedelta(days=40))
+    assert e.value.reason == "timestamp_expired"
+
+
+def test_a_row_with_no_usage_time_is_never_billed_on_a_guess(monkeypatch):
+    """Rows written before migration 092 have usage_at NULL.
+
+    Their real usage time is not recoverable. Substituting `now` would be a
+    guess that gets charged for, so they go to a human.
+    """
+    import src.api.billing.skip_trace_usage as st
+
+    price = _metered_price(st)
+    _patch_subs(monkeypatch, st, [_sub_with(price)])
+    with pytest.raises(st._NotBillableError) as e:
+        st.assert_billable("cus_1", None)
+    assert e.value.reason == "usage_at_unknown"
+
+
+def test_a_stripe_outage_is_not_an_answer(monkeypatch):
+    """"We could not ask" must not settle the row.
+
+    A _NotBillableError would write a disposition and stop the retries, turning
+    an outage into a permanent decision. The raw exception propagates instead so
+    the task's autoretry gets another go and the row stays pending.
+    """
+    import stripe as _stripe
+
+    import src.api.billing.skip_trace_usage as st
+
+    def _boom(**kw):
+        raise RuntimeError("stripe is down")
+
+    monkeypatch.setattr(_stripe.Subscription, "list", _boom)
+    monkeypatch.setattr(st.settings, "STRIPE_SECRET_KEY", "sk_test_fake")
+
+    with pytest.raises(RuntimeError):
+        st.assert_billable("cus_1", datetime.now(UTC))
+
+
+def test_the_meter_event_carries_an_explicit_timestamp(monkeypatch):
+    """Omitting it bills into whatever period is open when the row is sent.
+
+    A row that waits in the outbox — a broker outage, a retry, the beat sweep —
+    would otherwise be stamped at submission time and land in the wrong period.
+    """
+    import stripe as _stripe
+
+    import src.api.billing.skip_trace_usage as st
+
+    captured: dict = {}
+
+    def _create(**kwargs):
+        captured.update(kwargs)
+        return {"identifier": "id_1"}
+
+    monkeypatch.setattr(_stripe.billing.MeterEvent, "create", _create)
+    monkeypatch.setattr(st, "_stripe_enabled", lambda: True)
+    monkeypatch.setattr(st.settings, "STRIPE_SECRET_KEY", "sk_test_fake")
+
+    when = datetime.now(UTC) - timedelta(days=2)
+    st.report_meter_event_to_stripe(
+        user_id="u1", queue_id=7, billable_units=3,
+        stripe_customer_id="cus_1", plan="pro", usage_at=when,
+    )
+    assert captured["timestamp"] == int(when.timestamp()), (
+        "the event must be dated when the usage happened, not when it was sent"
+    )

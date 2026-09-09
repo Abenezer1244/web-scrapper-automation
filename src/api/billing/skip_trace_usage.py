@@ -221,12 +221,146 @@ class _StripeNotConfiguredError(Exception):
     """
 
 
+
+
+# ─── Is this usage billable at all? ───────────────────────────────────────────
+
+# Stripe refuses a meter event timestamped more than 35 calendar days back. A
+# day of slack, because the check and the API call are not simultaneous and a
+# retry can sit in the queue.
+_BACKDATE_LIMIT_DAYS = 34
+
+
+class _NotBillableError(Exception):
+    """This usage must not be reported. `reason` says which rule refused it.
+
+    Carries the disposition reason rather than a message, because the caller
+    writes it to the row: the answer to "why was this never billed" has to
+    survive in the database, not only in a log line nobody reads.
+    """
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(detail or reason)
+        self.reason = reason
+
+
+def _configured_metered_price_ids() -> set[str]:
+    """Every skip-trace metered Price this deployment knows about."""
+    return {
+        p for p in (
+            settings.STRIPE_PRICE_SKIP_TRACE_PRO,
+            settings.STRIPE_PRICE_SKIP_TRACE_PRO_ANNUAL,
+            settings.STRIPE_PRICE_SKIP_TRACE_BUSINESS_OVERAGE,
+            settings.STRIPE_PRICE_SKIP_TRACE_BUSINESS_ANNUAL,
+            settings.STRIPE_PRICE_SKIP_TRACE_AGENCY_OVERAGE,
+            settings.STRIPE_PRICE_SKIP_TRACE_AGENCY_ANNUAL,
+        ) if p and p.startswith("price_")
+    }
+
+
+def assert_billable(stripe_customer_id: str | None, usage_at, now=None) -> dict:
+    """Refuse unless a real billing agreement covered this usage. Returns the sub.
+
+    THE P1. The sweep used to release a held row as soon as the owner had a
+    `stripe_customer_id` — an id `create_checkout` writes when the checkout
+    SESSION is created, before payment and before any subscription exists. Both
+    outcomes of that are wrong, and which one you get is a race:
+
+      * fired before a subscription exists -> the event has a timestamp inside
+        no billable period, we stamp the row settled, and real usage is silently
+        stranded;
+      * a subscription starts first -> the whole backlog is charged
+        retroactively at a rate the customer never agreed to.
+
+    "The customer has a Stripe id" is not a billing agreement. What is: a LIVE
+    subscription, carrying the metered skip-trace item, whose current period
+    actually contains the moment the usage happened. All three matter —
+
+      * `active` only. `trialing` is not permission to bill trial usage, and
+        `past_due` / `unpaid` mean the last invoice did not clear, so adding
+        more to it is not the right move without a human.
+      * the metered ITEM must be on it. A subscription proves they bought a
+        plan; only the metered item proves they bought per-lookup overage at a
+        price. This is the fact the "checkout disclosed it" argument rests on,
+        so it is checked rather than assumed.
+      * the period must CONTAIN usage_at. Usage from before this subscription
+        began does not become billable because a later one exists — that is the
+        retroactive charge, just arrived at politely.
+
+    Anything this refuses is kept, not written off: the caller records the
+    reason and a human decides. Refusing to bill is reversible; billing someone
+    for something they never agreed to is not.
+    """
+    from datetime import timedelta
+
+    now = now or datetime.now(UTC)
+
+    if usage_at is None:
+        # Rows written before migration 092. Their real usage time is not
+        # recoverable, and a guess here is a guess that gets charged for.
+        raise _NotBillableError("usage_at_unknown")
+
+    if usage_at.tzinfo is None:
+        usage_at = usage_at.replace(tzinfo=UTC)
+
+    if usage_at > now + timedelta(minutes=5):
+        # Stripe rejects anything more than five minutes ahead; a timestamp from
+        # the future means a clock problem, not usage.
+        raise _NotBillableError("usage_at_in_future")
+
+    if usage_at < now - timedelta(days=_BACKDATE_LIMIT_DAYS):
+        # Too old for Stripe to accept against its true date. The alternative is
+        # to send it with today's date, which is exactly the retroactive charge
+        # this function exists to prevent, so it goes to a human instead.
+        raise _NotBillableError("timestamp_expired")
+
+    if not stripe_customer_id:
+        raise _NotBillableError("no_customer_id")
+
+    metered = _configured_metered_price_ids()
+    if not metered:
+        # Nothing to check against. Reporting anyway would bill against whatever
+        # item Stripe happens to match.
+        raise _NotBillableError("no_metered_price_configured")
+
+    import stripe
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+    try:
+        subs = list(
+            stripe.Subscription.list(
+                customer=stripe_customer_id, status="active", limit=100,
+            ).auto_paging_iter()
+        )
+    except Exception:  # noqa: BLE001 — unknown is NOT "not billable"
+        # Deliberately NOT a _NotBillableError: we could not ask. Propagating lets
+        # the task's autoretry try again rather than settling the row on the
+        # strength of an outage.
+        raise
+
+    for sub in subs:
+        if sub.get("status") != "active":
+            continue
+        items = ((sub.get("items") or {}).get("data")) or []
+        if not any(
+            ((i or {}).get("price") or {}).get("id") in metered for i in items
+        ):
+            continue
+        start, end = sub.get("current_period_start"), sub.get("current_period_end")
+        if start is None or end is None:
+            continue
+        if start <= int(usage_at.timestamp()) < end:
+            return sub
+
+    raise _NotBillableError("no_covering_agreement")
+
+
 def report_meter_event_to_stripe(
     user_id: str,
     queue_id: int,
     billable_units: int,
     stripe_customer_id: str | None,
     plan: str,
+    usage_at=None,
 ) -> str | None:
     """Fire ONE Stripe skip-trace MeterEvent — RAISES on transient failure.
 
@@ -282,14 +416,24 @@ def report_meter_event_to_stripe(
     # makes that retry idempotent. We do NOT swallow it here.
     import stripe
     stripe.api_key = settings.STRIPE_SECRET_KEY
-    event = stripe.billing.MeterEvent.create(
-        event_name=settings.STRIPE_METER_EVENT_NAME_SKIP_TRACE,
-        payload={
+    # The timestamp is EXPLICIT. Omitted, Stripe stamps the event at submission
+    # time, so a row that sat in the outbox for a week billed into whatever
+    # period happened to be open when it was finally sent — the wrong period,
+    # and for a held backlog the wrong subscription entirely. There is no
+    # fallback to "now" on purpose: assert_billable has already refused anything
+    # whose real time cannot be used, and silently substituting today's date is
+    # the retroactive charge we are trying to stop.
+    event_kwargs: dict = {
+        "event_name": settings.STRIPE_METER_EVENT_NAME_SKIP_TRACE,
+        "payload": {
             "value": str(billable_units),
             "stripe_customer_id": stripe_customer_id,
         },
-        identifier=stable_identifier,
-    )
+        "identifier": stable_identifier,
+    }
+    if usage_at is not None:
+        event_kwargs["timestamp"] = int(usage_at.timestamp())
+    event = stripe.billing.MeterEvent.create(**event_kwargs)
     _logger.info(
         "Reported %d skip-trace lookups to Stripe for user %s (plan=%s, over-quota)",
         billable_units, user_id[:8], plan,
@@ -408,6 +552,25 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
         {"qid": queue_id, "states": list(billable_states)},
     ).fetchall()
 
+    # When the usage actually happened, captured ONCE for this batch.
+    #
+    # Not `created_at`: that is server_default=now(), the transaction clock of
+    # this reconciliation, which can be long after the provider ran the
+    # lookups. Not `submitted_at` either — it is rewritten when a queue is
+    # adopted, so it does not reliably describe this batch. `completed_at` is
+    # when the provider batch settled, which is the closest recorded fact to
+    # "when the customer consumed these lookups", and it is what Stripe will
+    # bill the period of. NOW() only when the queue has no completed_at, which
+    # for a batch being reconciled right now is a near-identical value.
+    usage_at = db.execute(
+        text("""
+            SELECT COALESCE(completed_at, NOW()) AS usage_at
+            FROM skip_trace_queues
+            WHERE tracerfy_queue_id = :qid
+        """),
+        {"qid": queue_id},
+    ).scalar()
+
     summary: dict = {"queue_id": queue_id, "users": [], "outbox_ids": []}
     for row in rows:
         result = report_lookups_for_user(
@@ -431,6 +594,7 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
                     billable_units=result["billable_units"],
                     stripe_customer_id=result.get("stripe_customer_id"),
                     plan=result.get("plan", ""),
+                    usage_at=usage_at,
                 )
                 .on_conflict_do_nothing(
                     index_elements=["tracerfy_queue_id", "user_id"]
@@ -446,7 +610,7 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
             SELECT id
             FROM skip_trace_meter_events
             WHERE tracerfy_queue_id = :qid
-              AND reported_at IS NULL
+              AND disposition = 'pending'
         """),
         {"qid": queue_id},
     ).fetchall()

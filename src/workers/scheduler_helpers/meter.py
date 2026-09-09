@@ -28,36 +28,38 @@ def _flush_skip_trace_meter_outbox_impl() -> None:
     from src.workers.tracerfy_ingest import report_skip_trace_meter_event
 
     with system_sync_session() as db:
-        # Only rows whose OWNER has a Stripe customer id. A user without one
-        # cannot be sent a MeterEvent, and report_skip_trace_meter_event no
-        # longer writes the row off for that reason, so without this join every
-        # such row would be re-enqueued every three minutes forever. The join is
-        # a HOLD, not a write-off: the moment the user checks out and
-        # stripe_customer_id lands, the row is picked up on the next sweep and
-        # billed. Joining `users` rather than reading the row's own snapshot is
-        # the whole point, because the snapshot is what was stale.
+        # `disposition = 'pending'` and nothing else.
+        #
+        # This used to join `users` and require a stripe_customer_id, which was
+        # THE P1: create_checkout writes that id when the checkout SESSION is
+        # created, before payment, so merely starting checkout released a user's
+        # entire pre-subscription backlog. It also could not distinguish "not
+        # sent yet" from "decided not billable", because both were reported_at
+        # IS NULL.
+        #
+        # The sweep no longer decides anything. It re-enqueues pending rows and
+        # the task applies assert_billable at report time — one rule, one place.
+        # A row this sweep picks up may well come back non_billable, and that is
+        # the correct outcome, not a wasted pass.
         rows = db.execute(
             text("""
                 SELECT e.id
                 FROM skip_trace_meter_events e
-                JOIN users u ON u.id = e.user_id
-                WHERE e.reported_at IS NULL
+                WHERE e.disposition = 'pending'
                   AND e.created_at < NOW() - INTERVAL '30 seconds'
-                  AND u.stripe_customer_id IS NOT NULL
-                  AND u.stripe_customer_id <> ''
             """)
         ).fetchall()
         # Held rows are invisible otherwise. Nothing else in the system says
         # "there is real usage here that nobody can be charged for", and the
         # write-off this replaced at least had the virtue of being loud once.
+        # What a human still has to decide. `needs_review` only: non_billable
+        # has already been decided, and alerting on a settled decision every
+        # three minutes is how an alert becomes noise nobody reads.
         held = db.execute(
             text("""
                 SELECT COUNT(*), COALESCE(SUM(e.billable_units), 0)
                 FROM skip_trace_meter_events e
-                JOIN users u ON u.id = e.user_id
-                WHERE e.reported_at IS NULL
-                  AND e.created_at < NOW() - INTERVAL '1 hour'
-                  AND (u.stripe_customer_id IS NULL OR u.stripe_customer_id = '')
+                WHERE e.disposition = 'needs_review'
             """)
         ).fetchone()
 
@@ -82,8 +84,8 @@ def _flush_skip_trace_meter_outbox_impl() -> None:
     held_rows, held_units = (held[0], held[1]) if held else (0, 0)
     if held_rows:
         _logger.warning(
-            "Skip-trace meter outbox: %d event(s) totalling %d billable unit(s) "
-            "are held because their owner has no Stripe customer id",
+            "Skip-trace meter outbox: %d event(s) totalling %d unit(s) need a "
+            "human decision before they can be billed",
             held_rows, held_units,
         )
         try:
@@ -95,11 +97,15 @@ def _flush_skip_trace_meter_outbox_impl() -> None:
                 subject="Skip-trace usage that cannot be billed",
                 body=(
                     f"{held_rows} skip-trace meter event(s) totalling "
-                    f"{held_units} billable unit(s) are waiting on a Stripe "
-                    "customer id. The usage is real and the rows are kept, not "
-                    "written off: they bill automatically once the account "
-                    "checks out. If these accounts are never going to "
-                    "subscribe, the usage is a cost with no revenue against it."
+                    f"{held_units} unit(s) are marked needs_review: the usage "
+                    "is real, but no billing agreement covered it that we can "
+                    "charge against automatically — most often because the "
+                    "usage is older than Stripe's 35-day backdating limit. "
+                    "These do NOT bill on their own, deliberately. Sending them "
+                    "with today's date would charge a customer for usage at a "
+                    "rate and in a period they never agreed to. Query "
+                    "skip_trace_meter_events WHERE disposition = 'needs_review' "
+                    "and settle or write them off explicitly."
                 ),
             )
         except Exception as exc:  # noqa: BLE001 - alerting must never break the beat

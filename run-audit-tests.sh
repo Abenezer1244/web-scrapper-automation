@@ -27,5 +27,16 @@ export STRIPE_PRICE_BUSINESS="price_test_business_monthly"
 export STRIPE_PRICE_BUSINESS_ANNUAL="price_test_business_annual"
 export STRIPE_PRICE_AGENCY="price_test_agency_monthly"
 export STRIPE_PRICE_AGENCY_ANNUAL="price_test_agency_annual"
+# The METERED skip-trace prices, for the same reason as the plan prices above:
+# _configured_metered_price_ids() returns an empty set without them, and the
+# billing-eligibility rule then refuses everything with
+# "no_metered_price_configured" BEFORE reaching the rule a test meant to
+# exercise — so the suite goes green while testing nothing.
+export STRIPE_PRICE_SKIP_TRACE_PRO="price_test_st_pro_m"
+export STRIPE_PRICE_SKIP_TRACE_PRO_ANNUAL="price_test_st_pro_y"
+export STRIPE_PRICE_SKIP_TRACE_BUSINESS_OVERAGE="price_test_st_biz_m"
+export STRIPE_PRICE_SKIP_TRACE_BUSINESS_ANNUAL="price_test_st_biz_y"
+export STRIPE_PRICE_SKIP_TRACE_AGENCY_OVERAGE="price_test_st_agy_m"
+export STRIPE_PRICE_SKIP_TRACE_AGENCY_ANNUAL="price_test_st_agy_y"
 export ENVIRONMENT="test"
 exec python -m pytest -q -p no:cacheprovider -o addopts="" "$@"

@@ -69,7 +69,9 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
 
     from src.api.billing.skip_trace_usage import (
         _MissingCustomerError,
+        _NotBillableError,
         _StripeNotConfiguredError,
+        assert_billable,
         report_meter_event_to_stripe,
     )
     from src.db.models import SkipTraceMeterEvent
@@ -101,13 +103,39 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
             if customer_id:
                 row.stripe_customer_id = customer_id
 
-        # _StripeNotConfiguredError is terminal (Stripe is off): stamp
-        # reported_at so the row stops being swept. _MissingCustomerError is
-        # NOT: the usage is real and billable, and the user simply has no
-        # customer id yet. Leaving reported_at NULL keeps the row claimable.
-        # The sweep skips it until a customer id exists, so this is a hold, not
-        # a retry loop. Transient Stripe failures still propagate to autoretry,
-        # and the stable identifier inside makes any retry idempotent.
+        # THE eligibility gate, and the only one. Both paths that fire a meter
+        # event — the inline enqueue after ingest and the beat sweep — come
+        # through this task, and report_meter_event_to_stripe has exactly one
+        # caller (here), so this is a single choke point rather than a rule
+        # duplicated into the sweep's SQL where the two copies could drift.
+        # It is re-evaluated at REPORT time, not at enqueue time: a row can sit
+        # in the queue while the subscription behind it changes.
+        try:
+            assert_billable(customer_id, row.usage_at)
+        except _NotBillableError as refusal:
+            # Kept, never written off. The usage is real; what is missing is a
+            # billing agreement that covered it. Recording WHY on the row is the
+            # point — "why was this never billed" has to be answerable from the
+            # database a month later, not from a log line nobody kept.
+            row.disposition = (
+                "needs_review"
+                if refusal.reason in ("timestamp_expired", "usage_at_unknown")
+                else "non_billable"
+            )
+            row.disposition_at = datetime.now(UTC)
+            row.disposition_reason = refusal.reason
+            db.commit()
+            _logger.warning(
+                "Skip-trace meter outbox %s: NOT billable (%s) — %d unit(s) "
+                "recorded as %s, not reported and not written off",
+                outbox_id, refusal.reason, row.billable_units, row.disposition,
+            )
+            return {"outbox_id": outbox_id, "not_billable": refusal.reason}
+
+        # _StripeNotConfiguredError is terminal (Stripe is off). _MissingCustomerError
+        # is not reachable any more — assert_billable refuses a missing customer
+        # id above — but the handler stays: it is the safety net if that ordering
+        # is ever changed, and it must NOT settle the row.
         try:
             report_meter_event_to_stripe(
                 user_id=str(row.user_id),
@@ -115,12 +143,9 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
                 billable_units=row.billable_units,
                 stripe_customer_id=customer_id,
                 plan=row.plan or "",
+                usage_at=row.usage_at,
             )
         except _MissingCustomerError:
-            # Nothing to commit here: this branch is only reachable when the
-            # re-resolution above found nothing, so the row is unchanged. The
-            # session is discarded and reported_at stays NULL, which is the
-            # whole point.
             _logger.warning(
                 "Skip-trace meter outbox %s: user has no Stripe customer id; "
                 "holding %d billable unit(s), NOT written off",
@@ -129,12 +154,20 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
             return {"outbox_id": outbox_id, "held": "no_customer_id"}
         except _StripeNotConfiguredError as exc:
             _logger.warning(
-                "Skip-trace meter outbox %s: terminal no-op (%s), marking "
-                "reported to stop the sweep",
+                "Skip-trace meter outbox %s: terminal no-op (%s), settling the "
+                "row so the sweep stops — NOT a billing fact",
                 outbox_id, exc,
             )
+            row.disposition = "non_billable"
+            row.disposition_reason = "stripe_not_configured"
+            row.disposition_at = datetime.now(UTC)
+            row.reported_at = datetime.now(UTC)
+            db.commit()
+            return {"outbox_id": outbox_id, "not_billable": "stripe_not_configured"}
 
         row.reported_at = datetime.now(UTC)
+        row.disposition = "reported"
+        row.disposition_at = row.reported_at
         db.commit()
 
     return {"outbox_id": outbox_id, "reported": True}

@@ -1129,6 +1129,30 @@ def run_scrape_job(self, job_id: str) -> None:
                         },
                     )
                 return
+        else:
+            # Every OTHER record type collapses its same-run siblings here.
+            # dedup_hash is the app-wide BILLING key, but the cross-job scan only
+            # records that a hash was CLAIMED once — it leaves same-JOB rows
+            # sharing a hash all is_duplicate=false, and billing counts ROWS. So
+            # a run that scraped two filings on one property charged for both.
+            #
+            # trustee_sale has collapsed its own siblings since 2026-07-03 (with
+            # an auction-aware survivor rule, hence the branch). Nothing else
+            # did: an audit on 2026-09-08 found 8 completed probate and
+            # pre_foreclosure jobs that had charged 50 records for properties
+            # already billed in the same run, including a 122-record job that
+            # covered 120 properties. Runs BEFORE billing, in the same
+            # transaction, so the charge reflects the collapse.
+            from src.workers.tasks_helpers.dedup import collapse_same_run_siblings
+            _collapsed = collapse_same_run_siblings(db, job_id, job.user_id)
+            if _collapsed:
+                dup_count += _collapsed
+                _publish_log(
+                    r, job_id, "info",
+                    f"Combined {_collapsed} record(s) already covered by another "
+                    "record in this run — you are charged once per property.",
+                    db=db,
+                )
 
         # ── EXPORT ────────────────────────────────────────────────────────────
         from src.api.schemas import DeliverConfigDict
@@ -1545,6 +1569,34 @@ def run_scrape_job(self, job_id: str) -> None:
                         ).fetchall()
                     ]
                     if _capped_ids:
+                        # A capped row's SAME-RUN siblings must inherit the
+                        # exclusion (Codex P1). The cap ranks non-duplicates only,
+                        # so a sibling collapsed by collapse_same_run_siblings is
+                        # invisible here — and lists and the batch combined export
+                        # deliberately KEEP duplicates. Without this, a property
+                        # whose survivor was excluded for quota would still be
+                        # delivered through its sibling, unpaid, while the claim
+                        # release below frees the hash for yet another charge.
+                        db.execute(
+                            sa_text(
+                                "UPDATE results sib SET enrichment_data = "
+                                "  (CASE WHEN jsonb_typeof(COALESCE(sib.enrichment_data, '{}')::jsonb) = 'object' "
+                                "        THEN COALESCE(sib.enrichment_data, '{}')::jsonb "
+                                "        ELSE '{}'::jsonb END "
+                                "   || jsonb_build_object(:key, :reason))::json "
+                                "FROM results capped "
+                                "WHERE capped.id = ANY(CAST(:ids AS uuid[])) "
+                                "  AND capped.user_id = CAST(:uid AS uuid) "
+                                "  AND sib.job_id = :jid "
+                                "  AND sib.user_id = CAST(:uid AS uuid) "
+                                "  AND sib.dedup_hash = capped.dedup_hash "
+                                "  AND sib.dedup_hash IS NOT NULL "
+                                "  AND sib.duplicate_reason = 'same_run'"
+                            ),
+                            {"ids": _capped_ids, "uid": str(job.user_id),
+                             "jid": job_id, "key": DELIVERY_EXCLUDED_KEY,
+                             "reason": OVER_QUOTA},
+                        )
                         # Release the dedup claims of rows we are NOT delivering,
                         # so a later run (or next month's quota) can still deliver
                         # them. Keeping the claim would make the lead permanently

@@ -71,7 +71,6 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
         _MissingCustomerError,
         _NotBillableError,
         _StripeNotConfiguredError,
-        assert_billable,
         report_meter_event_to_stripe,
     )
     from src.db.models import SkipTraceMeterEvent
@@ -129,44 +128,12 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
         # duplicated into the sweep's SQL where the two copies could drift.
         # It is re-evaluated at REPORT time, not at enqueue time: a row can sit
         # in the queue while the subscription behind it changes.
-        # The gate itself now lives inside report_meter_event_to_stripe, bound
-        # to the exact customer and timestamp it sends. This call stays because
-        # the DISPOSITION has to be decided before we try, and because a refusal
-        # here costs one Stripe read where a refusal after the send would be too
-        # late. The sender re-checks; the two cannot disagree because they ask
-        # the same function the same question.
-        try:
-            assert_billable(customer_id, row.usage_at)
-        except _NotBillableError as refusal:
-            # Kept, never written off. The usage is real; what is missing is a
-            # billing agreement that covered it. Recording WHY on the row is the
-            # point — "why was this never billed" has to be answerable from the
-            # database a month later, not from a log line nobody kept.
-            # needs_review means "a human has to decide", NOT "we decided no".
-            # closed_billing_period belongs here: the customer DID owe this and
-            # a renewal simply closed the window we could bill it in, so
-            # settling it non_billable would quietly discard real revenue.
-            # non_billable is a WRITE-OFF and only two refusals are certain
-            # enough to earn one: the customer has no Stripe customer at all,
-            # or has never held a subscription of any status. Everything else
-            # — a closed period, a cancelled subscription, a replaced metered
-            # item, usage we cannot place in time — is uncertainty, and
-            # uncertainty goes to a human. Discarding revenue silently is the
-            # same class of error as charging for something never agreed.
-            row.disposition = (
-                "non_billable"
-                if refusal.reason in ("no_customer_id", "no_subscription_ever")
-                else "needs_review"
-            )
-            row.disposition_at = datetime.now(UTC)
-            row.disposition_reason = refusal.reason
-            db.commit()
-            _logger.warning(
-                "Skip-trace meter outbox %s: NOT billable (%s) — %d unit(s) "
-                "recorded as %s, not reported and not written off",
-                outbox_id, refusal.reason, row.billable_units, row.disposition,
-            )
-            return {"outbox_id": outbox_id, "not_billable": refusal.reason}
+        # NO pre-check here. The gate runs inside report_meter_event_to_stripe,
+        # bound to the exact customer id and usage_at it sends, and calling it
+        # here as well meant TWO Stripe subscription listings for every single
+        # report — the same question asked twice, one of them thrown away
+        # (Codex). The refusal is caught below instead, which is where the
+        # disposition is written.
 
         # _StripeNotConfiguredError is terminal (Stripe is off). _MissingCustomerError
         # is not reachable any more — assert_billable refuses a missing customer
@@ -182,21 +149,41 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
                 usage_at=row.usage_at,
             )
         except _NotBillableError as refusal:
-            # The sender runs the gate again against what it is actually about
-            # to send. Reaching here means the two evaluations disagreed —
-            # a subscription that changed in the gap, or a bug — and either way
-            # a refusal is an answer, not a transient failure. Without this it
-            # would escape into autoretry_for=(Exception,) and retry a permanent
-            # refusal with backoff forever.
-            row.disposition = "needs_review"
+            # THE refusal path. The gate lives inside the sender, so this is
+            # where a "no" arrives and where the answer is written down.
+            #
+            # Kept, never written off. The usage is real; what is missing is a
+            # billing agreement that covered it. Recording WHY on the row is the
+            # point — "why was this never billed" has to be answerable from the
+            # database a month later, not from a log line nobody kept.
+            # needs_review means "a human has to decide", NOT "we decided no".
+            # closed_billing_period belongs there: the customer DID owe it and a
+            # renewal simply closed the window we could bill it in, so settling
+            # non_billable would quietly discard real revenue.
+            #
+            # non_billable is a WRITE-OFF, and only two refusals are certain
+            # enough to earn one: the customer has no Stripe customer at all, or
+            # has never held a subscription of any status. Everything else — a
+            # closed period, a cancelled subscription, a replaced metered item,
+            # usage we cannot place in time — is uncertainty, and uncertainty
+            # goes to a human. Discarding revenue silently is the same class of
+            # error as charging for something never agreed.
+            #
+            # It also has to be caught: _NotBillableError is not in the sender's
+            # terminal set, so without this it escapes into
+            # autoretry_for=(Exception,) and retries a permanent refusal forever.
+            row.disposition = (
+                "non_billable"
+                if refusal.reason in ("no_customer_id", "no_subscription_ever")
+                else "needs_review"
+            )
             row.disposition_at = datetime.now(UTC)
             row.disposition_reason = refusal.reason
             db.commit()
-            _logger.error(
-                "Skip-trace meter outbox %s: the SENDER refused (%s) after the "
-                "gate passed — these two disagreeing is a bug, not a billing "
-                "outcome; %d unit(s) held for review",
-                outbox_id, refusal.reason, row.billable_units,
+            _logger.warning(
+                "Skip-trace meter outbox %s: NOT billable (%s) — %d unit(s) "
+                "recorded as %s, not reported and not written off",
+                outbox_id, refusal.reason, row.billable_units, row.disposition,
             )
             return {"outbox_id": outbox_id, "not_billable": refusal.reason}
         except _MissingCustomerError:

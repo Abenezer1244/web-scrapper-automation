@@ -716,11 +716,20 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
             # its full detail; the ops alert surfaces it and a human allocates it
             # against the window it belongs to.
             counted_from = result.get("counted_window_start")
-            outside_counted_window = (
-                usage_at is not None
-                and counted_from is not None
-                and usage_at < counted_from
-            )
+            if usage_at is None:
+                # Left to the gate, which refuses it as usage_at_unknown. That
+                # is the more accurate reason than anything about windows, and
+                # the row reaches a human either way.
+                outside_counted_window = False
+            else:
+                # A MISSING window is held too, not waved through. It means we
+                # could not establish which window the count was made against,
+                # and "we do not know" has to fail the same way "we know it is
+                # the wrong one" does — otherwise the one case nobody can
+                # reason about is the one that bills automatically (Codex).
+                outside_counted_window = (
+                    counted_from is None or usage_at < counted_from
+                )
             db.execute(
                 pg_insert(SkipTraceMeterEvent)
                 .values(

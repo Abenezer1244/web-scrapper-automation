@@ -1,5 +1,6 @@
 """Stripe billing routes: checkout, portal, webhooks, plans, usage."""
 
+import asyncio
 from datetime import UTC, datetime
 
 import stripe
@@ -1154,6 +1155,55 @@ def _plan_change_items(sub: dict, new_price: str, new_plan: str, new_interval: s
     return items
 
 
+def _mark_stranded_metered_usage(user_id: str, period_start: int) -> int:
+    """Move this period's REPORTED meter events to needs_review. Own transaction.
+
+    Runs on an independent session, and that is not incidental. The obvious
+    thing — issuing this on the request's session and committing — would commit
+    the REQUEST's transaction, and the checkout/plan-change guard is held by
+    `pg_advisory_xact_lock`, which is transaction-scoped. Committing to make the
+    marking durable would therefore release the lock while the plan change is
+    still in flight and let a concurrent checkout through the guard, trading a
+    lost-revenue bug for a duplicate-subscription one.
+
+    So it gets its own connection: durable on its own, and the caller's
+    transaction (and its lock) are untouched. `system_sync_session` because this
+    is deliberately a system-level write; the tenant is pinned explicitly in the
+    predicate below rather than by an RLS GUC.
+
+    Off the event loop via asyncio.to_thread — it is a sync session inside an
+    async route, and a blocking call there stalls every other request.
+    """
+    from src.db.session import system_sync_session
+
+    with system_sync_session() as db:
+        rows = db.execute(
+            text("""
+                UPDATE skip_trace_meter_events
+                   SET disposition = 'needs_review',
+                       disposition_at = NOW(),
+                       disposition_reason = 'metered_item_replaced_before_invoice'
+                 WHERE user_id = CAST(:uid AS uuid)
+                   AND disposition = 'reported'
+                   AND (
+                         (usage_at IS NOT NULL
+                          AND usage_at >= to_timestamp(:period_start))
+                         -- Rows written before migration 093 carry no usage_at
+                         -- at all. They were still reported and are still
+                         -- stranded by the delete, so they are placed by the
+                         -- outbox write time instead: it is at or after the
+                         -- usage, which over-includes rather than misses one.
+                      OR (usage_at IS NULL
+                          AND created_at >= to_timestamp(:period_start))
+                   )
+                RETURNING id
+            """),
+            {"uid": user_id, "period_start": period_start},
+        ).fetchall()
+        db.commit()
+        return len(rows)
+
+
 def _no_subscription_conflict() -> HTTPException:
     """409 for a plan change on an account that has no subscription yet."""
     return HTTPException(
@@ -1276,6 +1326,15 @@ async def change_plan(
                 },
             )
 
+        # Shape FIRST, then the same-plan shortcut. The other way round, a
+        # subscription carrying two licensed items or an unrecognised price
+        # answered "you are already on that plan" and nobody ever heard about
+        # it, because the only thing that inspects the shape is
+        # _plan_change_items and the shortcut returned before reaching it
+        # (Codex). A malformed subscription is worth saying out loud even when
+        # the caller is asking for nothing.
+        items = _plan_change_items(sub, stripe_price_id, new_plan, new_interval)
+
         current_price = _plan_item_price_id((sub.get("items") or {}).get("data") or [])
         if current_price == stripe_price_id:
             # Not an error, and deliberately not a Stripe call: modifying a
@@ -1285,8 +1344,6 @@ async def change_plan(
                 "plan": new_plan,
                 "message": "You are already on that plan.",
             }
-
-        items = _plan_change_items(sub, stripe_price_id, new_plan, new_interval)
 
         current_interval = (_PRICE_TO_PLAN.get(current_price) or (None, None, None))[2]
         interval_changed = current_interval != new_interval
@@ -1307,6 +1364,40 @@ async def change_plan(
             # skip-trace entitlement window keys off.
             modify_kwargs["billing_cycle_anchor"] = "now"
 
+        # Usage already REPORTED against a metered item we are about to delete
+        # will never be invoiced: Stripe does not carry a deleted subscription
+        # item's usage onto the invoice. Our rows still say `reported`, which
+        # reads as "on its way to an invoice", so without this the money is
+        # silently uncollectable with nothing pointing at it.
+        #
+        # Deleting is still right — keeping the item re-rates this period's
+        # earlier lookups at the new price — so the usage is HANDED OVER rather
+        # than abandoned: needs_review, where the ops alert names it and the
+        # settle script recovers it on an invoice.
+        #
+        # BEFORE the Stripe call, and that ordering is the whole point. Written
+        # afterwards it was not retry-safe: if this UPDATE or the request's
+        # commit failed after Stripe had already changed the subscription, the
+        # rows stayed `reported` and a retry took the same-plan shortcut and
+        # never came back to them (Codex). Marking first can only over-flag —
+        # if Stripe then refuses, some rows sit in review that did not need to,
+        # and a human releases them. That is the survivable direction; the other
+        # one loses revenue with no record that it existed.
+        if any(i.get("deleted") for i in items):
+            period_start = sub.get("current_period_start")
+            if period_start is not None:
+                n_stranded = await asyncio.to_thread(
+                    _mark_stranded_metered_usage, str(user.id), int(period_start),
+                )
+                if n_stranded:
+                    _logger.warning(
+                        "change-plan: user %s has %d reported skip-trace meter "
+                        "event(s) against the metered item about to be replaced. "
+                        "Stripe will not invoice them; moved to needs_review for "
+                        "manual recovery BEFORE the subscription is modified.",
+                        user.id, n_stranded,
+                    )
+
         try:
             updated = stripe.Subscription.modify(sub["id"], **modify_kwargs)
         except Exception as exc:  # noqa: BLE001 — surfaced, never swallowed
@@ -1323,48 +1414,6 @@ async def change_plan(
             "change-plan: user %s %s -> %s on subscription %s (interval_changed=%s)",
             user.id, current_price, stripe_price_id, sub["id"], interval_changed,
         )
-
-        # Usage already REPORTED against a metered item we just deleted will
-        # never be invoiced.
-        #
-        # Stripe does not carry a deleted subscription item's usage onto the
-        # invoice, so every MeterEvent we sent for this period against the old
-        # item is now unbillable — while our own rows still say `reported`, which
-        # reads as "this is on its way to an invoice" and would leave the money
-        # silently uncollected with nothing pointing at it (Codex).
-        #
-        # Deleting was still the right call: keeping the item would re-rate this
-        # period's earlier lookups at the new plan's price. So the usage is not
-        # abandoned, it is HANDED OVER — moved to needs_review so the ops alert
-        # names it and a human recovers it on an invoice with the settle script.
-        #
-        # Scoped to the period being left and to rows that were actually sent.
-        if any(i.get("deleted") for i in items):
-            period_start = sub.get("current_period_start")
-            if period_start is not None:
-                stranded = await db.execute(
-                    text("""
-                        UPDATE skip_trace_meter_events
-                           SET disposition = 'needs_review',
-                               disposition_at = NOW(),
-                               disposition_reason = 'metered_item_replaced_before_invoice'
-                         WHERE user_id = :uid
-                           AND disposition = 'reported'
-                           AND usage_at IS NOT NULL
-                           AND usage_at >= to_timestamp(:period_start)
-                        RETURNING id
-                    """),
-                    {"uid": str(user.id), "period_start": period_start},
-                )
-                n_stranded = len(stranded.fetchall())
-                if n_stranded:
-                    _logger.warning(
-                        "change-plan: user %s had %d reported skip-trace meter "
-                        "event(s) against the metered item just replaced. Stripe "
-                        "will not invoice them; moved to needs_review for manual "
-                        "recovery.",
-                        user.id, n_stranded,
-                    )
 
         # users.plan is NOT written here. customer.subscription.updated is the
         # single writer for it, so the plan the app enforces always reflects what

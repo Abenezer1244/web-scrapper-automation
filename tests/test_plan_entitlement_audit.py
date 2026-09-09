@@ -2716,3 +2716,139 @@ def test_an_incomplete_subscription_is_not_modified_underneath_its_payment():
     src = inspect.getsource(b.change_plan)
     assert '"incomplete"' in src
     assert "subscription_incomplete" in src
+# ─── The re-gate findings, pinned ────────────────────────────────────────────
+
+
+def test_the_gate_is_asked_once_per_report(monkeypatch):
+    """Two calls meant two Stripe subscription listings for every report.
+
+    The gate briefly lived in BOTH the worker and the sender: the worker asked
+    to decide the disposition, then the sender asked again to authorise the
+    send. Same question, same answer, one of them thrown away, and Stripe billed
+    for the round trip either way. The sender owns it now, and the worker reads
+    the refusal it raises.
+    """
+    import inspect
+
+    from src.workers import tracerfy_ingest as ti
+
+    src = inspect.getsource(ti.report_skip_trace_meter_event)
+    assert "assert_billable(" not in src, (
+        "the worker must not re-ask the gate; the sender runs it on the exact "
+        "arguments it sends"
+    )
+    # ...and the refusal must still be turned into a disposition here, or the
+    # rule would run with nobody writing down the answer.
+    assert "_NotBillableError as refusal" in src
+    assert '"no_customer_id", "no_subscription_ever"' in src, (
+        "only those two refusals may be written off; everything else is "
+        "uncertainty and goes to a human"
+    )
+
+
+def test_stranded_usage_is_recorded_before_stripe_is_called():
+    """Ordering is the whole fix, so ordering is what gets asserted.
+
+    Written after the modify, it was not retry-safe: if the UPDATE or the
+    request commit failed once Stripe had already swapped the item, the rows
+    stayed `reported` and a retry took the same-plan shortcut and never came
+    back. Marking first can only over-flag, and a human releases those.
+    """
+    import inspect
+
+    from src.api.routes import billing as b
+
+    src = inspect.getsource(b.change_plan)
+    mark = src.index("_mark_stranded_metered_usage")
+    modify = src.index("stripe.Subscription.modify")
+    assert mark < modify, (
+        "the stranded-usage marking must be durable BEFORE the subscription is "
+        "modified; afterwards a failure loses the revenue with no record"
+    )
+
+
+def test_the_stranded_marking_does_not_release_the_checkout_lock():
+    """Committing on the request session would have unlocked the guard.
+
+    The plan-change guard is pg_advisory_xact_lock, which is TRANSACTION scoped.
+    Committing the request's transaction to make the marking durable would
+    release it mid-flight and let a concurrent checkout through — trading a
+    lost-revenue bug for a duplicate-subscription one.
+    """
+    import inspect
+
+    from src.api.routes import billing as b
+
+    helper = inspect.getsource(b._mark_stranded_metered_usage)
+    assert "system_sync_session" in helper, (
+        "the marking needs its own connection so the caller's lock survives"
+    )
+    change = inspect.getsource(b.change_plan)
+    assert "asyncio.to_thread" in change, (
+        "a sync session in an async route must not run on the event loop"
+    )
+    assert "await db.commit()" not in change, (
+        "committing the request transaction releases the advisory lock"
+    )
+
+
+def test_a_malformed_subscription_is_reported_even_when_nothing_changes():
+    """The shape check must run before the same-plan shortcut.
+
+    The other way round, a subscription carrying two licensed items answered
+    "you are already on that plan" and the malformation was never surfaced,
+    because the only thing that inspects the shape is _plan_change_items and the
+    shortcut returned before reaching it.
+    """
+    import inspect
+
+    from src.api.routes import billing as b
+
+    src = inspect.getsource(b.change_plan)
+    validate = src.index("_plan_change_items(")
+    shortcut = src.index('"status": "unchanged"')
+    assert validate < shortcut, (
+        "validate the subscription shape before returning 'unchanged', or a "
+        "malformed subscription is silently accepted"
+    )
+
+
+def test_two_licensed_items_are_refused_not_sampled():
+    """The behaviour behind the ordering test above."""
+    b = _billing()
+    pro_m = b.settings.STRIPE_PRICE_PRO
+    biz_m = b.settings.STRIPE_PRICE_BUSINESS
+
+    sub = _sub_items(pro_m, biz_m)  # two licensed items
+    with pytest.raises(b._UnrecognisedSubscriptionError):
+        b._plan_change_items(sub, biz_m, "business", "month")
+
+
+def test_an_unknown_price_on_the_subscription_is_refused():
+    """Something we do not sell is on there. Proceeding leaves the customer on
+    a subscription nobody chose."""
+    b = _billing()
+    pro_m = b.settings.STRIPE_PRICE_PRO
+    biz_m = b.settings.STRIPE_PRICE_BUSINESS
+
+    sub = _sub_items(pro_m, "price_mystery")
+    with pytest.raises(b._UnrecognisedSubscriptionError):
+        b._plan_change_items(sub, biz_m, "business", "month")
+
+
+def test_usage_is_held_when_the_counted_window_cannot_be_established():
+    """"We do not know which window this was counted against" must fail closed.
+
+    billable_units is a function of one specific entitlement window's counter.
+    If that window is unknown, the quantity cannot be defended, and the case
+    nobody can reason about must not be the one that bills automatically.
+    """
+    import inspect
+
+    from src.api.billing import skip_trace_usage as st
+
+    src = inspect.getsource(st.report_usage_from_webhook)
+    assert "counted_from is None or usage_at < counted_from" in src, (
+        "a missing counted window must hold the row, not wave it through"
+    )
+    assert "usage_outside_counted_window" in src

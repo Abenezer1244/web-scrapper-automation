@@ -1119,3 +1119,238 @@ def test_on_failure_is_attempt_scoped_skips_requeued_attempt():
         row = db.get(Job, job_id)
         assert row.status == "scraping"  # live newer attempt untouched
         assert row.error_message is None
+
+
+# ─── Job liveness: the 2026-09-09 stranded-scrape incident (job 9c8b7259) ────
+# A Railway worker redeploy stopped the container ~13s into a scrape. A container
+# stop raises no Python exception, so Task.on_failure never ran and the row stayed
+# 'scraping' with no error and no finished_at. Recovery is owned by the watchdog,
+# whose fast branch keys on last_heartbeat_at — which was permanently NULL because
+# the HeartbeatThread had been disabled since the 2026-06-18 pool-deadlock
+# rollback. The job therefore showed as running for the full 70-minute fallback.
+# These tests pin the three things that fix and keep fixing that.
+
+def test_heartbeat_writes_on_the_isolated_engine_and_never_the_work_pool():
+    """The heartbeat MUST NOT touch the worker's pool_size=2 work engine.
+
+    Sharing that pool is what deadlocked every scrape at the insert phase on
+    2026-06-18 and got the heartbeat disabled for months, which in turn left
+    last_heartbeat_at NULL and the watchdog's fast branch dead.
+
+    Asserting the engine's poolclass alone would still pass if _write_heartbeat
+    were switched back to system_sync_session (Codex), so this OBSERVES which
+    engine actually serves the write, via connection events on both.
+    """
+    from sqlalchemy import event
+    from sqlalchemy.pool import NullPool
+
+    from src.db.session import heartbeat_engine, sync_engine
+    from src.workers.tasks_helpers.status import _HB_ALIVE, _write_heartbeat
+
+    assert heartbeat_engine is not sync_engine
+    assert isinstance(heartbeat_engine.pool, NullPool)
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        started = datetime.now(UTC) - timedelta(minutes=3)
+        job = _create_stuck_job(db, user.id, config.id, minutes_ago=3)
+        job.started_at = started
+        job_id = job.id
+        db.commit()
+
+    seen = {"heartbeat": 0, "work": 0}
+
+    def _on_hb(*_a, **_kw):
+        seen["heartbeat"] += 1
+
+    def _on_work(*_a, **_kw):
+        seen["work"] += 1
+
+    event.listen(heartbeat_engine, "connect", _on_hb)
+    event.listen(sync_engine, "connect", _on_work)
+    try:
+        # Drain the work pool so a fresh checkout there would have to CONNECT,
+        # making an accidental use of it observable rather than pool-cached.
+        sync_engine.dispose()
+        seen["heartbeat"] = seen["work"] = 0
+        assert _write_heartbeat(job_id, started) == _HB_ALIVE
+    finally:
+        event.remove(heartbeat_engine, "connect", _on_hb)
+        event.remove(sync_engine, "connect", _on_work)
+
+    assert seen["heartbeat"] >= 1, "the heartbeat did not use its own engine"
+    assert seen["work"] == 0, "the heartbeat opened a connection on the WORK engine"
+
+    with SyncSessionLocal() as db:
+        assert db.get(Job, job_id).last_heartbeat_at is not None
+
+
+def test_run_scrape_job_still_starts_the_heartbeat():
+    """The heartbeat start was disabled by COMMENTING IT OUT for three months and
+    nothing failed: last_heartbeat_at just went NULL everywhere and the watchdog
+    silently lost its 15-minute branch. A behavioural test cannot reach that call
+    (it sits deep inside a task needing Redis and a browser), so pin the one thing
+    that actually regressed: it must be live code, not a comment."""
+    import inspect
+
+    from src.workers.tasks import run_scrape_job
+
+    body = inspect.getsource(run_scrape_job.__wrapped__)
+    live = [
+        ln for ln in body.splitlines()
+        if "_hb.start(" in ln and not ln.strip().startswith("#")
+    ]
+    assert live, "run_scrape_job no longer starts the HeartbeatThread"
+
+
+def test_production_claim_stamps_a_fresh_heartbeat_and_is_at_most_once():
+    """The retry-storm guard, asserted against the PRODUCTION claim helper.
+
+    run_scrape_job calls claim_job_for_attempt; a test that re-typed the UPDATE
+    would stay green if the heartbeat stamp were deleted from the real claim
+    (Codex), so this calls the same function the worker calls.
+    """
+    from src.workers.tasks_helpers.status import claim_job_for_attempt
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="pending",
+            trigger="manual",
+            retry_count=1,
+            # Worst case: a stale stamp survived onto a pending row.
+            last_heartbeat_at=datetime.now(UTC) - timedelta(minutes=45),
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    with SyncSessionLocal() as db:
+        claimed_at = claim_job_for_attempt(db, job_id)
+    assert claimed_at is not None                         # first delivery wins
+
+    with SyncSessionLocal() as db:
+        assert claim_job_for_attempt(db, job_id) is None  # duplicate claims nothing
+
+    with SyncSessionLocal() as db:
+        row = db.get(Job, job_id)
+        assert row.status == "queued"
+        assert row.started_at is not None
+        # The stale 45-minute-old stamp must be GONE, replaced by this attempt's.
+        assert row.last_heartbeat_at is not None
+        assert row.last_heartbeat_at >= row.started_at - timedelta(seconds=1)
+        assert row.last_heartbeat_at > datetime.now(UTC) - timedelta(minutes=1)
+
+
+def test_a_freshly_claimed_attempt_survives_the_next_watchdog_tick():
+    """End to end: a job re-queued carrying a dead attempt's stale heartbeat, then
+    re-claimed, must NOT be re-queued again by the very next watchdog sweep.
+    Without the claim-time stamp this burns the retry budget until a healthy job
+    is permanently failed."""
+    from src.workers.scheduler import watchdog_stuck_jobs
+    from src.workers.tasks_helpers.status import claim_job_for_attempt
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = Job(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            scraper_config_id=config.id,
+            status="pending",
+            trigger="manual",
+            retry_count=1,
+            last_heartbeat_at=datetime.now(UTC) - timedelta(minutes=45),
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+
+    with SyncSessionLocal() as db:
+        assert claim_job_for_attempt(db, job_id) is not None
+
+    watchdog_stuck_jobs()
+
+    with SyncSessionLocal() as db:
+        row = db.get(Job, job_id)
+        assert row.status == "queued"     # still owned by the live attempt
+        assert row.retry_count == 1       # no retry burned
+
+
+def test_watchdog_requeue_clears_the_dead_attempts_heartbeat():
+    """A re-queued job is 'pending' and owned by nobody, so it must carry NO
+    liveness stamp from the attempt that died.
+
+    Leaving the dead attempt's last_heartbeat_at in place is a lie about a worker
+    that is gone, and it is what would let the NEXT attempt inherit an already
+    stale value.
+    """
+    from src.workers.scheduler import watchdog_stuck_jobs
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = _create_stuck_job(db, user.id, config.id, minutes_ago=30)
+        job.last_heartbeat_at = datetime.now(UTC) - timedelta(minutes=20)  # stale
+        job_id = job.id
+        db.commit()
+
+    watchdog_stuck_jobs()
+
+    with SyncSessionLocal() as db:
+        refreshed = db.get(Job, job_id)
+        assert refreshed.status == "pending"
+        assert refreshed.retry_count == 1
+        assert refreshed.last_heartbeat_at is None
+
+
+def test_transient_retry_reset_clears_the_heartbeat_and_keeps_billing_safe():
+    """_retry_scrape_job hands the row back as a clean, un-started, un-beaten
+    'pending' attempt, and refuses outright once billing has been applied."""
+    from src.workers.tasks_helpers.status import _retry_scrape_job
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        started = datetime.now(UTC) - timedelta(minutes=1)
+        job = _create_stuck_job(db, user.id, config.id, minutes_ago=1)
+        job.started_at = started
+        job.last_heartbeat_at = datetime.now(UTC)
+        job.page_current, job.page_total, job.record_count = 1, 2, 38
+        job_id = job.id
+        db.commit()
+
+        countdown = _retry_scrape_job(
+            db, job, job_id, started, max_retries=2, backoffs=(300, 1200),
+        )
+        assert countdown is not None
+        assert 300 <= countdown <= 360  # base + bounded jitter
+
+    with SyncSessionLocal() as db:
+        refreshed = db.get(Job, job_id)
+        assert refreshed.status == "pending"
+        assert refreshed.retry_count == 1
+        assert refreshed.started_at is None
+        assert refreshed.last_heartbeat_at is None
+        assert (refreshed.page_current, refreshed.page_total, refreshed.record_count) == (0, 0, 0)
+
+    # Once billing has landed, a transient retry must never re-queue the job.
+    with SyncSessionLocal() as db:
+        job = db.get(Job, job_id)
+        billed_started = datetime.now(UTC)
+        job.status = "enriching"
+        job.started_at = billed_started
+        job.billing_applied_at = datetime.now(UTC)
+        job.billed_count = 38
+        db.commit()
+        assert _retry_scrape_job(
+            db, job, job_id, billed_started, max_retries=2, backoffs=(300, 1200),
+        ) is None
+
+    with SyncSessionLocal() as db:
+        assert db.get(Job, job_id).retry_count == 1  # unchanged, no extra retry

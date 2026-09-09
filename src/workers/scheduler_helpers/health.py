@@ -2,7 +2,12 @@
 
 from datetime import UTC, datetime, timedelta
 
-from src.config.constants import STUCK_CHECK_STATUSES
+from src.config.constants import (
+    HEARTBEAT_STALE_MINUTES,
+    STUCK_CHECK_STATUSES,
+    STUCK_STARTED_AT_FALLBACK_MINUTES,
+    ZOMBIE_UNSTARTED_MINUTES,
+)
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("worker.scheduler")
@@ -71,18 +76,18 @@ def _watchdog_stuck_jobs_impl() -> None:
     # gone (process hard-killed by Celery's time_limit, OOM, crash, broker loss).
     # Comfortably above the longest single bounded blocking unit (30s GIS chunk,
     # 240s assessor cap) so a slow-but-alive step can't trip it.
-    heartbeat_cutoff = now - timedelta(minutes=15)
+    heartbeat_cutoff = now - timedelta(minutes=HEARTBEAT_STALE_MINUTES)
     # Fallback for NULL-heartbeat jobs only (pre-deploy / not-yet-beat): keep the
     # conservative > Celery-hard-limit (65min) cutoff so a LIVE long job is never
     # declared stuck while still running.
-    stuck_cutoff = now - timedelta(minutes=70)
+    stuck_cutoff = now - timedelta(minutes=STUCK_STARTED_AT_FALLBACK_MINUTES)
     # A job stuck in 'queued' state with started_at=NULL is a zombie
     # — the worker died before it could mark the job started. The
     # old predicate `Job.started_at < stuck_cutoff` returned NULL
     # for those rows and Postgres filtered them OUT, so they were
     # invisible to the watchdog forever. H8 from the full-SaaS
     # review: catch them via a separate "queued forever" branch.
-    queued_cutoff = now - timedelta(minutes=10)
+    queued_cutoff = now - timedelta(minutes=ZOMBIE_UNSTARTED_MINUTES)
 
     with system_sync_session() as db:
         stuck_jobs = db.execute(
@@ -183,6 +188,15 @@ def _watchdog_stuck_jobs_impl() -> None:
                 job.retry_count += 1
                 job.status = "pending"
                 job.started_at = None
+                # Clear the DEAD attempt's liveness stamp. A re-queued row is
+                # 'pending' and owned by nobody, so a leftover last_heartbeat_at
+                # is a lie about a worker that is gone. Leaving it set also let the
+                # next attempt inherit an already-stale value and be re-queued on
+                # the following tick, before its own heartbeat thread had written
+                # anything — a retry storm that burns the budget and fails a healthy
+                # job (Codex). run_scrape_job's claim CAS stamps a fresh
+                # last_heartbeat_at too; both layers are deliberate.
+                job.last_heartbeat_at = None
                 # M12 (full-SaaS review): also reset the progress
                 # counters so the UI doesn't show nonsense like
                 # "Page 3 of 5" after a job was re-queued from

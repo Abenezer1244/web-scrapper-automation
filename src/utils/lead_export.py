@@ -522,12 +522,41 @@ def write_lead_csv(
 # preferring the stronger signal (death > nonprobate > tod > unknown). References
 # the `lead_subtype` column selected in each query's candidates CTE; goes in the agg
 # CTE. NULL when the bucket has no probate row -> exported blank.
+# The single source of the subtype preference order. The SQL below is BUILT from
+# it, and the same-run sibling collapse (workers/tasks_helpers/dedup.py) elects a
+# survivor's subtype by reading it directly — so a combined export and a collapsed
+# per-job row can never disagree about which of two filings' subtypes wins. They
+# were two hand-written copies of the same CASE ladder until 2026-09-08; a change
+# to one would silently have left the other behind (Codex).
+PROBATE_SUBTYPE_PRIORITY: tuple[str, ...] = (
+    "probate_death_inheritance",
+    "nonprobate_transfer",
+    "tod_living_owner_estate_planning",
+)
+
+
+def probate_subtype_rank(subtype: str | None) -> int:
+    """Position of ``subtype`` in PROBATE_SUBTYPE_PRIORITY; unknown/blank sorts last.
+
+    Mirrors the CASE ladder in PROBATE_SUBTYPE_AGG_SQL exactly — both read the
+    same tuple, so 1-based ranks line up with the SQL's 1/2/3/ELSE 4.
+    """
+    value = (subtype or "").strip()
+    if not value:
+        return len(PROBATE_SUBTYPE_PRIORITY) + 1
+    try:
+        return PROBATE_SUBTYPE_PRIORITY.index(value) + 1
+    except ValueError:
+        return len(PROBATE_SUBTYPE_PRIORITY) + 1
+
+
 PROBATE_SUBTYPE_AGG_SQL: str = (
     "(array_agg(lead_subtype ORDER BY CASE lead_subtype "
-    "WHEN 'probate_death_inheritance' THEN 1 "
-    "WHEN 'nonprobate_transfer' THEN 2 "
-    "WHEN 'tod_living_owner_estate_planning' THEN 3 "
-    "ELSE 4 END) "
+    + " ".join(
+        f"WHEN '{_sub}' THEN {_i}"
+        for _i, _sub in enumerate(PROBATE_SUBTYPE_PRIORITY, start=1)
+    )
+    + f" ELSE {len(PROBATE_SUBTYPE_PRIORITY) + 1} END) "
     "FILTER (WHERE lead_subtype IS NOT NULL AND lead_subtype <> ''))[1] AS lead_subtype"
 )
 

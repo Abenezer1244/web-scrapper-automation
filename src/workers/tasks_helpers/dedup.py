@@ -7,7 +7,7 @@ to the originals in tasks.py.
 
 import time
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import text as sa_text
@@ -320,8 +320,285 @@ def release_capped_dedup_claims(db, user_id: str, job_id: str, capped_ids: list[
 
 # ─── Same-run sibling collapse (all record types) ──────────────────────────────
 
+# Every column the grouping, the ranking and the source-field merge read. ONE
+# list so the collapse and the reconciliation cannot select different shapes and
+# then rank the same rows differently.
+_GROUP_COLUMNS = (
+    "id, dedup_hash, parcel_id, property_address, mailing_address, "
+    "party_name, date_recorded, heirs, legal_description, enrichment_data, "
+    "auction_date"
+)
+
+
+def _usable(v) -> bool:
+    """True when a value is a real, deliverable string rather than blank or the
+    '(enrichment unavailable)' placeholder."""
+    from src.api.lead_actionability import ADDRESS_PLACEHOLDER
+
+    v = (v or "").strip()
+    return bool(v) and v != ADDRESS_PLACEHOLDER
+
+
+def survivor_sort_key(row: dict) -> tuple:
+    """Ordering that decides which row of a property group survives. Lowest wins.
+
+      1. ACTIONABLE first. A row whose only address is blank or the
+         '(enrichment unavailable)' placeholder is not deliverable anywhere the
+         customer looks, and keeping it would hide the usable sibling while the
+         property stayed claimed (Codex P2).
+      2. then most complete: mailing address, parcel, party name.
+      3. then oldest by (date_recorded, id), so a re-run picks the same winner
+         and the delivered set does not shrink on every pass.
+
+    ONE function so the first collapse and the post-enrichment reconciliation
+    cannot rank differently. A reconciliation that disagreed with the collapse
+    would swap the survivor back and forth on every retry.
+
+    It reads ONLY address/parcel/name/date/id. It deliberately does NOT read
+    ``heirs``, ``legal_description`` or ``enrichment_data`` -- exactly the fields
+    _merged_survivor_fields writes ONTO the winner. If a merged field ever became
+    a ranking input, a retry would rank on values the previous pass merged in and
+    the election would stop being idempotent (Codex). A test pins this.
+    """
+    return (
+        not (_usable(row.get("property_address")) or _usable(row.get("mailing_address"))),
+        not _usable(row.get("mailing_address")),
+        not (row.get("parcel_id") or "").strip(),
+        not (row.get("party_name") or "").strip(),
+        (row.get("date_recorded") or ""),
+        str(row.get("id")),
+    )
+
+
+def auction_survivor_sort_key(row: dict) -> tuple:
+    """Ordering for trustee_sale groups: soonest auction wins, stable by id.
+
+    Auction Leads keeps the most URGENT notice rather than the most complete row
+    -- a product decision from 2026-07-03. Lives here beside survivor_sort_key so
+    finalize_trustee_sale_job and the reconciliation read the same definition;
+    they were separate before, and the reconciliation re-ranked trustee_sale
+    groups by actionability, quietly replacing the soonest-auction survivor with
+    a later one (Codex).
+    """
+    return (row.get("auction_date") or date.max, str(row.get("id")))
+
+
+def sort_key_for(record_type):
+    """The survivor ranking THIS record type collapses by.
+
+    The reconciliation must re-order a group by the same rule that formed it. Any
+    other key would not be re-electing the group's survivor, it would be
+    overriding the collapse's product rule after the fact.
+    """
+    if (record_type or "").strip().lower() == "trustee_sale":
+        return auction_survivor_sort_key
+    return survivor_sort_key
+
+
+# Record types whose ``heirs`` column holds a LIST of names. Everything else
+# stores a single SECONDARY PARTY there -- divorce keeps the OTHER SPOUSE in it
+# (src/scrapers/divorce.py) -- and unioning two filings' values would invent a
+# multi-party string no source ever asserted. Two filings on one property can
+# also REVERSE which party is primary, which is why the union additionally drops
+# the survivor's own party_name (Codex). An unknown record_type falls back to
+# fill-only, the conservative side.
+HEIR_LIST_RECORD_TYPES: frozenset = frozenset({"probate"})
+
+
+def _as_dict(value) -> dict:
+    """enrichment_data as a dict. The column is JSON, and a raw text() SELECT can
+    hand back a dict, a JSON string, or None depending on the driver path."""
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        import json
+
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _merge_heirs(survivor: dict, members: list[dict], record_type) -> str | None:
+    """Deduplicated union of the group's ``heirs``, or None when it does not apply.
+
+    Returns None only when the union DOES NOT APPLY (not an heir-list record
+    type); an applicable union that comes out empty returns "". The caller needs
+    that distinction: treating an empty union as "does not apply" sent it down
+    the fill-only path, which copied back the very name the exclusion below had
+    just removed (Codex).
+
+    Only for record types where heirs is a name LIST; every other type gets
+    fill-only, handled by the caller. Names equal to the SURVIVOR's own
+    party_name are dropped: on a reversed-party filing the sibling's heirs field
+    holds the survivor's own party, and splicing it in would assert that the
+    survivor is their own heir (Codex).
+    """
+    if (record_type or "").strip().lower() not in HEIR_LIST_RECORD_TYPES:
+        return None
+    own = (survivor.get("party_name") or "").strip().casefold()
+    merged: list[str] = []
+    seen: set = set()
+    for member in [survivor] + [m for m in members if m is not survivor]:
+        for name in (member.get("heirs") or "").split(","):
+            name = name.strip()
+            key = name.casefold()
+            if not name or key in seen or (own and key == own):
+                continue
+            seen.add(key)
+            merged.append(name)
+    return ", ".join(merged)
+
+
+def _merged_survivor_fields(survivor: dict, members: list[dict], record_type) -> dict:
+    """Column updates carrying the group's source-only facts onto the winner.
+
+    The collapse marked a loser and stopped, so anything the loser ALONE carried
+    -- the only heir on a later filing, the only legal description -- left the
+    per-job export with it. Ranking never looked at these fields, so nothing was
+    weighing them when the winner was chosen (Codex P2).
+
+    Deliberately narrow, an ALLOWLIST rather than a blacklist (Codex):
+
+    - ``heirs``: union for heir-list record types (see _merge_heirs), otherwise
+      fill-only.
+    - ``legal_description``: FILL-ONLY, never overwritten. Two filings can carry
+      two genuinely different legals, and concatenating them would present one
+      invented string as the property's authoritative description.
+    - ``lead_subtype`` inside enrichment_data: elected by the SAME priority order
+      the combined export aggregates with, read from the one shared constant so
+      the two cannot drift.
+    - EVERY OTHER enrichment_data key is left alone. Copying keys individually
+      across two filings manufactures an object no single source ever produced (a
+      billed_amount from one filing beside a paid_amount from another), and the
+      blob also carries per-ROW state such as the plan-cap exclusion key, which
+      must never travel to a different row.
+
+    Losers keep their own values -- nothing is deleted, so a later swap re-merges
+    from the same set and lands on the same answer.
+    """
+    from src.utils.lead_export import probate_subtype_rank
+
+    updates: dict = {}
+    others = [m for m in members if m is not survivor]
+
+    heirs = _merge_heirs(survivor, members, record_type)
+    if heirs is not None:
+        # An empty union CLEARS the column rather than leaving it: the only way
+        # to get here with a value already present is that every name in it was
+        # the survivor's own party, which is not an heir relationship.
+        if heirs != (survivor.get("heirs") or ""):
+            updates["heirs"] = heirs or None
+    elif not (survivor.get("heirs") or "").strip():
+        for member in others:
+            candidate = (member.get("heirs") or "").strip()
+            if candidate:
+                updates["heirs"] = candidate
+                break
+
+    if not (survivor.get("legal_description") or "").strip():
+        for member in others:
+            candidate = (member.get("legal_description") or "").strip()
+            if candidate:
+                updates["legal_description"] = candidate
+                break
+
+    best = None
+    best_rank = None
+    for member in members:
+        subtype = (_as_dict(member.get("enrichment_data")).get("lead_subtype") or "").strip()
+        if not subtype:
+            continue
+        rank = probate_subtype_rank(subtype)
+        if best_rank is None or rank < best_rank:
+            best, best_rank = subtype, rank
+    if best:
+        current = _as_dict(survivor.get("enrichment_data"))
+        if (current.get("lead_subtype") or "").strip() != best:
+            current["lead_subtype"] = best
+            updates["enrichment_data"] = current
+
+    return updates
+
+
+def _apply_survivor_merge(db, user_id, survivor_id, updates: dict) -> None:
+    """Write _merged_survivor_fields' output. Does NOT commit; the caller's
+    transaction owns the write, exactly like the flag updates beside it."""
+    if not updates:
+        return
+    import json
+
+    sets = []
+    params = {"rid": str(survivor_id), "uid": str(user_id)}
+    for column, value in updates.items():
+        if column == "enrichment_data":
+            sets.append("enrichment_data = CAST(:enrichment_data AS json)")
+            params["enrichment_data"] = json.dumps(value)
+        else:
+            sets.append(f"{column} = :{column}")
+            params[column] = value
+    db.execute(
+        sa_text(
+            f"UPDATE results SET {', '.join(sets)} "
+            "WHERE id = CAST(:rid AS uuid) AND user_id = CAST(:uid AS uuid)"
+        ),
+        params,
+    )
+
+
+def _repoint_claim_anchor(db, user_id, dedup_hash: str, survivor_id, loser_ids: list) -> int:
+    """Point this hash's delivered_records claim at the row that SURVIVED.
+
+    The cross-job dedup writes ``first_result_id`` from whichever row PostgreSQL
+    reached first inside the batched ``INSERT ... ON CONFLICT DO NOTHING``; the
+    collapse elects its survivor by actionability. Nothing coordinated the two,
+    so the claim could name a row the collapse then flagged is_duplicate (Codex).
+
+    That is not only the "claims naming a row that is itself flagged
+    is_duplicate" invariant. ``_reuse_enrichment_for_duplicates`` joins
+    ``results ro ON ro.id = dr.first_result_id`` and copies address plus settled
+    skip-trace PII FROM that row, so an anchor left on a collapsed loser makes
+    the reuse source a row the run deliberately suppressed.
+
+    Only moves an anchor that is one of THIS group's losers, so a claim owned by
+    an earlier run is never touched. Returns the number of claims repointed.
+    """
+    if not loser_ids:
+        return 0
+    result = db.execute(
+        sa_text(
+            "UPDATE delivered_records SET first_result_id = CAST(:sid AS uuid) "
+            "WHERE user_id = CAST(:uid AS uuid) "
+            "  AND dedup_hash = :hash "
+            "  AND first_result_id = ANY(CAST(:losers AS uuid[]))"
+        ),
+        {
+            "sid": str(survivor_id),
+            "uid": str(user_id),
+            "hash": dedup_hash,
+            "losers": [str(i) for i in loser_ids],
+        },
+    )
+    return result.rowcount or 0
+
+
 def _collapse_loser_ids(rows: list[dict]) -> list:
-    """Ids to mark duplicate so each PROPERTY keeps ONE row. Pure, so the rule is
+    """Ids to mark duplicate so each PROPERTY keeps ONE row.
+
+    Thin view over _collapse_groups, kept because the ids alone are what the
+    is_duplicate write needs and what the collapse tests assert on.
+    """
+    return [
+        loser.get("id")
+        for _survivor, losers in _collapse_groups(rows)
+        for loser in losers
+    ]
+
+
+def _collapse_groups(rows: list[dict]) -> list:
+    """``(survivor, losers)`` per PROPERTY group. Pure, so the rule is
     unit-testable without a database.
 
     Only groups rows whose dedup_hash came from the STRONG branch. That branch is
@@ -333,21 +610,9 @@ def _collapse_loser_ids(rows: list[dict]) -> list:
     rather than reimplemented in SQL, so the rule cannot drift from the one that
     produced the hash.
 
-    Survivor ranking, in order:
-      1. ACTIONABLE first. A row whose only address is blank or the
-         '(enrichment unavailable)' placeholder is not deliverable anywhere the
-         customer looks, and keeping it would hide the usable sibling while the
-         property stayed claimed (Codex P2).
-      2. then most complete: mailing address, parcel, party name.
-      3. then oldest by (date_recorded, id), so a re-run picks the same winner
-         and the delivered set does not shrink on every pass.
+    Survivors are ranked by survivor_sort_key -- see it for the order and for why
+    the merged source-only fields are deliberately absent from it.
     """
-    from src.api.lead_actionability import ADDRESS_PLACEHOLDER
-
-    def _usable(v) -> bool:
-        v = (v or "").strip()
-        return bool(v) and v != ADDRESS_PLACEHOLDER
-
     groups: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
         # Require the strong signature of the row's CURRENT parcel + address to
@@ -371,23 +636,16 @@ def _collapse_loser_ids(rows: list[dict]) -> list:
             continue
         groups[row.get("dedup_hash")].append(row)
 
-    losers: list = []
+    collapsed: list = []
     for grp in groups.values():
         if len(grp) <= 1:
             continue
-        ordered = sorted(grp, key=lambda r: (
-            not (_usable(r.get("property_address")) or _usable(r.get("mailing_address"))),
-            not _usable(r.get("mailing_address")),
-            not (r.get("parcel_id") or "").strip(),
-            not (r.get("party_name") or "").strip(),
-            (r.get("date_recorded") or ""),
-            str(r.get("id")),
-        ))
-        losers.extend(r.get("id") for r in ordered[1:])
-    return losers
+        ordered = sorted(grp, key=survivor_sort_key)
+        collapsed.append((ordered[0], ordered[1:]))
+    return collapsed
 
 
-def collapse_same_run_siblings(db, job_id: str, user_id) -> int:
+def collapse_same_run_siblings(db, job_id: str, user_id, record_type=None) -> int:
     """Collapse rows in ONE job that share a PROPERTY, so it bills once.
 
     ``dedup_hash`` (parcel|address) is the app-wide BILLING key. The cross-job
@@ -415,8 +673,7 @@ def collapse_same_run_siblings(db, job_id: str, user_id) -> int:
     """
     rows = db.execute(
         sa_text(
-            "SELECT id, dedup_hash, parcel_id, property_address, mailing_address, "
-            "       party_name, date_recorded "
+            f"SELECT {_GROUP_COLUMNS} "
             "FROM results "
             "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
             "  AND dedup_hash IS NOT NULL AND is_duplicate = false"
@@ -424,10 +681,11 @@ def collapse_same_run_siblings(db, job_id: str, user_id) -> int:
         {"jid": job_id, "uid": str(user_id)},
     ).fetchall()
 
-    losers = _collapse_loser_ids([dict(r._mapping) for r in rows])
-    if not losers:
+    groups = _collapse_groups([dict(r._mapping) for r in rows])
+    if not groups:
         return 0
 
+    losers = [loser.get("id") for _s, group_losers in groups for loser in group_losers]
     result = db.execute(
         sa_text(
             "UPDATE results SET is_duplicate = true, "
@@ -439,4 +697,128 @@ def collapse_same_run_siblings(db, job_id: str, user_id) -> int:
         ),
         {"ids": [str(i) for i in losers], "jid": job_id, "uid": str(user_id)},
     )
+
+    for survivor, group_losers in groups:
+        _apply_survivor_merge(
+            db,
+            user_id,
+            survivor.get("id"),
+            _merged_survivor_fields(survivor, [survivor] + group_losers, record_type),
+        )
+        _repoint_claim_anchor(
+            db,
+            user_id,
+            survivor.get("dedup_hash"),
+            survivor.get("id"),
+            [loser.get("id") for loser in group_losers],
+        )
+
     return result.rowcount or 0
+
+
+def reconcile_same_run_survivors(db, job_id: str, user_id, record_type=None) -> int:
+    """Re-elect each same-run group's survivor once enrichment has settled.
+
+    collapse_same_run_siblings runs BEFORE inline enrichment, because the export
+    and the billing count both need the collapse already applied. That means it
+    ranks on the addresses as SCRAPED. Two addressless rows sharing a strong
+    parcel hash are therefore separated by completeness alone -- and then the
+    Pierce legal-description repair can fill an address onto the row that lost.
+    The survivor stays undeliverable, the one actionable row is flagged
+    is_duplicate, and no retry ever revisits it because the collapse SELECT reads
+    ``is_duplicate = false`` (Codex P2).
+
+    So this runs AFTER enrichment and re-ranks what the collapse already grouped.
+
+    Membership is READ, never recomputed. Passing the rows back through
+    _collapse_groups would be wrong: enrichment rewrites property_address, so a
+    member can stop satisfying that function's hash-equality admission test and
+    simply vanish from its result -- and "not returned as a loser" is not the
+    same as "elected winner" (Codex). Grouping already happened under equality at
+    collapse time; this pass only re-orders the members it finds. Membership by
+    dedup_hash is stable because the hash is computed once at INSERT and never
+    recomputed.
+
+    A group must have EXACTLY ONE non-duplicate member. With k of them the
+    duplicate count would move by k-1 and billing with it, so a malformed group
+    is logged and skipped rather than "repaired" (Codex).
+
+    Rows are locked FOR UPDATE so two elections cannot race.
+
+    Returns the number of groups whose survivor actually changed. The per-group
+    duplicate count is invariant by construction -- exactly one survivor before,
+    exactly one after -- so the caller's dup_count and the charge do not move.
+    """
+    rows = db.execute(
+        sa_text(
+            f"SELECT {_GROUP_COLUMNS}, is_duplicate "
+            "FROM results "
+            "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
+            "  AND dedup_hash IS NOT NULL "
+            "  AND (is_duplicate = false OR (duplicate_reason = 'same_run' "
+            "       AND duplicate_source_job_id = :jid)) "
+            "ORDER BY id "
+            "FOR UPDATE"
+        ),
+        {"jid": job_id, "uid": str(user_id)},
+    ).fetchall()
+
+    groups: dict = defaultdict(list)
+    for row in rows:
+        groups[row.dedup_hash].append(dict(row._mapping))
+
+    swapped = 0
+    for dedup_hash, members in groups.items():
+        collapsed = [m for m in members if m.get("is_duplicate")]
+        if not collapsed:
+            continue  # nothing was collapsed here; the collapse pass owns it
+        standing = [m for m in members if not m.get("is_duplicate")]
+        if len(standing) != 1:
+            _logger.warning(
+                "Job %s: same-run group %s has %d standing rows (expected 1) — "
+                "skipped, not reconciled",
+                job_id, str(dedup_hash)[:12], len(standing),
+            )
+            continue
+
+        current = standing[0]
+        elected = sorted(members, key=sort_key_for(record_type))[0]
+
+        if elected.get("id") != current.get("id"):
+            db.execute(
+                sa_text(
+                    "UPDATE results SET is_duplicate = false, "
+                    "  duplicate_reason = NULL, "
+                    "  duplicate_source_job_id = NULL, "
+                    "  duplicate_source_at = NULL "
+                    "WHERE id = CAST(:rid AS uuid) AND user_id = CAST(:uid AS uuid)"
+                ),
+                {"rid": str(elected.get("id")), "uid": str(user_id)},
+            )
+            db.execute(
+                sa_text(
+                    "UPDATE results SET is_duplicate = true, "
+                    "  duplicate_reason = 'same_run', "
+                    "  duplicate_source_job_id = :jid, "
+                    "  duplicate_source_at = NULL "
+                    "WHERE id = CAST(:rid AS uuid) AND user_id = CAST(:uid AS uuid)"
+                ),
+                {"rid": str(current.get("id")), "jid": job_id, "uid": str(user_id)},
+            )
+            swapped += 1
+
+        _apply_survivor_merge(
+            db,
+            user_id,
+            elected.get("id"),
+            _merged_survivor_fields(elected, members, record_type),
+        )
+        _repoint_claim_anchor(
+            db,
+            user_id,
+            dedup_hash,
+            elected.get("id"),
+            [m.get("id") for m in members if m.get("id") != elected.get("id")],
+        )
+
+    return swapped

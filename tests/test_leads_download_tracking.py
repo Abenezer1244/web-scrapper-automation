@@ -508,3 +508,118 @@ async def test_the_batch_download_tracks_only_when_it_carried_rows(monkeypatch):
     assert carried.background is not None
     assert carried.background.func is mark_leads_downloaded
     assert carried.background.args == (str(run.user_id),)
+
+
+async def test_a_segment_export_with_rows_records_the_download(
+    client: AsyncClient,
+    db: AsyncSession,
+    starter_user: User,
+    starter_token: str,
+    scraper_config: ScraperConfig,
+):
+    """The positive half of the segment case, end to end through the route.
+
+    The empty-export test above proves a header-only file does NOT count. This
+    proves the other side actually fires: a Lists CSV with real leads in it is
+    leads in the user's hands, so it completes the activation milestone.
+    """
+    from src.db.models import Result
+
+    job = Job(
+        id=str(uuid.uuid4()),
+        user_id=starter_user.id,
+        scraper_config_id=scraper_config.id,
+        status="done",
+        trigger="manual",
+        record_count=1,
+        finished_at=datetime.now(UTC),
+        export_key="exports/segment.csv",
+    )
+    db.add(job)
+    await db.flush()
+    db.add(
+        Result(
+            id=str(uuid.uuid4()),
+            job_id=job.id,
+            user_id=starter_user.id,
+            party_name="DOE, JANE",
+            property_address="123 Main St, Tacoma, WA 98402",
+            is_duplicate=False,
+        )
+    )
+    await db.commit()
+    await db.refresh(starter_user)
+    assert starter_user.first_leads_downloaded_at is None
+
+    resp = await client.post(
+        "/segments/union/export",
+        headers={"Authorization": f"Bearer {starter_token}"},
+        json={"record_types": [scraper_config.record_type]},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.text.strip().splitlines()
+    assert len(body) > 1, f"expected a lead row, got only a header: {body}"
+
+    await db.refresh(starter_user)
+    assert starter_user.first_leads_downloaded_at is not None
+
+async def test_a_batch_download_with_rows_records_the_download(
+    db: AsyncSession, starter_user: User, scraper_config: ScraperConfig
+):
+    """The positive half of the batch case, with the REAL renderer.
+
+    No patched renderer: the run's child_job_ids point at a real job with a real
+    Result, so render_combined_csv builds the CSV from the database the way it
+    does in production. That matters because the thing being proved is that a
+    batch download which genuinely carried leads moves the milestone, and a
+    stubbed renderer would only prove the route forwards a number.
+
+    _stream_run_csv is the single path both batch download routes take, so this
+    covers /batches/<id>/download and the run-scoped one together.
+
+    `await resp.background()` is exactly how Starlette invokes it (its __call__
+    is an async method that awaits the func). It runs inline here rather than
+    after the response, which is the one thing this cannot reproduce.
+    """
+    from src.api.routes.batches import _stream_run_csv
+    from src.db.models import Result
+
+    job = Job(
+        id=str(uuid.uuid4()),
+        user_id=starter_user.id,
+        scraper_config_id=scraper_config.id,
+        status="done",
+        trigger="manual",
+        record_count=1,
+        finished_at=datetime.now(UTC),
+        export_key="exports/batch.csv",
+    )
+    db.add(job)
+    await db.flush()
+    db.add(
+        Result(
+            id=str(uuid.uuid4()),
+            job_id=job.id,
+            user_id=starter_user.id,
+            party_name="DOE, JANE",
+            property_address="123 Main St, Tacoma, WA 98402",
+            is_duplicate=False,
+        )
+    )
+    await db.commit()
+    await db.refresh(starter_user)
+    assert starter_user.first_leads_downloaded_at is None
+
+    run = SimpleNamespace(
+        id=str(uuid.uuid4()),
+        user_id=str(starter_user.id),
+        status="done",
+        child_job_ids=[str(job.id)],
+    )
+    resp = await _stream_run_csv(str(uuid.uuid4()), run, None, "everything")
+
+    assert resp.background is not None, "a batch export carrying a lead must track"
+    await resp.background()
+
+    await db.refresh(starter_user)
+    assert starter_user.first_leads_downloaded_at is not None

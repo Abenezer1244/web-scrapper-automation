@@ -555,6 +555,16 @@ async def test_a_segment_export_with_rows_records_the_download(
             is_duplicate=False,
         )
     )
+    # Overlap / intersection is a Business and Agency line and /segments now
+    # carries a router-level plan dependency, so Starter gets a 402 here and
+    # never reaches the question this test asks. The SUBJECT is "a Lists CSV
+    # with real leads in it completes the activation milestone", not the
+    # entitlement, so the plan is raised rather than the assertion weakened.
+    # Raised on the ROW, not by minting a new token: the gate reads the plan
+    # from the database, and the job and results above are owned by this user.
+    # The gate itself is pinned across every plan and endpoint by
+    # test_overlap_and_intersection_are_business_and_above.
+    starter_user.plan = "business"
     await db.commit()
     await db.refresh(starter_user)
     assert starter_user.first_leads_downloaded_at is None

@@ -1159,7 +1159,21 @@ def _plan_change_items(sub: dict, new_price: str, new_plan: str, new_interval: s
 # five concurrent plan changes would queue on it and surface a 30s timeout as an
 # unhandled 500 (Codex). Bounded here instead, well under that, so the failure
 # mode is a clean 503 that says "try again" rather than a stack trace.
-_STRANDED_MARK_SLOTS = asyncio.Semaphore(3)
+#
+# Created lazily, per running loop, rather than at import. A module-level
+# Semaphore binds to whichever loop first contends on it, and a process that
+# runs more than one loop over its lifetime — test clients, a loop restart —
+# then raises RuntimeError on a later acquire.
+_stranded_slots_by_loop: dict = {}
+
+
+def _stranded_mark_slots() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _stranded_slots_by_loop.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(3)
+        _stranded_slots_by_loop[loop] = sem
+    return sem
 
 
 def _mark_stranded_metered_usage(user_id: str, period_start: int) -> int:
@@ -1184,6 +1198,12 @@ def _mark_stranded_metered_usage(user_id: str, period_start: int) -> int:
     from src.db.session import system_sync_session
 
     with system_sync_session() as db:
+        # A REAL bound, on the database, which can stop the statement. This runs
+        # while the caller holds the plan-change advisory lock, so a statement
+        # that blocks here blocks that user's plan change; better to fail it and
+        # let the caller 503 than to sit on the connection.
+        db.execute(text("SET LOCAL lock_timeout = '5s'"))
+        db.execute(text("SET LOCAL statement_timeout = '15s'"))
         rows = db.execute(
             text("""
                 UPDATE skip_trace_meter_events
@@ -1394,13 +1414,20 @@ async def change_plan(
             period_start = sub.get("current_period_start")
             if period_start is not None:
                 try:
-                    async with asyncio.timeout(20):
-                        async with _STRANDED_MARK_SLOTS:
-                            n_stranded = await asyncio.to_thread(
-                                _mark_stranded_metered_usage,
-                                str(user.id), int(period_start),
-                            )
-                except Exception as exc:  # noqa: BLE001 — incl. the timeout above
+                    # No asyncio.timeout here, deliberately. It looked like a
+                    # bound and was not: to_thread cannot be cancelled, so a
+                    # timeout would stop us AWAITING the thread while the thread
+                    # kept running and committed anyway — after we had already
+                    # returned 503 — and would release the semaphore slot while
+                    # still holding the connection (Codex reproduced it). The
+                    # real bound is inside the session, on the database, where
+                    # it can actually stop the statement.
+                    async with _stranded_mark_slots():
+                        n_stranded = await asyncio.to_thread(
+                            _mark_stranded_metered_usage,
+                            str(user.id), int(period_start),
+                        )
+                except Exception as exc:  # noqa: BLE001
                     # This runs BEFORE Stripe, so failing here has changed
                     # nothing: no subscription was modified and no usage was
                     # marked. Refusing is therefore free, and proceeding is not

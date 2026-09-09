@@ -41,6 +41,42 @@ def _flush_skip_trace_meter_outbox_impl() -> None:
         # the task applies assert_billable at report time — one rule, one place.
         # A row this sweep picks up may well come back non_billable, and that is
         # the correct outcome, not a wasted pass.
+        # First, un-hold the ONE review reason that can stop being true.
+        #
+        # `no_customer_id` means "this user had no Stripe customer when we
+        # looked". That is mutable local state — it becomes false the moment
+        # they check out — so unlike every other review reason it does not need
+        # a human, it needs asking again. Left alone it was a one-way sink: the
+        # sweep only re-enqueues `pending`, so those rows sat in review forever
+        # and quietly underbilled usage that had become recoverable (Codex).
+        #
+        # Only rows whose owner NOW has a customer id are moved back, and they
+        # are moved to `pending`, NOT to billable: the full gate still runs and
+        # can refuse them again for any of its own reasons. Having a customer id
+        # is permission to re-ask the question, never an answer to it.
+        requeued = db.execute(
+            text("""
+                UPDATE skip_trace_meter_events e
+                   SET disposition = 'pending',
+                       disposition_at = NULL,
+                       disposition_reason = NULL
+                  FROM users u
+                 WHERE u.id = e.user_id
+                   AND e.disposition = 'needs_review'
+                   AND e.disposition_reason = 'no_customer_id'
+                   AND u.stripe_customer_id IS NOT NULL
+                   AND u.stripe_customer_id <> ''
+                RETURNING e.id
+            """)
+        ).fetchall()
+        if requeued:
+            db.commit()
+            _logger.info(
+                "Skip-trace meter sweep: %d row(s) held for a missing Stripe "
+                "customer now have one — re-queued for the gate to decide again",
+                len(requeued),
+            )
+
         rows = db.execute(
             text("""
                 SELECT e.id

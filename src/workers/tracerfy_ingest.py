@@ -105,10 +105,28 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
                 outbox_id,
             )
             return {"outbox_id": outbox_id, "skipped": "not_found"}
-        db.execute(
-            text("SELECT pg_advisory_xact_lock(4243, hashtext(:uid))"),
+        # TRY, not wait. The Stripe calls below happen inside this transaction,
+        # so whoever holds this lock holds it across a network round trip — and
+        # if that were this worker, a customer clicking Upgrade would sit behind
+        # a background meter report for as long as Stripe took (Codex).
+        #
+        # The asymmetry is deliberate: a plan change is a person waiting, and
+        # this is a background task with a sweep behind it every three minutes.
+        # So the worker yields. Failing to take the lock is not an error and
+        # nothing is written; the row stays `pending` and the next sweep picks
+        # it up once the transition has finished.
+        got_lock = db.execute(
+            text("SELECT pg_try_advisory_xact_lock(4243, hashtext(:uid))"),
             {"uid": lock_uid},
-        )
+        ).scalar()
+        if not got_lock:
+            _logger.info(
+                "Skip-trace meter outbox %s: a billing change is in progress for "
+                "this user — deferring to the next sweep rather than reporting "
+                "against a subscription that is being modified",
+                outbox_id,
+            )
+            return {"outbox_id": outbox_id, "deferred": "billing_change_in_progress"}
         # FOR UPDATE. Checking an unlocked read is not a claim: an operator can
         # commit `written_off_manual` in the gap between this check and the
         # Stripe call, and the worker would then bill the row and overwrite

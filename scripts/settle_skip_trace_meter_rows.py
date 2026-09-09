@@ -150,7 +150,11 @@ def main() -> int:
     a = ap.parse_args()
 
     with system_sync_session() as db:
-        if a.list or not (a.settle or a.writeoff or a.writeoff_user):
+        # EVERY action must appear here. --release did not, so it fell into
+        # list mode and printed the review queue while releasing nothing, and
+        # said so in a way that read like success. Codex found it by running it.
+        _ACTIONS = (a.settle, a.writeoff, a.writeoff_user, a.release, a.release_user)
+        if a.list or not any(_ACTIONS):
             rows = _rows(db, user_id=a.user)
             if not rows:
                 print("Nothing awaiting review.")

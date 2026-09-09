@@ -2880,13 +2880,28 @@ def test_the_meter_worker_takes_the_same_lock_as_the_plan_change():
     from src.workers import tracerfy_ingest as ti
 
     src = inspect.getsource(ti.report_skip_trace_meter_event)
-    assert "pg_advisory_xact_lock(4243" in src, (
-        "the worker must serialise against checkout and change-plan, which both "
-        "hold namespace 4243 for this same invariant"
+
+    # TRY, not wait. The Stripe calls happen inside this transaction, so
+    # whoever holds this lock holds it across a network round trip. If that
+    # were the worker, a customer clicking Upgrade would wait behind a
+    # background meter report for as long as Stripe took. A plan change is a
+    # person waiting; this is a background task with a sweep behind it.
+    assert "pg_try_advisory_xact_lock(4243" in src, (
+        "the worker must YIELD to a plan change, not block it"
+    )
+    assert "pg_advisory_xact_lock(4243" not in src.replace("pg_try_advisory_xact_lock", ""), (
+        "a blocking wait here puts a background task in front of a customer"
     )
     # Before the row is read, or it is not a barrier at all.
-    assert src.index("pg_advisory_xact_lock(4243") < src.index("with_for_update=True"), (
-        "the lock must be taken before the row is read"
+    assert src.index("pg_try_advisory_xact_lock(4243") < src.index("with_for_update=True"), (
+        "the lock must be taken before the row is read, so the worker never "
+        "waits on the lock while holding a row lock"
+    )
+    # Failing to get it must write NOTHING and leave the row for the sweep.
+    assert "billing_change_in_progress" in src
+    deferral = src.split("if not got_lock:")[1][:400]
+    assert "row.disposition" not in deferral, (
+        "deferring is not a decision; the row must stay pending"
     )
 
 
@@ -2959,6 +2974,25 @@ def test_the_stranded_marking_fails_the_plan_change_rather_than_skipping_it():
     assert "HTTP_503_SERVICE_UNAVAILABLE" in guard, (
         "a failure to record stranded usage must refuse the plan change"
     )
-    assert "_STRANDED_MARK_SLOTS" in src, (
+    assert "_stranded_mark_slots()" in src, (
         "the sync pool is small; unbounded use surfaces a timeout as a 500"
+    )
+    # asyncio.timeout around to_thread is not a bound: the thread cannot be
+    # cancelled, so it keeps running and commits after the 503 has been sent,
+    # while its semaphore slot is already released.
+    #
+    # Asserted against CODE only. The comment above the fix names the thing it
+    # removed, so a raw source search fails on the documentation rather than the
+    # implementation — the same overstated-assertion trap this file has already
+    # had to retire twice.
+    code_only = chr(10).join(
+        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "asyncio.timeout" not in code_only, (
+        "to_thread cannot be cancelled; bound the statement in the database "
+        "instead of pretending the await is a timeout"
+    )
+    helper = inspect.getsource(b._mark_stranded_metered_usage)
+    assert "statement_timeout" in helper and "lock_timeout" in helper, (
+        "the real bound belongs where it can stop the work"
     )

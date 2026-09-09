@@ -992,6 +992,19 @@
         "title": "CachedResultsPage",
         "type": "object"
       },
+      "ChangePlanRequest": {
+        "properties": {
+          "price_id": {
+            "title": "Price Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "price_id"
+        ],
+        "title": "ChangePlanRequest",
+        "type": "object"
+      },
       "CheckoutRequest": {
         "properties": {
           "price_id": {
@@ -5427,6 +5440,55 @@
           }
         ],
         "summary": "Activation Funnel",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/billing/change-plan": {
+      "post": {
+        "description": "Move an EXISTING subscriber to a different plan or billing interval.\n\nCheckout creates a subscription; this changes the one that already exists.\nThey are separate endpoints because they are separate operations, and\nconflating them is what produced the defect: create_checkout always built a\nsubscription-mode Session and nothing modified or cancelled the old one, so a\nmonthly subscriber buying annual ended up holding BOTH — two live\nobligations, and with the metered skip-trace item attached, two metered items\non one meter for one customer.\n\nNothing in here can create a subscription. If there is no live one to modify\nthis returns 409 and points at checkout, which is the endpoint that may.",
+        "operationId": "change_plan_billing_change_plan_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePlanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Change Plan Billing Change Plan Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Change Plan",
         "tags": [
           "billing"
         ]

@@ -2462,3 +2462,200 @@ def test_the_dispatcher_records_the_provider_time_it_computes():
     assert "trace_type, queue, adopted=True)" in inspect.getsource(d), (
         "the reconciler's adoption call must pass adopted=True"
     )
+# ─── Plan switching: one subscription, moved, never a second one ─────────────
+
+
+def _sub_items(*price_ids):
+    """A Stripe subscription shaped the way _plan_change_items reads one."""
+    return {
+        "id": "sub_live",
+        "status": "active",
+        "items": {
+            "data": [
+                {"id": f"si_{i}", "price": {"id": pid}}
+                for i, pid in enumerate(price_ids)
+            ]
+        },
+    }
+
+
+def _billing():
+    from src.api.routes import billing as b
+    return b
+
+
+def test_a_plan_change_moves_the_licensed_item_it_does_not_add_one():
+    """The defect, at its root: a switch must not leave two plan items.
+
+    create_checkout built a whole second subscription; the same mistake one
+    level down is adding a second licensed item beside the first. The array must
+    carry the EXISTING item id with a new price.
+    """
+    b = _billing()
+    pro_m = b.settings.STRIPE_PRICE_PRO
+    biz_m = b.settings.STRIPE_PRICE_BUSINESS
+
+    sub = _sub_items(pro_m)
+    items = b._plan_change_items(sub, biz_m, "business", "month")
+
+    licensed = [i for i in items if i.get("price") == biz_m]
+    assert len(licensed) == 1
+    assert licensed[0].get("id") == "si_0", (
+        "the licensed item must be re-priced by id, not added alongside the old one"
+    )
+
+
+def test_the_metered_item_is_replaced_not_repriced():
+    """Re-pricing in place would retroactively re-rate this period's lookups.
+
+    assert_billable refuses to bill usage against a metered item created AFTER
+    the usage happened — that is what stops a rate agreed today being applied to
+    last week. Updating an item keeps its id and its `created`, so an in-place
+    re-price produces an item that looks like it always carried the new rate and
+    the check silently passes. Delete plus add gives the new item a new
+    `created`, so pre-switch usage goes to a human instead.
+    """
+    b = _billing()
+    pro_m = b.settings.STRIPE_PRICE_PRO
+    biz_m = b.settings.STRIPE_PRICE_BUSINESS
+    st_pro_m = b.settings.STRIPE_PRICE_SKIP_TRACE_PRO
+    st_biz_m = b.settings.STRIPE_PRICE_SKIP_TRACE_BUSINESS_OVERAGE
+
+    sub = _sub_items(pro_m, st_pro_m)
+    items = b._plan_change_items(sub, biz_m, "business", "month")
+
+    # The old metered item is DELETED...
+    deleted = [i for i in items if i.get("deleted")]
+    assert [i["id"] for i in deleted] == ["si_1"]
+
+    # ...and the new one is ADDED with no id, so Stripe mints a fresh `created`.
+    added = [i for i in items if i.get("price") == st_biz_m]
+    assert len(added) == 1
+    assert "id" not in added[0], (
+        "carrying the old item id would preserve its `created` and re-rate "
+        "usage that predates this price"
+    )
+
+
+def test_a_monthly_to_annual_switch_moves_both_items_in_one_call():
+    """Stripe requires every item on a subscription to share one interval.
+
+    So the licensed and metered prices cannot move separately: a first call
+    leaving a monthly metered price beside an annual plan price is rejected, and
+    the customer is left mid-transition. One array, one modify.
+    """
+    b = _billing()
+    pro_m = b.settings.STRIPE_PRICE_PRO
+    pro_y = b.settings.STRIPE_PRICE_PRO_ANNUAL
+    st_pro_m = b.settings.STRIPE_PRICE_SKIP_TRACE_PRO
+    st_pro_y = b.settings.STRIPE_PRICE_SKIP_TRACE_PRO_ANNUAL
+
+    sub = _sub_items(pro_m, st_pro_m)
+    items = b._plan_change_items(sub, pro_y, "pro", "year")
+
+    prices = {i.get("price") for i in items if i.get("price")}
+    assert prices == {pro_y, st_pro_y}, (
+        "both the plan price and the metered price must move to the new interval"
+    )
+    assert any(i.get("deleted") for i in items), "the monthly metered item must go"
+
+
+def test_an_unprovisioned_metered_interval_removes_the_item_rather_than_mixing():
+    """No metered price for the target interval means no metered item.
+
+    Leaving the old one attached is the interval violation this function exists
+    to avoid, and it would also keep billing overage at a rate belonging to a
+    plan the customer has left.
+    """
+    b = _billing()
+    pro_m = b.settings.STRIPE_PRICE_PRO
+    pro_y = b.settings.STRIPE_PRICE_PRO_ANNUAL
+    st_pro_m = b.settings.STRIPE_PRICE_SKIP_TRACE_PRO
+
+    sub = _sub_items(pro_m, st_pro_m)
+    # Force "no metered price provisioned for the target".
+    import pytest as _pytest
+    mp = _pytest.MonkeyPatch()
+    try:
+        mp.setattr(b, "_metered_skip_trace_price", lambda plan, interval: None)
+        items = b._plan_change_items(sub, pro_y, "pro", "year")
+    finally:
+        mp.undo()
+
+    assert {"id": "si_1", "deleted": True} in items
+    assert not any(
+        i.get("price") and i["price"].startswith("price_test_st") for i in items
+    ), "no metered item may survive a move to an interval that has no price"
+
+
+def test_a_subscription_with_no_recognised_plan_price_is_refused():
+    """Guessing which item to re-price is worse than refusing.
+
+    Re-pricing an unidentified item, or adding a licensed item beside it, both
+    end with the customer on something nobody chose.
+    """
+    b = _billing()
+    sub = _sub_items("price_something_we_do_not_sell")
+    with pytest.raises(b._UnrecognisedSubscriptionError):
+        b._plan_change_items(sub, b.settings.STRIPE_PRICE_PRO, "pro", "month")
+
+
+def test_change_plan_can_never_create_a_subscription():
+    """The whole point of separating this from checkout.
+
+    If this endpoint can mint a Session or a Subscription, then the duplicate it
+    exists to prevent has simply moved to a new address.
+    """
+    import inspect
+
+    b = _billing()
+    src = inspect.getsource(b.change_plan)
+
+    for forbidden in ("Session.create", "Subscription.create", "Customer.create"):
+        assert forbidden not in src, (
+            f"change_plan must not call {forbidden}: it modifies the "
+            "subscription that exists and refuses when there is none"
+        )
+    assert "Subscription.modify" in src
+
+
+def test_change_plan_and_checkout_share_one_lock_namespace():
+    """Two locks would let the two endpoints interleave.
+
+    They guard one invariant between them — this customer has exactly one
+    subscription. A checkout and a plan change running concurrently under
+    different keys is exactly how the second subscription gets created while
+    both guards read "none".
+    """
+    import inspect
+
+    b = _billing()
+    assert "pg_advisory_xact_lock(4243" in inspect.getsource(b.change_plan)
+    assert "pg_advisory_xact_lock(4243" in inspect.getsource(b.create_checkout)
+
+
+def test_checkout_sends_an_existing_subscriber_to_the_change_plan_path():
+    """A refusal that names no next step is a dead end.
+
+    The portal cannot do it (subscription_update is disabled on the live
+    configuration), and checkout itself would create the duplicate.
+    """
+    b = _billing()
+    exc = b._subscription_conflict({"id": "sub_1", "status": "active"})
+    assert exc.status_code == 409
+    assert exc.detail["code"] == "subscription_exists"
+    assert exc.detail.get("action") == "change_plan"
+    assert "support" not in exc.detail["message"].lower(), (
+        "there is an endpoint for this now; support is not the next step"
+    )
+
+
+def test_an_incomplete_subscription_is_not_modified_underneath_its_payment():
+    """Stripe holds a first payment ~23h; changing the price mid-flight changes
+    what the customer is being charged after they have already authorised it."""
+    import inspect
+
+    b = _billing()
+    src = inspect.getsource(b.change_plan)
+    assert '"incomplete"' in src
+    assert "subscription_incomplete" in src

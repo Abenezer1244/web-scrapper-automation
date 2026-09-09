@@ -871,10 +871,10 @@ def _subscription_conflict(sub: dict) -> HTTPException:
     Sending them to support for a card that just needs retrying would lock them
     out of their own purchase for a day.
 
-    Everyone else is routed to support rather than the customer portal: the
-    live portal configuration has `subscription_update` DISABLED, so offering
-    the portal as the place to switch plans sends people somewhere that
-    genuinely cannot do it.
+    Everyone else is routed to /billing/change-plan, which modifies the
+    subscription they already have. NOT the customer portal: the live portal
+    configuration has `subscription_update` DISABLED, so offering it as the
+    place to switch plans sends people somewhere that genuinely cannot do it.
     """
     if sub.get("status") == "incomplete":
         return HTTPException(
@@ -893,9 +893,13 @@ def _subscription_conflict(sub: dict) -> HTTPException:
         detail={
             "code": "subscription_exists",
             "message": (
-                "You already have a subscription. Contact support to change "
-                "your plan or billing frequency."
+                "You already have a subscription. Change your plan or billing "
+                "frequency instead of starting a new one."
             ),
+            # The endpoint that CAN do this. Checkout only ever creates, so
+            # sending the caller back here would produce the second subscription
+            # this refusal exists to prevent.
+            "action": "change_plan",
         },
     )
 
@@ -1057,6 +1061,270 @@ async def create_checkout(
     except Exception:
         _logger.exception("Checkout failed for user %s", current_user.id)
         raise HTTPException(status_code=502, detail="Checkout temporarily unavailable")
+
+
+# ─── Plan switching: modify the subscription, never create a second ───────────
+
+
+class _UnrecognisedSubscriptionError(Exception):
+    """The live subscription does not carry a price this deployment sells."""
+
+
+def _plan_change_items(sub: dict, new_price: str, new_plan: str, new_interval: str) -> list[dict]:
+    """The `items` array that turns `sub` into the requested plan. Pure.
+
+    ONE array, ONE Subscription.modify call. Sequential calls would leave the
+    subscription briefly holding a monthly metered price beside an annual plan
+    price, and Stripe requires every item on a subscription to share a recurring
+    interval — the second call would be rejected and the customer left stranded
+    mid-transition, which is a worse state than either end of it.
+
+    The metered item is REPLACED (delete + add), never re-priced in place, on any
+    change of price. Updating an item keeps its id and its `created`, and
+    assert_billable uses exactly that field to refuse billing usage at a rate
+    agreed after the usage happened. Re-pricing in place would leave an item that
+    looks like it had always carried the new rate, so this period's earlier
+    lookups would be charged at it. Replacing gives the new item a new `created`,
+    so pre-switch usage fails that check and goes to needs_review instead.
+
+    That is a deliberate trade, not an oversight: a review-queue row costs a
+    conversation, a silent retroactive re-rate costs a customer money they never
+    agreed to pay.
+    """
+    items: list[dict] = []
+    # Every metered price this deployment knows about, derived from the same map
+    # _metered_skip_trace_price selects from. Read from that rather than
+    # importing the worker's copy so the item this identifies and the item that
+    # gets attached can never come from two different sources of truth.
+    metered_ids = {
+        pid
+        for by_interval in _SKIP_TRACE_METERED_PRICE.values()
+        for pid in by_interval.values()
+        if pid and pid.startswith("price_")
+    }
+
+    licensed_item = None
+    metered_item = None
+    for item in (sub.get("items") or {}).get("data") or []:
+        pid = ((item or {}).get("price") or {}).get("id")
+        if pid in _PRICE_TO_PLAN:
+            licensed_item = item
+        elif pid in metered_ids:
+            metered_item = item
+
+    if licensed_item is None:
+        # Nothing here maps to a plan we sell. Re-pricing an item we cannot
+        # identify, and adding a second licensed item beside it, are both worse
+        # than refusing and asking a human to look.
+        raise _UnrecognisedSubscriptionError(
+            "subscription carries no recognised plan price"
+        )
+
+    items.append({"id": licensed_item["id"], "price": new_price})
+
+    target_metered = _metered_skip_trace_price(new_plan, new_interval)
+    current_metered = ((metered_item or {}).get("price") or {}).get("id")
+
+    if current_metered != target_metered:
+        if metered_item is not None:
+            items.append({"id": metered_item["id"], "deleted": True})
+        if target_metered:
+            items.append({"price": target_metered})
+
+    return items
+
+
+def _no_subscription_conflict() -> HTTPException:
+    """409 for a plan change on an account that has no subscription yet."""
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "no_subscription",
+            "message": (
+                "You do not have a subscription to change yet. Choose a plan to "
+                "get started."
+            ),
+        },
+    )
+
+
+class ChangePlanRequest(BaseModel):
+    price_id: str
+
+
+@router.post("/change-plan")
+async def change_plan(
+    request: Request,
+    body: ChangePlanRequest,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_rls_db),
+) -> dict:
+    """Move an EXISTING subscriber to a different plan or billing interval.
+
+    Checkout creates a subscription; this changes the one that already exists.
+    They are separate endpoints because they are separate operations, and
+    conflating them is what produced the defect: create_checkout always built a
+    subscription-mode Session and nothing modified or cancelled the old one, so a
+    monthly subscriber buying annual ended up holding BOTH — two live
+    obligations, and with the metered skip-trace item attached, two metered items
+    on one meter for one customer.
+
+    Nothing in here can create a subscription. If there is no live one to modify
+    this returns 409 and points at checkout, which is the endpoint that may.
+    """
+    await rate_limit(request, zone="stripe", identifier=current_user.id)
+
+    _PRODUCT_TO_PRICE = {
+        settings.STRIPE_PRODUCT_PRO: settings.STRIPE_PRICE_PRO,
+        settings.STRIPE_PRODUCT_BUSINESS: settings.STRIPE_PRICE_BUSINESS,
+        settings.STRIPE_PRODUCT_AGENCY: settings.STRIPE_PRICE_AGENCY,
+    }
+    stripe_price_id = _PRODUCT_TO_PRICE.get(body.price_id, body.price_id)
+
+    if stripe_price_id not in _PRICE_TO_PLAN:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
+    if not stripe_price_id.startswith("price_"):
+        _logger.error(
+            "change-plan: resolved id %r is not a price id — STRIPE_PRICE_* is "
+            "misconfigured (check Railway env on api AND worker).",
+            stripe_price_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Billing is temporarily unavailable. Please try again later.",
+        )
+
+    new_plan, _limit, new_interval = _PRICE_TO_PLAN[stripe_price_id]
+
+    try:
+        # The SAME lock namespace as checkout (4243). Between them these two
+        # guard ONE invariant — this customer has exactly one subscription — so
+        # they must not run at once. A separate key here would let a checkout and
+        # a plan change interleave and produce the second subscription that both
+        # of them exist to prevent.
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(4243, hashtext(:uid))"),
+            {"uid": str(current_user.id)},
+        )
+
+        _row = await db.execute(select(User).where(User.id == current_user.id))
+        user = _row.scalar_one()
+
+        customer_id = user.stripe_customer_id
+        if not customer_id:
+            # No customer means no subscription. Deliberately NOT creating one:
+            # the purpose of this endpoint is to avoid a second subscription, and
+            # a customer minted here would be one more thing for the checkout
+            # guard to have to enumerate correctly.
+            raise _no_subscription_conflict()
+
+        # Read AFTER the lock. A checkout that won the race may have just created
+        # the subscription we are about to modify, and a pre-lock read misses it.
+        sub = _live_subscription(customer_id)
+        if sub is None:
+            raise _no_subscription_conflict()
+
+        if sub.get("status") == "incomplete":
+            # The first payment has not settled and Stripe still accepts it for
+            # about 23 hours. Modifying the subscription underneath an in-flight
+            # payment changes what the customer is being charged mid-transaction.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "subscription_incomplete",
+                    "message": (
+                        "Your subscription payment is incomplete. Complete that "
+                        "payment first, then change your plan."
+                    ),
+                },
+            )
+
+        current_price = _plan_item_price_id((sub.get("items") or {}).get("data") or [])
+        if current_price == stripe_price_id:
+            # Not an error, and deliberately not a Stripe call: modifying a
+            # subscription to what it already is can still write prorations.
+            return {
+                "status": "unchanged",
+                "plan": new_plan,
+                "message": "You are already on that plan.",
+            }
+
+        items = _plan_change_items(sub, stripe_price_id, new_plan, new_interval)
+
+        current_interval = (_PRICE_TO_PLAN.get(current_price) or (None, None, None))[2]
+        interval_changed = current_interval != new_interval
+
+        modify_kwargs: dict = {
+            "items": items,
+            # Credit the unused remainder of what they already paid for and charge
+            # the new plan pro rata. The alternative makes an upgrade free until
+            # the next invoice and a downgrade a donation.
+            "proration_behavior": "create_prorations",
+            "metadata": {"user_id": str(user.id), "price_id": body.price_id},
+        }
+        if interval_changed:
+            # A monthly-to-annual move cannot leave the old period running: the
+            # items recur yearly now, and the period they were billed in was
+            # monthly. Restarting the cycle makes that boundary explicit rather
+            # than leaving Stripe to infer one, and it is the boundary the
+            # skip-trace entitlement window keys off.
+            modify_kwargs["billing_cycle_anchor"] = "now"
+
+        try:
+            updated = stripe.Subscription.modify(sub["id"], **modify_kwargs)
+        except Exception as exc:  # noqa: BLE001 — surfaced, never swallowed
+            _logger.exception(
+                "change-plan: Stripe refused to modify subscription %s for user %s "
+                "(%s -> %s)", sub.get("id"), user.id, current_price, stripe_price_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Could not change your plan. Please try again or contact support.",
+            ) from exc
+
+        _logger.info(
+            "change-plan: user %s %s -> %s on subscription %s (interval_changed=%s)",
+            user.id, current_price, stripe_price_id, sub["id"], interval_changed,
+        )
+
+        # users.plan is NOT written here. customer.subscription.updated is the
+        # single writer for it, so the plan the app enforces always reflects what
+        # Stripe actually did rather than what we asked it to do. If the modify
+        # half-succeeds, the app stays on the plan Stripe still says is in force.
+        return {
+            "status": "updated",
+            "plan": new_plan,
+            "subscription_id": (updated or {}).get("id") or sub["id"],
+            "interval_changed": interval_changed,
+        }
+    except HTTPException:
+        raise
+    except _UnrecognisedSubscriptionError as exc:
+        _logger.error(
+            "change-plan: subscription for user %s carries no recognised plan "
+            "price (%s) — refusing to guess which item to re-price",
+            current_user.id, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "subscription_unrecognised",
+                "message": (
+                    "Your subscription could not be matched to a plan. Please "
+                    "contact support."
+                ),
+            },
+        ) from exc
+    except _StripeStateUnavailableError as exc:
+        _logger.error(
+            "change-plan: could not read Stripe subscription state for user %s "
+            "(%s) — refusing rather than acting on an unknown subscription",
+            current_user.id, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Billing is temporarily unavailable. Please try again later.",
+        ) from exc
 
 
 # ─── Customer portal ──────────────────────────────────────────────────────────

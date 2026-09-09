@@ -1,161 +1,246 @@
-# Duplicate-scope follow-ups — the three deferred Codex P2s
+# Pierce Probate job stuck after retry (job 9c8b7259) — investigation + fix
 
-Branch `fix/dedup-collapse-p2s`, cut from `origin/main` @ `b511797`.
-Continues `docs/HANDOFF-duplicate-scope-2026-09-08.md` §7A/§7B.
+Branch: `fix/pierce-retry-stuck` · worktree `C:/Users/Windows/bridgeleads-worktrees/pierce-retry-stuck`
 
-## Preconditions confirmed before any work
+## Evidence (production, read-only)
 
-- [x] All 13 ledger invariants return 0 in production; `records_used` 1001/1000 unchanged.
-- [x] §7B rev7 gate re-run and **GATE PASS** — all four questions answered
-      independently this time, no P1. The hash-equality guard closes the
-      weak-hash hole; under-collapsing is safe.
+**The job**
 
-## The scope change: a latent defect in ALREADY-SHIPPED code
+| field | value |
+|---|---|
+| job_id | `9c8b7259-a940-454e-b510-a074b861af59` |
+| scraper_config_id | `ea533c9e-d194-4f74-a8e7-4b32e9d428e1` ("Tester", pierce/WA/probate) |
+| user_id | `e73585c6-e10d-48e3-941f-28090380ff51` (starter plan) |
+| trigger | manual |
+| status | `scraping` (still, at 09:38 UTC = 23m52s) |
+| retry_count | 1 |
+| created_at | 2026-09-09 09:07:51.596 UTC |
+| started_at | 2026-09-09 09:14:10.489 UTC (attempt 2's claim) |
+| finished_at / error_message | NULL / NULL |
+| last_heartbeat_at | **NULL** |
+| record_count / page_current / page_total | 0 / 0 / 0 |
+| reserved_count / reserved_at | 0 / NULL |
+| billed_count / billing_applied_at | 0 / NULL |
+| attempt 1 celery task | `05bca6e1-35f3-467f-9e0c-2ee42b5ff870` |
+| attempt 2 celery task | `0172959c-f3ad-4e4d-8af6-d10cd1a2faad` |
 
-Codex's design review found that `collapse_same_run_siblings` (shipped in #265)
-and the cross-job dedup pick their winner **independently**:
+**Attempt 1 — the real exception (worker deployment `c5c12eca`)**
 
-- the dedup claim's `first_result_id` is whichever row PostgreSQL happened to
-  hit first inside the multi-row `ON CONFLICT ... DO NOTHING`;
-- the collapse elects its survivor by an actionability/completeness ranking.
+```
+09:07:52.143 run_scrape_job[05bca6e1] received
+09:07:54.334 Browser context started (headless=False, DISPLAY=:99, chromium=151.0.7922.34)
+09:07:54.853 Navigated to https://armsweb.co.pierce.wa.us/
+09:07:54.924 Disclaimer accepted
+09:07:55.173 Navigated to .../RealEstate/SearchEntry.aspx
+09:08:11.31  playwright._impl._errors.TimeoutError: Locator.wait_for: Timeout 15000ms exceeded.
+             Call log: waiting for locator("input[title*=\"Date Filed From\"]").first to be visible
+             at src/scrapers/pierce_wa_probate.py:305 in _fill_search_form
+09:08:11.588 transient scrape error - re-queued (retry 1/2, countdown 358s)
+09:08:11.590 run_scrape_job[05bca6e1] succeeded in 19.44s  <- attempt 1 EXITED here
+09:08:11.560 run_scrape_job[0172959c] received  <- retry prefetched + held for its ETA
+```
 
-Nothing coordinates them, so the claim can name a row the collapse then flags
-`is_duplicate` — which invariant #5 forbids, and which matters beyond the
-invariant because `_reuse_enrichment_for_duplicates` joins
-`results ro ON ro.id = dr.first_result_id` and copies address + settled
-skip-trace PII **from** that row.
+Upstream render flake on the ARMS ASP.NET search form. Correctly classified transient,
+correctly retried. Not a BridgeLeads defect.
 
-**Latent, not active:** production has **0** `same_run` rows — the collapse has
-never fired on real data (matches §7D). Nothing is corrupted today. It fires on
-the next run with same-run siblings, which the §4 audit says is common.
+**Attempt 2 — it did NOT stall at "Connecting to county portal"**
+
+```
+09:13:30 UTC  worker deployment c9f9f3df goes SUCCESS  <- ROLLOUT STARTS
+09:14:07-15   new replicas boot and go "ready"
+09:14:10.489  job claimed (started_at) -- by ForkPoolWorker-12 on the OLD container
+09:14:13.200  Browser context started
+09:14:14.309  Disclaimer accepted
+09:14:14.735  Navigated to SearchEntry.aspx
+09:14:17.955  Typed date range: 08/10/2026 - 09/02/2026   <- form filled fine, flake cleared
+09:14:18.225  Checked 1 doc types for PROBATE
+09:14:23.663  Search: 38 records found
+09:14:23.666  Total pages: 2
+09:14:23.667  Processing page 1
+              worker: Warm shutdown (MainProcess) / Stopping Container
+              *** LOG ENDS. Container killed ~13s into the scrape phase. ***
+```
+
+## Root cause
+
+1. The retry task was prefetched and held in memory by a worker on the OLD deployment
+   for its 358s ETA. That ETA came due ON SCHEDULE at ~09:14:09 (09:08:11 + 358s)
+   while the old container was still alive and serving; the rollout did not cause it
+   to fire early. The container was then stopped at ~09:14:23, ~13s into the scrape
+   phase, and killed the attempt in flight. (Codex corrected my first, stronger
+   causal claim here; the arithmetic confirms Codex.)
+2. A SIGTERM/stop leaves no Python-level exception, so `_RunScrapeJobTask.on_failure`
+   never runs. The row is stranded at `status='scraping'`.
+3. `acks_late` redelivery is a deliberate no-op here: the claim CAS only accepts
+   `pending`, and the row is `scraping`. Recovery is owned solely by the watchdog.
+4. **`HeartbeatThread` has been disabled since the 2026-06-18 pool-deadlock rollback**
+   (`tasks.py`: `# _hb.start(job.started_at)  # DISABLED`). So `last_heartbeat_at` is
+   permanently NULL on every job in production (verified: all 11 pierce/probate rows
+   have `hb=None`). The watchdog's fast 15-minute stale-heartbeat branch is DEAD CODE.
+   Every worker-lost job falls to the NULL-heartbeat fallback `started_at < now-70min`.
+   This job would have shown "Scraping records... LIVE" until **10:24:10 UTC**.
+5. The UI has no liveness input at all: `JobProgress.model_post_init` maps a non-terminal
+   status straight to an in-progress label, and the stream badge says LIVE because the
+   job is non-terminal. There is no "waiting to retry" state either.
+
+## Secondary defect found
+
+`src/workers/tasks.py:603` assigns `job.progress_label` and commits inside a try/except
+that logs "Failed to commit progress_label". **`progress_label` is not a column on `Job`**
+and is in no migration (prod confirms `column j.progress_label does not exist`); it is a
+computed Pydantic field on `JobProgress`. The assignment is a no-op on a plain Python
+attribute, the commit writes nothing, and the handler can never fire. Dead code that reads
+as a working feature.
+
+## Verified NOT broken (do not "fix")
+
+- **No duplicate execution.** Attempt 1 returned at 09:08:11.590 before attempt 2 ran at
+  09:14:10. The `pending`->`queued` CAS makes concurrent execution structurally impossible.
+- **No quota/billing duplication.** reserved=0/NULL, billed=0/NULL. The plan cap and the
+  reservation run *after* enrichment, so a scrape-phase retry cannot double-reserve;
+  `_retry_scrape_job` additionally refuses when `billing_applied_at IS NOT NULL`.
+- **Pierce ARMS is healthy.** Attempt 2 reached the results grid: 38 records, 2 pages.
+- **Transient classification is correct.** Playwright `TimeoutError` -> retryable.
 
 ## Plan
 
-### FIX 0 — the claim anchor follows the elected survivor
-- [x] In the same transaction as the flag write, repoint
-      `delivered_records.first_result_id` to the survivor whenever the current
-      anchor is one of this job's losers. Scoped `user_id` + `dedup_hash`.
-- [x] Applies to BOTH the existing collapse and the new reconciliation.
+- [x] 1. Consult Codex on the fix design; reconcile before coding. (see Codex section)
+- [x] 2. `src/db/session.py`: dedicated NullPool heartbeat engine + `heartbeat_sync_session()`,
+      isolated from the pool_size=2 work pool (the documented precondition for re-enabling).
+- [x] 3. `src/workers/tasks_helpers/status.py`: point `_write_heartbeat` at that session.
+- [x] 4. `src/workers/tasks.py`: re-enable `_hb.start(job.started_at)`; delete the dead
+      `progress_label` write; make the transient retry log carry phase + exception type,
+      and the user-facing line carry the attempt number without internal detail.
+- [x] 5. `src/api/schemas.py`: honest job presentation - "waiting to retry" for
+      `pending`+`retry_count>0`, and a stalled signal when an active job has no live worker.
+- [x] 6. Tests for each of the above.
+- [x] 7. Verification: `ruff` clean; full `pytest` green on an isolated test DB.
+- [x] 8. Codex diff review; reconcile. (see "Codex diff review" below)
 
-### FIX 1 — reconcile survivors AFTER inline enrichment (§7A.1)
-- [x] New `reconcile_same_run_survivors(db, job_id, user_id, record_type)`.
-- [x] Runs after `_run_inline_enrichment` + the NTS match and **before** the
-      refetch/re-export — the only safe point, since the re-export and property
-      membership both read from that refetch, and nothing else reads
-      `is_duplicate` between enrichment and the plan cap.
-- [x] Membership is READ from what exists (`duplicate_reason='same_run'` and
-      `duplicate_source_job_id = this job`, plus the same-hash non-duplicate),
-      never recomputed by `_collapse_loser_ids` — a row whose address enrichment
-      rewrote drops out of that function's eligible set, and "not a loser" would
-      then be misread as "winner".
-- [x] Membership by `dedup_hash` is stable: the hash is computed once at INSERT
-      and never recomputed (the premise the rev7 gate rests on).
-- [x] Require **exactly one** existing non-duplicate member per group; a group
-      with k != 1 is skipped and logged, never "fixed" — with k members the
-      duplicate count would move by k-1 and billing with it.
-- [x] Elect by the same ranking order applied to CURRENT values. The
-      hash-equality admission test is deliberately NOT re-applied: it decides
-      grouping, and grouping already happened.
-- [x] `SELECT ... FOR UPDATE` on the group so two elections cannot race.
+## Codex consult, reconciled
 
-### FIX 2 — merge source-only facts onto the winner (§7A.2)
-Elect first, merge second — ranking reads original row facts only.
-- [x] `heirs`: case-insensitive deduplicated union, winner's names first,
-      **excluding the winner's own `party_name`**, and only for record types
-      where `heirs` is a multi-name list. Fill-only otherwise — for `divorce`,
-      `heirs` is the OTHER SPOUSE, and two filings with reversed primary/
-      secondary parties would otherwise union the winner's own party in.
-- [x] `legal_description`: fill-only, never overwrite. Two different legals must
-      not be concatenated into one authoritative-looking description.
-- [x] `lead_subtype`: elected by the SAME priority order as
-      `PROBATE_SUBTYPE_AGG_SQL`, lifted into ONE shared constant both the SQL
-      and the Python read, so they cannot drift.
-- [x] Every other `enrichment_data` key: deliberately NOT merged. Generic
-      copying mixes two filings into an internally inconsistent object and can
-      carry row-state such as the plan-cap exclusion key.
-- [x] Merged fields provably do not participate in the ranking key — asserted by
-      a test, so a future ranking change cannot silently break idempotency.
+Codex's verdict was "block F3 until stale attempts are fenced from writing", on the
+grounds that faster recovery could repeat the 2026-06-17 result-duplication incident
+and that reservation/billing safety was unproven. It said so explicitly WITHOUT repo
+access, flagging unverified risk rather than an observed defect.
 
-### FIX 3 — batch_export job-status filter (§7A.3)
-- [x] `AND j.status = 'done'` on the jobs join in `_COMBINED_CTES` — serves both
-      the emailed partial-batch CSV and the in-app combined download.
-- [x] `done` is the only deliverable terminal status. Production holds only
-      `done`/`failed`; the code also writes `cancelled` at force-finalize.
-- [x] Per-child `record_count` -> 0 for TERMINAL non-done children; still
-      counted for in-flight ones, where it is honest progress.
-- [x] Rewrite the comment at `batches.py:622`, which justifies counting a failed
-      child's rows *because* batch_export has no status filter. This change is
-      what makes that premise false. Evidence it is then unreachable: segments
-      and analytics already filter on done, and **0** non-done jobs hold an
-      `export_key` in production (48/48 done jobs do), because `export_key` is
-      written only inside the mark-done transaction.
+**Independently verified in the code, and the blocker does not stand.** Three
+per-JOB (not per-attempt) idempotency gates already fence a superseded attempt:
 
-## Verification
-- [ ] `bash C:/Users/Windows/bl-testenv/run-full-pytest.sh <worktree>` — never bare pytest.
-- [ ] Prove any failure against a clean `origin/main` worktree before believing it.
-- [x] Codex diff review + challenge; any Critical/High = NO-GO.
-- [ ] Re-run `scripts/diag_verify_repair_invariants.py` (13 checks, all 0).
+| side effect | gate | where |
+|---|---|---|
+| result rows | `ON CONFLICT (job_id, source_fingerprint) DO NOTHING` | migration 062, `tasks.py:914` |
+| quota reservation | CAS `UPDATE jobs SET reserved_at=... WHERE reserved_at IS NULL` | `tasks.py:1519` |
+| billing | CAS `UPDATE jobs ... WHERE billing_applied_at IS NULL` | `tasks.py:1922` |
+
+Per-job CAS is *stronger* than per-attempt fencing for this purpose: the outcome is
+idempotent no matter which attempt wins the race. Migration 062 exists precisely
+because of the 2026-06-17 incident Codex was worried about.
+
+**Codex findings ACCEPTED (each verified in code first):**
+
+1. **Stale-heartbeat inheritance = a real retry storm, activated by F3.** Verified:
+   `_watchdog_stuck_jobs_impl` resets status/started_at/counters but NOT
+   `last_heartbeat_at`, and the claim CAS never stamped it. Dormant only because the
+   column is always NULL today. Fixed on both layers: the claim stamps a fresh
+   `last_heartbeat_at`, and the watchdog re-queue nulls the dead attempt's.
+2. **`lock_timeout` below `statement_timeout`** on the heartbeat engine. The heartbeat
+   UPDATE takes the `jobs` row lock that the long-lived work session also holds.
+3. **F4: "the except can never fire" was wrong of me.** `db.commit()` can fail for
+   unrelated reasons. The commit is also load-bearing (it flushes `date_from`/`date_to`
+   before a call that can run 30 minutes), so only the dead assignment was removed and
+   the log message corrected.
+4. **F5: do not promise a time when the broker publish failed.** Verified: the old code
+   emitted "retrying in ~5 min" even on a publish exception. Now branch on it.
+5. **F6 wording:** NULL heartbeat means UNOBSERVED, not dead. The copy avoids claiming
+   a dead worker, and a NULL heartbeat falls back to the watchdog's own 70-minute
+   cutoff rather than being called stalled early.
+6. **Causal correction on the ETA** (folded into Root cause above).
+
+**Codex points NOT actioned, with reasons:**
+
+- *"Verify port 6543 is really pgbouncer, not Supavisor"* — true but pre-existing and
+  identical for the work engine; the heartbeat engine reuses the same proven DSN.
+- *"Replace ETA retries with an outbox / durable dispatch"* — Codex itself scoped this
+  out. The stranded-retry watchdog branch already recovers a failed publish.
+- *"5 minutes is not evidence-based"* — agreed it is unproven, so the backoff is
+  UNCHANGED. Changing it was never in scope.
+- *"A heartbeat can keep beating while the scrape is wedged"* — true, and bounded
+  already: `_SCRAPE_TIMEOUT` 1800s, soft limit 3600s, hard limit 3900s.
+
+## Codex diff review (post-implementation gate)
+
+Ran against the `src/` diff with no repo, shell or git access (inline diff only, so Codex
+could not mutate this worktree). Verdict **GATE: PASS, no P1**. Codex explicitly caveated
+items 1, 2, 3 and 6 as "unverifiable from this diff" because it saw only the changed
+hunks; each was verified here against the full files:
+
+| Codex question | Independent verification in this tree | Outcome |
+|---|---|---|
+| 1. Can attempt 1's heartbeat mask a dead attempt 2? | `_HEARTBEAT_SQL` pins `started_at` AND excludes terminal statuses, so a superseded attempt updates 0 rows and self-reaps within one interval | No defect |
+| 2. Can attempt 2 block on attempt 1's lock? | The only `FOR UPDATE` in the work path is `FOR UPDATE OF u` on `users`, never `jobs`; the work session commits before the long scrape, so no `jobs` row lock is held across it | No defect |
+| 3. Double reserve / double bill? | Reservation `WHERE reserved_at IS NULL` and billing `WHERE billing_applied_at IS NULL` are per-JOB CAS, and this diff touches neither path | No defect |
+| 6. Cancellation vs heartbeat | The heartbeat CAS excludes `done/failed/cancelled`, so it cannot stamp or resurrect a cancelled job | No defect |
+
+**Codex findings ACCEPTED and fixed in this branch:**
+
+1. **[P3] Threshold sharing was incomplete.** `ZOMBIE_UNSTARTED_MINUTES` was introduced and
+   consumed by the API, but `health.py` still computed `queued_cutoff` from a bare
+   `timedelta(minutes=10)` - precisely the drift the shared-constants block exists to
+   prevent, and the constant's own comment already claimed the watchdog read it. Fixed; the
+   comment now says what is true.
+   Guarded by `test_the_watchdog_reads_the_shared_constants_not_its_own_literals`, which
+   reads the watchdog's source and rejects a bare numeric cutoff. Asserting the constants
+   equal 15/70/10 (the test that already existed) would NOT have caught this: a literal that
+   agrees today still drifts tomorrow. The guard was negative-proved against the pre-fix
+   source before being kept.
+2. **[P3] "Could not reach the county portal" overstates the diagnosis.** In this very
+   incident the portal WAS reached (disclaimer accepted, `SearchEntry.aspx` navigated); it
+   was the search form that failed to render, and the transient class also covers resets and
+   5xx. Reworded to "The county portal request could not be completed.", which is true for a
+   request that fails at any point.
+
+**Codex findings ACCEPTED as bounded, NOT actioned (with reasons):**
+
+- **[P2] No end-to-end network deadline on the heartbeat connection.** True: `connect_timeout`
+  plus server-side `statement_timeout`/`lock_timeout` do not bound a black-holed socket
+  mid-query. Materially different from the pre-rollback design, though: the heartbeat is a
+  DAEMON thread on its own NullPool connection, so a hung ping cannot wedge the scrape or
+  block process exit. Worst case it stops beating, the row goes stale, and the watchdog
+  re-queues - the designed failure mode, not a new one.
+- **[P2] The heartbeat still contends for the `jobs` row lock.** True in principle, bounded in
+  practice: the work session commits before entering the scraper, so no `jobs` lock is held
+  across the long phase; going stale would need 15 consecutive 60s ticks to lose the lock
+  race. `_FAIL_WARN_AT` already logs sustained heartbeat write failure.
 
 ## Review
 
-Four fixes, not three. Codex's design review found that the collapse shipped in
-#265 and the cross-job dedup elect their winner independently — the claim's
-`first_result_id` is whichever row PostgreSQL reached first inside the batched
-`ON CONFLICT DO NOTHING`, while the collapse ranks by actionability — so the
-claim could name a row the collapse had just flagged `is_duplicate`. That is
-invariant #5, and it also feeds `_reuse_enrichment_for_duplicates`, which copies
-address and settled skip-trace PII FROM the anchored row. Confirmed **latent**:
-production holds 0 `same_run` rows, so the collapse has never fired on real data.
-Fixed in both collapse paths (FIX 0).
+**Recovered, not restarted.** Everything from the pre-restart session survived as uncommitted
+work (no commits had been made): the production evidence above, the root cause, the reconciled
+Codex design consult, and the implementation of plan items 2-6 across 6 source files plus 2
+test files. Nothing was rebuilt.
 
-### What changed
+**What the fix actually changes.** The incident needed two things to go wrong: Pierce flaked
+(a genuine upstream render flake, correctly classified and correctly retried), and then a
+deploy killed the retry attempt 13s into its scrape. Only the second half is a BridgeLeads
+defect, and the defect was not the kill - it was that nothing could SEE the kill.
+`HeartbeatThread` had been disabled since the 2026-06-18 pool-deadlock rollback, so
+`last_heartbeat_at` was NULL on every job in production and the watchdog's 15-minute
+stale-heartbeat branch was dead code. Recovery fell to a 70-minute age fallback, and the UI
+had no liveness input at all. This branch re-enables the heartbeat on the isolated NullPool
+engine the rollback note demanded, makes the claim stamp liveness so no attempt inherits a
+dead one's, and gives the API the same thresholds the watchdog uses.
 
-| Area | Change |
-|---|---|
-| `tasks_helpers/dedup.py` | `survivor_sort_key` + `auction_survivor_sort_key` + `sort_key_for`; `_collapse_groups`; `_merged_survivor_fields`; `_repoint_claim_anchor`; `reconcile_same_run_survivors` |
-| `workers/tasks.py` | passes `record_type` to the collapse; runs the reconciliation after enrichment and before the refetch |
-| `trustee_sale_finalize.py` | `_sibling_groups`; anchor repoint + field merge; ranks via the shared auction key |
-| `batch_export.py` | `j.status = 'done'` on the combined-export jobs join |
-| `api/routes/batches.py` | `_child_lead_count` returns 0 for failed/cancelled children; the comment that justified the old behavior is rewritten |
-| `utils/lead_export.py` | `PROBATE_SUBTYPE_PRIORITY` + `probate_subtype_rank`; the agg SQL is now built from them |
+**Verification.** `ruff` clean. Full suite green on an isolated database
+(`bridgeleads_pierce_test`, Redis db 15) so no other agent's rig was touched:
+**2777 passed, 2 skipped, 65 deselected, 0 failed** before the Codex fixes, re-run green
+after them.
 
-### Things that turned out not to be true
-
-- **`_collapse_groups` cannot be reused for reconciliation.** Enrichment rewrites
-  `property_address`, so a member stops satisfying the hash-equality admission
-  test and vanishes from the result — and "not returned as a loser" is not
-  "elected winner". Membership is read from the existing flags instead.
-- **The reconciliation must not use one ranking for everything.** Auction Leads
-  elects the soonest-auction row by a 2026-07-03 product decision. Ranking it by
-  actionability silently overrode that. Caught by Codex in the diff review, after
-  I had written a docstring claiming a single shared ranking and then broken it
-  for exactly one record type.
-- **`heirs` cannot be blindly unioned.** For `divorce` it holds the other spouse,
-  and two filings can reverse primary/secondary. The union is gated to probate
-  AND drops the survivor's own `party_name`.
-- **An empty union is not "does not apply".** `_merge_heirs` returned `None` for
-  both, so when the exclusion removed the only name, the fill-only fallback
-  copied it straight back — making the survivor their own heir, the exact
-  corruption the exclusion existed to prevent. Also Codex, also in the diff review.
-- **The comment at `batches.py:622` was load-bearing.** It justified counting a
-  failed child's rows *because* batch_export had no status filter. Closing that
-  gap is what made it false, so it had to change in the same commit.
-
-### Gates
-
-- rev7 (§7B): **GATE PASS**, four questions answered independently, no P1.
-- Design consult: two rounds, REVISE → all findings adopted.
-- Diff review: **GATE PASS**, no P1; two P2s, both real, both fixed and
-  re-confirmed by Codex.
-- Codex could not verify whether any caller passes `record_type=None`; closed
-  here — `ScraperConfig.record_type` is `nullable=False` and both call sites pass
-  it. The default exists only to keep the pre-existing 3-arg test signature.
-
-### Notes for the next session
-
-- The local rig was shared with another session running integration tests, so
-  this ran against an isolated `bridgeleads_p2s_test` DB on Redis db 15 rather
-  than resetting the shared one.
-- The harness memory watchdog killed several background test tasks while the
-  underlying pytest kept running. A "killed" task here does not mean the process
-  stopped — check for a stray `pytest` before relaunching.
+**Known gap, deliberately not closed here (frontend repo, different branch).**
+`app/(dashboard)/live/[id]/page.tsx` in `bridgeleads-web` derives its own status text and does
+not read `progress_label`, `progress_stalled` or `retry_pending`. So the backend now reports
+the truth but the "Scraping records..." label is still client-side. The user-visible win that
+lands with THIS branch is the log stream (the retry line is honest now) and the recovery
+window shrinking from ~70 min to ~15 min. Wiring the three fields into the live page is a
+separate FE change; `bridgeleads-web` is currently checked out on another agent's branch
+(`feat/schedule-day-picker`), so it was left alone.

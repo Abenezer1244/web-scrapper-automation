@@ -115,6 +115,75 @@ SyncSessionLocal = sessionmaker(
 )
 
 
+# ─── Heartbeat engine — worker liveness pings ONLY ────────────────────────────
+# The job-liveness heartbeat (src/workers/tasks_helpers/status.py) runs on a
+# daemon THREAD alongside the task's own work session. Pointing it at
+# ``sync_engine`` is what broke production on 2026-06-18: that pool is
+# deliberately tiny (pool_size=2, max_overflow=3, shared with the work session
+# AND _publish_log), and during the DB-heavy insert phase the heartbeat thread
+# and the main thread deadlocked contending for it — wedging EVERY scrape at
+# "Saving records to database...". The heartbeat was disabled as the rollback,
+# which left jobs.last_heartbeat_at permanently NULL and the watchdog's fast
+# stale-heartbeat branch dead: a job whose worker was killed then sat visibly
+# "running" for the full 70-minute started_at fallback.
+#
+# NullPool is the fix the rollback note demanded: every checkout opens its own
+# connection and closes it on return, so a heartbeat can never hold, wait for,
+# or starve a pooled connection the work session needs. It is also what makes
+# this engine safe to build at import time under Celery's prefork model — there
+# are no live connections to inherit across the fork (unlike a pooled engine).
+#
+# Keep this engine for the heartbeat and nothing else. A second caller would
+# reintroduce exactly the contention NullPool is here to prevent.
+_HEARTBEAT_STATEMENT_TIMEOUT_MS = 15_000  # single-row PK UPDATE; never legitimately slow
+# lock_timeout MUST stay below statement_timeout (Codex). The heartbeat UPDATE
+# takes a row lock on `jobs`, and run_scrape_job holds that same row in a
+# long-lived session that flushes mid-task. Without this the heartbeat would
+# QUEUE behind the work transaction and burn its whole statement budget waiting;
+# with it the ping fails fast, _write_heartbeat records _HB_ERROR (= still alive,
+# keep beating), and the next tick tries again. Blocking here is never useful:
+# a heartbeat's only job is to be timely.
+_HEARTBEAT_LOCK_TIMEOUT_MS = 3_000
+
+heartbeat_engine = create_engine(
+    _sync_url,
+    poolclass=NullPool,
+    echo=False,  # never echo: this fires every 60s per running job
+    connect_args={
+        "connect_timeout": 10,
+        # Deliberately far tighter than the work engine's 120s. A liveness ping
+        # that cannot finish in 15s has failed; _write_heartbeat treats that as
+        # _HB_ERROR (still alive, keep beating) rather than letting the thread
+        # block on a stalled pooler.
+        "options": (
+            f"-c statement_timeout={_HEARTBEAT_STATEMENT_TIMEOUT_MS} "
+            f"-c lock_timeout={_HEARTBEAT_LOCK_TIMEOUT_MS}"
+        ),
+        **_ssl_connect_args(_sync_url, async_driver=False),
+    },
+)
+
+HeartbeatSessionLocal = sessionmaker(heartbeat_engine, expire_on_commit=False)
+
+
+@contextmanager
+def heartbeat_sync_session() -> Iterator[Session]:
+    """Open a session on the isolated NullPool heartbeat engine.
+
+    System-level (no RLS context) by design: it writes only ``jobs.last_heartbeat_at``
+    under a CAS that pins both the job id and the attempt's ``started_at``.
+
+    Use ONLY for the liveness heartbeat. Anything else belongs on
+    ``system_sync_session`` / ``rls_sync_session`` — see the engine comment above
+    for why this pool is kept empty.
+    """
+    session = HeartbeatSessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
 def get_sync_db() -> Session:
     """Returns a synchronous database session for Celery workers.
     Caller is responsible for closing.

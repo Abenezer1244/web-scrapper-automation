@@ -144,9 +144,22 @@ def main() -> int:
                 )
             return 0
 
+        # Validated BEFORE the dry run, not after. A dry run that prints "WOULD
+        # SET" for a value the real UPDATE will reject teaches the operator to
+        # trust a preview that is wrong (Codex). Whitespace is not a name.
+        a.actor = (a.actor or "").strip()
+        a.reason = (a.reason or "").strip() or None
+        a.reference = (a.reference or "").strip() or None
+
         if not a.actor:
             print("--actor is required: a decision with no name on it is not a decision.")
             return 2
+        for field, value in (("--actor", a.actor), ("--reference", a.reference)):
+            # varchar(128) in migration 092. Over-length fails the UPDATE, which
+            # rolls the whole settlement back after reporting it would succeed.
+            if value and len(value) > 128:
+                print(f"{field} is {len(value)} characters; the column holds 128.")
+                return 2
 
         # Exactly one action. Accepting several and silently picking a branch
         # means an operator can believe they wrote off one row while the script

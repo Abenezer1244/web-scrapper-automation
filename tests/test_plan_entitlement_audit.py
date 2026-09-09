@@ -1336,10 +1336,11 @@ def test_a_missing_customer_id_is_not_the_same_signal_as_stripe_being_off():
 
     monkeypatch = _pytest.MonkeyPatch()
     try:
-        # billing_proof stands in for the gate having already passed; the
-        # sender refuses outright without it, which would mask both signals
-        # this test is here to keep apart.
-        proof = {"id": "sub_x"}
+        # The gate now runs inside the sender, so it has to be satisfied for
+        # these two signals to be reachable at all. Neutered here on purpose:
+        # this test is about keeping _MissingCustomerError and
+        # _StripeNotConfiguredError apart, not about the gate.
+        monkeypatch.setattr(st, "assert_billable", lambda *a, **k: {"id": "sub_x"})
         monkeypatch.setattr(st, "_stripe_enabled", lambda: True)
         with pytest.raises(st._MissingCustomerError):
             st.report_meter_event_to_stripe(
@@ -1348,7 +1349,7 @@ def test_a_missing_customer_id_is_not_the_same_signal_as_stripe_being_off():
                 billable_units=5,
                 stripe_customer_id=None,
                 plan="pro",
-                billing_proof=proof,
+                usage_at=datetime.now(UTC),
             )
         # Stripe genuinely off stays the OTHER signal, and stays terminal.
         monkeypatch.setattr(st, "_stripe_enabled", lambda: False)
@@ -1359,7 +1360,7 @@ def test_a_missing_customer_id_is_not_the_same_signal_as_stripe_being_off():
                 billable_units=5,
                 stripe_customer_id="cus_x",
                 plan="pro",
-                billing_proof=proof,
+                usage_at=datetime.now(UTC),
             )
     finally:
         monkeypatch.undo()
@@ -2115,12 +2116,14 @@ def test_the_meter_event_carries_an_explicit_timestamp(monkeypatch):
     monkeypatch.setattr(_stripe.billing.MeterEvent, "create", _create)
     monkeypatch.setattr(st, "_stripe_enabled", lambda: True)
     monkeypatch.setattr(st.settings, "STRIPE_SECRET_KEY", "sk_test_fake")
+    # The subject here is the TIMESTAMP, not eligibility; the gate has its own
+    # tests above and would otherwise need a whole subscription fixture.
+    monkeypatch.setattr(st, "assert_billable", lambda *a, **k: {"id": "sub_1"})
 
     when = datetime.now(UTC) - timedelta(days=2)
     st.report_meter_event_to_stripe(
         user_id="u1", queue_id=7, billable_units=3,
         stripe_customer_id="cus_1", plan="pro", usage_at=when,
-        billing_proof={"id": "sub_1"},
     )
     assert captured["timestamp"] == int(when.timestamp()), (
         "the event must be dated when the usage happened, not when it was sent"
@@ -2342,14 +2345,18 @@ def test_a_null_usage_at_is_refused_even_with_the_switch_on(monkeypatch):
     assert e.value.reason == "usage_at_unknown"
 
 
-def test_the_stripe_sender_refuses_without_a_proof_from_the_gate(monkeypatch):
-    """The gate must live where the Stripe call is, not one layer above it.
+def test_the_stripe_sender_runs_the_gate_on_what_it_is_about_to_send(monkeypatch):
+    """The gate must be bound to the event, not to a token beside it.
 
-    assert_billable ran only in the calling task, so report_meter_event_to_stripe
-    — the function that actually creates the MeterEvent — could be reached
-    without it. Codex got a real event out of a direct call with billing
-    switched off. One caller checking first is not the same as the sender being
-    safe; the next caller is one refactor away.
+    It briefly lived one layer up in the calling task, then behind a
+    `billing_proof` dict this function only checked for None — and Codex broke
+    that by passing `{}`, emitting a real MeterEvent with billing switched off
+    and no timestamp at all. A token that is not bound to the customer and time
+    it vouches for is not evidence; a proof fetched for one customer authorised
+    a send for any other.
+
+    So the sender calls assert_billable on the SAME arguments it is about to
+    send. These three cases would each have passed the token version.
     """
     import src.api.billing.skip_trace_usage as st
 
@@ -2360,36 +2367,83 @@ def test_the_stripe_sender_refuses_without_a_proof_from_the_gate(monkeypatch):
         lambda **kw: sent.append(kw) or {"identifier": "x"},
     )
     monkeypatch.setattr(st.settings, "STRIPE_SECRET_KEY", "sk_test_fake")
+    monkeypatch.setattr(st, "_stripe_enabled", lambda: True)
 
+    def _send(**over):
+        kwargs = {
+            "user_id": "u1", "queue_id": 1, "billable_units": 5,
+            "stripe_customer_id": "cus_1", "plan": "pro",
+            "usage_at": datetime.now(UTC),
+        }
+        kwargs.update(over)
+        return st.report_meter_event_to_stripe(**kwargs)
+
+    # 1. Billing switched off entirely.
+    monkeypatch.setattr(st, "USAGE_PROVENANCE_IS_TRUSTWORTHY", False)
     with pytest.raises(st._NotBillableError) as e:
-        st.report_meter_event_to_stripe(
-            user_id="u1", queue_id=1, billable_units=5,
-            stripe_customer_id="cus_1", plan="pro",
-            usage_at=datetime.now(UTC),
-            # no billing_proof
-        )
-    assert e.value.reason == "unverified_billing"
-    assert sent == [], "a MeterEvent was created without the gate having passed"
+        _send()
+    assert e.value.reason == "usage_at_unknown"
+
+    # 2. Switch on, but no defensible time. The token version emitted an event
+    #    with NO timestamp here, letting Stripe stamp submission time.
+    monkeypatch.setattr(st, "USAGE_PROVENANCE_IS_TRUSTWORTHY", True)
+    with pytest.raises(st._NotBillableError) as e:
+        _send(usage_at=None)
+    assert e.value.reason == "usage_at_unknown"
+
+    # 3. Switch on, real time, but no subscription behind the customer.
+    class _Empty:
+        def auto_paging_iter(self):
+            return iter([])
+
+    monkeypatch.setattr(_stripe.Subscription, "list", lambda **kw: _Empty())
+    with pytest.raises(st._NotBillableError):
+        _send()
+
+    assert sent == [], (
+        "a MeterEvent reached Stripe without the gate having passed for it"
+    )
 
 
-def test_the_sender_refuses_before_deciding_stripe_is_merely_switched_off(monkeypatch):
-    """Order matters: unverified must not be reported as a terminal no-op.
+def test_the_sender_takes_no_caller_supplied_authorisation(monkeypatch):
+    """There must be no argument a caller can pass to skip the gate.
 
-    _StripeNotConfiguredError is terminal — the caller settles the row on it. If
-    the "Stripe is off" check ran first, an unverified send on a deployment with
-    Stripe disabled would be recorded as a decision rather than as the bug it is.
+    The whole failure mode was an authorisation value the sender trusted instead
+    of checking. If one comes back, this fails.
     """
+    import inspect
+
     import src.api.billing.skip_trace_usage as st
 
-    monkeypatch.setattr(st, "_stripe_enabled", lambda: False)
-
-    with pytest.raises(st._NotBillableError) as e:
-        st.report_meter_event_to_stripe(
-            user_id="u1", queue_id=1, billable_units=5,
-            stripe_customer_id="cus_1", plan="pro",
-            usage_at=datetime.now(UTC),
+    params = inspect.signature(st.report_meter_event_to_stripe).parameters
+    assert "billing_proof" not in params
+    for name in params:
+        assert "proof" not in name and "verified" not in name and "skip" not in name, (
+            f"{name!r} looks like a caller-supplied way past the gate"
         )
-    assert e.value.reason == "unverified_billing"
+    assert "assert_billable(stripe_customer_id, usage_at)" in inspect.getsource(
+        st.report_meter_event_to_stripe
+    ), "the gate must run on the arguments actually being sent"
+
+
+def test_the_meter_timestamp_is_never_omitted(monkeypatch):
+    """Omitting it lets Stripe stamp submission time and bill the wrong period.
+
+    It used to be conditional on usage_at being present. The gate now refuses a
+    NULL usage_at outright, so there is no branch left where it can be left off
+    — and this pins that, because re-adding the condition would look harmless.
+    """
+    import inspect
+
+    import src.api.billing.skip_trace_usage as st
+
+    src = inspect.getsource(st.report_meter_event_to_stripe)
+    assert 'event_kwargs["timestamp"] = int(usage_at.timestamp())' in src
+    assert "if usage_at is not None:" not in src, (
+        "the timestamp must be unconditional; the gate guarantees usage_at"
+    )
+
+
 def test_adoption_never_stamps_its_own_clock_as_the_provider_time():
     """The defect that killed the previous two attempts, pinned.
 
@@ -2403,26 +2457,29 @@ def test_adoption_never_stamps_its_own_clock_as_the_provider_time():
     """
     from src.workers.skip_trace_dispatcher import provider_submitted_time
 
-    now = datetime(2026, 9, 9, 12, 0, tzinfo=UTC)
+    claim_time = datetime(2026, 9, 9, 12, 0, tzinfo=UTC)
     provider = {"created_at": "2026-09-01T10:00:00.123456Z"}
     expected = datetime(2026, 9, 1, 10, 0, 0, 123456, tzinfo=UTC)
 
-    # Dispatch, no provider timestamp: our own send time is legitimate here —
-    # we have just completed the POST, so the lookups cannot predate it.
-    assert provider_submitted_time({}, now, adopted=False) == now
+    # Dispatch, no provider timestamp: the CLAIM time, taken and committed
+    # before the POST went out. The first version used the bookkeeping clock and
+    # called it a lower bound; it is not one, because bookkeeping runs after the
+    # POST returns and the provider can start work the moment it receives the
+    # batch.
+    assert provider_submitted_time({}, claim_time, adopted=False) == claim_time
 
     # Dispatch WITH a provider timestamp: the provider's wins over ours.
-    assert provider_submitted_time(provider, now, adopted=False) == expected
+    assert provider_submitted_time(provider, claim_time, adopted=False) == expected
 
     # Adoption WITH a provider timestamp: still the provider's, unaffected by
     # when we happened to notice the batch.
-    assert provider_submitted_time(provider, now, adopted=True) == expected
+    assert provider_submitted_time(provider, claim_time, adopted=True) == expected
 
     # Adoption with NOTHING: NULL. This is the whole point of the parameter.
-    # `now` here is the adoption clock, and billing against it is the bug.
-    assert provider_submitted_time({}, now, adopted=True) is None
-    assert provider_submitted_time({"created_at": None}, now, adopted=True) is None
-    assert provider_submitted_time({"created_at": "not-a-date"}, now, adopted=True) is None
+    # Every clock still available on that path is later than the work.
+    assert provider_submitted_time({}, claim_time, adopted=True) is None
+    assert provider_submitted_time({"created_at": None}, claim_time, adopted=True) is None
+    assert provider_submitted_time({"created_at": "not-a-date"}, claim_time, adopted=True) is None
 
 
 def test_a_naive_provider_timestamp_is_pinned_to_utc():
@@ -2433,8 +2490,8 @@ def test_a_naive_provider_timestamp_is_pinned_to_utc():
     """
     from src.workers.skip_trace_dispatcher import provider_submitted_time
 
-    now = datetime(2026, 9, 9, 12, 0, tzinfo=UTC)
-    got = provider_submitted_time({"created_at": "2026-09-01T10:00:00"}, now, adopted=True)
+    claim_time = datetime(2026, 9, 9, 12, 0, tzinfo=UTC)
+    got = provider_submitted_time({"created_at": "2026-09-01T10:00:00"}, claim_time, adopted=True)
     assert got == datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
     assert got.tzinfo is not None
 
@@ -2451,7 +2508,7 @@ def test_the_dispatcher_records_the_provider_time_it_computes():
     from src.workers import skip_trace_dispatcher as d
 
     src = inspect.getsource(d._persist_submission)
-    assert "provider_submitted_time(response, now, adopted)" in src, (
+    assert "provider_submitted_time(response, claim_time, adopted)" in src, (
         "_persist_submission must derive the value from the shared rule"
     )
     assert "provider_submitted_at=provider_submitted_at" in src, (

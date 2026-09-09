@@ -233,7 +233,10 @@ def dispatch_pending_skip_trace() -> dict:
                 # backstop — it re-derives the association from Tracerfy's own
                 # queue list on a later tick.
                 try:
-                    _persist_submission(db, queue_id, claimed, trace_type, response)
+                    _persist_submission(
+                        db, queue_id, claimed, trace_type, response,
+                        claim_time=claim_time,
+                    )
                 except Exception as exc:  # noqa: BLE001 — a paid batch is at stake
                     _logger.error(
                         "Bookkeeping FAILED for accepted Tracerfy queue %s (%d rows): "
@@ -244,7 +247,9 @@ def dispatch_pending_skip_trace() -> dict:
                         db.rollback()
                     except Exception:  # noqa: BLE001 — session may already be dead
                         pass
-                    if not _persist_submission_retry(queue_id, claimed, trace_type, response):
+                    if not _persist_submission_retry(
+                        queue_id, claimed, trace_type, response, claim_time=claim_time,
+                    ):
                         _alert_orphaned_queue(queue_id, trace_type, len(claimed))
                         errors.append(f"bookkeeping failed for queue {queue_id}")
                         return _tick_result(
@@ -386,7 +391,7 @@ def _fail_unsubmittable(db, rows: list) -> None:
 
 def _persist_submission(
     db, queue_id: int, claimed: list, trace_type: str, response: dict,
-    adopted: bool = False,
+    adopted: bool = False, claim_time=None,
 ) -> None:
     """Record an accepted Tracerfy batch: queue row + row/Result status flips.
 
@@ -394,6 +399,12 @@ def _persist_submission(
     can re-run it safely: the SkipTraceQueue insert is ON CONFLICT DO NOTHING on
     the unique tracerfy_queue_id, and both updates are guarded on the status
     they expect to move from.
+
+    `claim_time` is the instant the rows were claimed, committed BEFORE the POST
+    went out. It is passed IN rather than computed here because everything
+    computable at this point is later than the provider receiving the batch —
+    including on the retry path, which runs on a fresh session after a failed
+    commit and would otherwise mint a clock later still.
 
     `adopted` says WHICH path this is, and it exists because the two disagree
     about what time it is. On the live path we have just completed the POST, so
@@ -412,7 +423,7 @@ def _persist_submission(
     now = datetime.now(UTC)
     first = claimed[0]
 
-    provider_submitted_at = provider_submitted_time(response, now, adopted)
+    provider_submitted_at = provider_submitted_time(response, claim_time, adopted)
     db.execute(
         pg_insert(SkipTraceQueue)
         .values(
@@ -465,7 +476,7 @@ def _persist_submission(
 
 
 def _persist_submission_retry(
-    queue_id: int, claimed: list, trace_type: str, response: dict
+    queue_id: int, claimed: list, trace_type: str, response: dict, claim_time=None
 ) -> bool:
     """Retry _persist_submission on a brand-new session. True when it stuck.
 
@@ -477,7 +488,9 @@ def _persist_submission_retry(
         from src.db.session import system_sync_session
 
         with system_sync_session() as db2:
-            _persist_submission(db2, queue_id, claimed, trace_type, response)
+            _persist_submission(
+                db2, queue_id, claimed, trace_type, response, claim_time=claim_time,
+            )
         _logger.info(
             "Bookkeeping recovered for Tracerfy queue %s on retry (%d rows)",
             queue_id, len(claimed),
@@ -609,7 +622,7 @@ def _release_is_safe(
     return True
 
 
-def provider_submitted_time(response: dict, now: datetime, adopted: bool):
+def provider_submitted_time(response: dict, claim_time, adopted: bool):
     """When the PROVIDER got this batch, or None if we cannot defend an answer.
 
     Pure, so the rule can be tested without a database — this is the value skip
@@ -618,16 +631,23 @@ def provider_submitted_time(response: dict, now: datetime, adopted: bool):
 
     Tracerfy's own ``created_at`` first. It is the provider's record of when it
     received the batch, it reads the same whether we ask now or on an adoption
-    three days later, and it is therefore the only value that is correct on both
-    paths.
+    three days later, and it is therefore the only value correct on both paths.
 
-    Failing that, ``now`` is honest ONLY on the live dispatch path, where we have
-    just completed the POST. On the adoption path there is no defensible
-    fallback: the batch went out on some earlier tick that never recorded it, so
-    ``now`` is the adoption clock. That was the exact defect in the previous
-    attempt — ``submitted_at`` was taken for a lower bound on execution and the
-    adoption path moved it — so this returns None instead and the usage goes to
-    a human.
+    Failing that, ``claim_time`` — and specifically NOT `now`. This is the
+    correction to the first version of this function, which used the moment
+    bookkeeping ran and called it a lower bound. It is not one: bookkeeping runs
+    AFTER the POST returns, and the provider can begin work the instant it
+    receives the batch, so lookups can predate that value. The bookkeeping-retry
+    path made it worse by computing a FRESH clock, later still (Codex).
+
+    `claim_time` is taken before the rows are marked 'submitting' and committed
+    BEFORE the POST is issued, so nothing the provider does can precede it. It is
+    computed once per tick and passed in, so a retry cannot advance it.
+
+    On the adoption path there is no defensible fallback at all: the batch went
+    out on some earlier tick that never recorded it, and every clock still
+    available is later than the work. That returns None, and the usage goes to a
+    human.
     """
     ts = _parse_tracerfy_ts(response.get("created_at"))
     if ts is not None:
@@ -637,7 +657,11 @@ def provider_submitted_time(response: dict, now: datetime, adopted: bool):
             # sends Z-suffixed UTC; anything else is assumed to be the same.
             ts = ts.replace(tzinfo=UTC)
         return ts
-    return None if adopted else now
+    if adopted or claim_time is None:
+        return None
+    if claim_time.tzinfo is None:
+        claim_time = claim_time.replace(tzinfo=UTC)
+    return claim_time
 
 
 def _parse_tracerfy_ts(value) -> datetime | None:

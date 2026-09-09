@@ -129,8 +129,14 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
         # duplicated into the sweep's SQL where the two copies could drift.
         # It is re-evaluated at REPORT time, not at enqueue time: a row can sit
         # in the queue while the subscription behind it changes.
+        # The gate itself now lives inside report_meter_event_to_stripe, bound
+        # to the exact customer and timestamp it sends. This call stays because
+        # the DISPOSITION has to be decided before we try, and because a refusal
+        # here costs one Stripe read where a refusal after the send would be too
+        # late. The sender re-checks; the two cannot disagree because they ask
+        # the same function the same question.
         try:
-            billing_proof = assert_billable(customer_id, row.usage_at)
+            assert_billable(customer_id, row.usage_at)
         except _NotBillableError as refusal:
             # Kept, never written off. The usage is real; what is missing is a
             # billing agreement that covered it. Recording WHY on the row is the
@@ -174,16 +180,14 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
                 stripe_customer_id=customer_id,
                 plan=row.plan or "",
                 usage_at=row.usage_at,
-                # The proof from the gate above. The sender refuses without it.
-                billing_proof=billing_proof,
             )
         except _NotBillableError as refusal:
-            # Unreachable while this is the only caller — we just passed the
-            # proof. It stays because the alternative is worse than dead code:
-            # _NotBillableError is not in the sender's terminal set, so without
-            # this it would escape into autoretry_for=(Exception,) and retry a
-            # permanent refusal with backoff forever. A refusal is an answer;
-            # answers go on the row and go to a human.
+            # The sender runs the gate again against what it is actually about
+            # to send. Reaching here means the two evaluations disagreed —
+            # a subscription that changed in the gap, or a bug — and either way
+            # a refusal is an answer, not a transient failure. Without this it
+            # would escape into autoretry_for=(Exception,) and retry a permanent
+            # refusal with backoff forever.
             row.disposition = "needs_review"
             row.disposition_at = datetime.now(UTC)
             row.disposition_reason = refusal.reason

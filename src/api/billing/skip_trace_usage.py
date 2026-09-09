@@ -190,6 +190,11 @@ def report_lookups_for_user(
         # while holding the caller's row lock.
         "stripe_customer_id": user_row.stripe_customer_id,
         "meter_event_id": None,
+        # The window these numbers were computed against. The caller needs it
+        # because billable_units is a function of THIS window's counter, so a
+        # batch whose usage happened in an earlier one cannot be billed on the
+        # strength of it. See the check at the outbox insert.
+        "counted_window_start": window_start,
     }
 
     if billable_units <= 0:
@@ -429,19 +434,21 @@ def report_meter_event_to_stripe(
     stripe_customer_id: str | None,
     plan: str,
     usage_at=None,
-    billing_proof: dict | None = None,
 ) -> str | None:
     """Fire ONE Stripe skip-trace MeterEvent — RAISES on transient failure.
 
-    `billing_proof` is the subscription dict `assert_billable` returns, and it
-    is REQUIRED. The eligibility rule used to live only in the calling task, one
-    layer above this function, so the thing that actually talks to Stripe could
-    be reached without it — Codex reproduced a real MeterEvent from a direct
-    call with billing switched off. One production caller checking first is not
-    the same as the sender being safe, because the next caller is one refactor
-    away. Passing the proof makes the rule structurally impossible to skip
-    rather than conventionally observed, and costs no extra Stripe round trip:
-    the caller already holds the value.
+    THE GATE RUNS HERE, against these arguments. It briefly lived one layer up
+    in the calling task, and then behind a `billing_proof` dict this function
+    merely checked for None — which Codex broke by passing `{}`, emitting a real
+    MeterEvent with billing switched off and no timestamp. A token that is not
+    bound to the customer and the time it vouches for is not evidence: a proof
+    obtained for one customer authorised a send for any other.
+
+    So there is no token. assert_billable is called on the SAME customer id and
+    usage_at this function is about to send, which is the only formulation where
+    "the gate passed" and "the gate passed FOR THIS EVENT" are the same
+    statement. Its _NotBillableError propagates to the caller, which records the
+    reason on the row.
 
     REDTEAM (Codex convergence — meter outbox): this used to CATCH every
     Stripe exception and return out["error"] normally. The durable report
@@ -463,16 +470,10 @@ def report_meter_event_to_stripe(
     if billable_units <= 0:
         return None
 
-    # The gate, restated where the Stripe call actually happens. Deliberately
-    # BEFORE _stripe_enabled(): an unverified send must be refused as
-    # unverified, not reported as "Stripe is off", because the second is a
+    # Deliberately BEFORE _stripe_enabled(): an ineligible send must be refused
+    # as ineligible, not reported as "Stripe is off", because the second is a
     # terminal no-op the caller settles the row on.
-    if billing_proof is None:
-        raise _NotBillableError(
-            "unverified_billing",
-            "report_meter_event_to_stripe requires the subscription dict returned "
-            "by assert_billable; refusing to emit a MeterEvent without it",
-        )
+    assert_billable(stripe_customer_id, usage_at)
 
     if not _stripe_enabled():
         _logger.warning(
@@ -521,8 +522,10 @@ def report_meter_event_to_stripe(
         },
         "identifier": stable_identifier,
     }
-    if usage_at is not None:
-        event_kwargs["timestamp"] = int(usage_at.timestamp())
+    # Unconditional. assert_billable above has already refused a NULL usage_at,
+    # so there is no branch where this is omitted — and omitting it is what
+    # let Stripe stamp submission time and bill into whatever period was open.
+    event_kwargs["timestamp"] = int(usage_at.timestamp())
     event = stripe.billing.MeterEvent.create(**event_kwargs)
     _logger.info(
         "Reported %d skip-trace lookups to Stripe for user %s (plan=%s, over-quota)",
@@ -692,6 +695,32 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
             # CONFLICT DO NOTHING on (tracerfy_queue_id, user_id) means a
             # replay can't duplicate the row; the existing reported_at on the
             # surviving row decides whether it still needs to be fired.
+            # QUANTITY and TIMESTAMP must describe the same window.
+            #
+            # billable_units above is derived from the counter for the user's
+            # CURRENT entitlement window: how much of this window's free
+            # allowance was already spent. usage_at says when the lookups
+            # actually happened. When those two disagree — a batch reconciled
+            # late, a stalled queue, a replayed webhook, and this system has had
+            # queues sit for days — the number is measured against one window and
+            # dated into another.
+            #
+            # Codex's case: an annual subscriber with allowance left over in last
+            # month's window; that batch arrives after this month's allowance is
+            # exhausted, so it counts as overage HERE while its older timestamp
+            # still sits inside the annual Stripe period and passes coverage. The
+            # customer is charged for lookups their allowance covered.
+            #
+            # A correct timestamp does not make a wrong quantity right, so this
+            # does not bill it. The row is written straight to needs_review with
+            # its full detail; the ops alert surfaces it and a human allocates it
+            # against the window it belongs to.
+            counted_from = result.get("counted_window_start")
+            outside_counted_window = (
+                usage_at is not None
+                and counted_from is not None
+                and usage_at < counted_from
+            )
             db.execute(
                 pg_insert(SkipTraceMeterEvent)
                 .values(
@@ -701,6 +730,16 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
                     stripe_customer_id=result.get("stripe_customer_id"),
                     plan=result.get("plan", ""),
                     usage_at=usage_at,
+                    disposition=(
+                        "needs_review" if outside_counted_window else "pending"
+                    ),
+                    disposition_at=(
+                        datetime.now(UTC) if outside_counted_window else None
+                    ),
+                    disposition_reason=(
+                        "usage_outside_counted_window"
+                        if outside_counted_window else None
+                    ),
                 )
                 .on_conflict_do_nothing(
                     index_elements=["tracerfy_queue_id", "user_id"]

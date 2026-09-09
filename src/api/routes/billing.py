@@ -1103,22 +1103,42 @@ def _plan_change_items(sub: dict, new_price: str, new_plan: str, new_interval: s
         if pid and pid.startswith("price_")
     }
 
-    licensed_item = None
-    metered_item = None
+    licensed: list = []
+    metered: list = []
+    unknown: list = []
     for item in (sub.get("items") or {}).get("data") or []:
         pid = ((item or {}).get("price") or {}).get("id")
         if pid in _PRICE_TO_PLAN:
-            licensed_item = item
+            licensed.append(item)
         elif pid in metered_ids:
-            metered_item = item
+            metered.append(item)
+        else:
+            unknown.append(pid)
 
-    if licensed_item is None:
-        # Nothing here maps to a plan we sell. Re-pricing an item we cannot
-        # identify, and adding a second licensed item beside it, are both worse
-        # than refusing and asking a human to look.
+    # The shape is VALIDATED, not sampled. The first version of this loop kept
+    # the LAST match of each kind while _plan_item_price_id reads the FIRST, so a
+    # subscription carrying two licensed items would have had only one re-priced
+    # and the other left attached — two plan charges after a same-interval
+    # switch, or a stranded monthly item that makes an annual switch fail the
+    # interval rule. Codex reproduced it. Anything we cannot describe exactly is
+    # refused for a human to reconcile, because every way of proceeding here
+    # leaves the customer on a subscription nobody chose.
+    if len(licensed) != 1:
         raise _UnrecognisedSubscriptionError(
-            "subscription carries no recognised plan price"
+            f"expected exactly one plan price, found {len(licensed)}"
         )
+    if len(metered) > 1:
+        raise _UnrecognisedSubscriptionError(
+            f"expected at most one metered price, found {len(metered)}"
+        )
+    if unknown:
+        raise _UnrecognisedSubscriptionError(
+            f"subscription carries {len(unknown)} price(s) this deployment does "
+            "not recognise"
+        )
+
+    licensed_item = licensed[0]
+    metered_item = metered[0] if metered else None
 
     items.append({"id": licensed_item["id"], "price": new_price})
 
@@ -1224,6 +1244,23 @@ async def change_plan(
         if sub is None:
             raise _no_subscription_conflict()
 
+        if sub.get("status") in ("past_due", "unpaid"):
+            # create_prorations credits the UNUSED portion of the current period
+            # — but only "unused" is checked, never "paid". On a subscription
+            # whose latest invoice has not settled, that issues a credit against
+            # money we never received, and Stripe documents exactly this risk.
+            # The customer's real next step is the outstanding invoice.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "subscription_unpaid",
+                    "message": (
+                        "There is an unpaid invoice on your subscription. Settle "
+                        "that first and you will be able to change your plan."
+                    ),
+                },
+            )
+
         if sub.get("status") == "incomplete":
             # The first payment has not settled and Stripe still accepts it for
             # about 23 hours. Modifying the subscription underneath an in-flight
@@ -1286,6 +1323,48 @@ async def change_plan(
             "change-plan: user %s %s -> %s on subscription %s (interval_changed=%s)",
             user.id, current_price, stripe_price_id, sub["id"], interval_changed,
         )
+
+        # Usage already REPORTED against a metered item we just deleted will
+        # never be invoiced.
+        #
+        # Stripe does not carry a deleted subscription item's usage onto the
+        # invoice, so every MeterEvent we sent for this period against the old
+        # item is now unbillable — while our own rows still say `reported`, which
+        # reads as "this is on its way to an invoice" and would leave the money
+        # silently uncollected with nothing pointing at it (Codex).
+        #
+        # Deleting was still the right call: keeping the item would re-rate this
+        # period's earlier lookups at the new plan's price. So the usage is not
+        # abandoned, it is HANDED OVER — moved to needs_review so the ops alert
+        # names it and a human recovers it on an invoice with the settle script.
+        #
+        # Scoped to the period being left and to rows that were actually sent.
+        if any(i.get("deleted") for i in items):
+            period_start = sub.get("current_period_start")
+            if period_start is not None:
+                stranded = await db.execute(
+                    text("""
+                        UPDATE skip_trace_meter_events
+                           SET disposition = 'needs_review',
+                               disposition_at = NOW(),
+                               disposition_reason = 'metered_item_replaced_before_invoice'
+                         WHERE user_id = :uid
+                           AND disposition = 'reported'
+                           AND usage_at IS NOT NULL
+                           AND usage_at >= to_timestamp(:period_start)
+                        RETURNING id
+                    """),
+                    {"uid": str(user.id), "period_start": period_start},
+                )
+                n_stranded = len(stranded.fetchall())
+                if n_stranded:
+                    _logger.warning(
+                        "change-plan: user %s had %d reported skip-trace meter "
+                        "event(s) against the metered item just replaced. Stripe "
+                        "will not invoice them; moved to needs_review for manual "
+                        "recovery.",
+                        user.id, n_stranded,
+                    )
 
         # users.plan is NOT written here. customer.subscription.updated is the
         # single writer for it, so the plan the app enforces always reflects what

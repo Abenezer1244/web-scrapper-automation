@@ -172,3 +172,146 @@ def test_activation_funnel_counts_seeded_user() -> None:
         assert grandfathered.first_download == base.first_download
 
         conn.rollback()
+
+
+# ─── activation_funnel_v2: rates that cannot exceed 100% (migration 091) ─────
+
+def _funnel_v2(conn, days: int = 30):
+    return conn.execute(
+        text("SELECT * FROM public.activation_funnel_v2(:d)"), {"d": days}
+    ).fetchone()
+
+
+def _mark_paid(conn, user_id: str) -> None:
+    # stripe_customer_id is UNIQUE, so it has to differ per user.
+    conn.execute(
+        text(
+            "UPDATE users SET plan='pro', stripe_customer_id = :cus WHERE id = :u"
+        ),
+        {"u": user_id, "cus": f"cus_{uuid.uuid4().hex[:16]}"},
+    )
+
+
+def _mark_downloaded(conn, user_id: str) -> None:
+    conn.execute(
+        text("UPDATE users SET first_leads_downloaded_at = NOW() WHERE id = :u"),
+        {"u": user_id},
+    )
+
+
+def test_v2_returns_the_same_stage_counts_as_v1() -> None:
+    """The bars must not move. Only the ratios were wrong."""
+    with sync_engine.begin() as conn:
+        v1 = conn.execute(
+            text("SELECT * FROM public.activation_funnel(30)")
+        ).fetchone()
+        v2 = _funnel_v2(conn)
+
+        assert v2.signups == v1.signups
+        assert v2.first_scraper == v1.first_scraper
+        assert v2.first_job == v1.first_job
+        assert v2.first_download == v1.first_download
+        assert v2.paid_upgrade == v1.paid_upgrade
+        conn.rollback()
+
+
+def test_paid_and_downloaded_are_counted_separately_from_their_overlap() -> None:
+    """The 200% case, exactly.
+
+    Two paid users and one downloader. Dividing the paid COUNT by the downloader
+    count gives 200%; the intersection gives the real answer, which is that the
+    one observed downloader is also paid.
+    """
+    with sync_engine.begin() as conn:
+        base = _funnel_v2(conn)
+
+        paid_downloader = _seed_user(conn)
+        _mark_paid(conn, paid_downloader)
+        _mark_downloaded(conn, paid_downloader)
+
+        paid_only = _seed_user(conn)
+        _mark_paid(conn, paid_only)
+
+        after = _funnel_v2(conn)
+
+        assert after.paid_upgrade == base.paid_upgrade + 2
+        assert after.first_download == base.first_download + 1
+        # The naive rate divided these two marginals: +2 paid over +1 downloader.
+        assert (after.paid_upgrade - base.paid_upgrade) > (
+            after.first_download - base.first_download
+        )
+        # The intersection only counts the user who did both.
+        assert after.downloaded_and_paid == base.downloaded_and_paid + 1
+        assert after.downloaded_and_paid <= after.first_download
+        conn.rollback()
+
+
+def test_a_downloader_who_never_paid_is_not_in_the_intersection() -> None:
+    with sync_engine.begin() as conn:
+        base = _funnel_v2(conn)
+
+        u = _seed_user(conn)
+        _mark_downloaded(conn, u)
+
+        after = _funnel_v2(conn)
+        assert after.first_download == base.first_download + 1
+        assert after.downloaded_and_paid == base.downloaded_and_paid
+        conn.rollback()
+
+
+def test_a_user_with_many_jobs_is_counted_once() -> None:
+    """EXISTS, not a JOIN: joining users to jobs would multiply the user."""
+    with sync_engine.begin() as conn:
+        base = _funnel_v2(conn)
+
+        uid = _seed_user(conn)
+        sc_id = str(uuid.uuid4())
+        conn.execute(
+            text("""
+                INSERT INTO scraper_configs (
+                    id, user_id, name, county, state, record_type,
+                    fields, enrichment, schedule, deliver,
+                    skip_trace_enabled, active
+                ) VALUES (
+                    :sc, :u, 'cfg', 'pierce', 'WA', 'probate',
+                    '[]'::json, '[]'::json, '{}'::json, '{}'::json, false, true
+                )
+            """),
+            {"sc": sc_id, "u": uid},
+        )
+        for _ in range(3):
+            conn.execute(
+                text("""
+                    INSERT INTO jobs (
+                        id, user_id, scraper_config_id, status, trigger,
+                        page_current, page_total, record_count, retry_count
+                    ) VALUES (:j, :u, :sc, 'done', 'manual', 0, 0, 1, 0)
+                """),
+                {"j": str(uuid.uuid4()), "u": uid, "sc": sc_id},
+            )
+        _mark_downloaded(conn, uid)
+
+        after = _funnel_v2(conn)
+        assert after.first_job == base.first_job + 1
+        assert after.scraper_and_job == base.scraper_and_job + 1
+        assert after.job_and_download == base.job_and_download + 1
+        conn.rollback()
+
+
+def test_every_intersection_is_bounded_by_both_of_its_populations() -> None:
+    """The invariant the whole change exists to guarantee."""
+    with sync_engine.begin() as conn:
+        # Seed a mix so the assertion is not vacuous on an empty database.
+        both = _seed_user(conn)
+        _mark_paid(conn, both)
+        _mark_downloaded(conn, both)
+        _mark_paid(conn, _seed_user(conn))
+        _mark_downloaded(conn, _seed_user(conn))
+
+        r = _funnel_v2(conn)
+        assert r.scraper_and_job <= min(r.first_scraper, r.first_job)
+        assert r.job_and_download <= min(r.first_job, r.first_download)
+        assert r.downloaded_and_paid <= min(r.first_download, r.paid_upgrade)
+        for n in (r.first_scraper, r.first_job, r.first_download, r.paid_upgrade):
+            assert n <= r.signups
+        conn.rollback()

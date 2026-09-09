@@ -326,9 +326,13 @@ def assert_billable(stripe_customer_id: str | None, usage_at, now=None) -> dict:
     import stripe
     stripe.api_key = settings.STRIPE_SECRET_KEY
     try:
+        # status="all": the ACTIVE ones decide billability, but a customer who
+        # has only CANCELED subscriptions has still had an agreement, and
+        # writing their usage off as "never subscribed" would be wrong. The
+        # default listing omits canceled, so this must be explicit.
         subs = list(
             stripe.Subscription.list(
-                customer=stripe_customer_id, status="active", limit=100,
+                customer=stripe_customer_id, status="all", limit=100,
             ).auto_paging_iter()
         )
     except Exception:  # noqa: BLE001 — unknown is NOT "not billable"
@@ -376,7 +380,16 @@ def assert_billable(stripe_customer_id: str | None, usage_at, now=None) -> dict:
 
     if covered_but_closed:
         raise _NotBillableError("closed_billing_period")
-    raise _NotBillableError("no_covering_agreement")
+
+    # A customer who has never had ANY subscription cannot have had an
+    # agreement covering this usage, whatever its timestamp. That is the one
+    # refusal we can make with certainty, and it is the case the owner approved
+    # writing off. Everything else — a cancelled subscription, a replaced
+    # metered item, a period we cannot place the usage in — is UNCERTAIN, and
+    # uncertainty goes to a human rather than becoming a silent write-off.
+    if not subs:
+        raise _NotBillableError("no_subscription_ever")
+    raise _NotBillableError("coverage_unproven")
 
 
 def report_meter_event_to_stripe(
@@ -577,34 +590,39 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
         {"qid": queue_id, "states": list(billable_states)},
     ).fetchall()
 
-    # When the usage actually happened, captured ONCE for this batch, as the
-    # EARLIEST time it could have happened.
+    # usage_at means "a time we can DEFEND billing against". NULL means we
+    # cannot, and NULL is currently the honest answer for every batch.
     #
-    # This first used COALESCE(completed_at, NOW()) and that was wrong in the
-    # one direction that costs a customer money (Codex found it). This function
-    # runs inside the ingest transaction that has just set
-    # `completed_at = now` a few statements earlier, so it was reading the
-    # reconciliation clock while claiming to read provider settlement. A batch
-    # that finished days ago and is only being reconciled now — a stalled queue,
-    # a replayed webhook — would be stamped today, which makes usage from BEFORE
-    # a subscription look like usage inside it, and makes usage past Stripe's
-    # 35-day backdating limit look fresh.
+    # Three candidates were tried and all three are the wrong clock:
     #
-    # `submitted_at` is when WE sent the batch to the provider. The lookups
-    # cannot have happened before that, and ingest never writes this column —
-    # only the dispatcher does, when it actually submits. That makes it a
-    # trustworthy LOWER BOUND, and a lower bound is the fail-safe direction: it
-    # can only push usage out of a billable window (refused, reviewed by a
-    # human), never into one. An upper bound does the opposite, which is how
-    # this was wrong the first time.
-    usage_at = db.execute(
-        text("""
-            SELECT submitted_at
-            FROM skip_trace_queues
-            WHERE tracerfy_queue_id = :qid
-        """),
-        {"qid": queue_id},
-    ).scalar()
+    #   created_at    server_default=now(), i.e. this reconciliation
+    #                 transaction.
+    #   completed_at  set to `now` by the ingest worker a few statements before
+    #                 this function runs, in the same transaction. It reads as
+    #                 provider settlement and is not.
+    #   submitted_at  written by the dispatcher when the batch is sent — but
+    #                 _persist_submission also writes it on the RECONCILER'S
+    #                 ADOPTION path, so for an adopted queue it is the adoption
+    #                 time, days after the work. Not a lower bound either.
+    #
+    # Nothing in this system records when the provider actually performed the
+    # lookups. Every one of those values can place usage from before a
+    # subscription inside it, which bills a customer for something they had not
+    # agreed to pay for, and can make usage past Stripe's 35-day backdating
+    # limit look fresh.
+    #
+    # So this does not guess. The rows are kept with full detail and land in
+    # needs_review, where the ops alert surfaces them and a human settles them.
+    # That is the owner's stated policy for usage with no agreement behind it,
+    # and it is the only answer the recorded data supports.
+    #
+    # TO RE-ENABLE AUTOMATIC BILLING: record a trustworthy provider-execution
+    # time at dispatch (one that adoption does not overwrite) and select it
+    # here. assert_billable already implements the rest of the rule and needs no
+    # change — it refuses a NULL usage_at as usage_at_unknown today, and will
+    # start passing the ordinary case the moment this column carries a real
+    # value.
+    usage_at = None
 
     summary: dict = {"queue_id": queue_id, "users": [], "outbox_ids": []}
     for row in rows:

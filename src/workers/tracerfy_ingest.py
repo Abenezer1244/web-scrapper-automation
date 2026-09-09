@@ -78,7 +78,13 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
     from src.db.session import system_sync_session
 
     with system_sync_session() as db:
-        row = db.get(SkipTraceMeterEvent, outbox_id)
+        # FOR UPDATE. Checking an unlocked read is not a claim: an operator can
+        # commit `written_off_manual` in the gap between this check and the
+        # Stripe call, and the worker would then bill the row and overwrite
+        # their decision with `reported`. Codex reproduced exactly that
+        # interleaving. The lock is held until this transaction commits, so a
+        # settlement writer either lands before we read or waits behind us.
+        row = db.get(SkipTraceMeterEvent, outbox_id, with_for_update=True)
         if row is None:
             _logger.warning(
                 "Skip-trace meter outbox %s: row not found — nothing to report",
@@ -134,12 +140,17 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
             # closed_billing_period belongs here: the customer DID owe this and
             # a renewal simply closed the window we could bill it in, so
             # settling it non_billable would quietly discard real revenue.
+            # non_billable is a WRITE-OFF and only two refusals are certain
+            # enough to earn one: the customer has no Stripe customer at all,
+            # or has never held a subscription of any status. Everything else
+            # — a closed period, a cancelled subscription, a replaced metered
+            # item, usage we cannot place in time — is uncertainty, and
+            # uncertainty goes to a human. Discarding revenue silently is the
+            # same class of error as charging for something never agreed.
             row.disposition = (
-                "needs_review"
-                if refusal.reason in (
-                    "timestamp_expired", "usage_at_unknown", "closed_billing_period",
-                )
-                else "non_billable"
+                "non_billable"
+                if refusal.reason in ("no_customer_id", "no_subscription_ever")
+                else "needs_review"
             )
             row.disposition_at = datetime.now(UTC)
             row.disposition_reason = refusal.reason

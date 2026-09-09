@@ -1965,7 +1965,9 @@ def test_a_customer_id_alone_no_longer_authorises_billing(monkeypatch):
     _patch_subs(monkeypatch, st, [])
     with pytest.raises(st._NotBillableError) as e:
         st.assert_billable("cus_started_checkout", datetime.now(UTC))
-    assert e.value.reason == "no_covering_agreement"
+    # The ONE refusal certain enough to write off: no subscription has ever
+    # existed, of any status, so nothing can have covered this usage.
+    assert e.value.reason == "no_subscription_ever"
 
 
 def test_a_subscription_without_the_metered_item_does_not_authorise_overage(
@@ -1982,7 +1984,8 @@ def test_a_subscription_without_the_metered_item_does_not_authorise_overage(
     _patch_subs(monkeypatch, st, [_sub_with("price_plan_only_not_metered")])
     with pytest.raises(st._NotBillableError) as e:
         st.assert_billable("cus_1", datetime.now(UTC))
-    assert e.value.reason == "no_covering_agreement"
+    # A subscription exists, so this is NOT a certain write-off — a human looks.
+    assert e.value.reason == "coverage_unproven"
 
 
 @pytest.mark.parametrize("status", ["trialing", "past_due", "unpaid", "paused"])
@@ -1995,7 +1998,7 @@ def test_only_an_active_subscription_authorises_billing(monkeypatch, status):
     _patch_subs(monkeypatch, st, [_sub_with(price, status=status)])
     with pytest.raises(st._NotBillableError) as e:
         st.assert_billable("cus_1", datetime.now(UTC))
-    assert e.value.reason == "no_covering_agreement"
+    assert e.value.reason == "coverage_unproven"
 
 
 def test_usage_from_before_the_subscription_is_not_swept_into_it(monkeypatch):
@@ -2015,7 +2018,7 @@ def test_usage_from_before_the_subscription_is_not_swept_into_it(monkeypatch):
     before_the_subscription = datetime.now(UTC) - timedelta(days=3)
     with pytest.raises(st._NotBillableError) as e:
         st.assert_billable("cus_1", before_the_subscription)
-    assert e.value.reason == "no_covering_agreement"
+    assert e.value.reason == "coverage_unproven"
 
 
 def test_usage_inside_an_active_metered_period_is_billable(monkeypatch):
@@ -2205,42 +2208,62 @@ def test_a_metered_item_added_later_does_not_price_earlier_usage(monkeypatch):
         st.assert_billable("cus_1", usage_before_the_item_existed)
 
 
-def test_usage_at_is_a_lower_bound_that_ingest_cannot_move():
-    """The provenance defect: usage_at read the reconciliation clock.
+def test_usage_at_is_never_guessed_from_a_clock_we_control():
+    """No column in this system records when the provider ran the lookups.
 
-    report_usage_from_webhook runs inside the ingest transaction that has just
-    set `completed_at = now`, so COALESCE(completed_at, NOW()) was the time we
-    RECONCILED, dressed up as the time the provider settled. A batch that
-    finished days ago and is reconciled today would be stamped today — making
-    pre-subscription usage look covered, and 35-day-old usage look fresh.
+    Three candidates were tried and every one is the wrong clock:
 
-    `submitted_at` is written only by the dispatcher, never by ingest, and the
-    lookups cannot predate it. A lower bound can only push usage OUT of a
-    billable window, which is the direction that fails safe.
+      created_at    server_default=now() — this reconciliation transaction.
+      completed_at  set to `now` by the ingest worker a few statements before
+                    billing runs, in the SAME transaction.
+      submitted_at  written by the dispatcher on send, but _persist_submission
+                    writes it again on the reconciler's ADOPTION path, so for an
+                    adopted queue it is the adoption time, days after the work.
+
+    Each of them can place usage from before a subscription inside it — which
+    bills a customer for something they never agreed to — and can make usage
+    past Stripe's 35-day limit look fresh. So usage_at is left NULL and the row
+    goes to needs_review, where a human settles it. Absent is not the same as
+    unknown-but-guessed, and only one of those is safe to bill.
+
+    This test exists to fail loudly if someone re-attaches a clock here without
+    first recording a real provider-execution time.
     """
     import inspect
 
     from src.api.billing import skip_trace_usage as st
 
-    # Comments stripped: the phrase this asserts against deliberately survives
-    # in the comment explaining why it was replaced, and matching that would
-    # make the test fail for the documentation rather than the code.
     code = [
         line for line in inspect.getsource(st.report_usage_from_webhook).splitlines()
         if not line.lstrip().startswith("#")
     ]
-    assert any("SELECT submitted_at" in line for line in code), (
-        "usage_at must come from a column ingest does not write"
+    assert any("usage_at = None" in line for line in code), (
+        "usage_at must not be derived from a clock this system controls"
     )
-    assert not any("COALESCE(completed_at" in line for line in code), (
-        "completed_at is set by this very transaction — it is the "
-        "reconciliation clock, not provider settlement"
-    )
+    for wrong_clock in ("completed_at", "submitted_at", "NOW()"):
+        assert not any(
+            wrong_clock in line and "usage_at" in line for line in code
+        ), f"usage_at is being derived from {wrong_clock} again"
 
-    ingest = inspect.getsource(
-        __import__("src.workers.tracerfy_ingest", fromlist=["x"])
-    )
-    assert "completed_at=now" in ingest, (
-        "if ingest stopped writing completed_at, revisit which timestamp is "
-        "the trustworthy one — this test is the reason submitted_at was chosen"
+
+def test_a_null_usage_at_reaches_a_human_rather_than_a_write_off(monkeypatch):
+    """The consequence of the above: it must land in needs_review.
+
+    Routing it to non_billable would silently discard revenue the customer may
+    genuinely owe, which is the same class of error as charging them for
+    something they did not.
+    """
+    import src.api.billing.skip_trace_usage as st
+
+    price = _metered_price(st)
+    _patch_subs(monkeypatch, st, [_sub_with(price)])
+    with pytest.raises(st._NotBillableError) as e:
+        st.assert_billable("cus_1", None)
+    assert e.value.reason == "usage_at_unknown"
+
+    import src.workers.tracerfy_ingest as ti
+
+    src = inspect.getsource(ti.report_skip_trace_meter_event)
+    assert '"no_customer_id", "no_subscription_ever"' in src, (
+        "only those two refusals may be written off; the rest need a human"
     )

@@ -437,6 +437,79 @@ def _fail_job(db, job, r, job_id: str, reason: str, expected_started_at=None) ->
     return cas_ok
 
 
+def claim_job_for_attempt(db, job_id: str):
+    """Atomically take ownership of a ``pending`` job for ONE attempt.
+
+    Returns the timestamp stamped on the winning attempt, or ``None`` when the
+    row was not claimable (already in flight, cancelled, or claimed by another
+    worker). Compare-and-set on ``status='pending'`` is what makes a duplicate
+    Celery delivery or a recovery re-enqueue a no-op instead of a second
+    concurrent scrape.
+
+    ``last_heartbeat_at`` is stamped with the SAME instant as ``started_at``, and
+    that is load-bearing rather than tidy. The watchdog re-queue path resets
+    status/started_at but the row can still carry the DEAD attempt's heartbeat;
+    a fresh attempt's heartbeat thread does not write for up to 60s, so an
+    inherited stale value would let the next watchdog tick re-queue a brand-new,
+    perfectly healthy attempt, burning the retry budget until the job failed
+    outright (Codex). Stamping at claim time makes an attempt immune to that
+    regardless of what any re-queue path left behind.
+
+    This lives here, rather than inline in ``run_scrape_job``, so the guarantee is
+    testable against the code production actually runs. A test that re-types this
+    UPDATE proves only that the test's own SQL works: deleting the heartbeat stamp
+    from the real claim would leave such a test green (Codex).
+    """
+    from sqlalchemy import update
+
+    from src.db.models import Job
+
+    claimed_at = _now()
+    rowcount = db.execute(
+        update(Job)
+        .where(Job.id == job_id, Job.status == "pending")
+        .values(status="queued", started_at=claimed_at, last_heartbeat_at=claimed_at)
+    ).rowcount
+    db.commit()
+    return claimed_at if rowcount else None
+
+
+def transient_retry_notice(
+    *, retry_count: int, max_retries: int, countdown: int, published: bool
+) -> str:
+    """The USER-FACING line for a transient scrape failure that will be retried.
+
+    Kept as a pure function, apart from the engineering log, so the copy customers
+    actually read is greppable and unit-testable rather than buried in a 200-line
+    except block. The engineering log is separate and MAY carry the exception class,
+    countdown and publish outcome; this string carries none of that.
+
+    The wording it replaced ("Transient error, retrying in ~5 min") had two problems.
+    It read as though the records had failed rather than the connection, and it
+    quoted a time even when the broker publish had FAILED — in which case nothing is
+    scheduled and the row waits for the watchdog's stranded-retry sweep instead, so
+    the promised minute count was a promise the system had not made (Codex).
+
+    On a publish failure the copy claims NO schedule at all, not even "shortly":
+    that path is picked up by the stranded-retry branch of the watchdog, which only
+    looks at rows older than STUCK_STARTED_AT_FALLBACK_MINUTES, so recovery is
+    bounded but can be well over an hour away. "Queued and starting shortly" would
+    be as wrong as quoting the countdown (Codex).
+
+    ``retry_count`` is the value AFTER _retry_scrape_job incremented it, so the
+    attempt about to run is ``retry_count + 1`` out of ``max_retries + 1`` total.
+    """
+    attempt = f"attempt {retry_count + 1} of {max_retries + 1}"
+    if published:
+        return (
+            "The county portal request could not be completed. Retrying in about "
+            f"{max(1, countdown // 60)} min ({attempt})."
+        )
+    return (
+        f"The county portal request could not be completed. This run will be retried ({attempt})."
+    )
+
+
 def _retry_scrape_job(
     db,
     job,
@@ -527,11 +600,16 @@ def _write_heartbeat(job_id: str, started_at) -> int:
     is best-effort and must not fail a job. A write error returns _HB_ERROR (not
     _HB_TERMINAL) so a single bad commit doesn't stop the thread and strand a
     healthy job — the thread counts consecutive errors instead.
+
+    Runs on ``heartbeat_sync_session`` — the ISOLATED NullPool engine, never the
+    pool_size=2 work engine. Sharing that pool is what deadlocked every scrape at
+    the insert phase on 2026-06-18 and got this heartbeat disabled for months. Do
+    not "simplify" this back to ``system_sync_session``.
     """
-    from src.db.session import system_sync_session
+    from src.db.session import heartbeat_sync_session
 
     try:
-        with system_sync_session() as _db:
+        with heartbeat_sync_session() as _db:
             rowcount = _db.execute(
                 _HEARTBEAT_SQL, {"j": str(job_id), "sa": started_at}
             ).rowcount

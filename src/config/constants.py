@@ -82,6 +82,39 @@ STUCK_CHECK_STATUSES: frozenset[str] = frozenset({
     JobStatus.ENRICHING.value,
 })
 
+# ─── Job liveness thresholds ─────────────────────────────────────────────────
+# A running job beats jobs.last_heartbeat_at every ~60s from run_scrape_job's
+# HeartbeatThread. These two numbers decide when silence means "the worker is
+# gone" — and they are read by BOTH the watchdog that re-queues the job
+# (src/workers/scheduler_helpers/health.py) and the API that describes the job
+# to the user (JobResponse in src/api/schemas.py). They live here so those two
+# can never disagree: a UI that calls a job stalled earlier than the watchdog
+# acts would alarm users about jobs nothing is about to fix, and one that calls
+# it stalled later would keep claiming live progress after the re-queue.
+# health.py's docstring already referred to "HEARTBEAT_STALE_MINUTES" as though
+# it were a constant; it was a bare literal until now.
+#
+# 15 min: a live worker beats every ~60s, so this is 15 consecutive misses.
+# Comfortably above the longest bounded blocking unit inside a beat interval
+# (30s GIS chunk, 240s assessor cap) so a slow-but-alive step cannot trip it.
+HEARTBEAT_STALE_MINUTES: int = 15
+
+# Fallback for rows with NO heartbeat observation at all (claimed before the
+# heartbeat shipped / by an older worker image). Deliberately ABOVE the 65-min
+# Celery hard time limit so a genuinely long, genuinely live job is never
+# declared stuck on age alone. NULL is "unobserved", not "dead".
+STUCK_STARTED_AT_FALLBACK_MINUTES: int = 70
+
+# A job that was claimed but never stamped a started_at is a ZOMBIE: the worker
+# died between the broker delivery and the claim. It has neither of the two
+# signals above, so age since CREATION is the only evidence there is. A healthy
+# job goes pending -> queued -> probing within seconds, so 10 minutes is already
+# generous. The watchdog has always used this cutoff; the API needs it too, or a
+# zombie reports "live" forever while the watchdog is re-queueing it.
+# Both readers now take the number from here (Codex: the watchdog branch was
+# still a bare literal after the API was hoisted onto the constant).
+ZOMBIE_UNSTARTED_MINUTES: int = 10
+
 
 # Length of the free Pro trial granted at registration, in days. Single source
 # of truth: the registration handler stamps trial_ends_at from this, and the

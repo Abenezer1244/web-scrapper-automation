@@ -1791,6 +1791,18 @@
             "title": "Id",
             "type": "string"
           },
+          "last_heartbeat_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Heartbeat At"
+          },
           "page_current": {
             "title": "Page Current",
             "type": "integer"
@@ -1821,6 +1833,11 @@
             ],
             "title": "Progress Pct"
           },
+          "progress_stalled": {
+            "default": false,
+            "title": "Progress Stalled",
+            "type": "boolean"
+          },
           "record_count": {
             "title": "Record Count",
             "type": "integer"
@@ -1839,6 +1856,11 @@
           "retry_count": {
             "title": "Retry Count",
             "type": "integer"
+          },
+          "retry_pending": {
+            "default": false,
+            "title": "Retry Pending",
+            "type": "boolean"
           },
           "scraper_config_id": {
             "title": "Scraper Config Id",

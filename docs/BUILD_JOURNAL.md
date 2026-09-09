@@ -19,6 +19,97 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-09 — a rollback nulled a column, and that quietly killed a whole recovery branch
+
+> **Provenance:** commit SHAs, CI results, the production timestamps and the browser
+> assertion counts below were read back from `git`, `gh`, `railway run` and Playwright
+> in-session. The narrative ordering is session recollection - read it as such.
+
+**Built / Shipped:**
+- **BE #273** (`26db616`, deployed 16:27 UTC) - re-enable the liveness `HeartbeatThread` on a
+  DEDICATED **NullPool** `heartbeat_engine` (`src/db/session.py`), isolated from the
+  `pool_size=2` work pool. `claim_job_for_attempt()` now stamps `last_heartbeat_at` with the
+  same instant as `started_at`; the watchdog re-queue nulls the dead attempt's. Watchdog
+  thresholds hoisted to `src/config/constants.py` and read by BOTH the watchdog and the API
+  (`HEARTBEAT_STALE_MINUTES` 15 / `STUCK_STARTED_AT_FALLBACK_MINUTES` 70 /
+  `ZOMBIE_UNSTARTED_MINUTES` 10). `JobResponse` gained `progress_stalled` / `retry_pending` /
+  `last_heartbeat_at`.
+- **FE #126** (`9685a28`, Vercel prod 18:19 UTC) - `app/(dashboard)/live/[id]/page.tsx` and
+  `components/log-stream.tsx` consume those flags. Pulse, ping ring, status chip (colour AND
+  label), status text, log badge and the elapsed clock all defer to `isLive`, not `isRunning`.
+- Suite 2778 passed / 2 skipped / 0 failed; CI green on both PRs.
+
+**Tried / Decided:**
+- **Recovered, did not restart.** A machine restart killed the prior session. Both worktrees
+  still held uncommitted work (BE: 6 source files + 2 test files; FE: an existing
+  `fe-pierce-retry-stuck` worktree on `fix/live-job-stalled-state` I nearly duplicated).
+  🔑 **`git worktree list` in BOTH repos before starting anything.**
+- **Did NOT change any timeout or the retry backoff.** No evidence justified it, and the brief
+  said not to raise them blindly.
+- Codex's design-phase "block until stale attempts are fenced" was **rejected** after checking
+  the code: result rows (`ON CONFLICT DO NOTHING`, mig 062), reservation (`WHERE reserved_at IS
+  NULL`) and billing (`WHERE billing_applied_at IS NULL`) are per-JOB CAS, which is *stronger*
+  than per-attempt fencing.
+
+**Failed / Blocked:**
+- `bash run-full-pytest.sh | tail` **never returned** and wrote 0 bytes - the backgrounded
+  `redis-server` holds the pipe open so `tail` never sees EOF. pytest had already finished.
+  Diagnose by looking for a pytest *process*, not by waiting.
+- `railway run` cannot enqueue: `redis.railway.internal` only resolves INSIDE Railway. Had to
+  use `railway ssh --service worker "python -c ..."` (single line; a multi-line `-c` is mangled).
+  My trigger script committed the job row and *then* failed to enqueue, leaving a `pending` row
+  that the watchdog deliberately skips (`retry_count=0`) - it had to be enqueued, not abandoned.
+- Local rig flakes: Turbopack cold-compile made login fail silently twice, and every assertion
+  after it was vacuous. Fixed by polling for the URL and hard-failing if login never lands.
+
+**Caught & fixed:**
+- **Codex [P3], BE:** `ZOMBIE_UNSTARTED_MINUTES` was consumed by the API while `health.py` still
+  used a bare `timedelta(minutes=10)` - the exact drift the shared constants exist to prevent.
+  Guarded by a test that reads the watchdog's SOURCE and rejects a bare numeric cutoff, because
+  the existing `assert == 15/70/10` test would have stayed green through it. Negative-proved
+  against the pre-fix source before keeping it.
+- **Codex [P3], BE:** "Could not reach the county portal" overstated the diagnosis - the portal
+  *was* reached. Now "The county portal request could not be completed."
+- **Mine, FE:** passing `isConnected && isLive` into `LogStream` hid the "live" marker correctly
+  but flipped the empty panel to **"Connecting..."**, inventing a reconnect. Same false-progress
+  bug pointed the other way. Split into separate `isConnected` / `jobLive` props.
+- **Codex [P1], FE (GATE FAIL):** the elapsed clock still used `isRunning`. It measured against
+  `Date.now()` and re-rendered on every 3s refetch, so a DEAD run counted upward forever and
+  could promise "~Xm remaining". Codex caught it from the diff alone; my screenshots then
+  confirmed it (28m 6s -> 31m 5s). Gated on `isLive`; a stalled run shows its start time.
+- **Codex [P2], FE:** a terminal job has `isRunning === false`, so an empty log panel on a
+  COMPLETED run borrowed the stalled wording. Added an explicit `jobFinished` prop.
+
+**Pending / Handoff:**
+- 👤 **Tracerfy is OUT OF CREDITS (402)** - 372 normal skip-trace rows queued, auto-submit once
+  funded. Surfaced in the worker logs; unrelated to this work.
+- The controlled production run finished with `records=0, pages=0/2`. Plausible for a
+  `since_last_run` window with nothing new, but nobody has confirmed that.
+
+**Facts learned:**
+- 🛑 **A rollback that nulls a column can kill an entire recovery branch with nothing failing.**
+  `HeartbeatThread` was disabled on 2026-06-18 for a pool deadlock. That left
+  `last_heartbeat_at` NULL on every job, which silently made the watchdog's fast 15-minute
+  stale-heartbeat branch **dead code** for ~3 months. Recovery fell to the 70-minute
+  `started_at` fallback, the watchdog still ran and still looked healthy, and nothing alerted.
+  Job `9c8b7259` would have read "Scraping records... LIVE" until 10:24 UTC.
+- **A SIGTERM raises no Python exception**, so `on_failure` never runs and a deploy-killed job
+  strands in `scraping` with NULL `finished_at` AND NULL `error_message`. There is no exception
+  to find; liveness is the only signal.
+- `progress_label` is **not** a column on `jobs` and never was. `tasks.py` assigned it inside a
+  try/except that logged "Failed to commit progress_label" - a no-op write and a handler that
+  could never fire. The surrounding `db.commit()` IS load-bearing (flushes the date window
+  before a call that can run 30 minutes).
+- **Proof that the heartbeat THREAD works, not just the claim:** the claim stamps `started_at`
+  and `last_heartbeat_at` with the *same* instant, so a later heartbeat can only come from the
+  thread. Prod job `eb088490`: started `18:40:28.741`, heartbeat `18:40:29.271` - **0.530s
+  after the claim**. Jobs with a non-NULL `last_heartbeat_at` went 0 -> 1, all time.
+- 🛑 **Two browser-assertion instruments lied before the code did.** (1) Section headings are
+  uppercased by CSS, so `inner_text` returns "LOG STREAM" and a case-sensitive assert fails on
+  working code. (2) A collision detector using `getBoundingClientRect()` reports garbage for
+  `AnimatedCounter` digit strips and for any **inline** element that wraps (the rect is the
+  UNION of its line boxes). Both produced confident failures on correct markup. Screenshot
+  before believing an assertion, and always run an unchanged CONTROL page through the same test.
 ## 2026-09-09 — skip-trace overage can finally be billed, and three gate rounds to earn it
 
 > **Provenance:** commit SHAs, suite counts and the Codex verdicts below were read back from

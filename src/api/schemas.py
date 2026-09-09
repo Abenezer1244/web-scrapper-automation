@@ -1,12 +1,20 @@
 import re
 import unicodedata
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
-from src.config.constants import BatchRunStatus, JobStatus, NotificationType
+from src.config.constants import (
+    HEARTBEAT_STALE_MINUTES,
+    STUCK_CHECK_STATUSES,
+    STUCK_STARTED_AT_FALLBACK_MINUTES,
+    ZOMBIE_UNSTARTED_MINUTES,
+    BatchRunStatus,
+    JobStatus,
+    NotificationType,
+)
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -1036,6 +1044,11 @@ class JobResponse(BaseModel):
     started_at: datetime | None
     finished_at: datetime | None
     created_at: datetime
+    # Last liveness ping from the worker that owns this attempt (written every
+    # ~60s by run_scrape_job's HeartbeatThread). Exposed so the client can stop
+    # claiming a run is live when nothing has reported in. NULL means UNOBSERVED
+    # (claimed by an older worker image, or claimed seconds ago), never "dead".
+    last_heartbeat_at: datetime | None = None
     # Scraper config context — avoids separate lookup on frontend
     scraper_name: str | None = None
     county: str | None = None
@@ -1054,6 +1067,18 @@ class JobResponse(BaseModel):
     elapsed_seconds: int | None = None
     elapsed_time: str | None = None  # "1m 15s"
     progress_label: str | None = None  # "Scraping page 3 of 5", "Looking up parcels 42/100"
+    # True when this job holds an ACTIVE status but nothing has reported progress
+    # for HEARTBEAT_STALE_MINUTES. The client must use it to stop presenting the
+    # run as live: a worker killed mid-scrape (deploy, OOM, hard timeout) leaves
+    # the row in 'scraping' with no exception and no finished_at, and every label
+    # below would otherwise keep describing work that stopped. It is a statement
+    # about MISSING OBSERVATIONS, not proof the worker died — the watchdog re-queues
+    # on the same threshold, so a stalled job is one the system is about to recover.
+    progress_stalled: bool = False
+    # True while a bounded transient retry is waiting out its backoff. The row is
+    # 'pending' with retry_count > 0, which otherwise reads as "queued, waiting for
+    # capacity" and looks frozen for the whole 5- or 20-minute delay.
+    retry_pending: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -1092,6 +1117,68 @@ class JobResponse(BaseModel):
                 if self.status == JobStatus.DONE
                 else self.status.value.title()
             )
+            return
+
+        # ── Liveness, before any "in progress" label is chosen ────────────────
+        # A job whose worker was killed mid-run keeps an ACTIVE status, a NULL
+        # finished_at and a NULL error_message: there is no exception to record
+        # when a container is stopped. Nothing below can tell that apart from real
+        # work, so decide it here, from the liveness signal, and let the labels
+        # defer to it. Thresholds are shared with the watchdog (constants.py) so
+        # the UI never calls a job stalled earlier or later than the code that
+        # actually recovers it.
+        if self.status in STUCK_CHECK_STATUSES:
+            if self.last_heartbeat_at is not None:
+                beat = (
+                    self.last_heartbeat_at
+                    if self.last_heartbeat_at.tzinfo
+                    else self.last_heartbeat_at.replace(tzinfo=UTC)
+                )
+                self.progress_stalled = beat < now - timedelta(
+                    minutes=HEARTBEAT_STALE_MINUTES
+                )
+            elif self.started_at is not None:
+                # No heartbeat ever observed for this attempt. NULL is "unobserved",
+                # not "dead", so fall back to the same conservative age cutoff the
+                # watchdog uses for these rows rather than guessing early.
+                started = (
+                    self.started_at if self.started_at.tzinfo
+                    else self.started_at.replace(tzinfo=UTC)
+                )
+                self.progress_stalled = started < now - timedelta(
+                    minutes=STUCK_STARTED_AT_FALLBACK_MINUTES
+                )
+            else:
+                # ZOMBIE: an active status with NEITHER a heartbeat NOR a started_at.
+                # The worker died between the broker delivery and the claim, so the
+                # row never recorded an attempt at all. Age since creation is the
+                # only evidence there is, and the watchdog already re-queues these on
+                # exactly this cutoff — without this branch the API would report a
+                # zombie as live indefinitely while the watchdog was recovering it
+                # (Codex).
+                created = (
+                    self.created_at if self.created_at.tzinfo
+                    else self.created_at.replace(tzinfo=UTC)
+                )
+                self.progress_stalled = created < now - timedelta(
+                    minutes=ZOMBIE_UNSTARTED_MINUTES
+                )
+
+        # A bounded transient retry waiting out its backoff. Checked before the
+        # generic PENDING label so a retrying job does not read "Waiting to start".
+        if self.status == JobStatus.PENDING and self.retry_count > 0:
+            self.retry_pending = True
+            self.progress_label = "Waiting to retry"
+            return
+
+        if self.progress_stalled:
+            # No exception class, no task id, no URL. Deliberately does NOT promise
+            # a restart: the watchdog re-queues a stalled job only while its retry
+            # budget lasts, and permanently fails it once that is spent, so
+            # "will restart automatically" would be a promise broken for exactly
+            # the jobs that most need honest wording (Codex). "Checking on this
+            # run" is true in both cases.
+            self.progress_label = "No recent progress reported. Checking on this run."
             return
 
         # Progress based on page_current / page_total

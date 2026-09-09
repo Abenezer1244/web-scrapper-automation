@@ -77,6 +77,8 @@ from src.workers.tasks_helpers.status import (
     _redis,
     _retry_scrape_job,
     _set_status,
+    claim_job_for_attempt,
+    transient_retry_notice,
 )
 
 _logger = setup_logger("worker.task")
@@ -349,7 +351,7 @@ class _RunScrapeJobTask(app.Task):
 )
 def run_scrape_job(self, job_id: str) -> None:
     """Execute a full scrape job lifecycle for the given job_id."""
-    from sqlalchemy import func, select, update
+    from sqlalchemy import func, select
 
     from src.api.middleware.security import register_connector_domains_from_db
     from src.db.models import Job, Result, ScraperConfig, User
@@ -438,19 +440,11 @@ def run_scrape_job(self, job_id: str) -> None:
         # genuine duplicates. A per-job lease would buy back the fast path; out of
         # scope here and unnecessary (the batch barrier waits for terminal
         # children regardless of which recovery path fires).
-        # ROLLBACK 2026-06-18: the HeartbeatThread is DISABLED (see below) because it
-        # deadlocked the insert phase contending for the small worker connection pool
-        # (every post-PR#59 scrape wedged at "Saving records to database..."). We
-        # deliberately do NOT stamp last_heartbeat_at here, so it stays NULL and the
-        # watchdog uses its conservative started_at>stuck_cutoff fallback (the proven
-        # PR#57 behavior). Re-enable the heartbeat only with a dedicated NullPool
-        # engine isolated from the work pool (see docs/BUILD_JOURNAL.md).
-        claimed = db.execute(
-            update(Job)
-            .where(Job.id == job_id, Job.status == "pending")
-            .values(status="queued", started_at=_now())
-        ).rowcount
-        db.commit()
+        # claim_job_for_attempt also stamps last_heartbeat_at with the same instant
+        # as started_at, so every attempt begins with a FRESH liveness observation
+        # and can never be re-queued on the previous attempt's stale one. See that
+        # helper for why the CAS lives there rather than inline here.
+        claimed = claim_job_for_attempt(db, job_id) is not None
         if not claimed:
             _logger.info(
                 "Job %s not claimable (already in flight / not pending) — "
@@ -491,16 +485,20 @@ def run_scrape_job(self, job_id: str) -> None:
             _fail_job(db, job, r, job_id, f"{_violation.title}. {_violation.message}")
             return
 
-        # Liveness heartbeat DISABLED (rollback 2026-06-18). The daemon thread shared
-        # the worker's small sync connection pool (pool_size=2) with the main work
-        # session + _publish_log; during the DB-heavy insert phase the main thread and
-        # the heartbeat thread deadlocked on the pool, wedging EVERY scrape at the
-        # insert with a frozen heartbeat (worker-internal, invisible to pg_stat_activity;
-        # DB/insert/commit all verified fast in isolation). Leaving it unstarted (the
-        # `with HeartbeatThread(...)` __enter__ never starts it; __exit__.stop() no-ops)
-        # restores scraping and reverts the watchdog to its started_at fallback. Re-enable
-        # ONLY with a dedicated NullPool engine for the heartbeat (Codex; BUILD_JOURNAL).
-        # _hb.start(job.started_at)  # DISABLED — do not re-enable without pool isolation
+        # Liveness heartbeat RE-ENABLED (2026-09-09) under the condition the
+        # 2026-06-18 rollback set: the heartbeat now runs on `heartbeat_engine`, a
+        # DEDICATED NullPool engine (src/db/session.py), so it can never contend
+        # with the pool_size=2 work pool that the main session and _publish_log
+        # share. That contention is what deadlocked every scrape at the insert
+        # phase and got this disabled.
+        #
+        # It was disabled for long enough that last_heartbeat_at was NULL on every
+        # job in production, which quietly made the watchdog's 15-minute
+        # stale-heartbeat branch DEAD CODE: a job whose worker was killed mid-scrape
+        # (a deploy, an OOM, a hard timeout) sat visibly "running" for the full
+        # 70-minute started_at fallback with nothing to show it was gone. That is
+        # exactly what stranded job 9c8b7259 on 2026-09-09.
+        _hb.start(job.started_at)
         _publish_log(r, job_id, "info", f"Job queued: {config.name} ({config.county}, {config.state})", db=db)
 
         # ── PROBING ───────────────────────────────────────────────────────────
@@ -596,16 +594,25 @@ def run_scrape_job(self, job_id: str) -> None:
                     _publish_log(r, job_id, "info", f"Looking up addresses for {page_total} parcels...", db=db)
 
         _publish_log(r, job_id, "info", "Connecting to county portal...", db=db)
-        # Update progress label so the live page shows activity during captcha solve.
-        # L7 (full-SaaS review): the previous "rollback() then commit()"
-        # recovery dance is fragile — unpack it into explicit branches
-        # so the intent is grep-friendly.
-        job.progress_label = "Connecting to portal..."
+        # Flush the resolved date window to disk before entering the scraper, which
+        # can run for up to _SCRAPE_TIMEOUT below. Until this commits, job.date_from
+        # / job.date_to exist only in this session's uncommitted transaction, so the
+        # live page and any support query would show a NULL window for the whole run.
+        #
+        # This block used to also set `job.progress_label = "Connecting to portal..."`.
+        # That was dead: `progress_label` is NOT a column on Job and is in no
+        # migration (production confirms `column jobs.progress_label does not exist`)
+        # — it is a COMPUTED field on the JobProgress response schema, derived in
+        # src/api/schemas.py from status + page counters. The assignment therefore
+        # just set a stray Python attribute on the ORM instance and wrote nothing,
+        # while the log message below claimed a progress_label write had failed.
+        # Removed rather than implemented: schemas.py already derives a better label
+        # from state that is actually persisted.
         try:
             db.commit()
         except Exception as commit_exc:
             _logger.warning(
-                "Failed to commit progress_label for job %s: %s",
+                "Job %s: failed to commit the resolved date window before scraping: %s",
                 job_id, str(commit_exc)[:120],
             )
             try:
@@ -668,7 +675,16 @@ def run_scrape_job(self, job_id: str) -> None:
                     backoffs=SCRAPE_TRANSIENT_BACKOFF_SECONDS,
                 )
                 if countdown is not None:
+                    # BOTH sides of this merge were needed. This branch replaced
+                    # the inline PRIORITY_QUEUE_PLANS test with
+                    # scrape_queue_for_plan, which normalizes the plan first — an
+                    # untrimmed or uppercased plan silently fell to the standard
+                    # queue and a paying customer lost priority. main
+                    # independently added `published = True`, which the except
+                    # below flips to False and the watchdog branch depends on.
+                    # Taking either side alone would have dropped the other.
                     queue = scrape_queue_for_plan(user.plan if user else None)
+                    published = True
                     try:
                         run_scrape_job.apply_async(
                             args=[job_id], queue=queue, countdown=countdown
@@ -679,21 +695,34 @@ def run_scrape_job(self, job_id: str) -> None:
                         # re-delivers via its stranded-retry branch (retry_count>0,
                         # started_at IS NULL) once the row ages past the stuck cutoff.
                         # Recovery is bounded (not immediate), but no retry is lost.
+                        published = False
                         _logger.warning(
                             "run_scrape_job retry publish failed for job %s; left "
                             "'pending' for watchdog re-delivery", job_id, exc_info=True,
                         )
+                    # USER-FACING copy — see transient_retry_notice for the wording
+                    # rules. Deliberately separate from the engineering log below,
+                    # which is the one allowed to carry the exception class.
                     _publish_log(
                         r, job_id, "warning",
-                        f"Transient error, retrying in ~{max(1, countdown // 60)} min "
-                        f"(retry {job.retry_count} of {SCRAPE_TRANSIENT_MAX_RETRIES}).",
+                        transient_retry_notice(
+                            retry_count=job.retry_count,
+                            max_retries=SCRAPE_TRANSIENT_MAX_RETRIES,
+                            countdown=countdown,
+                            published=published,
+                        ),
                         db=db,
                     )
+                    # ENGINEERING log. Carries the exception CLASS as well as its
+                    # message: the message alone ("Timeout 15000ms exceeded") does not
+                    # say whether this was a Playwright timeout, a TransientScrapeError
+                    # or a ScraperBlockedError, and that distinction is the first thing
+                    # anyone triaging a stuck job needs.
                     _logger.warning(
-                        "Job %s: transient scrape error — re-queued (retry %d/%d, "
-                        "countdown %ds): %s",
+                        "Job %s: transient scrape error in the SCRAPE phase — re-queued "
+                        "(retry %d/%d, countdown %ds, published=%s): %s: %s",
                         job_id, job.retry_count, SCRAPE_TRANSIENT_MAX_RETRIES,
-                        countdown, str(exc)[:200],
+                        countdown, published, type(exc).__name__, str(exc)[:200],
                     )
                     return
             reason = "Scraper encountered an error. Our team has been notified."

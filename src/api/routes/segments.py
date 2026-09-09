@@ -79,6 +79,18 @@ async def _require_overlap_plan(current_user: CurrentUser) -> None:
         raise plan_limit_http(overlap_violation(current_user.plan))
 
 
+# Every query below joins `jobs` with `j.status = 'done'`. A run that never
+# finished delivered nothing: its rows were not charged, not emailed, and cannot
+# be downloaded, because /download requires an export_key a failed run never
+# wrote. Surfacing them in Lists offered leads the customer does not actually
+# have. Found 2026-09-08 alongside the same gap in analytics — one King
+# tax_delinquent run that scraped 17,157 records and then failed on the plan cap
+# was putting 8,819 of them in front of its owner through this path.
+#
+# Duplicates are still KEPT here, deliberately and separately: a lead whose only
+# contactable row happens to be a duplicate must not vanish from a list. That
+# rule is about is_duplicate; this one is about whether the run happened at all.
+
 router = APIRouter(
     prefix="/segments",
     tags=["segments"],
@@ -174,7 +186,7 @@ WITH candidates AS (
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at
     FROM results r
-    JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid
+    JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid AND j.status = 'done'
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
     WHERE r.user_id = :uid
       AND r.property_key IS NOT NULL
@@ -252,7 +264,7 @@ WITH candidates AS (
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at,
            COALESCE(r.property_key, r.dedup_hash, 'id:' || r.id::text) AS bucket
     FROM results r
-    JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid
+    JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid AND j.status = 'done'
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
     WHERE r.user_id = :uid
       AND sc.record_type = ANY(:types)
@@ -322,7 +334,7 @@ WITH candidates AS (
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at
     FROM results r
-    JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid
+    JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid AND j.status = 'done'
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
     WHERE r.user_id = :uid
       AND r.property_key IS NOT NULL
@@ -389,7 +401,7 @@ def _resolve_filing_window(
 _EXCLUDED_NO_DATE_SQL = f"""
 SELECT count(*)
 FROM results r
-JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid
+JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid AND j.status = 'done'
 JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
 WHERE r.user_id = :uid
   AND sc.record_type = ANY(:types)

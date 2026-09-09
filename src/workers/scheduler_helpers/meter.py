@@ -55,13 +55,35 @@ def _flush_skip_trace_meter_outbox_impl() -> None:
         # What a human still has to decide. `needs_review` only: non_billable
         # has already been decided, and alerting on a settled decision every
         # three minutes is how an alert becomes noise nobody reads.
-        held = db.execute(
+        # Broken down by REASON, with no age floor.
+        #
+        # A 24h floor was here to stop the alert firing every three minutes. It
+        # is the wrong instrument: `created_at` is the OUTBOX clock, so usage
+        # reconciled 34 days after it was incurred would wait another day before
+        # anyone heard about it — and Stripe stops accepting a backdated event at
+        # 35. The floor could therefore spend the last of the window it was
+        # supposed to protect (Codex). Repetition is already handled properly by
+        # send_ops_alert's own cooldown on (billing, skip_trace_meter_held), so
+        # surfacing a row immediately costs nothing and buys back the days.
+        #
+        # The per-reason split means the message says what actually needs doing
+        # rather than guessing at one cause for all of them.
+        reasons = db.execute(
             text("""
-                SELECT COUNT(*), COALESCE(SUM(e.billable_units), 0)
+                SELECT COALESCE(e.disposition_reason, 'unspecified') AS reason,
+                       COUNT(*) AS n,
+                       COALESCE(SUM(e.billable_units), 0) AS units,
+                       MIN(e.created_at) AS oldest
                 FROM skip_trace_meter_events e
                 WHERE e.disposition = 'needs_review'
+                GROUP BY 1
+                ORDER BY units DESC
             """)
-        ).fetchone()
+        ).fetchall()
+        held = (
+            sum(r.n for r in reasons),
+            sum(r.units for r in reasons),
+        )
 
     enqueued = 0
     for row in rows:
@@ -97,15 +119,24 @@ def _flush_skip_trace_meter_outbox_impl() -> None:
                 subject="Skip-trace usage that cannot be billed",
                 body=(
                     f"{held_rows} skip-trace meter event(s) totalling "
-                    f"{held_units} unit(s) are marked needs_review: the usage "
-                    "is real, but no billing agreement covered it that we can "
-                    "charge against automatically — most often because the "
-                    "usage is older than Stripe's 35-day backdating limit. "
-                    "These do NOT bill on their own, deliberately. Sending them "
-                    "with today's date would charge a customer for usage at a "
-                    "rate and in a period they never agreed to. Query "
-                    "skip_trace_meter_events WHERE disposition = 'needs_review' "
-                    "and settle or write them off explicitly."
+                    f"{held_units} unit(s) are waiting for a decision."
+                    "\n\nBy reason (oldest row first seen):\n"
+                    + "\n".join(
+                        f"  {r.reason}: {r.n} row(s), {r.units} unit(s), "
+                        f"oldest {r.oldest:%Y-%m-%d}"
+                        for r in reasons
+                    )
+                    + "\n\nThe usage is real. It does not bill on its own, "
+                    "deliberately: something about it could not be tied to a "
+                    "billing agreement that covered it, so sending it would "
+                    "charge a customer for usage in a period or at a rate they "
+                    "never agreed to. The reason above says which."
+                    "\n\nTIME LIMIT: Stripe refuses a meter event backdated "
+                    "more than 35 days, so a row left here long enough can no "
+                    "longer be billed through the meter at all and has to be "
+                    "recovered on an invoice by hand."
+                    + "\n\nSettle or write them off with:\n"
+                    "  python scripts/settle_skip_trace_meter_rows.py --list"
                 ),
             )
         except Exception as exc:  # noqa: BLE001 - alerting must never break the beat

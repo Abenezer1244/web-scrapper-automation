@@ -130,7 +130,7 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
         # It is re-evaluated at REPORT time, not at enqueue time: a row can sit
         # in the queue while the subscription behind it changes.
         try:
-            assert_billable(customer_id, row.usage_at)
+            billing_proof = assert_billable(customer_id, row.usage_at)
         except _NotBillableError as refusal:
             # Kept, never written off. The usage is real; what is missing is a
             # billing agreement that covered it. Recording WHY on the row is the
@@ -174,7 +174,27 @@ def report_skip_trace_meter_event(self, outbox_id: str) -> dict:
                 stripe_customer_id=customer_id,
                 plan=row.plan or "",
                 usage_at=row.usage_at,
+                # The proof from the gate above. The sender refuses without it.
+                billing_proof=billing_proof,
             )
+        except _NotBillableError as refusal:
+            # Unreachable while this is the only caller — we just passed the
+            # proof. It stays because the alternative is worse than dead code:
+            # _NotBillableError is not in the sender's terminal set, so without
+            # this it would escape into autoretry_for=(Exception,) and retry a
+            # permanent refusal with backoff forever. A refusal is an answer;
+            # answers go on the row and go to a human.
+            row.disposition = "needs_review"
+            row.disposition_at = datetime.now(UTC)
+            row.disposition_reason = refusal.reason
+            db.commit()
+            _logger.error(
+                "Skip-trace meter outbox %s: the SENDER refused (%s) after the "
+                "gate passed — these two disagreeing is a bug, not a billing "
+                "outcome; %d unit(s) held for review",
+                outbox_id, refusal.reason, row.billable_units,
+            )
+            return {"outbox_id": outbox_id, "not_billable": refusal.reason}
         except _MissingCustomerError:
             _logger.warning(
                 "Skip-trace meter outbox %s: user has no Stripe customer id; "

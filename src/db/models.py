@@ -1204,6 +1204,24 @@ class SkipTraceQueue(Base):
     error_message = Column(Text, nullable=True)
     submitted_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at = Column(DateTime(timezone=True), nullable=True)
+    # When the PROVIDER received this batch (migration 093), and the only
+    # timestamp here that overage may be billed against.
+    #
+    # `submitted_at` above looks like it should serve and does not:
+    # _persist_submission also runs on the reconciler's ADOPTION path, where it
+    # inserts the row for the first time with `now`, so for an adopted queue it
+    # is the adoption clock — days after the work. `completed_at` is set by the
+    # ingest worker in the same transaction that bills, so it reads as provider
+    # settlement and is really our own clock.
+    #
+    # This one is written once, from Tracerfy's own `created_at` where the
+    # response carries it, otherwise the moment we finished the POST — and on
+    # the adoption path from Tracerfy's value ONLY, staying NULL when there is
+    # none. Every accepted value is therefore at or before the lookups: a LOWER
+    # bound, which can only push usage out of a billable window and never into
+    # one. NULL means "no time we can defend"; assert_billable refuses it and
+    # the row goes to a human.
+    provider_submitted_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class PendingSkipTraceRow(Base):
@@ -1342,7 +1360,14 @@ class SkipTraceMeterEvent(Base):
         String(32), nullable=False, server_default="pending",
     )
     disposition_at = Column(DateTime(timezone=True), nullable=True)
-    disposition_reason = Column(String(64), nullable=True)
+    # Text: a machine reason fits in 64 chars, an operator's explanation does
+    # not, and an over-length reason makes Postgres reject the whole settlement.
+    disposition_reason = Column(Text, nullable=True)
+    # Who decided, and what recovered it. Separate columns because these are the
+    # two questions asked long after the fact, and neither should need a
+    # sentence parsed to answer it.
+    disposition_actor = Column(String(128), nullable=True)
+    disposition_reference = Column(String(128), nullable=True)
 
     # When the usage HAPPENED — not when this row was written. `created_at` is
     # server_default=now(), the transaction clock during ingest reconciliation,

@@ -231,6 +231,30 @@ class _StripeNotConfiguredError(Exception):
 _BACKDATE_LIMIT_DAYS = 34
 
 
+# Automatic billing of skip-trace overage is ON, gated on a usage time whose
+# provenance is known.
+#
+# This was False for exactly as long as nothing recorded when the provider ran
+# the lookups. Two review rounds killed every attempt to derive that time from
+# an existing column, because all of them are our own clock at some later
+# moment (see report_usage_from_webhook). Migration 093 adds
+# skip_trace_queues.provider_submitted_at, written once at dispatch from
+# Tracerfy's own created_at — or, on the adoption path, from that and nothing
+# else — so it is always at or before the lookups.
+#
+# The switch stays as a switch rather than being deleted. If the dispatcher ever
+# stops recording a defensible time, this is the one line that stops every
+# reporting path at once, and it is cheaper to flip than to re-derive the
+# argument under pressure. Turning it off strands no revenue: refused rows go to
+# needs_review, not to a write-off.
+#
+# Note this is NOT the only thing standing between a bad timestamp and a charge.
+# assert_billable still requires a live subscription carrying the metered item
+# whose period contains usage_at, and a NULL usage_at is still refused as
+# usage_at_unknown.
+USAGE_PROVENANCE_IS_TRUSTWORTHY = True
+
+
 class _NotBillableError(Exception):
     """This usage must not be reported. `reason` says which rule refused it.
 
@@ -294,6 +318,12 @@ def assert_billable(stripe_customer_id: str | None, usage_at, now=None) -> dict:
     from datetime import timedelta
 
     now = now or datetime.now(UTC)
+
+    if not USAGE_PROVENANCE_IS_TRUSTWORTHY:
+        # Applies to EVERY row, whatever it has stored. A timestamp written by
+        # an earlier version of this code is exactly as undefendable as one we
+        # would write today.
+        raise _NotBillableError("usage_at_unknown")
 
     if usage_at is None:
         # Rows written before migration 092. Their real usage time is not
@@ -399,8 +429,19 @@ def report_meter_event_to_stripe(
     stripe_customer_id: str | None,
     plan: str,
     usage_at=None,
+    billing_proof: dict | None = None,
 ) -> str | None:
     """Fire ONE Stripe skip-trace MeterEvent — RAISES on transient failure.
+
+    `billing_proof` is the subscription dict `assert_billable` returns, and it
+    is REQUIRED. The eligibility rule used to live only in the calling task, one
+    layer above this function, so the thing that actually talks to Stripe could
+    be reached without it — Codex reproduced a real MeterEvent from a direct
+    call with billing switched off. One production caller checking first is not
+    the same as the sender being safe, because the next caller is one refactor
+    away. Passing the proof makes the rule structurally impossible to skip
+    rather than conventionally observed, and costs no extra Stripe round trip:
+    the caller already holds the value.
 
     REDTEAM (Codex convergence — meter outbox): this used to CATCH every
     Stripe exception and return out["error"] normally. The durable report
@@ -421,6 +462,17 @@ def report_meter_event_to_stripe(
     """
     if billable_units <= 0:
         return None
+
+    # The gate, restated where the Stripe call actually happens. Deliberately
+    # BEFORE _stripe_enabled(): an unverified send must be refused as
+    # unverified, not reported as "Stripe is off", because the second is a
+    # terminal no-op the caller settles the row on.
+    if billing_proof is None:
+        raise _NotBillableError(
+            "unverified_billing",
+            "report_meter_event_to_stripe requires the subscription dict returned "
+            "by assert_billable; refusing to emit a MeterEvent without it",
+        )
 
     if not _stripe_enabled():
         _logger.warning(
@@ -590,10 +642,10 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
         {"qid": queue_id, "states": list(billable_states)},
     ).fetchall()
 
-    # usage_at means "a time we can DEFEND billing against". NULL means we
-    # cannot, and NULL is currently the honest answer for every batch.
+    # usage_at means "a time we can DEFEND billing against".
     #
-    # Three candidates were tried and all three are the wrong clock:
+    # Three candidates were tried before this and all three were the wrong
+    # clock:
     #
     #   created_at    server_default=now(), i.e. this reconciliation
     #                 transaction.
@@ -605,24 +657,25 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
     #                 ADOPTION path, so for an adopted queue it is the adoption
     #                 time, days after the work. Not a lower bound either.
     #
-    # Nothing in this system records when the provider actually performed the
-    # lookups. Every one of those values can place usage from before a
-    # subscription inside it, which bills a customer for something they had not
-    # agreed to pay for, and can make usage past Stripe's 35-day backdating
-    # limit look fresh.
+    # `provider_submitted_at` (migration 093) is the column that was missing.
+    # It is written once, on the dispatch path from Tracerfy's own created_at or
+    # the completed POST, and on the adoption path from Tracerfy's value ONLY —
+    # never from an adoption clock. Every accepted value is at or before the
+    # lookups, so it is a LOWER bound, and a lower bound can only push usage out
+    # of a billable window and never into one.
     #
-    # So this does not guess. The rows are kept with full detail and land in
-    # needs_review, where the ops alert surfaces them and a human settles them.
-    # That is the owner's stated policy for usage with no agreement behind it,
-    # and it is the only answer the recorded data supports.
-    #
-    # TO RE-ENABLE AUTOMATIC BILLING: record a trustworthy provider-execution
-    # time at dispatch (one that adoption does not overwrite) and select it
-    # here. assert_billable already implements the rest of the rule and needs no
-    # change — it refuses a NULL usage_at as usage_at_unknown today, and will
-    # start passing the ordinary case the moment this column carries a real
-    # value.
-    usage_at = None
+    # NULL still means "no time we can defend": adopted queues where Tracerfy
+    # gave us nothing, and every row written before 093. assert_billable refuses
+    # those as usage_at_unknown and they go to needs_review for a human, which
+    # is the same answer they got when this returned NULL unconditionally.
+    usage_at = db.execute(
+        text("""
+            SELECT provider_submitted_at
+            FROM skip_trace_queues
+            WHERE tracerfy_queue_id = :qid
+        """),
+        {"qid": queue_id},
+    ).scalar()
 
     summary: dict = {"queue_id": queue_id, "users": [], "outbox_ids": []}
     for row in rows:

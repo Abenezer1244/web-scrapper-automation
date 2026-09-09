@@ -1336,6 +1336,10 @@ def test_a_missing_customer_id_is_not_the_same_signal_as_stripe_being_off():
 
     monkeypatch = _pytest.MonkeyPatch()
     try:
+        # billing_proof stands in for the gate having already passed; the
+        # sender refuses outright without it, which would mask both signals
+        # this test is here to keep apart.
+        proof = {"id": "sub_x"}
         monkeypatch.setattr(st, "_stripe_enabled", lambda: True)
         with pytest.raises(st._MissingCustomerError):
             st.report_meter_event_to_stripe(
@@ -1344,6 +1348,7 @@ def test_a_missing_customer_id_is_not_the_same_signal_as_stripe_being_off():
                 billable_units=5,
                 stripe_customer_id=None,
                 plan="pro",
+                billing_proof=proof,
             )
         # Stripe genuinely off stays the OTHER signal, and stays terminal.
         monkeypatch.setattr(st, "_stripe_enabled", lambda: False)
@@ -1354,6 +1359,7 @@ def test_a_missing_customer_id_is_not_the_same_signal_as_stripe_being_off():
                 billable_units=5,
                 stripe_customer_id="cus_x",
                 plan="pro",
+                billing_proof=proof,
             )
     finally:
         monkeypatch.undo()
@@ -1945,6 +1951,13 @@ def _patch_subs(monkeypatch, st, subs):
     import stripe as _stripe
     monkeypatch.setattr(_stripe.Subscription, "list", lambda **kw: _L(subs))
     monkeypatch.setattr(st.settings, "STRIPE_SECRET_KEY", "sk_test_fake")
+    # These tests exercise the RULE, so they pin the kill switch ON rather than
+    # inheriting whatever the module default happens to be. It is True today.
+    # If it is ever switched off, every one of these would short-circuit to
+    # usage_at_unknown and keep passing while testing nothing — a green suite
+    # proving the shutdown works and the rule not at all. The switch has its own
+    # test below, in both positions.
+    monkeypatch.setattr(st, "USAGE_PROVENANCE_IS_TRUSTWORTHY", True)
 
 
 def _metered_price(st):
@@ -2107,6 +2120,7 @@ def test_the_meter_event_carries_an_explicit_timestamp(monkeypatch):
     st.report_meter_event_to_stripe(
         user_id="u1", queue_id=7, billable_units=3,
         stripe_customer_id="cus_1", plan="pro", usage_at=when,
+        billing_proof={"id": "sub_1"},
     )
     assert captured["timestamp"] == int(when.timestamp()), (
         "the event must be dated when the usage happened, not when it was sent"
@@ -2209,25 +2223,28 @@ def test_a_metered_item_added_later_does_not_price_earlier_usage(monkeypatch):
 
 
 def test_usage_at_is_never_guessed_from_a_clock_we_control():
-    """No column in this system records when the provider ran the lookups.
+    """usage_at may come from the PROVIDER's clock and from nothing else.
 
-    Three candidates were tried and every one is the wrong clock:
+    Three candidates were tried before migration 093 and every one is a clock
+    this system controls, at some moment later than the work:
 
-      created_at    server_default=now() — this reconciliation transaction.
+      created_at    server_default=now() — the reconciliation transaction.
       completed_at  set to `now` by the ingest worker a few statements before
                     billing runs, in the SAME transaction.
       submitted_at  written by the dispatcher on send, but _persist_submission
-                    writes it again on the reconciler's ADOPTION path, so for an
-                    adopted queue it is the adoption time, days after the work.
+                    ALSO runs on the reconciler's adoption path and inserts the
+                    row there with `now` — for an adopted queue, the adoption
+                    time, days after the work.
 
-    Each of them can place usage from before a subscription inside it — which
-    bills a customer for something they never agreed to — and can make usage
-    past Stripe's 35-day limit look fresh. So usage_at is left NULL and the row
-    goes to needs_review, where a human settles it. Absent is not the same as
-    unknown-but-guessed, and only one of those is safe to bill.
+    Each can place usage from before a subscription inside it, which bills a
+    customer for something they never agreed to, and can make usage past
+    Stripe's 35-day limit look fresh.
 
-    This test exists to fail loudly if someone re-attaches a clock here without
-    first recording a real provider-execution time.
+    The answer is `skip_trace_queues.provider_submitted_at`, which is written
+    once with known provenance (see provider_submitted_time) and is always at or
+    before the lookups. This test fails loudly if anyone re-attaches one of the
+    wrong clocks — including by widening this select to COALESCE onto one, which
+    is exactly how a "harmless fallback" would get back in.
     """
     import inspect
 
@@ -2235,15 +2252,27 @@ def test_usage_at_is_never_guessed_from_a_clock_we_control():
 
     code = [
         line for line in inspect.getsource(st.report_usage_from_webhook).splitlines()
-        if not line.lstrip().startswith("#")
+        if not line.lstrip().startswith("#") and not line.lstrip().startswith("--")
     ]
-    assert any("usage_at = None" in line for line in code), (
-        "usage_at must not be derived from a clock this system controls"
+    body = chr(10).join(code)
+
+    assert "provider_submitted_at" in body, (
+        "usage_at must be read from the column whose provenance is known"
     )
-    for wrong_clock in ("completed_at", "submitted_at", "NOW()"):
-        assert not any(
-            wrong_clock in line and "usage_at" in line for line in code
-        ), f"usage_at is being derived from {wrong_clock} again"
+
+    # The wrong clocks, checked on the SELECT that feeds usage_at. Note
+    # provider_submitted_at legitimately ends in 'submitted_at', so that one is
+    # matched as a whole word rather than as a substring.
+    import re
+
+    for wrong_clock in ("created_at", "completed_at", "NOW()", "now()"):
+        assert wrong_clock not in body, (
+            f"usage_at is being derived from {wrong_clock} again"
+        )
+    assert not re.search(r"(?<!provider_)\bsubmitted_at\b", body), (
+        "usage_at is being derived from submitted_at again — the adoption path "
+        "rewrites it, which is why provider_submitted_at exists"
+    )
 
 
 def test_a_null_usage_at_reaches_a_human_rather_than_a_write_off(monkeypatch):
@@ -2266,4 +2295,170 @@ def test_a_null_usage_at_reaches_a_human_rather_than_a_write_off(monkeypatch):
     src = inspect.getsource(ti.report_skip_trace_meter_event)
     assert '"no_customer_id", "no_subscription_ever"' in src, (
         "only those two refusals may be written off; the rest need a human"
+    )
+
+
+def test_the_kill_switch_stops_every_report_when_it_is_off(monkeypatch):
+    """The switch, not the rule.
+
+    Every other test here pins this ON to reach the rule underneath. This one
+    checks the switch itself does what it claims in BOTH positions: off, nothing
+    is billable whatever a row has stored, because a timestamp written by an
+    earlier version of this code is exactly as undefendable as one written
+    today; on, a well-formed row reaches the rule instead of being refused here.
+    """
+    import src.api.billing.skip_trace_usage as st
+
+    price = _metered_price(st)
+    _patch_subs(monkeypatch, st, [_sub_with(price)])
+
+    # OFF: a perfectly billable-looking row, with a stored timestamp, refuses.
+    monkeypatch.setattr(st, "USAGE_PROVENANCE_IS_TRUSTWORTHY", False)
+    with pytest.raises(st._NotBillableError) as e:
+        st.assert_billable("cus_1", datetime.now(UTC))
+    assert e.value.reason == "usage_at_unknown"
+
+    # ON: the same row now reaches the rule and passes it. Without this half the
+    # test would still pass with the rule permanently broken.
+    monkeypatch.setattr(st, "USAGE_PROVENANCE_IS_TRUSTWORTHY", True)
+    assert st.assert_billable("cus_1", datetime.now(UTC)) is not None
+
+
+def test_a_null_usage_at_is_refused_even_with_the_switch_on(monkeypatch):
+    """The switch is not the only thing holding the line.
+
+    Adopted queues where Tracerfy gave us no created_at, and every row written
+    before migration 093, still carry usage_at = NULL. Turning automatic billing
+    on must not turn those into charges: "we do not know when this happened" is
+    a refusal on its own merits, not a consequence of the switch.
+    """
+    import src.api.billing.skip_trace_usage as st
+
+    price = _metered_price(st)
+    _patch_subs(monkeypatch, st, [_sub_with(price)])
+
+    with pytest.raises(st._NotBillableError) as e:
+        st.assert_billable("cus_1", None)
+    assert e.value.reason == "usage_at_unknown"
+
+
+def test_the_stripe_sender_refuses_without_a_proof_from_the_gate(monkeypatch):
+    """The gate must live where the Stripe call is, not one layer above it.
+
+    assert_billable ran only in the calling task, so report_meter_event_to_stripe
+    — the function that actually creates the MeterEvent — could be reached
+    without it. Codex got a real event out of a direct call with billing
+    switched off. One caller checking first is not the same as the sender being
+    safe; the next caller is one refactor away.
+    """
+    import src.api.billing.skip_trace_usage as st
+
+    sent = []
+    import stripe as _stripe
+    monkeypatch.setattr(
+        _stripe.billing.MeterEvent, "create",
+        lambda **kw: sent.append(kw) or {"identifier": "x"},
+    )
+    monkeypatch.setattr(st.settings, "STRIPE_SECRET_KEY", "sk_test_fake")
+
+    with pytest.raises(st._NotBillableError) as e:
+        st.report_meter_event_to_stripe(
+            user_id="u1", queue_id=1, billable_units=5,
+            stripe_customer_id="cus_1", plan="pro",
+            usage_at=datetime.now(UTC),
+            # no billing_proof
+        )
+    assert e.value.reason == "unverified_billing"
+    assert sent == [], "a MeterEvent was created without the gate having passed"
+
+
+def test_the_sender_refuses_before_deciding_stripe_is_merely_switched_off(monkeypatch):
+    """Order matters: unverified must not be reported as a terminal no-op.
+
+    _StripeNotConfiguredError is terminal — the caller settles the row on it. If
+    the "Stripe is off" check ran first, an unverified send on a deployment with
+    Stripe disabled would be recorded as a decision rather than as the bug it is.
+    """
+    import src.api.billing.skip_trace_usage as st
+
+    monkeypatch.setattr(st, "_stripe_enabled", lambda: False)
+
+    with pytest.raises(st._NotBillableError) as e:
+        st.report_meter_event_to_stripe(
+            user_id="u1", queue_id=1, billable_units=5,
+            stripe_customer_id="cus_1", plan="pro",
+            usage_at=datetime.now(UTC),
+        )
+    assert e.value.reason == "unverified_billing"
+def test_adoption_never_stamps_its_own_clock_as_the_provider_time():
+    """The defect that killed the previous two attempts, pinned.
+
+    `submitted_at` looked like a lower bound on execution and was not:
+    _persist_submission also runs on the reconciler's ADOPTION path, and there it
+    INSERTS the queue row for the first time, so ON CONFLICT DO NOTHING protects
+    nothing and the row gets `now` — days after the lookups. Billing against that
+    places pre-subscription usage inside a paid period.
+
+    Asserts provenance per path, not merely that a column is populated.
+    """
+    from src.workers.skip_trace_dispatcher import provider_submitted_time
+
+    now = datetime(2026, 9, 9, 12, 0, tzinfo=UTC)
+    provider = {"created_at": "2026-09-01T10:00:00.123456Z"}
+    expected = datetime(2026, 9, 1, 10, 0, 0, 123456, tzinfo=UTC)
+
+    # Dispatch, no provider timestamp: our own send time is legitimate here —
+    # we have just completed the POST, so the lookups cannot predate it.
+    assert provider_submitted_time({}, now, adopted=False) == now
+
+    # Dispatch WITH a provider timestamp: the provider's wins over ours.
+    assert provider_submitted_time(provider, now, adopted=False) == expected
+
+    # Adoption WITH a provider timestamp: still the provider's, unaffected by
+    # when we happened to notice the batch.
+    assert provider_submitted_time(provider, now, adopted=True) == expected
+
+    # Adoption with NOTHING: NULL. This is the whole point of the parameter.
+    # `now` here is the adoption clock, and billing against it is the bug.
+    assert provider_submitted_time({}, now, adopted=True) is None
+    assert provider_submitted_time({"created_at": None}, now, adopted=True) is None
+    assert provider_submitted_time({"created_at": "not-a-date"}, now, adopted=True) is None
+
+
+def test_a_naive_provider_timestamp_is_pinned_to_utc():
+    """A naive value in a timestamptz column is read back in the server's zone.
+
+    That silently shifts the billing period by the offset, which is how usage
+    lands in the wrong Stripe invoice without anything looking wrong.
+    """
+    from src.workers.skip_trace_dispatcher import provider_submitted_time
+
+    now = datetime(2026, 9, 9, 12, 0, tzinfo=UTC)
+    got = provider_submitted_time({"created_at": "2026-09-01T10:00:00"}, now, adopted=True)
+    assert got == datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
+    assert got.tzinfo is not None
+
+
+def test_the_dispatcher_records_the_provider_time_it_computes():
+    """The pure rule above is only worth anything if the writer actually uses it.
+
+    Pins the wiring: _persist_submission must pass its response/adopted through
+    to provider_submitted_time and store the result, so the rule cannot be
+    correct while the column stays NULL.
+    """
+    import inspect
+
+    from src.workers import skip_trace_dispatcher as d
+
+    src = inspect.getsource(d._persist_submission)
+    assert "provider_submitted_time(response, now, adopted)" in src, (
+        "_persist_submission must derive the value from the shared rule"
+    )
+    assert "provider_submitted_at=provider_submitted_at" in src, (
+        "the derived value must actually be written to the queue row"
+    )
+    # And the adoption call site must declare itself, or every adopted queue
+    # silently takes the dispatch branch and gets the adoption clock.
+    assert "trace_type, queue, adopted=True)" in inspect.getsource(d), (
+        "the reconciler's adoption call must pass adopted=True"
     )

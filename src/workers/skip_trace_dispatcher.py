@@ -384,13 +384,25 @@ def _fail_unsubmittable(db, rows: list) -> None:
 # ─── Post-accept bookkeeping (a PAID batch depends on this) ───────────────────
 
 
-def _persist_submission(db, queue_id: int, claimed: list, trace_type: str, response: dict) -> None:
+def _persist_submission(
+    db, queue_id: int, claimed: list, trace_type: str, response: dict,
+    adopted: bool = False,
+) -> None:
     """Record an accepted Tracerfy batch: queue row + row/Result status flips.
 
-    Idempotent by construction so the retry path (and a future reconciler
-    adoption) can re-run it safely: the SkipTraceQueue insert is ON CONFLICT DO
-    NOTHING on the unique tracerfy_queue_id, and both updates are guarded on the
-    status they expect to move from.
+    Idempotent by construction so the retry path (and the reconciler adoption)
+    can re-run it safely: the SkipTraceQueue insert is ON CONFLICT DO NOTHING on
+    the unique tracerfy_queue_id, and both updates are guarded on the status
+    they expect to move from.
+
+    `adopted` says WHICH path this is, and it exists because the two disagree
+    about what time it is. On the live path we have just completed the POST, so
+    `now` is a true send time. On the reconciler's adoption path the batch was
+    sent on some earlier tick that never recorded it — often days ago — and the
+    row is being inserted for the first time, so ON CONFLICT protects nothing
+    and `now` is the adoption clock. Billing overage against that would place
+    usage inside a subscription period that had not begun when the lookups ran.
+    See migration 093.
     """
     from sqlalchemy import update
     from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -399,6 +411,8 @@ def _persist_submission(db, queue_id: int, claimed: list, trace_type: str, respo
 
     now = datetime.now(UTC)
     first = claimed[0]
+
+    provider_submitted_at = provider_submitted_time(response, now, adopted)
     db.execute(
         pg_insert(SkipTraceQueue)
         .values(
@@ -422,6 +436,7 @@ def _persist_submission(db, queue_id: int, claimed: list, trace_type: str, respo
             # if the enqueue is lost (Codex).
             download_url=response.get("download_url"),
             submitted_at=now,
+            provider_submitted_at=provider_submitted_at,
         )
         .on_conflict_do_nothing(index_elements=["tracerfy_queue_id"])
     )
@@ -592,6 +607,37 @@ def _release_is_safe(
             # the queue, so we cannot rule it out.
             return False
     return True
+
+
+def provider_submitted_time(response: dict, now: datetime, adopted: bool):
+    """When the PROVIDER got this batch, or None if we cannot defend an answer.
+
+    Pure, so the rule can be tested without a database — this is the value skip
+    trace overage is billed against, and getting it wrong charges a customer for
+    usage in a period they never agreed to.
+
+    Tracerfy's own ``created_at`` first. It is the provider's record of when it
+    received the batch, it reads the same whether we ask now or on an adoption
+    three days later, and it is therefore the only value that is correct on both
+    paths.
+
+    Failing that, ``now`` is honest ONLY on the live dispatch path, where we have
+    just completed the POST. On the adoption path there is no defensible
+    fallback: the batch went out on some earlier tick that never recorded it, so
+    ``now`` is the adoption clock. That was the exact defect in the previous
+    attempt — ``submitted_at`` was taken for a lower bound on execution and the
+    adoption path moved it — so this returns None instead and the usage goes to
+    a human.
+    """
+    ts = _parse_tracerfy_ts(response.get("created_at"))
+    if ts is not None:
+        if ts.tzinfo is None:
+            # A naive value in a timestamptz column is read back in the server's
+            # timezone, shifting the billing period by the offset. Tracerfy
+            # sends Z-suffixed UTC; anything else is assumed to be the same.
+            ts = ts.replace(tzinfo=UTC)
+        return ts
+    return None if adopted else now
 
 
 def _parse_tracerfy_ts(value) -> datetime | None:
@@ -869,7 +915,7 @@ def _reconcile_stale_claims(db) -> dict:
                 # process dying right after this commit) would leave the queue
                 # recorded — and therefore excluded from every future
                 # reconciliation pass — with nothing ever ingesting it (Codex).
-                _persist_submission(db, queue_id, claimed, trace_type, queue)
+                _persist_submission(db, queue_id, claimed, trace_type, queue, adopted=True)
                 known.add(queue_id)
                 summary["adopted"] += len(claimed)
                 _redrive_completed_queue(queue)

@@ -33,13 +33,22 @@ What this adds:
                        reconciliation, which can be long after the lookup and is
                        not a defensible thing to bill against.
 
-Backfill: every existing unreported row becomes `non_billable /
-pre_subscription`. That is not a judgement call on this deployment — there have
-never been any Stripe subscriptions (0 at the time of writing, all plans set by
-hand), so no held row can belong to a billing agreement that existed when the
-usage was incurred. It follows that the unrecoverable true `usage_at` for those
-rows cannot change their disposition either, which is why this migration does
-not try to invent one.
+Backfill: classified on evidence READ WHEN THIS RUNS, not on what was true when
+it was written. Unreported rows whose owner has no Stripe customer at all become
+`non_billable / pre_subscription` — they cannot have had an agreement, which is
+the same certainty the runtime rule demands before writing anything off.
+Everything else unreported becomes `needs_review / coverage_unproven`.
+
+An earlier draft wrote off EVERY unreported row, justified by a comment saying
+this deployment had no subscriptions. That is an assertion about the past which
+stops being true the moment somebody subscribes before the migration runs, and
+it would have discarded their usage silently while an identical row arriving a
+minute after deploy went to review. A backfill must not be more confident than
+the runtime rule it precedes.
+
+`usage_at` is left NULL throughout: it cannot be reconstructed, and a fabricated
+value would be worse than an absent one because it would look authoritative and
+would be billed against.
 
 Rows that already carry `reported_at` are marked `reported` and NOT relabelled
 "billed": their provenance is ambiguous per the first paragraph, and deciding
@@ -72,9 +81,25 @@ def upgrade() -> None:
         "skip_trace_meter_events",
         sa.Column("disposition_at", sa.DateTime(timezone=True), nullable=True),
     )
+    # Text, not String(64). A machine reason ("pre_subscription") fits in 64
+    # characters; the human one a settlement carries does not, and the failure
+    # mode is the worst kind — Postgres rejects the UPDATE and rolls the
+    # settlement back, so an operator is told nothing was recorded after they
+    # decided it. Actor and reference are their OWN columns rather than being
+    # concatenated into the reason: "who decided this" and "which invoice
+    # recovered it" are the two questions asked six months later, and neither
+    # should require parsing a sentence to answer.
     op.add_column(
         "skip_trace_meter_events",
-        sa.Column("disposition_reason", sa.String(64), nullable=True),
+        sa.Column("disposition_reason", sa.Text(), nullable=True),
+    )
+    op.add_column(
+        "skip_trace_meter_events",
+        sa.Column("disposition_actor", sa.String(128), nullable=True),
+    )
+    op.add_column(
+        "skip_trace_meter_events",
+        sa.Column("disposition_reference", sa.String(128), nullable=True),
     )
     # Nullable on purpose: it cannot be reconstructed for existing rows, and a
     # fabricated value would be worse than an absent one — it would look
@@ -94,15 +119,48 @@ def upgrade() -> None:
         """
     )
 
-    # The held backlog. No subscription has ever existed on this deployment, so
-    # none of this usage was incurred under a billing agreement.
+    # The held backlog, classified on EVIDENCE READ AT MIGRATION TIME rather
+    # than on what was true when this file was written.
+    #
+    # The first draft wrote every unreported row off as pre_subscription, on the
+    # strength of a comment saying production had no subscriptions. That is an
+    # assertion about the past that stops being true the moment someone
+    # subscribes before this runs — and it would silently discard their usage,
+    # while an identical row arriving a minute after deploy goes to review. A
+    # backfill must not be more confident than the runtime rule it precedes.
+    #
+    # Write off ONLY rows whose owner has no Stripe customer at all: they cannot
+    # have had an agreement, which is the same certainty the runtime rule
+    # requires for a write-off.
     op.execute(
         """
-        UPDATE skip_trace_meter_events
+        UPDATE skip_trace_meter_events e
            SET disposition = 'non_billable',
                disposition_at = NOW(),
                disposition_reason = 'pre_subscription'
+          FROM users u
+         WHERE u.id = e.user_id
+           AND e.reported_at IS NULL
+           -- Only ever classifies an UNDECIDED row. Without this a replay
+           -- would overwrite settled_manual / written_off_manual and destroy
+           -- the audit trail behind a human's decision (Codex).
+           AND e.disposition = 'pending'
+           AND (u.stripe_customer_id IS NULL OR u.stripe_customer_id = '')
+        """
+    )
+
+    # Everything else unreported goes to a human. On a deployment with no
+    # subscriptions this matches zero rows; on one where somebody has
+    # subscribed, it is the difference between reviewing their usage and
+    # throwing it away.
+    op.execute(
+        """
+        UPDATE skip_trace_meter_events
+           SET disposition = 'needs_review',
+               disposition_at = NOW(),
+               disposition_reason = 'coverage_unproven'
          WHERE reported_at IS NULL
+           AND disposition = 'pending'
         """
     )
 
@@ -123,6 +181,8 @@ def downgrade() -> None:
         table_name="skip_trace_meter_events",
     )
     op.drop_column("skip_trace_meter_events", "usage_at")
+    op.drop_column("skip_trace_meter_events", "disposition_reference")
+    op.drop_column("skip_trace_meter_events", "disposition_actor")
     op.drop_column("skip_trace_meter_events", "disposition_reason")
     op.drop_column("skip_trace_meter_events", "disposition_at")
     op.drop_column("skip_trace_meter_events", "disposition")

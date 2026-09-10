@@ -227,3 +227,58 @@ def test_county_row_with_neither_situs_nor_mailing_is_still_dropped():
     )
 
     assert mapped == {}
+
+
+# ─── Addressee prefixes glued onto a real street ─────────────────────────────
+
+def _sno_mail(line1: str) -> str | None:
+    return _parse_gis_response(_feature({
+        "parcel_id": "00522400008900", "situsline1": "22801 64TH PL W",
+        "situscity": "EVERETT", "situsstate": "WA", "situszip": "98203",
+        "taxprline1": line1, "taxprcity": "SEATTLE", "taxprstate": "WA",
+        "taxprzip": "98133",
+    }), SNOHOMISH)["mailing_address"]
+
+
+def test_care_of_prefix_is_stripped_and_the_street_kept():
+    assert _sno_mail("C/O RYAN LLC 10500 NE 8TH ST SUITE 1400") == (
+        "10500 NE 8TH ST SUITE 1400, SEATTLE, WA 98133")
+
+
+def test_attn_prefix_with_a_person_name_does_not_store_the_name():
+    got = _sno_mail("ATTN SUSAN CORNELL 981 POWELL AVE SW")
+    assert got == "981 POWELL AVE SW, SEATTLE, WA 98133"
+    assert "CORNELL" not in got
+
+
+def test_stripping_an_addressee_must_not_eat_the_po_box():
+    """Cutting at the first DIGIT turned this into a bare '330310'."""
+    assert _sno_mail("DEPT OF TRANS PO BOX 330310") == "PO BOX 330310, SEATTLE, WA 98133"
+    assert _sno_mail("PROP TAX MRG - R MASCHING PO BOX 152206") == (
+        "PO BOX 152206, SEATTLE, WA 98133")
+
+
+def test_a_street_that_does_not_start_with_a_number_is_kept():
+    """taxprline1 is Snohomish's only mailing column, so there is nothing to
+    disambiguate and a house-number rule would just discard real addresses."""
+    assert _sno_mail("ONE ASHLEY WAY") == "ONE ASHLEY WAY, SEATTLE, WA 98133"
+
+
+def test_unit_first_and_foreign_streets_are_kept():
+    assert _sno_mail("#2011 7495 132ND ST") == "#2011 7495 132ND ST, SEATTLE, WA 98133"
+    assert _sno_mail("67-6588 SOUTHOAKS CR") == "67-6588 SOUTHOAKS CR, SEATTLE, WA 98133"
+
+
+def test_placeholder_tokens_are_not_addresses():
+    for token in ("UNKNOWN", "NONE", "N/A", "null"):
+        assert _sno_mail(token) is None
+
+
+# ─── Ambiguous parcel ids ────────────────────────────────────────────────────
+
+def test_two_parcels_sharing_a_loose_key_are_never_guessed_between():
+    """'0123456' and '123456' are different parcels. Picking either would put one
+    owner's mailing address on the other's property."""
+    assert _callers_for("123456", {"0123456": ["0123456"], "123456": ["123456"]}) == [
+        "123456"]  # exact match still wins
+    assert _callers_for("00123456", {"0123456": ["0123456"], "123456": ["123456"]}) == []

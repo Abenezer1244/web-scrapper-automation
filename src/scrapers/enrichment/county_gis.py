@@ -671,9 +671,23 @@ def _callers_for(pid: object, clean_to_originals: dict[str, list[str]]) -> list[
     if exact:
         return exact
     loose = raw.lstrip("0")
-    for clean, originals in clean_to_originals.items():
-        if clean.lstrip("0") == loose and loose:
-            return originals
+    if loose:
+        hits = [
+            originals for clean, originals in clean_to_originals.items()
+            if clean.lstrip("0") == loose
+        ]
+        # Only when exactly ONE requested id collapses to this form. If a chunk holds
+        # both "0123456" and "123456" they are different parcels that share a loose
+        # key, and picking either would put one owner's mailing address on the other's
+        # property. Ambiguity resolves to "drop", never to a guess.
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            _logger.warning(
+                "County GIS parcel %r is ambiguous across %d requested ids — dropped",
+                raw, len(hits),
+            )
+            return []
     _logger.warning(
         "County GIS returned parcel %r that matches no requested id — dropped", raw
     )
@@ -742,7 +756,27 @@ def _map_county_features(
 # store a taxpayer NAME, which this codebase deliberately does not collect (the same
 # boundary pierce_atip._drop_person_line enforces for ATIP). A real street line starts
 # with a house number, a post-office box, or a military/rural route designator.
-_MAIL_STREET_SHAPE_RE = re.compile(r"^\s*(?:\d|P\.?\s*O\.?\s*B|POB\b|PSC\b|RR\b|HC\b)", re.I)
+_MAIL_STREET_SHAPE_RE = re.compile(r"^\s*(?:\d|#|P\.?\s*O\.?\s*B|POB\b|PSC\b|RR\b|HC\b)", re.I)
+
+# An addressee marker glued onto the FRONT of an otherwise good street, which the
+# counties do inline as well as in a separate column: "C/O RYAN LLC 10500 NE 8TH ST",
+# "ATTN SUSAN CORNELL 981 POWELL AVE SW". Where a street plainly begins further along
+# the line, the addressee is dropped and the street kept — losing the whole value would
+# throw away a mailable address, and keeping it whole would store a person's name.
+_ADDRESSEE_PREFIX_RE = re.compile(
+    r"^\s*(?:C\s*/\s*O|ATTN|ATTENTION|DEPT|DEPARTMENT|PROP\s+TAX)\b", re.I
+)
+
+# Where the street itself begins, used to cut an addressee prefix at the right point.
+# "PO BOX" has to be found as a street start, not skipped past: cutting at the first
+# DIGIT instead turned "DEPT OF TRANS PO BOX 330310" into a bare "330310".
+_MAIL_STREET_START_RE = re.compile(
+    r"(?:\b|(?<=\s))(?:\d|#|P\.?\s*O\.?\s*B|PSC\b|RR\b|HC\b)", re.I
+)
+
+# Values that are a stand-in for "no data", not an address. UNKNOWN is the token
+# address_intel._PLACEHOLDER_STREET_RE already measured in production.
+_MAIL_PLACEHOLDER_RE = re.compile(r"^\s*(?:UNKNOWN|NONE|N/?A|NULL)\s*$", re.I)
 
 # A LIKE metacharacter (% or _) in an interpolated value silently widens the
 # predicate to unrelated rows. Values carrying one are rejected, not rewritten.
@@ -782,10 +816,28 @@ def _compose_mailing(attrs: dict, gis_config: dict) -> str | None:
     is not somewhere you can mail a letter, and persisting it would turn an unknown into
     a false positive on the mailing-coverage numbers.
     """
+    fields = gis_config.get("mailing_street_fields") or []
+    # The shape check exists to CHOOSE between columns. Where a layer designates a
+    # single mailing-street column there is nothing to choose, so demanding a
+    # house-number start there only discards real addresses: 0.31% of sampled
+    # Snohomish taxprline1 values fail it, and some ("ONE ASHLEY WAY") are genuine.
+    disambiguating = len(fields) > 1
+
     street = None
-    for field in gis_config.get("mailing_street_fields") or []:
+    for field in fields:
         candidate = _attr_text(attrs, field)
-        if candidate and _MAIL_STREET_SHAPE_RE.match(candidate):
+        if not candidate or _MAIL_PLACEHOLDER_RE.match(candidate):
+            continue
+        trimmed = candidate
+        if _ADDRESSEE_PREFIX_RE.match(candidate):
+            start = _MAIL_STREET_START_RE.search(candidate)
+            trimmed = candidate[start.start():].strip() if start else candidate
+        if _MAIL_STREET_SHAPE_RE.match(trimmed):
+            street = trimmed
+            break
+        if not disambiguating and not _ADDRESSEE_PREFIX_RE.match(candidate):
+            # Sole designated column, no addressee marker, not a placeholder: a
+            # street that simply does not open with a number.
             street = candidate
             break
     if not street:

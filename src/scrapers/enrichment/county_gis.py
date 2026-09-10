@@ -62,6 +62,77 @@ _KNOWN_GIS_ENDPOINTS: dict[str, dict] = {
         "skip_statewide_fallback": True,
         "out_fields": "PIN,ADDR_FULL,POSTALCTYNAME,STATE_ABBR,ZIP5",
     },
+    # Snohomish County — public hosted parcel layer. Before this entry Snohomish had
+    # NO mailing source at all: it fell through to the WA statewide situs-only layer,
+    # so property_address filled and mailing_address was structurally always NULL
+    # (0/30 live pre_foreclosure + trustee_sale leads, 2026-09-10).
+    #
+    # `taxpr*` is the TAXPAYER block (who the tax bill is mailed to) — the same thing
+    # King's tax-bill scrape reads. `owner*` is a separate block on this layer; taxpayer
+    # is the mailing-of-record and is what the other counties store.
+    #
+    # taxprline2/3 are deliberately NOT read: line3 is empty layer-wide and line2 is
+    # populated on 6 parcels out of ~250k, half of them "C/O <person>" — an addressee
+    # NAME, which this codebase does not collect. taxprname is a name for the same
+    # reason. parcel_id is a 14-char string with leading zeros; NEVER int-cast it.
+    "snohomish_WA": {
+        "endpoint": (
+            "https://gis.snoco.org/host/rest/services"
+            "/Hosted/CADASTRAL__parcels/FeatureServer/0/query"
+        ),
+        "parcel_field": "parcel_id",
+        "address_field": "situsline1",
+        # Structured situs only — NOT address_suffix_fields, which would fold city/
+        # state/zip into property_address itself. These counties reach here from the
+        # statewide layer today, which stores a street-only property_address plus
+        # separate property_city/state/zip; keep that shape byte-for-byte so adding
+        # a mailing source does not silently reformat every existing lead's address.
+        "situs_part_fields": ["situscity", "situsstate", "situszip"],
+        "mailing_street_fields": ["taxprline1"],
+        "mailing_locality_fields": ["taxprcity", "taxprstate", "taxprzip"],
+        "out_fields": (
+            "parcel_id,situsline1,situscity,situsstate,situszip,"
+            "taxprline1,taxprcity,taxprstate,taxprzip"
+        ),
+    },
+    # Cowlitz County — Assessor parcel layer. Same story as Snohomish: no mailing
+    # source before this entry (0/22 live probate leads, 2026-09-10).
+    #
+    # Two shapes this layer needs that no other config had:
+    #   * situs is SPLIT across five columns, so `address_part_fields` composes it;
+    #   * the mailing street is in DEED_HOLDER_ADDRESS_2 for 53,109 parcels while
+    #     _ADDRESS_1 holds an "ATTN …"/"C/O …" addressee. _2 is therefore tried first
+    #     and _1 only when it independently looks like a street (203 such parcels).
+    #
+    # Use Assessor/Parcels, NOT Assessor/Cowlitz_Tax_Parcels — the latter shares
+    # DEED_HOLDER_NAME but publishes no mailing columns at all. PARCNO is a string and
+    # carries leading zeros ("08931001"); verified 2026-09-10 that none contain dashes.
+    "cowlitz_WA": {
+        "endpoint": (
+            "https://gis.cowlitzwa.gov/ccserver/rest/services"
+            "/Assessor/Parcels/MapServer/0/query"
+        ),
+        "parcel_field": "PARCNO",
+        "address_part_fields": [
+            "SITUS_STREET_NUMBER", "SITUS_STREET_DIRECTION", "SITUS_STREET_NAME",
+            "SITUS_STREET_SUFFIX", "SITUS_STREET_UNIT",
+        ],
+        # No SITUS_STATE column exists on this layer; the state is WA by construction
+        # (it is the Cowlitz County assessor's own service), the same reasoning
+        # _situs_parts applies to the WA statewide layer.
+        "situs_part_fields": ["SITUS_CITY", None, "SITUS_ZIP_CODE"],
+        "situs_state_literal": "WA",
+        "mailing_street_fields": ["DEED_HOLDER_ADDRESS_2", "DEED_HOLDER_ADDRESS_1"],
+        "mailing_locality_fields": [
+            "DEED_HOLDER_CITY", "DEED_HOLDER_STATE", "DEED_HOLDER_ZIPCODE",
+        ],
+        "out_fields": (
+            "PARCNO,SITUS_STREET_NUMBER,SITUS_STREET_DIRECTION,SITUS_STREET_NAME,"
+            "SITUS_STREET_SUFFIX,SITUS_STREET_UNIT,SITUS_CITY,SITUS_ZIP_CODE,"
+            "DEED_HOLDER_ADDRESS_1,DEED_HOLDER_ADDRESS_2,DEED_HOLDER_CITY,"
+            "DEED_HOLDER_STATE,DEED_HOLDER_ZIPCODE"
+        ),
+    },
 }
 
 # ─── Statewide GIS endpoints (covers ALL counties in a state) ────────────────
@@ -412,7 +483,12 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
 
     # Property/situs STREET address
     address_field = gis_config.get("address_field", "Site_Address")
-    street = attrs.get(address_field) or None
+    if gis_config.get("address_part_fields"):
+        # Layers that publish the situs street in components (house number,
+        # prefix, name, suffix, unit) rather than one column.
+        street = _compose_street_parts(attrs, gis_config["address_part_fields"])
+    else:
+        street = attrs.get(address_field) or None
     if street:
         street = str(street).replace("&nbsp;", "").strip() or None
 
@@ -438,7 +514,12 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
     # The stricter rule wins; King's `echo_property_to_mailing: False` is now
     # simply redundant, and harmless.
     mailing_fields = gis_config.get("mailing_fields", [])
-    if mailing_fields:
+    if gis_config.get("mailing_street_fields"):
+        # Layers whose mailing block is street + separate city/state/zip, and whose
+        # street may live in one of several columns. Formatted "STREET, CITY, ST ZIP"
+        # instead of the flat join below, which would emit "…, WA, 98043".
+        mailing_address = _compose_mailing(attrs, gis_config)
+    elif mailing_fields:
         parts = []
         for field in mailing_fields:
             val = attrs.get(field)
@@ -461,7 +542,8 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
         "parcel_id": attrs.get(parcel_field) or None,
         # 085 structured situs (#188) and the match/vacant signals (#153) are
         # disjoint key sets and BOTH are consumed downstream — keep both.
-        **_situs_parts_from_confirmed_mailing(attrs, property_address, gis_config),
+        **(_situs_parts_direct(attrs, gis_config)
+           or _situs_parts_from_confirmed_mailing(attrs, property_address, gis_config)),
         "matched": True,
         "vacant_no_situs": not street,
         "situs_city": situs_city,
@@ -533,9 +615,31 @@ def batch_enrich_parcels_gis(
     skip_statewide = bool(gis_config and gis_config.get("skip_statewide_fallback"))
     if not skip_statewide:
         missing = [pid for pid in parcel_ids if pid not in results and pid and len(pid.strip()) >= 6]
-        if missing:
-            statewide = _batch_query_wa_statewide(missing, county)
-            results.update(statewide)
+        # Rows the county answered with a mailing address but no situs street. They
+        # are already in `results`, so the `missing` filter above skips them; they
+        # still need the statewide layer for the property address. A plain
+        # `results.update()` would replace the county row wholesale and drop the
+        # mailing address we came here for, so these merge field-by-field instead.
+        needs_situs = [
+            pid for pid in parcel_ids
+            if pid in results and results[pid].get("needs_situs_fallback")
+        ]
+        if missing or needs_situs:
+            statewide = _batch_query_wa_statewide(missing + needs_situs, county)
+            for pid, sw_row in statewide.items():
+                county_row = results.get(pid)
+                if county_row and county_row.get("needs_situs_fallback"):
+                    merged = dict(sw_row)
+                    # County mailing wins; the statewide layer has none to offer.
+                    merged["mailing_address"] = (
+                        county_row.get("mailing_address") or sw_row.get("mailing_address")
+                    )
+                    results[pid] = merged
+                else:
+                    results[pid] = sw_row
+
+    for row in results.values():
+        row.pop("needs_situs_fallback", None)
 
     return results
 
@@ -547,6 +651,33 @@ def _arcgis_literal(value: str) -> str:
     stray quote in a parsed value must not break or reshape the predicate (Codex).
     """
     return "'" + value.replace("'", "''") + "'"
+
+
+def _callers_for(pid: object, clean_to_originals: dict[str, list[str]]) -> list[str]:
+    """Caller parcel ids a returned feature is allowed to answer for.
+
+    The query is an exact ``IN`` over values we supplied, but nothing forced the
+    server to echo them verbatim: an ArcGIS layer typed numeric, or a JSON decoder,
+    can hand back ``8931001`` for the ``08931001`` we asked about. Matching only on
+    the raw string silently misses those, and the previous ``or [str(pid)]`` fallback
+    did something worse — it invented a caller id nobody requested and filed a real
+    owner's mailing address under it.
+
+    Match on the raw string first, then on a leading-zero-insensitive form. A feature
+    that still corresponds to no requested id is dropped, never guessed at.
+    """
+    raw = str(pid).strip()
+    exact = clean_to_originals.get(raw)
+    if exact:
+        return exact
+    loose = raw.lstrip("0")
+    for clean, originals in clean_to_originals.items():
+        if clean.lstrip("0") == loose and loose:
+            return originals
+    _logger.warning(
+        "County GIS returned parcel %r that matches no requested id — dropped", raw
+    )
+    return []
 
 
 def _map_county_features(
@@ -574,6 +705,20 @@ def _map_county_features(
         if not pid:
             continue
         parsed = _parse_gis_response({"features": [feature]}, gis_config)
+        if (not parsed.get("property_address")
+                and not gis_config.get("skip_statewide_fallback")
+                and parsed.get("mailing_address")):
+            # The county knows where the owner gets mail but not where the property
+            # is. Dropping the row here (as the branch below does) threw that mailing
+            # address away and let the situs-only statewide layer answer instead, so
+            # the lead ended up with a property address and NO mailing — the exact
+            # shape of the bug this file is being changed to fix (Codex, 2026-09-10).
+            # Keep it and let the statewide layer top up the situs.
+            parsed["needs_situs_fallback"] = True
+            parsed["parcel_id"] = pid
+            for caller_pid in _callers_for(pid, clean_to_originals):
+                results[caller_pid] = dict(parsed)
+            continue
         if not parsed.get("property_address") and not gis_config.get("skip_statewide_fallback"):
             # No street. For a county that still uses the WA statewide fallback,
             # dropping the row is right — statewide may know the address.
@@ -585,14 +730,77 @@ def _map_county_features(
             # trace is never billed, and the situs city/zip still ride along.
             continue
         parsed["parcel_id"] = pid
-        for caller_pid in clean_to_originals.get(str(pid)) or [str(pid)]:
+        for caller_pid in _callers_for(pid, clean_to_originals):
             results[caller_pid] = dict(parsed)
     return results
 
 
+# An addressee line is NOT a street. Cowlitz files "ATTN ALAN M ANNIS, DIRECTOR OF
+# TAXES" and "C/O LLOYD MILTON PURSLEY" in DEED_HOLDER_ADDRESS_1 while the real street
+# sits in _2 (measured 2026-09-10: 53,109 rows street-in-_2-only, 4,473 with _1 as an
+# attn/c-o line, 203 with _1 only). Taking _1 blindly would both corrupt the address and
+# store a taxpayer NAME, which this codebase deliberately does not collect (the same
+# boundary pierce_atip._drop_person_line enforces for ATIP). A real street line starts
+# with a house number, a post-office box, or a military/rural route designator.
+_MAIL_STREET_SHAPE_RE = re.compile(r"^\s*(?:\d|P\.?\s*O\.?\s*B|POB\b|PSC\b|RR\b|HC\b)", re.I)
+
 # A LIKE metacharacter (% or _) in an interpolated value silently widens the
 # predicate to unrelated rows. Values carrying one are rejected, not rewritten.
 _LIKE_META = re.compile(r"[%_]")
+
+
+def _attr_text(attrs: dict, field: str | None) -> str | None:
+    """One trimmed attribute, or None for null/blank/whitespace."""
+    if not field:
+        return None
+    val = attrs.get(field)
+    if val is None:
+        return None
+    text = str(val).replace("&nbsp;", "").strip()
+    return text or None
+
+
+def _compose_street_parts(attrs: dict, part_fields: list[str]) -> str | None:
+    """Join a situs street published as components into one street line.
+
+    Space-joined in the configured order and collapsed, so a null middle component
+    ("W" in "5919 W 218TH AVE NE") never leaves a double space.
+    """
+    parts = [_attr_text(attrs, f) for f in part_fields]
+    street = " ".join(p for p in parts if p)
+    return " ".join(street.split()) or None
+
+
+def _compose_mailing(attrs: dict, gis_config: dict) -> str | None:
+    """Build "STREET, CITY, ST ZIP" from a street column plus locality columns.
+
+    ``mailing_street_fields`` is tried in order and the FIRST value that looks like a
+    street wins (see ``_MAIL_STREET_SHAPE_RE``) — this is a priority list, not a
+    concatenation, because the runner-up column is usually an addressee name.
+
+    A locality with no street is dropped rather than stored: "EVERETT, WA 98203" alone
+    is not somewhere you can mail a letter, and persisting it would turn an unknown into
+    a false positive on the mailing-coverage numbers.
+    """
+    street = None
+    for field in gis_config.get("mailing_street_fields") or []:
+        candidate = _attr_text(attrs, field)
+        if candidate and _MAIL_STREET_SHAPE_RE.match(candidate):
+            street = candidate
+            break
+    if not street:
+        return None
+
+    locality = gis_config.get("mailing_locality_fields") or []
+
+    def _loc(i: int) -> str | None:
+        return _attr_text(attrs, locality[i]) if i < len(locality) else None
+
+    city, state, zipcode = _loc(0), _loc(1), _loc(2)
+    tail = ", ".join(p for p in (city, state) if p)
+    if zipcode:
+        tail = f"{tail} {zipcode}".strip()
+    return f"{street}, {tail}" if tail else street
 _CITY_STATE_RE = re.compile(r"^\s*(.+?)\s*,\s*([A-Z]{2})\s*$")
 # "PO BOX", "P.O. BOX", "P O BOX", "P.O BOX", "POB" — any post-office box spelling.
 _PO_BOX_RE = re.compile(r"^\s*P\.?\s*O\.?\s*B(?:OX)?\b", re.I)
@@ -621,6 +829,35 @@ def _situs_parts_from_confirmed_mailing(
         "property_city": m.group(1).strip(),
         "property_state": m.group(2),
         "property_zip": zipcode[:10] or None,
+    }
+
+
+def _situs_parts_direct(attrs: dict, gis_config: dict) -> dict[str, str | None]:
+    """Structured situs from a layer that publishes its OWN situs city/state/zip.
+
+    Unlike _situs_parts_from_confirmed_mailing, no inference is needed: these columns
+    already describe the property, so nothing has to be proven about where the owner
+    receives mail. ``situs_state_literal`` covers a layer with no state column, where
+    the state is fixed by which county's service is being queried.
+    """
+    fields = gis_config.get("situs_part_fields") or []
+    if not fields:
+        return {}
+
+    def _part(i: int) -> str | None:
+        return _attr_text(attrs, fields[i]) if i < len(fields) else None
+
+    city, zipcode = _part(0), _part(2)
+    if not city and not zipcode and not _part(1):
+        # Nothing located this parcel. `situs_state_literal` alone would assert a
+        # state for a row we know nothing else about, and property_state feeds the
+        # absentee / out-of-state owner flags — so emit nothing rather than a
+        # half-fact the flags would then reason from.
+        return {}
+    return {
+        "property_city": city,
+        "property_state": _part(1) or gis_config.get("situs_state_literal") or None,
+        "property_zip": zipcode[:10] if zipcode else None,
     }
 
 

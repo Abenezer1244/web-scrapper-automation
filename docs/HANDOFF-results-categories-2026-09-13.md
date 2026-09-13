@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-13
 **Worktree:** `C:/Users/Windows/bridgeleads-worktrees/results-categories`
-**Branch:** `investigate/results-categories` (local only, NOT pushed, no PR). HEAD `3e4ce26`.
+**Branch:** `investigate/results-categories` (local only, NOT pushed, no PR). Code HEAD `358b94c` (run `git log --oneline -1` for the latest).
 **Base:** cut from `origin/main` `ff9ecd6`, merged `origin/main` `18fcdf3` in `51c953b`.
 **Status:** Phase A (D1 + D5) implemented and tested. Codex diff-review loop at round 6
 (rounds 1-5 fixed; see §3 and §8). Phase B (D2 + D3 + D4) designed, NOT started, blocked on owner
@@ -57,9 +57,10 @@ The defects found (D-numbers are the owner's):
 | `9e3a688` | Codex review r1: release claims on both in-worker cancellation exits; dispatcher re-read locked; per-hash failure isolation (`_transfer_one_claim`); tenant filter on the claim UPDATE |
 | `b0a97fc` | Codex review r2: cancellation release re-checks `status='cancelled' AND billing_applied_at IS NULL` inside the DELETE (a stale attempt must never strip a DONE job's claims) |
 | `0bb0ff9` | Codex review r3: a failed post-enrichment refetch now fails the job before billing for EVERY plan (unlimited used to bill a count the file did not match); dispatcher buys lookups only for jobs in `done`; `FOR SHARE SKIP LOCKED` (locked rows deferred to next tick, no lock inversion vs purge cascade) |
+| `358b94c` | Codex review r5: failed/cancelled anchor jobs must also be unbilled before a claim can move; this handoff + plan file |
 | `3e4ce26` | Codex review r4: `sweep_stranded_dedup_claims` (status.py) + beat entry `sweep-stranded-dedup-claims` (scheduler.py, every 5 min): releases claims of failed/cancelled jobs that never billed. Prod dry-run: releases nothing today |
 
-## 4. Active files (branch diff vs merge-base, 13 files)
+## 4. Active files (branch diff vs merge-base: 13 code/test files + this handoff + the plan file)
 
 - `src/workers/tasks.py` — `_release_claims_of_cancelled_job`; transfer call after reconcile;
   skip-trace enqueue after cap + `populate_existing` reload; refetch-failure = re-export failure.
@@ -76,7 +77,7 @@ The defects found (D-numbers are the owner's):
 - Tests: `tests/test_claim_transfer.py` (new, ~28 tests incl. thread race, sweep matrix),
   `tests/test_skip_trace_enqueue_after_delivery.py` (new), `tests/test_skip_trace_dispatcher_claim.py`,
   `tests/test_duplicate_provenance.py`.
-- Plan file: `tasks/todo-results-categories.md` (untracked; update its Review section).
+- Plan file: `tasks/todo-results-categories.md` (committed; update its Review section).
 
 No migration. No OpenAPI change. No frontend change.
 
@@ -88,7 +89,7 @@ No migration. No OpenAPI change. No frontend change.
 - **Transfer eligibility** (all under the claim row lock): claim hash strong, proven from the
   parcel/address stored ON THE CLAIM (result rows are rewritten by enrichment); anchor row exists
   (NULL anchor = purged source = cannot disprove delivery, 44,866 such claims keep suppressing);
-  anchor not actionable; anchor job `failed`/`cancelled`, or `done` with
+  anchor not actionable; anchor job `failed`/`cancelled` AND never billed, or `done` with
   `billing_applied_at >= 2026-09-03 12:05:28 UTC` (merge of #191). Evidence for the cutoff: no job
   holding unactionable non-dup rows was billed between 2026-09-02 09:38 (old rule, billed all) and
   2026-09-04 09:32; first clearly new-rule job billed 2026-09-07 01:35. Only 22 identities qualify today.

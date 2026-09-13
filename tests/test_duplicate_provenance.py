@@ -326,6 +326,33 @@ async def test_same_run_collapse_is_not_reported_as_a_prior_delivery(
     assert body["unattributed_duplicate_count"] == 0
 
 
+async def test_a_superseded_row_is_neither_new_nor_already_delivered_on_its_run(
+    client: AsyncClient, starter_user: User, starter_token: str,
+    scraper_config: ScraperConfig,
+    db,
+):
+    """transfer_undelivered_claims moved this run's claim to a LATER run that
+    delivered the lead. If a backfill later gives the old row an address, its own
+    run must not start reporting it: as a duplicate it would name a source run
+    newer than the one being viewed, which is the forward-pointing link that was
+    once reported as a data leak."""
+    viewed = await _job(db, starter_user, scraper_config, created_at=NOW - timedelta(days=5))
+    later = await _job(db, starter_user, scraper_config, created_at=NOW)
+    await _rows(db, viewed, starter_user.id, [
+        {"duplicate": True, "source_job": later, "source_at": NOW, "reason": "superseded"},
+        {"duplicate": False},
+    ])
+
+    body = await _results(client, viewed, starter_token)
+    assert body["new_count"] == 1
+    assert body["duplicate_count"] == 0
+    assert body["total_scraped"] == 1
+    assert body["same_run_duplicate_count"] == 0
+    assert body["duplicate_sources"] == []
+    assert body["unattributed_duplicate_count"] == 0
+    assert body["total"] == 1
+
+
 # ─── 3. Tenant isolation on the surfaces this change touches ────────────────────
 
 async def test_another_accounts_run_is_not_readable_by_id(

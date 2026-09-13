@@ -1,13 +1,15 @@
 """Tests for job CRUD, record limit enforcement, cancel rules, and SSE log replay."""
+import asyncio
 import json
 import uuid
 
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import src.db.session as _db_session
 from src.db.models import Job, JobLog, ScraperBatch, ScraperConfig, User
+from src.db.session import system_sync_session
 
 # ─── List jobs ────────────────────────────────────────────────────────────────
 
@@ -292,6 +294,53 @@ async def test_cancel_failed_job_returns_400(
         headers={"Authorization": f"Bearer {starter_token}"},
     )
     assert resp.status_code == 400
+
+
+async def test_a_cancel_that_loses_the_race_to_completion_never_unfinishes_the_job(
+    client: AsyncClient,
+    db: AsyncSession,
+    starter_user: User,
+    starter_token: str,
+    scraper_config: ScraperConfig,
+):
+    """The worker bills and marks the job done in one transaction. A cancel that
+    read 'enriching' just before that commit used to overwrite 'done' with
+    'cancelled' by primary key: the customer was charged and holds a download, but
+    the job reads cancelled and its paid skip traces were withdrawn (Codex review
+    round 6). The cancel must re-check the status in the same statement."""
+    job_id = str(uuid.uuid4())
+    async with _db_session.AsyncSessionLocal() as s:
+        s.add(Job(id=job_id, user_id=starter_user.id, scraper_config_id=scraper_config.id,
+                  status="enriching", trigger="manual"))
+        await s.commit()
+
+    with system_sync_session() as worker, system_sync_session() as probe:
+        # The worker's billing + done-CAS, not yet committed: holds the row lock.
+        worker.execute(
+            text("UPDATE jobs SET status = 'done', billing_applied_at = now() WHERE id = :id"),
+            {"id": job_id},
+        )
+        cancel = asyncio.create_task(client.delete(
+            f"/jobs/{job_id}", headers={"Authorization": f"Bearer {starter_token}"},
+        ))
+        # Wait until the cancel is blocked on that lock, so the ordering is real.
+        for _ in range(200):
+            await asyncio.sleep(0.05)
+            waiting = probe.execute(text(
+                "SELECT count(*) FROM pg_stat_activity "
+                "WHERE datname = current_database() AND wait_event_type = 'Lock' "
+                "  AND query ILIKE 'UPDATE jobs%'"
+            )).scalar()
+            probe.rollback()
+            if waiting or cancel.done():
+                break
+        assert waiting, "the cancel never reached the jobs row lock"
+        worker.commit()
+        resp = await cancel
+
+    assert resp.status_code == 400
+    async with _db_session.AsyncSessionLocal() as s:
+        assert (await s.get(Job, job_id)).status == "done"
 
 
 # ─── SSE log replay ───────────────────────────────────────────────────────────

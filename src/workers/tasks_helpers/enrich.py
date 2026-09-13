@@ -1144,10 +1144,12 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             no_parcel_no_legal, has_parcel, legal_no_parcel,
         )
 
-    # Skip trace is NOT enqueued here. It used to be, which queued paid Tracerfy
-    # lookups before the plan cap had marked which rows are over quota, so leads
-    # that were never delivered were still traced and paid for. run_scrape_job
-    # now calls _enqueue_skip_trace_rows after the cap (see tasks.py).
+    # Skip trace is deliberately NOT enqueued here. Which rows are delivered is
+    # still undecided at this point: the same-run survivor re-election, the claim
+    # transfer and the plan cap all run after enrichment and can each change it.
+    # A lookup bought now could land on a row that ends up suppressed, while the
+    # row actually delivered is never traced. tasks.py calls
+    # _enqueue_skip_trace_rows once those have settled.
 
 
 def pierce_address_recovery(db, r, job_id: str, config, all_results) -> None:

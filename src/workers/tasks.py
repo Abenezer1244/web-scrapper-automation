@@ -137,6 +137,49 @@ def _alert_dedup_release_failed(job_id: str, user_id, context: str, exc: Excepti
         _logger.error("Job %s: dedup-release alert failed too: %s", job_id, str(alert_exc)[:160])
 
 
+def _release_claims_of_cancelled_job(db, job_id: str, user_id) -> None:
+    """Release every claim a job holds once it has been cancelled mid-run.
+
+    A cancelled run delivers nothing and bills nothing, yet the two paths that
+    notice a cancellation (the force-finalize guard before billing, and the
+    done-CAS losing to a cancel) returned with the job's claims still in place:
+    the ones its dedup step wrote and any it took over from an earlier run. Every
+    later run then hid those leads as "already delivered" with nothing ever
+    delivered. Same defect class as the post-crash cleanup fixed on 2026-09-08,
+    on the two exits that still had it (Codex).
+
+    ``user_id`` must be a plain value, for the reason in _alert_dedup_release_failed.
+
+    The job's state is re-checked INSIDE the delete, not trusted from the caller:
+    both callers only know the job is terminal, and 'done' is terminal too. A
+    stale attempt overlapping a watchdog retry that already completed and billed
+    would otherwise strip a finished job's claims, and the next run would deliver
+    and bill those properties again (Codex). Only a job that is cancelled and was
+    never billed gives its claims up, and only if it was created after billing
+    was stamped: a requeued older job's NULL stamp proves nothing (Codex review
+    round 7).
+    """
+    from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
+
+    try:
+        db.execute(
+            sa_text(
+                "DELETE FROM delivered_records "
+                "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid) "
+                "  AND EXISTS (SELECT 1 FROM jobs j "
+                "              WHERE j.id = :jid AND j.user_id = CAST(:uid AS uuid) "
+                "                AND j.status = 'cancelled' "
+                "                AND j.billing_applied_at IS NULL "
+                "                AND j.created_at >= :since)"
+            ),
+            {"jid": job_id, "uid": str(user_id), "since": BILLING_STAMP_RELIABLE_SINCE},
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        _alert_dedup_release_failed(job_id, user_id, "cancelled", exc)
+
+
 def _upload_export_with_retry(exporter, local_file, object_key) -> tuple[bool, Exception | None]:
     """Upload an export to R2 with bounded retries. Never raises.
 
@@ -1437,6 +1480,32 @@ def run_scrape_job(self, job_id: str) -> None:
                 "Job %s: same-run reconciliation failed: %s", job_id, str(exc)[:160]
             )
 
+        # Take over any claim whose holder never delivered the lead: an earlier
+        # run's address-less row pins a property that THIS run found with an
+        # address, and without this the lead is hidden as "already delivered"
+        # forever. HERE: actionability is settled (after enrichment and the
+        # re-election) and the refetch below still precedes the plan cap, skip
+        # trace, the re-export and billing, so all four see the promoted row.
+        # Each claim commits on its own. Non-fatal: a failure leaves the rows
+        # flagged exactly as the cross-run dedup left them.
+        try:
+            from src.workers.tasks_helpers.dedup import transfer_undelivered_claims
+
+            _transferred = transfer_undelivered_claims(
+                db, job_id, job.user_id, config.record_type
+            )
+            if _transferred:
+                dup_count -= _transferred
+                _logger.info(
+                    "Job %s: took over %d claim(s) an earlier run held without "
+                    "ever delivering the lead", job_id, _transferred,
+                )
+        except Exception as exc:
+            db.rollback()
+            _logger.warning(
+                "Job %s: claim transfer failed: %s", job_id, str(exc)[:160]
+            )
+
         # Fetch post-enrichment rows ONCE; reused by re-export AND membership.
         # Same deterministic order as the in-app download (jobs.py) so the emailed/
         # R2 CSV and the download are byte-identical, not just same-columns (Codex).
@@ -1736,21 +1805,46 @@ def run_scrape_job(self, job_id: str) -> None:
                     "Job %s: plan cap excluded %d actionable rows (remaining=%d)",
                     job_id, len(_capped_ids), _remaining,
                 )
-            # Reload whenever the cap RAN — after the mark AND after the clear.
-            #
-            # populate_existing is load-bearing, not defensive: the sessions are
-            # built with expire_on_commit=False (src/db/session.py), and these
-            # Result identities were already loaded by the post-enrichment refetch
-            # above. A plain re-SELECT returns those SAME objects with their STALE
-            # enrichment_data, so `is_actionable(res)` at export time would miss
-            # the marker the raw SQL just wrote — the export would ship over-quota
-            # rows while billing (which reads the DB) charged for fewer. That is
-            # exactly the file/bill disagreement this cap exists to prevent, and
-            # no test caught it because nothing exercises the worker cap
-            # end-to-end (Codex, 2026-09-03).
-            #
-            # The clear path needs it too: with no rows newly marked, stale
-            # objects could still carry a PREVIOUS run's marker and under-export.
+
+        # ── SKIP TRACE ENQUEUE (once delivery is decided) ────────────────────
+        # Only here, after the survivor re-election and the plan cap, which are
+        # the last steps that decide which rows ship. It used to run at the end
+        # of inline enrichment, before both: a lookup could be bought for a row
+        # the re-election then demoted or the cap then excluded, while the row
+        # actually delivered was never traced. The enqueue selects non-duplicate,
+        # actionable (so not over-quota), not-yet-attempted rows, so reading the
+        # settled flags is all the fix needs.
+        #
+        # Non-fatal, exactly as it was inside enrichment: everything before this
+        # point has already committed, so the rollback can only discard the
+        # enqueue's own uncommitted work, and an unqueued lead stays
+        # 'not_attempted' for a later backfill rather than failing a delivery.
+        #
+        # Only when enrichment succeeded (main #280). Commit first so the rollback
+        # can only ever discard the enqueue's own writes, never earlier job work;
+        # a savepoint would not help, the enqueue commits internally.
+        if _enrichment_ok:
+            db.commit()
+            try:
+                _enqueue_skip_trace_rows(db, job, r, job_id, config)
+            except Exception as exc:
+                db.rollback()
+                _logger.warning(
+                    "Job %s: skip trace enqueue failed: %s", job_id, str(exc)[:160]
+                )
+
+        # Reload the rows every consumer below reads, for EVERY plan.
+        #
+        # populate_existing is load-bearing, not defensive: the sessions are
+        # built with expire_on_commit=False (src/db/session.py), and these
+        # Result identities were already loaded by the post-enrichment refetch
+        # above. A plain re-SELECT returns those SAME objects with their STALE
+        # state, so the export would miss what raw SQL wrote since: the plan
+        # cap's over-quota marker (the export would ship rows billing then
+        # refuses to charge, Codex 2026-09-03), a row the claim transfer
+        # promoted, and the contact data a skip-trace cache hit just copied in.
+        # Billing reads the DB, so a stale export is a file/bill disagreement.
+        if refreshed is not None:
             refreshed = db.execute(
                 select(Result)
                 .where(Result.job_id == job_id, Result.user_id == job.user_id)
@@ -1758,26 +1852,17 @@ def run_scrape_job(self, job_id: str) -> None:
                 .execution_options(populate_existing=True)
             ).scalars().all()
 
-        # ── SKIP TRACE ENQUEUE (after the plan cap) ──────────────────────────
-        # Rows the cap marked over_quota fail actionable_condition(), so they are
-        # never queued for a paid lookup. Before the re-export so free cache hits
-        # still land in the delivered file (same identity-mapped Result objects as
-        # `refreshed`). Non-fatal: a delivered job must not fail on skip trace.
-        if _enrichment_ok:
-            # Commit first so the rollback below can only ever discard the
-            # enqueue's own writes, never earlier job work. A savepoint would not
-            # help: the enqueue commits internally.
-            db.commit()
-            try:
-                _enqueue_skip_trace_rows(db, job, r, job_id, config)
-            except Exception as exc:
-                db.rollback()
-                _logger.warning("Job %s: skip trace enqueue failed: %s", job_id, str(exc)[:160])
-
-        # Re-export CSV with enriched data — only if the refetch succeeded.
-        if refreshed is not None:
+        # Re-export CSV with enriched data. A refetch that FAILED is a re-export
+        # failure too, for every plan: the R2 object is still the pre-enrichment
+        # file, while billing below counts the rows as they are now, including any
+        # that enrichment made actionable or the claim transfer promoted. Finite
+        # plans already failed on this before the cap; unlimited plans used to skip
+        # the re-export silently and bill a count the file did not match (Codex).
+        reexport_error: Exception | None = None
+        if refreshed is None:
+            reexport_error = RuntimeError("post-enrichment refetch failed")
+        else:
             enriched_file = None
-            reexport_error: Exception | None = None
             try:
                 # Deliverable = actionable, NON-DUPLICATE rows (see the first export
                 # above for both rules); `refreshed` itself stays complete for the
@@ -1805,50 +1890,50 @@ def run_scrape_job(self, job_id: str) -> None:
             finally:
                 if enriched_file:
                     enriched_file.unlink(missing_ok=True)
-            if reexport_error is not None:
-                # The R2 object is the PRE-enrichment deliverable, which (by the
-                # actionability rule) omits rows that enrichment has since made
-                # actionable — and those rows are about to be billed. A bill that
-                # does not match the delivered file is never acceptable, so this is
-                # fatal exactly like the first upload: release the dedup claims,
-                # fail before billing, and let the user re-run (Codex).
+        if reexport_error is not None:
+            # The R2 object is the PRE-enrichment deliverable, which (by the
+            # actionability rule) omits rows that enrichment has since made
+            # actionable — and those rows are about to be billed. A bill that
+            # does not match the delivered file is never acceptable, so this is
+            # fatal exactly like the first upload: release the dedup claims,
+            # fail before billing, and let the user re-run (Codex).
+            _logger.error(
+                "Job %s: enriched re-export failed — failing job before billing: %s",
+                job_id, str(reexport_error)[:200],
+            )
+            try:
+                db.rollback()
+                db.execute(
+                    sa_text(
+                        "DELETE FROM delivered_records "
+                        "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
+                    ),
+                    {"jid": job_id, "uid": str(job.user_id)},
+                )
+                db.commit()
+            except Exception as cleanup_exc:
+                db.rollback()
                 _logger.error(
-                    "Job %s: enriched re-export failed — failing job before billing: %s",
-                    job_id, str(reexport_error)[:200],
+                    "Job %s: failed to release dedup claims after re-export failure: %s",
+                    job_id, str(cleanup_exc)[:200],
                 )
-                try:
-                    db.rollback()
-                    db.execute(
-                        sa_text(
-                            "DELETE FROM delivered_records "
-                            "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
-                        ),
-                        {"jid": job_id, "uid": str(job.user_id)},
-                    )
-                    db.commit()
-                except Exception as cleanup_exc:
-                    db.rollback()
-                    _logger.error(
-                        "Job %s: failed to release dedup claims after re-export failure: %s",
-                        job_id, str(cleanup_exc)[:200],
-                    )
-                    _alert_dedup_release_failed(job_id, _boot_user_id, "reexport_failure", cleanup_exc)
-                reason = (
-                    "The lead file could not be refreshed with enriched addresses. "
-                    "No file was delivered and you were not charged. Please run the "
-                    "scraper again; contact support if it keeps failing."
+                _alert_dedup_release_failed(job_id, _boot_user_id, "reexport_failure", cleanup_exc)
+            reason = (
+                "The lead file could not be refreshed with enriched addresses. "
+                "No file was delivered and you were not charged. Please run the "
+                "scraper again; contact support if it keeps failing."
+            )
+            if _fail_job(db, job, r, job_id, reason):
+                from src.workers.notification_emit import create_notification
+                create_notification(
+                    user_id=job.user_id, type="job_failed", job_id=job_id,
+                    detail={
+                        "scraper_name": getattr(config, "name", None),
+                        "county": getattr(config, "county", None),
+                        "error_summary": reason[:200],
+                    },
                 )
-                if _fail_job(db, job, r, job_id, reason):
-                    from src.workers.notification_emit import create_notification
-                    create_notification(
-                        user_id=job.user_id, type="job_failed", job_id=job_id,
-                        detail={
-                            "scraper_name": getattr(config, "name", None),
-                            "county": getattr(config, "county", None),
-                            "error_summary": reason[:200],
-                        },
-                    )
-                return
+            return
 
         # ── PHASE 3: RESULT.property_key (combine/overlap join key) ──────────
         # Stamp the strong-identity key on this job's rows BEFORE the membership
@@ -1916,6 +2001,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 "Job %s externally terminalized (%s) after export — skipping billing/delivery",
                 job_id, job.status,
             )
+            _release_claims_of_cancelled_job(db, job_id, _boot_user_id)
             return
 
         # Atomic update of monthly record usage.
@@ -2138,6 +2224,7 @@ def run_scrape_job(self, job_id: str) -> None:
             from src.workers.tasks_helpers.status import release_quota_reservation
 
             release_quota_reservation(db, job_id)
+            _release_claims_of_cancelled_job(db, job_id, _boot_user_id)
             _logger.info(
                 "Job %s externally terminalized (%s) — suppressing completion delivery",
                 job_id, job.status,

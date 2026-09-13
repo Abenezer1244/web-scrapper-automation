@@ -831,11 +831,15 @@ class Result(Base):
     # verifier in provision_rls_roles.sql. So provenance lives here instead.
     #
     # duplicate_reason: 'prior_run' — an earlier run of this user's genuinely
-    # delivered it; 'same_run' — the trustee_sale sibling collapse
-    # (trustee_sale_finalize.py) flagged it so one property bills once, and it
-    # was NEVER previously delivered. Copy must not call the second "already
-    # received". NULL on all three = classified before 089; the API reports
-    # those as unattributed rather than guessing.
+    # delivered it; 'same_run' — the same-run sibling collapse
+    # (collapse_same_run_siblings, and trustee_sale_finalize.py for Auction Leads)
+    # flagged it so one property bills once, and it was NEVER previously
+    # delivered. Copy must not call the second "already received".
+    # 'superseded' — this row held the claim but was never delivered (no
+    # address), and the LATER run named in duplicate_source_job_id took the claim
+    # over and delivered the lead (transfer_undelivered_claims); hidden so the
+    # property is never delivered twice. NULL on all three = classified before
+    # 089; the API reports those as unattributed rather than guessing.
     #
     # No FK on duplicate_source_job_id, deliberately, matching
     # delivered_records.first_job_id: purging the source job must never cascade

@@ -44,12 +44,13 @@ def dispatch_pending_skip_trace() -> dict:
         _logger.warning("TRACERFY_API_TOKEN missing — dispatcher tick skipped")
         return {"skipped": "no_token"}
 
-    from sqlalchemy import and_, func, select, update
+    from sqlalchemy import and_, func, select, text, update
 
     from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
     from src.db.models import Job, PendingSkipTraceRow, Result
     from src.db.session import system_sync_session
     from src.scrapers.enrichment.skip_trace import TracerfyError, submit_batch
+    from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
 
     max_batches = max(1, settings.SKIP_TRACE_MAX_BATCHES_PER_TICK)
     submitted_batches = 0
@@ -82,8 +83,10 @@ def dispatch_pending_skip_trace() -> dict:
                         # Eligibility is decided HERE, in SQL, not after the LIMIT:
                         # filtering in Python would let ineligible rows occupy the
                         # FIFO head and starve everything behind them. A row goes
-                        # out only once its job is DONE (delivered and billed) and
-                        # its lead is still deliverable and still waiting.
+                        # out only once its job delivered (done, or billed whatever
+                        # status was written over it, or a terminal job from before
+                        # billing was stamped: _job_delivered_sql) and its lead is
+                        # still deliverable and still waiting.
                         # Tenant-pinned joins: this runs in a system session.
                         .join(
                             Job,
@@ -103,7 +106,8 @@ def dispatch_pending_skip_trace() -> dict:
                             and_(
                                 PendingSkipTraceRow.status == "queued",
                                 PendingSkipTraceRow.trace_type == trace_type,
-                                Job.status == "done",
+                                text(_job_delivered_sql("jobs")).bindparams(
+                                    since=BILLING_STAMP_RELIABLE_SINCE),
                                 Result.skip_trace_status == "queued",
                                 Result.is_duplicate.is_not(True),
                                 func.coalesce(
@@ -125,6 +129,22 @@ def dispatch_pending_skip_trace() -> dict:
                 if not rows:
                     continue
 
+                # Buy a lookup only for a lead that was actually delivered.
+                rows, withdrawn, left_queued = _partition_still_deliverable(db, rows)
+                if withdrawn:
+                    _cancel_undeliverable(db, withdrawn)
+                    _logger.info(
+                        "Dispatcher: %d %s row(s) withdrawn before submit: the job did "
+                        "not deliver, or the lead is now a duplicate or over the plan "
+                        "limit", len(withdrawn), trace_type,
+                    )
+                if left_queued:
+                    _logger.info(
+                        "Dispatcher: %d %s row(s) left queued for a later tick (job "
+                        "still running, or the lead is being updated)",
+                        left_queued, trace_type,
+                    )
+
                 # Tracerfy's batch endpoint REQUIRES address + city + state on
                 # every row, and a row missing one is not rejected loudly — it is
                 # dropped from the upload. Production queue 162456: we sent 4 rows,
@@ -143,10 +163,13 @@ def dispatch_pending_skip_trace() -> dict:
                     errors.append(msg)
                     _logger.warning("Dispatcher: %s", msg)
                 if not rows:
-                    # Nothing submittable left: commit the failures on their own
-                    # (no claim follows to carry them).
-                    if unsubmittable:
+                    # Nothing to claim: commit the failures and withdrawals on their
+                    # own (no claim follows to carry them), and in every case end the
+                    # transaction so no lock on a deferred row outlives this pass.
+                    if unsubmittable or withdrawn:
                         db.commit()
+                    else:
+                        db.rollback()
                     continue
 
                 # DURABLE CLAIM before the external POST (Codex High, 2026-09-02).
@@ -315,10 +338,33 @@ class _Claim(NamedTuple):
     user_id: str
 
 
+def _job_delivered_sql(alias: str) -> str:
+    """SQL: this job delivered its file, so its leads' lookups may be bought.
+
+    Billing and the done-CAS commit together, so a billed job delivered whatever
+    status a racing cancel wrote over it later (Codex review round 6). A failed
+    or cancelled job created before BILLING_STAMP_RELIABLE_SINCE may have charged
+    and delivered without a stamp (round 8). Binds ``:since``.
+    """
+    return (
+        f"({alias}.status = 'done' OR {alias}.billing_applied_at IS NOT NULL "
+        f" OR ({alias}.status IN ('failed', 'cancelled') AND {alias}.created_at < :since))"
+    )
+
+
+def _job_undelivered_sql(alias: str) -> str:
+    """SQL: this job ended without delivering anything. Binds ``:since``."""
+    return (
+        f"({alias}.status IN ('failed', 'cancelled') AND {alias}.billing_applied_at IS NULL "
+        f" AND {alias}.created_at >= :since)"
+    )
+
+
 def _cancel_undeliverable_queued(db) -> int:
     """Cancel queued rows that must never be paid for. Returns rows cancelled.
 
-    A queued row is cancelled when its job ended failed/cancelled, or its lead is
+    A queued row is cancelled when its job ended failed/cancelled without billing
+    (and after billing was stamped, see _job_undelivered_sql), or its lead is
     over quota, a duplicate, or no longer 'queued' (for example a trace was copied
     onto it after it was enqueued). Only 'queued' rows are touched: 'submitting'
     and 'submitted' are already at Tracerfy and belong to the reconciler.
@@ -332,22 +378,24 @@ def _cancel_undeliverable_queued(db) -> int:
     from sqlalchemy import text
 
     from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
+    from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
 
     try:
         cancelled = db.execute(
             text(
-                "UPDATE pending_skip_trace_rows p SET status = 'cancelled' "
+                "UPDATE pending_skip_trace_rows p SET status = 'cancelled' "  # noqa: S608 — fixed literals + bound params only
                 "FROM jobs j, results r "
                 "WHERE p.status = 'queued' "
                 "  AND j.id = p.job_id AND j.user_id = p.user_id "
                 "  AND r.id = p.result_id AND r.user_id = p.user_id "
-                "  AND (j.status IN ('failed', 'cancelled') "
+                f"  AND ({_job_undelivered_sql('j')} "
                 "       OR r.is_duplicate IS TRUE "
                 "       OR r.skip_trace_status <> 'queued' "
                 "       OR COALESCE(r.enrichment_data->>:key, '') = :over_quota) "
                 "RETURNING p.result_id, p.user_id"
             ),
-            {"key": DELIVERY_EXCLUDED_KEY, "over_quota": OVER_QUOTA},
+            {"key": DELIVERY_EXCLUDED_KEY, "over_quota": OVER_QUOTA,
+             "since": BILLING_STAMP_RELIABLE_SINCE},
         ).fetchall()
         if cancelled:
             db.execute(
@@ -474,6 +522,127 @@ def _fail_unsubmittable(db, rows: list) -> None:
             Result.skip_trace_status.in_(("queued", "submitted")),
         )
         .values(skip_trace_status="errored", skip_trace_attempted_at=datetime.now(UTC))
+    )
+
+
+def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
+    """Split the FIFO head into (buy now, withdraw) and a count left for later.
+
+    A lookup is bought only for a lead that was actually delivered: its Result is
+    not a duplicate, not excluded by the plan cap, and its job billed or reached
+    'done'. Billing and the done-CAS commit together, so a billed job delivered
+    its file whatever status was written over it later (Codex review round 6);
+    'done' alone still counts for jobs that predate the billing stamp, and so
+    does a failed or cancelled job created before BILLING_STAMP_RELIABLE_SINCE:
+    it may have charged and delivered without a stamp (Codex review round 8).
+    Rows are queued just before the enriched re-export and billing, so a job can
+    still fail after queueing them (a failed upload, a failed refetch), and the
+    flags can still change (a watchdog re-run repeats the survivor election and
+    the cap). Paying Tracerfy for any of those buys contact data nobody receives.
+
+    - buy now: billed, done, or pre-stamp terminal job; non-duplicate, not over
+      quota.
+    - withdraw: the job failed or was cancelled without billing after billing
+      was stamped, or the lead is a duplicate or over quota. Never charged.
+    - left for later (neither list): the job is still running, the Result row is
+      locked by a writer right now, or it no longer exists (its pending row is
+      CASCADE-deleted with it). Nothing is decided on a value that is changing.
+
+    The Result rows are read FOR SHARE SKIP LOCKED and the share lock is held
+    until the claim commits. SKIP LOCKED rather than a plain FOR SHARE: the
+    dispatcher already holds the pending rows, and a purge cascading from a job
+    locks results before pending rows, so waiting here would invert that order
+    and deadlock (Codex). A skipped row is simply retried on the next tick, after
+    the writer has committed, which also closes the read-then-claim race: no
+    stale flag is ever acted on.
+
+    The job row needs no lock: each job-side answer is final once seen. A job
+    that billed stays billed, and a failed or cancelled job that never billed can
+    never bill (the done-CAS only moves a non-terminal job).
+    """
+    if not rows:
+        return [], [], 0
+    from sqlalchemy import func, select, tuple_
+
+    from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
+    from src.db.models import Job, Result
+    from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
+
+    # Tenant-paired like every other write from this cross-tenant head.
+    state = {
+        (str(rid), str(uid)): (is_dup, excluded, status, billed, stamped)
+        for rid, uid, is_dup, excluded, status, billed, stamped in db.execute(
+            select(
+                Result.id,
+                Result.user_id,
+                Result.is_duplicate,
+                # Same spelling as lead_actionability.actionable_condition; a NULL
+                # blob yields NULL from ->>, which the COALESCE turns into ''.
+                func.coalesce(
+                    Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
+                ) == OVER_QUOTA,
+                Job.status,
+                Job.billing_applied_at.is_not(None),
+                Job.created_at >= BILLING_STAMP_RELIABLE_SINCE,
+            )
+            .join(Job, Job.id == Result.job_id)
+            .where(
+                tuple_(Result.id, Result.user_id).in_(
+                    [(r.result_id, r.user_id) for r in rows]
+                )
+            )
+            .with_for_update(read=True, skip_locked=True, of=Result)
+        ).all()
+    }
+    keep: list = []
+    drop: list = []
+    later = 0
+    for r in rows:
+        seen = state.get((str(r.result_id), str(r.user_id)))
+        if seen is None:
+            later += 1
+            continue
+        is_dup, excluded, status, billed, stamped = seen
+        terminal = status in ("failed", "cancelled")
+        if is_dup or excluded or (terminal and not billed and stamped):
+            drop.append(r)
+        elif billed or status == "done" or terminal:
+            keep.append(r)
+        else:
+            later += 1
+    return keep, drop, later
+
+
+def _cancel_undeliverable(db, rows: list) -> None:
+    """Withdraw queued rows whose lead is no longer delivered. Never charged.
+
+    The pending row becomes 'cancelled' and its Result goes back to
+    'not_attempted', not 'errored': nothing failed, and if a later re-run makes
+    the lead deliverable again the normal enqueue picks it up.
+
+    Does NOT commit, for the reason spelled out in _fail_unsubmittable: the caller
+    holds FOR UPDATE SKIP LOCKED on the whole head until the claim commits.
+    """
+    if not rows:
+        return
+    from sqlalchemy import tuple_, update
+
+    from src.db.models import PendingSkipTraceRow, Result
+
+    db.execute(
+        update(PendingSkipTraceRow)
+        .where(PendingSkipTraceRow.id.in_([r.id for r in rows]))
+        .values(status="cancelled")
+    )
+    db.execute(
+        update(Result)
+        .where(
+            tuple_(Result.id, Result.user_id).in_(
+                [(r.result_id, r.user_id) for r in rows]
+            ),
+            Result.skip_trace_status == "queued",
+        )
+        .values(skip_trace_status="not_attempted")
     )
 
 

@@ -89,12 +89,12 @@ def _sources() -> dict:
     "Legals - M-D-YY.pdf" spelling and could not reach the no-separator names the paper
     switched to by 2026-09-02).
     """
-    from src.scrapers.sources.nts_king_pdf import parse_king_notice
+    from src.scrapers.sources.nts_king_pdf import parse_king_notice, parse_snoho_notice
     from src.scrapers.sources.nts_pdf_archive import ARCHIVE_SOURCES
 
     parsers = {
         "queen_anne_news": parse_king_notice,
-        "snohomish_tribune": nts.parse_nts_notice,
+        "snohomish_tribune": parse_snoho_notice,
     }
     return {name: {**cfg, "parse": parsers[name]} for name, cfg in ARCHIVE_SOURCES.items()}
 

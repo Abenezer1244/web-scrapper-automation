@@ -346,6 +346,26 @@ _AUCTION_WORDED = re.compile(
     re.I,
 )
 
+# ── Month-name date with an "o'clock" time (live 2026-09-09, Snohomish Tribune, Burns
+# Law commercial notice): "…the undersigned trustee will on September 18, 2026, at the
+# hour of 10:00 o'clock a.m., outside the main entrance of the Snohomish County
+# Courthouse … to sell at public auction". _AUCTION_KING already reads "on September
+# 18, 2026, at the hour of 10:00 AM" but its time must be "HH:MM AM", so the "o'clock"
+# between the minutes and "a.m." defeated it; _AUCTION_WORDED needs an ordinal day. The
+# notice was dropped with auction_date None.
+# Kept narrower than both neighbours rather than widening them (their behaviour on
+# King/Pierce/Clark stays byte-identical): the date must hang off "will on" (so a deed
+# date, a cure-by date or "recorded on November 10, 2022" cannot be read as the sale),
+# "o'clock" is REQUIRED, and "sell at public auction" must follow within 600 chars.
+# Tried only after every other pattern missed. Bounded gaps, no nested quantifiers.
+# group(1)=month, (2)=day, (3)=year, (4)=H[:MM], (5)=A|P.
+_AUCTION_MONTH_OCLOCK = re.compile(
+    rf"will\s*,?\s*on\s+(?:{_WEEKDAY})?({_MONTHS})\.?\s+(\d{{1,2}}),?\s+(\d{{4}})"
+    r"\s*,?\s*at\s+(?:the\s+hour\s+of\s+)?(\d{1,2}(?::\d{2})?)\s*o'?clock\s*([AP])\.?\s*M\.?"
+    r"[\s\S]{0,600}?sell\s+at\s+public\s+auction",
+    re.I,
+)
+
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
     m = pattern.search(text)
@@ -483,6 +503,12 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
             wm = _AUCTION_WORDED.search(text)
             if wm:
                 day, month, year, hhmm, ampm = wm.groups()
+            else:
+                # Month-name + "o'clock" (see _AUCTION_MONTH_OCLOCK); same normalization.
+                wm = _AUCTION_MONTH_OCLOCK.search(text)
+                if wm:
+                    month, day, year, hhmm, ampm = wm.groups()
+            if wm:
                 auction_date = f"{month.title()} {int(day)}, {year}"
                 if ":" not in hhmm:
                     hhmm = f"{hhmm}:00"

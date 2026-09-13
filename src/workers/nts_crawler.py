@@ -163,7 +163,7 @@ def crawl_nts_tacoma_index() -> dict:
                     skipped += 1  # not a parseable NTS body
                     continue
                 row["fetched_at"] = datetime.now(UTC)
-                _upsert_notice(db, NtsNotice, row)
+                _upsert_notice(db, NtsNotice, row, deed_reference=parsed.get("deed_reference"))
                 upserted += 1
             except Exception as exc:  # noqa: BLE001
                 errored += 1
@@ -215,11 +215,19 @@ def crawl_nts_tacoma_index() -> dict:
 @app.task(name="src.workers.nts_crawler.crawl_nts_snoho_tribune")
 def crawl_nts_snoho_tribune() -> dict:
     """Crawl the Snohomish County Tribune weekly Legals PDF into nts_notices."""
+    # The Tribune carries the same Affinia no-colon and no-TS# layouts as the King
+    # paper (live 2026-09-09: an Affinia sale and a Burns Law commercial sale were
+    # both dropped by the plain colon parser), so it uses the PDF parser with the REF-
+    # surrogate identity (never APN-, see parse_snoho_notice). On every notice that
+    # already carried its own TS number the output is unchanged (measured over 5
+    # Tribune issues).
+    from src.scrapers.sources.nts_king_pdf import parse_snoho_notice
     return _crawl_pacific_publishing_pdf(
         page_url=_SNOHO_PAGE,
         pdf_path_prefix=_SNOHO_PDF_PREFIX,
         source=_SNOHO_SOURCE,
         county="snohomish",
+        parse_fn=parse_snoho_notice,
         archive=True,
     )
 
@@ -302,7 +310,7 @@ def crawl_nts_columbian_clark() -> dict:
                 row["fetched_at"] = datetime.now(UTC)
                 # Per-row SAVEPOINT: one bad notice rolls back alone, not the whole run.
                 with db.begin_nested():
-                    _upsert_notice(db, NtsNotice, row)
+                    _upsert_notice(db, NtsNotice, row, deed_reference=parsed.get("deed_reference"))
                 summary["upserted"] += 1
             except Exception as exc:  # noqa: BLE001
                 summary["errored"] += 1
@@ -458,7 +466,7 @@ def _ingest_pdf_blocks(
                 continue
             row["fetched_at"] = datetime.now(UTC)
             with db.begin_nested():
-                _upsert_notice(db, model, row)
+                _upsert_notice(db, model, row, deed_reference=parsed.get("deed_reference"))
             upserted += 1
         except Exception as exc:  # noqa: BLE001
             summary["errored"] += 1
@@ -553,9 +561,9 @@ def _crawl_pacific_publishing_pdf(
     from src.db.session import system_sync_session
     from src.scrapers.sources import nts_tacoma_index as nts
 
-    # Parser variance is isolated per paper (Codex): Snohomish uses the shared
-    # colon parser; King passes parse_king_notice for its no-colon/surrogate-key
-    # layouts. Default preserves existing (Snohomish/Tacoma) behavior.
+    # Parser variance is isolated per paper (Codex): the King and Snohomish tasks
+    # pass parse_king_notice / parse_snoho_notice for the surrogate-key layouts. The default
+    # (shared colon parser) is kept for any caller that passes none.
     if parse_fn is None:
         parse_fn = nts.parse_nts_notice
 
@@ -659,7 +667,7 @@ _COALESCE_ON_UPDATE = frozenset({
 })
 
 
-def _upsert_notice(db, model, row: dict) -> None:
+def _upsert_notice(db, model, row: dict, *, deed_reference: str | None = None) -> None:
     """Upsert one notice on (source, ts_number); refresh all mutable fields.
 
     Idempotent: a re-crawl rewrites the mutable fields. id (PK) is set only on the
@@ -670,10 +678,22 @@ def _upsert_notice(db, model, row: dict) -> None:
     Value columns are COALESCEd (see _COALESCE_ON_UPDATE) so a re-crawl can improve a
     field but never blank one out — a NULL from the parser means "this run could not
     read it", not "the notice stopped saying it".
+
+    ``deed_reference`` is the parsed deed-of-trust recording number. It is not a column;
+    it only identifies this notice's REF-<recording #> surrogate twin (see below).
     """
     from uuid import uuid4
 
     from sqlalchemy import func as _func
+
+    ts = row["ts_number"]
+    was_inactive = False
+    if ts.startswith("REF-"):
+        prior = db.execute(
+            _sa_text("SELECT is_active FROM nts_notices WHERE source = :source AND ts_number = :ts"),
+            {"source": row["source"], "ts": ts},
+        ).first()
+        was_inactive = prior is not None and not prior[0]
 
     row = {**row, "id": str(uuid4())}
     stmt = pg_insert(model).values(**row)
@@ -698,6 +718,48 @@ def _upsert_notice(db, model, row: dict) -> None:
         ),
         {"source": row["source"], "dashed": row["ts_number"] + "-"},
     )
+    # Retire a SURROGATE twin: a notice first ingested without a trustee sale number
+    # is keyed REF-<deed recording #> (nts_king_pdf / parse_tacoma_notice). When a later
+    # issue prints the real TS number for the same sale, that is a DIFFERENT natural
+    # key, so without this both rows stay active and one sale surfaces as two auction
+    # leads (Codex P1). The twin is identified EXACTLY by this notice's own recording
+    # number: a recording number is unique per deed of trust, so equality is identity.
+    # Parcel + auction date are deliberately NOT conditions (Codex P1 round 2): alone
+    # they could retire a second lien's sale on the same parcel and day, and as an extra
+    # filter they would miss a genuine twin whose sale was postponed (the date moves).
+    # No all-digit deed reference -> retire nothing. Rows are never deleted.
+    ref = (deed_reference or "").strip()
+    if not ts.startswith(("REF-", "APN-")) and ref.isdigit():
+        db.execute(
+            _sa_text(
+                "UPDATE nts_notices SET is_active = false "
+                "WHERE source = :source AND ts_number = :twin AND is_active"
+            ),
+            {"source": row["source"], "twin": f"REF-{ref}"[:64]},
+        )
+    # Do not resurrect a retired surrogate. The upsert refreshes is_active, so
+    # re-reading an OLDER issue that still prints the REF- version would switch the
+    # retired twin back on next to its real row. nts_notices stores no deed reference,
+    # so without a migration a real row's recording number cannot be compared. The
+    # conservative rule: a REF- upsert never turns a row that WAS inactive back on while
+    # an active non-surrogate row with the same source + parcel exists. The auction date
+    # is deliberately NOT compared: a postponed sale moves the real row's date, and the
+    # older REF- notice would otherwise come back to life beside it (Codex). An
+    # already-active REF- row is left alone, and a REF- row with no such neighbour
+    # activates normally. Worst case, a distinct surrogate on the same parcel that was
+    # ALREADY inactive stays inactive; it can never switch an active row off.
+    if was_inactive and row.get("parcel"):
+        db.execute(
+            _sa_text(
+                "UPDATE nts_notices SET is_active = false "
+                "WHERE source = :source AND ts_number = :ts AND is_active "
+                "AND EXISTS (SELECT 1 FROM nts_notices r WHERE r.source = :source "
+                "AND r.is_active AND r.ts_number NOT LIKE 'REF-%' "
+                "AND r.ts_number NOT LIKE 'APN-%' "
+                "AND r.parcel = :parcel)"
+            ),
+            {"source": row["source"], "ts": ts, "parcel": row["parcel"]},
+        )
 
 
 _RESWEEP_SELECT = _sa_text(
@@ -741,14 +803,15 @@ def _resweep_null_amount_notices(
                 counts["not_found"] += 1
                 db.execute(_TOUCH_FETCHED, {"now": now, "id": r.id})
                 continue
-            row = notice_to_row(parse(html), source_url=r.source_url, today=today,
+            parsed = parse(html)
+            row = notice_to_row(parsed, source_url=r.source_url, today=today,
                                 source=source, county=county)
             if row is None or row.get("principal_owing") is None:
                 counts["unchanged_null"] += 1
                 db.execute(_TOUCH_FETCHED, {"now": now, "id": r.id})
                 continue
             row["fetched_at"] = now
-            _upsert_notice(db, model, row)
+            _upsert_notice(db, model, row, deed_reference=parsed.get("deed_reference"))
             counts["updated"] += 1
         except Exception as exc:  # noqa: BLE001 — one bad notice must not stop the sweep
             counts["errors"] += 1

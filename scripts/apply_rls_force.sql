@@ -43,7 +43,9 @@ DECLARE
         'notifications',
         -- pending_registrations (074): email-verified signup staging; app + system
         -- policies in apply_rls_cutover_policies.sql
-        'pending_registrations'
+        'pending_registrations',
+        -- stripe_webhook_events (095): append-only webhook ledger, app SELECT/INSERT
+        'stripe_webhook_events'
     ];
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_app')
@@ -99,6 +101,6 @@ $guard$;
 --     'skip_trace_meter_events','public_sample_cache','property_list_membership',
 --     'mfa_backup_codes','mfa_break_glass_codes','dialer_deliveries',
 --     'scraper_batches','batch_runs','audit_events','nts_notices',
---     'notifications','pending_registrations']
+--     'notifications','pending_registrations','stripe_webhook_events']
 --   LOOP EXECUTE format('ALTER TABLE IF EXISTS public.%I NO FORCE ROW LEVEL SECURITY', t);
 --   END LOOP; END $$;

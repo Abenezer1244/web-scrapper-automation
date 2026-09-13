@@ -31,7 +31,6 @@ from src.api.billing_entitlement import (
     apply_plan_change,
     end_subscription,
     mark_payment_failed,
-    mark_payment_succeeded,
 )
 from src.api.quota import effective_records_used, is_over_record_limit
 from src.api.quota_window import (
@@ -192,18 +191,26 @@ def test_p2_the_anniversary_is_what_resets_quota():
     )
 
 
-def test_p2_payment_succeeded_never_resets_the_counter():
+def test_p2_a_renewed_subscription_never_resets_the_counter():
     """Renewal is OBSERVED, not acted on.
 
     Making payment the trigger for fresh quota would strand a renewed payer at
     cap behind a late webhook and hand out a second bucket on a replay. The
-    window advances on its own, from the anchor.
+    window advances on its own, from the anchor. A renewal reaches us as a
+    subscription update on the subscription we already hold.
     """
     with SyncSessionLocal() as db:
-        user = _mk_user(db, records_used=640, subscription_status="active")
+        user = _mk_user(db, records_used=640, subscription_status="active",
+                        stripe_subscription_id="sub_1", first_paid_at=NOW)
         before = (user.quota_period_start, user.quota_period_end)
-        mark_payment_succeeded(user, status="active", now=NOW)
+        outcome = apply_plan_change(
+            user, plan="pro", records_limit=1000, subscription_id="sub_1",
+            status="active", cancel_at_period_end=False, entitlement_end=None,
+            now=NOW,
+        )
         db.flush()
+
+    assert outcome == "unchanged"
 
     assert user.records_used == 640
     assert (user.quota_period_start, user.quota_period_end) == before
@@ -543,11 +550,18 @@ def test_p7_recovery_grants_exactly_one_window_not_one_per_frozen_month():
             quota_period_end=datetime(2026, 7, 1, tzinfo=UTC),
             subscription_status="past_due",
             entitlement_grace_ends_at=datetime(2026, 6, 8, tzinfo=UTC),
+            stripe_subscription_id="sub_1", first_paid_at=start,
         )
         recovered_at = datetime(2026, 9, 6, tzinfo=UTC)
-        mark_payment_succeeded(user, status="active", now=recovered_at)
+        # Recovery arrives as customer.subscription.updated: past_due -> active.
+        outcome = apply_plan_change(
+            user, plan="pro", records_limit=1000, subscription_id="sub_1",
+            status="active", cancel_at_period_end=False, entitlement_end=None,
+            now=recovered_at,
+        )
         db.flush()
 
+    assert outcome == "unchanged", "a recovery is not a conversion"
     assert user.entitlement_grace_ends_at is None
     assert is_frozen(user, recovered_at) is False
     start_w, end_w = effective_window(user, recovered_at)

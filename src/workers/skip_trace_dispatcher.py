@@ -44,11 +44,13 @@ def dispatch_pending_skip_trace() -> dict:
         _logger.warning("TRACERFY_API_TOKEN missing — dispatcher tick skipped")
         return {"skipped": "no_token"}
 
-    from sqlalchemy import and_, select, update
+    from sqlalchemy import and_, func, select, text, update
 
-    from src.db.models import PendingSkipTraceRow
+    from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
+    from src.db.models import Job, PendingSkipTraceRow, Result
     from src.db.session import system_sync_session
     from src.scrapers.enrichment.skip_trace import TracerfyError, submit_batch
+    from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
 
     max_batches = max(1, settings.SKIP_TRACE_MAX_BATCHES_PER_TICK)
     submitted_batches = 0
@@ -64,6 +66,10 @@ def dispatch_pending_skip_trace() -> dict:
         # draining new work: a released claim rejoins the FIFO head below and
         # goes out in this same tick instead of waiting another five minutes.
         reconciled = _reconcile_stale_claims(db)
+        # Never pay for a lead that will not be delivered: cancel queued rows whose
+        # job failed or was cancelled, or whose lead is over quota, a duplicate,
+        # or no longer waiting on a trace.
+        _cancel_undeliverable_queued(db)
 
         for _ in range(max_batches):
             # Pick a trace_type to drain this pass. Prefer 'normal' first
@@ -74,18 +80,48 @@ def dispatch_pending_skip_trace() -> dict:
                 rows = (
                     db.execute(
                         select(PendingSkipTraceRow)
+                        # Eligibility is decided HERE, in SQL, not after the LIMIT:
+                        # filtering in Python would let ineligible rows occupy the
+                        # FIFO head and starve everything behind them. A row goes
+                        # out only once its job delivered (done, or billed whatever
+                        # status was written over it, or a terminal job from before
+                        # billing was stamped: _job_delivered_sql) and its lead is
+                        # still deliverable and still waiting.
+                        # Tenant-pinned joins: this runs in a system session.
+                        .join(
+                            Job,
+                            and_(
+                                Job.id == PendingSkipTraceRow.job_id,
+                                Job.user_id == PendingSkipTraceRow.user_id,
+                            ),
+                        )
+                        .join(
+                            Result,
+                            and_(
+                                Result.id == PendingSkipTraceRow.result_id,
+                                Result.user_id == PendingSkipTraceRow.user_id,
+                            ),
+                        )
                         .where(
                             and_(
                                 PendingSkipTraceRow.status == "queued",
                                 PendingSkipTraceRow.trace_type == trace_type,
+                                text(_job_delivered_sql("jobs")).bindparams(
+                                    since=BILLING_STAMP_RELIABLE_SINCE),
+                                Result.skip_trace_status == "queued",
+                                Result.is_duplicate.is_not(True),
+                                func.coalesce(
+                                    Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
+                                ) != OVER_QUOTA,
                             )
                         )
                         .order_by(PendingSkipTraceRow.enqueued_at)
                         .limit(5000)  # Tracerfy handles large batches; cap for safety
                         # Lock the FIFO head so a concurrent tick (beat double-fire
                         # across a redeploy, a tick outliving its interval) skips
-                        # these rows instead of reading the same 'queued' set.
-                        .with_for_update(skip_locked=True)
+                        # these rows instead of reading the same 'queued' set. OF
+                        # the queue table only: jobs/results stay unlocked.
+                        .with_for_update(skip_locked=True, of=PendingSkipTraceRow)
                     )
                     .scalars()
                     .all()
@@ -300,6 +336,90 @@ class _Claim(NamedTuple):
     result_id: str
     job_id: str
     user_id: str
+
+
+def _job_delivered_sql(alias: str) -> str:
+    """SQL: this job delivered its file, so its leads' lookups may be bought.
+
+    Billing and the done-CAS commit together, so a billed job delivered whatever
+    status a racing cancel wrote over it later (Codex review round 6). A failed
+    or cancelled job created before BILLING_STAMP_RELIABLE_SINCE may have charged
+    and delivered without a stamp (round 8). Binds ``:since``.
+    """
+    return (
+        f"({alias}.status = 'done' OR {alias}.billing_applied_at IS NOT NULL "
+        f" OR ({alias}.status IN ('failed', 'cancelled') AND {alias}.created_at < :since))"
+    )
+
+
+def _job_undelivered_sql(alias: str) -> str:
+    """SQL: this job ended without delivering anything. Binds ``:since``."""
+    return (
+        f"({alias}.status IN ('failed', 'cancelled') AND {alias}.billing_applied_at IS NULL "
+        f" AND {alias}.created_at >= :since)"
+    )
+
+
+def _cancel_undeliverable_queued(db) -> int:
+    """Cancel queued rows that must never be paid for. Returns rows cancelled.
+
+    A queued row is cancelled when its job ended failed/cancelled without billing
+    (and after billing was stamped, see _job_undelivered_sql), or its lead is
+    over quota, a duplicate, or no longer 'queued' (for example a trace was copied
+    onto it after it was enqueued). Only 'queued' rows are touched: 'submitting'
+    and 'submitted' are already at Tracerfy and belong to the reconciler.
+
+    The lead's status goes back to 'not_attempted' only when it is still 'queued'
+    and no other active row still references it, so a later run can trace it if
+    it becomes deliverable. Two statements, not one: a single statement's
+    NOT EXISTS would still see the rows it is cancelling as 'queued'. Both are
+    tenant-pinned (system session). Commits; best-effort, never breaks the tick.
+    """
+    from sqlalchemy import text
+
+    from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
+    from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
+
+    try:
+        cancelled = db.execute(
+            text(
+                "UPDATE pending_skip_trace_rows p SET status = 'cancelled' "  # noqa: S608 — fixed literals + bound params only
+                "FROM jobs j, results r "
+                "WHERE p.status = 'queued' "
+                "  AND j.id = p.job_id AND j.user_id = p.user_id "
+                "  AND r.id = p.result_id AND r.user_id = p.user_id "
+                f"  AND ({_job_undelivered_sql('j')} "
+                "       OR r.is_duplicate IS TRUE "
+                "       OR r.skip_trace_status <> 'queued' "
+                "       OR COALESCE(r.enrichment_data->>:key, '') = :over_quota) "
+                "RETURNING p.result_id, p.user_id"
+            ),
+            {"key": DELIVERY_EXCLUDED_KEY, "over_quota": OVER_QUOTA,
+             "since": BILLING_STAMP_RELIABLE_SINCE},
+        ).fetchall()
+        if cancelled:
+            db.execute(
+                text(
+                    "UPDATE results r SET skip_trace_status = 'not_attempted' "
+                    "FROM unnest(CAST(:rids AS uuid[]), CAST(:uids AS uuid[])) "
+                    "     AS x(result_id, user_id) "
+                    "WHERE r.id = x.result_id AND r.user_id = x.user_id "
+                    "  AND r.skip_trace_status = 'queued' "
+                    "  AND NOT EXISTS (SELECT 1 FROM pending_skip_trace_rows o "
+                    "    WHERE o.result_id = r.id AND o.user_id = r.user_id "
+                    "      AND o.status IN ('queued', 'submitting', 'submitted'))"
+                ),
+                {"rids": [str(c.result_id) for c in cancelled],
+                 "uids": [str(c.user_id) for c in cancelled]},
+            )
+        db.commit()
+        if cancelled:
+            _logger.info("Dispatcher: cancelled %d undeliverable queued row(s)", len(cancelled))
+        return len(cancelled)
+    except Exception as exc:  # noqa: BLE001 - never break the submit loop
+        db.rollback()
+        _logger.warning("Dispatcher: cancel sweep failed: %s", str(exc)[:160])
+        return 0
 
 
 def _tick_result(batches: int, rows: int, errors: list[str], deferred: str | None = None) -> dict:

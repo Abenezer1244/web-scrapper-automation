@@ -93,10 +93,10 @@ _SOURCE_COUNTY = {"snohomish_tribune": "snohomish", "queen_anne_news": "king"}
 
 def _source_parsers() -> dict:
     """source -> the parse function its crawler passes to the shared PDF pipeline."""
-    from src.scrapers.sources.nts_king_pdf import parse_king_notice
+    from src.scrapers.sources.nts_king_pdf import parse_king_notice, parse_snoho_notice
 
     return {
-        "snohomish_tribune": nts.parse_nts_notice,   # shared colon parser
+        "snohomish_tribune": parse_snoho_notice,      # same parser its crawler task passes
         "queen_anne_news": parse_king_notice,        # King: no-colon + surrogate keys
     }
 

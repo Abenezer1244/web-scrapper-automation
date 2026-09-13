@@ -32,6 +32,7 @@ from src.scrapers.preforeclosure import strip_vesting_clause
 from src.scrapers.reliability import ScraperExecutionError, TransientScrapeError
 from src.scrapers.sources import nts_pdf
 from src.scrapers.sources import nts_tacoma_index as nts
+from src.scrapers.sources.nts_king_pdf import parse_snoho_notice
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_download_to_file, safe_get_following
 
@@ -216,7 +217,7 @@ class SnohomishWAPreForeclosureScraper(BridgeScraper):
         blocks = nts_pdf.split_notice_blocks(text)
         records: list[ScrapedRecord] = []
         for block in blocks:
-            parsed = nts.parse_nts_notice(block)
+            parsed = parse_snoho_notice(block)
             if not nts.is_valid_nts(parsed):
                 continue  # commercial/MTC/other format we don't yet parse — safely skipped
             records.append(_record_from_notice(parsed))

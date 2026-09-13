@@ -1388,6 +1388,9 @@ def run_scrape_job(self, job_id: str) -> None:
         # the worker — which is what the previous thread guard was
         # actually relying on anyway.
         _publish_log(r, job_id, "info", "Looking up property and mailing addresses...", db=db)
+        # Skip trace is enqueued only after a completed enrichment, and only after
+        # the plan cap below (never for a row that will not be delivered).
+        _enrichment_ok = False
         try:
             # `enrich_summary` lets this line tell the truth. It used to announce
             # "Enrichment complete" unconditionally, so a job that looked up 0 of
@@ -1397,6 +1400,7 @@ def run_scrape_job(self, job_id: str) -> None:
             # difference between "scrape failed" and "some enrichment is pending".
             enrich_summary: dict = {}
             _run_inline_enrichment(db, job, r, job_id, config, summary=enrich_summary)
+            _enrichment_ok = True
             _pending_mail = int(enrich_summary.get("mailing_deferred") or 0)
             if _pending_mail:
                 _publish_log(
@@ -1815,13 +1819,19 @@ def run_scrape_job(self, job_id: str) -> None:
         # point has already committed, so the rollback can only discard the
         # enqueue's own uncommitted work, and an unqueued lead stays
         # 'not_attempted' for a later backfill rather than failing a delivery.
-        try:
-            _enqueue_skip_trace_rows(db, job, r, job_id, config)
-        except Exception as exc:
-            db.rollback()
-            _logger.warning(
-                "Job %s: skip trace enqueue failed: %s", job_id, str(exc)[:160]
-            )
+        #
+        # Only when enrichment succeeded (main #280). Commit first so the rollback
+        # can only ever discard the enqueue's own writes, never earlier job work;
+        # a savepoint would not help, the enqueue commits internally.
+        if _enrichment_ok:
+            db.commit()
+            try:
+                _enqueue_skip_trace_rows(db, job, r, job_id, config)
+            except Exception as exc:
+                db.rollback()
+                _logger.warning(
+                    "Job %s: skip trace enqueue failed: %s", job_id, str(exc)[:160]
+                )
 
         # Reload the rows every consumer below reads, for EVERY plan.
         #

@@ -1,12 +1,15 @@
 """Stripe billing routes: checkout, portal, webhooks, plans, usage."""
 
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
+from functools import partial
 
 import stripe
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser, require_admin
@@ -15,7 +18,6 @@ from src.api.billing_entitlement import (
     apply_plan_change,
     end_subscription,
     mark_payment_failed,
-    mark_payment_succeeded,
 )
 from src.api.deps import get_rls_db
 from src.api.middleware import client_ip, rate_limit
@@ -33,15 +35,17 @@ from src.config.constants import (
     allowed_export_formats,
     allowed_schedule_frequencies,
     export_format_label,
+    normalize_plan,
     record_type_label,
 )
 from src.config.plans import PLAN_CATALOG
+from src.config.stripe_client import configure_stripe
 from src.db import User, get_db
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("billing")
 
-stripe.api_key = settings.STRIPE_SECRET_KEY
+configure_stripe()
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
@@ -370,6 +374,52 @@ _PRICE_TO_PLAN: dict[str, tuple[str, int, str]] = {
     )
     if pid
 }
+
+
+def _legacy_plan_prices(raw: str, sold: dict) -> dict[str, tuple[str, int, str]]:
+    """Retired plan prices from STRIPE_LEGACY_PLAN_PRICES, for existing subscriptions.
+
+    A Stripe price cannot move between Products, so re-issuing a plan price on
+    a new Product (which the single-customer promotion needs) leaves current
+    subscribers on the old id. Without this map the webhooks would stop
+    recognising their plan. Malformed entries are logged and skipped, never
+    raised: a failure at import would crash-loop the api on boot.
+    """
+    # Paid plans only: the free tier has no Stripe price to be legacy of.
+    by_plan = {p["id"]: p["records_limit"] for p in _PLANS if p.get("price_monthly")}
+    out: dict[str, tuple[str, int, str]] = {}
+    ids = [e.split(":")[0].strip() for e in (raw or "").split(",") if e.strip()]
+    # The same price listed twice with different plans would make entitlement
+    # depend on entry order; neither entry is trusted.
+    conflicted = {pid for pid in ids if ids.count(pid) > 1}
+    for entry in (e.strip() for e in (raw or "").split(",") if e.strip()):
+        if entry.split(":")[0].strip() in conflicted:
+            _logger.warning(
+                "billing config: STRIPE_LEGACY_PLAN_PRICES lists %r more than once; "
+                "ignored", entry.split(":")[0].strip(),
+            )
+            continue
+        parts = [s.strip() for s in entry.split(":")]
+        if (
+            len(parts) != 3
+            or not parts[0].startswith("price_")
+            or parts[1] not in by_plan
+            or parts[2] not in ("month", "year")
+            or parts[0] in sold
+        ):
+            _logger.warning(
+                "billing config: STRIPE_LEGACY_PLAN_PRICES entry %r ignored (expected "
+                "price_id:plan:interval for a paid plan, not a currently sold price)",
+                entry,
+            )
+            continue
+        out[parts[0]] = (parts[1], by_plan[parts[1]], parts[2])
+    return out
+
+
+# Prices recognised on existing subscriptions but never sold again.
+_LEGACY_PRICE_TO_PLAN = _legacy_plan_prices(settings.STRIPE_LEGACY_PLAN_PRICES, _PRICE_TO_PLAN)
+_PRICE_TO_PLAN.update(_LEGACY_PRICE_TO_PLAN)
 
 # Config sanity (log-only — NEVER raise here: a hard failure at import would
 # crash-loop the Railway api on boot, per the boot-migration landmine). Warn
@@ -863,6 +913,49 @@ def _expire_open_checkout_sessions(customer_id: str) -> int:
     return expired
 
 
+# ─── Single-customer promotions and annual billing ───────────────────────────
+#
+# Stripe applies a `repeating` coupon to every invoice issued inside its
+# duration_in_months window, and an annual invoice is ONE invoice for twelve
+# months: "100% off for 3 months" on an annual price would be a free year.
+#
+# That is prevented in Stripe, not here. Annual prices live on their own
+# Products, and scripts/stripe_single_customer_promo.py restricts the coupon's
+# applies_to to the plan's MONTHLY product, refusing to issue it against a
+# product that carries any yearly price. Stripe then declines the discount on
+# an annual line wherever it is attempted: Checkout, a plan switch, or the
+# Dashboard. Checkout keeps its promotion code box for everyone, so general
+# codes such as FOUNDING25 work on monthly and annual exactly as before.
+#
+# What remains here is detection: an annual subscription carrying one of those
+# coupons means the product split was undone, and ops must hear about it.
+
+#: The metadata tag the promotion script stamps on its coupons.
+_SINGLE_CUSTOMER_PROMO_TAG = ("bridgeleads_resource", "single_customer_promo")
+
+
+def _coupon_of(obj: dict) -> dict | None:
+    """The coupon behind a discount, as a dict.
+
+    Older API versions embed the coupon object at `coupon`; newer ones move it
+    under `source.coupon`, possibly as a bare id, which is retrieved rather than
+    guessed at.
+    """
+    coupon = obj.get("coupon") or (obj.get("source") or {}).get("coupon")
+    # An id, or a partial object without metadata, is retrieved: the metadata
+    # tag is exactly what the alert needs.
+    if isinstance(coupon, str):
+        coupon = stripe.Coupon.retrieve(coupon)
+    elif isinstance(coupon, dict) and coupon.get("id") and "metadata" not in coupon:
+        coupon = stripe.Coupon.retrieve(coupon["id"])
+    return coupon or None
+
+
+def _is_single_customer_promo(coupon: dict | None) -> bool:
+    key, value = _SINGLE_CUSTOMER_PROMO_TAG
+    return bool(coupon) and (coupon.get("metadata") or {}).get(key) == value
+
+
 def _subscription_conflict(sub: dict) -> HTTPException:
     """The 409 for a customer who already has a live subscription.
 
@@ -930,8 +1023,9 @@ async def create_checkout(
     }
     stripe_price_id = _PRODUCT_TO_PRICE.get(price_or_product_id, price_or_product_id)
 
-    # Validate: resolved price must be a known plan price
-    if stripe_price_id not in _PRICE_TO_PLAN:
+    # Validate: resolved price must be a plan price we still SELL. A legacy price
+    # is recognised on existing subscriptions only.
+    if stripe_price_id not in _PRICE_TO_PLAN or stripe_price_id in _LEGACY_PRICE_TO_PLAN:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
 
     # Defensive: the resolved id MUST be a Stripe Price ("price_…"), never a
@@ -1027,12 +1121,50 @@ async def create_checkout(
             mode="subscription",
 
             payment_method_types=["card"],
+            # Explicit, and "always" on purpose: a fully discounted first
+            # invoice would otherwise let Checkout skip the card, and the first
+            # full-price renewal after a promotion would then have nothing to
+            # charge.
+            payment_method_collection="always",
             line_items=line_items,
             success_url=f"{settings.FRONTEND_URL}/settings?upgrade=success",
             cancel_url=f"{settings.FRONTEND_URL}/settings?upgrade=cancelled",
             metadata={"user_id": current_user.id, "price_id": price_or_product_id},
+            # Every paid session, monthly and annual. Stripe validates each code:
+            # its customer restriction, redemption count, expiry and, through
+            # the coupon's applies_to, which products it may discount (see the
+            # single-customer promotion note above).
             allow_promotion_codes=True,
         )
+
+        # Defense in depth for the one window the checks above leave: a Session
+        # that was already being paid while we expired it. Expiring a Session
+        # mid-completion raises (fail closed), and one that completed just
+        # before is visible now. Either way the new Session must not survive.
+        try:
+            late = _live_subscription(customer_id)
+        except _StripeStateUnavailableError:
+            # We cannot tell whether this Session is now a second subscription in
+            # waiting, so it must not be left open for the caller to pay.
+            try:
+                stripe.checkout.Session.expire(session["id"])
+            except Exception as exc:  # noqa: BLE001 - already failing closed
+                _logger.error(
+                    "checkout: could not expire session %s after a failed re-check "
+                    "for user %s (%s)", session["id"], user.id, str(exc)[:200],
+                )
+            raise
+        if late is not None:
+            try:
+                stripe.checkout.Session.expire(session["id"])
+            except Exception as exc:  # noqa: BLE001 - an unexpirable Session is "unknown"
+                raise _StripeStateUnavailableError(str(exc)[:200]) from exc
+            _logger.warning(
+                "checkout refused for user %s: subscription %s (%s) appeared "
+                "after the new session was created; session expired",
+                user.id, late.get("id"), late.get("status"),
+            )
+            raise _subscription_conflict(late)
 
         # Persist the customer id only now that a Session exists. Before the
         # guard this write happened first, which meant a REFUSED checkout still
@@ -1278,7 +1410,7 @@ async def change_plan(
     }
     stripe_price_id = _PRODUCT_TO_PRICE.get(body.price_id, body.price_id)
 
-    if stripe_price_id not in _PRICE_TO_PLAN:
+    if stripe_price_id not in _PRICE_TO_PLAN or stripe_price_id in _LEGACY_PRICE_TO_PLAN:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan")
     if not stripe_price_id.startswith("price_"):
         _logger.error(
@@ -1544,6 +1676,7 @@ async def customer_portal(request: Request, current_user: CurrentUser) -> dict:
 @router.post("/webhook", status_code=status.HTTP_200_OK)
 async def stripe_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     stripe_signature: str = Header(..., alias="stripe-signature"),
 ) -> dict:
@@ -1551,10 +1684,13 @@ async def stripe_webhook(
 
     Registers for:
       - checkout.session.completed      → activate new plan (trial → paid)
+      - customer.subscription.created   → same as updated, entitled statuses only
       - customer.subscription.updated   → upgrades / downgrades / cancellation
       - customer.subscription.deleted   → downgrade to starter
       - invoice.payment_failed          → start the dunning grace + notify
-      - invoice.payment_succeeded       → lift the dunning freeze
+
+    Recovery from dunning arrives as customer.subscription.updated (past_due ->
+    active); invoice.payment_succeeded is deliberately not handled.
 
     NOTE what these handlers deliberately do NOT do: advance a quota window.
     Record quota rolls on the user's entitlement anniversary, lazily, inside the
@@ -1585,36 +1721,154 @@ async def stripe_webhook(
             detail="Invalid webhook signature",
         )
 
-    # Idempotency: skip duplicate webhook deliveries. Uses SET NX EX
-    # (atomic set-if-not-exists with TTL) so two Stripe retries
-    # delivered within milliseconds of each other cannot both pass
-    # the check — the second call returns None from .set() and we
-    # bail. The prior get-then-setex pattern was racy and allowed
-    # duplicate plan updates + duplicate notification emails when
-    # Stripe's retry latency overlapped request processing. C4 from
-    # the full-SaaS review. Stripe retries for up to 3 days, so we
-    # keep the TTL at 3 days to cover the full retry window.
-    import redis.asyncio as aioredis
-    redis = aioredis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+    # Idempotency (C4, full-SaaS review), durable and transactional.
+    #
+    # The event is recorded in stripe_webhook_events in the SAME transaction as
+    # the changes its handler makes, so "recorded" and "applied" commit or roll
+    # back together. It used to be a Redis key written BEFORE the handler ran,
+    # which meant a handler that raised (a Stripe read blip), a failed commit, or
+    # a process killed mid-request (every deploy restarts the api) left an event
+    # Stripe would retry and we would skip. For a fully discounted checkout that
+    # event is the only one that activates the plan.
+    #
+    # The transaction-scoped advisory lock serialises deliveries of ONE event: a
+    # duplicate waits for the first attempt to commit (then sees the row and
+    # acknowledges) or roll back (then processes it itself). A killed process
+    # drops its connection and with it the lock. lock_timeout bounds that wait,
+    # and a delivery that times out gets a 409 so Stripe retries it later.
+    event_id = event.get("id") or ""
     try:
-        event_id = event.get("id", "")
         if event_id:
-            dedup_key = f"stripe_event:{event_id}"
-            # set(..., nx=True, ex=N) returns True on first write,
-            # None on conflict. On conflict we've already processed
-            # this event — return success so Stripe stops retrying.
-            claimed = await redis.set(dedup_key, "1", nx=True, ex=259200)  # 3 days
-            if not claimed:
+            # The timeout bounds ONLY the wait for this event's lock. It is reset
+            # straight after, so the user-row locks the handlers take keep their
+            # normal behaviour instead of turning ordinary contention into 409s.
+            await db.execute(text(f"SET LOCAL lock_timeout = '{_WEBHOOK_LOCK_TIMEOUT}'"))
+            await db.execute(
+                text("SELECT pg_advisory_xact_lock(4244, hashtext(:eid))"),
+                {"eid": event_id},
+            )
+            await db.execute(text("SET LOCAL lock_timeout TO DEFAULT"))
+            already = await db.execute(
+                text("SELECT 1 FROM stripe_webhook_events WHERE event_id = :eid"),
+                {"eid": event_id},
+            )
+            if already.first() is not None:
                 _logger.info("stripe webhook dedup: already processed %s", event_id)
                 return {"received": True}
-    finally:
-        await redis.aclose()
+            if await _handled_before_the_ledger(event_id):
+                await _record_stripe_event(db, event_id, event["type"])
+                await db.commit()
+                _logger.info(
+                    "stripe webhook dedup: %s was handled before the ledger existed",
+                    event_id,
+                )
+                return {"received": True}
 
-    event_type: str = event["type"]
-    data: dict = event["data"]["object"]
+        notifications = await _dispatch_stripe_event(
+            event["type"], event["data"]["object"], db
+        )
 
+        if event_id:
+            await _record_stripe_event(db, event_id, event["type"])
+        await db.commit()
+    except DBAPIError as exc:
+        if getattr(exc.orig, "sqlstate", None) != _LOCK_NOT_AVAILABLE:
+            raise
+        await db.rollback()
+        _logger.info("stripe webhook: %s is being processed elsewhere; retry later", event_id)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Event is already being processed",
+        ) from exc
+
+    # Only once the changes and the ledger row are committed, and after the
+    # response is sent. Sent inside the transaction, a commit that then failed
+    # left an email Stripe's retry would send again; sent inline, a slow email
+    # provider held the webhook open (and, before, the user's row lock).
+    for notify in notifications:
+        background_tasks.add_task(_run_notification, notify)
+    return {"received": True}
+
+
+def _run_notification(notify: Callable[[], None]) -> None:
+    """Run one post-commit notification; a failure is logged, never raised.
+
+    Background tasks run in sequence and Starlette stops at the first one that
+    raises, so an email outage must not also swallow the in-app notice.
+    """
+    try:
+        notify()
+    except Exception as exc:  # noqa: BLE001 - the billing change is already committed
+        _logger.warning(
+            "stripe webhook: post-commit notification failed (%s: %s)",
+            type(exc).__name__, str(exc)[:200],
+        )
+
+
+async def _record_stripe_event(db: AsyncSession, event_id: str, event_type: object) -> None:
+    await db.execute(
+        text(
+            "INSERT INTO stripe_webhook_events (event_id, event_type) "
+            "VALUES (:eid, :etype)"
+        ),
+        {"eid": event_id, "etype": str(event_type)[:100]},
+    )
+
+
+async def _handled_before_the_ledger(event_id: str) -> bool:
+    """Whether the Redis dedup this ledger replaced already claimed this event.
+
+    Cutover only. Stripe retries an event for up to three days, and events the
+    previous code handled have no ledger row, so a late retry would otherwise
+    run its handler a second time (a second payment-failed email, for one).
+    Those keys expire on their own within three days of deploy; after that this
+    always answers False and can be deleted.
+
+    Best effort by design: if Redis cannot be asked, the answer is "not seen",
+    and the handler runs. Every handler is idempotent on durable state, so the
+    cost of a missed dedup is a repeated notification, never a repeated grant.
+    """
+    import redis.asyncio as aioredis
+
+    try:
+        redis = aioredis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+        try:
+            value = await redis.get(f"stripe_event:{event_id}")
+        finally:
+            await redis.aclose()
+    except Exception as exc:  # noqa: BLE001 - cutover aid only, never a hard dependency
+        _logger.warning(
+            "stripe webhook: pre-ledger dedup lookup failed for %s (%s)",
+            event_id, str(exc)[:120],
+        )
+        return False
+    return value is not None
+
+
+#: Upper bound on waiting for another delivery of the same event to finish.
+_WEBHOOK_LOCK_TIMEOUT = "15s"
+#: SQLSTATE for lock_timeout expiry.
+_LOCK_NOT_AVAILABLE = "55P03"
+
+_ENTITLED_CHECKOUT_STATUSES = ("active", "trialing")
+_DUNNING_SUBSCRIPTION_STATUSES = ("past_due", "unpaid")
+
+
+async def _dispatch_stripe_event(
+    event_type: str, data: dict, db: AsyncSession
+) -> list[Callable[[], None]]:
+    """Apply one event. Returns the notifications to send once it is committed."""
     if event_type == "checkout.session.completed":
         await _handle_checkout_completed(data, db)
+
+    elif event_type == "customer.subscription.created":
+        # Normally checkout.session.completed gets there first. This is the belt
+        # for when it does not: a fully discounted subscription is created
+        # active, so no later update is guaranteed to follow. Entitled statuses
+        # only, and checked on the RE-READ subscription: through the update path
+        # an `incomplete` Agency subscription would otherwise count as an
+        # upgrade and grant Agency before anything was paid.
+        await _handle_subscription_updated(data, db, require_entitled=True)
 
     elif event_type == "customer.subscription.updated":
         await _handle_subscription_updated(data, db)
@@ -1623,12 +1877,9 @@ async def stripe_webhook(
         await _handle_subscription_deleted(data, db)
 
     elif event_type == "invoice.payment_failed":
-        await _handle_payment_failed(data, db)
+        return await _handle_payment_failed(data, db)
 
-    elif event_type == "invoice.payment_succeeded":
-        await _handle_payment_succeeded(data, db)
-
-    return {"received": True}
+    return []
 
 
 # ─── Webhook handlers ─────────────────────────────────────────────────────────
@@ -1754,6 +2005,49 @@ async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
         if not user.stripe_customer_id:
             user.stripe_customer_id = session_customer_id
 
+    # A completed Session is not proof of an entitled subscription. Checkout
+    # never reads payment_status or a PaymentIntent here, which is what lets a
+    # fully discounted session (no_payment_required, no PaymentIntent) activate
+    # normally, so the subscription's own status is the gate. Anything not yet
+    # entitled is left to customer.subscription.updated, which converts it the
+    # moment Stripe says it is active. The customer binding above still stands,
+    # because that update is looked up by it.
+    if subscription.get("status") not in _ENTITLED_CHECKOUT_STATUSES:
+        _logger.warning(
+            "checkout.session.completed: subscription %s for user %s is %s; "
+            "plan not activated yet, waiting for the subscription to become "
+            "active", subscription_id, user_id, subscription.get("status"),
+        )
+        await db.flush()
+        return
+
+    # The checkout guard refuses a second subscription, but it cannot see a
+    # Session that was already open and paid in the gap. If the subscription we
+    # have on record is a different one that is still live, the customer now
+    # owes on two: surface it for a human. Never cancel from here, because which
+    # one the customer meant to keep is not knowable in a webhook.
+    previous_id = user.stripe_subscription_id
+    if previous_id and previous_id != subscription_id:
+        try:
+            previous_status = stripe.Subscription.retrieve(previous_id).get("status")
+        except Exception as exc:  # noqa: BLE001 - an alert must never fail the webhook
+            previous_status = None
+            _logger.warning(
+                "checkout.session.completed: could not read previous subscription "
+                "%s for user %s (%s)", previous_id, user_id, str(exc)[:200],
+            )
+        if previous_status and previous_status not in _TERMINAL_SUBSCRIPTION_STATUSES:
+            _alert_billing_gap(
+                "checkout completed while another subscription is still live: "
+                "customer may be billed twice",
+                f"second-live-subscription:{user_id}",
+                previous_subscription=previous_id,
+                previous_status=previous_status,
+                subscription=subscription_id,
+                customer=session_customer_id,
+                user_id=user_id,
+            )
+
     # P1 (trial -> paid) / P9 (resubscribe). Durable entitlement (migration 077)
     # plus the entitlement window (migration 088): a customer who consumed their
     # trial allowance and then PAID starts a fresh paid month AT CONVERSION,
@@ -1808,8 +2102,14 @@ async def _grant_referral_credit(db: AsyncSession, referee: User) -> None:
     _logger.info("referral: grant_referral_credit processed referee=%s", referee.id)
 
 
-async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
+async def _handle_subscription_updated(
+    data: dict, db: AsyncSession, *, require_entitled: bool = False
+) -> None:
     """Handle plan changes (upgrades or downgrades) and scheduled cancellation.
+
+    ``require_entitled`` is for ``customer.subscription.created``: it applies
+    nothing unless the subscription is active or trialing, judged on the re-read
+    subscription when Stripe answers.
 
     RE-READS the subscription from Stripe rather than trusting the event body.
     Stripe retries for three days and does not guarantee ordering, so a delayed
@@ -1824,20 +2124,47 @@ async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
     if not customer_id:
         return
 
+    # FOR UPDATE — see _handle_checkout_completed: this handler can also perform
+    # the one-time conversion reset, so it must serialise against the checkout
+    # handler for the same user. Taken BEFORE the re-read below: locked after
+    # it, a slow read of an older state could win the lock second and overwrite
+    # the newer state another delivery had just written. Locked first, the
+    # handler that writes last is also the one that asked Stripe last. (Codex)
+    result = await db.execute(
+        select(User).where(User.stripe_customer_id == customer_id).with_for_update()
+    )
+    user = result.scalar_one_or_none()
+
     subscription_id = data.get("id")
     if subscription_id:
         try:
             data = dict(
                 stripe.Subscription.retrieve(
-                    subscription_id, expand=["items.data.price"]
+                    subscription_id, expand=["items.data.price", "discounts"]
                 )
             )
         except Exception as exc:  # noqa: BLE001 — never 500 a webhook
+            if require_entitled:
+                # A creation is only ever acted on when Stripe confirms it is
+                # entitled NOW. The event body can be stale (created active,
+                # cancelled since), so failing to ask is a retry, not a grant.
+                _logger.error(
+                    "customer.subscription.created: could not re-read %s from "
+                    "Stripe (%s); retrying later", subscription_id, str(exc)[:200],
+                )
+                raise
             _logger.warning(
                 "customer.subscription.updated: could not re-read %s from Stripe "
                 "(%s) — applying the event payload, which may be out of order",
                 subscription_id, str(exc)[:200],
             )
+
+    if require_entitled and data.get("status") not in _ENTITLED_CHECKOUT_STATUSES:
+        _logger.info(
+            "customer.subscription.created: %s is %s; nothing granted until it "
+            "is active", subscription_id, data.get("status"),
+        )
+        return
 
     items = (data.get("items") or {}).get("data", [])
     if not items:
@@ -1859,13 +2186,33 @@ async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
         return
 
     plan_name, records_limit, _interval = plan_info
-    # FOR UPDATE — see _handle_checkout_completed: this handler can also perform
-    # the one-time conversion reset, so it must serialise against the checkout
-    # handler for the same user.
-    result = await db.execute(
-        select(User).where(User.stripe_customer_id == customer_id).with_for_update()
-    )
-    user = result.scalar_one_or_none()
+
+    # A single-customer promotion coupon on an ANNUAL subscription means the
+    # product split that keeps it monthly-only was undone (see the note above
+    # _coupon_of). An alert only: the entitlement is still what the price says.
+    if _interval == "year":
+        for discount in data.get("discounts") or []:
+            if not isinstance(discount, dict):
+                continue
+            try:
+                promo = _is_single_customer_promo(_coupon_of(discount))
+            except Exception as exc:  # noqa: BLE001 - an alert must never fail the webhook
+                _logger.warning(
+                    "subscription %s: could not read discount %s (%s)",
+                    subscription_id, discount.get("id"), str(exc)[:200],
+                )
+                continue
+            if promo:
+                _alert_billing_gap(
+                    "annual subscription carries a single-customer promotion coupon: "
+                    "the whole year may be discounted",
+                    f"annual-single-customer-promo:{subscription_id}",
+                    subscription=subscription_id,
+                    discount=discount.get("id"),
+                    customer=customer_id,
+                )
+                break
+
     if user is None:
         # A real plan change for a customer we can't resolve to a user — lost
         # silently before. Loud warning (no ops page: often a benign unknown
@@ -1874,6 +2221,62 @@ async def _handle_subscription_updated(data: dict, db: AsyncSession) -> None:
             "customer.subscription.updated: no user for stripe_customer_id=%s — "
             "plan change to %s (limit %s) NOT applied",
             customer_id, plan_name, records_limit,
+        )
+        return
+
+    # A subscription we have not recorded may only CHANGE entitlement once it is
+    # entitled. Through apply_plan_change an `incomplete` Agency subscription
+    # ranks above a trial's 1,000 records and would be applied as an upgrade
+    # before anything was paid. The recorded subscription keeps every status
+    # transition (past_due, unpaid, ...), which is what dunning depends on, and
+    # so does an account already paying for THIS plan without a recorded id
+    # (plans set by hand before subscription ids were stored): a status change
+    # on the plan they already hold grants nothing, and blocking it would stop
+    # their dunning from ever starting. (Codex)
+    # Dunning statuses only: an unrelated `incomplete` subscription on the same
+    # plan must not be adopted as the account's subscription, or its later
+    # payment failure or expiry would freeze or downgrade a paying customer.
+    dunning_on_plan_already_paid_for = (
+        data.get("status") in _DUNNING_SUBSCRIPTION_STATUSES
+        and user.stripe_subscription_id is None
+        and user.first_paid_at is not None
+        and normalize_plan(user.plan) == normalize_plan(plan_name)
+    )
+    if (
+        dunning_on_plan_already_paid_for
+        and data.get("id") != user.stripe_subscription_id
+    ):
+        # Nothing on record says WHICH subscription is theirs, so bind this one
+        # only when it is unambiguous: the customer's sole live subscription.
+        # With two, starting dunning could freeze a customer over the wrong
+        # one, so a human decides. Failing to ask raises and Stripe retries.
+        live_ids = [
+            s.get("id") for s in stripe.Subscription.list(
+                customer=customer_id, status="all", limit=100,
+            ).auto_paging_iter()
+            if s.get("status") not in _TERMINAL_SUBSCRIPTION_STATUSES
+        ]
+        if live_ids != [data.get("id")]:
+            _alert_billing_gap(
+                "subscription entered dunning for an account with no recorded "
+                "subscription and more than one live subscription: not applied",
+                f"ambiguous-dunning:{user.id}",
+                subscription=data.get("id"),
+                live_subscriptions=",".join(str(i) for i in live_ids),
+                customer=customer_id,
+                user_id=user.id,
+            )
+            return
+
+    if (
+        data.get("id") != user.stripe_subscription_id
+        and data.get("status") not in _ENTITLED_CHECKOUT_STATUSES
+        and not dunning_on_plan_already_paid_for
+    ):
+        _logger.info(
+            "customer.subscription.updated: %s for user %s is %s and not the "
+            "recorded subscription; nothing applied until it is active",
+            data.get("id"), user.id, data.get("status"),
         )
         return
 
@@ -1924,17 +2327,95 @@ async def _handle_subscription_deleted(data: dict, db: AsyncSession) -> None:
     if not customer_id:
         return
 
-    result = await db.execute(select(User).where(User.stripe_customer_id == customer_id))
+    # Locked BEFORE Stripe is asked for a survivor, for the same reason as in
+    # _handle_subscription_updated: a user loaded unlocked here could be
+    # overwritten with stale state after a concurrent update committed, and
+    # a live payer downgraded. (Codex)
+    result = await db.execute(
+        select(User).where(User.stripe_customer_id == customer_id).with_for_update()
+    )
     user = result.scalar_one_or_none()
     if user:
+        # Which subscription ended matters. Cancelling one of two live
+        # subscriptions (a stray duplicate, or the recorded one while the other
+        # survives), or an old one we no longer track, must not downgrade an
+        # account that is still paying, or still inside a promotion, on another.
+        # So Stripe is asked every time which entitled plan subscription
+        # remains; failing to ask raises and Stripe retries the event.
+        deleted_id = data.get("id")
+        try:
+            # Every subscription, not the first non-terminal one: an `incomplete`
+            # stray listed ahead of the active subscription must not hide it. A
+            # survivor must carry a price we sell, or it grants nothing.
+            survivor = next(
+                (
+                    s for s in stripe.Subscription.list(
+                        customer=customer_id, status="all", limit=100,
+                    ).auto_paging_iter()
+                    if s.get("id") != deleted_id
+                    and s.get("status") in _ENTITLED_CHECKOUT_STATUSES
+                    and _plan_item_price_id(((s.get("items") or {}).get("data")) or [])
+                ),
+                None,
+            )
+        except Exception as exc:  # noqa: BLE001 - unknown must not read as "none left"
+            _logger.error(
+                "customer.subscription.deleted: %s ended for user %s and Stripe "
+                "could not be asked what remains (%s); retrying later",
+                deleted_id, user.id, str(exc)[:200],
+            )
+            raise
+        if survivor is not None:
+            _logger.warning(
+                "customer.subscription.deleted: %s ended but user %s is still "
+                "entitled on %s (%s); rebinding instead of downgrading",
+                deleted_id, user.id, survivor.get("id"), survivor.get("status"),
+            )
+            if survivor.get("id") != user.stripe_subscription_id:
+                # The ordinary update path re-reads it and applies its plan.
+                await _handle_subscription_updated(
+                    {"id": survivor.get("id"), "customer": customer_id}, db
+                )
+            return
         end_subscription(user)
         await db.flush()
         from src.api.entitlements import apply_reconciliation_async
         await apply_reconciliation_async(db, str(user.id), user.plan)
 
 
-async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:
-    """Send a payment failure notification email via Resend."""
+def _invoice_subscription_id(invoice: dict) -> str | None:
+    """The subscription an invoice belongs to, on every webhook API version.
+
+    Webhook payloads are rendered in the ENDPOINT's API version, not the SDK's.
+    From 2025-03-31 onward Stripe removed the top-level `invoice.subscription`
+    and moved it to `invoice.parent.subscription_details.subscription`. Reading
+    only the old field makes every invoice look subscription-less on a newer
+    endpoint, so dunning would never start and never clear.
+    """
+    legacy = invoice.get("subscription")
+    if legacy:
+        return legacy if isinstance(legacy, str) else legacy.get("id")
+    details = (invoice.get("parent") or {}).get("subscription_details") or {}
+    current = details.get("subscription")
+    if isinstance(current, dict):
+        return current.get("id")
+    return current or None
+
+
+async def _handle_payment_failed(data: dict, db: AsyncSession) -> list[Callable[[], None]]:
+    """Start dunning if Stripe says the subscription is in it NOW, and notify.
+
+    Judged on Stripe's CURRENT state, never on the event body. Stripe retries a
+    webhook for three days and does not order deliveries, so a failure for an
+    invoice that has since been paid can arrive after the recovery was already
+    applied; trusted as-is it would re-freeze a paying customer and email them
+    about a payment that went through. Both reads happen under the user's row
+    lock, so a concurrent ``customer.subscription.updated`` cannot interleave.
+
+    Deliberately narrow: this handler only ever starts the grace and records a
+    dunning status. It never changes the plan, the limits or the window, and it
+    never clears dunning; ``customer.subscription.updated`` owns recovery.
+    """
     customer_id = data.get("customer")
 
     # REDTEAM B3: clamp the webhook-supplied attempt_count before it flows
@@ -1948,12 +2429,23 @@ async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:
         attempt_count = 1
 
     if not customer_id:
-        return
+        return []
 
-    result = await db.execute(select(User).where(User.stripe_customer_id == customer_id))
+    result = await db.execute(
+        select(User).where(User.stripe_customer_id == customer_id).with_for_update()
+    )
     user = result.scalar_one_or_none()
     if not user:
-        return
+        return []
+
+    # A failed read raises: no ledger row is written and Stripe retries, which
+    # beats acting on a body that may describe the past. An invoice event with
+    # no id cannot be checked against Stripe at all, so it raises too rather
+    # than notifying or freezing on trust.
+    invoice_id = data.get("id")
+    if not invoice_id:
+        raise ValueError("invoice.payment_failed event carries no invoice id")
+    invoice_status = stripe.Invoice.retrieve(invoice_id).get("status")
 
     # P7: start the dunning grace. Until it expires the customer is served
     # normally (Stripe's retries span days, and freezing someone whose card
@@ -1962,75 +2454,52 @@ async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:
     # advancing, so an unpaid subscription cannot accrue a fresh bucket every
     # month. Nothing is deleted; results and past exports stay available.
     #
-    # Only a SUBSCRIPTION invoice may do this. Skip-trace overage is billed on
-    # its own metered invoice, and letting one of those failures mark the
-    # subscription past_due would freeze a customer who is paying for the plan
-    # perfectly well.
-    invoice_sub = data.get("subscription")
-    if invoice_sub and user.stripe_subscription_id and (
-        invoice_sub == user.stripe_subscription_id
-    ):
-        grace_until = mark_payment_failed(user)
-        user.subscription_status = "past_due"
-        await db.flush()
-        _logger.info(
-            "invoice.payment_failed: user %s served until %s, then frozen",
-            user.id, grace_until.isoformat(),
-        )
+    # Only the RECORDED subscription, and only while Stripe itself has it in
+    # dunning. Following the subscription's status rather than the individual
+    # invoice is the product rule: Stripe's retry settings decide when a
+    # subscription is past_due, so a failed skip-trace overage charge on an
+    # otherwise healthy subscription does not freeze the plan on its own.
+    invoice_sub = _invoice_subscription_id(data)
+    if invoice_sub and invoice_sub == user.stripe_subscription_id:
+        status = stripe.Subscription.retrieve(invoice_sub).get("status")
+        if status in _DUNNING_SUBSCRIPTION_STATUSES:
+            grace_until = mark_payment_failed(user)
+            user.subscription_status = status
+            await db.flush()
+            _logger.info(
+                "invoice.payment_failed: user %s (%s) served until %s, then frozen",
+                user.id, status, grace_until.isoformat(),
+            )
+        else:
+            _logger.info(
+                "invoice.payment_failed: subscription %s for user %s is %s now; "
+                "dunning not started", invoice_sub, user.id, status,
+            )
 
-    # Send notification — imported here to avoid circular at startup
+    if invoice_status != "open":
+        # Paid, voided or written off since the attempt failed: telling the
+        # customer their payment failed would be wrong.
+        _logger.info(
+            "invoice.payment_failed: invoice %s is %s now; no notification sent",
+            invoice_id, invoice_status,
+        )
+        return []
+
+    # Returned, not sent: the webhook route sends them only after this change
+    # commits (see stripe_webhook). Imported here to avoid a circular import at
+    # startup. Values are captured now; the ORM row expires on commit.
     from src.workers.delivery import _send_payment_failed_email
-    _send_payment_failed_email(user.email, attempt_count)
-
-    # Phase 2b: best-effort in-app notification via the worker/system path
-    # (the webhook session has no user RLS GUC — never write notifications here).
-    try:
-        from src.workers.tasks import emit_payment_notification
-        emit_payment_notification.delay(str(user.id), attempt_count)
-    except Exception as exc:  # enqueue failure must not fail the webhook
-        _logger.warning("payment notification enqueue failed (non-fatal): %s", exc)
+    return [
+        partial(_send_payment_failed_email, user.email, attempt_count),
+        partial(_enqueue_payment_notification, str(user.id), attempt_count),
+    ]
 
 
-async def _handle_payment_succeeded(data: dict, db: AsyncSession) -> None:
-    """Payment recovered, or a renewal invoice was paid.
+def _enqueue_payment_notification(user_id: str, attempt_count: int) -> None:
+    """Phase 2b in-app notification, written by the worker/system path.
 
-    Previously unhandled, which meant nothing in the system ever observed a
-    renewal. It is handled now — but note carefully what it does NOT do: it does
-    not reset the counter and it does not advance the entitlement window.
-
-    Making payment the trigger for fresh quota is the obvious design and the
-    wrong one. Stripe retries for three days and can deliver out of order, so a
-    late delivery would strand a renewed payer at cap while a replay would hand
-    them a second bucket. The window advances on its own, lazily, from the
-    anchor — so a webhook that never arrives at all cannot cost a paying
-    customer their month.
-
-    What this DOES do is lift the dunning freeze from P7. The advance is then
-    automatic: the next quota operation (or the hourly reconciliation) sees a
-    window that ended while the account was frozen and rolls it forward to the
-    window containing now — exactly one bucket, never one per frozen month.
+    The webhook session has no user RLS GUC, so notifications are never
+    written from here directly.
     """
-    customer_id = data.get("customer")
-    if not customer_id:
-        return
-
-    result = await db.execute(select(User).where(User.stripe_customer_id == customer_id))
-    user = result.scalar_one_or_none()
-    if not user:
-        return
-
-    # Only a SUBSCRIPTION invoice clears dunning. A paid skip-trace overage
-    # invoice says nothing about whether the plan itself is being paid for.
-    invoice_sub = data.get("subscription")
-    if not (invoice_sub and user.stripe_subscription_id
-            and invoice_sub == user.stripe_subscription_id):
-        return
-
-    was_frozen = user.entitlement_grace_ends_at is not None
-    mark_payment_succeeded(user, status="active")
-    await db.flush()
-    if was_frozen:
-        _logger.info(
-            "invoice.payment_succeeded: user %s recovered — dunning freeze lifted",
-            user.id,
-        )
+    from src.workers.tasks import emit_payment_notification
+    emit_payment_notification.delay(user_id, attempt_count)

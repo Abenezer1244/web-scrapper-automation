@@ -31,6 +31,9 @@ _GIS_COMMIT_BATCH = 500
 # token inside the street (house numbers, road numbers).
 _TRAILING_ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\s*$")
 
+# Seattle SDCI code-violation statuses that are never sent to a paid skip trace.
+SETTLED_COMPLAINT_STATUSES = frozenset({"Completed", "Open Duplicate"})
+
 
 def _keep_situs_parts(res, gis_data: dict) -> None:
     """Fill results.property_city / property_state / property_zip (migration 085)
@@ -220,6 +223,42 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
     result = db.execute(_sa_text(sql), {"ids": strong_ids, "uid": uid, "ttl": ttl})
     db.commit()
     return result.rowcount or 0
+
+
+def _fill_king_mailing_from_extract(pid_map: dict[str, list], job_id: str) -> int:
+    """Fill missing King mailing addresses from the Assessor extract. Returns rows filled.
+
+    Only rows with no mailing address are touched, and only from an unambiguous answer
+    (every account on the parcel agrees). Provenance is stamped so a later reader can
+    tell this value from a tax-bill page lookup. The caller commits.
+    """
+    from src.scrapers.enrichment.king_rpacct import SOURCE, resolve_pins
+
+    wanted = {pid for pid, rows in pid_map.items()
+              if any(not res.mailing_address for res in rows)}
+    if not wanted:
+        return 0
+    resolved = resolve_pins(wanted)
+    if resolved is None:
+        _logger.info("Job %s: King extract unavailable, mailing uses the tax-bill pages", job_id)
+        return 0
+    answers, snapshot = resolved
+    filled = 0
+    for pid, answer in answers.items():
+        if answer.status != "found":
+            continue
+        for res in pid_map.get(pid, []):
+            if res.mailing_address:
+                continue
+            res.mailing_address = answer.mailing_address
+            ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+            ed["mailing_source"] = SOURCE
+            ed["mailing_rpacct_snapshot"] = snapshot
+            res.enrichment_data = ed
+            filled += 1
+    _logger.info("Job %s: King extract filled %d row(s) across %d requested parcel(s)",
+                 job_id, filled, len(wanted))
+    return filled
 
 
 def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None = None) -> None:
@@ -514,6 +553,71 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
     # the SAME production path for an already-delivered job.
     pierce_address_recovery(db, r, job_id, config, all_results)
 
+    # King code violations carry coordinates but no parcel, so the parcel-keyed passes
+    # below can never give them a mailing address. Locate the parcel strictly (one
+    # polygon, same normalized street and ZIP) and take the mailing from the Assessor
+    # extract. The PIN is stored beside the lead, never in parcel_id (dedup/billing).
+    if (config.county.lower() == "king" and config.state.upper() == "WA"
+            and config.record_type == "code_violation"):
+        _cv_rows = {
+            str(res.id): res for res in all_results
+            if not res.parcel_id and not res.mailing_address
+            and isinstance(res.enrichment_data, dict)
+            and res.enrichment_data.get("latitude") and res.enrichment_data.get("longitude")
+            and not res.enrichment_data.get("kc_pin_status")
+        }
+        if _cv_rows:
+            from src.scrapers.enrichment.king_parcel_locate import (
+                SOURCE as _KC_PIN_SOURCE,
+            )
+            from src.scrapers.enrichment.king_parcel_locate import (
+                resolve_code_violation_mailing,
+            )
+
+            _publish_log(r, job_id, "info",
+                         f"Matching {len(_cv_rows)} code violations to King County parcels...",
+                         db=db)
+            # Budget covers the WHOLE step: 420 s of parcel lookups (15 s request
+            # timeout, so the last call ends by ~435 s) + one extract scan (~15 s) +
+            # commit. A code_violation job runs no eRealProperty pass (no parcel_id),
+            # so this replaces rather than adds to the King budget in the sum below.
+            # Rows not reached keep no status and are picked up by
+            # scripts/backfill_king_code_violation_mailing.py.
+            try:
+                _cv_decisions, _cv_snapshot = resolve_code_violation_mailing(
+                    [(k, res.enrichment_data["latitude"], res.enrichment_data["longitude"],
+                      res.property_address) for k, res in _cv_rows.items()],
+                    budget_s=420,
+                )
+            except Exception as exc:  # noqa: BLE001 -- enrichment is best-effort
+                if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+                    raise
+                _logger.warning("Job %s: code violation parcel match failed: %s",
+                                job_id, str(exc)[:120])
+                _cv_decisions, _cv_snapshot = {}, None
+            _cv_mail = 0
+            for k, d in _cv_decisions.items():
+                res = _cv_rows[k]
+                ed = dict(res.enrichment_data)
+                ed.update({key: d[key] for key in ("kc_pin_status", "kc_pin", "kc_parcel_address")
+                           if key in d})
+                if d.get("kc_pin"):
+                    ed["kc_pin_source"] = _KC_PIN_SOURCE
+                if d.get("mailing_address") and not res.mailing_address:
+                    res.mailing_address = d["mailing_address"]
+                    ed["mailing_source"] = "king_rpacct"
+                    ed["mailing_rpacct_snapshot"] = _cv_snapshot
+                    _cv_mail += 1
+                res.enrichment_data = ed
+            try:
+                db.commit()
+                _publish_log(r, job_id, "info",
+                             f"Found {_cv_mail} mailing addresses for code violations.", db=db)
+            except Exception as exc:
+                db.rollback()
+                _logger.warning("Job %s: code violation mailing commit failed: %s",
+                                job_id, str(exc)[:120])
+
     # King County: eRealProperty + Tax Bill for property + mailing
     if config.county.lower() == "king" and config.state.upper() == "WA":
         # A row qualifies if it is missing a mailing address OR (tax-delinquent) is
@@ -539,6 +643,31 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 if pid not in pid_map:
                     pid_map[pid] = []
                 pid_map[pid].append(res)
+            # ── Mailing from the Assessor bulk extract FIRST ──────────────────────
+            # The tax-bill page below costs 5-10 s per parcel and King rate-blocks it:
+            # a 16,630-parcel job on 2026-09-13 deferred every lookup and put the
+            # source in cooldown. The same taxpayer mailing block is published for
+            # every parcel as a weekly file, so any parcel it answers unambiguously is
+            # filled here and never reaches the page (pass 2 only visits rows that
+            # still lack a mailing address). Pass 1 still runs: it carries the owner
+            # name, which the extract deliberately redacts. Fill-only, and a missing
+            # or unreadable file falls straight through to the pages as before.
+            # Budget: one streamed scan of the file (~15 s) before _king_deadline
+            # starts, well inside the soft-limit headroom computed below.
+            _rpacct_filled = _fill_king_mailing_from_extract(pid_map, job_id)
+            if _rpacct_filled:
+                try:
+                    db.commit()
+                    _publish_log(
+                        r, job_id, "info",
+                        f"Found {_rpacct_filled} mailing addresses in King County "
+                        "assessor records.",
+                        db=db,
+                    )
+                except Exception as exc:
+                    db.rollback()
+                    _logger.warning("Job %s: extract mailing commit failed: %s",
+                                    job_id, str(exc)[:120])
             # NO fixed parcel cap. A count cap truncated the parcel list before the
             # work started, so on a 384-parcel job 84 parcels were dropped without
             # ever being attempted — and the cheap phase-1 lookup (property + OWNER,
@@ -1188,9 +1317,15 @@ def pierce_address_recovery(db, r, job_id: str, config, all_results) -> None:
 def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     """Enqueue eligible Result rows into pending_skip_trace_rows.
 
-    Runs at the end of _run_inline_enrichment, after GIS + county
-    assessor + post-enrichment cleanup. Only records that survived the
-    cleanup (have a property_address) are eligible.
+    Called by run_scrape_job AFTER enrichment AND the plan cap, so the
+    actionable_condition() below already excludes rows the cap marked
+    over_quota: a lead that will not be delivered is never traced. Only
+    records with a property_address are eligible.
+
+    Runs only if SKIP_TRACE_ENABLED, TRACERFY_API_TOKEN is set, the config has
+    skip_trace_enabled and the plan is not Starter. Cache hits are copied onto
+    the row for free; misses are queued for the dispatcher, which makes the
+    actual (paid) Tracerfy calls.
     """
     # Local imports — sa_select must be imported here because the module-
     # level import is scoped inside _run_inline_enrichment, not globally
@@ -1267,6 +1402,26 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
             "we do not have",
             db=db,
         )
+
+    # A code-violation complaint the city already closed as Completed, or filed as a
+    # duplicate of another complaint, is not a lead worth a paid lookup (owner decision
+    # 2026-09-13). Exact SDCI status values; "Closed" is deliberately still traced.
+    if config.record_type == "code_violation":
+        settled_rows = [
+            rec for rec in eligible
+            if isinstance(rec.enrichment_data, dict)
+            and isinstance(rec.enrichment_data.get("status"), str)
+            and rec.enrichment_data["status"] in SETTLED_COMPLAINT_STATUSES
+        ]
+        if settled_rows:
+            _settled_ids = {rec.id for rec in settled_rows}
+            eligible = [rec for rec in eligible if rec.id not in _settled_ids]
+            _publish_log(
+                r, job_id, "info",
+                f"Skip trace skipped for {len(settled_rows)} code violation lead(s) whose "
+                "complaint is already completed or is a duplicate",
+                db=db,
+            )
 
     if not eligible:
         return

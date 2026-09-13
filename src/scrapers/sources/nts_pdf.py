@@ -36,7 +36,18 @@ _MAX_PAGES = 40  # a weekly legals section is a handful of pages; cap hostile in
 # is Title-Case "Notice of Trustee Sale" (no possessive 'S) and is excluded by both
 # the case-sensitivity AND the required ['’ʼ�]S. The lookahead keeps the header with
 # its block. (normalize_pdf_text has already mapped � → '.)
-_NOTICE_SPLIT = re.compile(r"(?=NOTICE\s+OF\s+TRUSTEE['’ʼ�]S\s+SALE)")
+#
+# One exception, measured live (Snohomish Tribune "Legals 9-9-26", Burns Law commercial
+# notice): the notice opens "NOTICE OF TRUSTEE'S SALE OF COMMERCIAL LOAN … REFERENCE
+# NO. (DOT): …" and then TITLES its own section I with the same all-caps words: "I.
+# NOTICE OF TRUSTEE'S SALE NOTICE IS HEREBY GIVEN that the undersigned trustee will on
+# …". Splitting there cut ONE notice in two: a header half with the identity but no
+# sale sentence, and a body half with the sale sentence but no identity, so both were
+# dropped. A real notice never starts right after a bare section marker "I.", so a
+# header preceded by " I. " stays inside its notice. Across the 7 real issues measured
+# (Snohomish + King, 2025-12-17 to 2026-09-09) this lookbehind matched exactly once,
+# at that section title. Fixed-width lookbehind: no backtracking cost.
+_NOTICE_SPLIT = re.compile(r"(?<!\sI\.\s)(?=NOTICE\s+OF\s+TRUSTEE['’ʼ�]S\s+SALE)")
 _HAS_HEADER = re.compile(r"NOTICE\s+OF\s+TRUSTEE['’ʼ�]S\s+SALE")
 
 # De-hyphenate column-wrap breaks. TWO cases, because a hyphen before a wrap is

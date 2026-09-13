@@ -128,6 +128,13 @@ class Settings(BaseSettings):
     # ─── Stripe ───────────────────────────────────────────────────────────────
     STRIPE_SECRET_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
+    # Bound on every Stripe API call (src/config/stripe_client.py). The SDK
+    # default is 80s with 2 retries, about four minutes for one call, and the
+    # billing webhooks make their calls while holding a user's row lock. A
+    # retried POST reuses the SDK's idempotency key, so a retry cannot
+    # create a second object.
+    STRIPE_TIMEOUT_SECONDS: int = 10
+    STRIPE_MAX_NETWORK_RETRIES: int = 1
     STRIPE_PRICE_PRO: str = ""
     STRIPE_PRICE_BUSINESS: str = ""
     STRIPE_PRICE_AGENCY: str = ""
@@ -139,6 +146,13 @@ class Settings(BaseSettings):
     STRIPE_PRODUCT_PRO: str = ""
     STRIPE_PRODUCT_BUSINESS: str = ""
     STRIPE_PRODUCT_AGENCY: str = ""
+    # Plan prices that are no longer sold but still carry subscriptions, so the
+    # webhooks keep recognising them. Comma-separated `price_id:plan:interval`,
+    # e.g. "price_abc:agency:month". Needed when a plan price is re-issued on a
+    # new Product (a Stripe price cannot move products): the single-customer
+    # promotion coupon must apply to a product that sells no yearly price.
+    # Recognised for existing subscriptions only, never offered at checkout.
+    STRIPE_LEGACY_PLAN_PRICES: str = ""
     # Sprint 4: Stripe metered billing for skip-trace lookups
     STRIPE_PRODUCT_SKIP_TRACE: str = ""
     STRIPE_METER_SKIP_TRACE: str = ""
@@ -300,6 +314,10 @@ class Settings(BaseSettings):
     TRACERFY_API_BASE_URL: str = "https://tracerfy.com"
     TRACERFY_WEBHOOK_SECRET: str = ""
     SKIP_TRACE_ENABLED: bool = False
+    # County GIS owner/taxpayer mailing from layers whose license restricts commercial
+    # use of lists of individuals (Snohomish, Cowlitz). OFF until counsel clears it;
+    # property-address enrichment from those layers is unaffected.
+    COUNTY_GIS_RESTRICTED_MAILING_ENABLED: bool = False
     SKIP_TRACE_CACHE_DAYS: int = 90
     # Tracerfy rate limit is 10 POSTs per 5-minute window. We leave headroom
     # by only submitting up to 2 batches per dispatcher tick (Beat runs every

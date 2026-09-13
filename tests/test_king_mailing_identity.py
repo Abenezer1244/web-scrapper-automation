@@ -250,3 +250,41 @@ class TestPartialRenderIsNeverTerminal:
         # The county's own answer needs no render guarantee.
         out = self._run_unsettled("No accounts found for this search\n")
         assert out["result"]["mailing_lookup"] == "none"
+
+
+class TestMailingBlockParser:
+    """Blocks copied from King tax-bill pages rendered live on 2026-09-13."""
+
+    def test_two_line_address(self):
+        body = "Mailing Address\n750 BERING DRIVE, STE 500\nHOUSTON TX 77057\nPay by mail\nBilling Details\n"
+        assert kca.parse_mailing_block(body) == "750 BERING DRIVE, STE 500, HOUSTON TX 77057"
+
+    def test_three_line_address_keeps_city_state_zip_even_when_glued_to_the_next_label(self):
+        body = ("Mailing Address\n2250 NW FLANDERS ST\nSUITE GARDEN 02\n"
+                "PORTLAND OR 97210Pay by mail\nAnnual statement requested by\n")
+        assert kca.parse_mailing_block(body) == "2250 NW FLANDERS ST, SUITE GARDEN 02, PORTLAND OR 97210"
+
+    def test_a_po_box_number_does_not_end_the_block(self):
+        body = "Mailing Address\nPO BOX 12345\nSEATTLE WA 98111-2345\nPay by mail\n"
+        assert kca.parse_mailing_block(body) == "PO BOX 12345, SEATTLE WA 98111-2345"
+
+    def test_canadian_postal_code(self):
+        body = "Mailing Address\n310-1501 WEST BROADWAY\nVANCOUVER BC V6J 4Z6\nPay by mail\n"
+        assert kca.parse_mailing_block(body) == "310-1501 WEST BROADWAY, VANCOUVER BC V6J 4Z6"
+
+    def test_a_block_without_a_postal_line_is_not_an_address(self):
+        assert kca.parse_mailing_block("Mailing Address\n400 KC ADMIN BLDG/4TH AVE\nSTE #830\nPay by mail\n") is None
+        assert kca.parse_mailing_block("Mailing Address\nPay by mail\n") is None
+        assert kca.parse_mailing_block("Billing Details\n") is None
+        assert kca.parse_mailing_block("Mailing Address\n400 MAIN ST ZZ 12345\nPay by mail\n") is None
+
+    def test_a_truncated_render_stays_unknown_in_the_phase(self):
+        out = _run("Parcel 123450-0000\nMailing Address\n2250 NW FLANDERS ST\nSUITE GARDEN 02\nPay by mail\n")
+        assert out.get("mailing_address") is None
+        assert out["mailing_lookup"] == "error"
+
+    def test_a_three_line_address_is_found_in_the_phase(self):
+        out = _run("Parcel 123450-0000\nMailing Address\n2250 NW FLANDERS ST\nSUITE GARDEN 02\n"
+                   "PORTLAND OR 97210Pay by mail\n")
+        assert out["mailing_address"] == "2250 NW FLANDERS ST, SUITE GARDEN 02, PORTLAND OR 97210"
+        assert out["mailing_lookup"] == "found"

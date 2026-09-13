@@ -133,6 +133,10 @@ GRANT SELECT, UPDATE ON dialer_deliveries TO bridgeleads_app;
 -- like users. This is the SECOND allowlisted app DELETE (see the verify block) —
 -- the row is unverified pre-account staging, not tenant data.
 GRANT SELECT, INSERT, DELETE ON pending_registrations TO bridgeleads_app;
+-- stripe_webhook_events (migration 095): the Stripe webhook (API, no tenant GUC)
+-- checks and records handled event ids in its own transaction. Not tenant data.
+-- Append-only: no UPDATE, no DELETE.
+GRANT SELECT, INSERT ON stripe_webhook_events TO bridgeleads_app;
 
 -- Converge to least privilege regardless of any prior (over-)grant: GRANT does
 -- not remove privileges an earlier version of this script handed out, so
@@ -156,6 +160,8 @@ REVOKE SELECT, UPDATE, DELETE ON audit_events FROM bridgeleads_app;
 REVOKE INSERT, DELETE ON dialer_deliveries FROM bridgeleads_app;
 -- notifications (065): app gets SELECT + UPDATE only; system writes the feed.
 REVOKE INSERT, DELETE ON notifications FROM bridgeleads_app;
+-- stripe_webhook_events (095): append-only ledger.
+REVOKE UPDATE, DELETE ON stripe_webhook_events FROM bridgeleads_app;
 
 -- Hard-fail if the app role still holds any DELETE (allowlisted exceptions:
 -- mfa_backup_codes — H1 grant block; pending_registrations — verify drops the

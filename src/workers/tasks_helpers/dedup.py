@@ -866,9 +866,10 @@ def transfer_undelivered_claims(db, job_id: str, user_id, record_type=None) -> i
       - its anchor row still exists for this user on another job. A NULL anchor
         means the source run was purged; delivery cannot be disproved, so the
         claim keeps suppressing.
-      - the anchor is not actionable (no address, or excluded by the plan cap).
       - the anchor's run delivered nothing chargeable for it: failed/cancelled
-        and never billed, or done and billed after NO_ADDRESS_NOT_BILLED_SINCE.
+        and never billed (no export exists, so its row's address does not
+        matter), or done, billed after NO_ADDRESS_NOT_BILLED_SINCE, with the
+        anchor not actionable (no address, or excluded by the plan cap).
         A run still in flight is never robbed.
 
     Returns the number of claims transferred (each un-flags exactly one row).
@@ -943,14 +944,19 @@ def _transfer_one_claim(db, job_id, uid, user_id, dedup_hash, members, record_ty
     if (
         anchor is None
         or str(anchor.job_id) == str(job_id)
-        or anchor.actionable
         or not (
-            # A job can bill and only later be marked failed/cancelled (watchdog
-            # retries), so a terminal status alone does not prove "charged
-            # nothing"; the sweep and the cancellation release use the same rule.
+            # A job can bill and only later be marked failed/cancelled (a cancel
+            # racing the done-CAS), so a terminal status alone does not prove
+            # "charged nothing"; the sweep and the cancellation release use the
+            # same rule. Such a run never wrote an export (export_key comes only
+            # from the done-CAS), so whether its row has an address is
+            # irrelevant: nobody received it (Codex review round 6).
             (anchor.status in ("failed", "cancelled") and anchor.billing_applied_at is None)
             or (
+                # A done run delivered every actionable row, so only a row that
+                # was not actionable can have been left undelivered.
                 anchor.status == "done"
+                and not anchor.actionable
                 and anchor.billing_applied_at is not None
                 and anchor.billing_applied_at >= NO_ADDRESS_NOT_BILLED_SINCE
             )

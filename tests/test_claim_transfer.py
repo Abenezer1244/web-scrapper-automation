@@ -209,6 +209,31 @@ async def test_a_run_that_billed_before_it_was_marked_failed_keeps_its_claim(
     assert await _transfer(db, new_job, starter_user.id) == 0
     assert (await _fresh(db, Result, row)).is_duplicate is True
 
+
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+async def test_an_addressed_row_on_a_run_that_never_billed_still_delivered_nothing(
+    db, starter_user: User, scraper_config: ScraperConfig, status,
+):
+    """Actionable is not delivered. A run that ended without billing never wrote an
+    export (export_key comes only from the done-CAS), so an address the row got,
+    from its own enrichment or a later mailing backfill, reached nobody. The
+    claim must still move, and the old row must be hidden (Codex review round 6)."""
+    h = _strong()
+    old_job = await _job(db, starter_user, scraper_config, status=status, billed_at=None)
+    anchor = await _row(db, old_job, starter_user.id, h,
+                        property_address="5006 61ST ST CT E",
+                        mailing_address="PO BOX 156, SOUTH PRAIRIE, WA 98385")
+    claim = await _claim(db, starter_user.id, h, anchor, old_job)
+    new_job, row = await _found_again(db, starter_user, scraper_config, h, old_job)
+
+    assert await _transfer(db, new_job, starter_user.id) == 1
+    assert (await _fresh(db, Result, row)).is_duplicate is False
+    assert str((await _fresh(db, DeliveredRecord, claim)).first_job_id) == new_job
+    old = await _fresh(db, Result, anchor)
+    assert old.is_duplicate is True
+    assert old.duplicate_reason == "superseded"
+
+
 async def test_a_run_still_in_flight_is_never_robbed(
     db, starter_user: User, scraper_config: ScraperConfig,
 ):

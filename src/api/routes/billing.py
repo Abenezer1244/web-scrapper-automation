@@ -1,10 +1,12 @@
 """Stripe billing routes: checkout, portal, webhooks, plans, usage."""
 
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
+from functools import partial
 
 import stripe
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
@@ -37,12 +39,13 @@ from src.config.constants import (
     record_type_label,
 )
 from src.config.plans import PLAN_CATALOG
+from src.config.stripe_client import configure_stripe
 from src.db import User, get_db
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("billing")
 
-stripe.api_key = settings.STRIPE_SECRET_KEY
+configure_stripe()
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
@@ -1673,6 +1676,7 @@ async def customer_portal(request: Request, current_user: CurrentUser) -> dict:
 @router.post("/webhook", status_code=status.HTTP_200_OK)
 async def stripe_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     stripe_signature: str = Header(..., alias="stripe-signature"),
 ) -> dict:
@@ -1760,7 +1764,9 @@ async def stripe_webhook(
                 )
                 return {"received": True}
 
-        await _dispatch_stripe_event(event["type"], event["data"]["object"], db)
+        notifications = await _dispatch_stripe_event(
+            event["type"], event["data"]["object"], db
+        )
 
         if event_id:
             await _record_stripe_event(db, event_id, event["type"])
@@ -1775,7 +1781,28 @@ async def stripe_webhook(
             detail="Event is already being processed",
         ) from exc
 
+    # Only once the changes and the ledger row are committed, and after the
+    # response is sent. Sent inside the transaction, a commit that then failed
+    # left an email Stripe's retry would send again; sent inline, a slow email
+    # provider held the webhook open (and, before, the user's row lock).
+    for notify in notifications:
+        background_tasks.add_task(_run_notification, notify)
     return {"received": True}
+
+
+def _run_notification(notify: Callable[[], None]) -> None:
+    """Run one post-commit notification; a failure is logged, never raised.
+
+    Background tasks run in sequence and Starlette stops at the first one that
+    raises, so an email outage must not also swallow the in-app notice.
+    """
+    try:
+        notify()
+    except Exception as exc:  # noqa: BLE001 - the billing change is already committed
+        _logger.warning(
+            "stripe webhook: post-commit notification failed (%s: %s)",
+            type(exc).__name__, str(exc)[:200],
+        )
 
 
 async def _record_stripe_event(db: AsyncSession, event_id: str, event_type: object) -> None:
@@ -1827,7 +1854,10 @@ _ENTITLED_CHECKOUT_STATUSES = ("active", "trialing")
 _DUNNING_SUBSCRIPTION_STATUSES = ("past_due", "unpaid")
 
 
-async def _dispatch_stripe_event(event_type: str, data: dict, db: AsyncSession) -> None:
+async def _dispatch_stripe_event(
+    event_type: str, data: dict, db: AsyncSession
+) -> list[Callable[[], None]]:
+    """Apply one event. Returns the notifications to send once it is committed."""
     if event_type == "checkout.session.completed":
         await _handle_checkout_completed(data, db)
 
@@ -1847,7 +1877,9 @@ async def _dispatch_stripe_event(event_type: str, data: dict, db: AsyncSession) 
         await _handle_subscription_deleted(data, db)
 
     elif event_type == "invoice.payment_failed":
-        await _handle_payment_failed(data, db)
+        return await _handle_payment_failed(data, db)
+
+    return []
 
 
 # ─── Webhook handlers ─────────────────────────────────────────────────────────
@@ -2370,7 +2402,7 @@ def _invoice_subscription_id(invoice: dict) -> str | None:
     return current or None
 
 
-async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:
+async def _handle_payment_failed(data: dict, db: AsyncSession) -> list[Callable[[], None]]:
     """Start dunning if Stripe says the subscription is in it NOW, and notify.
 
     Judged on Stripe's CURRENT state, never on the event body. Stripe retries a
@@ -2397,14 +2429,14 @@ async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:
         attempt_count = 1
 
     if not customer_id:
-        return
+        return []
 
     result = await db.execute(
         select(User).where(User.stripe_customer_id == customer_id).with_for_update()
     )
     user = result.scalar_one_or_none()
     if not user:
-        return
+        return []
 
     # A failed read raises: no ledger row is written and Stripe retries, which
     # beats acting on a body that may describe the past. An invoice event with
@@ -2451,16 +2483,23 @@ async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:
             "invoice.payment_failed: invoice %s is %s now; no notification sent",
             invoice_id, invoice_status,
         )
-        return
+        return []
 
-    # Send notification — imported here to avoid circular at startup
+    # Returned, not sent: the webhook route sends them only after this change
+    # commits (see stripe_webhook). Imported here to avoid a circular import at
+    # startup. Values are captured now; the ORM row expires on commit.
     from src.workers.delivery import _send_payment_failed_email
-    _send_payment_failed_email(user.email, attempt_count)
+    return [
+        partial(_send_payment_failed_email, user.email, attempt_count),
+        partial(_enqueue_payment_notification, str(user.id), attempt_count),
+    ]
 
-    # Phase 2b: best-effort in-app notification via the worker/system path
-    # (the webhook session has no user RLS GUC — never write notifications here).
-    try:
-        from src.workers.tasks import emit_payment_notification
-        emit_payment_notification.delay(str(user.id), attempt_count)
-    except Exception as exc:  # enqueue failure must not fail the webhook
-        _logger.warning("payment notification enqueue failed (non-fatal): %s", exc)
+
+def _enqueue_payment_notification(user_id: str, attempt_count: int) -> None:
+    """Phase 2b in-app notification, written by the worker/system path.
+
+    The webhook session has no user RLS GUC, so notifications are never
+    written from here directly.
+    """
+    from src.workers.tasks import emit_payment_notification
+    emit_payment_notification.delay(user_id, attempt_count)

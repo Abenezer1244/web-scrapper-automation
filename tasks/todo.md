@@ -169,3 +169,21 @@ Known, accepted (pre-existing, P2): an email sent before a failed commit can rep
   order/state dependent, untouched by this diff). ruff 0.15.6 clean. Codex gate FAIL -> reconciled -> delta PASS.
 - Deferred (Codex Medium, pre-existing module-wide): synchronous Stripe calls with default timeouts and the failure
   email run while the user row lock is held. Follow-up: bounded Stripe timeouts + post-commit notification.
+
+### Phase 5 (owner: "do it yourself", 2026-09-13, branch `fix/stripe-timeouts-post-commit-notify`)
+Codex Medium deferred from #290: Stripe calls ran on SDK defaults (80s x 3 attempts) and the payment-failed email
+was sent inside the webhook transaction.
+Codex design consult on the first draft (SQLAlchemy after_commit session events): FAIL, adopted: the listener is
+synchronous on the event loop and fires on nested savepoint commits; returning notifications as data and scheduling
+them after the route's commit is simpler. Dropped: masking emails in delivery.py logs (already masked by the
+`setup_logger` redaction filter).
+- [x] `STRIPE_TIMEOUT_SECONDS=10`, `STRIPE_MAX_NETWORK_RETRIES=1` (settings + .env.example); `src/config/stripe_client.py`
+      `configure_stripe()` at billing-route import and in `src/workers/__init__.py`. SDK retries reuse the idempotency key.
+- [x] `_handle_payment_failed` returns its notifications; `stripe_webhook` runs them as BackgroundTasks after commit,
+      each guarded so an email failure cannot swallow the in-app notice.
+- [x] Tests + mutation checks (send-before-commit, unguarded runner, ignored timeout: all caught). 107 + 159 billing and
+      entitlement tests pass; ruff clean; `export_openapi.py --check` OK.
+- [x] Codex review gate: PASS, no findings (residual: a notification can be lost if the API dies after commit; accepted).
+- [ ] PR, CI, merge, deploy check.
+Trade accepted: at-most-once notification (a crash between commit and send loses one email, logged) instead of a
+duplicate email after a failed commit.

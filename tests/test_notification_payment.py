@@ -47,5 +47,6 @@ async def test_webhook_enqueues_payment_notification():
                return_value={"id": "in_1", "status": "open"}), \
          patch("src.workers.delivery._send_payment_failed_email"), \
          patch("src.workers.tasks.emit_payment_notification.delay") as m:
-        await _handle_payment_failed(data, db)
+        for notify in await _handle_payment_failed(data, db):
+            notify()
     m.assert_called_once_with("user-xyz", 3)

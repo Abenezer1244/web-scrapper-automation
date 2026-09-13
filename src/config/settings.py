@@ -128,6 +128,13 @@ class Settings(BaseSettings):
     # ─── Stripe ───────────────────────────────────────────────────────────────
     STRIPE_SECRET_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
+    # Bound on every Stripe API call (src/config/stripe_client.py). The SDK
+    # default is 80s with 2 retries, about four minutes for one call, and the
+    # billing webhooks make their calls while holding a user's row lock. A
+    # retried POST reuses the SDK's idempotency key, so a retry cannot
+    # create a second object.
+    STRIPE_TIMEOUT_SECONDS: int = 10
+    STRIPE_MAX_NETWORK_RETRIES: int = 1
     STRIPE_PRICE_PRO: str = ""
     STRIPE_PRICE_BUSINESS: str = ""
     STRIPE_PRICE_AGENCY: str = ""

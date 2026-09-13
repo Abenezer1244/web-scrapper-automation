@@ -4,6 +4,11 @@ from celery import Celery
 from kombu import Exchange, Queue
 
 from src.config import settings
+from src.config.stripe_client import configure_stripe
+
+# Every Stripe call a worker makes (skip-trace metering, trial expiry) gets the
+# bounded timeout and retry budget, not the SDK's 80s x 3 attempts.
+configure_stripe()
 
 app = Celery(
     "bridgeleads",

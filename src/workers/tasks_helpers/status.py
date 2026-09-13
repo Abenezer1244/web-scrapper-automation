@@ -365,6 +365,55 @@ def sweep_stranded_quota_reservations(limit: int = 500) -> int:
     return released
 
 
+def sweep_stranded_dedup_claims(limit: int = 5000) -> int:
+    """Release dedup claims held by jobs that ended without delivering anything.
+
+    The claim is written at the dedup step, long before delivery, so a job that
+    never finishes leaves claims behind that make every later run hide those
+    leads as "already delivered". The in-task paths release them on the failures
+    and cancellations the worker itself sees. They cannot cover a job that ended
+    while no worker was running it: the worker died after claiming and the job
+    was then cancelled, a redelivered task stopped at the cancelled bootstrap
+    check, or the watchdog permanently failed it by writing only jobs.status
+    (Codex). Same reasoning as sweep_stranded_quota_reservations: sweep by STATE,
+    not by code path.
+
+    The state is exact: failed or cancelled AND never billed. Such a job exported
+    nothing a customer can reach (export_key is only written by the done-CAS) and
+    charged nothing. A 'done' job, or any job that billed, is never touched.
+
+    Deliberately raises on error rather than logging: a sweep that silently could
+    not delete is how 16,761 claims stranded on 2026-09-04.
+
+    Returns the number of claims released.
+    """
+    from src.db.session import system_sync_session
+
+    with system_sync_session() as db:
+        result = db.execute(
+            text(
+                "DELETE FROM delivered_records dr "
+                "WHERE dr.id IN ("
+                "  SELECT d.id FROM delivered_records d "
+                "  JOIN jobs j ON j.id = d.first_job_id AND j.user_id = d.user_id "
+                "  WHERE j.status IN ('failed', 'cancelled') "
+                "    AND j.billing_applied_at IS NULL "
+                "  LIMIT :lim"
+                ")"
+            ),
+            {"lim": limit},
+        )
+        db.commit()
+        released = result.rowcount or 0
+
+    if released:
+        _logger.warning(
+            "Released %d dedup claim(s) held by failed or cancelled jobs that never "
+            "billed", released,
+        )
+    return released
+
+
 def _fail_job(db, job, r, job_id: str, reason: str, expected_started_at=None) -> bool:
     """Transition job to FAILED with a human-readable error message.
 

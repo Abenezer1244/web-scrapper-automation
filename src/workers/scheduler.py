@@ -81,6 +81,10 @@ app.conf.beat_schedule = {
         "task": "src.workers.scheduler.sweep_quota_reservations",
         "schedule": 300.0,  # every 5 minutes, alongside the watchdog
     },
+    "sweep-stranded-dedup-claims": {
+        "task": "src.workers.scheduler.sweep_dedup_claims",
+        "schedule": 300.0,  # every 5 minutes, alongside the reservation sweep
+    },
     "canary-check": {
         "task": "src.workers.scheduler.canary_check",
         "schedule": 3600.0,  # every 1 hour
@@ -310,6 +314,20 @@ def sweep_quota_reservations() -> int:
     from src.workers.tasks_helpers.status import sweep_stranded_quota_reservations
 
     return sweep_stranded_quota_reservations()
+
+
+@app.task(name="src.workers.scheduler.sweep_dedup_claims")
+def sweep_dedup_claims() -> int:
+    """Release dedup claims held by failed or cancelled jobs that never billed.
+
+    The companion of sweep_quota_reservations for the other thing a job holds
+    before it delivers. Without it, a job that ended while no worker was running
+    it keeps its claims forever, and every later run hides those leads as
+    "already delivered" although nothing was delivered or charged.
+    """
+    from src.workers.tasks_helpers.status import sweep_stranded_dedup_claims
+
+    return sweep_stranded_dedup_claims()
 
 
 @app.task(name="src.workers.scheduler.watchdog_stuck_jobs")

@@ -455,3 +455,66 @@ async def test_only_a_cancelled_unbilled_run_gives_its_claims_up(
     await db.commit()
 
     assert (await _fresh(db, DeliveredRecord, claim)) is not None
+
+
+# ── the sweep: claims of a job that ended while no worker ran it ─────────────
+
+
+@pytest.mark.parametrize("status,billed,released", [
+    ("cancelled", False, True),    # worker died, then the job was cancelled
+    ("failed", False, True),       # watchdog permanent-fail writes only status
+    ("done", True, False),         # a real delivery
+    ("done", False, False),        # done before billing was stamped (pre-063): delivered
+    ("cancelled", True, False),    # billed: something was charged, keep it
+    ("enriching", False, False),   # still running
+])
+async def test_the_sweep_releases_only_claims_nothing_was_delivered_for(
+    db, starter_user: User, scraper_config: ScraperConfig, status, billed, released,
+):
+    from src.workers.tasks_helpers.status import sweep_stranded_dedup_claims
+
+    h = _strong()
+    job_id = await _job(db, starter_user, scraper_config, status=status,
+                        billed_at=AFTER_RULE if billed else None)
+    row = await _row(db, job_id, starter_user.id, h, property_address="5006 61ST ST CT E")
+    claim = await _claim(db, starter_user.id, h, row, job_id)
+
+    sweep_stranded_dedup_claims()
+
+    gone = (await db.execute(
+        select(func.count()).select_from(DeliveredRecord).where(DeliveredRecord.id == claim)
+    )).scalar_one() == 0
+    assert gone is released
+
+
+async def test_the_sweep_never_touches_another_accounts_claim_on_the_same_property(
+    db, starter_user: User, business_user: User, scraper_config: ScraperConfig,
+):
+    from src.workers.tasks_helpers.status import sweep_stranded_dedup_claims
+
+    h = _strong()
+    dead = await _job(db, starter_user, scraper_config, status="cancelled", billed_at=None)
+    dead_row = await _row(db, dead, starter_user.id, h)
+    await _claim(db, starter_user.id, h, dead_row, dead)
+
+    b_config = ScraperConfig(
+        id=str(uuid.uuid4()), user_id=business_user.id, name="b", county="pierce",
+        state="WA", record_type="probate", fields=[], enrichment=[],
+        schedule={"frequency": "manual"}, deliver={"formats": ["csv"], "emails": []},
+    )
+    db.add(b_config)
+    await db.commit()
+    live = await _job(db, business_user, b_config)
+    live_row = await _row(db, live, business_user.id, h, property_address="5006 61ST ST CT E")
+    b_claim = await _claim(db, business_user.id, h, live_row, live)
+
+    sweep_stranded_dedup_claims()
+
+    assert (await _fresh(db, DeliveredRecord, b_claim)) is not None
+
+
+async def test_the_claim_sweep_is_scheduled_under_its_registered_name():
+    from src.workers.scheduler import app
+
+    entry = app.conf.beat_schedule["sweep-stranded-dedup-claims"]["task"]
+    assert entry in app.tasks, f"{entry} is scheduled but not registered"

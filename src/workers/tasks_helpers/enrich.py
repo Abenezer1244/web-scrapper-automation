@@ -222,6 +222,42 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
     return result.rowcount or 0
 
 
+def _fill_king_mailing_from_extract(pid_map: dict[str, list], job_id: str) -> int:
+    """Fill missing King mailing addresses from the Assessor extract. Returns rows filled.
+
+    Only rows with no mailing address are touched, and only from an unambiguous answer
+    (every account on the parcel agrees). Provenance is stamped so a later reader can
+    tell this value from a tax-bill page lookup. The caller commits.
+    """
+    from src.scrapers.enrichment.king_rpacct import SOURCE, resolve_pins
+
+    wanted = {pid for pid, rows in pid_map.items()
+              if any(not res.mailing_address for res in rows)}
+    if not wanted:
+        return 0
+    resolved = resolve_pins(wanted)
+    if resolved is None:
+        _logger.info("Job %s: King extract unavailable, mailing uses the tax-bill pages", job_id)
+        return 0
+    answers, snapshot = resolved
+    filled = 0
+    for pid, answer in answers.items():
+        if answer.status != "found":
+            continue
+        for res in pid_map.get(pid, []):
+            if res.mailing_address:
+                continue
+            res.mailing_address = answer.mailing_address
+            ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+            ed["mailing_source"] = SOURCE
+            ed["mailing_rpacct_snapshot"] = snapshot
+            res.enrichment_data = ed
+            filled += 1
+    _logger.info("Job %s: King extract filled %d row(s) across %d requested parcel(s)",
+                 job_id, filled, len(wanted))
+    return filled
+
+
 def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None = None) -> None:
     """Run GIS + King County enrichment inline (before job marks done).
 
@@ -539,6 +575,31 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 if pid not in pid_map:
                     pid_map[pid] = []
                 pid_map[pid].append(res)
+            # ── Mailing from the Assessor bulk extract FIRST ──────────────────────
+            # The tax-bill page below costs 5-10 s per parcel and King rate-blocks it:
+            # a 16,630-parcel job on 2026-09-13 deferred every lookup and put the
+            # source in cooldown. The same taxpayer mailing block is published for
+            # every parcel as a weekly file, so any parcel it answers unambiguously is
+            # filled here and never reaches the page (pass 2 only visits rows that
+            # still lack a mailing address). Pass 1 still runs: it carries the owner
+            # name, which the extract deliberately redacts. Fill-only, and a missing
+            # or unreadable file falls straight through to the pages as before.
+            # Budget: one streamed scan of the file (~15 s) before _king_deadline
+            # starts, well inside the soft-limit headroom computed below.
+            _rpacct_filled = _fill_king_mailing_from_extract(pid_map, job_id)
+            if _rpacct_filled:
+                try:
+                    db.commit()
+                    _publish_log(
+                        r, job_id, "info",
+                        f"Found {_rpacct_filled} mailing addresses in King County "
+                        "assessor records.",
+                        db=db,
+                    )
+                except Exception as exc:
+                    db.rollback()
+                    _logger.warning("Job %s: extract mailing commit failed: %s",
+                                    job_id, str(exc)[:120])
             # NO fixed parcel cap. A count cap truncated the parcel list before the
             # work started, so on a 384-parcel job 84 parcels were dropped without
             # ever being attempted — and the cheap phase-1 lookup (property + OWNER,

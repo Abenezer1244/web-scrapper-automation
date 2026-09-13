@@ -4,12 +4,14 @@ Pure, DB-agnostic translation of a user-facing filter into Result column
 predicates. This is a VIEW/EXPORT filter (option B): it narrows what the user
 sees and exports, it does NOT change scraping or billing.
 
-"Months delinquent" is derived from `delinquent_bill_year` at query time (King
-property-tax bills issue ~Jan 1 of the bill year) so it never goes stale:
-    months_delinquent(Y) = base - 12*Y,  base = today.year*12 + (today.month - 1)
-which is monotonically decreasing in Y, so a months RANGE maps to a bill_year
-range. Rows with NULL structured columns (every non-King-tax row) never satisfy
-a `>=`/`<=` comparison, so they are correctly excluded whenever a filter is set.
+"Months delinquent" is derived from `delinquent_bill_year` at query time, counted
+from May 1 of the bill year (WA first-half delinquency, RCW 84.56.020), so it
+never goes stale:
+    months_delinquent(Y) = max(0, anchor - 12*Y)
+    anchor = today.year*12 + (today.month - 1) - (WA_FIRST_DELINQUENT_MONTH - 1)
+which is non-increasing in Y, so a months RANGE maps to a bill_year range. Rows
+with a NULL `delinquent_bill_year` (every non-tax row) are excluded whenever a
+months filter is set.
 """
 from datetime import date
 from decimal import Decimal
@@ -17,6 +19,7 @@ from decimal import Decimal
 from sqlalchemy import or_
 
 from src.db.models import Result
+from src.utils.lead_signals import delinquency_anchor
 
 # Hard product cap: a tax-delinquent parcel is visible (and stored by future
 # scrapes) ONLY if its OLDEST unpaid bill year is within this many months of
@@ -26,9 +29,8 @@ from src.db.models import Result
 # delinquent right now but carry old debt too; user confirmed the trade with
 # full dissent on record (recency over volume).
 #
-# Year granularity: `delinquent_bill_year` is a YEAR (bills modeled ~Jan 1), so
-# the cutoff is calendar-year-approximated — a Jan-2025 bill reads as ~17.5mo in
-# mid-2026, just inside an 18-month window, and flips out as the year turns. The
+# Year granularity: `delinquent_bill_year` is a YEAR, so the cutoff is
+# approximate; see tax_cap_min_year for how last year is kept visible. The
 # caller MUST freeze `today` for the whole request/job (use UTC, matching
 # build_tax_conditions) so the cap and the optional months filter never drift.
 DEFAULT_TAX_CAP_MONTHS = 18
@@ -84,21 +86,24 @@ def bill_year_bounds_for_months(
 ) -> tuple[int | None, int | None]:
     """Translate a months-delinquent range into (max_bill_year, min_bill_year).
 
-    months_delinquent(Y) = base - 12*Y, base = today.year*12 + (today.month-1).
+    months_delinquent(Y) = max(0, anchor - 12*Y) (see src/utils/lead_signals.py).
     - `min_months` (delinquent for AT LEAST N months) -> bill_year <= max_year
-      (older bills are more delinquent), via floor.
-    - `max_months` (AT MOST N months) -> bill_year >= min_year, via ceil.
-    Each bound is None when its filter is unset.
+      (older bills are more delinquent), via floor. `min_months <= 0` gives NO
+      bound: every clamped value is >= 0, so every tax row qualifies.
+    - `max_months` (AT MOST N months, N >= 0) -> bill_year >= min_year, via ceil.
+      The clamp cannot matter here because N >= 0.
+    Each bound is None when it does not constrain. Callers that need "tax rows
+    only" must add that themselves (build_tax_conditions does).
     """
-    base = today.year * 12 + (today.month - 1)
+    anchor = delinquency_anchor(today)
     max_year: int | None = None
     min_year: int | None = None
-    if min_months is not None:
-        # base - 12Y >= min_months  ->  Y <= (base - min_months)/12  (floor)
-        max_year = (base - min_months) // 12
+    if min_months is not None and min_months > 0:
+        # anchor - 12Y >= min_months  ->  Y <= (anchor - min_months)/12  (floor)
+        max_year = (anchor - min_months) // 12
     if max_months is not None:
-        # base - 12Y <= max_months  ->  Y >= (base - max_months)/12  (ceil)
-        num = base - max_months
+        # anchor - 12Y <= max_months  ->  Y >= (anchor - max_months)/12  (ceil)
+        num = anchor - max_months
         min_year = -((-num) // 12)
     return (max_year, min_year)
 
@@ -112,12 +117,12 @@ def tax_cap_min_year(today: date) -> int:
 
     Why the floor: the source only has a tax YEAR, and a full tax roll can only
     call a year delinquent once it is a PRIOR year (Snohomish excludes the current
-    year). With the calendar math alone, from August the minimum year became the
-    current year, so every Snohomish parcel was capped out and the connector
-    returned nothing from Aug 1 to Dec 31 each year. With year-only data, "oldest
+    year). Counted from January 1, the minimum year became the current year from
+    August, capping out every Snohomish parcel from Aug 1 to Dec 31. Counted from
+    May 1 it still becomes the current year in December. With year-only data, "oldest
     unpaid year is last year" is the closest honest reading of 18 months: last
     year's first half went delinquent on May 1 (RCW 84.56.020), so it is at most
-    about 20 months old on December 31. Older years stay capped as before.
+    19 months old on December 31. Older years stay capped as before.
     """
     _, min_year = bill_year_bounds_for_months(None, DEFAULT_TAX_CAP_MONTHS, today)
     assert min_year is not None  # max_months is always supplied above
@@ -177,6 +182,9 @@ def build_tax_conditions(
     if max_amount is not None:
         conditions.append(Result.delinquent_amount <= max_amount)
     if min_months is not None or max_months is not None:
+        # Explicit, not implied by a comparison: min_months=0 adds no year bound,
+        # and non-tax rows must still drop out of a months-filtered view.
+        conditions.append(Result.delinquent_bill_year.is_not(None))
         max_year, min_year = bill_year_bounds_for_months(min_months, max_months, today)
         if max_year is not None:
             conditions.append(Result.delinquent_bill_year <= max_year)

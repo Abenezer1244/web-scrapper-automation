@@ -19,6 +19,23 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-13 - Months delinquent now count from May 1, when WA taxes actually go delinquent
+
+**Built / Shipped (branch `fix/tax-months-may-anchor`):** `months_delinquent` and the
+months filter both count from May 1 of the bill year (RCW 84.56.020, shared constant
+`WA_FIRST_DELINQUENT_MONTH` in `src/utils/lead_signals.py`), clamped at 0. A 2025 bill in
+September 2026 now shows 16 months, not 20. `min_months=0` adds no year bound, and
+`build_tax_conditions` adds an explicit `delinquent_bill_year IS NOT NULL` so non-tax rows
+still drop out. The 18-month cap is unchanged (0 differing days 2020-2035 vs main).
+
+**Tried / Decided:** owner approved this after Phase 1. Codex design consult GO; diff review
+first said GATE FAIL claiming the cap moved, but it had compared against pre-floor code. Measured
+main vs branch day by day (0 differences), Codex withdrew it: GATE PASS.
+
+**Facts learned:** King rows shift by 4 months in display and filter; the frontend never
+computes months (it shows the oldest tax year and sends min/max). An exhaustive test pins
+filter/display parity for every month of 2026-2028, bill years 1990-2030, min/max 0..60.
+
 ## 2026-09-13 - Snohomish tax leads: dark every August to December, and reading an April file
 
 > **Provenance:** file measurements, parser runs against the two live county files, test

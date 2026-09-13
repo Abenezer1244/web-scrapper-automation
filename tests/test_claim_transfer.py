@@ -195,6 +195,20 @@ async def test_a_run_that_never_finished_delivered_nothing(
     assert str((await _fresh(db, DeliveredRecord, claim)).first_job_id) == new_job
 
 
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+async def test_a_run_that_billed_before_it_was_marked_failed_keeps_its_claim(
+    db, starter_user: User, scraper_config: ScraperConfig, status,
+):
+    """A watchdog retry can mark a job failed after it billed. Billed before the
+    no-address rule means the address-less row was charged and exported, so the
+    status alone must not let the claim move (Codex review round 5)."""
+    h, old_job, _, _ = await _setup_undelivered(
+        db, starter_user, scraper_config, status=status, billed_at=BEFORE_RULE)
+    new_job, row = await _found_again(db, starter_user, scraper_config, h, old_job)
+
+    assert await _transfer(db, new_job, starter_user.id) == 0
+    assert (await _fresh(db, Result, row)).is_duplicate is True
+
 async def test_a_run_still_in_flight_is_never_robbed(
     db, starter_user: User, scraper_config: ScraperConfig,
 ):

@@ -867,9 +867,9 @@ def transfer_undelivered_claims(db, job_id: str, user_id, record_type=None) -> i
         means the source run was purged; delivery cannot be disproved, so the
         claim keeps suppressing.
       - the anchor is not actionable (no address, or excluded by the plan cap).
-      - the anchor's run delivered nothing chargeable for it: failed/cancelled,
-        or done and billed after NO_ADDRESS_NOT_BILLED_SINCE. A run still in
-        flight is never robbed.
+      - the anchor's run delivered nothing chargeable for it: failed/cancelled
+        and never billed, or done and billed after NO_ADDRESS_NOT_BILLED_SINCE.
+        A run still in flight is never robbed.
 
     Returns the number of claims transferred (each un-flags exactly one row).
     """
@@ -945,7 +945,10 @@ def _transfer_one_claim(db, job_id, uid, user_id, dedup_hash, members, record_ty
         or str(anchor.job_id) == str(job_id)
         or anchor.actionable
         or not (
-            anchor.status in ("failed", "cancelled")
+            # A job can bill and only later be marked failed/cancelled (watchdog
+            # retries), so a terminal status alone does not prove "charged
+            # nothing"; the sweep and the cancellation release use the same rule.
+            (anchor.status in ("failed", "cancelled") and anchor.billing_applied_at is None)
             or (
                 anchor.status == "done"
                 and anchor.billing_applied_at is not None

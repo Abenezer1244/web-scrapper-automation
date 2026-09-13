@@ -27,14 +27,16 @@ from __future__ import annotations
 
 import hashlib
 import re
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import func, select
 
 from src.db.models import NtsNotice
 from src.db.session import system_sync_session
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.enrichment.source_health import get_source_state
 from src.scrapers.preforeclosure import strip_vesting_clause
+from src.scrapers.reliability import ScraperExecutionError
 from src.utils.lead_signals import auction_reference_date
 from src.utils.logger import setup_logger
 
@@ -46,6 +48,55 @@ RECORD_TYPE = "trustee_sale"
 # accepts M/D/YYYY; any other format (incl. ISO) parses to NULL and drops the row from
 # date-windowed Lists/overlap + blanks its freshness signal.
 _MDY_RE = re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$")
+
+# ── cache freshness ──────────────────────────────────────────────────────────
+# This scraper only READS nts_notices; the daily NTS crawler fills it. A crawler
+# that stops working leaves an empty or shrinking cache, and an empty result used
+# to finish the job DONE with "0 leads", indistinguishable from a week with no
+# trustee sales. The crawler now records a heartbeat (external_source_health,
+# key below, status always 'healthy' so the source canary never probes it) after
+# every run that actually READ its source, whether or not the issue held a sale.
+_CRAWL_HEARTBEAT_PREFIX = "nts_crawl:"
+# The crawler runs daily, so three missed days is a failing crawler, not a gap.
+_CRAWL_STALE_AFTER = timedelta(days=3)
+# Before a county's first heartbeat (e.g. right after this shipped) fall back to the
+# newest fetched_at. That timestamp only moves on writes, so a sale-free issue does
+# not move it: 15 days tolerates one empty weekly issue plus timing (Codex).
+_CACHE_FALLBACK_STALE_AFTER = timedelta(days=15)
+
+
+def nts_crawl_heartbeat_key(county: str) -> str:
+    """external_source_health key for a county's NTS crawler heartbeat."""
+    return f"{_CRAWL_HEARTBEAT_PREFIX}{county.strip().lower()}"
+
+
+def cache_staleness_reason(
+    last_crawl_success: datetime | None,
+    last_fetched_at: datetime | None,
+    now: datetime,
+) -> str | None:
+    """Why the county's NTS cache cannot be trusted right now, or None if fresh.
+
+    Pure. The heartbeat wins when present; the fetched_at fallback is only for a
+    county that has never recorded one.
+    """
+    if last_crawl_success is not None:
+        age = now - last_crawl_success
+        if age > _CRAWL_STALE_AFTER:
+            return (
+                f"the NTS crawler has not read its source since "
+                f"{last_crawl_success.date().isoformat()} ({age.days} days)"
+            )
+        return None
+    if last_fetched_at is None:
+        return "the NTS cache has never been filled for this county"
+    age = now - last_fetched_at
+    if age > _CACHE_FALLBACK_STALE_AFTER:
+        return (
+            f"no NTS notice has been refreshed since "
+            f"{last_fetched_at.date().isoformat()} ({age.days} days)"
+        )
+    return None
 
 # NOTE: there is deliberately NO minimum-span floor. An earlier draft clamped a
 # same-day/inverted window up to 7 days, which Codex correctly called another silent
@@ -233,6 +284,14 @@ class _TrusteeSaleScraper(BridgeScraper):
             # auction anywhere is 29 days out, so nothing is excluded today — but a
             # shorter window on a longer-dated county would, and the operator has to be
             # able to see that rather than wonder where the leads went.
+            # Freshness inputs, read in the same session. max(fetched_at) spans
+            # inactive rows too: an expired history still proves the crawler ran.
+            heartbeat = get_source_state(db, nts_crawl_heartbeat_key(self.COUNTY))
+            last_fetched_at = db.execute(
+                select(func.max(NtsNotice.fetched_at)).where(
+                    func.lower(NtsNotice.county) == self.COUNTY
+                )
+            ).scalar_one()
             beyond = 0
             if horizon is not None:
                 beyond = db.execute(
@@ -254,6 +313,23 @@ class _TrusteeSaleScraper(BridgeScraper):
             )
 
         records = [_record_from_notice(n) for n in notices]
+        stale = cache_staleness_reason(
+            (heartbeat or {}).get("last_success_at"), last_fetched_at, datetime.now(UTC)
+        )
+        if stale and not records:
+            # An empty result from a cache nobody is refreshing is not "no sales".
+            raise ScraperExecutionError(
+                self.COUNTY, "nts_cache",
+                f"0 auction leads, and {stale}. Refusing to report an empty list "
+                "that may only mean the crawler is failing",
+                record_type=RECORD_TYPE,
+            )
+        if stale:
+            # Real upcoming sales are still worth delivering; say the list may be short.
+            _logger.warning(
+                "trustee_sale %s: delivering %d notice(s) from a stale cache: %s",
+                self.COUNTY, len(records), stale,
+            )
         if not records:
             _logger.warning(
                 "trustee_sale %s: 0 active future-dated NTS notices (no auction leads this run)",

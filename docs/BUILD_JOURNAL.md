@@ -19,6 +19,39 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-13 - Auction and pre-foreclosure lists stop calling a dead source "0 leads"
+
+**Built / Shipped (branch `fix/nts-silent-empty`):**
+- `trustee_sale` (Auction Leads, all four counties): an EMPTY result now fails the job when
+  the county's crawler has not read its source in 3 days (heartbeat) or, before any heartbeat
+  exists, when no notice was refreshed in 15 days. A populated result from a stale cache is
+  still delivered, with a warning.
+- `nts_crawler`: heartbeat `nts_crawl:<county>` in `external_source_health` via
+  `mark_source_healthy` only (the canary probes only throttled/blocked rows, so no probing and
+  no migration). Recorded when the paper was READ and any trustee-sale notice found parsed:
+  PDF text passes `nts_pdf.looks_like_legals_issue`; Tacoma listing page 200; Clark listing
+  had ads and not every fetch failed.
+- Snohomish `pre_foreclosure`: unreadable extraction and "notices found, none parsed" raise;
+  a partial parse delivers and logs coverage; transport errors on discovery and PDF download
+  are `TransientScrapeError`; 429/5xx is retried before any link is trusted; the normal soft
+  404 still works.
+
+**Tried / Decided:**
+- Codex consult rejected `max(fetched_at)` as the health signal (a sale-free week writes no
+  rows); heartbeat adopted, fetched_at kept only as the pre-heartbeat fallback.
+- Codex r2 P1 "crawler should raise TransientScrapeError" was withdrawn after explaining the
+  crawler is a beat task with no retry consumer; the visible failure is the missing heartbeat.
+
+**Caught & fixed:** Codex r1 P1 PDF download timeouts not retryable; r2 P2 a readable issue whose
+notices all failed to parse still wrote a heartbeat (would have hidden parser drift).
+
+**Facts learned:**
+- The live 9-9-26 Tribune issue has 10 trustee-sale notices and only 7 parse: 3 real Snohomish
+  leads are lost today. Now logged as partial coverage; the parser gap itself is NOT fixed.
+- Real legals issues: 67k-163k normalized chars, 36-85 "NOTICE". Unfixed main returned `[]`
+  for a never-crawled county and called a network outage "page layout/source change".
+- Snohomish pre_foreclosure and trustee_sale still read the same notices (owner product call).
+
 ## 2026-09-13 - Months delinquent now count from May 1, when WA taxes actually go delinquent
 
 **Built / Shipped (branch `fix/tax-months-may-anchor`):** `months_delinquent` and the

@@ -80,7 +80,7 @@ CHECKS = [
     ("duplicate_reason values outside the known set", """
         SELECT count(*) FROM results
         WHERE duplicate_reason IS NOT NULL
-          AND duplicate_reason NOT IN ('prior_run', 'same_run')
+          AND duplicate_reason NOT IN ('prior_run', 'same_run', 'superseded')
     """),
 ]
 

@@ -503,6 +503,14 @@ async def get_results(
     # new_count is deliberately NOT tax-capped, matching workers/tasks.py's
     # billable_count exactly — it must track jobs.record_count, which is what the
     # list, the email and the webhook all report, not `total`.
+    #
+    # A 'superseded' row is left out of every count here. It held the claim on
+    # this run without ever being delivered, and a LATER run took the claim and
+    # delivered the lead (transfer_undelivered_claims). From this run's page it is
+    # neither new nor "already delivered", and counting it as a duplicate would
+    # name a source run newer than this one. It only becomes actionable here if a
+    # backfill fills its address after the handover, which is exactly when a
+    # count would start telling the reader something false.
     counts_row = (await db.execute(
         select(
             func.count().label("total_scraped"),
@@ -518,6 +526,7 @@ async def get_results(
             Result.job_id == job_id,
             Result.user_id == current_user.id,
             actionable_condition(),
+            func.coalesce(Result.duplicate_reason, "") != "superseded",
         )
     )).one()
     total_scraped = counts_row.total_scraped
@@ -548,7 +557,8 @@ async def get_results(
             Result.user_id == current_user.id,
             Result.is_duplicate.is_(True),
             actionable_condition(),
-            func.coalesce(Result.duplicate_reason, "prior_run") != "same_run",
+            # The same buckets as the counts above: only prior deliveries.
+            func.coalesce(Result.duplicate_reason, "prior_run") == "prior_run",
         )
         .group_by(Result.duplicate_source_job_id)
         .order_by(func.count().desc())

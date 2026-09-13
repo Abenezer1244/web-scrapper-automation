@@ -113,3 +113,19 @@ without idempotency key (pre-existing; ops alert added); change-plan vs. operato
 - [x] Stripe sandbox e2e: 43/44 pass, 0 fail, 1 skipped (test clock needs the sandbox claimed).
 - [ ] 3-month test-clock run (owner: claim sandbox `acct_1UF5cBIoeMQyAQ5z` before 2026-09-20).
 - [ ] LIVE (owner approval): Agency monthly product + price, env swap + `STRIPE_LEGACY_PLAN_PRICES`, enable `customer.subscription.created`, run the script with `--live`.
+
+### Phase 3 (2026-09-13, branch `chore/stripe-followups`): handoff section 9 step 1
+- [x] FOUNDING25 promotion code created LIVE (owner approved): `promo_1UFBJtHE9wT1C7yZS3O21fcH` on coupon
+      `FOUNDING25`, no customer/expiry/code cap (coupon cap 25 is the limit). Read back active; re-run reports EXISTS.
+      Script `scripts/stripe_founding_code_and_webhook_events.py` (dry run by default, `--apply --live`).
+- [x] `invoice.payment_succeeded` NOT enabled (owner had approved; withheld on review). Codex consult FAIL (3 High
+      on `_handle_payment_succeeded`: stale late event clears dunning / writes `active` without a Stripe re-read,
+      no `FOR UPDATE` against `invoice.payment_failed`, overage invoices on the same subscription count as plan
+      payment). Reconciled: recovery already clears dunning via `customer.subscription.updated` ->
+      `apply_plan_change` (billing_entitlement.py:265-269), so the event is redundant today. Codex agreed; PASS for FOUNDING25 only.
+      Codex's Medium (`coupon=` removed on clover) withdrawn: stripe 11.4.0 pins `2024-12-18.acacia`.
+- [ ] Follow-up before ever enabling `invoice.payment_succeeded`: harden both invoice handlers (row lock,
+      Stripe subscription re-read, plan-line vs overage invoice). Same stale-event gap exists today in
+      `_handle_payment_failed` (writes `past_due` without a re-read).
+- [ ] 3-month test-clock run: owner has NOT claimed sandbox `acct_1UF5cBIoeMQyAQ5z` yet (deadline 2026-09-20).
+- [ ] After 2026-09-16: remove the Redis cutover dual-read.

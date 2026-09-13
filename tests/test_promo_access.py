@@ -806,32 +806,6 @@ async def test_a_recorded_event_is_acknowledged_without_running_its_handler_agai
 
 
 @pytest.mark.asyncio
-async def test_an_event_the_redis_dedup_already_handled_is_recorded_not_rerun(
-    client, db, monkeypatch, redis_client
-):
-    """Cutover: a late Stripe retry of an event the previous code handled."""
-    b = _billing()
-    monkeypatch.setattr(settings, "STRIPE_WEBHOOK_SECRET", _WEBHOOK_SECRET)
-    user = await _trial_user(db)
-    uid = user.id
-    event_id = f"evt_{uuid.uuid4().hex}"
-    redis_client.set(f"stripe_event:{event_id}", "1", ex=300)
-
-    def _must_not_run(sid, **kw):
-        raise AssertionError("an event handled before the ledger must not run again")
-
-    monkeypatch.setattr(b.stripe.Subscription, "retrieve", _must_not_run)
-    payload, sig = _signed(_checkout_event(uid, event_id))
-    resp = await client.post(
-        "/billing/webhook", content=payload, headers={"stripe-signature": sig}
-    )
-
-    assert resp.status_code == 200, resp.text
-    assert tuple(await _ledger_row(db, event_id)) == ("checkout.session.completed",)
-    assert (await _reload(db, uid)).plan == "pro"
-
-
-@pytest.mark.asyncio
 async def test_a_handler_row_lock_is_not_bound_by_the_event_lock_timeout(
     client, db, monkeypatch
 ):

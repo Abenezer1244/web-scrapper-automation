@@ -91,7 +91,7 @@ _UPDATE_SQL = """
            OR (CAST(:pass AS text) = 'deferred_fill'
                AND mailing_address IS NULL
                AND coalesce(enrichment_data::jsonb->>'mailing_lookup_deferred', '') = 'true'
-               AND coalesce(enrichment_data::jsonb->>'mailing_recovery_outcome', '')
+               AND btrim(coalesce(enrichment_data::jsonb->>'mailing_recovery_outcome', ''))
                    IN ('', 'error', 'identity_unverified')))
       AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = results.job_id AND j.status = 'done')
 """

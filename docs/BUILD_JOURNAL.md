@@ -48,6 +48,64 @@ post-commit notification instead of work under the row lock. After 2026-09-16 re
 **Facts learned:** the live webhook's `api_version` only shapes event payloads; request shape follows the SDK pin.
 Full local suite: 3,098 passed; `test_session_refresh_contract.py` fails only in batch order (passes alone).
 
+## 2026-09-13 - Closing the Snohomish coverage work, and a schema check that finally runs
+
+**Built / Shipped:** backend #284 (`3aefcce`, license-restricted county GIS mailing held off) and
+#281 (`b878796`, three dropped Tribune trustee sales) merged; Railway api + worker SUCCESS at
+`b878796`, a descendant of `3aefcce`, so the deploy includes #284. Frontend #130 (`678703e`): CI reads the private backend schema through the GitHub API
+with `BACKEND_SCHEMA_TOKEN`. Committed the Snohomish coverage audit
+(`docs/audits/snohomish-coverage-audit-2026-09-13.md`) and closed its handoff.
+
+**Tried / Decided:** merged #284 while #281's CI was still running because the two touch no common
+file; #281 was then merged by the previous session's watcher, so no rebase was needed.
+
+**Failed / Blocked:** the first token saved as the secret was rejected with 401 (not a valid
+token; a token without repo access answers 404). The replacement worked on the next CI run. Today's 10:45 UTC Tribune crawl ran on the old code
+(deploy 10:58), so recovery of `REF-202411260448` / `REF-202211100430` is unverified until the next
+crawl. Production DB reads remain unavailable to the agent.
+
+**Caught & fixed:** once the schema fetch worked, the drift check failed on one added doc-comment
+line from backend #282 (webhook `customer.subscription.created`); regenerated with
+openapi-typescript 7.13.0 from backend main (`821f6fd`), tsc and eslint clean.
+
+**Pending / Handoff:** owner decisions (Snohomish pre_foreclosure vs trustee_sale on the same
+notices; legal review of the county GIS license incl. Cowlitz, taxpayer names, Tribune reuse
+terms); check the next Tribune crawl and the Snohomish tax canary.
+
+**Facts learned:** every backend change that alters `schema/openapi.json`, including docstrings, now fails
+frontend CI until `lib/api-types.generated.ts` is regenerated. When the token expires, frontend CI
+fails at "Fetch backend OpenAPI schema" with 401.
+
+## 2026-09-13 - King code-violation leads get mailing addresses (merge, backfill, live check)
+
+**Built / Shipped:** PR #283 squash-merged as `d31586a` (CI Test + Dependency Audit green on the
+head). Railway worker `697c2a15` and api `7e7c44c1` deployed from the merge. Applied
+`scripts/backfill_king_code_violation_mailing.py --apply` to prod twice (owner approved):
+run 1 wrote 1,636 of 1,782 rows (1,172 mailing), run 2 wrote 131 of the 146 retries (93 mailing).
+Extract snapshot 2026-09-05. Write guard skipped 0 rows in both runs.
+
+**Result (read-only check):** King code_violation mailing 0% -> 1,265 / 1,782 (71.0%), every one
+`mailing_source=king_rpacct` with a `kc_pin`. `kc_pin_status`: matched 1,389, address_mismatch 365,
+multiple 7, no_parcel 6. `parcel_id` still NULL on all 1,782 rows (dedup/billing identity untouched).
+124 matched parcels had no unambiguous extract answer and stay without mailing. Owner flags:
+absentee 840, out of state 134.
+
+**Verified at the source:** 5 random matched rows, Playwright Chromium paced 6 to 8 s:
+eRealProperty site address equals the lead street, the rendered payment.kingcounty.gov tax bill
+names the PIN, and its Mailing Address block equals the stored mailing. 5/5 MATCH.
+
+**Failed / Blocked:** run 1 hit 226 local DNS failures resolving gismaps.kingcounty.gov (this
+box, same as the dry run); the script left them unstamped by design and run 2 had 0. Browser proof
+of the Results page not done (no test login).
+
+**Pending / Handoff:** 15 rows can never be located: their stored latitude/longitude are JSON null
+(3 have no address either). They cost no network call but every re-run revisits them; stamping
+them with a terminal status is a possible follow-up. Main now also carries #284, which holds
+Snohomish and Cowlitz GIS mailing OFF pending legal review; King is not affected.
+
+**Facts learned:** the King RPAcct extract answered 91% of strictly located code-violation
+parcels (1,265 / 1,389); strict point-in-parcel matching accepted 78% of rows with coordinates.
+
 ## 2026-09-13 - Three dropped Snohomish trustee sales, and the identities that keep them single
 
 **Built / Shipped (branch `fix/nts-parser-formats`):** the 9-9-26 Tribune had 10 notice blocks,

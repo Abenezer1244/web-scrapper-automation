@@ -1,3 +1,27 @@
+# Mailing follow-ups after #283 (2026-09-13)
+
+Branch `feat/mailing-followups` (worktree `C:/Users/Windows/bl-wt-rpacct`, from `origin/main` @ `a55308f`).
+Owner approved all follow-ups, turning the Snohomish/Cowlitz restricted mailing flag on, and a UI check.
+
+## Done without code
+- [x] #286 journal merged `a55308f`
+- [x] `COUNTY_GIS_RESTRICTED_MAILING_ENABLED=true` on worker + api (deploys 42aeeba1 / 267fe7ff SUCCESS); prod env reports Snohomish + Cowlitz as mailing sources; 0 rows created while the flag was off
+- [x] Snohomish Test 5 (job 425d49ce, 4 rows): county taxpayer mailing equals the stored value for all 4. No write: Snohomish GIS rows never carry `mailing_source`, so these are now indistinguishable from sourced rows and confirmed
+
+## Phase 1 (code, <= 4 files)
+- [ ] A. Backfill candidates skip rows whose latitude/longitude are JSON null or empty (same rule as the live hook), so the 15 unlocatable rows stop being revisited
+- [ ] B. Auto skip trace does not enqueue code_violation leads whose complaint status is `Completed` or `Open Duplicate` (log a count, row stays `not_attempted`, like the placeholder gate)
+- [ ] Tests for A and B; Codex consult before, review after; CI; merge; deploy
+
+## Phase 2 (script + prod run)
+- [ ] C. `scripts/king_taxbill_mailing_verify.py`: King's live tax bill for (1) 149 situs-echo rows the extract could not answer (90 ambiguous / 57 absent / 2 no_address) and (2) 124 matched code-violation PINs with no extract answer (89 absent / 35 ambiguous). Uses `batch_enrich_king_county` (shared source lease, identity gate, circuit breaker) at a gentle pace. Guarded writes on done jobs: echo row found -> replace (or confirm) with `mailing_source=king_tax_bill`; CV row found -> fill. `none`/error -> unchanged. Dry-run first
+- [ ] D. Results page UI check with Playwright (owner supplied a login; never stored)
+
+## Review
+(pending)
+
+---
+
 # Single-user 3-month Agency promotion through Stripe
 
 Branch: `feat/stripe-promo-access` · worktree `C:/Users/Windows/bridgeleads-worktrees/stripe-promo` (from `origin/main` @ `ff9ecd6`, includes #268)

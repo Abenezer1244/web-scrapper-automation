@@ -19,6 +19,85 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-13 - a 100%-off promotion is a price, not a plan (and a 3-month coupon is a free YEAR on annual)
+
+> **Update, later 2026-09-13 (owner: keep FOUNDING25 for everyone, finish the risks, verify in Stripe yourself).**
+> - Annual gating REPLACED by Stripe product scoping: the single-customer coupon's `applies_to` is the Agency MONTHLY product only; annual prices live on their own product; the script refuses a product carrying any yearly price and reads `applies_to` back (Stripe omits it unless expanded, verified). Checkout offers codes on every plan again; FOUNDING25 unchanged.
+> - Remaining risks closed: durable webhook ledger `stripe_webhook_events` (migration 095, advisory lock 4244, recorded in the same transaction as the handler; Redis claim removed, old keys dual-read for cutover); post-create checkout re-check; `STRIPE_LEGACY_PLAN_PRICES` for retired prices (recognised, never sold); invoice webhooks read `parent.subscription_details.subscription` (a REAL sandbox run showed API 2026-08-26.dahlia has no top-level `invoice.subscription`, so dunning never started or cleared on current payloads).
+> - Stripe CLI device login never completed (approval did not reach the waiting CLI twice); used `stripe sandbox create` (claimable sandbox, test only). My redaction regex missed the `rkcs_test_` prefix and printed that sandbox key once in the session output.
+> - Sandbox end-to-end (real hosted Checkout, real `stripe listen` signatures, local API): 43/44 pass, 0 fail, 1 SKIPPED (sandbox key cannot use test clocks; the 3-month clock run needs the sandbox claimed). Observed: $0 session reports `payment_status=paid` on dahlia, not `no_payment_required`.
+> - Codex: consult FAIL -> reconciled plan PASS; post-build PASS; two follow-up deltas PASS. Suite 2909 passed / 2 skipped; billing integration 145 passed / 10 skipped.
+> - Found, not caused: `test_auth.py::test_brute_force_lockout_after_five_failures` fails on pristine origin/main against one local test DB and passes on another; local state, unrelated.
+
+> **Provenance:** code facts read from `origin/main` @ `ff9ecd6` in worktree
+> `bridgeleads-worktrees/stripe-promo`; Stripe behaviour quoted from docs.stripe.com
+> (billing/subscriptions/coupons, api/checkout/sessions/create, api/promotion_codes/list);
+> test counts read back in-session. NOT committed, NOT deployed, NOT yet verified in Stripe
+> test mode (no test key available this session).
+
+**Built / Shipped (uncommitted, branch `feat/stripe-promo-access`):**
+- `src/api/routes/billing.py`: annual Checkout never offers the promotion code box; monthly
+  keeps it (Stripe alone validates code, customer restriction, redemptions);
+  `payment_method_collection="always"` explicit; change-plan refuses a switch TO annual while a
+  repeating (<12 mo) discount runs (409 `promotional_pricing_active`); webhook claim is
+  `processing` (300s) until handler + commit succeed, then `done`, released on failure, in-flight
+  duplicate gets 409; `checkout.session.completed` activates only active/trialing;
+  `customer.subscription.created` handled (gated on the re-read status, re-read failure retries);
+  unrecorded subscriptions cannot change entitlement unless active/trialing (legacy NULL-id
+  payers keep dunning on their own plan when the subscription is unambiguous);
+  `customer.subscription.deleted` rebinds to a surviving sold subscription instead of
+  downgrading; ops alerts for annual+short coupon and a second live subscription.
+- `scripts/stripe_single_customer_promo.py` (args only; refuses live key without `--live`).
+- `tests/test_promo_access.py`: 32 tests, every guard mutation-verified.
+- Suite 2899 passed / 2 skipped / 0 failed (CI target, 4 batches); billing integration 145 passed.
+
+**Tried / Decided:**
+- Entitlement already came only from Price -> plan; nothing read amounts, discounts,
+  payment_status or PaymentIntents. So no "promo plan" and no discount math in code.
+- Checkout already had `allow_promotion_codes=True` on every session (FOUNDING25 exists).
+- First annual guard was "disable the box only if this customer holds a short repeating code".
+  Codex r1: check-then-act, a code issued while the Session is open still works. Replaced by
+  "annual never offers codes". Consequence to confirm with the owner: FOUNDING25 no longer
+  enterable on annual.
+- Durable webhook event ledger / claim lease: rejected for this change (migration + webhook
+  redesign the owner ruled out). Reported as risk.
+
+**Failed / Blocked:**
+- Stripe test-mode verification not run: `C:/Users/Windows/bl-testenv/stripe-test.env` never
+  appeared. Verifier is written (session scratchpad `verify_promo_testmode.py`: test clock, real
+  hosted Checkout with the code, real events signed to the in-process app, 4-month advance).
+- Local env drift: Anaconda is gone, so `.venv-schema` and the rig's `python` are dead. Used a
+  uv-built Python 3.12 venv.
+- Full pytest was killed twice for low memory in the background; ran in 4 foreground batches.
+- My own ad-hoc test runs shared the full suite's database and produced phantom F/E (the `db`
+  fixture deletes every user). Use a separate `_test` database for ad-hoc runs.
+
+**Caught & fixed (Codex consult + 6 review rounds, each finding verified against the code):**
+- Redis dedup claimed "done" BEFORE handling: a raised handler or killed process swallowed the
+  retry. For a $0 checkout that event is the only activation.
+- An `incomplete` Agency subscription could be applied as an "upgrade" via
+  `customer.subscription.updated` (and would have via the new `created` handler).
+- Cancelling one of two live subscriptions downgraded the account.
+- Legacy NULL-id exemption was too broad (adopted incomplete / ambiguous / recorded-account subs);
+  narrowed in rounds 3-5. Codex gate PASS on round 6.
+- Rejected with evidence: "customer adoption is email-only" (requires exact metadata.user_id);
+  "no signature verification" (construct_event).
+
+**Pending / Handoff:**
+- Stripe test-mode run (needs a sk_test_ key file), then owner review, commit, PR.
+- Owner decision: FOUNDING25 on annual.
+- Dashboard: enable `customer.subscription.created` on the webhook endpoint; confirm the
+  endpoint API version keeps `invoice.subscription` (payment handlers read it).
+
+**Facts learned:**
+- Stripe: a `repeating` coupon on a yearly subscription discounts the ENTIRE year if the invoice
+  falls in its window. `applies_to` works on products only; monthly and annual share a product.
+- Checkout `payment_method_collection` defaults to `always`; a $0 subscription Session completes
+  with `payment_status=no_payment_required` and no PaymentIntent.
+- `PromotionCode.list` accepts `customer`; codes can be customer-restricted and single-use.
+
+---
+
 ## 2026-09-13 - Tracerfy stops being paid for leads nobody receives
 
 **Built / Shipped (branch `fix/skip-trace-over-quota`):** skip trace is enqueued in

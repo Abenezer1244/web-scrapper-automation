@@ -9,7 +9,7 @@ import redis.asyncio as aioredis
 import redis.exceptions as _redis_exceptions
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser
@@ -300,19 +300,32 @@ async def cancel_job(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> None:
-    result = await db.execute(
-        select(Job).where(Job.id == job_id, Job.user_id == current_user.id)
-    )
-    job = result.scalar_one_or_none()
-    if job is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-    if job.status not in CANCELLABLE_STATUSES:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot cancel a job in '{job.status}' status",
+    # One statement, so the status is checked against the row as it is when the
+    # write lands. Checking in Python and then writing by primary key let a cancel
+    # that read 'enriching' overwrite the worker's just-committed billed 'done':
+    # the customer was charged and holds a download, but the job read cancelled
+    # and its paid skip traces were withdrawn (Codex review round 6).
+    cancelled = (await db.execute(
+        update(Job)
+        .where(
+            Job.id == job_id,
+            Job.user_id == current_user.id,
+            Job.status.in_(CANCELLABLE_STATUSES),
         )
-    job.status = "cancelled"
-    await db.flush()
+        .values(status="cancelled", finished_at=func.now())
+        .returning(Job.id)
+    )).first()
+    if cancelled is not None:
+        return
+    current = (await db.execute(
+        select(Job.status).where(Job.id == job_id, Job.user_id == current_user.id)
+    )).scalar_one_or_none()
+    if current is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Cannot cancel a job in '{current}' status",
+    )
 
 
 @router.get("/{job_id}/results", response_model=ResultsPage)

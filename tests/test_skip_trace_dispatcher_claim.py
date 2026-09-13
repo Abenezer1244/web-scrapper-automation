@@ -21,6 +21,7 @@ from src.workers.skip_trace_dispatcher import dispatch_pending_skip_trace
 def _seed_pending(
     user_id: str, *, status: str = "queued", submitted_at=None,
     is_duplicate: bool = False, enrichment_data: str = "{}", job_status: str = "done",
+    billed: bool = False,
 ) -> tuple[str, str]:
     """scraper_config → job → result (skip_trace_status='queued') → pending row."""
     sc_id, job_id, result_id, pending_id = (str(uuid.uuid4()) for _ in range(4))
@@ -39,10 +40,13 @@ def _seed_pending(
         db.execute(
             text("""
                 INSERT INTO jobs (id, user_id, scraper_config_id, status, trigger,
-                                  page_current, page_total, record_count, retry_count)
-                VALUES (:job_id, :user_id, :sc_id, :job_status, 'manual', 0, 0, 0, 0)
+                                  page_current, page_total, record_count, retry_count,
+                                  billing_applied_at)
+                VALUES (:job_id, :user_id, :sc_id, :job_status, 'manual', 0, 0, 0, 0,
+                        CASE WHEN :billed THEN now() END)
             """),
-            {"job_id": job_id, "user_id": user_id, "sc_id": sc_id, "job_status": job_status},
+            {"job_id": job_id, "user_id": user_id, "sc_id": sc_id, "job_status": job_status,
+             "billed": billed},
         )
         db.execute(
             text("""
@@ -286,6 +290,25 @@ async def test_a_job_that_delivered_nothing_never_buys_its_queued_lookups(
     assert out == {"submitted_batches": 0, "submitted_rows": 0, "errors": []}
     assert _pending_state(pending_id)[0] == "cancelled"
     assert _result_status(result_id) == "not_attempted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job_status", ["failed", "cancelled"])
+async def test_a_job_that_billed_before_it_was_marked_terminal_still_buys_its_lookups(
+    starter_user, _dispatcher_enabled, job_status
+):
+    """Billing and the done-CAS commit together, so a billed job delivered its file
+    (the download is gated on export_key, not status) and the customer paid. A
+    status written over 'done' afterwards (a cancel racing completion) must not
+    withdraw what they bought (Codex review round 6). The row goes through the
+    claim path; the fake endpoint's definite rejection marks it errored."""
+    pending_id, result_id = _seed_pending(starter_user.id, job_status=job_status, billed=True)
+
+    out = dispatch_pending_skip_trace()
+
+    assert any("HTTPS" in e for e in out["errors"])
+    assert _pending_state(pending_id)[0] == "errored"
+    assert _result_status(result_id) == "errored"
 
 
 @pytest.mark.asyncio

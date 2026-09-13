@@ -409,15 +409,18 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
     """Split the FIFO head into (buy now, withdraw) and a count left for later.
 
     A lookup is bought only for a lead that was actually delivered: its Result is
-    not a duplicate, not excluded by the plan cap, and its job reached 'done'.
+    not a duplicate, not excluded by the plan cap, and its job billed or reached
+    'done'. Billing and the done-CAS commit together, so a billed job delivered
+    its file whatever status was written over it later (Codex review round 6);
+    'done' alone still counts for jobs that predate the billing stamp.
     Rows are queued just before the enriched re-export and billing, so a job can
     still fail after queueing them (a failed upload, a failed refetch), and the
     flags can still change (a watchdog re-run repeats the survivor election and
     the cap). Paying Tracerfy for any of those buys contact data nobody receives.
 
-    - buy now: done job, non-duplicate, not over quota.
-    - withdraw: the job failed or was cancelled, or the lead is a duplicate or
-      over quota. Never charged.
+    - buy now: billed or done job, non-duplicate, not over quota.
+    - withdraw: the job failed or was cancelled without billing, or the lead is
+      a duplicate or over quota. Never charged.
     - left for later (neither list): the job is still running, the Result row is
       locked by a writer right now, or it no longer exists (its pending row is
       CASCADE-deleted with it). Nothing is decided on a value that is changing.
@@ -429,6 +432,10 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
     and deadlock (Codex). A skipped row is simply retried on the next tick, after
     the writer has committed, which also closes the read-then-claim race: no
     stale flag is ever acted on.
+
+    The job row needs no lock: each job-side answer is final once seen. A job
+    that billed stays billed, and a failed or cancelled job that never billed can
+    never bill (the done-CAS only moves a non-terminal job).
     """
     if not rows:
         return [], [], 0
@@ -439,8 +446,8 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
 
     # Tenant-paired like every other write from this cross-tenant head.
     state = {
-        (str(rid), str(uid)): (is_dup, excluded, status)
-        for rid, uid, is_dup, excluded, status in db.execute(
+        (str(rid), str(uid)): (is_dup, excluded, status, billed)
+        for rid, uid, is_dup, excluded, status, billed in db.execute(
             select(
                 Result.id,
                 Result.user_id,
@@ -451,6 +458,7 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
                     Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
                 ) == OVER_QUOTA,
                 Job.status,
+                Job.billing_applied_at.is_not(None),
             )
             .join(Job, Job.id == Result.job_id)
             .where(
@@ -469,10 +477,10 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
         if seen is None:
             later += 1
             continue
-        is_dup, excluded, status = seen
-        if status in ("failed", "cancelled") or is_dup or excluded:
+        is_dup, excluded, status, billed = seen
+        if is_dup or excluded or (status in ("failed", "cancelled") and not billed):
             drop.append(r)
-        elif status == "done":
+        elif billed or status == "done":
             keep.append(r)
         else:
             later += 1

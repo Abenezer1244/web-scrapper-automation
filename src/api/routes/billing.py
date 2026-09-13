@@ -1929,7 +1929,7 @@ async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
     plan_name, records_limit, _interval = plan_info
     # FOR UPDATE. checkout.session.completed and customer.subscription.updated
     # are two DIFFERENT Stripe events describing ONE conversion, so the route's
-    # per-event Redis dedup does not stop them running concurrently on two API
+    # per-event ledger dedup does not stop them running concurrently on two API
     # workers. Both would load a user with first_paid_at NULL, both would decide
     # this is a fresh entitlement, and both would zero the counter — a free
     # bucket, and worse, a stale second commit can wipe usage consumed between

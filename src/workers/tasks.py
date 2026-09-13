@@ -1837,10 +1837,17 @@ def run_scrape_job(self, job_id: str) -> None:
                 .execution_options(populate_existing=True)
             ).scalars().all()
 
-        # Re-export CSV with enriched data — only if the refetch succeeded.
-        if refreshed is not None:
+        # Re-export CSV with enriched data. A refetch that FAILED is a re-export
+        # failure too, for every plan: the R2 object is still the pre-enrichment
+        # file, while billing below counts the rows as they are now, including any
+        # that enrichment made actionable or the claim transfer promoted. Finite
+        # plans already failed on this before the cap; unlimited plans used to skip
+        # the re-export silently and bill a count the file did not match (Codex).
+        reexport_error: Exception | None = None
+        if refreshed is None:
+            reexport_error = RuntimeError("post-enrichment refetch failed")
+        else:
             enriched_file = None
-            reexport_error: Exception | None = None
             try:
                 # Deliverable = actionable, NON-DUPLICATE rows (see the first export
                 # above for both rules); `refreshed` itself stays complete for the
@@ -1868,50 +1875,50 @@ def run_scrape_job(self, job_id: str) -> None:
             finally:
                 if enriched_file:
                     enriched_file.unlink(missing_ok=True)
-            if reexport_error is not None:
-                # The R2 object is the PRE-enrichment deliverable, which (by the
-                # actionability rule) omits rows that enrichment has since made
-                # actionable — and those rows are about to be billed. A bill that
-                # does not match the delivered file is never acceptable, so this is
-                # fatal exactly like the first upload: release the dedup claims,
-                # fail before billing, and let the user re-run (Codex).
+        if reexport_error is not None:
+            # The R2 object is the PRE-enrichment deliverable, which (by the
+            # actionability rule) omits rows that enrichment has since made
+            # actionable — and those rows are about to be billed. A bill that
+            # does not match the delivered file is never acceptable, so this is
+            # fatal exactly like the first upload: release the dedup claims,
+            # fail before billing, and let the user re-run (Codex).
+            _logger.error(
+                "Job %s: enriched re-export failed — failing job before billing: %s",
+                job_id, str(reexport_error)[:200],
+            )
+            try:
+                db.rollback()
+                db.execute(
+                    sa_text(
+                        "DELETE FROM delivered_records "
+                        "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
+                    ),
+                    {"jid": job_id, "uid": str(job.user_id)},
+                )
+                db.commit()
+            except Exception as cleanup_exc:
+                db.rollback()
                 _logger.error(
-                    "Job %s: enriched re-export failed — failing job before billing: %s",
-                    job_id, str(reexport_error)[:200],
+                    "Job %s: failed to release dedup claims after re-export failure: %s",
+                    job_id, str(cleanup_exc)[:200],
                 )
-                try:
-                    db.rollback()
-                    db.execute(
-                        sa_text(
-                            "DELETE FROM delivered_records "
-                            "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
-                        ),
-                        {"jid": job_id, "uid": str(job.user_id)},
-                    )
-                    db.commit()
-                except Exception as cleanup_exc:
-                    db.rollback()
-                    _logger.error(
-                        "Job %s: failed to release dedup claims after re-export failure: %s",
-                        job_id, str(cleanup_exc)[:200],
-                    )
-                    _alert_dedup_release_failed(job_id, _boot_user_id, "reexport_failure", cleanup_exc)
-                reason = (
-                    "The lead file could not be refreshed with enriched addresses. "
-                    "No file was delivered and you were not charged. Please run the "
-                    "scraper again; contact support if it keeps failing."
+                _alert_dedup_release_failed(job_id, _boot_user_id, "reexport_failure", cleanup_exc)
+            reason = (
+                "The lead file could not be refreshed with enriched addresses. "
+                "No file was delivered and you were not charged. Please run the "
+                "scraper again; contact support if it keeps failing."
+            )
+            if _fail_job(db, job, r, job_id, reason):
+                from src.workers.notification_emit import create_notification
+                create_notification(
+                    user_id=job.user_id, type="job_failed", job_id=job_id,
+                    detail={
+                        "scraper_name": getattr(config, "name", None),
+                        "county": getattr(config, "county", None),
+                        "error_summary": reason[:200],
+                    },
                 )
-                if _fail_job(db, job, r, job_id, reason):
-                    from src.workers.notification_emit import create_notification
-                    create_notification(
-                        user_id=job.user_id, type="job_failed", job_id=job_id,
-                        detail={
-                            "scraper_name": getattr(config, "name", None),
-                            "county": getattr(config, "county", None),
-                            "error_summary": reason[:200],
-                        },
-                    )
-                return
+            return
 
         # ── PHASE 3: RESULT.property_key (combine/overlap join key) ──────────
         # Stamp the strong-identity key on this job's rows BEFORE the membership

@@ -93,14 +93,20 @@ def dispatch_pending_skip_trace() -> dict:
                 if not rows:
                     continue
 
-                # Never buy a lookup for a lead that is no longer delivered.
-                rows, withdrawn = _partition_still_deliverable(db, rows)
+                # Buy a lookup only for a lead that was actually delivered.
+                rows, withdrawn, left_queued = _partition_still_deliverable(db, rows)
                 if withdrawn:
                     _cancel_undeliverable(db, withdrawn)
                     _logger.info(
-                        "Dispatcher: %d %s row(s) withdrawn before submit: the lead "
-                        "is now a duplicate or over the plan limit",
-                        len(withdrawn), trace_type,
+                        "Dispatcher: %d %s row(s) withdrawn before submit: the job did "
+                        "not deliver, or the lead is now a duplicate or over the plan "
+                        "limit", len(withdrawn), trace_type,
+                    )
+                if left_queued:
+                    _logger.info(
+                        "Dispatcher: %d %s row(s) left queued for a later tick (job "
+                        "still running, or the lead is being updated)",
+                        left_queued, trace_type,
                     )
 
                 # Tracerfy's batch endpoint REQUIRES address + city + state on
@@ -121,10 +127,13 @@ def dispatch_pending_skip_trace() -> dict:
                     errors.append(msg)
                     _logger.warning("Dispatcher: %s", msg)
                 if not rows:
-                    # Nothing submittable left: commit the failures and withdrawals
-                    # on their own (no claim follows to carry them).
+                    # Nothing to claim: commit the failures and withdrawals on their
+                    # own (no claim follows to carry them), and in every case end the
+                    # transaction so no lock on a deferred row outlives this pass.
                     if unsubmittable or withdrawn:
                         db.commit()
+                    else:
+                        db.rollback()
                     continue
 
                 # DURABLE CLAIM before the external POST (Codex High, 2026-09-02).
@@ -396,56 +405,78 @@ def _fail_unsubmittable(db, rows: list) -> None:
     )
 
 
-def _partition_still_deliverable(db, rows: list) -> tuple[list, list]:
-    """Split rows into (still deliverable, no longer delivered), FIFO order kept.
+def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
+    """Split the FIFO head into (buy now, withdraw) and a count left for later.
 
-    A row is queued at the moment its lead is decided, but the flags that decide
-    delivery can still change afterwards (a watchdog re-run repeats the survivor
-    election and the plan cap). A row whose Result is now a duplicate, or excluded
-    by the plan cap, is never delivered or billed, so paying Tracerfy for it buys
-    contact data nobody receives. This re-reads those two flags for the FIFO head
-    inside the same locked selection, before anything is claimed, and share-locks
-    the Result rows so neither flag can change until the claim is committed.
+    A lookup is bought only for a lead that was actually delivered: its Result is
+    not a duplicate, not excluded by the plan cap, and its job reached 'done'.
+    Rows are queued just before the enriched re-export and billing, so a job can
+    still fail after queueing them (a failed upload, a failed refetch), and the
+    flags can still change (a watchdog re-run repeats the survivor election and
+    the cap). Paying Tracerfy for any of those buys contact data nobody receives.
 
-    A Result that no longer exists falls in the second bucket too: its pending row
-    would only be CASCADE-deleted anyway, and a lookup for it could never be
-    ingested.
+    - buy now: done job, non-duplicate, not over quota.
+    - withdraw: the job failed or was cancelled, or the lead is a duplicate or
+      over quota. Never charged.
+    - left for later (neither list): the job is still running, the Result row is
+      locked by a writer right now, or it no longer exists (its pending row is
+      CASCADE-deleted with it). Nothing is decided on a value that is changing.
+
+    The Result rows are read FOR SHARE SKIP LOCKED and the share lock is held
+    until the claim commits. SKIP LOCKED rather than a plain FOR SHARE: the
+    dispatcher already holds the pending rows, and a purge cascading from a job
+    locks results before pending rows, so waiting here would invert that order
+    and deadlock (Codex). A skipped row is simply retried on the next tick, after
+    the writer has committed, which also closes the read-then-claim race: no
+    stale flag is ever acted on.
     """
     if not rows:
-        return [], []
+        return [], [], 0
     from sqlalchemy import func, select, tuple_
 
     from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
-    from src.db.models import Result
+    from src.db.models import Job, Result
 
     # Tenant-paired like every other write from this cross-tenant head.
-    deliverable = {
-        (str(rid), str(uid))
-        for rid, uid in db.execute(
-            select(Result.id, Result.user_id).where(
-                tuple_(Result.id, Result.user_id).in_(
-                    [(r.result_id, r.user_id) for r in rows]
-                ),
-                Result.is_duplicate.is_(False),
+    state = {
+        (str(rid), str(uid)): (is_dup, excluded, status)
+        for rid, uid, is_dup, excluded, status in db.execute(
+            select(
+                Result.id,
+                Result.user_id,
+                Result.is_duplicate,
                 # Same spelling as lead_actionability.actionable_condition; a NULL
                 # blob yields NULL from ->>, which the COALESCE turns into ''.
                 func.coalesce(
                     Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
-                ) != OVER_QUOTA,
+                ) == OVER_QUOTA,
+                Job.status,
             )
-            # FOR SHARE, held until the claim commits (Codex). Without it a
-            # re-election or cap UPDATE could land between this read and the
-            # 'submitting' commit, and the stale answer would buy the lookup. With
-            # it that writer waits for the claim, and the only window left is the
-            # one after the claim, before the POST (accepted residual).
-            .with_for_update(read=True)
+            .join(Job, Job.id == Result.job_id)
+            .where(
+                tuple_(Result.id, Result.user_id).in_(
+                    [(r.result_id, r.user_id) for r in rows]
+                )
+            )
+            .with_for_update(read=True, skip_locked=True, of=Result)
         ).all()
     }
     keep: list = []
     drop: list = []
+    later = 0
     for r in rows:
-        (keep if (str(r.result_id), str(r.user_id)) in deliverable else drop).append(r)
-    return keep, drop
+        seen = state.get((str(r.result_id), str(r.user_id)))
+        if seen is None:
+            later += 1
+            continue
+        is_dup, excluded, status = seen
+        if status in ("failed", "cancelled") or is_dup or excluded:
+            drop.append(r)
+        elif status == "done":
+            keep.append(r)
+        else:
+            later += 1
+    return keep, drop, later
 
 
 def _cancel_undeliverable(db, rows: list) -> None:

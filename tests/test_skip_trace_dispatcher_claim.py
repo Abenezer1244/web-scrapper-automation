@@ -20,7 +20,7 @@ from src.workers.skip_trace_dispatcher import dispatch_pending_skip_trace
 
 def _seed_pending(
     user_id: str, *, status: str = "queued", submitted_at=None,
-    is_duplicate: bool = False, enrichment_data: str = "{}",
+    is_duplicate: bool = False, enrichment_data: str = "{}", job_status: str = "done",
 ) -> tuple[str, str]:
     """scraper_config → job → result (skip_trace_status='queued') → pending row."""
     sc_id, job_id, result_id, pending_id = (str(uuid.uuid4()) for _ in range(4))
@@ -40,9 +40,9 @@ def _seed_pending(
             text("""
                 INSERT INTO jobs (id, user_id, scraper_config_id, status, trigger,
                                   page_current, page_total, record_count, retry_count)
-                VALUES (:job_id, :user_id, :sc_id, 'done', 'manual', 0, 0, 0, 0)
+                VALUES (:job_id, :user_id, :sc_id, :job_status, 'manual', 0, 0, 0, 0)
             """),
-            {"job_id": job_id, "user_id": user_id, "sc_id": sc_id},
+            {"job_id": job_id, "user_id": user_id, "sc_id": sc_id, "job_status": job_status},
         )
         db.execute(
             text("""
@@ -243,52 +243,59 @@ async def test_withdrawal_does_not_hold_back_the_deliverable_rows_beside_it(
 
 
 @pytest.mark.asyncio
-async def test_a_flag_written_while_the_dispatcher_reads_is_waited_for(
+async def test_a_lead_being_updated_right_now_is_left_for_the_next_tick(
     starter_user, _dispatcher_enabled
 ):
-    """The race Codex found in the diff review. A re-election flags the row
-    duplicate in a transaction still open when the dispatcher re-checks. The
-    share lock makes the dispatcher wait for that commit and read the new flag,
-    instead of reading the old one and buying the lookup."""
-    import threading
-    import time
-
+    """The race Codex found in the diff review. A re-election is flagging the row
+    duplicate in a transaction still open when the dispatcher reads it. The old
+    committed value says "deliverable", so reading it would buy the lookup. The
+    dispatcher skips the locked row instead (never waiting on it, which would
+    invert lock order against a purge cascade) and decides on the next tick."""
     pending_id, result_id = _seed_pending(starter_user.id)
 
-    writer = system_sync_session().__enter__()
-    writer.execute(
-        text("UPDATE results SET is_duplicate = true WHERE id = :id"), {"id": result_id}
-    )  # uncommitted: holds the row lock
+    with system_sync_session() as writer:
+        writer.execute(
+            text("UPDATE results SET is_duplicate = true WHERE id = :id"), {"id": result_id}
+        )  # uncommitted: holds the row lock
 
-    outcome: dict = {}
+        out = dispatch_pending_skip_trace()
 
-    def _tick():
-        try:
-            outcome["out"] = dispatch_pending_skip_trace()
-        except BaseException as exc:  # surfaced by the assertion below
-            outcome["exc"] = exc
-
-    t = threading.Thread(target=_tick)
-    t.start()
-    try:
-        # Wait until the dispatcher is actually blocked on the row lock.
-        deadline = time.monotonic() + 20
-        blocked = False
-        while time.monotonic() < deadline and not blocked:
-            with system_sync_session() as probe:
-                blocked = bool(probe.execute(text(
-                    "SELECT count(*) FROM pg_stat_activity "
-                    "WHERE wait_event_type = 'Lock' AND query ILIKE '%FROM results%FOR SHARE%'"
-                )).scalar())
-            if not blocked:
-                time.sleep(0.1)
-        assert blocked, "the dispatcher never waited for the open flag write"
-    finally:
+        assert out == {"submitted_batches": 0, "submitted_rows": 0, "errors": []}
+        assert _pending_state(pending_id)[0] == "queued"
         writer.commit()
-        writer.close()
-        t.join(timeout=30)
 
-    assert "exc" not in outcome, outcome.get("exc")
-    assert outcome["out"] == {"submitted_batches": 0, "submitted_rows": 0, "errors": []}
+    out = dispatch_pending_skip_trace()
+
+    assert out == {"submitted_batches": 0, "submitted_rows": 0, "errors": []}
     assert _pending_state(pending_id)[0] == "cancelled"
     assert _result_status(result_id) == "not_attempted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job_status", ["failed", "cancelled"])
+async def test_a_job_that_delivered_nothing_never_buys_its_queued_lookups(
+    starter_user, _dispatcher_enabled, job_status
+):
+    """Rows are queued just before the enriched re-export and billing. If the job
+    then fails (an upload that never lands) the file was never delivered, so its
+    queued lookups are withdrawn, not paid for."""
+    pending_id, result_id = _seed_pending(starter_user.id, job_status=job_status)
+
+    out = dispatch_pending_skip_trace()
+
+    assert out == {"submitted_batches": 0, "submitted_rows": 0, "errors": []}
+    assert _pending_state(pending_id)[0] == "cancelled"
+    assert _result_status(result_id) == "not_attempted"
+
+
+@pytest.mark.asyncio
+async def test_a_job_still_running_keeps_its_rows_queued_until_it_finishes(
+    starter_user, _dispatcher_enabled
+):
+    pending_id, result_id = _seed_pending(starter_user.id, job_status="enriching")
+
+    out = dispatch_pending_skip_trace()
+
+    assert out == {"submitted_batches": 0, "submitted_rows": 0, "errors": []}
+    assert _pending_state(pending_id)[0] == "queued"
+    assert _result_status(result_id) == "queued"

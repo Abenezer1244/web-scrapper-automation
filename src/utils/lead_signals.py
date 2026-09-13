@@ -22,25 +22,38 @@ from zoneinfo import ZoneInfo
 # full 3 years delinquent. Used by wa_foreclosure_eligible().
 _WA_TAX_FORECLOSURE_YEARS = 3
 
+# WA RCW 84.56.020: the first half of tax year Y is due April 30 and delinquent
+# from May 1 of Y. Months delinquent are counted from this month, and the filter
+# math in src/api/tax_filters.py imports it so the two can never disagree.
+WA_FIRST_DELINQUENT_MONTH = 5
+
+
+def delinquency_anchor(today: date) -> int:
+    """Month index of `today`, shifted so May 1 of a tax year is month 0 of it.
+
+    months_delinquent(Y) = max(0, delinquency_anchor(today) - 12*Y).
+    """
+    return today.year * 12 + (today.month - 1) - (WA_FIRST_DELINQUENT_MONTH - 1)
+
 _MDY = re.compile(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\b")
 
 
 def months_delinquent(bill_year: int | None, today: date) -> int | None:
     """Months a tax bill has been delinquent, derived from its bill year.
 
-    Mirrors src/api/tax_filters.py EXACTLY (Codex review): WA property-tax bills
-    issue ~Jan 1 of the bill year, so months = base - bill_year*12 where
-    base = today.year*12 + (today.month-1). No clamp — the value must agree with
-    the filter math for every bill_year. Real delinquent data never goes negative
-    (you can't be delinquent on a not-yet-issued bill, and _extract_tax_fields
-    caps bill_year at current+1); the unclamped formula only matters for that
-    one defensive edge, where parity with the filter beats a cosmetic floor.
+    Counted from May 1 of the bill year, when WA's first half goes delinquent
+    (WA_FIRST_DELINQUENT_MONTH), not from January 1: a 2025 bill is 16 months
+    delinquent in September 2026, not 20. Clamped at 0, so a bill that is not
+    delinquent yet (a current-year bill before May) never shows a negative count.
+
+    Exact parity with src/api/tax_filters.bill_year_bounds_for_months holds with
+    the clamp: a max-months filter (>= 0) is unaffected by it, and a min-months
+    filter of 0 applies no year bound because every clamped value is >= 0.
     None bill_year (every non-King/Snohomish-tax row) -> None.
     """
     if bill_year is None:
         return None
-    base = today.year * 12 + (today.month - 1)
-    return base - bill_year * 12
+    return max(0, delinquency_anchor(today) - bill_year * 12)
 
 
 def wa_foreclosure_eligible(bill_year: int | None, today: date) -> bool:

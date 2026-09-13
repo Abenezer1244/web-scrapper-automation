@@ -326,7 +326,7 @@ def _rotate(db, by_parcel: dict, parcels: list[str], stats: dict) -> None:
                 db.execute(
                     sa_text(
                         "UPDATE results SET enrichment_data = "
-                        "  (COALESCE(enrichment_data::jsonb, '{}'::jsonb) "
+                        "  ((CASE WHEN jsonb_typeof(enrichment_data::jsonb) = 'object' THEN enrichment_data::jsonb ELSE '{}'::jsonb END) "
                         "   || CAST(:payload AS jsonb))::json "
                         "WHERE id = :rid AND user_id = :uid AND mailing_address IS NULL"
                     ),
@@ -389,6 +389,11 @@ def _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats) ->
     filled the mailing address or repaired the parcel in between. Committing on a
     stale read would let a lookup for the OLD parcel land on the new one.
 
+    The merge base is the existing value only when it is a JSON OBJECT. A row written
+    with `enrichment_data=None` through the ORM stores JSON `null`, which COALESCE does
+    not catch, and `'null'::jsonb || '{...}'` builds an ARRAY: the marker would land
+    inside `[null, {...}]` where `->>` cannot see it and the row would never recover.
+
     `jsonb_strip_nulls` is not used and the whole column is not replaced: the
     bookkeeping keys are merged with `||` so unrelated enrichment metadata
     (situs parts, parcel provenance, assessor owner, delivery exclusion) survives.
@@ -433,7 +438,7 @@ def _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats) ->
                 # JSONB operator: merging without the casts raises
                 # "COALESCE could not convert type jsonb to json". Cast in to
                 # merge, cast back out to store.
-                "  enrichment_data = (COALESCE(enrichment_data::jsonb, '{}'::jsonb) "
+                "  enrichment_data = ((CASE WHEN jsonb_typeof(enrichment_data::jsonb) = 'object' THEN enrichment_data::jsonb ELSE '{}'::jsonb END) "
                 "                     || CAST(:payload AS jsonb))::json "
                 "WHERE id = :rid "
                 "  AND user_id = :uid "          # tenant filter, always

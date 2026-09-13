@@ -28,9 +28,9 @@ inside one entitlement month.
 
 IDEMPOTENCY
 
-Stripe retries for three days and can deliver out of order. Redis dedup in the
-route stops an identical event being processed twice, but two DIFFERENT events
-can describe the same conversion. So the one destructive action here — zeroing
+Stripe retries for three days and can deliver out of order. The webhook's event
+ledger (stripe_webhook_events) stops an identical event being processed twice,
+but two DIFFERENT events can describe the same conversion. So the one destructive action here — zeroing
 the counter on conversion — is gated on durable state (``first_paid_at`` /
 ``paid_entitlement_ended_at``) rather than on the event, and every function is
 safe to run repeatedly.

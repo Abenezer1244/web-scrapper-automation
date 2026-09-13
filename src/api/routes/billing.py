@@ -1755,14 +1755,6 @@ async def stripe_webhook(
             if already.first() is not None:
                 _logger.info("stripe webhook dedup: already processed %s", event_id)
                 return {"received": True}
-            if await _handled_before_the_ledger(event_id):
-                await _record_stripe_event(db, event_id, event["type"])
-                await db.commit()
-                _logger.info(
-                    "stripe webhook dedup: %s was handled before the ledger existed",
-                    event_id,
-                )
-                return {"received": True}
 
         notifications = await _dispatch_stripe_event(
             event["type"], event["data"]["object"], db
@@ -1813,36 +1805,6 @@ async def _record_stripe_event(db: AsyncSession, event_id: str, event_type: obje
         ),
         {"eid": event_id, "etype": str(event_type)[:100]},
     )
-
-
-async def _handled_before_the_ledger(event_id: str) -> bool:
-    """Whether the Redis dedup this ledger replaced already claimed this event.
-
-    Cutover only. Stripe retries an event for up to three days, and events the
-    previous code handled have no ledger row, so a late retry would otherwise
-    run its handler a second time (a second payment-failed email, for one).
-    Those keys expire on their own within three days of deploy; after that this
-    always answers False and can be deleted.
-
-    Best effort by design: if Redis cannot be asked, the answer is "not seen",
-    and the handler runs. Every handler is idempotent on durable state, so the
-    cost of a missed dedup is a repeated notification, never a repeated grant.
-    """
-    import redis.asyncio as aioredis
-
-    try:
-        redis = aioredis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
-        try:
-            value = await redis.get(f"stripe_event:{event_id}")
-        finally:
-            await redis.aclose()
-    except Exception as exc:  # noqa: BLE001 - cutover aid only, never a hard dependency
-        _logger.warning(
-            "stripe webhook: pre-ledger dedup lookup failed for %s (%s)",
-            event_id, str(exc)[:120],
-        )
-        return False
-    return value is not None
 
 
 #: Upper bound on waiting for another delivery of the same event to finish.
@@ -1967,7 +1929,7 @@ async def _handle_checkout_completed(data: dict, db: AsyncSession) -> None:
     plan_name, records_limit, _interval = plan_info
     # FOR UPDATE. checkout.session.completed and customer.subscription.updated
     # are two DIFFERENT Stripe events describing ONE conversion, so the route's
-    # per-event Redis dedup does not stop them running concurrently on two API
+    # per-event ledger dedup does not stop them running concurrently on two API
     # workers. Both would load a user with first_paid_at NULL, both would decide
     # this is a fresh entitlement, and both would zero the counter — a free
     # bucket, and worse, a stale second commit can wipe usage consumed between

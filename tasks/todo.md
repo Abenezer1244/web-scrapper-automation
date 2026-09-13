@@ -53,15 +53,23 @@ Status: Phase 1 (backend) DONE and verified locally, not pushed. Phase 2 (fronte
   Phase 2). Chrome's 6 connections per host (HTTP/1.1) means 5 streams in ONE browser profile starve its other
   API calls locally; production protocol still unverified.
 
-## Proposed Phase 2 (frontend, 2-3 files) - NOT STARTED
-- [ ] Hook: 429 / reader end without terminal -> `isConnected=false`, "paused" state; backoff retry (e.g. 15s, 30s, 60s) only while job non-terminal; stop on terminal server status; handle `timeout`, `cancelled`.
-- [ ] Release stream when tab hidden > ~30s, reconnect on visible (replay dedup by log id already exists).
-- [ ] Copy: "Live updates paused. Your scrape is still running." + "Retry live updates". No em dashes.
-- [ ] Playwright: 1/5/6 tabs, reload x10, nav away/back, close tabs, mobile viewport, exact lease counts.
+## Phase 2 (frontend) - DONE, bridgeleads-web PR #132 (backend PR #297)
+- [x] Backend add-on (PR #297 `e269532`): CORS `expose_headers=["Retry-After"]`; the app could not read it cross-origin. Test + mutation check.
+- [x] Hook rewrite (`hooks/use-log-stream.ts`): states connecting/live/paused/failed/ended; one restart path + generation
+      counter; 429 or legacy 200 refusal -> paused, retry >= Retry-After with 15/30/60s backoff + jitter; terminal ends;
+      timeout / unterminated end reconnects; jobFinished stops retries, live stream swapped for a slot-free replay after 5s
+      (also armed on admission-before-finish); hidden 30s / pagehide releases, visible / pageshow resumes; events validated.
+- [x] UI: "Live updates paused. Your scrape is still running." + "Retry live updates" (stalled run: "Live updates paused.");
+      header indicators status only; one retry control. No em dashes.
+- [x] Codex: consult, then 4 review rounds (3 FAIL, all fixed) -> GATE PASS. Declined with evidence: 401 special path;
+      id-less log lines (backend `LogLine.id: str` required).
+- [x] Chromium E2E (P1-P12) all pass; focused checks: render once across 10 reloads, cancel-while-paused replay 3/3.
 
-## Not verified yet
-- Production edge HTTP/1.1 vs HTTP/2 (prod probe was not run).
-- WebKit / iOS background-foreground, real sleep/resume. Playwright `set_offline` did not drop localhost sockets (inconclusive).
+## Review (Phase 2)
+- Not verified: WebKit / iOS Safari (Playwright WebKit on Windows would not keep the local 127.0.0.1 auth session).
+- Not verified: production edge HTTP/1.1 vs HTTP/2.
+- ⏭️ After #297 merges: regenerate FE `lib/api-types.generated.ts` (route description changed; FE CI gate reads BE main).
+- ⏭️ Merge order: either is safe (FE handles old 200 refusal and new 429).
 
 ---
 

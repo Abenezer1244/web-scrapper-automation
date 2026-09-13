@@ -8,17 +8,22 @@ Owner approved all follow-ups, turning the Snohomish/Cowlitz restricted mailing 
 - [x] `COUNTY_GIS_RESTRICTED_MAILING_ENABLED=true` on worker + api (deploys 42aeeba1 / 267fe7ff SUCCESS); prod env reports Snohomish + Cowlitz as mailing sources; 0 rows created while the flag was off
 - [x] Snohomish Test 5 (job 425d49ce, 4 rows): county taxpayer mailing equals the stored value for all 4. No write: Snohomish GIS rows never carry `mailing_source`, so these are now indistinguishable from sourced rows and confirmed
 
-## Phase 1 (code, <= 4 files)
-- [ ] A. Backfill candidates skip rows whose latitude/longitude are JSON null or empty (same rule as the live hook), so the 15 unlocatable rows stop being revisited
-- [ ] B. Auto skip trace does not enqueue code_violation leads whose complaint status is `Completed` or `Open Duplicate` (log a count, row stays `not_attempted`, like the placeholder gate)
-- [ ] Tests for A and B; Codex consult before, review after; CI; merge; deploy
+## Phase 1 (#288 `2f1cb5c`)
+- [x] A. `no_coordinates` terminal kc_pin_status (Codex: a SQL filter still loops on junk strings); 15 prod rows stamped, backfill converged to 0
+- [x] B. Auto skip trace skips code_violation `Completed` / `Open Duplicate`; `Closed` still traced
 
-## Phase 2 (script + prod run)
-- [ ] C. `scripts/king_taxbill_mailing_verify.py`: King's live tax bill for (1) 149 situs-echo rows the extract could not answer (90 ambiguous / 57 absent / 2 no_address) and (2) 124 matched code-violation PINs with no extract answer (89 absent / 35 ambiguous). Uses `batch_enrich_king_county` (shared source lease, identity gate, circuit breaker) at a gentle pace. Guarded writes on done jobs: echo row found -> replace (or confirm) with `mailing_source=king_tax_bill`; CV row found -> fill. `none`/error -> unchanged. Dry-run first
-- [ ] D. Results page UI check with Playwright (owner supplied a login; never stored)
+## Phase 2 (#289 `2945ebd`, #291 `345ee16`)
+- [x] Found: the King tax-bill parser kept 2 lines, so 3-line addresses lost city/state/ZIP. `parse_mailing_block` (real state code or Canadian postal required)
+- [x] Code-violation party names use " - " (King + Pierce); 1,836 existing rows rewritten (all strong parcel|address identity)
+- [x] Truncation repair from the Assessor extract: 3,511 rows written, 0 guard skips
+- [x] `scripts/king_taxbill_mailing_check.py` (renamed from the plan's `_verify`): 2 runs, 209 rows written (146 echo, 30 truncated, 33 cv); live spot-check 3/3
+- [x] D. Results page UI check (owner login, never stored): 44/50 page-1 rows show mailing, 0 stuck Pending
 
 ## Review
-(pending)
+- King code violations with mailing: 1,265 -> 1,298 of 1,782. Situs echoes left: 3 of 149. Unsourced King mailings without a postal code: 112 of 48,094, almost all county placeholders ("ADDRESS UNKNOWN").
+- Remaining tax-bill unknowns are real non-answers: 91 cv parcels have no tax account; 104 truncated rows show a placeholder on the county's own bill.
+- Environment, not code: the harness killed the first tax-bill run's Playwright driver for low memory (nothing written); reran detached. Locally the shared King lease failed open (`redis.railway.internal` unresolvable); reran through the public Redis URL so the lease was really shared.
+- Codex: every design consult and diff review ran; all P1s reconciled before build, diff gates PASS, P2s fixed.
 
 ---
 

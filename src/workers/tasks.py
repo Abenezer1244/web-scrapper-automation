@@ -1345,6 +1345,9 @@ def run_scrape_job(self, job_id: str) -> None:
         # the worker — which is what the previous thread guard was
         # actually relying on anyway.
         _publish_log(r, job_id, "info", "Looking up property and mailing addresses...", db=db)
+        # Skip trace is enqueued only after a completed enrichment, and only after
+        # the plan cap below (never for a row that will not be delivered).
+        _enrichment_ok = False
         try:
             # `enrich_summary` lets this line tell the truth. It used to announce
             # "Enrichment complete" unconditionally, so a job that looked up 0 of
@@ -1354,6 +1357,7 @@ def run_scrape_job(self, job_id: str) -> None:
             # difference between "scrape failed" and "some enrichment is pending".
             enrich_summary: dict = {}
             _run_inline_enrichment(db, job, r, job_id, config, summary=enrich_summary)
+            _enrichment_ok = True
             _pending_mail = int(enrich_summary.get("mailing_deferred") or 0)
             if _pending_mail:
                 _publish_log(
@@ -1753,6 +1757,22 @@ def run_scrape_job(self, job_id: str) -> None:
                 .order_by(Result.party_name, Result.date_recorded, Result.id)
                 .execution_options(populate_existing=True)
             ).scalars().all()
+
+        # ── SKIP TRACE ENQUEUE (after the plan cap) ──────────────────────────
+        # Rows the cap marked over_quota fail actionable_condition(), so they are
+        # never queued for a paid lookup. Before the re-export so free cache hits
+        # still land in the delivered file (same identity-mapped Result objects as
+        # `refreshed`). Non-fatal: a delivered job must not fail on skip trace.
+        if _enrichment_ok:
+            # Commit first so the rollback below can only ever discard the
+            # enqueue's own writes, never earlier job work. A savepoint would not
+            # help: the enqueue commits internally.
+            db.commit()
+            try:
+                _enqueue_skip_trace_rows(db, job, r, job_id, config)
+            except Exception as exc:
+                db.rollback()
+                _logger.warning("Job %s: skip trace enqueue failed: %s", job_id, str(exc)[:160])
 
         # Re-export CSV with enriched data — only if the refetch succeeded.
         if refreshed is not None:

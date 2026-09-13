@@ -1015,17 +1015,10 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             no_parcel_no_legal, has_parcel, legal_no_parcel,
         )
 
-    # ── Sprint 4: skip trace enqueue ─────────────────────────────────────
-    # Only runs if:
-    #   1. SKIP_TRACE_ENABLED globally (env flag)
-    #   2. The user's scraper config has skip_trace_enabled=True
-    #   3. The user's plan permits skip trace (Starter blocked)
-    #   4. TRACERFY_API_TOKEN is configured
-    # Matching records are either hydrated from skip_trace_cache (free)
-    # or inserted into pending_skip_trace_rows for the dispatcher to
-    # submit in a batch. Actual Tracerfy calls happen in the dispatcher;
-    # this step is instant and never blocks scrape completion.
-    _enqueue_skip_trace_rows(db, job, r, job_id, config)
+    # Skip trace is NOT enqueued here. It used to be, which queued paid Tracerfy
+    # lookups before the plan cap had marked which rows are over quota, so leads
+    # that were never delivered were still traced and paid for. run_scrape_job
+    # now calls _enqueue_skip_trace_rows after the cap (see tasks.py).
 
 
 def pierce_address_recovery(db, r, job_id: str, config, all_results) -> None:
@@ -1193,9 +1186,15 @@ def pierce_address_recovery(db, r, job_id: str, config, all_results) -> None:
 def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     """Enqueue eligible Result rows into pending_skip_trace_rows.
 
-    Runs at the end of _run_inline_enrichment, after GIS + county
-    assessor + post-enrichment cleanup. Only records that survived the
-    cleanup (have a property_address) are eligible.
+    Called by run_scrape_job AFTER enrichment AND the plan cap, so the
+    actionable_condition() below already excludes rows the cap marked
+    over_quota: a lead that will not be delivered is never traced. Only
+    records with a property_address are eligible.
+
+    Runs only if SKIP_TRACE_ENABLED, TRACERFY_API_TOKEN is set, the config has
+    skip_trace_enabled and the plan is not Starter. Cache hits are copied onto
+    the row for free; misses are queued for the dispatcher, which makes the
+    actual (paid) Tracerfy calls.
     """
     # Local imports — sa_select must be imported here because the module-
     # level import is scoped inside _run_inline_enrichment, not globally

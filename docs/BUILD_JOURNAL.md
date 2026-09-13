@@ -19,6 +19,64 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-13 - Snohomish tax leads: dark every August to December, and reading an April file
+
+> **Provenance:** file measurements, parser runs against the two live county files, test
+> counts and both Codex gates were read back in-session. Production state (connector health,
+> stored rows) was NOT read: the read-only prod query was denied by the permission classifier.
+
+**Built / Shipped (branch `fix/tax-cap-delinquency-age`, not yet merged):**
+- `src/api/tax_filters.py`: `tax_cap_min_year` floors at `today.year - 1`. The calendar math
+  alone returned the CURRENT year from Aug 1, and a full tax roll only calls PRIOR years
+  delinquent, so every Snohomish parcel was capped out Aug 1 to Dec 31 and the scrape raised.
+- `src/scrapers/snohomish_wa_tax_delinquent.py`: link regex accepts the host-pinned absolute
+  href; the selector raises instead of returning the field-description twin; majority as-of
+  DATE plus a staleness guard (62 days old / 2 days future); whole-file as-of check compares
+  dates not years; post-parse checks moved verbatim into pure `_validate_parsed`;
+  `date_recorded = None` (no fabricated January 1st, same as King #210).
+- Tests: every day of 2026 and 2028 for the floor, current landing-page shape, twin-only page,
+  foreign host, stale/future as-of, same-year splice, validation on real parser output.
+
+**Tried / Decided:**
+- Codex design consult picked option A (May 1 anchor + floor). Only the floor shipped: moving
+  the `months_delinquent` anchor to May 1 also shifts King's displayed months, so it is a
+  separate Phase 1b needing owner sign-off.
+- Rejected inferring current-year first-half delinquency: in September 244,457 parcels show
+  owed exactly half the levy with nothing paid, so the columns cannot separate "first half
+  unpaid" from "second half billed". Current year stays excluded.
+- Codex P1 "use Pacific time for the cap year" not adopted: 8 surfaces share a UTC `today` by
+  a stated parity invariant; with the floor the only effect is the intended Jan 1 roll-forward
+  up to 8 hours early, a loud failure, never silent data.
+
+**Failed / Blocked:**
+- Every project venv (and `bl-testenv/venv-bump`) points at a removed Anaconda; the Python 3.13
+  install is broken. Built `bl-testenv/venv-taxcap` from system Python 3.11 (CI uses 3.12).
+- 7 `test_plan_entitlement_audit` tests fail locally on UNMODIFIED main too (env, not this
+  change). One full-suite run was killed for low memory while another session ran pytest.
+
+**Caught & fixed:**
+- The page moved the data link to an absolute URL; the relative-only regex saw only the twin
+  (doc 148137, as-of 04/21/2026, 17 fields) and the fallback returned it. Proven: old code
+  resolves 148137 and yields 0 parcels on both files; fixed code resolves 151113 and yields
+  1,751 parcels, and the April file raises stale.
+- Codex r1 P2 same-year splice passed the freshness guard; P3 guard untested through the
+  scraper path. Codex r2 P3 warning mislabelled date drift as year drift. All fixed; both
+  gates PASS, Codex edited nothing (git status before/after).
+
+**Pending / Handoff:**
+- Merge, deploy, then let the canary re-probe (do not hand-flip health). Stored Snohomish rows
+  with bill_year 2025 become visible again automatically (the cap is query-time).
+- Between Jan 1 and the county's first new-year file the scrape fails loudly (0 parcels):
+  intended, not widened.
+- Phase 1b (May 1 anchor), Phase 2 (NTS silent-empty health, connector-health ordering),
+  Phase 3 (Tracerfy dispatched for over-quota rows) await approval. The mailing-source
+  license question is with the owner.
+
+**Facts learned:**
+- As-of is the file's publish date and is identical on every valid row (326,308 and 328,069).
+- Current file: parcels by oldest unpaid year 2024 = 1,110, 2025 = 1,751.
+- Both files stay live side by side and ids rotate (`_36`, `_41`): never trust "the only link".
+
 ## 2026-09-09 — a rollback nulled a column, and that quietly killed a whole recovery branch
 
 > **Provenance:** commit SHAs, CI results, the production timestamps and the browser

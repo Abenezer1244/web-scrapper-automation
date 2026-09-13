@@ -107,12 +107,21 @@ def tax_cap_min_year(today: date) -> int:
     """Oldest `delinquent_bill_year` still visible under the 18-month cap.
 
     Reuses bill_year_bounds_for_months (the same math the optional months filter
-    uses) so the hard cap and the user filter can never drift. `max_months` is
-    always passed, so the returned min_year is never None.
+    uses), then FLOORS the result at last year: the most recent completed tax year
+    is never capped out.
+
+    Why the floor: the source only has a tax YEAR, and a full tax roll can only
+    call a year delinquent once it is a PRIOR year (Snohomish excludes the current
+    year). With the calendar math alone, from August the minimum year became the
+    current year, so every Snohomish parcel was capped out and the connector
+    returned nothing from Aug 1 to Dec 31 each year. With year-only data, "oldest
+    unpaid year is last year" is the closest honest reading of 18 months: last
+    year's first half went delinquent on May 1 (RCW 84.56.020), so it is at most
+    about 20 months old on December 31. Older years stay capped as before.
     """
     _, min_year = bill_year_bounds_for_months(None, DEFAULT_TAX_CAP_MONTHS, today)
     assert min_year is not None  # max_months is always supplied above
-    return min_year
+    return min(min_year, today.year - 1)
 
 
 def tax_cap_condition(today: date):

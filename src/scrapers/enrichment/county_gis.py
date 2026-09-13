@@ -651,6 +651,12 @@ def batch_enrich_parcels_gis(
                     merged["mailing_address"] = (
                         county_row.get("mailing_address") or sw_row.get("mailing_address")
                     )
+                    # Same parcel, so the county's own situs parts stay valid wherever
+                    # the statewide row has none (Codex P2): replacing the row wholesale
+                    # dropped a city/ZIP the county had already published.
+                    for key in ("property_city", "property_state", "property_zip"):
+                        if not merged.get(key) and county_row.get(key):
+                            merged[key] = county_row[key]
                     results[pid] = merged
                 else:
                     results[pid] = sw_row
@@ -680,23 +686,32 @@ def _callers_for(pid: object, clean_to_originals: dict[str, list[str]]) -> list[
     did something worse — it invented a caller id nobody requested and filed a real
     owner's mailing address under it.
 
-    Match on the raw string first, then on a leading-zero-insensitive form. A feature
-    that still corresponds to no requested id is dropped, never guessed at.
+    Match on the raw string first, then on a dash- and leading-zero-insensitive form.
+    The county path keys its requests dashless while the statewide path can key them
+    dashed (Kitsap), so a layer echoing "602543-087-0" for "6025430870", or the
+    reverse, still resolves (Codex P2). A feature that still corresponds to no
+    requested id is dropped, never guessed at.
     """
     raw = str(pid).strip()
     exact = clean_to_originals.get(raw)
     if exact:
         return exact
-    loose = raw.lstrip("0")
+
+    def _loose(value: str) -> str:
+        return value.replace("-", "").strip().lstrip("0")
+
+    loose = _loose(raw)
     if loose:
-        hits = [
-            originals for clean, originals in clean_to_originals.items()
-            if clean.lstrip("0") == loose
-        ]
-        # Only when exactly ONE requested id collapses to this form. If a chunk holds
-        # both "0123456" and "123456" they are different parcels that share a loose
-        # key, and picking either would put one owner's mailing address on the other's
-        # property. Ambiguity resolves to "drop", never to a guess.
+        # Distinct caller lists, not keys: Kitsap queries two dashed spellings of ONE
+        # caller's parcel, and those must not read as two competing parcels.
+        hits: list[list[str]] = []
+        for clean, originals in clean_to_originals.items():
+            if _loose(clean) == loose and originals not in hits:
+                hits.append(originals)
+        # Only when exactly ONE requested parcel collapses to this form. If a chunk
+        # holds both "0123456" and "123456" they are different parcels that share a
+        # loose key, and picking either would put one owner's mailing address on the
+        # other's property. Ambiguity resolves to "drop", never to a guess.
         if len(hits) == 1:
             return hits[0]
         if len(hits) > 1:

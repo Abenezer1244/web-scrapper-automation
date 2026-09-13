@@ -388,3 +388,55 @@ class TestSingleParcelKeepsCountyMailing:
         )
         out = cg.enrich_parcel_gis(None, "cowlitz", "WA", owner_name="FOYEN VERLINDA")
         assert out["mailing_address"] is None
+
+
+# ─── Codex gate on the rebased branch (2026-09-12) ───────────────────────────
+
+def test_a_dashed_echo_resolves_to_the_dashless_request():
+    assert _callers_for("602543-087-0", {"6025430870": ["602543-087-0"]}) == ["602543-087-0"]
+
+
+def test_two_dashed_spellings_of_one_callers_parcel_are_not_ambiguous():
+    """Kitsap's statewide query sends two dashed formats for ONE caller parcel."""
+    keys = {"012302-2-005-2007": ["01230220052007"], "0123-022-005-2007": ["01230220052007"]}
+    assert _callers_for("12302220052007", keys) == []  # different digits: no match
+    assert _callers_for("01230220052007", keys) == ["01230220052007"]
+
+
+def test_a_dash_insensitive_match_across_different_parcels_still_drops():
+    keys = {"0123456": ["0123456"], "12-3456": ["12-3456"]}
+    assert _callers_for("123456", keys) == []
+
+
+def test_statewide_top_up_keeps_the_county_situs_parts_it_lacks(monkeypatch):
+    from src.scrapers.enrichment import county_gis as cg
+
+    mail = "PO BOX 961089, FORT WORTH, TX 76161-0089"
+    monkeypatch.setattr(cg, "_batch_query_county", lambda pids, cfg: {
+        "08931001": {"property_address": None, "mailing_address": mail,
+                     "property_city": "LONGVIEW", "property_state": "WA",
+                     "property_zip": "98632", "needs_situs_fallback": True},
+    })
+    monkeypatch.setattr(cg, "_batch_query_wa_statewide", lambda pids, county: {
+        "08931001": {"property_address": "3738 PENNSYLVANIA ST", "mailing_address": None,
+                     "property_city": None, "property_state": "WA", "property_zip": None},
+    })
+    out = cg.batch_enrich_parcels_gis(["08931001"], "cowlitz", "WA")["08931001"]
+    assert out["property_address"] == "3738 PENNSYLVANIA ST"
+    assert out["mailing_address"] == mail
+    assert (out["property_city"], out["property_zip"]) == ("LONGVIEW", "98632")
+    assert "needs_situs_fallback" not in out
+
+
+async def test_parcel_wrapper_keeps_a_mailing_only_gis_answer(monkeypatch):
+    from src.scrapers.enrichment import county_gis as cg
+    from src.scrapers.enrichment import parcel as p
+
+    monkeypatch.setattr(p, "_source_down", {})
+    monkeypatch.setattr(cg, "enrich_parcel_gis", lambda *a, **kw: {
+        "property_address": None, "mailing_address": "22801 64TH PL W, MOUNTLAKE TERRACE, WA 98043"})
+    from src.config import settings
+    monkeypatch.setattr(settings, "GIS_ENRICHMENT_ENABLED", True, raising=False)
+    out = await p.enrich_parcel("00522400008900", "snohomish", "WA")
+    assert out["mailing_address"] == "22801 64TH PL W, MOUNTLAKE TERRACE, WA 98043"
+    assert out["property_address"] is None

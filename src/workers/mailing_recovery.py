@@ -273,7 +273,9 @@ def _recover_impl(stats: dict, deadline: float | None = None) -> dict:
                     for p in _hits
                 }, stats)
                 parcels = [p for p in parcels if p not in set(_hits)]
-                stats["extract_found"] = len(_hits)
+                # Extract hits are terminal "found" answers, so charging them the one
+                # attempt they used is harmless: they never retry.
+                stats["extract_found"] = stats.get("extract_found", 0) + len(_hits)
                 _logger.info("Mailing recovery: %d parcel(s) answered by the King extract (%s)",
                              len(_hits), _snapshot)
             if not parcels:
@@ -403,14 +405,15 @@ def _apply(db, by_parcel: dict, parcels: list[str], enriched: dict, stats: dict)
             # or when we have asked enough times. Anything else stays eligible.
             terminal = outcome in ("found", "none") or attempts >= _MAX_ATTEMPTS
             _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats,
-                       source=data.get("source") if mailing else None)
+                       source=data.get("source") if mailing else None,
+                       snapshot=data.get("snapshot") if mailing else None)
 
         stats[{"found": "found", "none": "none",
                "identity_unverified": "unverified"}.get(outcome, "errors")] += 1
 
 
 def _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats,
-               source: str | None = None) -> None:
+               source: str | None = None, snapshot: str | None = None) -> None:
     """Conditional single-row write. Never overwrites, never widens its blast radius.
 
     The guard is the WHERE clause, not a read-then-write: this tick's lookup began
@@ -437,6 +440,8 @@ def _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats,
         # Provenance: a value from the Assessor extract must stay distinguishable
         # from a tax-bill page answer (the extract is a dated snapshot).
         payload["mailing_source"] = source
+        if snapshot:
+            payload["mailing_rpacct_snapshot"] = snapshot
     # The owner-location flags are derived from the mailing address, and the job's
     # own recompute (tasks.py) ran while it was still NULL. Without this a recovered
     # absentee owner never reaches the absentee / out-of-state filters. Computed only

@@ -33,6 +33,7 @@ import os
 import re
 import tempfile
 import time
+import uuid
 import zipfile
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
@@ -84,6 +85,16 @@ def download_extract(dest: Path, timeout: int = 300) -> str:
 # plenty, and a job must never pay an 18 MB download per run.
 _CACHE_DIR = Path(tempfile.gettempdir()) / "bridgeleads_king_rpacct"
 _CACHE_MAX_AGE_S = 24 * 3600
+# A failed refresh may keep using the file on disk, but not forever: past two weekly
+# releases the snapshot is too old to present as the owner's current mailing address,
+# and the per-parcel pages are the better answer (Codex P1).
+_STALE_LIMIT_S = 14 * 24 * 3600
+
+
+def _reraise_time_limit(exc: BaseException) -> None:
+    """Celery's SoftTimeLimitExceeded subclasses Exception; a catch-all must not eat it."""
+    if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+        raise exc
 
 
 def cached_extract(max_age_s: float = _CACHE_MAX_AGE_S) -> tuple[Path, str] | None:
@@ -95,22 +106,41 @@ def cached_extract(max_age_s: float = _CACHE_MAX_AGE_S) -> tuple[Path, str] | No
     """
     zip_path = _CACHE_DIR / "rpacct.zip"
     meta_path = _CACHE_DIR / "snapshot.json"
-    fresh = zip_path.exists() and (time.time() - zip_path.stat().st_mtime) < max_age_s
-    if not fresh:
+
+    def _age() -> float | None:
+        try:
+            return time.time() - zip_path.stat().st_mtime
+        except OSError:
+            return None
+
+    age = _age()
+    if age is None or age >= max_age_s:
+        # Unique per attempt (not per PID): threads in one process must not share it.
+        tmp = _CACHE_DIR / f"rpacct.{os.getpid()}.{uuid.uuid4().hex}.part"
+        meta_tmp = tmp.with_suffix(".json")
         try:
             _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            # Download beside the target and rename: two workers refreshing at once
-            # must never leave a half-written zip for a third to read.
-            tmp = _CACHE_DIR / f"rpacct.{os.getpid()}.part"
             snapshot = download_extract(tmp)
+            # Metadata first, then the zip, each by atomic rename, so a reader never
+            # sees a half-written file. A reader racing the pair can at worst label a
+            # new zip with the previous date for one lookup, never a corrupt answer.
+            meta_tmp.write_text(json.dumps({"snapshot": snapshot}), encoding="utf-8")
+            os.replace(meta_tmp, meta_path)
             os.replace(tmp, zip_path)
-            meta_path.write_text(json.dumps({"snapshot": snapshot}), encoding="utf-8")
         except Exception as exc:  # noqa: BLE001 -- enrichment falls back to the pages
+            _reraise_time_limit(exc)
             _logger.warning("King RPAcct refresh failed: %s", str(exc)[:160])
-            if not zip_path.exists():
-                return None
+            for leftover in (tmp, meta_tmp):
+                try:
+                    leftover.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        age = _age()
+        if age is None or age >= _STALE_LIMIT_S:
+            return None
     try:
-        snapshot = json.loads(meta_path.read_text(encoding="utf-8")).get("snapshot", "unknown")
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        snapshot = str(meta.get("snapshot") or "unknown") if isinstance(meta, dict) else "unknown"
     except (OSError, ValueError):
         snapshot = "unknown"
     return zip_path, snapshot
@@ -125,6 +155,7 @@ def resolve_pins(pins: set[str]) -> tuple[dict[str, Answer], str] | None:
     try:
         accounts = load_accounts(zip_path, pins)
     except Exception as exc:  # noqa: BLE001 -- a bad file must not break enrichment
+        _reraise_time_limit(exc)
         _logger.warning("King RPAcct read failed: %s", str(exc)[:160])
         return None
     return {pin: resolve(accounts.get(pin)) for pin in pins}, snapshot

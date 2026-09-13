@@ -324,7 +324,7 @@ class TestCachedExtract:
         cache.mkdir()
         z = cache / "rpacct.zip"
         z.write_bytes(_extract(tmp_path, []).read_bytes())
-        old = time.time() - 3 * 24 * 3600
+        old = time.time() - 3 * 24 * 3600  # stale but inside the 14-day limit
         os.utime(z, (old, old))
         monkeypatch.setattr(mod, "_CACHE_DIR", cache)
 
@@ -414,6 +414,7 @@ async def test_recovery_takes_the_extract_answer_and_never_asks_the_page(
     assert row.mailing_address == "2736 ROSECLIFF TERRACE, GRAPEVINE, TX 76051"
     assert row.enrichment_data["mailing_source"] == "king_rpacct"
     assert row.enrichment_data["mailing_recovery_outcome"] == "found"
+    assert row.enrichment_data["mailing_rpacct_snapshot"] == "2026-09-05"
 
 
 @pytest.mark.asyncio
@@ -461,3 +462,42 @@ async def test_a_live_king_job_skips_the_tax_bill_page_for_extract_answered_parc
     assert page_mailing_asked == ["9999900001"]
     assert (await db.execute(text("SELECT mailing_address FROM results WHERE id = :i"),
                              {"i": answered})).scalar() == "2736 ROSECLIFF TERRACE, GRAPEVINE, TX 76051"
+
+
+
+def test_a_file_older_than_the_stale_limit_is_not_used(monkeypatch, tmp_path):
+    import os
+    import time
+
+    from src.scrapers.enrichment import king_rpacct as mod
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    z = cache / "rpacct.zip"
+    z.write_bytes(_extract(tmp_path, []).read_bytes())
+    old = time.time() - 30 * 24 * 3600
+    os.utime(z, (old, old))
+    monkeypatch.setattr(mod, "_CACHE_DIR", cache)
+
+    def _fail(*a, **kw):
+        raise RuntimeError("county site down")
+
+    monkeypatch.setattr(mod, "download_extract", _fail)
+    assert _REAL_CACHED_EXTRACT() is None
+    assert not list(cache.glob("*.part"))
+
+
+def test_a_soft_time_limit_is_never_swallowed(monkeypatch, tmp_path):
+    from src.scrapers.enrichment import king_rpacct as mod
+
+    class SoftTimeLimitExceeded(Exception):
+        pass
+
+    monkeypatch.setattr(mod, "_CACHE_DIR", tmp_path / "c")
+
+    def _limit(*a, **kw):
+        raise SoftTimeLimitExceeded()
+
+    monkeypatch.setattr(mod, "download_extract", _limit)
+    with pytest.raises(SoftTimeLimitExceeded):
+        _REAL_CACHED_EXTRACT()

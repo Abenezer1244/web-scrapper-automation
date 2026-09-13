@@ -412,15 +412,18 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
     not a duplicate, not excluded by the plan cap, and its job billed or reached
     'done'. Billing and the done-CAS commit together, so a billed job delivered
     its file whatever status was written over it later (Codex review round 6);
-    'done' alone still counts for jobs that predate the billing stamp.
+    'done' alone still counts for jobs that predate the billing stamp, and so
+    does a failed or cancelled job created before BILLING_STAMP_RELIABLE_SINCE:
+    it may have charged and delivered without a stamp (Codex review round 8).
     Rows are queued just before the enriched re-export and billing, so a job can
     still fail after queueing them (a failed upload, a failed refetch), and the
     flags can still change (a watchdog re-run repeats the survivor election and
     the cap). Paying Tracerfy for any of those buys contact data nobody receives.
 
-    - buy now: billed or done job, non-duplicate, not over quota.
-    - withdraw: the job failed or was cancelled without billing, or the lead is
-      a duplicate or over quota. Never charged.
+    - buy now: billed, done, or pre-stamp terminal job; non-duplicate, not over
+      quota.
+    - withdraw: the job failed or was cancelled without billing after billing
+      was stamped, or the lead is a duplicate or over quota. Never charged.
     - left for later (neither list): the job is still running, the Result row is
       locked by a writer right now, or it no longer exists (its pending row is
       CASCADE-deleted with it). Nothing is decided on a value that is changing.
@@ -443,11 +446,12 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
 
     from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
     from src.db.models import Job, Result
+    from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
 
     # Tenant-paired like every other write from this cross-tenant head.
     state = {
-        (str(rid), str(uid)): (is_dup, excluded, status, billed)
-        for rid, uid, is_dup, excluded, status, billed in db.execute(
+        (str(rid), str(uid)): (is_dup, excluded, status, billed, stamped)
+        for rid, uid, is_dup, excluded, status, billed, stamped in db.execute(
             select(
                 Result.id,
                 Result.user_id,
@@ -459,6 +463,7 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
                 ) == OVER_QUOTA,
                 Job.status,
                 Job.billing_applied_at.is_not(None),
+                Job.created_at >= BILLING_STAMP_RELIABLE_SINCE,
             )
             .join(Job, Job.id == Result.job_id)
             .where(
@@ -477,10 +482,11 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
         if seen is None:
             later += 1
             continue
-        is_dup, excluded, status, billed = seen
-        if is_dup or excluded or (status in ("failed", "cancelled") and not billed):
+        is_dup, excluded, status, billed, stamped = seen
+        terminal = status in ("failed", "cancelled")
+        if is_dup or excluded or (terminal and not billed and stamped):
             drop.append(r)
-        elif billed or status == "done":
+        elif billed or status == "done" or terminal:
             keep.append(r)
         else:
             later += 1

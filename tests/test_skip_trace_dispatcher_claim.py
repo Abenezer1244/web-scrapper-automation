@@ -21,7 +21,7 @@ from src.workers.skip_trace_dispatcher import dispatch_pending_skip_trace
 def _seed_pending(
     user_id: str, *, status: str = "queued", submitted_at=None,
     is_duplicate: bool = False, enrichment_data: str = "{}", job_status: str = "done",
-    billed: bool = False,
+    billed: bool = False, created_at=None,
 ) -> tuple[str, str]:
     """scraper_config → job → result (skip_trace_status='queued') → pending row."""
     sc_id, job_id, result_id, pending_id = (str(uuid.uuid4()) for _ in range(4))
@@ -41,12 +41,13 @@ def _seed_pending(
             text("""
                 INSERT INTO jobs (id, user_id, scraper_config_id, status, trigger,
                                   page_current, page_total, record_count, retry_count,
-                                  billing_applied_at)
+                                  billing_applied_at, created_at)
                 VALUES (:job_id, :user_id, :sc_id, :job_status, 'manual', 0, 0, 0, 0,
-                        CASE WHEN :billed THEN now() END)
+                        CASE WHEN :billed THEN now() END,
+                        COALESCE(CAST(:created_at AS timestamptz), now()))
             """),
             {"job_id": job_id, "user_id": user_id, "sc_id": sc_id, "job_status": job_status,
-             "billed": billed},
+             "billed": billed, "created_at": created_at},
         )
         db.execute(
             text("""
@@ -303,6 +304,27 @@ async def test_a_job_that_billed_before_it_was_marked_terminal_still_buys_its_lo
     withdraw what they bought (Codex review round 6). The row goes through the
     claim path; the fake endpoint's definite rejection marks it errored."""
     pending_id, result_id = _seed_pending(starter_user.id, job_status=job_status, billed=True)
+
+    out = dispatch_pending_skip_trace()
+
+    assert any("HTTPS" in e for e in out["errors"])
+    assert _pending_state(pending_id)[0] == "errored"
+    assert _result_status(result_id) == "errored"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job_status", ["failed", "cancelled"])
+async def test_a_job_from_before_billing_was_stamped_still_buys_its_lookups(
+    starter_user, _dispatcher_enabled, job_status
+):
+    """Before migration 063 a job could charge and deliver and still end failed or
+    cancelled with no stamp, so NULL proves nothing: its lookups are bought, as
+    they were before the withdrawal existed (Codex review round 8)."""
+    from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
+
+    pending_id, result_id = _seed_pending(
+        starter_user.id, job_status=job_status,
+        created_at=BILLING_STAMP_RELIABLE_SINCE - timedelta(days=1))
 
     out = dispatch_pending_skip_trace()
 

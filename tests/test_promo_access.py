@@ -816,6 +816,7 @@ async def test_a_handler_row_lock_is_not_bound_by_the_event_lock_timeout(
 
     async def _spy(event_type, data, session):
         captured.append((await session.execute(text("SHOW lock_timeout"))).scalar())
+        return []  # no post-commit notifications
 
     monkeypatch.setattr(b, "_dispatch_stripe_event", _spy)
     monkeypatch.setattr(settings, "STRIPE_WEBHOOK_SECRET", _WEBHOOK_SECRET)
@@ -1123,8 +1124,10 @@ async def test_dunning_starts_from_a_new_api_version_invoice_and_recovery_clears
     _stripe_now(monkeypatch, b, invoice_status="open", subscription_status="past_due")
     uid = (await _dunning_customer(db)).id
 
-    await b._handle_payment_failed(_renewal_invoice(), db)
+    notifications = await b._handle_payment_failed(_renewal_invoice(), db)
     await db.commit()
+    for notify in notifications:
+        notify()
     user = await _reload(db, uid)
     assert user.subscription_status == "past_due"
     assert user.entitlement_grace_ends_at is not None
@@ -1151,8 +1154,10 @@ async def test_a_late_failure_for_a_since_paid_invoice_changes_nothing_and_says_
     _stripe_now(monkeypatch, b, invoice_status="paid", subscription_status="active")
     uid = (await _dunning_customer(db)).id
 
-    await b._handle_payment_failed(_renewal_invoice(), db)
+    notifications = await b._handle_payment_failed(_renewal_invoice(), db)
     await db.commit()
+    for notify in notifications:
+        notify()
 
     user = await _reload(db, uid)
     assert user.subscription_status == "active"
@@ -1167,8 +1172,10 @@ async def test_an_unpaid_subscription_records_unpaid_not_past_due(db, monkeypatc
     _stripe_now(monkeypatch, b, invoice_status="open", subscription_status="unpaid")
     uid = (await _dunning_customer(db)).id
 
-    await b._handle_payment_failed(_renewal_invoice(), db)
+    notifications = await b._handle_payment_failed(_renewal_invoice(), db)
     await db.commit()
+    for notify in notifications:
+        notify()
 
     user = await _reload(db, uid)
     assert user.subscription_status == "unpaid"
@@ -1189,8 +1196,10 @@ async def test_a_failure_off_the_recorded_subscription_notifies_but_never_freeze
     reads = _stripe_now(monkeypatch, b, invoice_status="open", subscription_status="past_due")
     uid = (await _dunning_customer(db)).id
 
-    await b._handle_payment_failed(_renewal_invoice(parent=parent), db)
+    notifications = await b._handle_payment_failed(_renewal_invoice(parent=parent), db)
     await db.commit()
+    for notify in notifications:
+        notify()
 
     user = await _reload(db, uid)
     assert user.subscription_status == "active"
@@ -1236,6 +1245,54 @@ async def test_a_failure_stripe_cannot_confirm_is_retried_not_recorded(
     )
     assert retry.status_code == 200, retry.text
     assert tuple(await _ledger_row(db, event_id)) == ("invoice.payment_failed",)
+    assert (await _reload(db, uid)).entitlement_grace_ends_at is not None
+
+
+def _ledger_committed(event_id: str) -> bool:
+    """Whether the event's ledger row is visible to another connection, i.e. committed."""
+    from src.db.session import SyncSessionLocal
+
+    with SyncSessionLocal() as other:
+        return other.execute(
+            text("SELECT 1 FROM stripe_webhook_events WHERE event_id = :e"), {"e": event_id}
+        ).first() is not None
+
+
+@pytest.mark.asyncio
+async def test_failure_notices_go_out_only_after_the_webhook_commits(client, db, monkeypatch):
+    """Sent inside the transaction, a commit that then failed left an email that
+    Stripe's retry sent a second time. And an email outage must not also swallow
+    the in-app notice queued after it."""
+    import src.workers.delivery as delivery
+    import src.workers.tasks as worker_tasks
+
+    b = _billing()
+    monkeypatch.setattr(settings, "STRIPE_WEBHOOK_SECRET", _WEBHOOK_SECRET)
+    _stripe_now(monkeypatch, b, invoice_status="open", subscription_status="past_due")
+    uid = (await _dunning_customer(db)).id
+    event_id = f"evt_{uuid.uuid4().hex}"
+    committed_at_send: list = []
+
+    def _email_provider_down(email, n):
+        committed_at_send.append(("email", _ledger_committed(event_id)))
+        raise RuntimeError("email provider unavailable")
+
+    monkeypatch.setattr(delivery, "_send_payment_failed_email", _email_provider_down)
+    monkeypatch.setattr(
+        worker_tasks.emit_payment_notification, "delay",
+        lambda user_id, n: committed_at_send.append(("in_app", _ledger_committed(event_id))),
+    )
+    payload, sig = _signed({
+        "id": event_id, "object": "event", "type": "invoice.payment_failed",
+        "data": {"object": _renewal_invoice()},
+    })
+
+    resp = await client.post(
+        "/billing/webhook", content=payload, headers={"stripe-signature": sig}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert committed_at_send == [("email", True), ("in_app", True)]
     assert (await _reload(db, uid)).entitlement_grace_ends_at is not None
 
 

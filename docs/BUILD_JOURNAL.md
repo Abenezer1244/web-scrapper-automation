@@ -41,6 +41,42 @@ Dropped a planned email-masking change: `setup_logger` already redacts emails.
 
 **Pending / Handoff:** claim sandbox `acct_1UF5cBIoeMQyAQ5z` by 2026-09-20 for the 3-month test-clock run.
 
+## 2026-09-13 - King mailing follow-ups: a 2-line tax-bill parser, 3,511 truncated addresses, em dashes
+
+**Built / Shipped:** #288 `2f1cb5c` (coordinate-less code violations get a terminal
+`no_coordinates` status; auto skip trace skips SDCI `Completed` / `Open Duplicate`). #289 `2945ebd`
+(`parse_mailing_block`: the King tax-bill parser kept at most two lines and stopped only at a line
+STARTING with "Pay by", so 3-line addresses lost city/state/ZIP; code-violation party names use
+" - "). #291 `345ee16` (truncation pass in `king_rpacct_mailing.py`, `king_taxbill_mailing_check.py`,
+`repair_code_violation_party_name_dash.py`). `COUNTY_GIS_RESTRICTED_MAILING_ENABLED=true` on worker
+and api (owner: legal cleared), overriding #284's hold.
+
+**Applied to prod (owner approved):** 1,836 party names rewritten; 3,511 truncated King mailings
+replaced from the Assessor extract (0 guard skips); tax-bill check 2 runs, 209 rows written (146
+situs echoes, 30 truncations, 33 code violations). Live spot-check 3/3 against rendered tax bills;
+one "echo" was really a hidden absentee billed at 88 S HUDSON ST. UI check of the King
+code-violation Results page with the owner's login: 44/50 page-1 rows show mailing, 0 Pending.
+
+**Tried / Decided:** Plan A first filtered null coordinates in SQL; Codex showed junk strings would
+still loop, so `locate()` returns a terminal status instead. Snohomish "Test 5": county GIS mailing
+equals the stored value for all 4 rows, so nothing was written. The party-name rewrite was checked
+first: all 1,836 rows use the parcel|address dedup key (the 3 weak rows had no em dash).
+
+**Failed / Blocked:** the first tax-bill run died when the harness killed its Playwright driver for
+low memory (phase 1 done, nothing written); a detached `Start-Process` run finished. Locally the
+King source lease failed OPEN ("Error 11001 connecting to redis.railway.internal ... admitting"):
+a local run would not have coordinated with prod workers. Rerun through a scratch wrapper that
+points REDIS_URL at the Redis service's REDIS_PUBLIC_URL (lease verified visible). One extract
+dry-run hit a prod statement timeout; the retry passed.
+
+**Pending / Handoff:** 91 code-violation parcels have no King tax account; 104 truncated rows carry
+a county placeholder ("ADDRESS UNKNOWN", "UNKOWN") on the county's own bill; 3 echoes unanswered.
+Placeholder mailings are stored as if they were addresses; clearing them is a product decision.
+
+**Facts learned:** the tax-bill page sometimes renders the mailing block after the 4 s settle
+wait, so a second run answered 46 more echoes. `railway run` injects the private Redis host, which
+does not resolve off Railway; anything using SourceAdmission locally must use the public URL.
+
 ## 2026-09-13 - FOUNDING25 was never enterable, and three webhooks trusted stale state
 
 **Built / Shipped:** PR #285: `scripts/stripe_founding_code_and_webhook_events.py`; run LIVE with owner approval,

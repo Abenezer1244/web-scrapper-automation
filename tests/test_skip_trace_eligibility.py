@@ -58,6 +58,11 @@ class TestNonPersonalGate:
         "Land Use ? 12 PINE ST",
         "Noise complaint",
         "Derelict vehicle ? 5 ELM RD",
+        # The code-violation scrapers' own format since 2026-09-13 (SDCI / Pierce labels
+        # with no prefix keyword of their own).
+        "Complaint - 2908 E HARRISON ST",
+        "Emergency , LandLord/Tenant - 3652 WHITMAN AVE N",
+        "Nuisance Vehicle - 1300 E MERCER ST",
         # The party name IS a bare street address.
         "419 21ST AVE",
         "1819 HARVARD AVE",

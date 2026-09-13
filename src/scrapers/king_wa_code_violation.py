@@ -217,7 +217,9 @@ class KingWACodeViolationScraper(BridgeScraper):
                     or item.get("recordtype")
                     or "Code Violation"
                 ).strip()[:_LABEL_MAX]
-                record.party_name = f"{label} — {addr}" if addr else label
+                # Plain hyphen: party_name is shown to customers, and a " - <number>"
+                # separator is what skip-trace eligibility reads as a case description.
+                record.party_name = f"{label} - {addr}" if addr else label
 
                 # Legal description — record number
                 record.legal_description = rec_num

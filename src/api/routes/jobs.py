@@ -486,6 +486,15 @@ async def get_results(
         )
         enrichment_task_finished = skip_result.scalar_one() > 0
 
+    # A terminal job cannot still be enriching: inline enrichment runs before the job
+    # leaves `enriching`. Matching log text alone missed every completion line added
+    # later ("Address enrichment partly complete...", "Address enrichment failed..."),
+    # so a job with deferred mailing lookups reported enriching=true forever and the
+    # results page polled every 5 seconds indefinitely. Background mailing recovery is
+    # surfaced per row (enrichment_data.mailing_lookup_deferred), not by this flag.
+    if job.status in {"done", "failed", "cancelled"}:
+        enrichment_task_finished = True
+
     enriching = parcel_count > 0 and not enrichment_task_finished
 
     # Total scraped (including duplicates) and duplicate count — both scoped to

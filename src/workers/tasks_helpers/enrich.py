@@ -275,7 +275,14 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
     ]
     if results_need_addr:
         _publish_log(r, job_id, "info", f"Looking up {len(results_need_addr)} property addresses...", db=db)
-        from src.scrapers.enrichment.county_gis import batch_enrich_parcels_gis
+        from src.scrapers.enrichment.county_gis import (
+            batch_enrich_parcels_gis,
+            has_gis_mailing_source,
+        )
+        # Only a county whose own layer publishes mailing can have its mailing lookup
+        # "not happen". Everywhere else there was never a lookup to defer.
+        gis_mailing_source = has_gis_mailing_source(config.county, config.state)
+        gis_mailing_deferred = 0
         parcel_map: dict[str, list] = {}
         for res in results_need_addr:
             pid = res.parcel_id.strip()
@@ -292,8 +299,14 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
         commit_failures = 0
         for i in range(0, len(all_pids), _GIS_COMMIT_BATCH):
             batch_pids = all_pids[i:i + _GIS_COMMIT_BATCH]
-            gis_results = batch_enrich_parcels_gis(batch_pids, config.county, config.state)
+            gis_stats: dict = {}
+            gis_results = batch_enrich_parcels_gis(
+                batch_pids, config.county, config.state, stats=gis_stats
+            )
             batch_updated = 0
+            # Parcels, not rows: one lookup serves every lead on a parcel, and the
+            # King summary counts parcels too (Codex P2).
+            batch_deferred: set[str] = set()
             for pid, gis_data in gis_results.items():
                 prop = gis_data.get("property_address")
                 mail = gis_data.get("mailing_address")
@@ -342,6 +355,22 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                             if _v and not getattr(res, _col, None):
                                 setattr(res, _col, str(_v).strip()[:_w])
                         batch_updated += 1
+            if gis_mailing_source:
+                # The county request for these parcels failed (HTTP error, timeout,
+                # ArcGIS error body), so their mailing lookup never happened. Without a
+                # marker they read exactly like "the county has no mailing address"
+                # and nothing ever asks again. Mark them for the background recovery
+                # sweep, the same contract King's deferral uses. Fill-only: a row that
+                # already has a mailing address is left alone.
+                for pid in gis_stats.get("county_unreached", []):
+                    for res in parcel_map.get(pid, []):
+                        if res.mailing_address:
+                            continue
+                        ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+                        if ed.get("mailing_lookup_deferred") is not True:
+                            ed["mailing_lookup_deferred"] = True
+                            res.enrichment_data = ed
+                            batch_deferred.add(pid)
             try:
                 db.commit()
             except Exception as exc:
@@ -359,7 +388,34 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                     "Job %s: GIS batch commit failed at %d/%d: %s",
                     job_id, i, len(all_pids), str(exc)[:120],
                 )
+                if gis_mailing_source:
+                    # The rollback discarded this batch's mailing fills AND any
+                    # deferral markers, so none of its rows got the mailing answer
+                    # the lookup produced. Leave a marker-only write behind so the
+                    # recovery sweep asks again; without it they read as "no address"
+                    # forever (Codex P1). Counted only once it is actually stored.
+                    batch_deferred = set()
+                    try:
+                        for pid in batch_pids:
+                            for res in parcel_map.get(pid, []):
+                                if res.mailing_address:
+                                    continue
+                                ed = (dict(res.enrichment_data)
+                                      if isinstance(res.enrichment_data, dict) else {})
+                                if ed.get("mailing_lookup_deferred") is not True:
+                                    ed["mailing_lookup_deferred"] = True
+                                    res.enrichment_data = ed
+                                    batch_deferred.add(pid)
+                        db.commit()
+                        gis_mailing_deferred += len(batch_deferred)
+                    except Exception as mark_exc:
+                        db.rollback()
+                        _logger.warning(
+                            "Job %s: deferral markers after a failed GIS commit were "
+                            "not stored either: %s", job_id, str(mark_exc)[:120],
+                        )
                 continue
+            gis_mailing_deferred += len(batch_deferred)
             rows_updated += batch_updated
             _publish_log(
                 r, job_id, "info",
@@ -367,6 +423,15 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 f"/{len(all_pids)} parcels ({rows_updated} rows updated)",
                 db=db,
             )
+        if gis_mailing_deferred:
+            _logger.warning(
+                "Job %s: county GIS unreachable for %d row(s); mailing deferred to recovery",
+                job_id, gis_mailing_deferred,
+            )
+            if summary is not None:
+                summary["mailing_deferred"] = (
+                    int(summary.get("mailing_deferred") or 0) + gis_mailing_deferred
+                )
         if commit_failures:
             _logger.warning(
                 "Job %s: GIS sweep finished with %d batch commit failure(s) — some "

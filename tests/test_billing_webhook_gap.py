@@ -28,15 +28,16 @@ def test_alert_billing_gap_logs_error_and_never_raises(caplog):
 
 
 @pytest.mark.asyncio
-async def test_subscription_updated_unmapped_price_is_surfaced(caplog):
-    # The unmapped-price branch returns BEFORE touching the DB, so db is unused on
-    # this path — passing None exercises exactly the early-return we hardened.
+async def test_subscription_updated_unmapped_price_is_surfaced(caplog, db):
+    # A real session: the handler takes the user's row lock before anything else
+    # (so a slow Stripe re-read cannot overwrite a newer delivery). No user owns
+    # cus_TEST, and the event has no id, so nothing is re-read or written.
     event = {
         "customer": "cus_TEST",
         "items": {"data": [{"price": {"id": "price_NOT_IN_MAP"}}]},
     }
     with caplog.at_level(logging.ERROR):
-        await _handle_subscription_updated(event, db=None)  # db unused on this path
+        await _handle_subscription_updated(event, db)
     assert any(
         "price not in plan map" in r.getMessage() for r in caplog.records
     ), "an unmapped subscription price must be logged loudly, not silently dropped"

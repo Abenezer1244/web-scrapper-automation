@@ -16,7 +16,6 @@ from src.api.billing_entitlement import (
     apply_plan_change,
     end_subscription,
     mark_payment_failed,
-    mark_payment_succeeded,
 )
 from src.api.deps import get_rls_db
 from src.api.middleware import client_ip, rate_limit
@@ -1685,7 +1684,9 @@ async def stripe_webhook(
       - customer.subscription.updated   → upgrades / downgrades / cancellation
       - customer.subscription.deleted   → downgrade to starter
       - invoice.payment_failed          → start the dunning grace + notify
-      - invoice.payment_succeeded       → lift the dunning freeze
+
+    Recovery from dunning arrives as customer.subscription.updated (past_due ->
+    active); invoice.payment_succeeded is deliberately not handled.
 
     NOTE what these handlers deliberately do NOT do: advance a quota window.
     Record quota rolls on the user's entitlement anniversary, lazily, inside the
@@ -1823,6 +1824,7 @@ _WEBHOOK_LOCK_TIMEOUT = "15s"
 _LOCK_NOT_AVAILABLE = "55P03"
 
 _ENTITLED_CHECKOUT_STATUSES = ("active", "trialing")
+_DUNNING_SUBSCRIPTION_STATUSES = ("past_due", "unpaid")
 
 
 async def _dispatch_stripe_event(event_type: str, data: dict, db: AsyncSession) -> None:
@@ -1846,9 +1848,6 @@ async def _dispatch_stripe_event(event_type: str, data: dict, db: AsyncSession) 
 
     elif event_type == "invoice.payment_failed":
         await _handle_payment_failed(data, db)
-
-    elif event_type == "invoice.payment_succeeded":
-        await _handle_payment_succeeded(data, db)
 
 
 # ─── Webhook handlers ─────────────────────────────────────────────────────────
@@ -2093,6 +2092,17 @@ async def _handle_subscription_updated(
     if not customer_id:
         return
 
+    # FOR UPDATE — see _handle_checkout_completed: this handler can also perform
+    # the one-time conversion reset, so it must serialise against the checkout
+    # handler for the same user. Taken BEFORE the re-read below: locked after
+    # it, a slow read of an older state could win the lock second and overwrite
+    # the newer state another delivery had just written. Locked first, the
+    # handler that writes last is also the one that asked Stripe last. (Codex)
+    result = await db.execute(
+        select(User).where(User.stripe_customer_id == customer_id).with_for_update()
+    )
+    user = result.scalar_one_or_none()
+
     subscription_id = data.get("id")
     if subscription_id:
         try:
@@ -2171,13 +2181,6 @@ async def _handle_subscription_updated(
                 )
                 break
 
-    # FOR UPDATE — see _handle_checkout_completed: this handler can also perform
-    # the one-time conversion reset, so it must serialise against the checkout
-    # handler for the same user.
-    result = await db.execute(
-        select(User).where(User.stripe_customer_id == customer_id).with_for_update()
-    )
-    user = result.scalar_one_or_none()
     if user is None:
         # A real plan change for a customer we can't resolve to a user — lost
         # silently before. Loud warning (no ops page: often a benign unknown
@@ -2202,7 +2205,7 @@ async def _handle_subscription_updated(
     # plan must not be adopted as the account's subscription, or its later
     # payment failure or expiry would freeze or downgrade a paying customer.
     dunning_on_plan_already_paid_for = (
-        data.get("status") in ("past_due", "unpaid")
+        data.get("status") in _DUNNING_SUBSCRIPTION_STATUSES
         and user.stripe_subscription_id is None
         and user.first_paid_at is not None
         and normalize_plan(user.plan) == normalize_plan(plan_name)
@@ -2292,7 +2295,13 @@ async def _handle_subscription_deleted(data: dict, db: AsyncSession) -> None:
     if not customer_id:
         return
 
-    result = await db.execute(select(User).where(User.stripe_customer_id == customer_id))
+    # Locked BEFORE Stripe is asked for a survivor, for the same reason as in
+    # _handle_subscription_updated: a user loaded unlocked here could be
+    # overwritten with stale state after a concurrent update committed, and
+    # a live payer downgraded. (Codex)
+    result = await db.execute(
+        select(User).where(User.stripe_customer_id == customer_id).with_for_update()
+    )
     user = result.scalar_one_or_none()
     if user:
         # Which subscription ended matters. Cancelling one of two live
@@ -2362,7 +2371,19 @@ def _invoice_subscription_id(invoice: dict) -> str | None:
 
 
 async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:
-    """Send a payment failure notification email via Resend."""
+    """Start dunning if Stripe says the subscription is in it NOW, and notify.
+
+    Judged on Stripe's CURRENT state, never on the event body. Stripe retries a
+    webhook for three days and does not order deliveries, so a failure for an
+    invoice that has since been paid can arrive after the recovery was already
+    applied; trusted as-is it would re-freeze a paying customer and email them
+    about a payment that went through. Both reads happen under the user's row
+    lock, so a concurrent ``customer.subscription.updated`` cannot interleave.
+
+    Deliberately narrow: this handler only ever starts the grace and records a
+    dunning status. It never changes the plan, the limits or the window, and it
+    never clears dunning; ``customer.subscription.updated`` owns recovery.
+    """
     customer_id = data.get("customer")
 
     # REDTEAM B3: clamp the webhook-supplied attempt_count before it flows
@@ -2378,10 +2399,21 @@ async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:
     if not customer_id:
         return
 
-    result = await db.execute(select(User).where(User.stripe_customer_id == customer_id))
+    result = await db.execute(
+        select(User).where(User.stripe_customer_id == customer_id).with_for_update()
+    )
     user = result.scalar_one_or_none()
     if not user:
         return
+
+    # A failed read raises: no ledger row is written and Stripe retries, which
+    # beats acting on a body that may describe the past. An invoice event with
+    # no id cannot be checked against Stripe at all, so it raises too rather
+    # than notifying or freezing on trust.
+    invoice_id = data.get("id")
+    if not invoice_id:
+        raise ValueError("invoice.payment_failed event carries no invoice id")
+    invoice_status = stripe.Invoice.retrieve(invoice_id).get("status")
 
     # P7: start the dunning grace. Until it expires the customer is served
     # normally (Stripe's retries span days, and freezing someone whose card
@@ -2390,21 +2422,36 @@ async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:
     # advancing, so an unpaid subscription cannot accrue a fresh bucket every
     # month. Nothing is deleted; results and past exports stay available.
     #
-    # Only a SUBSCRIPTION invoice may do this. Skip-trace overage is billed on
-    # its own metered invoice, and letting one of those failures mark the
-    # subscription past_due would freeze a customer who is paying for the plan
-    # perfectly well.
+    # Only the RECORDED subscription, and only while Stripe itself has it in
+    # dunning. Following the subscription's status rather than the individual
+    # invoice is the product rule: Stripe's retry settings decide when a
+    # subscription is past_due, so a failed skip-trace overage charge on an
+    # otherwise healthy subscription does not freeze the plan on its own.
     invoice_sub = _invoice_subscription_id(data)
-    if invoice_sub and user.stripe_subscription_id and (
-        invoice_sub == user.stripe_subscription_id
-    ):
-        grace_until = mark_payment_failed(user)
-        user.subscription_status = "past_due"
-        await db.flush()
+    if invoice_sub and invoice_sub == user.stripe_subscription_id:
+        status = stripe.Subscription.retrieve(invoice_sub).get("status")
+        if status in _DUNNING_SUBSCRIPTION_STATUSES:
+            grace_until = mark_payment_failed(user)
+            user.subscription_status = status
+            await db.flush()
+            _logger.info(
+                "invoice.payment_failed: user %s (%s) served until %s, then frozen",
+                user.id, status, grace_until.isoformat(),
+            )
+        else:
+            _logger.info(
+                "invoice.payment_failed: subscription %s for user %s is %s now; "
+                "dunning not started", invoice_sub, user.id, status,
+            )
+
+    if invoice_status != "open":
+        # Paid, voided or written off since the attempt failed: telling the
+        # customer their payment failed would be wrong.
         _logger.info(
-            "invoice.payment_failed: user %s served until %s, then frozen",
-            user.id, grace_until.isoformat(),
+            "invoice.payment_failed: invoice %s is %s now; no notification sent",
+            invoice_id, invoice_status,
         )
+        return
 
     # Send notification — imported here to avoid circular at startup
     from src.workers.delivery import _send_payment_failed_email
@@ -2417,48 +2464,3 @@ async def _handle_payment_failed(data: dict, db: AsyncSession) -> None:
         emit_payment_notification.delay(str(user.id), attempt_count)
     except Exception as exc:  # enqueue failure must not fail the webhook
         _logger.warning("payment notification enqueue failed (non-fatal): %s", exc)
-
-
-async def _handle_payment_succeeded(data: dict, db: AsyncSession) -> None:
-    """Payment recovered, or a renewal invoice was paid.
-
-    Previously unhandled, which meant nothing in the system ever observed a
-    renewal. It is handled now — but note carefully what it does NOT do: it does
-    not reset the counter and it does not advance the entitlement window.
-
-    Making payment the trigger for fresh quota is the obvious design and the
-    wrong one. Stripe retries for three days and can deliver out of order, so a
-    late delivery would strand a renewed payer at cap while a replay would hand
-    them a second bucket. The window advances on its own, lazily, from the
-    anchor — so a webhook that never arrives at all cannot cost a paying
-    customer their month.
-
-    What this DOES do is lift the dunning freeze from P7. The advance is then
-    automatic: the next quota operation (or the hourly reconciliation) sees a
-    window that ended while the account was frozen and rolls it forward to the
-    window containing now — exactly one bucket, never one per frozen month.
-    """
-    customer_id = data.get("customer")
-    if not customer_id:
-        return
-
-    result = await db.execute(select(User).where(User.stripe_customer_id == customer_id))
-    user = result.scalar_one_or_none()
-    if not user:
-        return
-
-    # Only a SUBSCRIPTION invoice clears dunning. A paid skip-trace overage
-    # invoice says nothing about whether the plan itself is being paid for.
-    invoice_sub = _invoice_subscription_id(data)
-    if not (invoice_sub and user.stripe_subscription_id
-            and invoice_sub == user.stripe_subscription_id):
-        return
-
-    was_frozen = user.entitlement_grace_ends_at is not None
-    mark_payment_succeeded(user, status="active")
-    await db.flush()
-    if was_frozen:
-        _logger.info(
-            "invoice.payment_succeeded: user %s recovered — dunning freeze lifted",
-            user.id,
-        )

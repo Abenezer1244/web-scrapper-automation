@@ -336,26 +336,3 @@ def end_subscription(user: User, *, now: datetime | None = None) -> None:
     _clear_dunning(user)
     user.pending_plan = None
     user.pending_records_limit = None
-
-
-def mark_payment_succeeded(
-    user: User, *, status: str | None = None, now: datetime | None = None
-) -> None:
-    """Payment recovered, or a renewal invoice was paid.
-
-    Deliberately does NOT reset the counter or advance the window. Renewal is
-    observed, not acted on: making payment the trigger for fresh quota would
-    strand a renewed payer at cap behind a late webhook and would hand out a
-    second bucket on a replay. The window advances on its own schedule, lazily,
-    from the anchor — which is why a missing ``invoice.payment_succeeded`` can
-    never cost a paying customer their month.
-
-    What it DOES do is lift the dunning freeze, and advancing is then automatic:
-    the next quota operation (or the hourly reconciliation) sees a window that
-    ended while frozen and rolls it to the window containing now — exactly one
-    bucket, never one per frozen month.
-    """
-    now = as_utc(now or datetime.now(UTC))
-    _clear_dunning(user)
-    if status:
-        user.subscription_status = status

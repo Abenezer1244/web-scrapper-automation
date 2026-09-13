@@ -105,3 +105,43 @@ without idempotency key (pre-existing; ops alert added); change-plan vs. operato
       `_handle_payment_failed` (writes `past_due` without a re-read).
 - [ ] 3-month test-clock run: owner has NOT claimed sandbox `acct_1UF5cBIoeMQyAQ5z` yet (deadline 2026-09-20).
 - [ ] After 2026-09-16: remove the Redis cutover dual-read.
+
+### Phase 4 (owner-approved, DONE on `fix/stripe-webhook-ordering`): harden invoice + subscription webhook ordering
+Codex design consult on the first draft ("invoice events delegate to _handle_subscription_updated"): FAIL, adopted:
+delegation drags in plan changes, first-observer quota reset, scraper reconciliation and alerts; and the row lock is
+taken AFTER the Stripe re-read, so a slow stale read can still overwrite a newer one. That last point is ALSO true of
+the live `customer.subscription.updated` path today.
+
+Decision: dunning follows the subscription's CURRENT Stripe status (Stripe's own retry/dunning settings decide
+past_due), not "any unpaid invoice". `invoice.payment_succeeded` stays disabled; recovery is owned by
+`customer.subscription.updated`.
+
+- [x] 1. `_handle_subscription_updated`: take `User ... FOR UPDATE` BEFORE the Stripe re-read, so the last writer
+      always holds the newest read (fixes the live stale-overwrite race). No behaviour change otherwise.
+- [x] 2. `_handle_payment_failed`: lock user first, then re-read the subscription and the invoice from Stripe (a
+      failed read raises: no ledger row, Stripe retries). Start grace + `past_due` only if the invoice's subscription
+      is the recorded one AND is currently past_due/unpaid. Never changes plan, limits, window, reconciliation or
+      alerts. Send the failure email/in-app notice only if the invoice is still `open` (a stale failure for a since
+      paid/void/uncollectible invoice is silent). Non-subscription invoices: email as today, no state change.
+- [x] 3. Remove `_handle_payment_succeeded` and its dispatch branch (never ran in prod; if the event is ever enabled
+      by accident it is ignored). `mark_payment_succeeded` removed only if nothing but its own tests uses it.
+- [x] 4. Tests `tests/test_billing_invoice_webhooks.py` (real test DB; only Stripe reads patched): stale failure while
+      sub now active = no grace, no email; failure while past_due = grace; invoice now paid = no email; Stripe read
+      failure raises with no state change and no ledger row; non-subscription invoice = email, no state; unrecorded
+      subscription = nothing; ordering test proving the lock precedes the re-read. Update `test_notification_payment.py`.
+- [x] 5. Verify: billing test files in foreground batches on a `_test` DB (C:/v312 venv), ruff 0.15.6, Codex review
+      gate, security Master Review. PR; no live Stripe change needed.
+Known, accepted (pre-existing, P2): an email sent before a failed commit can repeat on Stripe's retry.
+
+#### Phase 4 review
+- Built as planned, plus two Codex gate adoptions: `_handle_subscription_deleted` also locks the user row before its
+  Stripe survivor lookup (same stale-write class, High), and an invoice event with no id raises instead of notifying
+  (Medium). Tests went into `tests/test_promo_access.py` (not a new file) to stay inside the per-phase file budget;
+  `tests/test_billing_webhook_gap.py` needed a real session because the handler now locks before its early return.
+- Deviation from the plan text: the "invoice still open" check applies to non-subscription invoices too (a stale
+  failure for a since-paid one-off invoice is also silent).
+- Evidence: mutation checks caught all 5 guards; billing files 103 passed; full `not integration` suite in 4 batches on
+  an isolated `_test` DB: 3,098 passed, 3 failed only in `test_session_refresh_contract.py`, which passes alone (7/7,
+  order/state dependent, untouched by this diff). ruff 0.15.6 clean. Codex gate FAIL -> reconciled -> delta PASS.
+- Deferred (Codex Medium, pre-existing module-wide): synchronous Stripe calls with default timeouts and the failure
+  email run while the user row lock is held. Follow-up: bounded Stripe timeouts + post-commit notification.

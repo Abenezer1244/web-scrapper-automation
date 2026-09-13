@@ -847,7 +847,7 @@ async def test_a_handler_row_lock_is_not_bound_by_the_event_lock_timeout(
     monkeypatch.setattr(settings, "STRIPE_WEBHOOK_SECRET", _WEBHOOK_SECRET)
 
     event = {"id": f"evt_{uuid.uuid4().hex}", "object": "event",
-             "type": "invoice.payment_succeeded", "data": {"object": {}}}
+             "type": "invoice.payment_failed", "data": {"object": {}}}
     payload, sig = _signed(event)
     resp = await client.post(
         "/billing/webhook", content=payload, headers={"stripe-signature": sig}
@@ -1085,35 +1085,255 @@ def test_the_invoice_subscription_is_read_on_old_and_new_api_versions():
     assert b._invoice_subscription_id({"parent": None}) is None
 
 
-@pytest.mark.asyncio
-async def test_dunning_starts_and_clears_from_a_new_api_version_invoice(db, monkeypatch):
-    """Month 4 is the promotion's first real charge. On an endpoint rendering
-    2025-03-31+ payloads there is no top-level invoice.subscription, and reading
-    only that field left a failed renewal with no grace and no freeze."""
-    b = _billing()
-    import src.workers.tasks as worker_tasks
-
-    monkeypatch.setattr(worker_tasks.emit_payment_notification, "delay", lambda *a, **k: None)
-    user = await _trial_user(
+async def _dunning_customer(db: AsyncSession) -> User:
+    """An Agency payer 95 days in: the promotion's first real charge is due."""
+    return await _trial_user(
         db, plan="agency", records_limit=-1, trial_ends_at=None,
         stripe_subscription_id="sub_promo", subscription_status="active",
         first_paid_at=datetime.now(UTC) - timedelta(days=95),
     )
-    uid = user.id
+
+
+def _renewal_invoice(**overrides) -> dict:
     invoice = {
         "id": "in_month4", "customer": "cus_promo", "attempt_count": 1,
         "parent": {"type": "subscription_details",
                    "subscription_details": {"subscription": "sub_promo"}},
     }
+    invoice.update(overrides)
+    return invoice
 
-    await b._handle_payment_failed(invoice, db)
+
+def _stripe_now(monkeypatch, b, *, invoice_status: str, subscription_status: str):
+    """Stripe's CURRENT answer for the invoice and subscription; returns the reads."""
+    reads: list = []
+
+    def _invoice(iid, **kw):
+        reads.append(("invoice", iid))
+        return {"id": iid, "status": invoice_status}
+
+    def _subscription(sid, **kw):
+        reads.append(("subscription", sid))
+        return _agency_subscription(status=subscription_status, sub_id=sid)
+
+    monkeypatch.setattr(b.stripe.Invoice, "retrieve", _invoice)
+    monkeypatch.setattr(b.stripe.Subscription, "retrieve", _subscription)
+    return reads
+
+
+def _capture_notifications(monkeypatch) -> list:
+    import src.workers.delivery as delivery
+    import src.workers.tasks as worker_tasks
+
+    sent: list = []
+    monkeypatch.setattr(
+        delivery, "_send_payment_failed_email", lambda email, n: sent.append(("email", n))
+    )
+    monkeypatch.setattr(
+        worker_tasks.emit_payment_notification, "delay",
+        lambda uid, n: sent.append(("in_app", n)),
+    )
+    return sent
+
+
+@pytest.mark.asyncio
+async def test_dunning_starts_from_a_new_api_version_invoice_and_recovery_clears_it(
+    db, monkeypatch
+):
+    """Month 4 is the promotion's first real charge. On an endpoint rendering
+    2025-03-31+ payloads there is no top-level invoice.subscription, and reading
+    only that field left a failed renewal with no grace and no freeze. Recovery
+    arrives as customer.subscription.updated, past_due -> active."""
+    b = _billing()
+    sent = _capture_notifications(monkeypatch)
+    _stripe_now(monkeypatch, b, invoice_status="open", subscription_status="past_due")
+    uid = (await _dunning_customer(db)).id
+
+    await b._handle_payment_failed(_renewal_invoice(), db)
     await db.commit()
     user = await _reload(db, uid)
     assert user.subscription_status == "past_due"
     assert user.entitlement_grace_ends_at is not None
+    assert sent == [("email", 1), ("in_app", 1)]
 
-    await b._handle_payment_succeeded(invoice, db)
+    _stripe_now(monkeypatch, b, invoice_status="paid", subscription_status="active")
+    await b._handle_subscription_updated({"id": "sub_promo", "customer": "cus_promo"}, db)
     await db.commit()
     user = await _reload(db, uid)
     assert user.subscription_status == "active"
     assert user.entitlement_grace_ends_at is None
+    assert user.plan == "agency" and user.records_limit == -1
+
+
+@pytest.mark.asyncio
+async def test_a_late_failure_for_a_since_paid_invoice_changes_nothing_and_says_nothing(
+    db, monkeypatch
+):
+    """Stripe does not order deliveries. The failure for retry 1 can land after
+    retry 2 succeeded and the recovery was applied; trusting its body re-froze a
+    paying customer and emailed them about a payment that went through."""
+    b = _billing()
+    sent = _capture_notifications(monkeypatch)
+    _stripe_now(monkeypatch, b, invoice_status="paid", subscription_status="active")
+    uid = (await _dunning_customer(db)).id
+
+    await b._handle_payment_failed(_renewal_invoice(), db)
+    await db.commit()
+
+    user = await _reload(db, uid)
+    assert user.subscription_status == "active"
+    assert user.entitlement_grace_ends_at is None
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_an_unpaid_subscription_records_unpaid_not_past_due(db, monkeypatch):
+    b = _billing()
+    _capture_notifications(monkeypatch)
+    _stripe_now(monkeypatch, b, invoice_status="open", subscription_status="unpaid")
+    uid = (await _dunning_customer(db)).id
+
+    await b._handle_payment_failed(_renewal_invoice(), db)
+    await db.commit()
+
+    user = await _reload(db, uid)
+    assert user.subscription_status == "unpaid"
+    assert user.entitlement_grace_ends_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent", [
+    None,
+    {"type": "subscription_details", "subscription_details": {"subscription": "sub_other"}},
+])
+async def test_a_failure_off_the_recorded_subscription_notifies_but_never_freezes(
+    db, monkeypatch, parent
+):
+    """A one-off invoice, or one for a subscription the account does not hold."""
+    b = _billing()
+    sent = _capture_notifications(monkeypatch)
+    reads = _stripe_now(monkeypatch, b, invoice_status="open", subscription_status="past_due")
+    uid = (await _dunning_customer(db)).id
+
+    await b._handle_payment_failed(_renewal_invoice(parent=parent), db)
+    await db.commit()
+
+    user = await _reload(db, uid)
+    assert user.subscription_status == "active"
+    assert user.entitlement_grace_ends_at is None
+    assert [r for r in reads if r[0] == "subscription"] == []
+    assert sent == [("email", 1), ("in_app", 1)]
+
+
+@pytest.mark.asyncio
+async def test_a_failure_stripe_cannot_confirm_is_retried_not_recorded(
+    client, db, monkeypatch
+):
+    b = _billing()
+    monkeypatch.setattr(settings, "STRIPE_WEBHOOK_SECRET", _WEBHOOK_SECRET)
+    sent = _capture_notifications(monkeypatch)
+    uid = (await _dunning_customer(db)).id
+    event_id = f"evt_{uuid.uuid4().hex}"
+    payload, sig = _signed({
+        "id": event_id, "object": "event", "type": "invoice.payment_failed",
+        "data": {"object": _renewal_invoice()},
+    })
+
+    def _stripe_down(iid, **kw):
+        raise b.stripe.error.APIConnectionError("connection reset")
+
+    monkeypatch.setattr(b.stripe.Invoice, "retrieve", _stripe_down)
+    try:
+        first = await client.post(
+            "/billing/webhook", content=payload, headers={"stripe-signature": sig}
+        )
+        assert first.status_code >= 500
+    except b.stripe.error.APIConnectionError:
+        pass  # the transport re-raised the app exception: also a failed delivery
+
+    assert await _ledger_row(db, event_id) is None, "an unconfirmed failure was recorded"
+    user = await _reload(db, uid)
+    assert user.entitlement_grace_ends_at is None and user.subscription_status == "active"
+    assert sent == []
+
+    _stripe_now(monkeypatch, b, invoice_status="open", subscription_status="past_due")
+    retry = await client.post(
+        "/billing/webhook", content=payload, headers={"stripe-signature": sig}
+    )
+    assert retry.status_code == 200, retry.text
+    assert tuple(await _ledger_row(db, event_id)) == ("invoice.payment_failed",)
+    assert (await _reload(db, uid)).entitlement_grace_ends_at is not None
+
+
+def _row_is_locked(user_id: str) -> bool:
+    """Whether another transaction holds this user's row lock, asked from outside."""
+    from sqlalchemy.exc import OperationalError
+
+    from src.db.session import SyncSessionLocal
+
+    with SyncSessionLocal() as other:
+        try:
+            other.execute(
+                text("SELECT 1 FROM users WHERE id = CAST(:u AS uuid) FOR UPDATE NOWAIT"),
+                {"u": str(user_id)},
+            )
+            return False
+        except OperationalError:
+            return True
+        finally:
+            other.rollback()
+
+
+@pytest.mark.asyncio
+async def test_a_failure_event_without_an_invoice_id_is_refused_not_trusted(db, monkeypatch):
+    b = _billing()
+    sent = _capture_notifications(monkeypatch)
+    reads = _stripe_now(monkeypatch, b, invoice_status="open", subscription_status="past_due")
+    uid = (await _dunning_customer(db)).id
+
+    with pytest.raises(ValueError):
+        await b._handle_payment_failed(_renewal_invoice(id=None), db)
+    await db.rollback()
+
+    user = await _reload(db, uid)
+    assert user.entitlement_grace_ends_at is None and user.subscription_status == "active"
+    assert reads == [] and sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event", ["subscription_updated", "subscription_deleted", "payment_failed"]
+)
+async def test_the_user_row_is_locked_before_stripe_is_asked(db, monkeypatch, event):
+    """Locked AFTER the read, a slow read of an older state could take the lock
+    second and overwrite what a newer delivery had just written."""
+    b = _billing()
+    _capture_notifications(monkeypatch)
+    uid = (await _dunning_customer(db)).id
+    locked_at_read: list = []
+
+    def _invoice(iid, **kw):
+        locked_at_read.append(_row_is_locked(uid))
+        return {"id": iid, "status": "open"}
+
+    def _subscription(sid, **kw):
+        locked_at_read.append(_row_is_locked(uid))
+        return _agency_subscription(status="past_due", sub_id=sid)
+
+    def _subscriptions(**kw):
+        locked_at_read.append(_row_is_locked(uid))
+        return _List([])
+
+    monkeypatch.setattr(b.stripe.Invoice, "retrieve", _invoice)
+    monkeypatch.setattr(b.stripe.Subscription, "retrieve", _subscription)
+    monkeypatch.setattr(b.stripe.Subscription, "list", _subscriptions)
+
+    if event == "payment_failed":
+        await b._handle_payment_failed(_renewal_invoice(), db)
+    elif event == "subscription_deleted":
+        await b._handle_subscription_deleted({"id": "sub_promo", "customer": "cus_promo"}, db)
+    else:
+        await b._handle_subscription_updated({"id": "sub_promo", "customer": "cus_promo"}, db)
+    await db.commit()
+
+    assert locked_at_read and all(locked_at_read), locked_at_read

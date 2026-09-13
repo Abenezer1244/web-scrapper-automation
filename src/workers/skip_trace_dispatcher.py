@@ -404,7 +404,8 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list]:
     election and the plan cap). A row whose Result is now a duplicate, or excluded
     by the plan cap, is never delivered or billed, so paying Tracerfy for it buys
     contact data nobody receives. This re-reads those two flags for the FIFO head
-    inside the same locked selection, before anything is claimed.
+    inside the same locked selection, before anything is claimed, and share-locks
+    the Result rows so neither flag can change until the claim is committed.
 
     A Result that no longer exists falls in the second bucket too: its pending row
     would only be CASCADE-deleted anyway, and a lookup for it could never be
@@ -432,6 +433,12 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list]:
                     Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
                 ) != OVER_QUOTA,
             )
+            # FOR SHARE, held until the claim commits (Codex). Without it a
+            # re-election or cap UPDATE could land between this read and the
+            # 'submitting' commit, and the stale answer would buy the lookup. With
+            # it that writer waits for the claim, and the only window left is the
+            # one after the claim, before the POST (accepted residual).
+            .with_for_update(read=True)
         ).all()
     }
     keep: list = []

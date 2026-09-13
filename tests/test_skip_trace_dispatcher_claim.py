@@ -240,3 +240,55 @@ async def test_withdrawal_does_not_hold_back_the_deliverable_rows_beside_it(
     assert _result_status(dup_result) == "not_attempted"
     assert _pending_state(live_pending)[0] == "errored"
     assert _result_status(live_result) == "errored"
+
+
+@pytest.mark.asyncio
+async def test_a_flag_written_while_the_dispatcher_reads_is_waited_for(
+    starter_user, _dispatcher_enabled
+):
+    """The race Codex found in the diff review. A re-election flags the row
+    duplicate in a transaction still open when the dispatcher re-checks. The
+    share lock makes the dispatcher wait for that commit and read the new flag,
+    instead of reading the old one and buying the lookup."""
+    import threading
+    import time
+
+    pending_id, result_id = _seed_pending(starter_user.id)
+
+    writer = system_sync_session().__enter__()
+    writer.execute(
+        text("UPDATE results SET is_duplicate = true WHERE id = :id"), {"id": result_id}
+    )  # uncommitted: holds the row lock
+
+    outcome: dict = {}
+
+    def _tick():
+        try:
+            outcome["out"] = dispatch_pending_skip_trace()
+        except BaseException as exc:  # surfaced by the assertion below
+            outcome["exc"] = exc
+
+    t = threading.Thread(target=_tick)
+    t.start()
+    try:
+        # Wait until the dispatcher is actually blocked on the row lock.
+        deadline = time.monotonic() + 20
+        blocked = False
+        while time.monotonic() < deadline and not blocked:
+            with system_sync_session() as probe:
+                blocked = bool(probe.execute(text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE wait_event_type = 'Lock' AND query ILIKE '%FROM results%FOR SHARE%'"
+                )).scalar())
+            if not blocked:
+                time.sleep(0.1)
+        assert blocked, "the dispatcher never waited for the open flag write"
+    finally:
+        writer.commit()
+        writer.close()
+        t.join(timeout=30)
+
+    assert "exc" not in outcome, outcome.get("exc")
+    assert outcome["out"] == {"submitted_batches": 0, "submitted_rows": 0, "errors": []}
+    assert _pending_state(pending_id)[0] == "cancelled"
+    assert _result_status(result_id) == "not_attempted"

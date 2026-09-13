@@ -137,6 +137,33 @@ def _alert_dedup_release_failed(job_id: str, user_id, context: str, exc: Excepti
         _logger.error("Job %s: dedup-release alert failed too: %s", job_id, str(alert_exc)[:160])
 
 
+def _release_claims_of_cancelled_job(db, job_id: str, user_id) -> None:
+    """Release every claim a job holds once it has been cancelled mid-run.
+
+    A cancelled run delivers nothing and bills nothing, yet the two paths that
+    notice a cancellation (the force-finalize guard before billing, and the
+    done-CAS losing to a cancel) returned with the job's claims still in place:
+    the ones its dedup step wrote and any it took over from an earlier run. Every
+    later run then hid those leads as "already delivered" with nothing ever
+    delivered. Same defect class as the post-crash cleanup fixed on 2026-09-08,
+    on the two exits that still had it (Codex).
+
+    ``user_id`` must be a plain value, for the reason in _alert_dedup_release_failed.
+    """
+    try:
+        db.execute(
+            sa_text(
+                "DELETE FROM delivered_records "
+                "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
+            ),
+            {"jid": job_id, "uid": str(user_id)},
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        _alert_dedup_release_failed(job_id, user_id, "cancelled", exc)
+
+
 def _upload_export_with_retry(exporter, local_file, object_key) -> tuple[bool, Exception | None]:
     """Upload an export to R2 with bounded retries. Never raises.
 
@@ -1941,6 +1968,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 "Job %s externally terminalized (%s) after export — skipping billing/delivery",
                 job_id, job.status,
             )
+            _release_claims_of_cancelled_job(db, job_id, _boot_user_id)
             return
 
         # Atomic update of monthly record usage.
@@ -2163,6 +2191,7 @@ def run_scrape_job(self, job_id: str) -> None:
             from src.workers.tasks_helpers.status import release_quota_reservation
 
             release_quota_reservation(db, job_id)
+            _release_claims_of_cancelled_job(db, job_id, _boot_user_id)
             _logger.info(
                 "Job %s externally terminalized (%s) — suppressing completion delivery",
                 job_id, job.status,

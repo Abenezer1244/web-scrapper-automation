@@ -893,92 +893,112 @@ def transfer_undelivered_claims(db, job_id: str, user_id, record_type=None) -> i
     transferred = 0
     # Sorted: a stable lock order across concurrent runs of the same user.
     for dedup_hash in sorted(groups):
-        members = groups[dedup_hash]
-        claim = db.execute(
-            sa_text(
-                "SELECT id, first_result_id, parcel_id, property_address "
-                "FROM delivered_records "
-                "WHERE user_id = CAST(:uid AS uuid) AND dedup_hash = :hash "
-                "FOR UPDATE"
-            ),
-            {"uid": uid, "hash": dedup_hash},
-        ).first()
-        if claim is None or claim.first_result_id is None:
+        try:
+            if _transfer_one_claim(db, job_id, uid, user_id, dedup_hash,
+                                   groups[dedup_hash], record_type):
+                transferred += 1
+        except Exception as exc:
+            # One hash's failure must not hide the claims already moved: each
+            # commits on its own, and the caller subtracts the returned count
+            # from the run's duplicate total. Rolled back, logged with the job and
+            # a hash prefix, and the remaining hashes still get their chance.
             db.rollback()
-            continue
-        if legacy_strong_signature(claim.parcel_id, claim.property_address) != dedup_hash:
-            db.rollback()
-            continue
-        anchor = db.execute(
-            sa_text(
-                "SELECT a.id, a.job_id, j.status, j.billing_applied_at, "
-                f"  {actionable_sql('a')} AS actionable "
-                "FROM results a JOIN jobs j ON j.id = a.job_id "
-                "WHERE a.id = CAST(:aid AS uuid) AND a.user_id = CAST(:uid AS uuid) "
-                "FOR UPDATE OF a"
-            ),
-            {"aid": str(claim.first_result_id), "uid": uid},
-        ).first()
-        if (
-            anchor is None
-            or str(anchor.job_id) == str(job_id)
-            or anchor.actionable
-            or not (
-                anchor.status in ("failed", "cancelled")
-                or (
-                    anchor.status == "done"
-                    and anchor.billing_applied_at is not None
-                    and anchor.billing_applied_at >= NO_ADDRESS_NOT_BILLED_SINCE
-                )
+            _logger.warning(
+                "Job %s: claim transfer failed for hash %s: %s",
+                job_id, dedup_hash[:12], str(exc)[:160],
             )
-        ):
-            db.rollback()
-            continue
-
-        elected = sorted(members, key=sort_key_for(record_type))[0]
-        others = [str(m.get("id")) for m in members if m is not elected]
-        params = {"uid": uid, "jid": job_id, "eid": str(elected.get("id"))}
-
-        db.execute(
-            sa_text(
-                "UPDATE delivered_records SET first_result_id = CAST(:eid AS uuid), "
-                "  first_job_id = :jid, first_delivered_at = clock_timestamp() "
-                "WHERE id = :cid"
-            ),
-            {**params, "cid": str(claim.id)},
-        )
-        db.execute(
-            sa_text(
-                "UPDATE results SET is_duplicate = false, duplicate_reason = NULL, "
-                "  duplicate_source_job_id = NULL, duplicate_source_at = NULL "
-                "WHERE id = CAST(:eid AS uuid) AND user_id = CAST(:uid AS uuid)"
-            ),
-            params,
-        )
-        if others:
-            # Same property, same run: exactly what the collapse makes of
-            # siblings, so they read "combined", not "already delivered".
-            db.execute(
-                sa_text(
-                    "UPDATE results SET duplicate_reason = 'same_run', "
-                    "  duplicate_source_job_id = :jid, duplicate_source_at = NULL "
-                    "WHERE id = ANY(CAST(:ids AS uuid[])) "
-                    "  AND user_id = CAST(:uid AS uuid)"
-                ),
-                {**params, "ids": others},
-            )
-            _apply_survivor_merge(
-                db, user_id, elected.get("id"),
-                _merged_survivor_fields(elected, members, record_type),
-            )
-        db.execute(
-            sa_text(
-                "UPDATE results SET is_duplicate = true, duplicate_reason = 'superseded', "
-                "  duplicate_source_job_id = :jid, duplicate_source_at = clock_timestamp() "
-                "WHERE id = CAST(:aid AS uuid) AND user_id = CAST(:uid AS uuid)"
-            ),
-            {**params, "aid": str(anchor.id)},
-        )
-        db.commit()
-        transferred += 1
     return transferred
+
+
+def _transfer_one_claim(db, job_id, uid, user_id, dedup_hash, members, record_type) -> bool:
+    """One hash of transfer_undelivered_claims, in its own transaction. Returns
+    True when the claim moved. Every condition is evaluated under the lock."""
+    from src.api.lead_actionability import actionable_sql
+
+    claim = db.execute(
+        sa_text(
+            "SELECT id, first_result_id, parcel_id, property_address "
+            "FROM delivered_records "
+            "WHERE user_id = CAST(:uid AS uuid) AND dedup_hash = :hash "
+            "FOR UPDATE"
+        ),
+        {"uid": uid, "hash": dedup_hash},
+    ).first()
+    if claim is None or claim.first_result_id is None:
+        db.rollback()
+        return False
+    if legacy_strong_signature(claim.parcel_id, claim.property_address) != dedup_hash:
+        db.rollback()
+        return False
+    anchor = db.execute(
+        sa_text(
+            "SELECT a.id, a.job_id, j.status, j.billing_applied_at, "
+            f"  {actionable_sql('a')} AS actionable "
+            "FROM results a JOIN jobs j ON j.id = a.job_id "
+            "WHERE a.id = CAST(:aid AS uuid) AND a.user_id = CAST(:uid AS uuid) "
+            "FOR UPDATE OF a"
+        ),
+        {"aid": str(claim.first_result_id), "uid": uid},
+    ).first()
+    if (
+        anchor is None
+        or str(anchor.job_id) == str(job_id)
+        or anchor.actionable
+        or not (
+            anchor.status in ("failed", "cancelled")
+            or (
+                anchor.status == "done"
+                and anchor.billing_applied_at is not None
+                and anchor.billing_applied_at >= NO_ADDRESS_NOT_BILLED_SINCE
+            )
+        )
+    ):
+        db.rollback()
+        return False
+
+    elected = sorted(members, key=sort_key_for(record_type))[0]
+    others = [str(m.get("id")) for m in members if m is not elected]
+    params = {"uid": uid, "jid": job_id, "eid": str(elected.get("id"))}
+
+    db.execute(
+        sa_text(
+            "UPDATE delivered_records SET first_result_id = CAST(:eid AS uuid), "
+            "  first_job_id = :jid, first_delivered_at = clock_timestamp() "
+            "WHERE id = :cid AND user_id = CAST(:uid AS uuid)"
+        ),
+        {**params, "cid": str(claim.id)},
+    )
+    db.execute(
+        sa_text(
+            "UPDATE results SET is_duplicate = false, duplicate_reason = NULL, "
+            "  duplicate_source_job_id = NULL, duplicate_source_at = NULL "
+            "WHERE id = CAST(:eid AS uuid) AND user_id = CAST(:uid AS uuid)"
+        ),
+        params,
+    )
+    if others:
+        # Same property, same run: exactly what the collapse makes of
+        # siblings, so they read "combined", not "already delivered".
+        db.execute(
+            sa_text(
+                "UPDATE results SET duplicate_reason = 'same_run', "
+                "  duplicate_source_job_id = :jid, duplicate_source_at = NULL "
+                "WHERE id = ANY(CAST(:ids AS uuid[])) "
+                "  AND user_id = CAST(:uid AS uuid)"
+            ),
+            {**params, "ids": others},
+        )
+        _apply_survivor_merge(
+            db, user_id, elected.get("id"),
+            _merged_survivor_fields(elected, members, record_type),
+        )
+    db.execute(
+        sa_text(
+            "UPDATE results SET is_duplicate = true, duplicate_reason = 'superseded', "
+            "  duplicate_source_job_id = :jid, duplicate_source_at = clock_timestamp() "
+            "WHERE id = CAST(:aid AS uuid) AND user_id = CAST(:uid AS uuid)"
+        ),
+        {**params, "aid": str(anchor.id)},
+    )
+    db.commit()
+    return True

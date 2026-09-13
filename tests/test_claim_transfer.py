@@ -400,3 +400,34 @@ async def test_two_runs_racing_for_one_claim_deliver_it_once(
     held = await _fresh(db, DeliveredRecord, claim)
     assert str(held.first_result_id) == shipped[0]
 
+
+
+async def test_a_run_cancelled_after_taking_a_claim_hands_it_back(
+    db, starter_user: User, scraper_config: ScraperConfig,
+):
+    """Force-finalize can cancel the run between the transfer and billing. That
+    run delivers nothing, so it must not keep the claim it took over, or every
+    later run hides the lead again. The earlier run's row stays superseded."""
+    from src.workers.tasks import _release_claims_of_cancelled_job
+
+    h, old_job, anchor, _ = await _setup_undelivered(db, starter_user, scraper_config)
+    other_hash = _strong("7003054290")
+    other_job = await _job(db, starter_user, scraper_config)
+    other_row = await _row(db, other_job, starter_user.id, other_hash, parcel_id="7003054290",
+                           property_address="12967 190TH AVE E")
+    other_claim = await _claim(db, starter_user.id, other_hash, other_row, other_job,
+                               parcel="7003054290", address="12967 190TH AVE E")
+    new_job, _row_id = await _found_again(db, starter_user, scraper_config, h, old_job)
+    assert await _transfer(db, new_job, starter_user.id) == 1
+
+    await db.run_sync(lambda s: _release_claims_of_cancelled_job(s, new_job, starter_user.id))
+    await db.commit()
+
+    held = (await db.execute(
+        select(func.count()).select_from(DeliveredRecord).where(
+            DeliveredRecord.user_id == starter_user.id, DeliveredRecord.dedup_hash == h)
+    )).scalar_one()
+    assert held == 0
+    assert (await _fresh(db, Result, anchor)).duplicate_reason == "superseded"
+    # Only the cancelled run's claims go.
+    assert (await _fresh(db, DeliveredRecord, other_claim)) is not None

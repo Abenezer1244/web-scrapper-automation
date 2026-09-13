@@ -39,6 +39,7 @@ _CANDIDATES_SQL = """
       AND r.parcel_id IS NULL
       AND r.mailing_address IS NULL
       AND r.enrichment_data::jsonb ? 'latitude'
+      AND r.enrichment_data::jsonb ? 'longitude'
       AND NOT (r.enrichment_data::jsonb ? 'kc_pin_status')
     ORDER BY r.id
 """
@@ -78,6 +79,8 @@ def run(db, *, apply_writes: bool, limit: int | None, report: Path | None,
     decisions, snapshot = resolve_code_violation_mailing(
         [(k, r.lat, r.lon, r.property_address) for k, r in by_id.items()], pace_s=pace_s)
     stats = {"candidates": len(rows), "snapshot": snapshot,
+             "reached_with_status": len(decisions),
+             "left_for_retry": len(rows) - len(decisions),
              "pin_status": dict(Counter(d["kc_pin_status"] for d in decisions.values())),
              "mailing_found": sum(1 for d in decisions.values() if d.get("mailing_address"))}
     if report is not None:

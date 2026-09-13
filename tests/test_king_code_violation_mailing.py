@@ -160,3 +160,24 @@ async def test_backfill_fills_done_rows_keeps_parcel_id_null_and_converges(
 
     again = await asyncio.to_thread(_run, True)
     assert again["candidates"] == 0
+
+
+def test_a_unit_address_is_never_matched_to_the_base_parcel(monkeypatch):
+    _layer(monkeypatch, P0904)
+    assert kpl.locate(47.6, -122.4, "5412 39TH AVE W #6, SEATTLE WA 98199").status == "unit_address"
+    assert kpl.locate(47.6, -122.4, "5412 39TH AVE W UNIT 6, SEATTLE WA 98199").status == "unit_address"
+
+
+def test_a_truncated_response_is_not_one_polygon(monkeypatch):
+    monkeypatch.setattr(kpl, "safe_get", lambda *a, **kw: _Resp(
+        {"features": [{"attributes": P0904}], "exceededTransferLimit": True}))
+    assert kpl.locate(47.6, -122.4, "5412 39TH AVE W, SEATTLE WA 98199").status == "multiple"
+
+
+def test_an_unavailable_extract_leaves_matched_rows_retryable(monkeypatch):
+    _layer(monkeypatch, P0904)
+    monkeypatch.setattr(kpl.time, "sleep", lambda s: None)
+    monkeypatch.setattr(kr, "cached_extract", lambda *a, **kw: None)
+    decisions, snap = kpl.resolve_code_violation_mailing(
+        [("a", 47.6, -122.4, "5412 39TH AVE W, SEATTLE WA 98199")])
+    assert decisions == {} and snap is None

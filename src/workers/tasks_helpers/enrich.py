@@ -574,14 +574,24 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             _publish_log(r, job_id, "info",
                          f"Matching {len(_cv_rows)} code violations to King County parcels...",
                          db=db)
-            # Budget: ~0.35 s per distinct point; 600 s bounds a very large Seattle
-            # window inside the soft limit. Rows not reached keep no status and are
-            # picked up by scripts/backfill_king_code_violation_mailing.py.
-            _cv_decisions, _cv_snapshot = resolve_code_violation_mailing(
-                [(k, res.enrichment_data["latitude"], res.enrichment_data["longitude"],
-                  res.property_address) for k, res in _cv_rows.items()],
-                budget_s=600,
-            )
+            # Budget covers the WHOLE step: 420 s of parcel lookups (15 s request
+            # timeout, so the last call ends by ~435 s) + one extract scan (~15 s) +
+            # commit. A code_violation job runs no eRealProperty pass (no parcel_id),
+            # so this replaces rather than adds to the King budget in the sum below.
+            # Rows not reached keep no status and are picked up by
+            # scripts/backfill_king_code_violation_mailing.py.
+            try:
+                _cv_decisions, _cv_snapshot = resolve_code_violation_mailing(
+                    [(k, res.enrichment_data["latitude"], res.enrichment_data["longitude"],
+                      res.property_address) for k, res in _cv_rows.items()],
+                    budget_s=420,
+                )
+            except Exception as exc:  # noqa: BLE001 -- enrichment is best-effort
+                if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+                    raise
+                _logger.warning("Job %s: code violation parcel match failed: %s",
+                                job_id, str(exc)[:120])
+                _cv_decisions, _cv_snapshot = {}, None
             _cv_mail = 0
             for k, d in _cv_decisions.items():
                 res = _cv_rows[k]

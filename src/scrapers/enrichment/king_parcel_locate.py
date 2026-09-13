@@ -25,6 +25,7 @@ row and must not change underneath it.
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 
@@ -40,10 +41,15 @@ PARCEL_LAYER = (
 )
 SOURCE = "king_gis_point_in_parcel"
 
+# A lead address naming a unit ("#6", "UNIT 6", "APT 6", "STE 6") cannot be proven by a
+# street comparison: the normalizer strips units, so two condo units on one base parcel
+# would compare equal and one owner's mailing would land on another's lead (Codex P1).
+_UNIT_RE = re.compile(r"(?:#\s*\w+|\b(?:UNIT|APT|APARTMENT|STE|SUITE|BLDG|SPC|LOT)\s+\w+)", re.I)
+
 
 @dataclass(frozen=True)
 class Located:
-    status: str                      # matched | no_parcel | multiple | address_mismatch | error
+    status: str      # matched | no_parcel | multiple | address_mismatch | unit_address | error
     pin: str | None = None
     parcel_address: str | None = None
 
@@ -62,12 +68,14 @@ def locate(lat: object, lon: object, property_address: str | None) -> Located:
         return Located("error")
     if not (-90 <= lat_f <= 90 and -180 <= lon_f <= 180):
         return Located("error")
+    if _UNIT_RE.search((property_address or "").split(",")[0]):
+        return Located("unit_address")
     try:
         resp = safe_get(PARCEL_LAYER, params={
             "geometry": f"{lon_f},{lat_f}", "geometryType": "esriGeometryPoint",
             "inSR": "4326", "spatialRel": "esriSpatialRelIntersects",
             "outFields": "PIN,ADDR_FULL,ZIP5", "returnGeometry": "false", "f": "json",
-        }, headers={"User-Agent": "Mozilla/5.0 BridgeLeads/1.0"}, timeout=30)
+        }, headers={"User-Agent": "Mozilla/5.0 BridgeLeads/1.0"}, timeout=15)
         data = resp.json() if resp.status_code == 200 else None
     except Exception as exc:  # noqa: BLE001 -- one failed lookup must not stop a batch
         if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
@@ -76,6 +84,9 @@ def locate(lat: object, lon: object, property_address: str | None) -> Located:
         return Located("error")
     if not isinstance(data, dict) or data.get("error"):
         return Located("error")
+    if data.get("exceededTransferLimit"):
+        # A capped page does not prove "exactly one polygon" (Codex P1).
+        return Located("multiple")
     features = data.get("features") or []
     if not features:
         return Located("no_parcel")
@@ -144,7 +155,12 @@ def resolve_code_violation_mailing(
     snapshot = None
     if pins:
         resolved = resolve_pins(pins)
-        if resolved is not None:
+        if resolved is None:
+            # The extract is temporarily unusable. A matched row stamped now would be
+            # excluded from every later run with no mailing (Codex P1), so matched rows
+            # carry no status and retry; definite non-matches keep theirs.
+            decisions = {k: d for k, d in decisions.items() if d["kc_pin_status"] != "matched"}
+        else:
             answers, snapshot = resolved
             for d in decisions.values():
                 ans = answers.get(d.get("kc_pin"))

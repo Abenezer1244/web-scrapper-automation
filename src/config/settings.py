@@ -307,6 +307,10 @@ class Settings(BaseSettings):
     TRACERFY_API_BASE_URL: str = "https://tracerfy.com"
     TRACERFY_WEBHOOK_SECRET: str = ""
     SKIP_TRACE_ENABLED: bool = False
+    # County GIS owner/taxpayer mailing from layers whose license restricts commercial
+    # use of lists of individuals (Snohomish, Cowlitz). OFF until counsel clears it;
+    # property-address enrichment from those layers is unaffected.
+    COUNTY_GIS_RESTRICTED_MAILING_ENABLED: bool = False
     SKIP_TRACE_CACHE_DAYS: int = 90
     # Tracerfy rate limit is 10 POSTs per 5-minute window. We leave headroom
     # by only submitting up to 2 batches per dispatcher tick (Beat runs every

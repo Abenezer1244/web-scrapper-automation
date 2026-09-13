@@ -216,6 +216,28 @@ async def test_over_cap_returns_429_with_retry_after(
     assert await sse_leases.active_count(str(starter_user.id)) == CAP
 
 
+async def test_the_app_origin_can_read_retry_after(
+    client: AsyncClient, starter_user: User, starter_token: str, pending_job: Job,
+):
+    """The app and the API are different origins; Retry-After is not CORS-safelisted."""
+    for _ in range(CAP):
+        await sse_leases.acquire(str(starter_user.id))
+
+    resp = await client.get(
+        f"/jobs/{pending_job.id}/logs",
+        headers={
+            "Authorization": f"Bearer {starter_token}",
+            "Accept": "text/event-stream",
+            "Origin": "https://app.bridgeleads.io",
+        },
+    )
+
+    assert resp.status_code == 429
+    assert resp.headers["access-control-allow-origin"] == "https://app.bridgeleads.io"
+    exposed = {h.strip().lower() for h in resp.headers["access-control-expose-headers"].split(",")}
+    assert "retry-after" in exposed
+
+
 async def test_finished_job_replays_without_taking_a_slot(
     client: AsyncClient, starter_user: User, starter_token: str, pending_job: Job,
 ):

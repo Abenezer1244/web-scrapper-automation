@@ -19,6 +19,34 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-13 - Closing the Snohomish coverage work, and a schema check that finally runs
+
+**Built / Shipped:** backend #284 (`3aefcce`, license-restricted county GIS mailing held off) and
+#281 (`b878796`, three dropped Tribune trustee sales) merged; Railway api + worker SUCCESS at
+`b878796`, a descendant of `3aefcce`, so the deploy includes #284. Frontend #130 (`678703e`): CI reads the private backend schema through the GitHub API
+with `BACKEND_SCHEMA_TOKEN`. Committed the Snohomish coverage audit
+(`docs/audits/snohomish-coverage-audit-2026-09-13.md`) and closed its handoff.
+
+**Tried / Decided:** merged #284 while #281's CI was still running because the two touch no common
+file; #281 was then merged by the previous session's watcher, so no rebase was needed.
+
+**Failed / Blocked:** the first token saved as the secret was rejected with 401 (not a valid
+token; a token without repo access answers 404). The replacement worked on the next CI run. Today's 10:45 UTC Tribune crawl ran on the old code
+(deploy 10:58), so recovery of `REF-202411260448` / `REF-202211100430` is unverified until the next
+crawl. Production DB reads remain unavailable to the agent.
+
+**Caught & fixed:** once the schema fetch worked, the drift check failed on one added doc-comment
+line from backend #282 (webhook `customer.subscription.created`); regenerated with
+openapi-typescript 7.13.0 from backend main (`821f6fd`), tsc and eslint clean.
+
+**Pending / Handoff:** owner decisions (Snohomish pre_foreclosure vs trustee_sale on the same
+notices; legal review of the county GIS license incl. Cowlitz, taxpayer names, Tribune reuse
+terms); check the next Tribune crawl and the Snohomish tax canary.
+
+**Facts learned:** every backend change that alters `schema/openapi.json`, including docstrings, now fails
+frontend CI until `lib/api-types.generated.ts` is regenerated. When the token expires, frontend CI
+fails at "Fetch backend OpenAPI schema" with 401.
+
 ## 2026-09-13 - King code-violation leads get mailing addresses (merge, backfill, live check)
 
 **Built / Shipped:** PR #283 squash-merged as `d31586a` (CI Test + Dependency Audit green on the

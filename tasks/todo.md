@@ -1,3 +1,70 @@
+# SSE "Too many concurrent streams (max 5)" (2026-09-13)
+
+Branches: BE `investigate/sse-stream-cap` (worktree `bridgeleads-worktrees/sse-stream-cap`),
+FE `investigate/sse-stream-cap` (worktree `bridgeleads-worktrees/fe-sse-stream-cap`).
+Status: Phase 1 (backend) DONE and verified locally, not pushed. Phase 2 (frontend) awaiting approval.
+
+## Proven findings (local uvicorn + private Redis 6391 + isolated `_test` DB + real Chromium)
+- Source: `src/api/routes/jobs.py` `stream_logs` -> `event_stream()`, `_MAX_SSE_PER_USER = 5` hardcoded,
+  Redis INCR counter `sse_count:{user_id}` (TTL 120s, refreshed only on INCR). Per user, across all tabs/jobs/replicas.
+- Transport: fetch + ReadableStream reading `text/event-stream` (not EventSource), Redis Pub/Sub `job_logs:{job_id}`.
+- LEAK: on any client disconnect, the finally block's `await r.delete(conn_key)` raises CancelledError
+  (anyio re-cancels), so `decr` never runs and `r.aclose()` is cancelled. Only server-ended streams release a slot.
+  Chromium: ONE tab reloaded 4x -> 5th load rejected with 1 real subscriber. Navigate away, close tab, close browser: all leak.
+- Self-sustaining lockout: every rejected attempt re-arms the 120s TTL.
+- Bypass: streams older than 120s outlive the counter key; user held 10 live streams with cap 5.
+- Cancelled jobs publish no terminal event, so their stream stays open up to 30 min.
+- Scrape unaffected: worker never reads publish results/subscriber counts; status page polls GET /jobs/{id} every 3s (3 polls/10s observed while capped).
+- FE: rejection is HTTP 200 + `{"type":"error"}` without `level` -> rendered as `[INF]` log line; hook exits
+  normally with `isConnected` still true -> false LIVE badge, no retry, no reconnect. `timeout`/`cancelled` unhandled.
+- Authorization OK: ownership check on Job.id + user_id, replay filtered by user_id, channel is job-scoped.
+
+## Phase 1 (backend) - DONE
+- [x] Lease ZSET `sse_leases:{user_id}` in new `src/api/sse_leases.py`: atomic Lua admit, renew only unexpired leases,
+      Redis TIME as the one clock, shielded + time-bounded release and Pub/Sub close; expiry is the backstop.
+- [x] Admission before the stream; over cap = HTTP 429 + Retry-After (no fake log line). Finished jobs take no lease.
+- [x] `SSE_MAX_STREAMS_PER_USER` (default 5, validated >= 1) in settings + `.env.example`.
+- [x] Stream re-checks job status every 60s (and once at open) so cancelled / recovered jobs end their stream.
+- [x] Found during build: each open stream held a Postgres connection "idle in transaction" (NullPool) for up to
+      30 min. Request transaction now committed before streaming; stream reads use short-lived RLS sessions.
+- [x] Found by Codex r2 (P1): a line could be lost between replay and subscribe. Worker `_publish_log` now commits
+      before publishing; the stream subscribes first, then replays.
+- [x] Logs: sse opened / rejected / closed with reason and lifetime (user and job ids, no tokens).
+- [x] Tests `tests/test_sse_leases.py` (14): cap per user, no overshoot under concurrency, release, crash expiry,
+      refusals do not extend lockout, renew guard, 429 + Retry-After, finished job no lease, other tenant 404,
+      real-socket disconnect release, 10 refreshes, terminal event, cancelled-without-event, worker ordering.
+
+## Review (Phase 1)
+- Files: `src/api/sse_leases.py` (new), `src/api/routes/jobs.py`, `src/workers/tasks_helpers/status.py`,
+  `src/config/settings.py`, `.env.example`, `tests/test_sse_leases.py`, `schema/openapi.json` (regenerated: route
+  description only). 6 source files, one over the 5-file phase guideline because the Codex P1 fix needed the worker.
+- Mutation-verified: removing the shield, the renew score guard, or commit-before-publish each fails a test.
+- Full suite on the branch: 3093 passed. 16 failures reproduce identically on pristine `origin/main` 8cc709f in the
+  same env (anthropic wheel truncated by Windows MAX_PATH 263 > 260; missing Stripe price env) = environmental.
+- Chromium E2E (local API + FE master, unchanged): 10 reloads -> 1 lease; navigate away -> 0; 6th stream -> 429 x4
+  while job polls keep returning 200; close one -> Retry admitted; user B admitted while A at cap; terminal event
+  releases only that job's streams; iPhone 13 viewport 8 open/reload/leave cycles -> 1 lease; all closed -> 0.
+  Postgres "idle in transaction" during an open stream: 1 before, 0 after.
+- Codex: r1 GATE PASS (7 P2/P3), r2 GATE FAIL (replay gap P1, fixed), r3 GATE PASS.
+- Deferred follow-ups (Codex P2/P3, all pre-existing): unbounded replay size; terminal events are not persisted
+  (status check closes within 60s, page status poll is 3s); publish failure after commit only reaches viewers on
+  reconnect; no shutdown close for the module Redis client (same as rate_limit); TIME/EVAL two round trips.
+- Local rig note: the current FE on 429 retries 3x then shows "Disconnected. Retry" (honest but not the target UX;
+  Phase 2). Chrome's 6 connections per host (HTTP/1.1) means 5 streams in ONE browser profile starve its other
+  API calls locally; production protocol still unverified.
+
+## Proposed Phase 2 (frontend, 2-3 files) - NOT STARTED
+- [ ] Hook: 429 / reader end without terminal -> `isConnected=false`, "paused" state; backoff retry (e.g. 15s, 30s, 60s) only while job non-terminal; stop on terminal server status; handle `timeout`, `cancelled`.
+- [ ] Release stream when tab hidden > ~30s, reconnect on visible (replay dedup by log id already exists).
+- [ ] Copy: "Live updates paused. Your scrape is still running." + "Retry live updates". No em dashes.
+- [ ] Playwright: 1/5/6 tabs, reload x10, nav away/back, close tabs, mobile viewport, exact lease counts.
+
+## Not verified yet
+- Production edge HTTP/1.1 vs HTTP/2 (prod probe was not run).
+- WebKit / iOS background-foreground, real sleep/resume. Playwright `set_offline` did not drop localhost sockets (inconclusive).
+
+---
+
 # Mailing follow-ups after #283 (2026-09-13)
 
 Branch `feat/mailing-followups` (worktree `C:/Users/Windows/bl-wt-rpacct`, from `origin/main` @ `a55308f`).

@@ -337,6 +337,20 @@ class Settings(BaseSettings):
             )
         return v
 
+    # ─── Live job log stream (SSE) ────────────────────────────────────────────
+    # Concurrent live log streams one user may hold, across all tabs, jobs and
+    # API replicas. Each stream holds a Redis Pub/Sub connection for up to 30
+    # minutes. Enforced as expiring leases in src/api/sse_leases.py.
+    SSE_MAX_STREAMS_PER_USER: int = 5
+
+    @field_validator("SSE_MAX_STREAMS_PER_USER")
+    @classmethod
+    def sse_cap_must_be_positive(cls, v: int) -> int:
+        """0 or less would reject every live stream for every user."""
+        if v < 1:
+            raise ValueError("SSE_MAX_STREAMS_PER_USER must be at least 1.")
+        return v
+
     # ─── Daily Scrape Cache ────────────────────────────────────────────────
     ENABLE_DAILY_SCRAPE: bool = False
     RECORD_RETENTION_DAYS: int = 365

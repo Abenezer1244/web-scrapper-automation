@@ -1,17 +1,17 @@
 """Job routes: CRUD + SSE live log stream."""
 
-import asyncio
 import json
+import time
 import uuid
 from collections.abc import AsyncGenerator
 
-import redis.asyncio as aioredis
 import redis.exceptions as _redis_exceptions
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api import sse_leases
 from src.api.auth import CurrentUser
 from src.api.deps import get_db, get_rls_db
 from src.api.dialer_filters import dialer_ready_conditions
@@ -34,9 +34,19 @@ from src.config.constants import (
     scrape_queue_for_plan,
 )
 from src.db import CountyConnector, Job, JobLog, Result, ScraperConfig, User
+from src.db import session as db_session
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("api.jobs")
+
+# Live log stream (GET /jobs/{id}/logs).
+_SSE_TERMINAL_STATUSES = frozenset({"done", "failed", "cancelled"})
+_SSE_MAX_DURATION_SECONDS = 1800
+_SSE_STATUS_CHECK_SECONDS = 60
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",  # Disable nginx buffering for SSE
+}
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -722,7 +732,15 @@ async def stream_logs(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> StreamingResponse:
-    """SSE endpoint: replays existing logs then streams new ones via Redis Pub/Sub."""
+    """SSE endpoint: replays existing logs then streams new ones via Redis Pub/Sub.
+
+    A finished job replays and ends with ``{"type": "done"}``. A running job
+    needs a stream lease (``src/api/sse_leases.py``); over the per-user cap the
+    request is refused with 429 + Retry-After before any stream opens. A live
+    stream ends with the job's terminal event, or ``{"type": "timeout"}`` after
+    30 minutes or if its lease was reclaimed, after which the client reconnects.
+    Nothing here affects the job itself: the worker never reads stream state.
+    """
     # Verify ownership
     result = await db.execute(
         select(Job).where(Job.id == job_id, Job.user_id == current_user.id)
@@ -731,129 +749,166 @@ async def stream_logs(
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
-    # Fetch existing logs for replay. C7 (full-SaaS review):
-    # JobLog has no direct user_id column, so we join through Job
-    # explicitly with a user_id filter. The ownership check above
-    # already proves the caller owns this job_id, but adding the
-    # filter here is defense-in-depth: if anyone ever swaps
-    # get_rls_db for get_db on this route, the JobLog RLS policy
-    # (which joins through jobs.user_id) would be bypassed and
-    # the query would silently read across tenants. This explicit
-    # filter keeps the tenant boundary at the ORM layer.
-    logs_result = await db.execute(
-        select(JobLog)
-        .join(Job, JobLog.job_id == Job.id)
-        .where(
-            JobLog.job_id == job_id,
-            Job.user_id == current_user.id,
-        )
-        .order_by(JobLog.created_at.asc())
-    )
-    existing_logs = logs_result.scalars().all()
+    user_id = str(current_user.id)
 
-    _MAX_SSE_PER_USER = 5
-    _SSE_HEARTBEAT_TTL = 60  # Each connection key expires after 60s if not refreshed
+    if job.status in _SSE_TERMINAL_STATUSES:
+        # A finished job streams nothing live, so it takes no slot. The query
+        # filters on user_id itself (C7, see _job_logs_select), so swapping
+        # get_rls_db for get_db here would not read across tenants.
+        replay = [_sse_log_line(log) for log in (await db.execute(_job_logs_select(job_id, user_id))).scalars()]
+        await db.commit()
+
+        async def replay_only() -> AsyncGenerator[str, None]:
+            for line in replay:
+                yield line
+            yield "data: {\"type\": \"done\"}\n\n"
+
+        return StreamingResponse(replay_only(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+    # End the read transaction before streaming. The async engine is NullPool,
+    # so an open transaction pins a real Postgres connection "idle in
+    # transaction" for the life of the stream, up to 30 minutes (measured
+    # 2026-09-13). The stream does its own reads on short-lived sessions.
+    await db.commit()
+
+    admission = await sse_leases.acquire(user_id)
+    if not admission.admitted:
+        _logger.info(
+            "sse rejected user=%s job=%s active=%d cap=%d retry_after=%ds",
+            user_id, job_id, admission.active, settings.SSE_MAX_STREAMS_PER_USER,
+            admission.retry_after_seconds,
+        )
+        # A 429 before any stream opens, not a 200 carrying an error "log line":
+        # the client can tell "live view unavailable" from job output. The job
+        # itself is unaffected; only this view of it was refused.
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Live log stream limit reached for this account. The job is still running.",
+            headers={"Retry-After": str(admission.retry_after_seconds)},
+        )
+    lease_id = admission.lease_id
+    _logger.info("sse opened user=%s job=%s active=%d", user_id, job_id, admission.active)
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        # Track concurrent SSE connections using per-connection keys with TTL.
-        # Each connection registers a unique key that auto-expires in 60s.
-        # The polling loop refreshes the TTL — if the connection dies (crash,
-        # network loss, tab close), the key expires automatically.
-        conn_id = f"{current_user.id}:{uuid.uuid4().hex[:8]}"
-        conn_key = f"sse_conn:{conn_id}"
-        counter_key = f"sse_count:{current_user.id}"
-
-        r = aioredis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
-
-        # C6 (full-SaaS review): atomic INCR-then-check instead of
-        # scan_iter+count+set. Previously a user who opened 20 tabs
-        # simultaneously could all pass the `conn_count < 5` check
-        # before any of them wrote a key, leading to 20 stuck SSE
-        # streams per user. Now we INCR first and decrement in the
-        # finally block; if the incremented value exceeds the cap we
-        # bail immediately and undo our own increment.
-        conn_count = await r.incr(counter_key)
-        # Expire the counter key so a long-lived overflow doesn't
-        # poison future connections. Refreshed on each INCR.
-        await r.expire(counter_key, _SSE_HEARTBEAT_TTL * 2)
-
-        if conn_count > _MAX_SSE_PER_USER:
-            # Undo our own increment so we don't block future
-            # legitimate connections.
-            await r.decr(counter_key)
-            await r.aclose()
-            yield f"data: {{\"type\": \"error\", \"message\": \"Too many concurrent streams (max {_MAX_SSE_PER_USER}). Close other tabs and retry.\"}}\n\n"
-            return
-
-        # Register this specific connection for heartbeat tracking
-        await r.set(conn_key, "1", ex=_SSE_HEARTBEAT_TTL)
-
+        opened = time.monotonic()
+        end_reason = "client_disconnect"
+        pubsub = None
         try:
-            # 1. Replay persisted logs
-            for log in existing_logs:
-                payload = LogLine.model_validate(log).model_dump_json()
-                yield f"data: {payload}\n\n"
+            pubsub = sse_leases.get_redis().pubsub()
+            # Subscribe BEFORE reading stored lines. The worker commits a line
+            # before publishing it (_publish_log), so every line is either in
+            # this read or published after the subscription. A line in both
+            # carries the same id and is dropped by the client.
+            await pubsub.subscribe(f"job_logs:{job_id}")
+            for line in await _stream_stored_log_lines(job_id, user_id):
+                yield line
 
-            # 2. If job is already terminal, stop here
-            if job.status in {"done", "failed", "cancelled"}:
-                yield "data: {\"type\": \"done\"}\n\n"
-                return
-
-            # 3. Subscribe to Redis Pub/Sub channel for live events
-            import time as _time
-            max_duration = 1800  # 30 minutes max SSE connection
-            start_time = _time.time()
-            last_heartbeat = _time.time()
-
-            pubsub = r.pubsub()
-            channel = f"job_logs:{job_id}"
-            await pubsub.subscribe(channel)
-
-            try:
-                while True:
-                    if _time.time() - start_time > max_duration:
+            next_renew = opened + sse_leases.LEASE_HEARTBEAT_SECONDS
+            next_status_check = opened  # first pass: catch a job that ended before we subscribed
+            while True:
+                now = time.monotonic()
+                if now - opened > _SSE_MAX_DURATION_SECONDS:
+                    end_reason = "max_duration"
+                    yield "data: {\"type\": \"timeout\"}\n\n"
+                    break
+                if now >= next_renew:
+                    next_renew = now + sse_leases.LEASE_HEARTBEAT_SECONDS
+                    if not await sse_leases.renew(user_id, lease_id):
+                        # The slot was reclaimed (renewals stalled past the TTL).
+                        # Holding the stream would exceed the cap; the client
+                        # reconnects through admission instead.
+                        end_reason = "lease_lost"
                         yield "data: {\"type\": \"timeout\"}\n\n"
                         break
+                if now >= next_status_check:
+                    # Cancellation and some recovery paths terminalize a job
+                    # without publishing an event; without this the stream would
+                    # hold its slot for the full 30 minutes.
+                    next_status_check = now + _SSE_STATUS_CHECK_SECONDS
+                    current = await _stream_job_status(job_id, user_id)
+                    if current is None or current in _SSE_TERMINAL_STATUSES:
+                        end_reason = "job_terminal"
+                        if current is not None:
+                            yield f"data: {{\"type\": \"{current}\"}}\n\n"
+                        break
 
-                    # Refresh TTL every 30s to prove connection is alive
-                    if _time.time() - last_heartbeat > 30:
-                        await r.expire(conn_key, _SSE_HEARTBEAT_TTL)
-                        last_heartbeat = _time.time()
-
-                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=30.0)
-                    if message and message.get("type") == "message":
-                        yield f"data: {message['data']}\n\n"
-                        # Check for terminal event
-                        try:
-                            data = json.loads(message["data"])
-                            if data.get("type") in {"done", "failed", "cancelled"}:
-                                break
-                        except (json.JSONDecodeError, KeyError):
-                            pass
-                    await asyncio.sleep(0.1)
-            finally:
-                await pubsub.unsubscribe(channel)
+                wait = max(0.0, min(next_renew, next_status_check) - time.monotonic())
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=wait)
+                if message and message.get("type") == "message":
+                    yield f"data: {message['data']}\n\n"
+                    try:
+                        data = json.loads(message["data"])
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if isinstance(data, dict) and data.get("type") in _SSE_TERMINAL_STATUSES:
+                        end_reason = "job_terminal"
+                        break
+        except Exception:
+            end_reason = "error"
+            _logger.exception("sse stream error user=%s job=%s", user_id, job_id)
+            raise
         finally:
-            # Clean up — delete our connection key immediately and
-            # decrement the atomic counter. The counter may go
-            # temporarily negative if keys were deleted out of
-            # order; `max(0, ...)` defensive clamp at the top of
-            # the handler ensures a negative doesn't prevent the
-            # next connection from being accepted.
-            try:
-                await r.delete(conn_key)
-                await r.decr(counter_key)
-            finally:
-                await r.aclose()
+            # Both are shielded and time-bounded: on client disconnect this
+            # task is cancelled, and an unshielded await here is cancelled too
+            # (that is how the old counter leaked). Neither raises, so the
+            # release always runs; the lease expires even if it fails.
+            if pubsub is not None:
+                await sse_leases.close_pubsub(pubsub, job_id)
+            await sse_leases.release(user_id, lease_id)
+            _logger.info(
+                "sse closed user=%s job=%s reason=%s lifetime=%.1fs",
+                user_id, job_id, end_reason, time.monotonic() - opened,
+            )
 
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # Disable nginx buffering for SSE
-        },
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+
+def _job_logs_select(job_id: str, user_id: str):
+    """A job's stored log lines, oldest first, tenant-filtered.
+
+    C7 (full-SaaS review): JobLog has no user_id column, so the query joins
+    through Job with an explicit user_id filter. The caller's ownership check
+    already proves the job is theirs; this keeps the tenant boundary at the
+    ORM layer even if a caller ever runs it on a session without RLS.
+    """
+    return (
+        select(JobLog)
+        .join(Job, JobLog.job_id == Job.id)
+        .where(JobLog.job_id == job_id, Job.user_id == user_id)
+        .order_by(JobLog.created_at.asc())
     )
+
+
+def _sse_log_line(log: JobLog) -> str:
+    return f"data: {LogLine.model_validate(log).model_dump_json()}\n\n"
+
+
+def _stream_session(user_id: str) -> AsyncSession:
+    """A short-lived RLS-bound session for work inside a live stream.
+
+    The request's own session is committed before streaming begins, and
+    reusing it would reopen a transaction held for the stream's lifetime.
+    The binding is the one get_rls_db applies, re-applied per transaction by
+    the after_begin listener; queries still filter on user_id explicitly.
+    """
+    session = db_session.AsyncSessionLocal()
+    session.sync_session.info["rls_user_id"] = user_id
+    return session
+
+
+async def _stream_job_status(job_id: str, user_id: str) -> str | None:
+    """Current status of the streamed job."""
+    async with _stream_session(user_id) as session:
+        result = await session.execute(
+            select(Job.status).where(Job.id == job_id, Job.user_id == user_id)
+        )
+        return result.scalar_one_or_none()
+
+
+async def _stream_stored_log_lines(job_id: str, user_id: str) -> list[str]:
+    """Every stored log line of the streamed job, as SSE events."""
+    async with _stream_session(user_id) as session:
+        return [_sse_log_line(log) for log in (await session.execute(_job_logs_select(job_id, user_id))).scalars()]
 
 
 # ─── Export URL (presigned R2 download) ──────────────────────────────────────
